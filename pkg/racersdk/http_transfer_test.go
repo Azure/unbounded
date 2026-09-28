@@ -44,17 +44,7 @@ func testHTTPTransferKeepsConnectionsAndRanges(t *testing.T, window int) {
 	const size = 2*int64(PageSize) + 173
 
 	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		selected, err := parseRange(r.Header.Get("Range"))
-		if err != nil {
-			t.Error(err)
-			return
-		}
-
-		first, last, err := selected.resolve(ByteLength(size))
-		if err != nil {
-			t.Error(err)
-			return
-		}
+		first, last := fixtureRange(t, r, size)
 
 		streamResponseHead(w, int64(first), int64(last-first)+1, size, `"v"`)
 		_, _ = io.CopyN(w, &offsetStream{offset: int64(first)}, int64(last-first)+1)
@@ -115,7 +105,7 @@ func testHTTPTransferKeepsConnectionsAndRanges(t *testing.T, window int) {
 		}
 	}
 
-	if connections.Load() != 1 || fast.Load() < size {
+	if connections.Load() != 1 || fast.Load() != 0 {
 		t.Fatal("keep-alive/fast path", connections.Load(), fast.Load())
 	}
 

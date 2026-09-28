@@ -201,9 +201,9 @@ func TestGantryIntegration(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, fmt.Sprintf("sha256:%x", want.Sum(nil)), actual)
 		require.Equal(t, float64(n), testutil.ToFloat64(metrics.receivedBytes)-before)
-		// Stat selects metadata once; Get reuses its snapshot and fetches only
-		// the two requested pages, never page zero.
-		require.Equal(t, int64(3), callbacks.Load())
+		// The noncaching fake validates the subscription pin with an origin HEAD
+		// after Stat, then fetches only the two selected pages, never page zero.
+		require.Equal(t, int64(4), callbacks.Load())
 		assertRanges(t, 0, 1, 1)
 	})
 

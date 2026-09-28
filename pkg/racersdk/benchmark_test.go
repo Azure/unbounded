@@ -17,8 +17,8 @@ import (
 	"time"
 )
 
-// benchmarkPeer generates bytes with fixed scratch. Both clients receive the same
-// bootstrap/continuation framing from this peer; no page-sized fixture is resident.
+// benchmarkPeer generates bytes with fixed scratch. The SDK uses subscriptions;
+// the stdlib baseline uses origin-style ranges. Neither retains an object fixture.
 func benchmarkPeer(b *testing.B, size int64, origin bool) string {
 	b.Helper()
 	path := socketDir(b) + "/socket"
@@ -61,7 +61,7 @@ func benchmarkPeer(b *testing.B, size int64, origin bool) string {
 		}
 		server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { serveOperation(w, r, config, callback, slots, headSlots) })
 	} else {
-		server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		server.Handler = subscriptionHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == "HEAD" {
 				w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 				w.Header().Set("ETag", `"v"`)
@@ -72,6 +72,18 @@ func benchmarkPeer(b *testing.B, size int64, origin bool) string {
 
 			if size == 0 {
 				streamResponse(w, 0, 0, 0, `"v"`)
+				return
+			}
+
+			if r.Method == "POST" {
+				selected, err := parseFakeSubscription(r)
+				if err != nil {
+					b.Error(err)
+					return
+				}
+
+				streamResponse(w, int64(selected.first), int64(min(selected.end, uint64(size))-selected.first), size, `"v"`)
+
 				return
 			}
 
@@ -88,7 +100,7 @@ func benchmarkPeer(b *testing.B, size int64, origin bool) string {
 			}
 
 			streamResponse(w, int64(first), int64(last-first)+1, size, `"v"`)
-		})
+		}))
 	}
 
 	finished := make(chan struct{})

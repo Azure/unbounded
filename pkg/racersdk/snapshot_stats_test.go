@@ -39,7 +39,7 @@ func TestReadOptionsSnapshot(t *testing.T) {
 			path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				gets.Add(1)
 
-				if r.Method != "GET" || r.Header.Get("If-Match") != `"v"` || r.Header.Get("Range") != "bytes=1-2" {
+				if r.Method != "POST" || r.Header.Get("If-Match") != `"v"` || r.Header.Get("Range") != "bytes=1-" {
 					t.Error("snapshot did not skip HEAD or pin exact range")
 				}
 
@@ -99,6 +99,13 @@ func TestReadOptionsInvalidSnapshotDoesNotFetch(t *testing.T) {
 	assertKind(t, err, ErrorUnsatisfiableRange)
 
 	empty := originMeta(0)
+	c = testClient(t, clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("If-Match") != empty.ETag.String() {
+			t.Error("empty snapshot pin lost")
+		}
+
+		streamResponse(w, 0, 0, 0, `"v"`)
+	})), 1)
 
 	v, err := c.Get(context.Background(), Request{}, ReadOptions{Metadata: &empty})
 	if err != nil {
@@ -110,7 +117,7 @@ func TestReadOptionsInvalidSnapshotDoesNotFetch(t *testing.T) {
 		t.Fatal(n, err)
 	}
 
-	if stats := c.Stats(); stats.Dials != 0 || stats.ActiveBulk != 0 || stats.ActiveMetadata != 0 {
+	if stats := c.Stats(); stats.Dials != 1 || stats.ActiveBulk != 0 || stats.ActiveMetadata != 0 {
 		t.Fatal(stats)
 	}
 }
@@ -189,14 +196,14 @@ func TestClientStats(t *testing.T) {
 	closeBody(v)
 
 	s = c.Stats()
-	if s.QueueDepth != 0 || s.QueueWaits != 2 || s.QueueTimeouts != 1 || s.QueueWaitNanoseconds == 0 || s.ConnectionReuses != 1 || s.BytesRead != 6 || s.ActiveBulk != 0 || s.Retries != 0 {
+	if s.QueueDepth != 0 || s.QueueWaits != 2 || s.QueueTimeouts != 1 || s.QueueWaitNanoseconds == 0 || s.ConnectionReuses != 0 || s.BytesRead != 6 || s.ActiveBulk != 0 || s.Retries != 0 {
 		t.Fatal(s)
 	}
 
 	closeBody(c)
 
 	s = c.Stats()
-	if s.Connections != 0 || s.IdleConnections != 0 || s.Dials != 2 || s.BytesRead != 6 {
+	if s.Connections != 0 || s.IdleConnections != 0 || s.Dials != 3 || s.BytesRead != 6 {
 		t.Fatal("cleanup lost counters or retained gauges", s)
 	}
 }
@@ -204,7 +211,7 @@ func TestClientStats(t *testing.T) {
 // A scripted peer warms one pooled lease, then fails its next exchange. A retry
 // is allowed only for an empty EOF/reset, never after any response prefix.
 func TestClientStaleRetryBoundary(t *testing.T) {
-	for _, method := range []string{"GET", "HEAD"} {
+	for _, method := range []string{"POST", "HEAD"} {
 		for _, mode := range []string{"stale", "partial", "malformed", "timeout", "twice", "fresh", "canceled"} {
 			t.Run(method+"/"+mode, func(t *testing.T) {
 				path := socketDir(t) + "/socket"
@@ -242,7 +249,10 @@ func TestClientStaleRetryBoundary(t *testing.T) {
 							return
 						}
 
-						_, _ = io.WriteString(conn, "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: bytes 0-0/1\r\nContent-Type: application/octet-stream\r\nETag: \"v\"\r\nRacer-Expires-At: 0\r\n\r\nx")
+						_, _ = io.WriteString(conn, subscriptionHead(1, 0, 1))
+						_ = fakeSubscriptionFrame(conn, 1, 0, 0, 1)
+						_, _ = io.WriteString(conn, "x")
+						_ = fakeSubscriptionFrame(conn, 2, 1, 1, 0)
 					}
 
 					if mode != "fresh" {
@@ -252,6 +262,18 @@ func TestClientStaleRetryBoundary(t *testing.T) {
 
 						exchanges.Add(1)
 						respond(conn)
+
+						if method == "POST" {
+							closeBody(conn)
+
+							conn, err = listener.Accept()
+							if err != nil {
+								return
+							}
+							defer closeBody(conn)
+
+							r = bufio.NewReader(conn)
+						}
 					}
 
 					if _, err := readRawHead(r, false); err != nil {
@@ -273,7 +295,7 @@ func TestClientStaleRetryBoundary(t *testing.T) {
 
 					closeBody(conn)
 
-					if mode == "stale" || mode == "twice" {
+					if method == "HEAD" && (mode == "stale" || mode == "twice") {
 						conn, err := listener.Accept()
 						if err != nil {
 							return
@@ -322,7 +344,7 @@ func TestClientStaleRetryBoundary(t *testing.T) {
 				}
 
 				err = read(ctx)
-				if mode == "stale" {
+				if method == "HEAD" && mode == "stale" {
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -346,11 +368,16 @@ func TestClientStaleRetryBoundary(t *testing.T) {
 				<-serverDone
 
 				want := uint64(0)
-				if mode == "stale" || mode == "twice" {
+				if method == "HEAD" && (mode == "stale" || mode == "twice") {
 					want = 1
 				}
 
-				if s := c.Stats(); s.Retries != want || s.Dials != 1+want {
+				wantDials := 1 + want
+				if method == "POST" && mode != "fresh" {
+					wantDials = 2
+				}
+
+				if s := c.Stats(); s.Retries != want || s.Dials != wantDials {
 					t.Fatal("retry boundary", s)
 				}
 
@@ -407,12 +434,15 @@ func TestClientStaleIdlePinnedRetryPreservesRequest(t *testing.T) {
 				return
 			}
 
-			r, err := parseRequestHead(head, false)
-			if err != nil || r.operation != OperationPinned || r.pin.value != `"v"` || r.byteRange.first != 1 || r.byteRange.last != 2 || r.context.authorization.value != "secret" || r.context.metadata.value != "opaque" {
-				t.Error("retry changed request", err)
+			h := headHeaders(head)
+			if h.Get("If-Match") != `"v"` || h.Get("Range") != "bytes=1-" || h.Get("Authorization") != "secret" || h.Get("Racer-Metadata") != "opaque" {
+				t.Error("subscription changed request")
 			}
 
-			_, _ = io.WriteString(conn, "HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nContent-Range: bytes 1-2/3\r\nContent-Type: application/octet-stream\r\nETag: \"v\"\r\nRacer-Expires-At: 0\r\n\r\nxx")
+			_, _ = io.WriteString(conn, subscriptionHead(3, 1, 3))
+			_ = fakeSubscriptionFrame(conn, 1, 0, 1, 2)
+			_, _ = io.WriteString(conn, "xx")
+			_ = fakeSubscriptionFrame(conn, 2, 1, 2, 0)
 			closeBody(conn)
 
 			if i == 0 {
@@ -445,7 +475,7 @@ func TestClientStaleIdlePinnedRetryPreservesRequest(t *testing.T) {
 	<-done
 
 	s := c.Stats()
-	if s.Dials != 2 || s.ConnectionReuses != 1 || s.Retries != 1 || s.BytesRead != 4 {
+	if s.Dials != 2 || s.ConnectionReuses != 0 || s.Retries != 0 || s.BytesRead != 4 {
 		t.Fatal(s)
 	}
 }

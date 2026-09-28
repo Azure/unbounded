@@ -152,7 +152,7 @@ func headerToken(b byte) bool {
 
 func singletonHeader(name string) bool {
 	switch name {
-	case "host", "content-length", "content-type", "content-range", "etag", "if-match", "range", "racer-expires-at", "racer-content-type", "racer-metadata", "authorization":
+	case "host", "content-length", "content-type", "content-range", "etag", "if-match", "range", "racer-expires-at", "racer-content-type", "racer-metadata", "authorization", "racer-object-length", "racer-range-start", "racer-range-end", "racer-page-credits", "racer-byte-credits", "racer-ordered":
 		return true
 	default:
 		return false

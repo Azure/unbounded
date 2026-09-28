@@ -179,21 +179,26 @@ type Request struct {
 
 func (r Request) Format(s fmt.State, _ rune) { writeDiagnostic(s, "Request([redacted])") }
 
-// ReadOptions selects a pinned byte range. Length zero reads through EOF. Pin
-// optionally selects an existing immutable version; without a snapshot, zero
-// selects fresh metadata.
+// ReadOptions selects a subscription byte range. Length zero reads through EOF.
+// Pin optionally selects an existing immutable version; without a snapshot,
+// zero selects fresh metadata in the same subscription request.
 // A range extending beyond the object is rejected rather than silently shortened.
 type ReadOptions struct {
+	// PageCredits and ByteCredits bound outstanding subscription leases. Zero
+	// selects the configured PageWindow (default two) and PageCredits*PageSize
+	// bytes. Ordered requests ascending pages; Get always enables it.
+	PageCredits int
+	ByteCredits ByteLength
+	Ordered     bool
 	// SmallObject selects reserved admission for objects no larger than PageSize.
-	// With no range, pin or snapshot it preserves the normal bootstrap GET.
 	// Larger objects fail with ErrorInvalidArgument before a Value is exposed.
 	SmallObject bool
 	Offset      ByteOffset
 	Length      ByteLength
 	Pin         ETag
 	// Metadata is an optional trusted snapshot for this request's object, usually
-	// from Stat. It skips HEAD and pins the GET to its ETag. A nonzero Pin must
-	// match. Get validates and copies the snapshot; do not mutate it during Get.
+	// from Stat. It pins the subscription to its ETag. A nonzero Pin must match.
+	// The SDK validates and copies it; do not mutate it during the opening call.
 	Metadata *Metadata
 }
 

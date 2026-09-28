@@ -20,17 +20,7 @@ func TestValueWriteToSplicesOrderedHTTPBodies(t *testing.T) {
 	const size = 2*int64(PageSize) + 173
 
 	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rangeValue, err := parseRange(r.Header.Get("Range"))
-		if err != nil {
-			t.Error(err)
-			return
-		}
-
-		first, last, err := rangeValue.resolve(ByteLength(size))
-		if err != nil {
-			t.Error(err)
-			return
-		}
+		first, last := fixtureRange(t, r, size)
 
 		streamResponseHead(w, int64(first), int64(last-first)+1, size, `"v"`)
 		_, _ = io.CopyN(w, &offsetStream{offset: int64(first)}, int64(last-first)+1)
@@ -89,11 +79,11 @@ func TestValueWriteToSplicesOrderedHTTPBodies(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if sink.SplicedBytes() < size/2 {
-		t.Fatal("no substantial kernel splice", sink.SplicedBytes())
+	if sink.SplicedBytes() != 0 {
+		t.Fatal("framed subscription bypassed page validation", sink.SplicedBytes())
 	}
 
-	if len(c.pages) != 0 {
+	if len(c.slots) != 0 {
 		t.Fatal("body permits leaked")
 	}
 	// A later response still goes through Transport parsing and body lifecycle.
@@ -165,7 +155,7 @@ func TestValueWriteToSpliceCancellation(t *testing.T) {
 		t.Fatal("splice did not cancel")
 	}
 
-	if len(c.pages) != 0 {
+	if len(c.slots) != 0 {
 		t.Fatal("canceled splice retained page")
 	}
 }
@@ -174,13 +164,7 @@ func TestValueServeHTTPLifecycle(t *testing.T) {
 	const size = int64(PageSize) + 173
 
 	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requested, _ := parseRange(r.Header.Get("Range"))
-
-		first, last, err := requested.resolve(ByteLength(size))
-		if err != nil {
-			t.Error(err)
-			return
-		}
+		first, last := fixtureRange(t, r, size)
 
 		streamResponseHead(w, int64(first), int64(last-first)+1, size, `"v"`)
 		_, _ = io.CopyN(w, &offsetStream{offset: int64(first)}, int64(last-first)+1)

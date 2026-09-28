@@ -122,6 +122,11 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, upstream, re
 	if ranged {
 		remaining -= offset
 	}
+	// Page leases become readable only after a complete verified slice arrives.
+	// Publish the already validated response headers without waiting for a page.
+	if err := http.NewResponseController(w).Flush(); err != nil {
+		panic(http.ErrAbortHandler)
+	}
 	// Read through SDK EOF, including its final framing check. A LimitedReader
 	// would hide a truncated terminator after the advertised payload. OCI digest
 	// verification belongs to the consumer, including resumed object assembly.

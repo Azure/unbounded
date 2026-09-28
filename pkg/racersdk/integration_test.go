@@ -63,63 +63,18 @@ func pageForwarder(t *testing.T, path string, size int64) http.Handler {
 	t.Cleanup(transport.CloseIdleConnections)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requested, err := parseRange(r.Header.Get("Range"))
-		if err != nil {
-			t.Error(err)
-			return
-		}
-
-		first, last, err := requested.resolve(ByteLength(size))
-		if err != nil {
-			t.Error(err)
-			return
-		}
-
-		for start := int64(first); start <= int64(last); start += int64(PageSize) {
-			end := min(start+int64(PageSize)-1, int64(last))
-
-			req, err := http.NewRequestWithContext(r.Context(), "GET", "http://racer"+r.URL.Path, nil)
-			if err != nil {
-				t.Error(err)
-				return
-			}
-
-			req.Header = r.Header.Clone()
-			if r.Header.Get("If-Match") != "" {
-				req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
-			}
-
-			res, err := transport.RoundTrip(req)
-			if err != nil {
-				t.Error(err)
-				panic(http.ErrAbortHandler)
-			}
-
-			if res.StatusCode != 206 || res.ContentLength != end-start+1 {
-				closeBody(res.Body)
-				t.Errorf("origin response: %d length %d", res.StatusCode, res.ContentLength)
-				panic(http.ErrAbortHandler)
-			}
-
-			if start == int64(first) {
-				for name, values := range res.Header {
-					w.Header()[name] = values
-				}
-
-				w.Header().Set("Content-Length", strconv.FormatInt(int64(last-first)+1, 10))
-				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", first, last, size))
-				w.WriteHeader(206)
-			}
-
-			_, err = io.Copy(w, res.Body)
-			closeBody(res.Body)
-
-			if err != nil {
-				t.Error(err)
-				panic(http.ErrAbortHandler)
-			}
+		if r.Method == http.MethodPost {
+			serveFakeSubscription(w, r, transport)
+		} else {
+			serveFakePages(w, r, transport)
 		}
 	})
+}
+
+// originClient exercises the real Unix origin through the subscription fake.
+func originClient(t *testing.T, path string, maxConnections int) *Client {
+	t.Helper()
+	return testClient(t, rawClientPeer(t, pageForwarder(t, path, 0)), maxConnections)
 }
 
 func TestIntegrationOriginRoundTrip(t *testing.T) {
@@ -165,11 +120,7 @@ func TestIntegrationOriginRoundTrip(t *testing.T) {
 
 			defer func() { cancel(); <-done }()
 
-			if size > 2*int64(PageSize) {
-				path = clientPeer(t, pageForwarder(t, path, size))
-			}
-
-			client := testClient(t, path, 1)
+			client := originClient(t, path, 1)
 
 			value, err := client.Get(context.Background(), request)
 			if err != nil {
@@ -201,7 +152,7 @@ func TestIntegrationClientConnectionReuse(t *testing.T) {
 	defer func() { cancel(); <-done }()
 	// Only consume bootstrap, then close: a completely consumed HTTP frame can be
 	// reused even though the lazy full-object continuation was never requested.
-	client := testClient(t, path, 1)
+	client := originClient(t, path, 1)
 
 	var connections []net.Conn
 
@@ -221,8 +172,8 @@ func TestIntegrationClientConnectionReuse(t *testing.T) {
 		closeBody(v)
 	}
 
-	if len(connections) != 3 || connections[0] != connections[1] || connections[1] != connections[2] {
-		t.Fatal("fully consumed bootstrap connection was not reused")
+	if len(connections) != 3 || connections[0] == connections[1] || connections[1] == connections[2] {
+		t.Fatal("subscription socket must not be reused")
 	}
 }
 
@@ -284,7 +235,7 @@ func TestIntegrationResponseHeadBoundary(t *testing.T) {
 					return
 				}
 
-				fields := "Content-Length: 0\r\nContent-Type: application/octet-stream\r\nETag: \"v\"\r\nRacer-Expires-At: 0\r\nX: \r\n"
+				fields := "Content-Length: 21\r\nContent-Type: application/octet-stream\r\nETag: \"v\"\r\nRacer-Expires-At: 0\r\nRacer-Object-Length: 0\r\nRacer-Range-Start: 0\r\nRacer-Range-End: 0\r\nConnection: close\r\nX: \r\n"
 				padding := strings.Repeat("x", size-len(rawResponse(200, fields)))
 				_, _ = conn.Write(rawResponse(200, strings.Replace(fields, "X: ", "X: "+padding, 1)))
 			}()
@@ -317,7 +268,7 @@ func TestIntegrationValueCloseBlockedBody(t *testing.T) {
 
 			defer func() { stop(); <-done }()
 
-			client := testClient(t, path, 1)
+			client := originClient(t, path, 1)
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -405,7 +356,7 @@ func TestIntegrationExpiredBootstrapDoesNotCacheVersion(t *testing.T) {
 
 	defer func() { cancel(); <-done }()
 
-	client := testClient(t, path, 1)
+	client := originClient(t, path, 1)
 	for _, want := range []string{"1", "2"} {
 		value, err := client.Get(context.Background(), Request{})
 		if err != nil {

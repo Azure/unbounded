@@ -10,12 +10,12 @@ import (
 )
 
 // FDSink explicitly permits direct body delivery to a stream connection. The
-// caller owns the connection and its framing; it must not write concurrently.
+// caller owns the connection and its framing; it must not write concurrently
+// or change its write deadline during WriteTo.
 // Use ordinary writers for TLS or HTTP ResponseWriters, whose framing and
 // encryption cannot be bypassed. Context cancellation interrupts blocked writes.
 type FDSink struct {
 	connection net.Conn
-	spliced    int64
 }
 
 func NewFDSink(connection net.Conn) (*FDSink, error) {
@@ -29,9 +29,8 @@ func NewFDSink(connection net.Conn) (*FDSink, error) {
 
 func (s *FDSink) Write(p []byte) (int, error) { return s.connection.Write(p) }
 
-// SplicedBytes reports bytes delivered by actual kernel splice calls. Access it
-// only after WriteTo returns; it is not a concurrent metric.
-func (s *FDSink) SplicedBytes() int64 { return s.spliced }
+// SplicedBytes is zero: subscription frames require page validation before copy.
+func (s *FDSink) SplicedBytes() int64 { return 0 }
 
 // ServeHTTP serves an unconsumed full-object Value as a fixed-length HTTP response. For plain
 // HTTP/1 it explicitly takes connection ownership through Hijack, flushes headers,
@@ -89,76 +88,5 @@ func (v *Value) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if _, err := v.WriteTo(w); err != nil {
 		return
-	}
-}
-
-// spliceTo bypasses only a fully parsed body with no buffered read-ahead. The
-// custom pool's body counter observes every consumed byte, allowing safe reuse.
-func (v *Value) spliceTo(sink *FDSink) (int64, bool, error) {
-	v.mu.Lock()
-	body, ok := v.body.(*responseBody)
-	window, windowed := v.body.(*windowBody)
-	terminal := v.terminal
-	v.mu.Unlock()
-
-	if terminal != nil {
-		return 0, false, terminal
-	}
-
-	if windowed {
-		if window.remaining == 0 {
-			return 0, false, nil
-		}
-
-		n, used, err := window.spliceTo(sink)
-		v.offset += n
-
-		v.remaining -= n
-		if err != nil {
-			v.finish(err)
-		}
-
-		return n, used, err
-	}
-
-	if !ok || body.conn.reader.Buffered() != 0 {
-		return 0, false, nil
-	}
-
-	n, used, err := spliceBody(v.ctx, body, sink, v.remaining)
-	if used {
-		v.offset += n
-		v.remaining -= n
-	}
-
-	if err != nil {
-		if canceled := v.ctx.Err(); canceled != nil {
-			err = canceled
-		}
-
-		body.mu.Lock()
-		body.reusable = false
-		body.mu.Unlock()
-		v.finish(ioFailure("splice", err))
-
-		return n, used, v.err()
-	}
-
-	return n, used, nil
-}
-
-// bufferedBodyBytes finds parser read-ahead through a window child.
-func (v *Value) bufferedBodyBytes() int {
-	v.mu.Lock()
-	body := v.body
-	v.mu.Unlock()
-
-	switch body := body.(type) {
-	case *responseBody:
-		return body.conn.reader.Buffered()
-	case *windowBody:
-		return body.bufferedBodyBytes()
-	default:
-		return 0
 	}
 }

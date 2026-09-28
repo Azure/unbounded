@@ -6,7 +6,6 @@ package racersdk
 import (
 	"context"
 	"io"
-	"math"
 	"math/rand/v2"
 	"net"
 	"sync"
@@ -16,15 +15,14 @@ import (
 // ClientConfig selects a cache and bounds a Client's resources. Zero numeric
 // fields select defaults; negative values and a zero Cache are invalid.
 type ClientConfig struct {
-	// PrefetchBootstrap starts pinned pages using spare admission while the first
-	// page is consumed. Requires PageWindow > 1; default false preserves lazy IO.
+	// PrefetchBootstrap is ignored. Subscriptions always prefetch within credits.
+	// Deprecated: configure ReadOptions credits instead.
 	PrefetchBootstrap bool
 	Cache             CacheName
 	// MaxConnections bounds bulk connections and live Values (default 64).
 	MaxConnections int
-	// PageWindow enables ordered concurrent page continuations when greater than one.
-	// Zero preserves the single pinned-remainder request; connections remain bounded
-	// by MaxConnections, with separate metadata and small-object reservations.
+	// PageWindow selects default subscription page credits (zero selects two).
+	// Each subscription uses one connection regardless of its page credits.
 	PageWindow int
 	// MetadataConnections reserves a separate Stat connection pool (default 4).
 	MetadataConnections int
@@ -61,7 +59,6 @@ type Client struct {
 	active                        map[*Value]struct{}
 	slots                         chan struct{}
 	queued                        chan struct{}
-	pages                         chan struct{}
 	bulk, metadataPool, smallPool connectionPool
 	config                        ClientConfig
 	path                          string
@@ -86,7 +83,7 @@ func NewClient(config ClientConfig) (*Client, error) {
 }
 
 func newClient(config ClientConfig, path string) (*Client, error) {
-	if config.PageWindow < 0 {
+	if config.PageWindow < 0 || config.PageWindow > 64 {
 		return nil, failure(ErrorInvalidArgument, "page window", nil)
 	}
 
@@ -149,7 +146,6 @@ func newClient(config ClientConfig, path string) (*Client, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Client{active: make(map[*Value]struct{}), slots: make(chan struct{}, config.MaxConnections), queued: make(chan struct{}, config.MaxQueuedRequests), config: config, path: path, ctx: ctx, cancel: cancel}
 	c.bulk.slots = c.slots
-	c.pages = make(chan struct{}, config.MaxConnections)
 	c.bulk.queued = c.queued
 	c.copySlots = make(chan struct{}, config.MaxConnections)
 	c.copyBuffers = make(chan *[copyBufferSize]byte, config.MaxConnections)
@@ -242,125 +238,30 @@ func (c *Client) admit(ctx context.Context, pool *connectionPool, r OriginReques
 	return v, nil
 }
 
-// Get returns validated headers and an owned stream. Without options it performs
-// a fresh bootstrap followed lazily by one pinned remainder. Empty options and
-// SmallObject alone preserve bootstrap. Range/pin options select metadata using
-// HEAD (or a validated supplied snapshot), then open
-// exactly the pinned range without a page-zero body. ctx governs admission and
-// the returned Value's entire lifetime.
+// Get returns an ordered reader over one subscription. It does not issue HEAD,
+// bootstrap, or continuation requests. ctx governs admission and the entire
+// Value lifetime. Use OpenPages for unordered page delivery.
 func (c *Client) Get(ctx context.Context, request Request, options ...ReadOptions) (*Value, error) {
-	if ctx == nil || len(options) > 1 {
+	if len(options) > 1 {
 		return nil, failure(ErrorInvalidArgument, "get", nil)
 	}
-
-	r := OriginRequest{key: request.Key, context: request.Context, operation: OperationBootstrap, byteRange: bootstrapRange()}
-	if err := validateRequest(r); err != nil {
-		return nil, err
-	}
-
-	var (
-		snapshot   *Metadata
-		first, end int64
-	)
 
 	var o ReadOptions
 	if len(options) == 1 {
 		o = options[0]
 	}
 
-	pool := &c.bulk
-	if o.SmallObject {
-		pool = &c.smallPool
-	}
+	o.Ordered = true
 
-	if o.Offset != 0 || o.Length != 0 || o.Pin.value != "" || o.Metadata != nil {
-		if uint64(o.Offset) > math.MaxInt64 || uint64(o.Length) > math.MaxInt64 || uint64(o.Length) > math.MaxInt64-uint64(o.Offset) {
-			return nil, failure(ErrorInvalidArgument, "read options", nil)
-		}
-
-		if o.Pin.value != "" {
-			if _, err := ParseETag(o.Pin.value); err != nil {
-				return nil, err
-			}
-		}
-
-		var m Metadata
-		if o.Metadata != nil {
-			m = *o.Metadata
-			if err := m.Validate(); err != nil {
-				return nil, err
-			}
-
-			if o.Pin.value != "" && o.Pin != m.ETag {
-				return nil, failure(ErrorInvalidArgument, "snapshot pin", nil)
-			}
-		} else {
-			var err error
-
-			m, err = c.stat(ctx, request, o.Pin)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		if ByteLength(o.Offset) > m.Size || o.Length > m.Size-ByteLength(o.Offset) {
-			return nil, failure(ErrorUnsatisfiableRange, "read options", nil)
-		}
-
-		if o.SmallObject && m.Size > PageSize {
-			return nil, failure(ErrorInvalidArgument, "small object size", nil)
-		}
-
-		first, end = int64(o.Offset), int64(m.Size)
-		if o.Length != 0 {
-			end = first + int64(o.Length)
-		}
-
-		snapshot = &m
-		r.operation, r.pin = OperationPinned, m.ETag
-		r.byteRange = Range{present: true, first: uint64(first), last: uint64(end - 1)}
-	}
-
-	v, err := c.admit(ctx, pool, r)
+	s, err := c.OpenPages(ctx, request, o)
 	if err != nil {
 		return nil, err
 	}
 
-	if snapshot != nil && first == end {
-		v.metadata, v.offset, v.end = *snapshot, first, end
-		v.finish(io.EOF)
+	s.owner.stream = s
+	s.owner.offset, s.owner.end = int64(s.first), int64(s.end)
 
-		if err := v.err(); err != io.EOF {
-			return nil, err
-		}
-
-		return v, nil
-	}
-
-	meta, length, err := v.open(r, snapshot)
-	if err != nil {
-		v.finish(err)
-		return nil, v.err()
-	}
-
-	v.metadata, v.remaining, v.offset, v.end = meta, length, first, int64(meta.Size)
-	if snapshot != nil {
-		v.metadata, v.end = *snapshot, end
-	}
-
-	if snapshot == nil && c.config.PrefetchBootstrap && c.config.PageWindow > 1 && pool == &c.bulk {
-		v.mu.Lock()
-		if v.terminal == nil {
-			v.startPages(first+length, false)
-		}
-		v.mu.Unlock()
-	}
-
-	if err := v.err(); err != nil {
-		return nil, err
-	}
-
-	return v, nil
+	return s.owner, nil
 }
 
 // Stat obtains fresh full-object metadata using HEAD on separately reserved

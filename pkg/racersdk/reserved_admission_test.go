@@ -136,8 +136,8 @@ func TestSmallObjectSizeAndBootstrap(t *testing.T) {
 			path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
 
-				if r.Method != "GET" || r.Header.Get("If-Match") != "" || r.Header.Get("Range") != "bytes=0-16777215" {
-					t.Error("SmallObject added HEAD or changed bootstrap")
+				if r.Method != "POST" || r.Header.Get("If-Match") != "" || r.Header.Get("Range") != "" {
+					t.Error("SmallObject did not use a single unpinned subscription")
 				}
 
 				streamResponse(w, 0, int64(min(size, PageSize)), int64(size), `"v"`)
@@ -190,7 +190,7 @@ func TestOriginHeadReservedFromFullBodyAdmission(t *testing.T) {
 
 	defer func() { cancel(); <-done }()
 
-	c := testClient(t, path, 2)
+	c := originClient(t, path, 2)
 	for range 2 {
 		v, err := c.Get(context.Background(), Request{})
 		if err != nil {
@@ -307,7 +307,12 @@ func TestSmallObjectPinnedRangeAndHeadSizeValidation(t *testing.T) {
 
 					gets.Add(1)
 
-					if r.Header.Get("If-Match") != `"v"` || r.Header.Get("Range") != "bytes=1-1" {
+					pin := ""
+					if snapshot {
+						pin = `"v"`
+					}
+
+					if r.Header.Get("If-Match") != pin || r.Header.Get("Range") != "bytes=1-1" {
 						t.Error("small range lost pin or bounds")
 					}
 
@@ -324,7 +329,12 @@ func TestSmallObjectPinnedRangeAndHeadSizeValidation(t *testing.T) {
 				if oversized {
 					assertKind(t, err, ErrorInvalidArgument)
 
-					if v != nil || gets.Load() != 0 {
+					wantGets := int32(1)
+					if snapshot {
+						wantGets = 0
+					}
+
+					if v != nil || gets.Load() != wantGets {
 						t.Fatal("oversized pinned object fetched")
 					}
 				} else {
@@ -347,10 +357,7 @@ func TestSmallObjectPinnedRangeAndHeadSizeValidation(t *testing.T) {
 					}
 				}
 
-				wantHeads := int32(1)
-				if snapshot {
-					wantHeads = 0
-				}
+				wantHeads := int32(0)
 
 				if heads.Load() != wantHeads {
 					t.Fatal("wrong HEAD count", heads.Load())

@@ -67,6 +67,11 @@ func testClient(t *testing.T, path string, maxConn int) *Client {
 
 func clientPeer(t *testing.T, handler http.Handler) string {
 	t.Helper()
+	return rawClientPeer(t, subscriptionHandler(handler))
+}
+
+func rawClientPeer(t *testing.T, handler http.Handler) string {
+	t.Helper()
 	path := filepath.Join(socketDir(t), "socket")
 
 	l, err := net.Listen("unix", path)
@@ -117,25 +122,16 @@ func TestClientStreamingTranscript(t *testing.T) {
 			var calls atomic.Int32
 
 			path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				call := calls.Add(1)
+				calls.Add(1)
 
-				if r.Method != "GET" || r.Host != "racer" || r.Header.Get("Accept-Encoding") != "" || r.Header.Get("Authorization") != "secret\xff" {
+				if r.Method != "POST" || r.Host != "racer" || r.Header.Get("Accept-Encoding") != "" || r.Header.Get("Authorization") != "secret\xff" || r.Header.Get("Racer-Ordered") != "1" {
 					t.Error("request envelope")
 				}
 
-				first, length := int64(0), min(size, int64(PageSize))
+				first, length := int64(0), size
 
-				if call == 1 {
-					if r.Header.Get("If-Match") != "" || r.Header.Get("Range") != "bytes=0-16777215" {
-						t.Error("bootstrap")
-					}
-				} else {
-					first = int64(call-1) * int64(PageSize)
-
-					length = size - first
-					if r.Header.Get("If-Match") != `"v"` || r.Header.Get("Range") != "bytes="+strconv.FormatInt(first, 10)+"-"+strconv.FormatInt(first+length-1, 10) {
-						t.Error("continuation")
-					}
+				if r.Header.Get("If-Match") != "" || r.Header.Get("Range") != "" {
+					t.Error("unexpected pin/range")
 				}
 
 				streamResponseHead(w, first, length, size, `"v"`)
@@ -166,9 +162,6 @@ func TestClientStreamingTranscript(t *testing.T) {
 			}
 
 			want := int32(1)
-			if size > int64(PageSize) {
-				want = 2
-			}
 
 			if calls.Load() != want {
 				t.Fatal("request count", calls.Load())
@@ -392,19 +385,17 @@ func TestClientContinuationFailures(t *testing.T) {
 					remainder := size - first
 
 					path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-						call := calls.Add(1)
-						if call == 1 {
-							streamResponse(w, 0, int64(PageSize), size, `"v"`)
-							return
-						}
+						calls.Add(1)
+						streamResponseHead(w, 0, size, size, `"v"`)
+						_, _ = io.CopyN(w, repeatedByte('x'), first)
 
 						switch mode {
 						case "pin":
-							streamResponse(w, first, remainder, size, `"other"`)
+							w.(*subscriptionFixture).err = io.ErrUnexpectedEOF
 						case "size":
-							streamResponse(w, first, remainder, size+1, `"v"`)
+							w.(*subscriptionFixture).err = io.ErrUnexpectedEOF
 						case "range":
-							streamResponse(w, first-1, remainder, size, `"v"`)
+							w.(*subscriptionFixture).err = io.ErrUnexpectedEOF
 						case "length":
 							w.Header().Set("Content-Range", "bytes "+strconv.FormatInt(first, 10)+"-"+strconv.FormatInt(size-1, 10)+"/"+strconv.FormatInt(size, 10))
 							w.Header().Set("Content-Length", "1")
@@ -434,32 +425,19 @@ func TestClientContinuationFailures(t *testing.T) {
 					}
 
 					n, err := io.Copy(io.Discard, v)
-					if err == nil || n < first || calls.Load() != 2 {
+					if err == nil || n != first || calls.Load() != 1 {
 						t.Fatalf("failure %d %v", n, err)
 					}
 
-					switch mode {
-					case "pin", "size", "range", "length":
-						assertKind(t, err, ErrorProtocol)
-					case "412":
-						assertKind(t, err, ErrorVersionUnavailable)
-					case "503":
-						assertKind(t, err, ErrorUnavailable)
-					case "short":
-						if n != first+1 || !errors.Is(err, io.ErrUnexpectedEOF) {
-							t.Fatal("truncation", n, err)
-						}
-					case "empty":
-						if !errors.Is(err, io.ErrUnexpectedEOF) {
-							t.Fatal("missing body", err)
-						}
+					if !errors.Is(err, io.ErrUnexpectedEOF) {
+						t.Fatal("post-header failures must truncate", err)
 					}
 
 					if mode != "short" && n != first {
 						t.Fatal("invalid response bytes exposed", n)
 					}
 
-					if next, terminal := v.Read(make([]byte, 1)); next != 0 || terminal != err || calls.Load() != 2 {
+					if next, terminal := v.Read(make([]byte, 1)); next != 0 || terminal != err || calls.Load() != 1 {
 						t.Fatal("failure was not terminal", next, terminal)
 					}
 
@@ -481,10 +459,8 @@ func TestClientContinuationCloseAndContext(t *testing.T) {
 		t.Run(strconv.FormatBool(closeClient), func(t *testing.T) {
 			entered := make(chan struct{})
 			path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Header.Get("If-Match") == "" {
-					streamResponse(w, 0, int64(PageSize), int64(PageSize)+1, `"v"`)
-					return
-				}
+				streamResponseHead(w, 0, int64(PageSize)+1, int64(PageSize)+1, `"v"`)
+				_, _ = io.CopyN(w, repeatedByte('x'), int64(PageSize))
 
 				close(entered)
 				<-r.Context().Done()

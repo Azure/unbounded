@@ -305,7 +305,7 @@ func TestConnectionAgeBusyPools(t *testing.T) {
 		clock.advance(time.Second)
 	}
 
-	if s := c.Stats(); s.Dials != 9 || s.ConnectionRotations != 6 || s.ConnectionReuses != 27 || s.Retries != 0 || s.Connections != 3 || s.ActiveBulk != 0 || s.ActiveMetadata != 0 || s.ActiveSmallObjects != 0 {
+	if s := c.Stats(); s.Dials != 27 || s.ConnectionRotations != 2 || s.ConnectionReuses != 9 || s.Retries != 0 || s.Connections != 1 || s.ActiveBulk != 0 || s.ActiveMetadata != 0 || s.ActiveSmallObjects != 0 {
 		t.Fatal("busy reuse prevented rotation or changed admission", s)
 	}
 }
@@ -352,20 +352,20 @@ func TestConnectionAgeActiveResponseCompletes(t *testing.T) {
 
 	closeBody(v)
 
-	if s := c.Stats(); s.ConnectionRotations != 1 || s.Dials != 1 || s.Retries != 0 || s.Connections != 0 || s.ActiveBulk != 0 {
+	if s := c.Stats(); s.ConnectionRotations != 0 || s.Dials != 1 || s.Retries != 0 || s.Connections != 0 || s.ActiveBulk != 0 {
 		t.Fatal(s)
 	}
 }
 
 func TestConnectionAgeDialFailureAfterRotation(t *testing.T) {
 	c, clock := pipeConnClient(t)
-	conn, _ := checkoutConn(t, c, &c.bulk)
-	c.recycle(&c.bulk, conn)
+	conn, _ := checkoutConn(t, c, &c.metadataPool)
+	c.recycle(&c.metadataPool, conn)
 	clock.advance(4 * time.Second)
 
 	c.dial = func(context.Context, string, string) (net.Conn, error) { return nil, io.EOF }
 
-	_, err := c.Get(context.Background(), Request{})
+	_, err := c.Stat(context.Background(), Request{})
 	if !errors.Is(err, io.EOF) {
 		t.Fatal("dial failure lost", err)
 	}
@@ -431,24 +431,16 @@ func TestConnectionAgeBootstrapContinuation(t *testing.T) {
 	var calls atomic.Int32
 
 	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		call := calls.Add(1)
+		calls.Add(1)
 
-		if r.Method != "GET" || r.URL.Path != objectPrefix+(Key{7}).String() || r.Header.Get("Authorization") != "secret\xff" || r.Header.Get("Racer-Metadata") != "opaque  bytes" {
+		if r.Method != "POST" || r.URL.Path != "/v2/objects/"+(Key{7}).String() || r.Header.Get("Authorization") != "secret\xff" || r.Header.Get("Racer-Metadata") != "opaque  bytes" {
 			t.Error("rotation changed request envelope")
 		}
 
-		first, length := int64(0), int64(PageSize)
+		first, length := int64(0), size
 
-		if call == 1 {
-			if r.Header.Get("If-Match") != "" || r.Header.Get("Range") != "bytes=0-16777215" {
-				t.Error("invalid bootstrap")
-			}
-		} else {
-			first, length = int64(PageSize), 37
-
-			if call != 2 || r.Header.Get("If-Match") != `"v"` || r.Header.Get("Range") != "bytes=16777216-16777252" {
-				t.Error("rotation restarted or changed pinned continuation")
-			}
+		if r.Header.Get("If-Match") != "" || r.Header.Get("Range") != "" {
+			t.Error("unexpected pin or range")
 		}
 
 		streamResponseHead(w, first, length, size, `"v"`)
@@ -482,7 +474,7 @@ func TestConnectionAgeBootstrapContinuation(t *testing.T) {
 
 	closeBody(v)
 
-	if s := c.Stats(); s.Dials != 2 || s.ConnectionRotations != 1 || s.Retries != 0 || s.BytesRead != uint64(size) || s.ActiveBulk != 0 || calls.Load() != 2 || v.Metadata() != snapshot {
+	if s := c.Stats(); s.Dials != 1 || s.ConnectionRotations != 0 || s.Retries != 0 || s.BytesRead != uint64(size) || s.ActiveBulk != 0 || calls.Load() != 1 || v.Metadata() != snapshot {
 		t.Fatal("rotation changed continuation contract", s)
 	}
 }
@@ -490,10 +482,8 @@ func TestConnectionAgeBootstrapContinuation(t *testing.T) {
 func TestConnectionAgeContinuationKeepsContext(t *testing.T) {
 	entered := make(chan struct{})
 	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("If-Match") == "" {
-			streamResponse(w, 0, int64(PageSize), int64(PageSize)+1, `"v"`)
-			return
-		}
+		streamResponseHead(w, 0, int64(PageSize)+1, int64(PageSize)+1, `"v"`)
+		_, _ = io.CopyN(w, repeatedByte('x'), int64(PageSize))
 
 		close(entered)
 		<-r.Context().Done()
@@ -538,7 +528,7 @@ func TestConnectionAgeContinuationKeepsContext(t *testing.T) {
 
 	closeBody(v)
 
-	if s := c.Stats(); s.ConnectionRotations != 1 || s.Dials != 2 || s.Retries != 0 || s.Connections != 0 || s.ActiveBulk != 0 {
+	if s := c.Stats(); s.ConnectionRotations != 0 || s.Dials != 1 || s.Retries != 0 || s.Connections != 0 || s.ActiveBulk != 0 {
 		t.Fatal(s)
 	}
 }

@@ -56,7 +56,7 @@ func TestOwnedOriginSIGKILLRestart(t *testing.T) {
 				_ = child.Wait()
 			}
 		})
-		client := testClient(t, path, 1)
+		client := originClient(t, path, 1)
 		deadline := time.Now().Add(10 * time.Second)
 
 		for {

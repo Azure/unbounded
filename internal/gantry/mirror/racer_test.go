@@ -384,8 +384,8 @@ func TestRacerResumeAcrossPages(t *testing.T) {
 		t.Fatalf("cross-page resume failed: status=%d range=%q bytes=%d", resp.StatusCode, resp.Header.Get("Content-Range"), len(got))
 	}
 
-	if heads.Load() != 1 || gets.Load() != 1 {
-		t.Fatalf("resume transcript: heads=%d gets=%d; want 1/1", heads.Load(), gets.Load())
+	if heads.Load() != 2 || gets.Load() != 1 {
+		t.Fatalf("resume transcript: heads=%d gets=%d; want 2/1 (Stat and fake pin validation)", heads.Load(), gets.Load())
 	}
 }
 
@@ -909,7 +909,7 @@ func TestRacerStreamFailureAbortsHTTP(t *testing.T) {
 				t.Fatalf("client read error = %v; want unexpected EOF", err)
 			}
 
-			if len(got) == 0 || len(got) >= len(data)-offset || !bytes.Equal(got, data[offset:offset+len(got)]) {
+			if len(got) >= len(data)-offset || !bytes.Equal(got, data[offset:offset+len(got)]) {
 				t.Fatalf("failed stream was completed, replaced, or corrupted: got %d of %d bytes", len(got), len(data)-offset)
 			}
 
@@ -1104,6 +1104,10 @@ func TestRacerRejectedCredentialPreservesRememberedChallenge(t *testing.T) {
 					wantHeads = 1
 				}
 
+				if mode == "resume" && rejected == http.MethodGet {
+					wantHeads++
+				}
+
 				if mode == "GET" || (mode == "resume" && rejected == http.MethodGet) {
 					wantGets = 1
 				}
@@ -1124,6 +1128,10 @@ func TestRacerRejectedCredentialPreservesRememberedChallenge(t *testing.T) {
 				}
 
 				if mode != "GET" {
+					wantHeads++
+				}
+
+				if mode == "resume" {
 					wantHeads++
 				}
 

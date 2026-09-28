@@ -7,6 +7,7 @@ import (
 	"context"
 	"io"
 	"sync"
+	"time"
 )
 
 const copyBufferSize = 32 * 1024
@@ -15,29 +16,28 @@ const copyBufferSize = 32 * 1024
 // consume it using Read or WriteTo (including io.Copy); Metadata and Close may be called
 // concurrently. A Value must not be copied. Construct it with Client.Get.
 type Value struct {
-	mu        sync.Mutex
-	client    *Client
-	pool      *connectionPool
-	ctx       context.Context
-	cancel    context.CancelFunc
-	stop      func() bool
-	body      io.ReadCloser
-	terminal  error
-	finished  chan struct{}
-	slot      bool
-	metadata  Metadata
-	request   OriginRequest
-	remaining int64
-	offset    int64
-	end       int64
-	pending   []*pageJob
-	nextPage  int64
-	workers   sync.WaitGroup
-	window    bool
+	stream      *PageStream
+	lease       *PageLease
+	leaseOffset int
+	mu          sync.Mutex
+	client      *Client
+	pool        *connectionPool
+	ctx         context.Context
+	cancel      context.CancelFunc
+	stop        func() bool
+	body        io.ReadCloser
+	terminal    error
+	finished    chan struct{}
+	slot        bool
+	metadata    Metadata
+	request     OriginRequest
+	remaining   int64
+	offset      int64
+	end         int64
 }
 
-// Metadata returns the initial total-size/tag/expiry snapshot, never a remaining
-// length. A continuation's refreshed expiry does not change this value.
+// Metadata returns the immutable total-size/tag/expiry snapshot, never a
+// remaining length.
 func (v *Value) Metadata() Metadata { return v.metadata }
 
 func (v *Value) err() error {
@@ -87,16 +87,6 @@ func (v *Value) finish(err error) {
 	}
 
 	closeBody(body)
-	v.workers.Wait()
-	v.mu.Lock()
-	pending := v.pending
-	v.pending = nil
-	v.mu.Unlock()
-
-	for _, job := range pending {
-		closeBody((<-job.result).value)
-		<-v.client.pages
-	}
 
 	if v.client != nil {
 		if slot {
@@ -109,10 +99,13 @@ func (v *Value) finish(err error) {
 	}
 }
 
-// Read copies directly from the current HTTP body into p. Once bootstrap is
-// consumed, it lazily opens one pinned range through the selected end.
-// A terminal error preserves partial byte counts and never restarts the version.
+// Read consumes ordered page leases. An incomplete page is never exposed.
+// A terminal error never restarts the version or opens another subscription.
 func (v *Value) Read(p []byte) (int, error) {
+	if v.stream != nil {
+		return v.readPages(p)
+	}
+
 	if err := v.err(); err != nil {
 		return 0, err
 	}
@@ -137,18 +130,9 @@ func (v *Value) Read(p []byte) (int, error) {
 		v.mu.Unlock()
 		closeBody(body)
 
-		if v.offset == v.end {
-			v.finish(io.EOF)
-			return 0, v.err()
-		}
+		v.finish(io.EOF)
 
-		length, err := v.advance()
-		if err != nil {
-			v.finish(err)
-			return 0, v.err()
-		}
-
-		v.remaining = length
+		return 0, v.err()
 	}
 
 	v.mu.Lock()
@@ -189,7 +173,43 @@ func (v *Value) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// Close cancels in-flight reads/continuation and closes without draining. It is
+func (v *Value) readPages(p []byte) (int, error) {
+	if err := v.err(); err != nil {
+		return 0, err
+	}
+
+	if err := v.ctx.Err(); err != nil {
+		return 0, v.stream.fail(ioFailure("read", err))
+	}
+
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	if v.lease == nil {
+		lease, err := v.stream.Next()
+		if err != nil {
+			return 0, err
+		}
+
+		v.lease, v.leaseOffset = lease, 0
+	}
+
+	n := copy(p, v.lease.Data[v.leaseOffset:])
+	v.leaseOffset += n
+
+	v.offset += int64(n)
+	if v.leaseOffset == len(v.lease.Data) {
+		err := v.lease.Release()
+		v.lease = nil
+
+		return n, err
+	}
+
+	return n, nil
+}
+
+// Close cancels in-flight subscription reads and closes without draining. It is
 // idempotent. Later consumption reports a typed closed error, except that an
 // already observed clean EOF remains EOF.
 func (v *Value) Close() error {
@@ -205,10 +225,10 @@ func (v *Value) Close() error {
 // If those blocked writers exhaust scratch admission, WriteTo returns
 // ErrorUnavailable. Cancellation cannot interrupt an arbitrary destination Write.
 func (v *Value) WriteTo(w io.Writer) (int64, error) {
-	return v.writeTo(w, false)
+	return v.writeTo(w)
 }
 
-func (v *Value) writeTo(w io.Writer, httpTransfer bool) (int64, error) {
+func (v *Value) writeTo(w io.Writer) (int64, error) {
 	if _, err := v.Read(nil); err != nil {
 		if err == io.EOF {
 			return 0, nil
@@ -218,6 +238,28 @@ func (v *Value) writeTo(w io.Writer, httpTransfer bool) (int64, error) {
 	}
 
 	c := v.client
+	if sink, ok := w.(*FDSink); ok && v.stream != nil {
+		done := make(chan struct{})
+		stop := context.AfterFunc(v.ctx, func() {
+			defer close(done)
+
+			// A closed destination already interrupts any blocked write.
+			if err := sink.connection.SetWriteDeadline(time.Now()); err != nil {
+				return
+			}
+		})
+
+		defer func() {
+			if !stop() {
+				<-done
+			}
+
+			// Deadline cleanup cannot recover a destination that has closed.
+			if err := sink.connection.SetWriteDeadline(time.Time{}); err != nil {
+				return
+			}
+		}()
+	}
 
 	slots, buffers := c.copySlots, c.copyBuffers
 	if v.pool == &c.smallPool {
@@ -253,42 +295,6 @@ func (v *Value) writeTo(w io.Writer, httpTransfer bool) (int64, error) {
 	for {
 		buffer := buf[:]
 
-		if httpTransfer && v.remaining > 0 {
-			n, used, err := v.writeHTTPBody(w)
-
-			written += n
-			if err != nil {
-				return written, err
-			}
-
-			if used {
-				continue
-			}
-		}
-
-		if sink, ok := w.(*FDSink); ok && v.remaining > 0 {
-			n, used, err := v.spliceTo(sink)
-
-			written += n
-			if err != nil {
-				return written, err
-			}
-
-			if used {
-				continue
-			}
-
-			if buffered := v.bufferedBodyBytes(); buffered > 0 {
-				buffer = buffer[:min(len(buffer), buffered)]
-			}
-		}
-
-		if httpTransfer {
-			if buffered := v.bufferedBodyBytes(); buffered > 0 {
-				buffer = buffer[:min(len(buffer), buffered)]
-			}
-		}
-
 		n, readErr := v.Read(buffer)
 		if n > 0 {
 			empty = 0
@@ -303,7 +309,12 @@ func (v *Value) writeTo(w io.Writer, httpTransfer bool) (int64, error) {
 			}
 
 			written += int64(nw)
+
 			if writeErr != nil {
+				if _, ok := w.(*FDSink); ok && v.ctx.Err() != nil {
+					return written, v.stream.fail(ioFailure("write", v.ctx.Err()))
+				}
+
 				return written, writeErr
 			}
 

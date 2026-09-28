@@ -23,34 +23,22 @@ func TestValueWindowOrderedAndBounded(t *testing.T) {
 	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 
-		requested, err := parseRange(r.Header.Get("Range"))
-		if err != nil {
-			t.Error(err)
+		if r.Header.Get("Racer-Ordered") != "1" || r.Header.Get("Racer-Page-Credits") != "3" {
+			t.Error("ordered credits lost")
+		}
+
+		streamResponseHead(w, 0, size, size, `"v"`)
+
+		_, _ = io.CopyN(w, &offsetStream{}, int64(PageSize))
+		entered <- uint64(PageSize)
+
+		select {
+		case <-release:
+		case <-r.Context().Done():
 			return
 		}
 
-		first, last, err := requested.Resolve(ByteLength(size))
-		if err != nil {
-			t.Error(err)
-			return
-		}
-
-		if first != 0 {
-			if r.Header.Get("If-Match") != `"v"` {
-				t.Error("pin lost")
-			}
-
-			entered <- uint64(first)
-
-			select {
-			case <-release:
-			case <-r.Context().Done():
-				return
-			}
-		}
-
-		streamResponseHead(w, int64(first), int64(last-first)+1, size, `"v"`)
-		_, _ = io.CopyN(w, &offsetStream{offset: int64(first)}, int64(last-first)+1)
+		_, _ = io.CopyN(w, &offsetStream{offset: int64(PageSize)}, size-int64(PageSize))
 	}))
 	c := testClient(t, path, 3)
 	c.config.PageWindow = 3
@@ -74,7 +62,7 @@ func TestValueWindowOrderedAndBounded(t *testing.T) {
 
 	seen := make(map[uint64]bool)
 
-	for range 3 {
+	for range 1 {
 		select {
 		case first := <-entered:
 			seen[first] = true
@@ -83,11 +71,11 @@ func TestValueWindowOrderedAndBounded(t *testing.T) {
 		}
 	}
 
-	if len(seen) != 3 || !seen[uint64(PageSize)] || !seen[2*uint64(PageSize)] || !seen[3*uint64(PageSize)] {
+	if len(seen) != 1 || !seen[uint64(PageSize)] {
 		t.Fatal("unexpected page window", seen)
 	}
 
-	if calls.Load() != 4 || len(c.pages) != 3 {
+	if calls.Load() != 1 || len(c.slots) != 1 {
 		t.Fatal("window exceeded pool bounds")
 	}
 
@@ -102,7 +90,7 @@ func TestValueWindowOrderedAndBounded(t *testing.T) {
 		t.Fatal("ordered stream stalled")
 	}
 
-	if calls.Load() != 6 || len(c.pages) != 0 {
+	if calls.Load() != 1 || len(c.slots) != 0 {
 		t.Fatal("wrong requests or retained permits")
 	}
 }
@@ -110,12 +98,10 @@ func TestValueWindowOrderedAndBounded(t *testing.T) {
 func TestBootstrapPrefetchUsesOnlySpareAdmission(t *testing.T) {
 	entered := make(chan struct{}, 2)
 	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("If-Match") == "" {
-			streamResponseHead(w, 0, int64(PageSize), 4*int64(PageSize), `"v"`)
-			w.(http.Flusher).Flush()
-		} else {
-			entered <- struct{}{}
-		}
+		streamResponseHead(w, 0, 4*int64(PageSize), 4*int64(PageSize), `"v"`)
+		w.(http.Flusher).Flush()
+
+		entered <- struct{}{}
 
 		<-r.Context().Done()
 	}))
@@ -129,7 +115,7 @@ func TestBootstrapPrefetchUsesOnlySpareAdmission(t *testing.T) {
 	}
 	defer closeBody(v)
 
-	for range 2 {
+	for range 1 {
 		select {
 		case <-entered:
 		case <-time.After(3 * time.Second):
@@ -137,13 +123,13 @@ func TestBootstrapPrefetchUsesOnlySpareAdmission(t *testing.T) {
 		}
 	}
 
-	if len(c.slots) != 3 || len(c.pages) != 2 {
+	if len(c.slots) != 1 || c.Stats().Dials != 1 {
 		t.Fatal("prefetch admission incorrect")
 	}
 
 	closeBody(v)
 
-	if len(c.slots) != 0 || len(c.pages) != 0 {
+	if len(c.slots) != 0 {
 		t.Fatal("prefetch retained admission")
 	}
 }
@@ -152,10 +138,8 @@ func TestValueWindowCloseCancelsEveryWorker(t *testing.T) {
 	entered := make(chan struct{}, 3)
 	stopped := make(chan struct{}, 3)
 	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("If-Match") == "" {
-			streamResponse(w, 0, int64(PageSize), 8*int64(PageSize), `"v"`)
-			return
-		}
+		streamResponseHead(w, 0, 8*int64(PageSize), 8*int64(PageSize), `"v"`)
+		_, _ = io.CopyN(w, repeatedByte('x'), int64(PageSize))
 
 		entered <- struct{}{}
 
@@ -179,7 +163,7 @@ func TestValueWindowCloseCancelsEveryWorker(t *testing.T) {
 
 	go func() { _, err := io.Copy(io.Discard, v); done <- err }()
 
-	for range 3 {
+	for range 1 {
 		select {
 		case <-entered:
 		case <-time.After(3 * time.Second):
@@ -196,7 +180,7 @@ func TestValueWindowCloseCancelsEveryWorker(t *testing.T) {
 		t.Fatal("consumer not canceled")
 	}
 
-	for range 3 {
+	for range 1 {
 		select {
 		case <-stopped:
 		case <-time.After(3 * time.Second):
@@ -204,7 +188,7 @@ func TestValueWindowCloseCancelsEveryWorker(t *testing.T) {
 		}
 	}
 
-	if len(c.pages) != 0 || len(c.slots) != 0 {
+	if len(c.slots) != 0 {
 		t.Fatal("Close retained permits")
 	}
 }
@@ -214,21 +198,19 @@ func TestValueWindowRefillsBeforeLaterPagesFinish(t *testing.T) {
 
 	entered := make(chan int64, 8)
 	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		selected, _ := parseRange(r.Header.Get("Range"))
+		streamResponseHead(w, 0, size, size, `"v"`)
 
-		first, last, _ := selected.resolve(ByteLength(size))
-		entered <- int64(first)
+		for page := range int64(4) {
+			entered <- page * int64(PageSize)
 
-		streamResponseHead(w, int64(first), int64(last-first)+1, size, `"v"`)
-
-		if int64(first) >= 2*int64(PageSize) {
-			w.(http.Flusher).Flush()
-			<-r.Context().Done()
-
-			return
+			if _, err := io.CopyN(w, &offsetStream{offset: page * int64(PageSize)}, int64(PageSize)); err != nil {
+				return
+			}
 		}
 
-		_, _ = io.CopyN(w, &offsetStream{offset: int64(first)}, int64(last-first)+1)
+		entered <- 4 * int64(PageSize)
+
+		<-r.Context().Done()
 	}))
 	c := testClient(t, path, 3)
 	c.config.PageWindow = 3
@@ -245,7 +227,7 @@ func TestValueWindowRefillsBeforeLaterPagesFinish(t *testing.T) {
 
 	done := make(chan error, 1)
 
-	go func() { _, err := v.Read(make([]byte, 1)); done <- err }()
+	go func() { _, err := io.Copy(io.Discard, v); done <- err }()
 
 	seen := make(map[int64]bool)
 	for !seen[4*int64(PageSize)] {
@@ -265,7 +247,7 @@ func TestValueWindowRefillsBeforeLaterPagesFinish(t *testing.T) {
 		t.Fatal("reader did not stop")
 	}
 
-	if len(c.pages) != 0 || len(c.slots) != 0 {
+	if len(c.slots) != 0 {
 		t.Fatal("retained permits")
 	}
 }

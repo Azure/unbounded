@@ -170,13 +170,24 @@ func TestRealRuntimeConnectionAgeLoad(t *testing.T) {
 			t.Error("unexpected retries, rejection, timeout, or retained admission", stats)
 		}
 
-		if age <= time.Second && stats.ConnectionRotations < 3 {
-			t.Error("too few rotation cycles", stats)
-		}
-
 		if age > duration && stats.ConnectionRotations != 0 {
 			t.Error("baseline rotated", stats)
 		}
+	}
+
+	// HEAD connections remain reusable and must still rotate under sustained
+	// traffic. POST subscriptions close at completion, including SmallObject;
+	// every completed small read must dial once, never reuse or age-rotate.
+	if age <= time.Second && b.ConnectionRotations < 3 {
+		t.Error("too few metadata rotation cycles", b)
+	}
+
+	if b.ConnectionReuses == 0 || b.Dials < uint64(len(latencies["bulk"]))+1 {
+		t.Error("metadata reuse or dedicated bulk subscriptions not exercised", b)
+	}
+
+	if s.Dials != uint64(len(latencies["small"])) || s.ConnectionReuses != 0 || s.ConnectionRotations != 0 || s.Connections != 0 || s.IdleConnections != 0 {
+		t.Error("small subscriptions must use one dedicated connection per read", s)
 	}
 }
 
@@ -196,7 +207,7 @@ func ageLoadRequest(ctx context.Context, bulk, small *Client, request Request, w
 	if worker >= 6 {
 		c, length, options.SmallObject = small, 113, true
 	}
-	// Mix bootstrap-plus-continuation with an explicit cross-page pinned range.
+	// Mix whole-object subscriptions with an explicit cross-page range.
 	first := int64(0)
 	if worker == 3 {
 		first, length = int64(PageSize)-41, 97

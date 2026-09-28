@@ -36,17 +36,7 @@ func TestClientContinuationAbsoluteDeadline(t *testing.T) {
 
 		defer func() { _ = controller.SetWriteDeadline(time.Time{}) }()
 
-		requested, err := parseRange(r.Header.Get("Range"))
-		if err != nil {
-			t.Error(err)
-			return
-		}
-
-		first, last, err := requested.resolve(ByteLength(size))
-		if err != nil {
-			t.Error(err)
-			return
-		}
+		first, last := fixtureRange(t, r, size)
 
 		streamResponseHead(w, int64(first), int64(last-first)+1, size, `"v"`)
 
@@ -96,7 +86,7 @@ func TestClientContinuationAbsoluteDeadline(t *testing.T) {
 		t.Fatalf("continuations exceeded a single request budget: %d %v", n, err)
 	}
 
-	if time.Since(started) <= budget || calls.Load() != 2 {
+	if time.Since(started) <= budget || calls.Load() != 1 {
 		t.Fatal("test did not exercise a progressing multipage remainder beyond one budget")
 	}
 }
@@ -112,14 +102,12 @@ func TestClientLaterContinuationCancellation(t *testing.T) {
 
 					entered, stopped := make(chan struct{}), make(chan struct{})
 					path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-						call := calls.Add(1)
-						if call == 1 {
-							streamResponse(w, 0, int64(PageSize), size, `"v"`)
-							return
-						}
+						calls.Add(1)
+						streamResponseHead(w, 0, size, size, `"v"`)
+						_, _ = io.CopyN(w, repeatedByte('x'), int64(PageSize))
 
 						if bodyStarted {
-							streamResponseHead(w, int64(PageSize), size-int64(PageSize), size, `"v"`)
+							_, _ = w.Write([]byte("x"))
 
 							if err := http.NewResponseController(w).Flush(); err != nil {
 								t.Error(err)
@@ -195,7 +183,7 @@ func TestClientLaterContinuationCancellation(t *testing.T) {
 
 					closeBody(v)
 
-					if len(c.slots) != 0 || calls.Load() != 2 {
+					if len(c.slots) != 0 || calls.Load() != 1 {
 						t.Fatal("cancellation retained capacity or retried")
 					}
 				})

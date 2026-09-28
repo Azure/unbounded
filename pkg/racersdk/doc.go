@@ -15,25 +15,26 @@
 // destination write fails; io.Copy does not close its source.
 // Avoid io.ReadAll for large objects: it introduces caller-side object buffering.
 //
-// Get opens a fresh full-object stream with a page-zero bootstrap. After consuming
-// the first 16 MiB, reading lazily opens one pinned remainder through EOF.
-// Racer's multipage window schedules the remainder. Every request uses the original ETag,
-// total size, and fetch context. Racer schedules the underlying origin fetches.
-// Normal Get and empty ReadOptions have no HEAD preflight. Nonzero range/pin
-// options use HEAD followed by
-// the exact pinned range, without fetching a bootstrap body. Length zero means
-// through EOF; Pin optionally selects an existing version. Out-of-bounds ranges
-// are rejected. Stat uses HEAD to obtain metadata without fetching any body.
-// Pass a trusted Stat result as ReadOptions.Metadata to resume without repeating
-// HEAD. The snapshot is validated and copied, and a supplied Pin must match its
+// Get is an ordered adapter over one POST /v2 subscription, including ranges and
+// pins. There is no bootstrap, HEAD preflight, or continuation exchange. Racer
+// schedules underlying origin page fetches. OpenPages exposes unordered page
+// leases unless ReadOptions.Ordered is set. Release each lease after consuming
+// its Data; release returns the page and byte credits on the same socket. Next
+// waits when outstanding leases exhaust credits. Close cancels the subscription.
+// DownloadTo writes unordered slices to an io.WriterAt at absolute object offsets.
+// Length zero means through EOF; Pin optionally selects an existing version.
+// Out-of-bounds ranges are rejected. Stat uses HEAD to obtain metadata without
+// fetching any body. Pass a trusted Stat result as ReadOptions.Metadata to pin
+// a resume. The snapshot is validated and copied, and a supplied Pin must match its
 // ETag. Invalid snapshots fail before I/O; they never fall back to a fresh read.
 // ReadOptions.SmallObject reserves separate admission for manifests and other
 // objects whose total size is at most PageSize. It adds no HEAD by itself. An
 // oversized object fails with ErrorInvalidArgument before any Value is returned,
-// even if its selected byte range is small. It never opens a multipage remainder.
-// There is no client page cache or object-sized SDK buffer.
+// even if its selected byte range is small. There is no client page cache or
+// object-sized SDK buffer. Page payload allocations are bounded by negotiated
+// credits (default two pages), and duplicate tracking uses bounded intervals.
 // Value.Metadata is the initial total size, strong ETag, expiry and content type snapshot;
-// it is not a remaining length and does not change if continuation expiry changes.
+// it is not a remaining length and does not change during delivery.
 // Empty objects have valid metadata and read as EOF.
 //
 // Client.Get and Client.Close are safe concurrently. A Value permits one consuming
@@ -68,8 +69,8 @@
 // Metadata.ContentType is optional ASCII MIME metadata, at most 256 bytes, with
 // no control characters or duplicate parameters. Racer-Content-Type carries it;
 // the transport Content-Type for object bytes remains application/octet-stream.
-// Legacy peers may omit Racer-Content-Type on either exchange. A continuation
-// rejects conflicting MIME values only when both are present; Value.Metadata
+// Racer-Content-Type is optional. A supplied snapshot rejects conflicting MIME
+// values only when both are present; Value.Metadata
 // always retains the original snapshot, including an originally absent MIME type.
 //
 // # Cancellation, limits, and errors
@@ -89,7 +90,7 @@
 // Admission happens before allocating active stream state. A full queue returns
 // ErrorUnavailable; queue timeout returns ErrorDeadline. There is no total client
 // stream timeout. Zero numeric config fields select defaults; negatives are invalid.
-// Read uses the caller's buffer; each active origin stream uses a 32 KiB
+// Read copies verified page slices into the caller's buffer; each active origin stream uses a 32 KiB
 // scratch buffer. SDK buffering is independent of object size and page count;
 // connection/request limits bound active framing and copying resources.
 // WriteTo owns its 32 KiB loop and never delegates to destination ReaderFrom.
@@ -108,8 +109,9 @@
 // io.Copy's count as partial on failure. A failed Value is terminal; the SDK never
 // splices in a newer version or restarts a failed stream. Publish a copied object
 // only after successful completion. Direct HTTP/1.1 parsing preserves strict raw
-// framing and streams from the same connection reader. An EOF/reset/broken pipe
-// on a pooled connection is retried once on a fresh connection only before any
+// framing and streams from the same connection reader. Subscription connections
+// are never reused or retried. Only HEAD uses the idle pool. An EOF/reset/broken pipe
+// on a pooled HEAD connection is retried once on a fresh connection only before any
 // response bytes arrive. Timeouts, partial heads, invalid heads and body failures
 // are never retried. The original request and pin are preserved on retry.
 // Client.Stats provides fixed-size cumulative counters and current resource
@@ -167,12 +169,13 @@
 // sequential page forwarding. No /run directory, Racer process, endpoint
 // configuration, or testing-package dependency is required.
 //
-// Each Get fetches a fresh bootstrap. The fake forwards FetchContext on every page,
+// Each Get opens one credit-controlled subscription. The fake resolves metadata
+// using bootstrap or pinned HEAD, then forwards FetchContext on every origin page,
 // keeps bounded streaming buffers, and never caches objects. It does not model
 // Racer caching, distributed scheduling, retries, or performance, and passing fake
 // tests does not establish real Racer compatibility. Callback failures before a
-// page response starts preserve their HTTP classification, including later
-// remainder headers; failures within a started multipage body abort it. Both leave a partial
+// subscription response starts preserve their HTTP classification; failures
+// after the subscription head abort it. Both leave a partial
 // full-object byte count and a terminal Value.
 //
 // Cleanup is idempotent and safe concurrently. It closes the Client and both

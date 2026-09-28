@@ -6,12 +6,16 @@ package racersdk
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -21,9 +25,9 @@ import (
 // It uses private loopback listeners, requires no /run provisioning, and adds no
 // production endpoint overrides. Client and origin resource defaults apply.
 //
-// The fake forwards request metadata and authorization unchanged. Each Get opens
-// a fresh bootstrap; its lazy pinned continuations are forwarded as whole-page
-// origin requests, streamed sequentially without object-sized buffering. Origin
+// The fake forwards request metadata and authorization unchanged. It supports
+// v1 reads and credit-controlled v2 subscriptions, forwarding pinned continuations
+// as whole-page origin requests without object-sized buffering. Origin
 // callback errors before response headers retain their HTTP classification;
 // later errors abort the stream. Origin must obey the same cancellation/body
 // ownership contract as ServeOrigin.
@@ -139,6 +143,11 @@ func NewFakeClient(origin Origin) (*Client, func(), error) {
 	}
 
 	address, err := start(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.RequestURI, "/v2/") {
+			serveFakeSubscription(w, r, transport)
+			return
+		}
+
 		serveFakePages(w, r, transport)
 	}), false)
 	if err != nil {
@@ -151,6 +160,361 @@ func NewFakeClient(origin Origin) (*Client, func(), error) {
 	}
 
 	return client, cleanup, nil
+}
+
+type fakeSubscriptionRequest struct {
+	request                  OriginRequest
+	first, end               uint64
+	ranged                   bool
+	pageCredits, byteCredits uint64
+}
+
+// Translate only the subscription envelope. Origin traffic still uses the v1
+// validators and whole-page requests, including immutable continuation checks.
+func parseFakeSubscription(r *http.Request) (fakeSubscriptionRequest, error) {
+	s := fakeSubscriptionRequest{end: math.MaxInt64, pageCredits: 2, byteCredits: 2 * uint64(PageSize)}
+	bad := failure(ErrorInvalidArgument, "fake subscription", nil)
+
+	const prefix = "/v2/objects/"
+
+	if r.Method != http.MethodPost || r.Proto != "HTTP/1.1" || r.Host != "racer" ||
+		len(r.RequestURI) != len(prefix)+64 || !strings.HasPrefix(r.RequestURI, prefix) ||
+		r.Header.Get("Content-Length") != "0" || len(r.TransferEncoding) != 0 || forbiddenHeaders(r.Header) {
+		return s, bad
+	}
+
+	for _, name := range []string{"Content-Length", "If-Match", "Range", "Racer-Page-Credits", "Racer-Byte-Credits", "Racer-Ordered", "Racer-Metadata", "Authorization"} {
+		if len(r.Header.Values(name)) > 1 {
+			return s, bad
+		}
+	}
+
+	for _, credit := range []struct {
+		name string
+		dest *uint64
+		min  uint64
+		max  uint64
+	}{
+		{"Racer-Page-Credits", &s.pageCredits, 1, 64},
+		{"Racer-Byte-Credits", &s.byteCredits, uint64(PageSize), 64 * uint64(PageSize)},
+	} {
+		if values, ok := r.Header[credit.name]; ok {
+			n, err := decimal(values[0])
+			if err != nil || n < credit.min || n > credit.max {
+				return s, bad
+			}
+
+			*credit.dest = n
+		}
+	}
+
+	if values, ok := r.Header["Racer-Ordered"]; ok && values[0] != "0" && values[0] != "1" {
+		return s, bad
+	}
+
+	h := r.Header.Clone()
+	if values, ok := h["Range"]; ok {
+		s.ranged = true
+
+		value := values[0]
+		if strings.HasPrefix(value, "bytes=") && strings.HasSuffix(value, "-") {
+			first, err := decimal(strings.TrimSuffix(strings.TrimPrefix(value, "bytes="), "-"))
+			if err != nil {
+				return s, bad
+			}
+
+			s.first = first
+		} else {
+			bounds, err := parseRange(value)
+			if err != nil {
+				return s, bad
+			}
+
+			s.first, s.end = bounds.first, bounds.last+1
+		}
+	}
+
+	h.Del("Range")
+
+	var raw bytes.Buffer
+	fmt.Fprintf(&raw, "HEAD %s%s HTTP/1.1\r\nHost: racer\r\n", objectPrefix, r.RequestURI[len(prefix):])
+
+	if err := h.Write(&raw); err != nil {
+		return s, err
+	}
+
+	raw.WriteString("\r\n")
+	request, err := parseRequestHead(raw.Bytes(), false)
+	s.request = request
+
+	return s, err
+}
+
+type fakeSubscriptionCredits struct {
+	mu          sync.Mutex
+	outstanding map[uint64]uint32
+	bytes       uint64
+	changed     chan struct{}
+}
+
+func (c *fakeSubscriptionCredits) releases(reader io.Reader, cancel context.CancelFunc) {
+	defer cancel()
+
+	var release [12]byte
+
+	for {
+		if _, err := io.ReadFull(reader, release[:]); err != nil {
+			return
+		}
+
+		page, length := binary.BigEndian.Uint64(release[:8]), binary.BigEndian.Uint32(release[8:])
+
+		c.mu.Lock()
+
+		want, ok := c.outstanding[page]
+		if !ok || want != length {
+			c.mu.Unlock()
+			return
+		}
+
+		delete(c.outstanding, page)
+		c.bytes -= uint64(length)
+		close(c.changed)
+		c.changed = make(chan struct{})
+		c.mu.Unlock()
+	}
+}
+
+func (c *fakeSubscriptionCredits) reserve(ctx context.Context, s fakeSubscriptionRequest, page uint64, length uint32) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		c.mu.Lock()
+		if uint64(len(c.outstanding)) < s.pageCredits && c.bytes+uint64(length) <= s.byteCredits {
+			c.outstanding[page] = length
+			c.bytes += uint64(length)
+			c.mu.Unlock()
+
+			return nil
+		}
+
+		changed := c.changed
+		c.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
+func fakeSubscriptionHead(w io.Writer, status int, h http.Header) error {
+	h.Set("Connection", "close")
+
+	if _, err := fmt.Fprintf(w, "HTTP/1.1 %d %s\r\n", status, http.StatusText(status)); err != nil {
+		return err
+	}
+
+	if err := h.Write(w); err != nil {
+		return err
+	}
+
+	_, err := io.WriteString(w, "\r\n")
+
+	return err
+}
+
+func fakeSubscriptionFrame(w io.Writer, kind byte, page, offset uint64, length uint32) error {
+	var frame [21]byte
+
+	frame[0] = kind
+	binary.BigEndian.PutUint64(frame[1:9], page)
+	binary.BigEndian.PutUint64(frame[9:17], offset)
+	binary.BigEndian.PutUint32(frame[17:], length)
+	_, err := w.Write(frame[:])
+
+	return err
+}
+
+func serveFakeSubscription(w http.ResponseWriter, r *http.Request, transport *http.Transport) {
+	s, err := parseFakeSubscription(r)
+	if err != nil {
+		writeOriginErrorResponse(w, 400, Metadata{})
+		return
+	}
+
+	// Release records follow a CL=0 HTTP head, not an HTTP request body. Hijack
+	// before origin work so disconnects cancel even a pending origin callback.
+	conn, rw, err := http.NewResponseController(w).Hijack()
+	if err != nil {
+		return
+	}
+	defer closeBody(conn)
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	unhook := context.AfterFunc(ctx, func() { closeBody(conn) })
+	defer unhook()
+
+	credits := &fakeSubscriptionCredits{outstanding: make(map[uint64]uint32), changed: make(chan struct{})}
+	go credits.releases(rw.Reader, cancel)
+
+	page := s.request
+	if page.pin.value == "" && s.first == 0 {
+		page.operation, page.byteRange = OperationBootstrap, bootstrapRange()
+	}
+
+	res, response, err := fakePage(ctx, transport, page, nil)
+	if res != nil {
+		defer closeBody(res.Body)
+	}
+
+	if err != nil {
+		status, h := 502, http.Header{"Content-Length": {"0"}}
+
+		var typed *Error
+		if res != nil && errors.As(err, &typed) && typed.StatusCode() != 0 {
+			status, h = res.StatusCode, res.Header.Clone()
+		}
+
+		if fakeSubscriptionHead(rw, status, h) != nil || rw.Flush() != nil {
+			return
+		}
+
+		return
+	}
+
+	snapshot := response.metadata
+
+	end := min(s.end, uint64(snapshot.Size))
+	if s.ranged && s.first >= uint64(snapshot.Size) {
+		h := http.Header{"Content-Length": {"0"}, "Content-Range": {"bytes */" + strconv.FormatUint(uint64(snapshot.Size), 10)}}
+		if fakeSubscriptionHead(rw, 416, h) != nil || rw.Flush() != nil {
+			return
+		}
+
+		return
+	}
+
+	pages := uint64(0)
+	if end > s.first {
+		pages = (end-1)/uint64(PageSize) - s.first/uint64(PageSize) + 1
+	}
+	// Like the real listener, acquire the first selected slice before committing
+	// success headers. In particular, a first-page 401 must remain a 401.
+	if pages != 0 && page.operation != OperationBootstrap {
+		closeBody(res.Body)
+
+		page.operation, page.pin = OperationPinned, snapshot.ETag
+		page.byteRange = Range{present: true, first: s.first / uint64(PageSize) * uint64(PageSize), last: nominalPageEnd(s.first / uint64(PageSize) * uint64(PageSize))}
+
+		res, response, err = fakePage(ctx, transport, page, &snapshot)
+		if err != nil {
+			status, headers := 502, http.Header{"Content-Length": {"0"}}
+
+			var typed *Error
+
+			if res != nil {
+				defer closeBody(res.Body)
+
+				if errors.As(err, &typed) && typed.StatusCode() != 0 {
+					status, headers = res.StatusCode, res.Header.Clone()
+				}
+			}
+
+			if fakeSubscriptionHead(rw, status, headers) != nil || rw.Flush() != nil {
+				return
+			}
+
+			return
+		}
+		defer closeBody(res.Body)
+	}
+
+	length := end - s.first
+	if pages+1 > (math.MaxInt64-length)/21 {
+		if fakeSubscriptionHead(rw, 502, http.Header{"Content-Length": {"0"}}) != nil || rw.Flush() != nil {
+			return
+		}
+
+		return
+	}
+
+	h, err := metadataHeaders(snapshot)
+	if err != nil {
+		return
+	}
+
+	h.Set("Content-Type", "application/octet-stream")
+	h.Set("Racer-Object-Length", strconv.FormatUint(uint64(snapshot.Size), 10))
+	h.Set("Racer-Range-Start", strconv.FormatUint(s.first, 10))
+	h.Set("Racer-Range-End", strconv.FormatUint(end, 10))
+	h.Set("Content-Length", strconv.FormatUint(length+21*(pages+1), 10))
+
+	if fakeSubscriptionHead(rw, 200, h) != nil || rw.Flush() != nil {
+		return
+	}
+
+	buffer := make([]byte, copyBufferSize)
+
+	for first := s.first; first < end; {
+		number := first / uint64(PageSize)
+		pageEnd := min(nominalPageEnd(number*uint64(PageSize))+1, end)
+
+		n := uint32(pageEnd - first)
+		if credits.reserve(ctx, s, number, n) != nil {
+			return
+		}
+
+		if first != s.first {
+			page.operation, page.pin = OperationPinned, snapshot.ETag
+			page.byteRange = Range{present: true, first: number * uint64(PageSize), last: nominalPageEnd(number * uint64(PageSize))}
+
+			res, response, err = fakePage(ctx, transport, page, &snapshot)
+			if err != nil {
+				if res != nil {
+					closeBody(res.Body)
+				}
+
+				return
+			}
+		}
+
+		err = fakeSubscriptionFrame(rw, 1, number, first, n)
+		if err == nil {
+			_, err = io.CopyN(io.Discard, res.Body, int64(first-uint64(response.first)))
+		}
+
+		if err == nil {
+			var copied int64
+
+			copied, err = io.CopyBuffer(rw, io.LimitReader(res.Body, int64(n)), buffer)
+			if err == nil && copied != int64(n) {
+				err = io.ErrUnexpectedEOF
+			}
+		}
+
+		if err == nil {
+			_, err = io.CopyBuffer(io.Discard, res.Body, buffer)
+		}
+
+		closeBody(res.Body)
+
+		if err != nil || rw.Flush() != nil {
+			return
+		}
+
+		page.operation = OperationPinned
+		first = pageEnd
+	}
+
+	if fakeSubscriptionFrame(rw, 2, pages, length, 0) != nil || rw.Flush() != nil {
+		return
+	}
 }
 
 // fakePage uses the wire validators as well as the actual origin server. The

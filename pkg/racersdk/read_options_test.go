@@ -43,30 +43,30 @@ func TestReadOptionsExactRangesAndMetadata(t *testing.T) {
 
 				gets.Add(1)
 
-				if options == (ReadOptions{}) {
-					first, length := int64(0), int64(PageSize)
-					if r.Header.Get("If-Match") != "" {
-						first, length = int64(PageSize), size-int64(PageSize)
-					}
-
-					if r.Header.Get("Range") != "bytes="+strconv.FormatInt(first, 10)+"-"+strconv.FormatInt(first+length-1, 10) {
-						t.Error("empty options changed bootstrap/remainder")
-					}
-
-					streamResponseHead(w, first, length, size, `"v"`)
-					_, _ = io.CopyN(w, &offsetStream{offset: first}, length)
-
-					return
-				}
-
 				length := int64(options.Length)
 				if length == 0 {
 					length = size - int64(options.Offset)
 				}
 
-				want := "bytes=" + strconv.FormatUint(uint64(options.Offset), 10) + "-" + strconv.FormatInt(int64(options.Offset)+length-1, 10)
-				if r.Header.Get("Range") != want || r.Header.Get("If-Match") != `"v"` {
+				want := "bytes=" + strconv.FormatUint(uint64(options.Offset), 10) + "-"
+				if options.Length != 0 {
+					want += strconv.FormatInt(int64(options.Offset)+length-1, 10)
+				}
+
+				if options.Offset == 0 && options.Length == 0 {
+					want = ""
+				}
+
+				if r.Method != "POST" || r.Header.Get("Range") != want || r.Header.Get("If-Match") != options.Pin.String() {
 					t.Error("not an exact pinned range", r.Header)
+				}
+
+				if int64(options.Offset) == size {
+					w.Header().Set("Content-Range", "bytes */"+strconv.FormatInt(size, 10))
+					w.Header().Set("Content-Length", "0")
+					w.WriteHeader(416)
+
+					return
 				}
 
 				streamResponseHead(w, int64(options.Offset), length, size, `"v"`)
@@ -75,9 +75,15 @@ func TestReadOptionsExactRangesAndMetadata(t *testing.T) {
 			c := testClient(t, path, 1)
 
 			v, err := c.Get(context.Background(), Request{}, options)
+			if int64(options.Offset) == size {
+				assertKind(t, err, ErrorUnsatisfiableRange)
+				return
+			}
+
 			if err != nil {
 				t.Fatal(err)
 			}
+
 			defer closeBody(v)
 
 			want := int64(options.Length)
@@ -90,10 +96,7 @@ func TestReadOptionsExactRangesAndMetadata(t *testing.T) {
 				t.Fatal(n, err)
 			}
 
-			wantHeads, wantGets := int32(1), int32(min(1, want))
-			if options == (ReadOptions{}) {
-				wantHeads, wantGets = 0, 2
-			}
+			wantHeads, wantGets := int32(0), int32(1)
 
 			if v.Metadata().Size != ByteLength(size) || v.Metadata().ContentType != "application/vnd.oci.image.manifest.v1+json" || heads.Load() != wantHeads || gets.Load() != wantGets {
 				t.Fatal("metadata or exchange count")
@@ -213,8 +216,8 @@ func TestReadOptionsValidationAndPinnedHead(t *testing.T) {
 	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 
-		if r.Method != "HEAD" {
-			t.Error("invalid range fetched a body")
+		if r.Method != "POST" {
+			t.Error("range must use one subscription")
 		}
 
 		if r.Header.Get("If-Match") == `"old"` {
@@ -224,9 +227,9 @@ func TestReadOptionsValidationAndPinnedHead(t *testing.T) {
 			return
 		}
 
-		w.Header().Set("Content-Length", "3")
-		w.Header().Set("ETag", `"v"`)
-		w.Header().Set("Racer-Expires-At", "0")
+		w.Header().Set("Content-Length", "0")
+		w.Header().Set("Content-Range", "bytes */3")
+		w.WriteHeader(416)
 	}))
 
 	c := testClient(t, path, 1)
@@ -367,9 +370,6 @@ func TestClientIdleAndCloseConnectionPolicy(t *testing.T) {
 			}
 
 			want := int32(2)
-			if policy == "reuse" {
-				want = 1
-			}
 
 			if dials.Load() != want {
 				t.Fatal("connection policy", dials.Load(), want)
