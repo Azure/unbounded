@@ -183,7 +183,7 @@ func ValidateInstallation(ctx context.Context, reader client.Reader, namespace, 
 	return err
 }
 
-// CommitVersion mints the only installable type after a resource-version CAS.
+// CommitVersion mints publisher installable state after a resource-version CAS.
 // Even unchanged content is CAS-confirmed; its counters and bytes remain identical.
 func (r *TopologyReconciler) CommitVersion(ctx context.Context, p *PreparedPublication) (*CommittedPublication, error) {
 	if err := ctx.Err(); err != nil {

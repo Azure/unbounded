@@ -289,7 +289,12 @@ func TestPollValidationAndCancellation(t *testing.T) {
 		}
 
 		for _, cursor := range []wire.Sequence{0, sequence + 1} {
-			if _, err := r.Publications.Wait(context.Background(), identity, &cursor); !errors.Is(err, wire.Conflict) {
+			want := wire.Conflict
+			if cursor > sequence {
+				want = wire.Unavailable
+			}
+
+			if _, err := r.Publications.Wait(context.Background(), identity, &cursor); !errors.Is(err, want) {
 				t.Fatalf("future/zero cursor: %v", err)
 			}
 		}
@@ -411,6 +416,7 @@ func TestPollCertificateExpiration(t *testing.T) {
 func TestPollNormalTimeout(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := initializedTopology(t)
+		r.Publications.maxAge = 2 * wire.PollWait
 		p := reconcileTopology(t, r, context.Background())
 		identity := pollIdentity(r.Config, testNodeUID)
 		sequence := p.Version().Sequence

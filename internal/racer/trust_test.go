@@ -74,9 +74,7 @@ func TestLocalSnapshotsDuringAPIOutage(t *testing.T) {
 	}
 
 	response, err := peer.Get(fmt.Sprintf("%s%s?after=%d", endpoint, wire.SnapshotPath, current.record.Sequence))
-	if body := responseBody(t, response, err, http.StatusNoContent); len(body) != 0 {
-		t.Fatal("204 included a body")
-	}
+	responseBody(t, response, err, http.StatusServiceUnavailable)
 
 	if calls.Load() != 0 {
 		t.Fatalf("handshake/warm/204 used API: %d", calls.Load())
@@ -97,8 +95,8 @@ func TestLocalSnapshotsDuringAPIOutage(t *testing.T) {
 	response, err = peer.Do(req)
 	responseBody(t, response, err, http.StatusServiceUnavailable)
 
-	if calls.Load() == 0 {
-		t.Fatal("enrollment bypassed live authorization")
+	if calls.Load() != 0 {
+		t.Fatal("stale replica attempted enrollment authorization")
 	}
 
 	f.cancel()

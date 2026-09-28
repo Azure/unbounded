@@ -6,6 +6,7 @@ package racer
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"io"
 	"mime"
@@ -27,6 +28,7 @@ type Server struct {
 	Bootstrap      *Bootstrap
 	Publications   *Publications
 	Lifecycle      *Lifecycle
+	Replication    *Replication
 	once           sync.Once
 	admission      sync.Mutex
 	polls          map[wire.NodeID]struct{}
@@ -41,7 +43,7 @@ var (
 	_ manager.LeaderElectionRunnable = (*Server)(nil)
 )
 
-func (*Server) NeedLeaderElection() bool { return true }
+func (*Server) NeedLeaderElection() bool { return false }
 
 // TLSConfig must use VerifyClientCertIfGiven: bootstrap can omit the client
 // certificate, while snapshot explicitly requires VerifiedChains. Resumption
@@ -93,7 +95,9 @@ func (s *Server) tlsConfigWithCertificate(ctx context.Context, certificate func(
 
 		roots, err := s.Trust.pool()
 		if err != nil {
-			return nil, wire.Unavailable
+			// Replication uses a bearer token, not a dataplane certificate. Allow
+			// TLS startup before issuer trust exists to avoid bootstrap deadlock.
+			roots = x509.NewCertPool()
 		}
 
 		cfg := base.Clone()
@@ -108,8 +112,8 @@ func (s *Server) tlsConfigWithCertificate(ctx context.Context, certificate func(
 	return base
 }
 
-// Start waits for synchronized inputs and initialized issuer/publication state.
-// Leadership cancellation closes listeners/connections and cancels every poll.
+// Start opens TLS before public readiness so controller replication cannot
+// deadlock on bootstrap. Process cancellation closes connections and polls.
 func (s *Server) Start(ctx context.Context) error {
 	if err := s.Config.Validate(); err != nil {
 		return err
@@ -123,15 +127,7 @@ func (s *Server) Start(ctx context.Context) error {
 		return wire.Unavailable
 	}
 
-	if err := s.Lifecycle.Wait(ctx); err != nil {
-		if ctx.Err() != nil {
-			return nil
-		}
-
-		return err
-	}
-
-	serving, cancel := s.Lifecycle.LeaderContext(ctx)
+	serving, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	config, err := s.TLSConfig(serving)
@@ -148,7 +144,7 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 // serve owns the listener and every accepted connection. Close, rather than a
-// grace period for active traffic, is required as soon as leadership is lost.
+// grace period for active traffic, is required as soon as the process stops.
 func (s *Server) serve(ctx context.Context, listener net.Listener, config *tls.Config) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -324,6 +320,15 @@ func (s *Server) Handler() http.Handler {
 		var handler http.HandlerFunc
 
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == replicationPath && s.Replication != nil:
+			if r.TLS == nil || !r.TLS.HandshakeComplete {
+				writeFailure(w, wire.Unauthenticated)
+				return
+			}
+
+			s.serveReplication(w, r)
+
+			return
 		case r.Method == http.MethodPost && r.URL.Path == wire.BootstrapPath:
 			handler = s.serveBootstrap
 		case r.Method == http.MethodGet && r.URL.Path == wire.SnapshotPath:

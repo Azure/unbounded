@@ -140,11 +140,12 @@ func TestLifecycleFollowerWithPublicationRemainsUnready(t *testing.T) {
 	}
 
 	l := newLifecycle(r.Publications)
+	l.leader, l.synced = t.Context(), true
 	l.SetIssuerReady(true)
 	l.SetServingReady(true)
 
-	if err := l.Ready(nil); !errors.Is(err, wire.Unavailable) {
-		t.Fatalf("follower with usable state must not receive Service traffic: %v", err)
+	if err := l.Ready(nil); err != nil {
+		t.Fatalf("follower with validated state must receive Service traffic: %v", err)
 	}
 }
 
@@ -152,7 +153,7 @@ func TestLifecycleGatesAndCancellation(t *testing.T) {
 	r := initializedTopology(t)
 
 	l := newLifecycle(r.Publications)
-	if !l.NeedLeaderElection() || l.Ready(nil) == nil {
+	if l.NeedLeaderElection() || l.Ready(nil) == nil {
 		t.Fatal("follower ready")
 	}
 

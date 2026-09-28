@@ -33,6 +33,14 @@ type Config struct {
 	Limits                    Limits
 	Rotation                  RotationPolicy
 	CertificateLifetime       time.Duration
+	PodName                   string
+	PodUID                    string
+	ControllerServiceAccount  string
+	ReplicationTokenFile      string
+	ReplicationTrustFile      string
+	ReplicationServerName     string
+	ReplicationPort           uint16
+	SnapshotMaxAge            time.Duration
 }
 
 type Limits struct {
@@ -80,6 +88,13 @@ func ConfigFromLookup(lookup func(string) (string, bool)) (Config, error) {
 		KeyringSecretName:         env("RACER_KEYRING_SECRET_NAME", "racer-keyring"),
 		VersionConfigMapName:      env("RACER_VERSION_CONFIGMAP_NAME", "racer-version"),
 		InstallationConfigMapName: env("RACER_INSTALLATION_CONFIGMAP_NAME", "racer-installation"),
+		PodName:                   env("POD_NAME", ""),
+		PodUID:                    env("POD_UID", ""),
+		ControllerServiceAccount:  env("RACER_CONTROLLER_SERVICE_ACCOUNT", "racer-controller"),
+		ReplicationTokenFile:      env("RACER_REPLICATION_TOKEN_FILE", "/var/run/secrets/racer-controller/token"),
+		ReplicationTrustFile:      env("RACER_REPLICATION_TRUST_FILE", "/etc/racer/tls/ca.crt"),
+		ReplicationServerName:     env("RACER_REPLICATION_SERVER_NAME", "racer-controller."+env("POD_NAMESPACE", "unbounded-system")+".svc"),
+		SnapshotMaxAge:            30 * time.Second,
 		Limits: Limits{
 			MaxPolls:               wire.MaxMembers,
 			MaxConcurrentWrites:    128,
@@ -95,11 +110,19 @@ func ConfigFromLookup(lookup func(string) (string, bool)) (Config, error) {
 		},
 	}
 
+	replicationPort, err := strconv.ParseUint(env("RACER_REPLICATION_PORT", "8443"), 10, 16)
+	if err != nil || replicationPort == 0 {
+		return Config{}, fmt.Errorf("RACER_REPLICATION_PORT: %w", wire.InvalidRequest)
+	}
+
+	cfg.ReplicationPort = uint16(replicationPort)
+
 	for _, setting := range []struct {
 		name  string
 		value *time.Duration
 	}{
 		{"RACER_CERTIFICATE_LIFETIME", &cfg.CertificateLifetime},
+		{"RACER_SNAPSHOT_MAX_AGE", &cfg.SnapshotMaxAge},
 		{"RACER_ROTATION_INTERVAL", &cfg.Rotation.Interval},
 		{"RACER_ROTATION_PREPARE_FOR", &cfg.Rotation.PrepareFor},
 		{"RACER_ROTATION_RETAIN_FOR", &cfg.Rotation.RetainFor},
@@ -127,6 +150,10 @@ func (c Config) certificateLifetime() time.Duration {
 }
 
 func (c Config) Validate() error {
+	if c.SnapshotMaxAge < 0 || c.SnapshotMaxAge > 0 && c.SnapshotMaxAge < time.Second {
+		return fmt.Errorf("snapshot maximum age: %w", wire.InvalidRequest)
+	}
+
 	if !wire.ValidUUID(string(c.Cluster)) || len(validation.IsDNS1123Label(c.Namespace)) != 0 || c.PeerPort == 0 {
 		return fmt.Errorf("cluster, namespace, or peer port: %w", wire.InvalidRequest)
 	}
@@ -150,6 +177,22 @@ func (c Config) Validate() error {
 
 	if c.IssuerSecretName == c.KeyringSecretName || c.Rotation.PrepareFor <= 0 || c.Rotation.Interval < c.Rotation.PrepareFor || c.Rotation.RetainFor < lifetime || c.Rotation.Interval > 365*24*time.Hour || c.Rotation.RetainFor > 365*24*time.Hour {
 		return fmt.Errorf("credential names or rotation policy: %w", wire.InvalidRequest)
+	}
+
+	return nil
+}
+
+func (c Config) snapshotMaxAge() time.Duration {
+	if c.SnapshotMaxAge == 0 {
+		return 30 * time.Second
+	}
+
+	return c.SnapshotMaxAge
+}
+
+func (c Config) validateReplication() error {
+	if len(validation.IsDNS1123Subdomain(c.PodName)) != 0 || c.PodUID == "" || len(validation.IsDNS1123Subdomain(c.ControllerServiceAccount)) != 0 || len(validation.IsDNS1123Subdomain(c.ReplicationServerName)) != 0 || c.ReplicationPort == 0 || c.ReplicationTokenFile == "" || c.ReplicationTrustFile == "" {
+		return fmt.Errorf("replication requires POD_NAME, POD_UID, controller identity, TLS trust, token, server name, and port: %w", wire.InvalidRequest)
 	}
 
 	return nil

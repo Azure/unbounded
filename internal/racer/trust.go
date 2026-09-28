@@ -20,10 +20,12 @@ import (
 // delivery bundle. Requests never refresh this state or fall back to Kubernetes.
 // A failed observation cannot restore withdrawn trust.
 type Trust struct {
-	mu      sync.RWMutex
-	roots   *x509.CertPool
-	bundle  *acceptedKeyring
-	changed chan struct{}
+	mu        sync.RWMutex
+	roots     *x509.CertPool
+	bundle    *acceptedKeyring
+	changed   chan struct{}
+	confirmed time.Time
+	maxAge    time.Duration
 	// Retain only non-secret replay protection when serving state is withdrawn.
 	// Otherwise a rejected rollback could be accepted on the next reconcile.
 	highWater wire.Generation
@@ -70,6 +72,7 @@ func (t *Trust) install(ctx context.Context, roots *x509.CertPool, bundle wire.K
 
 	t.highWater, t.digest = accepted.generation, digest
 	t.roots = roots
+	t.confirmed = time.Now()
 	t.bundle = accepted
 	t.notifyLocked()
 
@@ -156,7 +159,7 @@ func (t *Trust) pool() (*x509.CertPool, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	if t.roots == nil {
+	if t.roots == nil || t.maxAge > 0 && time.Since(t.confirmed) >= t.maxAge {
 		return nil, wire.Unavailable
 	}
 

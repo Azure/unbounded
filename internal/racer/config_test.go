@@ -152,3 +152,39 @@ func TestConfigDurationsUseProvidedLookup(t *testing.T) {
 		t.Fatalf("absent custom values did not use defaults: %v", err)
 	}
 }
+
+func TestReplicationConfigDefaultsAndOverrides(t *testing.T) {
+	values := map[string]string{"RACER_CLUSTER_ID": string(testConfig(t).Cluster), "POD_NAMESPACE": "controllers"}
+	lookup := func(key string) (string, bool) { value, ok := values[key]; return value, ok }
+
+	cfg, err := ConfigFromLookup(lookup)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.SnapshotMaxAge != 30*time.Second || cfg.ReplicationPort != 8443 || cfg.ReplicationServerName != "racer-controller.controllers.svc" || cfg.ReplicationTokenFile != "/var/run/secrets/racer-controller/token" || cfg.ReplicationTrustFile != "/etc/racer/tls/ca.crt" || cfg.ControllerServiceAccount != "racer-controller" {
+		t.Fatalf("replication defaults: %+v", cfg)
+	}
+
+	values["RACER_SNAPSHOT_MAX_AGE"] = "45s"
+	values["RACER_REPLICATION_PORT"] = "9443"
+	values["POD_NAME"] = "controller-0"
+	values["POD_UID"] = "pod-uid"
+
+	cfg, err = ConfigFromLookup(lookup)
+	if err != nil || cfg.SnapshotMaxAge != 45*time.Second || cfg.ReplicationPort != 9443 || cfg.PodName != "controller-0" || cfg.PodUID != "pod-uid" {
+		t.Fatal("replication overrides", err)
+	}
+
+	for name, invalid := range map[string][]string{"RACER_REPLICATION_PORT": {"0", "65536", "-1", "bad"}, "RACER_SNAPSHOT_MAX_AGE": {"0s", "-1s", "500ms", "bad"}} {
+		previous := values[name]
+		for _, value := range invalid {
+			values[name] = value
+			if _, err := ConfigFromLookup(lookup); err == nil {
+				t.Fatalf("accepted %s=%s", name, value)
+			}
+		}
+
+		values[name] = previous
+	}
+}

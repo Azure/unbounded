@@ -11,9 +11,8 @@ import (
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
-// Lifecycle is one-shot, leader-scoped readiness infrastructure. Phase 4 reports
-// usable issuer/trust; Phase 5 reports listener readiness and uses Wait to gate
-// serving. A canceled leadership can never be restarted or made ready again.
+// Lifecycle owns process serving, independently of the leader-owned publishers.
+// The historical leader field and LeaderContext method bind process cancellation.
 type Lifecycle struct {
 	mu               sync.Mutex
 	started          bool
@@ -30,10 +29,10 @@ func newLifecycle(p *Publications) *Lifecycle {
 	return &Lifecycle{publications: p, changed: make(chan struct{})}
 }
 
-func (*Lifecycle) NeedLeaderElection() bool { return true }
+func (*Lifecycle) NeedLeaderElection() bool { return false }
 
-// LeaderContext binds a child of parent to the current leadership. Missing or
-// canceled leadership returns an already-canceled child. Cancel releases the link.
+// LeaderContext is the legacy name for binding a request to the serving process.
+// Missing or canceled process lifetime returns an already-canceled child.
 func (l *Lifecycle) LeaderContext(parent context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(parent)
 	if l == nil {
@@ -68,6 +67,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	}
 
 	l.started, l.leader = true, ctx
+	l.publications.bindProcess(ctx)
 	l.notifyLocked()
 	l.mu.Unlock()
 
@@ -134,8 +134,8 @@ func (l *Lifecycle) Ready(_ *http.Request) error {
 	return l.publications.Ready(nil)
 }
 
-// Wait gates listener startup on leadership, synchronized inputs, issuer/trust,
-// and the first committed publication. It also terminates on leadership loss.
+// Wait waits for synchronized inputs, issuer/trust, and a validated publication.
+// Listener startup deliberately does not use this public readiness gate.
 func (l *Lifecycle) Wait(ctx context.Context) error {
 	for {
 		if err := ctx.Err(); err != nil {

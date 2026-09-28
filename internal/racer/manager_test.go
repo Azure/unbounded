@@ -39,8 +39,8 @@ func TestAssemble(t *testing.T) {
 		t.Fatal("issuer and serving must share the leader readiness gate")
 	}
 
-	if a.Topology.Accepted == nil || !a.Server.NeedLeaderElection() {
-		t.Fatal("missing local accepted state or leader-scoped server")
+	if a.Topology.Accepted == nil || a.Server.NeedLeaderElection() || a.Replication.NeedLeaderElection() {
+		t.Fatal("missing local accepted state or process-scoped server")
 	}
 
 	if err := a.Server.Ready(nil); !errors.Is(err, wire.Unavailable) {

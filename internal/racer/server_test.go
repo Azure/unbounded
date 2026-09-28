@@ -213,7 +213,7 @@ func TestHTTPSBootstrapSnapshotAndStrictRoutes(t *testing.T) {
 		{"GET", "/v1/%73napshot", 400},
 		{"GET", "/healthz", 400},
 		{"GET", "/v1/snapshot?after=0", 409},
-		{"GET", "/v1/snapshot?after=999", 409},
+		{"GET", "/v1/snapshot?after=999", 503},
 		{"GET", "/v1/snapshot?after=01", 400},
 		{"GET", "/v1/snapshot?after=+1", 400},
 		{"GET", "/v1/snapshot?after=%31", 400},
@@ -763,13 +763,15 @@ func TestAdmissionHeldThroughWriteCompletion(t *testing.T) {
 		{"failed write", false, true, http.StatusOK},
 		{"failed flush", true, true, http.StatusOK},
 		{"no content flush", true, false, http.StatusNoContent},
-		{"error write", false, false, http.StatusConflict},
-		{"error flush", true, false, http.StatusConflict},
+		{"error write", false, false, http.StatusServiceUnavailable},
+		{"error flush", true, false, http.StatusServiceUnavailable},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				f := newServingFixture(t)
 				f.a.Server.Config.Limits.MaxPolls = 1
+				f.a.Server.Publications.maxAge = 2 * wire.PollWait
+				f.a.Server.Trust.maxAge = 2 * wire.PollWait
 				f.a.Server.Config.Limits.MaxConcurrentWrites = 1
 				other := *f
 				other.certificate = f.signLeaf(t, func(c *x509.Certificate) { c.URIs[0].Path = "/node/" + testOtherUID })
@@ -785,7 +787,7 @@ func TestAdmissionHeldThroughWriteCompletion(t *testing.T) {
 					}
 
 					cursor := current.record.Sequence
-					if tc.status == http.StatusConflict {
+					if tc.status == http.StatusServiceUnavailable {
 						cursor++
 					}
 
@@ -820,7 +822,7 @@ func TestAdmissionHeldThroughWriteCompletion(t *testing.T) {
 				}
 
 				wantWrites := 1
-				if tc.status == http.StatusConflict {
+				if tc.status == http.StatusServiceUnavailable {
 					wantWrites = 0
 				}
 

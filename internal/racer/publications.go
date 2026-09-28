@@ -25,8 +25,8 @@ type VersionRecord struct {
 	MembershipHash    string                 `json:"membership_hash"`
 }
 
-// PreparedPublication owns encoded candidate bytes. Only CommitVersion can mint
-// the installable type. Fields stay private so callers cannot bypass the CAS.
+// PreparedPublication owns encoded candidate bytes. Publishers require CAS;
+// replicas require canonical validation and an authoritative durable confirmation.
 type PreparedPublication struct {
 	owner           *Publications
 	previous        VersionRecord
@@ -63,6 +63,12 @@ func (p *CommittedPublication) WriteTo(w io.Writer) (int64, error) {
 		if err := p.leadership.Err(); err != nil {
 			return written, err
 		}
+
+		if p.owner != nil {
+			if _, err := p.owner.Current(); err != nil {
+				return written, err
+			}
+		}
 		// ResponseWriter need not implement StringWriter. Limit conversion scratch
 		// to 32 KiB rather than allocating a full publication for every response.
 		chunk := remaining[:min(len(remaining), 32*1024)]
@@ -90,10 +96,20 @@ type Publications struct {
 	current   *CommittedPublication
 	changed   chan struct{}
 	suspended bool
+	process   context.Context
+	confirmed time.Time
+	maxAge    time.Duration
 }
 
 func NewPublications() *Publications {
-	return &Publications{changed: make(chan struct{})}
+	return &Publications{changed: make(chan struct{}), maxAge: 30 * time.Second}
+}
+
+func (p *Publications) bindProcess(ctx context.Context) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.process = ctx
 }
 
 func (p *Publications) notifyLocked() { close(p.changed); p.changed = make(chan struct{}) }
@@ -182,6 +198,12 @@ func (p *Publications) Install(next *CommittedPublication) error {
 		return err
 	}
 
+	if p.process != nil {
+		copy := *next
+		copy.leadership = p.process
+		next = &copy
+	}
+
 	if current := p.current; current != nil {
 		if current.record.Cluster != next.record.Cluster || next.record.Sequence < current.record.Sequence || next.record.MembershipVersion < current.record.MembershipVersion {
 			return wire.Conflict
@@ -190,6 +212,11 @@ func (p *Publications) Install(next *CommittedPublication) error {
 		if next.record.Sequence == current.record.Sequence {
 			if next.record != current.record || next.encoded != current.encoded {
 				return wire.Conflict
+			}
+
+			p.confirmed = time.Now()
+			if current.leadership.Err() != nil {
+				p.current = next
 			}
 
 			if p.suspended {
@@ -202,6 +229,7 @@ func (p *Publications) Install(next *CommittedPublication) error {
 	}
 
 	p.current = next
+	p.confirmed = time.Now()
 	p.suspended = false
 	p.notifyLocked()
 
@@ -228,7 +256,7 @@ func (p *Publications) CurrentAndSubscribe() (*CommittedPublication, <-chan stru
 }
 
 func (p *Publications) currentLocked() (*CommittedPublication, error) {
-	if p.current == nil || p.suspended {
+	if p.current == nil || p.suspended || time.Since(p.confirmed) >= p.maxAge {
 		return nil, wire.Unavailable
 	}
 
@@ -273,8 +301,12 @@ func (p *Publications) Wait(ctx context.Context, identity NodeIdentity, after *w
 		return nil, wire.Forbidden
 	}
 
-	if after != nil && (*after == 0 || *after > current.record.Sequence) {
+	if after != nil && *after == 0 {
 		return nil, wire.Conflict
+	}
+
+	if after != nil && *after > current.record.Sequence {
+		return nil, wire.Unavailable
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -299,6 +331,9 @@ func (p *Publications) Wait(ctx context.Context, identity NodeIdentity, after *w
 	expiration := time.NewTimer(time.Until(identity.expires))
 	defer expiration.Stop()
 
+	freshness := time.NewTicker(min(p.maxAge, time.Second))
+	defer freshness.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -307,6 +342,12 @@ func (p *Publications) Wait(ctx context.Context, identity NodeIdentity, after *w
 			return nil, current.leadership.Err()
 		case <-expiration.C:
 			return nil, wire.Unauthenticated
+		case <-freshness.C:
+			if _, err := p.Current(); err != nil {
+				return nil, err
+			}
+
+			continue
 		case <-timer.C:
 			if err := ctx.Err(); err != nil {
 				return nil, err

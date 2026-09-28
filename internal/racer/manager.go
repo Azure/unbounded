@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package racer implements the Racer server using controller-runtime directly.
-// Constructors compose only; serving requires initialized, leader-owned state.
+// Constructors compose only; serving requires locally validated replicated state.
 package racer
 
 import (
@@ -11,8 +11,11 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -23,10 +26,11 @@ import (
 )
 
 type Application struct {
-	Topology  *TopologyReconciler
-	Keyring   *KeyringReconciler
-	Server    *Server
-	Lifecycle *Lifecycle
+	Topology    *TopologyReconciler
+	Keyring     *KeyringReconciler
+	Server      *Server
+	Lifecycle   *Lifecycle
+	Replication *Replication
 }
 
 // Assemble performs no Kubernetes calls, I/O, cryptography, or goroutine startup.
@@ -34,14 +38,16 @@ type Application struct {
 // reader must bypass the cache for authorization and durable-state validation.
 func Assemble(cfg Config, c client.Client, reader client.Reader) *Application {
 	publications := NewPublications()
+	publications.maxAge = cfg.snapshotMaxAge()
 	lifecycle := newLifecycle(publications)
-	trust := &Trust{}
+	trust := &Trust{maxAge: cfg.snapshotMaxAge()}
 	issuer := &Issuer{APIReader: reader, Config: cfg, Trust: trust}
 	bootstrap := &Bootstrap{Client: c, APIReader: reader, Config: cfg, Issuer: issuer}
 	// Serialize credential admission/pruning with topology's authoritative read
 	// and publication commit. Informer ordering alone cannot provide this gate.
 	catalogGate := newCatalogGate()
 	issuer.CatalogGate = catalogGate
+	replication := &Replication{Config: cfg, Client: c, APIReader: reader, Publications: publications, Trust: trust, Lifecycle: lifecycle, CatalogGate: catalogGate}
 
 	return &Application{
 		Topology: &TopologyReconciler{
@@ -67,15 +73,25 @@ func Assemble(cfg Config, c client.Client, reader client.Reader) *Application {
 			Bootstrap:    bootstrap,
 			Publications: publications,
 			Lifecycle:    lifecycle,
+			Replication:  replication,
 		},
-		Lifecycle: lifecycle,
+		Lifecycle:   lifecycle,
+		Replication: replication,
 	}
 }
 
 func (a *Application) SetupWithManager(mgr ctrl.Manager) error {
 	a.Lifecycle.waitForCacheSync = mgr.GetCache().WaitForCacheSync
 	if err := mgr.Add(a.Lifecycle); err != nil {
-		return fmt.Errorf("register leader lifecycle: %w", err)
+		return fmt.Errorf("register serving lifecycle: %w", err)
+	}
+
+	if err := mgr.Add(a.Replication); err != nil {
+		return fmt.Errorf("register replica observer: %w", err)
+	}
+
+	if err := mgr.Add(&publisherLifetime{replication: a.Replication}); err != nil {
+		return fmt.Errorf("register publisher lifetime: %w", err)
 	}
 
 	if err := a.Topology.SetupWithManager(mgr); err != nil {
@@ -120,7 +136,23 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 
-	mgr, err := ctrl.NewManager(restConfig, managerOptions(cfg, scheme))
+	if err := cfg.validateReplication(); err != nil {
+		return err
+	}
+
+	kube, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return err
+	}
+
+	options := managerOptions(cfg, scheme)
+	options.LeaderElectionResourceLockInterface = &resourcelock.LeaseLock{
+		LeaseMeta:  metav1.ObjectMeta{Namespace: cfg.Namespace, Name: "racer-controller"},
+		Client:     kube.CoordinationV1(),
+		LockConfig: resourcelock.ResourceLockConfig{Identity: cfg.PodName + "/" + cfg.PodUID},
+	}
+
+	mgr, err := ctrl.NewManager(restConfig, options)
 	if err != nil {
 		return err
 	}
