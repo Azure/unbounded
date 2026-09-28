@@ -74,10 +74,12 @@ func newServingFixture(t *testing.T) *servingFixture {
 	request := wire.BootstrapRequest{SchemaVersion: 1, Cluster: a.Server.Config.Cluster, Enrollment: wire.EnrollmentID(testOtherUID), CSRDER: csr}
 	identity := NodeIdentity{cluster: request.Cluster, node: wire.NodeID(testNodeUID), expires: time.Now().Add(time.Hour)}
 
-	response, err := a.Server.Bootstrap.Issuer.Issue(ctx, identity, request)
+	encoded, err := a.Server.Bootstrap.Issuer.Issue(ctx, identity, request)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	response := decodeIssuedResponse(t, encoded)
 
 	template := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
 
@@ -515,10 +517,12 @@ func TestPooledTLSRetiredTrustAndNoResumption(t *testing.T) {
 		t.Fatal("new TLS connection accepted retired root")
 	}
 	// A fresh identity reconnects successfully but cannot resume an old session.
-	responseChain, err := f.a.Server.Bootstrap.Issuer.Issue(f.ctx, NodeIdentity{cluster: f.request.Cluster, node: wire.NodeID(testNodeUID), expires: time.Now().Add(time.Hour)}, f.request)
+	encoded, err := f.a.Server.Bootstrap.Issuer.Issue(f.ctx, NodeIdentity{cluster: f.request.Cluster, node: wire.NodeID(testNodeUID), expires: time.Now().Add(time.Hour)}, f.request)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	responseChain := decodeIssuedResponse(t, encoded)
 
 	fresh := tls.Certificate{Certificate: responseChain.CertificateChain, PrivateKey: f.key}
 
@@ -1075,6 +1079,74 @@ func TestHTTPWriteBootstrapAndGlobalAdmission(t *testing.T) {
 
 			if w.Code != want {
 				t.Fatalf("unbounded %s: %d", resource, w.Code)
+			}
+		})
+	}
+}
+
+func TestBootstrapIssuanceBeforeWriteAdmission(t *testing.T) {
+	for _, scenario := range []string{"success", "write saturation", "readiness lost", "canceled"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newServingFixture(t)
+			s := f.a.Server
+			s.Config.Limits.MaxConcurrentWrites = 1
+			handler := s.Handler()
+
+			ctx, cancel := context.WithCancel(f.ctx)
+			defer cancel()
+
+			wantWrites, wantStatus := 0, http.StatusOK
+
+			if scenario == "write saturation" {
+				take(s.writes)
+				defer release(s.writes)
+
+				wantWrites, wantStatus = 1, http.StatusTooManyRequests
+			} else if scenario != "success" {
+				wantStatus = http.StatusServiceUnavailable
+			}
+
+			reads := 0
+			s.Bootstrap.Issuer.APIReader = interceptor.NewClient(f.a.Topology.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				reads++
+
+				if len(s.writes) != wantWrites || len(s.authSlots) != 1 {
+					t.Error("issuance changed write/auth admission timing")
+				}
+
+				switch scenario {
+				case "readiness lost":
+					f.a.Lifecycle.SetServingReady(false)
+				case "canceled":
+					cancel()
+				}
+
+				return c.Get(ctx, key, obj, opts...)
+			}})
+
+			body, err := wire.EncodeBootstrapRequest(f.request)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			r := httptest.NewRequestWithContext(ctx, "POST", wire.BootstrapPath, bytes.NewReader(body))
+			r.TLS = &tls.ConnectionState{HandshakeComplete: true}
+			r.Header.Set("Authorization", "Bearer "+f.token)
+			r.Header.Set("Content-Type", "application/json")
+
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, r)
+
+			encoded := responseBody(t, w.Result(), nil, wantStatus)
+			if reads == 0 || len(s.authSlots) != 0 || len(s.writes) != wantWrites {
+				t.Fatal("issuance skipped or admission leaked")
+			}
+
+			if scenario == "success" {
+				response := decodeIssuedResponse(t, encoded)
+				if response.Enrollment != f.request.Enrollment || response.Node != wire.NodeID(testNodeUID) || !w.Flushed || w.Header().Get("Cache-Control") != "no-store" {
+					t.Fatal("issued response was not served completely")
+				}
 			}
 		})
 	}

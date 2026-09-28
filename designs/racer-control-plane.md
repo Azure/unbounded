@@ -409,9 +409,12 @@ establishes 100,000-node HTTPS capacity.
   Generation exhaustion, malformed state, missing material, and durable overcommit
   fail closed without resetting generation or overwriting corrupt state.
 - `Issuer.Issue(ctx, NodeIdentity, wire.BootstrapRequest)` verifies Ed25519 CSR
-  proof of possession and response bounds, discards requested names/extensions,
+  proof of possession and full encoded request/response bounds, discards requested names/extensions,
   and signs a 24-hour client-auth/digital-signature leaf with the resolved cluster
-  and Node URI. It returns a leaf-first public chain and enrollment correlation.
+  and Node URI. It returns owned, validated JSON bytes containing a leaf-first public
+  chain and enrollment correlation. `Enroll` passes those bytes to the HTTP handler
+  without re-encoding. `wire.ValidateBootstrapRequest` checks request fields, CSR
+  syntax, and JSON/base64 size without serializing a throwaway request.
   Phase 5 must first obtain `NodeIdentity` from live token authorization, including
   its authorization expiration, and gate issuance on leadership. There is no
   enrollment receipt ledger. `AuthenticateCertificate` is implemented in Phase 5.

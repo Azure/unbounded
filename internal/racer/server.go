@@ -363,13 +363,7 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response, err := s.Bootstrap.Enroll(ctx, r, request)
-	if err != nil {
-		writeFailure(w, err)
-		return
-	}
-
-	encoded, err := wire.EncodeBootstrap(response)
+	encoded, err := s.Bootstrap.Enroll(ctx, r, request)
 	if err != nil {
 		writeFailure(w, err)
 		return

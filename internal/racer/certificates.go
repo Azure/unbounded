@@ -216,66 +216,69 @@ func (i *Issuer) loadSigning(ctx context.Context, now time.Time) (signingState, 
 
 // Issue accepts only the identity returned by token authentication. CSR names,
 // extensions and requested usages are discarded. Enrollment is correlation only.
-func (i *Issuer) Issue(ctx context.Context, identity NodeIdentity, request wire.BootstrapRequest) (wire.BootstrapResponse, error) {
+// It returns an owned, validated JSON response within the bootstrap wire bound.
+func (i *Issuer) Issue(ctx context.Context, identity NodeIdentity, request wire.BootstrapRequest) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
-		return wire.BootstrapResponse{}, err
+		return nil, err
 	}
 
 	now := i.now()
 	if identity.cluster != i.Config.Cluster || !wire.ValidUUID(string(identity.node)) || !identity.expires.After(now) {
-		return wire.BootstrapResponse{}, wire.Forbidden
+		return nil, wire.Forbidden
 	}
 
 	if request.Cluster != identity.cluster {
-		return wire.BootstrapResponse{}, wire.Forbidden
+		return nil, wire.Forbidden
 	}
 
-	if _, err := wire.EncodeBootstrapRequest(request); err != nil {
-		return wire.BootstrapResponse{}, err
+	if err := wire.ValidateBootstrapRequest(request); err != nil {
+		return nil, err
 	}
 
 	csr, err := x509.ParseCertificateRequest(request.CSRDER)
 	if err != nil || csr.CheckSignature() != nil {
-		return wire.BootstrapResponse{}, wire.InvalidRequest
+		return nil, wire.InvalidRequest
 	}
 
 	pub, ok := csr.PublicKey.(ed25519.PublicKey)
 	if !ok {
-		return wire.BootstrapResponse{}, wire.InvalidRequest
+		return nil, wire.InvalidRequest
 	}
 
 	state, err := i.loadSigning(ctx, now)
 	if err != nil {
-		return wire.BootstrapResponse{}, err
+		return nil, err
 	}
 
 	serial, err := serialNumber()
 	if err != nil {
-		return wire.BootstrapResponse{}, err
+		return nil, err
 	}
 
 	uri := &url.URL{Scheme: "spiffe", Host: string(identity.cluster), Path: "/node/" + string(identity.node)}
 	template := &x509.Certificate{SerialNumber: serial, NotBefore: now, NotAfter: now.Add(i.Config.certificateLifetime()), BasicConstraintsValid: true, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, URIs: []*url.URL{uri}}
 
 	if err := ctx.Err(); err != nil {
-		return wire.BootstrapResponse{}, err
+		return nil, err
 	}
 
 	leaf, err := x509.CreateCertificate(rand.Reader, template, state.certificate, pub, state.key)
 	if err != nil {
-		return wire.BootstrapResponse{}, wire.Unavailable
+		return nil, wire.Unavailable
 	}
 
 	response := wire.BootstrapResponse{SchemaVersion: wire.SchemaVersion, Cluster: identity.cluster, Node: identity.node, Enrollment: request.Enrollment, CertificateChain: [][]byte{leaf, state.certificate.Raw}}
-	if _, err := wire.EncodeBootstrap(response); err != nil {
-		return wire.BootstrapResponse{}, err
+
+	encoded, err := wire.EncodeBootstrap(response)
+	if err != nil {
+		return nil, err
 	}
 
 	if err := ctx.Err(); err != nil {
-		return wire.BootstrapResponse{}, err
+		return nil, err
 	}
 
-	return response, nil
+	return encoded, nil
 }
 
 // AuthenticateCertificate requires a verified chain, the client-auth usage,
