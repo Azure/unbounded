@@ -13,7 +13,7 @@ and shared-key rotation, Phase 5 token bootstrap/authenticated HTTPS serving,
 and Phase 6 deployment wiring are implemented. Workload ownership was subsequently
 moved exclusively to unbounded-operator (architecture simplification item 6). Phase 7
 server integration and bounded publication/reconciliation measurements are complete.
-The initialize-only command and leader-scoped HTTPS service are operational;
+The initialize-only command and replicated HTTPS service are operational;
 deployment must provide serving TLS files, bootstrap server trust, and a compatible
 dataplane image. The Rust control client, local identity logic, and transport
 were implemented independently and are outside the scope of this server work.
@@ -61,13 +61,16 @@ installation namespace; Nodes and ClusterCaches are cluster-scoped.
   bootstrap/recovery retains live authorization. Existing selectors are retained for
   in-place adoption, despite the legacy managed-by label.
 
-The server is a leader-election runnable. Readiness requires synchronized inputs,
-usable issuer/trust, and an installed publication. Followers are live but unready.
-On leadership loss the manager/process stops, closes connections, and cancels all
-polls; release-on-cancel remains disabled. Kubernetes updates use resource-version
+The server, lifecycle, and replication observer run on every replica independently
+of election. Readiness requires synchronized inputs, fresh usable issuer/trust,
+an installed fresh publication, and an accepting TLS listener. Every synchronized
+replica serves; topology and key rotation alone remain leader-scoped.
+On leadership loss the old manager/process stops, closes its connections, and
+cancels its polls; other synchronized replicas retain their own serving lifetime.
+Release-on-cancel remains disabled. Kubernetes updates use resource-version
 preconditions and conflict retries. Controller-runtime election is not a general
 storage fencing service: no claim of strict fencing under arbitrary process pauses
-is made. The implementation must honor leader cancellation before writes/serving
+is made. The implementation must honor leader cancellation before publisher writes
 and never refresh/retry an old leadership operation after cancellation.
 
 ## Minimal durable state
@@ -75,7 +78,9 @@ and never refresh/retry an old leadership operation after cancellation.
 Persist a permanent cluster UUID through deployment configuration. Persist one
 version ConfigMap with cluster ID, sequence, membership version, and two canonical
 content hashes. Hashes exclude counters. No member checkpoints, publication blobs,
-or history. Candidate bytes become visible only after a successful ConfigMap CAS.
+or history in that ConfigMap. Publisher candidate bytes become visible only after
+a successful ConfigMap CAS; replicas require bounded canonical validation plus
+exact authoritative confirmation of the same counters and hashes.
 Unchanged content reuses counters; cache-only changes preserve membership version.
 
 ### Initialization protocol (Phase 3)
@@ -144,13 +149,13 @@ annotations, deduplicate rails, choose non-terminating managed Pod endpoints by
 creation time then UID, and exclude Nodes carrying the exclusion label. Readiness
 never changes ownership. UIDs, not names, identify Nodes and caches.
 
-Accepted values and last endpoints are process-local. During normal operation,
-invalid updates preserve accepted values and Pod gaps preserve endpoints. On
-recovery, omit nodes with unavailable endpoints or malformed annotations until
-inputs become usable; absent annotations still get defaults. This intentionally
-relaxes restart continuity in exchange for eliminating derived-state checkpoints.
-Failover may change placement and cause cold fills. Never import an untrusted
-dataplane's remembered membership as controller authority.
+Accepted values and last endpoints are retained in a bounded Node-UID-bound
+annotation after publication. Invalid updates preserve accepted values and Pod
+gaps preserve endpoints, including recovery from that annotation. A Node without
+usable accepted history still needs a first valid endpoint and attributes;
+deletion, UID replacement, and exclusion cannot inherit the old identity. This
+history is distinct from replicated publication bytes, which are never persisted.
+Never import an untrusted dataplane's remembered membership as controller authority.
 
 The pure `ReconcileMembers` helper returns candidate accepted history and diagnostics
 without mutating inputs. The topology controller must install that history only
@@ -201,22 +206,26 @@ for the reserve formula, rejection diagnostics, stable existing-UID priority,
 deletion/recreation behavior, and upgrade/policy-change prerequisites. Active key
 scopes in the existing Secret retain admission across restart; no additional
 catalog checkpoint is introduced. Topology, keyring reconciliation, and issuance
-share a context-aware, leader-local `CatalogGate` for authoritative catalog and
-credential operations. Canceled admission preserves accepted trust and publications.
+share a context-aware, replica-local `CatalogGate` with replication observations
+for authoritative catalog and credential operations. Canceled admission preserves
+accepted trust and publications.
 Both reconcilers watch common Secret changes so additions are published only after
 their keys commit.
 
 ## Authentication
 
-Three HTTPS endpoints only:
+Three public HTTPS endpoints, available on every ready replica:
 
 1. POST /v1/bootstrap: projected bearer token, audience racer-control, CSR proof
    of possession, TokenReview plus live bound Pod/ServiceAccount/workload/Node
    checks through APIReader. Resolve the Node UID; never honor requested CSR SANs.
    Return a public leaf-first certificate chain directly. Retry correlation IDs
-   do not create persistent enrollment records.
+   do not create persistent enrollment records. Each receiving replica authorizes
+   and signs locally using authoritative signing-state reads, without a leader
+   proxy; cached snapshots cannot enable bootstrap during an API outage.
 2. GET /v1/snapshot: mTLS with node identity in its URI SAN. Verify chain, cluster,
-    usage, validity, and authorization on every request. Limit each node to one poll.
+   usage, validity, and authorization on every request. Limit each node to one poll
+   per replica; clients maintain one outstanding poll.
 3. GET /v1/keyring: the existing bounded 512 KiB JSON bundle over HTTPS, using
    bearer TokenReview plus live workload/Node authorization for bootstrap/recovery
    and mTLS for steady state. No `after` returns immediate 200; a canonical positive
@@ -225,6 +234,46 @@ Three HTTPS endpoints only:
    topology have independent per-node poll admission, cursors, and client loops.
    The controller serves only validated committed bundle state; issuer private
    material and rotation metadata never enter this response.
+
+The controller-only `GET /internal/v1/snapshot` route shares the TLS listener but
+is admitted before the public readiness gate. Only the elected publisher answers.
+It requires TokenReview for audience `racer-controller-replication`, the configured
+controller ServiceAccount in the installation namespace, and live Pod/ServiceAccount
+UID checks. Dataplane tokens and Node certificates alone cannot authorize it.
+Admission bounds authentication/API work and permits one outstanding internal poll
+per controller Pod UID. Responses are full bounded publications, not deltas.
+
+Followers discover the publisher from an unexpired `racer-controller` Lease with
+holder identity `<pod-name>/<pod-uid>`, check the live Pod UID, namespace, service
+account, nonterminal/nonterminating state, and IP, then dial the Pod directly.
+TLS uses the serving CA and Service DNS name, not the Pod IP as the expected name.
+This avoids depending on ready Service endpoints during bootstrap. Token and CA
+files are reread on each attempt; redirects are rejected.
+
+### Replica validation and bounded continuity
+
+Followers decode bounded full images, recompute canonical content/membership
+hashes, and confirm an exact durable record through APIReader before installation.
+They do not advance counters or write publication blobs. A publisher advance during
+transfer causes retry. Independent observations validate credentials and durable
+authority while the replication poll is blocked. An exact unchanged record renews
+the installed image's freshness; neither a newer record nor an internal 204 does.
+
+`RACER_SNAPSHOT_MAX_AGE` defaults to 30 seconds and bounds serving since the last
+successful authoritative confirmation of local state. Transient API/replication
+failures may retain accepted state only within that window. A reachable API that
+continues to confirm unchanged state can sustain serving without a publisher.
+Observed invalidity, deletion, rollback, or same-counter conflict fails closed
+immediately, and read failures cannot resurrect withdrawn trust. Stale state
+withdraws readiness and rejects public serving; no per-dataplane-request API
+fallback is added. Certificate expiry and trust retirement remain enforced.
+
+Publisher election lifetime is distinct from process-scoped public serving.
+The old leader still exits on election loss. Other synchronized replicas can
+bridge election while freshness permits; topology/key rotation wait for the new
+leader. This does not establish multi-replica throughput or an indefinite outage
+guarantee. See `internal/racer/replication.go`, `publications.go`, and `lifecycle.go`
+for the installation, confirmation, and lifetime gates.
 
 The listener verifies client certificates when provided; the snapshot handler
 requires them. Renewal at 16 hours and recovery both reuse bootstrap with a fresh
@@ -256,7 +305,7 @@ enums before acceptance. Unknown object fields are ignored. Do not substitute th
 default Go JSON decoder for these validation requirements. The bundle codec alone
 handles secret key material. Socket paths are derived and length-checked.
 
-Serving 100,000 HTTPS long polls/full snapshots from one leader remains a target,
+Serving 100,000 HTTPS long polls/full snapshots remains a target,
 not a tested capacity claim. Phase 7 measured 100,000 publication waiters and
 100,000-member reconciliation separately from live HTTPS/API authorization below.
 
@@ -294,32 +343,32 @@ composition tests; do not add tests that merely enumerate every placeholder.
   Missing/invalid durable state suspends readiness and wakes waiting polls; input
   validation failures retain the previous valid publication. No recovery Create.
 - `CommittedPublication.Version()` returns a value; `Encoding()` returns an
-  immutable shared string. `WriteTo(io.Writer)` checks leadership between bounded
-  32 KiB writes. Phase 5 must impose request cancellation, certificate deadlines,
-  concurrent write admission, and HTTP write deadlines around it and close active
-  connections on leadership loss. Never convert the entire encoding to `[]byte`
+  immutable shared string. `WriteTo(io.Writer)` checks process lifetime and current
+  publication validity/freshness between bounded 32 KiB writes. Serving imposes
+  request cancellation, certificate deadlines, concurrent write admission, and
+  HTTP write deadlines and closes active connections on process shutdown.
+  Never convert the entire encoding to `[]byte`
   per response. Retained publication references are bounded by admitted handlers.
 - `Publications.Wait(ctx, NodeIdentity, *wire.Sequence)` validates and waits without
   owning admission. Nil cursor returns
-  current immediately, lower cursor returns latest, future/zero cursor conflicts,
+  current immediately, lower cursor returns latest, zero cursor conflicts, and a
+  future cursor returns unavailable so a lagging replica cannot force rollback;
   equal waits at most 30 seconds. `(nil, nil)` is normal 204 timeout. Expiration,
-  request cancellation, and committed leadership cancellation terminate waits.
+  request cancellation, stale/suspended state, and process cancellation terminate waits.
   `Server` owns global `Limits.MaxPolls` and per-node admission through response
   write and flush so a node cannot overlap a waiting/writing response.
   `Publications.CurrentAndSubscribe()` owns the lock for an atomic current-state
-  read and change subscription; callers observe leadership cancellation separately.
+  read and change subscription; callers observe process cancellation separately.
 - `Application.Lifecycle` is shared with Keyring and Server. It is a one-shot
-  leader runnable and waits for manager cache sync. Phase 4 calls
+  process runnable and waits for manager cache sync. Reconciliation and observation call
   `SetIssuerReady(bool)` according to accepted local trust. Observed invalidity or
-  deletion withdraws trust; transient authority read failures preserve accepted trust.
-  Phase 5 calls `Lifecycle.Wait(ctx)` before listener startup, then
-  `SetServingReady(true)` when accepting authenticated connections, resetting on
-  shutdown. `Server.Ready` delegates to all lifecycle gates plus publications.
-  `Lifecycle.LeaderContext(parent)` owns the leadership lock and links serving and
-  request cancellation to leadership. `Server.Start` implements these gates in Phase 5.
-  Controller reconciliation currently has no per-reconcile timeout; committed publications
-  retain that leader-derived context. Do not introduce a short-lived reconcile
-  timeout without separately supplying the full leadership context for serving.
+  deletion withdraws trust; transient authority read failures preserve accepted trust
+  only within its freshness bound. `Server.Start` opens TLS before public readiness
+  for internal replication, then sets `SetServingReady(true)`, resetting on shutdown.
+  `Server.Ready` delegates to trust, all lifecycle gates, and publications.
+  The legacy name `Lifecycle.LeaderContext(parent)` now binds requests to process
+  cancellation. Installed publications likewise bind to the process lifetime, not
+  a short-lived reconciliation context or publisher election lifetime.
 - Both reconcilers use `initialEnqueue()` as a raw source, so startup runs
   even for empty lists. Sources/workers are leader-scoped; cache synchronization
   precedes worker execution. Pod `spec.nodeName` is indexed; predicates ignore
@@ -427,15 +476,16 @@ establishes 100,000-node HTTPS capacity.
   without re-encoding. `wire.ValidateBootstrapRequest` checks request fields, CSR
   syntax, and JSON/base64 size without serializing a throwaway request.
   Phase 5 must first obtain `NodeIdentity` from live token authorization, including
-  its authorization expiration, and gate issuance on leadership. There is no
+  its authorization expiration, and gate issuance on public readiness. There is no
   enrollment receipt ledger. `AuthenticateCertificate` is implemented in Phase 5.
 - `Issuer.TrustRoots(ctx)` returns a new owned pool from authoritative committed
   credentials, distinct from deployment HTTPS server trust. Signing material is
   parsed once per authoritative credential read. Reconciliation performs a fresh
   post-reconcile load before installing validated roots locally for TLS admission
   and snapshot chain verification; candidate signing state never installs trust.
-  Pooled TLS `VerifiedChains` alone cannot authorize retired roots. Serving uses `Lifecycle.Wait(ctx)`
-  and `SetServingReady` hooks, and must cancel serving on leadership loss.
+  Pooled TLS `VerifiedChains` alone cannot authorize retired roots. Public serving
+  checks readiness and cancels on process shutdown; replication can reach the TLS
+  listener before public readiness.
 
 Phase 4 fake-client/race tests cover initialization and rotation write boundaries,
 ambiguous responses, restart deadlines, multiple retiring generations, private
@@ -470,15 +520,18 @@ deployment integration check and is not exercised by envtest.
   replace the old UID, including when the disk certificate has expired. During
   renewal, a changed UID triggers a terminal `NodeIdentityChanged`, worker-wide
   drain/fencing, and container restart rather than rebinding a live graph. Snapshot
-  503s also schedule token reauthentication with backoff. Cross-cluster identity adoption remains forbidden. See
+  503s retry with backoff without forcing token reauthentication: a lagging replica
+  says nothing about Node identity. Renewal remains lifetime-driven. Cross-cluster
+  identity adoption remains forbidden. See
   `cmd/racer-dataplane/src/control/INTEGRATION.md` for persistence and restart details.
   Snapshot serving has no Kubernetes reader or discovery dependency. Reconciliation
   installs public trust only after validating committed installation, version,
   issuer, bundle, and rotation state. Observed invalidity/deletion withdraws local
   trust; read outages cannot resurrect it. A temporary API read outage can retain
-  previously accepted trust and durable publication bytes while still leader.
-  No freshness checkpoint, token, or additional lease subsystem is introduced.
-- `Server.Start` waits for lifecycle readiness, loads deployment TLS files, binds
+  previously accepted trust and durable publication bytes only within the configured
+  freshness bound. Observations are background work on every replica, not public
+  request work; no durable freshness checkpoint or additional Lease is introduced.
+- `Server.Start` loads deployment TLS files before public readiness, binds
   the listener, and marks serving ready. It serves TLS 1.3 HTTP/1.1 only, requests
   and verifies optional client certificates using current local roots per handshake, and
   disables session tickets. Bootstrap recovery omits an expired certificate.
@@ -495,7 +548,8 @@ deployment integration check and is not exercised by envtest.
   not close existing connections or long polls. Peer root rotation remains live
   and independent (`internal/racer/server.go:66-81`,
   `internal/racer/serving_certificate.go:24-77`, `:106-159`, `:215-279`).
-- Only exact POST `/v1/bootstrap`, GET `/v1/snapshot`, and GET `/v1/keyring` routes are admitted.
+- Only exact POST `/v1/bootstrap`, GET `/v1/snapshot`, GET `/v1/keyring`, and authenticated controller
+  GET `/internal/v1/snapshot` routes are admitted.
   Alternate methods/paths, encoded path aliases, unknown/duplicate/noncanonical
   query parameters, snapshot bodies, and bootstrap media/encoding mismatches fail
   with protocol errors. No ServeMux redirects or implicit HEAD endpoint exists.
@@ -525,12 +579,12 @@ deployment integration check and is not exercised by envtest.
   issuance, header/handshake reading, and response writes. Each snapshot write gets
   a fresh window capped by certificate expiration. HTTP parser header limits are
   supplemented by application header accounting. The standard library may reject
-  malformed/oversized HTTP framing before routing. Leadership cancellation cancels
+  malformed/oversized HTTP framing before routing. Process cancellation cancels
   requests, closes listeners and active/idle connections immediately, withdraws
   readiness, and bounds shutdown by `Limits.ShutdownTimeout`. Connection context
   tracks the raw transport so write deadlines/cancellation also close TCP directly;
   TLS close-notify cannot extend a blocked write past its admission deadline.
-  Listener failure and leadership cancellation share one force-close teardown:
+  Listener failure and process cancellation share one force-close teardown:
   withdraw readiness, cancel serving, close raw transports, and call HTTP `Close`.
   The shutdown deadline bounds waiting for both `Close` and the serve loop, without
   a graceful `Shutdown` pass. Newly accepted connections check cancellation after
@@ -580,25 +634,28 @@ Projection requires a kubelet and remains deployment verification.
    and `RACER_SERVICE_ACCOUNT_TOKEN` settings, with
   explicit identity/slab directories. The deployment's `RACER_CONTROL_URL` and
   shared `RACER_PEER_PORT` settings are translated when building the DaemonSet.
-- Existing manifests provide three controller replicas, leader-readiness Service
-  routing, controller RBAC, and the unprivileged dataplane ServiceAccount. Controller
+- Existing manifests provide three controller replicas, all-synchronized-replica
+  readiness Service routing, controller RBAC, and the unprivileged dataplane
+  ServiceAccount. Controller
   updates use explicit `Recreate`: all old pods terminate before replacements start.
-  RollingUpdate budgets that preserve one available replica cannot remove the last
-  old leader, because replacements remain unready until they win leadership. The
+  This is intentional for initial migration from an old leader without the internal
+  replication endpoint: new followers cannot synchronize from that leader, so a
+  RollingUpdate budget preserving it can block replacement. The
   accepted control-service interruption includes Lease expiry (release-on-cancel
   is disabled), startup/recovery, and endpoint propagation; unhealthy replacements
   can prolong it. Running dataplanes retain accepted state while control calls retry,
   subject to credential validity and peer availability. Service routing continues
-  to exclude unready followers. Only one of three replicas becomes ready, so normal
-  Deployment rollout-completion/all-replicas-available checks are unsuitable even
-  after replacement succeeds. See the controller README's
+  to exclude unsynchronized or stale replicas. All three replicas should become
+  ready, and normal Deployment rollout-completion/all-replicas-available checks
+  are valid completion gates. See the controller README's
   [update procedure](../cmd/racer-controller/README.md#controller-updates-and-availability)
   for verification, outage semantics, and rollback guidance. Templates
   accept `ServingTLSSecret`, `BootstrapTrustConfigMap`, and `ControlURL` overrides.
   For standalone deployments, supply the serving TLS Secret externally and keep
   an external certificate issuer and bootstrap trust owner responsible for renewal
   and overlap. The same hot reloader works without operator-managed issuance.
-  Supply the trust ConfigMap externally,
+  The Secret must include `tls.crt`, `tls.key`, and `ca.crt`; only those keys are
+  mounted, never the CA private key. Supply the trust ConfigMap externally,
   or render with `BootstrapCA` containing the public PEM CA bundle. An omitted
   `BootstrapCA` emits no ConfigMap, preserving externally managed trust. It must
   verify the controller Service hostname and must not be copied from rotating peer
@@ -609,6 +666,16 @@ Projection requires a kubelet and remains deployment verification.
   replacement does not. Bootstrap trust remains a live projected directory.
   The initial software update that introduces hot reload still incurs the
   Recreate interruption; routine TLS renewals afterward do not roll workloads.
+- The controller receives required `POD_NAME` and `POD_UID`, plus `POD_NAMESPACE`,
+  through the downward API. Initialize-only Jobs do not require these replication
+  identities. A separate projected token at `/var/run/secrets/racer-controller/token`
+  has audience `racer-controller-replication`, requested lifetime 3600 seconds, and
+  mode 0400. Directory mounts without subPath permit token rotation. Normal API
+  credentials remain separate. Replication defaults to port 8443, server name
+  `racer-controller.<namespace>.svc`, trust file `/etc/racer/tls/ca.crt`, and controller
+  service account `racer-controller`; the operator repairs this installation wiring
+  while preserving administrator `RACER_SNAPSHOT_MAX_AGE` tuning (default `30s`).
+  Network policy must permit direct controller Pod connections before readiness.
 
 ### Operator-managed serving TLS
 
@@ -779,14 +846,16 @@ the generated ClusterCache CRD. Assertions cover:
   existing unit/race tests.
 - Two real managers use production options and both reconcilers. Only election
   durations and bound addresses are shortened/isolated for the test; release-on-cancel
-  remains false. Readiness probes distinguish leader/follower. Empty input startup
+  remains false. Both leader and synchronized follower pass readiness probes.
+  Empty input startup
   does not create a DaemonSet. After independent workload provisioning, a watched
   pod-spec mutation remains untouched by Racer. Operator envtest covers workload
   adoption, overrides, and actual SSA removal.
 - Real Pod-bound TokenRequest credentials pass real TokenReview over HTTPS;
   wrong-audience tokens fail. The returned identity uses the API-assigned Node UID.
-  The managed Pod becomes published through the informer, and mTLS snapshot serving
-  uses that certificate. Node exclusion changes routing without revoking that certificate.
+  Enrollment runs on the follower. The managed Pod becomes published through the
+  informer and replicated to the follower, and both replicas serve mTLS snapshots
+  using that certificate. Node exclusion changes routing without revoking it.
 - A transport fault rejects only the leader's Lease renewal writes. The real elector
   loses leadership, manager exits, readiness withdraws, an authenticated pending poll
   terminates without snapshot data, and the old TCP listener closes. The follower
@@ -795,7 +864,7 @@ the generated ClusterCache CRD. Assertions cover:
   authority. The measured failover below uses test durations 4s/2s/500ms, not the
   production manager defaults.
 
-The whole server call path was reviewed: both HTTP routes reach implemented code.
+The whole public server call path was reviewed: both public HTTP routes reach implemented code.
 Unused `Server.Poll`/`ParseCursor` scaffold methods and their `Pending` error helpers
 were removed. Existing composition tests/functions and committed wire vectors are
 retained. No client runtime was added. Production manager options are shared with
@@ -878,9 +947,12 @@ not revoke certificates. Live issuance authorization tests retain their negative
 cases. Corrupt/deleted durable authority still withdraws serving state. A later API
 read failure cannot automatically accept the withdrawn state; successful controller
 validation is required to restore it. Read outages alone preserve accepted state
-while leadership remains valid. Trust retirement and leadership loss remain tested.
+only within the configured replica freshness bound. Trust retirement and leadership
+loss remain tested. Replica tests additionally cover exact durable confirmation,
+freshness expiry, publisher/process lifetime separation, observed invalidity,
+Pod UID discovery, internal audience/identity rejection, and early TLS startup.
 
-Production `Run` calls `ctrl.GetConfig()` (`internal/racer/manager.go:118`); the pinned
+Production `Run` calls `ctrl.GetConfig()` (`internal/racer/manager.go:134`); the pinned
 controller-runtime v0.25.1 `pkg/client/config/config.go:96-105` sets default QPS=-1,
 disabling client-side throttling in favor of API priority/fairness. It does not
 inherit standalone client-go's zero-config 5-QPS/10-burst defaults. The envtest

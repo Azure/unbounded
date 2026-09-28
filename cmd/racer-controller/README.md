@@ -2,13 +2,15 @@
 
 Phases 1-7 implement and verify the server: configuration, bounded codecs, membership/catalog calculation,
 one-shot initialization, durable publication CAS, issuer/shared-key rotation, and
-certificate issuance, TokenReview bootstrap, and operational leader-scoped HTTPS/mTLS
+certificate issuance, TokenReview bootstrap, and replicated HTTPS/mTLS
 serving. The operator owns both Racer workloads. Phase 7 exercises real Kubernetes
 API-server persistence, manager election/failover, TLS enrollment, and publication scale.
 The `initialize` command performs Kubernetes writes; normal startup validates
 existing durable state. Constructors only wire dependencies; they open no files
 or listeners and start no goroutines. HTTP readiness requires synchronized inputs,
-usable credentials, a committed publication, and an accepting TLS listener.
+usable fresh credentials, a locally validated fresh committed publication, and an
+accepting TLS listener. Every synchronized replica serves; only the elected leader
+reconciles topology and rotates credentials.
 
 The [control API](../racer-dataplane/CONTROL_API.md) is shared with the Rust
 dataplane. The [design](../../designs/racer-control-plane.md) describes intended
@@ -100,8 +102,11 @@ Run `make fmt` before committing. Generated deepcopy/CRD files are regenerated,
 never hand-edited. Behavioral and interoperability tests accompany implementation
 of each boundary; scaffold tests verify actual composition and fail-closed entry.
 
-Standalone deployment must supply the namespace, `racer-controller-tls` serving Secret, and
-`racer-bootstrap-trust` ConfigMap with `ca.crt`. The serving certificate must cover
+Standalone deployment must supply the namespace, `racer-controller-tls` serving Secret
+with `tls.crt`, `tls.key`, and **`ca.crt`**, and the `racer-bootstrap-trust` ConfigMap
+with the same public serving CA bundle in `ca.crt`. The Secret's CA is mounted for
+controller-to-controller TLS verification; do not mount a CA private key.
+The serving certificate must cover
 the configured service DNS name. These public trust/server TLS inputs are separate
 from the controller-managed node issuer. No sample private keys are shipped.
 The server validates serving files at startup and hot-reloads valid replacements
@@ -112,6 +117,7 @@ owner must renew certificates and distribute compatible bootstrap trust. Hot
 reload does not provide issuance or trust rotation for standalone installations.
 Rotating node issuer roots are read live and remain separate from serving TLS.
 Bootstrap recovery must omit expired client certificates; snapshot always requires mTLS.
+The internal replication route uses its own token authentication.
 
 ## Operator installation
 
@@ -264,7 +270,7 @@ deployment; do not run a second workload reconciler beside the operator.
    `rendered/installation.yaml` from `deploy/racer`. Do not start the Deployment yet.
 3. Run the following initialize-only Job, substituting the namespace and controller
    image. It consumes the marker once, then creates counters 1/1. No serving TLS
-   mount is needed by this command.
+   mount, replication token, or Pod name/UID is needed by this command.
 
 ```yaml
 apiVersion: batch/v1
@@ -297,7 +303,8 @@ spec:
    Rerender with the same settings and `RACER_INITIALIZATION_STATE=consumed`.
    Keep that consumed marker in deployment configuration/backups, then apply
    `deploy/racer/rendered/controller.yaml`. The leader creates credentials.
-   Only the leader becomes ready; followers remain live.
+   Every replica becomes ready after locally validating a committed snapshot and
+   usable credentials; followers obtain snapshot bytes from the leader.
 
 Never rerun initialization to repair an established cluster. If the Job fails
 after consuming the marker, inspect durable state: valid bound counters permit
@@ -311,22 +318,24 @@ from mismatched backups. The design includes the precise crash/rebootstrap rules
 
 The three-replica controller Deployment uses **Recreate**. A pod-template update
 (including an image change or `kubectl rollout restart`) terminates all old
-controller pods before starting replacements. Only the elected, fully initialized
-leader passes `/readyz`; followers stay live through `/healthz` but unready. The
-Service keeps normal ready-endpoint filtering; do not enable
-`publishNotReadyAddresses` or change readiness to admit followers.
+controller pods before starting replacements. Every synchronized replica passes
+`/readyz` and serves through the Service. Unsynchronized or stale replicas remain
+live through `/healthz` but unready. Keep normal ready-endpoint filtering; do not
+enable `publishNotReadyAddresses` or bypass the readiness gates.
 
-RollingUpdate is incompatible with this readiness contract when it requires any
-available replica during replacement. The default three-replica budget cannot
-make progress, and even `maxUnavailable: 2` leaves the last old leader blocking
-replacement while new followers cannot become ready. Recreate deliberately accepts
-a control-plane interruption to remove that dependency.
+Recreate is intentional for migration from the previous controller: an old leader
+has no internal replication endpoint, so new followers cannot synchronize from it.
+A RollingUpdate budget that preserves the last old ready leader can deadlock this
+initial migration. Recreate accepts a control-plane interruption to remove that
+dependency. It remains the shipped strategy, not a claim that replicated serving
+intrinsically requires Recreate for future upgrades.
 The rendered strategy also explicitly clears `rollingUpdate` so applying it to an
 existing Deployment removes the old, API-defaulted budget.
 
 During an update, the Service has no ready endpoint until a replacement wins the
 Lease, synchronizes inputs, recovers durable state/credentials, commits a
-publication, and starts its TLS listener. Lease release on shutdown is disabled,
+publication. TLS listeners start before public readiness to permit internal
+replication. Lease release on shutdown is disabled,
 so recovery can include waiting for the old Lease to expire, plus pod termination,
 scheduling, image pulls, startup, and endpoint propagation. This is an expected
 interruption under healthy cluster conditions, not a fixed outage-time guarantee;
@@ -341,16 +350,70 @@ operation through a prolonged outage or a dataplane restart.
 
 Verify an update by checking that the Deployment has observed its new generation,
 all three replicas belong to the new revision, no old controller pods remain, and
-one new pod is ready and present in the Service's ready EndpointSlice endpoints.
-Check the leader's `/readyz` on probe port 8081 and exercise the control API through
-the Service. Two live, unready followers
-are expected. `kubectl rollout status` and waiting for every pod to be Ready are
-not valid completion gates: Kubernetes expects all desired replicas to be
-available, so those checks can time out and the Deployment can report
-`ProgressDeadlineExceeded` despite a serving leader. Monitor the ready leader and
-control API directly. If the replacement cannot serve, correct the configuration
+all three new pods are ready and present in the Service's ready EndpointSlice
+endpoints. `kubectl rollout status deployment/racer-controller` and waiting for
+all replicas to be Ready are now valid completion gates. Check `/readyz` on probe
+port 8081 and exercise the control API through the Service. A persistently unready
+follower indicates a synchronization, credential, or configuration problem, not
+normal standby behavior. If the replacement cannot serve, correct the configuration
 or roll back to the previous working pod template; recovery uses the same Recreate
 interruption. Never rerun initialization for an update or rollback.
+
+### Replication configuration and failure behavior
+
+Normal controller `Run` requires `POD_NAME` and `POD_UID`; the Deployment supplies
+both, plus `POD_NAMESPACE`, through the downward API. Lease holder identity is
+`<pod-name>/<pod-uid>`. Followers read the unexpired `racer-controller` Lease and
+the matching live controller Pod directly, then dial its Pod IP. They do not use
+the ready-filtered Service for leader discovery. Network policies must allow
+controller-to-controller TCP on the replication port, including before readiness.
+
+| Setting | Default |
+| --- | --- |
+| `RACER_CONTROLLER_SERVICE_ACCOUNT` | `racer-controller` |
+| `RACER_REPLICATION_TOKEN_FILE` | `/var/run/secrets/racer-controller/token` |
+| `RACER_REPLICATION_TRUST_FILE` | `/etc/racer/tls/ca.crt` |
+| `RACER_REPLICATION_SERVER_NAME` | `racer-controller.<namespace>.svc` |
+| `RACER_REPLICATION_PORT` | `8443` (must match the control TLS listener port) |
+| `RACER_SNAPSHOT_MAX_AGE` | `30s` |
+
+The operator repairs replication identity/path/port wiring in `racer-config`, but
+preserves administrator freshness tuning. `RACER_SNAPSHOT_MAX_AGE` is a positive
+whole-second duration. It bounds serving without authoritative reconfirmation,
+not the interval between topology changes.
+
+`GET /internal/v1/snapshot` shares the TLS listener but precedes the public readiness
+gate. Only the elected publisher answers it. Authentication requires a Pod-bound
+projected ServiceAccount token with audience `racer-controller-replication`, real
+TokenReview, and live controller Pod and ServiceAccount UID checks in the installation
+namespace. Dataplane `racer-control` tokens and node certificates do not authorize
+replication. The projection uses a separate directory, a one-hour requested token
+lifetime, and no subPath; followers reread token and CA files on each attempt.
+TLS verifies the Service DNS name even though the connection goes to a Pod IP.
+
+Followers decode bounded full snapshots, recompute canonical hashes, and require
+an exact match with authoritative durable counters and hashes before installation.
+They never publish counters or persist snapshot blobs. Independent background
+observations validate credentials and reconfirm the installed image. A matching
+unchanged durable record renews freshness; an internal 204 response alone does not.
+
+Accepted local state can bridge a transient API/replication interruption for at
+most 30 seconds since its last successful authoritative confirmation by default.
+If the API remains reachable and confirms unchanged state, serving can continue
+without the publisher. A newer durable record does not renew an older image.
+Observed missing, corrupt, rolled-back, or conflicting authority fails closed
+without waiting for the age limit; transient errors cannot restore withdrawn
+trust. Stale replicas withdraw readiness and reject public service. Certificates
+still expire and trust retirement still applies on pooled connections.
+
+Bootstrap and renewal execute locally on whichever ready replica receives them:
+each performs live TokenReview, workload/Node authorization, and authoritative
+signing-state reads. They are not proxied to the leader and cannot succeed merely
+from a cached snapshot during an API outage. Leadership loss stops the old leader
+process and its connections, but other synchronized replicas retain their own
+serving lifetime. Topology publication and key rotation pause until a new leader
+is elected. This is bounded continuity, not an indefinite outage guarantee or a
+measured multi-replica capacity claim.
 
 ## Cache catalog capacity and rotation
 
@@ -390,8 +453,8 @@ evict a working cache. Deleting a rejected object changes nothing; deleting an
 admitted object frees a slot for the next waiting UID. Recreation has a new UID
 and unrelated keys. Topology reads authoritative inputs and publishes additions
 only after their keys commit; a Secret watch drives that follow-up reconciliation.
-Topology, keyring reconciliation, and issuance share a context-aware, leader-local
-`CatalogGate` to serialize authoritative catalog and credential operations and
+Topology, keyring reconciliation, replication observation, and issuance share a
+context-aware, replica-local `CatalogGate` to serialize authoritative catalog and credential operations and
 prevent an in-progress topology candidate from racing key pruning. Canceled
 admission preserves accepted trust and publications. Keyring and snapshot HTTPS
 delivery are asynchronous independent loops, not an atomic dataplane transaction.
@@ -430,10 +493,11 @@ authentication capacity. Enrollment saturation returns HTTP 429 after TLS setup;
 local authentication saturation can still reject a handshake. This isolation does
 not increase concurrent enrollment API work or remove its request deadline.
 
-Trust is installed by controller reconciliation after validating committed durable
-credentials and installation binding. Observed invalidity or deletion withdraws
+Trust is installed by reconciliation or each replica's observer after validating
+committed durable credentials and installation binding. Observed invalidity or deletion withdraws
 trust; subsequent API read failures cannot restore it. Temporary API read outages
-may serve previously accepted local state while leadership holds. Leadership loss,
+may serve previously accepted local state only within the configured freshness bound.
+Process shutdown (including the old leader's election loss),
 certificate expiration on pooled connections, and trust rotation remain enforced.
 See `designs/racer-control-plane.md` for the measurement setup and remaining costs.
 

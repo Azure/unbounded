@@ -43,7 +43,7 @@ Authenticated enrollment proposes `RACER_SHARES` (default four). The controller
 records the proposal; an explicit Node shares annotation wins. Local configuration
 never independently changes the topology used for placement.
 
-## Three HTTPS operations
+## Three public HTTPS operations
 
 | Operation | Authentication and result |
 | --- | --- |
@@ -80,11 +80,14 @@ labels of at most 63 bytes; each complete socket path is at most 107 bytes (plus
 the Linux pathname socket's NUL terminator).
 
 Failures have `{ "code": "..." }`: 400 `invalid_request`, 401 `unauthenticated`,
-403 `forbidden`, 409 `conflict` (including a future cursor), 413 `too_large`,
+403 `forbidden`, 409 `conflict` (including a zero cursor), 413 `too_large`,
 426 `unsupported_version`, 429 `overloaded`, or 503 `unavailable`. Back off on
 transport errors/429/503 with jitter, exponentially from 1 to 30 seconds; honor
-`Retry-After`. Other errors require corrected input/credentials. Normal 204 polls
-may immediately repeat. Keep tokens and key material out of diagnostics.
+`Retry-After`. A cursor ahead of the contacted replica returns 503 `unavailable`;
+retry without rolling back accepted or pending state or forcing reenrollment.
+Certificate renewal remains independently lifetime-driven. Other errors require corrected
+input/credentials. Normal 204 polls may immediately repeat. Keep tokens and key
+material out of diagnostics.
 
 ## Publication lifecycle
 
@@ -107,17 +110,46 @@ counters with resource-version preconditions, then expose the publication. Never
 serve uncommitted counters. Initial creation is explicit cluster initialization;
 missing established state must not silently recreate counters. No publication
 blobs or checkpoint chunks are persisted in that ConfigMap. Accepted member
-history is stored separately on each Node. Only the initialized
-leader serves; leadership loss closes connections and cancels long polls.
+history is stored separately on each Node. Only the leader reconciles topology and
+rotates keys, but every synchronized replica serves public requests. Followers
+obtain full images through authenticated internal replication, recompute canonical
+hashes, and confirm exact counters/hashes against authoritative durable state
+before installing. A hash alone never authorizes reconstructing or serving bytes.
+Replica serving is process-scoped, not tied to the publisher's election context.
+Election loss still stops the old leader process and its connections; other
+synchronized replicas continue subject to local freshness and trust gates.
+
+Background observations independently refresh validated credentials and confirm
+the installed image. The default `RACER_SNAPSHOT_MAX_AGE=30s` bounds serving since
+the last authoritative confirmation. Matching unchanged durable state can renew
+freshness without a new publication; a newer durable record or replication 204
+does not renew an older image. Transient API/replication failures retain accepted
+state only within that bound. Observed invalidity, deletion, rollback, or conflict
+fails closed immediately; read outages cannot restore withdrawn trust. Stale
+replicas withdraw readiness and public requests return unavailable.
+
+Controllers also expose `GET /internal/v1/snapshot` on the same TLS listener before
+public readiness, avoiding replication startup deadlock. This is not a dataplane
+operation. Only the leader answers, after TokenReview of a Pod-bound token with
+audience `racer-controller-replication` and live controller Pod/ServiceAccount UID
+checks. A dataplane token or Node certificate alone does not authorize this route.
+Followers discover the leader directly from the unexpired Lease's Pod name/UID,
+verify the live Pod, and dial its IP using deployment CA trust and the controller
+Service DNS name for TLS verification. Internal responses are full snapshots,
+not negotiated deltas.
 
 Clients may send `X-Racer-Delta-Base` with their canonical publication hash. The
 controller shares one bounded predecessor delta across clients when it is smaller
 than the full snapshot. Delta v1 binds cluster, base sequence/hash, target
 sequence/hash, member upserts/removals, and cache definitions. A missing base,
-restart, or skipped generation falls back to a full snapshot. Receivers validate
-the reconstructed canonical hash before installation. The 4 MiB delta cap does not
+restart, follower response, or skipped generation falls back to a full snapshot.
+Receivers validate the reconstructed canonical hash before installation. The 4 MiB delta cap does not
 replace the full publication cap. TLS connections are reused within an unchanged
-trust/identity epoch. Credential renewal and keyring delivery remain independent of
+trust/identity epoch. Authenticated connections have a per-dial jittered maximum
+reuse age of four to five minutes, allowing later requests to reach other ready
+replicas. Crossing that age does not interrupt an active response; it prevents
+subsequent reuse. Idle timeout, credential expiry, and trust/identity changes can
+retire a connection sooner. Credential renewal and keyring delivery remain independent of
 pending publication installation.
 
 Canonical content uses compact UTF-8 JSON, with no whitespace or trailing newline.
@@ -150,8 +182,9 @@ requires explicit rebootstrap. Acceptance/reload failures are local diagnostics.
 Generate Ed25519 private keys locally. Persist them in a node-private directory
 outside projected Secrets. Submit cluster ID, a UUID enrollment ID, and DER CSR
 with a projected token whose audience is `racer-control`. The controller performs
-TokenReview and checks the live bound Pod UID, its authorized service account and
-managed workload, and its assigned Node. It resolves the Node UID authoritatively;
+TokenReview locally on the receiving ready replica and checks the live bound Pod
+UID, its authorized service account and managed workload, and its assigned Node.
+It resolves the Node UID authoritatively;
 CSR SANs and caller-supplied identities are never authority. The request contains
 no Node UID, allowing first startup with only a projected token and public trust.
 
@@ -165,7 +198,9 @@ and peer signatures. They last 24 hours; begin renewal with a fresh key at 16 ho
 Validate response correlation, chain, identity, validity, and local key pairing
 before persisting/activating. Initial bootstrap, renewal, and expired-certificate
 recovery all use the same token-authenticated endpoint with a fresh projected
-token. Old verification material serves already-admitted traffic.
+token. Bootstrap and renewal are not proxied to the leader; authoritative signing
+state reads remain required, so cached snapshot continuity does not enable offline
+enrollment. Old verification material serves already-admitted traffic.
 
 The HTTPS listener verifies client certificates when supplied; the snapshot route
 requires an exact same-cluster Node identity and a currently valid chain under
@@ -180,7 +215,8 @@ exclusion, and membership removal do not revoke an issued certificate: membershi
 is routing, not authorization. Any authenticated same-cluster node may connect.
 Controller reconciliation installs trust updates and withdraws trust after observed
 invalid or deleted durable authority. An API read outage may retain accepted local
-state while leadership holds, but cannot restore previously withdrawn trust.
+state only within the replica freshness bound, but cannot restore previously
+withdrawn trust.
 Bootstrap can connect without a client certificate, including recovery from an
 expired identity. There are no control HTTP signatures or challenge endpoint.
 TLS authenticates responses. Peer HTTP uses separate certificate-authenticated v2
