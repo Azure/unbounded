@@ -6,7 +6,6 @@ package racer
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"time"
 
@@ -65,18 +64,23 @@ func add(plan *component.Plan, kind component.OpKind, obj client.Object) {
 	plan.Add(component.Operation{Kind: kind, Object: component.ToUnstructured(obj), Component: name})
 }
 
-// Plan only reads state. A zero-cache pass retains resources without reconciling
-// them, allowing deliberate manual removal. Neither a cache nor a Site owns the
-// installation's identity or durable counters.
+// Plan only reads state. A zero-cache pass maintains established serving TLS but
+// does not repair workloads or recreate deleted credentials. Neither a cache nor
+// a Site owns the installation's identity or durable counters.
 func (Component) Plan(ctx context.Context, env *component.Env, _ []machinav1.Site) (*component.Plan, component.Result, error) {
+	return planAt(ctx, env, time.Now())
+}
+
+func planAt(ctx context.Context, env *component.Env, now time.Time) (*component.Plan, component.Result, error) {
 	caches := &racerv1.ClusterCacheList{}
 	if err := env.LiveReader().List(ctx, caches, client.Limit(1)); err != nil {
 		return nil, component.Result{}, err
 	}
 
 	plan := component.NewPlan()
+
 	if len(caches.Items) == 0 {
-		return plan, component.Disabled("no ClusterCaches; Racer resources are retained"), nil
+		return planRetainedTLS(ctx, env, now)
 	}
 
 	marker, err := planIdentity(ctx, env, plan)
@@ -112,7 +116,7 @@ func (Component) Plan(ctx context.Context, env *component.Env, _ []machinav1.Sit
 		return nil, component.Result{}, fmt.Errorf("racer durable state: %w", err)
 	}
 
-	secret, err := planTLS(ctx, env, plan, fresh)
+	secret, err := planTLSAt(ctx, env, plan, fresh, now)
 	if err != nil {
 		return nil, component.Result{}, err
 	}
@@ -223,8 +227,18 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 
 			annotations := map[string]string{
 				"unbounded-cloud.io/racer-config-hash": configHash,
-				"unbounded-cloud.io/racer-tls-hash":    fmt.Sprintf("%x", sha256.Sum256(secret.Data[corev1.TLSCertKey])),
 			}
+			// TLS reloads from the projected Secret without rolling pods. Preserve
+			// the legacy annotation as an inert value to avoid a migration rollout.
+			current := &appsv1.Deployment{}
+			if err := env.LiveReader().Get(ctx, objectKey(env, controllerName), current); err != nil && !apierrors.IsNotFound(err) {
+				return err
+			}
+
+			if hash, exists := current.Spec.Template.Annotations["unbounded-cloud.io/racer-tls-hash"]; exists {
+				annotations["unbounded-cloud.io/racer-tls-hash"] = hash
+			}
+
 			if err := unstructured.SetNestedStringMap(obj.Object, annotations, "spec", "template", "metadata", "annotations"); err != nil {
 				return err
 			}
@@ -243,7 +257,7 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 	add(plan, component.OpApply, &corev1.ConfigMap{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
 		ObjectMeta: metav1.ObjectMeta{Name: trustName, Namespace: env.Namespace},
-		Data:       map[string]string{"ca.crt": string(secret.Data["ca.crt"])},
+		Data:       map[string]string{"ca.crt": string(secret.Data["ca.crt"]) + string(secret.Data[previousCAKey])},
 	})
 
 	defaults, err := env.DefaultConfigMap(manifests.Manifests, dataplaneConfigName, name)

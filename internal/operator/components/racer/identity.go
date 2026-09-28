@@ -77,6 +77,17 @@ func planIdentity(ctx context.Context, env *component.Env, plan *component.Plan)
 		return nil, fmt.Errorf("invalid Racer operator claim state")
 	}
 
+	return claimedMarker(ctx, env, claim)
+}
+
+// Read-only validation shared with retained TLS maintenance. This cannot reserve
+// a new claim, consume one, or recreate an installation marker.
+func claimedMarker(ctx context.Context, env *component.Env, claim *corev1.ConfigMap) (*corev1.ConfigMap, error) {
+	if claim.Annotations[managerAnnotation] != component.FieldOwner || claim.UID == "" || claim.ResourceVersion == "" || claim.DeletionTimestamp != nil ||
+		!wire.ValidUUID(claim.Data["cluster"]) || claim.Data["state"] != "consumed" || !ptr.Deref(claim.Immutable, false) {
+		return nil, fmt.Errorf("invalid established Racer operator claim")
+	}
+
 	marker := &corev1.ConfigMap{}
 	if err := env.LiveReader().Get(ctx, objectKey(env, markerName), marker); err != nil {
 		return nil, fmt.Errorf("racer marker unavailable after permanent claim consumption; restore consistent durable state: %w", err)

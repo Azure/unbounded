@@ -352,7 +352,7 @@ func TestInitializerDependsOnPrerequisites(t *testing.T) {
 }
 
 func TestServingTLSRenewal(t *testing.T) {
-	for _, age := range []time.Duration{340 * day, 9*365*day + day} {
+	for _, age := range []time.Duration{7 * day, 15 * day} {
 		t.Run(age.String(), func(t *testing.T) {
 			secret, err := newTLS("custom-system", time.Now().Add(-age))
 			require.NoError(t, err)
@@ -364,7 +364,7 @@ func TestServingTLSRenewal(t *testing.T) {
 			persist(t, env, plan)
 			result, err = planTLS(t.Context(), env, component.NewPlan(), false)
 			require.NoError(t, err)
-			require.Equal(t, secret.Data["ca.key"], result.Data["ca.key"])
+			require.NotEqual(t, secret.Data["ca.key"], result.Data["ca.key"])
 			pair, err := tls.X509KeyPair(result.Data[corev1.TLSCertKey], result.Data[corev1.TLSPrivateKeyKey])
 			require.NoError(t, err)
 			leaf, err := x509.ParseCertificate(pair.Certificate[0])
@@ -372,7 +372,16 @@ func TestServingTLSRenewal(t *testing.T) {
 
 			roots := x509.NewCertPool()
 			require.True(t, roots.AppendCertsFromPEM(secret.Data["ca.crt"]))
-			_, err = leaf.Verify(x509.VerifyOptions{DNSName: controllerName + ".custom-system.svc", Roots: roots})
+
+			intermediates := x509.NewCertPool()
+
+			for _, der := range pair.Certificate[1:] {
+				cert, err := x509.ParseCertificate(der)
+				require.NoError(t, err)
+				intermediates.AddCert(cert)
+			}
+
+			_, err = leaf.Verify(x509.VerifyOptions{DNSName: controllerName + ".custom-system.svc", Roots: roots, Intermediates: intermediates})
 			require.NoError(t, err)
 		})
 	}
