@@ -659,7 +659,28 @@ impl WorkerApplication {
             buffers.clone(),
         ));
         let transfers = Transfers::new(http.clone(), io.clone(), rdma.clone())
-            .with_wire(admission.clone(), wire.clone());
+            .with_wire(admission.clone(), wire.clone())
+            .with_reclamation({
+                let admission = admission.clone();
+                let memory = memory.clone();
+                let writer = writer.clone();
+                move |cache, amount| {
+                    let class = crate::model::limits::ResourceClass::Ciphertext;
+                    for _ in 0..2 {
+                        let Some((owner, bytes)) = admission.reclamation(cache, class, amount)
+                        else {
+                            break;
+                        };
+                        let released = memory.reclaim_idle(class, owner.as_ref(), bytes, |page| {
+                            writer.discard_idle_copy(page)
+                        });
+                        if released < bytes {
+                            writer.reclaim_ciphertext(owner.as_ref(), bytes - released);
+                        }
+                        admission.reclaim_buffers();
+                    }
+                }
+            });
         let transfers = Rc::new(match &sessions {
             Some(sessions) => transfers.with_native(signatures.clone(), sessions.clone()),
             None => transfers,

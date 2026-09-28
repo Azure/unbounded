@@ -613,6 +613,7 @@ struct Harness {
         crate::rdma::lifecycle::simulation::Operation,
         crate::rdma::lifecycle::simulation::Fault,
     )>,
+    payload_regression: bool,
 }
 impl Harness {
     fn new(seed: u64, sim: Simulation, clock: SimulationClock, native: bool) -> Self {
@@ -652,6 +653,7 @@ impl Harness {
             origin_faults: vec![],
             security_faults: vec![],
             native_rules: vec![],
+            payload_regression: false,
         }
     }
     fn update(&mut self, object: usize) {
@@ -659,6 +661,7 @@ impl Harness {
         *revision += 1;
         let length = match object {
             0 => 0,
+            1 if self.payload_regression => 4 * PAGE_BYTES as usize + 257,
             1 => PAGE_BYTES as usize + 257,
             _ => 1 + self.rng.pick(16384),
         };
@@ -746,6 +749,10 @@ impl Harness {
         // Match one quarter of the production node budget, including peer envelope
         // staging. This fixture assembles workers directly, bypassing size_workers.
         config.limits.request_context_bytes = NonZeroUsize::new(16 * 1024 * 1024).unwrap();
+        if self.payload_regression {
+            config.limits.plaintext_bytes = NonZeroUsize::new(64 * 1024 * 1024).unwrap();
+            config.limits.ciphertext_bytes = NonZeroUsize::new(64 * 1024 * 1024).unwrap();
+        }
         let worker_count = 1 + self.rng.pick(2);
         self.coverage.trace.record(format!(
             "node:{id}:{restart:?}:{worker_count}:{}",
@@ -2191,7 +2198,7 @@ impl Client {
             }
         }
         assert!(
-            self.response.len() <= 2 * PAGE_BYTES as usize + 32768,
+            self.response.len() <= self.size.max(2 * PAGE_BYTES as usize) + 32768,
             "unbounded client response"
         );
         if self.response.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -2433,6 +2440,37 @@ fn dst_coverage_policy_and_aggregation() {
             .keys()
             .all(|name| !name.starts_with("native"))
     );
+}
+
+#[test]
+fn healthy_relayed_page_reads() {
+    let sim = Simulation::new();
+    let _os = sim.enter();
+    let clock = SimulationClock::new(71);
+    let environment = clock.environment(0);
+    let _time = environment.enter();
+    let _strict = crate::runtime::environment::require_simulated();
+    let mut harness = Harness::new(71, sim, clock, false);
+    // Match the deployed 64 MiB per-worker payload budgets. A five-page layer
+    // exceeds resident capacity and forces receive admission to reclaim idle data.
+    harness.payload_regression = true;
+    harness.update(1);
+    for _ in 0..40 {
+        harness.add(None);
+    }
+    for node in 0..40 {
+        let mut client = harness.request_on(1, true, false, node);
+        client.first = 0;
+        client.end = client.size;
+        client.request = format!(
+            "GET /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nIf-Match: {}\r\nRange: bytes=0-{}\r\nRacer-Metadata: dst opaque metadata\r\nAuthorization: Bearer dst-fixture\r\nConnection: close\r\n\r\n",
+            key(1), client.tag, client.size - 1,
+        ).into_bytes();
+        harness.exchange(client, false);
+    }
+    assert_eq!(harness.coverage.success, 40);
+    assert_eq!(harness.coverage.failures, 0);
+    assert_eq!(harness.coverage.bytes, 40 * (4 * PAGE_BYTES as usize + 257));
 }
 
 fn replay(seed: u64, steps: usize, native: bool) -> Coverage {

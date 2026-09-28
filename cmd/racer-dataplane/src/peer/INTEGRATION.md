@@ -119,6 +119,14 @@ Page, metadata, and copy-only requests use actual pooled HTTP. Page bodies prese
 ciphertext; AEAD verification belongs to the receiving read coordinator. Relay
 verification preserves the original and every hop signature in both directions.
 
+HTTP receive admission charges ciphertext to the request's cache before allocation.
+Application assembly installs bounded idle-memory and unsubmitted-write reclamation
+for that admission; active readers and submitted writes retain their ownership.
+`response_reserved` transfers the completed receive charge into the decoded page
+without charging the same allocation twice. The decoder checks the admission owner,
+cache, resource class, capacity, and descriptor before accepting that charge.
+Fill reserves separate encryption output only after selecting local origin.
+
 `Requester::exchange` selects the route rail and automatically attempts native
 transfer when the local session provider is ready. The server validates the entire
 signed response path's rail mapping, then exchanges setup, grant, and completion

@@ -31,6 +31,16 @@ impl WireBuffer {
             _reservation: reservation,
         })
     }
+    fn reserved(reservation: Reservation, length: usize) -> Result<Self> {
+        reservation.validate(ResourceClass::Ciphertext, length)?;
+        if length > crate::model::range::PAGE_BYTES as usize + 16 {
+            return Err(Error::InvalidRequest);
+        }
+        Ok(Self {
+            bytes: vec![0; length].into_boxed_slice(),
+            _reservation: reservation,
+        })
+    }
     pub(crate) fn into_parts(self) -> (Vec<u8>, Reservation) {
         (self.bytes.into_vec(), self._reservation)
     }
@@ -45,7 +55,10 @@ impl IoBuffer for WireBuffer {
     }
 }
 
+type ReclaimCiphertext = dyn Fn(&crate::model::identity::CacheId, usize);
+
 pub struct Transfers {
+    reclaim: Option<Rc<ReclaimCiphertext>>,
     signatures: std::cell::RefCell<Option<Rc<crate::security::signing::Signatures>>>,
     #[cfg(test)]
     pub(super) native_completions: std::cell::Cell<usize>,
@@ -69,6 +82,7 @@ impl Transfers {
     }
     pub fn new(http: Rc<HttpPool>, io: Rc<HttpIo>, rdma: Option<Rc<RdmaTransfer>>) -> Self {
         Self {
+            reclaim: None,
             signatures: std::cell::RefCell::new(None),
             #[cfg(test)]
             native_completions: std::cell::Cell::new(0),
@@ -94,6 +108,13 @@ impl Transfers {
     }
     pub fn with_wire(mut self, admission: Rc<Admission>, codec: Rc<dyn LogicalCodec>) -> Self {
         self.wire = Some((admission, codec));
+        self
+    }
+    pub(crate) fn with_reclamation(
+        mut self,
+        reclaim: impl Fn(&crate::model::identity::CacheId, usize) + 'static,
+    ) -> Self {
+        self.reclaim = Some(Rc::new(reclaim));
         self
     }
     pub(crate) fn set_signatures(&self, signatures: Rc<crate::security::signing::Signatures>) {
@@ -264,10 +285,19 @@ impl Transfers {
                     .await;
             }
             let mut connection = received.connection;
-            let (body, _staging_reservation) = if length == 0 {
+            let (body, staging_reservation) = if length == 0 {
                 (Vec::new(), None)
             } else {
-                let mut buffer = WireBuffer::new(admission, length)?;
+                let cache = &request.request.origin.object.cache;
+                let mut reservation =
+                    admission.reserve(Some(cache), ResourceClass::Ciphertext, length);
+                if matches!(reservation, Err(Error::Overloaded))
+                    && let Some(reclaim) = &self.reclaim
+                {
+                    reclaim(cache, length);
+                    reservation = admission.reserve(Some(cache), ResourceClass::Ciphertext, length);
+                }
+                let mut buffer = WireBuffer::reserved(reservation?, length)?;
                 let mut offset = 0;
                 while offset < length {
                     let completion = self
@@ -285,7 +315,8 @@ impl Transfers {
                 (bytes, Some(reservation))
             };
             scope.check()?;
-            let response = codec.response(authentication, body, scope)?;
+            let response =
+                codec.response_reserved(authentication, body, staging_reservation, scope)?;
             // Logical decoding must account for every body byte before pooling.
             match &response.response {
                 PeerResponse::Bootstrap {

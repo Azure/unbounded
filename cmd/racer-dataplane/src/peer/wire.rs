@@ -112,6 +112,18 @@ pub trait LogicalCodec {
         body: Vec<u8>,
         scope: &crate::runtime::deadline::RequestScope,
     ) -> Result<SignedResponse>;
+    /// Transfer the completed receive allocation's charge into the decoded page.
+    fn response_reserved(
+        &self,
+        authentication: ForwardedHead,
+        body: Vec<u8>,
+        reservation: Option<crate::runtime::admission::Reservation>,
+        scope: &crate::runtime::deadline::RequestScope,
+    ) -> Result<SignedResponse> {
+        let result = self.response(authentication, body, scope);
+        drop(reservation);
+        result
+    }
 }
 pub use super::decode::SecurityCodec;
 

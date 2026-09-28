@@ -720,11 +720,6 @@ impl Fill {
         } else {
             None
         };
-        let ciphertext = self.reserve_with_reclamation(
-            &context.object.cache,
-            ResourceClass::Ciphertext,
-            PAGE_BYTES as usize + 16,
-        )?;
         let dirty = if persist {
             match self.dependencies.admission.reserve(
                 Some(&context.object.cache),
@@ -779,6 +774,13 @@ impl Fill {
                 authority.validate(&context.object, page.number)?;
                 budget.begin_attempt(crate::runtime::environment::now(), scope.deadline.0)?;
                 scope.check()?;
+                // Peer reception owns its ciphertext allocation. Reserve encryption
+                // output only when this candidate actually needs an origin fill.
+                let ciphertext = self.reserve_with_reclamation(
+                    &context.object.cache,
+                    ResourceClass::Ciphertext,
+                    PAGE_BYTES as usize + 16,
+                )?;
                 let plaintext = match plaintext.take() {
                     Some(reserved) => reserved,
                     None => self.reserve_bootstrap(&context.object.cache)?,

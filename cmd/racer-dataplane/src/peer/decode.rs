@@ -103,6 +103,106 @@ fn metadata(head: &MessageHead) -> Result<ObjectMetadata> {
 mod metadata_tests {
     use super::*;
     #[test]
+    fn received_page_keeps_one_charge_and_rejects_foreign_reservations() {
+        use crate::security::forwarding::ForwardedHead;
+        let signers = crate::peer::tests::signers();
+        let cache = CacheId("cccccccc-1111-4111-8111-111111111111".into());
+        let mut limits = crate::test_support::cluster::config(false).limits;
+        limits.ciphertext_bytes = std::num::NonZeroUsize::new(19).unwrap();
+        let admission = Rc::new(Admission::new(limits.clone()));
+        let foreign = Admission::new(limits);
+        let buffers = Rc::new(BufferPool::new(admission.clone()));
+        let codec = SecurityCodec::new(admission.clone(), buffers.clone());
+        let metadata = ObjectMetadata {
+            content_type: None,
+            version: ObjectVersion {
+                object: ObjectId {
+                    cache: cache.clone(),
+                    key: CacheKey([3; 32]),
+                },
+                etag: StrongEtag::test_value("v1"),
+            },
+            length: 3,
+            expires_at: ExpiresAt(UNIX_EPOCH),
+        };
+        let page = buffers
+            .ciphertext(
+                admission
+                    .reserve(Some(&cache), ResourceClass::Ciphertext, 19)
+                    .unwrap(),
+                PageEnvelope {
+                    page: PageId {
+                        version: metadata.version.clone(),
+                        number: PageNumber(0),
+                    },
+                    key_id: KeyId([1; 16]),
+                    nonce: Nonce([2; 24]),
+                    plaintext_length: 3,
+                    ciphertext_length: 19,
+                },
+                vec![9; 19],
+            )
+            .unwrap();
+        let response = PeerResponse::Page {
+            metadata,
+            ciphertext: page,
+        };
+        let mut head = p::response_head(
+            &response,
+            &[3; 32],
+            &[signers[0].node().clone(), signers[2].node().clone()],
+        )
+        .unwrap();
+        p::push(&mut head, "racer-receiver", &signers[0].node().0);
+        let authentication = ForwardedHead {
+            original: std::sync::Arc::new(signers[2].sign(head).unwrap()),
+            hops: vec![],
+        };
+        drop(response);
+        let scope = RequestScope::new(
+            RequestId([1; 16]),
+            crate::runtime::environment::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        for case in 0..5 {
+            let reservation = match case {
+                1 => foreign.reserve(Some(&cache), ResourceClass::Ciphertext, 19),
+                2 => admission.reserve(
+                    Some(&CacheId("other".into())),
+                    ResourceClass::Ciphertext,
+                    19,
+                ),
+                3 => admission.reserve(Some(&cache), ResourceClass::Plaintext, 19),
+                4 => admission.reserve(Some(&cache), ResourceClass::Ciphertext, 18),
+                _ => admission.reserve(Some(&cache), ResourceClass::Ciphertext, 19),
+            }
+            .unwrap();
+            let auth = ForwardedHead {
+                original: authentication.original.clone(),
+                hops: vec![],
+            };
+            let result = codec.response_reserved(auth, vec![9; 19], Some(reservation), &scope);
+            if case == 0 {
+                let result = result.unwrap();
+                assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+                let PeerResponse::Page { ciphertext, .. } = result.response else {
+                    panic!("page required")
+                };
+                assert_eq!(ciphertext.bytes(), &[9; 19]);
+                drop(ciphertext);
+            } else {
+                assert!(
+                    result.is_err(),
+                    "foreign or insufficient charge accepted: {case}"
+                );
+            }
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+            assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+            assert_eq!(foreign.used(ResourceClass::Ciphertext), 0);
+        }
+    }
+
+    #[test]
     fn explicit_metadata_version_round_trips_and_rejects_unknown_or_unsigned_shape() {
         let mut m = ObjectMetadata {
             content_type: None,
@@ -304,6 +404,15 @@ impl LogicalCodec for SecurityCodec {
         body: Vec<u8>,
         scope: &RequestScope,
     ) -> Result<SignedResponse> {
+        self.response_reserved(authentication, body, None, scope)
+    }
+    fn response_reserved(
+        &self,
+        authentication: ForwardedHead,
+        body: Vec<u8>,
+        reservation: Option<crate::runtime::admission::Reservation>,
+        scope: &RequestScope,
+    ) -> Result<SignedResponse> {
         scope.check()?;
         let head = &authentication.original.head;
         let outcome = p::field(head, "racer-outcome")?;
@@ -330,11 +439,22 @@ impl LogicalCodec for SecurityCodec {
                 {
                     return Err(Error::InvalidRequest);
                 }
-                let reservation = self.admission.reserve(
-                    Some(&metadata.version.object.cache),
-                    ResourceClass::Ciphertext,
-                    body.len(),
-                )?;
+                let reservation = match reservation {
+                    Some(reservation) => {
+                        reservation.validate(ResourceClass::Ciphertext, body.capacity())?;
+                        if !self.admission.owns(&reservation)
+                            || reservation.cache() != Some(&metadata.version.object.cache)
+                        {
+                            return Err(Error::InvalidRequest);
+                        }
+                        reservation
+                    }
+                    None => self.admission.reserve(
+                        Some(&metadata.version.object.cache),
+                        ResourceClass::Ciphertext,
+                        body.capacity(),
+                    )?,
+                };
                 let ciphertext = self.buffers.ciphertext(reservation, envelope, body)?;
                 if outcome == "bootstrap" {
                     if ciphertext.envelope().page.number.0 != 0 {
