@@ -493,9 +493,27 @@ func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release(s.writes)
 
-	deadline := minTime(identity.expires, time.Now().Add(s.Config.Limits.WriteTimeout))
+	image := publication
+	if image == nil {
+		image, err = s.Publications.Current()
+		if err != nil {
+			writeFailure(w, err)
+			return
+		}
+	}
 
-	stopWrite := boundConnection(ctx, deadline)
+	writeCtx, cancelWrite, err := image.writeContext(ctx)
+	if err != nil {
+		writeFailure(w, err)
+		return
+	}
+	defer cancelWrite()
+
+	freshUntil, _ := writeCtx.Deadline()
+	deadline := minTime(identity.expires, time.Now().Add(s.Config.Limits.WriteTimeout))
+	deadline = minTime(deadline, freshUntil)
+
+	stopWrite := boundConnection(writeCtx, deadline)
 	defer stopWrite()
 
 	responseControl(http.NewResponseController(w).SetWriteDeadline(deadline))
@@ -510,7 +528,7 @@ func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 
-	if _, err := publication.ForBase(r.Header.Get(wire.DeltaHeader)).WriteTo(requestWriter{ctx: ctx, writer: w}); err != nil {
+	if _, err := publication.ForBase(r.Header.Get(wire.DeltaHeader)).WriteTo(requestWriter{ctx: writeCtx, writer: w}); err != nil {
 		// A partial JSON response cannot be repaired with a protocol error.
 		panic(http.ErrAbortHandler)
 	}
@@ -551,8 +569,9 @@ func boundConnection(ctx context.Context, deadline time.Time) func() {
 	}
 
 	timer := time.AfterFunc(time.Until(deadline), func() { closeTransport(conn) })
+	stop := context.AfterFunc(ctx, func() { closeTransport(conn) })
 
-	return func() { timer.Stop() }
+	return func() { timer.Stop(); stop() }
 }
 
 func minTime(a, b time.Time) time.Time {

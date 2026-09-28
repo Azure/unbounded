@@ -6,9 +6,11 @@ package racer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -210,6 +212,85 @@ func TestReplicationRouteAuthorizationAndEarlyListener(t *testing.T) {
 
 		return nil
 	}})
+
+	for _, unchanged := range []bool{false, true} {
+		for _, fail := range []bool{false, true} {
+			t.Run(fmt.Sprintf("blocked flush unchanged=%v failure=%v", unchanged, fail), func(t *testing.T) {
+				request := httptest.NewRequest(http.MethodGet, replicationPath, nil)
+				request.TLS = f.requestState(t)
+				request.Header.Set("Authorization", "Bearer "+f.token)
+
+				want := http.StatusOK
+
+				if unchanged {
+					p, err := r.Publications.Current()
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					request.URL.RawQuery = fmt.Sprintf("after=%d", p.record.Sequence)
+					want = http.StatusNoContent
+				}
+
+				w := &blockingResponse{ResponseRecorder: httptest.NewRecorder(), entered: make(chan struct{}), unblock: make(chan struct{}), blockFlush: true, fail: fail}
+
+				unblock := sync.OnceFunc(func() { close(w.unblock) })
+				defer unblock()
+
+				done := make(chan any, 1)
+
+				go func() { defer func() { done <- recover() }(); f.a.Server.Handler().ServeHTTP(w, request) }()
+
+				select {
+				case <-w.entered:
+				case <-time.After(8 * time.Second):
+					t.Fatal("explicit flush not reached")
+				}
+
+				if len(f.a.Server.writes) != 1 {
+					t.Fatal("write admission released before flush")
+				}
+
+				r.mu.Lock()
+				held := r.polls[string(pod.UID)]
+				r.mu.Unlock()
+
+				if !held {
+					t.Fatal("poll admission released before flush")
+				}
+
+				duplicate := httptest.NewRecorder()
+				f.a.Server.Handler().ServeHTTP(duplicate, request.Clone(f.ctx))
+
+				if duplicate.Code != http.StatusTooManyRequests {
+					t.Fatalf("duplicate during flush: %d", duplicate.Code)
+				}
+
+				unblock()
+
+				var wantAbort any
+				if fail {
+					wantAbort = http.ErrAbortHandler
+				}
+
+				if aborted := <-done; aborted != wantAbort || w.Code != want {
+					t.Fatalf("flush result %v status %d", aborted, w.Code)
+				}
+
+				if len(f.a.Server.writes) != 0 {
+					t.Fatal("write admission leaked after flush")
+				}
+
+				r.mu.Lock()
+				held = r.polls[string(pod.UID)]
+				r.mu.Unlock()
+
+				if held {
+					t.Fatal("poll admission leaked after flush")
+				}
+			})
+		}
+	}
 
 	for _, tc := range []struct {
 		name string

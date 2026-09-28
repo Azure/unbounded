@@ -134,7 +134,7 @@ func TestPublicationCurrentAndSubscribe(t *testing.T) {
 		}
 
 		current, changed, err = p.CurrentAndSubscribe()
-		if current != installed || err != nil {
+		if err != nil || current.Encoding() != installed.Encoding() || current.authority == installed.authority || installed.authority.Err() == nil {
 			t.Fatalf("resumed publication: %p, %v", current, err)
 		}
 

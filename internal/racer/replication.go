@@ -163,18 +163,28 @@ func (p *Publications) confirm(record VersionRecord) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.current == nil {
-		return nil
+	if err := p.observeLocked(record); err != nil {
+		return err
 	}
 
-	old := p.current.record
-	if record.Cluster != old.Cluster || record.Sequence < old.Sequence || record.MembershipVersion < old.MembershipVersion || record.Sequence == old.Sequence && record != old || record.MembershipVersion == old.MembershipVersion && record.MembershipHash != old.MembershipHash {
+	if p.current != nil && record == p.current.record && !p.suspended {
+		p.confirmed = time.Now()
+	}
+
+	return nil
+}
+
+// observed is independent of installed bytes, including before the first image.
+// Suspension never forgets this high-water mark. Skipped versions may return to
+// earlier hashes, but counters and unchanged membership versions must agree.
+func (p *Publications) observeLocked(record VersionRecord) error {
+	old := p.observed
+	if !record.valid() || old.Sequence != 0 && (record.Cluster != old.Cluster || record.Sequence < old.Sequence || record.MembershipVersion < old.MembershipVersion || record.Sequence == old.Sequence && record != old || record.MembershipVersion == old.MembershipVersion && record.MembershipHash != old.MembershipHash || uint64(record.MembershipVersion-old.MembershipVersion) > uint64(record.Sequence-old.Sequence)) {
+		p.suspendLocked()
 		return wire.Conflict
 	}
 
-	if record == old && !p.suspended {
-		p.confirmed = time.Now()
-	}
+	p.observed = record
 
 	return nil
 }
@@ -452,15 +462,9 @@ func (s *Server) serveReplication(w http.ResponseWriter, request *http.Request) 
 		return
 	}
 
-	if errors.Is(err, context.DeadlineExceeded) {
-		if s.Publications.Ready(nil) != nil {
-			writeFailure(w, wire.Unavailable)
-			return
-		}
-
-		w.WriteHeader(http.StatusNoContent)
-
-		return
+	unchanged := errors.Is(err, context.DeadlineExceeded)
+	if unchanged {
+		publication, err = s.Publications.Current()
 	}
 
 	if err != nil {
@@ -474,7 +478,14 @@ func (s *Server) serveReplication(w http.ResponseWriter, request *http.Request) 
 	}
 	defer release(s.writes)
 
-	writeCtx, stopWrite := context.WithDeadline(request.Context(), minTime(expires, time.Now().Add(s.Config.Limits.WriteTimeout)))
+	authorityCtx, stopAuthority, err := publication.writeContext(request.Context())
+	if err != nil {
+		writeFailure(w, err)
+		return
+	}
+	defer stopAuthority()
+
+	writeCtx, stopWrite := context.WithDeadline(authorityCtx, minTime(expires, time.Now().Add(s.Config.Limits.WriteTimeout)))
 	defer stopWrite()
 
 	stopLeader := context.AfterFunc(leader, stopWrite)
@@ -489,7 +500,16 @@ func (s *Server) serveReplication(w http.ResponseWriter, request *http.Request) 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 
+	if unchanged {
+		w.WriteHeader(http.StatusNoContent)
+		responseControl(http.NewResponseController(w).Flush())
+
+		return
+	}
+
 	if _, err := publication.WriteTo(requestWriter{ctx: writeCtx, writer: w}); err != nil {
 		panic(http.ErrAbortHandler)
 	}
+
+	responseControl(http.NewResponseController(w).Flush())
 }

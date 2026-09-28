@@ -44,6 +44,7 @@ type CommittedPublication struct {
 	delta      string
 	deltaBase  string
 	leadership context.Context
+	authority  context.Context
 }
 
 func (p *CommittedPublication) Version() VersionRecord { return p.record }
@@ -57,17 +58,21 @@ func (p *CommittedPublication) WriteTo(w io.Writer) (int64, error) {
 		return 0, wire.Unavailable
 	}
 
+	ctx, cancel, err := p.writeContext(p.leadership)
+	if err != nil {
+		return 0, err
+	}
+	defer cancel()
+
 	var written int64
 
 	for remaining := p.encoded; remaining != ""; {
-		if err := p.leadership.Err(); err != nil {
-			return written, err
+		if p.authority != nil && p.authority.Err() != nil {
+			return written, wire.Unavailable
 		}
 
-		if p.owner != nil {
-			if _, err := p.owner.Current(); err != nil {
-				return written, err
-			}
+		if err := ctx.Err(); err != nil {
+			return written, err
 		}
 		// ResponseWriter need not implement StringWriter. Limit conversion scratch
 		// to 32 KiB rather than allocating a full publication for every response.
@@ -86,7 +91,38 @@ func (p *CommittedPublication) WriteTo(w io.Writer) (int64, error) {
 		remaining = remaining[n:]
 	}
 
-	return written, nil
+	if p.authority != nil && p.authority.Err() != nil {
+		return written, wire.Unavailable
+	}
+
+	return written, ctx.Err()
+}
+
+// writeContext pins one response to its image's revocable authority and the
+// freshness deadline at write admission. Later confirmations cannot extend an
+// in-flight response, and supersession or suspension permanently revokes it.
+func (p *CommittedPublication) writeContext(parent context.Context) (context.Context, context.CancelFunc, error) {
+	if p.owner == nil {
+		ctx, cancel := context.WithCancel(parent)
+		return ctx, cancel, nil
+	}
+
+	owner := p.owner
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+
+	if _, err := owner.currentLocked(); err != nil {
+		return nil, nil, err
+	}
+
+	if p.authority == nil || p.authority != owner.current.authority || p.authority.Err() != nil {
+		return nil, nil, wire.Unavailable
+	}
+
+	ctx, cancel := context.WithDeadline(parent, owner.confirmed.Add(owner.maxAge))
+	stop := context.AfterFunc(p.authority, cancel)
+
+	return ctx, func() { stop(); cancel() }, nil
 }
 
 // Publications owns only the current immutable publication and one broadcast
@@ -99,6 +135,8 @@ type Publications struct {
 	process   context.Context
 	confirmed time.Time
 	maxAge    time.Duration
+	observed  VersionRecord
+	revoke    context.CancelFunc
 }
 
 func NewPublications() *Publications {
@@ -183,7 +221,7 @@ func (p *CommittedPublication) ForBase(hash string) *CommittedPublication {
 		return p
 	}
 
-	return &CommittedPublication{owner: p.owner, record: p.record, encoded: p.delta, leadership: p.leadership}
+	return &CommittedPublication{owner: p.owner, record: p.record, encoded: p.delta, leadership: p.leadership, authority: p.authority}
 }
 
 func (p *Publications) Install(next *CommittedPublication) error {
@@ -195,6 +233,10 @@ func (p *Publications) Install(next *CommittedPublication) error {
 	}
 
 	if err := next.leadership.Err(); err != nil {
+		return err
+	}
+
+	if err := p.observeLocked(next.record); err != nil {
 		return err
 	}
 
@@ -215,7 +257,8 @@ func (p *Publications) Install(next *CommittedPublication) error {
 			}
 
 			p.confirmed = time.Now()
-			if current.leadership.Err() != nil {
+			if current.leadership.Err() != nil || p.suspended {
+				next = p.authorizeLocked(next)
 				p.current = next
 			}
 
@@ -228,12 +271,23 @@ func (p *Publications) Install(next *CommittedPublication) error {
 		}
 	}
 
-	p.current = next
+	p.current = p.authorizeLocked(next)
 	p.confirmed = time.Now()
 	p.suspended = false
 	p.notifyLocked()
 
 	return nil
+}
+
+func (p *Publications) authorizeLocked(next *CommittedPublication) *CommittedPublication {
+	if p.revoke != nil {
+		p.revoke()
+	}
+
+	copy := *next
+	copy.authority, p.revoke = context.WithCancel(copy.leadership)
+
+	return &copy
 }
 
 func (p *Publications) Current() (*CommittedPublication, error) {
@@ -273,6 +327,14 @@ func (p *Publications) currentLocked() (*CommittedPublication, error) {
 func (p *Publications) Suspend() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	p.suspendLocked()
+}
+
+func (p *Publications) suspendLocked() {
+	if p.revoke != nil {
+		p.revoke()
+	}
 
 	if !p.suspended {
 		p.suspended = true
