@@ -432,10 +432,35 @@ func probeEOF(body io.Reader) error {
 	return io.ErrNoProgress
 }
 
+// Retain at most 2 MiB across origin servers. Active buffers remain owned by the
+// admitted callback until copying returns, including noncooperative readers.
+var originCopyBuffers = make(chan *[copyBufferSize]byte, 64)
+
+func acquireOriginBuffer() *[copyBufferSize]byte {
+	select {
+	case buffer := <-originCopyBuffers:
+		return buffer
+	default:
+		return new([copyBufferSize]byte)
+	}
+}
+
+func releaseOriginBuffer(buffer *[copyBufferSize]byte) {
+	clear(buffer[:])
+
+	select {
+	case originCopyBuffers <- buffer:
+	default:
+	}
+}
+
 // Keep the final byte private until the callback proves EOF. Every write is
 // bounded by both the request deadline and a fresh blocked-write deadline.
 func copyOrigin(ctx context.Context, controller *http.ResponseController, w io.Writer, body io.Reader, remaining int64, timeout time.Duration) error {
-	buf := make([]byte, copyBufferSize)
+	buffer := acquireOriginBuffer()
+	defer releaseOriginBuffer(buffer)
+
+	buf := buffer[:]
 	deadline, _ := ctx.Deadline()
 	empty := 0
 
