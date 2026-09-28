@@ -158,7 +158,7 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 
 	var (
 		configHash    string
-		cfg           racercore.Config
+		cfg           racercore.WorkloadConfig
 		prerequisites []component.ObjectRef
 	)
 
@@ -196,7 +196,7 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 
 			configHash = component.ConfigMapPayloadHash(cm)
 
-			cfg, err = racercore.ConfigFromLookup(func(key string) (string, bool) {
+			cfg, err = racercore.WorkloadConfigFromLookup(func(key string) (string, bool) {
 				if key == "POD_NAMESPACE" {
 					return env.Namespace, true
 				}

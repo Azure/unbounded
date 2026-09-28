@@ -14,17 +14,15 @@ import (
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
+// Config contains controller runtime settings, not operator workload inputs.
 type Config struct {
 	Cluster                   wire.ClusterID
 	Namespace                 string
 	ControlAddress            string
 	MetricsAddress            string
 	ProbeAddress              string
-	ControlURL                string
 	TLSCertificateFile        string
 	TLSPrivateKeyFile         string
-	BootstrapTrustConfigMap   string
-	DataplaneImage            string
 	PeerPort                  uint16
 	DataplaneServiceAccount   string
 	DaemonSetName             string
@@ -73,11 +71,8 @@ func ConfigFromLookup(lookup func(string) (string, bool)) (Config, error) {
 		ControlAddress:            env("RACER_CONTROL_ADDRESS", ":8443"),
 		MetricsAddress:            env("RACER_METRICS_ADDRESS", ":8080"),
 		ProbeAddress:              env("RACER_PROBE_ADDRESS", ":8081"),
-		ControlURL:                env("RACER_CONTROL_URL", ""),
 		TLSCertificateFile:        env("RACER_TLS_CERTIFICATE_FILE", "/etc/racer/tls/tls.crt"),
 		TLSPrivateKeyFile:         env("RACER_TLS_PRIVATE_KEY_FILE", "/etc/racer/tls/tls.key"),
-		BootstrapTrustConfigMap:   env("RACER_BOOTSTRAP_TRUST_CONFIGMAP", "racer-bootstrap-trust"),
-		DataplaneImage:            env("RACER_DATAPLANE_IMAGE", ""),
 		PeerPort:                  uint16(port),
 		DataplaneServiceAccount:   env("RACER_DATAPLANE_SERVICE_ACCOUNT", "racer-dataplane"),
 		DaemonSetName:             env("RACER_DAEMONSET_NAME", "racer-dataplane"),
@@ -136,7 +131,7 @@ func (c Config) Validate() error {
 		return fmt.Errorf("cluster, namespace, or peer port: %w", wire.InvalidRequest)
 	}
 
-	for _, name := range []string{c.VersionConfigMapName, c.InstallationConfigMapName, c.DaemonSetName, c.IssuerSecretName, c.KeyringSecretName, c.BootstrapTrustConfigMap, c.DataplaneServiceAccount} {
+	for _, name := range []string{c.VersionConfigMapName, c.InstallationConfigMapName, c.DaemonSetName, c.IssuerSecretName, c.KeyringSecretName, c.DataplaneServiceAccount} {
 		if len(validation.IsDNS1123Subdomain(name)) != 0 {
 			return fmt.Errorf("resource name: %w", wire.InvalidRequest)
 		}

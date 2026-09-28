@@ -20,13 +20,16 @@ import (
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
-func workloadConfig(t *testing.T) Config {
+func workloadConfig(t *testing.T) WorkloadConfig {
 	t.Helper()
-	cfg := testConfig(t)
-	cfg.ControlURL = "https://racer-controller.racer.svc:8443"
-	cfg.DataplaneImage = "racer:test"
 
-	return cfg
+	return WorkloadConfig{
+		Cluster: "11111111-1111-1111-1111-111111111111", Namespace: "racer",
+		ControlURL: "https://racer-controller.racer.svc:8443", DataplaneImage: "racer:test",
+		BootstrapTrustConfigMap: "racer-bootstrap-trust", PeerPort: 8082,
+		DataplaneServiceAccount: "racer-dataplane", DaemonSetName: "racer-dataplane",
+		KeyringSecretName: "racer-keyring",
+	}
 }
 
 func TestWorkloadProjectionAndStorage(t *testing.T) {

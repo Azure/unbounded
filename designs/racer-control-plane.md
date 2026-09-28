@@ -519,6 +519,12 @@ Projection requires a kubelet and remains deployment verification.
   through its normal SSA executor and generic override pipeline. Normal Racer
   `Run` and initialize-only operation do not construct a workload or require a
   dataplane image or endpoint. A first ClusterCache triggers operator provisioning.
+  `DesiredDaemonSet` accepts a narrow `WorkloadConfig`, loaded independently with
+  `WorkloadConfigFromLookup`. It validates workload identity, names, peer port,
+  HTTPS endpoint, and image without controller limits, rotation, TLS files, or
+  durable-state configuration. Runtime `Config` no longer contains or reads the
+  workload-only image, control URL, or bootstrap trust ConfigMap fields. Controller
+  startup validates runtime settings; operator workload planning does not.
 - The operator preserves existing ConfigMap payloads, repairs only installation
   wiring under optimistic concurrency, and hashes configuration for rollouts.
   SSA removes fields introduced by overrides when those overrides are removed;
@@ -541,8 +547,8 @@ Projection requires a kubelet and remains deployment verification.
   `control` subcommand is injected. The generated environment uses the existing
   client's `RACER_CONTROL_ENDPOINT`, `RACER_PEER_LISTEN`, `RACER_TRUST_BUNDLE`,
   `RACER_SERVICE_ACCOUNT_TOKEN`, and `RACER_SECRET_DIRECTORY` settings, with
-  explicit identity/slab directories. The server's own `RACER_CONTROL_URL` and
-  `RACER_PEER_PORT` settings are translated when building the DaemonSet.
+  explicit identity/slab directories. The deployment's `RACER_CONTROL_URL` and
+  shared `RACER_PEER_PORT` settings are translated when building the DaemonSet.
 - Existing manifests provide three controller replicas, leader-readiness Service
   routing, controller RBAC, and the unprivileged dataplane ServiceAccount. Controller
   updates use explicit `Recreate`: all old pods terminate before replacements start.

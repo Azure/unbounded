@@ -166,7 +166,6 @@ func TestLifecycleWithoutSites(t *testing.T) {
 	require.True(t, roots.AppendCertsFromPEM([]byte(trust.Data["ca.crt"])))
 	_, err = leaf.Verify(x509.VerifyOptions{DNSName: controllerName + "." + env.Namespace + ".svc", Roots: roots})
 	require.NoError(t, err)
-	require.Equal(t, "https://racer-controller.custom-system.svc:8443", cfg.ControlURL)
 
 	job := &batchv1.Job{}
 	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, jobName), job))
@@ -186,6 +185,7 @@ func TestLifecycleWithoutSites(t *testing.T) {
 	ds := &appsv1.DaemonSet{}
 	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, "racer-dataplane"), ds))
 	require.Equal(t, env.Config.Image("racer-dataplane"), ds.Spec.Template.Spec.Containers[0].Image)
+	require.Contains(t, ds.Spec.Template.Spec.Containers[0].Env, corev1.EnvVar{Name: "RACER_CONTROL_ENDPOINT", Value: "https://racer-controller.custom-system.svc:8443"})
 
 	for _, name := range []string{"racer-issuer", "racer-keyring"} {
 		require.NoError(t, env.Client.Get(t.Context(), objectKey(env, name), &corev1.Secret{}))
@@ -555,7 +555,13 @@ func TestControllerRotationConfigUsesPreservedConfigMap(t *testing.T) {
 	require.Equal(t, component.ConfigMapPayloadHash(cm), deployment.Spec.Template.Annotations["unbounded-cloud.io/racer-config-hash"])
 	cm.Data["RACER_ROTATION_RETAIN_FOR"] = "119s"
 	require.NoError(t, env.Client.Update(t.Context(), cm))
-	_, _, err := (Component{}).Plan(t.Context(), env, nil)
+	// Runtime validation belongs to the controller. Invalid rotation settings
+	// still roll its config, but cannot prevent independent workload construction.
+	persist(t, env, planPass(t, env))
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), deployment))
+	require.Equal(t, component.ConfigMapPayloadHash(cm), deployment.Spec.Template.Annotations["unbounded-cloud.io/racer-config-hash"])
+
+	_, err := racercore.ConfigFromLookup(func(key string) (string, bool) { value, ok := cm.Data[key]; return value, ok })
 	require.ErrorContains(t, err, "rotation policy")
 }
 

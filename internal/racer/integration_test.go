@@ -87,8 +87,6 @@ func integrationInstallation(t *testing.T, c client.Client, namespace string) *A
 	t.Helper()
 	cfg := testConfig(t)
 	cfg.Namespace = namespace
-	cfg.DataplaneImage = "example.invalid/racer:test"
-	cfg.ControlURL = "https://127.0.0.1:8443"
 
 	cfg.MetricsAddress, cfg.ProbeAddress = "0", "0"
 	for _, obj := range []client.Object{
@@ -536,7 +534,13 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 		t.Fatalf("Racer manager created a workload: %v", err)
 	}
 
-	workload, err := DesiredDaemonSet(apps[leader].Topology.Config)
+	workload, err := DesiredDaemonSet(WorkloadConfig{
+		Cluster: cfg.Cluster, Namespace: cfg.Namespace,
+		ControlURL: "https://127.0.0.1:8443", DataplaneImage: "example.invalid/racer:test",
+		BootstrapTrustConfigMap: "racer-bootstrap-trust", PeerPort: cfg.PeerPort,
+		DataplaneServiceAccount: cfg.DataplaneServiceAccount, DaemonSetName: cfg.DaemonSetName,
+		KeyringSecretName: cfg.KeyringSecretName,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

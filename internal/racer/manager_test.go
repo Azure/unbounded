@@ -55,7 +55,7 @@ func TestFailClosedEntryPoints(t *testing.T) {
 	operations := map[string]func() error{
 		"topology": func() error { _, err := a.Topology.Reconcile(ctx, ctrl.Request{}); return err },
 		"keyring":  func() error { _, err := a.Keyring.Reconcile(ctx, ctrl.Request{}); return err },
-		"workload": func() error { _, err := DesiredDaemonSet(Config{}); return err },
+		"workload": func() error { _, err := DesiredDaemonSet(WorkloadConfig{}); return err },
 		"server":   func() error { return a.Server.Start(ctx) },
 		"run":      func() error { return Run(ctx, Config{}) },
 	}
