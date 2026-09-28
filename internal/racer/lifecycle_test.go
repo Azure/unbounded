@@ -78,6 +78,59 @@ func TestLifecycleLeaderContext(t *testing.T) {
 	}
 }
 
+func TestLifecycleReadyNotifications(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  func(*Lifecycle, bool)
+	}{
+		{name: "issuer", set: (*Lifecycle).SetIssuerReady},
+		{name: "serving", set: (*Lifecycle).SetServingReady},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := newLifecycle(NewPublications())
+
+			for _, step := range []struct {
+				name   string
+				ready  bool
+				notify bool
+			}{
+				{name: "initial false"},
+				{name: "become ready", ready: true, notify: true},
+				{name: "remain ready", ready: true},
+				{name: "withdraw readiness", notify: true},
+				{name: "remain unready"},
+				{name: "restore readiness", ready: true, notify: true},
+			} {
+				t.Run(step.name, func(t *testing.T) {
+					changed := l.changed
+					tc.set(l, step.ready)
+
+					select {
+					case <-changed:
+						if !step.notify {
+							t.Fatal("unchanged readiness notified subscribers")
+						}
+					default:
+						if step.notify {
+							t.Fatal("readiness transition did not notify subscribers")
+						}
+					}
+
+					if !step.notify && l.changed != changed {
+						t.Fatal("unchanged readiness replaced the subscription")
+					}
+
+					select {
+					case <-l.changed:
+						t.Fatal("new subscription is already closed")
+					default:
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestLifecycleFollowerWithPublicationRemainsUnready(t *testing.T) {
 	r := initializedTopology(t)
 	reconcileTopology(t, r, t.Context())

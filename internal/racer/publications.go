@@ -91,6 +91,8 @@ func NewPublications() *Publications {
 	return &Publications{changed: make(chan struct{})}
 }
 
+func (p *Publications) notifyLocked() { close(p.changed); p.changed = make(chan struct{}) }
+
 func (p *Publications) Prepare(previous VersionRecord, resourceVersion string, members AcceptedMembers, caches []wire.CacheDefinition) (*PreparedPublication, error) {
 	if !previous.valid() || resourceVersion == "" {
 		return nil, wire.InvalidRequest
@@ -166,8 +168,7 @@ func (p *Publications) Install(next *CommittedPublication) error {
 
 			if p.suspended {
 				p.suspended = false
-				close(p.changed)
-				p.changed = make(chan struct{})
+				p.notifyLocked()
 			}
 
 			return nil
@@ -176,8 +177,7 @@ func (p *Publications) Install(next *CommittedPublication) error {
 
 	p.current = next
 	p.suspended = false
-	close(p.changed)
-	p.changed = make(chan struct{})
+	p.notifyLocked()
 
 	return nil
 }
@@ -222,8 +222,7 @@ func (p *Publications) Suspend() {
 
 	if !p.suspended {
 		p.suspended = true
-		close(p.changed)
-		p.changed = make(chan struct{})
+		p.notifyLocked()
 	}
 }
 
