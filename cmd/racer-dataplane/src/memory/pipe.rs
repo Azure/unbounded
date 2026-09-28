@@ -215,11 +215,16 @@ impl PipePool {
         if capacity < 0 {
             return Err(Error::Io);
         }
-        if capacity as usize > MAX_PIPE_BYTES {
-            // SAFETY: the empty pipe can be shrunk without borrowing user memory.
-            capacity = unsafe {
+        if capacity as usize != MAX_PIPE_BYTES {
+            // Request one bounded chunk once at creation, before pooling. Under
+            // UID pipe pressure growth may fail; retain the smaller actual size.
+            // SAFETY: the empty pipe can be resized without borrowing user memory.
+            let resized = unsafe {
                 libc::fcntl(write.as_raw_fd(), libc::F_SETPIPE_SZ, MAX_PIPE_BYTES as i32)
             };
+            if resized > 0 {
+                capacity = resized;
+            }
         }
         if capacity <= 0 || capacity as usize > MAX_PIPE_BYTES {
             return Err(Error::Io);
@@ -711,6 +716,14 @@ pub(super) mod tests {
             );
         }
         assert!(first.capacity() <= MAX_PIPE_BYTES);
+        assert!(first.capacity() > 0);
+        // Account the actual kernel capacity, including denied best-effort growth.
+        assert_eq!(first.capacity(), unsafe {
+            libc::fcntl(
+                first.resources.as_ref().unwrap().write.as_raw_fd(),
+                libc::F_GETPIPE_SZ,
+            )
+        } as usize);
         let bytes = vec![0x5a; first.capacity()];
         assert_eq!(first.try_write(&bytes).unwrap(), bytes.len());
         assert_eq!(

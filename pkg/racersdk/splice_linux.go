@@ -41,6 +41,10 @@ func spliceBody(ctx context.Context, source *responseBody, sink *FDSink, length 
 		return 0, false, nil
 	}
 
+	// A UID under pipe pressure may receive an 8 KiB default. Request a bounded
+	// full chunk; denied growth is harmless because splice handles short counts.
+	prepareSplicePipe(pipe[1])
+
 	defer func() {
 		if err := unix.Close(pipe[0]); err != nil {
 			return
@@ -145,4 +149,10 @@ func spliceBody(ctx context.Context, source *responseBody, sink *FDSink, length 
 	}
 
 	return sent, true, nil
+}
+
+func prepareSplicePipe(fd int) {
+	if _, err := unix.FcntlInt(uintptr(fd), unix.F_SETPIPE_SZ, 64*1024); err != nil {
+		return // Best effort; the existing pipe remains usable.
+	}
 }
