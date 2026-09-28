@@ -42,6 +42,7 @@ func (r *KeyringReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl
 	}
 
 	result, err := r.reconcileKeys(ctx)
+
 	return r.finishKeyringReconcile(ctx, result, err)
 }
 
