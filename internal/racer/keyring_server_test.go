@@ -247,7 +247,8 @@ func TestKeyringMTLSNeverReadsAPI(t *testing.T) {
 
 			want := 200
 			if query != "" {
-				want = 204
+				// Without background confirmation the replica expires during the poll.
+				want = 503
 			}
 
 			body := requireKeyringResponse(t, w, want)
@@ -268,6 +269,9 @@ func TestKeyringPollWakeAndTermination(t *testing.T) {
 			t.Run(fmt.Sprintf("bearer=%t/%s", bearer, scenario), func(t *testing.T) {
 				synctest.Test(t, func(t *testing.T) {
 					f := newServingFixture(t)
+					// Isolate poll termination from the default 30-second freshness gate.
+					f.a.Server.Trust.maxAge = time.Minute
+					f.a.Server.Publications.maxAge = time.Minute
 
 					if scenario == "expired" {
 						if bearer {
@@ -382,6 +386,9 @@ func TestKeyringAdmissionHeldThroughResponse(t *testing.T) {
 				synctest.Test(t, func(t *testing.T) {
 					f := newServingFixture(t)
 					f.a.Server.Config.Limits.MaxPolls = 1
+					// Keep authority fresh through the 204 wait and blocked response.
+					f.a.Server.Trust.maxAge = time.Minute
+					f.a.Server.Publications.maxAge = time.Minute
 					handler := f.a.Server.Handler()
 
 					query := ""

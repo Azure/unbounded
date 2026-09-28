@@ -1020,7 +1020,9 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
         let new = NodeId("99999999-9999-4999-8999-999999999999".into());
         *fixture.binding.lock().unwrap() = new.clone();
         if !renewal_due {
-            fixture.poll_status.store(503, Ordering::Release);
+            // Only explicit binding rejection forces early enrollment. A 503
+            // can come from a lagging replica and must retain the current state.
+            fixture.poll_status.store(403, Ordering::Release);
         }
         let until = Instant::now() + Duration::from_secs(15);
         while node.observations.health.ready() {

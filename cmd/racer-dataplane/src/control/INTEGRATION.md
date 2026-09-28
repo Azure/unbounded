@@ -93,12 +93,14 @@ error to the whole worker group, stops admission, drains clients/flights/RDMA an
 crypto, checkpoints cache data, fences kernel work, and exits. Kubernetes must
 restart the container (or a standalone supervisor must restart the process).
 
-Snapshot 503 responses schedule token reauthentication on the next backoff-bounded
-turn, covering a deleted UID absent from controller discovery without waiting for
-certificate renewal. Ordinary token renewal uses two-thirds of the issued
+Snapshot 503 responses retry with backoff without forcing token reauthentication:
+a lagging replica does not invalidate the accepted Node binding. Explicit snapshot
+authentication rejection or mTLS keyring rejection schedules a binding check on
+the next backoff-bounded renewal turn. Ordinary renewal uses two-thirds of the issued
 certificate lifetime, capped at 16 hours (the default 24-hour leaf renews at
-16 hours). A
-403 remains terminal. Failure to authenticate never falls back to a disk identity.
+16 hours). Keyring recovery uses fresh server-authenticated TLS and live token
+authorization; it never downgrades TLS verification. Failure to authenticate never
+falls back to a disk identity.
 
 Restart recreates node-bound signing views, connection sessions, membership,
 publication cursor, and worker state. Cache slabs/checkpoints contain cache-keyed
