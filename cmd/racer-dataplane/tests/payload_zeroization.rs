@@ -12,18 +12,38 @@ use racer_dataplane::{
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     rc::Rc,
-    sync::atomic::{AtomicBool, AtomicPtr, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
+    },
 };
 
 struct InspectAllocator;
 static WATCH: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 static FREED: AtomicBool = AtomicBool::new(false);
 static ZEROED: AtomicBool = AtomicBool::new(false);
+static NEXT_SIZE: AtomicUsize = AtomicUsize::new(0);
+static CANCEL_AT_ALLOCATION: Mutex<Option<racer_dataplane::runtime::deadline::RequestScope>> =
+    Mutex::new(None);
 
 // SAFETY: All allocation operations delegate to System with the original layout.
 unsafe impl GlobalAlloc for InspectAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        unsafe { System.alloc(layout) }
+        let pointer = unsafe { System.alloc(layout) };
+        if !pointer.is_null()
+            && NEXT_SIZE
+                .compare_exchange(layout.size(), 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            WATCH.store(pointer, Ordering::SeqCst);
+            // This scope has no registered waiters; cancellation allocates nothing.
+            // Trigger after the engine's first scope check, before it transforms
+            // the initialized output, to exercise the final publication check.
+            if let Some(scope) = CANCEL_AT_ALLOCATION.lock().unwrap().take() {
+                scope.cancel().unwrap();
+            }
+        }
+        pointer
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if WATCH.load(Ordering::SeqCst) == ptr {
@@ -148,5 +168,174 @@ fn final_payload_owner_scrubs_full_allocation_on_reclaim_and_rejection() {
                 assert_eq!(admission.used(class), 0);
             }
         }
+    }
+    failed_crypto_output_is_scrubbed(&config);
+}
+
+fn failed_crypto_output_is_scrubbed(config: &Config) {
+    use base64::Engine;
+    use chacha20poly1305::{KeyInit, XChaCha20Poly1305, aead::AeadInOut};
+    use racer_dataplane::{
+        control::wire,
+        model::identity::{ClusterId, NodeId, RequestId, WorkerId},
+        runtime::{
+            crypto::{CryptoId, CryptoInput, pair},
+            deadline::RequestScope,
+        },
+        security::{
+            aead::{PageCryptoEngine, page_aad},
+            keyring::{KeyEpochs, KeyPurpose, Keyring},
+        },
+    };
+    use std::{
+        sync::Arc,
+        task::{Context, Poll},
+        time::{Duration, Instant},
+    };
+
+    let keys = Keyring::new(
+        ClusterId("11111111-1111-4111-8111-111111111111".into()),
+        NodeId("22222222-2222-4222-8222-222222222222".into()),
+        Arc::new(KeyEpochs::default()),
+    );
+    let mut bundle: serde_json::Value =
+        serde_json::from_slice(include_bytes!("../src/control/testdata/bundle.json")).unwrap();
+    for (i, key) in bundle["cache_keys"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .enumerate()
+    {
+        key["material"] = base64::engine::general_purpose::STANDARD
+            .encode([i as u8 + 7; 32])
+            .into();
+    }
+    keys.install(wire::decode_bundle(&serde_json::to_vec(&bundle).unwrap()).unwrap())
+        .unwrap();
+    let cache = CacheId("44444444-4444-4444-8444-444444444444".into());
+    // Unusual sizes isolate the admitted payload allocation from engine metadata.
+    let length = 4093;
+    for fault in [
+        "nonce",
+        "aad",
+        "ciphertext",
+        "tag",
+        "cancel-decrypt",
+        "cancel-encrypt",
+    ] {
+        let admission = Rc::new(Admission::new(config.limits.clone()));
+        let pool = BufferPool::new(admission.clone());
+        let key = keys.active(&cache, KeyPurpose::Page).unwrap();
+        let mut descriptor = PageEnvelope {
+            page: PageId {
+                version: ObjectVersion {
+                    object: ObjectId {
+                        cache: cache.clone(),
+                        key: CacheKey([3; 32]),
+                    },
+                    etag: StrongEtag::parse(b"\"scrub\"").unwrap(),
+                },
+                number: PageNumber(0),
+            },
+            key_id: key.id(),
+            nonce: Nonce([2; 24]),
+            plaintext_length: length as u32,
+            ciphertext_length: length as u32 + 16,
+        };
+        let encrypt = fault == "cancel-encrypt";
+        let scope = RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(10))
+            .unwrap();
+        let input = if encrypt {
+            let mut plaintext = pool
+                .plaintext(
+                    admission
+                        .reserve(Some(&cache), ResourceClass::Plaintext, length)
+                        .unwrap(),
+                    length,
+                )
+                .unwrap();
+            plaintext.bytes_mut().unwrap().fill(0xa7);
+            CryptoInput::Encrypt {
+                page: descriptor.page,
+                plaintext,
+                ciphertext: admission
+                    .reserve(Some(&cache), ResourceClass::Ciphertext, length + 16)
+                    .unwrap(),
+            }
+        } else {
+            let mut bytes = vec![0xa7; length];
+            XChaCha20Poly1305::new((&[7; 32]).into())
+                .encrypt_in_place(
+                    (&descriptor.nonce.0).into(),
+                    &page_aad(&descriptor).unwrap(),
+                    &mut bytes,
+                )
+                .unwrap();
+            match fault {
+                "nonce" => descriptor.nonce.0[0] ^= 1,
+                "aad" => descriptor.page.number.0 += 1,
+                "ciphertext" => bytes[0] ^= 1,
+                "tag" => bytes[length] ^= 1,
+                _ => {}
+            }
+            // In-place fixture growth may overallocate; charge its full capacity.
+            let ciphertext = pool
+                .ciphertext(
+                    admission
+                        .reserve(Some(&cache), ResourceClass::Ciphertext, bytes.capacity())
+                        .unwrap(),
+                    descriptor,
+                    bytes,
+                )
+                .unwrap();
+            CryptoInput::Decrypt {
+                ciphertext,
+                plaintext: admission
+                    .reserve(Some(&cache), ResourceClass::Plaintext, length)
+                    .unwrap(),
+            }
+        };
+        let cipher_charge = admission.used(ResourceClass::Ciphertext);
+        let (io, _port) = pair(WorkerId(0), 1, std::num::NonZeroUsize::new(1).unwrap());
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let Poll::Ready(Ok(permit)) = io.poll_reserve(
+            &mut cx,
+            CryptoId {
+                worker: WorkerId(0),
+                generation: 1,
+                sequence: 1,
+            },
+        ) else {
+            panic!("reserve")
+        };
+        let job = permit.job(input, key, scope.clone());
+        if fault.starts_with("cancel") {
+            *CANCEL_AT_ALLOCATION.lock().unwrap() = Some(scope.clone());
+        }
+        FREED.store(false, Ordering::SeqCst);
+        ZEROED.store(false, Ordering::SeqCst);
+        NEXT_SIZE.store(if encrypt { length + 16 } else { length }, Ordering::SeqCst);
+        let completion = PageCryptoEngine::process(job);
+        assert_eq!(
+            NEXT_SIZE.load(Ordering::SeqCst),
+            0,
+            "{fault}: output allocated"
+        );
+        assert!(
+            FREED.load(Ordering::SeqCst),
+            "{fault}: output not published"
+        );
+        assert!(
+            ZEROED.load(Ordering::SeqCst),
+            "{fault}: entire output wiped before dealloc"
+        );
+        if fault.starts_with("cancel") {
+            assert!(scope.check().is_err());
+        }
+        assert_eq!(admission.used(ResourceClass::Plaintext), length);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), cipher_charge);
+        drop(completion);
+        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
     }
 }
