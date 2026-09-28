@@ -1,6 +1,7 @@
 //! Ranked acquisition and copy-only predecessor probes. Only a validated local
 //! candidate can mint origin authority; request headers never change placement.
 use super::flight::AcquisitionBudget;
+use crate::telemetry::failures::{Detail, Failure, Observer, Stage};
 use crate::{
     error::{Error, Operation, Result},
     model::{
@@ -44,6 +45,7 @@ pub enum ProbeOutcome {
     UnusableCopy,
 }
 pub struct CandidatePolicy {
+    observer: Observer,
     node: NodeId,
     placement: Rc<Placement>,
     peers: Rc<dyn PeerClient>,
@@ -53,6 +55,7 @@ pub struct CandidatePolicy {
 impl CandidatePolicy {
     pub fn new(node: NodeId, placement: Rc<Placement>, peers: Rc<dyn PeerClient>) -> Self {
         Self {
+            observer: Observer::default(),
             node,
             placement,
             peers,
@@ -61,6 +64,10 @@ impl CandidatePolicy {
         }
     }
 
+    pub(crate) fn with_observer(mut self, observer: Observer) -> Self {
+        self.observer = observer;
+        self
+    }
     /// Composition hook: shares the same admission and credential domain as Fill.
     pub fn set_credentials(&self, credentials: Rc<CredentialCrypto>) {
         *self.credentials.borrow_mut() = Some(credentials);
@@ -280,6 +287,14 @@ impl CandidatePolicy {
             } else if saw_version && !saw_transient {
                 Err(Error::VersionUnavailable)
             } else {
+                self.observer.record(
+                    Failure::new(Stage::CandidateExhausted, Error::Unavailable)
+                        .request(scope)
+                        .detail(Detail::Budget {
+                            attempts: budget.remaining_attempts(),
+                            links: budget.remaining_links(),
+                        }),
+                );
                 Err(Error::Unavailable)
             }
         })
@@ -438,6 +453,37 @@ impl CandidatePolicy {
             exchange.as_mut().poll(cx)
         })
         .await;
+        match &response {
+            Err(error) => self.observer.record(
+                Failure::new(Stage::CandidateExchange, *error)
+                    .request(scope)
+                    .attempt(attempt)
+                    .detail(Detail::Budget {
+                        attempts: budget.remaining_attempts(),
+                        links: budget.remaining_links(),
+                    }),
+            ),
+            Ok(response) => {
+                let error = match response.response() {
+                    PeerResponse::Overloaded => Some(Error::Overloaded),
+                    PeerResponse::Unavailable => Some(Error::Unavailable),
+                    PeerResponse::VersionUnavailable => Some(Error::VersionUnavailable),
+                    PeerResponse::StaleMembership => Some(Error::IncompatibleMembership),
+                    _ => None,
+                };
+                if let Some(error) = error {
+                    self.observer.record(
+                        Failure::new(Stage::CandidateResponse, error)
+                            .request(scope)
+                            .attempt(attempt)
+                            .detail(Detail::Budget {
+                                attempts: budget.remaining_attempts(),
+                                links: budget.remaining_links(),
+                            }),
+                    );
+                }
+            }
+        }
         check_budget(scope, budget)?;
         match stopped.or_else(|| attempt_scope.check().err()) {
             Some(Error::DeadlineExceeded) => Err(Error::Unavailable),

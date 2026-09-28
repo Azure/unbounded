@@ -4,6 +4,7 @@ use super::{
     transfer::Transfers,
     wire::{PeerRequest, SignedRequest, SignedResponse, VerifiedResponse},
 };
+use crate::telemetry::failures::{Observer, Stage};
 use crate::{
     error::{Error, Operation},
     runtime::deadline::RequestScope,
@@ -58,6 +59,7 @@ pub trait PeerTransport {
     ) -> Operation<'a, SignedResponse>;
 }
 pub struct Requester {
+    observer: Observer,
     health: Rc<crate::topology::health::LinkHealth>,
     paths: Rc<Paths>,
     rails: Rc<Rails>,
@@ -75,6 +77,7 @@ impl Requester {
     ) -> Self {
         transfers.set_signatures(handshake.signatures.clone());
         Self {
+            observer: Observer::default(),
             health: paths.link_health(),
             paths,
             rails,
@@ -85,6 +88,10 @@ impl Requester {
     }
     pub fn with_network(mut self, network: Rc<super::PeerNetwork>) -> Self {
         self.network = Some(network);
+        self
+    }
+    pub(crate) fn with_observer(mut self, observer: Observer) -> Self {
+        self.observer = observer;
         self
     }
 }
@@ -102,15 +109,22 @@ impl PeerClient for Requester {
             super::check_membership(&request, &membership)?;
             let network = self.network.as_ref().ok_or(Error::InvalidConfiguration)?;
             let search_budget = super::search_budget(&request.route, &network.local)?;
-            let route = self
-                .paths
-                .shortest_async(membership.clone(), &network.local, &search_budget, &scope)
-                .await?;
+            let route = self.observer.result(
+                Stage::PeerRoute,
+                &scope,
+                self.paths
+                    .shortest_async(membership.clone(), &network.local, &search_budget, &scope)
+                    .await,
+            )?;
             let next = route.nodes.get(1).ok_or(Error::Unavailable)?;
             let (signed, binding) = self.forwarding.sign_request_to(request, next)?;
             let response = self.exchange(signed, membership, &scope).await?;
             scope.check()?;
-            self.forwarding.verify_response(response, &binding)
+            self.observer.result(
+                Stage::PeerVerify,
+                &scope,
+                self.forwarding.verify_response(response, &binding),
+            )
         })
     }
 }

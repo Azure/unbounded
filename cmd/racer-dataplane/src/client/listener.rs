@@ -694,6 +694,13 @@ async fn serve_connection(
         let response = match read_result {
             Ok(response) => response,
             Err(error) => {
+                admission.observer().record(
+                    crate::telemetry::failures::Failure::new(
+                        crate::telemetry::failures::Stage::ClientRead,
+                        error,
+                    )
+                    .request(scope),
+                );
                 let error = if error == Error::NotFound && kind.pin().is_some() {
                     Error::VersionUnavailable
                 } else {
@@ -1804,10 +1811,16 @@ mod tests {
         ] {
             let mut fixture = Fixture::new();
             let admission = fixture.listeners.admission.clone();
+            let failures = crate::telemetry::failures::Failures::default();
+            let observer = failures.observer(WorkerId(0));
             let delivery = Rc::new(Delivery::new(
                 Rc::new(PipePool::new(admission.clone(), fixture.reactor.clone())),
                 Duration::from_secs(2),
             ));
+            fixture.listeners.responses = Rc::new(
+                Responses::new(fixture.listeners.io.clone(), delivery.clone())
+                    .with_observer(observer.clone()),
+            );
             let directory = Arc::new(
                 WorkerDirectory::new(
                     Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
@@ -1820,7 +1833,8 @@ mod tests {
             // causes a real acquisition failure only after the first slice escaped.
             fixture.listeners.reads = Rc::new(Bodies {
                 admission,
-                streams: RangeStreams::from_directory(directory, delivery, 1),
+                streams: RangeStreams::from_directory(directory, delivery, 1)
+                    .with_observer(observer),
                 late_failure,
                 unseeded: false,
             });
@@ -1843,6 +1857,24 @@ mod tests {
             assert!(head.contains(&format!("content-length: {expected_length}\r\n")));
             assert!(head.contains(&format!("content-range: {expected_range}\r\n")));
             assert_eq!(&output[end..], expected_body);
+            let mut diagnostics = String::new();
+            failures.write(&mut diagnostics).unwrap();
+            if late_failure {
+                assert!(
+                    diagnostics.contains("stage=NextSlice error=Unavailable"),
+                    "{diagnostics}"
+                );
+                assert!(
+                    diagnostics.contains("sent: 2, expected: 3"),
+                    "{diagnostics}"
+                );
+                assert!(
+                    diagnostics.contains("stage=PageDispatch error=Unavailable"),
+                    "{diagnostics}"
+                );
+            } else {
+                assert!(diagnostics.starts_with("total=0 "), "{diagnostics}");
+            }
         }
     }
 
@@ -2062,7 +2094,13 @@ mod tests {
 
     #[test]
     fn actual_uds_first_page_failure_is_complete_503() {
-        let (fixture, _pipes) = body_fixture(2, true);
+        let (mut fixture, _pipes) = body_fixture(2, true);
+        let failures = crate::telemetry::failures::Failures::default();
+        let delivery = Rc::new(Delivery::new(_pipes.clone(), Duration::from_secs(2)));
+        fixture.listeners.responses = Rc::new(
+            Responses::new(fixture.listeners.io.clone(), delivery)
+                .with_observer(failures.observer(crate::model::identity::WorkerId(0))),
+        );
         // No owner is installed for the unseeded first page.
         let mut socket = start_body(&fixture);
         let output = fixture.receive(&mut socket, true);
@@ -2070,6 +2108,13 @@ mod tests {
         assert!(output.ends_with(b"\r\n\r\n"));
         assert_only_idle_pipes(&fixture, &_pipes);
         fixture.assert_metrics(1, 1, 0);
+        let mut diagnostics = String::new();
+        failures.write(&mut diagnostics).unwrap();
+        assert!(
+            diagnostics.contains("stage=FirstSlice error=Unavailable"),
+            "{diagnostics}"
+        );
+        assert!(!diagnostics.contains("stage=NextSlice"));
     }
 
     #[test]

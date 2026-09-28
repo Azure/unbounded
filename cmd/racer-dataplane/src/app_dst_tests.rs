@@ -614,6 +614,7 @@ struct Harness {
         crate::rdma::lifecycle::simulation::Fault,
     )>,
     payload_regression: bool,
+    concurrent_layers: bool,
 }
 impl Harness {
     fn new(seed: u64, sim: Simulation, clock: SimulationClock, native: bool) -> Self {
@@ -654,12 +655,14 @@ impl Harness {
             security_faults: vec![],
             native_rules: vec![],
             payload_regression: false,
+            concurrent_layers: false,
         }
     }
     fn update(&mut self, object: usize) {
         let revision = self.revisions.entry(object).or_default();
         *revision += 1;
         let length = match object {
+            1..=4 if self.concurrent_layers => 4 * PAGE_BYTES as usize + 257,
             0 => 0,
             1 if self.payload_regression => 4 * PAGE_BYTES as usize + 257,
             1 => PAGE_BYTES as usize + 257,
@@ -752,6 +755,12 @@ impl Harness {
         if self.payload_regression {
             config.limits.plaintext_bytes = NonZeroUsize::new(64 * 1024 * 1024).unwrap();
             config.limits.ciphertext_bytes = NonZeroUsize::new(64 * 1024 * 1024).unwrap();
+        }
+        if self.concurrent_layers {
+            config.limits.plaintext_bytes = NonZeroUsize::new(256 * 1024 * 1024).unwrap();
+            config.limits.ciphertext_bytes = NonZeroUsize::new(256 * 1024 * 1024).unwrap();
+            config.limits.client_connections = NonZeroUsize::new(512).unwrap();
+            config.limits.connections_per_neighbor = NonZeroUsize::new(16).unwrap();
         }
         let worker_count = 1 + self.rng.pick(2);
         self.coverage.trace.record(format!(
@@ -2471,6 +2480,105 @@ fn healthy_relayed_page_reads() {
     assert_eq!(harness.coverage.success, 40);
     assert_eq!(harness.coverage.failures, 0);
     assert_eq!(harness.coverage.bytes, 40 * (4 * PAGE_BYTES as usize + 257));
+}
+
+#[test]
+fn concurrent_relayed_layers_diagnose_receive_pressure_and_recover() {
+    let sim = Simulation::new();
+    let _os = sim.enter();
+    let clock = SimulationClock::new(73);
+    let environment = clock.environment(0);
+    let _time = environment.enter();
+    let _strict = crate::runtime::environment::require_simulated();
+    let mut harness = Harness::new(73, sim, clock, false);
+    harness.concurrent_layers = true;
+    for object in 1..=4 {
+        harness.update(object);
+    }
+    for _ in 0..40 {
+        harness.add(None);
+    }
+    // Exercise success, then controlled receive pressure after success headers,
+    // then recovery on the same graphs, identities, disk, and connections.
+    for pressure in [false, true, false] {
+        let mut clients: Vec<_> = (1..=4).map(|object| {
+            let mut client = harness.request_on(object, true, false, 0);
+            client.first = 0;
+            client.end = client.size;
+            client.request = format!("GET /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nIf-Match: {}\r\nRange: bytes=0-{}\r\nRacer-Metadata: dst opaque metadata\r\nAuthorization: Bearer dst-fixture\r\nConnection: close\r\n\r\n", key(object), client.tag, client.size - 1).into_bytes();
+            client
+        }).collect();
+        let mut charges = Vec::new();
+        let mut injected = false;
+        let before = harness.coverage.failures;
+        for _ in 0..MAX_TURNS {
+            harness.tick();
+            for client in &mut clients {
+                if !client.done && client.poll() {
+                    harness.check(client, pressure);
+                    client.fd.take();
+                    client.done = true;
+                }
+            }
+            if pressure
+                && !injected
+                && clients
+                    .iter()
+                    .any(|client| client.response.len() > 32768 && !client.done)
+            {
+                for node in &harness.nodes {
+                    for worker in &node.workers {
+                        worker.app.memory.evict_idle(usize::MAX).unwrap();
+                        worker.runtime.admission.reclaim_buffers();
+                        let admission = &worker.runtime.admission;
+                        let free = admission.limit(ResourceClass::Ciphertext)
+                            - admission.used(ResourceClass::Ciphertext);
+                        if free != 0 {
+                            charges.push(
+                                admission
+                                    .reserve(None, ResourceClass::Ciphertext, free)
+                                    .unwrap(),
+                            );
+                        }
+                    }
+                }
+                injected = true;
+            }
+            if clients.iter().all(|client| client.done) {
+                break;
+            }
+        }
+        assert!(
+            clients.iter().all(|client| client.done),
+            "concurrent layer reads stalled"
+        );
+        if pressure {
+            assert!(injected);
+            assert!(harness.coverage.failures > before);
+            let mut diagnostics = String::new();
+            for node in &harness.nodes {
+                node.app.telemetry.failures.write(&mut diagnostics).unwrap();
+            }
+            assert!(
+                diagnostics.contains("stage=Admission error=Overloaded"),
+                "{diagnostics}"
+            );
+            assert!(diagnostics.contains("stage=NextSlice"), "{diagnostics}");
+            assert!(diagnostics.contains("class: Ciphertext"), "{diagnostics}");
+            assert!(
+                diagnostics.contains("stage=CandidateResponse")
+                    || diagnostics.contains("stage=PeerReceiveAdmission"),
+                "{diagnostics}"
+            );
+        } else {
+            assert_eq!(harness.coverage.failures, before);
+        }
+        drop(charges);
+        harness.settle();
+    }
+    assert!(harness.coverage.secondary_worker_turns > 0);
+    assert!(harness.coverage.relay_turns > 0);
+    assert_eq!(harness.coverage.success, 8);
 }
 
 fn replay(seed: u64, steps: usize, native: bool) -> Coverage {

@@ -22,10 +22,10 @@ use zeroize::Zeroize;
 
 pub const MAX_CONNECTIONS: usize = 4;
 pub const MAX_REQUEST_BYTES: usize = 1024;
-pub const MAX_RESPONSE_BYTES: usize = 4096;
+pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(2);
 /// Fixed startup charge covers buffers and bounded service/future bookkeeping.
-pub const RESERVED_BYTES: usize = (MAX_CONNECTIONS + 1) * 8192;
+pub const RESERVED_BYTES: usize = (MAX_CONNECTIONS + 1) * (MAX_RESPONSE_BYTES + 4096);
 pub const CONTROL_SLOTS: usize = MAX_CONNECTIONS + 1;
 
 /// One attachment serves at most one listener. Resource reservations outlive
@@ -238,6 +238,7 @@ enum Route {
     Health,
     Ready,
     Metrics,
+    Failures,
     NotFound,
     Method,
     BadRequest,
@@ -280,6 +281,7 @@ fn parse(bytes: &[u8]) -> Route {
         Some("/healthz") => Route::Health,
         Some("/readyz") => Route::Ready,
         Some("/metrics") => Route::Metrics,
+        Some("/debug/failures") => Route::Failures,
         _ => Route::NotFound,
     }
 }
@@ -321,6 +323,7 @@ fn respond(
             Event::DiagnosticReady,
         ),
         Route::Metrics => ("200 OK", "", Event::DiagnosticMetrics),
+        Route::Failures => ("200 OK", "", Event::DiagnosticFailures),
         Route::Method => (
             "405 Method Not Allowed",
             "method not allowed\n",
@@ -358,6 +361,11 @@ fn respond(
             u8::from(telemetry.health.live())
         )
         .map_err(|_| Error::Internal)?;
+    } else if route == Route::Failures {
+        telemetry
+            .failures
+            .write(&mut output)
+            .map_err(|_| Error::Internal)?;
     } else {
         output.write_str(body).map_err(|_| Error::Internal)?;
     }

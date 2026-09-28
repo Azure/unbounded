@@ -471,7 +471,11 @@ impl LocalPageService for Coordinator {
             };
             match result {
                 Ok(response) => Ok(response),
-                Err(error) => peer_error(error),
+                Err(error) => {
+                    self.fill
+                        .observe_peer_error(&effective, request.route.attempt, error);
+                    peer_error(error)
+                }
             }
         })
     }

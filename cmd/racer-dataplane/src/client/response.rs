@@ -1,5 +1,6 @@
 //! Central status mapping and streaming body delivery, including late truncation.
 use super::request::ReadKind;
+use crate::telemetry::failures::{Detail, Failure, Observer, Stage};
 use crate::{
     error::{Error, Operation, Result},
     http::{
@@ -18,12 +19,21 @@ use std::{
 };
 
 pub struct Responses {
+    observer: Observer,
     io: Rc<HttpIo>,
     delivery: Rc<Delivery>,
 }
 impl Responses {
     pub fn new(io: Rc<HttpIo>, delivery: Rc<Delivery>) -> Self {
-        Self { io, delivery }
+        Self {
+            io,
+            delivery,
+            observer: Observer::default(),
+        }
+    }
+    pub(crate) fn with_observer(mut self, observer: Observer) -> Self {
+        self.observer = observer;
+        self
     }
     /// Version unavailable -> 412, transient unavailable -> 503, range -> 206.
     /// Define malformed/unsatisfiable/unsupported method mappings in one place.
@@ -150,6 +160,11 @@ impl Responses {
                     }
                     result => {
                         let error = result.err().unwrap_or(Error::BadGateway);
+                        self.observer.record(
+                            Failure::new(Stage::FirstSlice, error)
+                                .request(scope)
+                                .detail(Detail::Delivery { sent: 0, expected }),
+                        );
                         if let Some(observation) = observation {
                             observation.fail(error);
                         }
@@ -170,7 +185,13 @@ impl Responses {
                 loop {
                     let reader = match first.take() {
                         Some(reader) => reader,
-                        None => match stream.next_slice().await? {
+                        None => match stream.next_slice().await.inspect_err(|&error| {
+                            self.observer.record(
+                                Failure::new(Stage::NextSlice, error)
+                                    .request(scope)
+                                    .detail(Detail::Delivery { sent, expected }),
+                            );
+                        })? {
                             Some(reader) => reader,
                             None => break,
                         },
@@ -179,16 +200,23 @@ impl Responses {
                     if length == 0 || length > expected - sent {
                         return Err(Error::BadGateway);
                     }
-                    connection = if page_timeout.is_some() {
+                    let written = if page_timeout.is_some() {
                         let mut write = self.delivery.finish_progressing(reader, connection, scope);
                         std::future::poll_fn(|cx| {
                             stream.poll_prefetch(cx);
                             write.as_mut().poll(cx)
                         })
-                        .await?
+                        .await
                     } else {
-                        self.delivery.finish_to(reader, connection, scope).await?
+                        self.delivery.finish_to(reader, connection, scope).await
                     };
+                    connection = written.inspect_err(|&error| {
+                        self.observer.record(
+                            Failure::new(Stage::ClientWrite, error)
+                                .request(scope)
+                                .detail(Detail::Delivery { sent, expected }),
+                        );
+                    })?;
                     sent += length;
                 }
             }

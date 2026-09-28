@@ -111,6 +111,46 @@ fn good_resources() -> super::super::health::Resources {
 }
 
 #[test]
+fn failure_endpoint_exports_full_ring_with_maximum_numeric_fields() {
+    use crate::{
+        model::identity::{AttemptId, WorkerId},
+        telemetry::failures::{CAPACITY, Detail, Failure, Stage},
+    };
+    let telemetry = Telemetry::default();
+    let observer = telemetry.failures.observer(WorkerId(u16::MAX));
+    let scope = RequestScope::new(
+        RequestId([255; 16]),
+        Instant::now() + Duration::from_secs(10),
+    )
+    .unwrap();
+    for _ in 0..CAPACITY + 1 {
+        observer.record(
+            Failure::new(
+                Stage::PeerReceiveAdmission,
+                Error::UnsatisfiableRangeWithLength(u64::MAX),
+            )
+            .request(&scope)
+            .attempt(AttemptId([255; 16]))
+            .detail(Detail::Resource {
+                class: ResourceClass::OutboundConnection,
+                used: usize::MAX,
+                limit: usize::MAX,
+                requested: usize::MAX,
+                cache_used: Some(usize::MAX),
+                cache_limit: Some(usize::MAX),
+            }),
+        );
+    }
+    let mut bytes = vec![0; MAX_RESPONSE_BYTES];
+    let length = respond(&telemetry, parse(b"GET /debug/failures HTTP/1.1\r\nHost: local\r\nAuthorization: synthetic-secret\r\n\r\n"), true, &mut bytes).unwrap();
+    assert_response(&bytes[..length], "200 OK", None);
+    let text = std::str::from_utf8(&bytes[..length]).unwrap();
+    assert_eq!(text.matches("stage=PeerReceiveAdmission").count(), CAPACITY);
+    assert!(text.contains("sequence=2 worker=65535"));
+    assert!(!text.contains("synthetic"));
+}
+
+#[test]
 fn raw_endpoints_fragmentation_readiness_redaction_and_data_admission_stop() {
     let (admission, reactor, io) = setup();
     let telemetry = Telemetry::default();
@@ -173,6 +213,26 @@ fn raw_endpoints_fragmentation_readiness_redaction_and_data_admission_stop() {
     assert!(!text.contains("synthetic"));
     assert!(!text.contains("Authorization"));
     assert_eq!(telemetry.tracing.snapshot(&mut [None; 1]).unwrap(), 0);
+    telemetry
+        .failures
+        .observer(crate::model::identity::WorkerId(1))
+        .record(
+            crate::telemetry::failures::Failure::new(
+                crate::telemetry::failures::Stage::NextSlice,
+                Error::Unavailable,
+            )
+            .request(&scope),
+        );
+    let response = exchange_raw(
+        address,
+        get("/debug/failures").as_bytes(),
+        &mut server,
+        &reactor,
+    );
+    assert_response(&response, "200 OK", None);
+    let text = std::str::from_utf8(&response).unwrap();
+    assert!(text.contains("worker=1 stage=NextSlice error=Unavailable"));
+    assert!(!text.contains("synthetic"));
     finish(server, &scope, &reactor);
     assert_eq!(telemetry.metrics.gauge(Gauge::DiagnosticConnections), 0);
     drop(io);

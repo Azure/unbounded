@@ -6,6 +6,7 @@ use super::{
     fill::{Fill, PageResult},
     flight::AcquisitionBudget,
 };
+use crate::telemetry::failures::{Detail, Failure, Observer, Stage};
 use crate::{
     error::{Error, Operation, Result},
     memory::delivery::{Delivery, ReaderLease},
@@ -72,6 +73,7 @@ enum WindowPage {
 }
 
 pub struct RangeStreams {
+    observer: Observer,
     // Retains the same worker-local Fill graph as the coordinator. Actual page
     // acquisition always goes through the stable directory owner.
     _fill: Option<Rc<Fill>>,
@@ -86,6 +88,7 @@ pub struct RangeStreams {
 /// send::<RangeStream>();
 /// ```
 pub struct RangeStream {
+    observer: Observer,
     metadata: ObjectMetadata,
     range: ResolvedRange,
     context: OriginContext,
@@ -107,6 +110,7 @@ impl RangeStreams {
         window_pages: usize,
     ) -> Self {
         Self {
+            observer: Observer::default(),
             _fill: Some(fill),
             directory,
             delivery,
@@ -122,6 +126,7 @@ impl RangeStreams {
         window_pages: usize,
     ) -> Self {
         Self {
+            observer: Observer::default(),
             _fill: None,
             directory,
             delivery,
@@ -130,6 +135,10 @@ impl RangeStreams {
     }
     pub fn directory(&self) -> &Arc<WorkerDirectory> {
         &self.directory
+    }
+    pub(crate) fn with_observer(mut self, observer: Observer) -> Self {
+        self.observer = observer;
+        self
     }
     /// Open a client range with a bounded allowance for each distinct page and
     /// the original request deadline. Use open_with_budget for an aggregate cap.
@@ -192,6 +201,7 @@ impl RangeStreams {
         }
         let first = range.first_page();
         let mut stream = RangeStream {
+            observer: self.observer.clone(),
             metadata,
             range,
             context,
@@ -260,6 +270,8 @@ impl RangeStream {
             }
             let operation_scope = self.operation_scope();
             if let Err(error) = operation_scope.check() {
+                self.observer
+                    .record(Failure::new(Stage::RangeScope, error).request(&operation_scope));
                 self.terminated = true;
                 self.ready.clear();
                 return Err(error);
@@ -269,6 +281,8 @@ impl RangeStream {
             let pipe = match self.delivery.admit(&operation_scope).await {
                 Ok(pipe) => pipe,
                 Err(error) => {
+                    self.observer
+                        .record(Failure::new(Stage::RangePipe, error).request(&operation_scope));
                     self.terminated = true;
                     self.next_page = None;
                     self.ready.clear();
@@ -287,6 +301,11 @@ impl RangeStream {
                     Ok(Some(child)) => child,
                     Ok(None) => break,
                     Err(error) => {
+                        self.observer.record(
+                            Failure::new(Stage::RangeBudget, error)
+                                .request(&operation_scope)
+                                .detail(Detail::Page(number.0)),
+                        );
                         self.terminated = true;
                         self.ready.clear();
                         return Err(error);
@@ -304,7 +323,14 @@ impl RangeStream {
                 let failed = result.is_err();
                 let entry = match result {
                     Ok(future) => WindowPage::Waiting(future),
-                    Err(error) => WindowPage::Ready(Err(error)),
+                    Err(error) => {
+                        self.observer.record(
+                            Failure::new(Stage::PageDispatch, error)
+                                .request(&page_scope)
+                                .detail(Detail::Page(number.0)),
+                        );
+                        WindowPage::Ready(Err(error))
+                    }
                 };
                 if failed {
                     self.next_page = None;
@@ -323,13 +349,24 @@ impl RangeStream {
                 self.terminated = true;
                 return Ok(None);
             };
+            if let Err(error) = &result {
+                self.observer.record(
+                    Failure::new(Stage::PageAcquire, *error)
+                        .request(&operation_scope)
+                        .detail(Detail::Page(number.0)),
+                );
+            }
             let lease = result.and_then(|result| {
-                self.validate(&result, number)?;
-                let slice = self
-                    .range
-                    .slice_at(result.plaintext.page().number)?
-                    .ok_or(Error::CorruptRecord)?;
-                self.delivery.attach_reserved(result.plaintext, slice, pipe)
+                let attach = (|| {
+                    self.validate(&result, number)?;
+                    let slice = self
+                        .range
+                        .slice_at(result.plaintext.page().number)?
+                        .ok_or(Error::CorruptRecord)?;
+                    self.delivery.attach_reserved(result.plaintext, slice, pipe)
+                })();
+                self.observer
+                    .result(Stage::PageAttach, &operation_scope, attach)
             });
             match lease {
                 Ok(lease) => Ok(Some(lease)),
@@ -848,6 +885,7 @@ mod tests {
                 ));
             }
             let stream = RangeStream {
+                observer: Observer::default(),
                 metadata: metadata.clone(),
                 range,
                 context: OriginContext {

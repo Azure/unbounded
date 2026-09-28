@@ -385,7 +385,13 @@ impl PeerServer {
             network.endpoint(&membership, previous)?;
             if request.request().route.destination != network.local {
                 let binding = request.binding().clone();
-                return match self.relay.forward(request, membership, &scope).await {
+                let result = self.relay.forward(request, membership, &scope).await;
+                let result = self.admission.observer().result(
+                    crate::telemetry::failures::Stage::PeerRelay,
+                    &scope,
+                    result,
+                );
+                return match result {
                     Ok(response) => Ok(response),
                     Err(Error::Overloaded) => self
                         .forwarding
@@ -414,7 +420,13 @@ impl PeerServer {
                 }
                 Err(error) => return Err(error),
             };
-            let response = match self.local.serve_peer(request, membership, &scope).await {
+            let result = self.local.serve_peer(request, membership, &scope).await;
+            let result = self.admission.observer().result(
+                crate::telemetry::failures::Stage::PeerLocal,
+                &scope,
+                result,
+            );
+            let response = match result {
                 Ok(response) => response,
                 Err(Error::NotFound) => PeerResponse::NotFound,
                 Err(Error::VersionUnavailable) => PeerResponse::VersionUnavailable,

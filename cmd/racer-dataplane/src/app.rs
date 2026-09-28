@@ -118,6 +118,7 @@ pub struct Application {
 pub struct NodeState {
     ingress: Arc<crate::runtime::ingress::Ingress>,
     metrics: crate::telemetry::metrics::Metrics,
+    failures: crate::telemetry::failures::Failures,
     publications: Arc<PublishedState>,
     keys: Arc<KeyEpochs>,
     control_worker: WorkerId,
@@ -155,6 +156,7 @@ impl NodeState {
             ingress: Arc::new(crate::runtime::ingress::Ingress::new(&workers)),
             publications: Arc::new(PublishedState::default()),
             metrics: crate::telemetry::metrics::Metrics::default(),
+            failures: crate::telemetry::failures::Failures::default(),
             keys: Arc::new(KeyEpochs::default()),
             control_worker: WorkerId(0),
             workers: Arc::new(WorkerDirectory::new(map, workers, capacity)?),
@@ -498,6 +500,7 @@ impl WorkerApplication {
         let drivers = Rc::new(crate::read::drivers::DriverQueue::default());
         let _queue = drivers.enter();
         let admission = runtime.admission.clone();
+        admission.set_observer(node.failures.observer(worker));
         node.ingress.install(worker, &admission)?;
         let reactor = runtime.reactor.clone();
         let limits = admission.limits();
@@ -694,13 +697,13 @@ impl WorkerApplication {
                 handshake.clone(),
                 transfers.clone(),
             )
-            .with_network(network.clone()),
+            .with_network(network.clone())
+            .with_observer(admission.observer()),
         );
-        let candidates = Rc::new(CandidatePolicy::new(
-            config.node.clone(),
-            placement.clone(),
-            requester.clone(),
-        ));
+        let candidates = Rc::new(
+            CandidatePolicy::new(config.node.clone(), placement.clone(), requester.clone())
+                .with_observer(admission.observer()),
+        );
         candidates.set_publications(node.publications.clone());
         let origin: Rc<dyn Origin> = Rc::new(
             OriginClient::new(
@@ -749,12 +752,15 @@ impl WorkerApplication {
                 owners: node.workers.clone(),
             },
         ));
-        let streams = Rc::new(RangeStreams::new(
-            fill.clone(),
-            node.workers.clone(),
-            delivery.clone(),
-            config.limits.range_window_pages.get(),
-        ));
+        let streams = Rc::new(
+            RangeStreams::new(
+                fill.clone(),
+                node.workers.clone(),
+                delivery.clone(),
+                config.limits.range_window_pages.get(),
+            )
+            .with_observer(admission.observer()),
+        );
         let coordinator = Rc::new(
             Coordinator::new(
                 snapshots.clone(),
@@ -797,7 +803,8 @@ impl WorkerApplication {
             peers
         });
         let io = Rc::new(HttpIo::for_clients(reactor, admission.clone()));
-        let responses = Rc::new(Responses::new(io.clone(), delivery));
+        let responses =
+            Rc::new(Responses::new(io.clone(), delivery).with_observer(admission.observer()));
         let clients = ClientListeners::new(
             dispatcher.clone(),
             RequestParser::new(config.limits.header_bytes.get()),
@@ -814,6 +821,7 @@ impl WorkerApplication {
         });
 
         let mut telemetry = Telemetry::default();
+        telemetry.failures = node.failures.clone();
         telemetry.metrics = node.metrics.clone();
         telemetry.health = node.observations.health.clone();
         Ok(Self {

@@ -1,5 +1,6 @@
 //! Transport-neutral ciphertext lifecycle, selecting HTTP or authenticated RDMA.
 use super::wire::{LogicalCodec, PeerResponse, SignedRequest, SignedResponse, WireCodec};
+use crate::telemetry::failures::Stage;
 use crate::{
     error::{Error, Operation, Result},
     http::{io::HttpIo, pool::HttpPool},
@@ -249,22 +250,41 @@ impl Transfers {
                     .unwrap_or(&request.authentication.original)
                     .head,
             )?;
-            let connection = self.http.checkout(&endpoint, scope).await?;
+            let observer = admission.observer();
+            let connection = observer.result(
+                Stage::PeerCheckout,
+                scope,
+                self.http.checkout(&endpoint, scope).await,
+            )?;
             let connection = {
                 let _permit = connection
                     .session
                     .is_none()
                     .then(|| admission.reserve(None, ResourceClass::ControlProgress, 1))
                     .transpose()?;
-                crate::security::connection::connect(&self.io, connection, signatures, &peer, scope)
-                    .await?
+                observer.result(
+                    Stage::PeerHandshake,
+                    scope,
+                    crate::security::connection::connect(
+                        &self.io, connection, signatures, &peer, scope,
+                    )
+                    .await,
+                )?
             };
             let native = self.accept_native(&request, plan, scope)?;
             if let Some((_, accept, _)) = &native {
                 super::native::attach(&mut head, accept)?;
             }
-            let sent = self.io.send_head(connection, head, scope).await?;
-            let mut received = self.io.receive_head(sent.connection, scope).await?;
+            let sent = observer.result(
+                Stage::PeerHead,
+                scope,
+                self.io.send_head(connection, head, scope).await,
+            )?;
+            let mut received = observer.result(
+                Stage::PeerHead,
+                scope,
+                self.io.receive_head(sent.connection, scope).await,
+            )?;
             let control = super::native::detach(&mut received.value)?;
             let (authentication, length) = WireCodec::decode(received.value, true)?;
             if let Some(control) = control {
@@ -297,15 +317,21 @@ impl Transfers {
                     reclaim(cache, length);
                     reservation = admission.reserve(Some(cache), ResourceClass::Ciphertext, length);
                 }
-                let mut buffer = WireBuffer::reserved(reservation?, length)?;
+                let mut buffer = WireBuffer::reserved(
+                    observer.result(Stage::PeerReceiveAdmission, scope, reservation)?,
+                    length,
+                )?;
                 let mut offset = 0;
                 while offset < length {
-                    let completion = self
-                        .io
-                        .read_body_range(connection, buffer, offset..length, scope)
-                        .await?;
+                    let completion = observer.result(
+                        Stage::PeerReceiveBody,
+                        scope,
+                        self.io
+                            .read_body_range(connection, buffer, offset..length, scope)
+                            .await,
+                    )?;
                     if completion.bytes == 0 || completion.bytes > length - offset {
-                        return Err(Error::Io);
+                        return observer.result(Stage::PeerReceiveBody, scope, Err(Error::Io));
                     }
                     offset += completion.bytes;
                     connection = completion.lease;
@@ -315,8 +341,11 @@ impl Transfers {
                 (bytes, Some(reservation))
             };
             scope.check()?;
-            let response =
-                codec.response_reserved(authentication, body, staging_reservation, scope)?;
+            let response = observer.result(
+                Stage::PeerDecode,
+                scope,
+                codec.response_reserved(authentication, body, staging_reservation, scope),
+            )?;
             // Logical decoding must account for every body byte before pooling.
             match &response.response {
                 PeerResponse::Bootstrap {

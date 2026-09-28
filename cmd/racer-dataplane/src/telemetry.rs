@@ -1,4 +1,6 @@
 //! Bounded-cardinality diagnostics, independent of data-path admission.
+#[path = "telemetry/failures.rs"]
+pub mod failures;
 #[path = "telemetry/health.rs"]
 pub mod health;
 #[path = "telemetry/metrics.rs"]
@@ -16,6 +18,7 @@ use std::{cell::OnceCell, net::SocketAddr, rc::Rc};
 
 #[derive(Default)]
 pub struct Telemetry {
+    pub failures: failures::Failures,
     pub metrics: metrics::Metrics,
     pub health: health::Health,
     pub tracing: tracing::Tracing,

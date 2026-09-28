@@ -6,7 +6,7 @@ kernel resources. The app owner must integrate these explicit hooks:
 1. On the designated I/O worker, call
    `telemetry.attach_io(runtime.reactor.clone(), runtime.admission.clone())`
    before accepting data work. This initializes the supplied worker reactor and
-   reserves five `ControlProgress` slots plus 40 KiB of `RequestContext` memory.
+   reserves five `ControlProgress` slots plus 340 KiB of `RequestContext` memory.
    Attachment failure is a startup failure. It does not bind or start serving.
 2. Retain and poll `telemetry.serve(config.diagnostics_listen, &scope)` as an
    ordinary local worker task. First poll binds; surface bind/accept failures.
@@ -74,9 +74,9 @@ available. Diagnostics do not increment client request counters.
 
 ## Bounds and runtime integration constraint
 
-Only HTTP/1.1 GET `/healthz`, `/readyz`, and `/metrics` are served. Responses close
-the connection, have exact Content-Length, and never echo input. Heads are capped
-at 1 KiB/16 headers, responses at 4 KiB, active connections at four, and exchange
+HTTP/1.1 GET `/healthz`, `/readyz`, `/metrics`, and `/debug/failures` are served.
+Responses close the connection, have exact Content-Length, and never echo input. Heads are capped
+at 1 KiB/16 headers, responses at 64 KiB, active connections at four, and exchange
 time at two seconds. Bodies, transfer encoding, duplicate framing, and unsupported
 methods are rejected. Unknown paths and query strings produce fixed 404s.
 
@@ -91,6 +91,37 @@ diagnostic progress under *complete* shared reactor/memory saturation. Telemetry
 cannot enforce that global ceiling from its owned files. It does not create a
 second reactor to conceal this constraint. Reactor and Admission arguments must
 come from the same worker; Reactor currently exposes no provenance check.
+
+## Internal failure diagnostics
+
+GET `/debug/failures` returns the latest 128 internal failure records, oldest
+first, across the node's workers. It uses the existing diagnostic listener and
+access controls. `total` counts recorded internal failures since process startup;
+`retained` and `sequence` reveal ring overwrites. Snapshot reads do not clear it.
+This is diagnostic text, not a Prometheus metric or a stable public wire schema.
+
+Records include worker, wall-clock Unix milliseconds, typed stage/error, and
+request/attempt IDs when available. Page acquisition records include the page
+number; client continuation/write records include complete slice bytes sent and
+advertised body bytes. `ClientWrite.sent` excludes any partial current slice.
+Candidate records preserve remote statuses and remaining retry/link credits.
+Peer records distinguish routing, checkout, authentication, response heads,
+receive admission/body, decoding, local serving, and relay failures before the
+existing error mappings collapse them.
+
+Admission records capture the rejected resource, worker used/limit, requested
+amount, and cache used/fair limit when cache fairness rejected the reservation.
+They have no request ID because the quota API does not receive request context;
+use worker/time/sequence with surrounding correlated stage records. These record
+individual reserve failures, including those later recovered by reclamation or
+optional persistence skips. They are not terminal request counts. Cache-entry
+table saturation uses a separate `CacheEntries` detail.
+
+No object key, ETag, origin context, credential, header, or payload is accepted by
+the record API. Failure recording uses a fixed ring and a short node-local mutex;
+formatting and HTTP I/O happen after releasing it. Successes add no records.
+Collect snapshots promptly from requesting nodes and peer candidates/relays while
+reproducing a failure. A missing or overwritten record is not evidence of success.
 
 ## Focused checks
 

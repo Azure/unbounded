@@ -59,6 +59,7 @@ impl Drop for Counters {
 }
 
 pub struct Admission {
+    observer: RefCell<crate::telemetry::failures::Observer>,
     limits: Limits,
     totals: Arc<Counters>,
     caches: RefCell<HashMap<CacheId, Weak<Counters>>>,
@@ -210,6 +211,7 @@ pub struct ConnectionReservation {
 /// Only socket admission crosses workers; cache admission remains I/O-local.
 #[derive(Clone)]
 pub(crate) struct ConnectionAdmission {
+    observer: crate::telemetry::failures::Observer,
     totals: Arc<Counters>,
     stopped: Arc<AtomicBool>,
     total: usize,
@@ -228,7 +230,21 @@ impl ConnectionAdmission {
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                     used.checked_add(1).filter(|next| *next <= limit)
                 })
-                .map_err(|_| Error::Overloaded)?;
+                .map_err(|_| {
+                    use crate::telemetry::failures::{Detail, Failure, Stage};
+                    self.observer
+                        .record(Failure::new(Stage::Admission, Error::Overloaded).detail(
+                            Detail::Resource {
+                                class,
+                                used: self.totals.used[index(class)].load(Ordering::Acquire),
+                                limit,
+                                requested: 1,
+                                cache_used: None,
+                                cache_limit: None,
+                            },
+                        ));
+                    Error::Overloaded
+                })?;
             Ok(Reservation {
                 buffers: Weak::new(),
                 stopped: self.stopped.clone(),
@@ -248,8 +264,15 @@ impl ConnectionAdmission {
     }
 }
 impl Admission {
+    pub(crate) fn set_observer(&self, observer: crate::telemetry::failures::Observer) {
+        *self.observer.borrow_mut() = observer;
+    }
+    pub(crate) fn observer(&self) -> crate::telemetry::failures::Observer {
+        self.observer.borrow().clone()
+    }
     pub(crate) fn connection_admission(&self) -> ConnectionAdmission {
         ConnectionAdmission {
+            observer: self.observer(),
             totals: self.totals.clone(),
             stopped: self.stopped.clone(),
             total: self.limit(ResourceClass::Connection),
@@ -279,6 +302,7 @@ impl Admission {
     }
     pub fn new(limits: Limits) -> Self {
         Self {
+            observer: RefCell::default(),
             limits,
             totals: Arc::new(Counters::new()),
             caches: RefCell::new(HashMap::default()),
@@ -451,6 +475,15 @@ impl Admission {
             }
             drop(retired);
             if !caches.contains_key(cache) && caches.len() >= self.limits.metadata_entries.get() {
+                use crate::telemetry::failures::{Detail, Failure, Stage};
+                self.observer.borrow().record(
+                    Failure::new(Stage::Admission, Error::Overloaded).detail(
+                        Detail::CacheEntries {
+                            used: caches.len(),
+                            limit: self.limits.metadata_entries.get(),
+                        },
+                    ),
+                );
                 return Err(Error::Overloaded);
             }
             Some(
@@ -481,6 +514,12 @@ impl Admission {
                 .checked_add(amount)
                 .is_none_or(|used| used > fair_limit)
             {
+                self.rejected(
+                    class,
+                    amount,
+                    Some(local.used[index(class)].load(Ordering::Acquire)),
+                    Some(fair_limit),
+                );
                 return Err(Error::Overloaded);
             }
         }
@@ -488,7 +527,10 @@ impl Admission {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(amount).filter(|next| *next <= limit)
             })
-            .map_err(|_| Error::Overloaded)?;
+            .map_err(|_| {
+                self.rejected(class, amount, None, None);
+                Error::Overloaded
+            })?;
         if let Some(local) = &local {
             local.used[index(class)].fetch_add(amount, Ordering::AcqRel);
         }
@@ -501,6 +543,27 @@ impl Admission {
             buffers: Arc::downgrade(&self.buffers),
             stopped: self.stopped.clone(),
         })
+    }
+    fn rejected(
+        &self,
+        class: ResourceClass,
+        amount: usize,
+        cache_used: Option<usize>,
+        cache_limit: Option<usize>,
+    ) {
+        use crate::telemetry::failures::{Detail, Failure, Stage};
+        self.observer
+            .borrow()
+            .record(
+                Failure::new(Stage::Admission, Error::Overloaded).detail(Detail::Resource {
+                    class,
+                    used: self.used(class),
+                    limit: self.limit(class),
+                    requested: amount,
+                    cache_used,
+                    cache_limit,
+                }),
+            );
     }
     /// All allocation dimensions are acquired together; failure rolls back every charge.
     pub fn reserve_fill(&self, cache: &CacheId, persist: bool) -> Result<FillReservation> {

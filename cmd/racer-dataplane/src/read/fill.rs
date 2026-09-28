@@ -67,6 +67,19 @@ enum Prefetch {
     Ciphertext(UnverifiedPage),
 }
 impl Fill {
+    pub(crate) fn observe_peer_error(
+        &self,
+        scope: &RequestScope,
+        attempt: crate::model::identity::AttemptId,
+        error: Error,
+    ) {
+        use crate::telemetry::failures::{Failure, Stage};
+        self.dependencies.admission.observer().record(
+            Failure::new(Stage::PeerLocal, error)
+                .request(scope)
+                .attempt(attempt),
+        );
+    }
     pub(crate) fn record_peer_bootstrap(&self) -> Result<()> {
         self.metrics.record(Event::PeerBootstrap, 1)
     }
