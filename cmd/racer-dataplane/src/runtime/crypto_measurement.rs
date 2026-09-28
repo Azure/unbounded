@@ -13,7 +13,10 @@ use crate::{
         crc64,
     },
 };
-use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::AeadInPlace};
+use chacha20poly1305::{
+    KeyInit, XChaCha20Poly1305,
+    aead::{AeadInOut, inout::InOutBuf},
+};
 use std::{
     hint::black_box,
     rc::Rc,
@@ -99,7 +102,7 @@ fn validate(result: &CryptoCompletion, size: usize) {
         assert_eq!(plain.bytes()[size - 1], 7);
     }
 }
-fn primitive(size: usize, rotating: bool) {
+fn primitive(size: usize, rotating: bool, out_of_place: bool) {
     let slots = if rotating { ROTATING.div_ceil(size) } else { 1 };
     let iterations = if rotating {
         slots
@@ -109,14 +112,17 @@ fn primitive(size: usize, rotating: bool) {
     let mut buffers: Vec<u8> = vec![7; slots * size];
     let cipher = XChaCha20Poly1305::new((&[7; 32]).into());
     let aad = page_aad(&envelope(size)).unwrap();
-    let nonce = XNonce::from_slice(&[2; 24]);
+    let nonce = (&[2; 24]).into();
     let mut scratch = vec![0; size];
     for operation in ["crc", "encrypt", "decrypt", "bad_tag"] {
+        if out_of_place && operation == "crc" {
+            continue;
+        }
         let mut tags = Vec::new();
         if operation == "decrypt" || operation == "bad_tag" {
             for bytes in buffers.chunks_exact_mut(size) {
                 let mut tag = cipher
-                    .encrypt_in_place_detached(nonce, &aad, bytes)
+                    .encrypt_inout_detached(nonce, &aad, bytes.into())
                     .unwrap();
                 if operation == "bad_tag" {
                     tag[0] ^= 1;
@@ -135,9 +141,14 @@ fn primitive(size: usize, rotating: bool) {
                     black_box(crc64::checksum(black_box(bytes)));
                 }
                 "encrypt" => {
+                    let buffer = if out_of_place {
+                        InOutBuf::new(bytes, &mut scratch).unwrap()
+                    } else {
+                        bytes.into()
+                    };
                     let tag = black_box(
                         cipher
-                            .encrypt_in_place_detached(nonce, &aad, black_box(bytes))
+                            .encrypt_inout_detached(nonce, &aad, black_box(buffer))
                             .unwrap(),
                     );
                     // Validation outside timing is handled by the engine cases;
@@ -145,15 +156,17 @@ fn primitive(size: usize, rotating: bool) {
                     black_box(tag);
                 }
                 _ => {
-                    scratch.copy_from_slice(bytes);
+                    // Preserve the baseline copy-inclusive case separately from
+                    // the detached immutable-input path used by the page engine.
+                    let buffer = if out_of_place {
+                        InOutBuf::new(bytes, &mut scratch).unwrap()
+                    } else {
+                        scratch.copy_from_slice(bytes);
+                        scratch.as_mut_slice().into()
+                    };
                     failures += usize::from(
                         cipher
-                            .decrypt_in_place_detached(
-                                nonce,
-                                &aad,
-                                black_box(&mut scratch),
-                                &tags[index],
-                            )
+                            .decrypt_inout_detached(nonce, &aad, black_box(buffer), &tags[index])
                             .is_err(),
                     );
                 }
@@ -161,7 +174,13 @@ fn primitive(size: usize, rotating: bool) {
         }
         report(
             "primitive",
-            if operation == "decrypt" {
+            if out_of_place {
+                match operation {
+                    "encrypt" => "encrypt_inout",
+                    "decrypt" => "decrypt_inout",
+                    _ => "bad_tag_inout",
+                }
+            } else if operation == "decrypt" {
                 "decrypt_copy"
             } else {
                 operation
@@ -200,7 +219,7 @@ fn lifecycle(size: usize, rotating: bool, paired: bool, operation: &str) {
     let mut encrypted = vec![7; size];
     cipher
         .encrypt_in_place(
-            XNonce::from_slice(&descriptor.nonce.0),
+            (&descriptor.nonce.0).into(),
             &page_aad(&descriptor).unwrap(),
             &mut encrypted,
         )
@@ -380,12 +399,23 @@ fn crypto_measurement() {
     );
     for size in [63, 4095, 1024 * 1024, 16 * 1024 * 1024] {
         for rotating in [false, true] {
-            primitive(size, rotating);
+            primitive(size, rotating, false);
             for paired in [false, true] {
                 for operation in ["encrypt", "decrypt", "bad_tag"] {
                     lifecycle(size, rotating, paired, operation);
                 }
             }
+        }
+    }
+}
+
+#[test]
+#[ignore = "release-only detached immutable-input supplement to the 80-case baseline matrix"]
+fn crypto_measurement_inout() {
+    assert!(!cfg!(debug_assertions), "run with --release");
+    for size in [63, 4095, 1024 * 1024, 16 * 1024 * 1024] {
+        for rotating in [false, true] {
+            primitive(size, rotating, true);
         }
     }
 }
