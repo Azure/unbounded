@@ -24,6 +24,11 @@ const (
 	checkKubeletBindAddressName           = "kubelet-bind-address"
 	checkContainerdMetricsBindAddressName = "containerd-metrics-bind-address"
 	kubeletBindAddress                    = "0.0.0.0:10250"
+
+	// Executable paths inside the nspawn machine rootfs, used to prove that a
+	// listener belongs to this installation.
+	kubeletExecutablePath    = "usr/local/bin/kubelet"
+	containerdExecutablePath = "usr/local/bin/containerd"
 )
 
 type bindAddressChecker struct {
@@ -32,9 +37,18 @@ type bindAddressChecker struct {
 	description string
 	log         *slog.Logger
 	inspect     func(address string) (string, bool, error)
+	owned       func() bool
 }
 
-// CheckBindAddress verifies no TCP listener currently occupies an address's port.
+// CheckBindAddress verifies no TCP listener currently occupies an address's
+// port. Any listener fails, including one belonging to this installation.
+//
+// Nothing in the agent calls this: Preflight is unconditionally ownership-aware
+// and uses checkOwnedBindAddress, which accepts a listener it can prove this
+// installation owns. It stays exported because it is part of this package's
+// published surface, and callers outside the repository compose their own
+// preflight sets from it. Removing it would break them at compile time, so it
+// is kept deliberately rather than by oversight.
 func CheckBindAddress(log *slog.Logger, name, address, description string) preflight.Checker {
 	return bindAddressChecker{
 		name:        name,
@@ -45,6 +59,73 @@ func CheckBindAddress(log *slog.Logger, name, address, description string) prefl
 			return inspectTCPListener("/proc", address)
 		},
 	}
+}
+
+// checkOwnedBindAddress accepts only listeners with both the expected process
+// root and executable inode. An uninspectable owner is not proof of ownership.
+func checkOwnedBindAddress(log *slog.Logger, name, address, description, root, executable string) preflight.Checker {
+	c := bindAddressChecker{
+		name: name, address: address, description: description, log: log,
+		inspect: func(address string) (string, bool, error) { return inspectTCPListener("/proc", address) },
+	}
+	c.owned = func() bool { return listenerOwnedByRoot("/proc", address, root, executable) }
+
+	return c
+}
+
+func listenerOwnedByRoot(procRoot, address, root, executable string) bool {
+	_, portText, err := net.SplitHostPort(address)
+	if err != nil {
+		return false
+	}
+
+	port, err := strconv.ParseUint(portText, 10, 16)
+	if err != nil {
+		return false
+	}
+
+	wanted := map[string]struct{}{}
+
+	for _, table := range []string{"tcp", "tcp6"} {
+		data, err := os.ReadFile(filepath.Join(procRoot, "net", table))
+		if errors.Is(err, fs.ErrNotExist) && table == "tcp6" {
+			continue
+		}
+
+		if err != nil {
+			return false
+		}
+
+		for inode := range listenerSocketInodes(data, uint16(port)) {
+			wanted[inode] = struct{}{}
+		}
+	}
+
+	rootInfo, err := os.Stat(root)
+	if err != nil {
+		return false
+	}
+
+	exeInfo, err := os.Stat(filepath.Join(root, executable))
+	if err != nil {
+		return false
+	}
+
+	matched := map[string]bool{}
+
+	for _, owner := range socketOwners(procRoot, wanted) {
+		base := filepath.Join(procRoot, strconv.Itoa(owner.pid))
+		processRoot, rootErr := os.Stat(filepath.Join(base, "root"))
+
+		processExe, exeErr := os.Stat(filepath.Join(base, "exe"))
+		if rootErr != nil || exeErr != nil || !os.SameFile(rootInfo, processRoot) || !os.SameFile(exeInfo, processExe) {
+			return false
+		}
+
+		matched[owner.inode] = true
+	}
+
+	return len(wanted) > 0 && len(matched) == len(wanted)
 }
 
 func (c bindAddressChecker) Name() string { return c.name }
@@ -58,6 +139,10 @@ func (c bindAddressChecker) Check(context.Context) []preflight.Result {
 	}
 
 	if occupied {
+		if c.owned != nil && c.owned() {
+			return preflight.ResultsOK(c.name, c.address, c.description+" belongs to this installation")
+		}
+
 		if owner != "" {
 			return preflight.ResultsError(c.name, c.address, "%s is already in use by process %s", c.description, owner)
 		}
@@ -128,10 +213,33 @@ func listenerSocketInodes(socketTable []byte, port uint16) map[string]struct{} {
 }
 
 func findSocketOwner(procRoot string, inodes map[string]struct{}) string {
+	owners := socketOwners(procRoot, inodes)
+	if len(owners) > 0 {
+		owner := owners[0]
+
+		name, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(owner.pid), "comm"))
+		if err == nil && strings.TrimSpace(string(name)) != "" {
+			return strconv.Quote(strings.TrimSpace(string(name))) + " (PID " + strconv.Itoa(owner.pid) + ")"
+		}
+
+		return "PID " + strconv.Itoa(owner.pid)
+	}
+
+	return ""
+}
+
+type socketOwner struct {
+	pid   int
+	inode string
+}
+
+func socketOwners(procRoot string, inodes map[string]struct{}) []socketOwner {
 	processes, err := os.ReadDir(procRoot)
 	if err != nil {
-		return ""
+		return nil
 	}
+
+	var owners []socketOwner
 
 	for _, process := range processes {
 		pid, err := strconv.Atoi(process.Name())
@@ -155,14 +263,9 @@ func findSocketOwner(procRoot string, inodes map[string]struct{}) string {
 				continue
 			}
 
-			name, err := os.ReadFile(filepath.Join(procRoot, process.Name(), "comm"))
-			if err == nil && strings.TrimSpace(string(name)) != "" {
-				return strconv.Quote(strings.TrimSpace(string(name))) + " (PID " + strconv.Itoa(pid) + ")"
-			}
-
-			return "PID " + strconv.Itoa(pid)
+			owners = append(owners, socketOwner{pid: pid, inode: inode})
 		}
 	}
 
-	return ""
+	return owners
 }

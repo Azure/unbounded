@@ -70,7 +70,7 @@ func TestNodeStatusCacheApplyDelta(t *testing.T) {
 
 		changed := make(chan struct{}, 1)
 
-		cache.SetOnChange(func(_ string, _ *NodeStatusResponse) { changed <- struct{}{} })
+		cache.SetOnChange(func(_ string, _ *NodeStatusResponse, _ uint64) { changed <- struct{}{} })
 
 		delta := map[string]json.RawMessage{
 			"healthCheck": json.RawMessage(`{"healthy":true,"summary":"ok"}`),

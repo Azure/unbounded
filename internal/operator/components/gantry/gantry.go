@@ -21,6 +21,7 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	schedulingv1 "k8s.io/api/scheduling/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -35,8 +36,14 @@ import (
 )
 
 const (
-	daemonSetName = "gantry"
-	configName    = "gantry-config"
+	daemonSetName     = "gantry"
+	configName        = "gantry-config"
+	priorityClassName = "gantry-low"
+
+	installationManagerAnnotation = "gantry.unbounded-cloud.io/manager"
+	installationManagerOperator   = "unbounded-operator"
+	installationManagerHelm       = "helm"
+	reasonInstallationConflict    = "InstallationConflict"
 
 	// imageRepository is the operator-managed image repository for the gantry
 	// agent. The operator derives the full reference at reconcile time via
@@ -60,6 +67,13 @@ const (
 
 	configHashAnnotation = "unbounded-cloud.io/gantry-config-hash"
 )
+
+var operatorManifestFiles = map[string]struct{}{
+	"configmap.yaml":         {},
+	"daemonset.yaml":         {},
+	"rendezvous-leases.yaml": {},
+	"serviceaccount.yaml":    {},
+}
 
 // Component reconciles the gantry cluster singleton.
 type Component struct{}
@@ -89,6 +103,33 @@ func EnabledFor(site *unboundedv1alpha3.Site) bool {
 // out.
 func (c Component) Plan(ctx context.Context, env *component.Env, sites []unboundedv1alpha3.Site) (*component.Plan, component.Result, error) {
 	plan := component.NewPlan()
+	enabled := false
+
+	for i := range sites {
+		if EnabledFor(&sites[i]) {
+			enabled = true
+			break
+		}
+	}
+
+	installationManager, err := detectInstallationManager(ctx, env)
+	if err != nil {
+		return nil, component.Result{}, err
+	}
+
+	if installationManager != "" && installationManager != installationManagerOperator {
+		if !enabled {
+			return plan, component.Disabled("no site enables gantry; external Gantry installation is not managed"), nil
+		}
+
+		message := fmt.Sprintf(
+			"PriorityClass/%s is managed by %q; uninstall the existing Gantry installation before enabling operator-managed Gantry",
+			priorityClassName,
+			installationManager,
+		)
+
+		return plan, component.NotReady(reasonInstallationConflict, message), nil
+	}
 
 	// The legacy node config is removed before anything else is applied, and
 	// the applies depend on those deletes, so a failure to remove the legacy
@@ -99,15 +140,6 @@ func (c Component) Plan(ctx context.Context, env *component.Env, sites []unbound
 	legacyRefs := make([]component.ObjectRef, 0, len(legacy))
 	for _, op := range legacy {
 		legacyRefs = append(legacyRefs, op.Ref())
-	}
-
-	enabled := false
-
-	for i := range sites {
-		if EnabledFor(&sites[i]) {
-			enabled = true
-			break
-		}
 	}
 
 	if !enabled {
@@ -177,6 +209,41 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 		builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(daemonSetName, legacyNodeConfigDaemonSetName))))
 	b.Watches(&coordinationv1.Lease{}, env.RequestSingleton(),
 		builder.WithPredicates(chairLeaseDeletePredicate(env.Namespace)))
+	b.Watches(&schedulingv1.PriorityClass{}, env.RequestSingleton(),
+		builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
+			return obj.GetName() == priorityClassName
+		})))
+}
+
+func detectInstallationManager(ctx context.Context, env *component.Env) (string, error) {
+	priorityClass := &schedulingv1.PriorityClass{}
+	if err := env.Client.Get(ctx, client.ObjectKey{Name: priorityClassName}, priorityClass); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", nil
+		}
+
+		return "", fmt.Errorf("get PriorityClass/%s installation owner: %w", priorityClassName, err)
+	}
+
+	if manager := priorityClass.Annotations[installationManagerAnnotation]; manager != "" {
+		return manager, nil
+	}
+
+	if strings.EqualFold(priorityClass.Labels["app.kubernetes.io/managed-by"], "Helm") ||
+		priorityClass.Annotations["meta.helm.sh/release-name"] != "" {
+		return installationManagerHelm, nil
+	}
+
+	for _, fields := range priorityClass.ManagedFields {
+		switch fields.Manager {
+		case component.FieldOwner:
+			return installationManagerOperator, nil
+		case "helm":
+			return installationManagerHelm, nil
+		}
+	}
+
+	return "unknown", nil
 }
 
 func chairLeaseDeletePredicate(namespace string) predicate.Predicate {
@@ -199,25 +266,25 @@ func chairLeaseDeletePredicate(namespace string) predicate.Predicate {
 	}
 }
 
-// decodeManifests decodes Gantry's operator-managed top-level manifests. The
-// standalone node configurator and examples subtree are intentionally excluded.
+// decodeManifests decodes only the Gantry resources shared with the operator.
+// Standalone resources must be added to this allowlist deliberately.
 func decodeManifests(env *component.Env, mutate func(*unstructured.Unstructured) error) ([]*unstructured.Unstructured, error) {
 	files, err := component.YamlFiles(gantrymanifests.Manifests)
 	if err != nil {
 		return nil, err
 	}
 
-	topLevel := make([]string, 0, len(files))
+	operatorFiles := make([]string, 0, len(operatorManifestFiles))
 
 	for _, file := range files {
-		if file == "node-config.yaml" || strings.Contains(file, "/") {
+		if _, ok := operatorManifestFiles[file]; !ok {
 			continue
 		}
 
-		topLevel = append(topLevel, file)
+		operatorFiles = append(operatorFiles, file)
 	}
 
-	return env.DecodeManifestFiles(gantrymanifests.Manifests, topLevel, mutate)
+	return env.DecodeManifestFiles(gantrymanifests.Manifests, operatorFiles, mutate)
 }
 
 func resourcesExist(ctx context.Context, env *component.Env) (bool, error) {

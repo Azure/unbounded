@@ -12,6 +12,7 @@ import (
 	"k8s.io/klog/v2"
 
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
+	"github.com/Azure/unbounded/internal/net/healthcheck"
 	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
 	"github.com/Azure/unbounded/internal/net/routeplan"
 )
@@ -20,7 +21,7 @@ import (
 // - wg<port>: Main mesh interface for all mesh peers (intra-site, remote, same-pool gateways)
 // - wg<gwPort>: Separate interfaces for each gateway peer (for ECMP routing)
 // Endpoint and routing decisions are driven by peer.SiteName and peeredSites membership.
-func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers []meshPeerInfo, gatewayPeers []gatewayPeerInfo, mySiteName string, peeredSites, networkPeeredSites, gatewayNodePubKeys map[string]bool, siteHealthCheckProfileNames, peeringSiteHealthCheckProfileNames, assignmentSiteHealthCheckProfileNames, assignmentPoolHealthCheckProfileNames, poolHealthCheckProfileNames map[string]string, siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs, assignmentPoolTunnelMTUs, poolTunnelMTUs map[string]int, additionalRoutes []unboundednetnetlink.DesiredRoute, geneveHCPeers map[string]bool, state *wireGuardState) error {
+func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers []meshPeerInfo, gatewayPeers []gatewayPeerInfo, mySiteName string, peeredSites, networkPeeredSites, gatewayNodePubKeys map[string]bool, siteHealthCheckProfileNames, peeringSiteHealthCheckProfileNames, assignmentSiteHealthCheckProfileNames, assignmentPoolHealthCheckProfileNames, poolHealthCheckProfileNames map[string]string, siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs, assignmentPoolTunnelMTUs, poolTunnelMTUs map[string]int, additionalRoutes []unboundednetnetlink.DesiredRoute, geneveHCPeers map[string]bool, state *wireGuardState, profiles map[string]healthcheck.HealthCheckSettings) error {
 	nodePodCIDRs := state.nodePodCIDRs
 	isGatewayNode := state.isGatewayNode
 	myGatewayPort := state.myGatewayPort
@@ -619,12 +620,15 @@ func configureWireGuard(ctx context.Context, cfg *config, privKey string, peers 
 		len(peers), len(gatewayPeers), len(allDesiredRoutes))
 
 	// === Register healthcheck peers via shared HC registration ===
-	wgHCPeers := registerPeersWithHealthCheck(peers, gatewayPeers, mySiteName, isGatewayNode,
+	wgHCPeers, err := registerPeersWithHealthCheck(peers, gatewayPeers, mySiteName, isGatewayNode,
 		siteHealthCheckProfileNames, peeringSiteHealthCheckProfileNames,
 		assignmentSiteHealthCheckProfileNames, assignmentPoolHealthCheckProfileNames,
-		poolHealthCheckProfileNames, state,
+		poolHealthCheckProfileNames, profiles, state,
 		func(gw gatewayPeerInfo) string { return peerIfaceNameWireGuard(cfg, gw) },
 		false)
+	if err != nil {
+		return fmt.Errorf("register WireGuard health checks: %w", err)
+	}
 
 	// Remove peers that are no longer desired (preserve GENEVE HC peers)
 	if state.healthCheckManager != nil {

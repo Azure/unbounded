@@ -4,6 +4,7 @@
 package utilio
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -162,4 +163,51 @@ func TestProbeWritableDir(t *testing.T) {
 	if len(entries) != 0 {
 		t.Fatalf("probe left entries behind: %v", entries)
 	}
+}
+
+// TestNearestExistingDir pins the walk that lets a caller ask whether a path
+// could be created without creating it.
+func TestNearestExistingDir(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	nested := filepath.Join(root, "a", "b")
+
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	file := filepath.Join(root, "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name, path, want string
+	}{
+		{"existing directory is its own answer", nested, nested},
+		{"absent leaf walks up one", filepath.Join(nested, "absent"), nested},
+		{"absent subtree walks up to the deepest existing", filepath.Join(nested, "absent", "deeper"), nested},
+		{"absent intermediate walks past it", filepath.Join(root, "missing", "bin"), root},
+		{"a file is not a directory", file, root},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := NearestExistingDir(os.Stat, tc.path); got != tc.want {
+				t.Fatalf("NearestExistingDir(%q) = %q, want %q", tc.path, got, tc.want)
+			}
+		})
+	}
+
+	// The walk terminates at the filesystem root rather than looping forever
+	// when nothing on the path exists.
+	t.Run("terminates at the root", func(t *testing.T) {
+		t.Parallel()
+
+		neverExists := func(string) (fs.FileInfo, error) { return nil, os.ErrNotExist }
+		if got := NearestExistingDir(neverExists, "/definitely/not/here"); got != "/" {
+			t.Fatalf("NearestExistingDir = %q, want /", got)
+		}
+	})
 }

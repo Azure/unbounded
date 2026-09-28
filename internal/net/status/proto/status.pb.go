@@ -26,14 +26,18 @@ const (
 
 // NodeStatusMessage wraps all node-to-controller status messages.
 type NodeStatusMessage struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Type          string                 `protobuf:"bytes,1,opt,name=type,proto3" json:"type,omitempty"` // "node_status_full" or "node_status_delta"
-	NodeName      string                 `protobuf:"bytes,2,opt,name=node_name,json=nodeName,proto3" json:"node_name,omitempty"`
-	BaseRevision  uint64                 `protobuf:"varint,3,opt,name=base_revision,json=baseRevision,proto3" json:"base_revision,omitempty"`
-	Status        *NodeStatusFull        `protobuf:"bytes,4,opt,name=status,proto3" json:"status,omitempty"` // set for full updates
-	Delta         *NodeStatusDelta       `protobuf:"bytes,5,opt,name=delta,proto3" json:"delta,omitempty"`   // set for delta updates
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Type            string                 `protobuf:"bytes,1,opt,name=type,proto3" json:"type,omitempty"` // "node_status_full", "node_status_delta", "node_status_summary", or "node_status_details"
+	NodeName        string                 `protobuf:"bytes,2,opt,name=node_name,json=nodeName,proto3" json:"node_name,omitempty"`
+	BaseRevision    uint64                 `protobuf:"varint,3,opt,name=base_revision,json=baseRevision,proto3" json:"base_revision,omitempty"`
+	Status          *NodeStatusFull        `protobuf:"bytes,4,opt,name=status,proto3" json:"status,omitempty"`                                            // set for full updates
+	Delta           *NodeStatusDelta       `protobuf:"bytes,5,opt,name=delta,proto3" json:"delta,omitempty"`                                              // set for delta updates
+	Summary         *NodeStatusOverview    `protobuf:"bytes,6,opt,name=summary,proto3" json:"summary,omitempty"`                                          // complete overview, including on resync
+	DetailRequestId string                 `protobuf:"bytes,7,opt,name=detail_request_id,json=detailRequestId,proto3" json:"detail_request_id,omitempty"` // correlates one-shot details in status, never a revision
+	SupportsDetails bool                   `protobuf:"varint,8,opt,name=supports_details,json=supportsDetails,proto3" json:"supports_details,omitempty"`
+	DetailError     string                 `protobuf:"bytes,9,opt,name=detail_error,json=detailError,proto3" json:"detail_error,omitempty"` // correlated one-shot failure; status is unset
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *NodeStatusMessage) Reset() {
@@ -101,14 +105,46 @@ func (x *NodeStatusMessage) GetDelta() *NodeStatusDelta {
 	return nil
 }
 
+func (x *NodeStatusMessage) GetSummary() *NodeStatusOverview {
+	if x != nil {
+		return x.Summary
+	}
+	return nil
+}
+
+func (x *NodeStatusMessage) GetDetailRequestId() string {
+	if x != nil {
+		return x.DetailRequestId
+	}
+	return ""
+}
+
+func (x *NodeStatusMessage) GetSupportsDetails() bool {
+	if x != nil {
+		return x.SupportsDetails
+	}
+	return false
+}
+
+func (x *NodeStatusMessage) GetDetailError() string {
+	if x != nil {
+		return x.DetailError
+	}
+	return ""
+}
+
 // NodeStatusAck is the acknowledgment returned by the controller for push updates.
 type NodeStatusAck struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Status        string                 `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"` // "ok" or "resync_required"
-	Revision      uint64                 `protobuf:"varint,2,opt,name=revision,proto3" json:"revision,omitempty"`
-	Reason        string                 `protobuf:"bytes,3,opt,name=reason,proto3" json:"reason,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Status           string                 `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"` // "ok" or "resync_required"
+	Revision         uint64                 `protobuf:"varint,2,opt,name=revision,proto3" json:"revision,omitempty"`
+	Reason           string                 `protobuf:"bytes,3,opt,name=reason,proto3" json:"reason,omitempty"`
+	PeerMeasurements bool                   `protobuf:"varint,4,opt,name=peer_measurements,json=peerMeasurements,proto3" json:"peer_measurements,omitempty"` // Positive capability, scoped to this WebSocket connection.
+	DetailRequest    *DetailRequest         `protobuf:"bytes,5,opt,name=detail_request,json=detailRequest,proto3" json:"detail_request,omitempty"`           // unsolicited WS command or piggybacked HTTP response
+	SummarySupported bool                   `protobuf:"varint,6,opt,name=summary_supported,json=summarySupported,proto3" json:"summary_supported,omitempty"`
+	DetailRequestId  string                 `protobuf:"bytes,7,opt,name=detail_request_id,json=detailRequestId,proto3" json:"detail_request_id,omitempty"` // a detail ACK must not acknowledge a routine publication
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *NodeStatusAck) Reset() {
@@ -158,6 +194,34 @@ func (x *NodeStatusAck) GetRevision() uint64 {
 func (x *NodeStatusAck) GetReason() string {
 	if x != nil {
 		return x.Reason
+	}
+	return ""
+}
+
+func (x *NodeStatusAck) GetPeerMeasurements() bool {
+	if x != nil {
+		return x.PeerMeasurements
+	}
+	return false
+}
+
+func (x *NodeStatusAck) GetDetailRequest() *DetailRequest {
+	if x != nil {
+		return x.DetailRequest
+	}
+	return nil
+}
+
+func (x *NodeStatusAck) GetSummarySupported() bool {
+	if x != nil {
+		return x.SummarySupported
+	}
+	return false
+}
+
+func (x *NodeStatusAck) GetDetailRequestId() string {
+	if x != nil {
+		return x.DetailRequestId
 	}
 	return ""
 }
@@ -296,10 +360,16 @@ type NodeStatusDelta struct {
 	HealthCheck  *HealthCheckStatus     `protobuf:"bytes,4,opt,name=health_check,json=healthCheck,proto3" json:"health_check,omitempty"`
 	NodeErrors   []*NodeError           `protobuf:"bytes,5,rep,name=node_errors,json=nodeErrors,proto3" json:"node_errors,omitempty"`
 	// Track which top-level fields are present in this delta.
-	UpdatedFields []string    `protobuf:"bytes,15,rep,name=updated_fields,json=updatedFields,proto3" json:"updated_fields,omitempty"`
-	BpfEntries    []*BpfEntry `protobuf:"bytes,6,rep,name=bpf_entries,json=bpfEntries,proto3" json:"bpf_entries,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	UpdatedFields      []string          `protobuf:"bytes,15,rep,name=updated_fields,json=updatedFields,proto3" json:"updated_fields,omitempty"`
+	BpfEntries         []*BpfEntry       `protobuf:"bytes,6,rep,name=bpf_entries,json=bpfEntries,proto3" json:"bpf_entries,omitempty"`
+	PeerMeasurements   *PeerMeasurements `protobuf:"bytes,7,opt,name=peer_measurements,json=peerMeasurements,proto3" json:"peer_measurements,omitempty"`
+	TimestampUnixNs    int64             `protobuf:"varint,8,opt,name=timestamp_unix_ns,json=timestampUnixNs,proto3" json:"timestamp_unix_ns,omitempty"`
+	FetchError         string            `protobuf:"bytes,9,opt,name=fetch_error,json=fetchError,proto3" json:"fetch_error,omitempty"`
+	LastPushTimeUnixNs int64             `protobuf:"varint,10,opt,name=last_push_time_unix_ns,json=lastPushTimeUnixNs,proto3" json:"last_push_time_unix_ns,omitempty"`
+	StatusSource       string            `protobuf:"bytes,11,opt,name=status_source,json=statusSource,proto3" json:"status_source,omitempty"`
+	NodePodInfo        *NodePodInfo      `protobuf:"bytes,12,opt,name=node_pod_info,json=nodePodInfo,proto3" json:"node_pod_info,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *NodeStatusDelta) Reset() {
@@ -381,6 +451,145 @@ func (x *NodeStatusDelta) GetBpfEntries() []*BpfEntry {
 	return nil
 }
 
+func (x *NodeStatusDelta) GetPeerMeasurements() *PeerMeasurements {
+	if x != nil {
+		return x.PeerMeasurements
+	}
+	return nil
+}
+
+func (x *NodeStatusDelta) GetTimestampUnixNs() int64 {
+	if x != nil {
+		return x.TimestampUnixNs
+	}
+	return 0
+}
+
+func (x *NodeStatusDelta) GetFetchError() string {
+	if x != nil {
+		return x.FetchError
+	}
+	return ""
+}
+
+func (x *NodeStatusDelta) GetLastPushTimeUnixNs() int64 {
+	if x != nil {
+		return x.LastPushTimeUnixNs
+	}
+	return 0
+}
+
+func (x *NodeStatusDelta) GetStatusSource() string {
+	if x != nil {
+		return x.StatusSource
+	}
+	return ""
+}
+
+func (x *NodeStatusDelta) GetNodePodInfo() *NodePodInfo {
+	if x != nil {
+		return x.NodePodInfo
+	}
+	return nil
+}
+
+// PeerMeasurements replaces all measurement columns for the ordered base peers.
+// Every column must have exactly peer_count entries, including zero/empty values.
+// identity_digest is SHA-256 over the ordered, length-prefixed peer identities.
+// A nonzero matching base_revision and matching digest are required. This field
+// must be listed in updated_fields and cannot accompany a peers replacement.
+type PeerMeasurements struct {
+	state               protoimpl.MessageState `protogen:"open.v1"`
+	PeerCount           uint32                 `protobuf:"varint,1,opt,name=peer_count,json=peerCount,proto3" json:"peer_count,omitempty"`
+	IdentityDigest      []byte                 `protobuf:"bytes,2,opt,name=identity_digest,json=identityDigest,proto3" json:"identity_digest,omitempty"`
+	RxBytes             []int64                `protobuf:"varint,3,rep,packed,name=rx_bytes,json=rxBytes,proto3" json:"rx_bytes,omitempty"`
+	TxBytes             []int64                `protobuf:"varint,4,rep,packed,name=tx_bytes,json=txBytes,proto3" json:"tx_bytes,omitempty"`
+	LastHandshakeUnixNs []int64                `protobuf:"varint,5,rep,packed,name=last_handshake_unix_ns,json=lastHandshakeUnixNs,proto3" json:"last_handshake_unix_ns,omitempty"`
+	Uptime              []string               `protobuf:"bytes,6,rep,name=uptime,proto3" json:"uptime,omitempty"`
+	Rtt                 []string               `protobuf:"bytes,7,rep,name=rtt,proto3" json:"rtt,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
+}
+
+func (x *PeerMeasurements) Reset() {
+	*x = PeerMeasurements{}
+	mi := &file_status_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PeerMeasurements) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PeerMeasurements) ProtoMessage() {}
+
+func (x *PeerMeasurements) ProtoReflect() protoreflect.Message {
+	mi := &file_status_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PeerMeasurements.ProtoReflect.Descriptor instead.
+func (*PeerMeasurements) Descriptor() ([]byte, []int) {
+	return file_status_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *PeerMeasurements) GetPeerCount() uint32 {
+	if x != nil {
+		return x.PeerCount
+	}
+	return 0
+}
+
+func (x *PeerMeasurements) GetIdentityDigest() []byte {
+	if x != nil {
+		return x.IdentityDigest
+	}
+	return nil
+}
+
+func (x *PeerMeasurements) GetRxBytes() []int64 {
+	if x != nil {
+		return x.RxBytes
+	}
+	return nil
+}
+
+func (x *PeerMeasurements) GetTxBytes() []int64 {
+	if x != nil {
+		return x.TxBytes
+	}
+	return nil
+}
+
+func (x *PeerMeasurements) GetLastHandshakeUnixNs() []int64 {
+	if x != nil {
+		return x.LastHandshakeUnixNs
+	}
+	return nil
+}
+
+func (x *PeerMeasurements) GetUptime() []string {
+	if x != nil {
+		return x.Uptime
+	}
+	return nil
+}
+
+func (x *PeerMeasurements) GetRtt() []string {
+	if x != nil {
+		return x.Rtt
+	}
+	return nil
+}
+
 // NodeInfo contains basic node identification and metadata.
 type NodeInfo struct {
 	state              protoimpl.MessageState `protogen:"open.v1"`
@@ -407,7 +616,7 @@ type NodeInfo struct {
 
 func (x *NodeInfo) Reset() {
 	*x = NodeInfo{}
-	mi := &file_status_proto_msgTypes[4]
+	mi := &file_status_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -419,7 +628,7 @@ func (x *NodeInfo) String() string {
 func (*NodeInfo) ProtoMessage() {}
 
 func (x *NodeInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_status_proto_msgTypes[4]
+	mi := &file_status_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -432,7 +641,7 @@ func (x *NodeInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeInfo.ProtoReflect.Descriptor instead.
 func (*NodeInfo) Descriptor() ([]byte, []int) {
-	return file_status_proto_rawDescGZIP(), []int{4}
+	return file_status_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *NodeInfo) GetName() string {
@@ -566,7 +775,7 @@ type BuildInfo struct {
 
 func (x *BuildInfo) Reset() {
 	*x = BuildInfo{}
-	mi := &file_status_proto_msgTypes[5]
+	mi := &file_status_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -578,7 +787,7 @@ func (x *BuildInfo) String() string {
 func (*BuildInfo) ProtoMessage() {}
 
 func (x *BuildInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_status_proto_msgTypes[5]
+	mi := &file_status_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -591,7 +800,7 @@ func (x *BuildInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BuildInfo.ProtoReflect.Descriptor instead.
 func (*BuildInfo) Descriptor() ([]byte, []int) {
-	return file_status_proto_rawDescGZIP(), []int{5}
+	return file_status_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *BuildInfo) GetVersion() string {
@@ -628,7 +837,7 @@ type WireGuardStatusInfo struct {
 
 func (x *WireGuardStatusInfo) Reset() {
 	*x = WireGuardStatusInfo{}
-	mi := &file_status_proto_msgTypes[6]
+	mi := &file_status_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -640,7 +849,7 @@ func (x *WireGuardStatusInfo) String() string {
 func (*WireGuardStatusInfo) ProtoMessage() {}
 
 func (x *WireGuardStatusInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_status_proto_msgTypes[6]
+	mi := &file_status_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -653,7 +862,7 @@ func (x *WireGuardStatusInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WireGuardStatusInfo.ProtoReflect.Descriptor instead.
 func (*WireGuardStatusInfo) Descriptor() ([]byte, []int) {
-	return file_status_proto_rawDescGZIP(), []int{6}
+	return file_status_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *WireGuardStatusInfo) GetInterface() string {
@@ -702,7 +911,7 @@ type PeerStatus struct {
 
 func (x *PeerStatus) Reset() {
 	*x = PeerStatus{}
-	mi := &file_status_proto_msgTypes[7]
+	mi := &file_status_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -714,7 +923,7 @@ func (x *PeerStatus) String() string {
 func (*PeerStatus) ProtoMessage() {}
 
 func (x *PeerStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_status_proto_msgTypes[7]
+	mi := &file_status_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -727,7 +936,7 @@ func (x *PeerStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PeerStatus.ProtoReflect.Descriptor instead.
 func (*PeerStatus) Descriptor() ([]byte, []int) {
-	return file_status_proto_rawDescGZIP(), []int{7}
+	return file_status_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *PeerStatus) GetName() string {
@@ -810,7 +1019,7 @@ type PeerTunnelStatus struct {
 
 func (x *PeerTunnelStatus) Reset() {
 	*x = PeerTunnelStatus{}
-	mi := &file_status_proto_msgTypes[8]
+	mi := &file_status_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -822,7 +1031,7 @@ func (x *PeerTunnelStatus) String() string {
 func (*PeerTunnelStatus) ProtoMessage() {}
 
 func (x *PeerTunnelStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_status_proto_msgTypes[8]
+	mi := &file_status_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -835,7 +1044,7 @@ func (x *PeerTunnelStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PeerTunnelStatus.ProtoReflect.Descriptor instead.
 func (*PeerTunnelStatus) Descriptor() ([]byte, []int) {
-	return file_status_proto_rawDescGZIP(), []int{8}
+	return file_status_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *PeerTunnelStatus) GetProtocol() string {
@@ -906,7 +1115,7 @@ type RoutingTableInfo struct {
 
 func (x *RoutingTableInfo) Reset() {
 	*x = RoutingTableInfo{}
-	mi := &file_status_proto_msgTypes[9]
+	mi := &file_status_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -918,7 +1127,7 @@ func (x *RoutingTableInfo) String() string {
 func (*RoutingTableInfo) ProtoMessage() {}
 
 func (x *RoutingTableInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_status_proto_msgTypes[9]
+	mi := &file_status_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -931,7 +1140,7 @@ func (x *RoutingTableInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RoutingTableInfo.ProtoReflect.Descriptor instead.
 func (*RoutingTableInfo) Descriptor() ([]byte, []int) {
-	return file_status_proto_rawDescGZIP(), []int{9}
+	return file_status_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *RoutingTableInfo) GetRoutes() []*RouteEntry {
@@ -968,7 +1177,7 @@ type RouteEntry struct {
 
 func (x *RouteEntry) Reset() {
 	*x = RouteEntry{}
-	mi := &file_status_proto_msgTypes[10]
+	mi := &file_status_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -980,7 +1189,7 @@ func (x *RouteEntry) String() string {
 func (*RouteEntry) ProtoMessage() {}
 
 func (x *RouteEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_status_proto_msgTypes[10]
+	mi := &file_status_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -993,7 +1202,7 @@ func (x *RouteEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RouteEntry.ProtoReflect.Descriptor instead.
 func (*RouteEntry) Descriptor() ([]byte, []int) {
-	return file_status_proto_rawDescGZIP(), []int{10}
+	return file_status_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *RouteEntry) GetDestination() string {
@@ -1043,7 +1252,7 @@ type NextHop struct {
 
 func (x *NextHop) Reset() {
 	*x = NextHop{}
-	mi := &file_status_proto_msgTypes[11]
+	mi := &file_status_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1055,7 +1264,7 @@ func (x *NextHop) String() string {
 func (*NextHop) ProtoMessage() {}
 
 func (x *NextHop) ProtoReflect() protoreflect.Message {
-	mi := &file_status_proto_msgTypes[11]
+	mi := &file_status_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1068,7 +1277,7 @@ func (x *NextHop) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NextHop.ProtoReflect.Descriptor instead.
 func (*NextHop) Descriptor() ([]byte, []int) {
-	return file_status_proto_rawDescGZIP(), []int{11}
+	return file_status_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *NextHop) GetGateway() string {
@@ -1151,7 +1360,7 @@ type OptionalBool struct {
 
 func (x *OptionalBool) Reset() {
 	*x = OptionalBool{}
-	mi := &file_status_proto_msgTypes[12]
+	mi := &file_status_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1163,7 +1372,7 @@ func (x *OptionalBool) String() string {
 func (*OptionalBool) ProtoMessage() {}
 
 func (x *OptionalBool) ProtoReflect() protoreflect.Message {
-	mi := &file_status_proto_msgTypes[12]
+	mi := &file_status_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1176,7 +1385,7 @@ func (x *OptionalBool) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OptionalBool.ProtoReflect.Descriptor instead.
 func (*OptionalBool) Descriptor() ([]byte, []int) {
-	return file_status_proto_rawDescGZIP(), []int{12}
+	return file_status_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *OptionalBool) GetValue() bool {
@@ -1198,7 +1407,7 @@ type NextHopInfo struct {
 
 func (x *NextHopInfo) Reset() {
 	*x = NextHopInfo{}
-	mi := &file_status_proto_msgTypes[13]
+	mi := &file_status_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1210,7 +1419,7 @@ func (x *NextHopInfo) String() string {
 func (*NextHopInfo) ProtoMessage() {}
 
 func (x *NextHopInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_status_proto_msgTypes[13]
+	mi := &file_status_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1223,7 +1432,7 @@ func (x *NextHopInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NextHopInfo.ProtoReflect.Descriptor instead.
 func (*NextHopInfo) Descriptor() ([]byte, []int) {
-	return file_status_proto_rawDescGZIP(), []int{13}
+	return file_status_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *NextHopInfo) GetObjectName() string {
@@ -1258,7 +1467,7 @@ type RouteType struct {
 
 func (x *RouteType) Reset() {
 	*x = RouteType{}
-	mi := &file_status_proto_msgTypes[14]
+	mi := &file_status_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1270,7 +1479,7 @@ func (x *RouteType) String() string {
 func (*RouteType) ProtoMessage() {}
 
 func (x *RouteType) ProtoReflect() protoreflect.Message {
-	mi := &file_status_proto_msgTypes[14]
+	mi := &file_status_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1283,7 +1492,7 @@ func (x *RouteType) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RouteType.ProtoReflect.Descriptor instead.
 func (*RouteType) Descriptor() ([]byte, []int) {
-	return file_status_proto_rawDescGZIP(), []int{14}
+	return file_status_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *RouteType) GetType() string {
@@ -1313,7 +1522,7 @@ type HealthCheckStatus struct {
 
 func (x *HealthCheckStatus) Reset() {
 	*x = HealthCheckStatus{}
-	mi := &file_status_proto_msgTypes[15]
+	mi := &file_status_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1325,7 +1534,7 @@ func (x *HealthCheckStatus) String() string {
 func (*HealthCheckStatus) ProtoMessage() {}
 
 func (x *HealthCheckStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_status_proto_msgTypes[15]
+	mi := &file_status_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1338,7 +1547,7 @@ func (x *HealthCheckStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthCheckStatus.ProtoReflect.Descriptor instead.
 func (*HealthCheckStatus) Descriptor() ([]byte, []int) {
-	return file_status_proto_rawDescGZIP(), []int{15}
+	return file_status_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *HealthCheckStatus) GetHealthy() bool {
@@ -1382,7 +1591,7 @@ type HealthCheckPeerStatus struct {
 
 func (x *HealthCheckPeerStatus) Reset() {
 	*x = HealthCheckPeerStatus{}
-	mi := &file_status_proto_msgTypes[16]
+	mi := &file_status_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1394,7 +1603,7 @@ func (x *HealthCheckPeerStatus) String() string {
 func (*HealthCheckPeerStatus) ProtoMessage() {}
 
 func (x *HealthCheckPeerStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_status_proto_msgTypes[16]
+	mi := &file_status_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1407,7 +1616,7 @@ func (x *HealthCheckPeerStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthCheckPeerStatus.ProtoReflect.Descriptor instead.
 func (*HealthCheckPeerStatus) Descriptor() ([]byte, []int) {
-	return file_status_proto_rawDescGZIP(), []int{16}
+	return file_status_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *HealthCheckPeerStatus) GetEnabled() bool {
@@ -1450,7 +1659,7 @@ type NodeError struct {
 
 func (x *NodeError) Reset() {
 	*x = NodeError{}
-	mi := &file_status_proto_msgTypes[17]
+	mi := &file_status_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1462,7 +1671,7 @@ func (x *NodeError) String() string {
 func (*NodeError) ProtoMessage() {}
 
 func (x *NodeError) ProtoReflect() protoreflect.Message {
-	mi := &file_status_proto_msgTypes[17]
+	mi := &file_status_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1475,7 +1684,7 @@ func (x *NodeError) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeError.ProtoReflect.Descriptor instead.
 func (*NodeError) Descriptor() ([]byte, []int) {
-	return file_status_proto_rawDescGZIP(), []int{17}
+	return file_status_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *NodeError) GetType() string {
@@ -1511,7 +1720,7 @@ type NodePodInfo struct {
 
 func (x *NodePodInfo) Reset() {
 	*x = NodePodInfo{}
-	mi := &file_status_proto_msgTypes[18]
+	mi := &file_status_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1523,7 +1732,7 @@ func (x *NodePodInfo) String() string {
 func (*NodePodInfo) ProtoMessage() {}
 
 func (x *NodePodInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_status_proto_msgTypes[18]
+	mi := &file_status_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1536,7 +1745,7 @@ func (x *NodePodInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodePodInfo.ProtoReflect.Descriptor instead.
 func (*NodePodInfo) Descriptor() ([]byte, []int) {
-	return file_status_proto_rawDescGZIP(), []int{18}
+	return file_status_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *NodePodInfo) GetPodName() string {
@@ -1578,7 +1787,7 @@ type BpfEntry struct {
 
 func (x *BpfEntry) Reset() {
 	*x = BpfEntry{}
-	mi := &file_status_proto_msgTypes[19]
+	mi := &file_status_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1590,7 +1799,7 @@ func (x *BpfEntry) String() string {
 func (*BpfEntry) ProtoMessage() {}
 
 func (x *BpfEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_status_proto_msgTypes[19]
+	mi := &file_status_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1603,7 +1812,7 @@ func (x *BpfEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BpfEntry.ProtoReflect.Descriptor instead.
 func (*BpfEntry) Descriptor() ([]byte, []int) {
-	return file_status_proto_rawDescGZIP(), []int{19}
+	return file_status_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *BpfEntry) GetCidr() string {
@@ -1669,21 +1878,240 @@ func (x *BpfEntry) GetHealthy() bool {
 	return false
 }
 
+// NodeStatusOverview carries observed overview facts without detailed arrays.
+type NodeStatusOverview struct {
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	TimestampUnixNs    int64                  `protobuf:"varint,1,opt,name=timestamp_unix_ns,json=timestampUnixNs,proto3" json:"timestamp_unix_ns,omitempty"`
+	NodeInfo           *NodeInfo              `protobuf:"bytes,2,opt,name=node_info,json=nodeInfo,proto3" json:"node_info,omitempty"`
+	HealthCheck        *HealthCheckStatus     `protobuf:"bytes,3,opt,name=health_check,json=healthCheck,proto3" json:"health_check,omitempty"`
+	NodeErrors         []*NodeError           `protobuf:"bytes,4,rep,name=node_errors,json=nodeErrors,proto3" json:"node_errors,omitempty"`
+	FetchError         string                 `protobuf:"bytes,5,opt,name=fetch_error,json=fetchError,proto3" json:"fetch_error,omitempty"`
+	LastPushTimeUnixNs int64                  `protobuf:"varint,6,opt,name=last_push_time_unix_ns,json=lastPushTimeUnixNs,proto3" json:"last_push_time_unix_ns,omitempty"` // 0 means unset
+	StatusSource       string                 `protobuf:"bytes,7,opt,name=status_source,json=statusSource,proto3" json:"status_source,omitempty"`
+	NodePodInfo        *NodePodInfo           `protobuf:"bytes,8,opt,name=node_pod_info,json=nodePodInfo,proto3" json:"node_pod_info,omitempty"`
+	PeerCount          int32                  `protobuf:"varint,9,opt,name=peer_count,json=peerCount,proto3" json:"peer_count,omitempty"`
+	HealthyPeers       int32                  `protobuf:"varint,10,opt,name=healthy_peers,json=healthyPeers,proto3" json:"healthy_peers,omitempty"`
+	RouteCount         int32                  `protobuf:"varint,11,opt,name=route_count,json=routeCount,proto3" json:"route_count,omitempty"`
+	RouteMismatch      bool                   `protobuf:"varint,12,opt,name=route_mismatch,json=routeMismatch,proto3" json:"route_mismatch,omitempty"`
+	RouteMismatchCount int32                  `protobuf:"varint,13,opt,name=route_mismatch_count,json=routeMismatchCount,proto3" json:"route_mismatch_count,omitempty"`
+	UnhealthyPeerLinks int32                  `protobuf:"varint,14,opt,name=unhealthy_peer_links,json=unhealthyPeerLinks,proto3" json:"unhealthy_peer_links,omitempty"` // normalized diagnostic rules, not peer_count - healthy_peers
+	UsesIpip           bool                   `protobuf:"varint,15,opt,name=uses_ipip,json=usesIpip,proto3" json:"uses_ipip,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *NodeStatusOverview) Reset() {
+	*x = NodeStatusOverview{}
+	mi := &file_status_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NodeStatusOverview) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NodeStatusOverview) ProtoMessage() {}
+
+func (x *NodeStatusOverview) ProtoReflect() protoreflect.Message {
+	mi := &file_status_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NodeStatusOverview.ProtoReflect.Descriptor instead.
+func (*NodeStatusOverview) Descriptor() ([]byte, []int) {
+	return file_status_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *NodeStatusOverview) GetTimestampUnixNs() int64 {
+	if x != nil {
+		return x.TimestampUnixNs
+	}
+	return 0
+}
+
+func (x *NodeStatusOverview) GetNodeInfo() *NodeInfo {
+	if x != nil {
+		return x.NodeInfo
+	}
+	return nil
+}
+
+func (x *NodeStatusOverview) GetHealthCheck() *HealthCheckStatus {
+	if x != nil {
+		return x.HealthCheck
+	}
+	return nil
+}
+
+func (x *NodeStatusOverview) GetNodeErrors() []*NodeError {
+	if x != nil {
+		return x.NodeErrors
+	}
+	return nil
+}
+
+func (x *NodeStatusOverview) GetFetchError() string {
+	if x != nil {
+		return x.FetchError
+	}
+	return ""
+}
+
+func (x *NodeStatusOverview) GetLastPushTimeUnixNs() int64 {
+	if x != nil {
+		return x.LastPushTimeUnixNs
+	}
+	return 0
+}
+
+func (x *NodeStatusOverview) GetStatusSource() string {
+	if x != nil {
+		return x.StatusSource
+	}
+	return ""
+}
+
+func (x *NodeStatusOverview) GetNodePodInfo() *NodePodInfo {
+	if x != nil {
+		return x.NodePodInfo
+	}
+	return nil
+}
+
+func (x *NodeStatusOverview) GetPeerCount() int32 {
+	if x != nil {
+		return x.PeerCount
+	}
+	return 0
+}
+
+func (x *NodeStatusOverview) GetHealthyPeers() int32 {
+	if x != nil {
+		return x.HealthyPeers
+	}
+	return 0
+}
+
+func (x *NodeStatusOverview) GetRouteCount() int32 {
+	if x != nil {
+		return x.RouteCount
+	}
+	return 0
+}
+
+func (x *NodeStatusOverview) GetRouteMismatch() bool {
+	if x != nil {
+		return x.RouteMismatch
+	}
+	return false
+}
+
+func (x *NodeStatusOverview) GetRouteMismatchCount() int32 {
+	if x != nil {
+		return x.RouteMismatchCount
+	}
+	return 0
+}
+
+func (x *NodeStatusOverview) GetUnhealthyPeerLinks() int32 {
+	if x != nil {
+		return x.UnhealthyPeerLinks
+	}
+	return 0
+}
+
+func (x *NodeStatusOverview) GetUsesIpip() bool {
+	if x != nil {
+		return x.UsesIpip
+	}
+	return false
+}
+
+// DetailRequest uses the same deadline across all delivery attempts.
+// Standalone commands use ACK status "detail_request", not "ok".
+type DetailRequest struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	RequestId      string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	DeadlineUnixNs int64                  `protobuf:"varint,2,opt,name=deadline_unix_ns,json=deadlineUnixNs,proto3" json:"deadline_unix_ns,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *DetailRequest) Reset() {
+	*x = DetailRequest{}
+	mi := &file_status_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DetailRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DetailRequest) ProtoMessage() {}
+
+func (x *DetailRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_status_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DetailRequest.ProtoReflect.Descriptor instead.
+func (*DetailRequest) Descriptor() ([]byte, []int) {
+	return file_status_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *DetailRequest) GetRequestId() string {
+	if x != nil {
+		return x.RequestId
+	}
+	return ""
+}
+
+func (x *DetailRequest) GetDeadlineUnixNs() int64 {
+	if x != nil {
+		return x.DeadlineUnixNs
+	}
+	return 0
+}
+
 var File_status_proto protoreflect.FileDescriptor
 
 const file_status_proto_rawDesc = "" +
 	"\n" +
-	"\fstatus.proto\x12\x16unboundednet.status.v1\"\xe8\x01\n" +
+	"\fstatus.proto\x12\x16unboundednet.status.v1\"\xa8\x03\n" +
 	"\x11NodeStatusMessage\x12\x12\n" +
 	"\x04type\x18\x01 \x01(\tR\x04type\x12\x1b\n" +
 	"\tnode_name\x18\x02 \x01(\tR\bnodeName\x12#\n" +
 	"\rbase_revision\x18\x03 \x01(\x04R\fbaseRevision\x12>\n" +
 	"\x06status\x18\x04 \x01(\v2&.unboundednet.status.v1.NodeStatusFullR\x06status\x12=\n" +
-	"\x05delta\x18\x05 \x01(\v2'.unboundednet.status.v1.NodeStatusDeltaR\x05delta\"[\n" +
+	"\x05delta\x18\x05 \x01(\v2'.unboundednet.status.v1.NodeStatusDeltaR\x05delta\x12D\n" +
+	"\asummary\x18\x06 \x01(\v2*.unboundednet.status.v1.NodeStatusOverviewR\asummary\x12*\n" +
+	"\x11detail_request_id\x18\a \x01(\tR\x0fdetailRequestId\x12)\n" +
+	"\x10supports_details\x18\b \x01(\bR\x0fsupportsDetails\x12!\n" +
+	"\fdetail_error\x18\t \x01(\tR\vdetailError\"\xaf\x02\n" +
 	"\rNodeStatusAck\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\x12\x1a\n" +
 	"\brevision\x18\x02 \x01(\x04R\brevision\x12\x16\n" +
-	"\x06reason\x18\x03 \x01(\tR\x06reason\"\x9c\x05\n" +
+	"\x06reason\x18\x03 \x01(\tR\x06reason\x12+\n" +
+	"\x11peer_measurements\x18\x04 \x01(\bR\x10peerMeasurements\x12L\n" +
+	"\x0edetail_request\x18\x05 \x01(\v2%.unboundednet.status.v1.DetailRequestR\rdetailRequest\x12+\n" +
+	"\x11summary_supported\x18\x06 \x01(\bR\x10summarySupported\x12*\n" +
+	"\x11detail_request_id\x18\a \x01(\tR\x0fdetailRequestId\"\x9c\x05\n" +
 	"\x0eNodeStatusFull\x12*\n" +
 	"\x11timestamp_unix_ns\x18\x01 \x01(\x03R\x0ftimestampUnixNs\x12=\n" +
 	"\tnode_info\x18\x02 \x01(\v2 .unboundednet.status.v1.NodeInfoR\bnodeInfo\x128\n" +
@@ -1699,7 +2127,7 @@ const file_status_proto_rawDesc = "" +
 	"\rnode_pod_info\x18\n" +
 	" \x01(\v2#.unboundednet.status.v1.NodePodInfoR\vnodePodInfo\x12A\n" +
 	"\vbpf_entries\x18\v \x03(\v2 .unboundednet.status.v1.BpfEntryR\n" +
-	"bpfEntries\"\xd5\x03\n" +
+	"bpfEntries\"\x9b\x06\n" +
 	"\x0fNodeStatusDelta\x12=\n" +
 	"\tnode_info\x18\x01 \x01(\v2 .unboundednet.status.v1.NodeInfoR\bnodeInfo\x128\n" +
 	"\x05peers\x18\x02 \x03(\v2\".unboundednet.status.v1.PeerStatusR\x05peers\x12M\n" +
@@ -1709,7 +2137,24 @@ const file_status_proto_rawDesc = "" +
 	"nodeErrors\x12%\n" +
 	"\x0eupdated_fields\x18\x0f \x03(\tR\rupdatedFields\x12A\n" +
 	"\vbpf_entries\x18\x06 \x03(\v2 .unboundednet.status.v1.BpfEntryR\n" +
-	"bpfEntries\"\xc5\x05\n" +
+	"bpfEntries\x12U\n" +
+	"\x11peer_measurements\x18\a \x01(\v2(.unboundednet.status.v1.PeerMeasurementsR\x10peerMeasurements\x12*\n" +
+	"\x11timestamp_unix_ns\x18\b \x01(\x03R\x0ftimestampUnixNs\x12\x1f\n" +
+	"\vfetch_error\x18\t \x01(\tR\n" +
+	"fetchError\x122\n" +
+	"\x16last_push_time_unix_ns\x18\n" +
+	" \x01(\x03R\x12lastPushTimeUnixNs\x12#\n" +
+	"\rstatus_source\x18\v \x01(\tR\fstatusSource\x12G\n" +
+	"\rnode_pod_info\x18\f \x01(\v2#.unboundednet.status.v1.NodePodInfoR\vnodePodInfo\"\xef\x01\n" +
+	"\x10PeerMeasurements\x12\x1d\n" +
+	"\n" +
+	"peer_count\x18\x01 \x01(\rR\tpeerCount\x12'\n" +
+	"\x0fidentity_digest\x18\x02 \x01(\fR\x0eidentityDigest\x12\x19\n" +
+	"\brx_bytes\x18\x03 \x03(\x03R\arxBytes\x12\x19\n" +
+	"\btx_bytes\x18\x04 \x03(\x03R\atxBytes\x123\n" +
+	"\x16last_handshake_unix_ns\x18\x05 \x03(\x03R\x13lastHandshakeUnixNs\x12\x16\n" +
+	"\x06uptime\x18\x06 \x03(\tR\x06uptime\x12\x10\n" +
+	"\x03rtt\x18\a \x03(\tR\x03rtt\"\xc5\x05\n" +
 	"\bNodeInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1b\n" +
 	"\tsite_name\x18\x02 \x01(\tR\bsiteName\x12\x1d\n" +
@@ -1840,7 +2285,32 @@ const file_status_proto_rawDesc = "" +
 	"\x03vni\x18\x06 \x01(\rR\x03vni\x12\x10\n" +
 	"\x03mtu\x18\a \x01(\x05R\x03mtu\x12\x18\n" +
 	"\aifindex\x18\b \x01(\rR\aifindex\x12\x18\n" +
-	"\ahealthy\x18\t \x01(\bR\ahealthyB6Z4github.com/Azure/unbounded/internal/net/status/protob\x06proto3"
+	"\ahealthy\x18\t \x01(\bR\ahealthy\"\xe1\x05\n" +
+	"\x12NodeStatusOverview\x12*\n" +
+	"\x11timestamp_unix_ns\x18\x01 \x01(\x03R\x0ftimestampUnixNs\x12=\n" +
+	"\tnode_info\x18\x02 \x01(\v2 .unboundednet.status.v1.NodeInfoR\bnodeInfo\x12L\n" +
+	"\fhealth_check\x18\x03 \x01(\v2).unboundednet.status.v1.HealthCheckStatusR\vhealthCheck\x12B\n" +
+	"\vnode_errors\x18\x04 \x03(\v2!.unboundednet.status.v1.NodeErrorR\n" +
+	"nodeErrors\x12\x1f\n" +
+	"\vfetch_error\x18\x05 \x01(\tR\n" +
+	"fetchError\x122\n" +
+	"\x16last_push_time_unix_ns\x18\x06 \x01(\x03R\x12lastPushTimeUnixNs\x12#\n" +
+	"\rstatus_source\x18\a \x01(\tR\fstatusSource\x12G\n" +
+	"\rnode_pod_info\x18\b \x01(\v2#.unboundednet.status.v1.NodePodInfoR\vnodePodInfo\x12\x1d\n" +
+	"\n" +
+	"peer_count\x18\t \x01(\x05R\tpeerCount\x12#\n" +
+	"\rhealthy_peers\x18\n" +
+	" \x01(\x05R\fhealthyPeers\x12\x1f\n" +
+	"\vroute_count\x18\v \x01(\x05R\n" +
+	"routeCount\x12%\n" +
+	"\x0eroute_mismatch\x18\f \x01(\bR\rrouteMismatch\x120\n" +
+	"\x14route_mismatch_count\x18\r \x01(\x05R\x12routeMismatchCount\x120\n" +
+	"\x14unhealthy_peer_links\x18\x0e \x01(\x05R\x12unhealthyPeerLinks\x12\x1b\n" +
+	"\tuses_ipip\x18\x0f \x01(\bR\busesIpip\"X\n" +
+	"\rDetailRequest\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\x01 \x01(\tR\trequestId\x12(\n" +
+	"\x10deadline_unix_ns\x18\x02 \x01(\x03R\x0edeadlineUnixNsB6Z4github.com/Azure/unbounded/internal/net/status/protob\x06proto3"
 
 var (
 	file_status_proto_rawDescOnce sync.Once
@@ -1854,64 +2324,75 @@ func file_status_proto_rawDescGZIP() []byte {
 	return file_status_proto_rawDescData
 }
 
-var file_status_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
+var file_status_proto_msgTypes = make([]protoimpl.MessageInfo, 25)
 var file_status_proto_goTypes = []any{
 	(*NodeStatusMessage)(nil),     // 0: unboundednet.status.v1.NodeStatusMessage
 	(*NodeStatusAck)(nil),         // 1: unboundednet.status.v1.NodeStatusAck
 	(*NodeStatusFull)(nil),        // 2: unboundednet.status.v1.NodeStatusFull
 	(*NodeStatusDelta)(nil),       // 3: unboundednet.status.v1.NodeStatusDelta
-	(*NodeInfo)(nil),              // 4: unboundednet.status.v1.NodeInfo
-	(*BuildInfo)(nil),             // 5: unboundednet.status.v1.BuildInfo
-	(*WireGuardStatusInfo)(nil),   // 6: unboundednet.status.v1.WireGuardStatusInfo
-	(*PeerStatus)(nil),            // 7: unboundednet.status.v1.PeerStatus
-	(*PeerTunnelStatus)(nil),      // 8: unboundednet.status.v1.PeerTunnelStatus
-	(*RoutingTableInfo)(nil),      // 9: unboundednet.status.v1.RoutingTableInfo
-	(*RouteEntry)(nil),            // 10: unboundednet.status.v1.RouteEntry
-	(*NextHop)(nil),               // 11: unboundednet.status.v1.NextHop
-	(*OptionalBool)(nil),          // 12: unboundednet.status.v1.OptionalBool
-	(*NextHopInfo)(nil),           // 13: unboundednet.status.v1.NextHopInfo
-	(*RouteType)(nil),             // 14: unboundednet.status.v1.RouteType
-	(*HealthCheckStatus)(nil),     // 15: unboundednet.status.v1.HealthCheckStatus
-	(*HealthCheckPeerStatus)(nil), // 16: unboundednet.status.v1.HealthCheckPeerStatus
-	(*NodeError)(nil),             // 17: unboundednet.status.v1.NodeError
-	(*NodePodInfo)(nil),           // 18: unboundednet.status.v1.NodePodInfo
-	(*BpfEntry)(nil),              // 19: unboundednet.status.v1.BpfEntry
-	nil,                           // 20: unboundednet.status.v1.NodeInfo.K8sLabelsEntry
-	nil,                           // 21: unboundednet.status.v1.PeerStatus.RouteDistancesEntry
+	(*PeerMeasurements)(nil),      // 4: unboundednet.status.v1.PeerMeasurements
+	(*NodeInfo)(nil),              // 5: unboundednet.status.v1.NodeInfo
+	(*BuildInfo)(nil),             // 6: unboundednet.status.v1.BuildInfo
+	(*WireGuardStatusInfo)(nil),   // 7: unboundednet.status.v1.WireGuardStatusInfo
+	(*PeerStatus)(nil),            // 8: unboundednet.status.v1.PeerStatus
+	(*PeerTunnelStatus)(nil),      // 9: unboundednet.status.v1.PeerTunnelStatus
+	(*RoutingTableInfo)(nil),      // 10: unboundednet.status.v1.RoutingTableInfo
+	(*RouteEntry)(nil),            // 11: unboundednet.status.v1.RouteEntry
+	(*NextHop)(nil),               // 12: unboundednet.status.v1.NextHop
+	(*OptionalBool)(nil),          // 13: unboundednet.status.v1.OptionalBool
+	(*NextHopInfo)(nil),           // 14: unboundednet.status.v1.NextHopInfo
+	(*RouteType)(nil),             // 15: unboundednet.status.v1.RouteType
+	(*HealthCheckStatus)(nil),     // 16: unboundednet.status.v1.HealthCheckStatus
+	(*HealthCheckPeerStatus)(nil), // 17: unboundednet.status.v1.HealthCheckPeerStatus
+	(*NodeError)(nil),             // 18: unboundednet.status.v1.NodeError
+	(*NodePodInfo)(nil),           // 19: unboundednet.status.v1.NodePodInfo
+	(*BpfEntry)(nil),              // 20: unboundednet.status.v1.BpfEntry
+	(*NodeStatusOverview)(nil),    // 21: unboundednet.status.v1.NodeStatusOverview
+	(*DetailRequest)(nil),         // 22: unboundednet.status.v1.DetailRequest
+	nil,                           // 23: unboundednet.status.v1.NodeInfo.K8sLabelsEntry
+	nil,                           // 24: unboundednet.status.v1.PeerStatus.RouteDistancesEntry
 }
 var file_status_proto_depIdxs = []int32{
 	2,  // 0: unboundednet.status.v1.NodeStatusMessage.status:type_name -> unboundednet.status.v1.NodeStatusFull
 	3,  // 1: unboundednet.status.v1.NodeStatusMessage.delta:type_name -> unboundednet.status.v1.NodeStatusDelta
-	4,  // 2: unboundednet.status.v1.NodeStatusFull.node_info:type_name -> unboundednet.status.v1.NodeInfo
-	7,  // 3: unboundednet.status.v1.NodeStatusFull.peers:type_name -> unboundednet.status.v1.PeerStatus
-	9,  // 4: unboundednet.status.v1.NodeStatusFull.routing_table:type_name -> unboundednet.status.v1.RoutingTableInfo
-	15, // 5: unboundednet.status.v1.NodeStatusFull.health_check:type_name -> unboundednet.status.v1.HealthCheckStatus
-	17, // 6: unboundednet.status.v1.NodeStatusFull.node_errors:type_name -> unboundednet.status.v1.NodeError
-	18, // 7: unboundednet.status.v1.NodeStatusFull.node_pod_info:type_name -> unboundednet.status.v1.NodePodInfo
-	19, // 8: unboundednet.status.v1.NodeStatusFull.bpf_entries:type_name -> unboundednet.status.v1.BpfEntry
-	4,  // 9: unboundednet.status.v1.NodeStatusDelta.node_info:type_name -> unboundednet.status.v1.NodeInfo
-	7,  // 10: unboundednet.status.v1.NodeStatusDelta.peers:type_name -> unboundednet.status.v1.PeerStatus
-	9,  // 11: unboundednet.status.v1.NodeStatusDelta.routing_table:type_name -> unboundednet.status.v1.RoutingTableInfo
-	15, // 12: unboundednet.status.v1.NodeStatusDelta.health_check:type_name -> unboundednet.status.v1.HealthCheckStatus
-	17, // 13: unboundednet.status.v1.NodeStatusDelta.node_errors:type_name -> unboundednet.status.v1.NodeError
-	19, // 14: unboundednet.status.v1.NodeStatusDelta.bpf_entries:type_name -> unboundednet.status.v1.BpfEntry
-	5,  // 15: unboundednet.status.v1.NodeInfo.build_info:type_name -> unboundednet.status.v1.BuildInfo
-	6,  // 16: unboundednet.status.v1.NodeInfo.wire_guard:type_name -> unboundednet.status.v1.WireGuardStatusInfo
-	20, // 17: unboundednet.status.v1.NodeInfo.k8s_labels:type_name -> unboundednet.status.v1.NodeInfo.K8sLabelsEntry
-	21, // 18: unboundednet.status.v1.PeerStatus.route_distances:type_name -> unboundednet.status.v1.PeerStatus.RouteDistancesEntry
-	8,  // 19: unboundednet.status.v1.PeerStatus.tunnel:type_name -> unboundednet.status.v1.PeerTunnelStatus
-	16, // 20: unboundednet.status.v1.PeerStatus.health_check:type_name -> unboundednet.status.v1.HealthCheckPeerStatus
-	10, // 21: unboundednet.status.v1.RoutingTableInfo.routes:type_name -> unboundednet.status.v1.RouteEntry
-	11, // 22: unboundednet.status.v1.RouteEntry.next_hops:type_name -> unboundednet.status.v1.NextHop
-	14, // 23: unboundednet.status.v1.NextHop.route_types:type_name -> unboundednet.status.v1.RouteType
-	12, // 24: unboundednet.status.v1.NextHop.expected:type_name -> unboundednet.status.v1.OptionalBool
-	12, // 25: unboundednet.status.v1.NextHop.present:type_name -> unboundednet.status.v1.OptionalBool
-	13, // 26: unboundednet.status.v1.NextHop.info:type_name -> unboundednet.status.v1.NextHopInfo
-	27, // [27:27] is the sub-list for method output_type
-	27, // [27:27] is the sub-list for method input_type
-	27, // [27:27] is the sub-list for extension type_name
-	27, // [27:27] is the sub-list for extension extendee
-	0,  // [0:27] is the sub-list for field type_name
+	21, // 2: unboundednet.status.v1.NodeStatusMessage.summary:type_name -> unboundednet.status.v1.NodeStatusOverview
+	22, // 3: unboundednet.status.v1.NodeStatusAck.detail_request:type_name -> unboundednet.status.v1.DetailRequest
+	5,  // 4: unboundednet.status.v1.NodeStatusFull.node_info:type_name -> unboundednet.status.v1.NodeInfo
+	8,  // 5: unboundednet.status.v1.NodeStatusFull.peers:type_name -> unboundednet.status.v1.PeerStatus
+	10, // 6: unboundednet.status.v1.NodeStatusFull.routing_table:type_name -> unboundednet.status.v1.RoutingTableInfo
+	16, // 7: unboundednet.status.v1.NodeStatusFull.health_check:type_name -> unboundednet.status.v1.HealthCheckStatus
+	18, // 8: unboundednet.status.v1.NodeStatusFull.node_errors:type_name -> unboundednet.status.v1.NodeError
+	19, // 9: unboundednet.status.v1.NodeStatusFull.node_pod_info:type_name -> unboundednet.status.v1.NodePodInfo
+	20, // 10: unboundednet.status.v1.NodeStatusFull.bpf_entries:type_name -> unboundednet.status.v1.BpfEntry
+	5,  // 11: unboundednet.status.v1.NodeStatusDelta.node_info:type_name -> unboundednet.status.v1.NodeInfo
+	8,  // 12: unboundednet.status.v1.NodeStatusDelta.peers:type_name -> unboundednet.status.v1.PeerStatus
+	10, // 13: unboundednet.status.v1.NodeStatusDelta.routing_table:type_name -> unboundednet.status.v1.RoutingTableInfo
+	16, // 14: unboundednet.status.v1.NodeStatusDelta.health_check:type_name -> unboundednet.status.v1.HealthCheckStatus
+	18, // 15: unboundednet.status.v1.NodeStatusDelta.node_errors:type_name -> unboundednet.status.v1.NodeError
+	20, // 16: unboundednet.status.v1.NodeStatusDelta.bpf_entries:type_name -> unboundednet.status.v1.BpfEntry
+	4,  // 17: unboundednet.status.v1.NodeStatusDelta.peer_measurements:type_name -> unboundednet.status.v1.PeerMeasurements
+	19, // 18: unboundednet.status.v1.NodeStatusDelta.node_pod_info:type_name -> unboundednet.status.v1.NodePodInfo
+	6,  // 19: unboundednet.status.v1.NodeInfo.build_info:type_name -> unboundednet.status.v1.BuildInfo
+	7,  // 20: unboundednet.status.v1.NodeInfo.wire_guard:type_name -> unboundednet.status.v1.WireGuardStatusInfo
+	23, // 21: unboundednet.status.v1.NodeInfo.k8s_labels:type_name -> unboundednet.status.v1.NodeInfo.K8sLabelsEntry
+	24, // 22: unboundednet.status.v1.PeerStatus.route_distances:type_name -> unboundednet.status.v1.PeerStatus.RouteDistancesEntry
+	9,  // 23: unboundednet.status.v1.PeerStatus.tunnel:type_name -> unboundednet.status.v1.PeerTunnelStatus
+	17, // 24: unboundednet.status.v1.PeerStatus.health_check:type_name -> unboundednet.status.v1.HealthCheckPeerStatus
+	11, // 25: unboundednet.status.v1.RoutingTableInfo.routes:type_name -> unboundednet.status.v1.RouteEntry
+	12, // 26: unboundednet.status.v1.RouteEntry.next_hops:type_name -> unboundednet.status.v1.NextHop
+	15, // 27: unboundednet.status.v1.NextHop.route_types:type_name -> unboundednet.status.v1.RouteType
+	13, // 28: unboundednet.status.v1.NextHop.expected:type_name -> unboundednet.status.v1.OptionalBool
+	13, // 29: unboundednet.status.v1.NextHop.present:type_name -> unboundednet.status.v1.OptionalBool
+	14, // 30: unboundednet.status.v1.NextHop.info:type_name -> unboundednet.status.v1.NextHopInfo
+	5,  // 31: unboundednet.status.v1.NodeStatusOverview.node_info:type_name -> unboundednet.status.v1.NodeInfo
+	16, // 32: unboundednet.status.v1.NodeStatusOverview.health_check:type_name -> unboundednet.status.v1.HealthCheckStatus
+	18, // 33: unboundednet.status.v1.NodeStatusOverview.node_errors:type_name -> unboundednet.status.v1.NodeError
+	19, // 34: unboundednet.status.v1.NodeStatusOverview.node_pod_info:type_name -> unboundednet.status.v1.NodePodInfo
+	35, // [35:35] is the sub-list for method output_type
+	35, // [35:35] is the sub-list for method input_type
+	35, // [35:35] is the sub-list for extension type_name
+	35, // [35:35] is the sub-list for extension extendee
+	0,  // [0:35] is the sub-list for field type_name
 }
 
 func init() { file_status_proto_init() }
@@ -1925,7 +2406,7 @@ func file_status_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_status_proto_rawDesc), len(file_status_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   22,
+			NumMessages:   25,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

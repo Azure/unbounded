@@ -3,7 +3,10 @@
 
 package healthcheck
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // SessionState represents the health state of a peer session.
 type SessionState int
@@ -42,11 +45,32 @@ type HealthCheckSettings struct {
 // DefaultSettings returns the default health check settings.
 func DefaultSettings() HealthCheckSettings {
 	return HealthCheckSettings{
-		TransmitInterval: 1000 * time.Millisecond,
-		ReceiveInterval:  1000 * time.Millisecond,
+		TransmitInterval: 15 * time.Second,
+		ReceiveInterval:  15 * time.Second,
 		DetectMultiplier: 3,
 		MaxBackoff:       120 * time.Second,
 	}
+}
+
+func (s HealthCheckSettings) validate() error {
+	if s.TransmitInterval <= 0 || s.ReceiveInterval <= 0 {
+		return fmt.Errorf("health check intervals must be positive")
+	}
+
+	if s.DetectMultiplier < 1 || s.DetectMultiplier > 255 {
+		return fmt.Errorf("health check detect multiplier must be between 1 and 255")
+	}
+
+	const maxDuration = time.Duration(1<<63 - 1)
+	if max(s.TransmitInterval, s.ReceiveInterval) > maxDuration/time.Duration(s.DetectMultiplier) {
+		return fmt.Errorf("health check detection timeout overflows time.Duration")
+	}
+
+	if s.MaxBackoff < 0 {
+		return fmt.Errorf("health check maximum backoff must not be negative")
+	}
+
+	return nil
 }
 
 // PeerStatus contains the current health status of a peer.

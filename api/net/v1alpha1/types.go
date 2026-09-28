@@ -92,12 +92,14 @@ type HealthCheckSettings struct {
 
 	// ReceiveInterval is the minimum interval between received health check packets.
 	// Accepts either a duration string (e.g. "300ms") or an integer interpreted as milliseconds.
+	// Defaults to 15s when omitted from the selected health check scope.
 	// +kubebuilder:validation:XIntOrString
 	// +optional
 	ReceiveInterval *intstr.IntOrString `json:"receiveInterval,omitempty"`
 
 	// TransmitInterval is the minimum interval between transmitted health check packets.
 	// Accepts either a duration string (e.g. "300ms") or an integer interpreted as milliseconds.
+	// Defaults to 15s when omitted from the selected health check scope.
 	// +kubebuilder:validation:XIntOrString
 	// +optional
 	TransmitInterval *intstr.IntOrString `json:"transmitInterval,omitempty"`

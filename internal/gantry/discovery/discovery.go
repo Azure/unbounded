@@ -25,7 +25,7 @@
 // lookup latency, self-test success rate); in test mode where
 // no Monitor is wired it returns 1.0.
 // - Bootstrap pulls from operator-supplied `Libp2pBootstrapPeers` plus the
-// dynamic holder addresses stored in the 64 chair Leases. ConnectPeers dials
+// dynamic holder addresses stored in the configured chair Leases. ConnectPeers dials
 // those addresses with the bounded bootstrap cascade.
 package discovery
 

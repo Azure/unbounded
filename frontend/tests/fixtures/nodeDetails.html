@@ -1,0 +1,50 @@
+<!doctype html>
+<!-- Copyright (c) Microsoft Corporation.
+     SPDX-License-Identifier: Apache-2.0 -->
+<html lang="en">
+  <head><meta charset="utf-8"><title>Node details lifecycle test</title></head>
+  <body>
+    <div id="root"></div>
+    <button id="unmount">Unmount</button>
+    <script type="module">
+      import React, { useState } from 'react';
+      import { createRoot } from 'react-dom/client';
+      import useNodeDetails from '/src/hooks/useNodeDetails';
+      import NodeDetailDialog from '/src/components/nodes/NodeDetailDialog';
+
+      function Harness() {
+        const [selected, select] = useState(null);
+        const [tab, selectTab] = useState('peerings');
+        const [summary, updateSummary] = useState(() => ({
+          name: 'node-a', siteName: 'site-a', k8sReady: 'Ready',
+          cniStatus: 'Healthy', cniTone: 'success', statusSource: 'ws',
+          lastPushTime: new Date().toISOString(),
+          nodeInfo: {
+            internalIPs: ['192.0.2.10'], podCIDRs: ['10.1.0.0/24'],
+            kernel: 'summary-kernel', buildInfo: { version: 'summary-build' },
+          },
+        }));
+        const { detail, load } = useNodeDetails(selected);
+        return React.createElement(React.Fragment, null,
+          React.createElement('button', { onClick: () => select('node-a') }, 'Open node'),
+          React.createElement('button', {
+            onClick: () => updateSummary((previous) => ({
+              ...previous, cniStatus: 'Route mismatch', cniTone: 'warning',
+              nodeInfo: { ...previous.nodeInfo, kernel: 'updated-summary-kernel' },
+            })),
+          }, 'Update summary'),
+          React.createElement(NodeDetailDialog, {
+            nodeName: selected, summary, detail, onLoad: load,
+            allNodeNames: ['node-a'], gatewayByNode: new Map(),
+            theme: 'light', detailTab: tab,
+            onDetailTabChange: selectTab, onSelectNode: select,
+            onClose: () => select(null),
+          }),
+        );
+      }
+      const root = createRoot(document.getElementById('root'));
+      root.render(React.createElement(React.StrictMode, null, React.createElement(Harness)));
+      document.getElementById('unmount').onclick = () => root.unmount();
+    </script>
+  </body>
+</html>

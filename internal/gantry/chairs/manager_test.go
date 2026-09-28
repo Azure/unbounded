@@ -148,7 +148,7 @@ func TestManagerReadyRequiresCurrentEpochSnapshot(t *testing.T) {
 		Self:           chairs.Holder{PeerID: "self"},
 		Now:            func() time.Time { return clock },
 		RotationPeriod: time.Hour,
-		SeedCount:      chairs.SeedCount,
+		ChairCount:     chairs.SeedCount,
 	})
 	if err := manager.Initialize(context.Background()); err != nil {
 		t.Fatalf("Initialize: %v", err)
@@ -489,8 +489,8 @@ func TestStoreRenewPreservesSuccessorAndRotateIncrementsGeneration(t *testing.T)
 }
 
 func emptyChairObjects(namespace string) []runtime.Object {
-	objects := make([]runtime.Object, 0, chairs.Count)
-	for index := range chairs.Count {
+	objects := make([]runtime.Object, 0, chairs.DefaultCount)
+	for index := range chairs.DefaultCount {
 		objects = append(objects, &coordinationv1.Lease{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      chairs.ID(index).Name(),

@@ -27,6 +27,7 @@ name: unbounded release
 #     -> component-images  (matrix: machina, machine-ops-controller, unbounded-operator,
 #                           orca, gantry, unbounded-storage-supervisor, host-ubuntu2404,
 #                           inventory-aggregator, inventory-inspector, inventory-viewer)
+#         -> gantry-chart  (OCI chart + signed downloadable archive)
 #     -> manifests-tarball (make release-manifests + cosign sign)
 #     -> storage-binaries  (matrix: amd64, arm64; binary + bundled libfabric)
 #     -> finalize          (attach extras + krew manifest)
@@ -364,7 +365,7 @@ jobs:
               -o "$file"
           fi
 
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -382,7 +383,7 @@ jobs:
 
       # Trivy scan on a single-platform load build before pushing.
       - name: Build controller for scanning
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: images/net/Containerfile
@@ -408,7 +409,7 @@ jobs:
           exit-code: "1"
 
       - name: Build node for scanning
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: images/net/Containerfile
@@ -448,7 +449,7 @@ jobs:
 
       - name: Push controller image
         id: push_controller
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: images/net/Containerfile
@@ -467,7 +468,7 @@ jobs:
 
       - name: Push node image
         id: push_node
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: images/net/Containerfile
@@ -578,7 +579,7 @@ jobs:
       - name: Normalize container registry to lowercase
         run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
 
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -636,11 +637,11 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
-      - uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
           platforms: linux/amd64,linux/arm64
 
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to ghcr.io
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -651,7 +652,7 @@ jobs:
 
       - name: Build and push image
         id: push
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: images/netboot/Containerfile
@@ -720,11 +721,11 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
-      - uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
           platforms: linux/amd64,linux/arm64
 
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to ghcr.io
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -734,7 +735,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build image for scanning
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: images/metalman/Containerfile
@@ -757,7 +758,7 @@ jobs:
 
       - name: Build and push image
         id: push
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: images/metalman/Containerfile
@@ -882,11 +883,11 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
-      - uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
           platforms: linux/amd64,linux/arm64
 
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to ghcr.io
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -897,7 +898,7 @@ jobs:
 
       - name: Build image for scanning
         if: matrix.component.trivy
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ${{ matrix.component.file }}
@@ -920,7 +921,7 @@ jobs:
 
       - name: Build and push image
         id: push
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ${{ matrix.component.file }}
@@ -972,6 +973,85 @@ jobs:
           set -euo pipefail
 
           gh release upload "$TAG" "sbom-${{ matrix.component.name }}.spdx.json" --clobber
+
+  # ---------------------------------------------------------------------------
+  # Package the same Gantry chart revision used to render the operator's
+  # embedded manifests, publish it as an OCI artifact, and attach a signed
+  # chart archive for users that require an offline install path.
+  # ---------------------------------------------------------------------------
+  gantry-chart:
+    needs: [version, component-images]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Normalize container registry to lowercase
+        run: echo "REGISTRY=${REGISTRY,,}" >> "$GITHUB_ENV"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Package Gantry chart
+        run: |
+          set -euo pipefail
+
+          TAG="${{ needs.version.outputs.tag }}"
+          CHART_VERSION="${TAG#v}"
+          make gantry-chart-package \
+            VERSION="${TAG}" \
+            CONTAINER_REGISTRY="${REGISTRY}" \
+            GANTRY_CHART_VERSION="${CHART_VERSION}" \
+            GANTRY_CHART_APP_VERSION="${TAG}"
+
+      - name: Log in to the Helm registry
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GH_TOKEN" | bin/helm registry login ghcr.io \
+            --username "${{ github.actor }}" \
+            --password-stdin
+
+      - name: Push and sign Gantry chart
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          CHART_VERSION="${TAG#v}"
+          CHART="build/charts/gantry-${CHART_VERSION}.tgz"
+          OUTPUT="$(bin/helm push "$CHART" "oci://${REGISTRY}/charts")"
+          printf '%s\n' "$OUTPUT"
+
+          DIGEST="$(awk '$1 == "Digest:" {print $2}' <<<"$OUTPUT")"
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::could not resolve pushed Gantry chart digest"
+            exit 1
+          fi
+
+          cosign sign --yes "${REGISTRY}/charts/gantry@${DIGEST}"
+          cosign sign-blob --yes \
+            --bundle="${CHART}.bundle.json" \
+            "$CHART"
+
+      - name: Attach chart to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          CHART_VERSION="${TAG#v}"
+          gh release upload "$TAG" \
+            "build/charts/gantry-${CHART_VERSION}.tgz" \
+            "build/charts/gantry-${CHART_VERSION}.tgz.bundle.json" \
+            --clobber
 
   # ---------------------------------------------------------------------------
   # Build the stamped combined manifests tarball and directly applicable
@@ -1169,6 +1249,7 @@ jobs:
       - netboot-image
       - metalman-image
       - component-images
+      - gantry-chart
       - manifests-tarball
       - storage-binaries
     runs-on: ubuntu-latest

@@ -240,7 +240,7 @@ func runAgent(args []string) error {
 		}
 
 		chairStore = chairs.NewStore(chairClient.CoordinationV1().Leases(c.ChairNamespace))
-		chairCache = chairs.NewCache(chairStore, c.ChairSeedCount)
+		chairCache = chairs.NewCache(chairStore, c.ChairCount)
 	}
 
 	// Without a chair namespace every cold pull falls back to the origin
@@ -249,6 +249,9 @@ func runAgent(args []string) error {
 		slog.Bool("chairs_active", c.ChairNamespace != ""),
 		slog.String("chair_namespace", c.ChairNamespace),
 		slog.String("chair_listen", c.ChairListen),
+		slog.String("chair_capacity_daemonset", c.ChairCapacityDaemonSet),
+		slog.Int("chair_count", c.ChairCount),
+		slog.Int("chair_seed_count", c.ChairSeedCount),
 	)
 
 	const kademliaMaxRoutingTable = 256
@@ -316,7 +319,13 @@ func runAgent(args []string) error {
 	)
 
 	var chairManager *chairs.Manager
+
 	if chairStore != nil {
+		capacity := daemonSetChairCapacity{
+			daemonSets: chairClient.AppsV1().DaemonSets(c.ChairNamespace),
+			name:       c.ChairCapacityDaemonSet,
+			maximum:    c.ChairCount,
+		}
 		chairManager = chairs.NewManager(chairs.ManagerOptions{
 			Store:      chairStore,
 			Cache:      chairCache,
@@ -327,6 +336,7 @@ func runAgent(args []string) error {
 				return disco.ConnectPeers(connectCtx, addresses)
 			},
 			BootstrapHealthy:    func() bool { return disco.RoutingTableSize() > 0 },
+			HolderTarget:        capacity.HolderTarget,
 			Logger:              logger,
 			LeaseDuration:       c.ChairLeaseDuration,
 			RenewPeriod:         c.ChairRenewPeriod,
@@ -338,7 +348,7 @@ func runAgent(args []string) error {
 			ClaimInitialDivisor: uint64(c.ChairClaimInitialDivisor),
 			APITimeout:          c.ChairAPITimeout,
 			ClusterSizeEstimate: c.ChairClusterSizeEstimate,
-			SeedCount:           c.ChairSeedCount,
+			ChairCount:          c.ChairCount,
 		})
 	}
 	// pullerPump bridges inbound please_pull RPCs to the local origin
@@ -372,7 +382,7 @@ func runAgent(args []string) error {
 
 		p9.containerdIngestFailure.Inc()
 	}
-	pullerPump := newPullerPump(inflightMap, pullOriginClient, cstore, negCache, logger, pullerPumpGate, c.CoordMaxConcurrentPulls, func(ctx context.Context, d digest.Digest) bool {
+	pullerPump := newPullerPump(inflightMap, pullOriginClient, cstore, negCache, logger, pullerPumpGate, c.CoordMaxConcurrentPulls, c.OriginPullProgressTimeout, func(ctx context.Context, d digest.Digest) bool {
 		return adv.Notify(ctx, d, true)
 	}, originSuccessWithIngest, downstreamFailureWithIngest, leaseHooks, pumpMetricHooks{
 		OnQueueWait:    func(kind string, seconds float64) { inst.originPullQueueWait.WithLabelValues(kind).Observe(seconds) },
@@ -450,6 +460,7 @@ func runAgent(args []string) error {
 			Claimer:               chairManager,
 			Logger:                logger,
 			APITimeout:            c.ChairAPITimeout,
+			ChairCount:            c.ChairCount,
 			SeedCount:             c.ChairSeedCount,
 			TrustedFailureClasses: configuredFailureClasses(c.OriginFailureClassesTrustedClusterWide),
 			OnSeedRecruit: func(kind string, selectable, contacted, accepted int) {
@@ -467,8 +478,8 @@ func runAgent(args []string) error {
 		coldStartResolver = coldStartAdapter{r: realResolver}
 		layerPrefetcher = newLayerPrefetcher(realResolver, cstore, logger, layerProgress.observeManifest)
 		logger.Info("Lease-chair cold-start orchestrator wired",
-			slog.Int("chairs", chairs.Count),
-			slog.Int("seeds", c.ChairSeedCount),
+			slog.Int("chair_count", c.ChairCount),
+			slog.Int("seed_count", c.ChairSeedCount),
 		)
 	} else {
 		logger.Info("Lease-chair cold-start orchestrator disabled (no Kubernetes namespace configured)")
@@ -801,7 +812,7 @@ func runAgent(args []string) error {
 		}
 
 		if chairManager != nil && !chairManager.Ready() {
-			return fmt.Sprintf("no Lease chair held and fewer than %d are selectable", c.ChairSeedCount), false
+			return "no selectable Lease chair", false
 		}
 
 		if checkDialable && noDialableP2PAddrs {
@@ -827,7 +838,12 @@ func runAgent(args []string) error {
 			return "transfer listener family mismatches Pod IP; check transfer_listen vs Pod IP family", false
 		}
 
-		if chairManager != nil && c.ChairClusterSizeEstimate > 1 && disco.RoutingTableSize() < 1 {
+		holdingChair := false
+		if chairManager != nil {
+			_, holdingChair = chairManager.Held()
+		}
+
+		if chairManager != nil && !chairDHTReady(c.ChairClusterSizeEstimate, disco.RoutingTableSize(), holdingChair) {
 			return "dht routing table empty", false
 		}
 
@@ -1568,6 +1584,26 @@ type preIngestLeaseStore interface {
 	CreateLease(ctx context.Context, d digest.Digest, registry, repository string) (*containerdstore.LeaseGuard, error)
 }
 
+type resumableOriginStore interface {
+	ResumeWriter(ctx context.Context, d digest.Digest) (ifaces.ContentWriter, int64, error)
+}
+
+type preservableOriginWriter interface {
+	Preserve() error
+}
+
+func openOriginWriter(ctx context.Context, store ifaces.LocalContentStore, d digest.Digest, kind ifaces.OriginRefKind) (ifaces.ContentWriter, int64, error) {
+	if kind == ifaces.KindBlob {
+		if resumable, ok := store.(resumableOriginStore); ok {
+			return resumable.ResumeWriter(ctx, d)
+		}
+	}
+
+	w, err := store.Writer(ctx, d)
+
+	return w, 0, err
+}
+
 type pullerPumpGate struct {
 	mu        sync.Mutex
 	accepting bool
@@ -1633,7 +1669,7 @@ type pumpMetricHooks struct {
 // a bounded backlog instead.
 const pullAdmissionMultiplier = 4
 
-func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore ifaces.LocalContentStore, neg *negcache.Cache, logger *slog.Logger, gate *pullerPumpGate, maxConcurrentPulls int, markPresent func(ctx context.Context, d digest.Digest) bool, onOriginSuccess func(kind string, bytes int64), onDownstreamFailure func(kind, class string), leaseHooks leaseMetricHooks, pumpHooks pumpMetricHooks) coord.PullerPump {
+func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore ifaces.LocalContentStore, neg *negcache.Cache, logger *slog.Logger, gate *pullerPumpGate, maxConcurrentPulls int, originPullProgressTimeout time.Duration, markPresent func(ctx context.Context, d digest.Digest) bool, onOriginSuccess func(kind string, bytes int64), onDownstreamFailure func(kind, class string), leaseHooks leaseMetricHooks, pumpHooks pumpMetricHooks) coord.PullerPump {
 	lg := logger.With(slog.String("subsystem", "puller-pump"))
 
 	if maxConcurrentPulls < 1 {
@@ -1809,7 +1845,7 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 
 			pullStartedAt := time.Now()
 
-			runOriginPull(pullCtx, originClient, cstore, neg, lg, h, registry, repository, d, kind, markPresent, onOriginSuccess, onDownstreamFailure, leaseHooks)
+			runOriginPull(pullCtx, originClient, cstore, neg, lg, h, registry, repository, d, kind, originPullProgressTimeout, markPresent, onOriginSuccess, onDownstreamFailure, leaseHooks)
 
 			if pumpHooks.OnPullDuration != nil {
 				pumpHooks.OnPullDuration(kind.MetricLabel(), time.Since(pullStartedAt).Seconds())
@@ -1834,28 +1870,17 @@ func newPullerPump(infl *inflight.Map, originClient ifaces.OriginPuller, cstore 
 // puller on a flapping local disk while still self-healing.
 // - On commit success, we clear any prior entry so the ladder resets
 // for the next failure run.
-func runOriginPull(baseCtx context.Context, originClient ifaces.OriginPuller, cstore ifaces.LocalContentStore, neg *negcache.Cache, lg *slog.Logger, h *inflight.Handle, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind, markPresent func(ctx context.Context, d digest.Digest) bool, onOriginSuccess func(kind string, bytes int64), onDownstreamFailure func(kind, class string), leaseHooks leaseMetricHooks) {
+func runOriginPull(baseCtx context.Context, originClient ifaces.OriginPuller, cstore ifaces.LocalContentStore, neg *negcache.Cache, lg *slog.Logger, h *inflight.Handle, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind, progressTimeout time.Duration, markPresent func(ctx context.Context, d digest.Digest) bool, onOriginSuccess func(kind string, bytes int64), onDownstreamFailure func(kind, class string), leaseHooks leaseMetricHooks) {
 	defer h.Done()
 
-	// Background context: the requesting peer's stream is already
-	// closed by the time we get here. We bound the pull by a budget
-	// so a hung origin can't leak the in-flight slot forever, but
-	// the 5-minute fixed ceiling from earlier was too tight for
-	// real-world image sizes (e.g. a 5 GB GPU image at the-default
-	// 10 MB/s throughput floor needs ~8.5 min on its own). Start with
-	// a default budget that covers HEAD/auth and small blobs, then
-	// extend post-Pull once we know expectedSize.
-	const (
-		originPullDefaultBudget = 5 * time.Minute
-		originPullMinThroughput = 10 * 1024 * 1024 // 10 MB/s, matches the 7 stall-detection floor
-		originPullCeiling       = 30 * time.Minute // absolute ceiling so a stuck pull still releases the slot
-	)
+	pullStartedAt := time.Now()
 
-	ctx, cancel := context.WithCancel(baseCtx)
-	defer cancel()
-
-	budget := time.AfterFunc(originPullDefaultBudget, cancel)
-	defer budget.Stop()
+	// The requesting peer's stream has closed, so this context is detached from
+	// that request. Bound inactivity rather than total duration: progressing
+	// large layers may run for hours, while a stalled body must still release
+	// its in-flight and admission slots.
+	ctx, cancel := context.WithCancelCause(baseCtx)
+	defer cancel(nil)
 
 	ref := ifaces.OriginRef{
 		Registry:   registry,
@@ -1863,30 +1888,7 @@ func runOriginPull(baseCtx context.Context, originClient ifaces.OriginPuller, cs
 		Digest:     d,
 		Kind:       kind,
 	}
-
-	rc, expectedSize, err := originClient.Pull(ctx, ref)
-	if err != nil {
-		// A delegated credential is requester-specific. Its origin failure
-		// must not poison the digest-wide cache for another requester.
-		recordOriginFailure(neg, d, err, lg, "origin pull failed", registry, repository, registryauth.Authorization(ctx) == "")
-		return
-	}
-
-	defer func() { _ = rc.Close() }() //nolint:errcheck // best-effort close
-
-	// Extend the budget based on expectedSize / floor-throughput. The
-	// default-budget slack is kept on top so the io.Copy starts with
-	// at least originPullDefaultBudget of headroom regardless of size.
-	if expectedSize > 0 {
-		needed := time.Duration(expectedSize/originPullMinThroughput)*time.Second + originPullDefaultBudget
-		if needed > originPullCeiling {
-			needed = originPullCeiling
-		}
-
-		if needed > originPullDefaultBudget {
-			budget.Reset(needed)
-		}
-	}
+	expectedSize := int64(-1)
 
 	var leaseGuard *containerdstore.LeaseGuard
 
@@ -1931,10 +1933,19 @@ func runOriginPull(baseCtx context.Context, originClient ifaces.OriginPuller, cs
 		releaseCancel()
 	}
 
-	w, err := cstore.Writer(ctx, d)
+	w, resumeOffset, err := openOriginWriter(ctx, cstore, d, kind)
+	deadlineOwner := originPullDeadlineOwner(ctx, err)
+
 	if err != nil {
 		releaseLeaseOnFailure()
-		recordOriginFailure(neg, d, err, lg, "cache writer open failed", registry, repository, true)
+		recordOriginFailure(neg, d, err, lg, "cache writer open failed", registry, repository, true,
+			slog.String("pull_mode", "detached"),
+			slog.String("deadline_owner", deadlineOwner),
+			slog.Duration("elapsed", time.Since(pullStartedAt)),
+			slog.Int64("expected_size", expectedSize),
+			slog.Int64("resume_offset", resumeOffset),
+			slog.Int64("written", 0),
+		)
 		// Origin returned 2xx (we got past originClient.Pull above)
 		// but the cache writer couldn't open - terminal downstream
 		// failure. Bump p2p_origin_pull_failure_total{class=transient}
@@ -1949,12 +1960,83 @@ func runOriginPull(baseCtx context.Context, originClient ifaces.OriginPuller, cs
 		return
 	}
 
-	defer func() { _ = w.Abort(ctx) }() //nolint:errcheck // best-effort abort
+	defer func() {
+		if preservable, ok := w.(preservableOriginWriter); ok {
+			if err := preservable.Preserve(); err != nil {
+				lg.Warn("preserve partial origin ingest failed", slog.Any("err", err))
+			}
 
-	written, err := io.Copy(w, rc)
+			return
+		}
+
+		abortCtx, abortCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer abortCancel()
+
+		_ = w.Abort(abortCtx) //nolint:errcheck // best-effort abort
+	}()
+
+	ref.Offset = resumeOffset
+
+	rc, expectedSize, err := originClient.Pull(ctx, ref)
+	if err != nil && resumeOffset > 0 {
+		var rangeUnsupported *ifaces.ErrRangeUnsupported
+		if errors.As(err, &rangeUnsupported) {
+			abortCtx, abortCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			abortErr := w.Abort(abortCtx)
+
+			abortCancel()
+
+			if abortErr != nil {
+				err = fmt.Errorf("abort partial ingest before full retry: %w", abortErr)
+			} else {
+				replacement, replacementErr := cstore.Writer(ctx, d)
+
+				err = replacementErr
+				if err == nil {
+					w = replacement
+
+					lg.Info("origin does not support resume; restarting from byte zero",
+						slog.String("digest", d.String()),
+						slog.String("registry", registry),
+						slog.String("repository", repository),
+						slog.Int64("resume_offset", resumeOffset),
+					)
+
+					resumeOffset = 0
+					ref.Offset = 0
+					rc, expectedSize, err = originClient.Pull(ctx, ref)
+				}
+			}
+		}
+	}
+
+	if err != nil {
+		// A delegated credential is requester-specific. Its origin failure
+		// must not poison the digest-wide cache for another requester.
+		recordOriginFailure(neg, d, err, lg, "origin pull failed", registry, repository, registryauth.Authorization(ctx) == "",
+			slog.String("pull_mode", "detached"),
+			slog.String("deadline_owner", originPullDeadlineOwner(ctx, err)),
+			slog.Duration("elapsed", time.Since(pullStartedAt)),
+			slog.Int64("expected_size", expectedSize),
+			slog.Int64("resume_offset", resumeOffset),
+			slog.Int64("written", 0),
+		)
+
+		return
+	}
+
+	defer func() { _ = rc.Close() }() //nolint:errcheck // best-effort close
+
+	written, err := copyWithOriginProgressTimeout(ctx, cancel, w, rc, progressTimeout)
 	if err != nil {
 		releaseLeaseOnFailure()
-		recordOriginFailure(neg, d, err, lg, "origin pull copy failed", registry, repository, true)
+		recordOriginFailure(neg, d, err, lg, "origin pull copy failed", registry, repository, true,
+			slog.String("pull_mode", "detached"),
+			slog.String("deadline_owner", originPullDeadlineOwner(ctx, err)),
+			slog.Duration("elapsed", time.Since(pullStartedAt)),
+			slog.Int64("expected_size", expectedSize),
+			slog.Int64("written", written),
+		)
 		// io.Copy could have failed because origin truncated the
 		// stream OR because the local cache writer errored. We
 		// can't easily distinguish - but we already passed origin's
@@ -1970,9 +2052,18 @@ func runOriginPull(baseCtx context.Context, originClient ifaces.OriginPuller, cs
 		return
 	}
 
-	if err := w.Commit(ctx); err != nil {
+	commitErr := w.Commit(ctx)
+	deadlineOwner = originPullDeadlineOwner(ctx, commitErr)
+
+	if commitErr != nil {
 		releaseLeaseOnFailure()
-		recordOriginFailure(neg, d, err, lg, "cache commit failed (digest mismatch or io error)", registry, repository, true)
+		recordOriginFailure(neg, d, commitErr, lg, "cache commit failed (digest mismatch or io error)", registry, repository, true,
+			slog.String("pull_mode", "detached"),
+			slog.String("deadline_owner", deadlineOwner),
+			slog.Duration("elapsed", time.Since(pullStartedAt)),
+			slog.Int64("expected_size", expectedSize),
+			slog.Int64("written", written),
+		)
 		// Commit failure means EITHER the cache's internal
 		// digestpipe caught a content mismatch (origin lied) OR
 		// the local cache had an I/O error at finalize. Either
@@ -2059,6 +2150,87 @@ func runOriginPull(baseCtx context.Context, originClient ifaces.OriginPuller, cs
 	)
 }
 
+var errOriginPullNoProgress = errors.New("origin pull made no progress")
+
+type originProgressReader struct {
+	reader   io.Reader
+	progress chan<- struct{}
+}
+
+func (r *originProgressReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 {
+		select {
+		case r.progress <- struct{}{}:
+		default:
+		}
+	}
+
+	return n, err
+}
+
+func copyWithOriginProgressTimeout(ctx context.Context, cancel context.CancelCauseFunc, dst io.Writer, src io.Reader, timeout time.Duration) (int64, error) {
+	if timeout == 0 {
+		return io.Copy(dst, src)
+	}
+
+	progress := make(chan struct{}, 1)
+	done := make(chan struct{})
+
+	go func() {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			case <-progress:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+
+				timer.Reset(timeout)
+			case <-timer.C:
+				cancel(errOriginPullNoProgress)
+
+				return
+			}
+		}
+	}()
+
+	written, err := io.Copy(dst, &originProgressReader{reader: src, progress: progress})
+
+	close(done)
+
+	if err != nil && errors.Is(context.Cause(ctx), errOriginPullNoProgress) {
+		return written, errOriginPullNoProgress
+	}
+
+	return written, err
+}
+
+func originPullDeadlineOwner(ctx context.Context, err error) string {
+	switch {
+	case errors.Is(context.Cause(ctx), errOriginPullNoProgress):
+		return "progress"
+	case errors.Is(context.Cause(ctx), context.Canceled), errors.Is(context.Cause(ctx), context.DeadlineExceeded):
+		return "caller"
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "transport"
+	}
+
+	return "none"
+}
+
 // recordOriginFailure classifies err and records the failure into the
 // per-puller the design doc negative cache. Non-the design doc callers (e.g. cache I/O
 // errors not covered by *ifaces.OriginError) are bucketed as
@@ -2066,7 +2238,7 @@ func runOriginPull(baseCtx context.Context, originClient ifaces.OriginPuller, cs
 // them. The log is emitted at WARN regardless of class. recordCooldown is
 // false for requester-specific origin failures that are unsafe to store in a
 // digest-only shared cache.
-func recordOriginFailure(neg *negcache.Cache, d digest.Digest, err error, lg *slog.Logger, msg, registry, repository string, recordCooldown bool) {
+func recordOriginFailure(neg *negcache.Cache, d digest.Digest, err error, lg *slog.Logger, msg, registry, repository string, recordCooldown bool, details ...any) {
 	class := ifaces.FailureTransient
 
 	var oe *ifaces.OriginError
@@ -2074,13 +2246,16 @@ func recordOriginFailure(neg *negcache.Cache, d digest.Digest, err error, lg *sl
 		class = oe.Class
 	}
 
-	lg.Warn(msg,
+	attrs := []any{
 		slog.String("digest", d.String()),
 		slog.String("registry", registry),
 		slog.String("repository", repository),
 		slog.String("failure_class", string(class)),
 		slog.Any("err", err),
-	)
+	}
+	attrs = append(attrs, details...)
+
+	lg.Warn(msg, attrs...)
 
 	if neg != nil && recordCooldown {
 		neg.RecordFailure(d, class)

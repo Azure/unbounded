@@ -29,8 +29,9 @@ var nspawnTemplates = template.Must(
 )
 
 type ensureNSpawnWorkspace struct {
-	log       *slog.Logger
-	goalState *goalstates.RootFS
+	log         *slog.Logger
+	goalState   *goalstates.RootFS
+	ownedReplay bool
 }
 
 type NSpawnBind struct {
@@ -101,6 +102,10 @@ func (e *ensureNSpawnWorkspace) Do(ctx context.Context) error {
 
 func (e *ensureNSpawnWorkspace) bootstrapWorkspace(ctx context.Context) error {
 	bootstrapTask := oci.DownloadRootFS(e.log, e.goalState.MachineDir, e.goalState.HostArch, e.goalState.OCIImage)
+	if e.ownedReplay {
+		bootstrapTask = oci.DownloadOwnedRootFS(e.log, e.goalState.MachineDir, e.goalState.HostArch, e.goalState.OCIImage)
+	}
+
 	return phases.ExecuteTask(ctx, e.log, bootstrapTask)
 }
 

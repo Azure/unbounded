@@ -17,6 +17,46 @@ file mounted from the `unbounded-net-config` ConfigMap.
 - Startup behavior: fail-fast if the config file is missing or invalid.
 - CLI flags still work as explicit overrides when set.
 
+### Summary publication and explicit details
+
+Routine node publications contain overview metadata and aggregate counts, not
+peer lists, route entries, or BPF maps. Detailed data is collected for an
+explicit single-node request and kept temporarily. Changing these settings
+requires restarting the affected controller or node-agent pods.
+
+| Runtime setting | CLI override | Default | Allowed values |
+|-----------------|--------------|-----------------|----------------|
+| `node.statusDetailMode` | `--status-detail-mode` | `summary` | `summary`, `full` |
+| `controller.statusDetailCacheTTL` | `--status-detail-cache-ttl` | `300s` | Strictly positive duration |
+| `controller.statusDetailRequestTimeout` | `--status-detail-request-timeout` | `120s` | Strictly positive duration |
+
+The cache lifetime starts when actual details arrive, not on summary updates or
+reads. Continuous legacy full publications refresh it; on-demand duplicate or
+late replies do not. The request timeout covers all delivery attempts together.
+
+Requests are coalesced per node, but simultaneous requests for different nodes
+start independent dispatch workers. Deadline and TTL cleanup bound how long
+they remain, not peak concurrency or memory during a burst. The controller's
+background aggregate-pull concurrency limit does not apply to these explicit
+requests.
+
+Upgrade controllers and their dashboard/CLI consumers before restarting agents
+in summary mode. An incompatible controller is reported explicitly; agents do
+not silently resume full streaming. For node-publishing rollback, set
+`node.statusDetailMode: full` and restart agents. This restores full/delta
+publication, not detailed bulk exports or the retired connectivity views.
+
+Bulk APIs and global broadcasts remain summary-only in either mode. With no
+active capable node WebSocket, an explicit request tries HTTP pull first,
+regardless of the background-pull toggle. Failed pulls leave a command for the
+next authenticated status POST response. Both publishers may remain disabled:
+local HTTP diagnostics still work, but a failed pull has no polling fallback
+until outbound POST publication resumes.
+
+Requests and details are leader-local and in memory. Restart or leadership
+change may require an explicit retry. Releasing expired references permits
+garbage collection but does not guarantee an immediate RSS decrease.
+
 ### Config Structure
 
 ```yaml
@@ -246,7 +286,7 @@ the full protocol selection algorithm.
 | `--status-push-enabled` | `true` | Push status to controller. |
 | `--status-push-interval` | `10s` | Push interval. |
 | `--status-ws-enabled` | `true` | Enable WebSocket transport. |
-| `--status-ws-apiserver-mode` | `fallback` | `never`, `fallback`, or `preferred` for API server relay. |
+| `--status-ws-apiserver-mode` | `fallback` | Direct controller endpoints first; `fallback` permits API server relay, `never` disables it, and `preferred` is a compatibility alias for `fallback`. |
 | `--status-critical-interval` | `1s` | Max critical-delta publish frequency. |
 | `--status-stats-interval` | `15s` | Max statistics-delta publish frequency. |
 

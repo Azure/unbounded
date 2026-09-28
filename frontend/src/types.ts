@@ -10,7 +10,6 @@ export type ClusterStatus = {
   sites?: SiteStatus[];
   gatewayPools?: GatewayPoolStatus[];
   peerings?: PeeringStatus[];
-  connectivityMatrix?: Record<string, SiteMatrix>;
   buildInfo?: BuildInfo;
   leaderInfo?: LeaderInfo;
   errors?: string[];
@@ -137,7 +136,7 @@ export type NodeStatus = {
   routingTable?: RoutingTable;
   healthCheck?: HealthCheckStatus;
   nodeErrors?: NodeError[];
-  lastPushTime?: string;
+  lastPushTime?: string | null;
   statusSource?: string;
   fetchError?: string;
   bpfEntries?: BpfEntry[];
@@ -195,11 +194,6 @@ export type PeeringStatus = {
   healthCheckEnabled?: boolean;
 };
 
-export type SiteMatrix = {
-  nodes?: string[];
-  results?: Record<string, Record<string, string>>;
-};
-
 export type ClusterStatusDelta = {
   seq?: number;
   timestamp?: string;
@@ -212,7 +206,6 @@ export type ClusterStatusDelta = {
   sites?: SiteStatus[];
   gatewayPools?: GatewayPoolStatus[];
   peerings?: PeeringStatus[];
-  connectivityMatrix?: Record<string, SiteMatrix> | null;
   buildInfo?: BuildInfo;
   leaderInfo?: LeaderInfo;
   errors?: string[];
@@ -237,7 +230,6 @@ export type ClusterSummary = {
   problems?: StatusProblem[];
   pullEnabled?: boolean;
   nodeSummaries?: NodeSummary[];
-  connectivityMatrix?: Record<string, SiteMatrix>;
 };
 
 export type ClusterSummaryDelta = {
@@ -246,8 +238,8 @@ export type ClusterSummaryDelta = {
   nodeCount?: number;
   siteCount?: number;
   azureTenantId?: string;
-  leaderInfo?: LeaderInfo;
-  buildInfo?: BuildInfo;
+  leaderInfo?: LeaderInfo | null;
+  buildInfo?: BuildInfo | null;
   sites?: SiteStatus[];
   gatewayPools?: GatewayPoolStatus[];
   peerings?: PeeringStatus[];
@@ -257,10 +249,11 @@ export type ClusterSummaryDelta = {
   pullEnabled?: boolean;
   nodeSummaries?: NodeSummary[];
   removedNodes?: string[];
-  connectivityMatrix?: Record<string, SiteMatrix>;
 };
 
 export type NodeSummary = {
+  nodeInfo?: NodeInfo;
+  lastPushTime?: string | null;
   name?: string;
   siteName?: string;
   isGateway?: boolean;
@@ -275,4 +268,23 @@ export type NodeSummary = {
   routeCount?: number;
   routeMismatch?: boolean;
   fetchError?: string;
+  wireGuardOnline?: boolean;
+};
+
+export type NodeDetailSnapshot = {
+  nodeName: string;
+  requestId: string;
+  collectedAt: string;
+  receivedAt: string;
+  expiresAt: string;
+  status: NodeStatus;
+};
+
+export type NodeDetailResult = {
+  state: 'pending' | 'complete' | 'expired' | 'unavailable' | 'retryable';
+  nodeName: string;
+  requestId?: string;
+  deadline?: string;
+  error?: string;
+  details?: NodeDetailSnapshot;
 };

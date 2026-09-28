@@ -139,8 +139,15 @@ GANTRY_BIN=bin/gantry
 GANTRY_CMD=./cmd/gantry
 GANTRY_IMAGE ?= $(CONTAINER_REGISTRY)/gantry:$(VERSION_TAG)
 GANTRY_NAMESPACE ?= $(UNBOUNDED_NAMESPACE)
-GANTRY_MANIFEST_TEMPLATES_DIR := deploy/gantry
+GANTRY_CHART_DIR := deploy/gantry/chart
 GANTRY_MANIFEST_RENDERED_DIR  := deploy/gantry/rendered
+GANTRY_OPERATOR_RENDER_DIR    := tmp/gantry-operator-render
+GANTRY_SUPPORT_RENDER_DIR     := tmp/gantry-support-render
+GANTRY_CHART_VERSION ?= 0.0.0-dev
+GANTRY_CHART_APP_VERSION ?= $(VERSION_TAG)
+GANTRY_CHART_PACKAGE_DIR := build/charts
+GANTRY_CHART_STAGE_DIR := tmp/gantry-chart-package
+GANTRY_CHART_IMAGE_REPOSITORY ?= $(CONTAINER_REGISTRY)/gantry
 
 # unbounded-storage-supervisor (Go binary; distinct from the Rust crate below)
 UNBOUNDED_STORAGE_SUPERVISOR_BIN=bin/unbounded-storage-supervisor
@@ -284,8 +291,8 @@ NET_FRONTEND_CACHE_FILE    := $(NET_FRONTEND_DIST_DIR)/.frontend-build-key
 # Frontend build toggle (dev builds produce unminified output with sourcemaps).
 REACT_DEV ?= false
 
-.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
-.PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests release-bom release-manifests unbounded-operator-release-manifest
+.PHONY: all help fmt lint lint-actions test build vulncheck check-deps kubectl-unbounded kubectl-unbounded-build install-tools install-protoc install-helm generate kubectl-unbounded forge relctl relctl-build agent-artifacts-builder agent-artifacts-builder-build orcadev unbounded-agent machina machina-build machina-oci machina-oci-push machina-manifests machine-ops-controller machine-ops-controller-build machine-ops-controller-oci machine-ops-controller-oci-push machine-ops-manifests metalman metalman-build metalman-oci metalman-oci-push unbounded-operator unbounded-operator-build unbounded-operator-manifests playpen-manifests e2e-gantry e2e-playpen gomod docs-serve unbounded-net-controller unbounded-net-controller-build unbounded-net-node unbounded-net-node-build unbounded-net-routeplan-debug unping unping-build unroute unroute-build license-check notice notice-check gantry gantry-build gantry-manifests inventory-manifests
+.PHONY: net-frontend net-frontend-clean net-ebpf-build net-ebpf-generate net-ebpf-verify net-manifests gantry-chart-lint gantry-chart-package release-bom release-manifests unbounded-operator-release-manifest
 .PHONY: image-machina-local image-token-refresher-local image-machine-ops-controller-local image-metalman-local image-unbounded-operator-local image-unbounded-operator-push image-playpen-local image-net-controller-local image-net-node-local image-gantry-local image-gantry-push images-local
 .PHONY: image-net-controller-push image-net-node-push images-net-all images-net-all-push
 .PHONY: unbounded-storage unbounded-storage-build unbounded-storage-smoke unbounded-storage-tarball unbounded-storage-push bench unbounded-storage-test unbounded-storage-check unbounded-storage-model-check libfabric openssl
@@ -304,6 +311,7 @@ help: ## Show this help
 	@echo "  help                             Show this help"
 	@echo "  install-tools                    Install gofumpt, golangci-lint, protoc-gen-go, protoc-gen-go-grpc, controller-gen, actionlint"
 	@echo "  install-protoc                   Download pinned protoc into bin/protoc/"
+	@echo "  install-helm                     Download pinned Helm into bin/"
 	@echo ""
 	@echo "Development:"
 	@echo "  fmt                              Format Go source (gofumpt + wsl_v5)"
@@ -411,6 +419,8 @@ help: ## Show this help
 	@echo "  net-manifests                    Render net manifests into \$$(NET_MANIFEST_RENDERED_DIR)"
 	@echo "  orca-manifests                   Render orca manifests into deploy/orca/rendered"
 	@echo "  unbounded-operator-manifests     Render unbounded-operator manifests into deploy/unbounded-operator/rendered"
+	@echo "  gantry-chart-lint                Validate the standalone Gantry Helm chart"
+	@echo "  gantry-chart-package             Package the standalone Gantry Helm chart"
 	@echo "  unbounded-operator-release-manifest Build a versioned, directly applicable operator manifest under build/"
 	@echo "  unbounded-storage-supervisor-manifests  Render storage supervisor manifests into deploy/unbounded-storage-supervisor/rendered"
 	@echo ""
@@ -451,6 +461,36 @@ PROTOC_GEN_GO_VERSION ?= v1.36.11
 PROTOC_GEN_GO_GRPC_VERSION ?= v1.6.1
 CONTROLLER_GEN_VERSION ?= v0.21.0
 ACTIONLINT_VERSION ?= v1.7.12
+HELM_VERSION ?= 3.21.3
+HELM ?= $(CURDIR)/bin/helm
+HELM_STAMP := $(CURDIR)/bin/.helm-v$(HELM_VERSION)
+
+HELM_UNAME_S := $(shell uname -s)
+HELM_UNAME_M := $(shell uname -m)
+ifeq ($(HELM_UNAME_S),Darwin)
+	HELM_OS := darwin
+else
+	HELM_OS := linux
+endif
+ifeq ($(HELM_UNAME_M),x86_64)
+	HELM_ARCH := amd64
+else ifeq ($(HELM_UNAME_M),aarch64)
+	HELM_ARCH := arm64
+else ifeq ($(HELM_UNAME_M),arm64)
+	HELM_ARCH := arm64
+else
+	HELM_ARCH := unsupported
+endif
+
+ifeq ($(HELM_OS)-$(HELM_ARCH),linux-amd64)
+	HELM_SHA256 := 15e041a93a590dce8100f39385cd98c84a765c9e36aeeb9e2dc6ff9e4769e2e0
+else ifeq ($(HELM_OS)-$(HELM_ARCH),linux-arm64)
+	HELM_SHA256 := 67f58155079ff9ffab98ba5c88daff0ed9b542f3a4732f5dd426dde7dd0f5244
+else ifeq ($(HELM_OS)-$(HELM_ARCH),darwin-amd64)
+	HELM_SHA256 := 76d0db4730b05d3d625eee11e80f0721b32b4d8422f4e5d093de6337bf3ac9f8
+else ifeq ($(HELM_OS)-$(HELM_ARCH),darwin-arm64)
+	HELM_SHA256 := 19879a848cad832b7a1ac24b767a481d20fb3b95ab53a220849649422ada144e
+endif
 
 # Pinned protoc for deterministic .pb.go output across environments.
 # Downloaded from the upstream protobuf GitHub releases.
@@ -486,6 +526,30 @@ install-tools: ## Install development tools (gofumpt, golangci-lint, protoc-gen-
 	go install github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION)
 
 install-protoc: $(PROTOC) ## Download pinned protoc into bin/protoc/
+
+install-helm: $(HELM) ## Download pinned Helm into bin/
+
+$(HELM_STAMP):
+	@test -n "$(HELM_SHA256)" || { echo "unsupported Helm platform $(HELM_OS)-$(HELM_ARCH)" >&2; exit 1; }
+	@mkdir -p $(dir $(HELM)) tmp
+	@archive="helm-v$(HELM_VERSION)-$(HELM_OS)-$(HELM_ARCH).tar.gz"; \
+	  echo "Downloading Helm v$(HELM_VERSION) for $(HELM_OS)-$(HELM_ARCH)..."; \
+	  curl -fsSL --max-time 30 -o "tmp/$$archive" "https://get.helm.sh/$$archive"; \
+	  if command -v sha256sum >/dev/null 2>&1; then \
+	    actual=$$(sha256sum "tmp/$$archive" | awk '{print $$1}'); \
+	  else \
+	    actual=$$(shasum -a 256 "tmp/$$archive" | awk '{print $$1}'); \
+	  fi; \
+	  test "$$actual" = "$(HELM_SHA256)" || { echo "Helm checksum mismatch: got $$actual" >&2; rm -f "tmp/$$archive"; exit 1; }; \
+	  tar -xzf "tmp/$$archive" -C tmp; \
+	  cp "tmp/$(HELM_OS)-$(HELM_ARCH)/helm" "$(HELM)"; \
+	  chmod +x "$(HELM)"; \
+	  rm -rf "tmp/$$archive" "tmp/$(HELM_OS)-$(HELM_ARCH)"; \
+	  touch "$(HELM_STAMP)"
+	@$(HELM) version --short
+
+$(HELM): $(HELM_STAMP)
+	@test -x $(HELM) || { rm -f $(HELM_STAMP); $(MAKE) $(HELM_STAMP); }
 
 $(PROTOC):
 	@mkdir -p $(PROTOC_DIR)
@@ -554,7 +618,7 @@ test: lint machina-manifests token-refresher-manifests machine-ops-manifests pla
 
 endif
 
-e2e-gantry: ## Run the kind-based Gantry e2e suite
+e2e-gantry: $(HELM) ## Run the kind-based Gantry e2e suite
 	CONTAINER_ENGINE="$(CONTAINER_ENGINE)" KIND_EXPERIMENTAL_PROVIDER="$(CONTAINER_ENGINE)" PATH="$(CURDIR)/bin:$$PATH" \
 		$(GOTEST) -tags=e2e -count=1 -timeout=120m -v ./e2e/gantry
 
@@ -780,15 +844,42 @@ gantry-build: ## Build the gantry binary (no lint/test)
 
 gantry: test gantry-build ## Build gantry (implies test)
 
-gantry-manifests: ## Render gantry deployment manifests into deploy/gantry/rendered
+gantry-manifests: $(HELM) ## Render the Gantry operator profile into deploy/gantry/rendered
 	@mkdir -p $(GANTRY_MANIFEST_RENDERED_DIR)
 	@find $(GANTRY_MANIFEST_RENDERED_DIR) -mindepth 1 -not -name .gitignore -delete
+	@rm -rf $(GANTRY_OPERATOR_RENDER_DIR)
+	$(HELM) template gantry $(GANTRY_CHART_DIR) \
+		--namespace $(GANTRY_NAMESPACE) \
+		--values $(GANTRY_CHART_DIR)/values-operator.yaml \
+		--skip-schema-validation \
+		--set-string image.reference=$(GANTRY_IMAGE) \
+		--output-dir $(GANTRY_OPERATOR_RENDER_DIR)
+	@cp $(GANTRY_OPERATOR_RENDER_DIR)/gantry/templates/*.yaml $(GANTRY_MANIFEST_RENDERED_DIR)/
+	@rm -rf $(GANTRY_SUPPORT_RENDER_DIR)
 	$(GOCMD) run ./hack/cmd/render-manifests \
-		--templates-dir $(GANTRY_MANIFEST_TEMPLATES_DIR) \
-		--output-dir $(GANTRY_MANIFEST_RENDERED_DIR) \
-		--set Namespace=$(GANTRY_NAMESPACE) \
-		--set Image=$(GANTRY_IMAGE)
+		--templates-dir deploy/gantry \
+		--output-dir $(GANTRY_SUPPORT_RENDER_DIR) \
+		--set Namespace=$(GANTRY_NAMESPACE)
+	@cp -R $(GANTRY_SUPPORT_RENDER_DIR)/. $(GANTRY_MANIFEST_RENDERED_DIR)/
+	@rm -rf $(GANTRY_OPERATOR_RENDER_DIR) $(GANTRY_SUPPORT_RENDER_DIR)
 	@echo "Rendered gantry manifests into $(GANTRY_MANIFEST_RENDERED_DIR) (namespace: $(GANTRY_NAMESPACE))"
+
+gantry-chart-lint: $(HELM) ## Validate the standalone Gantry Helm chart
+	$(HELM) lint $(GANTRY_CHART_DIR)
+
+gantry-chart-package: gantry-chart-lint ## Package the standalone Gantry Helm chart
+	@mkdir -p $(GANTRY_CHART_PACKAGE_DIR)
+	@rm -f $(GANTRY_CHART_PACKAGE_DIR)/gantry-$(GANTRY_CHART_VERSION).tgz
+	@rm -rf $(GANTRY_CHART_STAGE_DIR)
+	$(GOCMD) run ./hack/cmd/gantry-chart-stage \
+		--source $(GANTRY_CHART_DIR) \
+		--output $(GANTRY_CHART_STAGE_DIR) \
+		--image-repository $(GANTRY_CHART_IMAGE_REPOSITORY)
+	$(HELM) package $(GANTRY_CHART_STAGE_DIR) \
+		--version $(GANTRY_CHART_VERSION) \
+		--app-version $(GANTRY_CHART_APP_VERSION) \
+		--destination $(GANTRY_CHART_PACKAGE_DIR)
+	@rm -rf $(GANTRY_CHART_STAGE_DIR)
 
 # Inventory render knobs. SSLMode/Password feed the database config and
 # secret templates; Password is base64-encoded data and defaults empty so

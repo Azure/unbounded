@@ -12,6 +12,9 @@ metadata:
     rbac.authorization.k8s.io/aggregate-to-view: "true"
 rules:
   - apiGroups: ["status.net.unbounded-cloud.io"]
+    resources: ["nodes/details"]
+    verbs: ["get", "create"]
+  - apiGroups: ["status.net.unbounded-cloud.io"]
     resources: ["status"]
     resourceNames: ["dashboard", "json"]
     verbs: ["get"]

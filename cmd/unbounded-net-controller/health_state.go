@@ -60,6 +60,13 @@ type healthState struct {
 	staleThreshold     time.Duration // from --status-stale-threshold flag
 	tokenAuth          *tokenAuthenticator
 	nodeServiceAccount string // expected service account in namespace:name format
+	nodeTokenVerifier  serviceAccountTokenVerifier
+	nodeAuthReady      func() bool // Required only by the startup-selected local OIDC verifier.
+
+	detailMu                   sync.Mutex
+	detailRequests             *nodeDetailRequests
+	statusDetailCacheTTL       time.Duration
+	statusDetailRequestTimeout time.Duration
 
 	// Pull fallback toggle (controlled via dashboard WS message; default: disabled).
 	pullEnabled atomic.Bool
@@ -78,11 +85,11 @@ type healthState struct {
 	// kubeProxyMonitor checks the local kube-proxy health endpoint.
 	kubeProxyMonitor *kubeProxyMonitor
 
-	// nodeWSRegistry tracks the active WS cancel function per node name.
+	// nodeWSRegistry tracks the active authenticated connection per node name.
 	// When a node reconnects, the previous connection is canceled to avoid
 	// duplicate connections consuming resources.
 	nodeWSMu       sync.Mutex
-	nodeWSRegistry map[string]context.CancelFunc
+	nodeWSRegistry map[string]*nodeWSConnection
 }
 
 const defaultMaxPullConcurrency = 20
@@ -90,45 +97,44 @@ const defaultMaxPullConcurrency = 20
 // registerNodeWS registers a WS connection for a node. If an existing
 // connection is registered for the same node, its context is canceled
 // to force it to close (preventing duplicate connections).
-func (h *healthState) registerNodeWS(nodeName string, cancel context.CancelFunc) {
+func (h *healthState) registerNodeWS(nodeName string, cancel context.CancelFunc) *nodeWSConnection {
 	if nodeName == "" {
-		return
+		return nil
 	}
 
 	h.nodeWSMu.Lock()
 	defer h.nodeWSMu.Unlock()
 
 	if h.nodeWSRegistry == nil {
-		h.nodeWSRegistry = make(map[string]context.CancelFunc)
+		h.nodeWSRegistry = make(map[string]*nodeWSConnection)
 	}
 
 	if prev, ok := h.nodeWSRegistry[nodeName]; ok {
-		prev() // cancel the old connection
+		prev.cancel()
 	}
 
-	h.nodeWSRegistry[nodeName] = cancel
+	connection := &nodeWSConnection{cancel: cancel}
+	h.nodeWSRegistry[nodeName] = connection
+
+	return connection
 }
 
-// unregisterNodeWS removes a node's WS registration. Only removes if the
-// cancel function matches (to avoid unregistering a newer connection).
-func (h *healthState) unregisterNodeWS(nodeName string, cancel context.CancelFunc) {
-	if nodeName == "" {
+// unregisterNodeWS cannot remove a newer connection with the same node identity.
+func (h *healthState) unregisterNodeWS(nodeName string, connection *nodeWSConnection) {
+	if connection == nil {
 		return
 	}
 
 	h.nodeWSMu.Lock()
-	defer h.nodeWSMu.Unlock()
 
-	if h.nodeWSRegistry == nil {
-		return
+	removed := h.nodeWSRegistry[nodeName] == connection
+	if removed {
+		delete(h.nodeWSRegistry, nodeName)
 	}
-	// Only remove if it's still our registration (not replaced by a newer connection)
-	if existing, ok := h.nodeWSRegistry[nodeName]; ok {
-		// Compare by pointer identity -- Go func values aren't comparable,
-		// but context.CancelFunc from the same WithCancel call is the same pointer.
-		if fmt.Sprintf("%p", existing) == fmt.Sprintf("%p", cancel) {
-			delete(h.nodeWSRegistry, nodeName)
-		}
+	h.nodeWSMu.Unlock()
+
+	if removed {
+		h.retryNodeDetails(nodeName)
 	}
 }
 
@@ -137,8 +143,12 @@ func (h *healthState) tokenAuthStatus() (bool, string) {
 		return false, "token authenticator not initialized"
 	}
 
-	if h.tokenAuth.tokenReviewer == nil {
-		return false, "token reviewer not configured"
+	if !h.tokenAuth.configured {
+		return true, "Token verifier disabled"
+	}
+
+	if h.tokenAuth.verifier == nil {
+		return false, "Token verifier not configured"
 	}
 
 	return true, "ok"
@@ -158,6 +168,10 @@ func (h *healthState) setLeader(leader bool) {
 	wasLeader := h.isLeader.Swap(leader)
 	if !leader || !wasLeader {
 		h.controllerReady.Store(false)
+	}
+
+	if !leader {
+		h.stopDetailRequests()
 	}
 
 	if leader {
@@ -226,6 +240,10 @@ func (h *healthState) readinessStatus(_ context.Context) (bool, string) {
 	ready, reason := h.tokenAuthStatus()
 	if !ready {
 		return false, fmt.Sprintf("token verifier not ready: %s", reason)
+	}
+
+	if h.nodeAuthReady != nil && !h.nodeAuthReady() {
+		return false, "node authentication informer caches not ready"
 	}
 
 	_, err := h.clientset.Discovery().ServerVersion()

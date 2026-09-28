@@ -26,6 +26,7 @@ type Manager struct {
 	conn     net.PacketConn
 
 	mu       sync.RWMutex
+	peerMu   sync.Mutex
 	sessions map[string]*session
 
 	ctx    context.Context
@@ -90,15 +91,26 @@ func (m *Manager) Start(ctx context.Context) error {
 
 // Stop gracefully shuts down the listener and all sessions.
 func (m *Manager) Stop() {
+	m.peerMu.Lock()
+	defer m.peerMu.Unlock()
+
 	if m.cancel != nil {
 		m.cancel()
 	}
 
-	m.mu.Lock()
+	m.mu.RLock()
+
+	sessions := make([]*session, 0, len(m.sessions))
 	for _, s := range m.sessions {
+		sessions = append(sessions, s)
+	}
+
+	m.mu.RUnlock()
+
+	for _, s := range sessions {
 		s.stop()
 	}
-	m.mu.Unlock()
+
 	m.listener.Stop()
 	klog.Info("healthcheck manager stopped")
 }
@@ -106,19 +118,30 @@ func (m *Manager) Stop() {
 // AddPeer registers a new peer for health checking. If the manager is
 // already running, the session starts immediately.
 func (m *Manager) AddPeer(peerHostname string, overlayIP net.IP, settings HealthCheckSettings) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	if err := settings.validate(); err != nil {
+		return err
+	}
 
+	m.peerMu.Lock()
+	defer m.peerMu.Unlock()
+
+	m.mu.Lock()
 	if existing, exists := m.sessions[peerHostname]; exists {
-		// Peer already registered -- update settings/IP if changed, otherwise no-op
-		if existing.overlayIP.Equal(overlayIP) && existing.settings == settings {
+		if existing.overlayIP.Equal(overlayIP) {
+			existing.updateSettings(settings)
+			m.mu.Unlock()
+
 			return nil
 		}
-		// Settings or IP changed -- stop old session and replace
+
+		delete(m.sessions, peerHostname)
+		m.mu.Unlock()
+		// Callbacks may query the manager while stop waits for their completion.
 		existing.stop()
 		klog.V(4).Infof("healthcheck: updating peer %s (%s -> %s)", peerHostname, existing.overlayIP, overlayIP)
-		delete(m.sessions, peerHostname)
+		m.mu.Lock()
 	}
+	defer m.mu.Unlock()
 
 	s := newSession(sessionConfig{
 		peerHostname:  peerHostname,
@@ -145,6 +168,9 @@ func (m *Manager) AddPeer(peerHostname string, overlayIP net.IP, settings Health
 
 // RemovePeer stops and removes a peer session.
 func (m *Manager) RemovePeer(peerHostname string) error {
+	m.peerMu.Lock()
+	defer m.peerMu.Unlock()
+
 	m.mu.Lock()
 
 	s, exists := m.sessions[peerHostname]
@@ -165,9 +191,14 @@ func (m *Manager) RemovePeer(peerHostname string) error {
 
 // UpdatePeerSettings modifies the health check parameters for an existing peer.
 func (m *Manager) UpdatePeerSettings(peerHostname string, settings HealthCheckSettings) error {
+	if err := settings.validate(); err != nil {
+		return err
+	}
+
 	m.mu.RLock()
+	defer m.mu.RUnlock()
+
 	s, exists := m.sessions[peerHostname]
-	m.mu.RUnlock()
 
 	if !exists {
 		return fmt.Errorf("peer %q not found", peerHostname)
@@ -176,6 +207,22 @@ func (m *Manager) UpdatePeerSettings(peerHostname string, settings HealthCheckSe
 	s.updateSettings(settings)
 
 	return nil
+}
+
+// GetPeerSettings returns a copy of the currently applied session settings.
+func (m *Manager) GetPeerSettings(peerHostname string) (HealthCheckSettings, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	s, exists := m.sessions[peerHostname]
+	if !exists {
+		return HealthCheckSettings{}, fmt.Errorf("peer %q not found", peerHostname)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.settings, nil
 }
 
 // GetPeerStatus returns the current health status for a single peer.

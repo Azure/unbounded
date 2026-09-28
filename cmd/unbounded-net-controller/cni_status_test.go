@@ -121,7 +121,7 @@ func TestCNIGuardProtoStatusRecovery(t *testing.T) {
 					if source == "ws" || source == "apiserver-ws" {
 						var messageType string
 
-						messageType, ack = handleProtoWSMessage(health, data, source)
+						messageType, ack = handleProtoWSBytes(health, data, source)
 						if messageType != "node_status_ack" {
 							t.Fatalf("unexpected message type %q: %+v", messageType, ack)
 						}

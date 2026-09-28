@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/tls"
@@ -26,6 +27,7 @@ import (
 	"github.com/Azure/unbounded/internal/net/html"
 	"github.com/Azure/unbounded/internal/net/metrics"
 	statusproto "github.com/Azure/unbounded/internal/net/status/proto"
+	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 	webhookpkg "github.com/Azure/unbounded/internal/net/webhook"
 )
 
@@ -33,7 +35,18 @@ const (
 	aggregatedNodeStatusWebSocketPath = "/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews"
 	aggregatedNodeStatusPushPath      = "/apis/status.net.unbounded-cloud.io/v1alpha1/status/push"
 	aggregatedStatusJSONPath          = "/apis/status.net.unbounded-cloud.io/v1alpha1/status/json"
+	nodeIdentityTokenHeader           = "X-Unbounded-Node-Token"
 )
+
+func withConnectionContext(requestCtx, connectionCtx context.Context) (context.Context, context.CancelFunc) {
+	writeCtx, cancelWrite := context.WithCancel(requestCtx)
+	stopConnectionCancel := context.AfterFunc(connectionCtx, cancelWrite)
+
+	return writeCtx, func() {
+		stopConnectionCancel()
+		cancelWrite()
+	}
+}
 
 // maxConcurrentNodeWS limits the number of simultaneous node WebSocket connections.
 const maxConcurrentNodeWS = 50000
@@ -45,38 +58,146 @@ type wsFrame struct {
 	data    []byte
 }
 
+type nodeStatusIdentityInfo struct {
+	Name string `json:"name"`
+}
+
 type nodeStatusWSIdentity struct {
 	NodeName string `json:"nodeName"`
+	// Match NodeStatusResponse's value semantics for repeated fields and JSON null.
+	NodeInfo nodeStatusIdentityInfo `json:"nodeInfo"`
 	Status   *struct {
-		NodeInfo *struct {
-			Name string `json:"name"`
-		} `json:"nodeInfo"`
+		NodeInfo nodeStatusIdentityInfo `json:"nodeInfo"`
 	} `json:"status"`
+	Summary *struct {
+		NodeInfo nodeStatusIdentityInfo `json:"nodeInfo"`
+	} `json:"summary"`
+	Delta map[string]json.RawMessage `json:"delta"`
 }
 
-func extractNodeNameFromWSMessage(data []byte) string {
+func extractNodeNameFromWSMessage(data []byte) (string, error) {
 	var identity nodeStatusWSIdentity
 	if err := json.Unmarshal(data, &identity); err != nil {
-		return ""
+		return "", fmt.Errorf("invalid JSON status identity: %w", err)
 	}
 
-	if identity.NodeName != "" {
-		return identity.NodeName
+	if err := rejectDuplicateStatusIdentityFields(data, "envelope"); err != nil {
+		return "", err
 	}
 
-	if identity.Status != nil && identity.Status.NodeInfo != nil {
-		return identity.Status.NodeInfo.Name
+	nodeNames := []string{identity.NodeName, identity.NodeInfo.Name}
+	if identity.Status != nil {
+		nodeNames = append(nodeNames, identity.Status.NodeInfo.Name)
 	}
 
-	return ""
+	if identity.Summary != nil {
+		nodeNames = append(nodeNames, identity.Summary.NodeInfo.Name)
+	}
+
+	// Match ApplyDelta's case-sensitive map lookup, not struct field matching.
+	if raw, ok := identity.Delta["nodeInfo"]; ok {
+		var info nodeStatusIdentityInfo
+		if err := json.Unmarshal(raw, &info); err != nil {
+			return "", fmt.Errorf("invalid nodeInfo delta: %w", err)
+		}
+
+		nodeNames = append(nodeNames, info.Name)
+	}
+
+	return validatedNodeNames(nodeNames)
 }
 
-// authorizeDirectStatusRequest checks HMAC token auth for direct (non-aggregated)
-// node push/websocket paths. The token must have the node role.
-func authorizeDirectStatusRequest(tokenIssuer *authn.TokenIssuer, r *http.Request) bool {
+// Duplicate identity fields can erase an earlier identity before validation.
+// Match struct folding, but keep delta map keys case-sensitive like ApplyDelta.
+func rejectDuplicateStatusIdentityFields(data []byte, object string) error {
+	if object != "envelope" && bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return nil
+	}
+
+	fields := []string{"nodeName", "nodeInfo", "status", "delta", "summary"}
+
+	switch object {
+	case "status", "delta", "summary":
+		fields = []string{"nodeInfo"}
+	case "nodeInfo":
+		fields = []string{"name"}
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(data))
+
+	start, err := decoder.Token()
+	if err != nil || start != json.Delim('{') {
+		return fmt.Errorf("status identity must be a JSON object")
+	}
+
+	seen := make(map[string]bool, 2)
+
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil {
+			return fmt.Errorf("invalid status identity key: %w", err)
+		}
+
+		name, ok := key.(string)
+		if !ok {
+			return fmt.Errorf("status identity key must be a string")
+		}
+
+		matched := ""
+
+		for _, field := range fields {
+			if name == field || (object != "delta" && strings.EqualFold(name, field)) {
+				matched = field
+				break
+			}
+		}
+
+		if matched != "" {
+			if seen[matched] {
+				return fmt.Errorf("duplicate status identity field %q in %s", matched, object)
+			}
+
+			seen[matched] = true
+		}
+
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return fmt.Errorf("invalid status identity value: %w", err)
+		}
+
+		if matched == "status" || matched == "delta" || matched == "nodeInfo" || matched == "summary" {
+			if err := rejectDuplicateStatusIdentityFields(value, matched); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func validatedNodeNames(nodeNames []string) (string, error) {
+	nodeName := ""
+
+	for _, candidate := range nodeNames {
+		if candidate == "" {
+			continue
+		}
+
+		if nodeName != "" && candidate != nodeName {
+			return "", fmt.Errorf("conflicting node names %q and %q", nodeName, candidate)
+		}
+
+		nodeName = candidate
+	}
+
+	return nodeName, nil
+}
+
+// authorizeDirectStatusRequest validates a node-scoped HMAC token.
+func authorizeDirectStatusRequest(tokenIssuer *authn.TokenIssuer, r *http.Request) (*authn.Claims, error) {
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
-		return false
+		return nil, fmt.Errorf("bearer token is required")
 	}
 
 	token := strings.TrimPrefix(authHeader, "Bearer ")
@@ -84,13 +205,23 @@ func authorizeDirectStatusRequest(tokenIssuer *authn.TokenIssuer, r *http.Reques
 	claims, err := tokenIssuer.Validate(token)
 	if err != nil {
 		klog.V(3).Infof("HMAC token validation failed: %v", err)
-		return false
+		return nil, err
 	}
 
-	return claims.Role == authn.RoleNode
+	if claims.Role != authn.RoleNode {
+		return nil, fmt.Errorf("token role %q is not authorized for node status", claims.Role)
+	}
+
+	if claims.NodeName == "" {
+		return nil, fmt.Errorf("node token has no node claim")
+	}
+
+	return claims, nil
 }
 
 func startServer(ctx context.Context, healthPort int, requireDashboardAuth bool, health *healthState, webhookServer *webhookpkg.Server, certMgr *certmanager.CertManager, tokenIssuer *authn.TokenIssuer, tokenCfg tokenEndpointConfig) {
+	health.statusCache.RequireDetails()
+
 	mux := webhookServer.Mux()
 
 	// Register webhook handlers (validate, mutate-nodes, aggregated API discovery).
@@ -103,12 +234,12 @@ func startServer(ctx context.Context, healthPort int, requireDashboardAuth bool,
 	clusterStatusCache := NewClusterStatusCache(health)
 
 	health.clusterStatusCache = clusterStatusCache
-	go clusterStatusCache.Run(context.Background())
+	go clusterStatusCache.Run(ctx)
 
 	broadcaster := NewWSBroadcaster(health)
-	go broadcaster.Run(context.Background())
+	go broadcaster.Run(ctx)
 	// Node status changes patch the pre-built cache in-place and notify the broadcaster.
-	health.statusCache.SetOnChange(func(nodeName string, status *NodeStatusResponse) {
+	health.statusCache.SetOnChange(func(nodeName string, status *NodeStatusResponse, eventSeq uint64) {
 		statusCopy := *status
 
 		// Set StatusSource from the cache entry's source (ws, push, etc.)
@@ -118,7 +249,12 @@ func startServer(ctx context.Context, healthPort int, requireDashboardAuth bool,
 			}
 		}
 
-		clusterStatusCache.PatchNode(nodeName, statusCopy)
+		clusterStatusCache.patchNodeEvent(nodeName, statusCopy, eventSeq)
+		clusterStatusCache.MarkDirty()
+		broadcaster.Notify()
+	})
+	health.statusCache.SetOnOverviewChange(func(nodeName string, overview statusv1alpha1.NodeStatusOverview, eventSeq uint64) {
+		clusterStatusCache.patchOverviewEvent(nodeName, overview, eventSeq)
 		clusterStatusCache.MarkDirty()
 		broadcaster.Notify()
 	})
@@ -266,12 +402,14 @@ func serveStatusJSON(health *healthState, w http.ResponseWriter, r *http.Request
 
 	w.Header().Set("Content-Type", "application/json")
 
-	if err := json.NewEncoder(w).Encode(status); err != nil {
+	if err := json.NewEncoder(w).Encode(buildClusterSummary(status)); err != nil {
 		klog.V(4).Infof("status json encode failed: %v", err)
 	}
 }
 
 func registerStatusHandlers(mux *http.ServeMux, health *healthState, requireDashboardAuth bool, webhookServer *webhookpkg.Server, dashAuthorizer *dashboardAuthorizer, tokenIssuer *authn.TokenIssuer) {
+	registerNodeDetailHandlers(mux, health, requireDashboardAuth, webhookServer, dashAuthorizer, tokenIssuer)
+
 	mux.HandleFunc("/status/json", func(w http.ResponseWriter, r *http.Request) {
 		if !authorizeDashboardOrAggregated(requireDashboardAuth, tokenIssuer, dashAuthorizer, webhookServer, r) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
@@ -298,84 +436,7 @@ func registerStatusHandlers(mux *http.ServeMux, health *healthState, requireDash
 			return
 		}
 
-		forcePull := r.URL.Query().Get("live") == "true"
-		if !forcePull {
-			if cached, ok := health.statusCache.Get(nodeName); ok {
-				age := time.Since(cached.ReceivedAt)
-				if age < health.staleThreshold {
-					result := cached.Status
-					t := cached.ReceivedAt
-					result.LastPushTime = &t
-
-					w.Header().Set("Content-Type", "application/json")
-
-					if err := json.NewEncoder(w).Encode(result); err != nil {
-						klog.V(4).Infof("status json encode failed: %v", err)
-					}
-
-					return
-				}
-
-				if !health.pullEnabled.Load() {
-					result := cached.Status
-					t := cached.ReceivedAt
-					result.LastPushTime = &t
-					result.StatusSource = "stale-cache"
-					result.FetchError = fmt.Sprintf("stale status (%s old), pull disabled", formatDurationAgo(age))
-
-					w.Header().Set("Content-Type", "application/json")
-
-					if err := json.NewEncoder(w).Encode(result); err != nil {
-						klog.V(4).Infof("status json encode failed: %v", err)
-					}
-
-					return
-				}
-			} else if !health.pullEnabled.Load() {
-				http.Error(w, "no cached status for node (pull disabled)", http.StatusNotFound)
-				return
-			}
-		}
-
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-		defer cancel()
-
-		if health.nodeLister == nil {
-			http.Error(w, "node informer not ready", http.StatusServiceUnavailable)
-			return
-		}
-
-		node, err := health.nodeLister.Get(nodeName)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("node not found: %v", err), http.StatusNotFound)
-			return
-		}
-
-		var nodeIP string
-
-		for _, addr := range node.Status.Addresses {
-			if addr.Type == "InternalIP" {
-				nodeIP = addr.Address
-				break
-			}
-		}
-
-		if nodeIP == "" {
-			http.Error(w, "no InternalIP found for node", http.StatusInternalServerError)
-			return
-		}
-
-		nodeStatus, err := fetchNodeStatus(ctx, nodeIP, health.nodeAgentHealthPort)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("failed to fetch node status: %v", err), http.StatusBadGateway)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-
-		if err := json.NewEncoder(w).Encode(nodeStatus); err != nil {
-			klog.V(4).Infof("status json encode failed: %v", err)
-		}
+		serveLegacyNodeDetails(health, w, r, nodeName)
 	})
 }
 
@@ -413,23 +474,43 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 				return
 			}
 
+			if expectedNode := authorizedNodeName(r); expectedNode != "" {
+				actualNode, identityErr := extractNodeNameFromStatusBody(r, bodyBytes)
+				if identityErr != nil {
+					http.Error(w, identityErr.Error(), http.StatusBadRequest)
+					return
+				}
+
+				if actualNode == "" {
+					http.Error(w, "nodeName is required", http.StatusBadRequest)
+					return
+				}
+
+				if actualNode != expectedNode {
+					http.Error(w, "node token cannot update another node", http.StatusForbidden)
+					return
+				}
+			}
+
 			ack, statusCode, ackErr := handleStatusPushBody(health, r, bodyBytes, source)
 			if ackErr != nil {
 				http.Error(w, ackErr.Error(), statusCode)
 				return
 			}
 
+			if ack.IsPublicationAck() && ack.Status == "ok" {
+				if manager := health.getDetailRequests(); manager != nil {
+					if command, ok := manager.Pending(authorizedNodeName(r)); ok {
+						ack.DetailRequest = &command
+					}
+				}
+			}
+
 			isProto := isProtobufContentType(r)
 			if isProto {
 				w.Header().Set("Content-Type", "application/x-protobuf")
 
-				pbAck := &statusproto.NodeStatusAck{
-					Status:   ack.Status,
-					Revision: ack.Revision,
-					Reason:   ack.Reason,
-				}
-
-				data, marshalErr := proto.Marshal(pbAck)
+				data, marshalErr := marshalProtoAck("node_status_ack", ack)
 				if marshalErr != nil {
 					klog.V(4).Infof("status push proto ack marshal failed: %v", marshalErr)
 					http.Error(w, "internal error", http.StatusInternalServerError)
@@ -458,15 +539,18 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 		}
 	}
 
-	// Direct push path -- HMAC token auth.
-	mux.HandleFunc("/status/push", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeDirectStatusRequest(tokenIssuer, r) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
+	if health.nodeTokenVerifier != nil {
+		// Direct push path -- HMAC token auth.
+		mux.HandleFunc("/status/push", func(w http.ResponseWriter, r *http.Request) {
+			claims, err := authorizeDirectStatusRequest(tokenIssuer, r)
+			if err != nil {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
 
-		statusPushHandler("push").ServeHTTP(w, r)
-	})
+			statusPushHandler("push").ServeHTTP(w, withAuthorizedNodeName(r, claims.NodeName))
+		})
+	}
 
 	nodeWSHandler := func(source string) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
@@ -503,7 +587,7 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 				return
 			}
 
-			conn.SetReadLimit(2 * 1024 * 1024) // 2 MiB -- status payloads grow with cluster size
+			conn.SetReadLimit(maxNodeWSFrameBytes)
 			websocketConnections.Inc()
 
 			defer func() {
@@ -514,37 +598,60 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 				}
 			}()
 
-			send := func(frameType websocket.MessageType, ackMsgType string, ack NodeStatusPushAck) {
-				if frameType == websocket.MessageBinary {
-					payload, marshalErr := marshalProtoAck(ackMsgType, ack)
-					if marshalErr != nil {
-						klog.V(4).Infof("Node WebSocket proto ack marshal failed (source=%s, node=%s): %v", source, nodeNameForLog(), marshalErr)
-						return
-					}
-
-					if writeErr := conn.Write(r.Context(), websocket.MessageBinary, payload); writeErr != nil {
-						klog.V(4).Infof("Node WebSocket ack write failed (source=%s, node=%s): %v", source, nodeNameForLog(), writeErr)
-					}
-
-					return
-				}
-
-				payload, marshalErr := json.Marshal(map[string]interface{}{"type": ackMsgType, "data": ack})
-				if marshalErr != nil {
-					klog.V(4).Infof("Node WebSocket ack marshal failed (source=%s, node=%s): %v", source, nodeNameForLog(), marshalErr)
-					return
-				}
-
-				if writeErr := conn.Write(r.Context(), websocket.MessageText, payload); writeErr != nil {
-					klog.V(4).Infof("Node WebSocket ack write failed (source=%s, node=%s): %v", source, nodeNameForLog(), writeErr)
-				}
-			}
-
 			wsCtx, wsCancel := context.WithCancel(r.Context())
 			defer wsCancel()
+
+			var registration *nodeWSConnection
 			defer func() {
-				health.unregisterNodeWS(lastWSNodeName, wsCancel)
+				health.markNodeWSStale(lastWSNodeName, registration, source)
+				health.unregisterNodeWS(lastWSNodeName, registration)
 			}()
+
+			writeGate := make(chan struct{}, 1)
+
+			sendContext := func(ctx context.Context, frameType websocket.MessageType, ackMsgType string, ack NodeStatusPushAck) error {
+				select {
+				case writeGate <- struct{}{}:
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-wsCtx.Done():
+					return wsCtx.Err()
+				}
+
+				defer func() { <-writeGate }()
+
+				var (
+					payload    []byte
+					marshalErr error
+				)
+				if frameType == websocket.MessageBinary {
+					payload, marshalErr = marshalProtoAck(ackMsgType, ack)
+				} else {
+					payload, marshalErr = json.Marshal(map[string]interface{}{"type": ackMsgType, "data": ack})
+				}
+
+				if marshalErr != nil {
+					return marshalErr
+				}
+
+				writeCtx, cancelWrite := withConnectionContext(ctx, wsCtx)
+				defer cancelWrite()
+
+				return conn.Write(writeCtx, frameType, payload)
+			}
+			send := func(frameType websocket.MessageType, ackMsgType string, ack NodeStatusPushAck) {
+				if err := sendContext(wsCtx, frameType, ackMsgType, ack); err != nil {
+					klog.V(4).Infof("Node WebSocket ack failed (source=%s): %v", source, err)
+					wsCancel()
+				}
+			}
+			enableDetails := func(nodeName string, frameType websocket.MessageType) {
+				health.setNodeWSDetailSender(nodeName, registration, func(ctx context.Context, command statusv1alpha1.DetailRequest) error {
+					return sendContext(ctx, frameType, "node_status_ack", NodeStatusPushAck{
+						Status: statusv1alpha1.DetailRequestStatus, DetailRequest: &command, SummarySupported: true,
+					})
+				})
+			}
 
 			recvCh := make(chan wsFrame)
 			errCh := make(chan error, 1)
@@ -553,16 +660,19 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 				defer close(recvCh)
 
 				for {
-					msgType, data, readErr := conn.Read(wsCtx)
+					frame, readErr := nodeWSBuffers.readFrame(wsCtx, conn)
 					if readErr != nil {
 						errCh <- readErr
 						return
 					}
 
 					select {
-					case recvCh <- wsFrame{msgType: msgType, data: data}:
+					case recvCh <- frame:
 					case <-wsCtx.Done():
+						nodeWSBuffers.put(frame.data)
+
 						errCh <- wsCtx.Err()
+
 						return
 					}
 				}
@@ -614,13 +724,19 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 			pingInFlight := false
 			lastActivity := time.Now()
 
+			var frameData []byte
+			defer func() { nodeWSBuffers.put(frameData) }()
+
 			for {
+				nodeWSBuffers.put(frameData)
+				frameData = nil
+
 				select {
 				case <-wsCtx.Done():
 					return
 				case readErr := <-errCh:
 					if lastWSNodeName != "" {
-						health.statusCache.UpdateSource(lastWSNodeName, "stale-cache")
+						health.markNodeWSStale(lastWSNodeName, registration, source)
 					}
 					// Log graceful close frames and expected disconnections at
 					// V(4) to reduce noise during rolling restarts.
@@ -643,30 +759,79 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 				case frame, ok := <-recvCh:
 					if !ok {
 						if lastWSNodeName != "" {
-							health.statusCache.UpdateSource(lastWSNodeName, "stale-cache")
+							health.markNodeWSStale(lastWSNodeName, registration, source)
 						}
 
 						return
 					}
 
+					frameData = frame.data
 					lastActivity = time.Now()
 
 					if frame.msgType == websocket.MessageBinary {
-						if nodeName := extractNodeNameFromProtoMessage(frame.data); nodeName != "" {
+						decoded, decodeErr := decodeProtoWSMessage(frame.data)
+						if decodeErr != nil {
+							send(websocket.MessageBinary, "node_status_resync", NodeStatusPushAck{
+								Status: "resync_required",
+								Reason: decodeErr.Error(),
+							})
+
+							continue
+						}
+
+						nodeName := decoded.nodeName
+						if expectedNode := authorizedNodeName(r); expectedNode != "" && nodeName != "" && nodeName != expectedNode {
+							send(websocket.MessageBinary, "node_status_resync", NodeStatusPushAck{
+								Status: "resync_required",
+								Reason: "node token cannot update another node",
+							})
+
+							return
+						}
+
+						if nodeName != "" {
 							if lastWSNodeName == "" {
 								// First message identifies the node -- register and evict old connections.
-								health.registerNodeWS(nodeName, wsCancel)
+								registration = health.registerNodeWS(nodeName, wsCancel)
 							}
 
 							lastWSNodeName = nodeName
 						}
 
-						ackType, ack := handleProtoWSMessage(health, frame.data, source)
+						ackType, ack := handleProtoWSMessage(health, decoded, source)
 						send(websocket.MessageBinary, ackType, ack)
+
+						if ack.Status == "ok" && decoded.message.SupportsDetails {
+							enableDetails(nodeName, websocket.MessageBinary)
+						}
 					} else {
-						if nodeName := extractNodeNameFromWSMessage(frame.data); nodeName != "" {
+						nodeName, identityErr := extractNodeNameFromWSMessage(frame.data)
+						if identityErr != nil || nodeName == "" {
+							reason := "nodeName is required"
+							if identityErr != nil {
+								reason = identityErr.Error()
+							}
+
+							send(websocket.MessageText, "node_status_resync", NodeStatusPushAck{
+								Status: "resync_required",
+								Reason: reason,
+							})
+
+							return
+						}
+
+						if expectedNode := authorizedNodeName(r); expectedNode != "" && nodeName != "" && nodeName != expectedNode {
+							send(websocket.MessageText, "node_status_resync", NodeStatusPushAck{
+								Status: "resync_required",
+								Reason: "node token cannot update another node",
+							})
+
+							return
+						}
+
+						if nodeName != "" {
 							if lastWSNodeName == "" {
-								health.registerNodeWS(nodeName, wsCancel)
+								registration = health.registerNodeWS(nodeName, wsCancel)
 							}
 
 							lastWSNodeName = nodeName
@@ -674,6 +839,13 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 
 						ackType, ack := handleNodeStatusWSMessageWithSource(health, frame.data, source)
 						send(websocket.MessageText, ackType, ack)
+
+						var capability struct {
+							SupportsDetails bool `json:"supportsDetails"`
+						}
+						if err := json.Unmarshal(frame.data, &capability); err == nil && ack.Status == "ok" && capability.SupportsDetails {
+							enableDetails(nodeName, websocket.MessageText)
+						}
 					}
 				case <-keepaliveCh:
 					// Skip ping if we received a message recently
@@ -717,7 +889,7 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 							klog.V(2).Infof("Node WebSocket keepalive closing connection after reaching failure threshold (source=%s, node=%s, failures=%d, threshold=%d)", source, nodeNameLog, keepaliveFailures, health.statusWSKeepaliveFailureCount)
 
 							if lastWSNodeName != "" {
-								health.statusCache.UpdateSource(lastWSNodeName, "stale-cache")
+								health.markNodeWSStale(lastWSNodeName, registration, source)
 							}
 
 							if closeErr := conn.Close(websocket.StatusGoingAway, "keepalive failure threshold reached"); closeErr != nil {
@@ -740,54 +912,43 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 		}
 	}
 
-	// Direct WebSocket path -- HMAC token auth.
-	mux.HandleFunc("/status/nodews", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeDirectStatusRequest(tokenIssuer, r) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
+	if health.nodeTokenVerifier != nil {
+		// Direct WebSocket path -- HMAC token auth.
+		mux.HandleFunc("/status/nodews", func(w http.ResponseWriter, r *http.Request) {
+			claims, err := authorizeDirectStatusRequest(tokenIssuer, r)
+			if err != nil {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
 
-		nodeWSHandler("ws").ServeHTTP(w, r)
-	})
+			nodeWSHandler("ws").ServeHTTP(w, withAuthorizedNodeName(r, claims.NodeName))
+		})
+	}
 
 	// Aggregated API paths -- front-proxy cert auth via webhook server.
 	if health.registerAggregatedAPIServer {
 		mux.HandleFunc(aggregatedNodeStatusPushPath, func(w http.ResponseWriter, r *http.Request) {
-			if !webhookServer.IsTrustedAggregatedRequest(r) {
-				http.Error(w, "forbidden", http.StatusForbidden)
-				return
-			}
-			// Verify the front-proxy identity is the expected node service account.
-			remoteUser := strings.TrimSpace(r.Header.Get("X-Remote-User"))
-
-			saID, ok := serviceAccountIDFromUsername(remoteUser)
-			if !ok || saID != health.nodeServiceAccount {
-				klog.V(3).Infof("aggregated push rejected for unexpected user %q", remoteUser)
+			authorizedRequest, err := authorizeAggregatedNodeRequest(r, health, webhookServer)
+			if err != nil {
+				klog.V(3).Infof("aggregated push rejected: %v", err)
 				http.Error(w, "forbidden", http.StatusForbidden)
 
 				return
 			}
 
-			statusPushHandler("apiserver-push").ServeHTTP(w, r)
+			statusPushHandler("apiserver-push").ServeHTTP(w, authorizedRequest)
 		})
 
 		mux.HandleFunc(aggregatedNodeStatusWebSocketPath, func(w http.ResponseWriter, r *http.Request) {
-			if !webhookServer.IsTrustedAggregatedRequest(r) {
-				http.Error(w, "forbidden", http.StatusForbidden)
-				return
-			}
-
-			remoteUser := strings.TrimSpace(r.Header.Get("X-Remote-User"))
-
-			saID, ok := serviceAccountIDFromUsername(remoteUser)
-			if !ok || saID != health.nodeServiceAccount {
-				klog.V(3).Infof("aggregated websocket rejected for unexpected user %q", remoteUser)
+			authorizedRequest, err := authorizeAggregatedNodeRequest(r, health, webhookServer)
+			if err != nil {
+				klog.V(3).Infof("aggregated websocket rejected: %v", err)
 				http.Error(w, "forbidden", http.StatusForbidden)
 
 				return
 			}
 
-			nodeWSHandler("apiserver-ws").ServeHTTP(w, r)
+			nodeWSHandler("apiserver-ws").ServeHTTP(w, authorizedRequest)
 		})
 
 		mux.HandleFunc(aggregatedStatusJSONPath, func(w http.ResponseWriter, r *http.Request) {
@@ -799,6 +960,47 @@ func registerPushHandlers(mux *http.ServeMux, health *healthState, webhookServer
 			serveStatusJSON(health, w, r)
 		})
 	}
+}
+
+func authorizeAggregatedNodeRequest(
+	r *http.Request,
+	health *healthState,
+	webhookServer *webhookpkg.Server,
+) (*http.Request, error) {
+	if !webhookServer.IsTrustedAggregatedRequest(r) {
+		return nil, fmt.Errorf("request is not from the trusted front proxy")
+	}
+
+	remoteUser := strings.TrimSpace(r.Header.Get("X-Remote-User"))
+
+	saID, ok := serviceAccountIDFromUsername(remoteUser)
+	if !ok || saID != health.nodeServiceAccount {
+		return nil, fmt.Errorf("unexpected user %q", remoteUser)
+	}
+
+	if health.nodeTokenVerifier == nil {
+		return nil, fmt.Errorf("node token verifier is not configured")
+	}
+
+	serviceAccountToken := strings.TrimSpace(r.Header.Get(nodeIdentityTokenHeader))
+	if serviceAccountToken == "" {
+		return nil, fmt.Errorf("missing node identity token")
+	}
+
+	identity, err := health.nodeTokenVerifier.Verify(r.Context(), serviceAccountToken)
+	if err != nil {
+		return nil, fmt.Errorf("validate node identity token: %w", err)
+	}
+
+	if identity.Subject != remoteUser {
+		return nil, fmt.Errorf("node identity subject %q does not match authenticated user %q", identity.Subject, remoteUser)
+	}
+
+	if err := authorizeNodeServiceAccount(identity, health.nodeServiceAccount); err != nil {
+		return nil, err
+	}
+
+	return withAuthorizedNodeName(r, identity.NodeName), nil
 }
 
 func registerDashboardHandlers(mux *http.ServeMux, health *healthState, broadcaster *WSBroadcaster, requireDashboardAuth bool, webhookServer *webhookpkg.Server, dashAuthorizer *dashboardAuthorizer, tokenIssuer *authn.TokenIssuer) {
@@ -862,11 +1064,10 @@ func registerDashboardHandlers(mux *http.ServeMux, health *healthState, broadcas
 
 		ctx, cancel := context.WithCancel(r.Context())
 		client := &WSClient{
-			conn:                    conn,
-			send:                    make(chan []byte, 16),
-			ctx:                     ctx,
-			cancel:                  cancel,
-			nodeDetailSubscriptions: make(map[string]bool),
+			conn:   conn,
+			send:   make(chan []byte, 16),
+			ctx:    ctx,
+			cancel: cancel,
 		}
 		broadcaster.Register(client)
 
@@ -911,6 +1112,34 @@ func handleStatusPushRequest(health *healthState, bodyBytes []byte) (NodeStatusP
 	return ack, code, err
 }
 
+type authorizedNodeContextKey struct{}
+
+func withAuthorizedNodeName(r *http.Request, nodeName string) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), authorizedNodeContextKey{}, nodeName))
+}
+
+func authorizedNodeName(r *http.Request) string {
+	nodeName, ok := r.Context().Value(authorizedNodeContextKey{}).(string)
+	if !ok {
+		return ""
+	}
+
+	return nodeName
+}
+
+func extractNodeNameFromStatusBody(r *http.Request, body []byte) (string, error) {
+	if isProtobufContentType(r) {
+		var msg statusproto.NodeStatusMessage
+		if err := proto.Unmarshal(body, &msg); err != nil {
+			return "", fmt.Errorf("invalid protobuf body: %w", err)
+		}
+
+		return validatedProtoNodeName(&msg)
+	}
+
+	return extractNodeNameFromWSMessage(body)
+}
+
 // isProtobufContentType returns true when the request Content-Type indicates
 // a protobuf payload.
 func isProtobufContentType(r *http.Request) bool {
@@ -928,13 +1157,47 @@ func handleStatusPushBody(health *healthState, r *http.Request, bodyBytes []byte
 	return handleStatusPushRequestWithSource(health, bodyBytes, source)
 }
 
-func handleStatusPushRequestWithSource(health *healthState, bodyBytes []byte, source string) (NodeStatusPushAck, int, error) {
+func handleStatusPushRequestWithSource(health *healthState, bodyBytes []byte, source string) (ack NodeStatusPushAck, code int, err error) {
+	defer func() { ack.SummarySupported = true }()
+
+	if _, err := extractNodeNameFromWSMessage(bodyBytes); err != nil {
+		return NodeStatusPushAck{}, http.StatusBadRequest, err
+	}
+
 	var envelope NodeStatusPushEnvelope
 	if err := json.Unmarshal(bodyBytes, &envelope); err != nil {
 		return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("invalid request body: %v", err)
 	}
 
-	ack := NodeStatusPushAck{Status: "ok"}
+	ack = NodeStatusPushAck{Status: "ok"}
+
+	if envelope.Type == statusv1alpha1.NodeStatusSummaryType {
+		if envelope.Mode != "" && envelope.Mode != "summary" {
+			return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("conflicting status mode and type")
+		}
+
+		envelope.Mode = "summary"
+	}
+
+	if envelope.Type == statusv1alpha1.NodeStatusDetailsType {
+		if envelope.Mode != "" && envelope.Mode != "details" {
+			return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("conflicting status mode and type")
+		}
+
+		envelope.Mode = "details"
+	}
+
+	if envelope.DetailError != "" && envelope.Mode != "details" {
+		return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("collection error requires a detail response")
+	}
+
+	if envelope.Summary != nil && envelope.Mode != "summary" {
+		return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("overview requires summary mode")
+	}
+
+	if envelope.Mode == "summary" && envelope.Type != "" && envelope.Type != statusv1alpha1.NodeStatusSummaryType {
+		return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("conflicting status mode and type")
+	}
 
 	if envelope.Mode == "" {
 		var nodeStatus NodeStatusResponse
@@ -946,7 +1209,11 @@ func handleStatusPushRequestWithSource(health *healthState, bodyBytes []byte, so
 			return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("nodeInfo.name is required")
 		}
 
-		ack.Revision = health.statusCache.StoreFull(nodeStatus.NodeInfo.Name, nodeStatus, source)
+		ack.Revision, err = health.statusCache.StoreFullChecked(nodeStatus.NodeInfo.Name, nodeStatus, source)
+		if err != nil {
+			return NodeStatusPushAck{}, http.StatusServiceUnavailable, fmt.Errorf("failed to store full status: %w", err)
+		}
+
 		klog.V(5).Infof("Received full status push from node %s", nodeStatus.NodeInfo.Name)
 
 		return ack, http.StatusOK, nil
@@ -957,11 +1224,32 @@ func handleStatusPushRequestWithSource(health *healthState, bodyBytes []byte, so
 		nodeName = envelope.Status.NodeInfo.Name
 	}
 
+	if envelope.Summary != nil && envelope.Summary.NodeInfo.Name != "" {
+		nodeName = envelope.Summary.NodeInfo.Name
+	}
+
 	if nodeName == "" {
 		return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("nodeName is required")
 	}
 
 	switch envelope.Mode {
+	case "details":
+		if envelope.Delta != nil {
+			return NodeStatusPushAck{Status: "error", DetailRequestID: envelope.DetailRequestID, Reason: "details cannot include a delta"}, http.StatusOK, nil
+		}
+
+		return handleNodeDetailResponse(health, nodeName, envelope.DetailRequestID, envelope.Status, envelope.DetailError), http.StatusOK, nil
+	case "summary":
+		if envelope.Summary == nil || envelope.Status != nil || envelope.Delta != nil || envelope.DetailRequestID != "" {
+			return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("summary must contain only overview data")
+		}
+
+		ack.Revision, err = health.statusCache.StoreOverview(nodeName, *envelope.Summary, source)
+		if err != nil {
+			return NodeStatusPushAck{}, http.StatusBadRequest, err
+		}
+
+		return ack, http.StatusOK, nil
 	case "full":
 		if envelope.Status == nil {
 			return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("status is required for full mode")
@@ -971,7 +1259,11 @@ func handleStatusPushRequestWithSource(health *healthState, bodyBytes []byte, so
 			envelope.Status.NodeInfo.Name = nodeName
 		}
 
-		ack.Revision = health.statusCache.StoreFull(nodeName, *envelope.Status, source)
+		ack.Revision, err = health.statusCache.StoreFullChecked(nodeName, *envelope.Status, source)
+		if err != nil {
+			return NodeStatusPushAck{}, http.StatusServiceUnavailable, fmt.Errorf("failed to store full status: %w", err)
+		}
+
 		klog.V(5).Infof("Received full status push from node %s", nodeName)
 
 		return ack, http.StatusOK, nil
@@ -994,7 +1286,7 @@ func handleStatusPushRequestWithSource(health *healthState, bodyBytes []byte, so
 
 		return ack, http.StatusOK, nil
 	default:
-		return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("mode must be full or delta")
+		return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("unsupported status mode %q", envelope.Mode)
 	}
 }
 
@@ -1002,10 +1294,24 @@ func handleNodeStatusWSMessage(health *healthState, data []byte) (string, NodeSt
 	return handleNodeStatusWSMessageWithSource(health, data, "ws")
 }
 
-func handleNodeStatusWSMessageWithSource(health *healthState, data []byte, source string) (string, NodeStatusPushAck) {
+func handleNodeStatusWSMessageWithSource(health *healthState, data []byte, source string) (ackType string, ack NodeStatusPushAck) {
+	defer func() { ack.SummarySupported = true }()
+
+	if _, err := extractNodeNameFromWSMessage(data); err != nil {
+		return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: err.Error()}
+	}
+
 	var message NodeStatusWSMessage
 	if err := json.Unmarshal(data, &message); err != nil {
 		return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: "invalid message"}
+	}
+
+	if message.Summary != nil && message.Type != statusv1alpha1.NodeStatusSummaryType {
+		return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: "overview requires summary message type"}
+	}
+
+	if message.DetailError != "" && message.Type != statusv1alpha1.NodeStatusDetailsType {
+		return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: "collection error requires a detail response"}
 	}
 
 	nodeName := message.NodeName
@@ -1013,11 +1319,32 @@ func handleNodeStatusWSMessageWithSource(health *healthState, data []byte, sourc
 		nodeName = message.Status.NodeInfo.Name
 	}
 
+	if message.Summary != nil && message.Summary.NodeInfo.Name != "" {
+		nodeName = message.Summary.NodeInfo.Name
+	}
+
 	if nodeName == "" {
 		return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: "nodeName is required"}
 	}
 
 	switch message.Type {
+	case statusv1alpha1.NodeStatusDetailsType:
+		if message.Delta != nil {
+			return "node_status_ack", NodeStatusPushAck{Status: "error", DetailRequestID: message.DetailRequestID, Reason: "details cannot include a delta"}
+		}
+
+		return "node_status_ack", handleNodeDetailResponse(health, nodeName, message.DetailRequestID, message.Status, message.DetailError)
+	case statusv1alpha1.NodeStatusSummaryType:
+		if message.Summary == nil || message.Status != nil || message.Delta != nil || message.DetailRequestID != "" {
+			return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: "summary must contain only overview data"}
+		}
+
+		revision, err := health.statusCache.StoreOverview(nodeName, *message.Summary, source)
+		if err != nil {
+			return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: err.Error()}
+		}
+
+		return "node_status_ack", NodeStatusPushAck{Status: "ok", Revision: revision}
 	case "node_status_full":
 		if message.Status == nil {
 			return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: "full message missing status"}
@@ -1027,7 +1354,10 @@ func handleNodeStatusWSMessageWithSource(health *healthState, data []byte, sourc
 			message.Status.NodeInfo.Name = nodeName
 		}
 
-		rev := health.statusCache.StoreFull(nodeName, *message.Status, source)
+		rev, err := health.statusCache.StoreFullChecked(nodeName, *message.Status, source)
+		if err != nil {
+			return "node_status_resync", NodeStatusPushAck{Status: "resync_required", Reason: err.Error()}
+		}
 
 		return "node_status_ack", NodeStatusPushAck{Status: "ok", Revision: rev}
 	case "node_status_delta":
@@ -1155,6 +1485,8 @@ func serveUnifiedServer(ctx context.Context, port int, mux *http.ServeMux, certM
 // advertises gzip support via Accept-Encoding. WebSocket upgrades and
 // requests without gzip support are passed through unmodified.
 func gzipHandler(next http.Handler) http.Handler {
+	pool := newGzipWriterPool()
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") ||
 			strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
@@ -1162,17 +1494,21 @@ func gzipHandler(next http.Handler) http.Handler {
 			return
 		}
 
-		gz, err := gzip.NewWriterLevel(w, gzip.BestSpeed)
+		gz, err := pool.get(w)
 		if err != nil {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		defer func() { _ = gz.Close() }() //nolint:errcheck
+		completed := false
+
+		defer func() { pool.put(gz, completed) }()
 
 		w.Header().Set("Content-Encoding", "gzip")
 		w.Header().Del("Content-Length")
 		next.ServeHTTP(&gzipResponseWriter{ResponseWriter: w, Writer: gz}, r)
+
+		completed = true
 	})
 }
 

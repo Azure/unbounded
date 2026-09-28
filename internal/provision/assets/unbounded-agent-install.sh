@@ -69,13 +69,40 @@ if [ -z "${AGENT_URL}" ]; then
 else
     _version_desc="${AGENT_VERSION:-custom}"
 fi
-AGENT_BIN="/usr/local/bin/unbounded-agent"
-
 echo "Downloading unbounded-agent ${_version_desc} for ${arch} from ${AGENT_URL}..."
-tmp_dir="$(mktemp -d)"
+# Staged under /var/lib rather than the default temporary directory because the
+# staged binary is executed, not just copied: admission runs from it below.
+# Hardened hosts commonly mount /tmp noexec, which would fail the run outright,
+# and image-based hosts are the ones most likely to do so.
+staging_root="/var/lib/unbounded"
+mkdir -p "${staging_root}"
+tmp_dir="$(mktemp -d "${staging_root}/install.XXXXXX")"
 trap 'rm -rf "${tmp_dir}"' EXIT
 curl -fsSL "${AGENT_URL}" | tar -xz -C "${tmp_dir}" unbounded-agent
-install -m 0755 "${tmp_dir}/unbounded-agent" "${AGENT_BIN}"
+# Run admission from the staged executable. Bootstrap installs the daemon binary
+# only after acquiring installation ownership; retries cannot overwrite a live
+# current/compatibility binary link before their intent has been accepted.
+AGENT_BIN="${tmp_dir}/unbounded-agent"
+chmod 0755 "${AGENT_BIN}"
+
+# Seed the daemon binary path when nothing usable is there yet. The agent
+# version is selected independently of this script - by AGENT_VERSION, by
+# AGENT_URL, or by the default of tracking the latest published release - so an
+# installer that relied on the agent to install its own binary would silently
+# break every agent released before that behavior existed. Such an agent never
+# writes the binary, and bootstrap then fails at daemon setup with no indication
+# that the installer and the agent disagree.
+#
+# The test follows symlinks on purpose. On a host this installation already owns
+# the path resolves through the compatibility symlink to a live blue-green slot,
+# so it is left untouched and admission still runs from the staged executable
+# above. A dangling link resolves to nothing and is replaced, because install
+# would otherwise write through it to a stale location.
+AGENT_BIN_TARGET="/usr/local/bin/unbounded-agent"
+if [ ! -x "${AGENT_BIN_TARGET}" ]; then
+    rm -f "${AGENT_BIN_TARGET}"
+    install -m 0755 "${AGENT_BIN}" "${AGENT_BIN_TARGET}"
+fi
 
 _START_ARGS=""
 case "${AGENT_DEBUG}" in

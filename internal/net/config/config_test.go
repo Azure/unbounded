@@ -40,7 +40,11 @@ func TestDefaultLeaderElectionConfig(t *testing.T) {
 
 // TestConfigValidate tests ConfigValidate.
 func TestConfigValidate(t *testing.T) {
-	cfg := &Config{StatusWSKeepaliveFailureCount: 2}
+	cfg := &Config{
+		StatusWSKeepaliveFailureCount: 2,
+		StatusDetailCacheTTL:          DefaultStatusDetailCacheTTL,
+		StatusDetailRequestTimeout:    DefaultStatusDetailRequestTimeout,
+	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("expected nil validation error, got %v", err)
 	}

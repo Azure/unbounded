@@ -7,13 +7,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	schedulingv1 "k8s.io/api/scheduling/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -24,7 +24,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	gantrymanifests "github.com/Azure/unbounded/deploy/gantry"
 	"github.com/Azure/unbounded/internal/operator/component"
 )
 
@@ -32,7 +31,7 @@ func testScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 
 	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{appsv1.AddToScheme, corev1.AddToScheme, unboundedv1alpha3.AddToScheme} {
+	for _, add := range []func(*runtime.Scheme) error{appsv1.AddToScheme, corev1.AddToScheme, schedulingv1.AddToScheme, unboundedv1alpha3.AddToScheme} {
 		if err := add(scheme); err != nil {
 			t.Fatalf("add to scheme: %v", err)
 		}
@@ -85,6 +84,53 @@ func TestEnabledForDefaultsToEnabled(t *testing.T) {
 	}
 }
 
+func TestPlanRejectsHelmManagedInstallation(t *testing.T) {
+	priorityClass := &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{
+		Name: priorityClassName,
+		Annotations: map[string]string{
+			installationManagerAnnotation: installationManagerHelm,
+		},
+	}}
+	env := testEnv(t, priorityClass)
+
+	plan, res, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{*siteWithGantry("edge", nil)})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	if plan.Len() != 0 {
+		t.Fatalf("plan has %d operations, want none", plan.Len())
+	}
+
+	if res.Ready || res.Reason != reasonInstallationConflict || !strings.Contains(res.Message, `managed by "helm"`) {
+		t.Fatalf("result = %+v, want Helm installation conflict", res)
+	}
+}
+
+func TestPlanLeavesHelmManagedInstallationWhenDisabled(t *testing.T) {
+	no := false
+	priorityClass := &schedulingv1.PriorityClass{ObjectMeta: metav1.ObjectMeta{
+		Name: priorityClassName,
+		Labels: map[string]string{
+			"app.kubernetes.io/managed-by": "Helm",
+		},
+	}}
+	env := testEnv(t, priorityClass)
+
+	plan, res, err := (Component{}).Plan(t.Context(), env, []unboundedv1alpha3.Site{*siteWithGantry("edge", &no)})
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+
+	if plan.Len() != 0 {
+		t.Fatalf("plan has %d operations, want none", plan.Len())
+	}
+
+	if !res.Ready || res.Reason != component.ReasonDisabled {
+		t.Fatalf("result = %+v, want external installation left disabled", res)
+	}
+}
+
 func TestEnsureConfigCreatesDefaultOnlyWhenAbsent(t *testing.T) {
 	env := testEnv(t)
 
@@ -129,27 +175,6 @@ func TestEnsureConfigPreservesExistingPayload(t *testing.T) {
 	}
 }
 
-func TestNodeConfigUsesAgentMarkerAndAcceptsLegacyMarker(t *testing.T) {
-	manifest, err := fs.ReadFile(gantrymanifests.Manifests, "node-config.yaml")
-	if err != nil {
-		t.Fatalf("read node-config manifest: %v", err)
-	}
-
-	const (
-		agentMarker  = "# Managed by unbounded-agent for Gantry."
-		legacyMarker = "# Managed by the Gantry node-config DaemonSet."
-	)
-
-	content := string(manifest)
-	if strings.Count(content, agentMarker) < 2 {
-		t.Fatalf("node-config manifest does not write and recognize agent marker %q", agentMarker)
-	}
-
-	if !strings.Contains(content, legacyMarker) {
-		t.Fatalf("node-config manifest does not recognize legacy marker %q", legacyMarker)
-	}
-}
-
 func TestApplyMutatorStampsDaemonSetAndSkipsConfig(t *testing.T) {
 	ds := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "apps/v1",
@@ -177,6 +202,31 @@ func TestApplyMutatorStampsDaemonSetAndSkipsConfig(t *testing.T) {
 	}}
 	if err := applyMutator("ghcr.io/azure/gantry:test", "gantry-hash")(config); err != nil || config.Object != nil {
 		t.Fatalf("gantry ConfigMap was not skipped: err=%v object=%#v", err, config.Object)
+	}
+}
+
+func TestOperatorManifestAllowlist(t *testing.T) {
+	want := map[string]bool{
+		"configmap.yaml":         true,
+		"daemonset.yaml":         true,
+		"rendezvous-leases.yaml": true,
+		"serviceaccount.yaml":    true,
+	}
+
+	if len(operatorManifestFiles) != len(want) {
+		t.Fatalf("operator manifest allowlist = %v, want %v", operatorManifestFiles, want)
+	}
+
+	for file := range want {
+		if _, ok := operatorManifestFiles[file]; !ok {
+			t.Fatalf("operator manifest allowlist is missing %s", file)
+		}
+	}
+
+	for _, standalone := range []string{"node-config.yaml", "examples/networkpolicy.yaml", "examples/registry-secret.example.yaml", "ownership-check.yaml"} {
+		if _, ok := operatorManifestFiles[standalone]; ok {
+			t.Fatalf("standalone resource %s is operator-managed", standalone)
+		}
 	}
 }
 
@@ -504,12 +554,8 @@ func reconcile(t *testing.T, env *component.Env, sites []unboundedv1alpha3.Site)
 // Two properties matter beyond the object set. The legacy node config is
 // removed first and every apply depends on those deletes, so a failure to
 // remove the legacy DaemonSet skips the replacement rather than running both
-// side by side. And node-config.yaml plus the examples/ subtree are excluded:
-// they are for operators to apply themselves, not for the operator to install.
-//
-// The Namespace ships inside daemonset.yaml, after the DaemonSet, which is why
-// it appears second rather than first. Gantry has no separate namespace
-// manifest, unlike net, machina and storage.
+// side by side. The operator chart profile omits standalone node configuration
+// and hardening resources, which remain owned by their respective installers.
 func TestPlanGolden(t *testing.T) {
 	env := testEnv(t)
 
@@ -539,10 +585,10 @@ Delete ClusterRoleBinding/gantry-agent
 Delete ClusterRole/gantry-agent
 CreateIfAbsent ConfigMap/unbounded-system/gantry-config
 Apply DaemonSet/unbounded-system/gantry [overridable]` + after + `
-` + chairPlan.String() + `Apply ServiceAccount/unbounded-system/gantry` + after + `
+` + chairPlan.String() + `Apply PriorityClass/gantry-low` + after + `
+Apply ServiceAccount/unbounded-system/gantry` + after + `
 Apply Role/unbounded-system/gantry-agent` + after + `
 Apply RoleBinding/unbounded-system/gantry-agent` + after + `
-Apply PriorityClass/gantry-low` + after + `
 `
 
 	if got := plan.Summary(); got != want {

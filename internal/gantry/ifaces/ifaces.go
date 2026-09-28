@@ -128,7 +128,7 @@ type OriginRef struct {
 	Repository string // e.g. "library/nginx"
 	Digest     digest.Digest
 	// Offset requests bytes starting at this position when fetching from a
-	// peer. Origin registry callers ignore it. Zero requests the full object.
+	// peer or origin registry. Zero requests the full object.
 	Offset int64
 
 	// Kind discriminates the OCI Distribution Spec URL family for this
@@ -370,7 +370,7 @@ type PleasePullOutcome struct {
 // seed pull. It is optional on the wire so membership-based agents can
 // interoperate with chair-aware agents during a rolling deployment.
 type ChairAssignment struct {
-	ChairID         uint32
+	ChairID         uint64
 	Generation      int64
 	AssignmentEpoch int64
 }
@@ -486,6 +486,18 @@ func (e *ErrUnavailable) Error() string {
 }
 
 func (e *ErrUnavailable) Unwrap() error { return e.Cause }
+
+// ErrRangeUnsupported reports that an origin did not honor a requested blob
+// offset. Callers may safely restart from byte zero; other transport and auth
+// errors must preserve the partial ingest for a later retry.
+type ErrRangeUnsupported struct {
+	Offset int64
+	Reason string
+}
+
+func (e *ErrRangeUnsupported) Error() string {
+	return fmt.Sprintf("origin range offset %d unsupported: %s", e.Offset, e.Reason)
+}
 
 // ErrPeerHTTPStatus is returned by PeerDialer implementations when a peer
 // transfer endpoint responds with an unexpected HTTP status. Callers can use

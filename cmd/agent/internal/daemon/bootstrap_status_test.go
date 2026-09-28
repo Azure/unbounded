@@ -109,3 +109,21 @@ func findMachineCondition(t *testing.T, conditions []metav1.Condition, condition
 
 	return metav1.Condition{}
 }
+
+// TestBootstrapStatusReporter_NilIsSafe pins that every reporting entry point
+// tolerates a nil receiver.
+//
+// Bootstrap builds the reporter only once attestation has supplied credentials,
+// so stages that run before that, and a failure on one of them, report through a
+// nil reporter. The callers rely on this instead of guarding each call, so it is
+// a contract rather than an accident.
+func TestBootstrapStatusReporter_NilIsSafe(t *testing.T) {
+	t.Parallel()
+
+	var reporter *BootstrapStatusReporter
+
+	assert.NotPanics(t, func() { reporter.Running(context.Background()) })
+	assert.NotPanics(t, func() { reporter.Failed(context.Background(), "Failed", errors.New("boom")) })
+	assert.NotPanics(t, func() { reporter.Failed(context.Background(), "Failed", nil) })
+	assert.NotPanics(t, func() { reporter.Succeeded(context.Background()) })
+}

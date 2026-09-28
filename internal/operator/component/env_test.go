@@ -4,6 +4,8 @@
 package component
 
 import (
+	"context"
+	"regexp"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -16,6 +18,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -249,6 +252,173 @@ func TestApplyObject(t *testing.T) {
 
 	if err := env.ApplyObject(t.Context(), deployment); err != nil {
 		t.Fatalf("ApplyObject returned error: %v", err)
+	}
+}
+
+func TestApplyObjectSkipsMatchingPayload(t *testing.T) {
+	scheme := testScheme(t)
+	desired := &appsv1.Deployment{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test"}},
+			Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "test"}}},
+		},
+	}
+
+	hash, err := AppliedPayloadHash(ToUnstructured(desired))
+	if err != nil {
+		t.Fatalf("appliedPayloadHash: %v", err)
+	}
+
+	if len(hash) > 63 || !regexp.MustCompile(`^[A-Za-z0-9_-]+$`).MatchString(hash) {
+		t.Fatalf("applied payload hash %q is not a valid label value", hash)
+	}
+
+	current := desired.DeepCopy()
+	current.Labels = map[string]string{}
+	current.Labels[AppliedHashLabel] = hash
+	applies := 0
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(current).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Apply: func(context.Context, client.WithWatch, runtime.ApplyConfiguration, ...client.ApplyOption) error {
+				applies++
+
+				return nil
+			},
+		}).
+		Build()
+	env := &Env{Client: cl}
+
+	if err := env.ApplyObject(t.Context(), desired); err != nil {
+		t.Fatalf("ApplyObject: %v", err)
+	}
+
+	if applies != 0 {
+		t.Fatalf("applies = %d, want 0 for matching payload", applies)
+	}
+
+	if _, ok := desired.Labels[AppliedHashLabel]; ok {
+		t.Fatalf("ApplyObject mutated desired labels: %v", desired.Labels)
+	}
+}
+
+func TestApplyObjectAppliesChangedPayloadOrMissingHash(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		mutate   func(*appsv1.Deployment)
+		withHash bool
+	}{
+		{name: "payload changed", withHash: true, mutate: func(obj *appsv1.Deployment) {
+			obj.Spec.Template.Labels["version"] = "new"
+		}},
+		{name: "hash removed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := testScheme(t)
+			current := &appsv1.Deployment{
+				TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec: appsv1.DeploymentSpec{
+					Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test"}},
+					Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "test"}}},
+				},
+			}
+
+			desired := current.DeepCopy()
+			if tc.withHash {
+				hash, err := AppliedPayloadHash(ToUnstructured(current))
+				if err != nil {
+					t.Fatalf("appliedPayloadHash: %v", err)
+				}
+
+				if current.Labels == nil {
+					current.Labels = map[string]string{}
+				}
+
+				current.Labels[AppliedHashLabel] = hash
+			}
+
+			if tc.mutate != nil {
+				tc.mutate(desired)
+			}
+
+			applies := 0
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(current).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Apply: func(_ context.Context, _ client.WithWatch, cfg runtime.ApplyConfiguration, _ ...client.ApplyOption) error {
+						applies++
+
+						named := cfg.(interface{ GetLabels() map[string]string })
+						if named.GetLabels()[AppliedHashLabel] == "" {
+							t.Fatal("apply payload has no applied hash")
+						}
+
+						return nil
+					},
+				}).
+				Build()
+
+			if err := (&Env{Client: cl}).ApplyObject(t.Context(), desired); err != nil {
+				t.Fatalf("ApplyObject: %v", err)
+			}
+
+			if applies != 1 {
+				t.Fatalf("applies = %d, want 1", applies)
+			}
+		})
+	}
+}
+
+func TestApplyObjectRepairsDriftDespiteMatchingHash(t *testing.T) {
+	desired := &corev1.ConfigMap{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+		Data:       map[string]string{"payload": "operator-owned"},
+	}
+
+	hash, err := AppliedPayloadHash(ToUnstructured(desired))
+	if err != nil {
+		t.Fatalf("appliedPayloadHash: %v", err)
+	}
+
+	current := desired.DeepCopy()
+	current.Data["payload"] = "drifted"
+	current.Labels = map[string]string{AppliedHashLabel: hash}
+	applies := 0
+	cl := fake.NewClientBuilder().
+		WithScheme(testScheme(t)).
+		WithObjects(current).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Apply: func(context.Context, client.WithWatch, runtime.ApplyConfiguration, ...client.ApplyOption) error {
+				applies++
+
+				return nil
+			},
+		}).
+		Build()
+
+	if err := (&Env{Client: cl}).ApplyObject(t.Context(), desired); err != nil {
+		t.Fatalf("ApplyObject: %v", err)
+	}
+
+	if applies != 1 {
+		t.Fatalf("applies = %d, want 1 to repair desired-field drift", applies)
+	}
+}
+
+func TestDesiredFieldsMatchIgnoresExtraCurrentFields(t *testing.T) {
+	desired := map[string]any{"metadata": map[string]any{"name": "test"}}
+	current := map[string]any{"metadata": map[string]any{
+		"name": "test", "annotations": map[string]any{"user": "preserved"},
+	}}
+
+	if !DesiredFieldsMatch(desired, current) {
+		t.Fatal("extra user-owned current fields should not force an apply")
 	}
 }
 

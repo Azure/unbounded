@@ -6,28 +6,49 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
+
+	"k8s.io/klog/v2"
+
+	statuspkg "github.com/Azure/unbounded/internal/net/status"
+	statusproto "github.com/Azure/unbounded/internal/net/status/proto"
+	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
 
-// CachedNodeStatus stores a node's pushed status with timestamp and revision.
+// CachedNodeStatus stores routine wire metadata and revision. Once bound to the
+// detail lifecycle, Status contains overview metadata only.
 type CachedNodeStatus struct {
 	Status     *NodeStatusResponse
 	ReceivedAt time.Time
 	Source     string
 	Revision   uint64
+	Overview   *statusv1alpha1.NodeStatusOverview
+
+	peerIdentity *peerIdentityDigest // Unbound compatibility cache only.
+	legacy       bool
 }
 
 // NodeStatusCache is a thread-safe cache of node status data pushed from node agents.
 type NodeStatusCache struct {
-	mu       sync.RWMutex
-	entries  map[string]*CachedNodeStatus
-	onChange func(nodeName string, status *NodeStatusResponse)
+	mu               sync.RWMutex
+	entries          map[string]*CachedNodeStatus
+	eventSeq         uint64
+	onChange         func(nodeName string, status *NodeStatusResponse, eventSeq uint64)
+	onOverviewChange func(nodeName string, overview statusv1alpha1.NodeStatusOverview, eventSeq uint64)
+	legacyObserver   *nodeDetailRequests
+	details          *nodeDetailRequests
+	detailsRequired  bool
 }
 
-// NewNodeStatusCache creates an empty NodeStatusCache.
+// NewNodeStatusCache creates an empty, unbound cache. Production binds the
+// detail lifecycle before retaining legacy publications.
 func NewNodeStatusCache() *NodeStatusCache {
 	return &NodeStatusCache{entries: make(map[string]*CachedNodeStatus)}
 }
@@ -40,13 +61,32 @@ func (c *NodeStatusCache) Len() int {
 	return len(c.entries)
 }
 
-// StoreFull stores a full node status payload and returns the new revision.
+// StoreFull is the compatibility helper. Production ingestion should use
+// StoreFullChecked so failed identity/lifecycle validation is not acknowledged.
 func (c *NodeStatusCache) StoreFull(nodeName string, status NodeStatusResponse, source string) uint64 {
+	revision, err := c.StoreFullChecked(nodeName, status, source)
+	if err != nil {
+		klog.Errorf("Store node %q status failed: %v", nodeName, err)
+	}
+
+	return revision
+}
+
+// StoreFullChecked exposes identity/lifecycle failures to ingestion handlers.
+func (c *NodeStatusCache) StoreFullChecked(nodeName string, status NodeStatusResponse, source string) (uint64, error) {
 	if source == "" {
 		source = "push"
 	}
 
+	if nodeName == "" || (status.NodeInfo.Name != "" && status.NodeInfo.Name != nodeName) {
+		return 0, fmt.Errorf("legacy status identity does not match node %q", nodeName)
+	}
+
 	c.mu.Lock()
+
+	if c.details != nil && status.NodeInfo.Name == "" {
+		status.NodeInfo.Name = nodeName
+	}
 
 	prevRevision := uint64(0)
 	if existing, ok := c.entries[nodeName]; ok {
@@ -54,36 +94,48 @@ func (c *NodeStatusCache) StoreFull(nodeName string, status NodeStatusResponse, 
 	}
 
 	revision := prevRevision + 1
-	c.entries[nodeName] = &CachedNodeStatus{
-		Status:     &status,
-		ReceivedAt: time.Now(),
-		Source:     source,
-		Revision:   revision,
+
+	entry, err := c.legacyEntryLocked(nodeName, &status, revision, nil, source, nil)
+	if err != nil {
+		c.mu.Unlock()
+
+		return 0, err
 	}
+
+	c.entries[nodeName] = entry
+	c.observeLegacyLocked(nodeName, entry, 0)
+	c.eventSeq++
+	eventSeq := c.eventSeq
 	fn := c.onChange
-	statusPtr := c.entries[nodeName].Status
+	overviewFn := c.onOverviewChange
 	c.mu.Unlock()
 
-	if fn != nil {
-		fn(nodeName, statusPtr)
+	if entry.Overview != nil {
+		if overviewFn != nil {
+			overviewFn(nodeName, entry.overviewForNotification(), eventSeq)
+		}
+	} else if fn != nil {
+		fn(nodeName, entry.Status, eventSeq)
 	}
 
-	return revision
+	return revision, nil
 }
 
 // parsedDelta holds pre-deserialized delta fields parsed outside the lock.
 type parsedDelta struct {
-	timestamp    *time.Time
-	nodeInfo     *NodeInfo
-	peers        []WireGuardPeerStatus
-	routingTable *RoutingTableInfo
-	healthCheck  *HealthCheckStatus
-	nodeErrors   []NodeError
-	fetchError   *string
-	lastPushTime *time.Time
-	statusSource *string
-	nodePodInfo  *NodePodInfo
-	bpfEntries   []BpfEntry
+	peerMeasurements *statusproto.PeerMeasurements
+	parseError       error
+	timestamp        *time.Time
+	nodeInfo         *NodeInfo
+	peers            []WireGuardPeerStatus
+	routingTable     *RoutingTableInfo
+	healthCheck      *HealthCheckStatus
+	nodeErrors       []NodeError
+	fetchError       *string
+	lastPushTime     *time.Time
+	statusSource     *string
+	nodePodInfo      *NodePodInfo
+	bpfEntries       []BpfEntry
 
 	// nullFields tracks fields explicitly set to null for clearing.
 	nullFields map[string]bool
@@ -193,13 +245,28 @@ func (c *NodeStatusCache) ApplyParsedDelta(nodeName string, baseRevision uint64,
 		source = "push"
 	}
 
-	return c.applyParsedDelta(nodeName, baseRevision, pd, source)
+	rev, conflict, err := c.applyParsedDelta(nodeName, baseRevision, pd, source)
+	if pd.peerMeasurements != nil || pd.parseError != nil {
+		outcome := "applied"
+		if err != nil {
+			outcome = "error"
+		} else if conflict {
+			outcome = "resync"
+		}
+
+		peerMeasurementUpdatesTotal.WithLabelValues(outcome).Inc()
+	}
+
+	return rev, conflict, err
 }
 
 // applyParsedDelta merges pre-parsed delta fields into a cached node status
 // under the lock. Both ApplyDelta (JSON) and ApplyParsedDelta (protobuf)
 // converge here.
 func (c *NodeStatusCache) applyParsedDelta(nodeName string, baseRevision uint64, pd parsedDelta, source string) (uint64, bool, error) {
+	if pd.parseError != nil {
+		return 0, false, pd.parseError
+	}
 	// Phase 1: Read entry under lock, copy it, release lock.
 	c.mu.RLock()
 
@@ -209,7 +276,15 @@ func (c *NodeStatusCache) applyParsedDelta(nodeName string, baseRevision uint64,
 		return 0, true, nil
 	}
 
-	if baseRevision != 0 && entry.Revision != baseRevision {
+	if c.detailsRequired && c.details == nil {
+		revision := entry.Revision
+
+		c.mu.RUnlock()
+
+		return revision, true, nil
+	}
+
+	if (entry.Overview != nil && !entry.legacy) || (pd.peerMeasurements != nil && baseRevision == 0) || (baseRevision != 0 && entry.Revision != baseRevision) {
 		rev := entry.Revision
 
 		c.mu.RUnlock()
@@ -219,12 +294,38 @@ func (c *NodeStatusCache) applyParsedDelta(nodeName string, baseRevision uint64,
 	// Snapshot values we need under lock
 	prevStatus := entry.Status
 	prevRevision := entry.Revision
+	peerIdentity := entry.peerIdentity
+
+	if c.details != nil {
+		var exists bool
+
+		prevStatus, peerIdentity, exists = c.details.LegacyBase(nodeName, prevRevision)
+		if !exists {
+			c.mu.RUnlock()
+
+			return prevRevision, true, nil
+		}
+	}
 
 	c.mu.RUnlock()
 
 	// Phase 2: Copy and merge OUTSIDE the lock. This is the expensive
 	// part (~1MB copy per node) and must not block other goroutines.
 	merged := *prevStatus
+
+	if pd.peerMeasurements != nil {
+		if pd.peers != nil || pd.nullFields["peers"] {
+			return prevRevision, false, fmt.Errorf("peer replacement conflicts with measurements")
+		}
+
+		peers, identity, err := applyPeerMeasurementsWithIdentity(prevStatus.Peers, pd.peerMeasurements, peerIdentity)
+		if err != nil {
+			return prevRevision, false, err
+		}
+
+		merged.Peers = peers
+		peerIdentity = identity
+	}
 
 	if pd.timestamp != nil {
 		merged.Timestamp = *pd.timestamp
@@ -240,10 +341,16 @@ func (c *NodeStatusCache) applyParsedDelta(nodeName string, baseRevision uint64,
 
 	if pd.peers != nil {
 		merged.Peers = pd.peers
+		peerIdentity = nil
+	} else if pd.nullFields["peers"] {
+		merged.Peers = nil
+		peerIdentity = nil
 	}
 
 	if pd.routingTable != nil {
 		merged.RoutingTable = *pd.routingTable
+	} else if pd.nullFields["routingTable"] {
+		merged.RoutingTable = RoutingTableInfo{}
 	}
 
 	if pd.healthCheck != nil {
@@ -292,16 +399,25 @@ func (c *NodeStatusCache) applyParsedDelta(nodeName string, baseRevision uint64,
 		merged.NodeInfo.Name = nodeName
 	}
 
+	return c.commitParsedDeltaBase(nodeName, entry, &merged, peerIdentity, source, prevStatus)
+}
+
+func (c *NodeStatusCache) commitParsedDelta(nodeName string, previous *CachedNodeStatus, merged *NodeStatusResponse, peerIdentity *peerIdentityDigest, source string) (uint64, bool, error) {
+	return c.commitParsedDeltaBase(nodeName, previous, merged, peerIdentity, source, previous.Status)
+}
+
+func (c *NodeStatusCache) commitParsedDeltaBase(nodeName string, previous *CachedNodeStatus, merged *NodeStatusResponse, peerIdentity *peerIdentityDigest, source string, base *NodeStatusResponse) (uint64, bool, error) {
 	// Phase 3: Write lock for the brief pointer swap.
 	c.mu.Lock()
-	// Re-check entry still exists and revision hasn't changed
-	entry, ok = c.entries[nodeName]
+	// Deletion and recreation can reuse a revision. The identity memo and
+	// merged status must still belong to the same entry, not just its number.
+	entry, ok := c.entries[nodeName]
 	if !ok {
 		c.mu.Unlock()
 		return 0, true, nil
 	}
 
-	if entry.Revision != prevRevision {
+	if entry != previous {
 		// Another goroutine updated this node while we were merging.
 		// Our merge is stale; signal resync.
 		rev := entry.Revision
@@ -311,32 +427,47 @@ func (c *NodeStatusCache) applyParsedDelta(nodeName string, baseRevision uint64,
 	}
 
 	revision := entry.Revision + 1
-	c.entries[nodeName] = &CachedNodeStatus{
-		Status:     &merged,
-		ReceivedAt: time.Now(),
-		Source:     source,
-		Revision:   revision,
+
+	next, err := c.legacyEntryLocked(nodeName, merged, revision, peerIdentity, source, base)
+	if err != nil {
+		c.mu.Unlock()
+
+		if errors.Is(err, errLegacyDetailBaseUnavailable) {
+			return entry.Revision, true, nil
+		}
+
+		return entry.Revision, false, err
 	}
+
+	c.entries[nodeName] = next
+	c.observeLegacyLocked(nodeName, next, previous.Revision)
+	c.eventSeq++
+	eventSeq := c.eventSeq
 	fn := c.onChange
-	mergedPtr := c.entries[nodeName].Status
+	overviewFn := c.onOverviewChange
 	c.mu.Unlock()
 
-	if fn != nil {
-		fn(nodeName, mergedPtr)
+	if next.Overview != nil {
+		if overviewFn != nil {
+			overviewFn(nodeName, next.overviewForNotification(), eventSeq)
+		}
+	} else if fn != nil {
+		fn(nodeName, next.Status, eventSeq)
 	}
 
 	return revision, false, nil
 }
 
 // SetOnChange sets a callback invoked after cache mutations.
-func (c *NodeStatusCache) SetOnChange(fn func(nodeName string, status *NodeStatusResponse)) {
+func (c *NodeStatusCache) SetOnChange(fn func(nodeName string, status *NodeStatusResponse, eventSeq uint64)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.onChange = fn
 }
 
-// Get returns a copy of the cached status for a node when present.
+// Get returns shallow copies of the cached entry and status when present.
+// Nested slices and maps remain shared.
 func (c *NodeStatusCache) Get(nodeName string) (*CachedNodeStatus, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -349,6 +480,11 @@ func (c *NodeStatusCache) Get(nodeName string) (*CachedNodeStatus, bool) {
 	statusCopy := *entry.Status
 	copy := *entry
 	copy.Status = &statusCopy
+
+	if entry.Overview != nil {
+		overviewCopy := *entry.Overview
+		copy.Overview = &overviewCopy
+	}
 
 	return &copy, true
 }
@@ -374,11 +510,21 @@ func (c *NodeStatusCache) Delete(nodeName string) {
 	defer c.mu.Unlock()
 
 	delete(c.entries, nodeName)
+
+	if c.details != nil {
+		c.details.Forget(nodeName)
+	}
 }
 
 // UpdateSource updates the cached status source for a node without changing
 // the cached payload or ReceivedAt timestamp.
 func (c *NodeStatusCache) UpdateSource(nodeName, source string) bool {
+	return c.UpdateSourceIf(nodeName, "", source)
+}
+
+// UpdateSourceIf changes the source only if the expected transport still owns it.
+// An empty expected source preserves the unconditional UpdateSource behavior.
+func (c *NodeStatusCache) UpdateSourceIf(nodeName, expectedSource, source string) bool {
 	if source == "" {
 		return false
 	}
@@ -386,7 +532,7 @@ func (c *NodeStatusCache) UpdateSource(nodeName, source string) bool {
 	c.mu.Lock()
 
 	entry, ok := c.entries[nodeName]
-	if !ok {
+	if !ok || (expectedSource != "" && entry.Source != expectedSource) {
 		c.mu.Unlock()
 		return false
 	}
@@ -396,13 +542,31 @@ func (c *NodeStatusCache) UpdateSource(nodeName, source string) bool {
 		return true
 	}
 
-	entry.Source = source
+	updated := *entry
+	updated.Source = source
+
+	if entry.Overview != nil {
+		overview := *entry.Overview
+		overview.StatusSource = source
+		metadata := statuspkg.OverviewMetadata(overview)
+		updated.Overview = &overview
+		updated.Status = &metadata
+	}
+
+	c.entries[nodeName] = &updated
+	c.eventSeq++
+	eventSeq := c.eventSeq
 	fn := c.onChange
-	statusCopy := entry.Status
+	overviewFn := c.onOverviewChange
+	statusCopy := updated.Status
 	c.mu.Unlock()
 
-	if fn != nil {
-		fn(nodeName, statusCopy)
+	if updated.Overview != nil {
+		if overviewFn != nil {
+			overviewFn(nodeName, updated.overviewForNotification(), eventSeq)
+		}
+	} else if fn != nil {
+		fn(nodeName, statusCopy, eventSeq)
 	}
 
 	return true
@@ -416,35 +580,51 @@ func (c *NodeStatusCache) CleanupStaleEntries(validNodes map[string]bool) {
 	for name := range c.entries {
 		if !validNodes[name] {
 			delete(c.entries, name)
+
+			if c.details != nil {
+				c.details.Forget(name)
+			}
 		}
 	}
 }
 
 func fetchNodeStatus(ctx context.Context, nodeIP string, port int) (*NodeStatusResponse, error) {
+	var status NodeStatusResponse
+	if err := fetchNodeJSON(ctx, nodeIP, port, "/status/json", &status); err != nil {
+		return nil, err
+	}
+
+	return &status, nil
+}
+
+func fetchNodeJSON(ctx context.Context, nodeIP string, port int, path string, result any) error {
 	client := &http.Client{Timeout: 5 * time.Second}
 
-	url := fmt.Sprintf("http://%s:%d/status/json", nodeIP, port)
+	url := "http://" + net.JoinHostPort(strings.Trim(nodeIP, "[]"), strconv.Itoa(port)) + path
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return fmt.Errorf("failed to create request: %w", err)
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		return fmt.Errorf("request failed: %w", err)
 	}
 
-	defer func() { _ = resp.Body.Close() }() //nolint:errcheck
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			klog.V(4).Infof("Node status response close failed: %v", err)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
-	var nodeStatus NodeStatusResponse
-	if err := json.NewDecoder(resp.Body).Decode(&nodeStatus); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+	if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
+		return fmt.Errorf("failed to decode response: %w", err)
 	}
 
-	return &nodeStatus, nil
+	return nil
 }

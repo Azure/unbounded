@@ -20,7 +20,7 @@ Gantry guide.
 2. Import a small private test image into ACR.
 3. Grant the AKS kubelet identity `AcrPull` on the ACR.
 4. Validate a plain private ACR Pod before installing Gantry.
-5. Install Gantry service account, containerd node config, ConfigMap, and DaemonSet.
+5. Install the Gantry Helm chart, including its continuously reconciling containerd node config.
 6. Validate the same private ACR image on worker nodes after Gantry is running.
 7. Check Gantry logs, health, and node-local metrics.
 
@@ -33,8 +33,7 @@ Gantry guide.
 - Workload manifests do not use `imagePullSecrets` for this validation.
 - Commands run from the repository root so relative `hack/` and `deploy/`
   paths resolve correctly.
-- Gantry is installed from this repository's manifest templates under
-  `deploy/gantry`, rendered with `make gantry-manifests`.
+- Gantry is installed from the Helm chart under `deploy/gantry/chart`.
 
 ## Set Variables
 
@@ -193,9 +192,9 @@ grep 'config_path.*certs.d' /etc/containerd/config.toml
 stat /run/containerd/containerd.sock
 ```
 
-If an unmanaged `/etc/containerd/certs.d/_default/hosts.toml` exists on any
-node, stop and resolve it. The Gantry node-config DaemonSet refuses to
-overwrite unrelated host configuration.
+If `/etc/containerd/certs.d/_default/hosts.toml` already exists on any node,
+back it up and confirm that Gantry should replace it. The standalone chart owns
+this path and continuously restores its payload when the file differs.
 
 ## Build And Publish Gantry
 
@@ -223,42 +222,15 @@ GOTOOLCHAIN=auto make image-gantry-push \
   CONTAINER_REGISTRY="$ACR_LOGIN_SERVER"
 ```
 
-## Prepare Gantry Manifests
+## Prepare Gantry Values
 
-`deploy/gantry` holds Go templates (`*.yaml.tmpl`), not applyable manifests.
-Render them with `make gantry-manifests`, which writes to the gitignored
-`deploy/gantry/rendered/` directory. The template default namespace is
-`unbounded-system`, so set `GANTRY_NAMESPACE` explicitly: the Gantry benchmark
-tooling defaults to `gantry-system` and the two must agree.
+Use the standalone chart profile and set the Gantry image plus the ACR upstream
+registry. The chart installs the node-config DaemonSet automatically.
 
 ```bash
 GANTRY_NAMESPACE="${GANTRY_NAMESPACE:-gantry-system}"
 
-make gantry-manifests \
-  GANTRY_NAMESPACE="$GANTRY_NAMESPACE" \
-  GANTRY_IMAGE="$GANTRY_IMAGE"
-```
-
-The rendered ConfigMap ships a placeholder upstream registry. Point it at the
-ACR login server, which rewrites both the `name` and the `endpoint`:
-
-```bash
-sed -i "s#registry.example.com#${ACR_LOGIN_SERVER}#g" \
-  deploy/gantry/rendered/configmap.yaml
-
-grep -A3 'upstream_registries:' deploy/gantry/rendered/configmap.yaml
-```
-
-Validate before applying. Apply the four manifests by name: the rendered
-directory also contains `examples/`, which must not be applied as part of a
-baseline install.
-
-```bash
-kubectl apply --dry-run=client -o name \
-  -f deploy/gantry/rendered/serviceaccount.yaml \
-  -f deploy/gantry/rendered/node-config.yaml \
-  -f deploy/gantry/rendered/configmap.yaml \
-  -f deploy/gantry/rendered/daemonset.yaml
+bin/helm lint deploy/gantry/chart
 ```
 
 Do not add `credentials_path` for this validation. The image pull credential
@@ -266,18 +238,21 @@ comes from kubelet through the ACR exec credential provider.
 
 ## Install Gantry
 
-Apply Gantry in dependency order. The `gantry-containerd-config` DaemonSet is
-required for standalone installs because it writes containerd's default
-`hosts.toml` mirror entry.
+Install Gantry from the local chart. The `gantry-containerd-config` DaemonSet
+continuously restores containerd's default `hosts.toml` mirror entry if a node
+upgrade or another host operation resets it.
 
 ```bash
-kubectl apply -f deploy/gantry/rendered/serviceaccount.yaml
+bin/helm upgrade --install gantry deploy/gantry/chart \
+  --namespace "$GANTRY_NAMESPACE" \
+  --create-namespace \
+  --set-string image.reference="$GANTRY_IMAGE" \
+  --set-string gantry.upstreamRegistries[0].name="$ACR_LOGIN_SERVER" \
+  --set-string gantry.upstreamRegistries[0].endpoint="https://$ACR_LOGIN_SERVER" \
+  --wait \
+  --timeout 15m
 
-kubectl apply -f deploy/gantry/rendered/node-config.yaml
 kubectl -n "$GANTRY_NAMESPACE" rollout status daemonset/gantry-containerd-config --timeout=15m
-
-kubectl apply -f deploy/gantry/rendered/configmap.yaml
-kubectl apply -f deploy/gantry/rendered/daemonset.yaml
 kubectl -n "$GANTRY_NAMESPACE" rollout status daemonset/gantry --timeout=15m
 
 kubectl -n "$GANTRY_NAMESPACE" get daemonsets -o wide
@@ -428,31 +403,28 @@ curl -fsS http://127.0.0.1:9096/metrics | grep -E \
 
 ## Optional NetworkPolicy Hardening
 
-Apply NetworkPolicy only after baseline success. Copy
-`deploy/gantry/rendered/examples/networkpolicy.yaml` into an overlay, replace
+Apply NetworkPolicy only after baseline success. Render
+`deploy/gantry/examples/networkpolicy.yaml.tmpl` into an overlay, replace
 every operator-required CIDR, and ensure mirror TCP/5000 allows the node CIDR
 rather than only `127.0.0.1/32`. Re-run Gantry health and private ACR pull
 validation after applying the policy.
 
 ## Rollback
 
-Remove Gantry and provider installer Kubernetes objects:
+Uninstall Gantry:
 
 ```bash
-kubectl delete -f deploy/gantry/rendered/daemonset.yaml --ignore-not-found
-kubectl delete -f deploy/gantry/rendered/configmap.yaml --ignore-not-found
-kubectl delete -f deploy/gantry/rendered/node-config.yaml --ignore-not-found
-kubectl delete -f deploy/gantry/rendered/serviceaccount.yaml --ignore-not-found
+bin/helm uninstall gantry --namespace "$GANTRY_NAMESPACE"
 kubectl delete pod acr-provider-preflight acr-gantry-pull-a acr-gantry-pull-b --ignore-not-found
 ```
 
-Deleting Kubernetes objects does not remove host state. The ACR credential
-provider is managed by AKS, so leave it in place. If Gantry host cleanup is
-required, run a narrowly scoped cleanup DaemonSet that removes only files with
-our managed markers:
+Graceful node-config pod termination removes the chart-owned
+`/etc/containerd/certs.d/_default/hosts.toml` when it still matches the chart
+payload. Check nodes that were unavailable during uninstall and remove only
+files carrying the Gantry Helm chart marker. The ACR credential provider is
+managed by AKS, so leave it in place. Optional Gantry peer identity state under
+`/var/lib/gantry/libp2p` is not removed automatically.
 
-- Gantry-managed `/etc/containerd/certs.d/_default/hosts.toml`.
-- Optional Gantry peer identity state under `/var/lib/gantry/libp2p`.
 
 ## Troubleshooting
 

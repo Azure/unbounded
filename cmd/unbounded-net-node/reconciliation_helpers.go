@@ -104,9 +104,7 @@ func healthCheckProfileNameForGatewayPoolPeering(name string) string {
 }
 
 func healthCheckProfilesEqual(a, b healthcheck.HealthCheckSettings) bool {
-	return a.DetectMultiplier == b.DetectMultiplier &&
-		a.ReceiveInterval == b.ReceiveInterval &&
-		a.TransmitInterval == b.TransmitInterval
+	return a == b
 }
 
 // mergeAssignmentHealthCheckState merges SiteGatewayPoolAssignment health check settings into active maps.
@@ -122,7 +120,7 @@ func mergeAssignmentHealthCheckState(
 	assignmentSiteHealthCheckProfileNames map[string]string,
 	assignmentSiteHealthCheckSourceAssignment map[string]string,
 ) {
-	assignmentHealthCheckProfileName := ""
+	assignmentHealthCheckProfileName := disabledHealthCheckProfile
 
 	assignmentScope := healthCheckLogScope(siteGatewayPoolAssignmentGVR, assignment.Name)
 	if enabled, profile := healthCheckProfileFromSettings(assignment.Spec.HealthCheckSettings, assignmentScope); enabled {
@@ -135,10 +133,6 @@ func mergeAssignmentHealthCheckState(
 				healthCheckProfileSources[assignmentHealthCheckProfileName] = assignmentScope
 			}
 		}
-	}
-
-	if assignmentHealthCheckProfileName == "" {
-		return
 	}
 
 	for _, poolName := range assignment.Spec.GatewayPools {

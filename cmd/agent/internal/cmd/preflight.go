@@ -13,6 +13,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/phases/host"
@@ -77,6 +78,22 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 		return fmt.Errorf("validate agent config: %w", err)
 	}
 
+	id, err := bootstrapIdentity(cfg)
+	if err != nil {
+		return err
+	}
+
+	_, disposition, err := installstate.Admit(installstate.DefaultStore(), id.MachineName, id.ConfigFingerprint)
+	if err != nil {
+		return err
+	}
+
+	if disposition == installstate.AlreadyComplete {
+		// Admission is non-mutating. start rechecks ownership under lock before
+		// verifying or repairing daemon assets, without the original artifacts.
+		return h.writeReport(preflight.Report{})
+	}
+
 	downloads, _, err := provision.ResolveDownloadOverridesWithOfflineArtifacts(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("resolve download overrides: %w", err)
@@ -98,12 +115,30 @@ func (h *preflightHandler) execute(ctx context.Context) error {
 		rootfs.Preflight(logger, cfg.AgentConfig, goalState),
 	)
 
+	if disposition == installstate.Resume {
+		// A resumed installation owns the artifacts a clean host must not have.
+		// Bind addresses remain checked, and accept only owned listeners.
+		var filtered []preflight.Checker
+
+		for _, check := range checks {
+			if check.Name() != host.CheckExistingDeploymentName {
+				filtered = append(filtered, check)
+			}
+		}
+
+		checks = filtered
+	}
+
 	opts := preflight.Options{
 		IgnoreErrors:   h.ignorePreflightErrors,
 		FailOnWarnings: h.failOnWarnings,
 	}
 	report := preflight.Run(ctx, checks, opts)
 
+	return h.writeReport(report)
+}
+
+func (h *preflightHandler) writeReport(report preflight.Report) error {
 	switch strings.ToLower(h.output) {
 	case "", "text":
 		if err := writePreflightText(h.writer, report); err != nil {

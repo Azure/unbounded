@@ -152,7 +152,7 @@ func (c nspawnMachineProvisioningChecker) checkMachineDir() []preflight.Result {
 
 func (c nspawnMachineProvisioningChecker) checkCreatableDir(path, label string) []preflight.Result {
 	c.log.Debug("checking "+label, "path", path)
-	existing := nearestExistingParent(c.deps.stat, path)
+	existing := utilio.NearestExistingDir(c.deps.stat, path)
 
 	if err := c.deps.writeProbe(existing); err != nil {
 		return preflight.ResultsError(
@@ -165,21 +165,6 @@ func (c nspawnMachineProvisioningChecker) checkCreatableDir(path, label string) 
 	}
 
 	return nil
-}
-
-func nearestExistingParent(stat func(string) (fs.FileInfo, error), path string) string {
-	for {
-		if info, err := stat(path); err == nil && info.IsDir() {
-			return path
-		}
-
-		parent := filepath.Dir(path)
-		if parent == path {
-			return path
-		}
-
-		path = parent
-	}
 }
 
 func isDirEmpty(open func(string) (*os.File, error), dir string) (bool, error) {

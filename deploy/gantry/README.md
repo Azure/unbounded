@@ -1,52 +1,104 @@
 # Gantry deployment artifacts
 
-This directory carries the operator-facing pieces needed to roll out
-the gantry agent as a Kubernetes DaemonSet.
+This directory carries the Helm chart and operator-facing rendered manifests
+needed to roll out the Gantry agent as a Kubernetes DaemonSet.
 
 ## Files
 
-These are Go templates (`*.yaml.tmpl`); the only templated value is the
-install namespace, which defaults to `unbounded-system`. Render them with
-`make gantry-manifests` (override with `GANTRY_NAMESPACE=<ns>` or the unified
-`UNBOUNDED_NAMESPACE=<ns>`), which writes plain manifests into
-`deploy/gantry/rendered/`.
+The Helm chart under `chart/` is the source of truth for resources shared by
+standalone and operator-managed installations. `make gantry-manifests` renders
+the internal operator profile into `deploy/gantry/rendered/`; the Unbounded
+operator embeds those files and applies its own image, ConfigMap, and Lease
+ownership semantics. The target also renders the standalone node configurator
+and examples used by development and benchmark tooling.
 
-| Template | Rendered to | Purpose |
+| Source | Rendered to | Purpose |
 | --- | --- | --- |
-| `daemonset.yaml.tmpl` | `rendered/daemonset.yaml` | One-pod-per-node DaemonSet. |
-| `serviceaccount.yaml.tmpl` | `rendered/serviceaccount.yaml` | Namespace + ServiceAccount + ClusterRole + Role + PriorityClass. |
-| `configmap.yaml.tmpl` | `rendered/configmap.yaml` | Default `config.yaml` (mirrors `config.NewDefault()`). |
+| `chart/templates/daemonset.yaml` | `rendered/daemonset.yaml` | One-pod-per-node DaemonSet. |
+| `chart/templates/serviceaccount.yaml` | `rendered/serviceaccount.yaml` | Namespace + ServiceAccount + Role + PriorityClass. |
+| `chart/templates/configmap.yaml` | `rendered/configmap.yaml` | Default `config.yaml` (mirrors `config.NewDefault()`). |
+| `chart/templates/rendezvous-leases.yaml` | `rendered/rendezvous-leases.yaml` | Fixed chair Lease set. |
+| `chart/templates/node-config.yaml` | Standalone chart only | Continuously reconciles containerd's default Gantry mirror route. |
 | `examples/registry-secret.example.yaml.tmpl` | `rendered/examples/registry-secret.example.yaml` | Template Secret for upstream-registry credentials. |
 | `examples/networkpolicy.yaml.tmpl` | `rendered/examples/networkpolicy.yaml` | **Hardening overlay (NOT applied by default).** See [Hardening overlays](#hardening-overlays) below. |
 | `hosts.toml.template` | (not rendered) | containerd registry mirror config; one file per upstream registry under `/etc/containerd/certs.d/<host>/hosts.toml`. |
-| `node-config.yaml` | (not rendered) | Standalone node configurator for containerd's default Gantry mirror. |
+
+## Installation paths
+
+- Operator-managed clusters use the manifests embedded in the
+   `unbounded-operator` binary. The operator never runs Helm.
+- Clusters without the operator install the released OCI chart. The chart
+   continuously reconciles `/etc/containerd/certs.d/_default/hosts.toml` on
+   every selected node. Containerd must already be configured to read
+   `/etc/containerd/certs.d`; the chart does not edit or restart containerd.
+
+The paths are mutually exclusive. `PriorityClass/gantry-low` records the active
+manager, and both installers reject ownership by the other path.
+
+```sh
+helm upgrade --install gantry oci://ghcr.io/azure/charts/gantry \
+   --version <release-without-v> \
+   --namespace gantry-system \
+   --create-namespace \
+   --set image.digest=sha256:<gantry-image-digest> \
+   --set gantry.upstreamRegistries[0].name=registry.example.com \
+   --set gantry.upstreamRegistries[0].endpoint=https://registry.example.com
+```
 
 The container image is built from `images/gantry/Containerfile` via
 `make image-gantry-local` (or `make image-gantry-push` to push).
 
-## Apply order
+## Chair sizing and upgrades
+
+`gantry.chairCount` controls the maximum active chair pool and
+`gantry.chairSeedCount` controls the per-digest seed cohort at a full pool.
+Both default to 64 chairs and 8 seeds. The counts have no configured maximum,
+but both must be positive and the seed count cannot exceed the chair count.
+The active pool is also bounded by the Gantry DaemonSet's desired scheduled
+pod count because one agent can hold at most one chair.
+The previous `chair_holder_count`, `GANTRY_CHAIR_HOLDER_COUNT`, and
+`--chair-holder-count` names remain accepted as deprecated aliases.
+
+For example:
 
 ```sh
-# Render the templates into deploy/gantry/rendered/ first (defaults to the
-# unbounded-system namespace; override with UNBOUNDED_NAMESPACE / GANTRY_NAMESPACE).
+helm upgrade gantry oci://ghcr.io/azure/charts/gantry \
+   --version <release-without-v> \
+   --namespace gantry-system \
+   --reuse-values \
+   --set gantry.chairCount=128 \
+   --set gantry.chairSeedCount=100
+```
+
+Increasing the chair count preserves every existing Lease and holder. Agents
+create and claim the additional numbered Leases through the normal election
+path until the new target is reached. Decreasing it makes holders at IDs above
+the new count vacate; the empty Lease objects may remain and are ignored.
+Chair Leases carry Helm's `keep` resource policy so a reduction does not delete
+coordination state during a rolling update. This also leaves the Leases behind
+on uninstall; delete them explicitly only after every Gantry pod has stopped.
+
+Releases that only understand the original 64-chair set reject higher-numbered
+Lease names. Upgrading from such a release therefore requires two stages:
+
+1. Upgrade every Gantry pod to the count-aware image while keeping
+   `gantry.chairCount=64`.
+2. After that rollout completes, raise `gantry.chairCount` and
+   `gantry.chairSeedCount`.
+
+Do not combine these stages in one Helm upgrade. A new pod can create a
+higher-numbered Lease while old pods are still running, which makes the old
+pods reject their next chair snapshot.
+
+## Operator Profile
+
+```sh
+# Render the profile embedded by unbounded-operator.
 make gantry-manifests
 
-kubectl apply -f deploy/gantry/rendered/serviceaccount.yaml
-kubectl apply -f deploy/gantry/rendered/configmap.yaml
-# Operator: for any PRIVATE upstream registry, edit
-# rendered/examples/registry-secret.example.yaml (rename it, fill in real
-# username:password values keyed by registry `name:`) and apply,
-# AND uncomment the matching `credentials_path:` line in
-# configmap.yaml. The default ConfigMap ships credentials-free so
-# the agent starts cleanly against public registries without any
-# Secret being applied - origin.New eagerly reads every
-# credentials_path at startup, so an unmatched path would
-# crashloop the pod.
-kubectl apply -f deploy/gantry/rendered/examples/registry-secret.example.yaml   # private registries only
-kubectl apply -f deploy/gantry/rendered/daemonset.yaml
-# rendered/examples/networkpolicy.yaml is a hardening overlay; do NOT
-# apply it as part of the initial install. See "Hardening overlays"
-# below for the workflow.
+# Validate and package the standalone chart.
+make gantry-chart-lint
+make gantry-chart-package GANTRY_CHART_VERSION=0.1.0 GANTRY_CHART_APP_VERSION=v0.1.0
 ```
 
 ## Building the image locally
@@ -70,10 +122,14 @@ entry in `/etc/containerd/certs.d/_default/hosts.toml`. On those nodes, install
 the Gantry DaemonSet normally; the mirror activates when the pod starts
 listening on `127.0.0.1:5000`.
 
-Use `node-config.yaml` only for standalone installs or non-agent-managed nodes
-that still need the default Gantry mirror entry written onto the node.
+Standalone Helm installations run `DaemonSet/gantry-containerd-config`. Its
+resident reconciler checks the default `hosts.toml` every five seconds and
+atomically restores the chart-owned payload when the file is missing or
+different, including after a node upgrade resets host configuration. Graceful
+shutdown removes the file only when it still matches the chart payload. Set
+`nodeConfig.enabled=false` when another node-management system owns this file.
 
-For each upstream registry the cluster pulls from, drop a
+Externally managed installations can instead drop a registry-specific
 `hosts.toml` at:
 
 ```
@@ -167,7 +223,7 @@ to production:
 | Kubelet probe source | `examples/networkpolicy.yaml` | Metrics ingress on TCP/9095 currently allows `0.0.0.0/0` so kubelet liveness/readiness probes (sourced from the node IP) reach the pod on strict CNIs. Replace with the node CIDR - `kubectl get nodes -o jsonpath='{.items[*].status.addresses[?(@.type=="InternalIP")].address}'`. |
 | Mirror port 5000 source | `examples/networkpolicy.yaml` | Ingress on TCP/5000 defaults to a deliberately-narrow `127.0.0.1/32` placeholder. Most CNIs (Calico, Cilium, and managed offerings) SNAT hostPort traffic so the in-pod source-IP after DNAT is the node IP, NOT 127.0.0.1 - the placeholder will then drop containerd's mirror pulls. Replace with the node CIDR (same command as the kubelet probe row). MUST NOT widen to the pod-network CIDR: that bypasses the `hostIP: 127.0.0.1` binding's loopback-only intent. |
 | containerd socket access | `daemonset.yaml` | The pod mounts `/run/containerd`, rather than the socket file, so reconnects observe the replacement socket after containerd restarts. It runs with non-root UID 65532 and primary GID 0 because many nodes expose `containerd.sock` as `root:root` mode 0660. Validate this on your target node pool before production. If your runtime uses a dedicated socket group, patch `runAsGroup`/`fsGroup` to that group; if your policy forbids GID 0, adjust node socket ownership or run a site-specific privileged wrapper. **Clearing `containerd_socket` is no longer a valid escape hatch** - after plan-final-copilot-v2 §Phase 8 containerd is Gantry's sole storage backend; without socket access the agent has no content store to read from or write to. The `storage_mode` config value must remain `containerd`. |
-| Kubernetes RBAC scope | `serviceaccount.yaml` | The agent's only Kubernetes access is `leases` (`get`, `list`, `create`, `update`) on the 64 chair Leases in its own namespace. It runs no informer and opens no watch, and it needs no access to Pods or Nodes. Review the `Role` to confirm scope hasn't drifted; a `ClusterRole` should not exist. |
+| Kubernetes RBAC scope | `serviceaccount.yaml` | The agent's only Kubernetes access is `leases` (`get`, `list`, `create`, `update`) on the configured chair Leases in its own namespace and `get` on its own DaemonSet for capacity. It runs no informer and opens no watch, and it needs no access to Pods or Nodes. Review the `Role` to confirm scope hasn't drifted; a `ClusterRole` should not exist. |
 
 ### HEAD semantics on cache miss
 

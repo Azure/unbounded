@@ -20,9 +20,14 @@ data:
       nodeAgentHealthPort: {{ default "9998" .ControllerNodeAgentHealthPort }}
       informerResyncPeriod: "{{ default "300s" .ControllerInformerResyncPeriod }}"
       statusStaleThreshold: "{{ default "90s" .ControllerStatusStaleThreshold }}"
+      # Startup-only lifetimes for cached node details and pending requests.
+      statusDetailCacheTTL: "{{ default "300s" .ControllerStatusDetailCacheTTL }}"
+      statusDetailRequestTimeout: "{{ default "120s" .ControllerStatusDetailRequestTimeout }}"
       statusWebsocketKeepaliveInterval: "{{ default "30s" .ControllerStatusWebsocketKeepaliveInterval }}"
       statusWsKeepaliveFailureCount: {{ default "3" .ControllerStatusWsKeepaliveFailureCount }}
       registerAggregatedAPIServer: {{ default "true" .ControllerRegisterAggregatedAPIServer }}
+      oidcIssuerURL: "{{ default "" .ControllerOIDCIssuerURL }}"
+      oidcAudience: "{{ default "" .ControllerOIDCAudience }}"
       kubeProxyHealthInterval: "{{ default "30s" .ControllerKubeProxyHealthInterval }}"
       managedKubeProxy:
         enabled: {{ default "true" .ControllerManagedKubeProxyEnabled }}
@@ -65,6 +70,8 @@ data:
       statusPushEnabled: {{ default "true" .NodeStatusPushEnabled }}
       statusPushURL: "{{ default "" .NodeStatusPushURL }}"
       statusPushDelta: {{ default "true" .NodeStatusPushDelta }}
+      # Startup-only; full restores legacy node publication, not bulk exports.
+      statusDetailMode: "{{ default "summary" .NodeStatusDetailMode }}"
       statusPushInterval: "{{ default "60s" .NodeStatusPushInterval }}"
       statusPushApiserverInterval: "{{ default "60s" .NodeStatusPushApiserverInterval }}"
       healthCheckPort: "{{ default "9997" .NodeHealthCheckPort }}"

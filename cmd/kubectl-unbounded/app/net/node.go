@@ -4,6 +4,7 @@
 package net
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -27,6 +28,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/remotecommand"
 
+	netstatus "github.com/Azure/unbounded/internal/net/status"
 	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
 
@@ -178,16 +180,16 @@ func runNodeList(rt *pluginRuntime, cmd *cobra.Command, baseFetch nodeStatusFetc
 		fetchOpts.timeout = override.timeout
 	}
 
-	status, err := fetchClusterStatus(rt, cmd, fetchOpts)
+	status, err := fetchClusterSummary(rt, cmd, fetchOpts)
 	if err != nil {
 		return err
 	}
 
-	rows := buildNodeRows(status)
+	rows := buildNodeRowsFromSummary(status)
 	useColor := shouldUseColor(cmd.OutOrStdout(), color)
 
 	if !suppressWarnings {
-		printWarnings(cmd.OutOrStdout(), collectWarnings(status), useColor)
+		printWarnings(cmd.OutOrStdout(), collectWarningsFromSummary(status), useColor)
 	}
 
 	switch output {
@@ -213,19 +215,32 @@ func runNodeList(rt *pluginRuntime, cmd *cobra.Command, baseFetch nodeStatusFetc
 func fetchClusterStatus(rt *pluginRuntime, cmd *cobra.Command, opts nodeStatusFetchOptions) (clusterStatusResponse, error) {
 	var status clusterStatusResponse
 
-	ns, err := rt.namespace()
+	raw, err := fetchClusterStatusRaw(rt, cmd, opts)
 	if err != nil {
 		return status, err
+	}
+
+	if err := json.Unmarshal(raw, &status); err != nil {
+		return status, fmt.Errorf("decode /status/json: %w", err)
+	}
+
+	return status, nil
+}
+
+func fetchClusterStatusRaw(rt *pluginRuntime, cmd *cobra.Command, opts nodeStatusFetchOptions) ([]byte, error) {
+	ns, err := rt.namespace()
+	if err != nil {
+		return nil, err
 	}
 
 	client, err := rt.kubeClient()
 	if err != nil {
-		return status, err
+		return nil, err
 	}
 
 	cfg, err := rt.restConfig()
 	if err != nil {
-		return status, err
+		return nil, err
 	}
 
 	ctx, cancel := context.WithTimeout(cmd.Context(), opts.timeout)
@@ -235,15 +250,89 @@ func fetchClusterStatus(rt *pluginRuntime, cmd *cobra.Command, opts nodeStatusFe
 	if err != nil {
 		raw, err = fetchStatusViaPortForward(ctx, client, cfg, ns, opts.controllerDeploy, opts.controllerSelector, opts.controllerPort, opts.timeout)
 		if err != nil {
-			return status, fmt.Errorf("fetch /status/json failed via service proxy (%s) and pod port-forward (%s)", opts.controllerService, err)
+			return nil, fmt.Errorf("fetch /status/json failed via service proxy (%s) and pod port-forward (%s)", opts.controllerService, err)
 		}
 	}
 
-	if err := json.Unmarshal(raw, &status); err != nil {
-		return status, fmt.Errorf("decode /status/json: %w", err)
+	return raw, nil
+}
+
+func fetchClusterSummary(rt *pluginRuntime, cmd *cobra.Command, opts nodeStatusFetchOptions) (clusterSummary, error) {
+	raw, err := fetchClusterStatusRaw(rt, cmd, opts)
+	if err != nil {
+		return clusterSummary{}, err
 	}
 
-	return status, nil
+	return decodeClusterSummary(raw)
+}
+
+// decodeClusterSummary projects legacy full responses once, never retaining details.
+func decodeClusterSummary(raw []byte) (clusterSummary, error) {
+	var shape map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &shape); err != nil {
+		return clusterSummary{}, fmt.Errorf("decode cluster overview: %w", err)
+	}
+
+	var summary clusterSummary
+	if err := json.Unmarshal(raw, &summary); err != nil {
+		return summary, fmt.Errorf("decode cluster overview: %w", err)
+	}
+
+	if _, ok := shape["nodeSummaries"]; ok {
+		return summary, nil
+	}
+
+	if _, ok := shape["nodes"]; !ok {
+		return summary, fmt.Errorf("malformed cluster overview: missing nodeSummaries or nodes")
+	}
+
+	var legacy clusterStatusResponse
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		return summary, fmt.Errorf("decode legacy cluster overview: %w", err)
+	}
+
+	summary.NodeSummaries = make([]nodeSummary, 0, len(legacy.Nodes))
+
+	now := time.Now()
+	for _, node := range legacy.Nodes {
+		overview := netstatus.OverviewFromStatus(&node, now)
+		// Keep the metadata allocation independent of the full diagnostic payload.
+		info := node.NodeInfo
+
+		entry := nodeSummary{
+			NodeInfo: &info, LastPushTime: node.LastPushTime,
+			WireGuardOnline: node.NodeInfo.WireGuard != nil && node.NodeInfo.WireGuard.Interface != "",
+			Name:            node.NodeInfo.Name, SiteName: node.NodeInfo.SiteName,
+			IsGateway: node.NodeInfo.IsGateway, K8sReady: node.NodeInfo.K8sReady,
+			StatusSource: node.StatusSource, FetchError: node.FetchError,
+			PeerCount: overview.PeerCount, HealthyPeers: overview.HealthyPeers, RouteCount: overview.RouteCount,
+			RouteMismatch: overview.RouteMismatch, ErrorCount: len(node.NodeErrors),
+			CniStatus: cniStatusLabel(node, legacy.PullEnabled), CniTone: statusTone(node, legacy.PullEnabled),
+		}
+		if len(node.NodeErrors) > 0 {
+			entry.FirstError = node.NodeErrors[0].Message
+		}
+
+		summary.NodeSummaries = append(summary.NodeSummaries, entry)
+	}
+
+	summary.NodeCount = len(summary.NodeSummaries)
+
+	return summary, nil
+}
+
+// summaryStatusMetadata adapts overview identity data for existing detail renderers.
+func summaryStatusMetadata(summary clusterSummary) clusterStatusResponse {
+	status := clusterStatusResponse{
+		PullEnabled: summary.PullEnabled, LeaderInfo: summary.LeaderInfo,
+		Sites: summary.Sites, GatewayPools: summary.GatewayPools, Warnings: summary.Warnings,
+		Nodes: make([]statusv1alpha1.NodeStatusResponse, 0, len(summary.NodeSummaries)),
+	}
+	for _, node := range summary.NodeSummaries {
+		status.Nodes = append(status.Nodes, node.statusMetadata())
+	}
+
+	return status
 }
 
 // newNodeLogsCommand shows CNI node-agent logs for a specific Kubernetes node.
@@ -506,110 +595,91 @@ func listNodeNamesForCompletion(rt *pluginRuntime, ctx context.Context, prefix s
 
 // listNodePeeringsForCompletion returns existing peering destination node names for a source node.
 func listNodePeeringsForCompletion(rt *pluginRuntime, cmd *cobra.Command, baseFetch nodeStatusFetchOptions, sourceNode, prefix string) ([]string, error) {
-	status, err := fetchClusterStatus(rt, cmd, nodeStatusFetchFromCommand(cmd).merged(baseFetch))
+	candidates, err := listNodeNamesForCompletion(rt, cmd.Context(), prefix)
 	if err != nil {
 		return nil, err
 	}
 
-	node, ok := nodeStatusByName(status, sourceNode)
-	if !ok {
-		return nil, fmt.Errorf("node %q not found in status", sourceNode)
-	}
-
-	seen := make(map[string]struct{})
-
-	names := make([]string, 0, len(node.Peers))
-	for _, peer := range node.Peers {
-		name := strings.TrimSpace(peer.Name)
-		if name == "" || !strings.HasPrefix(name, prefix) {
-			continue
+	names := make([]string, 0, len(candidates))
+	for _, name := range candidates {
+		if name != sourceNode {
+			names = append(names, name)
 		}
-
-		if _, exists := seen[name]; exists {
-			continue
-		}
-
-		seen[name] = struct{}{}
-		names = append(names, name)
 	}
 
 	return names, nil
 }
 
-// newNodeShowCommand prints node info and detail tables from cluster status.
+// newNodeShowCommand explicitly obtains one node's expiring diagnostics.
 func newNodeShowCommand(rt *pluginRuntime, baseFetch nodeStatusFetchOptions) *cobra.Command {
 	var (
-		color string
-		watch bool
+		color   string
+		watch   bool
+		refresh bool
 	)
 
 	cmd := &cobra.Command{
 		Use:   "show NODE_NAME [peer|peers|route|routes|bpf|json] [PEER_NODE]",
-		Short: "Show node info, peers, routes, BPF entries, or raw JSON from status data",
+		Short: "Load node diagnostics: info, peers, routes, BPF entries, or raw JSON",
 		Args:  cobra.RangeArgs(1, 3),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if watch {
-				fetchOpts := nodeStatusFetchFromCommand(cmd).merged(baseFetch)
-				nodeName := args[0]
-				mode := ""
-				peerName := ""
-
-				if len(args) >= 2 {
-					mode = strings.ToLower(args[1])
-				}
-
-				if len(args) == 3 {
-					peerName = args[2]
-				}
-
-				return runWatch(cmd.Context(), rt, cmd, fetchOpts, color, func(w io.Writer, status clusterStatusResponse, useColor bool) error {
-					node, ok := nodeStatusByName(status, nodeName)
-					if !ok {
-						return fmt.Errorf("node %q not found in controller status", nodeName)
-					}
-
-					switch mode {
-					case "peer", "peers":
-						return printNodePeerings(w, status, node, peerName, useColor)
-					case "route", "routes":
-						return printNodeRoutes(w, node, useColor, rt.interfaceNames)
-					case "bpf":
-						return printNodeBpf(w, node)
-					case "json":
-						data, jsonErr := json.MarshalIndent(node, "", "  ")
-						if jsonErr != nil {
-							return jsonErr
-						}
-
-						_, _ = fmt.Fprintf(w, "%s\n", data) //nolint:errcheck
-
-						return nil
-					default:
-						return printNodeInfoPane(w, status, node, useColor)
-					}
-				}, nil)
+				return fmt.Errorf("node show does not watch diagnostic data; use node list --watch for overview updates, or repeat node show --refresh")
 			}
 
-			useColor := shouldUseColor(cmd.OutOrStdout(), color)
+			mode := ""
+			if len(args) >= 2 {
+				mode = strings.ToLower(args[1])
+			}
 
-			status, err := fetchClusterStatus(rt, cmd, nodeStatusFetchFromCommand(cmd).merged(baseFetch))
+			switch mode {
+			case "", "peer", "peers", "route", "routes", "bpf", "json":
+			default:
+				return fmt.Errorf("unsupported show subcommand %q, expected peer(s), route(s), bpf, or json", args[1])
+			}
+
+			fetchOpts := nodeStatusFetchFromCommand(cmd).merged(baseFetch)
+
+			var (
+				status   clusterStatusResponse
+				overview *nodeSummary
+			)
+
+			if mode == "" || mode == "peer" || mode == "peers" {
+				summary, err := fetchClusterSummary(rt, cmd, fetchOpts)
+				if err != nil {
+					return err
+				}
+
+				status = summaryStatusMetadata(summary)
+				for i := range summary.NodeSummaries {
+					if summary.NodeSummaries[i].Name == args[0] {
+						overview = &summary.NodeSummaries[i]
+						break
+					}
+				}
+
+				if mode == "" && overview == nil {
+					return fmt.Errorf("node %q not found in cluster overview", args[0])
+				}
+			}
+
+			request, err := newStatusRequest(rt, fetchOpts)
 			if err != nil {
 				return err
 			}
 
-			nodeName := args[0]
-
-			node, ok := nodeStatusByName(status, nodeName)
-			if !ok {
-				return fmt.Errorf("node %q not found in controller status", nodeName)
+			details, err := (nodeDetailClient{request: request}).fetch(cmd.Context(), args[0], refresh)
+			if err != nil {
+				return err
 			}
 
-			if len(args) == 1 {
-				return printNodeInfoPane(cmd.OutOrStdout(), status, node, useColor)
-			}
+			node := *details
+			useColor := shouldUseColor(cmd.OutOrStdout(), color)
 
-			mode := strings.ToLower(args[1])
 			switch mode {
+			case "":
+				return printNodeInfoPane(cmd.OutOrStdout(), status, *overview, useColor)
 			case "peer", "peers":
 				var peerName string
 				if len(args) == 3 {
@@ -637,7 +707,8 @@ func newNodeShowCommand(rt *pluginRuntime, baseFetch nodeStatusFetchOptions) *co
 	}
 	cmd.ValidArgsFunction = nodeShowCompletion(rt, baseFetch)
 	cmd.Flags().StringVarP(&color, "color", "C", "auto", "Colorize output: auto|always|never (pass -C with no value for always)")
-	cmd.Flags().BoolVarP(&watch, "watch", "w", false, "Watch live updates via WebSocket")
+	cmd.Flags().BoolVarP(&watch, "watch", "w", false, "Unsupported for diagnostics; use node list --watch")
+	cmd.Flags().BoolVar(&refresh, "refresh", false, "Collect fresh node diagnostics instead of reusing an unexpired snapshot")
 
 	if flag := cmd.Flags().Lookup("color"); flag != nil {
 		flag.NoOptDefVal = "always"
@@ -768,16 +839,6 @@ func execInPod(
 }
 
 // nodeStatusByName returns the node status entry with the given node name.
-func nodeStatusByName(status clusterStatusResponse, nodeName string) (statusv1alpha1.NodeStatusResponse, bool) {
-	for _, n := range status.Nodes {
-		if strings.EqualFold(n.NodeInfo.Name, nodeName) {
-			return n, true
-		}
-	}
-
-	return statusv1alpha1.NodeStatusResponse{}, false
-}
-
 // fetchStatusViaServiceProxy fetches status through the aggregated API endpoint.
 func fetchStatusViaServiceProxy(ctx context.Context, client *kubernetes.Clientset, ns, service, port string) ([]byte, error) {
 	return client.CoreV1().RESTClient().
@@ -798,6 +859,18 @@ func fetchStatusViaPortForward(
 	selector string,
 	remotePort string,
 	timeout time.Duration,
+) ([]byte, error) {
+	return requestStatusViaPortForward(ctx, client, cfg, ns, deployName, selector, remotePort, timeout, http.MethodGet, "/status/json", nil)
+}
+
+func requestStatusViaPortForward(
+	ctx context.Context,
+	client *kubernetes.Clientset,
+	cfg *rest.Config,
+	ns, deployName, selector, remotePort string,
+	timeout time.Duration,
+	method, path string,
+	body []byte,
 ) ([]byte, error) {
 	pods, err := podsForController(ctx, client, ns, deployName, selector)
 	if err != nil {
@@ -825,6 +898,8 @@ func fetchStatusViaPortForward(
 	}
 
 	stopCh := make(chan struct{}, 1)
+	defer close(stopCh)
+
 	readyCh := make(chan struct{})
 	errCh := make(chan error, 1)
 
@@ -845,8 +920,6 @@ func fetchStatusViaPortForward(
 		return nil, ctx.Err()
 	}
 
-	defer close(stopCh)
-
 	fwdPorts, err := fw.GetPorts()
 	if err != nil {
 		return nil, err
@@ -861,9 +934,13 @@ func fetchStatusViaPortForward(
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, fmt.Sprintf("https://127.0.0.1:%d/status/json", localPort), nil)
+	req, err := http.NewRequestWithContext(reqCtx, method, fmt.Sprintf("https://127.0.0.1:%d%s", localPort, path), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
+	}
+
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
 
 	// Request an HMAC viewer token for authentication. When port-forwarding
@@ -892,6 +969,7 @@ func fetchStatusViaPortForward(
 			},
 		},
 	}
+	defer tlsClient.CloseIdleConnections()
 
 	resp, err := tlsClient.Do(req)
 	if err != nil {
@@ -900,16 +978,16 @@ func fetchStatusViaPortForward(
 
 	defer func() { _ = resp.Body.Close() }() //nolint:errcheck
 
-	body, err := io.ReadAll(resp.Body)
+	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("controller /status/json returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return responseBody, fmt.Errorf("controller %s returned %d: %s", path, resp.StatusCode, strings.TrimSpace(string(responseBody)))
 	}
 
-	return body, nil
+	return responseBody, nil
 }
 
 // podsForController returns controller pods from deployment selector, falling back to label selector.

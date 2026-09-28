@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"math"
 	"sync"
 	"time"
 
@@ -25,9 +24,10 @@ type WSMessage struct {
 
 // WSClientMessage is the client->server message
 type WSClientMessage struct {
-	Type     string `json:"type"`
-	Enabled  bool   `json:"enabled,omitempty"`  // for set_pull_enabled
-	NodeName string `json:"nodeName,omitempty"` // for node_detail_request / subscribe / unsubscribe
+	Type         string `json:"type"`
+	Enabled      bool   `json:"enabled,omitempty"`  // for set_pull_enabled
+	NodeName     string `json:"nodeName,omitempty"` // for node_detail_request / subscribe / unsubscribe
+	ForceRefresh bool   `json:"forceRefresh,omitempty"`
 }
 
 // WSClient represents a single WebSocket connection
@@ -37,30 +37,30 @@ type WSClient struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	// Summary protocol fields (protected by WSBroadcaster.mu during broadcast)
-	summarySubscribed       bool
-	nodeDetailSubscriptions map[string]bool
+	// summarySubscribed and closed are protected by WSBroadcaster.mu.
+	summarySubscribed bool
+	closed            bool
+	broadcaster       *WSBroadcaster
+	detailMu          sync.Mutex
+	detailWatches     map[string]*viewerDetailWatch
 }
 
 // WSBroadcaster manages all WebSocket clients and broadcasts updates
 type WSBroadcaster struct {
-	mu               sync.RWMutex
-	clients          map[*WSClient]struct{}
-	health           *healthState
-	notify           chan struct{}     // buffered 1, coalesces notifications
-	seq              uint64            // monotonic broadcast counter
-	lastNodeJSON     map[string][]byte // nodeName → JSON bytes of last-broadcast NodeStatusResponse
-	lastNodeFullJSON map[string][]byte // nodeName → full JSON for field-level diffing
-	lastSummary      *ClusterSummary   // previous summary for delta computation
+	mu          sync.RWMutex
+	clients     map[*WSClient]struct{}
+	health      *healthState
+	notify      chan struct{}   // buffered 1, coalesces notifications
+	seq         uint64          // monotonic broadcast counter
+	lastSummary *ClusterSummary // previous summary for delta computation
 }
 
 // NewWSBroadcaster creates a new WebSocket broadcaster
 func NewWSBroadcaster(health *healthState) *WSBroadcaster {
 	return &WSBroadcaster{
-		clients:      make(map[*WSClient]struct{}),
-		health:       health,
-		notify:       make(chan struct{}, 1),
-		lastNodeJSON: nil, // nil signals first broadcast should be full snapshot
+		clients: make(map[*WSClient]struct{}),
+		health:  health,
+		notify:  make(chan struct{}, 1),
 	}
 }
 
@@ -75,10 +75,21 @@ func (b *WSBroadcaster) getSeq() uint64 {
 // Register adds a client to the broadcaster
 func (b *WSBroadcaster) Register(client *WSClient) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
+
+	if client.closed {
+		b.mu.Unlock()
+		klog.Warning("WebSocket: cannot register a closed client")
+
+		return
+	}
 
 	b.clients[client] = struct{}{}
-	klog.V(3).Infof("WebSocket client registered (total: %d)", len(b.clients))
+	client.broadcaster = b
+	count := len(b.clients)
+	b.mu.Unlock()
+
+	b.subscribeSummary(client)
+	klog.V(3).Infof("WebSocket client registered in summary mode (total: %d)", count)
 }
 
 // Unregister removes a client from the broadcaster and closes its send channel
@@ -88,6 +99,12 @@ func (b *WSBroadcaster) Unregister(client *WSClient) {
 
 	if _, ok := b.clients[client]; ok {
 		delete(b.clients, client)
+		client.closed = true
+
+		if client.cancel != nil {
+			client.cancel()
+		}
+
 		close(client.send)
 		klog.V(3).Infof("WebSocket client unregistered (total: %d)", len(b.clients))
 	}
@@ -112,6 +129,19 @@ func (b *WSBroadcaster) ClientCount() int {
 
 // Run is the main broadcast loop
 func (b *WSBroadcaster) Run(ctx context.Context) {
+	defer func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+
+		b.lastSummary = nil
+
+		for client := range b.clients {
+			if client.cancel != nil {
+				client.cancel()
+			}
+		}
+	}()
+
 	coalesceTicker := time.NewTicker(2 * time.Second)
 	defer coalesceTicker.Stop()
 
@@ -189,420 +219,95 @@ func computeNodeDelta(prev, curr []byte) json.RawMessage {
 	return result
 }
 
-// broadcastUpdate fetches cluster status and sends a delta (or full snapshot on first broadcast) to all clients
+// broadcastUpdate sends only overview snapshots/deltas, including to clients
+// that never subscribed to the summary protocol. History never contains details.
 func (b *WSBroadcaster) broadcastUpdate(ctx context.Context) {
-	broadcastStart := time.Now()
-
-	var status *ClusterStatusResponse
-	if b.health.clusterStatusCache != nil {
-		status = b.health.clusterStatusCache.Get()
+	if ctx.Err() != nil {
+		return
 	}
 
+	status := b.getCachedStatus()
 	if status == nil {
 		return
 	}
 
-	// Check if any clients need legacy full/delta data (non-summary-subscribed).
-	// Skip the expensive per-node JSON marshaling if all clients use summary mode.
-	b.mu.RLock()
-
-	hasLegacyClients := false
-	hasNodeDetailSubs := false
-
-	for c := range b.clients {
-		if !c.summarySubscribed {
-			hasLegacyClients = true
-		}
-
-		if len(c.nodeDetailSubscriptions) > 0 {
-			hasNodeDetailSubs = true
-		}
-	}
-
-	b.mu.RUnlock()
-
-	// Only marshal per-node JSON when legacy clients or node detail subscribers need it
-	var currentNodeFullJSON map[string][]byte
-	if hasLegacyClients || hasNodeDetailSubs {
-		currentNodeFullJSON = make(map[string][]byte, len(status.Nodes))
-		for i := range status.Nodes {
-			nodeData, err := json.Marshal(status.Nodes[i])
-			if err != nil {
-				klog.Errorf("WebSocket: failed to marshal node %s: %v", status.Nodes[i].NodeInfo.Name, err)
-				continue
-			}
-
-			currentNodeFullJSON[status.Nodes[i].NodeInfo.Name] = nodeData
-		}
-	}
+	summary := buildClusterSummary(status)
 
 	b.mu.Lock()
 	b.seq++
-	currentSeq := b.seq
-	isFirstBroadcast := b.lastNodeJSON == nil && b.lastSummary == nil
+	summary.Seq = b.seq
+	previous := b.lastSummary
 	b.mu.Unlock()
 
-	if isFirstBroadcast {
-		// First broadcast: send full snapshot to all clients.
-		status.Seq = currentSeq
-		fullMsg := WSMessage{Type: "cluster_status", Data: status}
-
-		fullData, err := json.Marshal(fullMsg)
-		if err != nil {
-			klog.Errorf("WebSocket: failed to marshal cluster status: %v", err)
+	message := WSMessage{Type: "cluster_summary", Data: summary}
+	if previous != nil {
+		delta := computeClusterSummaryDelta(previous, summary)
+		if delta == nil {
 			return
 		}
 
-		summary := buildClusterSummary(status)
-		summaryMsg := WSMessage{Type: "cluster_summary", Data: summary}
-
-		summaryData, err := json.Marshal(summaryMsg)
-		if err != nil {
-			klog.Errorf("WebSocket: failed to marshal cluster summary: %v", err)
-			return
-		}
-
-		b.mu.RLock()
-
-		clients := make([]*WSClient, 0, len(b.clients))
-		for c := range b.clients {
-			clients = append(clients, c)
-		}
-
-		b.mu.RUnlock()
-
-		for _, c := range clients {
-			payload := fullData
-			if c.summarySubscribed {
-				payload = summaryData
-			}
-
-			select {
-			case c.send <- payload:
-			default:
-				klog.V(4).Info("WebSocket: client send buffer full, dropping cluster_status")
-			}
-		}
-
-		// Send node_detail_update for subscribed nodes
-		b.sendNodeDetailUpdates(status, nil, clients, currentNodeFullJSON)
-
-		b.mu.Lock()
-		b.lastNodeJSON = currentNodeFullJSON
-		b.lastNodeFullJSON = currentNodeFullJSON
-		b.lastSummary = buildClusterSummary(status)
-		b.mu.Unlock()
-
-		return
+		message = WSMessage{Type: "cluster_summary_delta", Data: delta}
 	}
 
-	// Fast path: if all clients use summary mode and no node detail
-	// subscriptions exist, skip the expensive per-node delta computation.
-	if !hasLegacyClients && !hasNodeDetailSubs {
-		summaryStart := time.Now()
-		summary := buildClusterSummary(status)
-		summaryDur := time.Since(summaryStart)
-
-		b.mu.RLock()
-		prevSummary := b.lastSummary
-		b.mu.RUnlock()
-
-		var summaryData []byte
-
-		deltaStart := time.Now()
-
-		if prevSummary != nil {
-			delta := computeClusterSummaryDelta(prevSummary, summary)
-			if delta == nil {
-				if dur := time.Since(broadcastStart); dur > 100*time.Millisecond {
-					klog.V(2).Infof("WebSocket: broadcast (no-op) took %v (summary=%v)", dur, summaryDur)
-				}
-
-				return
-			}
-
-			klog.V(4).Infof("WebSocket: summary delta: %d nodeSummaries, %d removed, sites=%v pools=%v matrix=%v",
-				len(delta.NodeSummaries), len(delta.RemovedNodes), delta.Sites != nil, delta.GatewayPools != nil, delta.ConnectivityMatrix != nil)
-			msg := WSMessage{Type: "cluster_summary_delta", Data: delta}
-			summaryData, _ = json.Marshal(msg) //nolint:errcheck
-		} else {
-			msg := WSMessage{Type: "cluster_summary", Data: summary}
-			summaryData, _ = json.Marshal(msg) //nolint:errcheck
-		}
-
-		deltaDur := time.Since(deltaStart)
-
-		if summaryData != nil {
-			b.mu.RLock()
-
-			clients := make([]*WSClient, 0, len(b.clients))
-			for c := range b.clients {
-				clients = append(clients, c)
-			}
-
-			b.mu.RUnlock()
-
-			for _, c := range clients {
-				select {
-				case c.send <- summaryData:
-				default:
-					klog.V(4).Info("WebSocket: client send buffer full, dropping cluster_summary")
-				}
-			}
-		}
-
-		b.mu.Lock()
-		b.lastSummary = summary
-		b.mu.Unlock()
-
-		if dur := time.Since(broadcastStart); dur > 100*time.Millisecond {
-			klog.Infof("WebSocket: broadcast took %v (summary=%v, delta=%v, marshal=%v, nodes=%d)",
-				dur, summaryDur, deltaDur, dur-summaryDur-deltaDur, len(status.Nodes))
-		}
-
-		return
-	}
-
-	// Compute delta: compare current vs last
-	b.mu.RLock()
-	lastJSON := b.lastNodeJSON
-	lastFullJSON := b.lastNodeFullJSON
-	b.mu.RUnlock()
-
-	var (
-		updatedNodes []json.RawMessage
-		removedNodes []string
-	)
-
-	// Find updated or new nodes
-
-	for i := range status.Nodes {
-		name := status.Nodes[i].NodeInfo.Name
-		lastData, existed := lastJSON[name]
-
-		currData := currentNodeFullJSON[name]
-		if !existed {
-			// New node: send full object
-			updatedNodes = append(updatedNodes, json.RawMessage(currData))
-		} else if !bytes.Equal(currData, lastData) {
-			// Changed node: compute field-level delta
-			prevFull := lastFullJSON[name]
-			if prevFull == nil {
-				// No previous full JSON available, send full object
-				updatedNodes = append(updatedNodes, json.RawMessage(currData))
-			} else {
-				updatedNodes = append(updatedNodes, computeNodeDelta(prevFull, currData))
-			}
-		}
-	}
-
-	// Find removed nodes (in last but not in current)
-	for name := range lastJSON {
-		if _, exists := currentNodeFullJSON[name]; !exists {
-			removedNodes = append(removedNodes, name)
-		}
-	}
-
-	// Build and send delta
-	delta := ClusterStatusDelta{
-		Seq:           currentSeq,
-		Timestamp:     status.Timestamp,
-		NodeCount:     status.NodeCount,
-		SiteCount:     status.SiteCount,
-		AzureTenantID: status.AzureTenantID,
-		LeaderInfo:    status.LeaderInfo,
-		Errors:        status.Errors,
-		Warnings:      status.Warnings,
-		Problems:      status.Problems,
-		UpdatedNodes:  updatedNodes,
-		RemovedNodes:  removedNodes,
-		Sites:         status.Sites,
-		GatewayPools:  status.GatewayPools,
-		Peerings:      status.Peerings,
-		PullEnabled:   status.PullEnabled,
-	}
-
-	// Always include ConnectivityMatrix so link-state-only changes refresh clients.
-	delta.ConnectivityMatrix = status.ConnectivityMatrix
-
-	msg := WSMessage{Type: "cluster_status_delta", Data: delta}
-
-	deltaData, err := json.Marshal(msg)
+	data, err := json.Marshal(message)
 	if err != nil {
-		klog.Errorf("WebSocket: failed to marshal cluster status delta: %v", err)
+		klog.Errorf("WebSocket: failed to marshal cluster overview: %v", err)
+
 		return
 	}
 
-	if len(updatedNodes) > 0 || len(removedNodes) > 0 {
-		klog.V(4).Infof("WebSocket: delta seq=%d: %d updated, %d removed (of %d total), %d bytes",
-			currentSeq, len(updatedNodes), len(removedNodes), len(status.Nodes), len(deltaData))
-	}
-
-	// Build summary delta for subscribed clients
-	summary := buildClusterSummary(status)
-
-	b.mu.RLock()
-	prevSummary := b.lastSummary
-	b.mu.RUnlock()
-
-	var summaryData []byte
-
-	if prevSummary != nil {
-		summaryDelta := computeClusterSummaryDelta(prevSummary, summary)
-		if summaryDelta != nil {
-			msg := WSMessage{Type: "cluster_summary_delta", Data: summaryDelta}
-			summaryData, _ = json.Marshal(msg) //nolint:errcheck
-		}
-		// If delta is nil, no summary update needed for subscribed clients
-	} else {
-		msg := WSMessage{Type: "cluster_summary", Data: summary}
-		summaryData, _ = json.Marshal(msg) //nolint:errcheck
-	}
-
-	// Build set of changed node names for node_detail_update.
-	// Cap the allocation hint to avoid overflow from adding two lengths.
-	changedCap := len(updatedNodes)
-	if len(removedNodes) <= math.MaxInt-changedCap {
-		changedCap += len(removedNodes)
-	}
-
-	changedNodes := make(map[string]bool, changedCap)
-
-	for _, raw := range updatedNodes {
-		var partial struct {
-			NodeInfo struct {
-				Name string `json:"name"`
-			} `json:"nodeInfo"`
-		}
-		if json.Unmarshal(raw, &partial) == nil && partial.NodeInfo.Name != "" {
-			changedNodes[partial.NodeInfo.Name] = true
-		}
-	}
-
-	for _, name := range removedNodes {
-		changedNodes[name] = true
-	}
-
-	// Send to clients based on subscription mode
-	b.mu.RLock()
-
-	clients := make([]*WSClient, 0, len(b.clients))
-	for c := range b.clients {
-		clients = append(clients, c)
-	}
-
-	b.mu.RUnlock()
-
-	for _, c := range clients {
-		if c.summarySubscribed {
-			// Summary-subscribed clients get the lightweight summary
-			if summaryData != nil {
-				select {
-				case c.send <- summaryData:
-				default:
-					klog.V(4).Info("WebSocket: client send buffer full, dropping cluster_summary")
-				}
-			}
-		} else {
-			// Legacy clients get the full delta
-			select {
-			case c.send <- deltaData:
-			default:
-				klog.V(4).Info("WebSocket: client send buffer full, dropping cluster_status_delta")
-			}
-		}
-	}
-
-	// Send node_detail_update for any node subscriptions on changed nodes
-	b.sendNodeDetailUpdates(status, changedNodes, clients, currentNodeFullJSON)
-
-	// Update tracking state
 	b.mu.Lock()
-	b.lastNodeJSON = currentNodeFullJSON
-	b.lastNodeFullJSON = currentNodeFullJSON
+	defer b.mu.Unlock()
+
 	b.lastSummary = summary
-	b.mu.Unlock()
+
+	for client := range b.clients {
+		select {
+		case client.send <- data:
+		default:
+			klog.V(4).Info("WebSocket: client send buffer full, dropping cluster overview")
+		}
+	}
 }
 
 // sendToClient sends a single message to a specific client (non-blocking)
 func (b *WSBroadcaster) sendToClient(client *WSClient, msg WSMessage) {
 	data, err := json.Marshal(msg)
 	if err != nil {
+		klog.Errorf("WebSocket: failed to encode client response: %v", err)
+		return
+	}
+
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	if client.closed {
 		return
 	}
 
 	select {
 	case client.send <- data:
 	default:
-		// Buffer full
-	}
-}
+		klog.V(4).Info("WebSocket: client send buffer full, dropping response")
 
-// sendNodeDetailUpdates sends node_detail_update messages to clients that have
-// node detail subscriptions. If changedNodes is nil (first broadcast), all
-// subscribed nodes are sent. Otherwise only nodes in changedNodes are sent.
-func (b *WSBroadcaster) sendNodeDetailUpdates(status *ClusterStatusResponse, changedNodes map[string]bool, clients []*WSClient, currentNodeFullJSON map[string][]byte) {
-	// Build a quick lookup of node index by name
-	nodeByName := make(map[string]int, len(status.Nodes))
-	for i := range status.Nodes {
-		nodeByName[status.Nodes[i].NodeInfo.Name] = i
-	}
-
-	// Pre-marshal node detail messages to avoid repeated marshaling
-	detailCache := make(map[string][]byte)
-
-	for _, c := range clients {
-		if len(c.nodeDetailSubscriptions) == 0 {
-			continue
-		}
-
-		for nodeName := range c.nodeDetailSubscriptions {
-			// On first broadcast (changedNodes == nil) send all; otherwise only changed
-			if changedNodes != nil && !changedNodes[nodeName] {
-				continue
-			}
-
-			detailData, ok := detailCache[nodeName]
-			if !ok {
-				idx, exists := nodeByName[nodeName]
-				if !exists {
-					continue
-				}
-
-				msg := WSMessage{Type: "node_detail_update", Data: status.Nodes[idx], NodeName: nodeName}
-
-				var err error
-
-				detailData, err = json.Marshal(msg)
-				if err != nil {
-					continue
-				}
-
-				detailCache[nodeName] = detailData
-			}
-
-			select {
-			case c.send <- detailData:
-			default:
-				klog.V(4).Infof("WebSocket: client send buffer full, dropping node_detail_update for %s", nodeName)
-			}
+		if msg.Type == "node_detail_response" && client.cancel != nil {
+			client.cancel()
 		}
 	}
 }
 
-// sendNodeDetail looks up a node in the cached status and sends it to the client.
-func (b *WSBroadcaster) sendNodeDetail(client *WSClient, nodeName, msgType string) {
-	status := b.getCachedStatus()
-	if status == nil {
+func (b *WSBroadcaster) subscribeSummary(client *WSClient) {
+	b.mu.Lock()
+	client.summarySubscribed = true
+	summary := b.lastSummary
+	b.mu.Unlock()
+
+	if summary != nil {
+		b.sendToClient(client, WSMessage{Type: "cluster_summary", Data: summary})
 		return
 	}
 
-	for i := range status.Nodes {
-		if status.Nodes[i].NodeInfo.Name == nodeName {
-			b.sendToClient(client, WSMessage{Type: msgType, Data: status.Nodes[i], NodeName: nodeName})
-			return
-		}
-	}
+	b.Notify()
 }
 
 // getCachedStatus returns the current pre-built cluster status, or nil if unavailable.
@@ -657,7 +362,7 @@ func (c *WSClient) readPump(b *WSBroadcaster) {
 			}
 
 			status.Seq = b.getSeq()
-			b.sendToClient(c, WSMessage{Type: "cluster_status", Data: status})
+			b.sendToClient(c, WSMessage{Type: "cluster_summary", Data: buildClusterSummary(status)})
 		case "set_pull_enabled":
 			b.health.pullEnabled.Store(msg.Enabled)
 
@@ -670,44 +375,28 @@ func (c *WSClient) readPump(b *WSBroadcaster) {
 			// Trigger a broadcast so all clients see the updated pullEnabled state
 			b.Notify()
 		case "cluster_summary_subscribe":
-			b.mu.Lock()
-			c.summarySubscribed = true
-			b.mu.Unlock()
+			b.subscribeSummary(c)
 			klog.V(4).Info("WebSocket: client subscribed to cluster_summary")
-			// Trigger an immediate broadcast so the client gets data quickly.
-			// The broadcast loop handles initial vs delta logic.
-			b.Notify()
 		case "cluster_summary_unsubscribe":
-			b.mu.Lock()
-			c.summarySubscribed = false
-			b.mu.Unlock()
-			klog.V(4).Info("WebSocket: client unsubscribed from cluster_summary")
+			klog.V(4).Info("WebSocket: ignored retired cluster_summary unsubscribe")
 		case "node_detail_request":
 			if msg.NodeName == "" {
 				continue
 			}
 
-			b.sendNodeDetail(c, msg.NodeName, "node_detail_response")
+			b.requestNodeDetails(c, msg.NodeName, msg.ForceRefresh)
 		case "node_detail_subscribe":
 			if msg.NodeName == "" {
 				continue
 			}
 
-			b.mu.Lock()
-			c.nodeDetailSubscriptions[msg.NodeName] = true
-			b.mu.Unlock()
-			klog.V(4).Infof("WebSocket: client subscribed to node_detail for %s", msg.NodeName)
-			// Send current detail immediately
-			b.sendNodeDetail(c, msg.NodeName, "node_detail_response")
+			b.rejectAutomaticDetails(c, msg.NodeName)
 		case "node_detail_unsubscribe":
 			if msg.NodeName == "" {
 				continue
 			}
 
-			b.mu.Lock()
-			delete(c.nodeDetailSubscriptions, msg.NodeName)
-			b.mu.Unlock()
-			klog.V(4).Infof("WebSocket: client unsubscribed from node_detail for %s", msg.NodeName)
+			c.cancelDetailWatch(msg.NodeName)
 		}
 	}
 }
@@ -731,7 +420,18 @@ func (c *WSClient) writePump() {
 				return
 			}
 
-			if err := c.conn.Write(c.ctx, websocket.MessageText, msg); err != nil {
+			payload, writeCtx, cleanup, err := c.prepareWrite(msg)
+			if err != nil {
+				klog.Errorf("WebSocket: failed to prepare response: %v", err)
+
+				return
+			}
+
+			err = c.conn.Write(writeCtx, websocket.MessageText, payload)
+
+			cleanup()
+
+			if err != nil {
 				return
 			}
 		}

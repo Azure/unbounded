@@ -5,6 +5,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -17,11 +18,23 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/machineconfigs"
 	"github.com/Azure/unbounded/internal/provision"
 )
 
 func (r *repaveReconciler) ReconcileRepave(ctx context.Context, _ string) (reconcile.Result, error) {
+	lock, err := r.installation.AcquireMutationLock()
+	if errors.Is(err, installstate.ErrLockHeld) {
+		return reconcile.Result{RequeueAfter: agentUpgradeLockRetryDelay}, nil
+	}
+
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+
+	defer releaseInstallationLock(r.log, lock)
+
 	active, err := r.nodeOperator.FindActiveMachine(r.log)
 	if err != nil {
 		return reconcile.Result{}, fmt.Errorf("find active machine: %w", err)

@@ -21,9 +21,9 @@ import (
 // renewing long ago and whose assignments predate the current epoch, which is
 // what a wholesale node-pool replacement leaves behind.
 func abandonedChairObjects(namespace string, renewedAt time.Time, epoch int64) []runtime.Object {
-	objects := make([]runtime.Object, 0, chairs.Count)
+	objects := make([]runtime.Object, 0, chairs.DefaultCount)
 
-	for index := range chairs.Count {
+	for index := range chairs.DefaultCount {
 		micro := metav1.NewMicroTime(renewedAt)
 		holder := fmt.Sprintf("departed-node-%02d", index)
 		seconds := int32(60)

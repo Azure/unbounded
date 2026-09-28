@@ -31,10 +31,14 @@ type ControllerRuntimeConfig struct {
 	HealthPort                  *int                          `yaml:"healthPort"`
 	NodeAgentHealthPort         *int                          `yaml:"nodeAgentHealthPort"`
 	StatusStaleThreshold        string                        `yaml:"statusStaleThreshold"`
+	StatusDetailCacheTTL        string                        `yaml:"statusDetailCacheTTL"`
+	StatusDetailRequestTimeout  string                        `yaml:"statusDetailRequestTimeout"`
 	StatusWSKeepaliveInterval   string                        `yaml:"statusWebsocketKeepaliveInterval"`
 	StatusWSKeepaliveFailCount  *int                          `yaml:"statusWsKeepaliveFailureCount"`
 	RegisterAggregatedAPIServer *bool                         `yaml:"registerAggregatedAPIServer"`
 	RequireDashboardAuth        *bool                         `yaml:"requireDashboardAuth"`
+	OIDCIssuerURL               string                        `yaml:"oidcIssuerURL"`
+	OIDCAudience                string                        `yaml:"oidcAudience"`
 	KubeProxyHealthInterval     string                        `yaml:"kubeProxyHealthInterval"`
 	ManagedKubeProxy            ManagedKubeProxyRuntimeConfig `yaml:"managedKubeProxy"`
 	LeaderElection              ControllerLeaderElectionYAML  `yaml:"leaderElection"`
@@ -80,6 +84,7 @@ type NodeRuntimeConfig struct {
 	StatusPushInterval                   string `yaml:"statusPushInterval"`
 	StatusPushAPIServerInterval          string `yaml:"statusPushApiserverInterval"`
 	StatusPushDelta                      *bool  `yaml:"statusPushDelta"`
+	StatusDetailMode                     string `yaml:"statusDetailMode"`
 	StatusWSEnabled                      *bool  `yaml:"statusWebsocketEnabled"`
 	StatusWSURL                          string `yaml:"statusWebsocketURL"`
 	StatusWSAPIServerMode                string `yaml:"statusWebsocketApiserverMode"`
@@ -137,4 +142,36 @@ func ParseDurationField(raw, fieldName string) (time.Duration, error) {
 	}
 
 	return value, nil
+}
+
+// ParsePositiveDurationField parses a configured lifetime; empty means unset.
+func ParsePositiveDurationField(raw, fieldName string) (time.Duration, error) {
+	value, err := ParseDurationField(raw, fieldName)
+	if err != nil {
+		return 0, err
+	}
+
+	if raw != "" && value <= 0 {
+		return 0, fmt.Errorf("%s must be greater than zero", fieldName)
+	}
+
+	return value, nil
+}
+
+const (
+	StatusDetailModeSummary           = "summary"
+	StatusDetailModeFull              = "full"
+	DefaultStatusDetailMode           = StatusDetailModeSummary
+	DefaultStatusDetailCacheTTL       = 300 * time.Second
+	DefaultStatusDetailRequestTimeout = 120 * time.Second
+)
+
+// ValidateStatusDetailMode checks the startup-loaded publication mode.
+func ValidateStatusDetailMode(mode string) error {
+	switch mode {
+	case StatusDetailModeSummary, StatusDetailModeFull:
+		return nil
+	default:
+		return fmt.Errorf("invalid node.statusDetailMode %q: must be summary or full", mode)
+	}
 }

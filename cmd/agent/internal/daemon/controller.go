@@ -22,11 +22,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	daemon "github.com/Azure/unbounded/pkg/agent/daemon"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
 
 type repaveReconciler struct {
+	installation *installstate.Store
 	client.Client
 	log          *slog.Logger
 	machineName  string
@@ -41,6 +43,7 @@ func runController(
 	machineName string,
 	nodeName string,
 	nodeOperator nodeOperator,
+	installation *installstate.Store,
 ) error {
 	mgr, err := ctrl.NewManager(restCfg, manager.Options{
 		Scheme: newScheme(),
@@ -69,6 +72,7 @@ func runController(
 
 	c := mgr.GetClient()
 	machineOperations := &machineOperationTarget{
+		installation:         installation,
 		Client:               c,
 		log:                  log,
 		machineName:          machineName,
@@ -92,6 +96,7 @@ func runController(
 	}
 
 	repaveReconciler := &repaveReconciler{
+		installation: installation,
 		Client:       c,
 		log:          log,
 		machineName:  machineName,

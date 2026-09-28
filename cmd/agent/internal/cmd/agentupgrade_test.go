@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/pkg/agent/agentbinary"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 )
@@ -80,6 +81,23 @@ func TestWriteHostAgentUpgradePlanOmitsUnchangedLastGood(t *testing.T) {
 
 	require.NoError(t, writeHostAgentUpgradePlan(&output, plan))
 	assert.NotContains(t, output.String(), "Last-good link:")
+}
+
+func TestHostAgentUpgradeTakesInstallationLockBeforeActivation(t *testing.T) {
+	dir := t.TempDir()
+	store := installstate.NewStore(filepath.Join(dir, "state"), filepath.Join(dir, "lock"))
+	lock, err := store.AcquireLock()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, lock.Release()) })
+
+	handler := &hostAgentUpgradeHandler{
+		cmdCtx: &CommandContext{LogFormat: "text"}, installation: store,
+		executable:   func() (string, error) { return filepath.Join(dir, "candidate"), nil },
+		resolvedPath: func() (goalstates.AgentUpgradePaths, error) { return goalstates.AgentUpgradePaths{}, nil },
+		newService:   func(goalstates.AgentUpgradePaths) agentbinary.DaemonService { return preflightOnlyDaemonService{} },
+		geteuid:      func() int { return 0 },
+	}
+	require.ErrorIs(t, handler.execute(t.Context()), installstate.ErrLockHeld)
 }
 
 func TestRecordAgentUpgradeFailureSignalCommand(t *testing.T) {

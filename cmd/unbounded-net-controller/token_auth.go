@@ -10,9 +10,6 @@ import (
 	"sync"
 	"time"
 
-	authenticationv1 "k8s.io/api/authentication/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 )
 
@@ -27,19 +24,19 @@ type tokenAuthResult struct {
 // When exceeded, expired entries are evicted first, then least-recently-used.
 const maxTokenCacheSize = 500
 
-// tokenAuthenticator verifies bearer tokens via the Kubernetes TokenReview API
-// with caching to minimize API server load.
+// tokenAuthenticator verifies bearer tokens with caching.
 type tokenAuthenticator struct {
 	mu             sync.RWMutex
 	cache          map[string]*tokenAuthResult
 	cacheTTL       time.Duration
 	allowedSANames map[string]bool
-	tokenReviewer  kubernetes.Interface
+	verifier       serviceAccountTokenVerifier
+	configured     bool
 }
 
 // newTokenAuthenticator creates a new token authenticator that accepts tokens from
 // the specified service accounts. If allowedSAs is empty, any authenticated SA is accepted.
-func newTokenAuthenticator(tokenReviewer kubernetes.Interface, allowedSAs []string) *tokenAuthenticator {
+func newTokenAuthenticator(verifier serviceAccountTokenVerifier, allowedSAs []string) *tokenAuthenticator {
 	allowed := make(map[string]bool, len(allowedSAs))
 	for _, sa := range allowedSAs {
 		allowed[sa] = true
@@ -49,12 +46,13 @@ func newTokenAuthenticator(tokenReviewer kubernetes.Interface, allowedSAs []stri
 		cache:          make(map[string]*tokenAuthResult),
 		cacheTTL:       5 * time.Minute,
 		allowedSANames: allowed,
-		tokenReviewer:  tokenReviewer,
+		verifier:       verifier,
+		configured:     verifier != nil,
 	}
 }
 
 // authenticate checks if the request has a valid bearer token from an allowed service account.
-// Results are cached to avoid repeated signature verification work.
+// Results are cached to avoid repeated authentication work.
 func (a *tokenAuthenticator) authenticate(r *http.Request) bool {
 	username, ok := a.authenticateUser(r)
 	if !ok {
@@ -79,10 +77,9 @@ func (a *tokenAuthenticator) authenticate(r *http.Request) bool {
 	return true
 }
 
-// authenticateUser validates the bearer token via TokenReview and returns the
+// authenticateUser validates the bearer token and returns the
 // authenticated username. Unlike authenticate(), it does not check the SA
-// allowlist -- authorization is delegated to the caller (e.g. via
-// SubjectAccessReview). Returns ("", false) if the token is missing or invalid.
+// allowlist. Returns ("", false) if the token is missing or invalid.
 func (a *tokenAuthenticator) authenticateUser(r *http.Request) (string, bool) {
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
@@ -111,7 +108,20 @@ func (a *tokenAuthenticator) authenticateUser(r *http.Request) (string, bool) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	username, authenticated := a.authenticateUserWithTokenReview(ctx, token)
+	var (
+		username      string
+		authenticated bool
+	)
+
+	if a.verifier != nil {
+		identity, err := a.verifier.Verify(ctx, token)
+		if err != nil {
+			klog.V(2).Infof("Token authentication failed: %v", err)
+		} else {
+			username = identity.Subject
+			authenticated = true
+		}
+	}
 
 	// Cache the result with LRU eviction.
 	now := time.Now()
@@ -164,28 +174,6 @@ func (a *tokenAuthenticator) evictCacheLocked(now time.Time) {
 
 		delete(a.cache, oldestKey)
 	}
-}
-
-// authenticateUserWithTokenReview performs a TokenReview and returns the
-// authenticated username on success. It does not check the SA allowlist.
-func (a *tokenAuthenticator) authenticateUserWithTokenReview(ctx context.Context, token string) (string, bool) {
-	if a.tokenReviewer == nil {
-		return "", false
-	}
-
-	review, err := a.tokenReviewer.AuthenticationV1().TokenReviews().Create(ctx, &authenticationv1.TokenReview{
-		Spec: authenticationv1.TokenReviewSpec{Token: token},
-	}, metav1.CreateOptions{})
-	if err != nil {
-		klog.V(2).Infof("TokenReview authentication failed: %v", err)
-		return "", false
-	}
-
-	if !review.Status.Authenticated {
-		return "", false
-	}
-
-	return review.Status.User.Username, true
 }
 
 func serviceAccountIDFromUsername(username string) (string, bool) {

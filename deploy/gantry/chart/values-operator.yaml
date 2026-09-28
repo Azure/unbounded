@@ -1,0 +1,13 @@
+image:
+  reference: ""
+  repository: gantry
+  tag: operator-managed
+  pullPolicy: IfNotPresent
+
+namespace:
+  create: true
+
+manager: unbounded-operator
+
+nodeConfig:
+  enabled: false

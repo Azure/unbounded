@@ -191,23 +191,23 @@ func TestHandleNodeStatusWSMessage(t *testing.T) {
 // TestExtractNodeNameFromWSMessage tests ExtractNodeNameFromWSMessage.
 func TestExtractNodeNameFromWSMessage(t *testing.T) {
 	t.Run("uses top level nodeName", func(t *testing.T) {
-		got := extractNodeNameFromWSMessage([]byte(`{"type":"node_status_delta","nodeName":"node-a"}`))
-		if got != "node-a" {
-			t.Fatalf("expected node-a, got %q", got)
+		got, err := extractNodeNameFromWSMessage([]byte(`{"type":"node_status_delta","nodeName":"node-a"}`))
+		if err != nil || got != "node-a" {
+			t.Fatalf("expected node-a, got %q, err=%v", got, err)
 		}
 	})
 
 	t.Run("falls back to status nodeInfo name", func(t *testing.T) {
-		got := extractNodeNameFromWSMessage([]byte(`{"type":"node_status_full","status":{"nodeInfo":{"name":"node-b"}}}`))
-		if got != "node-b" {
-			t.Fatalf("expected node-b, got %q", got)
+		got, err := extractNodeNameFromWSMessage([]byte(`{"type":"node_status_full","status":{"nodeInfo":{"name":"node-b"}}}`))
+		if err != nil || got != "node-b" {
+			t.Fatalf("expected node-b, got %q, err=%v", got, err)
 		}
 	})
 
 	t.Run("returns empty on invalid payload", func(t *testing.T) {
-		got := extractNodeNameFromWSMessage([]byte("{bad"))
-		if got != "" {
-			t.Fatalf("expected empty node name, got %q", got)
+		got, err := extractNodeNameFromWSMessage([]byte("{bad"))
+		if err == nil || got != "" {
+			t.Fatalf("expected empty node name and an error, got %q, err=%v", got, err)
 		}
 	})
 }

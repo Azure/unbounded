@@ -5,30 +5,26 @@ package gantry
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"sort"
+	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
-
-	"github.com/Azure/unbounded/hack/cmd/render-manifests/render"
 )
 
 func TestDaemonSetMountsContainerdRuntimeDirectory(t *testing.T) {
 	t.Parallel()
 
-	templatesDir := filepath.Dir(sourceFile(t))
-	outputDir := t.TempDir()
-
-	if err := render.Render(templatesDir, outputDir, map[string]string{
-		"Namespace": "unbounded-system",
-		"Image":     "gantry:test",
-	}); err != nil {
-		t.Fatalf("render manifests: %v", err)
-	}
+	outputDir := renderTemplates(t)
 
 	raw, err := os.ReadFile(filepath.Join(outputDir, "daemonset.yaml"))
 	if err != nil {
@@ -122,7 +118,8 @@ func TestRendersFixedChairLeaseSet(t *testing.T) {
 		var object struct {
 			Kind     string `yaml:"kind"`
 			Metadata struct {
-				Name string `yaml:"name"`
+				Name        string            `yaml:"name"`
+				Annotations map[string]string `yaml:"annotations"`
 			} `yaml:"metadata"`
 		}
 		if err := decoder.Decode(&object); err != nil {
@@ -141,6 +138,10 @@ func TestRendersFixedChairLeaseSet(t *testing.T) {
 			t.Fatalf("rendered chair kind = %q, want Lease", object.Kind)
 		}
 
+		if object.Metadata.Annotations["helm.sh/resource-policy"] != "keep" {
+			t.Fatalf("chair Lease %s is not retained across count reductions", object.Metadata.Name)
+		}
+
 		seen[object.Metadata.Name] = true
 	}
 
@@ -153,6 +154,57 @@ func TestRendersFixedChairLeaseSet(t *testing.T) {
 		if !seen[name] {
 			t.Fatalf("missing chair Lease %s", name)
 		}
+	}
+}
+
+func TestRendersConfiguredChairAndSeedCounts(t *testing.T) {
+	t.Parallel()
+
+	outputDir := renderChart(t, false,
+		"--set", "gantry.chairCount=128",
+		"--set", "gantry.chairSeedCount=100",
+	)
+
+	rawConfig, err := os.ReadFile(filepath.Join(outputDir, "configmap.yaml"))
+	if err != nil {
+		t.Fatalf("read rendered config: %v", err)
+	}
+
+	if !bytes.Contains(rawConfig, []byte("chair_count: 128")) {
+		t.Fatal("rendered config does not contain chair_count: 128")
+	}
+
+	if !bytes.Contains(rawConfig, []byte("chair_seed_count: 100")) {
+		t.Fatal("rendered config does not contain chair_seed_count: 100")
+	}
+
+	rawLeases, err := os.ReadFile(filepath.Join(outputDir, "rendezvous-leases.yaml"))
+	if err != nil {
+		t.Fatalf("read rendered chairs: %v", err)
+	}
+
+	decoder := yaml.NewDecoder(bytes.NewReader(rawLeases))
+	count := 0
+
+	for {
+		var object struct {
+			Kind string `yaml:"kind"`
+		}
+		if err := decoder.Decode(&object); err != nil {
+			if err == io.EOF {
+				break
+			}
+
+			t.Fatalf("decode chair manifest: %v", err)
+		}
+
+		if object.Kind == "Lease" {
+			count++
+		}
+	}
+
+	if count != 128 {
+		t.Fatalf("chair Lease count = %d, want 128", count)
 	}
 }
 
@@ -218,7 +270,8 @@ func TestChairRBACAllowsLeaseRecovery(t *testing.T) {
 	}
 
 	decoder := yaml.NewDecoder(bytes.NewReader(raw))
-	found := false
+	foundLeaseRule := false
+	foundDaemonSetRule := false
 
 	for {
 		var object struct {
@@ -249,13 +302,202 @@ func TestChairRBACAllowsLeaseRecovery(t *testing.T) {
 					}
 				}
 
-				found = true
+				foundLeaseRule = true
+			}
+
+			if containsString(rule.APIGroups, "apps") && containsString(rule.Resources, "daemonsets") {
+				if !containsString(rule.Verbs, "get") {
+					t.Fatalf("DaemonSet RBAC verbs = %v, missing get", rule.Verbs)
+				}
+
+				foundDaemonSetRule = true
 			}
 		}
 	}
 
-	if !found {
+	if !foundLeaseRule {
 		t.Fatal("no coordination Lease RBAC rule rendered")
+	}
+
+	if !foundDaemonSetRule {
+		t.Fatal("no apps DaemonSet RBAC rule rendered")
+	}
+}
+
+func TestStandaloneProfileContinuouslyReconcilesNodeConfig(t *testing.T) {
+	t.Parallel()
+
+	standaloneDir := renderStandaloneTemplates(t)
+	standaloneObjects := renderedObjects(t, standaloneDir)
+	operatorObjects := renderedObjects(t, renderTemplates(t))
+
+	for _, key := range []string{
+		"ConfigMap/unbounded-system/gantry-containerd-hosts",
+		"DaemonSet/unbounded-system/gantry-containerd-config",
+	} {
+		if _, ok := standaloneObjects[key]; !ok {
+			t.Fatalf("standalone profile is missing %s", key)
+		}
+
+		if _, ok := operatorObjects[key]; ok {
+			t.Fatalf("operator profile unexpectedly contains %s", key)
+		}
+	}
+
+	raw, err := os.ReadFile(filepath.Join(standaloneDir, "node-config.yaml"))
+	if err != nil {
+		t.Fatalf("read rendered node config: %v", err)
+	}
+
+	manifest := string(raw)
+	for _, fragment := range []string{
+		"path: /etc/containerd/certs.d",
+		"target_file=\"$target_dir/hosts.toml\"",
+		"while true; do",
+		"if ! cmp -s \"$source_file\" \"$target_file\"; then",
+		"mv \"$temp_file\" \"$target_file\"",
+		"sleep 5",
+		"rm -f \"$target_file\"",
+	} {
+		if !strings.Contains(manifest, fragment) {
+			t.Fatalf("standalone node config is missing %q", fragment)
+		}
+	}
+
+	decoder := yaml.NewDecoder(bytes.NewReader(raw))
+
+	var hostsConfig, reconcileScript string
+
+	for {
+		var object struct {
+			Kind string            `yaml:"kind"`
+			Data map[string]string `yaml:"data"`
+			Spec struct {
+				Selector struct {
+					MatchLabels map[string]string `yaml:"matchLabels"`
+				} `yaml:"selector"`
+				Template struct {
+					Spec struct {
+						Containers []struct {
+							Name    string   `yaml:"name"`
+							Command []string `yaml:"command"`
+						} `yaml:"containers"`
+					} `yaml:"spec"`
+				} `yaml:"template"`
+			} `yaml:"spec"`
+		}
+		if err := decoder.Decode(&object); err != nil {
+			if err == io.EOF {
+				break
+			}
+
+			t.Fatalf("decode node config: %v", err)
+		}
+
+		switch object.Kind {
+		case "ConfigMap":
+			hostsConfig = object.Data["hosts.toml"]
+		case "DaemonSet":
+			if got := object.Spec.Selector.MatchLabels["app.kubernetes.io/name"]; got != "gantry-containerd-config" {
+				t.Fatalf("node-config selector name = %q, want gantry-containerd-config", got)
+			}
+
+			for _, container := range object.Spec.Template.Spec.Containers {
+				if container.Name == "configure" && len(container.Command) == 3 {
+					reconcileScript = container.Command[2]
+				}
+			}
+		}
+	}
+
+	if hostsConfig == "" || reconcileScript == "" {
+		t.Fatal("rendered node config is missing its payload or reconcile script")
+	}
+
+	hostRoot := t.TempDir()
+	targetDir := filepath.Join(hostRoot, "_default")
+
+	sourceFile := filepath.Join(t.TempDir(), "hosts.toml")
+	if err := os.WriteFile(sourceFile, []byte(hostsConfig), 0o644); err != nil {
+		t.Fatalf("write source hosts config: %v", err)
+	}
+
+	reconcileScript = strings.Replace(reconcileScript, "target_dir=/host-certs/_default", fmt.Sprintf("target_dir=%q", targetDir), 1)
+	reconcileScript = strings.Replace(reconcileScript, "source_file=/config/hosts.toml", fmt.Sprintf("source_file=%q", sourceFile), 1)
+	reconcileScript = strings.Replace(reconcileScript, "sleep 5", "sleep 0.05", 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sh", "-c", reconcileScript)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start node config reconciler: %v", err)
+	}
+
+	defer func() {
+		cancel()
+
+		_ = cmd.Wait()
+	}()
+
+	targetFile := filepath.Join(targetDir, "hosts.toml")
+	waitForFileContent(t, targetFile, hostsConfig)
+
+	if err := os.WriteFile(targetFile, []byte("node upgrade reset\n"), 0o644); err != nil {
+		t.Fatalf("replace managed hosts config: %v", err)
+	}
+
+	waitForFileContent(t, targetFile, hostsConfig)
+}
+
+func waitForFileContent(t *testing.T, path, want string) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		content, err := os.ReadFile(path)
+		if err == nil && string(content) == want {
+			return
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Fatalf("%s did not converge to the desired content", path)
+}
+
+func TestStandaloneAndOperatorProfilesShareCoreResources(t *testing.T) {
+	t.Parallel()
+
+	operatorObjects := renderedObjects(t, renderTemplates(t))
+	standaloneObjects := renderedObjects(t, renderStandaloneTemplates(t))
+
+	delete(operatorObjects, "Namespace//unbounded-system")
+	delete(standaloneObjects, "ConfigMap/unbounded-system/gantry-containerd-hosts")
+	delete(standaloneObjects, "DaemonSet/unbounded-system/gantry-containerd-config")
+
+	if len(operatorObjects) != len(standaloneObjects) {
+		t.Fatalf("shared object counts differ: operator=%d standalone=%d", len(operatorObjects), len(standaloneObjects))
+	}
+
+	keys := make([]string, 0, len(operatorObjects))
+	for key := range operatorObjects {
+		keys = append(keys, key)
+	}
+
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		operatorObject := normalizeProfileObject(operatorObjects[key])
+
+		standaloneObject, ok := standaloneObjects[key]
+		if !ok {
+			t.Fatalf("standalone profile is missing %s", key)
+		}
+
+		if !reflect.DeepEqual(operatorObject, normalizeProfileObject(standaloneObject)) {
+			t.Fatalf("shared object %s differs between profiles\noperator: %#v\nstandalone: %#v", key, operatorObject, normalizeProfileObject(standaloneObject))
+		}
 	}
 }
 
@@ -272,15 +514,179 @@ func containsString(values []string, target string) bool {
 func renderTemplates(t *testing.T) string {
 	t.Helper()
 
-	outputDir := t.TempDir()
-	if err := render.Render(filepath.Dir(sourceFile(t)), outputDir, map[string]string{
-		"Namespace": "unbounded-system",
-		"Image":     "gantry:test",
-	}); err != nil {
-		t.Fatalf("render manifests: %v", err)
+	return renderChart(t, true)
+}
+
+func renderStandaloneTemplates(t *testing.T) string {
+	t.Helper()
+
+	return renderChart(t, false)
+}
+
+func renderChart(t *testing.T, operatorProfile bool, extraArgs ...string) string {
+	t.Helper()
+
+	deployDir := filepath.Dir(sourceFile(t))
+	repositoryDir := filepath.Clean(filepath.Join(deployDir, "..", ".."))
+
+	helm := filepath.Join(repositoryDir, "bin", "helm")
+	if _, err := os.Stat(helm); err != nil {
+		var lookupErr error
+
+		helm, lookupErr = exec.LookPath("helm")
+		if lookupErr != nil {
+			t.Fatal("helm not found; run make install-helm")
+		}
 	}
 
-	return outputDir
+	outputRoot := t.TempDir()
+
+	args := []string{
+		"template", "gantry", filepath.Join(deployDir, "chart"),
+		"--namespace", "unbounded-system",
+		"--set-string", "image.reference=gantry:test",
+		"--output-dir", outputRoot,
+	}
+	if operatorProfile {
+		args = append(
+			args,
+			"--values", filepath.Join(deployDir, "chart", "values-operator.yaml"),
+			"--skip-schema-validation",
+		)
+	}
+
+	args = append(args, extraArgs...)
+
+	cmd := exec.Command(helm, args...)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("render Gantry chart: %v\n%s", err, output)
+	}
+
+	return filepath.Join(outputRoot, "gantry", "templates")
+}
+
+func renderedObjects(t *testing.T, directory string) map[string]map[string]any {
+	t.Helper()
+
+	files, err := filepath.Glob(filepath.Join(directory, "*.yaml"))
+	if err != nil {
+		t.Fatalf("list rendered manifests: %v", err)
+	}
+
+	objects := make(map[string]map[string]any)
+
+	for _, file := range files {
+		raw, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+
+		decoder := yaml.NewDecoder(bytes.NewReader(raw))
+
+		for {
+			var object map[string]any
+			if err := decoder.Decode(&object); err != nil {
+				if err == io.EOF {
+					break
+				}
+
+				t.Fatalf("decode %s: %v", file, err)
+			}
+
+			if len(object) == 0 {
+				continue
+			}
+
+			metadata, ok := object["metadata"].(map[string]any)
+			if !ok {
+				t.Fatalf("%s object has no metadata", file)
+			}
+
+			kind, _ := object["kind"].(string)
+			namespace, _ := metadata["namespace"].(string)
+			name, _ := metadata["name"].(string)
+
+			key := fmt.Sprintf("%s/%s/%s", kind, namespace, name)
+			if _, exists := objects[key]; exists {
+				t.Fatalf("duplicate rendered object %s", key)
+			}
+
+			objects[key] = object
+		}
+	}
+
+	return objects
+}
+
+func normalizeProfileObject(object map[string]any) map[string]any {
+	normalized := deepCopyMap(object)
+	deleteMapKey(normalized, "metadata", "labels", "app.kubernetes.io/managed-by")
+	deleteMapKey(normalized, "metadata", "annotations", "gantry.unbounded-cloud.io/manager")
+	deleteMapKey(normalized, "metadata", "annotations", "meta.helm.sh/release-name")
+	deleteMapKey(normalized, "metadata", "annotations", "meta.helm.sh/release-namespace")
+	deleteMapKey(normalized, "spec", "template", "metadata", "labels", "app.kubernetes.io/managed-by")
+	deleteMapKey(normalized, "spec", "template", "metadata", "annotations", "checksum/config")
+	deleteEmptyMap(normalized, "metadata", "annotations")
+	deleteEmptyMap(normalized, "spec", "template", "metadata", "annotations")
+
+	return normalized
+}
+
+func deepCopyMap(value map[string]any) map[string]any {
+	copy := make(map[string]any, len(value))
+	for key, item := range value {
+		switch typed := item.(type) {
+		case map[string]any:
+			copy[key] = deepCopyMap(typed)
+		case []any:
+			items := make([]any, len(typed))
+			for index, element := range typed {
+				if child, ok := element.(map[string]any); ok {
+					items[index] = deepCopyMap(child)
+				} else {
+					items[index] = element
+				}
+			}
+
+			copy[key] = items
+		default:
+			copy[key] = item
+		}
+	}
+
+	return copy
+}
+
+func deleteMapKey(object map[string]any, path ...string) {
+	current := object
+	for _, part := range path[:len(path)-1] {
+		next, ok := current[part].(map[string]any)
+		if !ok {
+			return
+		}
+
+		current = next
+	}
+
+	delete(current, path[len(path)-1])
+}
+
+func deleteEmptyMap(object map[string]any, path ...string) {
+	current := object
+	for _, part := range path[:len(path)-1] {
+		next, ok := current[part].(map[string]any)
+		if !ok {
+			return
+		}
+
+		current = next
+	}
+
+	if value, ok := current[path[len(path)-1]].(map[string]any); ok && len(value) == 0 {
+		delete(current, path[len(path)-1])
+	}
 }
 
 func sourceFile(t *testing.T) string {

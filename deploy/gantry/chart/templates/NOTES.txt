@@ -1,0 +1,23 @@
+Gantry {{ .Chart.AppVersion }} is installed in namespace {{ .Release.Namespace }}.
+
+Verify the agent rollout:
+  kubectl -n {{ .Release.Namespace }} rollout status daemonset/gantry
+
+{{- if .Values.nodeConfig.enabled }}
+The chart continuously reconciles containerd's default Gantry mirror route:
+  kubectl -n {{ .Release.Namespace }} rollout status daemonset/gantry-containerd-config
+{{- else }}
+Containerd mirror routing is externally managed because nodeConfig.enabled=false.
+{{- end }}
+
+The chart does not edit or restart containerd. Ensure its CRI registry
+config_path already points at /etc/containerd/certs.d.
+
+Verify one agent:
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/name=gantry
+
+Uninstall Kubernetes resources:
+  helm uninstall {{ .Release.Name }} --namespace {{ .Release.Namespace }}
+
+Graceful node-config pod termination removes only the unchanged chart-owned
+hosts.toml. Check nodes that were unavailable during uninstall for stale files.

@@ -31,8 +31,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/Azure/unbounded/hack/cmd/render-manifests/render"
 )
 
 const (
@@ -56,8 +54,8 @@ type harness struct {
 	keepCluster     bool
 }
 
-// newHarness resolves the repository root and renders the current Gantry
-// templates into a test-local directory.
+// newHarness resolves the repository root and renders the Gantry chart into a
+// test-local directory.
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 
@@ -68,13 +66,7 @@ func newHarness(t *testing.T) *harness {
 		t.Fatalf("mkdir artifacts: %v", err)
 	}
 
-	manifests := t.TempDir()
-	if err := render.Render(filepath.Join(root, "deploy", "gantry"), manifests, map[string]string{
-		"Namespace": namespace,
-		"Image":     imageTag,
-	}); err != nil {
-		t.Fatalf("render gantry manifests: %v", err)
-	}
+	manifests := renderGantryChart(t, root)
 
 	return &harness{
 		t:               t,
@@ -84,6 +76,38 @@ func newHarness(t *testing.T) *harness {
 		containerEngine: resolveContainerEngine(t),
 		keepCluster:     os.Getenv("E2E_KEEP") == "1",
 	}
+}
+
+func renderGantryChart(t *testing.T, root string) string {
+	t.Helper()
+
+	helm := filepath.Join(root, "bin", "helm")
+	if _, err := os.Stat(helm); err != nil {
+		var lookupErr error
+
+		helm, lookupErr = exec.LookPath("helm")
+		if lookupErr != nil {
+			t.Skip("helm not found; run make install-helm")
+		}
+	}
+
+	outputRoot := t.TempDir()
+	cmd := exec.Command(
+		helm,
+		"template", "gantry", filepath.Join(root, "deploy", "gantry", "chart"),
+		"--namespace", namespace,
+		"--values", filepath.Join(root, "deploy", "gantry", "chart", "values-operator.yaml"),
+		"--skip-schema-validation",
+		"--set-string", "image.reference="+imageTag,
+		"--output-dir", outputRoot,
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("render Gantry chart: %v\n%s", err, output)
+	}
+
+	return filepath.Join(outputRoot, "gantry", "templates")
 }
 
 func resolveContainerEngine(t *testing.T) string {
@@ -755,13 +779,9 @@ func patchDaemonSetForE2E(raw, imageTag string) (string, error) {
 // registries. patchConfigMapForE2E swaps the whole block for a
 // single anonymous-public entry so the e2e cluster is self-contained
 // - see that helper's doc for why.
-const configMapUpstreamRegistriesAnchor = `    upstream_registries:
-      - name: "registry.example.com"
-        endpoint: "https://registry.example.com"
-        # credentials_path: "/etc/gantry/registry/registry.example.com"
-      # - name: "ghcr.io"
-      #   endpoint: "https://ghcr.io"
-      #   credentials_path: "/etc/gantry/registry/ghcr.io"`
+const configMapUpstreamRegistriesAnchor = "    upstream_registries:\n" +
+	"      - name: \"registry.example.com\"\n" +
+	"        endpoint: \"https://registry.example.com\""
 
 // e2eConfigMapUpstreamRegistriesReplacement is what patchConfigMapForE2E
 // substitutes in for configMapUpstreamRegistriesAnchor. A single
@@ -804,14 +824,12 @@ func patchConfigMapForE2E(raw string) (string, error) {
 		return "", fmt.Errorf("patchConfigMapForE2E: upstream_registries anchor not found in deploy/configmap.yaml; update configMapUpstreamRegistriesAnchor in harness_e2e.go")
 	}
 
-	// The shipped pacing staggers 100,000 nodes claiming 64 chairs. Readiness
-	// needs SeedCount chairs occupied, so on this 8-node cluster every pod must
-	// claim before the rollout completes, and the shipped values make that take
-	// ~118s per rollout: up to 30s of startup jitter plus 88s for the eligibility
-	// divisor to halve from 2048 down to 1. The suite rolls out a dozen times.
+	// The suite intentionally uses every kind node as a chair to exercise the
+	// eight-seed data path. Remove large-cluster claim pacing so repeated
+	// rollouts do not wait for the eligibility lottery to widen.
 	for _, sub := range []struct{ from, to string }{
 		{"    chair_cluster_size_estimate: 100000", "    chair_cluster_size_estimate: 8"},
-		{"    chair_seed_count: 50", "    chair_seed_count: 8"},
+		{"    chair_count: 64", "    chair_count: 8"},
 		{"    chair_claim_initial_divisor: 2048", "    chair_claim_initial_divisor: 1"},
 		{`    chair_startup_jitter: "30s"`, `    chair_startup_jitter: "2s"`},
 	} {

@@ -15,10 +15,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
@@ -48,7 +50,7 @@ func testTokenIssuer(t *testing.T) *authn.TokenIssuer {
 func testNodeToken(t *testing.T, issuer *authn.TokenIssuer) string {
 	t.Helper()
 
-	token, _, err := issuer.IssueNodeToken("system:serviceaccount:unbounded-net:unbounded-net-node", "test-node", time.Hour)
+	token, _, err := issuer.IssueNodeToken("system:serviceaccount:unbounded-net:unbounded-net-node", "node-a", time.Hour)
 	if err != nil {
 		t.Fatalf("IssueNodeToken: %v", err)
 	}
@@ -58,12 +60,31 @@ func testNodeToken(t *testing.T, issuer *authn.TokenIssuer) string {
 
 // TestRegisterStatusHandlers tests RegisterStatusHandlers.
 func TestRegisterStatusHandlers(t *testing.T) {
+	bindDetails := func(t *testing.T, health *healthState, fallbackUID types.UID) {
+		manager := testDetailRequests(t, nodeDetailRequestHooks{
+			Resolve: func(name string) (types.UID, error) {
+				if health.nodeLister == nil {
+					return fallbackUID, nil
+				}
+
+				node, err := health.nodeLister.Get(name)
+				if err != nil {
+					return "", err
+				}
+
+				return node.UID, nil
+			},
+		})
+		health.detailRequests = manager
+		health.statusCache.BindDetails(manager)
+	}
+
 	newHealth := func() *healthState {
 		h := &healthState{
 			clientset:      k8sfake.NewClientset(),
 			statusCache:    NewNodeStatusCache(),
 			staleThreshold: time.Minute,
-			tokenAuth:      &tokenAuthenticator{tokenReviewer: k8sfake.NewClientset()},
+			tokenAuth:      readyTokenAuthenticator(),
 		}
 		h.isLeader.Store(true)
 		h.pullEnabled.Store(false)
@@ -125,6 +146,7 @@ func TestRegisterStatusHandlers(t *testing.T) {
 
 	t.Run("status node returns fresh cached payload", func(t *testing.T) {
 		h := newHealth()
+		bindDetails(t, h, "uid")
 
 		rev := h.statusCache.StoreFull("node-a", NodeStatusResponse{NodeInfo: NodeInfo{Name: "node-a"}}, "push")
 		if rev == 0 {
@@ -149,13 +171,10 @@ func TestRegisterStatusHandlers(t *testing.T) {
 
 	t.Run("status node stale cache while pull disabled", func(t *testing.T) {
 		h := newHealth()
+		bindDetails(t, h, "uid")
 		h.staleThreshold = time.Second
-		h.statusCache.entries["node-a"] = &CachedNodeStatus{
-			Status:     &NodeStatusResponse{NodeInfo: NodeInfo{Name: "node-a"}},
-			ReceivedAt: time.Now().Add(-2 * time.Minute),
-			Source:     "push",
-			Revision:   1,
-		}
+		h.statusCache.StoreFull("node-a", NodeStatusResponse{NodeInfo: NodeInfo{Name: "node-a"}}, "push")
+		h.statusCache.entries["node-a"].ReceivedAt = time.Now().Add(-2 * time.Minute)
 		mux := http.NewServeMux()
 		registerStatusHandlers(mux, h, false, nil, nil, nil)
 
@@ -167,13 +186,15 @@ func TestRegisterStatusHandlers(t *testing.T) {
 			t.Fatalf("expected 200 for stale cache response, got %d body=%q", resp.Code, resp.Body.String())
 		}
 
-		if !strings.Contains(resp.Body.String(), "stale status") || !strings.Contains(resp.Body.String(), "pull disabled") {
-			t.Fatalf("expected stale-cache error message, got %q", resp.Body.String())
+		if strings.Contains(resp.Body.String(), "fetchError") || !strings.Contains(resp.Body.String(), "node-a") {
+			t.Fatalf("valid TTL details must not inherit an unrelated overview stale error: %q", resp.Body.String())
 		}
 	})
 
 	t.Run("status node missing cache with pull disabled", func(t *testing.T) {
 		h := newHealth()
+		bindDetails(t, h, "")
+
 		mux := http.NewServeMux()
 		registerStatusHandlers(mux, h, false, nil, nil, nil)
 
@@ -208,6 +229,7 @@ func TestRegisterStatusHandlers(t *testing.T) {
 
 		indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 		h.nodeLister = corev1listers.NewNodeLister(indexer)
+		bindDetails(t, h, "")
 
 		mux := http.NewServeMux()
 		registerStatusHandlers(mux, h, false, nil, nil, nil)
@@ -222,28 +244,31 @@ func TestRegisterStatusHandlers(t *testing.T) {
 	})
 
 	t.Run("status node live pull returns internal error when internal ip missing", func(t *testing.T) {
-		h := newHealth()
-		h.pullEnabled.Store(true)
+		synctest.Test(t, func(t *testing.T) {
+			h := newHealth()
+			h.pullEnabled.Store(true)
 
-		indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+			indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
 
-		node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}}
-		if err := indexer.Add(node); err != nil {
-			t.Fatalf("failed to add node to indexer: %v", err)
-		}
+			node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", UID: "uid"}}
+			if err := indexer.Add(node); err != nil {
+				t.Fatalf("failed to add node to indexer: %v", err)
+			}
 
-		h.nodeLister = corev1listers.NewNodeLister(indexer)
+			h.nodeLister = corev1listers.NewNodeLister(indexer)
+			bindDetails(t, h, "")
 
-		mux := http.NewServeMux()
-		registerStatusHandlers(mux, h, false, nil, nil, nil)
+			mux := http.NewServeMux()
+			registerStatusHandlers(mux, h, false, nil, nil, nil)
 
-		req := httptest.NewRequest(http.MethodGet, "/status/node/node-a?live=true", nil)
-		resp := httptest.NewRecorder()
-		mux.ServeHTTP(resp, req)
+			req := httptest.NewRequest(http.MethodGet, "/status/node/node-a?live=true", nil)
+			resp := httptest.NewRecorder()
+			mux.ServeHTTP(resp, req)
 
-		if resp.Code != http.StatusInternalServerError {
-			t.Fatalf("expected 500 when node has no InternalIP, got %d", resp.Code)
-		}
+			if resp.Code != http.StatusGone {
+				t.Fatalf("expected explicit expiry after unavailable pull and no polling response, got %d", resp.Code)
+			}
+		})
 	})
 }
 
@@ -252,7 +277,7 @@ func TestRegisterProbeHandlers(t *testing.T) {
 	mux := http.NewServeMux()
 	health := &healthState{
 		clientset: k8sfake.NewClientset(),
-		tokenAuth: &tokenAuthenticator{tokenReviewer: k8sfake.NewClientset()},
+		tokenAuth: readyTokenAuthenticator(),
 	}
 	health.setLeader(true)
 	registerProbeHandlers(mux, health)
@@ -290,7 +315,7 @@ func TestRegisterProbeHandlersTokenVerifierNotReady(t *testing.T) {
 	mux := http.NewServeMux()
 	health := &healthState{
 		clientset: k8sfake.NewClientset(),
-		tokenAuth: &tokenAuthenticator{},
+		tokenAuth: &tokenAuthenticator{configured: true},
 	}
 	registerProbeHandlers(mux, health)
 
@@ -307,27 +332,25 @@ func TestRegisterProbeHandlersTokenVerifierNotReady(t *testing.T) {
 	}
 }
 
+// testWebhookServerForPush trusts the supplied front-proxy CA.
+func testWebhookServerForPush(t *testing.T, caPEM []byte) *webhook.Server {
+	t.Helper()
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "extension-apiserver-authentication", Namespace: "kube-system"},
+		Data: map[string]string{
+			"requestheader-client-ca-file": string(caPEM),
+		},
+	}
+	clientset := k8sfake.NewClientset(cm)
+	ws := webhook.NewTestServer(clientset, "kube-system")
+	ws.RefreshAggregatedClientCAs(t.Context())
+
+	return ws
+}
+
 // TestRegisterPushHandlers tests RegisterPushHandlers.
 func TestRegisterPushHandlers(t *testing.T) {
-	// testWebhookServerForPush creates a webhook.Server whose IsTrustedAggregatedRequest
-	// returns true when the request has the expected client certificate.
-	testWebhookServerForPush := func(t *testing.T, caPEM []byte) *webhook.Server {
-		t.Helper()
-
-		cm := &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{Name: "extension-apiserver-authentication", Namespace: "kube-system"},
-			Data: map[string]string{
-				"requestheader-client-ca-file": string(caPEM),
-			},
-		}
-		clientset := k8sfake.NewClientset(cm)
-		ws := webhook.NewTestServer(clientset, "kube-system")
-		// Force refresh of aggregated client CAs from the fake ConfigMap.
-		ws.RefreshAggregatedClientCAs(t.Context())
-
-		return ws
-	}
-
 	issuer := testTokenIssuer(t)
 	validToken := testNodeToken(t, issuer)
 
@@ -336,10 +359,8 @@ func TestRegisterPushHandlers(t *testing.T) {
 			statusCache:                 NewNodeStatusCache(),
 			nodeServiceAccount:          "unbounded-net:unbounded-net-node",
 			registerAggregatedAPIServer: true,
-			tokenAuth: &tokenAuthenticator{
-				cache:    map[string]*tokenAuthResult{},
-				cacheTTL: time.Minute,
-			},
+			tokenAuth:                   readyTokenAuthenticator(),
+			nodeTokenVerifier:           fakeServiceAccountTokenVerifier{},
 		}
 		h.isLeader.Store(true)
 
@@ -356,6 +377,28 @@ func TestRegisterPushHandlers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse leaf: %v", err)
 	}
+
+	t.Run("direct paths disabled without token verifier", func(t *testing.T) {
+		h := newHealth()
+		h.nodeTokenVerifier = nil
+		ws := testWebhookServerForPush(t, caPEM)
+		mux := http.NewServeMux()
+		wsSem := make(chan struct{}, maxConcurrentNodeWS)
+		registerPushHandlers(mux, h, ws, wsSem, issuer)
+
+		for _, path := range []string{"/status/push", "/status/nodews"} {
+			req := httptest.NewRequest(http.MethodPost, path, nil)
+			req.Header.Set("Authorization", "Bearer "+validToken)
+
+			resp := httptest.NewRecorder()
+
+			mux.ServeHTTP(resp, req)
+
+			if resp.Code != http.StatusNotFound {
+				t.Fatalf("expected 404 for %s without token verifier, got %d", path, resp.Code)
+			}
+		}
+	})
 
 	t.Run("method not allowed", func(t *testing.T) {
 		h := newHealth()
@@ -460,6 +503,25 @@ func TestRegisterPushHandlers(t *testing.T) {
 		}
 	})
 
+	t.Run("direct push cannot update another node", func(t *testing.T) {
+		h := newHealth()
+		ws := testWebhookServerForPush(t, caPEM)
+		mux := http.NewServeMux()
+		wsSem := make(chan struct{}, maxConcurrentNodeWS)
+		registerPushHandlers(mux, h, ws, wsSem, issuer)
+
+		payload := `{"mode":"full","nodeName":"node-b","status":{"nodeInfo":{"name":"node-b"}}}`
+		req := httptest.NewRequest(http.MethodPost, "/status/push", bytes.NewBufferString(payload))
+		req.Header.Set("Authorization", "Bearer "+validToken)
+
+		resp := httptest.NewRecorder()
+		mux.ServeHTTP(resp, req)
+
+		if resp.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 for cross-node push, got %d body=%q", resp.Code, resp.Body.String())
+		}
+	})
+
 	t.Run("full push success with gzip", func(t *testing.T) {
 		h := newHealth()
 		ws := testWebhookServerForPush(t, caPEM)
@@ -470,7 +532,7 @@ func TestRegisterPushHandlers(t *testing.T) {
 		var body bytes.Buffer
 
 		gz := gzip.NewWriter(&body)
-		_, _ = gz.Write([]byte(`{"mode":"full","nodeName":"node-b","status":{"nodeInfo":{"siteName":"site-b"}}}`))
+		_, _ = gz.Write([]byte(`{"mode":"full","nodeName":"node-a","status":{"nodeInfo":{"siteName":"site-a"}}}`))
 		_ = gz.Close()
 
 		req := httptest.NewRequest(http.MethodPost, "/status/push", &body)
@@ -523,8 +585,9 @@ func TestRegisterPushHandlers(t *testing.T) {
 		}
 	})
 
-	t.Run("aggregated push with valid front-proxy cert", func(t *testing.T) {
+	t.Run("aggregated push requires token verifier", func(t *testing.T) {
 		h := newHealth()
+		h.nodeTokenVerifier = nil
 		ws := testWebhookServerForPush(t, caPEM)
 		mux := http.NewServeMux()
 		wsSem := make(chan struct{}, maxConcurrentNodeWS)
@@ -537,8 +600,75 @@ func TestRegisterPushHandlers(t *testing.T) {
 		resp := httptest.NewRecorder()
 		mux.ServeHTTP(resp, req)
 
-		if resp.Code != http.StatusOK {
-			t.Fatalf("expected 200 for aggregated push with front-proxy cert, got %d body=%q", resp.Code, resp.Body.String())
+		if resp.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 for aggregated push without token verifier, got %d body=%q", resp.Code, resp.Body.String())
+		}
+	})
+
+	t.Run("aggregated OIDC push enforces bound node", func(t *testing.T) {
+		h := newHealth()
+		h.nodeTokenVerifier = fakeServiceAccountTokenVerifier{
+			identity: &authn.KubernetesServiceAccountIdentity{
+				Subject:            "system:serviceaccount:unbounded-net:unbounded-net-node",
+				Namespace:          "unbounded-net",
+				ServiceAccountName: "unbounded-net-node",
+				NodeName:           "node-a",
+			},
+		}
+		ws := testWebhookServerForPush(t, caPEM)
+		mux := http.NewServeMux()
+		wsSem := make(chan struct{}, maxConcurrentNodeWS)
+		registerPushHandlers(mux, h, ws, wsSem, issuer)
+
+		req := httptest.NewRequest(
+			http.MethodPost,
+			aggregatedNodeStatusPushPath,
+			bytes.NewBufferString(`{"mode":"full","nodeName":"node-b","status":{"nodeInfo":{"name":"node-b"}}}`),
+		)
+		req.Header.Set("X-Remote-User", "system:serviceaccount:unbounded-net:unbounded-net-node")
+		req.Header.Set(nodeIdentityTokenHeader, "service-account-token")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{clientCert}}
+		resp := httptest.NewRecorder()
+
+		mux.ServeHTTP(resp, req)
+
+		if resp.Code != http.StatusForbidden {
+			t.Fatalf("expected 403 for cross-node aggregated push, got %d body=%q", resp.Code, resp.Body.String())
+		}
+	})
+
+	t.Run("aggregated TokenReview push enforces bound node without SAR", func(t *testing.T) {
+		for _, nodeName := range []string{"node-a", "node-b"} {
+			verifier, client, token := testTokenReviewVerifier(t, "unbounded-net", "unbounded-net-node", "node-a", true)
+			h := newHealth()
+			h.nodeTokenVerifier = verifier
+			h.clientset = client
+			ws := testWebhookServerForPush(t, caPEM)
+			mux := http.NewServeMux()
+			registerPushHandlers(mux, h, ws, make(chan struct{}, maxConcurrentNodeWS), issuer)
+
+			req := httptest.NewRequest(http.MethodPost, aggregatedNodeStatusPushPath, strings.NewReader(
+				`{"mode":"full","nodeName":"`+nodeName+`","status":{"nodeInfo":{"name":"`+nodeName+`"}}}`,
+			))
+			req.Header.Set("X-Remote-User", "system:serviceaccount:unbounded-net:unbounded-net-node")
+			req.Header.Set(nodeIdentityTokenHeader, token)
+			req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{clientCert}}
+			resp := httptest.NewRecorder()
+			mux.ServeHTTP(resp, req)
+
+			wantCode := http.StatusOK
+			if nodeName != "node-a" {
+				wantCode = http.StatusForbidden
+			}
+
+			if resp.Code != wantCode {
+				t.Fatalf("expected %d for %s, got %d: %s", wantCode, nodeName, resp.Code, resp.Body.String())
+			}
+
+			actions := client.Actions()
+			if len(actions) != 1 || actions[0].GetResource().Resource != "tokenreviews" {
+				t.Fatalf("expected only one TokenReview and no SAR: %v", actions)
+			}
 		}
 	})
 

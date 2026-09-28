@@ -146,6 +146,30 @@ type authorizationCapturingOrigin struct {
 	seen chan string
 }
 
+type rangeOriginRequest struct {
+	offset        int64
+	authorization string
+}
+
+type rangeCapturingOrigin struct {
+	body []byte
+	seen chan rangeOriginRequest
+}
+
+func (o *rangeCapturingOrigin) Pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
+	o.seen <- rangeOriginRequest{offset: ref.Offset, authorization: registryauth.Authorization(ctx)}
+
+	if ref.Offset < 0 || ref.Offset >= int64(len(o.body)) {
+		return nil, 0, errors.New("invalid offset")
+	}
+
+	return io.NopCloser(bytes.NewReader(o.body[ref.Offset:])), int64(len(o.body)), nil
+}
+
+func (o *rangeCapturingOrigin) Head(context.Context, ifaces.OriginRef) (int64, string, error) {
+	return int64(len(o.body)), "application/octet-stream", nil
+}
+
 type authorizationRejectingOrigin struct{}
 
 func (authorizationRejectingOrigin) Pull(_ context.Context, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
@@ -166,6 +190,101 @@ func (o *authorizationCapturingOrigin) Head(ctx context.Context, _ ifaces.Origin
 	o.seen <- registryauth.Authorization(ctx)
 
 	return int64(len(o.body)), "application/octet-stream", nil
+}
+
+func TestMirrorOriginRangeRetry(t *testing.T) {
+	body := []byte("0123456789")
+	d := digestOf(body)
+	origin := &rangeCapturingOrigin{body: body, seen: make(chan rangeOriginRequest, 1)}
+	cfg := &config.Config{UpstreamRegistries: []config.UpstreamRegistry{{Name: "reg.example.com", Endpoint: "https://reg.example.com"}}}
+
+	srv := httptest.NewServer(mirror.New(cfg, fakes.NewCache(), origin, mirror.WithLiveStreamThrough()).Handler())
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/v2/repo/blobs/"+d.String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req.Header.Set("Range", "bytes=4-")
+	req.Header.Set("Authorization", "Bearer requester-token")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusPartialContent {
+		t.Fatalf("status = %d; want 206", resp.StatusCode)
+	}
+
+	if got := resp.Header.Get("Content-Range"); got != "bytes 4-9/10" {
+		t.Fatalf("Content-Range = %q; want bytes 4-9/10", got)
+	}
+
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(got) != string(body[4:]) {
+		t.Fatalf("body = %q; want %q", got, body[4:])
+	}
+
+	seen := <-origin.seen
+	if seen.offset != 4 {
+		t.Fatalf("origin offset = %d; want 4", seen.offset)
+	}
+
+	if seen.authorization != "Bearer requester-token" {
+		t.Fatalf("origin authorization = %q; want requester token", seen.authorization)
+	}
+}
+
+func TestMirrorPreservesFullBodyPathForUnsupportedOriginRange(t *testing.T) {
+	for _, rangeHeader := range []string{"bytes=0-", "bytes=4-6", "invalid"} {
+		t.Run(rangeHeader, func(t *testing.T) {
+			body := []byte("0123456789")
+			d := digestOf(body)
+			origin := &rangeCapturingOrigin{body: body, seen: make(chan rangeOriginRequest, 1)}
+			cfg := &config.Config{UpstreamRegistries: []config.UpstreamRegistry{{Name: "reg.example.com", Endpoint: "https://reg.example.com"}}}
+
+			srv := httptest.NewServer(mirror.New(cfg, fakes.NewCache(), origin).Handler())
+			defer srv.Close()
+
+			req, err := http.NewRequest(http.MethodGet, srv.URL+"/v2/repo/blobs/"+d.String(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			req.Header.Set("Range", rangeHeader)
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d; want 200", resp.StatusCode)
+			}
+
+			got, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if string(got) != string(body) {
+				t.Fatalf("body = %q; want %q", got, body)
+			}
+
+			seen := <-origin.seen
+			if seen.offset != 0 {
+				t.Fatalf("origin offset = %d; want 0", seen.offset)
+			}
+		})
+	}
 }
 
 func TestMirror_CapturesInboundAuthorizationForOrigin(t *testing.T) {

@@ -16,6 +16,7 @@ import (
 
 	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	ebpfpkg "github.com/Azure/unbounded/internal/net/ebpf"
+	"github.com/Azure/unbounded/internal/net/healthcheck"
 	unboundednetnetlink "github.com/Azure/unbounded/internal/net/netlink"
 )
 
@@ -204,6 +205,7 @@ func configureTunnelPeers(
 	assignmentPoolTunnelMTUs map[string]int,
 	poolTunnelMTUs map[string]int,
 	state *wireGuardState,
+	profiles map[string]healthcheck.HealthCheckSettings,
 ) ([]unboundednetnetlink.DesiredRoute, map[string]bool, error) {
 	// Do NOT early-return when both peer lists are empty. Even when
 	// there are no tunnel-protocol peers (e.g. WG-only gateway
@@ -518,12 +520,19 @@ func configureTunnelPeers(
 	// TC egress BPF intercepts and redirects to geneve0.
 	var routes []unboundednetnetlink.DesiredRoute
 
-	hcPeers := registerPeersWithHealthCheck(meshPeers, gatewayPeers, mySiteName, false,
+	state.mu.Lock()
+	isGatewayNode := state.isGatewayNode
+	state.mu.Unlock()
+
+	hcPeers, healthErr := registerPeersWithHealthCheck(meshPeers, gatewayPeers, mySiteName, isGatewayNode,
 		siteHealthCheckProfileNames, peeringSiteHealthCheckProfileNames,
 		assignmentSiteHealthCheckProfileNames, assignmentPoolHealthCheckProfileNames,
-		poolHealthCheckProfileNames, state,
+		poolHealthCheckProfileNames, profiles, state,
 		func(gw gatewayPeerInfo) string { return peerIfaceName(cfg, gw) },
 		true)
+	if healthErr != nil {
+		return routes, hcPeers, fmt.Errorf("register shared-tunnel health checks: %w", healthErr)
+	}
 
 	klog.V(2).Infof("eBPF tunnel: configured %d mesh + %d gateway peers, %d BPF entries, %d supernet routes on %s",
 		len(meshPeers), len(gatewayPeers), len(bpfEntries), len(routes), ifName)

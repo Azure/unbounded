@@ -233,3 +233,31 @@ func assertFileContent(t *testing.T, path, expected string) {
 	require.NoError(t, err)
 	assert.Equal(t, expected, string(data))
 }
+
+// TestEnsureDaemonBinaryLinks_RepairsDanglingCurrent covers the one fault that
+// verify could report and repair could not fix.
+//
+// VerifyDaemonInstalled resolves the current link and fails when its target is
+// gone. Link initialization used to stat the link itself, which succeeds on a
+// dangling symlink, so it saw a healthy link and left it. start on a completed
+// installation then verified, repaired nothing, verified again, and returned
+// the same stat error on every run forever.
+func TestEnsureDaemonBinaryLinks_RepairsDanglingCurrent(t *testing.T) {
+	paths := setupDaemonBinaryTestPaths(t)
+	require.NoError(t, os.WriteFile(paths.BluePath, []byte("blue"), 0o755))
+
+	// A current link whose target no longer exists, as an interrupted
+	// activation or a removed slot leaves behind.
+	require.NoError(t, os.Symlink(filepath.Join(t.TempDir(), "removed-slot"), paths.CurrentPath))
+
+	_, err := filepath.EvalSymlinks(paths.CurrentPath)
+	require.Error(t, err, "fixture must be a link that cannot resolve")
+
+	require.NoError(t, EnsureDaemonBinaryLinks(context.Background(), slog.Default(), paths))
+
+	assertSymlinkTarget(t, paths.CurrentPath, paths.BluePath)
+
+	resolved, err := filepath.EvalSymlinks(paths.CurrentPath)
+	require.NoError(t, err, "the repaired link must resolve, or verify still fails")
+	require.Equal(t, paths.BluePath, resolved)
+}

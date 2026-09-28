@@ -62,6 +62,32 @@ func newClient(t *testing.T, ur config.UpstreamRegistry) *Client {
 	return c
 }
 
+func TestRegistryHTTPClientUsesPhaseTimeouts(t *testing.T) {
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: "https://registry.example.com"})
+	hc := c.registries["reg"].hc
+
+	if hc.Timeout != 0 {
+		t.Fatalf("client timeout = %v; want no total request timeout", hc.Timeout)
+	}
+
+	transport, ok := hc.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T; want *http.Transport", hc.Transport)
+	}
+
+	if transport.DialContext == nil {
+		t.Fatal("DialContext is nil; connection establishment must be bounded")
+	}
+
+	if transport.TLSHandshakeTimeout != originTLSHandshakeTimeout {
+		t.Fatalf("TLS handshake timeout = %v; want %v", transport.TLSHandshakeTimeout, originTLSHandshakeTimeout)
+	}
+
+	if transport.ResponseHeaderTimeout != originResponseHeaderTimeout {
+		t.Fatalf("response header timeout = %v; want %v", transport.ResponseHeaderTimeout, originResponseHeaderTimeout)
+	}
+}
+
 func TestPullBlob_Success(t *testing.T) {
 	body := []byte("layer-bytes")
 	d := digestOf(body)
@@ -96,6 +122,83 @@ func TestPullBlob_Success(t *testing.T) {
 
 	if size != int64(len(body)) {
 		t.Errorf("size = %d, want %d", size, len(body))
+	}
+}
+
+func TestPullBlobRange(t *testing.T) {
+	body := []byte("0123456789")
+	d := digestOf(body)
+
+	const offset = int64(4)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Range"); got != "bytes=4-" {
+			t.Errorf("Range = %q; want bytes=4-", got)
+		}
+
+		w.Header().Set("Content-Length", "6")
+		w.Header().Set("Content-Range", "bytes 4-9/10")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body[offset:]) //nolint:errcheck // best-effort write
+	}))
+	defer srv.Close()
+
+	c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL})
+
+	rc, size, err := c.Pull(context.Background(), ifaces.OriginRef{
+		Registry: "reg", Repository: "library/nginx", Digest: d, Kind: ifaces.KindBlob, Offset: offset,
+	})
+	if err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+	defer rc.Close()
+
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+
+	if string(got) != string(body[offset:]) {
+		t.Fatalf("body = %q; want %q", got, body[offset:])
+	}
+
+	if size != int64(len(body)) {
+		t.Fatalf("size = %d; want %d", size, len(body))
+	}
+}
+
+func TestPullBlobRangeRejectsIgnoredOrInvalidResponse(t *testing.T) {
+	body := []byte("0123456789")
+	d := digestOf(body)
+
+	tests := []struct {
+		name         string
+		status       int
+		contentRange string
+		want         string
+	}{
+		{name: "ignored", status: http.StatusOK, want: "unsupported"},
+		{name: "invalid", status: http.StatusPartialContent, contentRange: "bytes 0-5/10", want: "invalid Content-Range"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Range", test.contentRange)
+				w.WriteHeader(test.status)
+				_, _ = w.Write(body) //nolint:errcheck // best-effort write
+			}))
+			defer srv.Close()
+
+			c := newClient(t, config.UpstreamRegistry{Name: "reg", Endpoint: srv.URL})
+
+			_, _, err := c.Pull(context.Background(), ifaces.OriginRef{
+				Registry: "reg", Repository: "library/nginx", Digest: d, Kind: ifaces.KindBlob, Offset: 4,
+			})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v; want %q", err, test.want)
+			}
+		})
 	}
 }
 

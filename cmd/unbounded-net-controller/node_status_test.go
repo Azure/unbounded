@@ -21,7 +21,7 @@ func TestNodeStatusCacheOperations(t *testing.T) {
 	cache := NewNodeStatusCache()
 	changed := make(chan struct{}, 2)
 
-	cache.SetOnChange(func(_ string, _ *NodeStatusResponse) {
+	cache.SetOnChange(func(_ string, _ *NodeStatusResponse, _ uint64) {
 		_ = cache.GetAll()
 
 		changed <- struct{}{}

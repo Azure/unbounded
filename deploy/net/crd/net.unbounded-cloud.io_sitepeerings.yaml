@@ -84,6 +84,7 @@ spec:
                     description: |-
                       ReceiveInterval is the minimum interval between received health check packets.
                       Accepts either a duration string (e.g. "300ms") or an integer interpreted as milliseconds.
+                      Defaults to 15s when omitted from the selected health check scope.
                     x-kubernetes-int-or-string: true
                   transmitInterval:
                     anyOf:
@@ -92,6 +93,7 @@ spec:
                     description: |-
                       TransmitInterval is the minimum interval between transmitted health check packets.
                       Accepts either a duration string (e.g. "300ms") or an integer interpreted as milliseconds.
+                      Defaults to 15s when omitted from the selected health check scope.
                     x-kubernetes-int-or-string: true
                 type: object
               meshNodes:

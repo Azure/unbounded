@@ -354,11 +354,12 @@ func annotateNodeRoutes(
 
 	// Build expected routes and annotate
 	expectedIPv4, expectedIPv6 := buildExpectedRoutes(cfg, status, actx, localSiteName)
+	classificationPeers := buildRouteClassificationPeers(status.Peers)
 	ipv4Routes, ipv6Routes := splitRoutesByFamily(status.RoutingTable.Routes)
 	ipv4Routes = annotateFamilyRoutes(cfg, ipv4Routes, expectedIPv4)
 	ipv6Routes = annotateFamilyRoutes(cfg, ipv6Routes, expectedIPv6)
-	ipv4Routes = annotateRoutePeerDestinationsForFamily(cfg, ipv4Routes, status.Peers, actx, localSiteName)
-	ipv6Routes = annotateRoutePeerDestinationsForFamily(cfg, ipv6Routes, status.Peers, actx, localSiteName)
+	ipv4Routes = annotateRoutePeerDestinationsForFamily(cfg, ipv4Routes, status.Peers, classificationPeers, actx, localSiteName)
+	ipv6Routes = annotateRoutePeerDestinationsForFamily(cfg, ipv6Routes, status.Peers, classificationPeers, actx, localSiteName)
 
 	// Mark supernet routes on unbounded0 as expected. These are managed
 	// routes that don't correspond to individual peers but exist in the FIB
@@ -836,21 +837,12 @@ func annotateRoutePeerDestinationsForFamily(
 	cfg *config,
 	routes []RouteEntry,
 	peers []WireGuardPeerStatus,
+	classificationPeers map[string]routeplan.Peer,
 	actx *annotationContext,
 	localSiteName string,
 ) []RouteEntry {
 	if len(routes) == 0 || len(peers) == 0 {
 		return routes
-	}
-
-	peerByName := make(map[string]WireGuardPeerStatus, len(peers))
-	for _, peer := range peers {
-		peerName := strings.TrimSpace(peer.Name)
-		if peerName == "" {
-			continue
-		}
-
-		peerByName[peerName] = peer
 	}
 
 	expectations := make([]peerRouteExpectation, 0, len(peers))
@@ -957,23 +949,23 @@ func annotateRoutePeerDestinationsForFamily(
 
 			sort.Strings(peerNames)
 			hop.PeerDestinations = peerNames
-			hop.Info = routeInfoForNextHop(normalizedDestination, peerNames, peerByName, actx)
+			hop.Info = routeInfoForNextHop(normalizedDestination, peerNames, classificationPeers, actx)
 		}
 	}
 
 	return routes
 }
 
-// routeInfoForNextHop classifies a next-hop destination to determine its
-// object name, object type, and route type for display purposes.
-func routeInfoForNextHop(
-	normalizedDestination string,
-	peerNames []string,
-	peerByName map[string]WireGuardPeerStatus,
-	actx *annotationContext,
-) *NextHopInfo {
-	routePeers := make(map[string]routeplan.Peer, len(peerByName))
-	for peerName, peer := range peerByName {
+// buildRouteClassificationPeers creates one read-only index for both address
+// families in a status snapshot, rather than rebuilding it for each next-hop.
+func buildRouteClassificationPeers(peers []WireGuardPeerStatus) map[string]routeplan.Peer {
+	routePeers := make(map[string]routeplan.Peer, len(peers))
+	for _, peer := range peers {
+		peerName := strings.TrimSpace(peer.Name)
+		if peerName == "" {
+			continue
+		}
+
 		routePeers[peerName] = routeplan.Peer{
 			Name:              peer.Name,
 			PeerType:          peer.PeerType,
@@ -985,6 +977,17 @@ func routeInfoForNextHop(
 		}
 	}
 
+	return routePeers
+}
+
+// routeInfoForNextHop classifies a next-hop destination to determine its
+// object name, object type, and route type for display purposes.
+func routeInfoForNextHop(
+	normalizedDestination string,
+	peerNames []string,
+	routePeers map[string]routeplan.Peer,
+	actx *annotationContext,
+) *NextHopInfo {
 	sharedInfo := routeplan.ClassifyRouteInfoForPeerDestination(normalizedDestination, peerNames, routePeers, actx.routeNodes, actx.sitePodCIDRs, actx.siteNodeCIDRs, actx.gatewayPoolRoutedCIDRs)
 	if sharedInfo == nil {
 		return nil

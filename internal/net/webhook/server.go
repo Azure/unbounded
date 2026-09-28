@@ -163,7 +163,7 @@ func (s *Server) registerAggregatedDiscoveryHandlers() {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"status.net.unbounded-cloud.io/v1alpha1","resources":[{"name":"status/push","singularName":"","namespaced":false,"kind":"NodeStatusPush","verbs":["create"]},{"name":"status/nodews","singularName":"","namespaced":false,"kind":"NodeStatusStream","verbs":["get"]},{"name":"status/json","singularName":"","namespaced":false,"kind":"ClusterStatus","verbs":["get"]},{"name":"token/node","singularName":"","namespaced":false,"kind":"TokenRequest","verbs":["create"]},{"name":"token/viewer","singularName":"","namespaced":false,"kind":"TokenRequest","verbs":["create"]}]}`)) //nolint:errcheck
+		_, _ = w.Write([]byte(`{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"status.net.unbounded-cloud.io/v1alpha1","resources":[{"name":"status/push","singularName":"","namespaced":false,"kind":"NodeStatusPush","verbs":["create"]},{"name":"status/nodews","singularName":"","namespaced":false,"kind":"NodeStatusStream","verbs":["get"]},{"name":"status/json","singularName":"","namespaced":false,"kind":"ClusterStatus","verbs":["get"]},{"name":"nodes/details","singularName":"","namespaced":false,"kind":"NodeDetails","verbs":["get","create"]},{"name":"token/node","singularName":"","namespaced":false,"kind":"TokenRequest","verbs":["create"]},{"name":"token/viewer","singularName":"","namespaced":false,"kind":"TokenRequest","verbs":["create"]}]}`)) //nolint:errcheck
 	})
 }
 

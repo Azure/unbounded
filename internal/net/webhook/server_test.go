@@ -14,6 +14,8 @@ import (
 	"encoding/pem"
 	"math/big"
 	"net/http"
+	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -73,6 +75,54 @@ func TestIsTrustedAggregatedRequest(t *testing.T) {
 	if s.isTrustedAggregatedRequest(&http.Request{}) {
 		t.Fatal("expected request without TLS peer certs to be rejected")
 	}
+}
+
+func TestAggregatedDiscoveryAdvertisesNodeDetails(t *testing.T) {
+	clientCertPEM, _, caPEM, err := generateClientAuthCertificate("front-proxy-client")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	block, _ := pem.Decode(clientCertPEM)
+
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		t.Fatal("failed to append front-proxy CA")
+	}
+
+	server := &Server{aggregatedClientCAs: pool, mux: http.NewServeMux()}
+	server.registerAggregatedDiscoveryHandlers()
+
+	request := httptest.NewRequest(http.MethodGet, aggregatedAPIVersionPath, nil)
+	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}}
+	response := httptest.NewRecorder()
+	server.mux.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d, want %d: %s", response.Code, http.StatusOK, response.Body.String())
+	}
+
+	var discovery metav1.APIResourceList
+	if err := json.NewDecoder(response.Body).Decode(&discovery); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, resource := range discovery.APIResources {
+		if resource.Name == "nodes/details" {
+			if resource.Kind != "NodeDetails" || !slices.Equal(resource.Verbs, metav1.Verbs{"get", "create"}) {
+				t.Fatalf("unexpected nodes/details discovery: %+v", resource)
+			}
+
+			return
+		}
+	}
+
+	t.Fatal("nodes/details missing from aggregated API discovery")
 }
 
 func generateClientAuthCertificate(commonName string) ([]byte, []byte, []byte, error) {

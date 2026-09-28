@@ -4,7 +4,6 @@
 import * as React from 'react';
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import NodeTable from './components/nodes/NodesTable';
-import NetworkCard from './components/dashboard/NetworkCard';
 import SitesCard from './components/network/SitesCard';
 import StatusJsonModal from './components/status/StatusJsonModal';
 import ErrorBoundary from './components/common/ErrorBoundary';
@@ -13,27 +12,25 @@ import {
 } from './components/nodes/shared/index';
 import useClusterStatus from './hooks/useClusterStatus';
 import useDashboardData from './hooks/useDashboardData';
+import useNodeDetails from './hooks/useNodeDetails';
 
-const NodeDetailModal = React.lazy(() => import('./components/nodes/NodeDetailModal'));
+const NodeDetailModal = React.lazy(() => import('./components/nodes/NodeDetailDialog'));
 
 export default function App() {
   const {
-    summary, status, loading, error, wsConnected, sendWsMessage,
-    nodeDetail, requestNodeDetail, subscribeNodeDetail, unsubscribeNodeDetail
+    summary, loading, error, wsConnected, sendWsMessage
   } = useClusterStatus();
-  const nodes = status?.nodes || [];
-  const sites = summary?.sites || status?.sites || [];
-  const peerings = summary?.peerings || status?.peerings || [];
-  const gatewayPools = summary?.gatewayPools || status?.gatewayPools || [];
+  const sites = summary?.sites || [];
+  const gatewayPools = summary?.gatewayPools || [];
   const nodeSummaries = summary?.nodeSummaries || [];
   const [hiddenSites, setHiddenSites] = useState<Set<string>>(new Set());
   const [hiddenGatewayPools, setHiddenGatewayPools] = useState<Set<string>>(new Set());
   const [selectedNodeName, setSelectedNodeName] = useState<string | null>(null);
+  const { detail, load: loadNodeDetail, cancel: cancelNodeDetail } = useNodeDetails(selectedNodeName, nodeSummaries);
   const [selectedNodeDetailTab, setSelectedNodeDetailTab] = useState<'peerings' | 'routes' | 'bpf'>('peerings');
   const [pullEnabledOptimistic, setPullEnabledOptimistic] = useState<boolean | null>(null);
   const [selectedNodeTypesFilter, setSelectedNodeTypesFilter] = useState<Set<string>>(new Set(['Gateway', 'Worker']));
-  const [networkTab, setNetworkTab] = useState<'siteTopology' | 'matrix'>('siteTopology');
-  const [maximizedPanel, setMaximizedPanel] = useState<'nodes' | 'siteTopology' | 'matrix' | null>(null);
+  const [maximizedPanel, setMaximizedPanel] = useState<'nodes' | null>(null);
   const [infoOpen, setInfoOpen] = useState(false);
   const [statusJsonOpen, setStatusJsonOpen] = useState(false);
   const [errorsDismissed, setErrorsDismissed] = useState(false);
@@ -51,12 +48,6 @@ export default function App() {
     document.documentElement.dataset.theme = theme;
     window.localStorage.setItem('theme', theme);
   }, [theme]);
-
-  useEffect(() => {
-    if (maximizedPanel === 'siteTopology' || maximizedPanel === 'matrix') {
-      setNetworkTab(maximizedPanel);
-    }
-  }, [maximizedPanel]);
 
   useEffect(() => {
     if (!maximizedPanel) return;
@@ -91,23 +82,13 @@ export default function App() {
     setInfoOpen(false);
   }, [statusJsonOpen]);
 
-  // Request and subscribe to node detail when a node is selected
-  useEffect(() => {
-    if (!selectedNodeName) return;
-    requestNodeDetail(selectedNodeName);
-    subscribeNodeDetail(selectedNodeName);
-    return () => {
-      unsubscribeNodeDetail(selectedNodeName);
-    };
-  }, [selectedNodeName, requestNodeDetail, subscribeNodeDetail, unsubscribeNodeDetail]);
-
   useEffect(() => {
     if (pullEnabledOptimistic === null) return;
-    const pullEnabled = summary?.pullEnabled ?? status?.pullEnabled;
+    const pullEnabled = summary?.pullEnabled;
     if (typeof pullEnabled === 'boolean' && pullEnabled === pullEnabledOptimistic) {
       setPullEnabledOptimistic(null);
     }
-  }, [summary?.pullEnabled, status?.pullEnabled, pullEnabledOptimistic]);
+  }, [summary?.pullEnabled, pullEnabledOptimistic]);
 
   useEffect(() => {
     if (pullEnabledOptimistic === null) return;
@@ -121,43 +102,31 @@ export default function App() {
   const activeErrors = useMemo(() => {
     const items: string[] = [];
     if (error) items.push(`controller: ${error}`);
-    const errors = summary?.errors || status?.errors || [];
+    const errors = summary?.errors || [];
     for (const msg of errors) {
       items.push(`controller: ${msg}`);
     }
     items.sort();
     return items;
-  }, [error, summary?.errors, status?.errors]);
+  }, [error, summary?.errors]);
   const activeWarnings = useMemo(() => {
     const items: string[] = [];
-    const warnings = summary?.warnings || status?.warnings || [];
+    const warnings = summary?.warnings || [];
     for (const msg of warnings) {
       items.push(`controller: ${msg}`);
     }
-    // Use full node data for detailed error messages when available
-    const fullNodes = status?.nodes || [];
-    if (fullNodes.length > 0) {
-      for (const node of fullNodes) {
-        const name = node.nodeInfo?.name || 'unknown';
-        for (const ne of node.nodeErrors || []) {
-          const msg = (ne.message || '').trim();
-          if (msg) items.push(`node ${name}: ${msg}`);
-        }
-      }
-    } else {
-      // Fall back to summary error counts / first error message
-      for (const ns of nodeSummaries) {
-        const count = ns.errorCount || 0;
-        if (count === 1 && ns.firstError) {
-          items.push(`node ${ns.name || 'unknown'}: ${ns.firstError}`);
-        } else if (count > 0) {
-          items.push(`node ${ns.name || 'unknown'}: ${count} error(s)`);
-        }
+    // Summary errors stay independent of explicitly loaded diagnostics.
+    for (const ns of nodeSummaries) {
+      const count = ns.errorCount || 0;
+      if (count === 1 && ns.firstError) {
+        items.push(`node ${ns.name || 'unknown'}: ${ns.firstError}`);
+      } else if (count > 0) {
+        items.push(`node ${ns.name || 'unknown'}: ${count} error(s)`);
       }
     }
     items.sort();
     return items;
-  }, [summary?.warnings, status?.warnings, status?.nodes, nodeSummaries]);
+  }, [summary?.warnings, nodeSummaries]);
 
   useEffect(() => {
     const key = activeErrors.join('\n');
@@ -209,17 +178,16 @@ export default function App() {
   };
 
   const handleSelectNode = useCallback((nodeName: string) => {
+    cancelNodeDetail();
     setSelectedNodeName(nodeName);
-  }, []);
+  }, [cancelNodeDetail]);
 
   const handleCloseModal = useCallback(() => {
+    cancelNodeDetail();
     setSelectedNodeName(null);
-  }, []);
+  }, [cancelNodeDetail]);
 
   const {
-    activeNetworkTab,
-    activeSelectedNode,
-    edgeHealthCheckCounts,
     effectivePullEnabled,
     gatewayByNode,
     nodeK8sStatusMap,
@@ -227,62 +195,39 @@ export default function App() {
     nodeTotalCount,
     peerHealth,
     poolCounts,
-    poolToSite,
     siteCounts,
     visibleNodeSummaries
   } = useDashboardData({
     summary,
-    status,
-    nodes,
     nodeSummaries,
     gatewayPools,
     gatewayPoolHiddenNames: hiddenGatewayPools,
     hiddenSites,
     selectedNodeTypesFilter,
-    networkTab,
-    maximizedPanel,
-    pullEnabledOptimistic,
-    selectedNodeName,
-    nodeDetail
+    pullEnabledOptimistic
   });
 
   // All known node names for the detail modal's peer navigation
   const allNodeNames = useMemo(() => {
     const names = nodeSummaries.map((ns) => ns.name || '').filter(Boolean);
-    if (names.length === 0) {
-      return nodes.map((n) => n.nodeInfo?.name || '').filter(Boolean);
-    }
     return names;
-  }, [nodeSummaries, nodes]);
+  }, [nodeSummaries]);
 
   useEffect(() => {
     if (!selectedNodeName) return;
     // Check if node still exists in the cluster
-    const exists = nodeSummaries.some((ns) => ns.name === selectedNodeName)
-      || nodes.some((n) => n.nodeInfo?.name === selectedNodeName);
+    const exists = nodeSummaries.some((ns) => ns.name === selectedNodeName);
     if (!exists) {
-      setSelectedNodeName(null);
+      handleCloseModal();
     }
-  }, [nodeSummaries, nodes, selectedNodeName]);
+  }, [nodeSummaries, selectedNodeName, handleCloseModal]);
 
-  const wsState = wsConnected ? 'ok' : (summary || status) ? 'warn' : 'err';
+  const wsState = wsConnected ? 'ok' : summary ? 'warn' : 'err';
   const wsLabel = wsConnected
     ? 'WebSocket connected'
-    : (summary || status)
+    : summary
       ? 'Polling only'
       : 'No data';
-
-  const onSelectNetworkTab = (tab: 'siteTopology' | 'matrix') => {
-    if (maximizedPanel === 'siteTopology' || maximizedPanel === 'matrix') {
-      setMaximizedPanel(tab);
-      return;
-    }
-    setNetworkTab(tab);
-  };
-
-  const onToggleNetworkMaximize = (isMaximized: boolean) => {
-    setMaximizedPanel(isMaximized ? null : activeNetworkTab);
-  };
 
   const renderNodesCard = (isMaximized: boolean) => {
     const content = (
@@ -299,7 +244,6 @@ export default function App() {
         onToggleGatewayPool={toggleGatewayPool}
         onShowAllGatewayPools={showAllGatewayPools}
         gatewayByNode={gatewayByNode}
-            nodeK8sStatusMap={nodeK8sStatusMap}
         selectedNodeTypes={selectedNodeTypesFilter}
         onSelectedNodeTypesChange={setSelectedNodeTypesFilter}
         pullEnabled={effectivePullEnabled}
@@ -312,46 +256,25 @@ export default function App() {
     return <div className="card-maximized">{content}</div>;
   };
 
-  // Build info from summary or status
-  const buildInfo = summary?.buildInfo || status?.buildInfo;
-  const leaderInfo = summary?.leaderInfo || status?.leaderInfo;
-  const timestamp = summary?.timestamp || status?.timestamp;
-  const connectivityMatrix = summary?.connectivityMatrix || status?.connectivityMatrix;
+  const buildInfo = summary?.buildInfo;
+  const leaderInfo = summary?.leaderInfo;
+  const timestamp = summary?.timestamp;
 
   if (maximizedPanel) {
     return (
       <div className="app app-maximized">
         <div className="maximize-backdrop" onClick={() => setMaximizedPanel(null)}></div>
-        {maximizedPanel === 'nodes' ? renderNodesCard(true) : (
-          <NetworkCard
-            activeNetworkTab={activeNetworkTab}
-            edgeHealthCheckCounts={edgeHealthCheckCounts}
-            gatewayByNode={gatewayByNode}
-            nodeK8sStatusMap={nodeK8sStatusMap}
-            gatewayPools={gatewayPools}
-            hiddenGatewayPools={hiddenGatewayPools}
-            hiddenSites={hiddenSites}
-            isMaximized
-            nodeStatuses={nodes}
-            peerings={peerings}
-            poolCounts={poolCounts}
-            poolToSite={poolToSite}
-            siteCounts={siteCounts}
-            sites={sites}
-            statusMatrix={connectivityMatrix}
-            theme={theme}
-            onSelectTab={onSelectNetworkTab}
-            onToggleMaximize={() => onToggleNetworkMaximize(true)}
-          />
-        )}
+        {renderNodesCard(true)}
         <Suspense fallback={null}>
           <NodeDetailModal
             nodeName={selectedNodeName}
-            node={activeSelectedNode}
+            summary={nodeSummaries.find((node) => node.name === selectedNodeName)}
+            detail={detail}
+            onLoad={loadNodeDetail}
             allNodeNames={allNodeNames}
             gatewayByNode={gatewayByNode}
             nodeK8sStatusMap={nodeK8sStatusMap}
-            azureTenantId={summary?.azureTenantId || status?.azureTenantId}
+            azureTenantId={summary?.azureTenantId}
             pullEnabled={effectivePullEnabled}
             theme={theme}
             detailTab={selectedNodeDetailTab}
@@ -537,7 +460,7 @@ export default function App() {
               <div className="overview-grid">
                 <div className="card overview-metric-card">
                   <div className="section-title overview-metric-title">Sites</div>
-                  <div className="overview-metric-value">{(summary?.siteCount ?? status?.siteCount ?? sites.length).toLocaleString()}</div>
+                  <div className="overview-metric-value">{(summary?.siteCount ?? sites.length).toLocaleString()}</div>
                 </div>
                 <div className="card overview-metric-card">
                   <div className="section-title overview-metric-title">Gateway Pools</div>
@@ -557,27 +480,6 @@ export default function App() {
               sites={sites}
               siteCounts={siteCounts}
               nodeSummaries={nodeSummaries}
-              nodes={nodes}
-            />
-            <NetworkCard
-              activeNetworkTab={activeNetworkTab}
-              edgeHealthCheckCounts={edgeHealthCheckCounts}
-              gatewayByNode={gatewayByNode}
-            nodeK8sStatusMap={nodeK8sStatusMap}
-              gatewayPools={gatewayPools}
-              hiddenGatewayPools={hiddenGatewayPools}
-              hiddenSites={hiddenSites}
-              isMaximized={false}
-              nodeStatuses={nodes}
-              peerings={peerings}
-              poolCounts={poolCounts}
-              poolToSite={poolToSite}
-              siteCounts={siteCounts}
-              sites={sites}
-              statusMatrix={connectivityMatrix}
-              theme={theme}
-              onSelectTab={onSelectNetworkTab}
-              onToggleMaximize={() => onToggleNetworkMaximize(false)}
             />
           </div>
           <div>
@@ -588,11 +490,13 @@ export default function App() {
         <Suspense fallback={null}>
           <NodeDetailModal
             nodeName={selectedNodeName}
-            node={activeSelectedNode}
+            summary={nodeSummaries.find((node) => node.name === selectedNodeName)}
+            detail={detail}
+            onLoad={loadNodeDetail}
             allNodeNames={allNodeNames}
             gatewayByNode={gatewayByNode}
             nodeK8sStatusMap={nodeK8sStatusMap}
-            azureTenantId={summary?.azureTenantId || status?.azureTenantId}
+            azureTenantId={summary?.azureTenantId}
             pullEnabled={effectivePullEnabled}
             theme={theme}
             detailTab={selectedNodeDetailTab}

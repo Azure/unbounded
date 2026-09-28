@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
+	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/agentbinary"
 	daemon "github.com/Azure/unbounded/pkg/agent/daemon"
@@ -153,6 +154,7 @@ func newTestMachinaMachineOperationReconcilerWithLockPath(
 	t.Helper()
 
 	target := &machineOperationTarget{
+		installation:         installstate.NewStore(filepath.Join(t.TempDir(), "state"), filepath.Join(t.TempDir(), "install.lock")),
 		Client:               c,
 		log:                  discardLogger(),
 		machineName:          "test-machine",
@@ -557,6 +559,7 @@ func TestReconcileRepave_UsesDesiredMachineConfigurationVersion(t *testing.T) {
 	op := &fakeNodeOperator{active: active}
 	c := fakeStatusClient(machine, mcv)
 	reconciler := &repaveReconciler{
+		installation: installstate.NewStore(filepath.Join(t.TempDir(), "state"), filepath.Join(t.TempDir(), "install.lock")),
 		Client:       c,
 		log:          discardLogger(),
 		machineName:  "test-machine",
@@ -612,6 +615,7 @@ func TestReconcileRepave_NoDriftMarksDesiredConfigurationApplied(t *testing.T) {
 	op := &fakeNodeOperator{active: &ActiveMachine{Name: "kube1", Config: base}}
 	c := fakeStatusClient(machine, mcv)
 	reconciler := &repaveReconciler{
+		installation: installstate.NewStore(filepath.Join(t.TempDir(), "state"), filepath.Join(t.TempDir(), "install.lock")),
 		Client:       c,
 		log:          discardLogger(),
 		machineName:  "test-machine",

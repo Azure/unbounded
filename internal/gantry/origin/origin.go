@@ -22,7 +22,6 @@
 //
 // - the design doc negative-cache cooldown integration .
 // - Per-pull retries with backoff (caller's responsibility for now).
-// - Resumable / ranged pulls (the design doc layer-pull semantics).
 package origin
 
 import (
@@ -32,6 +31,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -344,9 +344,28 @@ type cachedAuthenticationChallenge struct {
 }
 
 const (
-	authenticationChallengeTTL = 30 * time.Minute
-	anonymousRegistryTTL       = time.Minute
+	authenticationChallengeTTL  = 30 * time.Minute
+	anonymousRegistryTTL        = time.Minute
+	originDialTimeout           = 30 * time.Second
+	originTLSHandshakeTimeout   = 10 * time.Second
+	originResponseHeaderTimeout = 30 * time.Second
+	originIdleConnTimeout       = 90 * time.Second
 )
+
+func newRegistryHTTPClient() *http.Client {
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: originDialTimeout, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       originIdleConnTimeout,
+		TLSHandshakeTimeout:   originTLSHandshakeTimeout,
+		ExpectContinueTimeout: time.Second,
+		ResponseHeaderTimeout: originResponseHeaderTimeout,
+	}
+
+	return &http.Client{Transport: transport, CheckRedirect: checkRedirect}
+}
 
 func newRegistry(ur config.UpstreamRegistry, logger *slog.Logger) (*registry, error) {
 	u, err := url.Parse(ur.Endpoint)
@@ -361,7 +380,7 @@ func newRegistry(ur config.UpstreamRegistry, logger *slog.Logger) (*registry, er
 	r := &registry{
 		name:   ur.Name,
 		base:   u,
-		hc:     &http.Client{Timeout: 5 * time.Minute, CheckRedirect: checkRedirect},
+		hc:     newRegistryHTTPClient(),
 		logger: logger.With(slog.String("registry", ur.Name)),
 	}
 	if ur.CredentialsPath != "" {
@@ -462,14 +481,18 @@ func (r *registry) rememberAuthenticationChallenge(challenge string) {
 }
 
 func (r *registry) pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
+	if ref.Offset < 0 {
+		return nil, 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, Err: fmt.Errorf("origin offset %d is negative", ref.Offset)}
+	}
+
 	path := r.urlFor(ref)
 
-	resp, err := r.do(ctx, http.MethodGet, path)
+	resp, err := r.do(ctx, http.MethodGet, path, ref.Offset)
 	if err != nil {
 		return nil, 0, &ifaces.OriginError{Ref: ref, Class: classOf(err), Err: err}
 	}
 
-	if resp.StatusCode == http.StatusNotFound && ref.Kind != ifaces.KindManifest {
+	if resp.StatusCode == http.StatusNotFound && ref.Kind != ifaces.KindManifest && ref.Offset == 0 {
 		// Containerd treats every digest in a pod spec as a generic
 		// "content descriptor" and fetches it via /v2/<repo>/blobs/
 		// <digest>. When that digest happens to be an image manifest,
@@ -489,7 +512,7 @@ func (r *registry) pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadClose
 		mRef.Kind = ifaces.KindManifest
 		mPath := r.urlFor(mRef)
 
-		mResp, mErr := r.do(ctx, http.MethodGet, mPath)
+		mResp, mErr := r.do(ctx, http.MethodGet, mPath, 0)
 		if mErr == nil && mResp.StatusCode == http.StatusOK {
 			mSize := int64(-1)
 
@@ -526,6 +549,24 @@ func (r *registry) pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadClose
 		return nil, 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureNotFound, Err: fmt.Errorf("origin: %s not found (blob 404, manifest 404)", ref.Digest)}
 	}
 
+	if ref.Offset > 0 {
+		if resp.StatusCode != http.StatusPartialContent {
+			defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort body close
+
+			return nil, 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, Err: &ifaces.ErrRangeUnsupported{Offset: ref.Offset, Reason: "status " + resp.Status}}
+		}
+
+		start, end, size, ok := parseOriginContentRange(resp.Header.Get("Content-Range"))
+		if !ok || start != ref.Offset || end != size-1 ||
+			(resp.ContentLength >= 0 && resp.ContentLength != end-start+1) {
+			defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort body close
+
+			return nil, 0, &ifaces.OriginError{Ref: ref, Class: ifaces.FailureTransient, Err: &ifaces.ErrRangeUnsupported{Offset: ref.Offset, Reason: fmt.Sprintf("invalid Content-Range %q", resp.Header.Get("Content-Range"))}}
+		}
+
+		return resp.Body, size, nil
+	}
+
 	if resp.StatusCode != http.StatusOK {
 		defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort body close
 		return nil, 0, r.classify(ref, resp)
@@ -560,7 +601,7 @@ func (r *registry) pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadClose
 func (r *registry) head(ctx context.Context, ref ifaces.OriginRef) (int64, string, error) {
 	path := r.urlFor(ref)
 
-	resp, err := r.do(ctx, http.MethodHead, path)
+	resp, err := r.do(ctx, http.MethodHead, path, 0)
 	if err != nil {
 		return 0, "", &ifaces.OriginError{Ref: ref, Class: classOf(err), Err: err}
 	}
@@ -570,7 +611,7 @@ func (r *registry) head(ctx context.Context, ref ifaces.OriginRef) (int64, strin
 		mRef := ref
 		mRef.Kind = ifaces.KindManifest
 
-		mResp, mErr := r.do(ctx, http.MethodHead, r.urlFor(mRef))
+		mResp, mErr := r.do(ctx, http.MethodHead, r.urlFor(mRef), 0)
 		if mErr == nil && mResp.StatusCode == http.StatusOK {
 			defer func() { _ = mResp.Body.Close() }() //nolint:errcheck // best-effort body close
 
@@ -634,7 +675,7 @@ func (r *registry) urlFor(ref ifaces.OriginRef) string {
 // is rejected, the 401 is returned rather than silently changing identity to
 // this node's configured credentials. Without delegated auth, the legacy
 // credentials-file bearer-token flow remains available.
-func (r *registry) do(ctx context.Context, method, urlStr string) (*http.Response, error) {
+func (r *registry) do(ctx context.Context, method, urlStr string, offset int64) (*http.Response, error) {
 	delegatedAuthorization := registryauth.Authorization(ctx)
 	if delegatedAuthorization != "" && !r.canSendBasicAuth() {
 		return nil, &tokenError{
@@ -659,6 +700,10 @@ func (r *registry) do(ctx context.Context, method, urlStr string) (*http.Respons
 
 		if authorization != "" {
 			req.Header.Set("Authorization", authorization)
+		}
+
+		if offset > 0 {
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 		}
 
 		return req, nil
@@ -703,7 +748,7 @@ func (r *registry) do(ctx context.Context, method, urlStr string) (*http.Respons
 
 	if !strings.HasPrefix(strings.ToLower(challenge), "bearer ") {
 		// No bearer challenge - return 401 verbatim so classify reports auth.
-		return r.repeatWithoutToken(ctx, method, urlStr)
+		return r.repeatWithoutToken(ctx, method, urlStr, offset)
 	}
 
 	tok, ttl, err := r.fetchBearerToken(ctx, challenge)
@@ -724,7 +769,7 @@ func (r *registry) do(ctx context.Context, method, urlStr string) (*http.Respons
 // repeatWithoutToken re-issues a request that received a 401 but no usable
 // bearer challenge. Returns the 401 response so the caller can classify it
 // as FailureAuth.
-func (r *registry) repeatWithoutToken(ctx context.Context, method, urlStr string) (*http.Response, error) {
+func (r *registry) repeatWithoutToken(ctx context.Context, method, urlStr string, offset int64) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, urlStr, nil)
 	if err != nil {
 		return nil, err
@@ -734,7 +779,44 @@ func (r *registry) repeatWithoutToken(ctx context.Context, method, urlStr string
 		req.SetBasicAuth(r.username, r.password)
 	}
 
+	if offset > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+	}
+
 	return r.hc.Do(req)
+}
+
+func parseOriginContentRange(value string) (start, end, size int64, ok bool) {
+	if !strings.HasPrefix(value, "bytes ") {
+		return 0, 0, 0, false
+	}
+
+	rangeAndSize := strings.Split(strings.TrimPrefix(value, "bytes "), "/")
+	if len(rangeAndSize) != 2 {
+		return 0, 0, 0, false
+	}
+
+	bounds := strings.Split(rangeAndSize[0], "-")
+	if len(bounds) != 2 {
+		return 0, 0, 0, false
+	}
+
+	start, err := strconv.ParseInt(bounds[0], 10, 64)
+	if err != nil {
+		return 0, 0, 0, false
+	}
+
+	end, err = strconv.ParseInt(bounds[1], 10, 64)
+	if err != nil {
+		return 0, 0, 0, false
+	}
+
+	size, err = strconv.ParseInt(rangeAndSize[1], 10, 64)
+	if err != nil {
+		return 0, 0, 0, false
+	}
+
+	return start, end, size, start >= 0 && end >= start && size > end
 }
 
 // fetchBearerToken parses a Bearer challenge and exchanges it for a token.

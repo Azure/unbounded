@@ -47,28 +47,82 @@ benefit.
 
 ## Installation
 
-### 1. Select a Released Gantry Image
+### 1. Confirm Compatibility
 
-Find the latest Gantry release on the
-[Unbounded releases page](https://github.com/Azure/unbounded/releases) and use
-its published image:
+The standalone chart supports Linux nodes running containerd. Before installing,
+confirm that every selected node exposes `/run/containerd/containerd.sock` and
+that containerd reads registry host configuration from
+`/etc/containerd/certs.d`.
 
-```bash
-export GANTRY_IMAGE="ghcr.io/azure/gantry:<release-version>"
+The chart does not modify or restart containerd. Provision the `certs.d`
+setting through your node-management system. For standalone installations, the
+chart runs a node-config DaemonSet that continuously reconciles the Gantry
+mirror route shown below. The Unbounded agent owns that route instead on
+operator-managed nodes, where the chart's node-config resources are disabled.
+
+The default route written on each node is:
+
+```toml
+# /etc/containerd/certs.d/_default/hosts.toml
+[host."http://127.0.0.1:5000"]
+   capabilities = ["pull", "resolve"]
+   dial_timeout = "200ms"
 ```
 
-### 2. Configure Upstream Registries
+Containerd must already have its CRI registry `config_path` set to
+`/etc/containerd/certs.d`. The chart mounts the runtime directory and expects
+the socket at `/run/containerd/containerd.sock` by default; use the
+`containerd.*` chart values for a different layout.
 
-Edit `deploy/gantry/configmap.yaml` and replace the example
-`upstream_registries` entry. This list is an opt-in allowlist: add only the
+Do not install the chart on a cluster where the Unbounded operator manages
+Gantry. Both paths check `PriorityClass/gantry-low` and reject ownership by the
+other manager.
+
+### 2. Install the OCI Chart
+
+Find the release on the
+[Unbounded releases page](https://github.com/Azure/unbounded/releases). The
+chart version omits the release tag's leading `v`:
+
+```bash
+export GANTRY_VERSION="<release-without-v>"
+export GANTRY_IMAGE_DIGEST="sha256:<digest-from-release-bom>"
+
+helm upgrade --install gantry oci://ghcr.io/azure/charts/gantry \
+   --version "$GANTRY_VERSION" \
+   --namespace gantry-system \
+   --create-namespace \
+   --set image.digest="$GANTRY_IMAGE_DIGEST" \
+   --set gantry.upstreamRegistries[0].name=registry.example.com \
+   --set gantry.upstreamRegistries[0].endpoint=https://registry.example.com \
+   --wait \
+   --timeout 15m
+```
+
+The chart owns the Gantry ConfigMap, image, RBAC, PriorityClass, chair Leases,
+agent DaemonSet, and node-config DaemonSet. The node-config process checks its
+`_default/hosts.toml` every five seconds and atomically restores it after drift
+or a node upgrade reset. Upgrade those resources through `helm upgrade`, not
+direct edits. Set `nodeConfig.enabled=false` only when another node-management
+system owns mirror routing.
+
+During graceful disable or uninstall, the node-config pod removes
+`hosts.toml` only when it still matches the chart payload. Nodes unavailable
+during uninstall may retain the file and should be checked before the Gantry
+endpoint is considered fully removed.
+
+### 3. Configure Upstream Registries
+
+Set `gantry.upstreamRegistries` in your values file. This list is an opt-in allowlist: add only the
 origin registries whose image pulls you want Gantry to accelerate. Registries
 that are not configured here continue using containerd's normal direct-origin
 path and are not distributed through Gantry.
 
 ```yaml
-upstream_registries:
-  - name: "registry.example.com"
-    endpoint: "https://registry.example.com"
+gantry:
+   upstreamRegistries:
+      - name: registry.example.com
+         endpoint: https://registry.example.com
 ```
 
 The `name` must match the registry host in the image reference and in
@@ -76,25 +130,6 @@ containerd's `certs.d` directory. Include the port when the image reference
 uses a non-default port. Gantry requires at least one accelerated upstream
 registry.
 
-
-
-### 3. Deploy Gantry
-
-
-```bash
-kubectl apply -f deploy/gantry/serviceaccount.yaml
-kubectl apply -f deploy/gantry/node-config.yaml
-kubectl -n gantry-system rollout status daemonset/gantry-containerd-config
-kubectl apply -f deploy/gantry/serviceaccount.yaml
-kubectl apply -f deploy/gantry/configmap.yaml
-kubectl set image --local \
-  -f deploy/gantry/daemonset.yaml \
-  gantry="${GANTRY_IMAGE}" \
-  -o yaml | kubectl apply -f -
-
-kubectl -n gantry-system rollout status daemonset/gantry
-kubectl -n gantry-system get pods -o wide
-```
 
 
 ### 4. Private Registry Authentication
@@ -128,9 +163,8 @@ Shared identity is a compatibility mode for environments where kubelet or CRI
 cannot provide a usable request credential. It gives every Gantry agent the
 same registry identity.
 
-To enable it, copy and edit
-`deploy/gantry/examples/registry-secret.example.yaml`, apply the resulting
-Secret, and set the matching registry's `credentials_path` in the ConfigMap.
+To enable it, create `Secret/gantry-registry-credentials` in the release
+namespace and set the matching registry's `credentialsPath` chart value.
 The file contains a `username:password` pair keyed by the registry `name`.
 
 Gantry reads configured credential files eagerly during startup. A missing

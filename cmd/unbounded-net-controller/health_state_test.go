@@ -78,7 +78,7 @@ func TestHealthStateHelpersAndLeaderInfo(t *testing.T) {
 		leaderElectionNS:   "kube-system",
 		leaderElectionName: "leader-lock",
 		nodeName:           "node-a",
-		tokenAuth:          &tokenAuthenticator{tokenReviewer: client},
+		tokenAuth:          readyTokenAuthenticator(),
 	}
 
 	h.setLeader(true)
@@ -124,7 +124,7 @@ func TestHealthStateReadinessFailure(t *testing.T) {
 
 	h := &healthState{
 		clientset: client,
-		tokenAuth: &tokenAuthenticator{tokenReviewer: client},
+		tokenAuth: readyTokenAuthenticator(),
 	}
 	h.setLeader(true)
 
@@ -149,7 +149,7 @@ func TestHealthStateReadinessIsIndependentOfLeadership(t *testing.T) {
 	client := k8sfake.NewClientset()
 	h := &healthState{
 		clientset: client,
-		tokenAuth: &tokenAuthenticator{tokenReviewer: client},
+		tokenAuth: readyTokenAuthenticator(),
 	}
 
 	// Neither the leader nor functionally ready: still Ready to the kubelet.

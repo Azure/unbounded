@@ -1,0 +1,17 @@
+{{- if eq .Values.manager "helm" }}
+{{- $priorityClass := lookup "scheduling.k8s.io/v1" "PriorityClass" "" "gantry-low" }}
+{{- if $priorityClass }}
+{{- $annotations := default dict $priorityClass.metadata.annotations }}
+{{- $labels := default dict $priorityClass.metadata.labels }}
+{{- $manager := default "" (get $annotations "gantry.unbounded-cloud.io/manager") }}
+{{- $managedBy := default "" (get $labels "app.kubernetes.io/managed-by") }}
+{{- $releaseName := default "" (get $annotations "meta.helm.sh/release-name") }}
+{{- $releaseNamespace := default "" (get $annotations "meta.helm.sh/release-namespace") }}
+{{- if and (eq $manager "helm") (eq $managedBy "Helm") (eq $releaseName .Release.Name) (eq $releaseNamespace .Release.Namespace) }}
+{{- else if eq $manager "unbounded-operator" }}
+{{- fail "Gantry is managed by unbounded-operator; disable and remove that installation before installing the Helm release" }}
+{{- else }}
+{{- fail "PriorityClass/gantry-low already exists without ownership by this Helm release; remove or restore the existing Gantry installation first" }}
+{{- end }}
+{{- end }}
+{{- end }}

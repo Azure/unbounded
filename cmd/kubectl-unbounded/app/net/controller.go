@@ -119,7 +119,7 @@ func newControllerLogsCommand(rt *pluginRuntime) *cobra.Command {
 	return cmd
 }
 
-// newControllerStatusJSONCommand dumps raw /status/json from the controller.
+// newControllerStatusJSONCommand exports the controller's cluster overview.
 func newControllerStatusJSONCommand(rt *pluginRuntime) *cobra.Command {
 	var pretty bool
 
@@ -127,12 +127,19 @@ func newControllerStatusJSONCommand(rt *pluginRuntime) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "status-json",
-		Short: "Dump raw /status/json from the controller",
-		Args:  cobra.NoArgs,
+		Short: "Dump summary JSON from the controller",
+		Long: "Export /status/json, preserving controller metadata and summary fields. " +
+			"Legacy full-node responses are projected into summaries without diagnostic arrays.",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			opts := nodeStatusFetchFromCommand(cmd).merged(fetch)
 
-			status, err := fetchClusterStatus(rt, cmd, opts)
+			raw, err := fetchClusterStatusRaw(rt, cmd, opts)
+			if err != nil {
+				return err
+			}
+
+			status, err := clusterSummaryJSON(raw)
 			if err != nil {
 				return err
 			}
@@ -157,4 +164,37 @@ func newControllerStatusJSONCommand(rt *pluginRuntime) *cobra.Command {
 	cmd.Flags().BoolVar(&pretty, "pretty", true, "Pretty-print JSON output")
 
 	return cmd
+}
+
+// clusterSummaryJSON preserves unknown fields while removing legacy node details.
+func clusterSummaryJSON(raw []byte) (json.RawMessage, error) {
+	summary, err := decodeClusterSummary(raw)
+	if err != nil {
+		return nil, err
+	}
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, err
+	}
+
+	if _, legacy := fields["nodes"]; !legacy {
+		return raw, nil
+	}
+
+	delete(fields, "nodes")
+
+	if _, current := fields["nodeSummaries"]; !current {
+		fields["nodeSummaries"], err = json.Marshal(summary.NodeSummaries)
+		if err != nil {
+			return nil, err
+		}
+
+		fields["nodeCount"], err = json.Marshal(summary.NodeCount)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return json.Marshal(fields)
 }

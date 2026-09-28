@@ -18,6 +18,8 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/Azure/unbounded/internal/net/controller"
+	statuspkg "github.com/Azure/unbounded/internal/net/status"
+	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 	"github.com/Azure/unbounded/internal/version"
 )
 
@@ -236,6 +238,23 @@ func fetchClusterStatus(ctx context.Context, health *healthState, pullEnabled bo
 	}
 
 	cachedStatuses := health.statusCache.GetAll()
+	status.NodeOverviews = make(map[string]*statusv1alpha1.NodeStatusOverview)
+
+	for name, cached := range cachedStatuses {
+		overview := cached.Overview
+		if overview == nil {
+			projected := statuspkg.OverviewFromStatus(cached.Status, status.Timestamp)
+			overview = &projected
+		}
+
+		metadata := statuspkg.OverviewMetadata(*overview)
+		entry := *cached
+		entry.Status = &metadata
+		entry.Overview = overview
+		entry.peerIdentity = nil
+		cachedStatuses[name] = &entry
+		status.NodeOverviews[name] = overview
+	}
 
 	type pullNode struct{ nodeName, nodeIP string }
 
@@ -320,7 +339,7 @@ func fetchClusterStatus(ctx context.Context, health *healthState, pullEnabled bo
 
 	type nodeResult struct {
 		nodeName string
-		status   *NodeStatusResponse
+		overview *statusv1alpha1.NodeStatusOverview
 		err      error
 	}
 
@@ -345,8 +364,8 @@ func fetchClusterStatus(ctx context.Context, health *healthState, pullEnabled bo
 
 				defer func() { <-sem }()
 
-				nodeStatus, fetchErr := fetchNodeStatus(ctx, ip, health.nodeAgentHealthPort)
-				resultCh <- nodeResult{nodeName: nodeName, status: nodeStatus, err: fetchErr}
+				overview, fetchErr := fetchNodeOverview(ctx, nodeName, ip, health.nodeAgentHealthPort)
+				resultCh <- nodeResult{nodeName: nodeName, overview: overview, err: fetchErr}
 			}(pn.nodeName, pn.nodeIP)
 		}
 
@@ -368,9 +387,10 @@ func fetchClusterStatus(ctx context.Context, health *healthState, pullEnabled bo
 				} else {
 					cachedResults[result.nodeName] = NodeStatusResponse{NodeInfo: NodeInfo{Name: result.nodeName}, StatusSource: "pull", FetchError: result.err.Error()}
 				}
-			} else if result.status != nil {
-				result.status.StatusSource = "pull"
-				cachedResults[result.nodeName] = *result.status
+			} else if result.overview != nil {
+				result.overview.StatusSource = "pull"
+				cachedResults[result.nodeName] = statuspkg.OverviewMetadata(*result.overview)
+				status.NodeOverviews[result.nodeName] = result.overview
 			}
 		}
 	}
@@ -447,6 +467,9 @@ func fetchClusterStatus(ctx context.Context, health *healthState, pullEnabled bo
 			if pubKey := node.Annotations[controller.WireGuardPubKeyAnnotation]; pubKey != "" {
 				if nodeStatus.NodeInfo.WireGuard == nil {
 					nodeStatus.NodeInfo.WireGuard = &WireGuardStatusInfo{}
+				} else {
+					wireguard := *nodeStatus.NodeInfo.WireGuard
+					nodeStatus.NodeInfo.WireGuard = &wireguard
 				}
 
 				nodeStatus.NodeInfo.WireGuard.PublicKey = pubKey
@@ -710,7 +733,6 @@ func fetchClusterStatus(ctx context.Context, health *healthState, pullEnabled bo
 	}
 
 	sort.Slice(status.Peerings, func(i, j int) bool { return status.Peerings[i].Name < status.Peerings[j].Name })
-	status.ConnectivityMatrix = buildConnectivityMatrix(status.Nodes, status.GatewayPools)
 	status.Problems = collectClusterProblems(status)
 
 	return status
@@ -807,6 +829,14 @@ func collectClusterProblems(status *ClusterStatusResponse) []StatusProblem {
 			}
 
 			appendProblem("node", nodeName, summary)
+		}
+
+		if overview := status.NodeOverviews[node.NodeInfo.Name]; overview != nil {
+			for _, message := range statuspkg.OverviewDiagnosticMessages(*overview, node.NodeInfo.ProviderID) {
+				appendProblem("node", nodeName, message)
+			}
+
+			continue
 		}
 
 		if mismatchCount := routeMismatchCount(node); mismatchCount > 0 {
@@ -1037,154 +1067,4 @@ func latestNodeUpdateTime(node *corev1.Node) time.Time {
 	}
 
 	return latest
-}
-
-// buildConnectivityMatrix builds health check connectivity matrices from node peer data.
-func buildConnectivityMatrix(nodes []*NodeStatusResponse, gatewayPools []GatewayPoolStatus) map[string]*SiteMatrix {
-	siteNodes := make(map[string]map[string]bool)
-	nodePeers := make(map[string][]WireGuardPeerStatus)
-	nodeByName := make(map[string]*NodeStatusResponse)
-
-	for _, n := range nodes {
-		name := n.NodeInfo.Name
-
-		site := n.NodeInfo.SiteName
-		if name == "" || site == "" {
-			continue
-		}
-
-		nodeByName[name] = n
-
-		if siteNodes[site] == nil {
-			siteNodes[site] = make(map[string]bool)
-		}
-
-		siteNodes[site][name] = true
-
-		var allPeers []WireGuardPeerStatus
-
-		for _, p := range n.Peers {
-			if p.PeerType == "site" || p.PeerType == "gateway" {
-				allPeers = append(allPeers, p)
-			}
-		}
-
-		nodePeers[name] = allPeers
-
-		for _, p := range n.Peers {
-			if p.PeerType == "gateway" && p.Name != "" && p.SiteName == site {
-				siteNodes[site][p.Name] = true
-			}
-		}
-	}
-
-	if len(siteNodes) == 0 {
-		siteNodes = make(map[string]map[string]bool)
-	}
-
-	result := make(map[string]*SiteMatrix)
-	selfMatrixStatusFromCNI := func(node *NodeStatusResponse) string {
-		if node.NodeInfo.WireGuard != nil && strings.TrimSpace(node.NodeInfo.WireGuard.Interface) != "" {
-			return "up"
-		}
-
-		return ""
-	}
-
-	buildScopeMatrix := func(nodeSet map[string]bool) *SiteMatrix {
-		if len(nodeSet) == 0 || len(nodeSet) > 100 {
-			return nil
-		}
-
-		nodeNames := make([]string, 0, len(nodeSet))
-		for name := range nodeSet {
-			nodeNames = append(nodeNames, name)
-		}
-
-		sort.Strings(nodeNames)
-
-		results := make(map[string]map[string]string)
-		for _, srcNode := range nodeNames {
-			results[srcNode] = make(map[string]string)
-			if node, ok := nodeByName[srcNode]; ok {
-				results[srcNode][srcNode] = selfMatrixStatusFromCNI(node)
-			}
-
-			for _, peer := range nodePeers[srcNode] {
-				tgtNode := peer.Name
-				if tgtNode == "" || tgtNode == srcNode || !nodeSet[tgtNode] {
-					continue
-				}
-
-				cellStatus := ""
-				if peer.HealthCheck != nil {
-					cellStatus = peer.HealthCheck.Status
-				} else if peer.PeerType == "gateway" && !peer.Tunnel.LastHandshake.IsZero() {
-					cellStatus = "up"
-				}
-
-				results[srcNode][tgtNode] = cellStatus
-			}
-		}
-
-		return &SiteMatrix{Nodes: nodeNames, Results: results}
-	}
-
-	for site, nodeSet := range siteNodes {
-		scopeMatrix := buildScopeMatrix(nodeSet)
-		if scopeMatrix != nil {
-			result[site] = scopeMatrix
-		}
-	}
-
-	for _, pool := range gatewayPools {
-		poolName := strings.TrimSpace(pool.Name)
-		if poolName == "" {
-			continue
-		}
-
-		poolNodeSet := make(map[string]bool)
-
-		for _, gatewayName := range pool.Gateways {
-			name := strings.TrimSpace(gatewayName)
-			if name == "" {
-				continue
-			}
-
-			poolNodeSet[name] = true
-			for _, peer := range nodePeers[name] {
-				peerName := strings.TrimSpace(peer.Name)
-				if peerName == "" {
-					continue
-				}
-
-				if _, ok := nodeByName[peerName]; ok {
-					poolNodeSet[peerName] = true
-				}
-			}
-
-			for srcNodeName, peers := range nodePeers {
-				for _, peer := range peers {
-					if strings.TrimSpace(peer.Name) == name {
-						if _, ok := nodeByName[srcNodeName]; ok {
-							poolNodeSet[srcNodeName] = true
-						}
-
-						break
-					}
-				}
-			}
-		}
-
-		scopeMatrix := buildScopeMatrix(poolNodeSet)
-		if scopeMatrix != nil {
-			result["pool:"+poolName] = scopeMatrix
-		}
-	}
-
-	if len(result) == 0 {
-		return nil
-	}
-
-	return result
 }

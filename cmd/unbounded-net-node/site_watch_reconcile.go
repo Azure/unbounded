@@ -989,6 +989,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 
 		enabled, profile := healthCheckProfileFromSettings(site.Spec.HealthCheckSettings, siteScope)
 		if !enabled {
+			siteHealthCheckProfileNames[siteName] = disabledHealthCheckProfile
 			continue
 		}
 
@@ -1109,7 +1110,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 		// If our site is in this peering, add all other sites
 		if mySiteInPeering {
 			remoteSites := make([]string, 0, len(peering.Spec.Sites))
-			peeringHealthCheckProfileName := ""
+			peeringHealthCheckProfileName := disabledHealthCheckProfile
 
 			peeringScope := healthCheckLogScope(sitePeeringGVR, peering.Name)
 			if enabled, profile := healthCheckProfileFromSettings(peering.Spec.HealthCheckSettings, peeringScope); enabled {
@@ -1287,6 +1288,8 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 				poolHealthCheckProfileNames[pool.Name] = profileName
 				healthCheckProfileSources[profileName] = poolScope
 			}
+		} else {
+			poolHealthCheckProfileNames[pool.Name] = disabledHealthCheckProfile
 		}
 		// Collect pool-level tunnelMTU override.
 		if v := tunnelMTUFromSpec(pool.Spec.TunnelMTU); v > 0 {
@@ -1407,7 +1410,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 				continue
 			}
 
-			peeringHealthCheckProfileName := ""
+			peeringHealthCheckProfileName := disabledHealthCheckProfile
 
 			peeringScope := healthCheckLogScope(gatewayPoolPeeringGVR, peering.Name)
 			if enabled, profile := healthCheckProfileFromSettings(peering.Spec.HealthCheckSettings, peeringScope); enabled {
@@ -2100,7 +2103,7 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 			assignmentSiteHealthCheckProfileNames, assignmentPoolHealthCheckProfileNames,
 			poolHealthCheckProfileNames,
 			siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs,
-			assignmentPoolTunnelMTUs, poolTunnelMTUs, state)
+			assignmentPoolTunnelMTUs, poolTunnelMTUs, state, healthCheckProfiles)
 		if sharedTunnelErr != nil {
 			klog.Warningf("Tunnel configuration failed (WireGuard will still be configured): %v", sharedTunnelErr)
 		}
@@ -2133,11 +2136,15 @@ func updateWireGuardFromSlices(ctx context.Context, dynamicClient dynamic.Interf
 
 	// Configure WireGuard with WG peers, merging tunnel routes into
 	// the unified route manager's SyncRoutes call.
-	if err := configureWireGuardFunc(ctx, cfg, privKey, wgMeshPeers, wgGatewayPeers, mySiteName, peeredSites, networkPeeredSites, gatewayNodePubKeys, siteHealthCheckProfileNames, peeringSiteHealthCheckProfileNames, assignmentSiteHealthCheckProfileNames, assignmentPoolHealthCheckProfileNames, poolHealthCheckProfileNames, siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs, assignmentPoolTunnelMTUs, poolTunnelMTUs, tunnelRoutes, tunnelHCPeers, state); err != nil {
+	if err := configureWireGuardFunc(ctx, cfg, privKey, wgMeshPeers, wgGatewayPeers, mySiteName, peeredSites, networkPeeredSites, gatewayNodePubKeys, siteHealthCheckProfileNames, peeringSiteHealthCheckProfileNames, assignmentSiteHealthCheckProfileNames, assignmentPoolHealthCheckProfileNames, poolHealthCheckProfileNames, siteTunnelMTUs, peeringSiteTunnelMTUs, assignmentSiteTunnelMTUs, assignmentPoolTunnelMTUs, poolTunnelMTUs, tunnelRoutes, tunnelHCPeers, state, healthCheckProfiles); err != nil {
 		return err
 	}
 
-	if sharedTunnelErr != nil && fabricMTUIncreased {
+	if sharedTunnelErr != nil && (fabricMTUIncreased || errors.Is(sharedTunnelErr, errRegisterHealthChecks)) {
+		if errors.Is(sharedTunnelErr, errRegisterHealthChecks) {
+			return sharedTunnelErr
+		}
+
 		return fmt.Errorf("cannot raise fabric MTU while tunnel reconciliation is incomplete: %w", sharedTunnelErr)
 	}
 

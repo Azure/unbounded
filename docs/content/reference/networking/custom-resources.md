@@ -253,8 +253,8 @@ spec:
   healthCheckSettings:
     enabled: true
     detectMultiplier: 3
-    receiveInterval: 300ms
-    transmitInterval: 300ms
+    receiveInterval: 15s
+    transmitInterval: 15s
   tunnelProtocol: Auto
 ```
 
@@ -384,15 +384,20 @@ GatewayPool, SiteGatewayPoolAssignment, and GatewayPoolPeering:
 |-------|------|---------|-------------|
 | `enabled` | `*bool` | `true` | Enable health checks for routes in this scope. |
 | `detectMultiplier` | `*int32` | 3 | Number of consecutive failures before marking unhealthy. |
-| `receiveInterval` | `string` | `300ms` | Expected interval between received probes. |
-| `transmitInterval` | `string` | `300ms` | Interval between sent probes. |
+| `receiveInterval` | `string` | `15s` | Expected interval between received probes. |
+| `transmitInterval` | `string` | `15s` | Interval between sent probes. |
 
 ### Precedence
 
-- **Same-site routes**: `Site.spec.healthCheckSettings`
-- **Peered-site routes**: `SitePeering.spec.healthCheckSettings`
-- **Gateway pool routes**: `SiteGatewayPoolAssignment.spec.healthCheckSettings`
-  → `GatewayPool.spec.healthCheckSettings` → `Site.spec.healthCheckSettings`
+- `Site.spec.healthCheckSettings` applies to node-to-node routes within the same site.
+- `SitePeering.spec.healthCheckSettings` applies to node-to-node routes between sites in that peering.
+- `GatewayPool.spec.healthCheckSettings` governs same-pool gateway peers.
+- `GatewayPoolPeering.spec.healthCheckSettings` applies to routes between gateway pools in that peering.
+
+For mesh peers, an explicit gateway-pool or pool-peering profile wins, followed by a `SiteGatewayPoolAssignment`, a `SitePeering`, and then the peer's `Site`.
+For node-to-gateway peers, the node's site/pool assignment governs; gateway nodes use their explicit peer profile or the peer's pool profile, with a remote-site/pool assignment as fallback.
+Shared-tunnel gateway peers may fall back to the local site's profile when no governing association exists; WireGuard gateway peers do not use that site fallback.
+An explicitly disabled governing profile blocks every fallback.
 
 If multiple peerings define conflicting settings, peerings are processed in
 deterministic name order and the first profile is kept.

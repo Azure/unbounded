@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/bits"
 	"sort"
 	"strings"
 	"sync"
@@ -49,12 +50,13 @@ type ChairOptions struct {
 	PollManifest          time.Duration
 	PollLayer             time.Duration
 	APITimeout            time.Duration
+	ChairCount            int
 	SeedCount             int
 	TrustedFailureClasses []ifaces.FailureClass
 	// OnSeedRecruit reports one completed seed-recruitment pass: how many chairs
 	// were selectable, how many were contacted, and how many accepted. contacted
-	// above SeedCount means the cohort accepted nothing and the resolver moved
-	// down the ranking, which widens the set of nodes fetching from origin.
+	// above the effective scaled cohort means the resolver moved down the ranking,
+	// which widens the set of nodes fetching from origin.
 	OnSeedRecruit func(kind string, selectable, contacted, accepted int)
 	// OnChairDispatch reports the outcome of one please_pull to one chair.
 	// reason is "accepted" or why the chair did not count: "rpc_error" (no
@@ -110,7 +112,11 @@ func NewChairResolver(opts ChairOptions) *ChairResolver {
 	}
 
 	if opts.SeedCount <= 0 {
-		opts.SeedCount = chairs.DefaultSeedCount
+		opts.SeedCount = chairs.SeedCount
+	}
+
+	if opts.ChairCount <= 0 {
+		opts.ChairCount = chairs.DefaultCount
 	}
 
 	if opts.APITimeout <= 0 {
@@ -140,8 +146,10 @@ func (r *ChairResolver) Resolve(ctx context.Context, d digest.Digest, kind iface
 		return nil, err
 	}
 
-	ranked := chairs.Rank(snapshot, d)
-	if len(ranked) < r.opts.SeedCount {
+	ranked := chairs.Rank(snapshot, d, r.opts.ChairCount)
+
+	seedCount := r.seedCount(len(ranked))
+	if seedCount == 0 {
 		return nil, ErrExhausted
 	}
 
@@ -154,7 +162,7 @@ func (r *ChairResolver) Resolve(ctx context.Context, d digest.Digest, kind iface
 		)
 	}
 
-	accepted := make([]chairs.Chair, 0, r.opts.SeedCount)
+	accepted := make([]chairs.Chair, 0, seedCount)
 	sawTransientFailure := false
 
 	// Recruit the seed cohort in one pass. A chair that does not answer inside
@@ -165,7 +173,7 @@ func (r *ChairResolver) Resolve(ctx context.Context, d digest.Digest, kind iface
 	// accepts nothing justifies moving down the ranking.
 	next := 0
 	for len(accepted) == 0 && next < len(ranked) {
-		end := next + r.opts.SeedCount
+		end := next + seedCount
 		if end > len(ranked) {
 			end = len(ranked)
 		}
@@ -243,7 +251,7 @@ func (r *ChairResolver) Resolve(ctx context.Context, d digest.Digest, kind iface
 			return nil, ErrExhausted
 		}
 
-		end := next + r.opts.SeedCount
+		end := next + seedCount
 		if end > len(ranked) {
 			end = len(ranked)
 		}
@@ -259,7 +267,7 @@ func (r *ChairResolver) Resolve(ctx context.Context, d digest.Digest, kind iface
 
 		next = end
 		for len(accepted) == 0 && next < len(ranked) {
-			end = next + r.opts.SeedCount
+			end = next + seedCount
 			if end > len(ranked) {
 				end = len(ranked)
 			}
@@ -414,12 +422,14 @@ func (r *ChairResolver) PrefetchManifestChildren(ctx context.Context, _ digest.D
 
 		seen[child.Digest] = struct{}{}
 
-		ranked := chairs.Rank(snapshot, child.Digest)
-		if len(ranked) < r.opts.SeedCount {
+		ranked := chairs.Rank(snapshot, child.Digest, r.opts.ChairCount)
+
+		seedCount := r.seedCount(len(ranked))
+		if seedCount == 0 {
 			continue
 		}
 
-		for _, chair := range ranked[:r.opts.SeedCount] {
+		for _, chair := range ranked[:seedCount] {
 			key := groupKey{
 				peer:       chair.Holder.PeerID,
 				chair:      chair.ID,
@@ -482,6 +492,28 @@ func (r *ChairResolver) PrefetchManifestChildren(ctx context.Context, _ digest.D
 	}
 
 	return nil
+}
+
+func (r *ChairResolver) seedCount(selectable int) int {
+	if selectable <= 0 {
+		return 0
+	}
+
+	seedCount := proportionalSeedCount(selectable, r.opts.SeedCount, r.opts.ChairCount)
+	seedCount = min(seedCount, r.opts.SeedCount)
+
+	return min(seedCount, selectable)
+}
+
+func proportionalSeedCount(selectable, seedCount, chairCount int) int {
+	high, low := bits.Mul64(uint64(selectable), uint64(seedCount))
+
+	quotient, remainder := bits.Div64(high, low, uint64(chairCount))
+	if remainder > 0 {
+		quotient++
+	}
+
+	return int(quotient)
 }
 
 func allChairOutcomesAccepted(outcomes []ifaces.PleasePullOutcome) bool {
@@ -548,7 +580,7 @@ func (r *ChairResolver) pullChairOnce(ctx context.Context, chair chairs.Chair, r
 	}
 
 	assignment := ifaces.ChairAssignment{
-		ChairID:         uint32(chair.ID),
+		ChairID:         uint64(chair.ID),
 		Generation:      chair.Generation,
 		AssignmentEpoch: chair.AssignmentEpoch,
 	}

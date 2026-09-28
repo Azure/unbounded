@@ -50,9 +50,14 @@ func EnsureDaemonBinaryLinks(ctx context.Context, log *slog.Logger, paths goalst
 	}
 
 	currentTarget := paths.CurrentTargetPath
-	if _, err := os.Lstat(paths.CurrentPath); err != nil {
+	// Resolved rather than stat'd, matching the last-good check below. Lstat
+	// succeeds on a symlink whose target is gone, so a dangling current link
+	// read as healthy and was left alone. VerifyDaemonInstalled resolves it and
+	// fails, which made the link the one fault that verify could report and
+	// repair could not fix: start returned the same stat error forever.
+	if _, err := filepath.EvalSymlinks(paths.CurrentPath); err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("stat current daemon binary symlink: %w", err)
+			return fmt.Errorf("resolve current daemon binary symlink: %w", err)
 		}
 
 		target, targetErr := initialDaemonBinaryTarget(paths)

@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	"github.com/Azure/unbounded/internal/operator/component"
@@ -704,6 +705,43 @@ func TestReconcileStaysReadyWhenWithholdingChangesNothing(t *testing.T) {
 	if res.RequeueAfter != backendIdlePollInterval {
 		t.Fatalf("RequeueAfter = %s, want the idle interval %s: with nothing pending there is no drift to converge, "+
 			"and the fast interval re-applies net's whole manifest set once per Site per tick", res.RequeueAfter, backendIdlePollInterval)
+	}
+}
+
+func TestControllerDeploymentPredicateFiresOnlyOnUsefulStatusTransitions(t *testing.T) {
+	env := &component.Env{Namespace: component.DefaultNamespace}
+	predicate := controllerDeploymentPredicate(env)
+
+	ready := servingObjects()[1].(*appsv1.Deployment)
+	rolling := ready.DeepCopy()
+	rolling.Status.AvailableReplicas = 0
+	intermediate := rolling.DeepCopy()
+	intermediate.Status.ReadyReplicas = 0
+
+	if predicate.Update(event.UpdateEvent{ObjectOld: rolling, ObjectNew: intermediate}) {
+		t.Fatal("intermediate rollout status churn should not enqueue")
+	}
+
+	if !predicate.Update(event.UpdateEvent{ObjectOld: rolling, ObjectNew: ready}) {
+		t.Fatal("transition to rollout complete must enqueue")
+	}
+
+	if !predicate.Update(event.UpdateEvent{ObjectOld: ready, ObjectNew: rolling}) {
+		t.Fatal("transition away from rollout complete must enqueue")
+	}
+
+	drifted := ready.DeepCopy()
+
+	drifted.Generation++
+	if !predicate.Update(event.UpdateEvent{ObjectOld: ready, ObjectNew: drifted}) {
+		t.Fatal("desired-state drift must still enqueue")
+	}
+
+	other := ready.DeepCopy()
+
+	other.Name = "other"
+	if predicate.Update(event.UpdateEvent{ObjectOld: other, ObjectNew: other.DeepCopy()}) {
+		t.Fatal("unmanaged Deployment should not enqueue")
 	}
 }
 
