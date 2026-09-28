@@ -919,6 +919,34 @@ func TestHTTPPollAdmissionAndCancellation(t *testing.T) {
 	}
 }
 
+func TestTLSAdmissionSaturationSendsInternalError(t *testing.T) {
+	f := newServingFixture(t)
+	f.a.Server.Config.Limits.MaxConcurrentBootstrap = 1
+
+	endpoint := f.start(t)
+	if !take(f.a.Server.authSlots) {
+		t.Fatal("could not saturate admission")
+	}
+	defer release(f.a.Server.authSlots)
+
+	conn, err := net.DialTimeout("tcp", strings.TrimPrefix(endpoint, "https://"), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	if err := conn.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	client := tls.Client(conn, &tls.Config{RootCAs: f.roots, ServerName: "example.com", MinVersion: tls.VersionTLS13})
+
+	err = client.HandshakeContext(f.ctx)
+	if err == nil || !strings.Contains(err.Error(), "internal error") {
+		t.Fatalf("saturated ClientHello should send TLS internal_error, got %v", err)
+	}
+}
+
 func TestAdmissionAndAPIDeadlines(t *testing.T) {
 	f := newServingFixture(t)
 	f.a.Server.Config.Limits.MaxConcurrentBootstrap = 1

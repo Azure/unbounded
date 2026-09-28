@@ -345,6 +345,7 @@ fn two_workers_start_from_real_control_and_checkpoint_one_complete_cut() {
 }
 
 struct Fixture {
+    handshake_alerts: Arc<Mutex<VecDeque<u8>>>,
     directory: PathBuf,
     stop: Arc<AtomicBool>,
     server: Option<thread::JoinHandle<()>>,
@@ -783,6 +784,80 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
 }
 
 #[test]
+fn startup_retries_tls_internal_error_before_enrollment_and_worker_snapshot() {
+    let mut fixture = Fixture::new();
+    let mut config = fixture.config.take().unwrap();
+    let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
+    fixture.handshake_alerts.lock().unwrap().push_back(80);
+    config.node = bootstrap(
+        &config,
+        &node,
+        &config.limits,
+        &scope(Duration::from_secs(15)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(fixture.enrollments.load(Ordering::Acquire), 1);
+    assert_eq!(fixture.polls.load(Ordering::Acquire), 0);
+    fixture.handshake_alerts.lock().unwrap().push_back(80);
+    let (mut worker, runtime, mut engine) = local_worker(&config, &node, 0);
+    drive(
+        &runtime,
+        &mut engine,
+        worker.start(&scope(Duration::from_secs(15)).unwrap()),
+    )
+    .unwrap();
+    assert!(node.observations.health.ready());
+    assert_eq!(fixture.enrollments.load(Ordering::Acquire), 2);
+    assert!(fixture.polls.load(Ordering::Acquire) > 0);
+    assert!(!fixture.poll_certificates.lock().unwrap().is_empty());
+    let shutdown = scope(Duration::from_secs(5)).unwrap();
+    drive(&runtime, &mut engine, worker.drain(&shutdown)).unwrap();
+    drive(&runtime, &mut engine, worker.shutdown(&shutdown)).unwrap();
+}
+
+#[test]
+fn startup_tls_authentication_alert_remains_terminal() {
+    let mut fixture = Fixture::new();
+    let config = fixture.config.take().unwrap();
+    let node = NodeState::new(vec![WorkerId(0)], 64).unwrap();
+    fixture.handshake_alerts.lock().unwrap().push_back(42);
+    assert_eq!(
+        bootstrap(
+            &config,
+            &node,
+            &config.limits,
+            &scope(Duration::from_secs(5)).unwrap()
+        ),
+        Err(Error::Unauthorized)
+    );
+    assert_eq!(fixture.enrollments.load(Ordering::Acquire), 0);
+    assert_eq!(fixture.polls.load(Ordering::Acquire), 0);
+    assert!(!config.identity_directory.join("identity.json").exists());
+    assert!(!node.observations.health.ready());
+}
+
+#[test]
+fn startup_tls_internal_error_respects_deadline() {
+    let mut fixture = Fixture::new();
+    let config = fixture.config.take().unwrap();
+    let node = NodeState::new(vec![WorkerId(0)], 64).unwrap();
+    fixture.handshake_alerts.lock().unwrap().extend([80; 16]);
+    assert_eq!(
+        bootstrap(
+            &config,
+            &node,
+            &config.limits,
+            &scope(Duration::from_millis(500)).unwrap()
+        ),
+        Err(Error::DeadlineExceeded)
+    );
+    assert_eq!(fixture.enrollments.load(Ordering::Acquire), 0);
+    assert_eq!(fixture.polls.load(Ordering::Acquire), 0);
+    assert!(!config.identity_directory.join("identity.json").exists());
+    assert!(!node.observations.health.ready());
+}
+
+#[test]
 fn startup_reauthenticates_retained_identity_and_fails_closed() {
     let mut fixture = Fixture::new();
     let config = fixture.config.take().unwrap();
@@ -1141,9 +1216,11 @@ impl Fixture {
         let certificates = poll_certificates.clone();
         let published = Arc::new(Mutex::new(None::<wire::Publication>));
         let external_publication = published.clone();
+        let handshake_alerts = Arc::new(Mutex::new(VecDeque::new()));
+        let alerts = handshake_alerts.clone();
         let server = thread::spawn(move || {
             while !stopping.load(Ordering::Acquire) {
-                let (socket, _) = match listener.accept() {
+                let (mut socket, _) = match listener.accept() {
                     Ok(pair) => pair,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(1));
@@ -1157,6 +1234,16 @@ impl Fixture {
                 socket
                     .set_write_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
+                if let Some(alert) = alerts.lock().unwrap().pop_front() {
+                    // Read the complete ClientHello before sending Go's fatal
+                    // pre-handshake alert, avoiding a reset from unread TCP data.
+                    let mut header = [0; 5];
+                    socket.read_exact(&mut header).unwrap();
+                    let mut hello = vec![0; u16::from_be_bytes([header[3], header[4]]) as usize];
+                    socket.read_exact(&mut hello).unwrap();
+                    socket.write_all(&[21, 3, 3, 0, 2, 2, alert]).unwrap();
+                    continue;
+                }
                 let mut stream = rustls::StreamOwned::new(
                     rustls::ServerConnection::new(tls.clone()).unwrap(),
                     socket,
@@ -1275,6 +1362,7 @@ impl Fixture {
             }
         });
         Self {
+            handshake_alerts,
             directory,
             stop,
             server: Some(server),

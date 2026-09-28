@@ -901,7 +901,29 @@ impl WorkerApplication {
             node.prepared.fetch_add(1, Ordering::Release);
             self.attach_cache_adapter();
             if let Some(control) = self.control.clone() {
-                let identity = control.start(startup).await?;
+                let identity = loop {
+                    match control.start(startup).await {
+                        Ok(identity) => break identity,
+                        Err(
+                            Error::Io
+                            | Error::Unavailable
+                            | Error::Overloaded
+                            | Error::DeadlineExceeded,
+                        ) => {
+                            startup.check()?;
+                            let io = ReactorControlIo::new(self.runtime.reactor.clone());
+                            crate::control::transport::ControlIo::sleep(
+                                &io,
+                                control
+                                    .next_attempt()
+                                    .unwrap_or_else(crate::runtime::environment::now),
+                                startup,
+                            )
+                            .await?;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                };
                 if identity.node() != self.keys.node() {
                     return Err(Error::NodeIdentityChanged);
                 }

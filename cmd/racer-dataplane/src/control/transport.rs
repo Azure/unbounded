@@ -538,9 +538,7 @@ impl ControlConnection {
             match self.tls.read_tls(&mut self.stream) {
                 Ok(0) => return Err(Error::Io),
                 Ok(_) => {
-                    self.tls
-                        .process_new_packets()
-                        .map_err(|_| Error::Unauthorized)?;
+                    self.tls.process_new_packets().map_err(tls_failure)?;
                     progress = true;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
@@ -793,6 +791,16 @@ impl ControlConnection {
         }
     }
 }
+// Go's TLS server sends internal_error when bounded ClientHello admission is
+// saturated. Retry that transport failure without accepting an unauthenticated
+// connection; certificate and protocol failures remain terminal.
+fn tls_failure(error: rustls::Error) -> Error {
+    match error {
+        rustls::Error::AlertReceived(rustls::AlertDescription::InternalError) => Error::Unavailable,
+        _ => Error::Unauthorized,
+    }
+}
+
 enum Framing {
     Length(usize),
     Chunked,

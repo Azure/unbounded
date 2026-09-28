@@ -487,6 +487,11 @@ deployment integration check and is not exercised by envtest.
   `Server.authenticateSnapshot` shares admission and certificate verification before
   and after waiting. The shared `authSlots` pool retains the public configuration
   name `Limits.MaxConcurrentBootstrap`.
+  Go reports ClientHello admission failure as a TLS `internal_error` alert before
+  HTTP is available. The dataplane treats that alert as unavailable and retries
+  with its bounded jittered backoff, including the worker's enrollment after
+  initial bootstrap. Certificate/protocol alerts and HTTP 401/403 remain terminal;
+  no connection or identity is accepted until normal authentication succeeds.
   Long polls are capped by the earliest verified-chain expiration and reauthorize
   after waiting, before writing. Expiration can return a bounded 401 recovery error.
   Snapshot bytes use `WriteTo` with bounded scratch and request cancellation checks.
