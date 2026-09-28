@@ -413,8 +413,9 @@ type registry struct {
 	// usually issue tokens whose scope covers an entire repo's pulls, so one
 	// token serves manifest + config + many layer requests. A per-scope map
 	// lands when the design doc retries make that worthwhile.
-	tokMu sync.Mutex
-	token *cachedToken
+	tokMu        sync.Mutex
+	token        *cachedToken
+	tokenRefresh *tokenRefresh
 
 	challengeMu     sync.Mutex
 	challenge       *cachedAuthenticationChallenge
@@ -427,6 +428,13 @@ type challengeFlight struct {
 	done    chan struct{}
 	cancel  context.CancelFunc
 	waiters int
+}
+
+type tokenRefresh struct {
+	challenge string
+	done      chan struct{}
+	token     string
+	err       error
 }
 
 type cachedToken struct {
@@ -929,7 +937,7 @@ func (r *registry) doRange(ctx context.Context, method, urlStr, rangeValue strin
 	_ = resp.Body.Close() //nolint:errcheck // best-effort body close
 
 	if cachedTok != "" {
-		r.clearToken()
+		r.clearToken(cachedTok)
 	}
 
 	if !strings.HasPrefix(strings.ToLower(challenge), "bearer ") {
@@ -946,12 +954,10 @@ func (r *registry) doRange(ctx context.Context, method, urlStr, rangeValue strin
 		return r.hc.Do(retry)
 	}
 
-	tok, ttl, err := r.fetchBearerToken(ctx, challenge)
+	tok, err := r.refreshBearerToken(ctx, challenge)
 	if err != nil {
 		return nil, err
 	}
-
-	r.setToken(tok, ttl)
 
 	req2, err := build("Bearer " + tok)
 	if err != nil {
@@ -959,6 +965,48 @@ func (r *registry) doRange(ctx context.Context, method, urlStr, rangeValue strin
 	}
 
 	return r.hc.Do(req2)
+}
+
+// Keep one refresh in flight per registry, not an unbounded map of scopes.
+// Different scopes wait and then negotiate independently. Delegated credentials
+// never enter this path. Every waiter can abandon its wait via its own context.
+func (r *registry) refreshBearerToken(ctx context.Context, challenge string) (string, error) {
+	for {
+		r.tokMu.Lock()
+		if flight := r.tokenRefresh; flight != nil {
+			r.tokMu.Unlock()
+
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-flight.done:
+			}
+
+			if flight.challenge == challenge {
+				return flight.token, flight.err
+			}
+
+			continue
+		}
+
+		flight := &tokenRefresh{challenge: challenge, done: make(chan struct{})}
+		r.tokenRefresh = flight
+		r.tokMu.Unlock()
+
+		token, ttl, err := r.fetchBearerToken(ctx, challenge)
+		if err == nil {
+			r.setToken(token, ttl)
+		}
+
+		r.tokMu.Lock()
+		flight.token, flight.err = token, err
+		r.tokenRefresh = nil
+
+		close(flight.done)
+		r.tokMu.Unlock()
+
+		return token, err
+	}
 }
 
 func parseOriginContentRange(value string) (start, end, size int64, ok bool) {
@@ -1153,11 +1201,13 @@ func (r *registry) setToken(value string, ttl time.Duration) {
 	r.token = &cachedToken{value: value, expiresAt: time.Now().Add(effective)}
 }
 
-func (r *registry) clearToken() {
+func (r *registry) clearToken(rejected string) {
 	r.tokMu.Lock()
 	defer r.tokMu.Unlock()
 
-	r.token = nil
+	if r.token != nil && r.token.value == rejected {
+		r.token = nil
+	}
 }
 
 // classify maps an HTTP status to a the design doc FailureClass and preserves

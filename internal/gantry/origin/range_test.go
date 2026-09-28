@@ -380,6 +380,7 @@ func TestPullRangeHTTP1PoolReuse(t *testing.T) {
 	var wg sync.WaitGroup
 	for range parallel {
 		wg.Add(1)
+
 		go func() {
 			defer wg.Done()
 
@@ -412,6 +413,7 @@ func TestPullRangeHTTP1PoolReuse(t *testing.T) {
 
 	for range parallel {
 		wg.Add(1)
+
 		go func() {
 			defer wg.Done()
 

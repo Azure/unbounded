@@ -156,6 +156,7 @@ func TestByteMetricsCloseDuringRead(t *testing.T) {
 	body := &countingReadCloser{ReadCloser: upstream, onFinish: func(n int64) { bytes.Add(n); calls.Add(1) }}
 
 	done := make(chan struct{})
+
 	go func() { _, _ = body.Read(make([]byte, 1)); close(done) }()
 
 	<-upstream.entered
