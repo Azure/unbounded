@@ -42,6 +42,13 @@ func (r *KeyringReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl
 	}
 
 	result, err := r.reconcileKeys(ctx)
+	return r.finishKeyringReconcile(ctx, result, err)
+}
+
+// finishKeyringReconcile runs while the catalog gate is still held. It refreshes
+// committed trust, applies failure policy, updates readiness, then selects retry
+// behavior. Failed gate admission must not pass through this completion path.
+func (r *KeyringReconciler) finishKeyringReconcile(ctx context.Context, result ctrl.Result, err error) (ctrl.Result, error) {
 	// Install only after authoritative validation of the committed credentials,
 	// including installation binding, rotation consistency, and signing lifetime.
 	if err == nil {
@@ -53,11 +60,12 @@ func (r *KeyringReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl
 		}
 	}
 
+	// Cancellation after admission overrides even an unavailable authority read.
 	if ctx.Err() != nil {
 		err = ctx.Err()
 	}
 
-	if observedAuthorityFailure(err) {
+	if shouldInvalidateTrust(err) {
 		r.Trust.invalidate()
 	}
 

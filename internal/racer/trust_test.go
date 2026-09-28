@@ -283,6 +283,106 @@ func TestTrustRequiresFreshPostReconcileCredentials(t *testing.T) {
 	}
 }
 
+func TestKeyringCancellationOverridesPostReconcileReadFailure(t *testing.T) {
+	for _, failure := range []string{"outage", "conflict", "success"} {
+		t.Run(failure, func(t *testing.T) {
+			r, now := testKeyring(t)
+			runKeys(t, r)
+			_, _, initial, _ := keyState(t, r)
+			*now = initial.NextRotation
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			reads := 0
+			r.APIReader = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if key.Name == r.Config.KeyringSecretName {
+					reads++
+					if reads == 2 {
+						defer cancel()
+
+						switch failure {
+						case "outage":
+							return errors.New("post-reconcile API outage")
+						case "conflict":
+							return apierrors.NewConflict(corev1.Resource("secrets"), key.Name, wire.Conflict)
+						}
+					}
+				}
+
+				return c.Get(ctx, key, obj, opts...)
+			}})
+
+			result, err := r.Reconcile(ctx, ctrl.Request{})
+			if reads != 2 || !errors.Is(err, context.Canceled) || !errors.Is(err, reconcile.TerminalError(nil)) || result != (ctrl.Result{}) {
+				t.Fatalf("post-reconcile cancellation: reads=%d result=%v err=%v", reads, result, err)
+			}
+
+			if _, err := r.Trust.pool(); err == nil || r.Lifecycle.issuer {
+				t.Fatal("cancellation after admission retained trust or issuer readiness")
+			}
+
+			r.APIReader = r.Client
+
+			_, staged, _, _ := keyState(t, r)
+			if staged.Generation != 2 || len(staged.PeerTrustRoots) != 2 {
+				t.Fatal("cancellation preceded successful rotation publication")
+			}
+		})
+	}
+}
+
+func TestReconcilerAlreadyExistsHandling(t *testing.T) {
+	for _, operation := range []string{"keyring", "topology"} {
+		t.Run(operation, func(t *testing.T) {
+			r, now := testKeyring(t)
+			runKeys(t, r)
+			_, _, initial, _ := keyState(t, r)
+			*now = initial.NextRotation
+
+			accepted, err := r.Trust.pool()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			writes := 0
+			writer := interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Update: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.UpdateOption) error {
+				writes++
+				return apierrors.NewAlreadyExists(corev1.Resource("secrets"), obj.GetName())
+			}})
+
+			var result ctrl.Result
+
+			if operation == "keyring" {
+				r.Client = writer
+				result, err = r.Reconcile(t.Context(), ctrl.Request{})
+				if err != nil || result.RequeueAfter != retryConflictDelay {
+					t.Fatalf("keyring AlreadyExists not requeued: %v %v", result, err)
+				}
+
+				if _, err := r.Trust.pool(); err == nil || r.Lifecycle.issuer {
+					t.Fatal("keyring write failure retained trust or issuer readiness")
+				}
+			} else {
+				topology := Assemble(r.Config, writer, r.APIReader).Topology
+				topology.Trust = r.Trust
+				result, err = topology.Reconcile(t.Context(), ctrl.Request{})
+				if !apierrors.IsAlreadyExists(err) || result != (ctrl.Result{}) {
+					t.Fatalf("topology AlreadyExists treated as Conflict: %v %v", result, err)
+				}
+
+				if current, err := r.Trust.pool(); err != nil || current != accepted {
+					t.Fatalf("topology publication write failure changed trust: %v", err)
+				}
+			}
+
+			if writes != 1 {
+				t.Fatalf("expected one failed write, got %d", writes)
+			}
+		})
+	}
+}
+
 func TestLocalTrustInvalidationDuringPoll(t *testing.T) {
 	f := newServingFixture(t)
 

@@ -207,7 +207,7 @@ func (i *Issuer) loadSigning(ctx context.Context, now time.Time) (signingState, 
 	}
 
 	state, err := loadSigning(ctx, i.APIReader, i.Config, now)
-	if observedAuthorityFailure(err) {
+	if shouldInvalidateTrust(err) {
 		i.Trust.invalidate()
 	}
 

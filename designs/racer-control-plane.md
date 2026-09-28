@@ -331,6 +331,15 @@ establishes 100,000-node HTTPS capacity.
   before every write. Readiness follows accepted local trust: observed invalidity
   or deletion withdraws it, while transient authority read failures neither discard
   accepted trust nor restore previously withdrawn trust.
+  `finishKeyringReconcile` performs the fresh committed signing-state load, trust
+  update, readiness update, and error/retry handling while the catalog gate remains
+  held. `shouldInvalidateTrust` is deliberately broader than observed invalidity:
+  only errors marked as unavailable authority reads preserve trust; all other
+  non-nil errors, including write and unclassified failures, withdraw it. Context
+  cancellation after keyring admission overrides even a marked read failure and
+  withdraws trust; cancellation before gate admission leaves accepted state alone.
+  Keyring write Conflict and AlreadyExists errors requeue from fresh inputs after
+  trust invalidation. Topology explicitly requeues only Conflict, not AlreadyExists.
 - Credential initialization CAS-adds the one-way
   `racer.unbounded-cloud.io/credentials` annotation to the existing version
   ConfigMap, binding the two Secret names and initial root fingerprint. Topology
