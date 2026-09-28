@@ -38,7 +38,7 @@ pub struct DiagnosticIo {
 }
 struct Resources {
     _memory: Reservation,
-    _control: Reservation,
+    submissions: Rc<crate::runtime::reactor::SubmissionCapacity>,
     active: Cell<usize>,
 }
 impl DiagnosticIo {
@@ -46,14 +46,16 @@ impl DiagnosticIo {
     /// Must run before ordinary request admission fills the memory quota.
     pub fn attach(reactor: Rc<Reactor>, admission: Rc<Admission>) -> Result<Self> {
         let control = admission.reserve(None, ResourceClass::ControlProgress, CONTROL_SLOTS)?;
-        let memory = admission.reserve(None, ResourceClass::RequestContext, RESERVED_BYTES)?;
-        reactor.init()?;
+        let mut memory = admission.reserve(None, ResourceClass::RequestContext, RESERVED_BYTES)?;
+        let bookkeeping =
+            memory.split(CONTROL_SLOTS * crate::runtime::reactor::SUBMISSION_BYTES)?;
+        let submissions = reactor.reserve_submissions(control, bookkeeping)?;
         Ok(Self {
             reactor,
             admission,
             resources: Rc::new(Resources {
                 _memory: memory,
-                _control: control,
+                submissions,
                 active: Cell::new(0),
             }),
             serving: Cell::new(false),
@@ -145,7 +147,11 @@ pub(super) fn serve<'a>(
             }
             if accepting.is_none() && io.resources.active.get() < MAX_CONNECTIONS {
                 accepting = Some(crate::runtime::listener::retry(scope, || {
-                    io.reactor.accept(listener.clone(), scope)
+                    io.reactor.accept_reserved(
+                        listener.clone(),
+                        Some(io.resources.submissions.clone()),
+                        scope,
+                    )
                 }));
             }
             if let Some(accept) = &mut accepting {
@@ -195,7 +201,10 @@ fn exchange<'a>(
         let route = loop {
             buffer.start = used;
             buffer.end = MAX_REQUEST_BYTES;
-            let completed = io.reactor.recv(fd.clone(), buffer, (), &scope).await?;
+            let completed = io
+                .reactor
+                .recv_reserved(fd.clone(), buffer, io.resources.submissions.clone(), &scope)
+                .await?;
             if completed.bytes == 0 || completed.bytes > MAX_REQUEST_BYTES - used {
                 return Err(Error::Io);
             }
@@ -223,7 +232,10 @@ fn exchange<'a>(
         while sent < length {
             buffer.start = sent;
             buffer.end = length;
-            let completed = io.reactor.send(fd.clone(), buffer, (), &scope).await?;
+            let completed = io
+                .reactor
+                .send_reserved(fd.clone(), buffer, io.resources.submissions.clone(), &scope)
+                .await?;
             if completed.bytes == 0 || completed.bytes > length - sent {
                 return Err(Error::Io);
             }

@@ -66,7 +66,7 @@ use std::{
     },
     path::PathBuf,
     pin::Pin,
-    rc::Rc,
+    rc::{Rc, Weak},
     sync::Arc,
     task::{Context, Poll, Waker},
     time::Duration,
@@ -76,6 +76,28 @@ pub struct Reactor {
     environment: super::environment::Environment,
     admission: Rc<Admission>,
     state: RefCell<State>,
+    ordinary: Rc<Cell<usize>>,
+    reserved: RefCell<Weak<SubmissionCapacity>>,
+}
+
+/// Startup-owned partition of the existing entry and bookkeeping ceilings.
+/// Only crate-internal diagnostics use this capability; it grants no data auth.
+pub(crate) struct SubmissionCapacity {
+    _slots: Reservation,
+    memory: Rc<Reservation>,
+    active: Rc<Cell<usize>>,
+    capacity: usize,
+}
+pub(crate) const SUBMISSION_BYTES: usize = 4096;
+
+struct SubmissionSlot {
+    active: Rc<Cell<usize>>,
+    _capacity: Option<Rc<SubmissionCapacity>>,
+}
+impl Drop for SubmissionSlot {
+    fn drop(&mut self) {
+        self.active.set(self.active.get() - 1);
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct IoId(pub u64);
@@ -221,6 +243,9 @@ struct Signal {
 }
 
 struct Reply<T> {
+    // A reserved slot includes completion bookkeeping, not just the SQE. Keep it
+    // until the result is consumed/dropped as well as the kernel being fenced.
+    _slot: Option<SubmissionSlot>,
     result: Option<Result<T>>,
     // Charge completed-but-unconsumed results as well as submitted work.
     _reservation: Rc<Reservation>,
@@ -381,6 +406,8 @@ impl Reactor {
         Self {
             environment: super::environment::Environment::current(),
             admission,
+            ordinary: Rc::new(Cell::new(0)),
+            reserved: RefCell::default(),
             state: RefCell::new(State {
                 ring: None,
                 wake: None,
@@ -455,11 +482,60 @@ impl Reactor {
         self.state.borrow().entries.len()
     }
 
+    pub(crate) fn reserve_submissions(
+        &self,
+        slots: Reservation,
+        memory: Reservation,
+    ) -> Result<Rc<SubmissionCapacity>> {
+        let capacity = slots.amount();
+        slots.validate(ResourceClass::ControlProgress, capacity)?;
+        memory.validate(
+            ResourceClass::RequestContext,
+            capacity
+                .checked_mul(SUBMISSION_BYTES)
+                .ok_or(Error::InvalidConfiguration)?,
+        )?;
+        if !self.admission.owns(&slots)
+            || !self.admission.owns(&memory)
+            || self.reserved.borrow().upgrade().is_some()
+            || self.ordinary.get()
+                > self
+                    .admission
+                    .limits()
+                    .queue_entries
+                    .get()
+                    .saturating_sub(capacity)
+            || capacity > self.admission.limits().queue_entries.get()
+        {
+            return Err(Error::InvalidConfiguration);
+        }
+        self.init()?;
+        let reserved = Rc::new(SubmissionCapacity {
+            _slots: slots,
+            memory: Rc::new(memory),
+            active: Rc::new(Cell::new(0)),
+            capacity,
+        });
+        *self.reserved.borrow_mut() = Rc::downgrade(&reserved);
+        Ok(reserved)
+    }
+
     fn submit<T: 'static>(
         &self,
         sqe: Submission,
         scope: &RequestScope,
         accept: bool,
+        finish: impl FnOnce(Result<KernelResult>) -> Result<T> + 'static,
+    ) -> Result<Waiting<T>> {
+        self.submit_reserved(sqe, scope, accept, None, finish)
+    }
+
+    fn submit_reserved<T: 'static>(
+        &self,
+        sqe: Submission,
+        scope: &RequestScope,
+        accept: bool,
+        capacity: Option<Rc<SubmissionCapacity>>,
         finish: impl FnOnce(Result<KernelResult>) -> Result<T> + 'static,
     ) -> Result<Waiting<T>> {
         scope.check()?;
@@ -471,21 +547,62 @@ impl Reactor {
         if state.entries.len() >= self.admission.limits().queue_entries.get() {
             return Err(Error::Overloaded);
         }
-        let reservation = Rc::new(self.admission.reserve_completion(
-            None,
-            ResourceClass::RequestContext,
-            std::mem::size_of::<Entry>()
-                + std::mem::size_of::<Reply<T>>()
-                + std::mem::size_of_val(&finish)
-                + std::mem::size_of::<Signal>()
-                + std::mem::size_of::<libc::sockaddr_storage>(),
-        )?);
+        let bytes = std::mem::size_of::<Entry>()
+            + std::mem::size_of::<Reply<T>>()
+            + std::mem::size_of_val(&finish)
+            + std::mem::size_of::<Signal>()
+            + std::mem::size_of::<libc::sockaddr_storage>();
+        let (reservation, active) = if let Some(pool) = &capacity {
+            if !self
+                .reserved
+                .borrow()
+                .upgrade()
+                .is_some_and(|own| Rc::ptr_eq(&own, pool))
+                || bytes > SUBMISSION_BYTES
+            {
+                return Err(Error::InvalidConfiguration);
+            }
+            if pool.active.get() >= pool.capacity {
+                return Err(Error::Overloaded);
+            }
+            (pool.memory.clone(), pool.active.clone())
+        } else {
+            let reserved = self
+                .reserved
+                .borrow()
+                .upgrade()
+                .map_or(0, |pool| pool.capacity);
+            if self.ordinary.get() >= self.admission.limits().queue_entries.get() - reserved {
+                return Err(Error::Overloaded);
+            }
+            (
+                Rc::new(self.admission.reserve_completion(
+                    None,
+                    ResourceClass::RequestContext,
+                    bytes,
+                )?),
+                self.ordinary.clone(),
+            )
+        };
         let id = IoId(state.next);
         if id.0 >= CANCEL_BIT {
             return Err(Error::Overloaded);
         }
         state.next += 1;
+        active.set(active.get() + 1);
+        let slot = SubmissionSlot {
+            active,
+            _capacity: capacity,
+        };
+        // Ordinary entries release their queue slot at the kernel fence, as
+        // before. Only the prepaid partition must also bound unconsumed replies.
+        let (ordinary_slot, reserved_slot) = if slot._capacity.is_some() {
+            (None, Some(slot))
+        } else {
+            (Some(slot), None)
+        };
         let reply = Rc::new(RefCell::new(Reply {
+            _slot: reserved_slot,
             result: None,
             _reservation: reservation,
         }));
@@ -501,6 +618,7 @@ impl Reactor {
             id,
             Entry {
                 finish: Box::new(move |result| {
+                    drop(ordinary_slot);
                     let result = finish(result);
                     if !notify.abandoned.get() {
                         output.borrow_mut().result = Some(result);
@@ -554,6 +672,7 @@ impl Reactor {
         lease: L,
         scope: &'a RequestScope,
         operation: BufferOperation,
+        capacity: Option<Rc<SubmissionCapacity>>,
     ) -> Operation<'a, Completion<B, L>> {
         Box::pin(async move {
             scope.check()?;
@@ -612,7 +731,7 @@ impl Reactor {
                     }
                 }
             );
-            self.submit(sqe, scope, false, move |result| {
+            self.submit_reserved(sqe, scope, false, capacity, move |result| {
                 // Destructure inside the closure to retain the FD even when a
                 // caller drops its own last reference while this I/O is pending.
                 let InFlight {
@@ -665,7 +784,14 @@ impl Reactor {
         lease: L,
         scope: &'a RequestScope,
     ) -> Operation<'a, Completion<B, L>> {
-        self.buffer_io(file, buffer, lease, scope, BufferOperation::Read(offset))
+        self.buffer_io(
+            file,
+            buffer,
+            lease,
+            scope,
+            BufferOperation::Read(offset),
+            None,
+        )
     }
     pub fn write_at<'a, B: IoBuffer, L: 'static>(
         &'a self,
@@ -675,7 +801,14 @@ impl Reactor {
         lease: L,
         scope: &'a RequestScope,
     ) -> Operation<'a, Completion<B, L>> {
-        self.buffer_io(file, buffer, lease, scope, BufferOperation::Write(offset))
+        self.buffer_io(
+            file,
+            buffer,
+            lease,
+            scope,
+            BufferOperation::Write(offset),
+            None,
+        )
     }
 
     pub fn recv<'a, B: IoBuffer, L: 'static>(
@@ -685,7 +818,27 @@ impl Reactor {
         lease: L,
         scope: &'a RequestScope,
     ) -> Operation<'a, Completion<B, L>> {
-        self.buffer_io(fd, buffer, lease, scope, BufferOperation::Recv)
+        self.buffer_io(fd, buffer, lease, scope, BufferOperation::Recv, None)
+    }
+
+    pub(crate) fn recv_reserved<'a, B: IoBuffer>(
+        &'a self,
+        fd: Rc<OwnedFd>,
+        buffer: B,
+        capacity: Rc<SubmissionCapacity>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Completion<B>> {
+        self.buffer_io(fd, buffer, (), scope, BufferOperation::Recv, Some(capacity))
+    }
+
+    pub(crate) fn send_reserved<'a, B: IoBuffer>(
+        &'a self,
+        fd: Rc<OwnedFd>,
+        buffer: B,
+        capacity: Rc<SubmissionCapacity>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Completion<B>> {
+        self.buffer_io(fd, buffer, (), scope, BufferOperation::Send, Some(capacity))
     }
 
     pub fn send<'a, B: SendBuffer, L: 'static>(
@@ -774,6 +927,15 @@ impl Reactor {
         fd: Rc<OwnedFd>,
         scope: &'a RequestScope,
     ) -> Operation<'a, OwnedFd> {
+        self.accept_reserved(fd, None, scope)
+    }
+
+    pub(crate) fn accept_reserved<'a>(
+        &'a self,
+        fd: Rc<OwnedFd>,
+        capacity: Option<Rc<SubmissionCapacity>>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, OwnedFd> {
         Box::pin(async move {
             let sqe = submission!(
                 self,
@@ -786,7 +948,7 @@ impl Reactor {
                 .flags(libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK)
                 .build()
             );
-            self.submit(sqe, scope, true, move |result| {
+            self.submit_reserved(sqe, scope, true, capacity, move |result| {
                 drop(fd);
                 match result? {
                     KernelResult::Accepted(fd) => Ok(fd),
@@ -1210,6 +1372,9 @@ fn encode_address(
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod reserved_submission_tests {
+        include!("reserved_submission_tests.rs");
+    }
     use crate::{
         model::{identity::RequestId, limits::Limits},
         runtime::deadline::{Cancellation, Deadline},
@@ -1691,6 +1856,7 @@ mod tests {
                     .unwrap(),
             );
             let reply = Rc::new(RefCell::new(Reply::<()> {
+                _slot: None,
                 result: None,
                 _reservation: reservation.clone(),
             }));

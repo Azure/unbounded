@@ -111,6 +111,122 @@ fn good_resources() -> super::super::health::Resources {
 }
 
 #[test]
+fn diagnostic_probe_and_monitors_progress_under_sustained_queue_pressure() {
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    limits.queue_entries = std::num::NonZeroUsize::new(8).unwrap();
+    let admission = Rc::new(Admission::new(limits));
+    let reactor = Rc::new(Reactor::new(admission.clone()));
+    let io = Rc::new(DiagnosticIo::attach(reactor.clone(), admission.clone()).unwrap());
+    let telemetry = Telemetry::default();
+    telemetry.health.observe(good_resources()).unwrap();
+    telemetry
+        .health
+        .transition(super::super::health::State::Ready)
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let scope = scope();
+    let mut server = telemetry.serve_listener_with_io(listener, io, &scope);
+    let mut sockets: Vec<_> = ["/readyz", "/metrics", "/debug/failures", "/healthz"]
+        .into_iter()
+        .map(|path| {
+            let mut socket = TcpStream::connect(address).unwrap();
+            socket
+                .write_all(format!("GET {path} HTTP/1.1\r\nHost: local\r\n\r\n").as_bytes())
+                .unwrap();
+            socket.set_nonblocking(true).unwrap();
+            (socket, Vec::new(), false)
+        })
+        .collect();
+    // Accept one connection first, then let ordinary work occupy every available
+    // slot before its receive is submitted. Before isolation this resets the probe.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while telemetry.metrics.count(Event::DiagnosticAccepted) == 0 {
+        assert!(Instant::now() < deadline);
+        poll_server(&mut server, &reactor);
+    }
+    let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let reader = Rc::new(OwnedFd::from(reader));
+    let mut pressure = Vec::new();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    for _ in 0..=8 {
+        let mut wait = reactor.readiness(reader.clone(), libc::POLLIN as u32, &scope);
+        match wait.as_mut().poll(&mut cx) {
+            Poll::Pending => pressure.push(wait),
+            Poll::Ready(Err(Error::Overloaded)) => break,
+            _ => panic!("unexpected pressure result"),
+        }
+    }
+    assert!(!pressure.is_empty());
+    assert_eq!(pressure.len(), 8 - CONTROL_SLOTS);
+    // Payload work also consumes all remaining bookkeeping memory. Diagnostics
+    // must use their existing startup charge, not acquire shared bytes per SQE.
+    let _memory_pressure = admission
+        .reserve(
+            None,
+            ResourceClass::RequestContext,
+            admission.limit(ResourceClass::RequestContext)
+                - admission.used(ResourceClass::RequestContext),
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while sockets.iter().any(|(_, _, done)| !done) {
+        assert!(
+            Instant::now() < deadline,
+            "diagnostics starved by ordinary queue entries"
+        );
+        poll_server(&mut server, &reactor);
+        assert!(reactor.in_flight() <= 8);
+        assert!(telemetry.metrics.gauge(Gauge::DiagnosticConnections) <= MAX_CONNECTIONS as u64);
+        for (socket, response, done) in &mut sockets {
+            if *done {
+                continue;
+            }
+            let mut bytes = [0; 4096];
+            match socket.read(&mut bytes) {
+                Ok(0) => {
+                    assert_response(response, "200 OK", None);
+                    *done = true;
+                }
+                Ok(count) => response.extend_from_slice(&bytes[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => (),
+                Err(error) => panic!("diagnostic reset under ordinary queue pressure: {error}"),
+            }
+        }
+    }
+    assert_eq!(telemetry.metrics.count(Event::DiagnosticIoError), 0);
+    assert_eq!(telemetry.metrics.count(Event::DiagnosticTimeout), 0);
+    // Isolation must not turn genuinely stale/unusable health into a ready result.
+    telemetry
+        .health
+        .observe(super::super::health::Resources {
+            observed_until: Some(Instant::now()),
+            ..good_resources()
+        })
+        .unwrap();
+    let response = exchange_raw(
+        address,
+        b"GET /readyz HTTP/1.1\r\nHost: local\r\n\r\n",
+        &mut server,
+        &reactor,
+    );
+    assert_response(&response, "503 Service Unavailable", Some("not ready\n"));
+    admission.stop();
+    let response = exchange_raw(
+        address,
+        b"GET /readyz HTTP/1.1\r\nHost: local\r\n\r\n",
+        &mut server,
+        &reactor,
+    );
+    assert_response(&response, "503 Service Unavailable", Some("not ready\n"));
+    drop(_memory_pressure);
+    drop(pressure);
+    finish(server, &scope, &reactor);
+    assert_eq!(reactor.in_flight(), 0);
+    assert_eq!(admission.used(ResourceClass::ControlProgress), 0);
+}
+
+#[test]
 fn diagnostic_accept_recovers_after_full_entry_table() {
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.queue_entries = std::num::NonZeroUsize::new(8).unwrap();
@@ -131,15 +247,16 @@ fn diagnostic_accept_recovers_after_full_entry_table() {
     let reader = Rc::new(OwnedFd::from(reader));
     let mut pressure = Vec::new();
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-    for _ in 0..8 {
+    // The ordinary partition can fill, but cannot steal the listener's slots.
+    for _ in 0..8 - CONTROL_SLOTS {
         let mut wait = reactor.readiness(reader.clone(), libc::POLLIN as u32, &scope);
         assert!(wait.as_mut().poll(&mut cx).is_pending());
         pressure.push(wait);
     }
-    assert_eq!(reactor.in_flight(), 8);
+    assert_eq!(reactor.in_flight(), 8 - CONTROL_SLOTS);
     for _ in 0..32 {
         assert!(server.as_mut().poll(&mut cx).is_pending());
-        assert_eq!(reactor.in_flight(), 8);
+        assert_eq!(reactor.in_flight(), 8 - CONTROL_SLOTS + 1);
     }
     drop(pressure);
     for path in ["/readyz", "/metrics"] {

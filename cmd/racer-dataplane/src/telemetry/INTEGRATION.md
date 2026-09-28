@@ -96,15 +96,17 @@ methods are rejected. Unknown paths and query strings produce fixed 404s.
 
 Diagnostics use their startup-reserved memory/control capacity instead of the
 ordinary Connection, Plaintext, or Ciphertext pools, and remain operational after
-ordinary admission stops. However, the current reactor `submit` still charges
-each submission to shared `RequestContext` memory and caps all in-flight entries
-at `queue_entries`. It has no reserved-control submission API. The runtime/app
-integrator must preserve at least five submission slots and submission-bookkeeping
-headroom from data work (or provide a reactor reserved-control API) to guarantee
-diagnostic progress under *complete* shared reactor/memory saturation. Telemetry
-cannot enforce that global ceiling from its owned files. It does not create a
-second reactor to conceal this constraint. Reactor and Admission arguments must
-come from the same worker; Reactor currently exposes no provenance check.
+ordinary admission stops. Attachment partitions five slots from the existing
+`queue_entries` ceiling and 20 KiB of submission bookkeeping from the existing
+340 KiB startup charge. Ordinary submissions cannot consume that partition;
+diagnostic accept/receive/send use a reactor-bound capability. The capability
+validates Admission provenance and rejects duplicate or late attachment that
+would overcommit the existing ceiling. No ring, thread, or quota is added.
+Slots and memory stay charged through original/cancel CQE fences and unconsumed
+results. Shutdown still rejects new submissions once the reactor is stopped.
+This protects against queue/memory admission starvation, not an unpolled worker,
+expired health observations, network loss, or four slow diagnostic connections.
+The four-connection and two-second limits still apply to probes and monitors alike.
 
 ## Internal failure diagnostics
 
