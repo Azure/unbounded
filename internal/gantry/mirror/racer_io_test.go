@@ -22,6 +22,40 @@ type racerDeadlineWriter struct {
 	deadlineErr error
 }
 
+type racerFastWriter struct {
+	*racerDeadlineWriter
+	reads int
+}
+
+func (w *racerFastWriter) ReadFrom(r io.Reader) (int64, error) {
+	w.reads++
+	return io.Copy(w.ResponseRecorder, r)
+}
+
+func TestRacerIOBoundedReadFrom(t *testing.T) {
+	for _, truncated := range []bool{false, true} {
+		w := &racerFastWriter{racerDeadlineWriter: &racerDeadlineWriter{ResponseRecorder: httptest.NewRecorder()}}
+		wrapped := &racerResponseWriter{ResponseWriter: w, timeout: time.Second}
+		length := 3*racerWriteChunk + 1
+
+		advertised := length
+		if truncated {
+			advertised++
+		}
+
+		source := &io.LimitedReader{R: bytes.NewReader(make([]byte, length)), N: int64(advertised)}
+
+		n, err := wrapped.ReadFrom(source)
+		if n != int64(length) || truncated != errors.Is(err, io.ErrUnexpectedEOF) || wrapped.failed != truncated {
+			t.Fatalf("bytes=%d err=%v failed=%v", n, err, wrapped.failed)
+		}
+
+		if w.reads != 4 || len(w.deadlines) != 5 || wrapped.bytes != n || source.N != int64(advertised-length) {
+			t.Fatalf("reads=%d deadlines=%d accounted=%d remaining=%d", w.reads, len(w.deadlines), wrapped.bytes, source.N)
+		}
+	}
+}
+
 func (w *racerDeadlineWriter) SetWriteDeadline(deadline time.Time) error {
 	w.deadlines = append(w.deadlines, deadline)
 	return w.deadlineErr

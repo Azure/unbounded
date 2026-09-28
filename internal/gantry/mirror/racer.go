@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 
@@ -88,6 +87,7 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, upstream, re
 		s.racerError(w, r, upstream, err)
 		return
 	}
+
 	defer func() { _ = value.Close() }() //nolint:errcheck // best-effort close
 
 	actual := value.Metadata()
@@ -125,7 +125,7 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, upstream, re
 	// Read through SDK EOF, including its final framing check. A LimitedReader
 	// would hide a truncated terminator after the advertised payload. OCI digest
 	// verification belongs to the consumer, including resumed object assembly.
-	if n, err := io.Copy(w, value); err != nil || n != remaining {
+	if n, err := value.WriteToHTTP(w); err != nil || n != remaining {
 		panic(http.ErrAbortHandler)
 	}
 }

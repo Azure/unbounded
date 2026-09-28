@@ -204,6 +204,10 @@ func (v *Value) Close() error {
 // If those blocked writers exhaust scratch admission, WriteTo returns
 // ErrorUnavailable. Cancellation cannot interrupt an arbitrary destination Write.
 func (v *Value) WriteTo(w io.Writer) (int64, error) {
+	return v.writeTo(w, false)
+}
+
+func (v *Value) writeTo(w io.Writer, httpTransfer bool) (int64, error) {
 	if _, err := v.Read(nil); err != nil {
 		if err == io.EOF {
 			return 0, nil
@@ -248,6 +252,19 @@ func (v *Value) WriteTo(w io.Writer) (int64, error) {
 	for {
 		buffer := buf[:]
 
+		if httpTransfer && v.remaining > 0 {
+			n, used, err := v.writeHTTPBody(w)
+
+			written += n
+			if err != nil {
+				return written, err
+			}
+
+			if used {
+				continue
+			}
+		}
+
 		if sink, ok := w.(*FDSink); ok && v.remaining > 0 {
 			n, used, err := v.spliceTo(sink)
 
@@ -260,6 +277,16 @@ func (v *Value) WriteTo(w io.Writer) (int64, error) {
 				continue
 			}
 
+			v.mu.Lock()
+			body, ok := v.body.(*responseBody)
+			v.mu.Unlock()
+
+			if ok && body.conn.reader.Buffered() > 0 {
+				buffer = buffer[:min(len(buffer), body.conn.reader.Buffered())]
+			}
+		}
+
+		if httpTransfer {
 			v.mu.Lock()
 			body, ok := v.body.(*responseBody)
 			v.mu.Unlock()

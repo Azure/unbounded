@@ -128,6 +128,50 @@ func (w *racerResponseWriter) Write(p []byte) (int, error) {
 	return total, nil
 }
 
+// ReadFrom keeps net/http in charge of framing and connection reuse. Only a
+// bounded source supplied by the SDK can use the underlying fast path. Preserve
+// the concrete socket under a single limiter so net.TCPConn can recognize it.
+func (w *racerResponseWriter) ReadFrom(r io.Reader) (int64, error) {
+	source, bounded := r.(*io.LimitedReader)
+
+	fast, supported := w.ResponseWriter.(io.ReaderFrom)
+	if !bounded || !supported {
+		return io.Copy(struct{ io.Writer }{w}, r)
+	}
+
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+
+	var total int64
+
+	for source.N > 0 {
+		if err := w.deadline(); err != nil {
+			return total, err
+		}
+
+		remaining := source.N
+		source.N = min(remaining, int64(racerWriteChunk))
+		chunk := source.N
+		n, err := fast.ReadFrom(source)
+		consumed := chunk - source.N
+		source.N += remaining - chunk
+		total += n
+
+		w.bytes += n
+		if err == nil && (n != chunk || consumed != chunk) {
+			err = io.ErrUnexpectedEOF
+		}
+
+		if err != nil {
+			w.failed = true
+			return total, err
+		}
+	}
+
+	return total, nil
+}
+
 func (w *racerResponseWriter) Flush() {
 	if err := w.FlushError(); err != nil {
 		panic(http.ErrAbortHandler)
