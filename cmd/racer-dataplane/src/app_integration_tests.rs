@@ -3,7 +3,6 @@ use super::*;
 use crate::control::wire;
 use std::{
     io::{Read, Write},
-    os::unix::fs::symlink,
     path::PathBuf,
     thread,
 };
@@ -367,6 +366,10 @@ fn two_workers_start_from_real_control_and_checkpoint_one_complete_cut() {
 }
 
 struct Fixture {
+    bundle: Arc<Mutex<wire::KeyringBundle>>,
+    keyring_override: Arc<Mutex<Option<(usize, Vec<u8>)>>>,
+    keyring_tokens: Arc<Mutex<Vec<String>>>,
+    reject_keyring_mtls: Arc<AtomicBool>,
     handshake_alerts: Arc<Mutex<VecDeque<u8>>>,
     directory: PathBuf,
     stop: Arc<AtomicBool>,
@@ -1200,7 +1203,7 @@ impl Fixture {
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
-        std::fs::create_dir_all(directory.join("secrets/epoch")).unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
         let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         ca_params.key_usages = vec![
@@ -1241,7 +1244,6 @@ impl Fixture {
         config.control_endpoint = format!("https://{}", listener.local_addr().unwrap());
         config.trust_bundle = directory.join("trust.pem");
         config.service_account_token = directory.join("token");
-        config.secret_directory = directory.join("secrets");
         config.identity_directory = directory.join("identity");
         config.slab_directory = directory.join("slabs");
         config.slab_bytes = 256 * 1024 * 1024;
@@ -1258,12 +1260,16 @@ impl Fixture {
             peer_trust_roots: vec![ca.der().to_vec()],
             cache_keys: vec![],
         };
-        std::fs::write(
-            directory.join("secrets/epoch/bundle.json"),
-            wire::encode_bundle(&bundle).unwrap(),
-        )
-        .unwrap();
-        symlink("epoch", directory.join("secrets/..data")).unwrap();
+        let bundle = Arc::new(Mutex::new(bundle));
+        let served_bundle = bundle.clone();
+        let keyring_override = Arc::new(Mutex::new(None::<(usize, Vec<u8>)>));
+        let keyring_tokens = Arc::new(Mutex::new(Vec::new()));
+        let reject_keyring_mtls = Arc::new(AtomicBool::new(false));
+        let (key_override, key_tokens, reject_mtls) = (
+            keyring_override.clone(),
+            keyring_tokens.clone(),
+            reject_keyring_mtls.clone(),
+        );
         let node = config.node.clone();
         let binding = Arc::new(Mutex::new(node.clone()));
         let current_binding = binding.clone();
@@ -1273,7 +1279,7 @@ impl Fixture {
         let snapshot_status = poll_status.clone();
         let certificate_age = Arc::new(AtomicUsize::new(1));
         let age = certificate_age.clone();
-        let mut publication = wire::Publication {
+        let publication = wire::Publication {
             schema_version: 1,
             cluster: config.cluster.clone(),
             sequence: wire::PublicationSequence(1),
@@ -1305,7 +1311,10 @@ impl Fixture {
         let held = hold_long_poll.clone();
         let long_polls = Arc::new(AtomicUsize::new(0));
         let waiting = long_polls.clone();
+        let ca = Arc::new(ca);
+        let ca_key = Arc::new(ca_key);
         let server = thread::spawn(move || {
+            let mut handlers = Vec::new();
             while !stopping.load(Ordering::Acquire) {
                 let (mut socket, _) = match listener.accept() {
                     Ok(pair) => pair,
@@ -1331,6 +1340,40 @@ impl Fixture {
                     socket.write_all(&[21, 3, 3, 0, 2, 2, alert]).unwrap();
                     continue;
                 }
+                let (
+                    tls,
+                    current_binding,
+                    external_publication,
+                    enrollment_status,
+                    snapshot_status,
+                ) = (
+                    tls.clone(),
+                    current_binding.clone(),
+                    external_publication.clone(),
+                    enrollment_status.clone(),
+                    snapshot_status.clone(),
+                );
+                let (requests, certificates, issued, polled, age) = (
+                    requests.clone(),
+                    certificates.clone(),
+                    issued.clone(),
+                    polled.clone(),
+                    age.clone(),
+                );
+                let (served_bundle, waiting, held, stopping) = (
+                    served_bundle.clone(),
+                    waiting.clone(),
+                    held.clone(),
+                    stopping.clone(),
+                );
+                let (ca, ca_key) = (ca.clone(), ca_key.clone());
+                let (key_override, key_tokens, reject_mtls) = (
+                    key_override.clone(),
+                    key_tokens.clone(),
+                    reject_mtls.clone(),
+                );
+                let mut publication = publication.clone();
+                handlers.push(thread::spawn(move || {
                 let mut stream = rustls::StreamOwned::new(
                     rustls::ServerConnection::new(tls.clone()).unwrap(),
                     socket,
@@ -1348,7 +1391,7 @@ impl Fixture {
                     assert!(head.len() <= 32768);
                 }
                 if !head.ends_with(b"\r\n\r\n") {
-                    continue;
+                    return;
                 }
                 let head = String::from_utf8(head).unwrap();
                 let length: usize = head
@@ -1366,7 +1409,9 @@ impl Fixture {
                     publication = next;
                 }
                 publication.members[0].node = node.clone();
-                let requested_status = if head.starts_with("POST ") {
+                let requested_status = if head.starts_with("GET /v1/keyring") {
+                    200
+                } else if head.starts_with("POST ") {
                     assert!(head.contains("Authorization: Bearer fixture.token"));
                     assert!(stream.conn.peer_certificates().is_none());
                     requests
@@ -1387,6 +1432,22 @@ impl Fixture {
                         requested_status,
                         format!("{{\"code\":\"{code}\"}}").into_bytes(),
                     )
+                } else if head.starts_with("GET /v1/keyring") {
+                    assert!(stream.conn.peer_certificates().is_some() || head.contains("Authorization: Bearer fixture.token"));
+                    if let Some(token) = head.lines().find_map(|line| line.strip_prefix("Authorization: Bearer ")) {
+                        key_tokens.lock().unwrap().push(token.to_owned());
+                    }
+                    let bundle = served_bundle.lock().unwrap();
+                    if reject_mtls.load(Ordering::Acquire) && stream.conn.peer_certificates().is_some() {
+                        (403, br#"{"code":"forbidden"}"#.to_vec())
+                    } else if let Some(response) = key_override.lock().unwrap().clone() {
+                        if response.0 == 0 { return; }
+                        response
+                    } else if head.lines().next().unwrap().contains(&format!("?after={} ", bundle.generation.0)) {
+                        (204, Vec::new())
+                    } else {
+                        (200, wire::encode_bundle(&bundle).unwrap())
+                    }
                 } else if head.starts_with("POST ") {
                     assert!(head.contains("Authorization: Bearer fixture.token"));
                     assert!(stream.conn.peer_certificates().is_none());
@@ -1450,9 +1511,25 @@ impl Fixture {
                     .write_all(response.as_bytes())
                     .and_then(|()| stream.write_all(&body))
                     .and_then(|()| stream.flush());
+                }));
+                let mut i = 0;
+                while i < handlers.len() {
+                    if handlers[i].is_finished() {
+                        handlers.swap_remove(i).join().unwrap();
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            for handler in handlers {
+                handler.join().unwrap();
             }
         });
         Self {
+            bundle,
+            keyring_override,
+            keyring_tokens,
+            reject_keyring_mtls,
             handshake_alerts,
             directory,
             stop,
@@ -1536,6 +1613,8 @@ fn blocked_publication_is_superseded_while_projection_rotates() {
     .unwrap();
     let control = worker.control.clone().unwrap();
     control.attach_cache_lifecycle(Rc::new(Blocked));
+    // This test drives key delivery explicitly below rather than the worker task.
+    worker.keyring_task.take();
     *fixture.publication.lock().unwrap() = Some(publication(&config, 2, vec![definition()]));
     drive(
         &runtime,
@@ -1547,11 +1626,17 @@ fn blocked_publication_is_superseded_while_projection_rotates() {
         worker.snapshots.cursor().unwrap(),
         Some(wire::PublicationSequence(1))
     );
-    let path = config.secret_directory.join("epoch/bundle.json");
-    let mut bundle = wire::decode_bundle(&std::fs::read(&path).unwrap()).unwrap();
-    bundle.generation = wire::BundleGeneration(2);
-    bundle.cache_keys.clear();
-    std::fs::write(&path, wire::encode_bundle(&bundle).unwrap()).unwrap();
+    {
+        let mut bundle = fixture.bundle.lock().unwrap();
+        bundle.generation = wire::BundleGeneration(2);
+        bundle.cache_keys.clear();
+    }
+    drive(
+        &runtime,
+        &mut engine,
+        control.keyring_progress(&scope(Duration::from_secs(5)).unwrap()),
+    )
+    .unwrap();
     *fixture.publication.lock().unwrap() = Some(publication(&config, 3, vec![]));
     drive(
         &runtime,
@@ -1598,6 +1683,165 @@ fn blocked_publication_is_superseded_while_projection_rotates() {
         worker.shutdown(&scope(Duration::from_secs(5)).unwrap()),
     )
     .unwrap();
+}
+
+#[test]
+fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
+    let mut fixture = Fixture::new();
+    let mut config = fixture.config.take().unwrap();
+    let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
+    {
+        let mut bundle = fixture.bundle.lock().unwrap();
+        *bundle =
+            crate::security::keyring::tests::rotation_bundle(1, bundle.peer_trust_roots.clone());
+        bundle.cluster = config.cluster.clone();
+    }
+    config.node = bootstrap(
+        &config,
+        &node,
+        &config.limits,
+        &scope(Duration::from_secs(15)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        *fixture.keyring_tokens.lock().unwrap(),
+        vec!["fixture.token"]
+    );
+    assert!(!fixture.directory.join("secrets").exists());
+    let (mut worker, runtime, mut engine) = local_worker(&config, &node, 0);
+    drive(
+        &runtime,
+        &mut engine,
+        worker.start(&scope(Duration::from_secs(15)).unwrap()),
+    )
+    .unwrap();
+    worker.keyring_task.take();
+    let control = worker.control.clone().unwrap();
+    let cache = fixture.bundle.lock().unwrap().cache_keys[0]
+        .key
+        .cache
+        .clone();
+    let lease = worker.keys.active(&cache, KeyPurpose::Page).unwrap();
+    let old_id = lease.id();
+    let old_material = *lease.material(KeyPurpose::Page).unwrap();
+    fixture.hold_long_poll.store(true, Ordering::Release);
+    let poll_scope = scope(Duration::from_secs(30)).unwrap();
+    let mut topology = control.progress(&poll_scope);
+    let key_scope = scope(Duration::from_secs(15)).unwrap();
+    {
+        let mut bundle = fixture.bundle.lock().unwrap();
+        *bundle =
+            crate::security::keyring::tests::rotation_bundle(2, bundle.peer_trust_roots.clone());
+        bundle.cluster = config.cluster.clone();
+    }
+    let mut rotation = control.keyring_progress(&key_scope);
+    drive(
+        &runtime,
+        &mut engine,
+        Box::pin(std::future::poll_fn(|cx| {
+            assert!(topology.as_mut().poll(cx).is_pending());
+            rotation.as_mut().poll(cx)
+        })),
+    )
+    .unwrap();
+    assert_eq!(control.projection_error(), None);
+    assert_ne!(
+        worker.keys.active(&cache, KeyPurpose::Page).unwrap().id(),
+        old_id
+    );
+    assert!(
+        worker
+            .keys
+            .lease(Some(&cache), old_id, KeyPurpose::Page)
+            .is_err()
+    );
+    assert_eq!(lease.material(KeyPurpose::Page).unwrap(), &old_material);
+    drop(topology);
+    fixture.hold_long_poll.store(false, Ordering::Release);
+    let accepted = worker.keys.active(&cache, KeyPurpose::Page).unwrap().id();
+    for response in [
+        (200, b"{}".to_vec()),
+        (200, vec![b' '; wire::MAX_BUNDLE_BYTES + 1]),
+        (0, Vec::new()),
+        (409, br#"{"code":"conflict"}"#.to_vec()),
+    ] {
+        *fixture.keyring_override.lock().unwrap() = Some(response);
+        drive(
+            &runtime,
+            &mut engine,
+            control.keyring_progress(&scope(Duration::from_secs(40)).unwrap()),
+        )
+        .unwrap();
+        assert!(control.projection_error().is_some());
+        assert_eq!(
+            worker.keys.active(&cache, KeyPurpose::Page).unwrap().id(),
+            accepted
+        );
+        *fixture.keyring_override.lock().unwrap() = None;
+        drive(
+            &runtime,
+            &mut engine,
+            control.keyring_progress(&scope(Duration::from_secs(10)).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(control.projection_error(), None);
+    }
+    *fixture.keyring_override.lock().unwrap() = None;
+    fixture.reject_keyring_mtls.store(true, Ordering::Release);
+    std::fs::write(&config.service_account_token, b"fixture.token.fresh").unwrap();
+    {
+        let mut bundle = fixture.bundle.lock().unwrap();
+        *bundle =
+            crate::security::keyring::tests::rotation_bundle(3, bundle.peer_trust_roots.clone());
+        bundle.cluster = config.cluster.clone();
+    }
+    drive(
+        &runtime,
+        &mut engine,
+        control.keyring_progress(&scope(Duration::from_secs(40)).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(control.projection_error(), None);
+    assert_eq!(
+        fixture.keyring_tokens.lock().unwrap().last().unwrap(),
+        "fixture.token.fresh"
+    );
+    assert_ne!(
+        worker.keys.active(&cache, KeyPurpose::Page).unwrap().id(),
+        accepted
+    );
+    fixture.reject_keyring_mtls.store(false, Ordering::Release);
+    fixture.handshake_alerts.lock().unwrap().push_back(42); // bad_certificate
+    std::fs::write(&config.service_account_token, b"fixture.token.newer").unwrap();
+    drive(
+        &runtime,
+        &mut engine,
+        control.keyring_progress(&scope(Duration::from_secs(10)).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(control.projection_error(), None);
+    assert_eq!(
+        fixture.keyring_tokens.lock().unwrap().last().unwrap(),
+        "fixture.token.newer"
+    );
+    let tokens = fixture.keyring_tokens.lock().unwrap().len();
+    let untrusted = rcgen::generate_simple_self_signed(vec!["untrusted.invalid".into()])
+        .unwrap()
+        .cert;
+    std::fs::write(&config.trust_bundle, untrusted.pem()).unwrap();
+    drive(
+        &runtime,
+        &mut engine,
+        control.keyring_progress(&scope(Duration::from_secs(10)).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(control.projection_error(), Some(Error::Unauthorized));
+    assert_eq!(
+        fixture.keyring_tokens.lock().unwrap().len(),
+        tokens,
+        "never disclose token to an untrusted TLS endpoint"
+    );
+    assert!(!fixture.directory.join("secrets").exists());
 }
 
 #[test]

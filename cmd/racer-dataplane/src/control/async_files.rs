@@ -166,6 +166,7 @@ pub(crate) async fn read_at(
         .await?;
     read_file(r, fd, limit, private, scope).await
 }
+#[cfg(test)]
 pub(crate) async fn projected_file(
     r: &Reactor,
     path: &Path,

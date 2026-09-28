@@ -149,7 +149,6 @@ pub fn config(enable_rdma: bool) -> Config {
         diagnostics_listen: "127.0.0.1:0".parse().unwrap(),
         trust_bundle: "unused/ca".into(),
         service_account_token: "unused/token".into(),
-        secret_directory: "unused/secrets".into(),
         identity_directory: "unused/identity".into(),
         slab_directory: "unused/slabs".into(),
         slab_bytes: 1024 * 1024 * 1024,

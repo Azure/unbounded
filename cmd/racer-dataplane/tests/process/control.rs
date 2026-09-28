@@ -9,7 +9,7 @@ use racer_dataplane::{
     model::identity::{CacheId, ClusterId, MembershipVersion, NodeId},
     topology::membership::Member,
 };
-use std::{num::NonZeroU32, os::unix::fs::symlink, time::SystemTime};
+use std::{num::NonZeroU32, time::SystemTime};
 
 pub struct Control {
     pub endpoint: String,
@@ -60,7 +60,6 @@ impl Control {
         );
         fs::write(root.join("trust.pem"), ca.pem()).unwrap();
         fs::write(root.join("token"), "fixture.token").unwrap();
-        fs::create_dir_all(root.join("secrets/epoch")).unwrap();
         // Runtime-generated test material, distinct for the two encryption purposes.
         let keys: Vec<_> = caches.iter().flat_map(|(cache, _)| [("page", 7u8), ("origin_credentials", 8u8)].into_iter().map(move |(purpose, id)| {
             let mut material = [0; 32];
@@ -68,12 +67,6 @@ impl Control {
             serde_json::json!({"cache": cache, "id": STANDARD.encode([id; 16]), "purpose": purpose, "state": "active", "material": STANDARD.encode(material)})
         })).collect();
         let bundle = serde_json::json!({"schema_version": 1, "cluster": CLUSTER, "generation": "1", "peer_trust_roots": [STANDARD.encode(ca.der())], "cache_keys": keys});
-        fs::write(
-            root.join("secrets/epoch/bundle.json"),
-            serde_json::to_vec(&bundle).unwrap(),
-        )
-        .unwrap();
-        symlink("epoch", root.join("secrets/..data")).unwrap();
         let publication = Arc::new(Mutex::new(wire::Publication {
             schema_version: 1,
             cluster: ClusterId(CLUSTER.into()),
@@ -109,7 +102,10 @@ impl Control {
         let blocked = Arc::new(AtomicBool::new(false));
         let (observed, paused) = (polls.clone(), blocked.clone());
         let (stopping, issued) = (stop.clone(), enrollments.clone());
+        let ca = Arc::new(ca);
+        let ca_key = Arc::new(ca_key);
         let thread = thread::spawn(move || {
+            let mut handlers = Vec::new();
             while !stopping.load(Ordering::Acquire) {
                 let (socket, _) = match listener.accept() {
                     Ok(pair) => pair,
@@ -125,12 +121,22 @@ impl Control {
                 socket
                     .set_write_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
+                let (tls, published, observed, paused, stopping, issued) = (
+                    tls.clone(),
+                    published.clone(),
+                    observed.clone(),
+                    paused.clone(),
+                    stopping.clone(),
+                    issued.clone(),
+                );
+                let (ca, ca_key, bundle) = (ca.clone(), ca_key.clone(), bundle.clone());
+                handlers.push(thread::spawn(move || {
                 let mut stream = rustls::StreamOwned::new(
                     rustls::ServerConnection::new(tls.clone()).unwrap(),
                     socket,
                 );
                 let Ok(head) = read_head(&mut stream) else {
-                    continue;
+                    return;
                 };
                 let fields = fields(&head);
                 let length = fields
@@ -139,9 +145,16 @@ impl Control {
                 assert!(length <= wire::MAX_ENROLLMENT_BYTES);
                 let mut body = vec![0; length];
                 if stream.read_exact(&mut body).is_err() {
-                    continue;
+                    return;
                 }
-                let (status, body) = if head.starts_with("POST /v1/bootstrap ") {
+                let (status, body) = if head.starts_with("GET /v1/keyring") {
+                    assert!(stream.conn.peer_certificates().is_some() || fields["authorization"].starts_with("Bearer fixture.token"));
+                    if head.starts_with("GET /v1/keyring?after=1 ") {
+                        (204, Vec::new())
+                    } else {
+                        (200, serde_json::to_vec(&bundle).unwrap())
+                    }
+                } else if head.starts_with("POST /v1/bootstrap ") {
                     let binding = fields["authorization"]
                         .strip_prefix("Bearer fixture.token")
                         .unwrap();
@@ -215,6 +228,18 @@ impl Control {
                     .write_all(response.as_bytes())
                     .and_then(|()| stream.write_all(&body))
                     .and_then(|()| stream.flush());
+                }));
+                let mut i = 0;
+                while i < handlers.len() {
+                    if handlers[i].is_finished() {
+                        handlers.swap_remove(i).join().unwrap();
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            for handler in handlers {
+                handler.join().unwrap();
             }
         });
         Self {

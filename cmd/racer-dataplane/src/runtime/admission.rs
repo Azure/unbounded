@@ -348,7 +348,8 @@ impl Admission {
                 .get()
                 .saturating_mul(self.limits.waiters_per_flight.get()),
             ResourceClass::Connection => self.limits.client_connections.get(),
-            ResourceClass::ControlConnection => (self.limits.client_connections.get() / 8).min(2),
+            // Snapshot, renewal, and keyring delivery must make independent progress.
+            ResourceClass::ControlConnection => (self.limits.client_connections.get() / 4).min(3),
             ResourceClass::OutboundConnection => self.limits.client_connections.get() / 4,
             ResourceClass::IngressConnection => {
                 self.limits.client_connections.get().saturating_sub(
@@ -734,6 +735,11 @@ mod tests {
                     .unwrap()
             })
             .collect();
+        assert_eq!(
+            control.len(),
+            3,
+            "snapshot, enrollment, and key delivery slots"
+        );
         assert_eq!(
             admission.used(ResourceClass::Connection),
             admission.limit(ResourceClass::Connection)

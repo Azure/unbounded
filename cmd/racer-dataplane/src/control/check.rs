@@ -260,7 +260,7 @@ fn production_transport_server_auth_and_mtls() {
 
 #[test]
 fn production_snapshot_lease_caps_and_projection_rejection() {
-    use std::{os::unix::fs::symlink, rc::Rc, sync::Arc};
+    use std::{rc::Rc, sync::Arc};
     let mut p = wire::decode_publication(include_bytes!("testdata/publication.json")).unwrap();
     p.sequence.0 = 1;
     p.membership_version.0 = 1;
@@ -293,36 +293,26 @@ fn production_snapshot_lease_caps_and_projection_rejection() {
     assert!(
         matches!(&registry.reconcile(&p.caches).unwrap()[0],caches::CacheEvent::Remove(id) if *id == old)
     );
-    let d = testing::Directory::new();
     let (ca, _) = testing::ca();
     let keys = Rc::new(security::keyring::Keyring::new(
         p.cluster,
         p.members[0].node.clone(),
         Arc::new(security::keyring::KeyEpochs::default()),
     ));
-    let watcher = secrets::SecretWatcher::new(d.0.clone(), keys.clone());
+    let watcher = secrets::BundleInstaller::new(keys.clone());
     let mut bundle = wire::decode_bundle(include_bytes!("testdata/bundle.json")).unwrap();
     bundle.generation.0 = 1;
     bundle.peer_trust_roots = vec![ca.der().to_vec()];
     // The public Go fixture repeats test material across purposes; production
     // security intentionally rejects such material reuse. Keep the page epochs.
     bundle.cache_keys.truncate(2);
-    std::fs::create_dir(d.0.join("epoch")).unwrap();
-    std::fs::write(
-        d.0.join("epoch/bundle.json"),
-        wire::encode_bundle(&bundle).unwrap(),
-    )
-    .unwrap();
-    symlink("epoch", d.0.join("..data")).unwrap();
-    assert_eq!(watcher.reload_now().unwrap().0, wire::BundleGeneration(1));
-    assert_eq!(watcher.reload_now().unwrap().0, wire::BundleGeneration(1));
-    std::fs::write(d.0.join("epoch/bundle.json"), b"{}").unwrap();
-    assert!(watcher.reload_now().is_err());
+    assert_eq!(watcher.install(bundle.clone()).unwrap().0, wire::BundleGeneration(1));
+    assert_eq!(watcher.install(bundle.clone()).unwrap().0, wire::BundleGeneration(1));
+    assert!(wire::decode_bundle(b"{}").is_err());
     assert!(
         keys.active(&old, security::keyring::KeyPurpose::Page)
             .is_ok()
     );
-    std::fs::remove_file(d.0.join("..data")).unwrap();
-    symlink("../", d.0.join("..data")).unwrap();
-    assert!(watcher.read_bundle().is_err());
+    bundle.generation.0 = 0;
+    assert!(watcher.install(bundle).is_err());
 }

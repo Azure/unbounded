@@ -222,10 +222,13 @@ mod tests {
             ingress.install(WorkerId(index as u16), admission).unwrap();
         }
         let waker = futures::task::noop_waker();
-        let offers: Vec<_> = (0..88).map(|_| ingress.reserve(&waker).unwrap()).collect();
+        let per_worker = admissions[0].limit(ResourceClass::IngressConnection);
+        let offers: Vec<_> = (0..per_worker * admissions.len())
+            .map(|_| ingress.reserve(&waker).unwrap())
+            .collect();
         assert!(matches!(ingress.reserve(&waker), Err(Error::Overloaded)));
         for admission in &admissions {
-            assert_eq!(admission.used(ResourceClass::IngressConnection), 22);
+            assert_eq!(admission.used(ResourceClass::IngressConnection), per_worker);
             assert!(
                 admission
                     .reserve_connection(ResourceClass::OutboundConnection)

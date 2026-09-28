@@ -1,4 +1,4 @@
-//! Bounded HTTPS/JSON v1 and projected bundle DTOs.
+//! Bounded HTTPS/JSON v1 and keyring bundle DTOs.
 //! See CONTROL_API.md for field encoding, bounds, authentication, and retry policy.
 use super::caches::CacheDefinition;
 use crate::{
@@ -21,9 +21,10 @@ mod contract_codec;
 pub const SCHEMA_VERSION: u32 = 1;
 pub const BOOTSTRAP_PATH: &str = "/v1/bootstrap";
 pub const SNAPSHOT_PATH: &str = "/v1/snapshot";
+pub const KEYRING_PATH: &str = "/v1/keyring";
 pub const TOKEN_AUDIENCE: &str = "racer-control";
 pub const MAX_ENROLLMENT_BYTES: usize = 64 * 1024;
-// Leave room below Kubernetes' Secret size limit for projection metadata.
+// Shared bound for controller responses and bundle decoding.
 pub const MAX_BUNDLE_BYTES: usize = 512 * 1024;
 pub const MAX_PUBLICATION_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_MEMBERS: usize = 100_000;
@@ -116,7 +117,7 @@ impl Drop for CacheEncryptionKey {
         self.material.zeroize();
     }
 }
-/// One common bundle.json from one coherent projected directory generation.
+/// One complete keyring generation delivered by the authenticated controller.
 /// No node certificates/private keys; missing keys request local retirement.
 #[derive(Clone)]
 pub struct KeyringBundle {

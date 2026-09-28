@@ -1,9 +1,9 @@
-//! Two HTTPS operations: server-authenticated enrollment and mTLS snapshot polling.
-//! One bounded long poll, accepted cursor, jittered retry; no node/status reporting.
+//! HTTPS enrollment, snapshot polling, and independent network keyring delivery.
+//! Bounded long polls, accepted cursors, jittered retry; no node/status reporting.
 use super::{
     caches::{CacheEvent, CacheRegistry},
     enrollment::{Enrollment, LocalSigningIdentity},
-    secrets::SecretWatcher,
+    secrets::BundleInstaller,
     snapshot::SnapshotStore,
     transport::{ControlIo, ControlTransport, HttpResponse},
     wire::{self, EnrollmentRequest, EnrollmentResponse, SnapshotRequest, SnapshotResponse},
@@ -26,9 +26,14 @@ pub struct ControlEndpoint {
 }
 pub struct ControlClient {
     transport: ControlTransport,
+    key_transport: ControlTransport,
     enrollment: Rc<Enrollment>,
     keys: RefCell<Rc<Keyring>>,
-    secrets: SecretWatcher,
+    secrets: BundleInstaller,
+    keyring_busy: Cell<bool>,
+    keyring_next: Cell<Option<Instant>>,
+    keyring_failures: Cell<u32>,
+    keyring_retry_after: Cell<Option<Duration>>,
     snapshots: Rc<SnapshotStore>,
     caches: Rc<CacheRegistry>,
     identity: RefCell<Option<LocalSigningIdentity>>,
@@ -82,12 +87,20 @@ impl ControlClient {
         endpoint: ControlEndpoint,
         enrollment: Rc<Enrollment>,
         keys: Rc<Keyring>,
-        secrets: SecretWatcher,
+        secrets: BundleInstaller,
         snapshots: Rc<SnapshotStore>,
         caches: Rc<CacheRegistry>,
     ) -> Self {
         Self {
+            key_transport: ControlTransport::new(ControlEndpoint {
+                url: endpoint.url.clone(),
+                trust_bundle: endpoint.trust_bundle.clone(),
+            }),
             transport: ControlTransport::new(endpoint),
+            keyring_busy: Cell::new(false),
+            keyring_next: Cell::new(None),
+            keyring_failures: Cell::new(0),
+            keyring_retry_after: Cell::new(None),
             enrollment,
             keys: RefCell::new(keys),
             secrets,
@@ -245,34 +258,51 @@ impl ControlClient {
                 }
             }
             self.activate_identity()?;
-            loop {
-                scope.check()?;
-                if self.stopped.get() {
-                    return Ok(());
+            let mut keyring = Box::pin(async {
+                loop {
+                    self.keyring_progress(scope).await?;
                 }
-                let now = crate::runtime::environment::now();
-                if let Some(next) = self.next.get().filter(|next| *next > now) {
-                    self.transport.io()?.sleep(next, scope).await?;
+                #[allow(unreachable_code)]
+                Ok::<(), Error>(())
+            });
+            let mut topology = Box::pin(async {
+                loop {
+                    scope.check()?;
+                    if self.stopped.get() {
+                        return Ok(());
+                    }
+                    let now = crate::runtime::environment::now();
+                    if let Some(next) = self.next.get().filter(|next| *next > now) {
+                        self.transport.io()?.sleep(next, scope).await?;
+                    }
+                    match self.progress(scope).await {
+                        Ok(_) => (),
+                        Err(
+                            Error::Io
+                            | Error::Unavailable
+                            | Error::Overloaded
+                            | Error::DeadlineExceeded,
+                        ) => (),
+                        Err(e) => return Err(e),
+                    }
                 }
-                match self.progress(scope).await {
-                    Ok(_) => (),
-                    Err(
-                        Error::Io
-                        | Error::Unavailable
-                        | Error::Overloaded
-                        | Error::DeadlineExceeded,
-                    ) => (),
-                    Err(e) => return Err(e),
+            });
+            std::future::poll_fn(|cx| {
+                use std::future::Future;
+                if let std::task::Poll::Ready(result) = keyring.as_mut().poll(cx) {
+                    return std::task::Poll::Ready(result);
                 }
-            }
+                topology.as_mut().poll(cx)
+            })
+            .await
         })
     }
     /// Runtime must attach its owner-local reactor adapter before start.
     pub fn attach_io(&self, io: Rc<dyn ControlIo>) {
         if let Some(reactor) = io.reactor() {
-            self.enrollment.attach_reactor(reactor.clone());
-            self.secrets.attach_reactor(reactor);
+            self.enrollment.attach_reactor(reactor);
         }
+        self.key_transport.attach_io(io.clone());
         self.transport.attach_io(io);
     }
     pub fn attach_cache_lifecycle(&self, lifecycle: Rc<dyn super::caches::CacheLifecycle>) {
@@ -365,7 +395,10 @@ impl ControlClient {
     }
     async fn start_inner(&self, scope: &RequestScope) -> Result<LocalSigningIdentity> {
         self.transport.io()?;
-        let bundle = self.secrets.read_bundle_async(scope).await?;
+        let bundle = self
+            .fetch_keyring(None, scope)
+            .await?
+            .ok_or(Error::InvalidRequest)?;
         if &bundle.cluster != self.enrollment.cluster() {
             return Err(Error::Unauthorized);
         }
@@ -483,25 +516,8 @@ impl ControlClient {
         })
     }
     async fn advance(&self, scope: &RequestScope) -> Result<()> {
-        // Each duty owns its future. A held long poll or renewal cannot prevent
-        // projection reload or local installation from being driven by the owner.
-        let projection_done = Cell::new(false);
+        // Key delivery has its own owner task and is never canceled by this turn.
         let renewal_done = Cell::new(false);
-        let mut projection = Box::pin(async {
-            loop {
-                self.reload(scope).await?;
-                projection_done.set(true);
-                self.transport
-                    .io()?
-                    .sleep(
-                        crate::runtime::environment::now() + Duration::from_secs(1),
-                        scope,
-                    )
-                    .await?;
-            }
-            #[allow(unreachable_code)]
-            Ok::<(), Error>(())
-        });
         let mut renewal = Box::pin(async {
             loop {
                 self.renew_if_due(scope).await?;
@@ -546,9 +562,6 @@ impl ControlClient {
         let mut polled = None;
         std::future::poll_fn(|cx| {
             use std::{future::Future, task::Poll};
-            if let Poll::Ready(result) = projection.as_mut().poll(cx) {
-                return Poll::Ready(result);
-            }
             if let Poll::Ready(result) = renewal.as_mut().poll(cx) {
                 return Poll::Ready(result);
             }
@@ -557,7 +570,7 @@ impl ControlClient {
                     polled = Some(result);
                 }
             }
-            if projection_done.get() && renewal_done.get() {
+            if renewal_done.get() {
                 if let Some(result) = polled.take() {
                     return Poll::Ready(result);
                 }
@@ -566,16 +579,125 @@ impl ControlClient {
         })
         .await
     }
-    async fn reload(&self, scope: &RequestScope) -> Result<()> {
-        // A malformed projection retains the installed epoch and does not stop polls.
-        match self.secrets.reload_async(scope).await {
-            Ok((_, roots)) => {
-                self.enrollment.set_peer_trust_roots(roots)?;
-                self.projection_error.set(None);
+    /// One independent bounded keyring turn. Errors preserve accepted keys and
+    /// the cursor, including conflicts from a controller behind our generation.
+    pub fn keyring_progress<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, ()> {
+        Box::pin(async move {
+            let _busy = enter(&self.keyring_busy)?;
+            if self.stopped.get() {
+                return Err(Error::Cancelled);
             }
-            Err(e) => self.projection_error.set(Some(e)),
+            if self.restart_required.get() {
+                return Err(Error::NodeIdentityChanged);
+            }
+            if let Some(next) = self.keyring_next.get() {
+                self.key_transport.io()?.sleep(next, scope).await?;
+            }
+            let mut turn = scope.clone();
+            turn.deadline.0 = turn.deadline.0.min(
+                crate::runtime::environment::now() + wire::POLL_WAIT + Duration::from_secs(10),
+            );
+            let result = async {
+                if let Some(bundle) = self.fetch_keyring(self.secrets.generation(), &turn).await? {
+                    turn.check()?;
+                    let (_, roots) = self.secrets.install(bundle)?;
+                    self.enrollment.set_peer_trust_roots(roots)?;
+                }
+                Ok::<(), Error>(())
+            }
+            .await;
+            self.projection_error.set(result.err());
+            let delay = if result.is_err() {
+                let failures = self.keyring_failures.get().saturating_add(1);
+                self.keyring_failures.set(failures);
+                let mut random = [0; 8];
+                crate::runtime::environment::fill_random(&mut random).map_err(|_| Error::Io)?;
+                let ceiling = (1u64 << failures.min(5)).min(30) * 1000;
+                Duration::from_millis(1000 + u64::from_ne_bytes(random) % (ceiling - 999))
+            } else {
+                self.keyring_failures.set(0);
+                Duration::from_millis(10)
+            };
+            let delay = delay.max(self.keyring_retry_after.take().unwrap_or_default());
+            self.keyring_next
+                .set(crate::runtime::environment::now().checked_add(delay));
+            scope.check()
+        })
+    }
+    async fn fetch_keyring(
+        &self,
+        after: Option<wire::BundleGeneration>,
+        scope: &RequestScope,
+    ) -> Result<Option<wire::KeyringBundle>> {
+        scope.check()?;
+        if self.stopped.get() {
+            return Err(Error::Cancelled);
         }
-        Ok(())
+        if self.restart_required.get() {
+            return Err(Error::NodeIdentityChanged);
+        }
+        let path = after.map_or_else(
+            || wire::KEYRING_PATH.to_owned(),
+            |n| format!("{}?after={}", wire::KEYRING_PATH, n.0),
+        );
+        let identity = self.identity.borrow().clone().filter(|i| i.valid_now());
+        if let Some(identity) = identity {
+            let result = async {
+                let response = self
+                    .key_transport
+                    .authenticated(&identity, scope)
+                    .await?
+                    .request("GET", &path, None, &[], wire::MAX_BUNDLE_BYTES, scope)
+                    .await?;
+                self.keyring_response(response, after)
+            }
+            .await;
+            match result {
+                Err(Error::Unauthorized) => {
+                    self.binding_check.set(true);
+                    self.key_transport.close_idle();
+                }
+                other => return other,
+            }
+        }
+        // Recovery is a fresh server-authenticated TLS connection, never an
+        // insecure retry. No token is sent until the mounted CA and name verify.
+        let connection = self.key_transport.bootstrap(scope).await?;
+        let token = self.enrollment.read_token_async(scope).await?;
+        let response = connection
+            .request(
+                "GET",
+                &path,
+                Some(&token),
+                &[],
+                wire::MAX_BUNDLE_BYTES,
+                scope,
+            )
+            .await?;
+        self.keyring_response(response, after)
+    }
+    fn keyring_response(
+        &self,
+        response: HttpResponse,
+        after: Option<wire::BundleGeneration>,
+    ) -> Result<Option<wire::KeyringBundle>> {
+        if response.status == 204 {
+            return if after.is_some() && response.body.is_empty() {
+                Ok(None)
+            } else {
+                Err(Error::InvalidRequest)
+            };
+        }
+        let bytes = zeroize::Zeroizing::new(Self::response_with_retry(
+            response,
+            false,
+            &self.keyring_retry_after,
+        )?);
+        let bundle = wire::decode_bundle(&bytes)?;
+        if after.is_some_and(|n| bundle.generation < n) {
+            return Err(Error::Replay);
+        }
+        Ok(Some(bundle))
     }
     async fn renew_if_due(&self, scope: &RequestScope) -> Result<()> {
         let renewal = self.binding_check.get()
@@ -598,7 +720,7 @@ impl ControlClient {
                 }
                 Err(e) => {
                     self.renewal_error.set(Some(e));
-                    if !transient(e) {
+                    if !transient(e) && e != Error::Unauthorized {
                         return Err(e);
                     }
                     self.renew_next.set(Some(self.backoff()?));
@@ -608,7 +730,11 @@ impl ControlClient {
                         .as_ref()
                         .is_none_or(|i| !i.valid_now())
                     {
-                        return Err(e);
+                        return Err(if e == Error::Unauthorized {
+                            Error::Unavailable
+                        } else {
+                            e
+                        });
                     }
                     // Already accepted identity remains useful while renewal retries.
                 }
@@ -627,8 +753,11 @@ impl ControlClient {
         // A deleted UID may disappear from the controller's informer index and
         // yield 503 indefinitely. Recheck via token enrollment on the next bounded
         // retry rather than waiting for the old certificate's renewal deadline.
-        if matches!(polled, Err(Error::Unavailable)) {
+        if matches!(polled, Err(Error::Unavailable | Error::Unauthorized)) {
             self.binding_check.set(true);
+        }
+        if matches!(polled, Err(Error::Unauthorized)) {
+            return Err(Error::Unavailable);
         }
         match polled? {
             SnapshotResponse::Updated(publication) => {
@@ -717,8 +846,15 @@ impl ControlClient {
         })
     }
     fn response(&self, response: HttpResponse, unchanged: bool) -> Result<Vec<u8>> {
+        Self::response_with_retry(response, unchanged, &self.retry_after)
+    }
+    fn response_with_retry(
+        mut response: HttpResponse,
+        unchanged: bool,
+        retry_after: &Cell<Option<Duration>>,
+    ) -> Result<Vec<u8>> {
         if response.status == 200 || unchanged && response.status == 204 {
-            return Ok(response.body);
+            return Ok(std::mem::take(&mut response.body));
         }
         let failure = wire::decode_error(&response.body)?.code;
         use wire::ProtocolFailure::*;
@@ -736,7 +872,7 @@ impl ControlClient {
             return Err(Error::InvalidRequest);
         }
         if matches!(status, 429 | 503) {
-            self.retry_after.set(response.retry_after);
+            retry_after.set(response.retry_after);
         }
         Err(error)
     }
@@ -744,6 +880,7 @@ impl ControlClient {
     pub fn shutdown(&self) -> Result<()> {
         self.stopped.set(true);
         self.transport.close_idle();
+        self.key_transport.close_idle();
         if let Some(scope) = self.active_scope.borrow().as_ref() {
             scope.cancel()?;
         }
@@ -784,7 +921,7 @@ mod tests {
                 d.0.join("identity"),
             )),
             keys.clone(),
-            SecretWatcher::new(d.0.clone(), keys),
+            BundleInstaller::new(keys),
             Rc::new(SnapshotStore::new(cluster, Arc::new(PublishedState), 2)),
             Rc::new(CacheRegistry),
         )
@@ -906,7 +1043,6 @@ mod tests {
     }
     #[test]
     fn projection_failure_retains_last_accepted_epoch() {
-        use std::os::unix::fs::symlink;
         let d = testing::Directory::new();
         let client = client(&d);
         let (ca, _) = testing::ca();
@@ -915,30 +1051,34 @@ mod tests {
         bundle.peer_trust_roots = vec![ca.der().to_vec()];
         // Production rejects material reuse across independent key purposes.
         bundle.cache_keys[2].material = [2; 32];
-        std::fs::create_dir(d.0.join("epoch")).unwrap();
-        std::fs::write(
-            d.0.join("epoch/bundle.json"),
-            wire::encode_bundle(&bundle).unwrap(),
-        )
-        .unwrap();
-        symlink("epoch", d.0.join("..data")).unwrap();
         assert_eq!(
-            client.secrets.reload_now().unwrap().0,
+            client.secrets.install(bundle.clone()).unwrap().0,
             wire::BundleGeneration(1)
         );
         assert_eq!(
-            client.secrets.reload_now().unwrap().0,
+            client.secrets.install(bundle.clone()).unwrap().0,
             wire::BundleGeneration(1)
         );
         bundle.cache_keys[0].material = [3; 32];
-        std::fs::write(
-            d.0.join("epoch/bundle.json"),
-            wire::encode_bundle(&bundle).unwrap(),
-        )
-        .unwrap();
-        assert!(matches!(client.secrets.reload_now(), Err(Error::Replay)));
-        std::fs::write(d.0.join("epoch/bundle.json"), b"{}").unwrap();
-        assert!(client.secrets.reload_now().is_err());
+        assert!(matches!(
+            client.secrets.install(bundle.clone()),
+            Err(Error::Replay)
+        ));
+        assert!(
+            client
+                .keyring_response(
+                    HttpResponse {
+                        status: 200,
+                        body: b"{}".to_vec(),
+                        retry_after: None
+                    },
+                    Some(wire::BundleGeneration(1))
+                )
+                .is_err()
+        );
+        bundle.generation = wire::BundleGeneration(0);
+        assert!(client.secrets.install(bundle.clone()).is_err());
+        assert_eq!(client.secrets.generation(), Some(wire::BundleGeneration(1)));
         assert!(
             client
                 .keys
@@ -949,5 +1089,50 @@ mod tests {
                 )
                 .is_ok()
         );
+    }
+    #[test]
+    fn keyring_cursor_status_and_retry_are_independent() {
+        let d = testing::Directory::new();
+        let client = client(&d);
+        let response = |status, body: &[u8]| HttpResponse {
+            status,
+            body: body.to_vec(),
+            retry_after: Some(Duration::from_secs(7)),
+        };
+        assert!(client.keyring_response(response(204, b""), None).is_err());
+        assert!(
+            client
+                .keyring_response(response(204, b""), Some(wire::BundleGeneration(1)))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            client
+                .keyring_response(response(204, b"x"), Some(wire::BundleGeneration(1)))
+                .is_err()
+        );
+        assert!(matches!(
+            client.keyring_response(
+                response(409, br#"{"code":"conflict"}"#),
+                Some(wire::BundleGeneration(1))
+            ),
+            Err(Error::Replay)
+        ));
+        assert!(matches!(
+            client.keyring_response(response(503, br#"{"code":"unavailable"}"#), None),
+            Err(Error::Unavailable)
+        ));
+        assert_eq!(
+            client.keyring_retry_after.get(),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(client.retry_after.get(), None);
+        client.keyring_busy.set(true);
+        assert!(matches!(
+            futures::executor::block_on(client.keyring_progress(&testing::scope())),
+            Err(Error::Overloaded)
+        ));
+        assert!(!client.poll_busy.get());
+        assert!(!client.enrollment_busy.get());
     }
 }

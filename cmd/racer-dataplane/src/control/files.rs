@@ -150,6 +150,7 @@ pub(crate) fn remove(dir: &File, component: &str) -> Result<()> {
 }
 
 /// Open Kubernetes' ..data target once, never through the per-file symlink.
+#[cfg(test)]
 pub(crate) fn projected_file(
     directory_path: &Path,
     component: &str,

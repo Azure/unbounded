@@ -13,6 +13,21 @@ use serde::{
 use serde_json::Value;
 use std::{collections::BTreeMap, fmt, num::NonZeroU32};
 
+struct JsonScratch(Value);
+impl Drop for JsonScratch {
+    fn drop(&mut self) {
+        fn clear(value: &mut Value) {
+            use zeroize::Zeroize;
+            match value {
+                Value::String(s) => s.zeroize(),
+                Value::Array(values) => values.iter_mut().for_each(clear),
+                Value::Object(values) => values.values_mut().for_each(clear),
+                _ => (),
+            }
+        }
+        clear(&mut self.0);
+    }
+}
 struct Strict(usize);
 impl<'de> DeserializeSeed<'de> for Strict {
     type Value = Value;
@@ -55,24 +70,26 @@ impl<'de> Visitor<'de> for Strict {
         if self.0 >= 64 {
             return Err(de::Error::custom("depth"));
         }
-        let mut v = Vec::new();
+        let mut scratch = JsonScratch(Value::Array(Vec::new()));
+        let v = scratch.0.as_array_mut().unwrap();
         while let Some(x) = a.next_element_seed(Strict(self.0 + 1))? {
             v.push(x);
         }
-        Ok(Value::Array(v))
+        Ok(std::mem::take(&mut scratch.0))
     }
     fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> std::result::Result<Value, A::Error> {
         if self.0 >= 64 {
             return Err(de::Error::custom("depth"));
         }
-        let mut v = serde_json::Map::new();
+        let mut scratch = JsonScratch(Value::Object(serde_json::Map::new()));
+        let v = scratch.0.as_object_mut().unwrap();
         while let Some(k) = a.next_key::<String>()? {
             if v.contains_key(&k) {
                 return Err(de::Error::custom("duplicate"));
             }
             v.insert(k, a.next_value_seed(Strict(self.0 + 1))?);
         }
-        Ok(Value::Object(v))
+        Ok(std::mem::take(&mut scratch.0))
     }
 }
 pub(crate) fn strict_json(b: &[u8], limit: usize) -> Result<Value> {
@@ -80,11 +97,13 @@ pub(crate) fn strict_json(b: &[u8], limit: usize) -> Result<Value> {
         return Err(Error::Overloaded);
     }
     let mut d = serde_json::Deserializer::from_slice(b);
-    let v = Strict(0)
-        .deserialize(&mut d)
-        .map_err(|_| Error::InvalidRequest)?;
+    let mut v = JsonScratch(
+        Strict(0)
+            .deserialize(&mut d)
+            .map_err(|_| Error::InvalidRequest)?,
+    );
     d.end().map_err(|_| Error::InvalidRequest)?;
-    Ok(v)
+    Ok(std::mem::take(&mut v.0))
 }
 fn decode<T: serde::de::DeserializeOwned>(b: &[u8], limit: usize) -> Result<T> {
     serde_json::from_value(strict_json(b, limit)?).map_err(|_| Error::InvalidRequest)
@@ -158,6 +177,28 @@ fn bytes(s: &str) -> Result<Vec<u8>> {
         return Err(Error::InvalidRequest);
     }
     Ok(b)
+}
+fn key_material(s: &str) -> Result<zeroize::Zeroizing<[u8; 32]>> {
+    // Decode directly into a zeroizing owner, including partially written error
+    // output. Neither decoding nor canonicality checking allocates secret bytes.
+    if s.len() != 44 {
+        return Err(Error::InvalidRequest);
+    }
+    let mut decoded = zeroize::Zeroizing::new([0; 32]);
+    let length = STANDARD
+        .decode_slice(s, &mut *decoded)
+        .map_err(|_| Error::InvalidRequest)?;
+    if length != decoded.len() {
+        return Err(Error::InvalidRequest);
+    }
+    let mut canonical = zeroize::Zeroizing::new([0; 44]);
+    STANDARD
+        .encode_slice(&*decoded, &mut *canonical)
+        .map_err(|_| Error::InvalidRequest)?;
+    if canonical.as_slice() != s.as_bytes() {
+        return Err(Error::InvalidRequest);
+    }
+    Ok(decoded)
 }
 fn certificates(v: &[String]) -> Result<Vec<Vec<u8>>> {
     if v.is_empty() {
@@ -590,8 +631,15 @@ struct Key {
     state: String,
     material: String,
 }
+impl Drop for Key {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.material.zeroize();
+    }
+}
 pub fn decode_bundle(b: &[u8]) -> Result<KeyringBundle> {
-    let r: Bundle = decode(b, MAX_BUNDLE_BYTES)?;
+    let scratch = JsonScratch(strict_json(b, MAX_BUNDLE_BYTES)?);
+    let r = Bundle::deserialize(&scratch.0).map_err(|_| Error::InvalidRequest)?;
     header(r.schema_version, &r.cluster)?;
     let generation = BundleGeneration(counter(&r.generation)?);
     let roots = certificates(&r.peer_trust_roots)?;
@@ -617,22 +665,21 @@ pub fn decode_bundle(b: &[u8]) -> Result<KeyringBundle> {
         let id: [u8; 16] = bytes(&k.id)?
             .try_into()
             .map_err(|_| Error::InvalidRequest)?;
-        let material: [u8; 32] = bytes(&k.material)?
-            .try_into()
-            .map_err(|_| Error::InvalidRequest)?;
+        let material = key_material(&k.material)?;
         if !seen.insert((k.cache.clone(), k.purpose.clone(), id)) {
             return Err(Error::InvalidRequest);
         }
-        *active.entry((k.cache.clone(), k.purpose)).or_insert(0) +=
-            usize::from(state == CacheKeyState::Active);
+        *active
+            .entry((k.cache.clone(), k.purpose.clone()))
+            .or_insert(0) += usize::from(state == CacheKeyState::Active);
         keys.push(CacheEncryptionKey {
             key: CacheKeyRef {
-                cache: CacheId(k.cache),
+                cache: CacheId(k.cache.clone()),
                 id: KeyId(id),
                 purpose,
             },
             state,
-            material,
+            material: *material,
         });
     }
     if active.values().any(|n| *n != 1) {
@@ -677,9 +724,27 @@ pub fn encode_bundle(b: &KeyringBundle) -> Result<Vec<u8>> {
             })
             .collect(),
     };
-    let encoded = encode(&raw, MAX_BUNDLE_BYTES)?;
-    decode_bundle(&encoded)?;
-    Ok(encoded)
+    struct BundleOutput(zeroize::Zeroizing<Vec<u8>>);
+    impl std::io::Write for BundleOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > MAX_BUNDLE_BYTES - self.0.len() {
+                return Err(std::io::ErrorKind::FileTooLarge.into());
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    // Fixed maximum capacity prevents reallocating and freeing a partially
+    // serialized secret. All bundle fields are ASCII after validation.
+    let mut encoded = BundleOutput(zeroize::Zeroizing::new(Vec::with_capacity(
+        MAX_BUNDLE_BYTES,
+    )));
+    serde_json::to_writer(&mut encoded, &raw).map_err(|_| Error::Overloaded)?;
+    decode_bundle(&encoded.0)?;
+    Ok(std::mem::take(&mut *encoded.0))
 }
 pub fn decode_error(b: &[u8]) -> Result<ErrorResponse> {
     #[derive(Deserialize)]
@@ -728,6 +793,41 @@ mod tests {
     const REQUEST: &str = include_str!("testdata/bootstrap-request.json");
     const RESPONSE: &str = include_str!("testdata/bootstrap-response.json");
     const BUNDLE: &str = include_str!("testdata/bundle.json");
+    #[test]
+    fn key_material_requires_exact_length_canonical_padding_and_trailing_bits() {
+        let canonical = STANDARD.encode([0xa7; 32]);
+        assert_eq!(*key_material(&canonical).unwrap(), [0xa7; 32]);
+        let mut trailing_bits = canonical.clone().into_bytes();
+        assert_eq!(trailing_bits[42], b'c');
+        trailing_bits[42] = b'd';
+        let mut invalid_tail = canonical.clone().into_bytes();
+        invalid_tail[40] = b'!';
+        let mut embedded_padding = canonical.clone().into_bytes();
+        embedded_padding[20] = b'=';
+        for malformed in [
+            canonical.trim_end_matches('=').to_owned(),
+            format!("{canonical}="),
+            format!("{canonical}\n"),
+            canonical.replace('=', " "),
+            String::from_utf8(trailing_bits).unwrap(),
+            String::from_utf8(invalid_tail).unwrap(),
+            String::from_utf8(embedded_padding).unwrap(),
+            STANDARD.encode([0xa7; 31]),
+            STANDARD.encode([0xa7; 33]),
+            String::new(),
+        ] {
+            assert!(matches!(
+                key_material(&malformed),
+                Err(Error::InvalidRequest)
+            ));
+            let mut bundle: Value = serde_json::from_str(BUNDLE).unwrap();
+            bundle["cache_keys"][0]["material"] = malformed.into();
+            assert!(matches!(
+                decode_bundle(&serde_json::to_vec(&bundle).unwrap()),
+                Err(Error::InvalidRequest)
+            ));
+        }
+    }
     #[test]
     fn go_delta_vector_applies_exactly_and_rejects_tampering() {
         let base = decode_publication(br#"{"schema_version":1,"cluster":"11111111-1111-4111-8111-111111111111","sequence":"1","membership_version":"1","members":[{"node":"22222222-2222-4222-8222-222222222222","shares":4,"peer_endpoint":"127.0.0.1:7443","rails":[],"alignment_enabled":true},{"node":"33333333-3333-4333-8333-333333333333","shares":4,"peer_endpoint":"127.0.0.2:7443","rails":[],"alignment_enabled":true}],"caches":[]}"#).unwrap();

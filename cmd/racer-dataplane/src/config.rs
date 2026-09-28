@@ -53,7 +53,6 @@ pub struct Config {
     pub diagnostics_listen: std::net::SocketAddr,
     pub trust_bundle: PathBuf,
     pub service_account_token: PathBuf,
-    pub secret_directory: PathBuf,
     /// Node-private persistent keys, separate from projected Secrets and slabs.
     pub identity_directory: PathBuf,
     pub slab_directory: PathBuf,
@@ -181,7 +180,6 @@ impl Config {
             Some("/var/run/secrets/racer-control/token"),
         )?
         .into();
-        let secret_directory = text("RACER_SECRET_DIRECTORY", Some("/etc/racer/keys"))?.into();
         let identity_directory =
             text("RACER_IDENTITY_DIRECTORY", Some("/var/lib/racer/identity"))?.into();
         let slab_directory = text("RACER_SLAB_DIRECTORY", Some("/var/lib/racer/slabs"))?.into();
@@ -252,7 +250,6 @@ impl Config {
             diagnostics_listen,
             trust_bundle,
             service_account_token,
-            secret_directory,
             identity_directory,
             slab_directory,
             slab_bytes,
@@ -296,7 +293,6 @@ impl Config {
         let paths = [
             &self.trust_bundle,
             &self.service_account_token,
-            &self.secret_directory,
             &self.identity_directory,
             &self.slab_directory,
         ];
@@ -1522,7 +1518,6 @@ mod tests {
         for name in [
             "RACER_TRUST_BUNDLE",
             "RACER_SERVICE_ACCOUNT_TOKEN",
-            "RACER_SECRET_DIRECTORY",
             "RACER_IDENTITY_DIRECTORY",
             "RACER_SLAB_DIRECTORY",
         ] {
@@ -1540,8 +1535,8 @@ mod tests {
             }
         }
         for path in [
-            "/etc/racer/keys",
-            "/etc/racer/keys/private",
+            "/etc/racer/trust/ca.crt",
+            "/etc/racer/trust",
             "/etc/racer",
             "/var/lib/racer/slabs",
             "/var/lib/racer",

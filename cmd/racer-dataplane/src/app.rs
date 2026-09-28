@@ -19,7 +19,7 @@ use crate::{
         caches::CacheRegistry,
         client::{ControlClient, ControlEndpoint},
         enrollment::Enrollment,
-        secrets::SecretWatcher,
+        secrets::BundleInstaller,
         snapshot::{PublishedState, SnapshotStore},
         transport::ReactorControlIo,
     },
@@ -299,7 +299,7 @@ fn bootstrap(
         NodeId(String::new()),
         node.keys.clone(),
     ));
-    let projection = SecretWatcher::new(config.secret_directory.clone(), unresolved.clone());
+    let projection = BundleInstaller::new(unresolved.clone());
     let enrollment = Rc::new(Enrollment::new(
         config.cluster.clone(),
         config.service_account_token.clone(),
@@ -463,6 +463,8 @@ pub struct WorkerApplication {
     node: Option<Arc<NodeState>>,
     endpoint: Option<WorkerEndpoint>,
     control_task: Option<Operation<'static, ()>>,
+    keyring_task: Option<Operation<'static, ()>>,
+    keyring_scope: Option<RequestScope>,
     peer_task: Option<Operation<'static, ()>>,
     writer_task: Option<Operation<'static, ()>>,
     checkpoint_task: Option<Operation<'static, ()>>,
@@ -541,7 +543,7 @@ impl WorkerApplication {
                 config.identity_directory.clone(),
             ));
             enrollment.set_shares(config.shares);
-            let secrets = SecretWatcher::new(config.secret_directory.clone(), keys.clone());
+            let secrets = BundleInstaller::new(keys.clone());
             let control = Rc::new(ControlClient::new(
                 ControlEndpoint {
                     url: config.control_endpoint.clone(),
@@ -866,6 +868,8 @@ impl WorkerApplication {
             node: None,
             endpoint: None,
             control_task: None,
+            keyring_task: None,
+            keyring_scope: None,
             peer_task: None,
             writer_task: None,
             checkpoint_task: None,
@@ -974,6 +978,7 @@ impl WorkerApplication {
                     startup.check()?;
                     let mut progress = control.progress(startup);
                     let result = std::future::poll_fn(|cx| {
+                        self.poll_keyring(cx)?;
                         self.poll_cache_preparation(cx)?;
                         let result = progress.as_mut().poll(cx).map(|r| r.map(|_| ()));
                         if matches!(result, Poll::Ready(Err(_))) {
@@ -1446,6 +1451,7 @@ impl WorkerApplication {
     }
 
     fn poll_control(&mut self, cx: &mut Context<'_>) -> Result<()> {
+        self.poll_keyring(cx)?;
         if let Some(result) = poll_task(&mut self.control_task, cx)
             && !matches!(
                 result,
@@ -1463,6 +1469,27 @@ impl WorkerApplication {
             self.control_task = Some(Box::pin(async move {
                 control.progress(&turn).await.map(|_| ())
             }));
+        }
+        Ok(())
+    }
+    fn poll_keyring(&mut self, cx: &mut Context<'_>) -> Result<()> {
+        if let Some(result) = poll_task(&mut self.keyring_task, cx)
+            && !matches!(
+                result,
+                Err(Error::Io | Error::Unavailable | Error::Overloaded | Error::DeadlineExceeded)
+            )
+        {
+            result?;
+        }
+        if self.keyring_task.is_none()
+            && let Some(control) = &self.control
+        {
+            let control = control.clone();
+            let turn = scope(Duration::from_secs(80))?;
+            self.keyring_scope = Some(turn.clone());
+            self.keyring_task = Some(Box::pin(
+                async move { control.keyring_progress(&turn).await },
+            ));
         }
         Ok(())
     }
@@ -1560,6 +1587,10 @@ impl WorkerService for WorkerApplication {
             control.shutdown()?;
         }
         self.control_task.take();
+        if let Some(scope) = self.keyring_scope.take() {
+            scope.cancel()?;
+        }
+        self.keyring_task.take();
         Ok(())
     }
     fn drain<'a>(&'a mut self, _scope: &'a RequestScope) -> Operation<'a, ()> {

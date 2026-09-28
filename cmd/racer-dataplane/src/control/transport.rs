@@ -212,6 +212,12 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
     pub retry_after: Option<Duration>,
 }
+impl Drop for HttpResponse {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.body.zeroize();
+    }
+}
 struct Endpoint {
     host: String,
     authority: String,
@@ -625,6 +631,7 @@ impl ControlConnection {
                 body.len()
             ));
             if let Some(token) = token {
+                request.reserve(token.len() + 32);
                 request.push_str("Authorization: Bearer ");
                 request.push_str(token);
                 request.push_str("\r\n");
@@ -654,8 +661,8 @@ impl ControlConnection {
             while self.tls.wants_write() {
                 self.step(scope).await?;
             }
-            let mut received = Vec::new();
-            let mut scratch = [0; 16384];
+            let mut received = zeroize::Zeroizing::new(Vec::new());
+            let mut scratch = zeroize::Zeroizing::new([0; 16384]);
             let (status, header_len, framing, retry_after) = loop {
                 if let Some(head) = parse_head(&received, limit)? {
                     break head;
@@ -663,7 +670,7 @@ impl ControlConnection {
                 if received.len() >= 16384 {
                     return Err(Error::Overloaded);
                 }
-                self.receive(&mut received, &mut scratch, scope).await?;
+                self.receive(&mut received, &mut scratch[..], scope).await?;
             };
             let close = std::str::from_utf8(&received[..header_len])
                 .map_err(|_| Error::InvalidRequest)?
@@ -682,16 +689,16 @@ impl ControlConnection {
                         return Err(Error::InvalidRequest);
                     }
                     while received.len() < header_len + length {
-                        self.receive(&mut received, &mut scratch, scope).await?;
+                        self.receive(&mut received, &mut scratch[..], scope).await?;
                         if received.len() > header_len + length {
                             return Err(Error::InvalidRequest);
                         }
                     }
-                    received.split_off(header_len)
+                    zeroize::Zeroizing::new(received[header_len..].to_vec())
                 }
                 Framing::Chunked => {
-                    let mut raw = received.split_off(header_len);
-                    let mut body = Vec::new();
+                    let mut raw = zeroize::Zeroizing::new(received[header_len..].to_vec());
+                    let mut body = zeroize::Zeroizing::new(Vec::new());
                     let bound = if status == 200 {
                         limit
                     } else {
@@ -705,7 +712,7 @@ impl ControlConnection {
                             if raw.len() > 128 {
                                 return Err(Error::InvalidRequest);
                             }
-                            self.receive(&mut raw, &mut scratch, scope).await?;
+                            self.receive(&mut raw, &mut scratch[..], scope).await?;
                         };
                         if line_end == 0
                             || line_end > 16
@@ -726,14 +733,15 @@ impl ControlConnection {
                         let mut remaining = length;
                         while remaining != 0 {
                             if raw.is_empty() {
-                                self.receive(&mut raw, &mut scratch, scope).await?;
+                                self.receive(&mut raw, &mut scratch[..], scope).await?;
                             }
                             let n = remaining.min(raw.len());
-                            body.extend(raw.drain(..n));
+                            append_sensitive(&mut body, &raw[..n]);
+                            raw.drain(..n);
                             remaining -= n;
                         }
                         while raw.len() < 2 {
-                            self.receive(&mut raw, &mut scratch, scope).await?;
+                            self.receive(&mut raw, &mut scratch[..], scope).await?;
                         }
                         if &raw[..2] != b"\r\n" {
                             return Err(Error::InvalidRequest);
@@ -766,14 +774,14 @@ impl ControlConnection {
             }
             Ok(HttpResponse {
                 status,
-                body,
+                body: body.to_vec(),
                 retry_after,
             })
         })
     }
     async fn receive(
         &mut self,
-        into: &mut Vec<u8>,
+        into: &mut zeroize::Zeroizing<Vec<u8>>,
         scratch: &mut [u8],
         scope: &RequestScope,
     ) -> Result<()> {
@@ -782,7 +790,7 @@ impl ControlConnection {
             match self.tls.reader().read(scratch) {
                 Ok(0) => return Err(Error::Io),
                 Ok(n) => {
-                    into.extend_from_slice(&scratch[..n]);
+                    append_sensitive(into, &scratch[..n]);
                     return Ok(());
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => self.step(scope).await?,
@@ -790,6 +798,16 @@ impl ControlConnection {
             }
         }
     }
+}
+// Grow without freeing an allocation containing plaintext key material.
+fn append_sensitive(into: &mut zeroize::Zeroizing<Vec<u8>>, bytes: &[u8]) {
+    if into.capacity() - into.len() < bytes.len() {
+        let capacity = (into.len() + bytes.len()).max(into.capacity().saturating_mul(2));
+        let mut next = zeroize::Zeroizing::new(Vec::with_capacity(capacity));
+        next.extend_from_slice(into);
+        std::mem::swap(into, &mut next);
+    }
+    into.extend_from_slice(bytes);
 }
 // Go's TLS server sends internal_error when bounded ClientHello admission is
 // saturated. Retry that transport failure without accepting an unauthenticated

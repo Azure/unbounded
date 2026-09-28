@@ -6,10 +6,10 @@
 mod control;
 #[path = "process/measurement.rs"]
 mod measurement;
-#[path = "process/throughput.rs"]
-mod throughput;
 #[path = "process/sdk_connection_age.rs"]
 mod sdk_connection_age;
+#[path = "process/throughput.rs"]
+mod throughput;
 
 use racer_dataplane::{model::range::PAGE_BYTES, store::checkpoint_format::CheckpointCodec};
 use std::{
@@ -134,7 +134,6 @@ impl Process {
         for (name, path) in [
             ("RACER_TRUST_BUNDLE", "trust.pem"),
             ("RACER_SERVICE_ACCOUNT_TOKEN", "token"),
-            ("RACER_SECRET_DIRECTORY", "secrets"),
             ("RACER_IDENTITY_DIRECTORY", "identity"),
             ("RACER_SLAB_DIRECTORY", "slabs"),
         ] {
