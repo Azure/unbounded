@@ -1,5 +1,53 @@
 # Racer throughput architecture: Phase 4
 
+## Delivered mapping and final compatibility
+
+Implementation is delivered in this worktree. Historical partial handoffs below
+are retained as execution history; this section is the current mapping.
+
+| Goal | Product implementation | Evidence |
+| --- | --- | --- |
+| A | One page flight with ciphertext-ready state and elected lazy plaintext promotion; unverified type cannot enter delivery; ciphertext-only memory residency; original ciphertext retained. | Shared promotion test requires one decrypt/buffer and one ingest; corrupted prefetch fallback, conditional invalidation, original credential/cancellation regressions. |
+| B | Explicit Bootstrap through routing, codec, signing, forwarding and coordinator; empty metadata-only reply; separate HEAD refresh intent. | Four actual Applications require one Bootstrap, one GET, no HEAD side effect, zero serving decrypts and one requester decrypt; malformed intent/page/presence/version rejection, credential-specific re-election and version-separated bytes. |
+| C | Bounded per-Value pinned page window across pooled UDS, ordered Read/Close; FD-aware Linux WriteTo and typed loopback HTTP handler. | SDK race suite, window/cancellation/ordered-byte tests and actual splice counter assertions. Normal consumed HTTP bodies return through Transport pooling; direct splice closes its source because Transport's private body counter did not observe the spliced bytes. |
+| D | Worker-local recycled pipes, aligned disk staging, bounded HTTP staging and two-entry admitted page pool; immutable reactor ciphertext send owner. | Pointer/FD identity reuse, zeroization, retained admission, cancellation and both CQE fence orders; strict process matrix. Mutable receives remain sealed and address-stable. No vmsplice is used. |
+| E | CRC-64/ECMA-182 with runtime PCLMUL and portable reference, crypto-worker checksum/AEAD verification, record v2; rotating derived-key HMAC request authentication plus certificate sessions and authority signatures. | Golden/equivalence tests, explicit host PCLMUL execution, frozen v1 record, corruption tests, RFC4231 MAC vector, retirement/missing/mutated tag and existing session/authority suites. |
+
+Compatibility matrix: peer v4 only (old v1/v2/v3 rejected, coordinated upgrade);
+record reader accepts v1/v2 and writer emits v2; control and client/origin APIs
+unchanged. Request MAC uses a domain-separated subkey of the rotating trusted
+OriginCredentials epoch, not a new distributed raw key or page-key reuse.
+Retiring key admission remains closed exactly as before; existing key leases
+retain memory-safe completion ownership. No new dependency was added.
+
+Performance boundaries: CRC is an additional ciphertext pass after encryption
+and before decryption, not fused into the third-party AEAD implementation. Cached
+checksums avoid rescanning verified ciphertext at record serialization. The
+portable reference and PCLMUL correctness were tested; no CRC throughput claim
+is made. Origin data must enter userspace for encryption; adding a splice pipe
+there would not remove that boundary, so direct admitted receives remain the
+origin path. Payload recycling uses one bounded pair-local mutex because final
+owners can drop on I/O or crypto threads; no node-global allocator lock exists.
+No RDMA/NIC/NUMA throughput, multi-host saturation or isolated-host p99 result is
+claimed. Existing hardware ignores remain explicit.
+
+Final verification uses external `timeout --signal=TERM --kill-after=10s 300s`
+for every listed test; Go also uses `-timeout=5m`. No external timeout fired.
+
+| Command (Rust from crate, Go from worktree root) | Result |
+| --- | --- |
+| `cargo test --locked --all-features --lib -j 2 -- --test-threads=2 --quiet` | Final after mutable plaintext recycle: 754 passed, seven ignores, 61.74 s. |
+| `cargo test --locked --all-features --lib recycled_payload -j 2 -- --test-threads=2 --quiet` | One passed after final fallible-allocation validation. |
+| `cargo test --locked --all-features --test production_dataplane --test client_origin_conformance -j 2 -- --test-threads=2 --quiet` | Production 13 passed/two ignores; conformance 19 passed/one ignore. |
+| `cargo test --locked --all-features --test production_dataplane -j 2 -- --test-threads=2 --quiet` | Final after mutable plaintext recycle: 13 passed/two ignores, 7.31 s. |
+| `env CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -n env RACER_THROUGHPUT_STRICT_BASELINE=1' cargo test --locked --test process_restart -j 2 -- --ignored --test-threads=1 --quiet` | All 14 passed, zero ignores, 103.43 s. |
+| `cargo test --locked --all-features --doc -j 2 -- --test-threads=2` | Six ordinary plus 26 compile-fail contracts passed. |
+| `env GOTOOLCHAIN=go1.26.6 go test -timeout=5m -race ./pkg/racersdk ./internal/gantry/racer -count=1` | SDK passed 18.830 s; Gantry adapter passed 2.716 s. |
+
+New completion commits: `4e0029a3` (CRC64, MAC, HTTP recycling), `68a12fc6`
+(page recycling and Bootstrap re-election). Earlier implementation commits are
+mapped below. Parent integration retains merge ownership; no merge performed.
+
 ## Latest continued implementation (supersedes historical status below)
 
 CRC64 uses CRC-64/ECMA-182, initial/final XOR zero and non-reflected bytes.

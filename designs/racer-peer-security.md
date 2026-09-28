@@ -15,11 +15,11 @@ and forwarding proofs remain mandatory. Key retirement follows existing keyring
 admission. Mixed v3/v4 fails closed and requires coordinated upgrade.
 
 Phase 4 is a coordinated dataplane upgrade. The signed profile is
-`racer-peer-v3`, outer version is `3`, and exchange target is
-`/racer/peer/v3/exchange`. Versions 1, 2, and unknown versions are rejected before
+`racer-peer-v4`, outer version is `4`, and exchange target is
+`/racer/peer/v4/exchange`. Versions 1, 2, 3, and unknown versions are rejected before
 logical execution; there is no downgrade or silent Metadata/Page substitution.
 The existing v2 session endpoint and digest domain labels remain unchanged;
-session messages carry the v3 signed profile, so mixed-profile sessions fail closed.
+session messages carry the v4 signed profile, so mixed-profile sessions fail closed.
 
 `Bootstrap { object, mode }` is an explicit fresh metadata-plus-page-zero intent.
 Its signed response is `bootstrap`, with complete immutable metadata and
@@ -70,7 +70,7 @@ Use RFC 9421 signature-base construction and structured `Signature-Input` and
 `@status`. Cover every security/operation header in deterministic order. Reject
 duplicate fields, malformed structured fields, unsupported signature algorithms,
 unknown profile versions, and logical fields that disagree with the signed head.
-The label is `racer`, algorithm is `ed25519`, and tag is `racer-peer-v3`.
+The label is `racer`, algorithm is `ed25519`, and tag is `racer-peer-v4`.
 No body digest is used: the signed page envelope and AEAD tag protect page bytes.
 
 Signature components begin with request derived components in the order above (or
@@ -80,7 +80,7 @@ case-insensitively. Header values must be ASCII without leading/trailing whitesp
 The signature parameters have this exact canonical structured-field serialization:
 
 ```
-("@method" "@request-target" ...);created=<Unix seconds>;keyid="<Node UUID>";alg="ed25519";tag="racer-peer-v3"
+("@method" "@request-target" ...);created=<Unix seconds>;keyid="<Node UUID>";alg="ed25519";tag="racer-peer-v4"
 ```
 
 The base consists of RFC 9421 `"component": value` lines joined by LF, followed by
@@ -327,7 +327,7 @@ signatures must also enforce freshness/deadline validity, while sequence admissi
 is only for the fresh immediate-hop HTTP head. Immutable response descriptors must
 match the requested object/version/page, not only a self-consistent signed response.
 The canonical application target is `/racer/peer/v1`; the transport envelope uses
-`/racer/peer/v3/exchange`, with the original signed application head carried intact.
+`/racer/peer/v4/exchange`, with the original signed application head carried intact.
 
 Current compiler integration requests:
 

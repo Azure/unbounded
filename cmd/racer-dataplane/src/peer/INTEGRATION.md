@@ -93,8 +93,9 @@ exact request/response provenance before dispatch. `Signatures::verify_proof` al
 is not replay admission. `security::connection::{connect,accept}` establishes the
 session once per socket using reciprocal signed fresh challenges. No challenge map
 or per-request capability negotiation remains. The outer wire version is 2 and
-the exchange target is `/racer/peer/v3/exchange`; mixed v1/v2/v3 paths fail closed.
-V3 adds explicit Bootstrap metadata with optional ciphertext page zero. Empty
+the exchange target is `/racer/peer/v4/exchange`; mixed v1/v2/v3/v4 paths fail closed.
+V4 requires the rotating request MAC plus the existing certificate/session proofs.
+The explicit Bootstrap operation returns metadata with optional ciphertext page zero. Empty
 objects carry no page. HEAD remains Metadata. Bootstrap uses HTTP until its
 version is known; subsequent pinned pages retain native transport eligibility.
 

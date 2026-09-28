@@ -103,7 +103,7 @@ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -n' \
   --ignored --test-threads=1
 ```
 
-The second command explicitly runs all thirteen privileged tests in this target,
+The second command explicitly runs all fourteen privileged tests in this target,
 including the two restart tests. It requires mount namespaces, io_uring,
 O_DIRECT, and enough allowed physical cores/quota for four worker pairs. Missing
 prerequisites fail visibly. Ordinary Cargo runs ignore these tests and are not
@@ -121,6 +121,11 @@ excluded from the exact userspace worker-pair count.
   authenticated TCP peer copy followed by memory reuse, then SIGKILL of the
   preferred peer with unchanged membership and verified origin fallback. Runs
   at 1/2/4 pairs. This is a two-node HTTP path, not RDMA or a multi-hop cluster.
+- `production_remote_bootstrap_one_get_and_empty`: four actual Applications;
+  a cold noncandidate receives one explicit peer Bootstrap and exactly one origin
+  GET, for both empty and nonempty objects. Checks candidate/requester decrypt
+  counters and a distinct HEAD with no body-fetch side effects. Peer v4 MACs,
+  certificate-bound sessions and original/destination signatures are active.
 - `production_blocked_control_progress` holds a real mTLS snapshot response
   while client traffic completes. `production_blocked_listener_publication`
   blocks a new socket with a regular file, verifies last-good-cache traffic,

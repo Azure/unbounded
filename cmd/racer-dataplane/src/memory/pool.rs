@@ -18,14 +18,24 @@ pub struct BufferPool {
 /// Fixed-size owned backing stays at the same address when this owner moves.
 pub struct PlaintextBuffer {
     bytes: Box<[u8]>,
-    reservation: Reservation,
+    reservation: Option<Reservation>,
 }
 impl PlaintextBuffer {
-    pub(crate) fn into_parts(self) -> (Box<[u8]>, Reservation) {
-        (self.bytes, self.reservation)
+    pub(crate) fn into_parts(mut self) -> (Box<[u8]>, Reservation) {
+        (
+            std::mem::take(&mut self.bytes),
+            self.reservation.take().expect("owned reservation"),
+        )
     }
     pub(crate) fn reservation(&self) -> &Reservation {
-        &self.reservation
+        self.reservation.as_ref().expect("owned reservation")
+    }
+}
+impl Drop for PlaintextBuffer {
+    fn drop(&mut self) {
+        if let Some(reservation) = &mut self.reservation {
+            reservation.recycle(std::mem::take(&mut self.bytes).into_vec());
+        }
     }
 }
 impl crate::runtime::reactor::sealed::Sealed for PlaintextBuffer {}
@@ -88,7 +98,10 @@ impl BufferPool {
         let bytes = reservation.buffer(length)?;
         let bytes = bytes.into_boxed_slice();
         reservation.shrink(bytes.len())?;
-        Ok(PlaintextBuffer { bytes, reservation })
+        Ok(PlaintextBuffer {
+            bytes,
+            reservation: Some(reservation),
+        })
     }
     pub fn ciphertext(
         &self,
