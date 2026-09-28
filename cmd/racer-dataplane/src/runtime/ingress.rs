@@ -46,7 +46,7 @@ struct State {
 pub(crate) struct Ingress(Mutex<State>);
 pub(crate) struct Offer {
     ingress: Arc<Ingress>,
-    worker: WorkerId,
+    target: usize,
     reservation: ConnectionReservation,
 }
 impl Ingress {
@@ -87,7 +87,7 @@ impl Ingress {
         let mut state = self.0.lock().map_err(|_| Error::Unavailable)?;
         for offset in 0..state.targets.len() {
             let index = (state.cursor + offset) % state.targets.len();
-            let (worker, target) = &state.targets[index];
+            let (_, target) = &state.targets[index];
             if target.closed {
                 continue;
             }
@@ -96,18 +96,22 @@ impl Ingress {
             };
             admission.register(waker);
             if let Ok(reservation) = admission.reserve() {
-                let worker = *worker;
                 state.cursor = (index + 1) % state.targets.len();
                 return Ok(Offer {
                     ingress: self.clone(),
-                    worker,
+                    target: index,
                     reservation,
                 });
             }
         }
         Err(Error::Overloaded)
     }
-    pub fn pop(&self, worker: WorkerId, waker: &Waker) -> Result<Option<Accepted>> {
+    pub fn pop_batch<const N: usize>(
+        &self,
+        worker: WorkerId,
+        waker: &Waker,
+        budget: usize,
+    ) -> Result<[Option<Accepted>; N]> {
         let mut state = self.0.lock().map_err(|_| Error::Unavailable)?;
         let target = &mut state
             .targets
@@ -115,8 +119,18 @@ impl Ingress {
             .find(|(id, _)| *id == worker)
             .ok_or(Error::InvalidConfiguration)?
             .1;
-        target.waker = Some(waker.clone());
-        Ok(target.queue.pop_front())
+        if let Some(old) = &mut target.waker {
+            old.clone_from(waker);
+        } else {
+            target.waker = Some(waker.clone());
+        }
+        Ok(std::array::from_fn(|index| {
+            if index < budget {
+                target.queue.pop_front()
+            } else {
+                None
+            }
+        }))
     }
     pub fn close(&self, worker: WorkerId) {
         let queued = {
@@ -133,12 +147,8 @@ impl Ingress {
 impl Offer {
     pub fn deliver(self, fd: OwnedFd, kind: Kind) -> Result<()> {
         let mut state = self.ingress.0.lock().map_err(|_| Error::Unavailable)?;
-        let target = &mut state
-            .targets
-            .iter_mut()
-            .find(|(id, _)| *id == self.worker)
-            .ok_or(Error::InvalidConfiguration)?
-            .1;
+        // The target vector is immutable after construction.
+        let target = &mut state.targets[self.target].1;
         if target.closed {
             return Err(Error::Unavailable);
         }
@@ -162,6 +172,41 @@ impl Offer {
 mod tests {
     use super::*;
     use crate::model::limits::ResourceClass;
+    #[test]
+    fn batch_pop_respects_budget_and_releases_unconsumed_entries() {
+        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
+        let ingress = Arc::new(Ingress::new(&[WorkerId(7)]));
+        ingress.install(WorkerId(7), &admission).unwrap();
+        let waker = futures::task::noop_waker();
+        let mut peers = Vec::new();
+        for _ in 0..3 {
+            let (fd, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            peers.push(peer);
+            ingress
+                .reserve(&waker)
+                .unwrap()
+                .deliver(fd.into(), Kind::Peer)
+                .unwrap();
+        }
+        assert!(
+            ingress
+                .pop_batch::<4>(WorkerId(7), &waker, 0)
+                .unwrap()
+                .iter()
+                .all(Option::is_none)
+        );
+        let batch = ingress.pop_batch::<4>(WorkerId(7), &waker, 2).unwrap();
+        assert_eq!(batch.iter().filter(|item| item.is_some()).count(), 2);
+        assert_eq!(admission.used(ResourceClass::Connection), 3);
+        drop(batch);
+        assert_eq!(admission.used(ResourceClass::Connection), 1);
+        ingress.close(WorkerId(7));
+        assert_eq!(admission.used(ResourceClass::Connection), 0);
+        assert!(matches!(
+            ingress.pop_batch::<4>(WorkerId(8), &waker, 4),
+            Err(Error::InvalidConfiguration)
+        ));
+    }
     #[test]
     fn target_charge_follows_queued_socket_and_closed_offer_rolls_back() {
         let mut limits = crate::test_support::cluster::config(false).limits;
@@ -198,7 +243,8 @@ mod tests {
             peers.push(peer);
             offer.deliver(fd.into(), Kind::Peer).unwrap();
         }
-        let accepted = ingress.pop(WorkerId(0), &waker).unwrap().unwrap();
+        let [accepted] = ingress.pop_batch::<1>(WorkerId(0), &waker, 1).unwrap();
+        let accepted = accepted.unwrap();
         ingress.close(WorkerId(0));
         assert_eq!(admissions[0].used(ResourceClass::Connection), 1);
         drop(accepted);

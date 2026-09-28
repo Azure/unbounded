@@ -1321,10 +1321,12 @@ impl WorkerApplication {
         }
         self.poll_checkpoint(cx)?;
         if let Some(node) = &self.node {
-            for _ in 0..budget {
-                let Some(accepted) = node.ingress.pop(self.worker, cx.waker())? else {
-                    break;
-                };
+            for accepted in node
+                .ingress
+                .pop_batch::<64>(self.worker, cx.waker(), budget)?
+                .into_iter()
+                .flatten()
+            {
                 let connection = crate::http::pool::ConnectionLease::from_reserved(
                     accepted.fd.into(),
                     accepted.reservation,
