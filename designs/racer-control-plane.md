@@ -82,6 +82,10 @@ or history in that ConfigMap. Publisher candidate bytes become visible only afte
 a successful ConfigMap CAS; replicas require bounded canonical validation plus
 exact authoritative confirmation of the same counters and hashes.
 Unchanged content reuses counters; cache-only changes preserve membership version.
+Each process also retains an in-memory observed version high-water mark independent
+of installed bytes, including observations before the first image. Suspension does
+not erase it. Same-sequence conflicts, counter rollback, or inconsistent membership
+progression withdraw authority even when the newer image has not arrived.
 
 ### Initialization protocol (Phase 3)
 
@@ -343,8 +347,12 @@ composition tests; do not add tests that merely enumerate every placeholder.
   Missing/invalid durable state suspends readiness and wakes waiting polls; input
   validation failures retain the previous valid publication. No recovery Create.
 - `CommittedPublication.Version()` returns a value; `Encoding()` returns an
-  immutable shared string. `WriteTo(io.Writer)` checks process lifetime and current
-  publication validity/freshness between bounded 32 KiB writes. Serving imposes
+  immutable shared string. `WriteTo(io.Writer)` checks process lifetime and
+  image-specific revocable authority between bounded 32 KiB writes. A response
+  pins its freshness deadline at write admission; later confirmations do not
+  extend it. Supersession or suspension permanently revokes an active response,
+  even across immediate recovery. Socket deadlines and cancellation bound blocked
+  writes and explicit flushes while poll/write admission remains held. Serving imposes
   request cancellation, certificate deadlines, concurrent write admission, and
   HTTP write deadlines and closes active connections on process shutdown.
   Never convert the entire encoding to `[]byte`

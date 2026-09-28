@@ -128,6 +128,15 @@ state only within that bound. Observed invalidity, deletion, rollback, or confli
 fails closed immediately; read outages cannot restore withdrawn trust. Stale
 replicas withdraw readiness and public requests return unavailable.
 
+Each process retains an authoritative version high-water mark independently of
+installed image bytes, including before the first image and across suspension.
+Rollback or conflicting counters/hashes cannot be hidden by a lagging image.
+An admitted snapshot response pins its freshness deadline; later confirmations
+do not extend that response. Superseding its image or suspending authority revokes
+the response, even if authority recovers before its next write. Blocked writes and
+flushes are bounded by that pinned deadline, certificate/token expiry, and the write
+timeout. Poll and write admission remain held through explicit response flush.
+
 Controllers also expose `GET /internal/v1/snapshot` on the same TLS listener before
 public readiness, avoiding replication startup deadlock. This is not a dataplane
 operation. Only the leader answers, after TokenReview of a Pod-bound token with

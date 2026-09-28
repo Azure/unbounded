@@ -467,10 +467,11 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 	}
 
 	var (
-		apps        [2]*Application
-		cancels     [2]context.CancelFunc
-		done        [2]chan error
-		denyRenewal [2]atomic.Bool
+		apps              [2]*Application
+		cancels           [2]context.CancelFunc
+		done              [2]chan error
+		denyRenewal       [2]atomic.Bool
+		topologyCommitted [2]atomic.Bool
 	)
 
 	for i := range apps {
@@ -526,6 +527,18 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 		}
 
 		apps[i] = Assemble(cfg, mgr.GetClient(), mgr.GetAPIReader())
+
+		apps[i].Topology.Client = interruptedClient{Client: mgr.GetClient(), update: func(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+			if err := mgr.GetClient().Update(ctx, obj, opts...); err != nil {
+				return err
+			}
+
+			if _, ok := obj.(*corev1.ConfigMap); ok && obj.GetName() == apps[i].Topology.Config.VersionConfigMapName {
+				topologyCommitted[i].Store(true)
+			}
+
+			return nil
+		}}
 		if err := apps[i].SetupWithManager(mgr); err != nil {
 			t.Fatal(err)
 		}
@@ -691,10 +704,17 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 		t.Fatal("old leader listener still accepts after manager exit")
 	}
 
-	eventually(t, "follower takes expired Lease and serves", func() bool { return apps[follower].Replication.isLeader() && apps[follower].Server.Ready(nil) == nil })
+	eventually(t, "follower takes expired Lease, commits topology, and serves", func() bool {
+		return apps[follower].Replication.isLeader() && topologyCommitted[follower].Load() && apps[follower].Server.Ready(nil) == nil
+	})
 
 	if err := c.Get(t.Context(), client.ObjectKeyFromObject(lease), lease); err != nil || *lease.Spec.HolderIdentity == oldHolder {
 		t.Fatalf("Lease did not change holder: %v", err)
+	}
+
+	_, committedVersion, err := readVersion(t.Context(), c, apps[follower].Topology.Config)
+	if err != nil || committedVersion.Sequence != publication.Sequence || committedVersion.MembershipVersion != publication.MembershipVersion {
+		t.Fatalf("new leader durable commit changed counters: %+v, %v", committedVersion, err)
 	}
 
 	response, err = peer.Get("https://" + apps[follower].Server.Config.ControlAddress + wire.SnapshotPath)
