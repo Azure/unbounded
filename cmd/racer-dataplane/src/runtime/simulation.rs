@@ -1073,9 +1073,8 @@ impl Handle {
             return Err(errno(libc::EAGAIN));
         }
         let count = bytes.len().min(input.len()).min(max_chunk).min(limit);
-        for byte in &mut bytes[..count] {
-            *byte = input.pop_front().unwrap();
-        }
+        // VecDeque's reader copies contiguous slices, including a wrapped tail.
+        std::io::Read::read_exact(input, &mut bytes[..count])?;
         w.record("recv", self.id, count as i64);
         Ok(count)
     }
@@ -1187,12 +1186,19 @@ impl Handle {
             .len()
             .min(node.length.saturating_sub(offset) as usize)
             .min(limit);
-        for (index, byte) in bytes[..len].iter_mut().enumerate() {
+        // Copy one sparse page at a time, including unaligned first/last pages.
+        let mut index = 0;
+        while index < len {
             let pos = offset + index as u64;
-            *byte = node
-                .pages
-                .get(&(pos / 4096))
-                .map_or(0, |p| p[(pos % 4096) as usize]);
+            let start = (pos % 4096) as usize;
+            let count = (4096 - start).min(len - index);
+            let output = &mut bytes[index..index + count];
+            if let Some(page) = node.pages.get(&(pos / 4096)) {
+                output.copy_from_slice(&page[start..start + count]);
+            } else {
+                output.fill(0);
+            }
+            index += count;
         }
         Ok(len)
     }
@@ -1217,13 +1223,18 @@ impl Handle {
         if node.mode as u32 & libc::S_IFMT != libc::S_IFREG {
             return Err(errno(libc::EISDIR));
         }
-        for (index, byte) in bytes.iter().enumerate() {
+        let mut index = 0;
+        while index < bytes.len() {
             let pos = offset + index as u64;
-            Rc::make_mut(
+            let start = (pos % 4096) as usize;
+            let count = (4096 - start).min(bytes.len() - index);
+            let page = Rc::make_mut(
                 node.pages
                     .entry(pos / 4096)
                     .or_insert_with(|| Rc::new([0; 4096])),
-            )[(pos % 4096) as usize] = *byte;
+            );
+            page[start..start + count].copy_from_slice(&bytes[index..index + count]);
+            index += count;
         }
         node.length = node.length.max(end);
         Ok(bytes.len())
@@ -1274,9 +1285,7 @@ impl Handle {
         if count == 0 && !bytes.is_empty() {
             return Err(errno(libc::EAGAIN));
         }
-        for byte in &mut bytes[..count] {
-            *byte = input.pop_front().unwrap();
-        }
+        std::io::Read::read_exact(&mut *input, &mut bytes[..count])?;
         Ok(count)
     }
     pub fn splice(&self, socket: &Handle, count: usize) -> io::Result<usize> {
@@ -1300,9 +1309,10 @@ impl Handle {
             };
             bytes.clone()
         };
-        let input: Vec<_> = bytes.borrow().iter().take(count).copied().collect();
-        let sent = socket.send(&input)?;
-        bytes.borrow_mut().drain(..sent);
+        let mut input = bytes.borrow_mut();
+        let count = count.min(input.len());
+        let sent = socket.send(&input.make_contiguous()[..count])?;
+        input.drain(..sent);
         Ok(sent)
     }
 }
@@ -1781,6 +1791,55 @@ mod tests {
         assert_eq!(sim.live_handles(), 0);
     }
     #[test]
+    fn sparse_page_copies_preserve_boundaries_holes_and_snapshots() {
+        for offset in [0, 1, 4095, 4096, 4097] {
+            for length in [0, 1, 4095, 4096, 4097, 8193] {
+                let sim = Simulation::new();
+                let Descriptor::Sim(file) = sim
+                    .open(None, Path::new("/file"), libc::O_CREAT | libc::O_RDWR)
+                    .unwrap()
+                else {
+                    unreachable!()
+                };
+                // Leave a full sparse page before an unaligned multi-page write.
+                let offset = 8192 + offset;
+                let original: Vec<_> = (0..length).map(|i| (i % 251) as u8).collect();
+                assert_eq!(file.file_write(offset, &original).unwrap(), length);
+                let mut expected = vec![0; offset as usize];
+                expected.extend_from_slice(&original);
+                let (node, _) = file.node().unwrap();
+                let snapshot = node.borrow().pages.clone();
+                let replacement = vec![0xa5; length + 1];
+                sim.inject("write", Fault::Short(length / 2));
+                assert_eq!(file.file_write(offset, &replacement).unwrap(), length / 2);
+                expected[offset as usize..offset as usize + length / 2].fill(0xa5);
+                for (index, byte) in original.iter().enumerate() {
+                    let pos = offset as usize + index;
+                    assert_eq!(snapshot[&(pos as u64 / 4096)][pos % 4096], *byte);
+                }
+                let mut output = vec![0xcc; expected.len() + 8];
+                assert_eq!(file.file_read(0, &mut output).unwrap(), expected.len());
+                assert_eq!(&output[..expected.len()], expected);
+                assert_eq!(&output[expected.len()..], &[0xcc; 8]);
+                let mut partial = vec![0xcc; length + 8];
+                sim.inject("read", Fault::Short(length / 2));
+                assert_eq!(file.file_read(offset, &mut partial).unwrap(), length / 2);
+                assert_eq!(
+                    &partial[..length / 2],
+                    &expected[offset as usize..offset as usize + length / 2]
+                );
+                assert!(partial[length / 2..].iter().all(|b| *b == 0xcc));
+                sim.inject("write", Fault::Errno(libc::EIO));
+                assert_eq!(
+                    file.file_write(offset, b"bad").unwrap_err().raw_os_error(),
+                    Some(libc::EIO)
+                );
+                assert_eq!(sim.read_file(Path::new("/file")).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
     fn sparse_files_partial_io_faults_rename_unlink_and_open_inode_ownership() {
         let sim = Simulation::new();
         let _environment = sim.enter();
@@ -1907,6 +1966,70 @@ mod tests {
         drop(client);
         assert_eq!(sim.live_handles(), 0);
     }
+    #[test]
+    fn wrapped_stream_and_pipe_copies_preserve_short_io_and_errors() {
+        let sim = Simulation::new();
+        let (Descriptor::Sim(writer), Descriptor::Sim(reader)) = sim.socket_pair() else {
+            unreachable!()
+        };
+        let (Descriptor::Sim(pipe_reader), Descriptor::Sim(pipe_writer)) = sim.pipe(16) else {
+            unreachable!()
+        };
+        // Install wrapped queues explicitly so this does not depend on allocator growth.
+        let wrapped = || {
+            let mut queue = VecDeque::with_capacity(16);
+            queue.extend(0..16);
+            queue.drain(..12);
+            queue.extend(16..24);
+            assert!(!queue.as_slices().1.is_empty());
+            queue
+        };
+        {
+            let mut world = sim.0.borrow_mut();
+            let Resource::Socket { bytes, .. } = world.resources.get_mut(&reader.id).unwrap()
+            else {
+                unreachable!()
+            };
+            *bytes = wrapped();
+            let Resource::Pipe { bytes, .. } = world.resources.get(&pipe_reader.id).unwrap() else {
+                unreachable!()
+            };
+            *bytes.borrow_mut() = wrapped();
+        }
+        let mut output = [0xcc; 16];
+        sim.inject("recv", Fault::Short(7));
+        assert_eq!(reader.recv(&mut output).unwrap(), 7);
+        assert_eq!(&output[..7], &[12, 13, 14, 15, 16, 17, 18]);
+        assert_eq!(&output[7..], &[0xcc; 9]);
+        assert_eq!(reader.recv(&mut output).unwrap(), 5);
+        assert_eq!(&output[..5], &[19, 20, 21, 22, 23]);
+        sim.inject("pipe_read", Fault::Short(7));
+        assert_eq!(pipe_reader.pipe_read(&mut output).unwrap(), 7);
+        assert_eq!(&output[..7], &[12, 13, 14, 15, 16, 17, 18]);
+        assert_eq!(pipe_writer.pipe_write(&[24, 25, 26, 27]).unwrap(), 4);
+        sim.inject("send", Fault::Errno(libc::EPIPE));
+        assert_eq!(
+            pipe_reader.splice(&writer, 9).unwrap_err().raw_os_error(),
+            Some(libc::EPIPE)
+        );
+        sim.inject("splice", Fault::Short(6));
+        assert_eq!(pipe_reader.splice(&writer, 9).unwrap(), 6);
+        assert_eq!(reader.recv(&mut output).unwrap(), 6);
+        assert_eq!(&output[..6], &[19, 20, 21, 22, 23, 24]);
+        assert_eq!(pipe_reader.pipe_read(&mut output).unwrap(), 3);
+        assert_eq!(&output[..3], &[25, 26, 27]);
+        assert_eq!(
+            pipe_reader.pipe_read(&mut output).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            reader.recv(&mut output).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(writer);
+        assert_eq!(reader.recv(&mut output).unwrap(), 0);
+    }
+
     #[test]
     fn simulated_pipe_splice_preserves_suffix_under_backpressure() {
         let sim = Simulation::new();

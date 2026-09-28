@@ -790,8 +790,9 @@ mod tests {
                 let until = std::time::Instant::now() + Duration::from_secs(5);
                 while r.in_flight() != 0 {
                     assert!(std::time::Instant::now() < until);
-                    r.poll_budgeted(1).unwrap();
-                    r.wait(Duration::from_millis(1)).unwrap();
+                    if r.poll_budgeted(1).unwrap() == 0 {
+                        r.wait(Duration::from_millis(1)).unwrap();
+                    }
                 }
             }
             drop(accept);
