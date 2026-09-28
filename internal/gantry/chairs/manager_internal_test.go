@@ -82,7 +82,7 @@ func TestManagersClaimOnlyProportionalTargetSlots(t *testing.T) {
 			ClaimJitter:         time.Nanosecond,
 			ClaimInitialDivisor: 1,
 			RotationPeriod:      time.Hour,
-			HolderCount:         50,
+			ChairCount:          50,
 			HolderTarget:        func(context.Context) (int, error) { return 2, nil },
 		})
 
@@ -123,7 +123,7 @@ func TestManagerVacatesChairAboveReducedTarget(t *testing.T) {
 		Self:           self,
 		Now:            func() time.Time { return time.Unix(1, 0) },
 		RotationPeriod: time.Hour,
-		HolderCount:    50,
+		ChairCount:     50,
 		HolderTarget:   func(context.Context) (int, error) { return 2, nil },
 	})
 	if err := manager.Initialize(context.Background()); err != nil {
@@ -165,7 +165,7 @@ func TestManagerClaimsAfterProportionalTargetIncreases(t *testing.T) {
 		ClaimInitialDivisor: 1,
 		RotationPeriod:      time.Hour,
 		ClusterSizeEstimate: 1,
-		HolderCount:         50,
+		ChairCount:          50,
 		HolderTarget:        func(context.Context) (int, error) { return target, nil },
 	})
 	if err := manager.Initialize(context.Background()); err != nil {
@@ -454,9 +454,9 @@ func TestHolderRefreshesSnapshotUntilBootstrapConnects(t *testing.T) {
 
 func TestManagerRetriesBootstrapAfterHealthDrops(t *testing.T) {
 	clock := time.Unix(0, 0)
-	objects := make([]runtime.Object, 0, Count)
+	objects := make([]runtime.Object, 0, DefaultCount)
 
-	for index := range Count {
+	for index := range DefaultCount {
 		holderID := fmt.Sprintf("holder-%d", index)
 		objects = append(objects, &coordinationv1.Lease{
 			ObjectMeta: metav1.ObjectMeta{
@@ -484,7 +484,7 @@ func TestManagerRetriesBootstrapAfterHealthDrops(t *testing.T) {
 		BootstrapHealthy:    func() bool { return bootstrapHealthy },
 		RotationPeriod:      time.Hour,
 		ClusterSizeEstimate: 1,
-		HolderCount:         1,
+		ChairCount:          1,
 	})
 	if err := manager.Initialize(context.Background()); err != nil {
 		t.Fatalf("Initialize: %v", err)

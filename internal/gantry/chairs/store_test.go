@@ -78,6 +78,25 @@ func TestStoreClaimCreatesMissingChair(t *testing.T) {
 	}
 }
 
+func TestStoreSupportsChairIDsAboveUint8(t *testing.T) {
+	client := fake.NewClientset()
+	store := chairs.NewStore(client.CoordinationV1().Leases("gantry-system"))
+	holder := chairs.Holder{
+		PeerID:       "peer-300",
+		P2PAddrs:     []string{"/ip4/10.0.0.1/tcp/4001"},
+		TransferAddr: "10.0.0.1:5001",
+	}
+
+	claimed, err := store.Claim(context.Background(), 300, holder, 1, time.Minute, false, time.Now())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+
+	if claimed.ID != 300 || claimed.Holder.PeerID != holder.PeerID {
+		t.Fatalf("claimed chair = %+v", claimed)
+	}
+}
+
 type countingReader struct {
 	mu       sync.Mutex
 	calls    int
@@ -236,7 +255,7 @@ func TestCacheUsesOldSnapshotWhenAPIUnavailable(t *testing.T) {
 
 func TestCacheUsesScaledHolderTargetWhenAPIUnavailable(t *testing.T) {
 	reader := &countingReader{snapshot: occupiedSnapshotWithCount(32, 32)}
-	cache := chairs.NewCache(reader, chairs.Count)
+	cache := chairs.NewCache(reader, chairs.DefaultCount)
 	cache.SetHolderCount(32)
 
 	if _, err := cache.Snapshot(context.Background(), 32); err != nil {

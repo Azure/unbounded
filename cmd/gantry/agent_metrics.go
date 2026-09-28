@@ -390,17 +390,17 @@ func newPhase3Metrics(reg *metrics.Registry, infl *inflight.Map) *phase3Metrics 
 		coldStartSeedContacted: reg.NewHistogramVec("coord", prometheus.HistogramOpts{
 			Name:    "p2p_cold_start_seed_chairs_contacted",
 			Help:    "Chairs contacted per Resolve before the active cohort accepted the digest. Larger than the selectable cohort means declines pushed the requester deeper into the ranking and added origin fetchers.",
-			Buckets: prometheus.LinearBuckets(4, 4, 17),
+			Buckets: prometheus.ExponentialBuckets(1, 2, 14),
 		}, []string{"digest_kind"}),
 		coldStartSeedSelectable: reg.NewHistogramVec("coord", prometheus.HistogramOpts{
 			Name:    "p2p_cold_start_selectable_chairs",
 			Help:    "Chairs this node considered selectable at Resolve time, after the epoch and occupancy filter in chairs.Rank. Values well below the configured chair count concentrate the same layers onto fewer pullers.",
-			Buckets: prometheus.LinearBuckets(4, 4, 17),
+			Buckets: prometheus.ExponentialBuckets(1, 2, 14),
 		}, []string{"digest_kind"}),
 		coldStartSeedAccepted: reg.NewHistogramVec("coord", prometheus.HistogramOpts{
 			Name:    "p2p_cold_start_seed_chairs_accepted",
 			Help:    "Chairs that accepted the digest per Resolve. Fewer than the active cohort is normal: accepted chairs are already fetching, so the resolver does not backfill silent chairs.",
-			Buckets: prometheus.LinearBuckets(1, 1, 16),
+			Buckets: prometheus.ExponentialBuckets(1, 2, 14),
 		}, []string{"digest_kind"}),
 		coldStartChairDispatch: reg.NewCounterVec("coord", prometheus.CounterOpts{
 			Name: "p2p_cold_start_chair_dispatch_total",

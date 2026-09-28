@@ -72,19 +72,19 @@ registry. Those nodes are called **chairs**.
 
 ### What a chair is
 
-There are 64 chairs, each represented by a Kubernetes **Lease** object with a
-fixed name (`gantry-chair-00` through `gantry-chair-63`). Agents claim empty
-Leases to become chair holders, and renew them as a heartbeat, exactly like any
-other leader-election use of the Lease API.
+Each configured chair is represented by a Kubernetes **Lease** object with a
+stable numbered name. Agents claim empty Leases to become chair holders, and
+renew them as a heartbeat, exactly like any other leader-election use of the
+Lease API.
 
 ```mermaid
 flowchart LR
-    subgraph leases["Kubernetes Lease objects (64, fixed names)"]
+    subgraph leases["Kubernetes Lease objects (configured stable names)"]
         direction TB
         L0["gantry-chair-00<br/>holder: node-abc"]
         L1["gantry-chair-01<br/>holder: node-def"]
         L2["...<br/>"]
-        L63["gantry-chair-63<br/>holder: node-xyz"]
+        LN["gantry-chair-N<br/>holder: node-xyz"]
     end
 
     style leases fill:#f3ecff,stroke:#8a6fc4
@@ -93,19 +93,19 @@ flowchart LR
 A chair is not a coordinator and does not decide anything for anyone else. It is
 simply a node that has agreed to be one of the designated registry fetchers.
 
-Being a chair is a small extra duty. Gantry fills up to 64 chair slots, with at
-most one chair per node. Clusters smaller than 64 nodes therefore use every
-node as a chair holder.
+Being a chair is a small extra duty. Gantry fills up to `chair_count` slots,
+with at most one chair per node. Clusters smaller than `chair_count` therefore
+use every node as a chair holder.
 
 ### Choosing which chairs seed which layer
 
 For any given layer, all nodes need to agree on which chairs should fetch it,
 **without talking to each other**. Gantry does this with a hash of the layer
-digest against the 64 chair names, producing a ranking.
+digest against the configured chair names, producing a ranking.
 
 ```mermaid
 flowchart LR
-    D["layer digest<br/>sha256:abc..."] --> H["hash against<br/>64 chair names"]
+    D["layer digest<br/>sha256:abc..."] --> H["hash against<br/>configured chair names"]
     H --> RK["ranked list<br/>chair-41, chair-07, chair-29, ..."]
     RK --> T["top-ranked seed cohort"]
 
@@ -117,9 +117,8 @@ the **same** ranking independently. No election, no coordination, no chatter.
 
 A different layer hashes to a different ranking, so the 40 layers of an image
 spread their seeding work across the holder pool rather than piling onto the
-same nodes. A full 64-holder pool uses the top eight chairs for each digest.
-Smaller pools preserve that ratio, rounded up: 32 holders use four seeds, 16
-use two, and eight or fewer use one.
+same nodes. A full pool uses `chair_seed_count` chairs for each digest. Smaller
+pools preserve the configured chair-to-seed ratio, rounded up.
 
 ### The cold pull, end to end
 
@@ -134,7 +133,7 @@ sequenceDiagram
     CD->>G: get layer sha256:abc
     G->>IX: who has sha256:abc?
     IX-->>G: nobody
-    G->>G: rank 64 chairs for this digest
+    G->>G: rank configured chairs for this digest
     G->>CH: please pull sha256:abc
     Note over CH: each selected chair checks:<br/>am I already pulling this?
     CH->>REG: fetch layer (one copy per selected chair)
@@ -160,16 +159,16 @@ duplicate requests and pulls once.
 Holder capacity and per-digest seed count are separate:
 
 $$
-    ext{holders}=\min\left(64,\text{desired Gantry pods}\right)
+    \text{holders}=\min\left(\text{chair count},\text{desired Gantry pods}\right)
 $$
 
 $$
-    ext{seeds}=\max\left(1,\left\lceil\frac{8\times\text{selectable holders}}{64}\right\rceil\right)
+    \text{seeds}=\max\left(1,\left\lceil\frac{\text{seed count}\times\text{selectable holders}}{\text{chair count}}\right\rceil\right)
 $$
 
-For example, 3 selectable holders select 1 seed, 20 select 3, 32 select 4,
-and the full 64-holder pool selects 8. The table below records the full-pool
-eight-seed benchmark.
+With the default 64 chairs and 8 seeds, 3 selectable holders select 1 seed, 20
+select 3, 32 select 4, and the full pool selects 8. The table below records
+that default full-pool benchmark.
 
 | Seeds | Registry traffic | Risk |
 |---|---|---|
@@ -284,20 +283,20 @@ flowchart LR
 
 The chair design does not need a membership view. A node does not need to know
 who its peers are, because the index tells it who has a given layer, and it does
-not need to know who the chairs are, because it computes the ranking from the 64
-fixed Lease names.
+not need to know who the chairs are, because it computes the ranking from the
+configured fixed Lease names.
 
 So the informers are gone. The agent opens **no watches at all**. It uses the
 Lease API the same way kubelet uses it for node heartbeats.
 
 ```mermaid
 flowchart LR
-    subgraph after["now: 64 Leases, no watches"]
+    subgraph after["now: configured Leases, no watches"]
         direction TB
-        B1["node 1"] -->|"read 64 Leases<br/>on epoch change"| API2[("API server")]
+        B1["node 1"] -->|"read chair Leases<br/>on epoch change"| API2[("API server")]
         B2["node 2"] --> API2
         B3["...1,000 nodes..."] --> API2
-        CH["64 chair holders"] -->|"renew own Lease<br/>every 20s"| API2
+        CH["chair holders"] -->|"renew own Lease<br/>every 20s"| API2
     end
 
     style API2 fill:#e9f7e9,stroke:#5c9c5c
@@ -307,24 +306,23 @@ flowchart LR
 |---|---|---|
 | Watch streams at 1,000 nodes | 2,000 | **0** |
 | Watch streams at 100,000 nodes | 200,000 | **0** |
-| Objects cached per agent | every Pod and every Node | 64 Leases |
-| Steady-state writes | Pod/Node churn, fans out to all | **3.2/sec**, fixed |
-| Reads | continuous watch delivery | one 64-Lease list per node per 6h |
+| Objects cached per agent | every Pod and every Node | configured chair Leases |
+| Steady-state writes | Pod/Node churn, fans out to all | `chair_count / 20s` at a full pool |
+| Reads | continuous watch delivery | one chair Lease list per node per 6h |
 
 ### Why the write rate is flat
 
 Only chair holders write, and only to renew their own Lease:
 
-$$\frac{64\ \text{chairs}}{20\ \text{s renew}} = 3.2\ \text{writes/sec}$$
+$$\frac{\text{active chairs}}{20\ \text{s renew}}$$
 
-That figure does not contain the node count. It is the same at 1,000 nodes and
-at 100,000. Reads are similarly bounded: a node re-reads the 64 Leases only when
-the 6-hour epoch changes, or when a chair it tried to reach did not answer.
-Nodes that are not pulling anything read nothing.
+That figure is bounded by `chair_count`, rather than growing with the fleet
+without limit. Reads are similarly bounded: a node re-reads the chair Leases
+only when the 6-hour epoch changes, or when a chair it tried to reach did not
+answer. Nodes that are not pulling anything read nothing.
 
 At 100,000 nodes the steady-state epoch reads work out to roughly 4.6 Lease
-lists per second across the whole cluster, against a fixed set of 64 small
-objects.
+lists per second across the whole cluster with the default settings.
 
 ### One thing to check in your cluster
 
@@ -363,7 +361,7 @@ flowchart TB
     B -->|yes| Z["serve locally"]
     B -->|no| C{"does the index<br/>know a peer?"}
     C -->|yes| D["fetch from peer"]
-    C -->|no| E["hash digest to rank 64 chairs"]
+    C -->|no| E["hash digest to rank configured chairs"]
     E --> F["ask the active chairs to fetch from the registry"]
     F --> G["chairs publish to the index"]
     G --> D

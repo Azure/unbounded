@@ -57,6 +57,8 @@ resources:
 gantry:
   config: ""
   pprofListen: ""
+  chairCount: 64
+  chairSeedCount: 8
   upstreamRegistries:
     - name: registry.example.com
       endpoint: https://registry.example.com

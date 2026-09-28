@@ -240,7 +240,7 @@ func runAgent(args []string) error {
 		}
 
 		chairStore = chairs.NewStore(chairClient.CoordinationV1().Leases(c.ChairNamespace))
-		chairCache = chairs.NewCache(chairStore, c.ChairHolderCount)
+		chairCache = chairs.NewCache(chairStore, c.ChairCount)
 	}
 
 	// Without a chair namespace every cold pull falls back to the origin
@@ -250,7 +250,7 @@ func runAgent(args []string) error {
 		slog.String("chair_namespace", c.ChairNamespace),
 		slog.String("chair_listen", c.ChairListen),
 		slog.String("chair_capacity_daemonset", c.ChairCapacityDaemonSet),
-		slog.Int("chair_holder_count", c.ChairHolderCount),
+		slog.Int("chair_count", c.ChairCount),
 		slog.Int("chair_seed_count", c.ChairSeedCount),
 	)
 
@@ -324,7 +324,7 @@ func runAgent(args []string) error {
 		capacity := daemonSetChairCapacity{
 			daemonSets: chairClient.AppsV1().DaemonSets(c.ChairNamespace),
 			name:       c.ChairCapacityDaemonSet,
-			maximum:    c.ChairHolderCount,
+			maximum:    c.ChairCount,
 		}
 		chairManager = chairs.NewManager(chairs.ManagerOptions{
 			Store:      chairStore,
@@ -348,7 +348,7 @@ func runAgent(args []string) error {
 			ClaimInitialDivisor: uint64(c.ChairClaimInitialDivisor),
 			APITimeout:          c.ChairAPITimeout,
 			ClusterSizeEstimate: c.ChairClusterSizeEstimate,
-			HolderCount:         c.ChairHolderCount,
+			ChairCount:          c.ChairCount,
 		})
 	}
 	// pullerPump bridges inbound please_pull RPCs to the local origin
@@ -460,7 +460,7 @@ func runAgent(args []string) error {
 			Claimer:               chairManager,
 			Logger:                logger,
 			APITimeout:            c.ChairAPITimeout,
-			HolderCount:           c.ChairHolderCount,
+			ChairCount:            c.ChairCount,
 			SeedCount:             c.ChairSeedCount,
 			TrustedFailureClasses: configuredFailureClasses(c.OriginFailureClassesTrustedClusterWide),
 			OnSeedRecruit: func(kind string, selectable, contacted, accepted int) {
@@ -478,8 +478,7 @@ func runAgent(args []string) error {
 		coldStartResolver = coldStartAdapter{r: realResolver}
 		layerPrefetcher = newLayerPrefetcher(realResolver, cstore, logger, layerProgress.observeManifest)
 		logger.Info("Lease-chair cold-start orchestrator wired",
-			slog.Int("chair_slots", chairs.Count),
-			slog.Int("holder_count", c.ChairHolderCount),
+			slog.Int("chair_count", c.ChairCount),
 			slog.Int("seed_count", c.ChairSeedCount),
 		)
 	} else {

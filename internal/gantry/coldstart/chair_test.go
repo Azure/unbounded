@@ -48,9 +48,9 @@ func (s *chairSnapshotStub) RefreshChair(_ context.Context, id chairs.ID) (chair
 type chairCoordStub struct {
 	mu         sync.Mutex
 	calls      []ifaces.ChairAssignment
-	fail       map[uint32]error
-	staleFirst map[uint32]bool
-	outcomes   map[uint32]ifaces.PleasePullOutcome
+	fail       map[uint64]error
+	staleFirst map[uint64]bool
+	outcomes   map[uint64]ifaces.PleasePullOutcome
 	onCall     func(ifaces.ChairAssignment)
 }
 
@@ -110,11 +110,11 @@ func (*backupDiscovery) Health() float64 { return 1 }
 func TestChairResolverDoesNotBackfillFailedSeeds(t *testing.T) {
 	d := digest.MustParse("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
 	snapshot := fullChairSnapshot(5)
-	ranked := chairs.Rank(snapshot, d)
+	ranked := chairs.Rank(snapshot, d, chairs.DefaultCount)
 
-	coord := &chairCoordStub{fail: map[uint32]error{}}
+	coord := &chairCoordStub{fail: map[uint64]error{}}
 	for _, chair := range ranked[:3] {
-		coord.fail[uint32(chair.ID)] = errors.New("dial failed")
+		coord.fail[uint64(chair.ID)] = errors.New("dial failed")
 	}
 
 	resolver := newTestChairResolver(&chairSnapshotStub{snapshot: snapshot}, coord, &stubDisco{
@@ -130,9 +130,9 @@ func TestChairResolverDoesNotBackfillFailedSeeds(t *testing.T) {
 		t.Fatalf("providers = %+v", resolution.Providers)
 	}
 
-	seeds := make(map[uint32]struct{}, chairs.SeedCount)
+	seeds := make(map[uint64]struct{}, chairs.SeedCount)
 	for _, chair := range ranked[:chairs.SeedCount] {
-		seeds[uint32(chair.ID)] = struct{}{}
+		seeds[uint64(chair.ID)] = struct{}{}
 	}
 
 	coord.mu.Lock()
@@ -200,7 +200,7 @@ func TestChairResolverPreservesHolderToSeedRatio(t *testing.T) {
 				Inflight:     inflight.New(inflight.DefaultStalls(), nil),
 				SelfPeerID:   "self",
 				CurrentEpoch: func() int64 { return 5 },
-				HolderCount:  chairs.Count,
+				ChairCount:   chairs.DefaultCount,
 				SeedCount:    chairs.SeedCount,
 			})
 
@@ -231,7 +231,7 @@ func TestChairPrefetchPreservesHolderToSeedRatio(t *testing.T) {
 		Inflight:     inflight.New(inflight.DefaultStalls(), nil),
 		SelfPeerID:   "self",
 		CurrentEpoch: func() int64 { return 5 },
-		HolderCount:  chairs.Count,
+		ChairCount:   chairs.DefaultCount,
 		SeedCount:    chairs.SeedCount,
 	})
 
@@ -255,9 +255,9 @@ func TestChairPrefetchPreservesHolderToSeedRatio(t *testing.T) {
 func TestChairResolverRefreshesStaleChairBeforeUsingBackup(t *testing.T) {
 	d := digest.MustParse("sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
 	snapshot := fullChairSnapshot(8)
-	ranked := chairs.Rank(snapshot, d)
+	ranked := chairs.Rank(snapshot, d, chairs.DefaultCount)
 	cache := &chairSnapshotStub{snapshot: snapshot}
-	coord := &chairCoordStub{staleFirst: map[uint32]bool{uint32(ranked[0].ID): true}}
+	coord := &chairCoordStub{staleFirst: map[uint64]bool{uint64(ranked[0].ID): true}}
 	resolver := newTestChairResolver(cache, coord, &stubDisco{
 		providers: [][]ifaces.Provider{{{NodeID: "seed", Addr: "seed:5001"}}},
 	})
@@ -283,7 +283,7 @@ func TestChairResolverRefreshesStaleChairBeforeUsingBackup(t *testing.T) {
 	var generations []int64
 
 	for _, call := range coord.calls {
-		if call.ChairID == uint32(ranked[0].ID) {
+		if call.ChairID == uint64(ranked[0].ID) {
 			generations = append(generations, call.Generation)
 		}
 	}
@@ -296,9 +296,9 @@ func TestChairResolverRefreshesStaleChairBeforeUsingBackup(t *testing.T) {
 func TestChairResolverTrustedFailureShortCircuits(t *testing.T) {
 	d := digest.MustParse("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
 	snapshot := fullChairSnapshot(8)
-	ranked := chairs.Rank(snapshot, d)
-	coord := &chairCoordStub{outcomes: map[uint32]ifaces.PleasePullOutcome{
-		uint32(ranked[0].ID): {
+	ranked := chairs.Rank(snapshot, d, chairs.DefaultCount)
+	coord := &chairCoordStub{outcomes: map[uint64]ifaces.PleasePullOutcome{
+		uint64(ranked[0].ID): {
 			Outcome:      ifaces.PleasePullRecentlyFailed,
 			FailureClass: ifaces.FailureNotFound,
 		},
@@ -314,11 +314,11 @@ func TestChairResolverTrustedFailureShortCircuits(t *testing.T) {
 func TestChairResolverUsesBackupAfterAcceptedPullNeverAdvertises(t *testing.T) {
 	d := digest.MustParse("sha256:abababababababababababababababababababababababababababababababab")
 	snapshot := fullChairSnapshot(8)
-	ranked := chairs.Rank(snapshot, d)
+	ranked := chairs.Rank(snapshot, d, chairs.DefaultCount)
 
-	primary := make(map[uint32]struct{}, chairs.SeedCount)
+	primary := make(map[uint64]struct{}, chairs.SeedCount)
 	for _, chair := range ranked[:chairs.SeedCount] {
-		primary[uint32(chair.ID)] = struct{}{}
+		primary[uint64(chair.ID)] = struct{}{}
 	}
 
 	discovery := &backupDiscovery{}
@@ -380,7 +380,7 @@ func (*afterCoordCallsDiscovery) Health() float64 { return 1 }
 func TestChairResolverWaitsWhileSeedsAreStillPulling(t *testing.T) {
 	d := digest.MustParse("sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
 	snapshot := fullChairSnapshot(8)
-	ranked := chairs.Rank(snapshot, d)
+	ranked := chairs.Rank(snapshot, d, chairs.DefaultCount)
 	coord := &chairCoordStub{}
 	resolver := newTestChairResolver(&chairSnapshotStub{snapshot: snapshot}, coord,
 		&afterCoordCallsDiscovery{coord: coord, min: chairs.SeedCount * 3})
@@ -389,9 +389,9 @@ func TestChairResolverWaitsWhileSeedsAreStillPulling(t *testing.T) {
 		t.Fatalf("Resolve: %v", err)
 	}
 
-	seeds := make(map[uint32]struct{}, chairs.SeedCount)
+	seeds := make(map[uint64]struct{}, chairs.SeedCount)
 	for _, chair := range ranked[:chairs.SeedCount] {
-		seeds[uint32(chair.ID)] = struct{}{}
+		seeds[uint64(chair.ID)] = struct{}{}
 	}
 
 	coord.mu.Lock()
@@ -410,11 +410,11 @@ func TestChairResolverWaitsWhileSeedsAreStillPulling(t *testing.T) {
 func TestChairResolverTimesChairCallsByOutcome(t *testing.T) {
 	d := digest.MustParse("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	snapshot := fullChairSnapshot(8)
-	ranked := chairs.Rank(snapshot, d)
+	ranked := chairs.Rank(snapshot, d, chairs.DefaultCount)
 
 	// The top-ranked chair reports a deadline; the rest answer at once.
-	slow := uint32(ranked[0].ID)
-	coord := &chairCoordStub{fail: map[uint32]error{slow: context.DeadlineExceeded}}
+	slow := uint64(ranked[0].ID)
+	coord := &chairCoordStub{fail: map[uint64]error{slow: context.DeadlineExceeded}}
 
 	outcomes := map[string]int{}
 
@@ -471,12 +471,12 @@ func TestChairResolverTimesChairCallsByOutcome(t *testing.T) {
 func TestChairResolverKeepsPartialSeedCohort(t *testing.T) {
 	d := digest.MustParse("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
 	snapshot := fullChairSnapshot(8)
-	ranked := chairs.Rank(snapshot, d)
+	ranked := chairs.Rank(snapshot, d, chairs.DefaultCount)
 
 	// Five of the top eight never produce a usable reply.
-	failing := make(map[uint32]error, 5)
+	failing := make(map[uint64]error, 5)
 	for _, chair := range ranked[:5] {
-		failing[uint32(chair.ID)] = errors.New("stream reset")
+		failing[uint64(chair.ID)] = errors.New("stream reset")
 	}
 
 	coord := &chairCoordStub{fail: failing}
@@ -532,11 +532,11 @@ func TestChairResolverKeepsPartialSeedCohort(t *testing.T) {
 func TestChairResolverReportsSeedRecruitmentDepth(t *testing.T) {
 	d := digest.MustParse("sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
 	snapshot := fullChairSnapshot(8)
-	ranked := chairs.Rank(snapshot, d)
+	ranked := chairs.Rank(snapshot, d, chairs.DefaultCount)
 
-	declining := make(map[uint32]ifaces.PleasePullOutcome, chairs.SeedCount)
+	declining := make(map[uint64]ifaces.PleasePullOutcome, chairs.SeedCount)
 	for _, chair := range ranked[:chairs.SeedCount] {
-		declining[uint32(chair.ID)] = ifaces.PleasePullOutcome{Outcome: ifaces.PleasePullUnspecified}
+		declining[uint64(chair.ID)] = ifaces.PleasePullOutcome{Outcome: ifaces.PleasePullUnspecified}
 	}
 
 	coord := &chairCoordStub{outcomes: declining}
@@ -601,7 +601,7 @@ func newTestChairResolver(cache coldstart.ChairSnapshotCache, coord ifaces.Chair
 
 func fullChairSnapshot(epoch int64) chairs.Snapshot {
 	snapshot := chairs.Snapshot{Epoch: epoch}
-	for index := range chairs.Count {
+	for index := range chairs.DefaultCount {
 		snapshot.Chairs = append(snapshot.Chairs, chairs.Chair{
 			ID: chairs.ID(index),
 			Holder: chairs.Holder{

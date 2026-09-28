@@ -50,7 +50,7 @@ func (c *Cache) SetHolderCount(holderCount int) {
 
 func (c *Cache) Snapshot(ctx context.Context, epoch int64) (Snapshot, error) {
 	c.mu.Lock()
-	if !c.invalid && c.snapshot.Epoch == epoch && c.snapshot.SelectableCount() >= c.holderCount {
+	if !c.invalid && c.snapshot.Epoch == epoch && c.snapshot.SelectableCountWithin(c.holderCount) >= c.holderCount {
 		snapshot := cloneSnapshot(c.snapshot)
 		c.mu.Unlock()
 
@@ -71,7 +71,7 @@ func (c *Cache) Snapshot(ctx context.Context, epoch int64) (Snapshot, error) {
 		holderCount := c.holderCount
 		c.mu.Unlock()
 
-		if refresh.err != nil && refresh.snapshot.SelectableCount() < holderCount {
+		if refresh.err != nil && refresh.snapshot.SelectableCountWithin(holderCount) < holderCount {
 			return Snapshot{}, fmt.Errorf("refresh chair snapshot: %w", refresh.err)
 		}
 
@@ -88,7 +88,7 @@ func (c *Cache) Snapshot(ctx context.Context, epoch int64) (Snapshot, error) {
 	if err == nil {
 		c.snapshot = cloneSnapshot(snapshot)
 		c.invalid = false
-	} else if c.snapshot.SelectableCount() >= c.holderCount {
+	} else if c.snapshot.SelectableCountWithin(c.holderCount) >= c.holderCount {
 		snapshot = cloneSnapshot(c.snapshot)
 		snapshot.Stale = true
 	} else {
@@ -103,7 +103,7 @@ func (c *Cache) Snapshot(ctx context.Context, epoch int64) (Snapshot, error) {
 	c.refresh = nil
 	c.mu.Unlock()
 
-	if err != nil && snapshot.SelectableCount() < holderCount {
+	if err != nil && snapshot.SelectableCountWithin(holderCount) < holderCount {
 		return Snapshot{}, fmt.Errorf("refresh chair snapshot: %w", err)
 	}
 
