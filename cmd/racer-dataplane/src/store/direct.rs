@@ -5,8 +5,11 @@ use crate::{
 };
 use std::{
     alloc::{Layout, alloc_zeroed, dealloc},
+    cell::RefCell,
     ptr::NonNull,
+    rc::{Rc, Weak},
 };
+use zeroize::Zeroize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DirectAlignment {
@@ -18,8 +21,9 @@ pub struct AlignedBuffer {
     allocation: NonNull<u8>,
     layout: Layout,
     length: usize,
-    reservation: Reservation,
+    reservation: Option<Reservation>,
     retained: Vec<std::rc::Rc<Reservation>>,
+    pool: Weak<RefCell<Option<AlignedBuffer>>>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DirectExtent {
@@ -100,8 +104,9 @@ impl DirectAlignment {
             allocation,
             layout,
             length,
-            reservation,
+            reservation: Some(reservation),
             retained: Vec::new(),
+            pool: Weak::new(),
         })
     }
     pub fn check(&self, extent: DirectExtent, buffer: &AlignedBuffer) -> Result<()> {
@@ -116,6 +121,15 @@ impl DirectAlignment {
     }
 }
 impl AlignedBuffer {
+    pub(crate) fn pooled(mut self, pool: &Rc<RefCell<Option<Self>>>) -> Self {
+        self.pool = Rc::downgrade(pool);
+        self
+    }
+    pub(crate) fn rebind(&mut self, reservation: Reservation) -> Result<()> {
+        reservation.validate(crate::model::limits::ResourceClass::Ciphertext, self.length)?;
+        self.reservation = Some(reservation);
+        Ok(())
+    }
     /// Additional accounting whose lifetime must include submitted kernel access.
     pub(crate) fn retain_charge(&mut self, charge: std::rc::Rc<Reservation>) {
         self.retained.push(charge);
@@ -129,6 +143,26 @@ impl AlignedBuffer {
 }
 impl Drop for AlignedBuffer {
     fn drop(&mut self) {
+        if self.reservation.is_none() {
+            return;
+        }
+        self.bytes_mut().expect("owned aligned buffer").zeroize();
+        self.retained.clear();
+        if let Some(pool) = self.pool.upgrade() {
+            if let Ok(mut idle) = pool.try_borrow_mut() {
+                if idle.is_none() {
+                    *idle = Some(Self {
+                        allocation: self.allocation,
+                        layout: self.layout,
+                        length: self.length,
+                        reservation: self.reservation.take(),
+                        retained: Vec::new(),
+                        pool: Weak::new(),
+                    });
+                    return;
+                }
+            }
+        }
         // SAFETY: allocation is exclusively owned, with its original layout.
         unsafe { dealloc(self.allocation.as_ptr(), self.layout) };
     }
@@ -147,6 +181,45 @@ impl IoBuffer for AlignedBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn aligned_pool_reuses_only_fenced_zeroed_admitted_storage() {
+        use crate::{
+            model::{identity::CacheId, limits::ResourceClass},
+            runtime::admission::Admission,
+        };
+        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
+        let cache = CacheId("pool".into());
+        let pool = Rc::new(RefCell::new(None));
+        let alignment = DirectAlignment::validate(512, 512, 512).unwrap();
+        let mut buffer = alignment
+            .allocate(
+                512,
+                admission
+                    .reserve(Some(&cache), ResourceClass::Ciphertext, 512)
+                    .unwrap(),
+            )
+            .unwrap()
+            .pooled(&pool);
+        let pointer = buffer.bytes().unwrap().as_ptr();
+        buffer.bytes_mut().unwrap().fill(42);
+        drop(buffer);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 512);
+        let mut reused = pool.borrow_mut().take().unwrap();
+        assert_eq!(reused.bytes().unwrap().as_ptr(), pointer);
+        assert!(reused.bytes().unwrap().iter().all(|b| *b == 0));
+        reused
+            .rebind(
+                admission
+                    .reserve(Some(&cache), ResourceClass::Ciphertext, 512)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 512);
+        drop(reused.pooled(&pool));
+        drop(pool);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+    }
+
     #[test]
     fn geometry_rounds_without_assuming_page_size() {
         let a = DirectAlignment::validate(512, 512, 1024).unwrap();

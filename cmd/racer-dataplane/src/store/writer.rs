@@ -287,7 +287,11 @@ impl StoreWriter {
     /// Release only enough queued ciphertext/staging charges to cover a deficit.
     /// Submitted writes are absent from queue and keep all completion-owned charges.
     pub(crate) fn reclaim_ciphertext(&self, cache: Option<&CacheId>, bytes: usize) -> usize {
-        let mut released = 0usize;
+        let pooled = self.slabs.reclaim_buffer();
+        if pooled >= bytes {
+            return pooled;
+        }
+        let mut released = pooled;
         let mut removed = 0;
         let mut pending = self.pending.borrow_mut();
         self.queue.borrow_mut().retain(|id| {
@@ -401,7 +405,7 @@ impl StoreWriter {
                 entry.ticket,
             )
         };
-        let mut buffer = alignment.allocate(disk_bytes, staging)?;
+        let mut buffer = self.slabs.allocate_reserved(disk_bytes, staging)?;
         buffer.retain_charge(dirty);
         let append = match self.segments.append(disk_bytes) {
             Ok(append) => append,
@@ -476,7 +480,9 @@ impl StoreWriter {
             while self.pending_count() != 0 {
                 self.progress(1, scope).await?;
             }
-            self.slabs.fence_writes().await
+            self.slabs.fence_writes().await?;
+            self.slabs.reclaim_buffer();
+            Ok(())
         })
     }
     /// Evict disposable references without canceling submitted I/O. Completion
@@ -505,6 +511,10 @@ impl StoreWriter {
     }
     pub fn is_idle(&self) -> bool {
         !self.busy.get() && self.pending_count() == 0 && self.writes_in_flight() == 0
+    }
+    #[cfg(test)]
+    pub(super) fn reclaim_idle_buffer(&self) -> usize {
+        self.slabs.reclaim_buffer()
     }
 }
 struct Busy<'a>(&'a StoreWriter);

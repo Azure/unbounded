@@ -108,13 +108,17 @@ impl StoreReader {
             };
             let length = entry.location.location.extent.length();
             let decoded_length = entry.metadata.page_length(page)? as usize + 16;
-            let mut decoded_reservation = reserve(
-                length
-                    .checked_add(decoded_length)
-                    .ok_or(Error::Overloaded)?,
-            )?;
+            let amount = length
+                .checked_add(decoded_length)
+                .ok_or(Error::Overloaded)?;
+            let mut reserved = reserve(amount);
+            if matches!(reserved, Err(Error::Overloaded)) {
+                self.slabs.reclaim_buffer();
+                reserved = reserve(amount);
+            }
+            let mut decoded_reservation = reserved?;
             let staging = decoded_reservation.split(length)?;
-            let buffer = self.slabs.alignment()?.allocate(length, staging)?;
+            let buffer = self.slabs.allocate_reserved(length, staging)?;
             let buffer = match self
                 .slabs
                 .read(entry.location.location, buffer, lease, scope)

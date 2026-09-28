@@ -334,6 +334,7 @@ fn index_capacity_rejection_preserves_segments_and_releases_all_charges_without_
     assert_eq!(f.store.writer.writes_in_flight(), 0);
     assert_eq!(f.reactor.in_flight(), 0);
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
+    f.store.writer.reclaim_idle_buffer();
     assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
 
     assert!(matches!(f.enqueue(f.copy(4, 64)), Err(Error::Overloaded)));
@@ -418,6 +419,7 @@ fn real_writer_rechecks_index_capacity_and_replaces_same_page_when_full() {
     assert_eq!(f.store.writer.writes_in_flight(), 0);
     assert_eq!(f.reactor.in_flight(), 0);
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
+    f.store.writer.reclaim_idle_buffer();
     assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
 
     f.enqueue(f.copy(1, 64)).unwrap();
@@ -451,6 +453,7 @@ fn real_writer_rechecks_index_capacity_and_replaces_same_page_when_full() {
     assert!(f.store.writer.is_idle());
     assert_eq!(f.reactor.in_flight(), 0);
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
+    f.store.writer.reclaim_idle_buffer();
     assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
 }
 
@@ -574,6 +577,7 @@ fn abandoned_write_retains_kernel_lease_and_cannot_publish() {
         f.reactor.poll_budgeted(32).unwrap();
         assert!(Instant::now() < deadline);
     }
+    f.store.writer.reclaim_idle_buffer();
     assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
     assert!(f.store.writer.is_idle());
     assert!(f.store.writer.index().lookup(&id).unwrap().is_none());
@@ -1008,6 +1012,7 @@ fn unreclaimable_segment_pressure_discards_copies_without_fatal_progress_error()
     assert_eq!(f.store.writer.discarded_count(), 2);
     assert!(f.store.writer.is_idle());
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
+    f.store.writer.reclaim_idle_buffer();
     assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
     assert!(segments.recycle(segment::SegmentId(0)).is_err());
     drop((first, second));

@@ -265,6 +265,29 @@ credential retry, disk invalidation, version and cancellation regressions pass.
 
 ### Historical partial handoff (superseded above for A/B)
 
+### Aligned staging recycling increment
+
+Slabs now owns one retained aligned staging allocation per worker. Its original
+reservation remains charged while idle; allocation reuses only matching geometry
+and rebinds to a newly admitted cache reservation. Last-owner Drop zeroizes bytes,
+releases dirty completion charges and recycles only after kernel ownership fences.
+Pool links are weak, with no reactor cycle. Read/write staging allocation uses
+this path; admission pressure reclaims idle staging before retrying a bounded
+reservation, and writer drain releases retained staging. Cancellation and failed
+write tests still require zero active owners and zero charges after explicit idle
+reclamation. A pointer-identity test proves real reuse and zeroed contents.
+
+Verification, with the mandatory external timeout prefix:
+
+- `cargo test --locked --all-features --lib -j 2 -- --test-threads=2 --quiet`:
+  746 passed, seven explicit ignores, 58.90 s.
+- `env CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -n env RACER_THROUGHPUT_STRICT_BASELINE=1' cargo test --locked --test process_restart -j 2 -- --ignored --test-threads=1 --quiet`:
+  all 14 process gates passed, 135.22 s.
+
+Still remaining: network/page allocation recycling, CRC64 hardware dispatch and
+versioned records, rotating shared-key MAC, and expanded Bootstrap mutation and
+credential-specific concurrency coverage. Phase 4 is not complete.
+
 This is a partial Phase 4 implementation, not full phase acceptance.
 
 | Goal | Delivered | Still required |

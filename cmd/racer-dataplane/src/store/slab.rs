@@ -44,6 +44,7 @@ pub struct Slabs {
     opened: RefCell<Option<OpenSlab>>,
     admission: RefCell<Option<Rc<Admission>>>,
     writes: Rc<Cell<usize>>,
+    idle_buffer: Rc<RefCell<Option<AlignedBuffer>>>,
 }
 impl Slabs {
     pub fn new(
@@ -62,6 +63,7 @@ impl Slabs {
             opened: RefCell::new(None),
             admission: RefCell::new(None),
             writes: Rc::new(Cell::new(0)),
+            idle_buffer: Rc::new(RefCell::new(None)),
         }
     }
     pub fn set_admission(&self, admission: Rc<Admission>) {
@@ -79,20 +81,42 @@ impl Slabs {
         class: ResourceClass,
         amount: usize,
     ) -> Result<Reservation> {
-        self.admission
+        let result = self
+            .admission
             .borrow()
             .as_ref()
             .ok_or(Error::Unavailable)?
-            .reserve(cache, class, amount)
+            .reserve(cache, class, amount);
+        if matches!(result, Err(Error::Overloaded)) {
+            self.idle_buffer.borrow_mut().take();
+            return self
+                .admission
+                .borrow()
+                .as_ref()
+                .ok_or(Error::Unavailable)?
+                .reserve(cache, class, amount);
+        }
+        result
     }
     /// Existing accepted fills may complete after request admission closes.
     /// Completion admission still enforces the configured byte quota.
     pub(crate) fn reserve_staging(&self, length: usize, cache: &CacheId) -> Result<Reservation> {
-        self.admission
+        let result = self
+            .admission
             .borrow()
             .as_ref()
             .ok_or(Error::Unavailable)?
-            .reserve_completion(Some(cache), ResourceClass::Ciphertext, length)
+            .reserve_completion(Some(cache), ResourceClass::Ciphertext, length);
+        if matches!(result, Err(Error::Overloaded)) {
+            self.idle_buffer.borrow_mut().take();
+            return self
+                .admission
+                .borrow()
+                .as_ref()
+                .ok_or(Error::Unavailable)?
+                .reserve_completion(Some(cache), ResourceClass::Ciphertext, length);
+        }
+        result
     }
     pub fn writes_in_flight(&self) -> usize {
         self.writes.get()
@@ -285,10 +309,36 @@ impl Slabs {
         })
     }
     pub fn allocate(&self, length: usize, cache: Option<&CacheId>) -> Result<AlignedBuffer> {
-        self.alignment()?.allocate(
+        self.allocate_reserved(
             length,
             self.reserve(cache, ResourceClass::Ciphertext, length)?,
         )
+    }
+    pub(crate) fn allocate_reserved(
+        &self,
+        length: usize,
+        reservation: Reservation,
+    ) -> Result<AlignedBuffer> {
+        if !self.owns_reservation(&reservation) {
+            return Err(Error::InvalidConfiguration);
+        }
+        let idle = self.idle_buffer.borrow_mut().take();
+        if let Some(mut buffer) = idle {
+            if buffer.len() == length {
+                buffer.rebind(reservation)?;
+                return Ok(buffer.pooled(&self.idle_buffer));
+            }
+        }
+        Ok(self
+            .alignment()?
+            .allocate(length, reservation)?
+            .pooled(&self.idle_buffer))
+    }
+    pub(crate) fn reclaim_buffer(&self) -> usize {
+        self.idle_buffer
+            .borrow_mut()
+            .take()
+            .map_or(0, |buffer| buffer.len())
     }
 }
 struct WriteFence(Rc<Cell<usize>>);
@@ -380,6 +430,7 @@ mod tests {
             -1
         );
         drop(buffer);
+        slabs.reclaim_buffer();
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
         let conflicting = Slabs::new(
             WorkerId(0),

@@ -162,6 +162,7 @@ fn retirement_during_pressure_write_prevents_late_publication() {
     assert!(f.store.writer.index().lookup(&second).unwrap().is_none());
     assert!(f.store.writer.is_idle());
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
+    f.store.writer.reclaim_idle_buffer();
     assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
     assert!(f.enqueue(f.copy(3, 113)).is_ok());
 }
