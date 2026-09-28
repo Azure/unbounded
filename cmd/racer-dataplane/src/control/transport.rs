@@ -176,6 +176,14 @@ pub struct ControlConnection {
     epoch: [u8; 32],
     idle: std::rc::Weak<RefCell<Option<ControlConnection>>>,
     idle_since: Instant,
+    // Redistribution is checked only between requests, never during a long poll.
+    retire_at: Option<Instant>,
+}
+const AUTHENTICATED_AGE_MIN: Duration = Duration::from_secs(240);
+const AUTHENTICATED_AGE_JITTER_MS: u64 = 60_000;
+
+fn authenticated_age(random: u64) -> Duration {
+    AUTHENTICATED_AGE_MIN + Duration::from_millis(random % (AUTHENTICATED_AGE_JITTER_MS + 1))
 }
 enum ControlStream {
     Real(TcpStream),
@@ -337,6 +345,7 @@ impl ControlTransport {
             if let Some(connection) = self.idle.borrow_mut().take() {
                 if identity.is_some()
                     && connection.epoch == epoch
+                    && connection.within_max_age()
                     && crate::runtime::environment::now()
                         .saturating_duration_since(connection.idle_since)
                         < Duration::from_secs(20)
@@ -422,6 +431,16 @@ impl ControlTransport {
             let mut tls = rustls::ClientConnection::new(Arc::new(config), server)
                 .map_err(|_| Error::Unauthorized)?;
             tls.set_buffer_limit(Some(64 * 1024));
+            let retire_at = if identity.is_some() {
+                let mut random = [0; 8];
+                crate::runtime::environment::fill_random(&mut random).map_err(|_| Error::Io)?;
+                Some(
+                    crate::runtime::environment::now()
+                        + authenticated_age(u64::from_ne_bytes(random)),
+                )
+            } else {
+                None
+            };
             let mut connection = ControlConnection {
                 health: self.health.clone(),
                 endpoint: crate::model::identity::NodeId(self.endpoint.url.clone()),
@@ -439,6 +458,7 @@ impl ControlTransport {
                     std::rc::Weak::new()
                 },
                 idle_since: crate::runtime::environment::now(),
+                retire_at,
             };
             while connection.tls.is_handshaking() {
                 connection.step(scope).await?;
@@ -507,6 +527,10 @@ fn connect_socket(address: SocketAddr) -> Result<TcpStream> {
     Ok(stream)
 }
 impl ControlConnection {
+    fn within_max_age(&self) -> bool {
+        self.retire_at
+            .is_none_or(|at| crate::runtime::environment::now() < at)
+    }
     fn check(&self, scope: &RequestScope) -> Result<()> {
         scope.check()?;
         if self
@@ -766,7 +790,9 @@ impl ControlConnection {
                 Ok(_) => return Err(Error::InvalidRequest),
                 Err(_) => false,
             };
-            if reusable && !close && matches!(status, 200 | 204) {
+            // Failed requests (including 429/503) must reselect a Service backend.
+            // An aged connection finishes its in-flight response, then retires.
+            if reusable && !close && matches!(status, 200 | 204) && self.within_max_age() {
                 if let Some(idle) = self.idle.upgrade() {
                     self.idle_since = crate::runtime::environment::now();
                     *idle.borrow_mut() = Some(self);
@@ -987,12 +1013,12 @@ fn retry_delay(bytes: &[u8]) -> Result<Duration> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::control::{enrollment::Enrollment, testing};
     /// Test-only synchronous driver. Production uses ReactorControlIo and never
     /// calls poll from within a future; this drives real loopback TLS fixtures.
-    struct FixtureIo;
+    pub(in crate::control) struct FixtureIo;
     impl ControlIo for FixtureIo {
         fn read_file<'a>(
             &'a self,
@@ -1041,6 +1067,271 @@ mod tests {
         fn sleep<'a>(&'a self, _: Instant, _: &'a RequestScope) -> Operation<'a, ()> {
             Box::pin(async { Ok(()) })
         }
+    }
+    /// Each group must use exactly one TLS connection. EOF after each group
+    /// proves that failure/retirement closes the socket rather than just hiding it.
+    pub(in crate::control) fn scripted_server(
+        d: &testing::Directory,
+        ca: &rcgen::Certificate,
+        ca_key: &rcgen::KeyPair,
+        groups: Vec<Vec<(String, u16, Vec<u8>)>>,
+    ) -> (ControlEndpoint, std::thread::JoinHandle<()>) {
+        let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let cert = params.signed_by(&key, ca, ca_key).unwrap();
+        let trust = d.0.join("trust");
+        std::fs::write(&trust, ca.pem()).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.der().clone()).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            provider.clone(),
+        )
+        .build()
+        .unwrap();
+        let config = Arc::new(
+            rustls::ServerConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(
+                    vec![cert.der().clone()],
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+                )
+                .unwrap(),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = ControlEndpoint {
+            url: format!("https://{}", listener.local_addr().unwrap()),
+            trust_bundle: trust,
+        };
+        let server = std::thread::spawn(move || {
+            for group in groups {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "missing backend connection");
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(e) => panic!("accept: {e}"),
+                    }
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut stream = rustls::StreamOwned::new(
+                    rustls::ServerConnection::new(config.clone()).unwrap(),
+                    socket,
+                );
+                let mut disconnected = false;
+                for (path, status, body) in group {
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        assert!(request.len() < 16384);
+                        let mut byte = [0];
+                        stream.read_exact(&mut byte).unwrap();
+                        request.push(byte[0]);
+                    }
+                    assert!(
+                        String::from_utf8(request)
+                            .unwrap()
+                            .starts_with(&format!("GET {path} HTTP/1.1\r\n"))
+                    );
+                    if status == 0 {
+                        disconnected = true;
+                        break;
+                    }
+                    let head = format!(
+                        "HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: 1\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(head.as_bytes()).unwrap();
+                    stream.write_all(&body).unwrap();
+                    stream.flush().unwrap();
+                }
+                if disconnected {
+                    continue;
+                }
+                match stream.read(&mut [0]) {
+                    Ok(0) => (),
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                        ) =>
+                    {
+                        ()
+                    }
+                    result => panic!("connection not discarded: {result:?}"),
+                }
+            }
+        });
+        (endpoint, server)
+    }
+    #[test]
+    fn authenticated_age_jitter_is_bounded() {
+        assert_eq!(authenticated_age(0), Duration::from_secs(240));
+        assert_eq!(authenticated_age(60_000), Duration::from_secs(300));
+        for random in [1, 30_000, 60_001, u64::MAX] {
+            let age = authenticated_age(random);
+            assert!((Duration::from_secs(240)..=Duration::from_secs(300)).contains(&age));
+        }
+        assert_ne!(authenticated_age(1), authenticated_age(30_000));
+    }
+    #[test]
+    fn pooled_connections_retire_between_requests_and_discard_failures() {
+        let d = testing::Directory::new();
+        let (ca, key) = testing::ca();
+        let enrollment = Enrollment::new(
+            crate::model::identity::ClusterId("11111111-1111-4111-8111-111111111111".into()),
+            d.0.join("token"),
+            d.0.join("identity"),
+        );
+        enrollment
+            .set_peer_trust_roots(vec![ca.der().to_vec()])
+            .unwrap();
+        let request = enrollment.prepare_now().unwrap();
+        let identity = enrollment
+            .accept_response(testing::issue(
+                &request,
+                &ca,
+                &key,
+                "22222222-2222-4222-8222-222222222222",
+            ))
+            .unwrap();
+        let response = |status| {
+            (
+                wire::SNAPSHOT_PATH.to_owned(),
+                status,
+                if status == 204 {
+                    vec![]
+                } else {
+                    b"{}".to_vec()
+                },
+            )
+        };
+        let (endpoint, server) = scripted_server(
+            &d,
+            &ca,
+            &key,
+            vec![
+                vec![response(200), response(204)], // Reuse before age boundary.
+                vec![response(204)],                // In-flight response survives retirement.
+                vec![response(200)],                // Idle timeout still applies.
+                vec![response(200)],                // Identity/trust epoch still applies.
+                vec![response(200), response(429)],
+                vec![response(200), response(503)],
+                vec![response(200)], // Invalid local request discards the pool lease.
+                vec![response(200), response(0)], // Backend disconnect during request.
+                vec![response(204)],
+            ],
+        );
+        let transport = ControlTransport::new(endpoint);
+        transport.attach_io(Rc::new(FixtureIo));
+        let scope = testing::scope();
+        let get = || {
+            futures::executor::block_on(async {
+                transport
+                    .authenticated(&identity, &scope)
+                    .await
+                    .unwrap()
+                    .request("GET", wire::SNAPSHOT_PATH, None, &[], 65536, &scope)
+                    .await
+                    .unwrap()
+            })
+        };
+        assert_eq!(get().status, 200);
+        let retire_at = transport.idle.borrow().as_ref().unwrap().retire_at.unwrap();
+        assert!(retire_at > Instant::now() + Duration::from_secs(239));
+        assert!(retire_at <= Instant::now() + Duration::from_secs(300));
+        assert_eq!(get().status, 204);
+        assert_eq!(
+            transport.idle.borrow().as_ref().unwrap().retire_at,
+            Some(retire_at)
+        );
+        transport.idle.borrow_mut().as_mut().unwrap().retire_at = Some(Instant::now());
+        // Checkout retires the first connection. Move the next connection across
+        // its age boundary after checkout: active I/O must not consult that age.
+        let mut connection =
+            futures::executor::block_on(transport.authenticated(&identity, &scope)).unwrap();
+        connection.retire_at = Some(Instant::now());
+        assert_eq!(connection.check(&scope), Ok(()));
+        let expiry = connection.expires;
+        connection.expires = Some(SystemTime::now() - Duration::from_secs(1));
+        assert_eq!(connection.check(&scope), Err(Error::Unauthorized));
+        connection.expires = expiry;
+        let result = futures::executor::block_on(connection.request(
+            "GET",
+            wire::SNAPSHOT_PATH,
+            None,
+            &[],
+            65536,
+            &scope,
+        ))
+        .unwrap();
+        assert_eq!(result.status, 204);
+        assert!(transport.idle.borrow().is_none());
+        assert_eq!(get().status, 200);
+        transport.idle.borrow_mut().as_mut().unwrap().idle_since =
+            Instant::now() - Duration::from_secs(20);
+        assert_eq!(get().status, 200);
+        transport.idle.borrow_mut().as_mut().unwrap().epoch = [0; 32];
+        for status in [429, 503] {
+            assert_eq!(get().status, 200);
+            assert_eq!(get().status, status);
+            assert!(transport.idle.borrow().is_none());
+        }
+        assert_eq!(get().status, 200);
+        let connection =
+            futures::executor::block_on(transport.authenticated(&identity, &scope)).unwrap();
+        assert!(matches!(
+            futures::executor::block_on(connection.request(
+                "GET",
+                "invalid",
+                None,
+                &[],
+                65536,
+                &scope
+            )),
+            Err(Error::InvalidRequest)
+        ));
+        assert!(transport.idle.borrow().is_none());
+        assert_eq!(get().status, 200);
+        let connection =
+            futures::executor::block_on(transport.authenticated(&identity, &scope)).unwrap();
+        assert!(matches!(
+            futures::executor::block_on(connection.request(
+                "GET",
+                wire::SNAPSHOT_PATH,
+                None,
+                &[],
+                65536,
+                &scope
+            )),
+            Err(Error::Io)
+        ));
+        assert!(transport.idle.borrow().is_none());
+        // Respect the existing link circuit; make its retry eligible without
+        // sleeping so this test isolates connection ownership, not timer jitter.
+        transport
+            .health
+            .observe_at(
+                &crate::model::identity::NodeId(transport.endpoint.url.clone()),
+                crate::topology::health::LinkOutcome::Refused,
+                Instant::now() - Duration::from_secs(60),
+            )
+            .unwrap();
+        assert_eq!(get().status, 204);
+        transport.close_idle();
+        server.join().unwrap();
     }
     #[test]
     fn real_server_auth_and_mutual_tls_chunked_response() {
