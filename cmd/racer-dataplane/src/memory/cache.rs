@@ -72,6 +72,7 @@ impl Entries {
 pub struct MemoryCache {
     pool: Rc<BufferPool>,
     entries: RefCell<Entries>,
+    ciphertext_entries: RefCell<HashMap<PageId, super::page::UnverifiedPage>>,
     availability: Option<Rc<crate::control::availability::Availability>>,
 }
 impl MemoryCache {
@@ -79,6 +80,7 @@ impl MemoryCache {
         Self {
             pool,
             entries: RefCell::new(Entries::default()),
+            ciphertext_entries: RefCell::new(HashMap::default()),
             availability: None,
         }
     }
@@ -116,12 +118,60 @@ impl MemoryCache {
         Ok(Some(result))
     }
     pub fn ciphertext(&self, page: &PageId) -> Result<Option<CiphertextCopy>> {
-        Ok(self.get(page)?.map(|entry| entry.copy()))
+        if let Some(entry) = self.get(page)? {
+            return Ok(Some(entry.copy()));
+        }
+        Ok(self.unverified(page)?.map(|entry| entry.copy))
+    }
+    pub(crate) fn unverified(&self, page: &PageId) -> Result<Option<super::page::UnverifiedPage>> {
+        let mut entries = self.ciphertext_entries.borrow_mut();
+        if entries.get(page).is_some_and(|entry| {
+            self.availability.as_ref().is_some_and(|a| {
+                !a.page(
+                    &page.version.object.cache,
+                    entry.copy.ciphertext.envelope().key_id,
+                )
+            })
+        }) {
+            entries.remove(page);
+        }
+        Ok(entries.get(page).cloned())
+    }
+    pub(crate) fn publish_ciphertext(&self, page: super::page::UnverifiedPage) -> Result<()> {
+        self.pool.validate_ciphertext(&page.copy)?;
+        let id = &page.copy.ciphertext.envelope().page;
+        if self.availability.as_ref().is_some_and(|a| {
+            !a.page(
+                &id.version.object.cache,
+                page.copy.ciphertext.envelope().key_id,
+            )
+        }) {
+            return Err(Error::MissingKey);
+        }
+        let mut entries = self.ciphertext_entries.borrow_mut();
+        if entries.contains_key(id) {
+            return Ok(());
+        }
+        if entries.len() + self.entries.borrow().len() >= self.pool.entry_limit() {
+            return Err(Error::Overloaded);
+        }
+        entries.insert(id.clone(), page);
+        Ok(())
+    }
+    pub(crate) fn invalidate_ciphertext(&self, page: &super::page::UnverifiedPage) {
+        let id = &page.copy.ciphertext.envelope().page;
+        let mut entries = self.ciphertext_entries.borrow_mut();
+        if entries.get(id).is_some_and(|entry| {
+            Arc::ptr_eq(&entry.copy.ciphertext.inner, &page.copy.ciphertext.inner)
+        }) {
+            entries.remove(id);
+        }
     }
     /// Validate matching identities and full-page bounds before retaining the bundle.
     pub fn publish(&self, page: PageResult) -> Result<()> {
         self.pool.validate_page(&page)?;
         let id = page.plaintext.page();
+        self.ciphertext_entries.borrow_mut().remove(id);
         if self
             .availability
             .as_ref()
@@ -151,7 +201,7 @@ impl MemoryCache {
             // or turn its historical deadline into renewed freshness.
             return Ok(());
         }
-        if entries.len() >= self.pool.entry_limit() {
+        if entries.len() + self.ciphertext_entries.borrow().len() >= self.pool.entry_limit() {
             let id = entries
                 .candidates()
                 .into_iter()
@@ -163,7 +213,7 @@ impl MemoryCache {
     }
     pub fn metadata(&self, version: &ObjectVersion) -> Result<Option<VersionMetadata>> {
         let entries = self.entries.borrow();
-        Ok(entries
+        let found = entries
             .versions
             .get(version)
             .and_then(|pages| {
@@ -172,12 +222,29 @@ impl MemoryCache {
                     .filter_map(|id| entries.pages.get(id))
                     .find(|(_, entry)| self.available(entry))
             })
-            .map(|(_, entry)| entry.metadata.immutable()))
+            .map(|(_, entry)| entry.metadata.immutable());
+        if found.is_some() {
+            return Ok(found);
+        }
+        Ok(self
+            .ciphertext_entries
+            .borrow()
+            .values()
+            .find(|entry| {
+                &entry.copy.metadata.version == version
+                    && self.availability.as_ref().is_none_or(|a| {
+                        a.page(
+                            &version.object.cache,
+                            entry.copy.ciphertext.envelope().key_id,
+                        )
+                    })
+            })
+            .map(|entry| entry.copy.metadata.immutable()))
     }
     /// Return released admission bytes, including any reserved final-page slack.
     /// Busy plaintext OR ciphertext protects the complete retained bundle.
     pub fn evict_idle(&self, bytes: usize) -> Result<usize> {
-        let mut released = 0usize;
+        let mut released = self.reclaim_ciphertext(None, bytes);
         let mut entries = self.entries.borrow_mut();
         let candidates = entries.candidates();
         for id in candidates {
@@ -207,7 +274,11 @@ impl MemoryCache {
         if !matches!(class, ResourceClass::Plaintext | ResourceClass::Ciphertext) {
             return 0;
         }
-        let mut released = 0usize;
+        let mut released = if matches!(class, ResourceClass::Ciphertext) {
+            self.reclaim_ciphertext(cache, bytes)
+        } else {
+            0
+        };
         let mut entries = self.entries.borrow_mut();
         let candidates = entries.candidates();
         for id in candidates {
@@ -241,6 +312,9 @@ impl MemoryCache {
     /// Evict lookup references. Existing owners keep
     /// their charges until their completion fences release them.
     pub fn retire_key(&self, cache: &CacheId, key: KeyId) -> Result<usize> {
+        self.ciphertext_entries.borrow_mut().retain(|id, entry| {
+            &id.version.object.cache != cache || entry.copy.ciphertext.envelope().key_id != key
+        });
         let mut entries = self.entries.borrow_mut();
         let before = entries.len();
         let removed: Vec<_> = entries
@@ -258,6 +332,9 @@ impl MemoryCache {
         Ok(before - entries.len())
     }
     pub fn remove_cache(&self, cache: &CacheId) -> Result<()> {
+        self.ciphertext_entries
+            .borrow_mut()
+            .retain(|id, _| &id.version.object.cache != cache);
         let mut entries = self.entries.borrow_mut();
         let removed: Vec<_> = entries
             .pages
@@ -269,6 +346,28 @@ impl MemoryCache {
             entries.remove(&id);
         }
         Ok(())
+    }
+    fn reclaim_ciphertext(&self, cache: Option<&CacheId>, bytes: usize) -> usize {
+        let mut entries = self.ciphertext_entries.borrow_mut();
+        let selected: Vec<_> = entries
+            .iter()
+            .take(256)
+            .filter(|(id, entry)| {
+                cache.is_none_or(|c| c == &id.version.object.cache)
+                    && Arc::strong_count(&entry.copy.ciphertext.inner) == 1
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut released = 0;
+        for id in selected {
+            if released >= bytes {
+                break;
+            }
+            if let Some(entry) = entries.remove(&id) {
+                released += entry.copy.ciphertext.inner.reservation.amount();
+            }
+        }
+        released
     }
 }
 fn idle(entry: &PageResult) -> bool {
@@ -282,6 +381,39 @@ mod tests {
         memory::pool::tests::{admission, bundle, bundle_for},
         model::{limits::ResourceClass, metadata::ExpiresAt},
     };
+    #[test]
+    fn ciphertext_residency_is_distinct_bounded_and_conditionally_invalidated() {
+        let admission = admission(2);
+        let cache = MemoryCache::new(Rc::new(BufferPool::new(admission.clone())));
+        let first = bundle(&admission, "cipher");
+        let id = first.plaintext.page().clone();
+        let unverified = super::super::page::UnverifiedPage {
+            copy: first.copy(),
+            disk_token: None,
+        };
+        cache.publish_ciphertext(unverified.clone()).unwrap();
+        assert!(cache.get(&id).unwrap().is_none());
+        assert_eq!(
+            cache.ciphertext(&id).unwrap().unwrap().ciphertext.bytes(),
+            first.ciphertext.bytes()
+        );
+        let replacement = bundle(&admission, "cipher");
+        cache.invalidate_ciphertext(&super::super::page::UnverifiedPage {
+            copy: replacement.copy(),
+            disk_token: None,
+        });
+        assert!(
+            cache.unverified(&id).unwrap().is_some(),
+            "different allocation must not invalidate"
+        );
+        cache.invalidate_ciphertext(&unverified);
+        assert!(cache.unverified(&id).unwrap().is_none());
+        cache.publish_ciphertext(unverified).unwrap();
+        cache.publish(first).unwrap();
+        assert!(cache.unverified(&id).unwrap().is_none());
+        assert!(cache.get(&id).unwrap().is_some());
+    }
+
     #[test]
     fn bounded_reclamation_advances_past_a_busy_prefix() {
         let admission = admission(300);

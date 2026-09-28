@@ -139,6 +139,15 @@ impl BufferPool {
             cache,
         )
     }
+    pub(super) fn validate_ciphertext(&self, copy: &super::page::CiphertextCopy) -> Result<()> {
+        copy.validate_metadata()?;
+        self.validate_reservation(
+            &copy.ciphertext.inner.reservation,
+            ResourceClass::Ciphertext,
+            copy.ciphertext.inner.bytes.capacity(),
+            Some(&copy.metadata.version.object.cache),
+        )
+    }
 }
 impl VerifiedPage {
     pub fn page(&self) -> &PageId {

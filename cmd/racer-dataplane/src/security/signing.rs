@@ -192,7 +192,8 @@ fn signature_input(head: &MessageHead) -> Result<String> {
     let keyid = field(head, "racer-signer")?;
     protocol::uuid(&keyid)?;
     Ok(format!(
-        "({components});created={timestamp};keyid=\"{keyid}\";alg=\"ed25519\";tag=\"racer-peer-v2\""
+        "({components});created={timestamp};keyid=\"{keyid}\";alg=\"ed25519\";tag=\"{}\"",
+        protocol::PROFILE
     ))
 }
 /// RFC 9421 section 2.5 signature base, using the strict Racer profile. The
@@ -368,14 +369,14 @@ pub(crate) mod tests {
         push(&mut request, "racer-timestamp", "1700000000123");
         push(&mut request, "racer-signer", node(0).0);
         push(&mut request, "content-length", "0");
-        let params = "(\"@method\" \"@request-target\" \"content-length\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v2\"";
+        let params = "(\"@method\" \"@request-target\" \"content-length\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v3\"";
         push(&mut request, "signature-input", format!("racer={params}"));
         assert_eq!(signature_base(&request).unwrap(), format!(
             "\"@method\": POST\n\"@request-target\": /racer/peer/v1?attempt=1\n\"content-length\": 0\n\"racer-signer\": 00000000-1111-4111-8111-111111111111\n\"racer-timestamp\": 1700000000123\n\"@signature-params\": {params}"
         ).as_bytes());
         request.start = StartLine::Response { status: 200 };
         request.headers.retain(|h| h.name != "signature-input");
-        let params = "(\"@status\" \"content-length\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v2\"";
+        let params = "(\"@status\" \"content-length\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v3\"";
         push(&mut request, "signature-input", format!("racer={params}"));
         assert_eq!(signature_base(&request).unwrap(), format!(
             "\"@status\": 200\n\"content-length\": 0\n\"racer-signer\": 00000000-1111-4111-8111-111111111111\n\"racer-timestamp\": 1700000000123\n\"@signature-params\": {params}"
@@ -389,7 +390,7 @@ pub(crate) mod tests {
         assert!(base.starts_with(
             "\"@method\": POST\n\"@request-target\": /racer/peer/v1\n\"content-length\": 0\n"
         ));
-        assert!(base.ends_with(";alg=\"ed25519\";tag=\"racer-peer-v2\""));
+        assert!(base.ends_with(";alg=\"ed25519\";tag=\"racer-peer-v3\""));
         for h in &original.head.headers {
             let mut tamper = clone_head(&original);
             tamper

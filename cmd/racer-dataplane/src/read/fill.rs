@@ -348,6 +348,7 @@ impl Fill {
                     AcquisitionEvent::Failed(error) => return Err(error),
                     AcquisitionEvent::Lead(leader) => {
                         let ready = self.dependencies.flights.ciphertext_for(&leader)?;
+                        let ready = ready.or(self.dependencies.memory.unverified(&page)?);
                         let driver_permit = super::drivers::reserve()?;
                         let acquisition = waiter.acquisition(&leader)?;
                         // The acquisition driver stays on this owner. Admit an
@@ -378,10 +379,18 @@ impl Fill {
                                     other => (ready, other),
                                 };
                                 if let Some(copy) = ready {
+                                    if !plaintext {
+                                        return Ok(AcquiredPage::Ciphertext(copy));
+                                    }
                                     let reservation =
                                         fill.reserve_bootstrap(&owned_page.version.object.cache)?;
                                     match fill
-                                        .decrypt(&owned_page, copy.copy, reservation, &owned_scope)
+                                        .decrypt(
+                                            &owned_page,
+                                            copy.copy.clone(),
+                                            reservation,
+                                            &owned_scope,
+                                        )
                                         .await
                                     {
                                         Ok(result) => {
@@ -390,6 +399,7 @@ impl Fill {
                                             return Ok(result.into());
                                         }
                                         Err(Error::CorruptRecord | Error::MissingKey) => {
+                                            fill.dependencies.memory.invalidate_ciphertext(&copy);
                                             flights.discard_ciphertext(&leader)?;
                                             if let Some(token) = copy.disk_token {
                                                 fill.dependencies.disk.invalidate(&token)?;
@@ -441,6 +451,21 @@ impl Fill {
                                     } else {
                                         result
                                     };
+                                    if let AcquiredPage::Ciphertext(copy) = &result {
+                                        match fill
+                                            .dependencies
+                                            .memory
+                                            .publish_ciphertext(copy.clone())
+                                        {
+                                            Ok(())
+                                            | Err(
+                                                Error::Overloaded
+                                                | Error::MissingKey
+                                                | Error::Unavailable,
+                                            ) => {}
+                                            Err(error) => return Err(error),
+                                        }
+                                    }
                                     let _ = flights.publish_acquired(leader, result);
                                 }
                                 Err(Error::OriginRejected) => {
