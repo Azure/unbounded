@@ -28,7 +28,7 @@ impl WireBuffer {
         }
         let reservation = admission.reserve(None, ResourceClass::Ciphertext, length)?;
         Ok(Self {
-            bytes: vec![0; length].into_boxed_slice(),
+            bytes: reservation.buffer(length)?.into_boxed_slice(),
             _reservation: reservation,
         })
     }
@@ -38,7 +38,7 @@ impl WireBuffer {
             return Err(Error::InvalidRequest);
         }
         Ok(Self {
-            bytes: vec![0; length].into_boxed_slice(),
+            bytes: reservation.buffer(length)?.into_boxed_slice(),
             _reservation: reservation,
         })
     }
@@ -448,5 +448,136 @@ impl Transfers {
     }
 }
 #[cfg(test)]
-mod tests { /* HTTP fallback, exact ciphertext preservation, bounded transfer credits. */
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_checkout_reuses_zeroed_payload_without_moving_or_releasing_its_charge() {
+        use crate::model::identity::CacheId;
+        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
+        let first = CacheId("first".into());
+        let second = CacheId("second".into());
+        let length = 1 << 20;
+        for reserved in [false, true] {
+            let mut old = admission
+                .reserve(Some(&first), ResourceClass::Plaintext, length)
+                .unwrap();
+            let mut bytes = old.buffer(length).unwrap();
+            bytes.fill(0xa7);
+            bytes.truncate(1);
+            let pointer = bytes.as_ptr();
+            old.recycle(bytes);
+            drop(old);
+            let mut buffer = if reserved {
+                WireBuffer::reserved(
+                    admission
+                        .reserve(Some(&second), ResourceClass::Ciphertext, length)
+                        .unwrap(),
+                    length,
+                )
+            } else {
+                WireBuffer::new(&admission, length)
+            }
+            .unwrap();
+            assert_eq!(buffer.bytes().unwrap().as_ptr(), pointer);
+            assert_eq!(buffer.bytes().unwrap().len(), length);
+            assert!(buffer.bytes().unwrap().iter().all(|byte| *byte == 0));
+            assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), length);
+            assert_eq!(admission.retained_buffer_bytes(), 0);
+            buffer.bytes_mut().unwrap()[..3].copy_from_slice(b"abc");
+            let (bytes, mut reservation) = buffer.into_parts();
+            assert_eq!(bytes.as_ptr(), pointer);
+            assert_eq!(&bytes[..3], b"abc");
+            assert_eq!(reservation.cache(), reserved.then_some(&second));
+            assert_eq!(reservation.amount(), length);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), length);
+            reservation.recycle(bytes);
+            drop(reservation);
+            admission.reclaim_buffers();
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+        }
+    }
+
+    #[test]
+    fn wire_checkout_validates_bounds_class_and_admission_before_reuse() {
+        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
+        let length = 1 << 20;
+        let mut old = admission
+            .reserve(None, ResourceClass::Ciphertext, length)
+            .unwrap();
+        old.recycle(old.buffer(length).unwrap());
+        drop(old);
+        for (class, amount, requested) in [
+            (ResourceClass::Plaintext, length, length),
+            (ResourceClass::Ciphertext, length - 1, length),
+            (ResourceClass::Ciphertext, (16 << 20) + 17, (16 << 20) + 17),
+        ] {
+            let reservation = admission.reserve(None, class, amount).unwrap();
+            assert!(WireBuffer::reserved(reservation, requested).is_err());
+            assert_eq!(admission.retained_buffer_bytes(), length);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), length);
+            assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+        }
+        assert!(matches!(
+            WireBuffer::new(&admission, (16 << 20) + 17),
+            Err(Error::InvalidRequest)
+        ));
+        assert!(matches!(
+            WireBuffer::new(&admission, 0),
+            Err(Error::InvalidConfiguration)
+        ));
+        // A pool miss still exposes only initialized bytes.
+        let fresh = WireBuffer::new(&admission, 3).unwrap();
+        assert_eq!(fresh.bytes().unwrap(), &[0; 3]);
+        drop(fresh);
+        admission.stop();
+        assert!(matches!(
+            WireBuffer::new(&admission, length),
+            Err(Error::Unavailable)
+        ));
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+    }
+
+    #[test]
+    #[ignore = "opt-in same-workload wire buffer checkout benchmark"]
+    fn wire_checkout_benchmark() {
+        use std::{hint::black_box, time::Instant};
+        const ITERATIONS: usize = 128;
+        for length in [1 << 20, 16 << 20, (16 << 20) + 16] {
+            for reserved in [false, true] {
+                let admission = Admission::new(crate::test_support::cluster::config(false).limits);
+                for sample in 0..6 {
+                    let start = Instant::now();
+                    for _ in 0..ITERATIONS {
+                        let mut buffer = if reserved {
+                            WireBuffer::reserved(
+                                admission
+                                    .reserve(None, ResourceClass::Ciphertext, length)
+                                    .unwrap(),
+                                length,
+                            )
+                        } else {
+                            WireBuffer::new(&admission, length)
+                        }
+                        .unwrap();
+                        buffer.bytes_mut().unwrap().fill(black_box(0xa7));
+                        black_box(buffer.bytes().unwrap());
+                        let (bytes, mut reservation) = buffer.into_parts();
+                        reservation.recycle(bytes);
+                        drop(reservation);
+                    }
+                    let elapsed = start.elapsed();
+                    if sample != 0 {
+                        println!(
+                            "wire_checkout length={length} reserved={reserved} sample={sample} iterations={ITERATIONS} ns_per_op={:.0}",
+                            elapsed.as_nanos() as f64 / ITERATIONS as f64,
+                        );
+                    }
+                }
+                admission.reclaim_buffers();
+                assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+            }
+        }
+    }
 }

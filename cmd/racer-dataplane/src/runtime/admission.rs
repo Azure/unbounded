@@ -108,6 +108,11 @@ impl Reservation {
         if pool.len() >= 2 {
             return;
         }
+        // SAFETY: Vec<u8>::zeroize above writes zero to the entire capacity,
+        // including previously uninitialized spare capacity. No allocation or
+        // byte mutation intervenes. Record that initialized length while idle
+        // so exact-capacity checkout needs no second zero-fill.
+        unsafe { bytes.set_len(bytes.capacity()) };
         let reservation = Reservation {
             class: self.class,
             amount: std::mem::take(&mut self.amount),
@@ -129,9 +134,9 @@ impl Reservation {
                 .iter()
                 .position(|(bytes, _)| bytes.capacity() == length)
             {
-                let (mut bytes, old) = pool.swap_remove(index);
+                let (bytes, old) = pool.swap_remove(index);
                 drop(old);
-                bytes.resize(length, 0);
+                debug_assert_eq!(bytes.len(), length);
                 return Ok(bytes);
             }
         }
@@ -617,10 +622,8 @@ mod tests {
             {
                 let pool = admission.buffers.lock().unwrap();
                 let bytes = &pool[0].0;
-                // SAFETY: buffer() initialized the entire allocation; truncation
-                // and recycling cannot deallocate it while the pool lock is held.
-                let idle = unsafe { std::slice::from_raw_parts(bytes.as_ptr(), capacity) };
-                assert!(idle.iter().all(|byte| *byte == 0));
+                assert_eq!(bytes.len(), capacity);
+                assert!(bytes.iter().all(|byte| *byte == 0));
             }
             let mut reservation = admission
                 .reserve(Some(&second), ResourceClass::Plaintext, capacity)
@@ -635,6 +638,70 @@ mod tests {
             admission.reclaim_buffers();
             assert_eq!(admission.used(ResourceClass::Plaintext), 0);
         }
+    }
+    #[test]
+    fn recycled_spare_capacity_is_initialized_and_checkout_is_exact_and_admitted() {
+        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
+        let mut bytes = Vec::with_capacity(1 << 20);
+        bytes.push(0xa7);
+        let capacity = bytes.capacity();
+        let pointer = bytes.as_ptr();
+        let mut reservation = admission
+            .reserve(None, ResourceClass::Ciphertext, capacity)
+            .unwrap();
+        reservation.recycle(bytes);
+        drop(reservation);
+        let reservation = admission
+            .reserve(None, ResourceClass::Plaintext, capacity)
+            .unwrap();
+        assert!(matches!(
+            reservation.buffer(capacity + 1),
+            Err(Error::InvalidConfiguration)
+        ));
+        let different = reservation.buffer(capacity - 1).unwrap();
+        assert_ne!(different.as_ptr(), pointer);
+        assert_eq!(different.len(), capacity - 1);
+        assert!(different.iter().all(|byte| *byte == 0));
+        drop(different);
+        assert_eq!(admission.retained_buffer_bytes(), capacity);
+        let bytes = reservation.buffer(capacity).unwrap();
+        assert_eq!(bytes.as_ptr(), pointer);
+        assert_eq!(bytes.len(), capacity);
+        assert!(bytes.iter().all(|byte| *byte == 0));
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+        assert_eq!(admission.used(ResourceClass::Plaintext), capacity);
+        drop((bytes, reservation));
+        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+    }
+    #[test]
+    fn recycled_pool_keeps_two_slots_and_pressure_releases_idle_charges() {
+        let capacity = 1 << 20;
+        let mut limits = crate::test_support::cluster::config(false).limits;
+        limits.ciphertext_bytes = std::num::NonZeroUsize::new(3 * capacity).unwrap();
+        let admission = Admission::new(limits);
+        let buffers: Vec<_> = (0..3)
+            .map(|_| {
+                let reservation = admission
+                    .reserve(None, ResourceClass::Ciphertext, capacity)
+                    .unwrap();
+                let mut bytes = reservation.buffer(capacity).unwrap();
+                bytes.fill(0xa7);
+                (bytes, reservation)
+            })
+            .collect();
+        for (bytes, mut reservation) in buffers {
+            reservation.recycle(bytes);
+        }
+        assert_eq!(admission.buffers.lock().unwrap().len(), 2);
+        assert_eq!(admission.retained_buffer_bytes(), 2 * capacity);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 2 * capacity);
+        let reservation = admission
+            .reserve(None, ResourceClass::Ciphertext, 3 * capacity)
+            .unwrap();
+        assert_eq!(admission.retained_buffer_bytes(), 0);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 3 * capacity);
+        drop(reservation);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
     }
     #[test]
     #[ignore = "opt-in same-workload payload recycle benchmark"]
