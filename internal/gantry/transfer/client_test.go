@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c" //nolint:staticcheck // h2c deliberate
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
@@ -40,10 +39,11 @@ func startHandlerOnEphemeral(t *testing.T, handler http.Handler) string {
 		t.Fatalf("listen: %v", err)
 	}
 
-	h2s := &http2.Server{}
-	handler = h2c.NewHandler(handler, h2s) //nolint:staticcheck // h2c deliberate
-
-	hsrv := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+	hsrv := &http.Server{
+		Handler:           handler,
+		Protocols:         newPeerServerProtocols(),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 
 	go func() {
 		_ = hsrv.Serve(ln) //nolint:errcheck // best-effort
@@ -58,6 +58,31 @@ func startHandlerOnEphemeral(t *testing.T, handler http.Handler) string {
 	})
 
 	return ln.Addr().String()
+}
+
+func TestHandlerServerSupportsHTTP1(t *testing.T) {
+	addr := startHandlerOnEphemeral(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ProtoMajor != 1 {
+			t.Errorf("protocol major = %d, want 1", r.ProtoMajor)
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+addr, nil)
+	if err != nil {
+		t.Fatalf("create HTTP/1 request: %v", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("HTTP/1 request: %v", err)
+	}
+	defer resp.Body.Close() //nolint:errcheck // test cleanup
+
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
 }
 
 func TestClientDefaultRequestTimeout(t *testing.T) {
@@ -173,34 +198,13 @@ func TestClientHeadOK(t *testing.T) {
 }
 
 func TestClientFetchBusyPreservesRetryAfter(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	server := &http2.Server{}
-
-	t.Cleanup(func() { _ = listener.Close() })
-
-	// Use the package's existing ephemeral transfer fixture pattern through a
-	// minimal h2c handler that returns only the capacity signal under test.
 	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Retry-After", "3")
 		http.Error(w, "busy", http.StatusTooManyRequests)
 	})
+	addr := startHandlerOnEphemeral(t, handler)
 
-	go func() {
-		for {
-			conn, acceptErr := listener.Accept()
-			if acceptErr != nil {
-				return
-			}
-
-			go server.ServeConn(conn, &http2.ServeConnOpts{Handler: handler})
-		}
-	}()
-
-	_, _, _, err = NewClient(WithRequestTimeout(time.Second)).FetchFromPeer(context.Background(), listener.Addr().String(), ifaces.OriginRef{
+	_, _, _, err := NewClient(WithRequestTimeout(time.Second)).FetchFromPeer(context.Background(), addr, ifaces.OriginRef{
 		Repository: "repo",
 		Digest:     mustDigest([]byte("busy")),
 	})
@@ -344,33 +348,9 @@ func TestClientFetchNotFound(t *testing.T) {
 }
 
 func TestClientFetchUnauthorizedStatus(t *testing.T) {
-	t.Helper()
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-
-	h2s := &http2.Server{}
-
-	hsrv := &http.Server{
-		Handler: h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { //nolint:staticcheck // h2c deliberate
-			w.WriteHeader(http.StatusUnauthorized)
-		}), h2s),
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-
-	go func() {
-		_ = hsrv.Serve(ln) //nolint:errcheck // best-effort
-	}()
-
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-
-		_ = hsrv.Shutdown(ctx) //nolint:errcheck // best-effort
-		_ = ln.Close()         //nolint:errcheck // best-effort close
-	})
+	addr := startHandlerOnEphemeral(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
 
 	client := NewClient()
 
@@ -379,7 +359,7 @@ func TestClientFetchUnauthorizedStatus(t *testing.T) {
 
 	d := digest.MustParse("sha256:" + strings.Repeat("e", 64))
 
-	_, _, _, err = client.FetchFromPeer(ctx, ln.Addr().String(), ifaces.OriginRef{Repository: "r", Digest: d})
+	_, _, _, err := client.FetchFromPeer(ctx, addr, ifaces.OriginRef{Repository: "r", Digest: d})
 	if err == nil {
 		t.Fatal("expected status error, got nil")
 	}

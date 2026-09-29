@@ -18,9 +18,6 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c" //nolint:staticcheck // h2c deliberate
-
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
@@ -91,10 +88,13 @@ func startPeerTransfer(t *testing.T, c ifaces.LocalContentStore) string {
 		t.Fatalf("listen: %v", err)
 	}
 
-	h2s := &http2.Server{}
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	protocols.SetUnencryptedHTTP2(true)
 
 	hsrv := &http.Server{
-		Handler:           h2c.NewHandler(s.Handler(), h2s), //nolint:staticcheck // h2c deliberate
+		Handler:           s.Handler(),
+		Protocols:         protocols,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
