@@ -509,7 +509,12 @@ impl MetadataService {
                             .open_charged(sealed, scope.request, attempt)?;
                     let service = self.clone();
                     let driver_registration = registration.clone();
-                    let owned_scope = scope.clone();
+                    // Detaching one refresh must not cancel the shared peer
+                    // ingress scope. Parent cancellation still reaches its work.
+                    let caller_scope = scope.clone();
+                    let caller_cancellation = caller_scope.cancellation.subscribe()?;
+                    let owned_scope =
+                        RequestScope::new(caller_scope.request, caller_scope.deadline.0)?;
                     let mut owned_budget = budget.transfer();
                     let (send, mut receive) = futures::channel::oneshot::channel();
                     driver_permit.submit(Box::pin(async move {
@@ -522,7 +527,13 @@ impl MetadataService {
                             bootstrap,
                         ));
                         let result = poll_fn(|cx| {
-                            if Rc::strong_count(&driver_registration.lifetime) == 1 {
+                            if !caller_scope.cancellation.is_cancelled() {
+                                caller_cancellation.register(cx.waker());
+                            }
+                            if !owned_scope.cancellation.is_cancelled()
+                                && (caller_scope.check().is_err()
+                                    || Rc::strong_count(&driver_registration.lifetime) == 1)
+                            {
                                 let _ = owned_scope.cancel();
                             }
                             work.as_mut().poll(cx)

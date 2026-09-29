@@ -379,12 +379,17 @@ impl Fill {
                             .dependencies
                             .credentials
                             .local_context(acquisition.origin, acquisition.scope)?;
+                        // Peer callers may share a worker-lifetime cancellation
+                        // domain. Driver abandonment must cancel only this work.
+                        let caller_scope = acquisition.scope.clone();
+                        let caller_cancellation = caller_scope.cancellation.subscribe()?;
+                        let owned_scope =
+                            RequestScope::new(caller_scope.request, caller_scope.deadline.0)?;
                         let operation = self
                             .dependencies
                             .flights
                             .retain_operation(&leader, self.metrics.lease(Gauge::ActiveFills)?)?;
                         let mut owned_budget = acquisition.budget.transfer();
-                        let owned_scope = acquisition.scope.clone();
                         let owned_membership = acquisition.membership.clone();
                         let owned_page = page.clone();
                         let prefetched = prefetch.take();
@@ -452,7 +457,13 @@ impl Fill {
                                 }
                             });
                             let result = std::future::poll_fn(|cx| {
-                                if operation.cancellation_requested() {
+                                if !caller_scope.cancellation.is_cancelled() {
+                                    caller_cancellation.register(cx.waker());
+                                }
+                                if !owned_scope.cancellation.is_cancelled()
+                                    && (caller_scope.check().is_err()
+                                        || operation.cancellation_requested())
+                                {
                                     let _ = owned_scope.cancel();
                                 }
                                 work.as_mut().poll(cx)
