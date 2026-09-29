@@ -5,7 +5,7 @@ use crate::{
 };
 use std::{
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, Ordering},
     },
     task::Waker,
@@ -19,6 +19,7 @@ pub struct Cancellation {
 }
 struct State {
     canceled: AtomicBool,
+    candidate_idle: OnceLock<Mutex<(std::time::Duration, Instant)>>,
     waiters: Mutex<Vec<Waker>>,
     registrations: Mutex<Vec<Weak<futures::task::AtomicWaker>>>,
 }
@@ -50,6 +51,7 @@ impl Cancellation {
         Ok(Self {
             state: Arc::new(State {
                 canceled: AtomicBool::new(false),
+                candidate_idle: OnceLock::new(),
                 waiters: Mutex::new(Vec::new()),
                 registrations: Mutex::new(Vec::new()),
             }),
@@ -132,6 +134,30 @@ pub struct RequestScope {
     pub(crate) body_deadlines: Option<(Instant, Instant)>,
 }
 impl RequestScope {
+    /// Local alarm only. The immutable hard deadline is what credentials and
+    /// routes sign; neither phase completion nor body progress can extend it.
+    pub(crate) fn set_candidate_idle(&self, allowance: std::time::Duration) -> Result<()> {
+        self.check()?;
+        self.cancellation
+            .state
+            .candidate_idle
+            .set(Mutex::new((
+                allowance,
+                crate::runtime::environment::now() + allowance,
+            )))
+            .map_err(|_| Error::Internal)?;
+        Ok(())
+    }
+
+    pub(crate) fn candidate_progress(&self) -> Result<()> {
+        self.check()?;
+        if let Some(idle) = self.cancellation.state.candidate_idle.get() {
+            let mut idle = idle.lock().map_err(|_| Error::Unavailable)?;
+            idle.1 = crate::runtime::environment::now() + idle.0;
+        }
+        Ok(())
+    }
+
     pub fn new(request: RequestId, deadline: Instant) -> Result<Self> {
         Ok(Self {
             request,
@@ -146,6 +172,12 @@ impl RequestScope {
         } else if crate::runtime::environment::now() >= self.deadline.0 {
             Err(Error::DeadlineExceeded)
         } else {
+            if let Some(idle) = self.cancellation.state.candidate_idle.get()
+                && crate::runtime::environment::now()
+                    >= idle.lock().map_err(|_| Error::Unavailable)?.1
+            {
+                return Err(Error::DeadlineExceeded);
+            }
             Ok(())
         }
     }
@@ -157,6 +189,31 @@ impl RequestScope {
 mod tests {
     use super::*;
     use std::{sync::atomic::AtomicUsize, task::Wake, time::Duration};
+    #[test]
+    fn candidate_idle_progress_never_renews_hard_deadline_or_revives_expiry() {
+        let clock = crate::runtime::environment::SimulationClock::new(39);
+        let _env = clock.environment(0).enter();
+        let start = crate::runtime::environment::now();
+        let scope = RequestScope::new(RequestId([39; 16]), start + Duration::from_secs(3)).unwrap();
+        scope.set_candidate_idle(Duration::from_secs(1)).unwrap();
+        let signed = crate::security::protocol::encode_deadline(scope.deadline).unwrap();
+        for _ in 0..5 {
+            clock.advance(Duration::from_millis(500));
+            scope.candidate_progress().unwrap();
+            assert_eq!(
+                crate::security::protocol::encode_deadline(scope.deadline).unwrap(),
+                signed
+            );
+        }
+        clock.advance(Duration::from_millis(500));
+        assert_eq!(scope.candidate_progress(), Err(Error::DeadlineExceeded));
+        let stalled =
+            RequestScope::new(RequestId([40; 16]), start + Duration::from_secs(10)).unwrap();
+        stalled.set_candidate_idle(Duration::from_secs(1)).unwrap();
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(stalled.check(), Err(Error::DeadlineExceeded));
+        assert_eq!(stalled.candidate_progress(), Err(Error::DeadlineExceeded));
+    }
     struct Count(AtomicUsize);
     impl Wake for Count {
         fn wake(self: Arc<Self>) {

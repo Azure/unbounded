@@ -393,11 +393,12 @@ impl CandidatePolicy {
         }
         let now = crate::runtime::environment::now();
         let overall = budget.begin_peer_attempt(now, scope.deadline.0, links)?;
-        // Share the remaining time among later candidates and, for predecessor
-        // probes, local origin. Fast failures leave their unused time available.
+        // Share bounds no-progress fallback, not a progressing body's lifetime.
+        // Sign the original hard ceiling before sending; it never renews.
         let deadline = now + (overall - now) / remaining_opportunities.max(1);
         // A clone shares cancellation: timing it out would cancel the caller too.
-        let mut attempt_scope = RequestScope::new(scope.request, deadline)?;
+        let mut attempt_scope = RequestScope::new(scope.request, overall)?;
+        attempt_scope.set_candidate_idle(deadline - now)?;
         attempt_scope.body_deadlines = Some((overall, deadline));
         let attempts = if matches!(mode, FetchMode::Acquire) {
             // Reserve remote acquisition credits from the same original call.
@@ -431,7 +432,7 @@ impl CandidatePolicy {
                 visited: vec![self.node.clone()],
                 remaining_links: links,
                 remaining_attempts: attempts,
-                deadline: Deadline(deadline),
+                deadline: Deadline(overall),
             },
         };
         let registration = scope.cancellation.subscribe()?;
