@@ -1,0 +1,308 @@
+{
+  "applied": false,
+  "patches": [
+    {
+      "node": "aks-ddsv6-84072342-vmss00000h",
+      "uid": "d4f155c0-fd55-4670-9da4-1939ca8ffef1",
+      "previous_override": null,
+      "patch": [
+        {
+          "op": "test",
+          "path": "/metadata/uid",
+          "value": "d4f155c0-fd55-4670-9da4-1939ca8ffef1"
+        },
+        {
+          "op": "test",
+          "path": "/metadata/resourceVersion",
+          "value": "115963934"
+        },
+        {
+          "op": "add",
+          "path": "/metadata/annotations/racer.unbounded-cloud.io~1shares",
+          "value": "1"
+        }
+      ],
+      "server_dry_run": "passed"
+    },
+    {
+      "node": "aks-ddsv6-84072342-vmss00002i",
+      "uid": "0cbf7383-6de8-4217-8188-9c3404127e1d",
+      "previous_override": null,
+      "patch": [
+        {
+          "op": "test",
+          "path": "/metadata/uid",
+          "value": "0cbf7383-6de8-4217-8188-9c3404127e1d"
+        },
+        {
+          "op": "test",
+          "path": "/metadata/resourceVersion",
+          "value": "115959891"
+        },
+        {
+          "op": "add",
+          "path": "/metadata/annotations/racer.unbounded-cloud.io~1shares",
+          "value": "1"
+        }
+      ],
+      "server_dry_run": "passed"
+    },
+    {
+      "node": "aks-ddsv6-84072342-vmss00003z",
+      "uid": "62002b4e-3a4b-4143-91af-e94d34372e74",
+      "previous_override": null,
+      "patch": [
+        {
+          "op": "test",
+          "path": "/metadata/uid",
+          "value": "62002b4e-3a4b-4143-91af-e94d34372e74"
+        },
+        {
+          "op": "test",
+          "path": "/metadata/resourceVersion",
+          "value": "115962529"
+        },
+        {
+          "op": "add",
+          "path": "/metadata/annotations/racer.unbounded-cloud.io~1shares",
+          "value": "1"
+        }
+      ],
+      "server_dry_run": "passed"
+    },
+    {
+      "node": "aks-ddsv6-84072342-vmss00005f",
+      "uid": "cde84a72-477b-4aa9-abe7-6f0b9564473d",
+      "previous_override": null,
+      "patch": [
+        {
+          "op": "test",
+          "path": "/metadata/uid",
+          "value": "cde84a72-477b-4aa9-abe7-6f0b9564473d"
+        },
+        {
+          "op": "test",
+          "path": "/metadata/resourceVersion",
+          "value": "115964040"
+        },
+        {
+          "op": "add",
+          "path": "/metadata/annotations/racer.unbounded-cloud.io~1shares",
+          "value": "1"
+        }
+      ],
+      "server_dry_run": "passed"
+    },
+    {
+      "node": "aks-ddsv6-84072342-vmss000066",
+      "uid": "36801da7-94a2-400c-900e-038fa7ac8450",
+      "previous_override": null,
+      "patch": [
+        {
+          "op": "test",
+          "path": "/metadata/uid",
+          "value": "36801da7-94a2-400c-900e-038fa7ac8450"
+        },
+        {
+          "op": "test",
+          "path": "/metadata/resourceVersion",
+          "value": "115962296"
+        },
+        {
+          "op": "add",
+          "path": "/metadata/annotations/racer.unbounded-cloud.io~1shares",
+          "value": "1"
+        }
+      ],
+      "server_dry_run": "passed"
+    },
+    {
+      "node": "aks-ddsv6-84072342-vmss00006d",
+      "uid": "207e72ef-7e32-4e08-9eaf-830002097f41",
+      "previous_override": null,
+      "patch": [
+        {
+          "op": "test",
+          "path": "/metadata/uid",
+          "value": "207e72ef-7e32-4e08-9eaf-830002097f41"
+        },
+        {
+          "op": "test",
+          "path": "/metadata/resourceVersion",
+          "value": "115962721"
+        },
+        {
+          "op": "add",
+          "path": "/metadata/annotations/racer.unbounded-cloud.io~1shares",
+          "value": "1"
+        }
+      ],
+      "server_dry_run": "passed"
+    },
+    {
+      "node": "aks-ddsv6-84072342-vmss000078",
+      "uid": "ccbd9563-029f-4b78-993c-fa6c4f612e6c",
+      "previous_override": null,
+      "patch": [
+        {
+          "op": "test",
+          "path": "/metadata/uid",
+          "value": "ccbd9563-029f-4b78-993c-fa6c4f612e6c"
+        },
+        {
+          "op": "test",
+          "path": "/metadata/resourceVersion",
+          "value": "115964753"
+        },
+        {
+          "op": "add",
+          "path": "/metadata/annotations/racer.unbounded-cloud.io~1shares",
+          "value": "1"
+        }
+      ],
+      "server_dry_run": "passed"
+    },
+    {
+      "node": "aks-ddsv6-84072342-vmss0000b1",
+      "uid": "5b8c26a9-96ee-45a3-b98d-7f92d29e3019",
+      "previous_override": null,
+      "patch": [
+        {
+          "op": "test",
+          "path": "/metadata/uid",
+          "value": "5b8c26a9-96ee-45a3-b98d-7f92d29e3019"
+        },
+        {
+          "op": "test",
+          "path": "/metadata/resourceVersion",
+          "value": "115961808"
+        },
+        {
+          "op": "add",
+          "path": "/metadata/annotations/racer.unbounded-cloud.io~1shares",
+          "value": "1"
+        }
+      ],
+      "server_dry_run": "passed"
+    },
+    {
+      "node": "aks-ddsv6-84072342-vmss0000bl",
+      "uid": "9713462f-21cb-457b-b48b-bc7d89c561d3",
+      "previous_override": null,
+      "patch": [
+        {
+          "op": "test",
+          "path": "/metadata/uid",
+          "value": "9713462f-21cb-457b-b48b-bc7d89c561d3"
+        },
+        {
+          "op": "test",
+          "path": "/metadata/resourceVersion",
+          "value": "115960843"
+        },
+        {
+          "op": "add",
+          "path": "/metadata/annotations/racer.unbounded-cloud.io~1shares",
+          "value": "1"
+        }
+      ],
+      "server_dry_run": "passed"
+    },
+    {
+      "node": "aks-ddsv6-84072342-vmss0000cp",
+      "uid": "08e27a59-88a7-4f53-a2e3-696ba6517915",
+      "previous_override": null,
+      "patch": [
+        {
+          "op": "test",
+          "path": "/metadata/uid",
+          "value": "08e27a59-88a7-4f53-a2e3-696ba6517915"
+        },
+        {
+          "op": "test",
+          "path": "/metadata/resourceVersion",
+          "value": "115962513"
+        },
+        {
+          "op": "add",
+          "path": "/metadata/annotations/racer.unbounded-cloud.io~1shares",
+          "value": "1"
+        }
+      ],
+      "server_dry_run": "passed"
+    },
+    {
+      "node": "aks-ddsv6-84072342-vmss0000d9",
+      "uid": "abea5a59-9194-413c-9328-859a138bb6a1",
+      "previous_override": null,
+      "patch": [
+        {
+          "op": "test",
+          "path": "/metadata/uid",
+          "value": "abea5a59-9194-413c-9328-859a138bb6a1"
+        },
+        {
+          "op": "test",
+          "path": "/metadata/resourceVersion",
+          "value": "115959262"
+        },
+        {
+          "op": "add",
+          "path": "/metadata/annotations/racer.unbounded-cloud.io~1shares",
+          "value": "1"
+        }
+      ],
+      "server_dry_run": "passed"
+    }
+  ],
+  "workloads": [
+    {
+      "name": "racer-dataplane",
+      "status": {
+        "currentNumberScheduled": 1500,
+        "desiredNumberScheduled": 1500,
+        "numberAvailable": 1500,
+        "numberMisscheduled": 0,
+        "numberReady": 1500,
+        "observedGeneration": 86,
+        "updatedNumberScheduled": 1500
+      },
+      "hostNetwork": false,
+      "images": [
+        "ghcr.io/azure/racer-dataplane:5e1a4554f8034fef676d5ca91315da80646e5b71@sha256:5c001d5d0345783b34346e15b30b633ab48e62ab1c83e74cbcbbb437d7de3fc2"
+      ]
+    },
+    {
+      "name": "gantry",
+      "status": {
+        "currentNumberScheduled": 1500,
+        "desiredNumberScheduled": 1500,
+        "numberAvailable": 1500,
+        "numberMisscheduled": 0,
+        "numberReady": 1500,
+        "observedGeneration": 13,
+        "updatedNumberScheduled": 1500
+      },
+      "hostNetwork": false,
+      "images": [
+        "ghcr.io/azure/gantry:b8d1a44a52938fa937c859a1b6a6548e2a392877"
+      ]
+    },
+    {
+      "name": "racer-loadgen",
+      "status": {
+        "currentNumberScheduled": 1500,
+        "desiredNumberScheduled": 1500,
+        "numberAvailable": 1500,
+        "numberMisscheduled": 0,
+        "numberReady": 1500,
+        "observedGeneration": 26,
+        "updatedNumberScheduled": 1500
+      },
+      "hostNetwork": false,
+      "images": [
+        "ghcr.io/azure/racer-loadgen:2082700dbbe86b932a9cb84b5d2972cde358936f@sha256:7aeccc5ab408f9319fe033856062168686b68a4e8369cb6bfafaca0b9fc8152b"
+      ]
+    }
+  ]
+}

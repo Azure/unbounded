@@ -1,0 +1,273 @@
+{
+  "model": "layer payload only; uniform full-catalog demand on all1500; primary hit; healthy V3 expected next hops; no retries/coalescing/local retention",
+  "membership_version": {
+    "cluster": "2bd8ccd9-f479-4ba8-b7a7-5b03624a708c",
+    "content_hash": "183dea25f90867fd9dda08974ef5913d944bc782e81bf9810be4fed9a53f3818",
+    "membership_hash": "1edebfa700248f4e50834169640843cef80a3f76956f2f8acbd4b4e45d5ca178",
+    "membership_version": "4974",
+    "sequence": "4975"
+  },
+  "cache": "79f749cf-6c6c-4e26-928f-2057ca9b4279",
+  "catalog_layer_bytes": 274439398400,
+  "pages": 18417,
+  "slots": 18249,
+  "changed_primary_bytes": 1296044032,
+  "mean_links": [
+    2.5509388916859734,
+    2.5509529717889756
+  ],
+  "cohort": [
+    {
+      "node": "aks-ddsv6-84072342-vmss00000h",
+      "uid": "d4f155c0-fd55-4670-9da4-1939ca8ffef1",
+      "position": 1251,
+      "neighbors": 36,
+      "before": {
+        "primary_bytes": 135708672,
+        "primary_pages": 10,
+        "top3_bytes": 539003904,
+        "owner_Gbps_at_586_GBs": 2.316643030142191,
+        "transit_Gbps_at_586_GBs": 6.028112789749893,
+        "local_remote_Gbps_at_586_GBs": 3.1237878743405765
+      },
+      "after": {
+        "primary_bytes": 50331648,
+        "primary_pages": 3,
+        "top3_bytes": 135708672,
+        "owner_Gbps_at_586_GBs": 0.859196835518147,
+        "transit_Gbps_at_586_GBs": 6.058486299920271,
+        "local_remote_Gbps_at_586_GBs": 3.124760153322981
+      }
+    },
+    {
+      "node": "aks-ddsv6-84072342-vmss00002i",
+      "uid": "0cbf7383-6de8-4217-8188-9c3404127e1d",
+      "position": 86,
+      "neighbors": 36,
+      "before": {
+        "primary_bytes": 151949824,
+        "primary_pages": 11,
+        "top3_bytes": 512084992,
+        "owner_Gbps_at_586_GBs": 2.593890983628022,
+        "transit_Gbps_at_586_GBs": 4.666116548522493,
+        "local_remote_Gbps_at_586_GBs": 3.123602919068071
+      },
+      "after": {
+        "primary_bytes": 34819584,
+        "primary_pages": 3,
+        "top3_bytes": 155363328,
+        "owner_Gbps_at_586_GBs": 0.5943949299426535,
+        "transit_Gbps_at_586_GBs": 4.678153680614404,
+        "local_remote_Gbps_at_586_GBs": 3.1249368056949463
+      }
+    },
+    {
+      "node": "aks-ddsv6-84072342-vmss00003z",
+      "uid": "62002b4e-3a4b-4143-91af-e94d34372e74",
+      "position": 585,
+      "neighbors": 35,
+      "before": {
+        "primary_bytes": 190529536,
+        "primary_pages": 14,
+        "top3_bytes": 613518848,
+        "owner_Gbps_at_586_GBs": 3.252473958411631,
+        "transit_Gbps_at_586_GBs": 4.530215415453006,
+        "local_remote_Gbps_at_586_GBs": 3.1231635708527383
+      },
+      "after": {
+        "primary_bytes": 63029760,
+        "primary_pages": 5,
+        "top3_bytes": 186208256,
+        "owner_Gbps_at_586_GBs": 1.0759625898891345,
+        "transit_Gbps_at_586_GBs": 4.5017349208471416,
+        "local_remote_Gbps_at_586_GBs": 3.1246155464154617
+      }
+    },
+    {
+      "node": "aks-ddsv6-84072342-vmss00005f",
+      "uid": "cde84a72-477b-4aa9-abe7-6f0b9564473d",
+      "position": 1215,
+      "neighbors": 36,
+      "before": {
+        "primary_bytes": 252459520,
+        "primary_pages": 17,
+        "top3_bytes": 657057792,
+        "owner_Gbps_at_586_GBs": 4.3096625940090485,
+        "transit_Gbps_at_586_GBs": 4.5766145714759165,
+        "local_remote_Gbps_at_586_GBs": 3.1224583082539414
+      },
+      "after": {
+        "primary_bytes": 83998720,
+        "primary_pages": 6,
+        "top3_bytes": 209159168,
+        "owner_Gbps_at_586_GBs": 1.433917570344108,
+        "transit_Gbps_at_586_GBs": 4.598624395510028,
+        "local_remote_Gbps_at_586_GBs": 3.1243767505645916
+      }
+    },
+    {
+      "node": "aks-ddsv6-84072342-vmss000066",
+      "uid": "36801da7-94a2-400c-900e-038fa7ac8450",
+      "position": 336,
+      "neighbors": 36,
+      "before": {
+        "primary_bytes": 198722560,
+        "primary_pages": 14,
+        "top3_bytes": 591664128,
+        "owner_Gbps_at_586_GBs": 3.392334673763615,
+        "transit_Gbps_at_586_GBs": 5.889821033111442,
+        "local_remote_Gbps_at_586_GBs": 3.1230702681740516
+      },
+      "after": {
+        "primary_bytes": 93999616,
+        "primary_pages": 6,
+        "top3_bytes": 194772480,
+        "owner_Gbps_at_586_GBs": 1.6046399396085933,
+        "transit_Gbps_at_586_GBs": 5.91150576716091,
+        "local_remote_Gbps_at_586_GBs": 3.1242628597245217
+      }
+    },
+    {
+      "node": "aks-ddsv6-84072342-vmss00006d",
+      "uid": "207e72ef-7e32-4e08-9eaf-830002097f41",
+      "position": 207,
+      "neighbors": 36,
+      "before": {
+        "primary_bytes": 145172992,
+        "primary_pages": 10,
+        "top3_bytes": 492622848,
+        "owner_Gbps_at_586_GBs": 2.478205667517608,
+        "transit_Gbps_at_586_GBs": 5.810076963339007,
+        "local_remote_Gbps_at_586_GBs": 3.123680094062141
+      },
+      "after": {
+        "primary_bytes": 57576960,
+        "primary_pages": 4,
+        "top3_bytes": 178727424,
+        "owner_Gbps_at_586_GBs": 0.9828794366271283,
+        "transit_Gbps_at_586_GBs": 5.823967023101241,
+        "local_remote_Gbps_at_586_GBs": 3.124677643248859
+      }
+    },
+    {
+      "node": "aks-ddsv6-84072342-vmss000078",
+      "uid": "ccbd9563-029f-4b78-993c-fa6c4f612e6c",
+      "position": 1210,
+      "neighbors": 36,
+      "before": {
+        "primary_bytes": 202808832,
+        "primary_pages": 13,
+        "top3_bytes": 643494400,
+        "owner_Gbps_at_586_GBs": 3.462090227395922,
+        "transit_Gbps_at_586_GBs": 4.791045977568537,
+        "local_remote_Gbps_at_586_GBs": 3.1230237334484796
+      },
+      "after": {
+        "primary_bytes": 106393600,
+        "primary_pages": 7,
+        "top3_bytes": 206737920,
+        "owner_Gbps_at_586_GBs": 1.8162140138821508,
+        "transit_Gbps_at_586_GBs": 4.8088572122098165,
+        "local_remote_Gbps_at_586_GBs": 3.1241217162460204
+      }
+    },
+    {
+      "node": "aks-ddsv6-84072342-vmss0000b1",
+      "uid": "5b8c26a9-96ee-45a3-b98d-7f92d29e3019",
+      "position": 545,
+      "neighbors": 36,
+      "before": {
+        "primary_bytes": 134217728,
+        "primary_pages": 8,
+        "top3_bytes": 441960960,
+        "owner_Gbps_at_586_GBs": 2.2911915613817255,
+        "transit_Gbps_at_586_GBs": 5.78386926515445,
+        "local_remote_Gbps_at_586_GBs": 3.1238048533057268
+      },
+      "after": {
+        "primary_bytes": 67108864,
+        "primary_pages": 4,
+        "top3_bytes": 117440512,
+        "owner_Gbps_at_586_GBs": 1.1455957806908628,
+        "transit_Gbps_at_586_GBs": 5.790790351396328,
+        "local_remote_Gbps_at_586_GBs": 3.12456909331953
+      }
+    },
+    {
+      "node": "aks-ddsv6-84072342-vmss0000bl",
+      "uid": "9713462f-21cb-457b-b48b-bc7d89c561d3",
+      "position": 915,
+      "neighbors": 36,
+      "before": {
+        "primary_bytes": 272494592,
+        "primary_pages": 18,
+        "top3_bytes": 648271360,
+        "owner_Gbps_at_586_GBs": 4.651675445679993,
+        "transit_Gbps_at_586_GBs": 5.114489283606809,
+        "local_remote_Gbps_at_586_GBs": 3.122230147579044
+      },
+      "after": {
+        "primary_bytes": 100663296,
+        "primary_pages": 6,
+        "top3_bytes": 266593792,
+        "owner_Gbps_at_586_GBs": 1.718393671036294,
+        "transit_Gbps_at_586_GBs": 5.143827042184614,
+        "local_remote_Gbps_at_586_GBs": 3.1241869733126286
+      }
+    },
+    {
+      "node": "aks-ddsv6-84072342-vmss0000cp",
+      "uid": "08e27a59-88a7-4f53-a2e3-696ba6517915",
+      "position": 68,
+      "neighbors": 36,
+      "before": {
+        "primary_bytes": 197098496,
+        "primary_pages": 12,
+        "top3_bytes": 559105536,
+        "owner_Gbps_at_586_GBs": 3.3646107524352495,
+        "transit_Gbps_at_586_GBs": 4.672731479738516,
+        "local_remote_Gbps_at_586_GBs": 3.123088763118233
+      },
+      "after": {
+        "primary_bytes": 33554432,
+        "primary_pages": 2,
+        "top3_bytes": 129731072,
+        "owner_Gbps_at_586_GBs": 0.5727978903454314,
+        "transit_Gbps_at_586_GBs": 4.700140547198855,
+        "local_remote_Gbps_at_586_GBs": 3.124951213326432
+      }
+    },
+    {
+      "node": "aks-ddsv6-84072342-vmss0000d9",
+      "uid": "abea5a59-9194-413c-9328-859a138bb6a1",
+      "position": 1032,
+      "neighbors": 36,
+      "before": {
+        "primary_bytes": 134977536,
+        "primary_pages": 9,
+        "top3_bytes": 499134464,
+        "owner_Gbps_at_586_GBs": 2.3041620214231164,
+        "transit_Gbps_at_586_GBs": 5.914669553659133,
+        "local_remote_Gbps_at_586_GBs": 3.1237962005638717
+      },
+      "after": {
+        "primary_bytes": 28619776,
+        "primary_pages": 2,
+        "top3_bytes": 95728640,
+        "owner_Gbps_at_586_GBs": 0.48855982169386164,
+        "transit_Gbps_at_586_GBs": 5.842516368977766,
+        "local_remote_Gbps_at_586_GBs": 3.125007409502984
+      }
+    }
+  ],
+  "all_nodes_modeled": 1500,
+  "healthy_nodes": 1489,
+  "cohort_primary_bytes": [
+    2016140288,
+    720096256
+  ],
+  "cohort_top3_bytes": [
+    6197919232,
+    1876171264
+  ]
+}
