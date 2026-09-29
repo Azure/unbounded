@@ -4,6 +4,7 @@
 package racer
 
 import (
+	"fmt"
 	"strconv"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -22,6 +23,11 @@ import (
 func DesiredDaemonSet(c WorkloadConfig) (*appsv1.DaemonSet, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
+	}
+
+	// Callers must implement drain-before-admit before opting into two workloads.
+	if len(c.PodNetworkNodes) != 0 {
+		return nil, fmt.Errorf("mixed networking requires the drain-aware two-workload planner: %w", wire.InvalidRequest)
 	}
 
 	// The legacy managed-by label is part of the immutable selector. Preserve it

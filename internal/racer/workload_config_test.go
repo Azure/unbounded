@@ -5,6 +5,7 @@ package racer
 
 import (
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -87,7 +88,7 @@ func TestWorkloadConfigLookupDefaultsAndOverrides(t *testing.T) {
 		ControlURL: "https://controller:8443", DataplaneImage: "racer:test", DaemonSetName: "custom.dataplane",
 		DataplaneServiceAccount: "custom.account", BootstrapTrustConfigMap: "custom.trust",
 	}
-	if err != nil || cfg != want {
+	if err != nil || !reflect.DeepEqual(cfg, want) {
 		t.Fatalf("custom lookup: %+v, %v", cfg, err)
 	}
 
@@ -129,14 +130,14 @@ func TestWorkloadConfigIgnoresControllerRuntime(t *testing.T) {
 		}
 
 		switch key {
-		case "RACER_PEER_PORT", "RACER_HOST_NETWORK", "RACER_DIAGNOSTICS_PORT", "RACER_DATAPLANE_SERVICE_ACCOUNT", "RACER_DAEMONSET_NAME", "RACER_BOOTSTRAP_TRUST_CONFIGMAP":
+		case "RACER_PEER_PORT", "RACER_HOST_NETWORK", "RACER_POD_NETWORK_NODES", "RACER_DIAGNOSTICS_PORT", "RACER_DATAPLANE_SERVICE_ACCOUNT", "RACER_DAEMONSET_NAME", "RACER_BOOTSTRAP_TRUST_CONFIGMAP":
 			return "", false
 		default:
 			t.Errorf("workload parser requested runtime setting %s", key)
 			return "invalid", true
 		}
 	})
-	if err != nil || cfg != want {
+	if err != nil || !reflect.DeepEqual(cfg, want) {
 		t.Fatalf("workload needs runtime configuration: %+v, %v", cfg, err)
 	}
 
@@ -157,7 +158,7 @@ func TestWorkloadIgnoresLegacyKeyringSecret(t *testing.T) {
 		value, ok := values[key]
 		return value, ok
 	})
-	if err != nil || cfg != want {
+	if err != nil || !reflect.DeepEqual(cfg, want) {
 		t.Fatalf("legacy environment changed workload configuration: %+v, %v", cfg, err)
 	}
 

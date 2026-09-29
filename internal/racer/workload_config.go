@@ -4,6 +4,7 @@
 package racer
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -24,6 +25,7 @@ type WorkloadConfig struct {
 	DataplaneImage          string
 	PeerPort                uint16
 	HostNetwork             bool
+	PodNetworkNodes         []string
 	// Zero preserves the legacy automatic diagnostics port (9090, or 9091).
 	DiagnosticsPort         uint16
 	DataplaneServiceAccount string
@@ -59,6 +61,13 @@ func WorkloadConfigFromLookup(lookup func(string) (string, bool)) (WorkloadConfi
 		}
 	}
 
+	var podNetworkNodes []string
+	if value, ok := lookup("RACER_POD_NETWORK_NODES"); ok {
+		if err := json.Unmarshal([]byte(value), &podNetworkNodes); err != nil || podNetworkNodes == nil {
+			return WorkloadConfig{}, fmt.Errorf("RACER_POD_NETWORK_NODES must be a JSON array: %w", wire.InvalidRequest)
+		}
+	}
+
 	cfg := WorkloadConfig{
 		Cluster:                 wire.ClusterID(env("RACER_CLUSTER_ID", "")),
 		Namespace:               env("POD_NAMESPACE", "unbounded-system"),
@@ -67,6 +76,7 @@ func WorkloadConfigFromLookup(lookup func(string) (string, bool)) (WorkloadConfi
 		DataplaneImage:          env("RACER_DATAPLANE_IMAGE", ""),
 		PeerPort:                uint16(port),
 		HostNetwork:             hostNetwork == "true",
+		PodNetworkNodes:         podNetworkNodes,
 		DiagnosticsPort:         uint16(diagnosticsPort),
 		DataplaneServiceAccount: env("RACER_DATAPLANE_SERVICE_ACCOUNT", "racer-dataplane"),
 		DaemonSetName:           env("RACER_DAEMONSET_NAME", "racer-dataplane"),
@@ -76,6 +86,19 @@ func WorkloadConfigFromLookup(lookup func(string) (string, bool)) (WorkloadConfi
 }
 
 func (c WorkloadConfig) Validate() error {
+	if len(c.PodNetworkNodes) != 0 && (!c.HostNetwork || c.DaemonSetName != DataplaneDaemonSetName) {
+		return fmt.Errorf("pod network exceptions require host networking and the fixed dataplane name: %w", wire.InvalidRequest)
+	}
+
+	seen := make(map[string]bool, len(c.PodNetworkNodes))
+	for _, node := range c.PodNetworkNodes {
+		if len(validation.IsDNS1123Subdomain(node)) != 0 || seen[node] {
+			return fmt.Errorf("pod network nodes must be unique valid node names: %w", wire.InvalidRequest)
+		}
+
+		seen[node] = true
+	}
+
 	if !wire.ValidUUID(string(c.Cluster)) || len(validation.IsDNS1123Label(c.Namespace)) != 0 || c.PeerPort < 1024 {
 		return fmt.Errorf("cluster, namespace, or peer port: %w", wire.InvalidRequest)
 	}
