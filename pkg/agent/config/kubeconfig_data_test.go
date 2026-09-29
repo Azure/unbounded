@@ -47,6 +47,10 @@ contexts:
 	}{
 		{name: "embedded data and impersonation", data: valid},
 		{name: "absolute exec command", data: strings.Replace(valid, "    client-certificate-data: Y2VydA==\n    client-key-data: a2V5", "    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: /usr/local/bin/kubelogin\n      interactiveMode: Never", 1)},
+		{name: "token credential", data: strings.Replace(valid, "    client-certificate-data: Y2VydA==\n    client-key-data: a2V5", "    token: embedded", 1)},
+		{name: "empty auth info", data: strings.Replace(valid, "    client-certificate-data: Y2VydA==\n    client-key-data: a2V5\n    as: kubelet\n    as-groups:\n    - system:nodes\n    as-user-extra:\n      example.com/header:\n      - preserved", "    {}", 1), wantErr: "must provide authentication credentials"},
+		{name: "impersonation without credential", data: strings.Replace(valid, "    client-certificate-data: Y2VydA==\n    client-key-data: a2V5", "", 1), wantErr: "must provide authentication credentials"},
+		{name: "incomplete certificate credential", data: strings.Replace(valid, "    client-key-data: a2V5", "", 1), wantErr: "must provide authentication credentials"},
 		{name: "malformed", data: "secret-sentinel: [", wantErr: "not a valid kubeconfig"},
 		{name: "missing current context", data: strings.Replace(valid, "current-context: current", "current-context: \"\"", 1), wantErr: "current context is required"},
 		{name: "missing context", data: strings.Replace(valid, "current-context: current", "current-context: missing", 1), wantErr: "current context is invalid"},

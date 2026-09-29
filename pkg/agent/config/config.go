@@ -472,7 +472,8 @@ func (a *AgentKubeletConfig) validateKubeconfigData() error {
 		}
 	}
 
-	if authInfo, ok := kubeconfig.AuthInfos[contextConfig.AuthInfo]; contextConfig.AuthInfo == "" || !ok || authInfo == nil {
+	authInfo, ok := kubeconfig.AuthInfos[contextConfig.AuthInfo]
+	if contextConfig.AuthInfo == "" || !ok || authInfo == nil {
 		return fmt.Errorf("Kubelet.KubeconfigData current context must reference valid auth info")
 	}
 
@@ -491,6 +492,14 @@ func (a *AgentKubeletConfig) validateKubeconfigData() error {
 		case authInfo.Exec != nil && !filepath.IsAbs(authInfo.Exec.Command):
 			return fmt.Errorf("Kubelet.KubeconfigData exec command must be an absolute path")
 		}
+	}
+
+	if authInfo.Token == "" &&
+		(len(authInfo.ClientCertificateData) == 0 || len(authInfo.ClientKeyData) == 0) &&
+		(authInfo.Username == "" || authInfo.Password == "") &&
+		authInfo.Exec == nil &&
+		authInfo.AuthProvider == nil {
+		return fmt.Errorf("Kubelet.KubeconfigData current context must provide authentication credentials")
 	}
 
 	restConfig, err := clientcmd.NewDefaultClientConfig(

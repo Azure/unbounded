@@ -149,6 +149,166 @@ func TestConfigureKubeletAuthenticationModes(t *testing.T) {
 	}
 }
 
+func TestConfigureKubeletRawKubeconfigReapply(t *testing.T) {
+	t.Parallel()
+
+	machineDir := t.TempDir()
+	goalState := &goalstates.NodeStart{
+		MachineDir: machineDir,
+		NodeName:   "worker-1",
+		Kubelet: goalstates.Kubelet{
+			KubeconfigData: []byte("first"),
+			ClusterDNS:     "10.0.0.10",
+		},
+	}
+
+	apply := func() *configureKubelet {
+		t.Helper()
+
+		task := ConfigureKubelet(goalState).(*configureKubelet)
+		if err := task.Do(context.Background()); err != nil {
+			t.Fatalf("ConfigureKubelet.Do() error = %v", err)
+		}
+
+		return task
+	}
+
+	if !apply().changed {
+		t.Fatal("initial raw kubeconfig write did not set changed")
+	}
+
+	if apply().changed {
+		t.Fatal("identical raw kubeconfig reapply set changed")
+	}
+
+	goalState.Kubelet.KubeconfigData = []byte("second")
+
+	if !apply().changed {
+		t.Fatal("raw-to-raw kubeconfig update did not set changed")
+	}
+
+	path := filepath.Join(machineDir, goalstates.KubeletKubeconfigPath)
+	if got := readTestFile(t, path); !bytes.Equal(got, goalState.Kubelet.KubeconfigData) {
+		t.Fatalf("raw kubeconfig = %q, want %q", got, goalState.Kubelet.KubeconfigData)
+	}
+
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatalf("chmod kubeconfig: %v", err)
+	}
+
+	if apply().changed {
+		t.Fatal("permission-only repair set changed")
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat kubeconfig: %v", err)
+	}
+
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("kubeconfig permissions = %04o, want 0600", got)
+	}
+}
+
+func TestConfigureKubeletDirectToBootstrap(t *testing.T) {
+	t.Parallel()
+
+	for _, direct := range []struct {
+		name string
+		set  func(*goalstates.Kubelet)
+	}{
+		{name: "raw", set: func(k *goalstates.Kubelet) { k.KubeconfigData = []byte("raw credentials") }},
+		{name: "exec", set: func(k *goalstates.Kubelet) {
+			k.ExecCredential = &clientcmdapi.ExecConfig{APIVersion: "client.authentication.k8s.io/v1", Command: "/usr/local/bin/kubelogin"}
+		}},
+	} {
+		t.Run(direct.name, func(t *testing.T) {
+			t.Parallel()
+
+			machineDir := t.TempDir()
+			goalState := &goalstates.NodeStart{
+				MachineDir: machineDir,
+				NodeName:   "worker-1",
+				Kubelet: goalstates.Kubelet{
+					APIServer:  "https://api.example.com",
+					CACertData: []byte("ca"),
+					ClusterDNS: "10.0.0.10",
+				},
+			}
+			direct.set(&goalState.Kubelet)
+
+			initial := ConfigureKubelet(goalState).(*configureKubelet)
+			if err := initial.Do(context.Background()); err != nil {
+				t.Fatalf("initial ConfigureKubelet.Do() error = %v", err)
+			}
+
+			kubeconfigPath := filepath.Join(machineDir, goalstates.KubeletKubeconfigPath)
+			if _, err := os.Stat(kubeconfigPath); err != nil {
+				t.Fatalf("direct kubeconfig stat error = %v", err)
+			}
+
+			goalState.Kubelet.KubeconfigData = nil
+			goalState.Kubelet.ExecCredential = nil
+			goalState.Kubelet.BootstrapToken = "bootstrap.token"
+
+			reconfigured := ConfigureKubelet(goalState).(*configureKubelet)
+			if err := reconfigured.Do(context.Background()); err != nil {
+				t.Fatalf("bootstrap ConfigureKubelet.Do() error = %v", err)
+			}
+
+			if !reconfigured.changed {
+				t.Fatal("direct-to-bootstrap reapply did not set changed")
+			}
+
+			if _, err := os.Stat(kubeconfigPath); !os.IsNotExist(err) {
+				t.Fatalf("stale direct kubeconfig remains, stat error = %v", err)
+			}
+
+			bootstrapPath := filepath.Join(machineDir, goalstates.KubeletBootstrapKubeconfigPath)
+			if got := readTestFile(t, bootstrapPath); !bytes.Contains(got, []byte("bootstrap.token")) {
+				t.Fatalf("bootstrap kubeconfig does not contain new credential: %q", got)
+			}
+
+			if got := readTestFile(t, filepath.Join(machineDir, goalstates.KubeletServiceDropInDir, "10-kubeconfig.conf")); !bytes.Contains(got, []byte("--bootstrap-kubeconfig=")) {
+				t.Fatalf("bootstrap drop-in does not select bootstrap mode: %q", got)
+			}
+
+			// After kubelet bootstraps, it owns its rotated kubeconfig.
+			if err := os.WriteFile(kubeconfigPath, []byte("rotated certificate"), 0o600); err != nil {
+				t.Fatalf("write rotated kubeconfig: %v", err)
+			}
+
+			reapplied := ConfigureKubelet(goalState).(*configureKubelet)
+			if err := reapplied.Do(context.Background()); err != nil {
+				t.Fatalf("bootstrap reapply error = %v", err)
+			}
+
+			if reapplied.changed {
+				t.Fatal("unchanged bootstrap reapply set changed")
+			}
+
+			if got := readTestFile(t, kubeconfigPath); !bytes.Equal(got, []byte("rotated certificate")) {
+				t.Fatalf("bootstrap reapply removed rotated kubeconfig: %q", got)
+			}
+
+			goalState.Kubelet.BootstrapToken = "new.bootstrap.token"
+
+			updated := ConfigureKubelet(goalState).(*configureKubelet)
+			if err := updated.Do(context.Background()); err != nil {
+				t.Fatalf("bootstrap token update error = %v", err)
+			}
+
+			if !updated.changed {
+				t.Fatal("bootstrap token update did not set changed")
+			}
+
+			if got := readTestFile(t, kubeconfigPath); !bytes.Equal(got, []byte("rotated certificate")) {
+				t.Fatalf("bootstrap token update removed rotated kubeconfig: %q", got)
+			}
+		})
+	}
+}
+
 func readTestFile(t *testing.T, path string) []byte {
 	t.Helper()
 
