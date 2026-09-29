@@ -235,7 +235,7 @@ fn subscription_stall_must_leave_time_for_fixed_page_fallback() {
         &mut f.budget,
     ));
     assert!(poll(subscribe.as_mut()).is_pending());
-    let deadline = f.peers.calls.borrow()[0].scope.deadline.0;
+    let deadline = f.peers.calls.borrow()[0].scope.body_deadlines.unwrap().1;
     assert!(deadline < f.scope.deadline.0);
     assert_eq!(
         f.peers.calls.borrow()[0].signed_deadline,
