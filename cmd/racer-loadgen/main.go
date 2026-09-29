@@ -55,6 +55,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	f.StringVar(&opts.pull.Target, "target", "http://127.0.0.1:5000", "Gantry mirror URL (or origin URL for baseline)")
 	f.StringVar(&opts.pull.Namespace, "namespace", "loadgen.invalid", "Gantry upstream registry name sent as ns query parameter")
 	f.IntVar(&opts.pull.Concurrency, "concurrency", 64, "Concurrent image pulls; zero serves only the origin")
+	f.StringVar(&opts.pull.ConcurrencyFile, "concurrency-file", "", "Optional regular file containing concurrency 0-256; polled every second without restarting the origin")
 	f.IntVar(&opts.pull.LayerConcurrency, "layer-concurrency", 4, "Concurrent layer requests per image pull")
 	f.DurationVar(&opts.pull.Timeout, "pull-timeout", 2*time.Minute, "Deadline for one complete image pull")
 	f.DurationVar(&opts.pull.RetryDelay, "retry-delay", time.Second, "Per-worker delay after failed pulls")

@@ -50,9 +50,10 @@ func pullTestMetrics() *loadMetrics {
 		pullDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name: "test_pull_duration_seconds",
 		}, []string{"result"}),
-		inFlight:      prometheus.NewGauge(prometheus.GaugeOpts{Name: "test_in_flight"}),
-		receivedBytes: prometheus.NewCounter(prometheus.CounterOpts{Name: "test_received_bytes_total"}),
-		verifiedBytes: prometheus.NewCounter(prometheus.CounterOpts{Name: "test_verified_bytes_total"}),
+		inFlight:           prometheus.NewGauge(prometheus.GaugeOpts{Name: "test_in_flight"}),
+		appliedConcurrency: prometheus.NewGauge(prometheus.GaugeOpts{Name: "test_applied_concurrency"}),
+		receivedBytes:      prometheus.NewCounter(prometheus.CounterOpts{Name: "test_received_bytes_total"}),
+		verifiedBytes:      prometheus.NewCounter(prometheus.CounterOpts{Name: "test_verified_bytes_total"}),
 		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "test_requests_total",
 		}, []string{"kind", "result"}),
