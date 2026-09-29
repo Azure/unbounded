@@ -306,8 +306,10 @@ func migrationPod(obj client.Object) bool {
 		return true
 	}
 
+	// Identity and slabs are exclusive dataplane state. Socket directories under
+	// /run/racer are shared with clients and origin servers, not occupancy claims.
 	for _, volume := range pod.Spec.Volumes {
-		if volume.HostPath != nil && (volume.HostPath.Path == "/var/lib/racer/identity" || volume.HostPath.Path == "/var/lib/racer/slabs" || volume.HostPath.Path == "/run/racer") {
+		if volume.HostPath != nil && (volume.HostPath.Path == "/var/lib/racer/identity" || volume.HostPath.Path == "/var/lib/racer/slabs") {
 			return true
 		}
 	}

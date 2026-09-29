@@ -25,6 +25,13 @@ func TestMixedPlannerMigration(t *testing.T) {
 			env := testEnv(t, cache("cache"))
 			initialize(t, env)
 
+			for i, node := range []string{"node-a", "node-b"} {
+				pod := gantrySocketPod(t, env, "/run/racer")
+				pod.Name += string(rune('a' + i))
+				pod.Spec.NodeName = node
+				require.NoError(t, env.Client.Create(t.Context(), pod))
+			}
+
 			cm := &corev1.ConfigMap{}
 			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, configName), cm))
 
