@@ -293,10 +293,10 @@ Lease API the same way kubelet uses it for node heartbeats.
 flowchart LR
     subgraph after["now: configured Leases, no watches"]
         direction TB
-        B1["node 1"] -->|"read chair Leases<br/>on epoch change"| API2[("API server")]
+        B1["node 1"] -->|"sampled Lease reads<br/>and epoch refresh"| API2[("API server")]
         B2["node 2"] --> API2
         B3["...1,000 nodes..."] --> API2
-        CH["chair holders"] -->|"renew own Lease<br/>every 20s"| API2
+        CH["chair holders"] -->|"renew own Lease<br/>every 1m"| API2
     end
 
     style API2 fill:#e9f7e9,stroke:#5c9c5c
@@ -307,22 +307,24 @@ flowchart LR
 | Watch streams at 1,000 nodes | 2,000 | **0** |
 | Watch streams at 100,000 nodes | 200,000 | **0** |
 | Objects cached per agent | every Pod and every Node | configured chair Leases |
-| Steady-state writes | Pod/Node churn, fans out to all | `chair_count / 20s` at a full pool |
-| Reads | continuous watch delivery | one chair Lease list per node per 6h |
+| Steady-state writes | Pod/Node churn, fans out to all | `chair_count / 1m` at a full pool |
+| Reads | continuous watch delivery | epoch refresh plus about one sampled health list per second cluster-wide |
 
 ### Why the write rate is flat
 
 Only chair holders write, and only to renew their own Lease:
 
-$$\frac{\text{active chairs}}{20\ \text{s renew}}$$
+$$\frac{\text{active chairs}}{60\ \text{s renew}}$$
 
 That figure is bounded by `chair_count`, rather than growing with the fleet
-without limit. Reads are similarly bounded: a node re-reads the chair Leases
-only when the 6-hour epoch changes, or when a chair it tried to reach did not
-answer. Nodes that are not pulling anything read nothing.
+without limit. Reads are similarly bounded. Nodes refresh on the 6-hour epoch
+change or when a chair they tried to reach did not answer. A deterministic
+sample of non-chair nodes also lists the fixed chair set to detect expired
+holders without pull demand.
 
-At 100,000 nodes the steady-state epoch reads work out to roughly 4.6 Lease
-lists per second across the whole cluster with the default settings.
+At 100,000 nodes the sampled health checks add approximately one Lease list per
+second across the whole cluster. Epoch refreshes add roughly 4.6 Lease lists per
+second when averaged over the 6-hour epoch.
 
 ### One thing to check in your cluster
 

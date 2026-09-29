@@ -23,8 +23,8 @@ data:
     libp2p_identity_path: "/var/lib/gantry/libp2p/identity.key"
 
     chair_namespace: {{ .Release.Namespace | quote }}
-    chair_lease_duration: "60s"
-    chair_renew_period: "20s"
+    chair_lease_duration: "5m"
+    chair_renew_period: "1m"
     chair_rotation_period: "6h"
     chair_rotation_lead: "5m"
     chair_startup_jitter: "30s"

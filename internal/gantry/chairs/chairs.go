@@ -73,6 +73,10 @@ func (c Chair) Expired(now time.Time) bool {
 	return c.Occupied() && c.LeaseDuration > 0 && !now.Before(c.RenewTime.Add(c.LeaseDuration))
 }
 
+func (c Chair) Active(now time.Time) bool {
+	return c.Selectable() && !c.Expired(now)
+}
+
 type Snapshot struct {
 	Epoch     int64
 	Chairs    []Chair
@@ -130,6 +134,22 @@ func (s Snapshot) SelectableCountWithin(chairCount int) int {
 		}
 
 		if chair.Selectable() && (chair.AssignmentEpoch == s.Epoch || chair.AssignmentEpoch == s.Epoch-1) {
+			count++
+		}
+	}
+
+	return count
+}
+
+func (s Snapshot) ActiveCountWithin(chairCount int, now time.Time) int {
+	count := 0
+
+	for _, chair := range s.Chairs {
+		if chairCount > 0 && int(chair.ID) >= chairCount {
+			continue
+		}
+
+		if chair.Active(now) && (chair.AssignmentEpoch == s.Epoch || chair.AssignmentEpoch == s.Epoch-1) {
 			count++
 		}
 	}

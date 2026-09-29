@@ -208,6 +208,44 @@ func TestManagerValidatesPreviousEpochUntilLeaseRenews(t *testing.T) {
 	}
 }
 
+func TestManagerRejectsExpiredHeldChair(t *testing.T) {
+	now := time.Unix(1_000, 0)
+	holder := "self"
+	duration := int32(60)
+	generation := int32(3)
+	renewTime := metav1.NewMicroTime(now.Add(-time.Minute))
+	lease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        chairs.ID(3).Name(),
+			Namespace:   "gantry-system",
+			Labels:      map[string]string{chairs.LabelChair: "true"},
+			Annotations: map[string]string{chairs.AnnotationEpoch: "0"},
+		},
+		Spec: coordinationv1.LeaseSpec{
+			HolderIdentity:       &holder,
+			LeaseDurationSeconds: &duration,
+			LeaseTransitions:     &generation,
+			RenewTime:            &renewTime,
+		},
+	}
+	client := fake.NewClientset(lease)
+
+	manager := chairs.NewManager(chairs.ManagerOptions{
+		Store:          chairs.NewStore(client.CoordinationV1().Leases("gantry-system")),
+		Self:           chairs.Holder{PeerID: "self"},
+		Now:            func() time.Time { return now },
+		RotationPeriod: time.Hour,
+	})
+	if err := manager.Initialize(context.Background()); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	assignment := ifaces.ChairAssignment{ChairID: 3, Generation: 3, AssignmentEpoch: 0}
+	if manager.ValidateChair(context.Background(), assignment) {
+		t.Fatal("manager accepted an assignment for its expired Lease")
+	}
+}
+
 func TestManagerClaimsExpiredUnresponsiveChairOnDemand(t *testing.T) {
 	now := time.Unix(5000, 0)
 	oldHolder := "old"

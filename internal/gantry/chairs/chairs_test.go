@@ -131,6 +131,37 @@ func TestSnapshotCountsOnlyConfiguredChairs(t *testing.T) {
 	}
 }
 
+func TestSnapshotActiveCountExcludesExpiredChairs(t *testing.T) {
+	now := time.Unix(1_000, 0)
+	snapshot := chairs.Snapshot{
+		Epoch: 4,
+		Chairs: []chairs.Chair{
+			{
+				ID:              0,
+				Holder:          testHolder("live"),
+				AssignmentEpoch: 4,
+				RenewTime:       now.Add(-time.Minute),
+				LeaseDuration:   5 * time.Minute,
+			},
+			{
+				ID:              1,
+				Holder:          testHolder("expired"),
+				AssignmentEpoch: 4,
+				RenewTime:       now.Add(-5 * time.Minute),
+				LeaseDuration:   5 * time.Minute,
+			},
+		},
+	}
+
+	if got := snapshot.SelectableCountWithin(2); got != 2 {
+		t.Fatalf("selectable chairs = %d, want 2", got)
+	}
+
+	if got := snapshot.ActiveCountWithin(2, now); got != 1 {
+		t.Fatalf("active chairs = %d, want 1", got)
+	}
+}
+
 func TestRankIncludesPreviousEpochDuringRollover(t *testing.T) {
 	snapshot := chairs.Snapshot{Epoch: 8}
 

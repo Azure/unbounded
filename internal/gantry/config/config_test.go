@@ -46,8 +46,8 @@ func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 		t.Fatalf("TransferMaxConcurrentServes = %d, want 10", c.TransferMaxConcurrentServes)
 	}
 
-	if c.ChairLeaseDuration != time.Minute || c.ChairRenewPeriod != 20*time.Second {
-		t.Fatalf("chair heartbeat defaults = %v/%v, want 1m/20s", c.ChairLeaseDuration, c.ChairRenewPeriod)
+	if c.ChairLeaseDuration != 5*time.Minute || c.ChairRenewPeriod != time.Minute {
+		t.Fatalf("chair heartbeat defaults = %v/%v, want 5m/1m", c.ChairLeaseDuration, c.ChairRenewPeriod)
 	}
 
 	if c.ChairRotationPeriod != 6*time.Hour || c.ChairRotationLead != 5*time.Minute {
