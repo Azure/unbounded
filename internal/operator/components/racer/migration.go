@@ -151,6 +151,10 @@ func migrationPlan(ctx context.Context, env *component.Env, cfg racercore.Worklo
 			}
 
 			node := pod.Spec.NodeName
+			if node == "" && owned {
+				node = pendingDaemonSetTarget(pod)
+			}
+
 			if node == "" {
 				blockAll = true
 			} else if permitsNode(desired, node) {
@@ -184,6 +188,38 @@ func migrationPlan(ctx context.Context, env *component.Env, cfg racercore.Worklo
 	}
 
 	return sets, result, nil
+}
+
+// pendingDaemonSetTarget recognizes the required affinity installed on a Pod by
+// the DaemonSet controller, not generic workload template affinity. The caller
+// must verify current DaemonSet ownership. Every OR term must enforce the same
+// single target; this is a conservative occupancy claim, not proof of binding.
+func pendingDaemonSetTarget(pod *corev1.Pod) string {
+	a := pod.Spec.Affinity
+	if a == nil || a.NodeAffinity == nil || a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		return ""
+	}
+
+	target := ""
+
+	for _, term := range a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
+		if len(term.MatchExpressions) != 0 || len(term.MatchFields) != 1 {
+			return ""
+		}
+
+		field := term.MatchFields[0]
+		if field.Key != "metadata.name" || field.Operator != corev1.NodeSelectorOpIn || len(field.Values) != 1 || field.Values[0] == "" {
+			return ""
+		}
+
+		if target != "" && target != field.Values[0] {
+			return ""
+		}
+
+		target = field.Values[0]
+	}
+
+	return target
 }
 
 // Retain previously applied node-name interlocks until the source controller
