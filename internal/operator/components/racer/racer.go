@@ -287,8 +287,9 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 			// TLS, metadata, allocator overhead and filesystem cache are additional.
 			container.Resources.Requests = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi")}
 
-			// Mixed placement restrictions must not be weakened by workload overrides.
-			op := component.Operation{Kind: component.OpApply, Object: component.ToUnstructured(ds), Component: name, Overridable: len(sets) == 1 && migration.Ready}
+			// Override affinity is intersected with every operator term. Legacy
+			// kind-only overrides target the host workload, not the pod-network one.
+			op := component.Operation{Kind: component.OpApply, Object: component.ToUnstructured(ds), Component: name, Overridable: true}
 			for _, dependency := range plan.Operations {
 				if dependency.Object.GetKind() != "Deployment" {
 					op.DependsOn = append(op.DependsOn, dependency.Ref())
@@ -305,7 +306,7 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	b.Watches(&racerv1.ClusterCache{}, env.RequestSingleton(), builder.WithPredicates(predicate.GenerationChangedPredicate{}))
 	b.Watches(&appsv1.Deployment{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(controllerName))))
-	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(dataplaneName, racercore.PodNetworkDaemonSetName))))
+	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(env.InNamespaceNamed(dataplaneName, racercore.PodNetworkDaemonSetName))))
 	b.Watches(&corev1.Pod{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool { return obj.GetNamespace() == env.Namespace && migrationPod(obj) })))
 	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(claimName, markerName, configName, dataplaneConfigName, trustName))))
 	b.Watches(&corev1.Secret{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(env.InNamespaceNamed(tlsName))))

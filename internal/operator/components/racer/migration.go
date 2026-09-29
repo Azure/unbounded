@@ -6,6 +6,7 @@ package racer
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"slices"
 	"time"
 
@@ -48,11 +49,16 @@ func migrationPlan(ctx context.Context, env *component.Env, cfg racercore.Worklo
 	// Retain an empty, unschedulable second workload on the return path. Its UID
 	// remains stable and its terminating Pods continue to block the destination.
 	if len(sets) == 1 && live[racercore.PodNetworkDaemonSetName] != nil {
-		pod := live[racercore.PodNetworkDaemonSetName].DeepCopy()
-		pod.TypeMeta = metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"}
-		pod.ManagedFields = nil
-		pod.ResourceVersion = ""
-		pod.Status = appsv1.DaemonSetStatus{}
+		emptyConfig := cfg
+		emptyConfig.HostNetwork = true
+		emptyConfig.PodNetworkNodes = []string{"racer-migration-blocked"}
+
+		emptySets, err := racercore.DesiredDaemonSets(emptyConfig)
+		if err != nil {
+			return nil, component.Result{}, err
+		}
+
+		pod := emptySets[1]
 		pod.Spec.Template.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: blockedTerms()}}}
 		sets = append(sets, pod)
 	}
@@ -77,7 +83,15 @@ func migrationPlan(ctx context.Context, env *component.Env, cfg racercore.Worklo
 		// admitted, even if the Pod list is temporarily empty.
 		if source != nil {
 			if source.Status.ObservedGeneration < source.Generation {
-				blockAll = true
+				// Observation lag must prevent new admission, not evict unrelated
+				// existing destinations and make both controllers drain each other.
+				if destination := live[desired.Name]; destination == nil {
+					blockAll = true
+				} else {
+					retainPlacement(desired, destination)
+				}
+
+				result = component.NotReadyAfter("Migrating", "waiting for source controller observation", 5*time.Second)
 			}
 
 			if desired.Name == racercore.PodNetworkDaemonSetName {
@@ -170,6 +184,47 @@ func migrationPlan(ctx context.Context, env *component.Env, cfg racercore.Worklo
 	}
 
 	return sets, result, nil
+}
+
+// Retain previously applied node-name interlocks until the source controller
+// observes its drain. Label constraints are reapplied by the override merger,
+// not copied here, to avoid multiplying user OR terms on every reconcile.
+func retainPlacement(desired, live *appsv1.DaemonSet) {
+	a := live.Spec.Template.Spec.Affinity
+	if a == nil || a.NodeAffinity == nil || a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		return
+	}
+
+	selector := desired.Spec.Template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+
+	var terms []corev1.NodeSelectorTerm
+
+	for _, want := range selector.NodeSelectorTerms {
+		for _, old := range a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
+			if len(old.MatchExpressions) == 0 && len(old.MatchFields) == 0 {
+				continue
+			}
+
+			term := want.DeepCopy()
+
+			term.MatchFields = unionRequirements(term.MatchFields, old.MatchFields)
+			if !slices.ContainsFunc(terms, func(existing corev1.NodeSelectorTerm) bool { return reflect.DeepEqual(existing, *term) }) {
+				terms = append(terms, *term)
+			}
+		}
+	}
+
+	selector.NodeSelectorTerms = terms
+}
+
+func unionRequirements(left, right []corev1.NodeSelectorRequirement) []corev1.NodeSelectorRequirement {
+	for _, requirement := range right {
+		if !slices.ContainsFunc(left, func(existing corev1.NodeSelectorRequirement) bool { return reflect.DeepEqual(existing, requirement) }) {
+			left = append(left, requirement)
+		}
+	}
+
+	return left
 }
 
 func permitsNode(ds *appsv1.DaemonSet, node string) bool {

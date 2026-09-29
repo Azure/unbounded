@@ -109,6 +109,14 @@ func matches(entry Entry, op component.Operation) bool {
 		return false
 	}
 
+	if entry.Name != "" && entry.Name != op.Object.GetName() {
+		return false
+	}
+
+	if entry.Name == "" && entry.Component == "racer" && entry.Kind == "DaemonSet" && op.Object.GetName() != "racer-dataplane" {
+		return false
+	}
+
 	// A nil selector matches every Site, including the empty Site of a cluster
 	// singleton. An explicitly empty selector is rejected during validation.
 	if entry.Sites == nil {
