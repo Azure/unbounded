@@ -158,10 +158,18 @@ Unordered readers retain provider-selected demand sharing. Because selected
 transfers bypass fixed-page singleflight, the current implementation excludes
 provider selection while fixed acquisitions for that version remain active, and
 vice versa. Multiple ordered readers still share fixed-page singleflight and
-retain independent credits and credentials. This conservative mixed-mode gate
-can delay unordered selection under sustained ordered acquisition; it is not a
-cross-mode fairness guarantee. Cancellation detaches the reader, but acquisition
-drivers retain exclusion until actual completion. No wire or origin authority
+retain independent credits and credentials. Capacity-bearing polling readers
+receive admission tickets. A waiting unordered selection stops later ordered
+admissions; earlier ordered tickets may each admit one page, then the finite
+accepted batch must drain before selection. Ordered readers may batch concurrently
+but cannot repeatedly refill ahead of that selection. Selection likewise yields
+to earlier tickets, so ordered work resumes even under repeated selections.
+Tickets occupy at most one slot per admitted reader, survive repolling, and are
+removed when the reader detaches. Credit-starved readers and readers that have
+not requested acquisition do not block admission. This bounds admission turns,
+not wall-clock completion: waiting tasks must be polled and accepted I/O
+must still reach its real completion fence. Cancellation detaches the reader,
+but acquisition drivers retain exclusion until actual completion. No wire or origin authority
 changes are implied by ordered prefetch (`src/read/subscription.rs`,
 `src/read/range_stream.rs`, `src/read/dispatch.rs`, `src/read/fill.rs`).
 

@@ -23,6 +23,7 @@ struct Demand {
     pending: BTreeSet<PageNumber>,
     credits: Credits,
     turn: bool,
+    gate_ticket: Option<u64>,
 }
 struct State {
     contracts: BTreeMap<
@@ -132,6 +133,7 @@ impl Scheduler {
                 pending: BTreeSet::new(),
                 credits,
                 turn: false,
+                gate_ticket: None,
             },
         );
         Ok(DemandLease {
@@ -202,6 +204,7 @@ impl Selection {
                 demand.next += 1;
             }
             demand.results.push_back(page.clone());
+            demand.gate_ticket = None;
         }
         drop(state);
         Ok(())
@@ -240,7 +243,11 @@ impl DemandLease {
             return Poll::Ready(Ok(None));
         }
         let version = demand.version.clone();
-        if !demand.eligible(demand.next) || state.selecting.contains(&version) {
+        if !demand.eligible(demand.next) {
+            return Poll::Pending;
+        }
+        let ticket = state.gate_ticket(self.id)?;
+        if state.selecting.contains(&version) || state.earlier_turn(&version, ticket, true) {
             return Poll::Pending;
         }
         let demand = state.demands.get_mut(&self.id).unwrap();
@@ -251,6 +258,7 @@ impl DemandLease {
             .ok_or(Error::InvalidRange)?
             .length;
         demand.credits.reserve(number, length)?;
+        demand.gate_ticket = None;
         demand.next += 1;
         *state.fixed.entry(version.clone()).or_default() += 1;
         Poll::Ready(Ok(Some((
@@ -280,7 +288,8 @@ impl DemandLease {
             return Poll::Pending;
         }
         let version = demand.version.clone();
-        if state.fixed.contains_key(&version) {
+        let ticket = state.gate_ticket(self.id)?;
+        if state.fixed.contains_key(&version) || state.earlier_turn(&version, ticket, false) {
             return Poll::Pending;
         }
         let mut intervals = Vec::new();
@@ -324,6 +333,7 @@ impl DemandLease {
         if !state.selecting.insert(version.clone()) {
             return Poll::Pending;
         }
+        state.demands.get_mut(&self.id).unwrap().gate_ticket = None;
         Poll::Ready(Ok(Next::Select(Selection {
             scheduler: self.scheduler.clone(),
             version,
@@ -470,6 +480,31 @@ impl DemandLease {
         !demand.queued.is_empty() || demand.eligible(demand.next)
     }
 }
+impl State {
+    /// One ticket per capacity-bearing polling demand, not per page or poll.
+    /// Ordered work batches across earlier ordered tickets, but cannot extend
+    /// its batch past a queued selection. Selection yields to all earlier tickets.
+    /// Thus either mode can drain the other mode's finite accepted work without
+    /// weakening the actual-completion exclusion held by the worker guards.
+    fn gate_ticket(&mut self, id: u64) -> Result<u64> {
+        let demand = self.demands.get_mut(&id).ok_or(Error::Cancelled)?;
+        if let Some(ticket) = demand.gate_ticket {
+            return Ok(ticket);
+        }
+        self.sequence = self.sequence.checked_add(1).ok_or(Error::Overloaded)?;
+        demand.gate_ticket = Some(self.sequence);
+        Ok(self.sequence)
+    }
+    fn earlier_turn(&self, version: &ObjectVersion, ticket: u64, ordered: bool) -> bool {
+        self.demands.values().any(|demand| {
+            &demand.version == version
+                && (!ordered || !demand.credits.ordered)
+                && demand.gate_ticket.is_some_and(|other| other < ticket)
+                && demand.results.is_empty()
+                && demand.eligible(demand.next)
+        })
+    }
+}
 /// Kept by the worker command, not the client future. Detachment cannot permit
 /// provider selection to race accepted fixed-page I/O before actual completion.
 pub(crate) struct FixedAcquisition {
@@ -535,6 +570,18 @@ impl Drop for DemandLease {
                         number,
                     },
                 );
+            }
+            // A cancelled waiter must not strand the next ticket. Wake outside
+            // the lock; accepted work still owns its separate completion guard.
+            let wake = state
+                .demands
+                .values_mut()
+                .filter(|other| other.version == demand.version)
+                .filter_map(|other| other.waker.take())
+                .collect::<Vec<_>>();
+            drop(state);
+            for waker in wake {
+                waker.wake();
             }
         }
     }
@@ -610,6 +657,130 @@ mod tests {
             },
             etag: StrongEtag::test_value("v1"),
         }
+    }
+
+    #[test]
+    fn mixed_gate_tickets_bound_turns_under_sustained_ordered_demand() {
+        use std::task::Poll;
+        let scheduler = Scheduler::new(4);
+        let range = ByteRange::From(0).resolve(1_000_000 * PAGE_BYTES).unwrap();
+        let mut a = scheduler
+            .register(version(), range, 2, 2 * PAGE_BYTES, true)
+            .unwrap();
+        let mut b = scheduler
+            .register(version(), range, 2, 2 * PAGE_BYTES, true)
+            .unwrap();
+        let mut unordered = scheduler
+            .register(version(), range, 1, PAGE_BYTES, false)
+            .unwrap();
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        for _ in 0..32 {
+            let Poll::Ready(Ok(Some((pa, ga)))) = a.poll_ordered(&mut cx) else {
+                panic!("ordered resumes")
+            };
+            let Poll::Ready(Ok(Some((pb, gb)))) = b.poll_ordered(&mut cx) else {
+                panic!("concurrent ordered resumes")
+            };
+            assert!(unordered.poll_next(&mut cx).is_pending());
+            let mut newcomer = scheduler
+                .register(version(), range, 1, PAGE_BYTES, true)
+                .unwrap();
+            assert!(
+                newcomer.poll_ordered(&mut cx).is_pending(),
+                "new readers cannot bypass a waiting selection"
+            );
+            drop(newcomer);
+            // Keep both ordered readers capacity-bearing, and poll them first
+            // at every boundary. Neither can refill ahead of the waiting ticket.
+            assert!(a.poll_ordered(&mut cx).is_pending());
+            assert!(b.poll_ordered(&mut cx).is_pending());
+            drop(ga);
+            a.issued(pa).unwrap();
+            a.release(pa, PAGE_BYTES as u32).unwrap();
+            assert!(a.poll_ordered(&mut cx).is_pending());
+            assert!(
+                unordered.poll_next(&mut cx).is_pending(),
+                "last fence still live"
+            );
+            drop(gb);
+            b.issued(pb).unwrap();
+            b.release(pb, PAGE_BYTES as u32).unwrap();
+            for _ in 0..8 {
+                assert!(a.poll_ordered(&mut cx).is_pending());
+                assert!(b.poll_ordered(&mut cx).is_pending());
+            }
+            let Poll::Ready(Ok(Next::Select(selection))) = unordered.poll_next(&mut cx) else {
+                panic!("selection gets the very next turn after two fences")
+            };
+            assert!(a.poll_ordered(&mut cx).is_pending());
+            // Simulate an unsuccessful selection. Even immediate retries cannot
+            // starve the ordered tickets queued during the preceding batch.
+            drop(selection);
+            assert!(unordered.poll_next(&mut cx).is_pending());
+        }
+        drop((a, b, unordered));
+        let state = scheduler.state.lock().unwrap();
+        assert!(state.fixed.is_empty());
+        assert!(state.selecting.is_empty());
+        assert!(state.demands.is_empty());
+    }
+
+    #[test]
+    fn cancelled_gate_waiter_wakes_successor_without_releasing_live_fences() {
+        use std::{
+            sync::atomic::{AtomicUsize, Ordering},
+            task::Poll,
+        };
+        #[derive(Default)]
+        struct Wakes(AtomicUsize);
+        impl futures::task::ArcWake for Wakes {
+            fn wake_by_ref(this: &Arc<Self>) {
+                this.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let wakes = Arc::new(Wakes::default());
+        let waker = futures::task::waker(wakes.clone());
+        let mut cx = std::task::Context::from_waker(&waker);
+        let scheduler = Scheduler::new(3);
+        let range = ByteRange::From(0).resolve(100 * PAGE_BYTES).unwrap();
+        let mut ordered = scheduler
+            .register(version(), range, 4, 4 * PAGE_BYTES, true)
+            .unwrap();
+        let mut cancelled = scheduler
+            .register(version(), range, 1, PAGE_BYTES, false)
+            .unwrap();
+        let Poll::Ready(Ok(Some((_, first)))) = ordered.poll_ordered(&mut cx) else {
+            panic!()
+        };
+        assert!(cancelled.poll_next(&mut cx).is_pending());
+        assert!(ordered.poll_ordered(&mut cx).is_pending());
+        let before = wakes.0.load(Ordering::Relaxed);
+        drop(cancelled);
+        assert!(wakes.0.load(Ordering::Relaxed) > before);
+        let Poll::Ready(Ok(Some((_, second)))) = ordered.poll_ordered(&mut cx) else {
+            panic!("cancelled selection no longer blocks refill")
+        };
+        let mut successor = scheduler
+            .register(version(), range, 1, PAGE_BYTES, false)
+            .unwrap();
+        assert!(successor.poll_next(&mut cx).is_pending());
+        assert!(ordered.poll_ordered(&mut cx).is_pending());
+        drop(ordered);
+        assert!(successor.poll_next(&mut cx).is_pending());
+        drop(first);
+        assert!(successor.poll_next(&mut cx).is_pending());
+        let before = wakes.0.load(Ordering::Relaxed);
+        drop(second);
+        assert!(wakes.0.load(Ordering::Relaxed) > before);
+        assert!(matches!(
+            successor.poll_next(&mut cx),
+            Poll::Ready(Ok(Next::Select(_)))
+        ));
+        drop(successor);
+        let state = scheduler.state.lock().unwrap();
+        assert!(state.demands.is_empty());
+        assert!(state.fixed.is_empty());
+        assert!(state.selecting.is_empty());
     }
 
     #[test]

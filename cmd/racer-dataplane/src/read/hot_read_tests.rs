@@ -465,6 +465,16 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
             stream
                 .release_page(PageNumber(0), PAGE_BYTES as u32)
                 .unwrap();
+            // The waiting unordered ticket must get its turn before ordered
+            // prefetch can refill, even though this stream still has credit.
+            stream.poll_prefetch(&mut cx);
+            assert_eq!(&*f.origin.started_pages.borrow(), &[0, 1]);
+            let Poll::Ready(Ok(crate::read::subscription::Next::Select(selection))) =
+                unordered.poll_next(&mut cx)
+            else {
+                panic!("unordered turn after the fixed batch completes")
+            };
+            drop(selection);
             let delivery = Delivery::new(
                 Rc::new(PipePool::new(
                     f.fill.dependencies.admission.clone(),
