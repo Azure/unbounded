@@ -1,0 +1,231 @@
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
+package racer
+
+import (
+	"context"
+	"fmt"
+	"slices"
+	"time"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/Azure/unbounded/internal/operator/component"
+	racercore "github.com/Azure/unbounded/internal/racer"
+)
+
+// Scheduling state and live occupants are the durable migration checkpoint.
+// Never delete a workload or Pod to advance this state machine.
+func migrationPlan(ctx context.Context, env *component.Env, cfg racercore.WorkloadConfig) ([]*appsv1.DaemonSet, component.Result, error) {
+	sets, err := racercore.DesiredDaemonSets(cfg)
+	if err != nil {
+		return nil, component.Result{}, err
+	}
+
+	live := map[string]*appsv1.DaemonSet{}
+
+	for _, name := range []string{dataplaneName, racercore.PodNetworkDaemonSetName} {
+		ds := &appsv1.DaemonSet{}
+		if err := env.LiveReader().Get(ctx, objectKey(env, name), ds); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+
+			return nil, component.Result{}, err
+		}
+
+		if ds.DeletionTimestamp != nil {
+			return nil, component.Result{}, fmt.Errorf("dataplane workload %s is deleting", name)
+		}
+
+		live[name] = ds
+	}
+	// Retain an empty, unschedulable second workload on the return path. Its UID
+	// remains stable and its terminating Pods continue to block the destination.
+	if len(sets) == 1 && live[racercore.PodNetworkDaemonSetName] != nil {
+		pod := live[racercore.PodNetworkDaemonSetName].DeepCopy()
+		pod.TypeMeta = metav1.TypeMeta{APIVersion: "apps/v1", Kind: "DaemonSet"}
+		pod.ManagedFields = nil
+		pod.ResourceVersion = ""
+		pod.Status = appsv1.DaemonSetStatus{}
+		pod.Spec.Template.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: blockedTerms()}}}
+		sets = append(sets, pod)
+	}
+
+	pods := &corev1.PodList{}
+	if err := env.LiveReader().List(ctx, pods, client.InNamespace(env.Namespace)); err != nil {
+		return nil, component.Result{}, err
+	}
+
+	result := component.ReconciledAfter("Racer installation reconciled", time.Hour)
+
+	for _, desired := range sets {
+		sourceName := racercore.PodNetworkDaemonSetName
+		if desired.Name == sourceName {
+			sourceName = dataplaneName
+		}
+
+		source := live[sourceName]
+		blocked := map[string]bool{}
+		blockAll := false
+		// A source controller must observe the drain before a destination can be
+		// admitted, even if the Pod list is temporarily empty.
+		if source != nil {
+			if source.Status.ObservedGeneration < source.Generation {
+				blockAll = true
+			}
+
+			if desired.Name == racercore.PodNetworkDaemonSetName {
+				for _, node := range cfg.PodNetworkNodes {
+					if permitsNode(source, node) {
+						blocked[node] = true
+					}
+				}
+			} else {
+				selector := source.Spec.Template.Spec.Affinity
+				if selector == nil || selector.NodeAffinity == nil || selector.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+					blockAll = true
+				} else {
+					for _, term := range selector.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
+						bounded := false
+
+						for _, field := range term.MatchFields {
+							if field.Key == "metadata.name" && field.Operator == corev1.NodeSelectorOpIn {
+								for _, node := range field.Values {
+									if permitsNode(source, node) && permitsNode(desired, node) {
+										blocked[node] = true
+									}
+								}
+
+								bounded = true
+							}
+						}
+
+						if !bounded {
+							blockAll = true
+						}
+					}
+				}
+			}
+		}
+
+		for i := range pods.Items {
+			pod := &pods.Items[i]
+			if !migrationPod(pod) {
+				continue
+			}
+
+			owner := metav1.GetControllerOf(pod)
+
+			current := (*appsv1.DaemonSet)(nil)
+			if owner != nil {
+				current = live[owner.Name]
+			}
+
+			owned := current != nil && current.UID != "" && owner.APIVersion == "apps/v1" && owner.Kind == "DaemonSet" && owner.UID == current.UID
+			if owned && owner.Name == desired.Name {
+				continue
+			}
+
+			if !owned {
+				result = component.NotReadyAfter("MigrationBlocked", "unexpected or stale-UID dataplane occupant; manual inspection required", 5*time.Second)
+			}
+
+			node := pod.Spec.NodeName
+			if node == "" {
+				blockAll = true
+			} else if permitsNode(desired, node) {
+				blocked[node] = true
+			}
+		}
+
+		if blockAll || len(blocked) != 0 {
+			if result.Ready {
+				result = component.NotReadyAfter("Migrating", "waiting for source scheduling drain and all source Pods to disappear", 5*time.Second)
+			}
+
+			selector := desired.Spec.Template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+			if blockAll {
+				selector.NodeSelectorTerms = blockedTerms()
+			} else {
+				nodes := make([]string, 0, len(blocked))
+				for node := range blocked {
+					nodes = append(nodes, node)
+				}
+
+				slices.Sort(nodes)
+
+				for i := range selector.NodeSelectorTerms {
+					for _, node := range nodes {
+						selector.NodeSelectorTerms[i].MatchFields = append(selector.NodeSelectorTerms[i].MatchFields, corev1.NodeSelectorRequirement{Key: "metadata.name", Operator: corev1.NodeSelectorOpNotIn, Values: []string{node}})
+					}
+				}
+			}
+		}
+	}
+
+	return sets, result, nil
+}
+
+func permitsNode(ds *appsv1.DaemonSet, node string) bool {
+	a := ds.Spec.Template.Spec.Affinity
+	if a == nil || a.NodeAffinity == nil || a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		return true
+	}
+
+	for _, term := range a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
+		allowed := true
+
+		for _, field := range term.MatchFields {
+			if field.Key != "metadata.name" {
+				continue
+			}
+
+			if field.Operator == corev1.NodeSelectorOpIn && !slices.Contains(field.Values, node) || field.Operator == corev1.NodeSelectorOpNotIn && slices.Contains(field.Values, node) {
+				allowed = false
+			}
+		}
+
+		if allowed {
+			return true
+		}
+	}
+
+	return false
+}
+
+func blockedTerms() []corev1.NodeSelectorTerm {
+	return []corev1.NodeSelectorTerm{{MatchFields: []corev1.NodeSelectorRequirement{
+		{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{"racer-migration-blocked"}},
+		{Key: "metadata.name", Operator: corev1.NodeSelectorOpNotIn, Values: []string{"racer-migration-blocked"}},
+	}}}
+}
+
+func migrationPod(obj client.Object) bool {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		return false
+	}
+
+	owner := metav1.GetControllerOf(pod)
+	if owner != nil && (owner.Name == dataplaneName || owner.Name == racercore.PodNetworkDaemonSetName) {
+		return true
+	}
+
+	if pod.Labels["app.kubernetes.io/name"] == dataplaneName || pod.Labels["app.kubernetes.io/name"] == racercore.PodNetworkDaemonSetName {
+		return true
+	}
+
+	for _, volume := range pod.Spec.Volumes {
+		if volume.HostPath != nil && (volume.HostPath.Path == "/var/lib/racer/identity" || volume.HostPath.Path == "/var/lib/racer/slabs" || volume.HostPath.Path == "/run/racer") {
+			return true
+		}
+	}
+
+	return false
+}

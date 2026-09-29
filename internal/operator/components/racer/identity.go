@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/unbounded/internal/operator/component"
+	racercore "github.com/Azure/unbounded/internal/racer"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
@@ -129,6 +130,7 @@ func checkNewInstallation(ctx context.Context, env *component.Env) error {
 		&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName}},
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: controllerName}},
 		&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "racer-dataplane"}},
+		&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: racercore.PodNetworkDaemonSetName}},
 	}
 	for _, obj := range objects {
 		err := env.LiveReader().Get(ctx, objectKey(env, obj.GetName()), obj)
