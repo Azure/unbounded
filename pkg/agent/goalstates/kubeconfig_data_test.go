@@ -40,6 +40,7 @@ contexts:
 	if err != nil {
 		t.Fatalf("resolveKubelet() error = %v", err)
 	}
+
 	if !bytes.Equal(got.KubeconfigData, data) {
 		t.Fatalf("KubeconfigData = %q, want %q", got.KubeconfigData, data)
 	}

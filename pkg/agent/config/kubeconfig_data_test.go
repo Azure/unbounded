@@ -74,19 +74,24 @@ contexts:
 				KubeconfigData: []byte(tt.data),
 				Auth:           tt.auth,
 			}
+
 			err := cfg.Validate()
 			if tt.wantErr == "" {
 				if err != nil {
 					t.Fatalf("Validate() error = %v", err)
 				}
+
 				return
 			}
+
 			if err == nil {
 				t.Fatalf("Validate() error = nil, want substring %q", tt.wantErr)
 			}
+
 			if !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("Validate() error = %q, want substring %q", err, tt.wantErr)
 			}
+
 			if strings.Contains(err.Error(), "secret-sentinel") {
 				t.Fatalf("Validate() error disclosed kubeconfig or credential data: %q", err)
 			}

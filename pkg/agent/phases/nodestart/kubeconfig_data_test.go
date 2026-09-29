@@ -86,6 +86,7 @@ func TestConfigureKubeletAuthenticationModes(t *testing.T) {
 				if strings.Contains(string(dropIn), "--bootstrap-kubeconfig") {
 					t.Fatalf("direct mode drop-in contains bootstrap kubeconfig flag:\n%s", dropIn)
 				}
+
 				if !strings.Contains(string(dropIn), "--kubeconfig="+goalstates.KubeletKubeconfigPath) {
 					t.Fatalf("direct mode drop-in missing kubeconfig flag:\n%s", dropIn)
 				}
@@ -94,10 +95,12 @@ func TestConfigureKubeletAuthenticationModes(t *testing.T) {
 			}
 
 			configurationData := readTestFile(t, filepath.Join(machineDir, goalstates.KubeletConfigurationPath))
+
 			var configuration map[string]any
 			if err := yaml.Unmarshal(configurationData, &configuration); err != nil {
 				t.Fatalf("unmarshal KubeletConfiguration: %v", err)
 			}
+
 			if got, ok := configuration["rotateCertificates"].(bool); !ok || got != tt.wantRotate {
 				t.Fatalf("rotateCertificates = %#v, want %t", configuration["rotateCertificates"], tt.wantRotate)
 			}
@@ -114,6 +117,7 @@ func TestConfigureKubeletAuthenticationModes(t *testing.T) {
 				if err := os.Chmod(kubeconfigPath, 0o644); err != nil {
 					t.Fatalf("chmod kubeconfig: %v", err)
 				}
+
 				goalState.Kubelet.KubeconfigData = tt.reconfigureRaw
 				if err := ConfigureKubelet(goalState).Do(context.Background()); err != nil {
 					t.Fatalf("second ConfigureKubelet.Do() error = %v", err)
@@ -122,6 +126,7 @@ func TestConfigureKubeletAuthenticationModes(t *testing.T) {
 
 			if tt.wantKubeconfigPrefix != "" {
 				kubeconfigPath := filepath.Join(machineDir, goalstates.KubeletKubeconfigPath)
+
 				kubeconfig := readTestFile(t, kubeconfigPath)
 				if tt.reconfigureRaw != nil {
 					if !bytes.Equal(kubeconfig, tt.reconfigureRaw) {
@@ -135,6 +140,7 @@ func TestConfigureKubeletAuthenticationModes(t *testing.T) {
 				if err != nil {
 					t.Fatalf("stat kubeconfig: %v", err)
 				}
+
 				if got := info.Mode().Perm(); got != 0o600 {
 					t.Fatalf("kubeconfig permissions = %04o, want 0600", got)
 				}
@@ -150,5 +156,6 @@ func readTestFile(t *testing.T, path string) []byte {
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}
+
 	return data
 }

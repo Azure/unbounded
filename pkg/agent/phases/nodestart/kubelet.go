@@ -20,6 +20,7 @@ import (
 
 	"github.com/Azure/unbounded/internal/executil"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/internal/utilio"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 )
 
@@ -284,6 +285,7 @@ func (c *configureKubelet) ensureKubeconfig() error {
 		if err := utilio.WriteFile(dest, spec.KubeconfigData, 0o600); err != nil {
 			return err
 		}
+
 		return os.Chmod(dest, 0o600)
 	case spec.ExecCredential != nil:
 		return c.ensureExecKubeconfig()
