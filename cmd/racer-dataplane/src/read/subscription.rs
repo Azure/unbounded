@@ -30,6 +30,7 @@ struct State {
         (crate::peer::subscriptions::Subscription, std::time::Instant),
     >,
     selecting: BTreeSet<ObjectVersion>,
+    fixed: BTreeMap<ObjectVersion, usize>,
     sequence: u64,
     demands: BTreeMap<u64, Demand>,
     pending: BTreeMap<PageId, usize>,
@@ -94,6 +95,7 @@ impl Scheduler {
             state: Mutex::new(State {
                 contracts: BTreeMap::new(),
                 selecting: BTreeSet::new(),
+                fixed: BTreeMap::new(),
                 sequence: 0,
                 demands: BTreeMap::new(),
                 pending: BTreeMap::new(),
@@ -182,7 +184,10 @@ impl Selection {
         })?;
         let mut state = self.scheduler.state.lock().unwrap();
         for demand in state.demands.values_mut() {
-            if demand.version != self.version || !demand.eligible(number.0) {
+            if demand.credits.ordered
+                || demand.version != self.version
+                || !demand.eligible(number.0)
+            {
                 continue;
             }
             let length = demand
@@ -220,6 +225,42 @@ impl Drop for Selection {
     }
 }
 impl DemandLease {
+    /// Reserve this reader's exact slice before dispatch. Fixed acquisitions may
+    /// overlap each other (the stable owner singleflights each page), but not an
+    /// unknown provider selection, which bypasses that singleflight.
+    pub(crate) fn poll_ordered(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Option<(PageNumber, FixedAcquisition)>>> {
+        use std::task::Poll;
+        let mut state = self.scheduler.state.lock().unwrap();
+        let demand = state.demands.get_mut(&self.id).ok_or(Error::Cancelled)?;
+        demand.waker = Some(cx.waker().clone());
+        if demand.next == demand.end {
+            return Poll::Ready(Ok(None));
+        }
+        let version = demand.version.clone();
+        if !demand.eligible(demand.next) || state.selecting.contains(&version) {
+            return Poll::Pending;
+        }
+        let demand = state.demands.get_mut(&self.id).unwrap();
+        let number = PageNumber(demand.next);
+        let length = demand
+            .range
+            .slice_at(number)?
+            .ok_or(Error::InvalidRange)?
+            .length;
+        demand.credits.reserve(number, length)?;
+        demand.next += 1;
+        *state.fixed.entry(version.clone()).or_default() += 1;
+        Poll::Ready(Ok(Some((
+            number,
+            FixedAcquisition {
+                scheduler: self.scheduler.clone(),
+                version,
+            },
+        ))))
+    }
     pub(crate) fn poll_next(
         &mut self,
         cx: &mut std::task::Context<'_>,
@@ -239,13 +280,14 @@ impl DemandLease {
             return Poll::Pending;
         }
         let version = demand.version.clone();
+        if state.fixed.contains_key(&version) {
+            return Poll::Pending;
+        }
         let mut intervals = Vec::new();
-        for demand in state
-            .demands
-            .values()
-            .filter(|other| other.version == version && other.eligible(other.next))
-        {
-            if demand.credits.ordered || !demand.turn || demand.selected.len() >= 63 {
+        for demand in state.demands.values().filter(|other| {
+            !other.credits.ordered && other.version == version && other.eligible(other.next)
+        }) {
+            if !demand.turn || demand.selected.len() >= 63 {
                 intervals.push(PageInterval {
                     start: demand.next,
                     end: demand.next + 1,
@@ -428,6 +470,34 @@ impl DemandLease {
         !demand.queued.is_empty() || demand.eligible(demand.next)
     }
 }
+/// Kept by the worker command, not the client future. Detachment cannot permit
+/// provider selection to race accepted fixed-page I/O before actual completion.
+pub(crate) struct FixedAcquisition {
+    scheduler: Arc<Scheduler>,
+    version: ObjectVersion,
+}
+impl Drop for FixedAcquisition {
+    fn drop(&mut self) {
+        let wake = {
+            let mut state = self.scheduler.state.lock().unwrap();
+            let count = state.fixed.get_mut(&self.version).unwrap();
+            *count -= 1;
+            if *count != 0 {
+                return;
+            }
+            state.fixed.remove(&self.version);
+            state
+                .demands
+                .values_mut()
+                .filter(|d| d.version == self.version)
+                .filter_map(|d| d.waker.take())
+                .collect::<Vec<_>>()
+        };
+        for waker in wake {
+            waker.wake();
+        }
+    }
+}
 impl Demand {
     fn eligible(&self, number: u64) -> bool {
         if number < self.next
@@ -540,6 +610,58 @@ mod tests {
             },
             etag: StrongEtag::test_value("v1"),
         }
+    }
+
+    #[test]
+    fn ordered_reservations_are_exact_and_mixed_exclusion_outlives_demand() {
+        let scheduler = Scheduler::new(3);
+        let range = ByteRange::From(PAGE_BYTES - 3)
+            .resolve(2 * PAGE_BYTES + 5)
+            .unwrap();
+        let mut ordered = scheduler
+            .register(version(), range, 2, PAGE_BYTES, true)
+            .unwrap();
+        let mut unordered = scheduler
+            .register(version(), range, 1, PAGE_BYTES, false)
+            .unwrap();
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        let std::task::Poll::Ready(Ok(Next::Select(selection))) = unordered.poll_next(&mut cx)
+        else {
+            panic!()
+        };
+        assert!(ordered.poll_ordered(&mut cx).is_pending());
+        drop(selection);
+        let std::task::Poll::Ready(Ok(Some((number, guard)))) = ordered.poll_ordered(&mut cx)
+        else {
+            panic!()
+        };
+        assert_eq!(number, PageNumber(0));
+        assert_eq!(
+            scheduler.state.lock().unwrap().demands[&ordered.id]
+                .credits
+                .used,
+            3
+        );
+        assert!(
+            ordered.poll_ordered(&mut cx).is_pending(),
+            "byte credit reserved before work"
+        );
+        assert!(unordered.poll_next(&mut cx).is_pending());
+        drop(ordered);
+        assert!(
+            unordered.poll_next(&mut cx).is_pending(),
+            "worker still owns exclusion"
+        );
+        drop(guard);
+        assert!(matches!(
+            unordered.poll_next(&mut cx),
+            std::task::Poll::Ready(Ok(Next::Select(_)))
+        ));
+        drop(unordered);
+        let state = scheduler.state.lock().unwrap();
+        assert!(state.fixed.is_empty());
+        assert!(state.selecting.is_empty());
+        assert!(state.demands.is_empty());
     }
 
     #[test]

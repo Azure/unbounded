@@ -77,6 +77,12 @@ enum Work {
     Resolve(MetadataSelector, MembershipLease, PeerOriginContext),
     Bootstrap(MetadataSelector, MembershipLease, PeerOriginContext),
     Acquire(PageId, MembershipLease, PeerOriginContext),
+    Ordered(
+        PageId,
+        MembershipLease,
+        PeerOriginContext,
+        Arc<super::subscription::FixedAcquisition>,
+    ),
     Publish(VersionMetadata),
     Retained(ObjectVersion),
     Peer(VerifiedRequest, MembershipLease),
@@ -621,6 +627,42 @@ impl WorkerDirectory {
             Ok((value, budget))
         }))
     }
+    /// Always enqueue, including local ingress. The command and elected Fill
+    /// driver, rather than the detachable receipt, own mixed-mode exclusion.
+    pub(crate) fn start_ordered_page(
+        &self,
+        page: PageId,
+        guard: super::subscription::FixedAcquisition,
+        membership: MembershipLease,
+        context: &OriginContext,
+        scope: &RequestScope,
+        budget: AcquisitionBudget,
+    ) -> Result<Operation<'static, (Result<PageResult>, AcquisitionBudget)>> {
+        if page.version.object != context.object {
+            return Err(Error::InvalidRequest);
+        }
+        let owner = self.page_owner(&page)?;
+        let receipt = self.submit(
+            owner,
+            Work::Ordered(
+                page,
+                membership,
+                self.seal(context, scope)?,
+                Arc::new(guard),
+            ),
+            scope,
+            Some(budget),
+        )?;
+        Ok(Box::pin(async move {
+            let completion = receipt.await?;
+            let budget = completion.budget.ok_or(Error::StaleFlight)?;
+            let value = completion.value.and_then(|value| match value {
+                Value::Page(value) => Ok(value),
+                _ => Err(Error::StaleFlight),
+            });
+            Ok((value, budget))
+        }))
+    }
     pub fn publish_metadata<'a>(
         &'a self,
         metadata: VersionMetadata,
@@ -955,6 +997,20 @@ async fn execute(
                     &context,
                     scope,
                     budget.ok_or(Error::StaleFlight)?,
+                )
+                .await
+                .map(Value::Page)
+        }
+        Work::Ordered(page, membership, envelope, guard) => {
+            let context = local.open_context(envelope)?;
+            local
+                .acquire_ordered(
+                    page,
+                    membership,
+                    &context,
+                    scope,
+                    budget.ok_or(Error::StaleFlight)?,
+                    guard,
                 )
                 .await
                 .map(Value::Page)

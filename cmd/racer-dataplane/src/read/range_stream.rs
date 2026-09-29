@@ -88,6 +88,7 @@ pub struct RangeStreams {
 /// send::<RangeStream>();
 /// ```
 pub struct RangeStream {
+    prefetch_error: Option<Error>,
     selected_ready: Option<PageResult>,
     selection: Option<Operation<'static, (Result<PageResult>, AcquisitionBudget)>>,
     retained: std::collections::BTreeMap<PageNumber, crate::memory::pool::VerifiedPage>,
@@ -205,6 +206,7 @@ impl RangeStreams {
         }
         let first = range.first_page();
         let mut stream = RangeStream {
+            prefetch_error: None,
             selected_ready: None,
             selection: None,
             retained: std::collections::BTreeMap::new(),
@@ -254,9 +256,14 @@ impl RangeStream {
                 return Err(Error::InvalidRequest);
             }
         }
-        // Credits are the only subscription scheduling bound; the legacy window
-        // remains only for internal ordered/bootstrap callers.
-        self.window_pages = pages;
+        // Ordered concurrency also respects the configured acquisition window:
+        // a large client lease allowance must not create an I/O admission burst.
+        // Unordered selection retains its existing credit-driven behavior.
+        self.window_pages = if ordered {
+            self.window_pages.min(pages)
+        } else {
+            pages
+        };
         self.subscription = Some(demand);
         Ok(())
     }
@@ -270,9 +277,117 @@ impl RangeStream {
     }
     /// Drive admitted acquisitions while the current slice encounters client
     /// backpressure. Completed pages leave their acquisition scopes promptly;
-    /// this never admits more than the existing bounded window.
+    /// new subscription work requires credit and ordered work also requires room
+    /// in the configured window, including delivered but unreleased pages.
     pub(crate) fn poll_prefetch(&mut self, cx: &mut Context<'_>) {
+        if self.terminated || self.prefetch_error.is_some() {
+            return;
+        }
+        let result = if self.subscription.as_ref().is_some_and(|d| d.ordered()) {
+            self.poll_ordered(cx)
+        } else if self.subscription.is_some() && self.ready.is_empty() {
+            self.poll_selection(cx)
+        } else {
+            poll_window(&mut self.ready, &mut self.budget, cx).map(|()| Ok(()))
+        };
+        if let Poll::Ready(Err(error)) = result {
+            self.prefetch_error = Some(error);
+        }
+    }
+    fn poll_ordered(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        let scope = self.operation_scope();
+        scope.check()?;
         let _ = poll_window(&mut self.ready, &mut self.budget, cx);
+        if self.subscription.as_ref().unwrap().exhausted() {
+            self.next_page = None;
+        }
+        while self.ready.len() + self.retained.len() < self.window_pages {
+            if self
+                .ready
+                .iter()
+                .any(|(_, page)| matches!(page, WindowPage::Ready(Err(_))))
+            {
+                break;
+            }
+            let child = match self.budget.next_page(!self.ready.is_empty())? {
+                Some(child) => child,
+                None => break,
+            };
+            let assignment = self.subscription.as_mut().unwrap().poll_ordered(cx);
+            let (number, guard) = match assignment {
+                Poll::Ready(Ok(Some(assignment))) => assignment,
+                other => {
+                    self.budget.complete(child)?;
+                    match other {
+                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                        Poll::Ready(Ok(None)) => self.next_page = None,
+                        _ => {}
+                    }
+                    break;
+                }
+            };
+            let mut child_scope = scope.clone();
+            child_scope.deadline.0 = child.deadline();
+            let future = self.directory.start_ordered_page(
+                PageId {
+                    version: self.metadata.version.clone(),
+                    number,
+                },
+                guard,
+                self.membership.clone(),
+                &self.context,
+                &child_scope,
+                child,
+            );
+            let failed = future.is_err();
+            self.ready.push_back((
+                number,
+                match future {
+                    Ok(future) => WindowPage::Waiting(future),
+                    Err(error) => WindowPage::Ready(Err(error)),
+                },
+            ));
+            if failed {
+                break;
+            }
+        }
+        poll_window(&mut self.ready, &mut self.budget, cx).map(|()| Ok(()))
+    }
+    fn poll_selection(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        use super::subscription::Next;
+        let scope = self.operation_scope();
+        scope.check()?;
+        loop {
+            if self.selected_ready.is_some() {
+                return Poll::Ready(Ok(()));
+            }
+            if let Some(future) = self.selection.as_mut() {
+                let (result, remaining) = std::task::ready!(future.as_mut().poll(cx))?;
+                self.budget.complete(remaining)?;
+                self.selection = None;
+                result?;
+            }
+            match std::task::ready!(self.subscription.as_mut().unwrap().poll_next(cx))? {
+                Next::End => {
+                    self.next_page = None;
+                    return Poll::Ready(Ok(()));
+                }
+                Next::Page(result) => self.selected_ready = Some(result),
+                Next::Select(selection) => {
+                    let child = self.budget.next_page(false)?.ok_or(Error::Overloaded)?;
+                    let mut child_scope = scope.clone();
+                    child_scope.deadline.0 = child.deadline();
+                    self.selection = Some(self.directory.start_selection(
+                        self.metadata.version.clone(),
+                        selection,
+                        self.membership.clone(),
+                        &self.context,
+                        &child_scope,
+                        child,
+                    )?);
+                }
+            }
+        }
     }
     /// Only client HTTP delivery may release the initial operation deadline after
     /// acquiring the first slice. Already admitted pages retain their original deadlines
@@ -307,6 +422,17 @@ impl RangeStream {
         Box::pin(async move {
             if self.terminated {
                 return Ok(None);
+            }
+            if let Some(error) = self.prefetch_error.take() {
+                self.terminate();
+                return Err(error);
+            }
+            if self.subscription.as_ref().is_some_and(|d| d.ordered()) {
+                let result = self.next_ordered_slice().await;
+                if result.is_err() {
+                    self.terminate();
+                }
+                return result;
             }
             if self.subscription.is_some() && self.ready.is_empty() {
                 return self.next_subscription_slice().await;
@@ -499,8 +625,38 @@ impl RangeStream {
         self.selected_ready = None;
     }
 
+    async fn next_ordered_slice(&mut self) -> Result<Option<ReaderLease>> {
+        let scope = self.operation_scope();
+        let cancellation = scope.cancellation.subscribe()?;
+        poll_fn(|cx| {
+            cancellation.register(cx.waker());
+            std::task::ready!(self.poll_ordered(cx))?;
+            if self.ready.is_empty() && self.next_page.is_some() {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        })
+        .await?;
+        if self.ready.is_empty() {
+            self.terminated = true;
+            return Ok(None);
+        }
+        // No delivery pipe is held while waiting for credit or the ordered head.
+        let pipe = self.delivery.admit(&scope).await?;
+        let Some((number, WindowPage::Ready(result))) = self.ready.pop_front() else {
+            return Err(Error::StaleFlight);
+        };
+        let result = result?;
+        self.validate(&result, number)?;
+        self.subscription.as_mut().unwrap().issued(number)?;
+        self.retained.insert(number, result.plaintext.clone());
+        let slice = self.range.slice_at(number)?.ok_or(Error::CorruptRecord)?;
+        self.delivery
+            .attach_reserved(result.plaintext, slice, pipe)
+            .map(Some)
+    }
     async fn next_subscription_slice(&mut self) -> Result<Option<ReaderLease>> {
-        use super::subscription::Next;
         let scope = self.operation_scope();
         let cancellation = scope.cancellation.subscribe()?;
         let result = async {
@@ -519,43 +675,14 @@ impl RangeStream {
                         .attach_reserved(result.plaintext, slice, pipe)
                         .map(Some);
                 }
-                if let Some(future) = self.selection.as_mut() {
-                    let (result, remaining) = future.await?;
-                    self.budget.complete(remaining)?;
-                    self.selection = None;
-                    result?;
-                }
-                let next = poll_fn(|cx| {
+                poll_fn(|cx| {
                     cancellation.register(cx.waker());
-                    if let Err(error) = scope.check() {
-                        return Poll::Ready(Err(error));
-                    }
-                    self.subscription.as_mut().unwrap().poll_next(cx)
+                    self.poll_selection(cx)
                 })
                 .await?;
-                match next {
-                    Next::End => {
-                        self.terminated = true;
-                        self.next_page = None;
-                        return Ok(None);
-                    }
-                    Next::Select(selection) => {
-                        let child = self.budget.next_page(false)?.ok_or(Error::Overloaded)?;
-                        let mut child_scope = scope.clone();
-                        child_scope.deadline.0 = child.deadline();
-                        let future = self.directory.start_selection(
-                            self.metadata.version.clone(),
-                            selection,
-                            self.membership.clone(),
-                            &self.context,
-                            &child_scope,
-                            child,
-                        )?;
-                        self.selection = Some(future);
-                    }
-                    Next::Page(result) => {
-                        self.selected_ready = Some(result);
-                    }
+                if self.selected_ready.is_none() && self.next_page.is_none() {
+                    self.terminated = true;
+                    return Ok(None);
                 }
             }
         }
@@ -1137,6 +1264,7 @@ mod tests {
                 ));
             }
             let mut stream = RangeStream {
+                prefetch_error: None,
                 selected_ready: None,
                 selection: None,
                 retained: std::collections::BTreeMap::new(),

@@ -354,13 +354,40 @@ impl Fill {
     ) -> Operation<'a, PageResult> {
         Box::pin(async move {
             match self
-                .acquire_with_prefetch(page, membership, context, scope, budget, None, true)
+                .acquire_with_prefetch(page, membership, context, scope, budget, None, true, None)
                 .await?
             {
                 AcquiredPage::Plaintext(page) => Ok(page),
                 AcquiredPage::Ciphertext(_) => Err(Error::CorruptRecord),
             }
         })
+    }
+
+    pub(crate) async fn acquire_ordered(
+        &self,
+        page: PageId,
+        membership: MembershipLease,
+        context: &OriginContext,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+        guard: std::sync::Arc<super::subscription::FixedAcquisition>,
+    ) -> Result<PageResult> {
+        match self
+            .acquire_with_prefetch(
+                page,
+                membership,
+                context,
+                scope,
+                budget,
+                None,
+                true,
+                Some(guard),
+            )
+            .await?
+        {
+            AcquiredPage::Plaintext(page) => Ok(page),
+            AcquiredPage::Ciphertext(_) => Err(Error::CorruptRecord),
+        }
     }
 
     pub fn acquire_ciphertext<'a>(
@@ -373,7 +400,7 @@ impl Fill {
     ) -> Operation<'a, crate::memory::page::CiphertextCopy> {
         Box::pin(async move {
             Ok(self
-                .acquire_with_prefetch(page, membership, context, scope, budget, None, false)
+                .acquire_with_prefetch(page, membership, context, scope, budget, None, false, None)
                 .await?
                 .copy())
         })
@@ -404,6 +431,7 @@ impl Fill {
                     budget,
                     Some(Prefetch::Origin(origin)),
                     true,
+                    None,
                 )
                 .await?
             {
@@ -435,6 +463,7 @@ impl Fill {
                         disk_token: None,
                     })),
                     true,
+                    None,
                 )
                 .await?
             {
@@ -453,6 +482,7 @@ impl Fill {
         budget: &'a mut AcquisitionBudget,
         mut prefetch: Option<Prefetch>,
         plaintext: bool,
+        guard: Option<std::sync::Arc<super::subscription::FixedAcquisition>>,
     ) -> Operation<'a, AcquiredPage> {
         Box::pin(async move {
             scope.check()?;
@@ -519,7 +549,12 @@ impl Fill {
                         let fill = self.clone();
                         let flights = self.dependencies.flights.clone();
                         let (send, mut receive) = futures::channel::oneshot::channel();
+                        // A cancelled waiter may return before accepted origin,
+                        // peer, or crypto work. Keep selection excluded until
+                        // this elected driver's actual completion, not its reply.
+                        let completion_guard = guard.clone();
                         driver_permit.submit(Box::pin(async move {
+                            let _completion_guard = completion_guard;
                             let mut work = Box::pin(async {
                                 let (ready, prefetched) = match prefetched {
                                     Some(Prefetch::Ciphertext(copy)) => {

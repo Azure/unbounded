@@ -259,16 +259,20 @@ impl Responses {
                         .checked_mul(PAGE_BYTES)
                         .and_then(|n| n.checked_add(u64::from(slice.offset)))
                         .ok_or(Error::BadGateway)?;
-                    connection = send_frame(
-                        &self.io,
-                        connection,
-                        frame(1, slice.page.0, offset, slice.length),
-                        &progress_scope,
-                    )
-                    .await?;
-                    let mut write =
+                    // Acquisition owns no delivery pipe and continues even while
+                    // the page frame or payload is blocked on this socket.
+                    let mut write = Box::pin(async {
+                        let connection = send_frame(
+                            &self.io,
+                            connection,
+                            frame(1, slice.page.0, offset, slice.length),
+                            &progress_scope,
+                        )
+                        .await?;
                         self.delivery
-                            .finish_progressing(reader, connection, &progress_scope);
+                            .finish_progressing(reader, connection, &progress_scope)
+                            .await
+                    });
                     let result = std::future::poll_fn(|cx| {
                         stream.poll_prefetch(cx);
                         write.as_mut().poll(cx)

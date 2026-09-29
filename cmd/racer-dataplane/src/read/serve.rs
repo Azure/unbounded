@@ -93,6 +93,19 @@ impl Coordinator {
             .select_subscription(version, demand, membership, context, scope, budget)
             .await
     }
+    pub(crate) async fn acquire_ordered(
+        &self,
+        page: crate::model::identity::PageId,
+        membership: MembershipLease,
+        context: &OriginContext,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+        guard: std::sync::Arc<super::subscription::FixedAcquisition>,
+    ) -> Result<super::fill::PageResult> {
+        self.fill
+            .acquire_ordered(page, membership, context, scope, budget, guard)
+            .await
+    }
     pub(crate) async fn accept_selected(
         &self,
         copy: crate::memory::page::CiphertextCopy,
