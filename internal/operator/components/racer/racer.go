@@ -125,7 +125,8 @@ func planAt(ctx context.Context, env *component.Env, now time.Time) (*component.
 		return plan, pending(), nil
 	}
 
-	if err := runtimePlan(ctx, env, plan, marker.Data["cluster"], secret, consumed); err != nil {
+	result := component.ReconciledAfter("Racer installation reconciled", time.Hour)
+	if err := runtimePlan(ctx, env, plan, marker.Data["cluster"], secret, consumed, &result); err != nil {
 		return nil, component.Result{}, err
 	}
 
@@ -151,10 +152,10 @@ func planAt(ctx context.Context, env *component.Env, now time.Time) (*component.
 		return plan, pending(), nil
 	}
 
-	return plan, component.ReconciledAfter("Racer installation reconciled", time.Hour), nil
+	return plan, result, nil
 }
 
-func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, cluster string, secret *corev1.Secret, ready bool) error {
+func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, cluster string, secret *corev1.Secret, ready bool, result *component.Result) error {
 	objects, err := env.DecodeManifestFiles(manifests.Manifests, []string{"create-restriction.yaml", "rbac.yaml", "config.yaml", "controller.yaml"}, nil)
 	if err != nil {
 		return err
@@ -271,26 +272,31 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 	}
 
 	if ready {
-		ds, err := racercore.DesiredDaemonSet(cfg)
+		sets, migration, err := migrationPlan(ctx, env, cfg)
 		if err != nil {
 			return err
 		}
 
-		ds.Spec.Template.Annotations = map[string]string{"unbounded-cloud.io/racer-config-hash": component.ConfigMapPayloadHash(tuning)}
-		container := &ds.Spec.Template.Spec.Containers[0]
-		container.EnvFrom = []corev1.EnvFromSource{{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: dataplaneConfigName}}}}
-		// Scheduling reservation, not a claim that admission budgets bound RSS.
-		// TLS, metadata, allocator overhead and filesystem cache are additional.
-		container.Resources.Requests = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi")}
+		*result = migration
 
-		op := component.Operation{Kind: component.OpApply, Object: component.ToUnstructured(ds), Component: name, Overridable: true}
-		for _, dependency := range plan.Operations {
-			if dependency.Object.GetKind() != "Deployment" {
-				op.DependsOn = append(op.DependsOn, dependency.Ref())
+		for _, ds := range sets {
+			ds.Spec.Template.Annotations = map[string]string{"unbounded-cloud.io/racer-config-hash": component.ConfigMapPayloadHash(tuning)}
+			container := &ds.Spec.Template.Spec.Containers[0]
+			container.EnvFrom = []corev1.EnvFromSource{{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: dataplaneConfigName}}}}
+			// Scheduling reservation, not a claim that admission budgets bound RSS.
+			// TLS, metadata, allocator overhead and filesystem cache are additional.
+			container.Resources.Requests = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi")}
+
+			// Mixed placement restrictions must not be weakened by workload overrides.
+			op := component.Operation{Kind: component.OpApply, Object: component.ToUnstructured(ds), Component: name, Overridable: len(sets) == 1 && migration.Ready}
+			for _, dependency := range plan.Operations {
+				if dependency.Object.GetKind() != "Deployment" {
+					op.DependsOn = append(op.DependsOn, dependency.Ref())
+				}
 			}
-		}
 
-		plan.Add(op)
+			plan.Add(op)
+		}
 	}
 
 	return nil
@@ -299,7 +305,8 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	b.Watches(&racerv1.ClusterCache{}, env.RequestSingleton(), builder.WithPredicates(predicate.GenerationChangedPredicate{}))
 	b.Watches(&appsv1.Deployment{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(controllerName))))
-	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(dataplaneName))))
+	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(dataplaneName, racercore.PodNetworkDaemonSetName))))
+	b.Watches(&corev1.Pod{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool { return obj.GetNamespace() == env.Namespace && migrationPod(obj) })))
 	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(claimName, markerName, configName, dataplaneConfigName, trustName))))
 	b.Watches(&corev1.Secret{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(env.InNamespaceNamed(tlsName))))
 	b.Watches(&batchv1.Job{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(env.InNamespaceNamed(jobName))))
