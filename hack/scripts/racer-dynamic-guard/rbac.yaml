@@ -1,0 +1,91 @@
+# Review-only operational RBAC. No apply is performed by this helper.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: racer-guard-source-owner
+  namespace: unbounded-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: racer-guard-source-nodes
+rules:
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: racer-guard-source-nodes
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: racer-guard-source-nodes
+subjects:
+  - kind: ServiceAccount
+    name: racer-guard-source-owner
+    namespace: unbounded-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: racer-guard-source-owner
+  namespace: unbounded-system
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list]
+  - apiGroups: [apps]
+    resources: [daemonsets]
+    resourceNames: [racer-dataplane, racer-dataplane-podnet]
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [racer-stage47-sources]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: racer-guard-source-owner
+  namespace: unbounded-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: racer-guard-source-owner
+subjects:
+  - kind: ServiceAccount
+    name: racer-guard-source-owner
+    namespace: unbounded-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: racer-guard-local
+  namespace: unbounded-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: racer-guard-local
+  namespace: unbounded-system
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [racer-stage47-sources]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: racer-guard-local
+  namespace: unbounded-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: racer-guard-local
+subjects:
+  - kind: ServiceAccount
+    name: racer-guard-local
+    namespace: unbounded-system

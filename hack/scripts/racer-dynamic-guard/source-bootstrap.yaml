@@ -1,0 +1,9 @@
+# First create this empty object, read its assigned UID, then pin that UID in the
+# immutable policy and watcher args. It never grants admission by itself.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: racer-stage47-sources
+  namespace: unbounded-system
+data:
+  state.json: '{}'
