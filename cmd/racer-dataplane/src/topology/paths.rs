@@ -159,14 +159,14 @@ impl Paths {
     ) -> Result<Route> {
         let key = self.key(&membership, from, budget)?;
         if let Some(route) = self.cached(&membership, &key, budget) {
-            return Ok(route);
+            return route;
         }
         let _admission = self.admit_search()?;
         let mut search = RouteSearch::new(membership.members().len(), &key, self.algorithm);
         while !search.step(SEARCH_QUANTUM, budget.deadline)? {}
         let nodes = search.finish()?;
         self.store(&membership, key, &nodes);
-        Ok(select_route(membership, &nodes, budget))
+        select_route(membership, &nodes, budget, self.algorithm)
     }
 
     /// Same result as `shortest`, yielding after at most 32 vertex expansions.
@@ -182,7 +182,7 @@ impl Paths {
             scope.check()?;
             let key = self.key(&membership, from, budget)?;
             if let Some(route) = self.cached(&membership, &key, budget) {
-                return Ok(route);
+                return route;
             }
             let _admission = self.admit_search()?;
             let mut search = RouteSearch::new(membership.members().len(), &key, self.algorithm);
@@ -208,7 +208,7 @@ impl Paths {
                 return Err(Error::Unavailable);
             }
             self.store(&membership, key, &nodes);
-            Ok(select_route(membership, &nodes, budget))
+            select_route(membership, &nodes, budget, self.algorithm)
         })
     }
 
@@ -272,11 +272,16 @@ impl Paths {
         membership: &MembershipLease,
         key: &PathKey,
         budget: &RouteBudget,
-    ) -> Option<Route> {
+    ) -> Option<Result<Route>> {
         let cache = self.cache.borrow();
         let (weak, nodes) = cache.entries.get(key)?;
         weak.upgrade()?;
-        Some(select_route(membership.clone(), nodes, budget))
+        Some(select_route(
+            membership.clone(),
+            nodes,
+            budget,
+            self.algorithm,
+        ))
     }
 
     fn store(&self, membership: &MembershipLease, key: PathKey, nodes: &[Vec<usize>]) {
@@ -306,9 +311,12 @@ fn select_route(
     membership: MembershipLease,
     alternatives: &[Vec<usize>],
     budget: &RouteBudget,
-) -> Route {
+    algorithm: RoutingAlgorithm,
+) -> Result<Route> {
     let index = if alternatives.len() == 1 {
         0
+    } else if algorithm == RoutingAlgorithm::V4 {
+        weighted_index(&membership, alternatives, budget)?
     } else {
         let mut digest = hash::domain(b"racer/next-hop/v3\0");
         digest.update(budget.request.0);
@@ -321,7 +329,57 @@ fn select_route(
         let sample = u64::from_be_bytes(hash::finish(digest)[..8].try_into().unwrap());
         (sample % alternatives.len() as u64) as usize
     };
-    route(membership, &alternatives[index])
+    Ok(route(membership, &alternatives[index]))
+}
+
+/// Positive authenticated membership shares weight only the eligible next hop.
+/// Integer rejection sampling avoids modulo bias, floats, and platform variance.
+/// At most 36 u32 weights fit in u64. The retry cap bounds adversarial work; a
+/// rejected draw never falls back to a biased choice. See the v4 contract.
+fn weighted_index(
+    membership: &Membership,
+    alternatives: &[Vec<usize>],
+    budget: &RouteBudget,
+) -> Result<usize> {
+    let weights: Vec<_> = alternatives
+        .iter()
+        .map(|path| u64::from(membership.members()[path[1]].shares.get()))
+        .collect();
+    let total: u64 = weights.iter().sum();
+    let mut digest = hash::domain(b"racer/next-hop/v4\0");
+    digest.update(budget.request.0);
+    digest.update(budget.attempt.0);
+    hash::bytes(
+        &mut digest,
+        membership.members()[alternatives[0][0]].node.0.as_bytes(),
+    );
+    hash::bytes(&mut digest, budget.destination.0.as_bytes());
+    for counter in 0u32..64 {
+        if crate::runtime::environment::now() >= budget.deadline.0 {
+            return Err(Error::DeadlineExceeded);
+        }
+        let mut draw = digest.clone();
+        draw.update(counter.to_be_bytes());
+        let sample = u64::from_be_bytes(hash::finish(draw)[..8].try_into().unwrap());
+        if let Some(index) = weighted_draw(sample, total, &weights) {
+            return Ok(index);
+        }
+    }
+    Err(Error::Unavailable)
+}
+
+fn weighted_draw(sample: u64, total: u64, weights: &[u64]) -> Option<usize> {
+    if sample < total.wrapping_neg() % total {
+        return None;
+    }
+    let mut ticket = sample % total;
+    for (index, weight) in weights.iter().enumerate() {
+        if ticket < *weight {
+            return Some(index);
+        }
+        ticket -= weight;
+    }
+    unreachable!("ticket is below the sum of positive weights")
 }
 
 enum RouteSearch {
@@ -332,7 +390,9 @@ impl RouteSearch {
     fn new(count: usize, key: &PathKey, algorithm: RoutingAlgorithm) -> Self {
         match algorithm {
             RoutingAlgorithm::V2 => Self::Legacy(Search::new(count, key)),
-            RoutingAlgorithm::V3 => Self::EqualCost(EqualCostSearch::new(count, key)),
+            RoutingAlgorithm::V3 | RoutingAlgorithm::V4 => {
+                Self::EqualCost(EqualCostSearch::new(count, key))
+            }
         }
     }
     fn step(&mut self, quantum: usize, deadline: Deadline) -> Result<bool> {
@@ -569,7 +629,7 @@ mod tests {
 
     #[test]
     fn v3_cache_reselects_identity_and_recomputes_deterministically() {
-        assert_eq!(crate::topology::ALGORITHM_VERSION, 3);
+        assert_eq!(crate::topology::ALGORITHM_VERSION, 4);
         let members = membership(1500);
         let source = &members.members()[0].node;
         let paths = Paths::with_algorithm(Rc::new(LinkHealth), 2, RoutingAlgorithm::V3);
@@ -612,10 +672,19 @@ mod tests {
 
     #[test]
     fn v3_health_cache_eviction_budget_and_deadline_regressions() {
+        health_cache_eviction_budget_and_deadline_regressions(RoutingAlgorithm::V3);
+    }
+
+    #[test]
+    fn v4_health_cache_eviction_budget_and_deadline_regressions() {
+        health_cache_eviction_budget_and_deadline_regressions(RoutingAlgorithm::V4);
+    }
+
+    fn health_cache_eviction_budget_and_deadline_regressions(algorithm: RoutingAlgorithm) {
         let members = membership(1500);
         let source = &members.members()[0].node;
         let health = Rc::new(LinkHealth::new(36));
-        let paths = Paths::with_algorithm(health.clone(), 1, RoutingAlgorithm::V3);
+        let paths = Paths::with_algorithm(health.clone(), 1, algorithm);
         let request = budget(&members, 1499, NORMAL_LINKS);
         let original = paths.shortest(members.clone(), source, &request).unwrap();
         let mut blocked = request.clone();
@@ -680,13 +749,158 @@ mod tests {
                 .unwrap_err(),
             Error::DeadlineExceeded
         );
-        let cold = Paths::with_algorithm(Rc::new(LinkHealth), 0, RoutingAlgorithm::V3);
+        let cold = Paths::with_algorithm(Rc::new(LinkHealth), 0, algorithm);
         assert_eq!(
             cold.shortest(members.clone(), source, &budget(&members, 0, 0))
                 .unwrap()
                 .nodes,
             vec![source.clone()]
         );
+    }
+
+    #[test]
+    fn v4_weighted_integer_mapping_and_probabilities() {
+        // 2^64 mod 5 = 1. Exactly reject the short prefix, not a modulo fallback.
+        assert_eq!(weighted_draw(0, 5, &[4, 1]), None);
+        let mut counts = [0; 2];
+        for sample in 1..=10_000 {
+            counts[weighted_draw(sample, 5, &[4, 1]).unwrap()] += 1;
+        }
+        assert_eq!(counts, [8000, 2000]);
+        let max = u64::from(u32::MAX);
+        assert_eq!(weighted_draw(u64::MAX, 36 * max, &[max; 36]), Some(5));
+
+        let mut input = membership(3).members().to_vec();
+        input[1].shares = std::num::NonZeroU32::new(4).unwrap();
+        input[2].shares = std::num::NonZeroU32::new(1).unwrap();
+        let members = Arc::new(Membership::validate(input_version(), input).unwrap());
+        let mut request = budget(&members, 2, 4);
+        let alternatives = vec![vec![0, 1, 2], vec![0, 2]];
+        // Selector unit test only: production search supplies equal-length paths.
+        let mut counts = [0; 2];
+        for id in 0u128..20_000 {
+            request.attempt = AttemptId(id.to_be_bytes());
+            counts[weighted_index(&members, &alternatives, &request).unwrap()] += 1;
+        }
+        assert!((15_700..16_300).contains(&counts[0]), "{counts:?}");
+        let mut equal = members.members().to_vec();
+        equal[2].shares = equal[1].shares;
+        let equal = Membership::validate(input_version(), equal).unwrap();
+        let mut counts = [0; 2];
+        for id in 0u128..20_000 {
+            request.attempt = AttemptId(id.to_be_bytes());
+            counts[weighted_index(&equal, &alternatives, &request).unwrap()] += 1;
+        }
+        assert!((9700..10_300).contains(&counts[0]), "{counts:?}");
+    }
+
+    fn input_version() -> crate::model::identity::MembershipVersion {
+        crate::model::identity::MembershipVersion(1)
+    }
+
+    #[test]
+    fn v4_independent_hash_vectors_and_snapshot_weights() {
+        let mut input = membership(1500).members().to_vec();
+        for member in &mut input {
+            member.shares = std::num::NonZeroU32::new(4).unwrap();
+        }
+        for i in [83, 833] {
+            input[i].shares = std::num::NonZeroU32::new(1).unwrap();
+        }
+        let members = Arc::new(Membership::validate(input_version(), input).unwrap());
+        let paths = Paths::with_algorithm(Rc::new(LinkHealth), 1, RoutingAlgorithm::V4);
+        let source = &members.members()[0].node;
+        for (attempt, expected) in [(0u128, 416), (1, 416), (2, 1166), (127, 666)] {
+            let mut request = budget(&members, 1499, 4);
+            request.attempt = AttemptId(attempt.to_be_bytes());
+            assert_eq!(
+                paths
+                    .shortest(members.clone(), source, &request)
+                    .unwrap()
+                    .nodes[1],
+                members.members()[expected].node
+            );
+        }
+        let mut changed = members.members().to_vec();
+        changed[83].shares = std::num::NonZeroU32::new(u32::MAX).unwrap();
+        let changed = Arc::new(
+            Membership::validate(crate::model::identity::MembershipVersion(2), changed).unwrap(),
+        );
+        let request = budget(&changed, 1499, 4);
+        assert_eq!(
+            paths
+                .shortest(changed.clone(), source, &request)
+                .unwrap()
+                .nodes[1],
+            changed.members()[83].node
+        );
+        assert_eq!(paths.cached_paths(), 1);
+    }
+
+    #[test]
+    fn v4_all_1500_endpoints_shortest_and_uniform_compatibility() {
+        let original = membership(1500);
+        let mut input = original.members().to_vec();
+        for (i, member) in input.iter_mut().enumerate() {
+            member.shares = std::num::NonZeroU32::new(if i % 137 == 0 { 1 } else { 4 }).unwrap();
+        }
+        let members = Arc::new(Membership::validate(input_version(), input).unwrap());
+        let paths = Paths::with_algorithm(Rc::new(LinkHealth), 2, RoutingAlgorithm::V4);
+        let cold = Paths::with_algorithm(Rc::new(LinkHealth), 0, RoutingAlgorithm::V4);
+        for destination in 0..1500 {
+            let source = (destination + 731) % 1500;
+            let mut request = budget(&members, destination, NORMAL_LINKS);
+            let expected = oracle(1500, source, destination, NORMAL_LINKS, &[], &[]).unwrap();
+            let mut current = members.members()[source].node.clone();
+            let mut links = 0;
+            while current != request.destination {
+                let route = paths.shortest(members.clone(), &current, &request).unwrap();
+                let scope = RequestScope::new(request.request, request.deadline.0).unwrap();
+                let recomputed = futures::executor::block_on(cold.shortest_async(
+                    members.clone(),
+                    &current,
+                    &request,
+                    &scope,
+                ))
+                .unwrap();
+                assert_eq!(route.nodes, recomputed.nodes);
+                let next = route.nodes[1].clone();
+                let forwarded = request.forwarded(&current, &next).unwrap();
+                request
+                    .validate_forwarded(&forwarded, &current, &next)
+                    .unwrap();
+                request = forwarded;
+                current = next;
+                links += 1;
+            }
+            assert_eq!(links + 1, expected.len());
+            assert!(links <= 4);
+            assert!(paths.cached_paths() <= 2);
+        }
+        // V2 and V3 do not read shares. Their existing choices remain exact.
+        for algorithm in [RoutingAlgorithm::V2, RoutingAlgorithm::V3] {
+            let paths = Paths::with_algorithm(Rc::new(LinkHealth), 1, algorithm);
+            for to in [0, 83, 1499] {
+                assert_eq!(
+                    paths
+                        .shortest(
+                            original.clone(),
+                            &original.members()[0].node,
+                            &budget(&original, to, 4)
+                        )
+                        .unwrap()
+                        .nodes,
+                    paths
+                        .shortest(
+                            members.clone(),
+                            &members.members()[0].node,
+                            &budget(&members, to, 4)
+                        )
+                        .unwrap()
+                        .nodes,
+                );
+            }
+        }
     }
 
     #[test]

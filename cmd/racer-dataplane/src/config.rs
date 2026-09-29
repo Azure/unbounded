@@ -174,6 +174,7 @@ impl Config {
         let routing_algorithm = match text("RACER_ROUTING_ALGORITHM", Some("2"))?.as_str() {
             "2" => crate::topology::RoutingAlgorithm::V2,
             "3" => crate::topology::RoutingAlgorithm::V3,
+            "4" => crate::topology::RoutingAlgorithm::V4,
             _ => return Err(Error::InvalidConfiguration),
         };
         let peer_listen =
@@ -1214,7 +1215,11 @@ mod tests {
     #[test]
     fn routing_algorithm_requires_a_supported_explicit_version() {
         use crate::topology::RoutingAlgorithm;
-        for (value, expected) in [("2", RoutingAlgorithm::V2), ("3", RoutingAlgorithm::V3)] {
+        for (value, expected) in [
+            ("2", RoutingAlgorithm::V2),
+            ("3", RoutingAlgorithm::V3),
+            ("4", RoutingAlgorithm::V4),
+        ] {
             assert_eq!(
                 parse(&[("RACER_ROUTING_ALGORITHM", value)])
                     .unwrap()
@@ -1222,7 +1227,7 @@ mod tests {
                 expected
             );
         }
-        for value in ["", "1", "4", "03", " 3", "3 ", "auto"] {
+        for value in ["", "1", "5", "03", " 3", "3 ", "auto"] {
             assert!(parse(&[("RACER_ROUTING_ALGORITHM", value)]).is_err());
         }
     }
