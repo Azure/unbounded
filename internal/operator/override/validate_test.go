@@ -240,6 +240,13 @@ func TestValidateRejectsProtectedPaths(t *testing.T) {
 	}
 }
 
+func TestRacerHostNetworkOverrideRemainsProtected(t *testing.T) {
+	err := validateFragment(t, "component: racer\nkind: DaemonSet\npatch:\n  spec:\n    template:\n      spec:\n        hostNetwork: true\n")
+	if err == nil || !strings.Contains(err.Error(), "spec.template.spec.hostNetwork is protected") {
+		t.Fatalf("Racer must opt in through its configuration, not generic overrides: %v", err)
+	}
+}
+
 // TestValidateRejectsDirectivesAtEveryDepth covers directive smuggling. An
 // earlier revision of the design restricted only $patch and $setElementOrder,
 // which was incomplete: the directive namespace is open.
