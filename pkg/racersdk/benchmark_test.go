@@ -246,6 +246,25 @@ func BenchmarkClientStream(b *testing.B) {
 	}
 }
 
+// Keep the fixture's generation cost visible independently of SDK transport.
+// A scalar fill loop previously dominated BenchmarkClientStream and changed
+// throughput with binary layout, even when no SDK code was executed.
+func BenchmarkFixtureGenerator(b *testing.B) {
+	var p [copyBufferSize]byte
+	b.SetBytes(int64(len(p)))
+	b.ReportAllocs()
+
+	r := fixtureReader()
+	for b.Loop() {
+		_, _ = r.Read(p[:])
+	}
+}
+
+// Match the interface dispatch used by streamResponse's io.CopyN.
+//
+//go:noinline
+func fixtureReader() io.Reader { return repeatedByte('x') }
+
 func BenchmarkOriginStream(b *testing.B) {
 	for _, size := range []int64{0, 4096, int64(PageSize)} {
 		for _, origin := range []bool{false, true} {

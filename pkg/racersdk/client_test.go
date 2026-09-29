@@ -92,11 +92,41 @@ func rawClientPeer(t *testing.T, handler http.Handler) string {
 type repeatedByte byte
 
 func (b repeatedByte) Read(p []byte) (int, error) {
-	for i := range p {
-		p[i] = byte(b)
+	// Use bulk copies rather than a scalar byte-store loop. The latter can
+	// dominate transport benchmarks and is sensitive to linked code alignment.
+	if len(p) > 0 {
+		p[0] = byte(b)
+		for filled := 1; filled < len(p); {
+			filled += copy(p[filled:], p[:filled])
+		}
 	}
 
 	return len(p), nil
+}
+
+func TestRepeatedByteFillsOnlyDestination(t *testing.T) {
+	for _, value := range []byte{0, 'x', 255} {
+		for _, size := range []int{0, 1, 2, 3, 7, 31, 32, 33, copyBufferSize - 1, copyBufferSize} {
+			buffer := make([]byte, size+2)
+			buffer[0], buffer[len(buffer)-1] = 42, 43
+			p := buffer[1 : len(buffer)-1]
+
+			n, err := repeatedByte(value).Read(p)
+			if n != size || err != nil || buffer[0] != 42 || buffer[len(buffer)-1] != 43 {
+				t.Fatalf("value=%d size=%d: count=%d err=%v or guard changed", value, size, n, err)
+			}
+
+			for i, got := range p {
+				if got != value {
+					t.Fatalf("value=%d size=%d: byte[%d]=%d", value, size, i, got)
+				}
+			}
+		}
+	}
+
+	if n, err := repeatedByte('x').Read(nil); n != 0 || err != nil {
+		t.Fatal(n, err)
+	}
 }
 
 func streamResponse(w http.ResponseWriter, first, length, size int64, tag string) {
