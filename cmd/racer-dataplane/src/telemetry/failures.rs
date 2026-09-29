@@ -45,6 +45,7 @@ pub enum Stage {
 pub enum Detail {
     #[default]
     None,
+    Body(BodyProgress),
     Page(u64),
     Delivery {
         sent: u64,
@@ -66,6 +67,29 @@ pub enum Detail {
         used: usize,
         limit: usize,
     },
+}
+
+/// Fixed-size facts only. Times are absolute Unix milliseconds through the same
+/// stable monotonic mapping as signed deadlines, not fresh relative allowances.
+/// Missing original/share means this process did not create the candidate.
+#[derive(Clone, Copy, Debug)]
+pub struct BodyProgress {
+    pub received: u32,
+    pub expected: u32,
+    pub reads: u32,
+    pub first: u64,
+    pub last: u64,
+    pub now: u64,
+    pub original: u64,
+    pub share: u64,
+    pub signed: u64,
+    pub remote: [u8; 36],
+    pub tuple: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
+}
+
+pub(crate) fn timestamp(at: std::time::Instant) -> u64 {
+    crate::security::protocol::encode_deadline(crate::runtime::deadline::Deadline(at))
+        .unwrap_or_default()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -142,11 +166,20 @@ impl Failures {
         for offset in 0..len {
             let index = (next + CAPACITY - len + offset) % CAPACITY;
             if let Some((sequence, worker, failure)) = entries[index] {
-                write!(
-                    out,
-                    "sequence={sequence} worker={} stage={:?} error={:?} request=",
-                    worker.0, failure.stage, failure.error
-                )?;
+                let body = matches!(failure.detail, Detail::Body(_));
+                if body {
+                    write!(
+                        out,
+                        "seq={sequence:x} w={} stage={:?} error={:?} request=",
+                        worker.0, failure.stage, failure.error
+                    )?;
+                } else {
+                    write!(
+                        out,
+                        "sequence={sequence} worker={} stage={:?} error={:?} request=",
+                        worker.0, failure.stage, failure.error
+                    )?;
+                }
                 if let Some(request) = failure.request {
                     for byte in request.0 {
                         write!(out, "{byte:02x}")?;
@@ -162,11 +195,36 @@ impl Failures {
                 } else {
                     write!(out, "none")?;
                 }
-                writeln!(
-                    out,
-                    " unix_millis={} detail={:?}",
-                    failure.unix_millis, failure.detail
-                )?;
+                if let Detail::Body(b) = failure.detail {
+                    // Compact formatting keeps all 128 worst-case records within
+                    // the existing 64-KiB diagnostic response budget.
+                    write!(
+                        out,
+                        " detail=Body rx={}/{} n={} ms=hex f={:x} l={:x} now={:x} orig={:x} share={:x} sig={:x} remote={}",
+                        b.received,
+                        b.expected,
+                        b.reads,
+                        b.first,
+                        b.last,
+                        b.now,
+                        b.original,
+                        b.share,
+                        b.signed,
+                        std::str::from_utf8(&b.remote).unwrap_or("unknown")
+                    )?;
+                    if let Some((local, remote)) = b.tuple {
+                        write!(out, " tcp={local}>{remote}")?;
+                    } else {
+                        write!(out, " tcp=none")?;
+                    }
+                    writeln!(out)?;
+                } else {
+                    writeln!(
+                        out,
+                        " unix_millis={} detail={:?}",
+                        failure.unix_millis, failure.detail
+                    )?;
+                }
             }
         }
         Ok(())
@@ -195,6 +253,46 @@ impl Observer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn body_ring_worst_case_fits_existing_response_budget() {
+        let failures = Failures::default();
+        let observer = failures.observer(WorkerId(u16::MAX));
+        let address = "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff%4294967295]:65535"
+            .parse()
+            .unwrap();
+        let body = BodyProgress {
+            received: u32::MAX,
+            expected: u32::MAX,
+            reads: u32::MAX,
+            first: u64::MAX,
+            last: u64::MAX,
+            now: u64::MAX,
+            original: u64::MAX,
+            share: u64::MAX,
+            signed: u64::MAX,
+            remote: [b'f'; 36],
+            tuple: Some((address, address)),
+        };
+        failures.0.lock().unwrap().total = u64::MAX - 128;
+        for _ in 0..CAPACITY {
+            observer.record(Failure {
+                unix_millis: u64::MAX,
+                stage: Stage::PeerReceiveBody,
+                error: Error::InvalidConfiguration,
+                request: Some(RequestId([255; 16])),
+                attempt: Some(AttemptId([255; 16])),
+                detail: Detail::Body(body),
+            });
+        }
+        let mut text = String::new();
+        failures.write(&mut text).unwrap();
+        assert_eq!(text.lines().count(), CAPACITY + 1);
+        assert!(
+            text.len() <= crate::telemetry::server::MAX_RESPONSE_BYTES - 256,
+            "{}",
+            text.len()
+        );
+    }
     #[test]
     fn shared_workers_bounded_oldest_first_and_success_is_silent() {
         let failures = Failures::default();

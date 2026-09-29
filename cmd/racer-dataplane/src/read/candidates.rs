@@ -397,7 +397,8 @@ impl CandidatePolicy {
         // probes, local origin. Fast failures leave their unused time available.
         let deadline = now + (overall - now) / remaining_opportunities.max(1);
         // A clone shares cancellation: timing it out would cancel the caller too.
-        let attempt_scope = RequestScope::new(scope.request, deadline)?;
+        let mut attempt_scope = RequestScope::new(scope.request, deadline)?;
+        attempt_scope.body_deadlines = Some((overall, deadline));
         let attempts = if matches!(mode, FetchMode::Acquire) {
             // Reserve remote acquisition credits from the same original call.
             // Without a signed response receipt unused remote credits stay spent.

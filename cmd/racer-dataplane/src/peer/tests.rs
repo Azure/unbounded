@@ -1,4 +1,6 @@
 use super::*;
+#[path = "body_progress_tests.rs"]
+mod body_progress;
 #[path = "opaque_tests.rs"]
 mod opaque;
 use crate::{

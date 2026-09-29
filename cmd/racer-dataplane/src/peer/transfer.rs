@@ -1,6 +1,6 @@
 //! Transport-neutral ciphertext lifecycle, selecting HTTP or authenticated RDMA.
 use super::wire::{LogicalCodec, PeerResponse, SignedRequest, SignedResponse, WireCodec};
-use crate::telemetry::failures::Stage;
+use crate::telemetry::failures::{BodyProgress, Detail, Failure, Stage, timestamp};
 use crate::{
     error::{Error, Operation, Result},
     http::{io::HttpIo, pool::HttpPool},
@@ -376,18 +376,67 @@ impl Transfers {
                     length,
                 )?;
                 let mut offset = 0;
+                let mut first = None;
+                let mut last = None;
+                let mut reads = 0u32;
+                // Capture numeric identity once; failed I/O consumes the lease.
+                // Do not retain the descriptor or extend socket/quota ownership.
+                let tuple = connection.socket().tcp_tuple();
+                let record = |error,
+                              offset,
+                              first: Option<std::time::Instant>,
+                              last: Option<std::time::Instant>,
+                              reads| {
+                    let mut remote = [b'?'; 36];
+                    if crate::security::certificates::canonical_uuid(&peer.0) {
+                        remote.copy_from_slice(peer.0.as_bytes());
+                    }
+                    observer.record(
+                        Failure::new(Stage::PeerReceiveBody, error)
+                            .request(scope)
+                            .attempt(request.request.route.attempt)
+                            .detail(Detail::Body(BodyProgress {
+                                received: offset as u32,
+                                expected: length as u32,
+                                reads,
+                                first: first.map(timestamp).unwrap_or_default(),
+                                last: last.map(timestamp).unwrap_or_default(),
+                                now: timestamp(crate::runtime::environment::now()),
+                                original: scope
+                                    .body_deadlines
+                                    .map(|d| timestamp(d.0))
+                                    .unwrap_or_default(),
+                                share: scope
+                                    .body_deadlines
+                                    .map(|d| timestamp(d.1))
+                                    .unwrap_or_default(),
+                                signed: timestamp(request.request.route.deadline.0),
+                                remote,
+                                tuple,
+                            })),
+                    );
+                };
                 while offset < length {
-                    let completion = observer.result(
-                        Stage::PeerReceiveBody,
-                        scope,
-                        self.io
-                            .read_body_range(connection, buffer, offset..length, scope)
-                            .await,
-                    )?;
+                    let completion = match self
+                        .io
+                        .read_body_range(connection, buffer, offset..length, scope)
+                        .await
+                    {
+                        Ok(completion) => completion,
+                        Err(error) => {
+                            record(error, offset, first, last, reads);
+                            return Err(error);
+                        }
+                    };
                     if completion.bytes == 0 || completion.bytes > length - offset {
-                        return observer.result(Stage::PeerReceiveBody, scope, Err(Error::Io));
+                        record(Error::Io, offset, first, last, reads);
+                        return Err(Error::Io);
                     }
                     offset += completion.bytes;
+                    let now = crate::runtime::environment::now();
+                    first.get_or_insert(now);
+                    last = Some(now);
+                    reads = reads.saturating_add(1);
                     connection = completion.lease;
                     buffer = completion.buffer;
                 }

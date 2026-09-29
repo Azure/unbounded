@@ -1439,6 +1439,7 @@ mod tests {
     }
     fn scope() -> RequestScope {
         RequestScope {
+            body_deadlines: None,
             request: RequestId([0; 16]),
             deadline: Deadline(Instant::now() + Duration::from_secs(5)),
             cancellation: Cancellation::new().unwrap(),

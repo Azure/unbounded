@@ -10,6 +10,18 @@ pub enum Descriptor {
 }
 
 impl Descriptor {
+    /// Numeric socket identity only, sampled on failure while the owner is live.
+    pub(crate) fn tcp_tuple(&self) -> Option<(std::net::SocketAddr, std::net::SocketAddr)> {
+        #[cfg(test)]
+        if matches!(self, Self::Sim(_)) {
+            return None;
+        }
+        // SAFETY: ManuallyDrop borrows this live descriptor without closing it.
+        let socket = std::mem::ManuallyDrop::new(unsafe {
+            std::net::TcpStream::from_raw_fd(self.as_raw_fd())
+        });
+        Some((socket.local_addr().ok()?, socket.peer_addr().ok()?))
+    }
     pub(crate) fn try_accept(&self) -> std::io::Result<Self> {
         #[cfg(test)]
         if let Self::Sim(handle) = self {

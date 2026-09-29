@@ -665,6 +665,7 @@ async fn serve_connection(
         let object = request.origin.object.clone();
         let socket = connection.socket();
         let watch_scope = RequestScope {
+            body_deadlines: None,
             request: scope.request,
             deadline: scope.deadline,
             cancellation: Cancellation::new()?,
@@ -769,6 +770,7 @@ fn new_scope(timeout: Duration, cancellation: Cancellation) -> Result<RequestSco
     let mut id = [0; 16];
     crate::runtime::environment::fill_random(&mut id).map_err(|_| Error::Unavailable)?;
     Ok(RequestScope {
+        body_deadlines: None,
         request: RequestId(id),
         deadline: crate::runtime::deadline::Deadline(crate::runtime::environment::now() + timeout),
         cancellation,

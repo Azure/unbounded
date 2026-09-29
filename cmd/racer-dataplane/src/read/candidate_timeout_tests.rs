@@ -77,6 +77,9 @@ impl PeerClient for Peers {
         assert_eq!(scope.deadline.0, request.route.deadline.0);
         assert_eq!(scope.deadline.0, request.origin.scope().deadline.0);
         assert_eq!(scope.request, request.route.request);
+        let (original, share) = scope.body_deadlines.expect("local diagnostic deadlines");
+        assert_eq!(share, scope.deadline.0);
+        assert!(original >= share);
         let copy = match &request.operation {
             PeerOperation::Bootstrap { mode, .. }
             | PeerOperation::Metadata { mode, .. }
@@ -211,6 +214,10 @@ fn stalled_first_candidate_drains_before_healthy_fallback_without_new_credits() 
     assert!(poll(resolve.as_mut()).is_pending());
     let deadline = f.peers.calls.borrow()[0].scope.deadline.0;
     assert!(deadline < f.scope.deadline.0);
+    assert_eq!(
+        f.peers.calls.borrow()[0].scope.body_deadlines,
+        Some((f.scope.deadline.0, deadline))
+    );
     expire(deadline);
     assert!(poll(resolve.as_mut()).is_pending());
     assert_eq!(
