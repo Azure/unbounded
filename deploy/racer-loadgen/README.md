@@ -186,6 +186,109 @@ but still consumes bodies and checks lengths (`cmd/racer-loadgen/pull.go:240-255
 `:268-295`). Record that setting with results and monitor node/process CPU before
 attributing throughput limits to Racer.
 
+## Live concurrency control (no catalog restart)
+
+Add `--concurrency-file=/etc/loadgen-control/concurrency` to opt in. With no flag,
+CLI-only behavior is unchanged. In file mode, both the CLI fallback and file value
+must be in `0..256`. The file contains one decimal integer, optionally surrounded
+by whitespace, and is limited to 64 bytes. Missing, unreadable, nonregular,
+oversized, or invalid files retain the last applied value; before the first valid
+read, `--concurrency` is the fallback. Rejections, recovery, and applied changes
+are logged, with repeated identical errors suppressed.
+
+The file is read once when the load phase begins (after catalog initialization and
+`--start-delay`), then reopened every second. Projected ConfigMap symlink swaps
+are supported. There is no mutable HTTP endpoint and no Kubernetes API client in
+the loadgen. Only concurrency changes live: catalog, seed, verification, layer
+concurrency, timeouts, and all other flags remain startup settings.
+
+Growing starts or wakes worker slots, up to 256 total. Shrinking prevents excess
+slots from admitting new pulls; already admitted pulls finish or reach the
+existing `--pull-timeout`. Excess slots park and preserve catalog traversal and
+pacing state, so repeated changes cannot accumulate draining worker generations.
+Zero stops new pulls without stopping the origin or changing readiness. SIGTERM
+or `--duration` expiry cancels requests and joins all workers, including parked
+and pacing workers. HTTP server shutdown retains its existing five-second grace.
+
+`racer_loadgen_applied_concurrency` reports the applied admission limit, **not**
+the number of unfinished pulls. During drain, `racer_loadgen_in_flight` can exceed
+it. At startup before the load phase and after shutdown the applied gauge is zero.
+Catalog generation, deterministic content, SHA verification, and existing
+throughput/error metrics are unchanged.
+
+### One shared ConfigMap for all 1,500 pods
+
+Create this in the loadgen namespace before the one-time rollout:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: racer-loadgen-control
+  namespace: unbounded-system
+data:
+  concurrency: "4"
+```
+
+Merge the following volume and mount into the existing DaemonSet pod template,
+and **append** `--concurrency-file=/etc/loadgen-control/concurrency` to the
+existing container args. Keep every other argument, especially the seed, catalog
+size, target, verification, and workload settings. Use `--concurrency=4` as the
+fallback (or `0` if you prefer origin-only on initial file failure).
+
+```yaml
+spec:
+  template:
+    spec:
+      containers:
+        - name: racer-loadgen
+          volumeMounts:
+            - name: live-control
+              mountPath: /etc/loadgen-control
+              readOnly: true
+      volumes:
+        - name: live-control
+          configMap:
+            name: racer-loadgen-control
+```
+
+Build and pin the live-control image once using the build instructions above.
+This initial image/flag/mount rollout still restarts pods and hashes the catalog;
+subsequent concurrency experiments do not. Mount the **directory**, not `subPath`
+(which does not receive ConfigMap updates). Use a stable ConfigMap name, not a
+content-hashed Kustomize name, and do not add a checksum annotation to the pod
+template that triggers rollouts when its data changes.
+
+Then change all consumers with one API update, without editing the DaemonSet:
+
+```sh
+timeout --signal=TERM --kill-after=10s 300s kubectl -n unbounded-system \
+  patch configmap racer-loadgen-control --type=merge \
+  -p '{"data":{"concurrency":"6"}}'
+```
+
+Use `"0"` to drain to origin-only, or another integer through `"256"` to resume
+or change load. No image-body regeneration, pod restart, or origin downtime is
+needed. Kubernetes projection is **eventually consistent, not a simultaneous
+barrier**: the one-second poll applies after each kubelet projects the change.
+Under default kubelet sync/cache settings propagation can take about two minutes;
+do not mistake this for a stuck rollout. For faster projection where needed,
+patch an annotation on the existing pods (not the DaemonSet template):
+
+```sh
+timeout --signal=TERM --kill-after=10s 300s kubectl -n unbounded-system \
+  annotate pods -l app.kubernetes.io/name=racer-loadgen \
+  loadgen-control-revision=experiment-006 --overwrite
+```
+
+Use a fresh revision on each change. This optional refresh makes per-pod API
+requests and is not an atomic 1,500-pod switch; the single ConfigMap patch is the
+normal control operation. In your loadgen scrape scope, verify
+`count(racer_loadgen_applied_concurrency == 6)` reaches the expected ready pod
+count (1,500 for full coverage), and check per-pod `racer_loadgen_in_flight` when
+draining. Begin measurement only after convergence and warmup, not immediately
+after the ConfigMap API response.
+
 ## Large-cluster catalog workload
 
 Use a shared catalog rather than raising concurrency on one image. With eight

@@ -24,6 +24,7 @@ type pullOptions struct {
 	Target           string
 	Namespace        string
 	Concurrency      int
+	ConcurrencyFile  string
 	LayerConcurrency int
 	Timeout          time.Duration
 	RetryDelay       time.Duration
@@ -51,7 +52,16 @@ func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*pu
 		return nil, errors.New("concurrency and interval must be nonnegative; layer concurrency, timeout, and retry delay must be positive")
 	}
 
-	if opts.Concurrency > int(^uint(0)>>1)/opts.LayerConcurrency {
+	capacity := opts.Concurrency
+	if opts.ConcurrencyFile != "" {
+		if opts.Concurrency > maxLiveConcurrency {
+			return nil, fmt.Errorf("concurrency must be in [0, %d] when concurrency-file is enabled", maxLiveConcurrency)
+		}
+
+		capacity = maxLiveConcurrency
+	}
+
+	if capacity > int(^uint(0)>>1)/opts.LayerConcurrency {
 		return nil, errors.New("combined image and layer concurrency is too large")
 	}
 
@@ -72,7 +82,7 @@ func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*pu
 
 	transport := base.Clone()
 	transport.DisableCompression = true
-	transport.MaxIdleConnsPerHost = max(2, opts.Concurrency*opts.LayerConcurrency)
+	transport.MaxIdleConnsPerHost = max(2, capacity*opts.LayerConcurrency)
 	transport.MaxIdleConns = transport.MaxIdleConnsPerHost
 	p := &puller{
 		img: img, images: []*syntheticImage{img}, opts: opts, target: target, metrics: metrics, transport: transport,
@@ -93,6 +103,14 @@ func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*pu
 // run owns the worker lifetime, including workers sleeping between pulls.
 func (p *puller) run(ctx context.Context) {
 	defer p.transport.CloseIdleConnections()
+	defer p.metrics.appliedConcurrency.Set(0)
+
+	if p.opts.ConcurrencyFile != "" {
+		p.runLive(ctx, livePollInterval)
+		return
+	}
+
+	p.metrics.appliedConcurrency.Set(float64(p.opts.Concurrency))
 
 	var workers sync.WaitGroup
 	for range p.opts.Concurrency {
