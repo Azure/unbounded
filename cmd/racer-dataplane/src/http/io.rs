@@ -437,8 +437,9 @@ impl HttpIo {
             connection.begin_io();
             let length =
                 Self::framing_with_limit(&head, connection.request_is_head, self.send_body_limit)?;
-            // Admit staging and scratch before session signing or HTTP encoding.
-            let mut buffer = self.buffer(self.codec.header_limit())?;
+            // Admit signing and encoding scratch before either can allocate.
+            // Only the encoded head needs to remain staged across socket I/O,
+            // not the endpoint's maximum legal envelope size.
             let scratch = self
                 .admission
                 .as_deref()
@@ -458,6 +459,7 @@ impl HttpIo {
                 connection.request_is_head = method == "HEAD";
             }
             let encoded = Zeroizing::new(self.codec.encode_head(&head)?);
+            let mut buffer = self.buffer(encoded.len())?;
             buffer.bytes[..encoded.len()].copy_from_slice(&encoded);
             let encoded_length = encoded.len();
             drop(encoded);
@@ -748,6 +750,36 @@ fn rejected_head(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn small_peer_send_stages_actual_head_under_context_pressure() {
+        let (admission, reactor, _, scope) = setup();
+        reactor.init().unwrap();
+        let limit = crate::peer::wire::MAX_ENVELOPE_HEAD;
+        let io = HttpIo::with_admission(reactor.clone(), Codec::new(limit, 16), admission.clone());
+        let baseline = admission.used(ResourceClass::RequestContext);
+        let held = admission
+            .reserve(
+                None,
+                ResourceClass::RequestContext,
+                admission.limit(ResourceClass::RequestContext) - baseline - limit - 4096,
+            )
+            .unwrap();
+        let head = response(0);
+        let expected = io.codec.encode_head(&head).unwrap();
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+        let result = drive(&reactor, io.send_head(connection, head, &scope)).unwrap();
+        let mut received = vec![0; expected.len()];
+        peer.read_exact(&mut received).unwrap();
+        assert_eq!(received, expected);
+        drop(result);
+        drop(held);
+        io.reclaim_buffer();
+        drain(&reactor);
+        assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+        assert_eq!(admission.used(ResourceClass::Connection), 0);
+    }
+
     #[test]
     fn staging_recycles_zeroed_backing_with_retained_admission() {
         let (admission, _, io, _) = setup();
