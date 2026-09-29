@@ -85,7 +85,13 @@ class StartTest(unittest.TestCase):
             bootstrap.install(host, self.api.cm, self.policy, self.node, ["tcp"])
         self.assertFalse(any(args[0] == "ipset" for args, _ in calls))
         calls.clear()
-        bootstrap.install(host, self.api.cm, self.policy, self.node, [])
+        with mock.patch.object(bootstrap, "read_intent", return_value=None), \
+                mock.patch.object(bootstrap, "write_intent"), \
+                mock.patch.object(bootstrap, "sync_directory"), \
+                mock.patch.object(bootstrap.Path, "unlink"), \
+                mock.patch.object(bootstrap, "listeners", return_value=[]), \
+                mock.patch.object(local, "members", side_effect=[w.authority(self.api.cm, 110)[1], []]):
+            bootstrap.install(host, self.api.cm, self.policy, self.node, [])
         transaction = next(data for args, data in calls if args[0] == "iptables-restore")
         self.assertIn("-I INPUT 1", transaction)
         self.assertNotIn("-F", transaction)

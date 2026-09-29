@@ -6,6 +6,44 @@ are superseded by this final validation section; deployment gates remain explici
 
 ## Final validation and exact deployment gates
 
+### Fresh-bootstrap crash recovery
+
+`bootstrap.py` now writes a root-owned0600, single-link regular-file intent in the
+locked root guard directory before creating either set. Unique exclusive temporary
+files, file fsync, atomic rename, and directory fsync make the ownership/generation
+record crash-atomic; symlink, nonroot, and permissive markers are refused. Intent
+binds bootID, source UID, content sequence/digest, exact1511 sources, node identity,
+and both immutable policy and generated rules. A heartbeat with unchanged content
+can retry; changed content/policy/boot cannot adopt that intermediate state.
+
+Only an owned CLOSED creation prefix is recoverable: absent sets, empty freshness
+alone, or empty freshness with a peer set containing the exact ordered population
+prefix. All present sets must retain exact type/options, and kernel reference
+counts must be zero (including other tables and list:set references). Staging sets,
+foreign members, nonempty freshness, or listeners block recovery before mutation.
+Cleanup deletes peers before freshness, so interruption leaves another valid prefix.
+No live set is flushed or open rule repaired. Fresh authority and listener absence
+are checked under the lock and again immediately before the filter transaction.
+Cooperating starts must use the existing launcher/lock contract; this is not a
+defense against privileged processes racing an independent bind or firewall write.
+
+After a successful transaction, the marker is removed durably. A crash between
+COMMIT and removal is accepted only with no listeners, exact current peer set,
+empty freshness, and the complete exact policy. Installation never opens freshness.
+The fixed transaction uses iptables-restore tokens, not shell quoting: shell-quoted
+`'!'` is rejected by the real restore parser.
+
+Focused `test_bootstrap.py` exercises injected failures after each creation,
+partial population, before transaction, after COMMIT, and during cleanup, plus
+foreign/active/drifted state and unsafe ownership files. `kernel_bootstrap_test.py`
+runs only in an explicitly authorized disposable private root netns. Real TCP
+peer18082 and diagnostic19090 tests establish fresh authorized success, unauthorized
+rejection, and expired NEW rejection with gate counters increasing while the old
+jump remains at zero. Established authorized flows continue after freshness expiry
+in this test: **expiry does not revoke established flows**. Existing policy still
+governs them, and source removal can change their behavior. This does not validate
+the application, a host reboot, or fleet deployment.
+
 - Full DP revision `5e1a4554f8034fef676d5ca91315da80646e5b71` recipe inspected with
   git show: entrypoint `/usr/local/bin/racer-dataplane`, default image user65532.
   Three-character `5e1` was an invalid lookup, not missing full revision evidence.
