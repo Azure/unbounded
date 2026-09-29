@@ -23,6 +23,9 @@ type WorkloadConfig struct {
 	BootstrapTrustConfigMap string
 	DataplaneImage          string
 	PeerPort                uint16
+	HostNetwork             bool
+	// Zero preserves the legacy automatic diagnostics port (9090, or 9091).
+	DiagnosticsPort         uint16
 	DataplaneServiceAccount string
 	DaemonSetName           string
 }
@@ -43,6 +46,19 @@ func WorkloadConfigFromLookup(lookup func(string) (string, bool)) (WorkloadConfi
 		return WorkloadConfig{}, fmt.Errorf("RACER_PEER_PORT: %w", wire.InvalidRequest)
 	}
 
+	hostNetwork := env("RACER_HOST_NETWORK", "false")
+	if hostNetwork != "true" && hostNetwork != "false" {
+		return WorkloadConfig{}, fmt.Errorf("RACER_HOST_NETWORK must be true or false: %w", wire.InvalidRequest)
+	}
+
+	var diagnosticsPort uint64
+	if value, ok := lookup("RACER_DIAGNOSTICS_PORT"); ok {
+		diagnosticsPort, err = strconv.ParseUint(value, 10, 16)
+		if err != nil || diagnosticsPort < 1024 {
+			return WorkloadConfig{}, fmt.Errorf("RACER_DIAGNOSTICS_PORT must be 1024..65535: %w", wire.InvalidRequest)
+		}
+	}
+
 	cfg := WorkloadConfig{
 		Cluster:                 wire.ClusterID(env("RACER_CLUSTER_ID", "")),
 		Namespace:               env("POD_NAMESPACE", "unbounded-system"),
@@ -50,6 +66,8 @@ func WorkloadConfigFromLookup(lookup func(string) (string, bool)) (WorkloadConfi
 		BootstrapTrustConfigMap: env("RACER_BOOTSTRAP_TRUST_CONFIGMAP", "racer-bootstrap-trust"),
 		DataplaneImage:          env("RACER_DATAPLANE_IMAGE", ""),
 		PeerPort:                uint16(port),
+		HostNetwork:             hostNetwork == "true",
+		DiagnosticsPort:         uint16(diagnosticsPort),
 		DataplaneServiceAccount: env("RACER_DATAPLANE_SERVICE_ACCOUNT", "racer-dataplane"),
 		DaemonSetName:           env("RACER_DAEMONSET_NAME", "racer-dataplane"),
 	}
@@ -58,8 +76,12 @@ func WorkloadConfigFromLookup(lookup func(string) (string, bool)) (WorkloadConfi
 }
 
 func (c WorkloadConfig) Validate() error {
-	if !wire.ValidUUID(string(c.Cluster)) || len(validation.IsDNS1123Label(c.Namespace)) != 0 || c.PeerPort == 0 {
+	if !wire.ValidUUID(string(c.Cluster)) || len(validation.IsDNS1123Label(c.Namespace)) != 0 || c.PeerPort < 1024 {
 		return fmt.Errorf("cluster, namespace, or peer port: %w", wire.InvalidRequest)
+	}
+
+	if c.DiagnosticsPort != 0 && (c.DiagnosticsPort < 1024 || c.DiagnosticsPort == c.PeerPort) {
+		return fmt.Errorf("diagnostics port must be 1024..65535 and distinct from peer port: %w", wire.InvalidRequest)
 	}
 
 	for _, name := range []string{c.DaemonSetName, c.BootstrapTrustConfigMap, c.DataplaneServiceAccount} {

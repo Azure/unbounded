@@ -27,10 +27,14 @@ func DesiredDaemonSet(c WorkloadConfig) (*appsv1.DaemonSet, error) {
 	// The legacy managed-by label is part of the immutable selector. Preserve it
 	// for in-place adoption; SSA's field manager records the actual workload owner.
 	labels := map[string]string{"app.kubernetes.io/name": "racer-dataplane", "app.kubernetes.io/managed-by": "racer-controller"}
-	// Keep diagnostics separate even when the configured peer port is 9090.
-	diagnosticsPort := int32(9090)
-	if c.PeerPort == uint16(diagnosticsPort) {
-		diagnosticsPort++
+	// Preserve the automatic port for existing installations; explicit ports
+	// are validated rather than silently moved on collision.
+	diagnosticsPort := int32(c.DiagnosticsPort)
+	if diagnosticsPort == 0 {
+		diagnosticsPort = 9090
+		if c.PeerPort == uint16(diagnosticsPort) {
+			diagnosticsPort++
+		}
 	}
 
 	affinity := &corev1.Affinity{
@@ -232,6 +236,12 @@ func DesiredDaemonSet(c WorkloadConfig) (*appsv1.DaemonSet, error) {
 			},
 		},
 	}
+
+	if c.HostNetwork {
+		ds.Spec.Template.Spec.HostNetwork = true
+		ds.Spec.Template.Spec.DNSPolicy = corev1.DNSClusterFirstWithHostNet
+	}
+
 	for _, mount := range []struct{ name, path string }{{"identity", "/var/lib/racer/identity"}, {"slabs", "/var/lib/racer/slabs"}, {"sockets", "/run/racer"}} {
 		ds.Spec.Template.Spec.Volumes = append(ds.Spec.Template.Spec.Volumes, corev1.Volume{Name: mount.name, VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: mount.path, Type: ptr.To(corev1.HostPathDirectoryOrCreate)}}})
 	}

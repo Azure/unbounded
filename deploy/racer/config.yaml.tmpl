@@ -15,6 +15,11 @@ data:
   RACER_METRICS_ADDRESS: ":8080"
   RACER_PROBE_ADDRESS: ":8081"
   RACER_PEER_PORT: "8082"
+  # Racer-only operator opt-in. Keep peer publication and listener wiring in this
+  # ConfigMap; a port transition requires quiescing traffic (see the runbook).
+  RACER_HOST_NETWORK: "false"
+  # Optional RACER_DIAGNOSTICS_PORT: "19090". If absent, preserve 9090 (9091
+  # when the peer port is 9090). Explicit ports must be distinct and >= 1024.
   RACER_TLS_CERTIFICATE_FILE: "/etc/racer/tls/tls.crt"
   RACER_TLS_PRIVATE_KEY_FILE: "/etc/racer/tls/tls.key"
   # Bootstrap trust is also workload-only wiring.

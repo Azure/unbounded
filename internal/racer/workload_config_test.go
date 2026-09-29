@@ -129,7 +129,7 @@ func TestWorkloadConfigIgnoresControllerRuntime(t *testing.T) {
 		}
 
 		switch key {
-		case "RACER_PEER_PORT", "RACER_DATAPLANE_SERVICE_ACCOUNT", "RACER_DAEMONSET_NAME", "RACER_BOOTSTRAP_TRUST_CONFIGMAP":
+		case "RACER_PEER_PORT", "RACER_HOST_NETWORK", "RACER_DIAGNOSTICS_PORT", "RACER_DATAPLANE_SERVICE_ACCOUNT", "RACER_DAEMONSET_NAME", "RACER_BOOTSTRAP_TRUST_CONFIGMAP":
 			return "", false
 		default:
 			t.Errorf("workload parser requested runtime setting %s", key)
@@ -170,5 +170,37 @@ func TestWorkloadIgnoresLegacyKeyringSecret(t *testing.T) {
 		if volume.Secret != nil || volume.Name == "keyring" {
 			t.Fatal("legacy environment must not restore shared key mounts")
 		}
+	}
+}
+
+func TestWorkloadNetworkPortBounds(t *testing.T) {
+	values := map[string]string{
+		"RACER_CLUSTER_ID":  "11111111-1111-1111-1111-111111111111",
+		"RACER_CONTROL_URL": "https://controller:8443", "RACER_DATAPLANE_IMAGE": "racer:test",
+		"RACER_HOST_NETWORK": "true", "RACER_PEER_PORT": "1024", "RACER_DIAGNOSTICS_PORT": "65535",
+	}
+	lookup := func(key string) (string, bool) { value, ok := values[key]; return value, ok }
+
+	for range 2 {
+		cfg, err := WorkloadConfigFromLookup(lookup)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := DesiredDaemonSet(cfg); err != nil {
+			t.Fatal(err)
+		}
+
+		cfg.DiagnosticsPort = cfg.PeerPort
+		if _, err := DesiredDaemonSet(cfg); !errors.Is(err, wire.InvalidRequest) {
+			t.Fatal("direct builder must reject colliding ports")
+		}
+
+		cfg.DiagnosticsPort = 1023
+		if _, err := DesiredDaemonSet(cfg); !errors.Is(err, wire.InvalidRequest) {
+			t.Fatal("direct builder must reject privileged diagnostics")
+		}
+
+		values["RACER_PEER_PORT"], values["RACER_DIAGNOSTICS_PORT"] = values["RACER_DIAGNOSTICS_PORT"], values["RACER_PEER_PORT"]
 	}
 }
