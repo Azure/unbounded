@@ -173,6 +173,358 @@ fn coordinator(
 }
 
 #[test]
+fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
+    let signers = network(1);
+    let mut f = fixture_with(3 * PAGE_BYTES + 7, None);
+    f.reactor.init().unwrap();
+    let membership = Arc::new(
+        Membership::validate(
+            MembershipVersion(1),
+            vec![Member {
+                node: signers[0].node().clone(),
+                shares: NonZeroU32::new(1).unwrap(),
+                peer_endpoint: "127.0.0.1:8000".into(),
+                rails: vec![],
+                alignment_enabled: false,
+            }],
+        )
+        .unwrap(),
+    );
+    let (local, mut endpoint, _publication) =
+        coordinator(&f, &signers[0], &membership, Rc::new(NoPeer));
+    let open = |ordered, credits, start| {
+        let request = ClientRequest {
+            kind: ReadKind::Subscription {
+                pin: Some(f.page.version.etag.clone()),
+                range: Some(ByteRange::From(start)),
+                page_credits: credits,
+                byte_credits: PAGE_BYTES,
+                ordered,
+            },
+            origin: OriginContext {
+                object: f.context.object.clone(),
+                metadata: None,
+                authorization: None,
+            },
+        };
+        let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+        futures::executor::block_on(local.read(request, &scope))
+            .unwrap()
+            .body
+            .unwrap()
+    };
+    // A one-byte first slice plus a whole page exceeds the byte credit despite
+    // two available page slots. No page-one work may start yet.
+    let mut a = open(true, 2, PAGE_BYTES - 1);
+    let mut slow = open(true, 1, PAGE_BYTES - 1);
+    let mut unordered = open(false, 1, PAGE_BYTES - 1);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let mut pump = |endpoint: &mut crate::read::dispatch::WorkerEndpoint| {
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        endpoint.poll(&mut cx, 64).unwrap();
+        crate::read::drivers::poll(&mut cx, 64);
+        f.engine.poll_budgeted(64).unwrap();
+        f.crypto.poll_budgeted(64).unwrap();
+        f.reactor.poll_budgeted(128).unwrap();
+    };
+    f.origin.blocked_pages.borrow_mut().insert(0);
+    for _ in 0..32 {
+        assert!(a.next_slice().as_mut().poll(&mut cx).is_pending());
+        assert!(slow.next_slice().as_mut().poll(&mut cx).is_pending());
+        assert!(unordered.next_slice().as_mut().poll(&mut cx).is_pending());
+        pump(&mut endpoint);
+    }
+    assert_eq!(
+        &*f.origin.started_pages.borrow(),
+        &[0],
+        "same-page ordered work singleflights and unordered waits"
+    );
+    f.origin.blocked_pages.borrow_mut().clear();
+    let mut first = None;
+    let mut slow_first = None;
+    let mut unordered_first = None;
+    for _ in 0..1024 {
+        if first.is_none() {
+            if let Poll::Ready(result) = a.next_slice().as_mut().poll(&mut cx) {
+                first = result.unwrap();
+            }
+        }
+        if slow_first.is_none() {
+            if let Poll::Ready(result) = slow.next_slice().as_mut().poll(&mut cx) {
+                slow_first = result.unwrap();
+            }
+        }
+        if unordered_first.is_none() {
+            if let Poll::Ready(result) = unordered.next_slice().as_mut().poll(&mut cx) {
+                unordered_first = result.unwrap();
+            }
+        }
+        if first.is_some() && slow_first.is_some() && unordered_first.is_some() {
+            break;
+        }
+        pump(&mut endpoint);
+    }
+    assert_eq!(first.as_ref().unwrap().slice().length, 1);
+    assert!(slow_first.is_some() && unordered_first.is_some());
+    assert_eq!(
+        f.origin.calls.get(),
+        1,
+        "mixed reader reuses verified fixed-page result"
+    );
+    drop(first);
+    a.release_page(PageNumber(0), 1).unwrap();
+    // Only prefetch, not next_slice, drives real new work while readers retain
+    // their current delivery leases. The one-page byte cap stops page two.
+    for _ in 0..1024 {
+        a.poll_prefetch(&mut cx);
+        pump(&mut endpoint);
+        if f.fill
+            .dependencies
+            .memory
+            .get(&PageId {
+                version: f.page.version.clone(),
+                number: PageNumber(1),
+            })
+            .unwrap()
+            .is_some()
+        {
+            break;
+        }
+    }
+    assert_eq!(&*f.origin.started_pages.borrow(), &[0, 1]);
+    let second = futures::executor::block_on(a.next_slice())
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.slice().page, PageNumber(1));
+    drop(second);
+    a.release_page(PageNumber(1), PAGE_BYTES as u32).unwrap();
+    drop((a, slow, unordered, slow_first, unordered_first));
+    for _ in 0..32 {
+        pump(&mut endpoint);
+    }
+    drop(pump);
+    endpoint.uninstall().unwrap();
+}
+
+#[test]
+fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fence() {
+    for mode in ["success", "cancel", "drop", "failure"] {
+        let signers = network(1);
+        let mut f = fixture_with(2 * PAGE_BYTES + 7, None);
+        f.reactor.init().unwrap();
+        let membership = Arc::new(
+            Membership::validate(
+                MembershipVersion(1),
+                vec![Member {
+                    node: signers[0].node().clone(),
+                    shares: NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: "127.0.0.1:8000".into(),
+                    rails: vec![],
+                    alignment_enabled: false,
+                }],
+            )
+            .unwrap(),
+        );
+        let (local, mut endpoint, _publication) =
+            coordinator(&f, &signers[0], &membership, Rc::new(NoPeer));
+        let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+        let request = ClientRequest {
+            kind: ReadKind::Subscription {
+                pin: Some(f.page.version.etag.clone()),
+                range: None,
+                page_credits: 64,
+                byte_credits: 64 * PAGE_BYTES,
+                ordered: true,
+            },
+            origin: OriginContext {
+                object: f.context.object.clone(),
+                metadata: None,
+                authorization: None,
+            },
+        };
+        let mut stream = futures::executor::block_on(local.read(request, &scope))
+            .unwrap()
+            .body
+            .unwrap();
+        let mut unordered = f
+            .fill
+            .dependencies
+            .metadata_owner
+            .subscriptions
+            .register(
+                f.page.version.clone(),
+                ByteRange::From(0)
+                    .resolve(f.origin.metadata.length)
+                    .unwrap(),
+                1,
+                PAGE_BYTES,
+                false,
+            )
+            .unwrap();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut pump = |endpoint: &mut crate::read::dispatch::WorkerEndpoint| {
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            endpoint.poll(&mut cx, 64).unwrap();
+            crate::read::drivers::poll(&mut cx, 64);
+            f.engine.poll_budgeted(64).unwrap();
+            f.crypto.poll_budgeted(64).unwrap();
+            f.reactor.poll_budgeted(128).unwrap();
+        };
+        f.origin.blocked_pages.borrow_mut().insert(0);
+        for _ in 0..1024 {
+            assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());
+            pump(&mut endpoint);
+            if f.fill
+                .dependencies
+                .memory
+                .get(&PageId {
+                    version: f.page.version.clone(),
+                    number: PageNumber(1),
+                })
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+        }
+        assert!(
+            f.fill
+                .dependencies
+                .memory
+                .get(&PageId {
+                    version: f.page.version.clone(),
+                    number: PageNumber(1)
+                })
+                .unwrap()
+                .is_some(),
+            "later page really completed"
+        );
+        assert_eq!(&*f.origin.started_pages.borrow(), &[0, 1]);
+        assert_eq!(stream.buffered_pages(), 2);
+        assert!(unordered.poll_next(&mut cx).is_pending());
+        if mode == "cancel" || mode == "drop" {
+            if mode == "cancel" {
+                futures::executor::block_on(stream.cancel()).unwrap();
+            }
+            drop(stream);
+            for _ in 0..32 {
+                pump(&mut endpoint);
+            }
+            assert!(
+                unordered.poll_next(&mut cx).is_pending(),
+                "cancelled waiter is not actual origin completion"
+            );
+            f.origin.blocked_pages.borrow_mut().clear();
+            for _ in 0..1024 {
+                pump(&mut endpoint);
+            }
+            assert!(matches!(
+                unordered.poll_next(&mut cx),
+                Poll::Ready(Ok(crate::read::subscription::Next::Select(_)))
+            ));
+        } else if mode == "failure" {
+            f.origin.version_unavailable.set(true);
+            f.origin.blocked_pages.borrow_mut().clear();
+            let mut failure = None;
+            for _ in 0..1024 {
+                if let Poll::Ready(result) = stream.next_slice().as_mut().poll(&mut cx) {
+                    failure = result.err();
+                    break;
+                }
+                pump(&mut endpoint);
+            }
+            assert_eq!(failure, Some(Error::VersionUnavailable));
+            assert_eq!(stream.buffered_pages(), 0);
+            assert!(
+                futures::executor::block_on(stream.next_slice())
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                &*f.origin.started_pages.borrow(),
+                &[0, 1],
+                "failure never retries or starts the tail"
+            );
+            drop(stream);
+        } else {
+            f.origin.blocked_pages.borrow_mut().clear();
+            let mut first = None;
+            for _ in 0..1024 {
+                if let Poll::Ready(result) = stream.next_slice().as_mut().poll(&mut cx) {
+                    first = result.unwrap();
+                    break;
+                }
+                pump(&mut endpoint);
+            }
+            assert_eq!(first.as_ref().unwrap().slice().page, PageNumber(0));
+            let second = futures::executor::block_on(stream.next_slice())
+                .unwrap()
+                .unwrap();
+            assert_eq!(second.slice().page, PageNumber(1));
+            drop(first);
+            stream
+                .release_page(PageNumber(0), PAGE_BYTES as u32)
+                .unwrap();
+            let delivery = Delivery::new(
+                Rc::new(PipePool::new(
+                    f.fill.dependencies.admission.clone(),
+                    f.reactor.clone(),
+                )),
+                Duration::from_secs(30),
+            );
+            let (socket, _stalled_client) = std::os::unix::net::UnixStream::pair().unwrap();
+            let mut connection = crate::http::pool::ConnectionLease::from_accepted(
+                socket.into(),
+                &f.fill.dependencies.admission,
+            )
+            .unwrap();
+            connection.tx_remaining = Some(PAGE_BYTES);
+            let mut write = delivery.finish_progressing(second, connection, &scope);
+            // No call to next_slice: page two is acquired while the current
+            // delivery lease (page one) is held, including its pipe and credit.
+            for _ in 0..1024 {
+                stream.poll_prefetch(&mut cx);
+                assert!(
+                    write.as_mut().poll(&mut cx).is_pending(),
+                    "client has not read any payload"
+                );
+                pump(&mut endpoint);
+                if f.fill
+                    .dependencies
+                    .memory
+                    .get(&PageId {
+                        version: f.page.version.clone(),
+                        number: PageNumber(2),
+                    })
+                    .unwrap()
+                    .is_some()
+                {
+                    break;
+                }
+            }
+            assert_eq!(&*f.origin.started_pages.borrow(), &[0, 1, 2]);
+            let third = futures::executor::block_on(stream.next_slice())
+                .unwrap()
+                .unwrap();
+            assert_eq!(third.slice().page, PageNumber(2));
+            assert_eq!(third.slice().length, 7);
+            assert!(
+                futures::executor::block_on(stream.next_slice())
+                    .unwrap()
+                    .is_none()
+            );
+            drop((stream, write, third));
+        }
+        drop(unordered);
+        for _ in 0..32 {
+            pump(&mut endpoint);
+        }
+        drop(pump);
+        endpoint.uninstall().unwrap();
+    }
+}
+
+#[test]
 fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_local_readers() {
     let signers = network(3);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

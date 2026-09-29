@@ -143,6 +143,28 @@ repository-relative).
 
 Subscription request fields:
 
+Ordered delivery does not serialize acquisition. The dataplane reserves each
+upcoming slice's page and byte credits before fixed-page dispatch, acquires a
+bounded prefix concurrently through stable page owners, and emits only its head.
+Pending, completed-but-reordered, and delivered-unreleased slices share the same
+credit ledger. The configured acquisition window additionally caps the total
+ordered pending, reordered, and delivered-unreleased pages, even if the client
+offers more page credits. Partial ranges reserve slice bytes, not whole-page bytes; separate
+payload admission still charges whole-page allocations. Acquisition is polled
+while the current page frame and payload are being written, without reserving
+another delivery pipe. One page credit cannot overlap successive acquisitions.
+
+Unordered readers retain provider-selected demand sharing. Because selected
+transfers bypass fixed-page singleflight, the current implementation excludes
+provider selection while fixed acquisitions for that version remain active, and
+vice versa. Multiple ordered readers still share fixed-page singleflight and
+retain independent credits and credentials. This conservative mixed-mode gate
+can delay unordered selection under sustained ordered acquisition; it is not a
+cross-mode fairness guarantee. Cancellation detaches the reader, but acquisition
+drivers retain exclusion until actual completion. No wire or origin authority
+changes are implied by ordered prefetch (`src/read/subscription.rs`,
+`src/read/range_stream.rs`, `src/read/dispatch.rs`, `src/read/fill.rs`).
+
 | Field | Allowed values | Default |
 | --- | --- | --- |
 | `Racer-Page-Credits` | Canonical decimal 1..64 | 2 |

@@ -51,6 +51,8 @@ struct TestOrigin {
     metadata: ObjectMetadata,
     reject_once: Cell<bool>,
     version_unavailable: Cell<bool>,
+    blocked_pages: RefCell<std::collections::BTreeSet<u64>>,
+    started_pages: RefCell<Vec<u64>>,
 }
 impl Origin for TestOrigin {
     fn metadata<'a>(
@@ -83,6 +85,16 @@ impl Origin for TestOrigin {
             scope.check()?;
             authority.validate(&context.object, page.number)?;
             self.calls.set(self.calls.get() + 1);
+            self.started_pages.borrow_mut().push(page.number.0);
+            std::future::poll_fn(|cx| {
+                if self.blocked_pages.borrow().contains(&page.number.0) {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
+                }
+            })
+            .await;
             let mut yielded = false;
             std::future::poll_fn(|cx| {
                 if yielded {
@@ -244,6 +256,8 @@ fn fixture_with_availability(
         metadata,
         reject_once: Cell::new(false),
         version_unavailable: Cell::new(false),
+        blocked_pages: RefCell::new(Default::default()),
+        started_pages: RefCell::new(Vec::new()),
     });
     let (port, engine) = crypto::pair(worker, 0, config.limits.queue_entries);
     let crypto = Rc::new(CryptoClient::new(port));
