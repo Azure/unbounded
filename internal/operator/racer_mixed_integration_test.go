@@ -319,6 +319,22 @@ overrides:
 	}
 	assertSteady(true)
 	t.Log("checkpoint: 11 pod-network / 1489 host-network steady")
+	// Delayed source observation in an already mixed installation must neither
+	// multiply impossible OR terms nor roll the opposite workload.
+	delayed := get(hostName)
+	delayed.Spec.Template.Annotations["test.unbounded-cloud.io/observation"] = "delayed"
+	require.NoError(t, c.Update(ctx, delayed))
+
+	podTemplate := get(podName).Spec.Template.DeepCopy()
+
+	for range 3 {
+		pass()
+		require.Equal(t, podTemplate, &get(podName).Spec.Template)
+	}
+
+	ack(hostName)
+	ack(podName)
+	pass()
 
 	hostSelectorMatch, err := metav1.LabelSelectorAsSelector(get(hostName).Spec.Selector)
 	require.NoError(t, err)

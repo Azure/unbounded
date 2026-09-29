@@ -208,13 +208,43 @@ func retainPlacement(desired, live *appsv1.DaemonSet) {
 			term := want.DeepCopy()
 
 			term.MatchFields = unionRequirements(term.MatchFields, old.MatchFields)
+			if contradictoryNames(term.MatchFields) {
+				continue
+			}
+
 			if !slices.ContainsFunc(terms, func(existing corev1.NodeSelectorTerm) bool { return reflect.DeepEqual(existing, *term) }) {
 				terms = append(terms, *term)
 			}
 		}
 	}
 
+	if len(terms) == 0 {
+		terms = blockedTerms()
+	}
+
 	selector.NodeSelectorTerms = terms
+}
+
+// metadata.name is single-valued. Discard impossible Cartesian combinations
+// instead of multiplying them on every pass while observation is delayed.
+func contradictoryNames(requirements []corev1.NodeSelectorRequirement) bool {
+	for _, required := range requirements {
+		if required.Key != "metadata.name" || required.Operator != corev1.NodeSelectorOpIn || len(required.Values) != 1 {
+			continue
+		}
+
+		for _, other := range requirements {
+			if other.Key != "metadata.name" {
+				continue
+			}
+
+			if other.Operator == corev1.NodeSelectorOpIn && !slices.Contains(other.Values, required.Values[0]) || other.Operator == corev1.NodeSelectorOpNotIn && slices.Contains(other.Values, required.Values[0]) {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 func unionRequirements(left, right []corev1.NodeSelectorRequirement) []corev1.NodeSelectorRequirement {
