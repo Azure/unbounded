@@ -53,7 +53,7 @@ def bundle(policy, python_image, carrier_image):
             serviceAccountName="racer-guard-local", hostNetwork=True, dnsPolicy="ClusterFirstWithHostNet",
             tolerations=[dict(operator="Exists")], volumes=guard_volumes,
             affinity=dict(nodeAffinity=dict(requiredDuringSchedulingIgnoredDuringExecution=dict(nodeSelectorTerms=[dict(
-                matchFields=[dict(key="metadata.name", operator="In", values=sorted(policy["nodes"]))])]))),
+                matchFields=[dict(key="metadata.name", operator="In", values=[name])]) for name in sorted(policy["nodes"])]))),
             containers=[guard]))))
     watcher = obj("Deployment", "racer-stage47-source-owner", spec=dict(replicas=2,
         selector=dict(matchLabels=dict(app="racer-stage47-source-owner")), template=dict(

@@ -21,7 +21,19 @@ class StartTest(unittest.TestCase):
         image = "python@sha256:" + "a" * 64
         result = render.bundle(policy, image, image)
         ds = result["objects"][-1]["spec"]["template"]["spec"]
-        self.assertEqual(1500, len(ds["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"][0]["matchFields"][0]["values"]))
+        terms = ds["affinity"]["nodeAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]["nodeSelectorTerms"]
+        self.assertEqual(1500, len(terms))
+        self.assertEqual([
+            dict(matchFields=[dict(key="metadata.name", operator="In", values=[name])])
+            for name in sorted(policy["nodes"])
+        ], terms)
+        # Terms are ORed, requirements within each term are ANDed.
+        def matches(name):
+            return any(all(name in field["values"] for field in term["matchFields"]) for term in terms)
+        self.assertTrue(all(matches(name) for name in policy["nodes"]))
+        for excluded in ("", "outside-policy", "node-1489"):
+            self.assertFalse(matches(excluded), excluded)
+        self.assertNotIn("affinity", result["hostDPFragment"])
         self.assertEqual(c.PROGRAM_CM, ds["volumes"][0]["configMap"]["name"])
         self.assertNotIn("annotations", result["objects"][-1]["spec"]["template"]["metadata"])
         self.assertEqual("DirectoryOrCreate", ds["volumes"][3]["hostPath"]["type"])
