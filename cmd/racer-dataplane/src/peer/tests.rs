@@ -804,6 +804,21 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
 
 #[test]
 fn v3_equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
+    equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction(
+        crate::topology::RoutingAlgorithm::V3,
+    );
+}
+
+#[test]
+fn v4_equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
+    equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction(
+        crate::topology::RoutingAlgorithm::V4,
+    );
+}
+
+fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction(
+    algorithm: crate::topology::RoutingAlgorithm,
+) {
     use crate::topology::{
         RoutingAlgorithm,
         health::{LinkHealth, LinkOutcome},
@@ -821,9 +836,17 @@ fn v3_equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
         Membership::validate(
             MembershipVersion(1),
             nodes
-                .map(|node| Member {
+                .enumerate()
+                .map(|(i, node)| Member {
                     node: NodeId(node),
-                    shares: std::num::NonZeroU32::new(4).unwrap(),
+                    shares: std::num::NonZeroU32::new(
+                        if algorithm == RoutingAlgorithm::V4 && i % 3 == 0 {
+                            1
+                        } else {
+                            4
+                        },
+                    )
+                    .unwrap(),
                     peer_endpoint: "127.0.0.1:7443".into(),
                     rails: vec![],
                     alignment_enabled: false,
@@ -832,9 +855,9 @@ fn v3_equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
         )
         .unwrap(),
     );
-    let paths = Paths::with_algorithm(Rc::new(LinkHealth), 1, RoutingAlgorithm::V3);
+    let paths = Paths::with_algorithm(Rc::new(LinkHealth), 1, algorithm);
     let health = Rc::new(LinkHealth::new(36));
-    let cold = Paths::with_algorithm(health.clone(), 0, RoutingAlgorithm::V3);
+    let cold = Paths::with_algorithm(health.clone(), 0, algorithm);
     let mut selected = std::collections::BTreeSet::new();
     for attempt in 1..=32 {
         let original = request(&admission, attempt);

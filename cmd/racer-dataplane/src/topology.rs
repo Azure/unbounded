@@ -11,13 +11,14 @@ mod hash;
 
 /// Algorithm changes require a new version and new interoperability vectors.
 /// Latest supported contract; production defaults to v2 until coordinated opt-in.
-pub const ALGORITHM_VERSION: u32 = 3;
+pub const ALGORITHM_VERSION: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RoutingAlgorithm {
     #[default]
     V2,
     V3,
+    V4,
 }
 
 #[cfg(test)]

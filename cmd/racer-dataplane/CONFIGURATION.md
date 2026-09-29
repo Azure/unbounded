@@ -29,7 +29,7 @@ consumes host disk capacity and is not accounted as a pod ephemeral-storage quot
 | `RACER_MAX_THREADS` | `8` | Total userspace thread cap, 2 through 256; odd caps floor to complete pairs |
 | `RACER_ALLOW_SMT` | `false` | Opt into allowed logical-CPU sizing and unique pinned roles; reactors prefer distinct physical cores and crypto threads prefer their reactor's SMT sibling |
 | `RACER_OPAQUE_RELAY` | `false` | Experimental opaque HTTP transit splice; absent or `false` uses the previous materialized relay path. Only exact `true` opts in; endpoint and native paths are unchanged |
-| `RACER_ROUTING_ALGORITHM` | `2` | Exactly `2` (legacy) or `3` (deterministic equal-cost next hops); coordinate all participating dataplanes before measuring v3. See `src/topology/ALGORITHM_V3.md` |
+| `RACER_ROUTING_ALGORITHM` | `2` | Exactly `2` (legacy), `3` (uniform shortest next hops), or `4` (authenticated-share-weighted shortest next hops). Coordinate all participating dataplanes before measuring. See `src/topology/ALGORITHM_V3.md` and `src/topology/ALGORITHM_V4.md`; v4 shares also affect ownership. |
 | `RACER_ENABLE_RDMA` | `auto` in the executable | `auto`, `true`, or `false`; auto requires an RDMA build and trusted fabric associations. Hardware/capability failure retains HTTP fallback |
 | `RACER_SHARES` | `4` | Positive u32 proposed during authenticated enrollment; an explicit Node shares annotation takes precedence |
 | `RACER_DISK_PAGE_ENTRIES` | `65536` | Node-wide disk page-index capacity, partitioned independently of metadata capacity |
