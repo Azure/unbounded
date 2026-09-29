@@ -188,6 +188,7 @@ fn exchange<'a>(
 ) -> Operation<'a, ()> {
     Box::pin(async move {
         let scope = RequestScope {
+            body_deadlines: parent.body_deadlines,
             request: parent.request,
             deadline: Deadline(
                 parent

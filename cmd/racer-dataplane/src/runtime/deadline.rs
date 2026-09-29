@@ -127,6 +127,9 @@ pub struct RequestScope {
     pub request: RequestId,
     pub deadline: Deadline,
     pub cancellation: Cancellation,
+    /// Local diagnostics only: original acquisition ceiling and candidate share.
+    /// Never serialized or consulted by deadline/cancellation policy.
+    pub(crate) body_deadlines: Option<(Instant, Instant)>,
 }
 impl RequestScope {
     pub fn new(request: RequestId, deadline: Instant) -> Result<Self> {
@@ -134,6 +137,7 @@ impl RequestScope {
             request,
             deadline: Deadline(deadline),
             cancellation: Cancellation::new()?,
+            body_deadlines: None,
         })
     }
     pub fn check(&self) -> Result<()> {

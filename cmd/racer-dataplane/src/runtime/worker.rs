@@ -640,6 +640,7 @@ fn drive(
 
 fn lifecycle_scope() -> Result<RequestScope> {
     Ok(RequestScope {
+        body_deadlines: None,
         request: RequestId([0; 16]),
         deadline: Deadline(crate::runtime::environment::now() + Duration::from_secs(30)),
         cancellation: Cancellation::new()?,
