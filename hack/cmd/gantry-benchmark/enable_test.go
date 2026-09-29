@@ -364,6 +364,10 @@ func TestContainerdPullTuningManifest(t *testing.T) {
 	if !bytes.Contains(deployScript, []byte("migrate_legacy_gantry_install\n  \"$repo_root/bin/helm\" upgrade --install gantry")) {
 		t.Fatal("deploy script does not migrate legacy Gantry resources before Helm install")
 	}
+
+	if !bytes.Contains(deployScript, []byte("if [[ \"$legacy\" != true ]]; then\n    return 0\n  fi")) {
+		t.Fatal("legacy Gantry migration must succeed when no prior installation exists")
+	}
 }
 
 func decodeManifestKinds(t *testing.T, rendered []byte) []string {

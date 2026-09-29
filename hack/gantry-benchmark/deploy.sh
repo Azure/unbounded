@@ -992,7 +992,7 @@ migrate_legacy_gantry_install() {
   release_secrets=$(kubectl -n "$GANTRY_NAMESPACE" get secrets \
     -l owner=helm,name=gantry -o json)
   if [[ $(jq '.items | length' <<<"$release_secrets") -gt 0 ]]; then
-    return
+    return 0
   fi
 
   local legacy=false
@@ -1000,7 +1000,9 @@ migrate_legacy_gantry_install() {
     kubectl get priorityclass gantry-low >/dev/null 2>&1; then
     legacy=true
   fi
-  [[ "$legacy" == true ]] || return
+  if [[ "$legacy" != true ]]; then
+    return 0
+  fi
 
   local resource
   for resource in \
