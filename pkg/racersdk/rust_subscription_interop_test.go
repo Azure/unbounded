@@ -134,6 +134,44 @@ func TestRustSubscriptionInterop(t *testing.T) {
 		})
 	}
 
+	t.Run("Get/read-ahead-large-bounded", func(t *testing.T) {
+		value, err := client.Get(ctx, Request{Key: Key{4}}, ReadOptions{PageCredits: 2, ByteCredits: 2 * PageSize})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer closeBody(value)
+
+		if cap(value.ordered.slots) != 2 {
+			t.Fatal("live ordered read did not enable two-buffer read-ahead")
+		}
+
+		n, err := io.Copy(&offsetSink{}, value)
+		if err != nil || n != 32*int64(PageSize)+13 {
+			t.Fatal("large ordered read", n, err)
+		}
+
+		orderedClean(t, value)
+	})
+
+	for _, credits := range []int{1, 2} {
+		t.Run("Get/read-ahead-partial/credits="+strconv.Itoa(credits), func(t *testing.T) {
+			options := ReadOptions{Offset: ByteOffset(PageSize - 7), Length: PageSize + 20, PageCredits: credits}
+
+			value, err := client.Get(ctx, Request{Key: Key{3}}, options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeBody(value)
+
+			n, err := io.Copy(&offsetSink{offset: int64(options.Offset)}, value)
+			if err != nil || n != int64(options.Length) {
+				t.Fatal("partial ordered read", n, err)
+			}
+
+			orderedClean(t, value)
+		})
+	}
+
 	t.Run("OpenPages/partial-release-final", func(t *testing.T) {
 		options := ReadOptions{Offset: ByteOffset(PageSize - 7), Length: 2*PageSize + 20, PageCredits: 1, ByteCredits: PageSize}
 
