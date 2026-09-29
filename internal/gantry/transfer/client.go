@@ -80,7 +80,7 @@ func NewClient(opts ...ClientOption) *Client {
 	}
 
 	tr := &http2.Transport{
-		// AllowHTTP enables h2c upgrade.
+		// AllowHTTP permits HTTP/2 over plain-text http URLs.
 		AllowHTTP: true,
 		// DialTLSContext is reused for non-TLS dials when AllowHTTP is true.
 		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
