@@ -116,8 +116,8 @@ func (r *TopologyReconciler) reconcile(ctx context.Context) error {
 		catalog = nil
 	}
 
-	var ds appsv1.DaemonSet
-	if err := r.Get(ctx, client.ObjectKey{Namespace: r.Config.Namespace, Name: r.Config.DaemonSetName}, &ds); err != nil && !apierrors.IsNotFound(err) {
+	owns, err := readManagedWorkloadOwnership(ctx, r.APIReader, r.Config)
+	if err != nil {
 		return err
 	}
 	// Indexed namespace-scoped queries avoid scanning unrelated Pods for each
@@ -137,7 +137,9 @@ func (r *TopologyReconciler) reconcile(ctx context.Context) error {
 		podsByNode[node.Name] = list.Items
 	}
 
-	candidate, diagnostics, err := ReconcileMembers(nodes.Items, podsByNode, ds.UID, r.Accepted, r.Config.PeerPort)
+	candidate, diagnostics, err := reconcileMembers(nodes.Items, podsByNode, func(pods []corev1.Pod, nodeName string, port uint16) (string, error) {
+		return selectEndpoint(pods, owns, nodeName, port)
+	}, r.Accepted, r.Config.PeerPort)
 	if err != nil {
 		return err
 	}
@@ -220,7 +222,7 @@ func (r *TopologyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		WatchesRawSource(initialEnqueue()).
 		Watches(&corev1.Node{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(nodeChanges())).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(managedPodChanges(r.Config))).
-		Watches(&appsv1.DaemonSet{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(namedChanges(r.Config.Namespace, r.Config.DaemonSetName))).
+		Watches(&appsv1.DaemonSet{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(namedChanges(r.Config.Namespace, managedWorkloadNames(r.Config)...))).
 		Watches(&racerv1.ClusterCache{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(cacheChanges())).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(namedChanges(r.Config.Namespace, r.Config.IssuerSecretName, r.Config.KeyringSecretName))).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(versionChanges(r.Config))).

@@ -37,7 +37,7 @@ func memberPod(uid types.UID, created int64, ip string) corev1.Pod {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "racer-" + string(uid), UID: uid, Namespace: "racer",
 			CreationTimestamp: metav1.NewTime(time.Unix(created, 0)),
-			OwnerReferences:   []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "DaemonSet", UID: testDaemonSetUID, Controller: &controller}},
+			OwnerReferences:   []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "DaemonSet", Name: DataplaneDaemonSetName, UID: testDaemonSetUID, Controller: &controller}},
 		},
 		Spec:   corev1.PodSpec{NodeName: "node-a"},
 		Status: corev1.PodStatus{PodIP: ip},

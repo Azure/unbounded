@@ -6,6 +6,7 @@ package racer
 import (
 	"context"
 	"reflect"
+	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -90,7 +91,7 @@ func managedPodChanges(cfg Config) predicate.Predicate {
 
 		owner := metav1.GetControllerOf(obj)
 
-		return owner != nil && owner.APIVersion == "apps/v1" && owner.Kind == "DaemonSet" && owner.Name == cfg.DaemonSetName
+		return owner != nil && owner.APIVersion == "apps/v1" && owner.Kind == "DaemonSet" && slices.Contains(managedWorkloadNames(cfg), owner.Name)
 	}, func(a, b client.Object) bool {
 		x, xok := a.(*corev1.Pod)
 
