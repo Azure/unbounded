@@ -24,15 +24,15 @@ import (
 func TestChairResolverWaitsOutHealthyLongPull(t *testing.T) {
 	d := digest.MustParse("sha256:" + repeatHex('d'))
 	snapshot := fullChairSnapshot(5)
-	ranked := chairs.Rank(snapshot, d)
+	ranked := chairs.Rank(snapshot, d, chairs.DefaultCount)
 
-	seeds := make(map[uint32]struct{}, chairs.SeedCount)
+	seeds := make(map[uint64]struct{}, chairs.SeedCount)
 	for _, chair := range ranked[:chairs.SeedCount] {
-		seeds[uint32(chair.ID)] = struct{}{}
+		seeds[uint64(chair.ID)] = struct{}{}
 	}
 
 	// Every seed reports that the pull is already under way, forever.
-	coord := &chairCoordStub{outcomes: map[uint32]ifaces.PleasePullOutcome{}}
+	coord := &chairCoordStub{outcomes: map[uint64]ifaces.PleasePullOutcome{}}
 	for id := range seeds {
 		coord.outcomes[id] = ifaces.PleasePullOutcome{Outcome: ifaces.PleasePullAlreadyPulling}
 	}

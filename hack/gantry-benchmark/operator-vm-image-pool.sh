@@ -299,10 +299,6 @@ SCRIPT
         )
         standalone_patch_base64=$(git -C "$local_repo_root" diff --binary HEAD -- \
           "${standalone_paths[@]}" | base64 -w0)
-        [[ -n "$standalone_patch_base64" ]] || {
-          echo "standalone source patch is empty" >&2
-          exit 1
-        }
         ;;
       fresh)
         (($# == 1)) || { usage >&2; exit 2; }
@@ -353,8 +349,12 @@ if [[ "$action" == standalone ]]; then
   printf '%s' '$standalone_patch_base64' | base64 --decode >"\$standalone_patch"
   cd "\$BENCHMARK_REPO_ROOT"
   if sha256sum --check --strict "\$standalone_base_hashes" >/dev/null 2>&1; then
-    git apply --check "\$standalone_patch"
-    git apply "\$standalone_patch"
+    if [[ -s "\$standalone_patch" ]]; then
+      git apply --check "\$standalone_patch"
+      git apply "\$standalone_patch"
+    else
+      echo "committed standalone benchmark source is already present"
+    fi
   elif sha256sum --check --strict "\$standalone_patched_hashes" >/dev/null 2>&1; then
     echo "standalone benchmark patch is already present"
   elif sha256sum --check --strict "\$standalone_compatible_hashes" >/dev/null 2>&1; then

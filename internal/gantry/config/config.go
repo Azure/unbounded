@@ -22,6 +22,7 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
@@ -174,11 +175,16 @@ type Config struct {
 	ChairClusterSizeEstimate int           `yaml:"chair_cluster_size_estimate"`
 	// ChairCapacityDaemonSet supplies actual Gantry scheduling capacity.
 	ChairCapacityDaemonSet string `yaml:"chair_capacity_daemonset"`
-	// ChairSeedPercentage selects a proportional chair cohort from capacity.
-	ChairSeedPercentage int `yaml:"chair_seed_percentage"`
-	// ChairSeedCount caps the proportional chair cohort.
-	ChairSeedCount  int           `yaml:"chair_seed_count"`
-	ChairAPITimeout time.Duration `yaml:"chair_api_timeout"`
+	// ChairCount caps the number of agents holding fixed chair Leases.
+	ChairCount int `yaml:"chair_count"`
+	// ChairHolderCount is the deprecated name for ChairCount.
+	ChairHolderCount *int `yaml:"chair_holder_count,omitempty"`
+	// ChairSeedCount is the per-digest replica count at a full holder pool.
+	ChairSeedCount int `yaml:"chair_seed_count"`
+	// ChairSeedPercentage is accepted for compatibility with the short-lived
+	// capacity-coupled configuration. Holder and seed sizing ignore it.
+	ChairSeedPercentage int           `yaml:"chair_seed_percentage,omitempty"`
+	ChairAPITimeout     time.Duration `yaml:"chair_api_timeout"`
 
 	// ---------- Storage backend ----------
 
@@ -484,8 +490,8 @@ func NewDefault() *Config {
 		MembersKubeconfig: "",
 
 		ChairNamespace:           "",
-		ChairLeaseDuration:       time.Minute,
-		ChairRenewPeriod:         20 * time.Second,
+		ChairLeaseDuration:       5 * time.Minute,
+		ChairRenewPeriod:         time.Minute,
 		ChairRotationPeriod:      6 * time.Hour,
 		ChairRotationLead:        5 * time.Minute,
 		ChairStartupJitter:       30 * time.Second,
@@ -494,8 +500,8 @@ func NewDefault() *Config {
 		ChairClaimInitialDivisor: 2048,
 		ChairClusterSizeEstimate: 100_000,
 		ChairCapacityDaemonSet:   "gantry",
-		ChairSeedPercentage:      10,
-		ChairSeedCount:           50,
+		ChairCount:               64,
+		ChairSeedCount:           8,
 		ChairAPITimeout:          5 * time.Second,
 
 		StorageMode: StorageModeContainerd,
@@ -550,10 +556,41 @@ func NewDefault() *Config {
 // LoadYAML overlays a YAML document onto c. Unknown fields are an error so
 // typos in config files don't silently no-op.
 func (c *Config) LoadYAML(r io.Reader) error {
-	dec := yaml.NewDecoder(r)
+	raw, err := io.ReadAll(r)
+	if err != nil {
+		return fmt.Errorf("read config YAML: %w", err)
+	}
+
+	var fields map[string]yaml.Node
+	if err := yaml.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
 	dec.KnownFields(true)
 
-	return dec.Decode(c)
+	if err := dec.Decode(c); err != nil {
+		return err
+	}
+
+	_, chairCountSet := fields["chair_count"]
+	_, holderCountSet := fields["chair_holder_count"]
+
+	if holderCountSet {
+		if c.ChairHolderCount == nil {
+			return errors.New("chair_holder_count: must be an integer")
+		}
+
+		if chairCountSet && c.ChairCount != *c.ChairHolderCount {
+			return fmt.Errorf("chair_count and deprecated chair_holder_count conflict: %d != %d", c.ChairCount, *c.ChairHolderCount)
+		}
+
+		if !chairCountSet {
+			c.ChairCount = *c.ChairHolderCount
+		}
+	}
+
+	return nil
 }
 
 // LoadEnv overlays environment variables of the form GANTRY_<UPPER_SNAKE>.
@@ -580,6 +617,21 @@ func (c *Config) LoadEnv(env func(string) string) error {
 
 			*dst = n
 		}
+	}
+	parseInt := func(key string) (int, bool) {
+		v, ok := lookup(env, key)
+		if !ok {
+			return 0, false
+		}
+
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("env GANTRY_%s: %w", key, err))
+
+			return 0, false
+		}
+
+		return n, true
 	}
 	setFloat := func(key string, dst *float64) {
 		if v, ok := lookup(env, key); ok {
@@ -640,8 +692,22 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setInt("CHAIR_CLAIM_INITIAL_DIVISOR", &c.ChairClaimInitialDivisor)
 	setInt("CHAIR_CLUSTER_SIZE_ESTIMATE", &c.ChairClusterSizeEstimate)
 	setStr("CHAIR_CAPACITY_DAEMONSET", &c.ChairCapacityDaemonSet)
-	setInt("CHAIR_SEED_PERCENTAGE", &c.ChairSeedPercentage)
+
+	chairCount, chairCountSet := parseInt("CHAIR_COUNT")
+
+	holderCount, holderCountSet := parseInt("CHAIR_HOLDER_COUNT")
+	if chairCountSet && holderCountSet && chairCount != holderCount {
+		errs = append(errs, fmt.Errorf("env GANTRY_CHAIR_COUNT and deprecated GANTRY_CHAIR_HOLDER_COUNT conflict: %d != %d", chairCount, holderCount))
+	} else if chairCountSet {
+		c.ChairCount = chairCount
+		c.ChairHolderCount = nil
+	} else if holderCountSet {
+		c.ChairCount = holderCount
+		c.ChairHolderCount = nil
+	}
+
 	setInt("CHAIR_SEED_COUNT", &c.ChairSeedCount)
+	setInt("CHAIR_SEED_PERCENTAGE", &c.ChairSeedPercentage)
 	setDur("CHAIR_API_TIMEOUT", &c.ChairAPITimeout)
 
 	// Deprecated env vars (GANTRY_CACHE_DIR, GANTRY_CACHE_BUDGET_BYTES,
@@ -712,7 +778,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.NodeName, "node-name", c.NodeName, "legacy no-op Kubernetes node name")
 	fs.StringVar(&c.PodIP, "pod-ip", c.PodIP, "Kubernetes pod IP of this agent (Downward API status.podIP); used to rewrite 0.0.0.0 listeners into dialable advertised addresses")
 	fs.StringVar(&c.MembersKubeconfig, "members-kubeconfig", c.MembersKubeconfig, "optional kubeconfig for chair Lease access (empty = in-cluster)")
-	fs.StringVar(&c.ChairNamespace, "chair-namespace", c.ChairNamespace, "namespace containing the 64 Gantry chair Leases")
+	fs.StringVar(&c.ChairNamespace, "chair-namespace", c.ChairNamespace, "namespace containing the Gantry chair Leases")
 	fs.DurationVar(&c.ChairLeaseDuration, "chair-lease-duration", c.ChairLeaseDuration, "heartbeat expiry for a chair holder")
 	fs.DurationVar(&c.ChairRenewPeriod, "chair-renew-period", c.ChairRenewPeriod, "chair heartbeat renewal period")
 	fs.DurationVar(&c.ChairRotationPeriod, "chair-rotation-period", c.ChairRotationPeriod, "wall-clock assignment epoch duration")
@@ -721,10 +787,33 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.DurationVar(&c.ChairClaimRoundPeriod, "chair-claim-round-period", c.ChairClaimRoundPeriod, "interval between widening empty-chair claim rounds")
 	fs.DurationVar(&c.ChairClaimJitter, "chair-claim-jitter", c.ChairClaimJitter, "maximum deterministic delay before a chair claim")
 	fs.IntVar(&c.ChairClaimInitialDivisor, "chair-claim-initial-divisor", c.ChairClaimInitialDivisor, "initial hash-lottery divisor, halved each claim round")
-	fs.IntVar(&c.ChairClusterSizeEstimate, "chair-cluster-size-estimate", c.ChairClusterSizeEstimate, "cluster size used to size direct-origin fallback jitter without pod watches")
-	fs.StringVar(&c.ChairCapacityDaemonSet, "chair-capacity-daemonset", c.ChairCapacityDaemonSet, "DaemonSet whose desired scheduled count sizes the chair cohort")
-	fs.IntVar(&c.ChairSeedPercentage, "chair-seed-percentage", c.ChairSeedPercentage, "percentage of Gantry DaemonSet capacity selected as chairs")
-	fs.IntVar(&c.ChairSeedCount, "chair-seed-count", c.ChairSeedCount, "maximum number of ranked chairs in each cold-start seed cohort")
+	fs.IntVar(&c.ChairClusterSizeEstimate, "chair-cluster-size-estimate", c.ChairClusterSizeEstimate, "cluster size used to size chair observation and direct-origin fallback without pod watches")
+	fs.StringVar(&c.ChairCapacityDaemonSet, "chair-capacity-daemonset", c.ChairCapacityDaemonSet, "DaemonSet whose desired scheduled count bounds the holder pool")
+
+	var chairCountFlagName string
+
+	setChairCountFlag := func(name string) func(string) error {
+		return func(raw string) error {
+			value, err := strconv.Atoi(raw)
+			if err != nil {
+				return err
+			}
+
+			if chairCountFlagName != "" && chairCountFlagName != name && c.ChairCount != value {
+				return fmt.Errorf("--%s conflicts with --%s: %d != %d", name, chairCountFlagName, value, c.ChairCount)
+			}
+
+			c.ChairCount = value
+			c.ChairHolderCount = nil
+			chairCountFlagName = name
+
+			return nil
+		}
+	}
+	fs.Func("chair-count", "number of agents holding fixed chair Leases", setChairCountFlag("chair-count"))
+	fs.Func("chair-holder-count", "deprecated alias for --chair-count", setChairCountFlag("chair-holder-count"))
+	fs.IntVar(&c.ChairSeedCount, "chair-seed-count", c.ChairSeedCount, "per-digest seed replicas at a full holder pool")
+	fs.IntVar(&c.ChairSeedPercentage, "chair-seed-percentage", c.ChairSeedPercentage, "deprecated and ignored")
 	fs.DurationVar(&c.ChairAPITimeout, "chair-api-timeout", c.ChairAPITimeout, "timeout for one Kubernetes chair Lease API operation")
 
 	// Deprecated cache flags (--cache-dir, --cache-budget-bytes,
@@ -978,12 +1067,12 @@ func (c *Config) Validate() error {
 		errs = append(errs, errors.New("chair_capacity_daemonset: must not be empty"))
 	}
 
-	if c.ChairSeedPercentage < 1 || c.ChairSeedPercentage > 100 {
-		errs = append(errs, fmt.Errorf("chair_seed_percentage: must be between 1 and 100, got %d", c.ChairSeedPercentage))
+	if c.ChairCount < 1 {
+		errs = append(errs, fmt.Errorf("chair_count: must be >= 1, got %d", c.ChairCount))
 	}
 
-	if c.ChairSeedCount < 1 || c.ChairSeedCount > 64 {
-		errs = append(errs, fmt.Errorf("chair_seed_count: must be between 1 and 64, got %d", c.ChairSeedCount))
+	if c.ChairSeedCount < 1 || c.ChairSeedCount > c.ChairCount {
+		errs = append(errs, fmt.Errorf("chair_seed_count: must be between 1 and chair_count (%d), got %d", c.ChairCount, c.ChairSeedCount))
 	}
 
 	if c.Libp2pConnManagerHigh <= 0 {

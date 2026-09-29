@@ -41,9 +41,6 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c" //nolint:staticcheck // h2c deliberate
-
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/oci"
@@ -474,6 +471,14 @@ func parseSingleRange(h string, size int64) (start, end int64, ok bool) {
 	return s, e, true
 }
 
+func newPeerServerProtocols() *http.Protocols {
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	protocols.SetUnencryptedHTTP2(true)
+
+	return protocols
+}
+
 // ListenAndServe runs the transfer server with h2c support on addr.
 // Returns a function that gracefully shuts the server down.
 func (s *Server) ListenAndServe(addr string) (func(context.Context) error, error) {
@@ -482,17 +487,10 @@ func (s *Server) ListenAndServe(addr string) (func(context.Context) error, error
 		return nil, fmt.Errorf("transfer: listen %s: %w", addr, err)
 	}
 
-	h2s := &http2.Server{}
-	handler := h2c.NewHandler(s.Handler(), h2s) //nolint:staticcheck // h2c deliberate
-
 	srv := &http.Server{
-		Handler:           handler,
+		Handler:           s.Handler(),
+		Protocols:         newPeerServerProtocols(),
 		ReadHeaderTimeout: 5 * time.Second,
-	}
-
-	if err := http2.ConfigureServer(srv, h2s); err != nil {
-		ln.Close() //nolint:errcheck // closing on config error
-		return nil, fmt.Errorf("transfer: configure h2: %w", err)
 	}
 
 	go func() {

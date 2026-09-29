@@ -195,7 +195,7 @@ func TestPleasePullChair_StaleAssignmentDoesNotStartPump(t *testing.T) {
 		atomic.AddInt32(&pumpCalls, 1)
 		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: time.Now()}
 	})
-	want := ifaces.ChairAssignment{ChairID: 7, Generation: 4, AssignmentEpoch: 12}
+	want := ifaces.ChairAssignment{ChairID: 1 << 40, Generation: 4, AssignmentEpoch: 12}
 	srv := coord.NewServer(c, infl,
 		coord.WithPullerPump(pump),
 		coord.WithChairValidator(fixedChairValidator{want: want}),
