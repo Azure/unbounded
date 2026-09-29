@@ -27,6 +27,7 @@ type PageLease struct {
 	stream *PageStream
 	number uint64
 	length uint32
+	buffer []byte
 	once   sync.Once
 	err    error
 }
@@ -39,6 +40,8 @@ func (p *PageLease) Release() error {
 	p.once.Do(func() {
 		p.err = p.stream.release(p.number, p.length)
 		p.Data = nil
+		p.stream.putBuffer(p.buffer)
+		p.buffer = nil
 	})
 
 	return p.err
@@ -65,6 +68,9 @@ type PageStream struct {
 	ordered                          bool
 	complete                         bool
 	notify                           chan struct{}
+	// Get alone reuses payload storage, within this subscription. Public leases
+	// from OpenPages keep their existing synchronous allocation behavior.
+	buffers chan []byte
 }
 
 func (s *PageStream) Metadata() Metadata              { return s.owner.metadata }
@@ -352,6 +358,21 @@ func (s *PageStream) fail(err error) error {
 // Next returns io.EOF only after validating the terminal frame. Lease payload
 // allocations and outstanding accounting are bounded by negotiated credits.
 func (s *PageStream) Next() (*PageLease, error) {
+	p, err := s.next()
+	if err != nil {
+		if err == io.EOF {
+			s.owner.finish(io.EOF)
+		} else {
+			err = s.fail(err)
+		}
+	}
+
+	return p, err
+}
+
+// next leaves terminal publication to its consumer. Get must consume already
+// verified pages before reporting a later receive failure.
+func (s *PageStream) next() (*PageLease, error) {
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
 
@@ -364,7 +385,6 @@ func (s *PageStream) Next() (*PageLease, error) {
 	s.mu.Unlock()
 
 	if complete {
-		s.owner.finish(io.EOF)
 		return nil, io.EOF
 	}
 
@@ -380,13 +400,13 @@ func (s *PageStream) Next() (*PageLease, error) {
 		select {
 		case <-s.notify:
 		case <-s.owner.ctx.Done():
-			return nil, s.fail(ioFailure("subscription", s.owner.ctx.Err()))
+			return nil, ioFailure("subscription", s.owner.ctx.Err())
 		}
 	}
 
 	var frame [21]byte
 	if err := s.readFull(frame[:]); err != nil {
-		return nil, s.fail(err)
+		return nil, err
 	}
 
 	number := binary.BigEndian.Uint64(frame[1:9])
@@ -396,26 +416,25 @@ func (s *PageStream) Next() (*PageLease, error) {
 
 	if frame[0] == 2 {
 		if number != s.pages || s.delivered != s.pages || offset != s.end-s.first || s.deliveredBytes != offset || length != 0 {
-			return nil, s.fail(bad)
+			return nil, bad
 		}
 
 		s.mu.Lock()
 		s.complete = true
 		s.mu.Unlock()
-		s.owner.finish(io.EOF)
 
 		return nil, io.EOF
 	}
 
 	if frame[0] != 1 || length == 0 || offset < s.first || offset >= s.end || number != offset/uint64(PageSize) {
-		return nil, s.fail(bad)
+		return nil, bad
 	}
 
 	start := max(s.first, number*uint64(PageSize))
 
 	end := min(s.end, (number+1)*uint64(PageSize))
 	if offset != start || uint64(length) != end-start || s.ordered && number != s.first/uint64(PageSize)+s.delivered {
-		return nil, s.fail(bad)
+		return nil, bad
 	}
 
 	s.mu.Lock()
@@ -432,12 +451,25 @@ func (s *PageStream) Next() (*PageLease, error) {
 	s.mu.Unlock()
 
 	if !valid {
-		return nil, s.fail(bad)
+		return nil, bad
 	}
 
-	data := make([]byte, int(length))
+	buffer := s.getBuffer(int(length))
+	data := buffer[:length:length]
+	validPayload := false
+
+	defer func() {
+		if !validPayload {
+			s.mu.Lock()
+			delete(s.outstanding, number)
+			s.bytesHeld -= uint64(length)
+			s.mu.Unlock()
+			s.putBuffer(buffer)
+		}
+	}()
+
 	if err := s.readPayload(data); err != nil {
-		return nil, s.fail(err)
+		return nil, err
 	}
 
 	s.delivered++
@@ -445,11 +477,11 @@ func (s *PageStream) Next() (*PageLease, error) {
 	s.deliveredBytes += uint64(length)
 	if s.delivered == s.pages {
 		if err := s.readFull(frame[:]); err != nil {
-			return nil, s.fail(err)
+			return nil, err
 		}
 
 		if frame[0] != 2 || binary.BigEndian.Uint64(frame[1:9]) != s.pages || binary.BigEndian.Uint64(frame[9:17]) != s.end-s.first || binary.BigEndian.Uint32(frame[17:21]) != 0 || s.deliveredBytes != s.end-s.first {
-			return nil, s.fail(bad)
+			return nil, bad
 		}
 
 		s.mu.Lock()
@@ -457,7 +489,31 @@ func (s *PageStream) Next() (*PageLease, error) {
 		s.mu.Unlock()
 	}
 
-	return &PageLease{Number: number, Offset: ByteOffset(offset), Data: data, stream: s, number: number, length: length}, nil
+	validPayload = true
+
+	return &PageLease{Number: number, Offset: ByteOffset(offset), Data: data, stream: s, number: number, length: length, buffer: buffer}, nil
+}
+
+func (s *PageStream) getBuffer(length int) []byte {
+	if s.buffers == nil {
+		return make([]byte, length)
+	}
+
+	select {
+	case b := <-s.buffers:
+		return b
+	default:
+		return make([]byte, int(min(uint64(PageSize), s.end-s.first)))
+	}
+}
+
+func (s *PageStream) putBuffer(buffer []byte) {
+	if s.buffers != nil {
+		select {
+		case s.buffers <- buffer:
+		default:
+		}
+	}
 }
 
 // record merges adjacent page intervals, avoiding an object-sized bitmap. The
@@ -578,6 +634,10 @@ func (s *PageStream) release(number uint64, length uint32) error {
 		// was held. The read side, not a racing release write, decides whether
 		// the subscription completed or was truncated.
 		if err != nil && !staleConnectionError(err) && !errors.Is(err, io.ErrClosedPipe) && !errors.Is(err, net.ErrClosed) {
+			if s.buffers != nil {
+				return ioFailure("subscription release", err)
+			}
+
 			return s.fail(ioFailure("subscription release", err))
 		}
 	}

@@ -33,6 +33,13 @@
 // even if its selected byte range is small. There is no client page cache or
 // object-sized SDK buffer. Page payload allocations are bounded by negotiated
 // credits (default two pages), and duplicate tracking uses bounded intervals.
+// Get receives ahead on one private goroutine, holding at most two payload
+// buffers in total (current, queued and in-flight), reduced by page/byte credits.
+// Released buffers are reused only within that request; final slices have their
+// capacity clipped to their verified length. OpenPages.Next remains synchronous.
+// Read-ahead retains admission until consumption ends or Close/cancellation joins
+// the receiver and drops its buffers. A later receive failure is reported after
+// earlier verified pages; the final page still requires a valid Complete frame.
 // Value.Metadata is the initial total size, strong ETag, expiry and content type snapshot;
 // it is not a remaining length and does not change during delivery.
 // Empty objects have valid metadata and read as EOF.

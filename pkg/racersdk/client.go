@@ -260,6 +260,7 @@ func (c *Client) Get(ctx context.Context, request Request, options ...ReadOption
 
 	s.owner.stream = s
 	s.owner.offset, s.owner.end = int64(s.first), int64(s.end)
+	s.owner.startOrdered(s)
 
 	return s.owner, nil
 }

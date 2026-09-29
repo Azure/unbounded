@@ -16,24 +16,23 @@ const copyBufferSize = 32 * 1024
 // consume it using Read or WriteTo (including io.Copy); Metadata and Close may be called
 // concurrently. A Value must not be copied. Construct it with Client.Get.
 type Value struct {
-	stream      *PageStream
-	lease       *PageLease
-	leaseOffset int
-	mu          sync.Mutex
-	client      *Client
-	pool        *connectionPool
-	ctx         context.Context
-	cancel      context.CancelFunc
-	stop        func() bool
-	body        io.ReadCloser
-	terminal    error
-	finished    chan struct{}
-	slot        bool
-	metadata    Metadata
-	request     OriginRequest
-	remaining   int64
-	offset      int64
-	end         int64
+	stream    *PageStream
+	ordered   *orderedRead
+	mu        sync.Mutex
+	client    *Client
+	pool      *connectionPool
+	ctx       context.Context
+	cancel    context.CancelFunc
+	stop      func() bool
+	body      io.ReadCloser
+	terminal  error
+	finished  chan struct{}
+	slot      bool
+	metadata  Metadata
+	request   OriginRequest
+	remaining int64
+	offset    int64
+	end       int64
 }
 
 // Metadata returns the immutable total-size/tag/expiry snapshot, never a
@@ -73,7 +72,7 @@ func (v *Value) finish(err error) {
 	}
 
 	v.terminal = err
-	body, slot, stop := v.body, v.slot, v.stop
+	body, slot, stop, ordered := v.body, v.slot, v.stop, v.ordered
 	v.body, v.slot, v.stop = nil, false, nil
 	v.request = OriginRequest{}
 	v.mu.Unlock()
@@ -87,6 +86,10 @@ func (v *Value) finish(err error) {
 	}
 
 	closeBody(body)
+
+	if ordered != nil {
+		ordered.shutdown()
+	}
 
 	if v.client != nil {
 		if slot {
@@ -186,27 +189,18 @@ func (v *Value) readPages(p []byte) (int, error) {
 		return 0, nil
 	}
 
-	if v.lease == nil {
-		lease, err := v.stream.Next()
-		if err != nil {
-			return 0, err
-		}
-
-		v.lease, v.leaseOffset = lease, 0
-	}
-
-	n := copy(p, v.lease.Data[v.leaseOffset:])
-	v.leaseOffset += n
-
+	n, err := v.ordered.read(p)
 	v.offset += int64(n)
-	if v.leaseOffset == len(v.lease.Data) {
-		err := v.lease.Release()
-		v.lease = nil
 
-		return n, err
+	if err != nil {
+		if err == io.EOF {
+			v.finish(io.EOF)
+		} else {
+			err = v.stream.fail(err)
+		}
 	}
 
-	return n, nil
+	return n, err
 }
 
 // Close cancels in-flight subscription reads and closes without draining. It is
