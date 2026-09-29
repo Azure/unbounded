@@ -72,6 +72,15 @@ and an absent ConfigMap means no overrides.
 Every key in the ConfigMap is parsed as an independent document, so you can split
 by concern or by ownership.
 
+An entry can include `name` alongside `component` and `kind` to select an exact
+workload name. For Racer, a legacy `component: racer`, `kind: DaemonSet` entry
+without `name` continues to target only `racer-dataplane`. It does not target
+`racer-dataplane-podnet`. Use an explicit `name: racer-dataplane-podnet` entry for
+pod-network tuning. In particular, host-only underlay guard init containers and
+host-only affinity must remain on `racer-dataplane`; do not copy them to podnet.
+Required affinity is intersected with every operator term, including migration
+interlocks, and cannot broaden the operator's placement.
+
 ```yaml
 apiVersion: v1
 kind: ConfigMap
