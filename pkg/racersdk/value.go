@@ -178,6 +178,9 @@ func (v *Value) Read(p []byte) (int, error) {
 
 func (v *Value) readPages(p []byte) (int, error) {
 	if err := v.err(); err != nil {
+		// Cancellation publishes the error before joining the receiver. A
+		// consumer observing it must also wait for admission/storage cleanup.
+		v.finish(err)
 		return 0, err
 	}
 

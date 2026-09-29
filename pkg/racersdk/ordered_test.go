@@ -456,3 +456,68 @@ func TestGetReadAheadReleaseFailureCleanup(t *testing.T) {
 
 	orderedClean(t, v)
 }
+
+type orderedCloseSignal struct {
+	io.ReadCloser
+	closed chan struct{}
+}
+
+func (b orderedCloseSignal) Close() error {
+	err := b.ReadCloser.Close()
+	close(b.closed)
+
+	return err
+}
+
+func TestGetTerminalReadWaitsForReceiverCleanup(t *testing.T) {
+	c := rawSubscriptionClient(t, func(conn net.Conn, _ *bufio.Reader, _ []byte) {
+		_, _ = io.WriteString(conn, subscriptionHead(3, 0, 3))
+		_ = fakeSubscriptionFrame(conn, 1, 0, 0, 3)
+		_, _ = io.WriteString(conn, "abc")
+		_ = fakeSubscriptionFrame(conn, 2, 1, 3, 0)
+	})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	v, err := c.Get(ctx, Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBody(v)
+
+	orderedWait(t, v.ordered.done)
+
+	closed := make(chan struct{})
+
+	v.mu.Lock()
+	v.body = orderedCloseSignal{v.body, closed}
+	v.mu.Unlock()
+	// Hold cleanup at its lease lock while cancellation publishes the terminal
+	// error and closes the connection. Read must join cleanup, not just err().
+	v.ordered.mu.Lock()
+	cancel()
+
+	orderedWait(t, closed)
+
+	result := make(chan error, 1)
+
+	go func() {
+		_, err := v.Read(make([]byte, 1))
+		result <- err
+	}()
+	v.ordered.mu.Unlock()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("terminal read did not join cleanup")
+	}
+
+	if c.Stats().ActiveBulk != 0 || len(v.stream.buffers) != 0 {
+		t.Fatal("terminal read returned before cleanup")
+	}
+}
