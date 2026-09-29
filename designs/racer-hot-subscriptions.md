@@ -16,28 +16,62 @@ page-numbered slices and explicit leases; Get forces ordered delivery as an
 io.Reader adapter. DownloadTo writes at absolute offsets through io.WriterAt and
 releases each lease after the destination returns. Neither adapter opens a second
 client request (`pkg/racersdk/client.go:241-255`,
-`pkg/racersdk/subscription.go:72-105,298-318`).
+`pkg/racersdk/subscription.go:80-151,653-703`).
 
 ## Local demand and ownership
 
 The receiving node retains compact per-version range demand with independent
-page and byte credits for each subscriber. The production poll path unions
-capacity-bearing demand, excludes already assigned holes, and serializes the next
-receiving selection per immutable version. It alternates oldest-page progress
-with broader unordered demand; ordered readers offer only their next page.
-Canonical wire demand is limited to 64 intervals. Excessive aggregate fragmentation
-returns Overloaded, not a silently shortened prefix
-(`cmd/racer-dataplane/src/read/subscription.rs:223-289,431-446`).
+page and byte credits for each subscriber. Ordered delivery does not serialize
+acquisition: it reserves each next page's exact selected slice before dispatching
+fixed-page work through the stable page owner and existing singleflight. Different
+pages may complete concurrently or out of order, but only the ordered head is
+delivered. Pending, ready/reordered, and delivered-unreleased pages together fit
+`min(RACER_RANGE_WINDOW_PAGES, page credits)`; byte credits independently bound
+their selected slice bytes. Whole-page acquisition still uses ordinary payload
+admission, so slice-byte credits are not a physical allocation estimate
+(`cmd/racer-dataplane/src/read/subscription.rs:230-271,590-641`,
+`cmd/racer-dataplane/src/read/range_stream.rs:259-268,297-355,628-658,699-722`,
+`cmd/racer-dataplane/src/read/fill.rs:366-390`).
 
-Verified results are fanned out only to eligible subscribers with capacity. Each
-receives its own credit reservation and immutable plaintext ownership. A slow
+Unordered readers instead union capacity-bearing demand, exclude already assigned
+holes, and serialize provider selection per immutable version. They alternate
+oldest-page progress with broader unordered demand. Canonical wire demand is
+limited to 64 intervals; excessive aggregate fragmentation returns Overloaded,
+not a silently shortened prefix. Ordered readers do not enter that union
+(`cmd/racer-dataplane/src/read/subscription.rs:272-342`).
+
+Fixed-page acquisitions may overlap one another, but must not overlap an unknown
+provider selection for the same version, which bypasses fixed-page singleflight.
+Each capacity-bearing polling demand gets one admission ticket, retained across
+polls. Ordered work may batch across earlier ordered tickets, but a waiting
+unordered ticket blocks later ordered admissions. Earlier ordered tickets may
+each admit one page; selection waits for accepted fixed work to finish, then
+takes its turn. Selection also yields to earlier tickets, preventing repeated
+selections from starving ordered work. Cancellation removes the waiting ticket
+and wakes successors, but accepted workers retain exclusion through actual
+completion, not merely client detachment. This is bounded turn arbitration, not
+a wall-clock latency guarantee
+(`cmd/racer-dataplane/src/read/subscription.rs:234-294,483-535,561-587`).
+
+Unordered selected results are fanned out only to eligible unordered subscribers
+with capacity. Each receives its own credit reservation and immutable plaintext
+ownership. A slow
 reader with no credits is not assigned more work. RangeStream retains plaintext
 after delivery until the exact page/length release, independently of the delivery
 pipe. Subscriber close detaches demand; accepted worker commands and submitted I/O
 retain their own completion owners
-(`cmd/racer-dataplane/src/read/subscription.rs:173-220,456-525`,
-`cmd/racer-dataplane/src/read/range_stream.rs:263-269,502-565`,
-`cmd/racer-dataplane/src/read/dispatch.rs:198-205`).
+(`cmd/racer-dataplane/src/read/subscription.rs:177-228,508-535`,
+`cmd/racer-dataplane/src/read/range_stream.rs:270-276,618-694`). Ordered readers
+share fixed-page work through singleflight rather than selected-result fanout.
+
+Prefetch is real acquisition progress, not just polling a previously full window.
+While the current frame or payload is blocked on the client socket,
+`poll_prefetch` polls completions and can admit new work when credits, the window,
+budgets, and arbitration permit. Acquisition does not hold a delivery pipe;
+ordered delivery admits its pipe only once the head is ready. Backpressure does
+not expand either window or credits
+(`cmd/racer-dataplane/src/client/subscription.rs:262-280`,
+`cmd/racer-dataplane/src/read/range_stream.rs:278-390,628-658`).
 
 Selected ciphertext is dispatched to its stable page owner before plaintext
 allocation and authentication. That owner admits a local ciphertext charge when
@@ -57,13 +91,27 @@ duplicate tracking to 4096 merged intervals. Release is idempotent in the SDK,
 but each wire release must match an outstanding issued slice exactly once.
 Complete validates total pages/bytes and does not wait for final releases. Close,
 malformed frames, missing Complete, and cancellation never trigger a transparent
-restart (`pkg/racersdk/subscription.go:180-295`,
-`cmd/racer-dataplane/src/client/subscription.rs:65-120,266-272`).
+restart (`pkg/racersdk/subscription.go:358-555,597-651`,
+`cmd/racer-dataplane/src/client/subscription.rs:65-120,286-293`).
+
+Get adds one receive goroutine and at most
+`min(2, page credits, floor(byte credits / PageSize))` request-local payload
+buffers. This includes the consuming lease, queued leases, and in-flight receive,
+not two buffers in addition to the current page. Only release makes storage
+reusable. OpenPages (even with Ordered) and DownloadTo remain synchronous lease
+consumers without this reuse/read-ahead layer. Get keeps its connection admission
+slot through consumption, not just wire Complete; terminal reads and Close join
+receiver cleanup and drop held, queued, and reusable buffers before returning
+capacity. WriteTo's separately bounded 32 KiB scratch prevents a blocked caller
+Write from retaining the page buffers during cleanup
+(`pkg/racersdk/ordered.go:11-98,100-133`,
+`pkg/racersdk/subscription.go:35-45,497-517`,
+`pkg/racersdk/value.go:57-103,179-207,217-335`).
 
 ## Remote selection, not a persistent whole-object push stream
 
 The node shares one provider Subscriptions scheduler across worker PeerServers
-(`cmd/racer-dataplane/src/app.rs:119,158,811`). The production receiving path calls
+(`cmd/racer-dataplane/src/app.rs:119,158,811`). The unordered receiving path calls
 CandidatePolicy::subscribe through Requester and the authenticated peer v5
 transport. It routes to the primary of the oldest demanded page. The provider
 chooses an eligible sweep endpoint from the compact demand, and Acquire permits
@@ -103,7 +151,7 @@ This is not a claim that every receiving node advertises its complete object to
 every provider, that a provider keeps pushing until EOF, or that subscriptions
 survive disconnect/restart or membership changes. Placement filters sweep endpoints,
 not an exhaustive expansion of every page in each interval. Local demand may be
-narrowed to ensure ordered/head progress, contracts have absolute deadlines and
+narrowed to ensure head progress, contracts have absolute deadlines and
 finite transfer ceilings, and each selection needs another bounded exchange.
 Failed remote selection can fall back through the existing fixed-page candidate
 path with remaining acquisition credits; it does not issue speculative backup
@@ -134,13 +182,24 @@ The following are inspected test assertions, not a new test-run report:
 - `pkg/racersdk/subscription_test.go:148-311` checks out-of-order slices, credit
   waits, idempotent release, malformed/missing Complete, DownloadTo absolute offsets
   and short/error writes, cancellation, duplicates, and ordered-mode rejection.
-- `cmd/racer-dataplane/src/read/subscription.rs:545-638` checks compact exclusive
+- `cmd/racer-dataplane/src/read/subscription.rs:663-836` checks mixed-mode ticket
+  fairness under sustained ordered demand and immediate selection retries,
+  canceled-waiter wakeups, exact slice credits, and completion-fenced exclusion.
+- `cmd/racer-dataplane/src/read/subscription.rs:839-932` checks compact exclusive
   aggregate selection, stable contract IDs, increasing sequences, nonrenewing
   deadlines/budgets, and exact issued-credit release.
 - `cmd/racer-dataplane/src/peer/subscriptions.rs:767-1001` checks shared provider
   work, finite capacity, replay/deadline constraints, credential-supplier election,
   shared ciphertext allocation, and per-receiver transfer accounting.
-- `cmd/racer-dataplane/src/read/hot_read_tests.rs:175-546` builds real Coordinator,
+- `cmd/racer-dataplane/src/read/hot_read_tests.rs:175-535` checks ordered same-page
+  sharing, byte-credit limits, later-page completion before the head, acquisition
+  during blocked socket delivery, fair mixed-mode refill, and cancellation/drop
+  exclusion through actual completion. Failure must not restart or admit the tail.
+- `pkg/racersdk/ordered_test.go:62-458` checks read-ahead overlap, buffer identity
+  reuse only after release, one-buffer credit limits, late-failure prefix delivery,
+  withheld invalid final slices, cleanup, and isolation from blocked writers and
+  subsequent requests.
+- `cmd/racer-dataplane/src/read/hot_read_tests.rs:537-908` builds real Coordinator,
   Requester, TCP/session, provider, and Fill paths under one membership. Assertions
   check page order 0, 2, 1, 3; page-2 work shared across two receiving nodes; local
   fanout without an extra receiving transfer; warm local-head reuse without another
@@ -192,19 +251,23 @@ and discards unsubmitted persistence work
 (`pkg/racersdk/rust_subscription_interop_test.go:21-103`,
 `cmd/racer-dataplane/src/subscription_interop.rs:42-123,265-320`).
 
-The harness defines 12 subtests, not a test-run total: four ordered Get sizes;
+The harness defines 15 subtests: four ordered Get sizes; a large read-ahead Get;
+partial-range Get with one and two page credits;
 partial-range fragmented releases; empty OpenPages; byte-credit exhaustion with
 a held final lease; partial/empty DownloadTo; a large DownloadTo; context and
 stream-close cancellation while credit is held; and destination failure
-(`pkg/racersdk/rust_subscription_interop_test.go:105-316`). Assertions check socket
+(`pkg/racersdk/rust_subscription_interop_test.go:105-417`). Assertions check socket
 silence without released page/byte credit, exact payload geometry/content, valid
 Complete before final-slice exposure, idempotent release, and recovered admission
 after cancellation. SDK accounting checks held bytes, page credits, and bounded
-interval state (`pkg/racersdk/rust_subscription_interop_test.go:329-339`).
+interval state (`pkg/racersdk/rust_subscription_interop_test.go:431-443`).
 
-The large case requires exactly `32*PageSize+13` bytes (512 MiB + 13) and 33 page
-offsets with two SDK page credits. Its WriterAt validates bytes without an
-object-sized backing buffer (`pkg/racersdk/rust_subscription_interop_test.go:252-259,354-362`).
+Both large Get and DownloadTo require exactly `32*PageSize+13` bytes (512 MiB + 13)
+with two SDK page credits. DownloadTo checks 33 page offsets; both destinations
+validate bytes without an object-sized backing buffer. Get also asserts the
+two-buffer limit and clean ordered storage/credit/admission teardown
+(`pkg/racersdk/rust_subscription_interop_test.go:137-173,338-347,460-470`,
+`pkg/racersdk/ordered_test.go:45-60`).
 Rust admits at most four plaintext pages (64 MiB) and asserts the observed charged
 plaintext peak stays within that limit. After draining and reclaiming reusable
 buffers it asserts zero plaintext, flight, and waiter charges
@@ -212,6 +275,7 @@ buffers it asserts zero plaintext, flight, and waiter charges
 payload-admission/accounting bounds, not a measurement of process RSS or Go heap
 high-water usage, a persistence test, or a distributed throughput result.
 
-This documentation review records code assertions rather than new execution
-results. No previous test totals, deployed results, or performance numbers are
-transferred to the replacement implementation.
+The [2026-09-29 validation record](racer-ordered-validation-20260929.md) records
+the independent live race rerun after the fairness and SDK cleanup fixes, plus
+the separate SDK fixture benchmark caveats. No historical deployed results or
+performance numbers are transferred to this implementation.

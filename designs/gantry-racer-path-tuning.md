@@ -27,10 +27,14 @@ multiple pairs explicitly rather than extrapolating single-worker results.
 
 ## Delivery
 
-Gantry uses bounded HTTP ReaderFrom transfers without hijacking the connection.
-Plain HTTP can use the Go TCP splice path; TLS and unsupported writers still copy.
-The explicit SDK FDSink path and worker pipes request at most 64 KiB kernel capacity;
-denied growth is not fatal. Worker pipes are pooled only when empty. After the first
+Gantry uses SDK WriteToHTTP without hijacking the connection. Subscription frames
+are validated before copying their payload through 32 KiB scratch; this path does
+not invoke the destination's ReaderFrom or splice the framed SDK socket, even for
+plain HTTP (`internal/gantry/mirror/racer.go:125-135`,
+`pkg/racersdk/http_transfer.go:8-14`, `pkg/racersdk/value.go:217-335`). Get receives
+ahead with at most two request-local payload buffers, reduced to one by page/byte
+credits, and reuses storage only after release (`pkg/racersdk/ordered.go:11-133`).
+Worker pipes are pooled only when empty. After the first
 backpressure pipe drain on a page, worker delivery switches to direct sends while
 preserving connection/page admission through the reactor completion fence.
 `racer_delivery_pipe_drains_total` and `racer_delivery_direct_bytes_total` expose
@@ -44,25 +48,32 @@ Gantry exposes the following YAML settings, matching `--racer-...` flags and
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| `racer_max_conn_age` | `5m` | Jittered connection rotation across workers |
+| `racer_max_conn_age` | `5m` | Jittered rotation of reusable connections; subscriptions already use fresh connections |
 | `racer_idle_conn_timeout` | `20s` | Retire idle SDK sockets before the worker's default 30-second idle deadline |
 | `racer_dial_timeout` | `5s` | Bound UDS connection establishment |
 | `racer_body_read_timeout` | `60s` | Bound an active body read or bounded socket transfer, not total object lifetime |
-| `racer_page_window` | `0` | Values above one enable bounded, rolling SDK page requests |
-| `racer_prefetch_bootstrap` | `false` | With a page window, use spare admission to fetch continuation pages before bootstrap is consumed |
+| `racer_page_window` | `0` | Default subscription page credits; zero selects two, explicit range 1..64 |
+| `racer_prefetch_bootstrap` | `false` | Unused compatibility setting; no bootstrap or continuation client requests |
 | `racer_http_max_connections` | `512` | Bound accepted public mirror connections |
 
 The public Racer mirror also has a 30-second HTTP idle timeout and a 32 KiB
-configured header limit. The SDK HTTP transfer uses 256 KiB batches; its body
-deadline is renewed between batches, not on every byte. Ordinary Go writes retain
-32 KiB chunks and downstream write-deadline renewal. A sufficiently slow consumer
-can still hit these bounds even while making some progress. Tune bounds together,
-not as interchangeable total request deadlines.
+configured header limit. SDK payload reads and release writes have bounded I/O
+deadlines; the caller context bounds the entire Value. A stalled arbitrary
+destination Write cannot be interrupted by SDK cancellation, but cleanup joins
+the receiver and drops page buffers without waiting for that Write. Only separately
+bounded 32 KiB copy scratch remains with the writer. Tune these bounds together,
+not as interchangeable total request deadlines (`pkg/racersdk/subscription.go:565-650`,
+`pkg/racersdk/ordered.go:76-98`, `pkg/racersdk/value.go:217-335`).
 
-Page windows and bootstrap prefetch remain opt-in. Window requests preserve pins,
-ordered assembly, bounded admission, and raw-socket transfers. More parallelism
-can increase origin traffic and pinned memory; whole-page validation remains a
-required integrity boundary and is not removed to improve time to first byte.
+Each subscription uses one POST/connection, regardless of page credits. Ordered
+Rust acquisition overlaps across stable page owners within the smaller of page
+credits and `RACER_RANGE_WINDOW_PAGES` (default two), including delivered but
+unreleased pages. Prefetch can admit work while sending when credits, window,
+budgets, and fair arbitration with unordered selections permit. More credits do
+not enlarge Get's two-buffer SDK limit or automatically raise Rust payload/pipe
+capacity. Whole-page validation remains an integrity boundary
+(`cmd/racer-dataplane/src/read/range_stream.rs:259-355,628-658`,
+`cmd/racer-dataplane/src/read/subscription.rs:483-535`).
 
 ## Isolation and remaining architectural limits
 

@@ -26,16 +26,19 @@ assertions, not newly executed results:
   (`cmd/racer-dataplane/tests/conformance/sdk.rs:101-159,325-432`). This exercises
   production HTTP/request parsing, not a full Coordinator.
 - The separate live `TestRustSubscriptionInterop` starts production Rust
-  ClientListeners, Coordinator, RangeStream, Fill, and crypto. Its 12 subtests
-  cover ordered Get, OpenPages credit/release/Complete behavior, cancellation,
-  DownloadTo, and writer failure. The large download asserts 512 MiB + 13 bytes
-  across 33 offsets with two SDK page credits; Rust asserts a 64 MiB charged
+  ClientListeners, Coordinator, RangeStream, Fill, and crypto. Its 15 subtests
+  cover ordered Get, including two-buffer large reads and partial ranges with
+  one/two credits, OpenPages credit/release/Complete behavior, cancellation,
+  DownloadTo, and writer failure. Large Get and DownloadTo assert 512 MiB + 13 bytes;
+  DownloadTo checks 33 offsets with two SDK page credits. Rust asserts a 64 MiB charged
   plaintext limit and zero plaintext/flight/waiter charges after cleanup
-  (`pkg/racersdk/rust_subscription_interop_test.go:105-316`,
+  (`pkg/racersdk/rust_subscription_interop_test.go:105-417`,
   `cmd/racer-dataplane/src/subscription_interop.rs:157-162,307-354`). Generated
   origin and initial publication are fixture supplied, peer traffic is absent,
   and unsubmitted persistence is discarded. These bounds are not process RSS or
-  Go heap measurements.
+  Go heap measurements. The separate
+  [2026-09-29 validation record](racer-ordered-validation-20260929.md) reports the
+  live race rerun after the ordered pipeline, fairness, and SDK cleanup changes.
 - Registry tests check bounded 206 responses and complete 200 responses that
   fit at offset zero, with rejection of unknown/oversized/nonzero-offset 200
   without body reads (`internal/gantry/origin/range_test.go:26-95,139-265`).

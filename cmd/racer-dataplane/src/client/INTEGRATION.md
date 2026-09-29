@@ -129,7 +129,10 @@ wait for final releases. Post-header errors truncate and close the response.
 The listener's observed response path uses `Delivery::finish_progressing` after
 the bounded first-slice/header phase. Each later distinct client page has a fixed
 child acquisition deadline; writes renew only their stall deadline on positive
-socket progress. It polls the already admitted prefetch window while writing.
+socket progress. While writing the current frame/payload, prefetch polls admitted
+work and may admit new acquisitions within credits, configured ordered window,
+budgets, and mixed-mode admission tickets (`subscription.rs:262-280`,
+`../read/range_stream.rs:278-390`).
 Full peer close signals shared cancellation while preserving completion owners;
 request write-half shutdown cannot return credits and is not a supported substitute
 for release frames on a progressing subscription. The unobserved
@@ -138,7 +141,12 @@ for release frames on a progressing subscription. The unobserved
 `Responses::send` prepares the first slice before writing success headers. A
 first-slice acquisition/admission failure sends the mapped error head and returns
 a poisoned connection; callers must check `is_reusable()` before another request.
-Range streams schedule delivery pipes before starting new page work. Each pipe
+Ordered subscriptions acquire through stable page owners without a delivery pipe,
+then admit a pipe when the ordered head is ready. Pending, ready/reordered, and
+delivered-unreleased pages share the bounded window; unordered selection retains
+its separate credit-driven path. Internal non-subscription range streams still
+schedule delivery pipes before new page work
+(`../read/range_stream.rs:259-268,465-476,628-676`). Each pipe
 pool has a FIFO capped by `queue_entries`, with request-context charges for live
 waiters. Pipe release and cancellation notify waiters; the existing bounded worker
 tick checks original deadlines and stopped admission. Raw `PipePool::acquire`

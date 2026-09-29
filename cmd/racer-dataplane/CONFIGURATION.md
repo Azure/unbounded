@@ -242,6 +242,13 @@ is no replay-entry capacity setting. MiB means 1048576 bytes.
 | `RACER_METADATA_ENTRIES` | `4096` | 1048576 |
 | `RACER_RELAY_TRANSFERS` | `16` | 65536 |
 
+`RACER_RANGE_WINDOW_PAGES` caps ordered v2 subscriptions as well as internal range
+prefetch. Ordered pending, ready/reordered, and delivered-unreleased pages together
+fit the smaller of this window and the subscriber's page credits; exact slice-byte
+credits impose a separate limit. Unordered provider selection remains credit-driven.
+This is not an SDK buffer-size setting or a relaxation of whole-page payload
+admission (`src/read/range_stream.rs:259-268,297-355`).
+
 `RACER_HEADER_BYTES` controls client/origin heads only. Peer envelopes use a
 separate 1,179,648-byte cap with 64 KiB embedded signed heads/handshakes, allowing
 base64 expansion and the maximum forwarding path. Each worker requires at least

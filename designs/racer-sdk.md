@@ -20,9 +20,11 @@ gates, including deployed E2E, for the previous client contract. It and the
 not acceptance of the replacement wire protocol. Current process, scripted
 conformance, and E2E client fixtures use v2 subscriptions. The separate live
 Go/Rust harness exercises production ClientListeners and the read graph, including
-a 512 MiB + 13 download under bounded payload admission. The
+a 512 MiB + 13 Get and DownloadTo under bounded payload admission. The
 [subscription design](racer-hot-subscriptions.md#evidence-and-validation-scope)
-records the actual assertions and limits, without assigning new pass totals.
+records the actual assertions and limits. The
+[ordered validation record](racer-ordered-validation-20260929.md) records the
+independent live race rerun and separates fixture benchmarks from deployed results.
 Historical measurements remain in [throughput performance](racer-sdk-throughput-performance.md).
 Scripted wire checks, live single-node interoperability, deployed coverage, and
 workload-specific performance measurements are distinct evidence.
@@ -159,7 +161,8 @@ For OpenPages or Get:
 2. Next reads a complete page slice before exposing a PageLease. Each slice has a
    page number and absolute object offset. Unordered is the OpenPages default;
    Ordered selects ascending delivery. Get always sets Ordered and presents the
-   same slices through Read, releasing each once consumed.
+   same slices through Read, releasing each once consumed. Get receives ahead in
+   one background goroutine; OpenPages.Next remains synchronous, even with Ordered.
 3. Hold each lease only while using Data, then call Release. It is idempotent and
    invalidates Data. Never copy a lease or access its Data concurrently with Release.
    Release writes the exact page number and slice length back on the same socket,
@@ -174,25 +177,51 @@ bytes. Limits are 1..64 pages and PageSize..64*PageSize bytes. Outstanding paylo
 allocations are credit-bounded; duplicate tracking uses merged intervals with a
 hard limit of 4096. Excessive fragmentation fails rather than allocating state
 proportional to object size. There is no whole-object buffer, reconnect/resume,
-GET fallback, or continuation request (`pkg/racersdk/subscription.go:72-99,180-246`).
+GET fallback, or continuation request (`pkg/racersdk/subscription.go:80-105,358-555`).
+
+Get owns at most `min(2, PageCredits, floor(ByteCredits / PageSize))` payload
+buffers across its current lease, queued leases, and in-flight receive combined.
+Credits can reduce this to one; larger credits do not raise the SDK read-ahead
+limit above two. Storage is allocated lazily, each buffer at most
+`min(PageSize, selected range length)`, and reused only after Release within that
+request. A short slice exposes only its exact length/capacity. No payload buffer
+crosses request boundaries and this is not a page cache. OpenPages and DownloadTo
+keep synchronous, per-slice allocation and explicit lease lifetimes; setting
+Ordered on OpenPages changes delivery order, not SDK allocation strategy
+(`pkg/racersdk/ordered.go:11-73,100-133`,
+`pkg/racersdk/subscription.go:35-45,457-517,653-703`).
+
+The receiver validates each complete payload before queuing its lease, and also
+validates Complete before queuing the final lease. A later receive failure is
+reported after already verified queued slices are consumed, without exposing an incomplete or invalid final
+slice. Cancellation and explicit Close instead terminate consumption and join
+cleanup. Wire completion alone does not release the live-Value admission slot:
+it stays held until consumption ends or cancellation closes the socket, joins
+the receiver, releases current/queued leases, and drops reusable buffers. Terminal
+Read and concurrent/idempotent Close wait for that cleanup before returning
+(`pkg/racersdk/subscription.go:373-494`, `pkg/racersdk/ordered.go:43-98`,
+`pkg/racersdk/value.go:57-103,179-214`).
 
 DownloadTo accepts an io.WriterAt, writes at absolute object offsets (including
 for a selected range), releases each lease after WriteAt returns, and closes on
 all exit paths. It preserves partial counts and reports short writes. It does
 not truncate, size, or verify the destination object. Cancellation cannot interrupt
-an arbitrary caller-owned WriteAt (`pkg/racersdk/subscription.go:298-318`).
+an arbitrary caller-owned WriteAt (`pkg/racersdk/subscription.go:653-703`).
 
 Initial HTTP errors retain their typed classification. Malformed frames are
 protocol errors; short payloads or a missing Complete are terminal I/O errors.
 No failure selects a newer version. The context bounds the entire subscription.
-SDK page allocations are now intentional, unlike the old direct-body reader.
+SDK page buffers are intentional, unlike the old direct-body reader; Get reuses
+its bounded payload storage instead of allocating another buffer for every page.
 `Value.WriteTo`, also selected by `io.Copy` and `io.CopyBuffer`, uses bounded
 32 KiB scratch and does not invoke the destination's ReadFrom. It counts only
 bytes accepted by the writer and preserves short-write errors. Copy scratch has
 independent bulk and small-object caps, including copies canceled while blocked
 inside caller-owned Write. Exhausted scratch returns ErrorUnavailable. Cancellation
 cannot interrupt an arbitrary writer; callers must still Close on writer failure
-(`pkg/racersdk/value.go:199-298`). WriteToHTTP uses this validated copy path without
+(`pkg/racersdk/value.go:217-335`). Cleanup does not wait for caller-owned Write:
+only the separately admitted scratch remains pinned there, not Get's page buffers
+(`pkg/racersdk/ordered.go:76-98`). WriteToHTTP uses this validated copy path without
 hijacking the downstream connection. SDK subscription delivery does not splice
 framed page data directly to a destination (`pkg/racersdk/http_transfer.go:8-14`).
 
@@ -304,8 +333,10 @@ by 32 KiB times bulk plus small-object copy capacity (2.125 MiB at defaults),
 allocated lazily and retained for reuse. Origin GET scratch is 32 KiB per active
 copy (up to 2 MiB at the default GET cap). These exclude framing buffers, caller
 memory, kernel sockets, Rust pages, and SDK PageLease payload allocations. Each
-subscription can retain up to its negotiated byte credits in live SDK payloads;
-default credits are 32 MiB, allocated as slices arrive. Connection and concurrency limits bound
+OpenPages subscription can retain up to its negotiated byte credits in live SDK
+payloads. Get additionally caps total request-local payload storage at two pages
+(32 MiB), reduced by page/byte credits as described above; default credits are
+32 MiB, allocated lazily. Connection and concurrency limits bound
 the parser buffers, goroutines, and body scratch. At the connection cap, stop
 accepting until capacity frees (the OS backlog is finite); an already accepted
 well-formed request at the callback cap gets empty 503. A stuck callback continues
@@ -363,8 +394,8 @@ Other ServeOrigin errors preserve their bind/serve causes. No grace-period API.
 The production client listener selects Responses::send_subscription for POST.
 It prepares the first slice before success headers, enables progress, and holds
 delivered plaintext ownership until exact release or stream teardown. Complete
-does not wait for final releases (`cmd/racer-dataplane/src/client/subscription.rs:145-179,229-272`,
-`cmd/racer-dataplane/src/read/range_stream.rs:263-269`). Rust paths in the rest of
+does not wait for final releases (`cmd/racer-dataplane/src/client/subscription.rs:145-179,246-293`,
+`cmd/racer-dataplane/src/read/range_stream.rs:270-276`). Rust paths in the rest of
 this section are relative to `cmd/racer-dataplane/`.
 
 - Initial metadata uses the coordinator's bounded acquisition budget. Normal
@@ -378,14 +409,35 @@ this section are relative to `cmd/racer-dataplane/`.
   pages and retries never receive new time or credits. Pending futures stay in
   the stream; dropping a next_slice future does not restart a page. Explicit
   aggregate budgets partition/reunite only their owned credits and cannot be
-  upgraded to progressing budgets (`src/read/range_stream.rs:277-305`).
+  upgraded to progressing budgets (`src/read/range_stream.rs:297-405`).
+- Ordered subscriptions reserve exact slice credits before dispatching concurrent
+  fixed-page acquisitions through the stable page owner and existing singleflight.
+  Pending, ready/reordered, and delivered-unreleased pages together fit the smaller
+  of the configured range window and page credits; byte credits independently
+  bound selected slice bytes. Later completions wait behind the ordered head.
+  Acquisition does not hold a delivery pipe while waiting for the head
+  (`src/read/range_stream.rs:259-268,297-355,628-658,699-722`).
+- Unordered subscriptions retain per-version exclusive provider selection and
+  selected-result fanout. They cannot overlap accepted ordered fixed-page work
+  for that version. Capacity-bearing polling demands receive tickets: an earlier
+  unordered ticket prevents ordered refill, while selection yields to all earlier
+  tickets. Ordered work can batch across ordered tickets. Canceling a waiting
+  demand wakes successors but does not drop accepted work's completion guards
+  (`src/read/subscription.rs:177-342,483-587`). See the
+  [subscription design](racer-hot-subscriptions.md#local-demand-and-ownership)
+  for the exact arbitration and ownership boundaries.
+- While a page frame or payload is being sent, prefetch polls completions and can
+  admit new acquisitions within credits, window, budgets, and ticket arbitration.
+  It is not limited to polling already admitted futures
+  (`src/client/subscription.rs:262-280`, `src/read/range_stream.rs:278-390`).
 - Positive client socket writes renew the reader-stall clock. Backpressure does
   not grow the prefetch window. Peer writes still take the minimum of the original
   deadline and stall deadline (`src/memory/delivery.rs:153-205,261-265`).
 - Runtime defaults are `RACER_REQUEST_TIMEOUT_MS=30000`,
   `RACER_READER_STALL_TIMEOUT_MS=10000`. Subscription scheduling uses negotiated
-  credits; `RACER_RANGE_WINDOW_PAGES=2` remains for internal legacy range callers,
-  not the v2 client contract (`src/read/range_stream.rs:235-260`). Increasing SDK concurrency does not increase Rust
+  credits; `RACER_RANGE_WINDOW_PAGES=2` also caps the ordered v2 pipeline, not just
+  internal range callers. Unordered selection remains credit-driven
+  (`src/read/range_stream.rs:259-268`). Increasing SDK concurrency does not increase Rust
   page, pipe, connection, queue, or origin capacity automatically.
 
 This permits progressing client subscriptions to outlive the initial request timeout;
@@ -621,7 +673,10 @@ contract and must not be reused as replacement performance or deployed acceptanc
   Check arbitrary page order, exact membership and slice offsets, duplicates,
   missing/invalid Complete, page/byte credit waits, exact release, and Close races.
   Verify Get forces ordering and DownloadTo uses absolute offsets and releases
-  leases on destination errors. Check independent bulk,
+  leases on destination errors. Verify Get overlaps receive with consumption,
+  bounds all payload buffers to two (or one with reduced credits), reuses only
+  released storage, and joins cleanup before returning terminal reads/admission.
+  Check independent bulk,
   metadata, and small-object queues under saturation and cancellation, oversized
   SmallObject rejection, and bounded scratch with blocked destination writers.
   Verify pin/size mismatch, 412/503, short body, late failure, expiry during read,
@@ -643,9 +698,13 @@ contract and must not be reused as replacement performance or deployed acceptanc
   and io.Copy. Report throughput, allocs/op, allocated bytes/op, peak live heap,
   and comparison to a bare stdlib Unix HTTP stream on the same host/toolchain.
   Warm reusable HEAD pools separately. Subscription connections are not reusable.
-  SDK cumulative payload allocations may scale with pages consumed; live payload
-  memory must remain bounded by negotiated credits and concurrency, plus bounded
-  scratch/framing and interval state. Full-page SDK allocations are expected.
+  Get's cumulative payload-buffer allocation must plateau at its request-local
+  one/two-buffer bound; small per-page bookkeeping allocations may still scale
+  with pages consumed. OpenPages/DownloadTo allocate per slice. Live payload
+  memory must remain bounded by credits and concurrency, plus bounded
+  scratch/framing and interval state. Use matched fixture generators: scalar
+  address-sensitive generation overhead must not be mistaken for SDK cost (see
+  the [benchmark caveat](racer-ordered-validation-20260929.md#fixture-benchmarks)).
   Use long steady-state streams to demonstrate a plateau, and run with slow
   destinations to verify backpressure rather than growing buffering. Record any
   throughput regression above 10% versus the same-buffer baseline for review;

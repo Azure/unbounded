@@ -151,7 +151,8 @@ credit ledger. The configured acquisition window additionally caps the total
 ordered pending, reordered, and delivered-unreleased pages, even if the client
 offers more page credits. Partial ranges reserve slice bytes, not whole-page bytes; separate
 payload admission still charges whole-page allocations. Acquisition is polled
-while the current page frame and payload are being written, without reserving
+while the current page frame and payload are being written, and may admit new
+work as credits, window space, budgets, and arbitration permit, without reserving
 another delivery pipe. One page credit cannot overlap successive acquisitions.
 
 Unordered readers retain provider-selected demand sharing. Because selected
@@ -211,8 +212,16 @@ The Go SDK exposes `OpenPages`/`PageStream.Next` and explicit `PageLease.Release
 each after WriteAt returns. Every path uses one POST and one connection per
 subscription, with no continuation requests. Always close abandoned streams or
 Values. The SDK buffers complete page slices within credits, not entire objects.
-See `pkg/racersdk/subscription.go:70-99,180-246,273-318` and
-`pkg/racersdk/value.go:171-197` (repository-relative).
+Get receives ahead with at most `min(2, page credits, floor(byte credits / P))`
+request-local payload buffers, counting the current lease, queued leases, and
+in-flight receive together. Only release permits reuse; buffers never cross
+requests. OpenPages (including Ordered) and DownloadTo do not use this read-ahead
+or reuse layer. Get retains connection admission until consumption ends or
+cancellation joins receiver cleanup, not merely until wire Complete. Terminal
+reads and Close wait for cleanup; an arbitrary blocked destination Write can
+retain only separately bounded copy scratch, not Get's page buffers.
+See `pkg/racersdk/subscription.go:358-517,653-703`, `pkg/racersdk/ordered.go:11-133`,
+and `pkg/racersdk/value.go:57-103,179-225` (repository-relative).
 
 ## Origin operations (unchanged v1)
 
