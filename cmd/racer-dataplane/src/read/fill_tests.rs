@@ -321,6 +321,94 @@ fn drive<T>(
 }
 
 #[test]
+fn abandoned_acquisition_does_not_cancel_shared_peer_scope() {
+    abandoned_acquisition_preserves_peer_scope(false);
+}
+
+#[test]
+fn abandoned_metadata_does_not_cancel_shared_peer_scope() {
+    abandoned_acquisition_preserves_peer_scope(true);
+}
+
+fn abandoned_acquisition_preserves_peer_scope(metadata: bool) {
+    use crate::{
+        model::metadata::MetadataSelector,
+        read::metadata::{MetadataDependencies, MetadataService},
+    };
+    {
+        let mut f = fixture();
+        let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+        let _queue = queue.enter();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+        if metadata {
+            let (send, receive) = futures::channel::oneshot::channel();
+            let service = MetadataService::new(
+                f.fill.dependencies.candidates.clone(),
+                Rc::new(GatedMetadataOrigin {
+                    receive: RefCell::new(Some(receive)),
+                    calls: Cell::new(0),
+                }),
+                f.fill.dependencies.peers.clone(),
+                f.fill.dependencies.credentials.clone(),
+                4,
+                MetadataDependencies {
+                    index: Rc::new(Index::new(WorkerId(0), 4)),
+                    owners: f.fill.dependencies.metadata_owner.clone(),
+                    fill: Rc::new(Fill::new(f.fill.dependencies.clone())),
+                },
+            );
+            let mut read = service.resolve(
+                MetadataSelector::Fresh,
+                f.membership.clone(),
+                &f.context,
+                &f.scope,
+            );
+            assert!(read.as_mut().poll(&mut cx).is_pending());
+            drop(read);
+            send.send(MetadataReply {
+                metadata: f.origin.metadata.clone(),
+                page_zero: None,
+            })
+            .ok()
+            .unwrap();
+            queue.poll(&mut cx, 64);
+        } else {
+            let mut read = f.fill.acquire(
+                f.page.clone(),
+                f.membership.clone(),
+                &f.context,
+                &f.scope,
+                &mut budget,
+            );
+            assert!(read.as_mut().poll(&mut cx).is_pending());
+            drop(read);
+            queue.poll(&mut cx, 64);
+        }
+        assert_eq!(
+            f.scope.check(),
+            Ok(()),
+            "abandoning metadata={metadata} must not poison worker peer ingress"
+        );
+        assert_eq!(queue.pending(), 0);
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+        let result = drive(
+            f.fill.acquire(
+                f.page.clone(),
+                f.membership.clone(),
+                &f.context,
+                &f.scope,
+                &mut budget,
+            ),
+            &mut f.engine,
+            &f.crypto,
+        )
+        .unwrap();
+        assert_eq!(result.plaintext.bytes(), b"abc");
+    }
+}
+
+#[test]
 fn completed_fill_waits_release_shared_cancellation_capacity() {
     use futures::{StreamExt, stream::FuturesUnordered};
     let mut f = fixture();
@@ -1407,6 +1495,9 @@ fn blocked_metadata_leader_and_follower_notify_without_spinning() {
                 Poll::Ready(Err(Error::Cancelled))
             ));
         }
+        // Parent cancellation now wakes the independent driver too. Consume
+        // that wake before checking the separate origin-completion notification.
+        super::super::drivers::poll(&mut cx, 64);
         let before = count.count();
         send.send(MetadataReply {
             metadata: f.origin.metadata.clone(),
