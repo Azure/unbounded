@@ -111,12 +111,15 @@ func equalNUMA(a, b *uint32) bool {
 // The caller supplies Pods from the installation namespace and the current
 // managed DaemonSet UID; labels alone never establish ownership.
 func SelectEndpoint(pods []corev1.Pod, daemonSetUID types.UID, nodeName string, port uint16) (string, error) {
+	return selectEndpoint(pods, func(pod *corev1.Pod) bool {
+		owner := metav1.GetControllerOf(pod)
+		return daemonSetUID != "" && owner != nil && owner.APIVersion == "apps/v1" && owner.Kind == "DaemonSet" && owner.UID == daemonSetUID
+	}, nodeName, port)
+}
+
+func selectEndpoint(pods []corev1.Pod, owns func(*corev1.Pod) bool, nodeName string, port uint16) (string, error) {
 	if nodeName == "" || port == 0 {
 		return "", wire.InvalidRequest
-	}
-
-	if daemonSetUID == "" {
-		return "", wire.Unavailable
 	}
 
 	var (
@@ -130,8 +133,7 @@ func SelectEndpoint(pods []corev1.Pod, daemonSetUID types.UID, nodeName string, 
 			continue
 		}
 
-		owner := metav1.GetControllerOf(pod)
-		if owner == nil || owner.APIVersion != "apps/v1" || owner.Kind != "DaemonSet" || owner.UID != daemonSetUID {
+		if !owns(pod) {
 			continue
 		}
 
@@ -163,6 +165,12 @@ func SelectEndpoint(pods []corev1.Pod, daemonSetUID types.UID, nodeName string, 
 // The caller supplies installation-namespace Pods grouped by assigned node name.
 // Each group is still checked for node assignment and DaemonSet ownership.
 func ReconcileMembers(nodes []corev1.Node, podsByNode map[string][]corev1.Pod, daemonSetUID types.UID, accepted AcceptedMembers, port uint16) (AcceptedMembers, []Diagnostic, error) {
+	return reconcileMembers(nodes, podsByNode, func(pods []corev1.Pod, nodeName string, port uint16) (string, error) {
+		return SelectEndpoint(pods, daemonSetUID, nodeName, port)
+	}, accepted, port)
+}
+
+func reconcileMembers(nodes []corev1.Node, podsByNode map[string][]corev1.Pod, endpointFor func([]corev1.Pod, string, uint16) (string, error), accepted AcceptedMembers, port uint16) (AcceptedMembers, []Diagnostic, error) {
 	if port == 0 {
 		return nil, nil, wire.InvalidRequest
 	}
@@ -207,7 +215,7 @@ func ReconcileMembers(nodes []corev1.Node, podsByNode map[string][]corev1.Pod, d
 			}
 		}
 
-		endpoint, endpointErr := SelectEndpoint(podsByNode[node.Name], daemonSetUID, node.Name, port)
+		endpoint, endpointErr := endpointFor(podsByNode[node.Name], node.Name, port)
 		if endpointErr != nil {
 			if !errors.Is(endpointErr, wire.Unavailable) {
 				return nil, nil, endpointErr

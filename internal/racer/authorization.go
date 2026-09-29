@@ -5,8 +5,8 @@ package racer
 
 import (
 	"context"
+	"slices"
 
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,7 +35,7 @@ func authorizedPodCandidate(cfg Config, pod *corev1.Pod) bool {
 
 	owner := metav1.GetControllerOf(pod)
 
-	return owner != nil && owner.APIVersion == "apps/v1" && owner.Kind == "DaemonSet" && owner.Name == cfg.DaemonSetName && owner.UID != ""
+	return owner != nil && owner.APIVersion == "apps/v1" && owner.Kind == "DaemonSet" && slices.Contains(managedWorkloadNames(cfg), owner.Name) && owner.UID != ""
 }
 
 // The configured namespace/name designate the managed workload. A Pod must be
@@ -45,14 +45,12 @@ func authorizePod(ctx context.Context, reader client.Reader, cfg Config, pod *co
 		return wire.Forbidden
 	}
 
-	owner := metav1.GetControllerOf(pod)
-
-	var ds appsv1.DaemonSet
-	if err := reader.Get(ctx, client.ObjectKey{Namespace: cfg.Namespace, Name: cfg.DaemonSetName}, &ds); err != nil {
+	owns, err := readManagedWorkloadOwnership(ctx, reader, cfg)
+	if err != nil {
 		return authorizationError(err)
 	}
 
-	if ds.UID != owner.UID || ds.DeletionTimestamp != nil {
+	if !owns(pod) {
 		return wire.Forbidden
 	}
 
