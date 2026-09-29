@@ -288,6 +288,9 @@ impl Transfers {
                     .await,
             )?;
             connection.relay_reservation = relay.clone();
+            // Connection and handshake get separate bounded idle allowances.
+            // No header byte can renew the request/head allowance.
+            scope.candidate_progress()?;
             let connection = {
                 let _permit = connection
                     .session
@@ -304,6 +307,7 @@ impl Transfers {
                 )?
             };
             let native = self.accept_native(&request, plan, scope)?;
+            scope.candidate_progress()?;
             if let Some((_, accept, _)) = &native {
                 super::native::attach(&mut head, accept)?;
             }
@@ -437,6 +441,10 @@ impl Transfers {
                     first.get_or_insert(now);
                     last = Some(now);
                     reads = reads.saturating_add(1);
+                    if let Err(error) = scope.candidate_progress() {
+                        record(error, offset, first, last, reads);
+                        return Err(error);
+                    }
                     connection = completion.lease;
                     buffer = completion.buffer;
                 }

@@ -64,11 +64,13 @@ runtime, crypto, peer wire, HTTP, origin, model, topology, and application seams
   copy once rather than adding a redundant decrypt on the serving peer. Local
   disk acquisition still conditionally invalidates its own bad read token.
 - Sequential peer attempts divide remaining time among the remaining candidates,
-  including one local-origin share after predecessor probes. Each attempt uses a
-  fresh cancellation scope and a deadline capped by the original scope and budget.
-  Expiring that share cancels and drains the peer operation before fallback; it
-  never cancels the caller or refunds uncertain attempt/link credits. Expired
-  original deadlines and caller cancellation remain terminal.
+  including one local-origin share after predecessor probes, for a local idle
+  allowance. Credentials and route sign the original scope/budget hard ceiling
+  before sending. Completed checkout and handshake start separate idle phases;
+  header bytes do not renew the alarm. Positive body reads renew only local idle.
+  Idle expiry cancels and drains before fallback, never cancels the caller or
+  refunds uncertain attempt/link credits. Progress, including slow trickle, never
+  extends the signed hard ceiling. Original expiry and cancellation are terminal.
 
 ## Completion and memory ownership
 

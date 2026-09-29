@@ -20,7 +20,17 @@ use std::{
 
 #[test]
 fn progressing_body_diagnostics_success_share_expiry_cancel_and_eof() {
-    for case in ["success", "share", "cancel", "eof"] {
+    body_cases(&["success", "share", "cancel", "eof"]);
+}
+
+#[test]
+fn progressing_body_completes_past_share_stall_and_trickle_are_bounded() {
+    body_cases(&["progress", "stall", "hard", "idle_cancel"]);
+}
+
+fn body_cases(cases: &[&str]) {
+    for &case in cases {
+        let idle = matches!(case, "progress" | "stall" | "hard" | "idle_cancel");
         let telemetry = Telemetry::default();
         let admission = Rc::new(Admission::new(
             crate::test_support::cluster::config(false).limits,
@@ -48,11 +58,18 @@ fn progressing_body_diagnostics_success_share_expiry_cancel_and_eof() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let start = Instant::now();
-        let original = start + Duration::from_secs(3);
+        let original = start
+            + if case == "hard" {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_secs(3)
+            };
+        let fixture_end = start + Duration::from_secs(5);
         let share = start + Duration::from_millis(250);
         let mut local = request(&admission, 9);
-        local.route.deadline = Deadline(share);
-        local.origin.scope.deadline = Deadline(share);
+        let signed_deadline = if idle { original } else { share };
+        local.route.deadline = Deadline(signed_deadline);
+        local.origin.scope.deadline = Deadline(signed_deadline);
         local.operation = Operation::Page {
             page: PageId {
                 version: ObjectVersion {
@@ -65,6 +82,9 @@ fn progressing_body_diagnostics_success_share_expiry_cancel_and_eof() {
         };
         let mut scope = local.origin.scope().clone();
         scope.body_deadlines = Some((original, share));
+        if idle {
+            scope.set_candidate_idle(share - start).unwrap();
+        }
         let auth = Forwarding::new(signers[0].clone());
         let (signed, binding) = auth.sign_request(local).unwrap();
         let server_scope = RequestScope::new(scope.request, original).unwrap();
@@ -82,6 +102,23 @@ fn progressing_body_diagnostics_success_share_expiry_cancel_and_eof() {
             let remote_auth = Forwarding::new(signers[2].clone());
             let req =
                 remote_auth.verify_request(codec(&admission).request(head, &server_scope)?)?;
+            // Wire rounding is sub-millisecond; remote authority is the original
+            // ceiling, established before signing, never a locally extended share.
+            let remote_deadline = req.request().route.deadline.0;
+            assert!(
+                signed_deadline.saturating_duration_since(remote_deadline)
+                    < Duration::from_millis(1)
+            );
+            assert!(remote_deadline <= signed_deadline);
+            assert!(
+                req.request()
+                    .origin
+                    .scope()
+                    .deadline
+                    .0
+                    .saturating_duration_since(remote_deadline)
+                    < Duration::from_millis(1)
+            );
             let Operation::Page { page, .. } = &req.request().operation else {
                 panic!()
             };
@@ -143,13 +180,16 @@ fn progressing_body_diagnostics_success_share_expiry_cancel_and_eof() {
                     .await?;
                 conn = done.lease;
                 sent.set(end);
-                if end == 4096 && case == "cancel" {
+                if end == 4096 && matches!(case, "cancel" | "idle_cancel") {
                     scope.cancel()?;
                 }
                 if end == 4096 && case == "eof" {
                     return Ok::<_, Error>(());
                 }
-                next = Instant::now() + Duration::from_millis(10);
+                if end == 4096 && case == "stall" {
+                    futures::future::pending::<()>().await;
+                }
+                next = Instant::now() + Duration::from_millis(if case == "hard" { 30 } else { 10 });
             }
             Ok::<_, Error>(())
         };
@@ -166,24 +206,28 @@ fn progressing_body_diagnostics_success_share_expiry_cancel_and_eof() {
                 server = Box::pin(futures::future::pending());
             }
             reactor.poll_budgeted(128).unwrap();
-            assert!(Instant::now() < original, "bounded body fixture");
+            assert!(Instant::now() < fixture_end, "bounded body fixture");
             std::thread::sleep(Duration::from_micros(100));
         };
-        if case == "success" {
+        if matches!(case, "success" | "progress") {
             let response = auth.verify_response(result.unwrap(), &binding).unwrap();
             assert!(
                 matches!(response.response(), PeerResponse::Page { ciphertext, .. } if ciphertext.bytes().len() == 8208)
             );
+            if case == "progress" {
+                assert!(Instant::now() > share && Instant::now() < original);
+            }
         } else {
             assert!(
-                matches!(result, Err(e) if e == match case { "share" => Error::DeadlineExceeded, "cancel" => Error::Cancelled, _ => Error::Io })
+                matches!(result, Err(e) if e == match case { "share" | "stall" | "hard" => Error::DeadlineExceeded, "cancel" | "idle_cancel" => Error::Cancelled, _ => Error::Io }),
+                "{case}"
             );
         }
         drop(client);
         drop(server);
         let mut text = String::new();
         telemetry.failures.write(&mut text).unwrap();
-        if case == "success" {
+        if matches!(case, "success" | "progress") {
             assert_eq!(text, "total=0 retained=0 capacity=128\n");
         } else {
             assert!(
@@ -216,8 +260,16 @@ fn progressing_body_diagnostics_success_share_expiry_cancel_and_eof() {
             assert!(field("n=") >= 3);
             assert!(field("f=") < field("l="));
             assert!(field("l=") <= field("now="));
-            assert!(field("now=") < field("orig="));
-            assert_eq!(field("share="), field("sig="));
+            if case == "hard" {
+                assert!(field("now=") >= field("orig="));
+                assert!(field("now=") - field("l=") < 100);
+            } else {
+                assert!(field("now=") < field("orig="));
+            }
+            assert_eq!(field(if idle { "orig=" } else { "share=" }), field("sig="));
+            if case == "stall" {
+                assert!(field("now=") - field("l=") >= 250);
+            }
             if case == "share" {
                 assert!(field("now=") >= field("share="));
                 assert!(field("now=") - field("l=") < 50, "{text}");
@@ -241,7 +293,7 @@ fn progressing_body_diagnostics_success_share_expiry_cancel_and_eof() {
             .is_pending()
         {
             reactor.poll_budgeted(128).unwrap();
-            assert!(Instant::now() < original);
+            assert!(Instant::now() < fixture_end);
         }
         drop(drain);
         drop(io);

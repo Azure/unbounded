@@ -83,7 +83,7 @@ impl PeerClient for Peers {
         assert_eq!(request.route.deadline.0, request.origin.scope().deadline.0);
         assert_eq!(scope.request, request.route.request);
         let (original, share) = scope.body_deadlines.expect("local diagnostic deadlines");
-        assert_eq!(share, scope.deadline.0);
+        assert_eq!(original, scope.deadline.0);
         assert!(original >= share);
         let copy = match &request.operation {
             PeerOperation::Subscribe { mode, .. }
@@ -379,7 +379,7 @@ fn stalled_first_candidate_drains_before_healthy_fallback_without_new_credits() 
         &mut f.budget,
     ));
     assert!(poll(resolve.as_mut()).is_pending());
-    let deadline = f.peers.calls.borrow()[0].scope.deadline.0;
+    let deadline = f.peers.calls.borrow()[0].scope.body_deadlines.unwrap().1;
     assert!(deadline < f.scope.deadline.0);
     assert_eq!(
         f.peers.calls.borrow()[0].scope.body_deadlines,
@@ -428,9 +428,9 @@ fn stalled_predecessors_leave_local_origin_time_and_credit() {
         &mut f.budget,
     ));
     assert!(poll(resolve.as_mut()).is_pending());
-    expire(f.peers.calls.borrow()[0].scope.deadline.0);
+    expire(f.peers.calls.borrow()[0].scope.body_deadlines.unwrap().1);
     assert!(poll(resolve.as_mut()).is_pending());
-    expire(f.peers.calls.borrow()[1].scope.deadline.0);
+    expire(f.peers.calls.borrow()[1].scope.body_deadlines.unwrap().1);
     let Poll::Ready(Ok(CandidateResolution::Origin(authority))) = poll(resolve.as_mut()) else {
         panic!("local origin must retain an opportunity")
     };
@@ -469,7 +469,7 @@ fn remaining_copy_slices_time_for_later_healthy_copy() {
         &mut f.budget,
     ));
     assert!(poll(resolve.as_mut()).is_pending());
-    let deadline = f.peers.calls.borrow()[0].scope.deadline.0;
+    let deadline = f.peers.calls.borrow()[0].scope.body_deadlines.unwrap().1;
     assert!(deadline < f.scope.deadline.0);
     expire(deadline);
     assert!(matches!(poll(resolve.as_mut()), Poll::Ready(Ok(Some(_)))));
@@ -499,7 +499,7 @@ fn exhausted_overall_budget_is_terminal_even_while_parent_scope_is_live() {
         &mut f.budget,
     ));
     assert!(poll(resolve.as_mut()).is_pending());
-    assert!(f.peers.calls.borrow()[0].scope.deadline.0 < overall);
+    assert_eq!(f.peers.calls.borrow()[0].scope.deadline.0, overall);
     expire(overall);
     assert!(matches!(
         poll(resolve.as_mut()),
@@ -526,7 +526,11 @@ fn all_stalled_candidates_stop_at_original_deadline_without_refunding_credits() 
     ));
     for index in 0..3 {
         assert!(poll(resolve.as_mut()).is_pending());
-        let deadline = f.peers.calls.borrow()[index].scope.deadline.0;
+        let deadline = f.peers.calls.borrow()[index]
+            .scope
+            .body_deadlines
+            .unwrap()
+            .1;
         assert!(deadline <= f.scope.deadline.0);
         expire(deadline);
     }
