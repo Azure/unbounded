@@ -1,5 +1,7 @@
 //! Single-node production graph validation. Only control publication, origin data,
 //! and the worker polling loop are fixtures. No read/storage/crypto success doubles.
+#[path = "production/bootstrap.rs"]
+mod bootstrap;
 #[path = "production/bootstrap_pressure.rs"]
 mod bootstrap_pressure;
 #[path = "production/index_pressure.rs"]
@@ -366,6 +368,7 @@ fn adapter_connection(
 }
 
 struct Rig {
+    bootstrap: bootstrap::Bootstrap,
     drivers: Rc<racer_dataplane::read::drivers::DriverQueue>,
     admission: Rc<Admission>,
     reactor: Rc<Reactor>,
@@ -493,8 +496,7 @@ impl Rig {
                 .encode([i as u8 + 7; 32])
                 .into();
         }
-        keys.install(wire::decode_bundle(&serde_json::to_vec(&bundle).unwrap()).unwrap())
-            .unwrap();
+        let sender_keys = bootstrap::identities(&mut bundle, &keys);
         let published = Arc::new(PublishedState::default());
         let snapshots = Rc::new(SnapshotStore::new(
             ClusterId(CLUSTER.into()),
@@ -533,7 +535,7 @@ impl Rig {
             Requester::new(
                 Rc::new(Paths::new(Rc::new(LinkHealth), 64)),
                 Rc::new(Rails),
-                forwarding,
+                forwarding.clone(),
                 transfers,
             )
             .with_network(network),
@@ -615,10 +617,18 @@ impl Rig {
             credentials,
         ));
         let endpoint = RefCell::new(directory.install(worker, coordinator.clone()).unwrap());
+        let bootstrap = bootstrap::Bootstrap::new(
+            sender_keys,
+            forwarding,
+            admission.clone(),
+            coordinator.clone(),
+            snapshot.membership.clone(),
+        );
         let dispatcher = Rc::new(Dispatcher::new(worker, directory, coordinator));
         let client_io = Rc::new(HttpIo::for_clients(reactor.clone(), admission.clone()));
         let responses = Rc::new(Responses::new(client_io.clone(), delivery));
         Self {
+            bootstrap,
             admission,
             drivers: Rc::new(racer_dataplane::read::drivers::DriverQueue::default()),
             reactor,
@@ -969,40 +979,21 @@ fn receive(mut stream: UnixStream, head_only: bool) -> Reply {
     }
 }
 fn check(reply: &Reply, version: u8, start: u64, end: u64, total: u64) {
-    assert_eq!(reply.status, 206);
-    assert_eq!(reply.fields["etag"], format!("\"v{version}\""));
-    assert_eq!(
-        reply.fields["content-range"],
-        format!("bytes {start}-{}/{total}", end - 1)
-    );
-    assert_eq!(reply.body.len() as u64, end - start);
-    for (offset, b) in reply.body.iter().enumerate() {
-        assert_eq!(
-            *b,
-            byte(version, start + offset as u64),
-            "body offset {offset}"
-        );
-    }
+    check_subscription(reply, version, start, end, total);
 }
 
 #[test]
 fn bootstrap_then_pinned_remainder_over_three_pages_and_disk_hits_without_origin() {
     let length = 5 * P + 113;
     let rig = Rig::new(length, false, 10);
-    check(
-        &rig.request("GET", "Range: bytes=0-16777215\r\n"),
-        1,
-        0,
-        P,
-        length,
-    );
+    check(&rig.bootstrap(0xab), 1, 0, P, length);
     let calls = rig.adapter.calls();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].method, "GET");
     assert_eq!(calls[0].pin, None);
     assert_eq!(calls[0].range.as_deref(), Some("bytes=0-16777215"));
     check(
-        &rig.request("GET", &format!("If-Match: \"v1\"\r\nRange: bytes={P}-\r\n")),
+        &rig.subscribe(&format!("If-Match: \"v1\"\r\nRange: bytes={P}-\r\n")),
         1,
         P,
         length,
@@ -1019,7 +1010,7 @@ fn bootstrap_then_pinned_remainder_over_three_pages_and_disk_hits_without_origin
     );
     rig.adapter.offline();
     check(
-        &rig.request("GET", "If-Match: \"v1\"\r\nRange: bytes=0-\r\n"),
+        &rig.subscribe("If-Match: \"v1\"\r\nRange: bytes=0-\r\n"),
         1,
         0,
         length,
@@ -1031,7 +1022,7 @@ fn bootstrap_then_pinned_remainder_over_three_pages_and_disk_hits_without_origin
     );
     assert_eq!(rig.admission.used(ResourceClass::Plaintext), 0);
     check(
-        &rig.request("GET", "If-Match: \"v1\"\r\nRange: bytes=0-\r\n"),
+        &rig.subscribe("If-Match: \"v1\"\r\nRange: bytes=0-\r\n"),
         1,
         0,
         length,
@@ -1047,13 +1038,7 @@ fn bootstrap_then_pinned_remainder_over_three_pages_and_disk_hits_without_origin
 #[test]
 fn zero_ttl_revalidates_fresh_reads_but_retained_pins_survive_metadata_change() {
     let rig = Rig::new(113, true, 6);
-    check(
-        &rig.request("GET", "Range: bytes=0-16777215\r\n"),
-        1,
-        0,
-        113,
-        113,
-    );
+    check(&rig.bootstrap(0xab), 1, 0, 113, 113);
     assert_eq!(rig.adapter.calls().len(), 1);
     assert_eq!(rig.request("HEAD", "").fields["racer-expires-at"], "0");
     assert_eq!(
@@ -1062,18 +1047,12 @@ fn zero_ttl_revalidates_fresh_reads_but_retained_pins_survive_metadata_change() 
         "zero TTL must revalidate unpinned HEAD"
     );
     rig.adapter.state.lock().unwrap().version = 2;
-    check(
-        &rig.request("GET", "Range: bytes=0-16777215\r\n"),
-        2,
-        0,
-        113,
-        113,
-    );
+    check(&rig.bootstrap(0xab), 2, 0, 113, 113);
     assert_eq!(rig.adapter.calls().len(), 3);
     rig.flush();
     rig.adapter.offline();
     check(
-        &rig.request("GET", "If-Match: \"v1\"\r\nRange: bytes=0-\r\n"),
+        &rig.subscribe("If-Match: \"v1\"\r\nRange: bytes=0-\r\n"),
         1,
         0,
         113,
@@ -1094,7 +1073,7 @@ fn zero_ttl_revalidates_fresh_reads_but_retained_pins_survive_metadata_change() 
 fn expired_nonzero_metadata_keeps_old_version_length_and_disk_bytes() {
     let rig = Rig::new(113, false, 6);
     rig.adapter.state.lock().unwrap().expires_at = Some(1);
-    let old = rig.request("GET", "Range: bytes=0-16777215\r\n");
+    let old = rig.bootstrap(0xab);
     check(&old, 1, 0, 113, 113);
     assert_eq!(old.fields["racer-expires-at"], "1");
     rig.flush();
@@ -1127,7 +1106,7 @@ fn expired_nonzero_metadata_keeps_old_version_length_and_disk_bytes() {
     assert_eq!(pinned.fields["etag"], "\"v1\"");
     assert_eq!(pinned.fields["content-length"], "113");
     check(
-        &rig.request("GET", "If-Match: \"v1\"\r\nRange: bytes=-17\r\n"),
+        &rig.subscribe("If-Match: \"v1\"\r\nRange: bytes=-17\r\n"),
         1,
         96,
         113,
@@ -1146,7 +1125,7 @@ fn cold_pinned_range_exceeds_32_pages_under_bounded_memory() {
     assert_eq!(head.fields["etag"], "\"v1\"");
     assert_eq!(head.fields["content-length"], length.to_string());
     check(
-        &rig.request("GET", "If-Match: \"v1\"\r\nRange: bytes=0-\r\n"),
+        &rig.subscribe("If-Match: \"v1\"\r\nRange: bytes=0-\r\n"),
         1,
         0,
         length,
@@ -1179,15 +1158,9 @@ fn cold_pinned_range_exceeds_32_pages_under_bounded_memory() {
 fn dirty_drain_and_byte_pressure_keep_long_range_progressing() {
     let length = 7 * P + 113;
     let rig = Rig::with_dirty_pages(length, false, 4, 2);
+    check(&rig.bootstrap(0xab), 1, 0, P, length);
     check(
-        &rig.request("GET", "Range: bytes=0-16777215\r\n"),
-        1,
-        0,
-        P,
-        length,
-    );
-    check(
-        &rig.request("GET", &format!("If-Match: \"v1\"\r\nRange: bytes={P}-\r\n")),
+        &rig.subscribe(&format!("If-Match: \"v1\"\r\nRange: bytes={P}-\r\n")),
         1,
         P,
         length,
@@ -1207,10 +1180,10 @@ fn dirty_drain_and_byte_pressure_keep_long_range_progressing() {
         let start = page.number.0 * P;
         let end = (start + P).min(length);
         check(
-            &rig.request(
-                "GET",
-                &format!("If-Match: \"v1\"\r\nRange: bytes={start}-{}\r\n", end - 1),
-            ),
+            &rig.subscribe(&format!(
+                "If-Match: \"v1\"\r\nRange: bytes={start}-{}\r\n",
+                end - 1
+            )),
             1,
             start,
             end,
@@ -1224,22 +1197,12 @@ fn dirty_drain_and_byte_pressure_keep_long_range_progressing() {
 fn concurrent_zero_ttl_bootstraps_share_only_the_inflight_cohort() {
     let rig = Rig::new(113, true, 6);
     rig.adapter.state.lock().unwrap().paused = true;
-    let mut servers = Vec::new();
-    let mut readers = Vec::new();
-    for _ in 0..2 {
-        let (local, mut remote) = UnixStream::pair().unwrap();
-        remote
-            .write_all(request("GET", "Range: bytes=0-16777215\r\n").as_bytes())
-            .unwrap();
-        servers.push(local);
-        readers.push(thread::spawn(move || receive(remote, false)));
-    }
     let first = scope();
     let second = scope();
     let mut turns = 0;
     let release = std::future::poll_fn(|_| {
         if !rig.adapter.calls().is_empty() {
-            // Both prewritten requests are polled on every turn while origin
+            // Both signed peer requests are polled on every turn while origin
             // completion is gated, making cohort overlap independent of timing.
             turns += 1;
             if turns == 64 {
@@ -1252,29 +1215,20 @@ fn concurrent_zero_ttl_bootstraps_share_only_the_inflight_cohort() {
     });
     let (a, b, ()) = rig.drive(async {
         futures::join!(
-            rig.serve(servers.remove(0), &first),
-            rig.serve(servers.remove(0), &second),
+            rig.bootstrap.acquire(0xab, &first),
+            rig.bootstrap.acquire(0xab, &second),
             release
         )
     });
-    a.unwrap();
-    b.unwrap();
-    for reader in readers {
-        check(&reader.join().unwrap(), 1, 0, 113, 113);
-    }
+    check(&a.unwrap(), 1, 0, 113, 113);
+    check(&b.unwrap(), 1, 0, 113, 113);
     assert_eq!(
         rig.adapter.calls().len(),
         1,
         "concurrent bootstrap duplicated origin GET"
     );
     rig.adapter.state.lock().unwrap().version = 2;
-    check(
-        &rig.request("GET", "Range: bytes=0-16777215\r\n"),
-        2,
-        0,
-        113,
-        113,
-    );
+    check(&rig.bootstrap(0xab), 2, 0, 113, 113);
     assert_eq!(
         rig.adapter.calls().len(),
         2,
@@ -1286,19 +1240,13 @@ fn concurrent_zero_ttl_bootstraps_share_only_the_inflight_cohort() {
 #[test]
 fn cancel_backpressured_reader_preserves_fast_reader_and_releases_leases() {
     let rig = Rig::new(P, false, 4);
-    check(
-        &rig.request("GET", "Range: bytes=0-16777215\r\n"),
-        1,
-        0,
-        P,
-        P,
-    );
+    check(&rig.bootstrap(0xab), 1, 0, P, P);
     rig.flush();
     rig.adapter.offline();
     let baseline_connections = rig.admission.used(ResourceClass::Connection);
     let (slow_local, mut slow_remote) = UnixStream::pair().unwrap();
     let (fast_local, mut fast_remote) = UnixStream::pair().unwrap();
-    let wire = request("GET", "If-Match: \"v1\"\r\nRange: bytes=0-\r\n");
+    let wire = subscription_request("If-Match: \"v1\"\r\nRange: bytes=0-\r\n");
     slow_remote.write_all(wire.as_bytes()).unwrap();
     fast_remote.write_all(wire.as_bytes()).unwrap();
     let slow_head = Arc::new(AtomicBool::new(false));
@@ -1306,7 +1254,7 @@ fn cancel_backpressured_reader_preserves_fast_reader_and_releases_leases() {
     let slow_reader = thread::spawn(move || {
         slow_remote.set_read_timeout(Some(TIMEOUT)).unwrap();
         let head = read_head(&mut slow_remote).unwrap();
-        assert_eq!(head.split_whitespace().nth(1), Some("206"));
+        assert_eq!(head.split_whitespace().nth(1), Some("200"));
         saw_head.store(true, Ordering::Release);
         // Retain the socket without draining its body until cancellation finishes.
         slow_remote
@@ -1314,7 +1262,7 @@ fn cancel_backpressured_reader_preserves_fast_reader_and_releases_leases() {
     let fast_done = Arc::new(AtomicBool::new(false));
     let done = fast_done.clone();
     let fast_reader = thread::spawn(move || {
-        let reply = receive(fast_remote, false);
+        let reply = receive_subscription(fast_remote);
         done.store(true, Ordering::Release);
         reply
     });
@@ -1366,7 +1314,7 @@ fn cancel_backpressured_reader_preserves_fast_reader_and_releases_leases() {
         "canceled reader retained a page"
     );
     check(
-        &rig.request("GET", "If-Match: \"v1\"\r\nRange: bytes=0-\r\n"),
+        &rig.subscribe("If-Match: \"v1\"\r\nRange: bytes=0-\r\n"),
         1,
         0,
         P,

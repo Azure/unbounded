@@ -17,16 +17,8 @@ fn full_page_writeback_reclaims_idle_ciphertext_at_default_worker_budget() {
     for version in 1..=6 {
         rig.adapter.state.lock().unwrap().version = version;
         let read_scope = scope();
-        let (local, mut remote) = UnixStream::pair().unwrap();
-        let reader = thread::spawn(move || {
-            remote
-                .write_all(request("GET", "Range: bytes=0-16777215\r\n").as_bytes())
-                .unwrap();
-            // receive reads exactly Content-Length and drops the client socket.
-            receive(remote, false)
-        });
-        rig.drive(rig.serve(local, &read_scope)).unwrap();
-        check(&reader.join().unwrap(), version, 0, P, P);
+        let reply = rig.drive(rig.bootstrap.acquire(0xab, &read_scope)).unwrap();
+        check(&reply, version, 0, P, P);
         read_scope.cancel().unwrap();
         rig.flush();
         assert_eq!(rig.writer.pending_count(), 0);
@@ -46,7 +38,7 @@ fn full_page_writeback_reclaims_idle_ciphertext_at_default_worker_budget() {
     rig.memory.evict_idle(usize::MAX).unwrap();
     rig.adapter.offline();
     check(
-        &rig.request("GET", "If-Match: \"v6\"\r\nRange: bytes=0-16777215\r\n"),
+        &rig.subscribe("If-Match: \"v6\"\r\nRange: bytes=0-16777215\r\n"),
         6,
         0,
         P,
@@ -73,13 +65,7 @@ fn writeback_staging_preserves_live_readers_and_recovers_after_release() {
     let mut held = Vec::new();
     for version in 1..=2 {
         rig.adapter.state.lock().unwrap().version = version;
-        check(
-            &rig.request("GET", "Range: bytes=0-16777215\r\n"),
-            version,
-            0,
-            P,
-            P,
-        );
+        check(&rig.bootstrap(0xab), version, 0, P, P);
         rig.flush();
         let entries = rig.writer.index().snapshot().unwrap().entries;
         let (page, _) = entries
@@ -92,13 +78,7 @@ fn writeback_staging_preserves_live_readers_and_recovers_after_release() {
         held.push(rig.memory.get(page).unwrap().unwrap());
     }
     rig.adapter.state.lock().unwrap().version = 3;
-    check(
-        &rig.request("GET", "Range: bytes=0-16777215\r\n"),
-        3,
-        0,
-        P,
-        P,
-    );
+    check(&rig.bootstrap(0xab), 3, 0, P, P);
     rig.flush();
     assert_eq!(
         rig.writer.index().snapshot().unwrap().entries.len(),
@@ -111,13 +91,7 @@ fn writeback_staging_preserves_live_readers_and_recovers_after_release() {
     }
     drop(held);
     rig.adapter.state.lock().unwrap().version = 4;
-    check(
-        &rig.request("GET", "Range: bytes=0-16777215\r\n"),
-        4,
-        0,
-        P,
-        P,
-    );
+    check(&rig.bootstrap(0xab), 4, 0, P, P);
     rig.flush();
     assert!(
         rig.writer
@@ -141,13 +115,7 @@ fn small_versions_keep_persisting_at_index_capacity_and_serve_from_disk_offline(
     rig.writer.index().set_page_capacity(2).unwrap();
     for version in 1..=4 {
         rig.adapter.state.lock().unwrap().version = version;
-        check(
-            &rig.request("GET", "Range: bytes=0-16777215\r\n"),
-            version,
-            0,
-            113,
-            113,
-        );
+        check(&rig.bootstrap(0xab), version, 0, 113, 113);
         rig.flush();
         let entries = rig.writer.index().snapshot().unwrap().entries;
         assert!(entries.len() <= 2);
@@ -169,10 +137,7 @@ fn small_versions_keep_persisting_at_index_capacity_and_serve_from_disk_offline(
     rig.adapter.offline();
     for version in [3, 4] {
         check(
-            &rig.request(
-                "GET",
-                &format!("If-Match: \"v{version}\"\r\nRange: bytes=0-\r\n"),
-            ),
+            &rig.subscribe(&format!("If-Match: \"v{version}\"\r\nRange: bytes=0-\r\n")),
             version,
             0,
             113,

@@ -1,20 +1,7 @@
 use super::*;
 
-fn wire(key: u8) -> String {
-    request("GET", "Range: bytes=0-16777215\r\n")
-        .replace(&"ab".repeat(32), &format!("{key:02x}").repeat(32))
-}
-
-fn sockets(key: u8) -> (UnixStream, thread::JoinHandle<Reply>) {
-    let (local, mut remote) = UnixStream::pair().unwrap();
-    remote.write_all(wire(key).as_bytes()).unwrap();
-    (local, thread::spawn(move || receive(remote, false)))
-}
-
 fn fetch(rig: &Rig, key: u8) -> Reply {
-    let (local, reader) = sockets(key);
-    rig.drive(rig.serve(local, &scope())).unwrap();
-    reader.join().unwrap()
+    rig.bootstrap(key)
 }
 
 fn page(key: u8, version: u8) -> PageId {
@@ -78,9 +65,6 @@ fn bootstrap_preserves_active_reader_and_inflight_admission_until_cancellation()
         state.version = 2;
         state.paused = true;
     }
-    let (pending, mut pending_remote) = UnixStream::pair().unwrap();
-    pending_remote.write_all(wire(2).as_bytes()).unwrap();
-    let (blocked, blocked_reader) = sockets(3);
     let pending_scope = scope();
     let blocked_scope = scope();
     let observer = async {
@@ -96,7 +80,14 @@ fn bootstrap_preserves_active_reader_and_inflight_admission_until_cancellation()
             rig.admission.used(ResourceClass::Plaintext),
             P as usize + 113
         );
-        rig.serve(blocked, &blocked_scope).await.unwrap();
+        assert_eq!(
+            rig.bootstrap
+                .acquire(3, &blocked_scope)
+                .await
+                .unwrap()
+                .status,
+            503
+        );
         assert_eq!(
             rig.adapter.calls().len(),
             2,
@@ -111,10 +102,8 @@ fn bootstrap_preserves_active_reader_and_inflight_admission_until_cancellation()
         pending_scope.cancel().unwrap();
     };
     let (pending_result, ()) =
-        rig.drive(async { futures::join!(rig.serve(pending, &pending_scope), observer) });
-    pending_result.unwrap();
-    assert_eq!(receive(pending_remote, false).status, 503);
-    assert_eq!(blocked_reader.join().unwrap().status, 503);
+        rig.drive(async { futures::join!(rig.bootstrap.acquire(2, &pending_scope), observer) });
+    assert!(matches!(pending_result, Err(Error::Cancelled)));
     rig.drive(std::future::poll_fn(|_| {
         if rig.admission.used(ResourceClass::Plaintext) == 113 {
             Poll::Ready(())
