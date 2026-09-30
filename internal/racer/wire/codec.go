@@ -14,9 +14,6 @@ import (
 	"unicode/utf8"
 )
 
-// Error returns only a protocol code, never input or secret material.
-func (c ErrorCode) Error() string { return string(c) }
-
 // DecodeBootstrap bounds the entire document before allocating decoded state.
 func DecodeBootstrap(r io.Reader) (BootstrapRequest, error) {
 	var v BootstrapRequest
@@ -58,28 +55,6 @@ func DecodeBootstrapResponse(r io.Reader) (BootstrapResponse, error) {
 	}
 
 	return v, nil
-}
-
-// EncodePublication sorts copies of the input collections, never caller state.
-func EncodePublication(v Publication) ([]byte, error) {
-	if err := validatePublication(v, true); err != nil {
-		return nil, err
-	}
-
-	return encode(canonicalPublication(v), MaxPublicationBytes)
-}
-
-func DecodePublication(r io.Reader) (Publication, error) {
-	var v Publication
-	if err := decode(r, MaxPublicationBytes, &v); err != nil {
-		return Publication{}, err
-	}
-
-	if err := validatePublication(v, true); err != nil {
-		return Publication{}, err
-	}
-
-	return canonicalPublication(v), nil
 }
 
 // DecodeRails decodes a Node annotation using the strict JSON contract, bounded
@@ -156,17 +131,6 @@ func EncodeBundle(v KeyringBundle) ([]byte, error) {
 	return encode(raw, MaxBundleBytes)
 }
 
-// NewCacheKey is the only material ingress besides bounded bundle decoding.
-func NewCacheKey(ref CacheKeyRef, state KeyState, material [32]byte) (CacheKey, error) {
-	if !validUUID(string(ref.Cache)) || len(ref.ID) != 16 || (ref.Purpose != PageKey && ref.Purpose != OriginCredentialsKey) || (state != PreparedKey && state != ActiveKey && state != RetiringKey) {
-		return CacheKey{}, InvalidRequest
-	}
-
-	ref.ID = bytes.Clone(ref.ID)
-
-	return CacheKey{Key: ref, State: state, material: material}, nil
-}
-
 func DecodeError(r io.Reader) (ErrorResponse, error) {
 	var v ErrorResponse
 	if err := decode(r, MaxBootstrapBytes, &v); err != nil {
@@ -186,15 +150,6 @@ func EncodeError(v ErrorResponse) ([]byte, error) {
 	}
 
 	return encode(v, MaxBootstrapBytes)
-}
-
-func validError(c ErrorCode) bool {
-	switch c {
-	case InvalidRequest, Unauthenticated, Forbidden, Conflict, TooLarge, UnsupportedVersion, Overloaded, Unavailable:
-		return true
-	default:
-		return false
-	}
 }
 
 // limitedWriter bounds encoder output too, including base64 expansion and escaping.
