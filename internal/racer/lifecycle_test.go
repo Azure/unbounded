@@ -266,6 +266,7 @@ func TestLifecycleRequiresPublicationAndHonorsRequestCancellation(t *testing.T) 
 		if err := <-done; err != nil {
 			t.Fatal(err)
 		}
+
 		require.ErrorIs(t, l.Ready(nil), wire.Unavailable)
 
 		beforeStartup := newLifecycle(r.Publications)
