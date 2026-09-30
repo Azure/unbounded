@@ -938,7 +938,6 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
             health::LinkHealth,
             membership::{Member, Membership},
             paths::Paths,
-            rails::Rails,
         },
     };
     use std::task::{Context, Poll};
@@ -985,7 +984,6 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
     ));
     let requester = requester::Requester::new(
         paths.clone(),
-        Rc::new(Rails),
         Rc::new(Forwarding::new(signers[0].clone())),
         transfers,
     )
@@ -1086,7 +1084,6 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
             health::LinkHealth,
             membership::{Member, Membership},
             paths::Paths,
-            rails::Rails,
         },
     };
     use std::{
@@ -1225,7 +1222,6 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
     let health = paths.link_health();
     let requester = requester::Requester::new(
         paths,
-        Rc::new(Rails),
         Rc::new(Forwarding::new(signers[0].clone())),
         transfers,
     )

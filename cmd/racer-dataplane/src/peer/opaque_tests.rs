@@ -12,7 +12,6 @@ use crate::{
         health::LinkHealth,
         membership::{Member, Membership},
         paths::Paths,
-        rails::Rails,
     },
 };
 use std::{
@@ -136,13 +135,8 @@ fn exchange(
     );
     let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4));
     let requester = Rc::new(
-        requester::Requester::new(
-            paths.clone(),
-            Rc::new(Rails),
-            auth.clone(),
-            transfers.clone(),
-        )
-        .with_network(network.clone()),
+        requester::Requester::new(paths.clone(), auth.clone(), transfers.clone())
+            .with_network(network.clone()),
     );
     let relay = Rc::new(
         relay::Relay::new(paths, auth.clone(), requester, admissions[1].clone())

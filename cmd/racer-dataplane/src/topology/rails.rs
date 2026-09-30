@@ -22,103 +22,98 @@ pub enum TransportPlan {
     Http,
     Rdma { rail: RailId },
 }
-pub struct Rails;
-impl Rails {
-    /// Select from authenticated advertised mappings. Before creating an RDMA
-    /// session, validate each hop's actual hardware with `select_with_local` or
-    /// `local_compatible`; discovery may only veto this plan, never replace it.
-    pub fn select(&self, route: &Route, page: &PageId) -> Result<TransportPlan> {
-        if route.nodes.is_empty()
-            || route.nodes.len() > usize::from(FAILURE_LINKS) + 1
-            || route
-                .nodes
-                .iter()
-                .enumerate()
-                .any(|(i, node)| route.nodes[..i].contains(node))
-        {
-            return Err(Error::InvalidRequest);
-        }
-        let members = route
+/// Select from authenticated advertised mappings. Before creating an RDMA
+/// session, validate each hop's actual hardware with `select_with_local` or
+/// `local_compatible`; discovery may only veto this plan, never replace it.
+pub fn select(route: &Route, page: &PageId) -> Result<TransportPlan> {
+    if route.nodes.is_empty()
+        || route.nodes.len() > usize::from(FAILURE_LINKS) + 1
+        || route
             .nodes
             .iter()
-            .map(|node| route.membership.member(node))
-            .collect::<Result<Vec<_>>>()?;
-        if members
+            .enumerate()
+            .any(|(i, node)| route.nodes[..i].contains(node))
+    {
+        return Err(Error::InvalidRequest);
+    }
+    let members = route
+        .nodes
+        .iter()
+        .map(|node| route.membership.member(node))
+        .collect::<Result<Vec<_>>>()?;
+    if members
+        .iter()
+        .any(|member| !member.alignment_enabled || member.rails.is_empty())
+    {
+        return Ok(TransportPlan::Http);
+    }
+    let domain = route.membership.rail_domain();
+    if domain.is_empty() {
+        return Ok(TransportPlan::Http);
+    }
+    let mut digest = hash::domain(b"racer/rail/v2\0");
+    hash::object(&mut digest, &page.version.object, page.number);
+    let digest = hash::finish(digest);
+    let sample = u64::from_be_bytes(digest[..8].try_into().unwrap());
+    let rail = domain[(sample % domain.len() as u64) as usize];
+    let Some(chosen) = members[0].rails.iter().find(|m| m.rail == rail) else {
+        return Ok(TransportPlan::Http);
+    };
+    if !members[1..].iter().all(|member| {
+        member
+            .rails
             .iter()
-            .any(|member| !member.alignment_enabled || member.rails.is_empty())
-        {
-            return Ok(TransportPlan::Http);
-        }
-        let domain = route.membership.rail_domain();
-        if domain.is_empty() {
-            return Ok(TransportPlan::Http);
-        }
-        let mut digest = hash::domain(b"racer/rail/v2\0");
-        hash::object(&mut digest, &page.version.object, page.number);
-        let digest = hash::finish(digest);
-        let sample = u64::from_be_bytes(digest[..8].try_into().unwrap());
-        let rail = domain[(sample % domain.len() as u64) as usize];
-        let Some(chosen) = members[0].rails.iter().find(|m| m.rail == rail) else {
-            return Ok(TransportPlan::Http);
-        };
-        if !members[1..].iter().all(|member| {
-            member
-                .rails
-                .iter()
-                .any(|m| m.rail == rail && m.fabric == chosen.fabric)
-        }) {
-            return Ok(TransportPlan::Http);
-        }
-        Ok(TransportPlan::Rdma { rail })
+            .any(|m| m.rail == rail && m.fabric == chosen.fabric)
+    }) {
+        return Ok(TransportPlan::Http);
     }
+    Ok(TransportPlan::Rdma { rail })
+}
 
-    pub fn select_with_local(
-        &self,
-        route: &Route,
-        page: &PageId,
-        local: &crate::model::NodeId,
-        discovered: &[RailMapping],
-    ) -> Result<TransportPlan> {
-        let plan = self.select(route, page)?;
-        if self.local_compatible(route, &plan, local, discovered)? {
-            Ok(plan)
-        } else {
-            Ok(TransportPlan::Http)
-        }
+pub fn select_with_local(
+    route: &Route,
+    page: &PageId,
+    local: &crate::model::NodeId,
+    discovered: &[RailMapping],
+) -> Result<TransportPlan> {
+    let plan = select(route, page)?;
+    if local_compatible(route, &plan, local, discovered)? {
+        Ok(plan)
+    } else {
+        Ok(TransportPlan::Http)
     }
+}
 
-    /// All participants must confirm the selected rail before payload admission.
-    /// NUMA IDs are local, so they match hardware locally, not between nodes.
-    pub fn local_compatible(
-        &self,
-        route: &Route,
-        plan: &TransportPlan,
-        local: &crate::model::NodeId,
-        discovered: &[RailMapping],
-    ) -> Result<bool> {
-        if !route.nodes.contains(local) {
-            return Err(Error::IncompatibleMembership);
-        }
-        let member = route.membership.member(local)?;
-        let TransportPlan::Rdma { rail } = plan else {
-            return Ok(true);
-        };
-        if !member.alignment_enabled {
-            return Ok(false);
-        }
-        let Some(published) = member.rails.iter().find(|mapping| mapping.rail == *rail) else {
-            return Ok(false);
-        };
-        let mut matching = discovered.iter().filter(|mapping| mapping.rail == *rail);
-        let Some(hardware) = matching.next() else {
-            return Ok(false);
-        };
-        Ok(matching.next().is_none()
-            && hardware.fabric == published.fabric
-            && published
-                .numa_node
-                .is_none_or(|numa| hardware.numa_node == Some(numa)))
+/// All participants must confirm the selected rail before payload admission.
+/// NUMA IDs are local, so they match hardware locally, not between nodes.
+pub fn local_compatible(
+    route: &Route,
+    plan: &TransportPlan,
+    local: &crate::model::NodeId,
+    discovered: &[RailMapping],
+) -> Result<bool> {
+    if !route.nodes.contains(local) {
+        return Err(Error::IncompatibleMembership);
     }
+    let member = route.membership.member(local)?;
+    let TransportPlan::Rdma { rail } = plan else {
+        return Ok(true);
+    };
+    if !member.alignment_enabled {
+        return Ok(false);
+    }
+    let Some(published) = member.rails.iter().find(|mapping| mapping.rail == *rail) else {
+        return Ok(false);
+    };
+    let mut matching = discovered.iter().filter(|mapping| mapping.rail == *rail);
+    let Some(hardware) = matching.next() else {
+        return Ok(false);
+    };
+    Ok(matching.next().is_none()
+        && hardware.fabric == published.fabric
+        && published
+            .numa_node
+            .is_none_or(|numa| hardware.numa_node == Some(numa)))
 }
 #[cfg(test)]
 mod tests {
@@ -161,7 +156,7 @@ mod tests {
         let route = route(|_| {});
         for (number, rail) in [(0, 2), (1, 7), (u64::MAX, 2)] {
             assert_eq!(
-                Rails.select(&route, &page(number)).unwrap(),
+                select(&route, &page(number)).unwrap(),
                 TransportPlan::Rdma { rail: RailId(rail) }
             );
         }
@@ -197,27 +192,27 @@ mod tests {
                 }
             }),
         ] {
-            assert_eq!(Rails.select(&route, &page(0)).unwrap(), TransportPlan::Http);
+            assert_eq!(select(&route, &page(0)).unwrap(), TransportPlan::Http);
         }
         let full = route(|_| {});
         let partial = route(|m| m[1].rails.retain(|rail| rail.rail == RailId(7)));
         for number in 0..100 {
-            let expected = match Rails.select(&full, &page(number)).unwrap() {
+            let expected = match select(&full, &page(number)).unwrap() {
                 TransportPlan::Rdma { rail: RailId(7) } => TransportPlan::Rdma { rail: RailId(7) },
                 _ => TransportPlan::Http,
             };
-            assert_eq!(Rails.select(&partial, &page(number)).unwrap(), expected);
+            assert_eq!(select(&partial, &page(number)).unwrap(), expected);
             let mut alternate = partial.clone();
             alternate.nodes.remove(1);
             assert_eq!(
-                Rails.select(&alternate, &page(number)).unwrap(),
-                Rails.select(&full, &page(number)).unwrap()
+                select(&alternate, &page(number)).unwrap(),
+                select(&full, &page(number)).unwrap()
             );
             let mut version = page(number);
             version.version.etag = StrongEtag::test_value("\"v2\"");
             assert_eq!(
-                Rails.select(&full, &version).unwrap(),
-                Rails.select(&full, &page(number)).unwrap()
+                select(&full, &version).unwrap(),
+                select(&full, &page(number)).unwrap()
             );
         }
     }
@@ -234,34 +229,28 @@ mod tests {
         reverse.nodes.reverse();
         let mut selected = std::collections::BTreeSet::new();
         for number in 0..100 {
-            let plan = Rails.select(&route, &page(number)).unwrap();
-            assert_eq!(plan, Rails.select(&reverse, &page(number)).unwrap());
+            let plan = select(&route, &page(number)).unwrap();
+            assert_eq!(plan, select(&reverse, &page(number)).unwrap());
             let TransportPlan::Rdma { rail } = plan else {
                 panic!("expected RDMA");
             };
             selected.insert(rail);
             assert_eq!(
-                Rails
-                    .select_with_local(&route, &page(number), &route.nodes[0], &mappings())
-                    .unwrap(),
+                select_with_local(&route, &page(number), &route.nodes[0], &mappings()).unwrap(),
                 plan
             );
             assert_eq!(
-                Rails
-                    .select_with_local(&route, &page(number), &route.nodes[1], &mappings())
-                    .unwrap(),
+                select_with_local(&route, &page(number), &route.nodes[1], &mappings()).unwrap(),
                 TransportPlan::Http
             );
             assert_eq!(
-                Rails
-                    .select_with_local(&route, &page(number), &route.nodes[0], &[])
-                    .unwrap(),
+                select_with_local(&route, &page(number), &route.nodes[0], &[]).unwrap(),
                 TransportPlan::Http
             );
         }
         assert_eq!(selected.len(), 2);
         let mut invalid = route.clone();
         invalid.nodes.push(invalid.nodes[0].clone());
-        assert_eq!(Rails.select(&invalid, &page(0)), Err(Error::InvalidRequest));
+        assert_eq!(select(&invalid, &page(0)), Err(Error::InvalidRequest));
     }
 }

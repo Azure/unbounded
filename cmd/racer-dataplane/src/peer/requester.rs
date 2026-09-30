@@ -8,7 +8,7 @@ use crate::{
     error::{Error, Operation},
     runtime::deadline::RequestScope,
     security::forwarding::Forwarding,
-    topology::{membership::MembershipLease, paths::Paths, rails::Rails},
+    topology::{membership::MembershipLease, paths::Paths, rails},
 };
 use std::rc::Rc;
 pub trait PeerClient {
@@ -74,23 +74,16 @@ pub struct Requester {
     observer: Observer,
     health: Rc<crate::topology::health::LinkHealth>,
     paths: Rc<Paths>,
-    rails: Rc<Rails>,
     forwarding: Rc<Forwarding>,
     transfers: Rc<Transfers>,
     network: Option<Rc<super::PeerNetwork>>,
 }
 impl Requester {
-    pub fn new(
-        paths: Rc<Paths>,
-        rails: Rc<Rails>,
-        forwarding: Rc<Forwarding>,
-        transfers: Rc<Transfers>,
-    ) -> Self {
+    pub fn new(paths: Rc<Paths>, forwarding: Rc<Forwarding>, transfers: Rc<Transfers>) -> Self {
         Self {
             observer: Observer::default(),
             health: paths.link_health(),
             paths,
-            rails,
             forwarding,
             transfers,
             network: None,
@@ -211,7 +204,7 @@ impl Requester {
                 if route.nodes.get(1) != Some(&next) {
                     return Err(Error::Unavailable);
                 }
-                self.rails.select(&route, &page)?
+                rails::select(&route, &page)?
             } else {
                 crate::topology::rails::TransportPlan::Http
             };

@@ -343,7 +343,6 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
     use crate::{
         http::pool::{ConnectionLease, HttpPool},
         peer::requester::PeerClient,
-        topology::rails::Rails,
     };
     struct Local(Rc<Admission>);
     impl server::LocalPageService for Local {
@@ -452,7 +451,6 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
     );
     let requester = requester::Requester::new(
         paths,
-        Rc::new(Rails),
         Rc::new(Forwarding::new(signers[0].clone())),
         transfers,
     )

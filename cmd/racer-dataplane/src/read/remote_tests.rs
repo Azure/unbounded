@@ -33,7 +33,6 @@ use crate::{
         membership::{Member, Membership},
         paths::Paths,
         placement::Placement,
-        rails::Rails,
     },
 };
 use std::{
@@ -511,7 +510,6 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     let requester = Rc::new(
         Requester::new(
             paths,
-            Rc::new(Rails),
             Rc::new(Forwarding::new(a.signatures.clone())),
             transfers,
         )

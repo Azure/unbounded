@@ -53,9 +53,7 @@ use racer_dataplane::{
         eviction::SegmentClock, index::Index, reader::StoreReader, segment::Segments, slab::Slabs,
         writer::StoreWriter,
     },
-    topology::{
-        health::LinkHealth, membership::Member, paths::Paths, placement::Placement, rails::Rails,
-    },
+    topology::{health::LinkHealth, membership::Member, paths::Paths, placement::Placement},
 };
 use std::{
     cell::RefCell,
@@ -530,7 +528,6 @@ impl Rig {
         let peers = Rc::new(
             Requester::new(
                 Rc::new(Paths::new(Rc::new(LinkHealth), 64)),
-                Rc::new(Rails),
                 forwarding.clone(),
                 transfers,
             )

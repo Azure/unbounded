@@ -600,7 +600,6 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
             let requester = Rc::new(
                 crate::peer::requester::Requester::new(
                     Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
-                    Rc::new(crate::topology::rails::Rails),
                     Rc::new(Forwarding::new(signers[i].clone())),
                     transfers,
                 )

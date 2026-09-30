@@ -70,7 +70,7 @@ use crate::{
         writer::StoreWriter,
     },
     telemetry::Telemetry,
-    topology::{health::LinkHealth, paths::Paths, placement::Placement, rails::Rails},
+    topology::{health::LinkHealth, paths::Paths, placement::Placement},
 };
 #[cfg(test)]
 use std::{collections::VecDeque, time::Instant};
@@ -736,7 +736,6 @@ impl WorkerApplication {
             limits.cached_paths.get(),
             config.routing_algorithm,
         ));
-        let rails = Rc::new(Rails);
         let placement = Rc::new(Placement::with_memory_budget(
             limits.cached_rankings.get() * crate::topology::placement::RANKING_BYTES,
         ));
@@ -778,7 +777,7 @@ impl WorkerApplication {
             None => transfers,
         });
         let requester = Rc::new(
-            Requester::new(paths.clone(), rails, forwarding.clone(), transfers.clone())
+            Requester::new(paths.clone(), forwarding.clone(), transfers.clone())
                 .with_network(network.clone())
                 .with_observer(admission.observer()),
         );

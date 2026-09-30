@@ -700,7 +700,7 @@ impl Transfers {
             membership: membership.clone(),
             nodes: path,
         };
-        if crate::topology::rails::Rails.select(&route, &ciphertext.envelope().page)?
+        if crate::topology::rails::select(&route, &ciphertext.envelope().page)?
             != (TransportPlan::Rdma { rail: binding.rail })
             || !rdma.ready(binding.rail)
         {
