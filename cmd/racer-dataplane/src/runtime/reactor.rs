@@ -901,7 +901,13 @@ impl Reactor {
     ) -> Operation<'a, u32> {
         Box::pin(async move {
             if interest == 0
-                || interest & !((libc::POLLIN | libc::POLLOUT | libc::POLLHUP) as u32) != 0
+                || interest
+                    & !((libc::POLLIN
+                        | libc::POLLOUT
+                        | libc::POLLRDHUP
+                        | libc::POLLHUP
+                        | libc::POLLERR) as u32)
+                    != 0
             {
                 return Err(Error::InvalidRequest);
             }

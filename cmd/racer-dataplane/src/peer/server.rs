@@ -403,8 +403,26 @@ impl PeerServer {
                     }
                 }
                 Ok(membership) => {
-                    self.dispatch_verified(request, membership.clone(), &request_scope)
+                    if admitted.is_none()
+                        && request.request().route.destination
+                            != self.network.as_ref().unwrap().local
+                    {
+                        // A listener scope is shared by unrelated connections. Only
+                        // this materialized HTTP transit exchange may be canceled.
+                        let exchange =
+                            RequestScope::new(request_scope.request, request_scope.deadline.0)?;
+                        materialized_exchange(
+                            &self.io,
+                            &received.connection,
+                            &request_scope,
+                            &exchange,
+                            self.dispatch_verified(request, membership.clone(), &exchange),
+                        )
                         .await?
+                    } else {
+                        self.dispatch_verified(request, membership.clone(), &request_scope)
+                            .await?
+                    }
                 }
                 Err(Error::IncompatibleMembership) => self
                     .forwarding
@@ -707,6 +725,64 @@ where
         }
     }
 }
+/// Cancel abandoned transit without dropping downstream work before its CQE fences.
+async fn materialized_exchange<T>(
+    io: &crate::http::io::HttpIo,
+    connection: &crate::http::pool::ConnectionLease,
+    parent: &RequestScope,
+    exchange: &RequestScope,
+    work: impl std::future::Future<Output = crate::error::Result<T>>,
+) -> crate::error::Result<T> {
+    use std::task::Poll;
+    let parent_wake = parent.cancellation.subscribe()?;
+    let watch_scope = RequestScope::new(exchange.request, exchange.deadline.0)?;
+    let socket = connection.socket();
+    let events = (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) as u32;
+    let mut watch = Some(io.reactor().readiness_with_lease(
+        socket.clone(),
+        events,
+        connection.reservation.clone(),
+        &watch_scope,
+    ));
+    let mut work = std::pin::pin!(work);
+    let mut failure = None;
+    let result = std::future::poll_fn(|cx| {
+        parent_wake.register(cx.waker());
+        if let Err(error) = parent.check() {
+            failure.get_or_insert(error);
+        }
+        if let Some(Poll::Ready(result)) = watch.as_mut().map(|watch| watch.as_mut().poll(cx)) {
+            watch = None;
+            match result {
+                Ok(ready) if ready & events != 0 => {
+                    failure.get_or_insert(Error::Cancelled);
+                }
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+                _ => (),
+            }
+        }
+        if socket.peer_read_closed() {
+            failure.get_or_insert(Error::Cancelled);
+        }
+        if failure.is_some() {
+            let _ = exchange.cancel();
+        }
+        work.as_mut().poll(cx)
+    })
+    .await;
+    // Fence the watch before sending a response or reusing the HTTP connection.
+    let _ = watch_scope.cancel();
+    if let Some(watch) = watch {
+        let _ = watch.await;
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => result,
+    }
+}
+
 fn header_scope(
     scope: &RequestScope,
     timeout: Duration,
@@ -793,6 +869,177 @@ mod tests {
             reactor.poll_budgeted(128).unwrap();
             reactor.wait(Duration::from_millis(1)).unwrap();
         }
+    }
+
+    #[test]
+    fn materialized_transit_fin_and_parent_cancel_fence_head_and_body() {
+        use crate::{
+            http::{codec::Codec, io::HttpIo, pool::ConnectionLease},
+            runtime::reactor::Reactor,
+        };
+        use std::net::{Shutdown, TcpListener, TcpStream};
+
+        for body in [false, true] {
+            for cancel_parent in [false, true] {
+                let admission = Rc::new(Admission::new(
+                    crate::test_support::cluster::config(false).limits,
+                ));
+                let reactor = Rc::new(Reactor::new(admission.clone()));
+                reactor.init().unwrap();
+                let io = HttpIo::with_admission(
+                    reactor.clone(),
+                    Codec::new(4096, 4096),
+                    admission.clone(),
+                );
+                let parent = listener_scope();
+                let exchange = RequestScope::new(
+                    RequestId([7; 16]),
+                    parent.deadline.0 - Duration::from_secs(10),
+                )
+                .unwrap();
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let upstream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+                let (socket, _) = listener.accept().unwrap();
+                let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+                let (socket, mut downstream) = UnixStream::pair().unwrap();
+                let downstream_connection =
+                    ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+                if body {
+                    downstream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nx")
+                        .unwrap();
+                }
+                let entered_body = Cell::new(false);
+                let completed = Cell::new(false);
+                let work = async {
+                    let _relay = admission.reserve(None, ResourceClass::Relay, 1)?;
+                    let result = async {
+                        let received = io.receive_head(downstream_connection, &exchange).await?;
+                        entered_body.set(true);
+                        let mut connection = received.connection;
+                        let mut buffer = io.buffer(4)?;
+                        while connection.remaining_body() != Some(0) {
+                            let read = io.read_body(connection, buffer, &exchange).await?;
+                            connection = read.lease;
+                            buffer = read.buffer;
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    completed.set(true);
+                    result
+                };
+                let mut work = Box::pin(materialized_exchange(
+                    &io,
+                    &connection,
+                    &parent,
+                    &exchange,
+                    work,
+                ));
+                drive(
+                    &reactor,
+                    std::future::poll_fn(|_| {
+                        assert!(
+                            poll(work.as_mut()).is_pending(),
+                            "body={body} parent={cancel_parent}"
+                        );
+                        if (!body || entered_body.get()) && reactor.in_flight() >= 2 {
+                            Poll::Ready(())
+                        } else {
+                            Poll::Pending
+                        }
+                    }),
+                );
+                assert_eq!(admission.used(ResourceClass::Relay), 1);
+                let start = Instant::now();
+                if cancel_parent {
+                    parent.cancel().unwrap();
+                } else {
+                    // Real TCP FIN, not Unix full-close/POLLHUP. Keep the read side open.
+                    upstream.shutdown(Shutdown::Write).unwrap();
+                }
+                assert_eq!(drive(&reactor, work.as_mut()), Err(Error::Cancelled));
+                assert!(start.elapsed() < Duration::from_secs(2));
+                assert!(
+                    completed.get(),
+                    "downstream future must run through cleanup"
+                );
+                assert_eq!(reactor.in_flight(), 0, "both IO and watch must be fenced");
+                assert_eq!(admission.used(ResourceClass::Relay), 0);
+                assert_eq!(parent.cancellation.is_cancelled(), cancel_parent);
+                drop(work);
+                downstream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                assert_eq!(downstream.read(&mut [0]).unwrap(), 0);
+                if !cancel_parent {
+                    // A different connection on the same listener still makes progress.
+                    let (socket, mut peer) = UnixStream::pair().unwrap();
+                    let unrelated =
+                        ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+                    peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .unwrap();
+                    drive(&reactor, io.receive_head(unrelated, &parent)).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn materialized_transit_success_fences_watch_before_keepalive() {
+        use crate::{
+            http::{codec::Codec, io::HttpIo, pool::ConnectionLease},
+            runtime::reactor::Reactor,
+        };
+        let admission = Rc::new(Admission::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let reactor = Rc::new(Reactor::new(admission.clone()));
+        reactor.init().unwrap();
+        let io = HttpIo::with_admission(reactor.clone(), Codec::new(4096, 4096), admission.clone());
+        let parent = listener_scope();
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        let mut connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+        for _ in 0..2 {
+            peer.write_all(b"GET / HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            let received = drive(&reactor, io.receive_head(connection, &parent)).unwrap();
+            connection = received.connection;
+            let exchange = RequestScope::new(RequestId([7; 16]), parent.deadline.0).unwrap();
+            let mut pending_once = true;
+            let work = std::future::poll_fn(|cx| {
+                if pending_once {
+                    pending_once = false;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                } else {
+                    Poll::Ready(Ok(42))
+                }
+            });
+            assert_eq!(
+                drive(
+                    &reactor,
+                    materialized_exchange(&io, &connection, &parent, &exchange, work)
+                ),
+                Ok(42)
+            );
+            assert_eq!(reactor.in_flight(), 0);
+            assert_eq!(exchange.check(), Ok(()));
+            let head = Codec::new(4096, 4096)
+                .decode_head(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .unwrap()
+                .unwrap()
+                .0;
+            connection = drive(&reactor, io.send_head(connection, head, &parent))
+                .unwrap()
+                .connection;
+            connection.finish_exchange().unwrap();
+            assert!(connection.is_reusable());
+            peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let mut response = [0; 128];
+            assert!(peer.read(&mut response).unwrap() > 0);
+        }
+        assert_eq!(parent.check(), Ok(()));
     }
 
     #[test]
