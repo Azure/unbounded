@@ -14,6 +14,13 @@ stable SHA-256-derived per-node phase. Initial bootstrap and every DP startup
 still fetch directly from the API; startup still invokes locked `Host.tick`.
 The unchanged launcher nonce/node request cannot select the readiness path.
 
+Deadline-aware refresh also schedules before the conservative kernel expiry
+`valid_until - 6`, advancing by a stable per-node 3-8s spread. An unchanged
+near-expiry API authority retries on a bounded 2-4s delay (or the next normal
+phase), not a past-deadline busy loop. Healthy authority retains the normal10s
+phase and API cost. These are scheduling targets, not a guarantee against slow
+operations: all original expiry and fail-closed checks remain unchanged.
+
 Readiness sends the distinct `{"ready": node}` request on the same private root
 UDS. The server revalidates its in-memory CM authority, source UID, pinned node
 UID/IP, current boot, sequence/content/expiry, exact live rules and1511 peer set,

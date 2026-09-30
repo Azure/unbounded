@@ -134,6 +134,16 @@ def next_poll_at(node, now):
     return (int((now - phase) // POLL_SECONDS) + 1) * POLL_SECONDS + phase
 
 
+def next_refresh_at(node, now, wall, proof):
+    # E-6 is the conservative earliest kernel expiry, not fresh authority.
+    # Stagger the advance by 3-8s across nodes. If the API keeps selecting the
+    # same near-expiry authority, retry after 2-4s (or the next normal phase),
+    # never a past deadline.
+    phase = next_poll_at(node, 0) / POLL_SECONDS
+    deadline = now + proof["valid_until"] - 6 - wall - (3 + 5 * phase)
+    return min(next_poll_at(node, now), max(now + 2 + 2 * phase, deadline))
+
+
 def pinned(policy, cm, node, own):
     c.require(cm["metadata"]["uid"] == policy["sourceUID"], "source CM recreated")
     c.require(set(policy["denyNodes"]) == c.DENY11, "DENY11 drift")
@@ -155,6 +165,7 @@ def reconcile(api, host, policy, node, cache=None, diagnostic=None):
     proof = host.tick(cm, node, uid)
     if cache is not None:
         cache.update(cm=cm, proof=dict(proof), observed=observed, observed_wall=observed_wall)
+        cache["refresh_at"] = next_refresh_at(node, time.monotonic(), host.clock(), proof)
         diagnostic.observed, diagnostic.observed_wall = observed, observed_wall
     return proof
 
@@ -263,7 +274,7 @@ def main():
             try:
                 signal.alarm(25)
                 diagnostic.mark("poll")
-                if time.monotonic() >= next_poll:
+                if time.monotonic() >= min(next_poll, cache.get("refresh_at", float("inf"))):
                     next_poll = next_poll_at(node, time.monotonic())
                     if not initialized:
                         diagnostic.mark("bootstrap-get")
@@ -275,6 +286,8 @@ def main():
                     next_poll = next_poll_at(node, time.monotonic())
                 try:
                     diagnostic.mark("accept")
+                    due = min(next_poll, cache.get("refresh_at", float("inf")))
+                    listener.settimeout(max(0.001, min(1, due - time.monotonic())))
                     connection, _ = listener.accept()
                 except socket.timeout:
                     continue
