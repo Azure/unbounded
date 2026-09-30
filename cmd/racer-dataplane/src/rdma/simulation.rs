@@ -1252,6 +1252,8 @@ mod tests {
             assert!(activation.as_mut().poll(&mut cx).is_pending());
             // Discovery still selects this service's node after its scope has exited.
             native.poll_budgeted(1).unwrap();
+            assert!(activation.as_mut().poll(&mut cx).is_pending());
+            native.poll_budgeted(1).unwrap();
             assert!(matches!(
                 activation.as_mut().poll(&mut cx),
                 Poll::Ready(Ok(_))

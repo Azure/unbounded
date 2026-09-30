@@ -380,7 +380,8 @@ impl CryptoService for PageCryptoEngine {
     fn drain<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
         Box::pin(futures::future::poll_fn(move |cx| {
             // Deadline never drops accepted owners; canceled jobs become failures.
-            if let Err(error) = self.drive(cx, 8) {
+            // Match the shared executor's one-page turn during teardown too.
+            if let Err(error) = self.drive(cx, 1) {
                 return Poll::Ready(Err(error));
             }
             if self.closed && self.pending.is_none() {
@@ -1086,7 +1087,6 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_secs(10),
         )
         .unwrap();
-        scope.cancel().unwrap();
         let (io, port) = pair(WorkerId(0), 1, std::num::NonZeroUsize::new(9).unwrap());
         let wake = Arc::new(WakeCount(AtomicUsize::new(0)));
         let waker = std::task::Waker::from(wake.clone());
@@ -1096,6 +1096,22 @@ mod tests {
         // Budget polling's noop task waker must not replace the runtime driver.
         engine.poll_budgeted(1).unwrap();
         for sequence in 1..=9 {
+            let job_scope =
+                RequestScope::new(RequestId([sequence as u8; 16]), scope.deadline.0).unwrap();
+            if sequence % 3 == 2 {
+                job_scope.cancel().unwrap();
+            }
+            let mut bytes = b"hello".to_vec();
+            XChaCha20Poly1305::new((&[7; 32]).into())
+                .encrypt_in_place(
+                    (&descriptor.nonce.0).into(),
+                    &page_aad(&descriptor).unwrap(),
+                    &mut bytes,
+                )
+                .unwrap();
+            if sequence % 3 == 0 {
+                bytes[0] ^= 1;
+            }
             let Poll::Ready(Ok(permit)) = io.poll_reserve(
                 &mut cx,
                 CryptoId {
@@ -1110,7 +1126,7 @@ mod tests {
                 inner: Arc::new(CiphertextBytes {
                     checksum: std::sync::OnceLock::new(),
                     envelope: descriptor.clone(),
-                    bytes: vec![0; 21],
+                    bytes,
                     reservation: admission
                         .reserve(Some(cache), ResourceClass::Ciphertext, 21)
                         .unwrap(),
@@ -1126,7 +1142,7 @@ mod tests {
                 io.try_submit(permit.job(
                     input,
                     keys.active(cache, KeyPurpose::Page).unwrap(),
-                    scope.clone()
+                    job_scope
                 ))
                 .is_ok()
             );
@@ -1134,15 +1150,38 @@ mod tests {
         io.close_submissions().unwrap();
         assert!(wake.0.swap(0, Ordering::SeqCst) > 0);
         let mut drain = engine.drain(&scope);
-        assert!(drain.as_mut().poll(&mut cx).is_pending());
-        assert!(wake.0.load(Ordering::SeqCst) > 0);
-        assert!(matches!(drain.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
-        for _ in 0..9 {
-            assert!(matches!(
-                io.poll_completion(&mut cx),
-                Poll::Ready(Ok(Some(_)))
-            ));
+        for sequence in 1..=9 {
+            assert!(drain.as_mut().poll(&mut cx).is_pending());
+            assert!(wake.0.swap(0, Ordering::SeqCst) > 0);
+            let Poll::Ready(Ok(Some(completion))) = io.poll_completion(&mut cx) else {
+                panic!("one completion per drain poll");
+            };
+            assert_eq!(completion.id().sequence, sequence);
+            match &completion.outcome {
+                CryptoOutcome::Completed(CryptoOutput::Decrypted(clear, _)) => {
+                    assert_eq!(sequence % 3, 1);
+                    assert_eq!(clear.bytes(), b"hello");
+                }
+                CryptoOutcome::Failed { error, .. } => {
+                    assert_eq!(
+                        *error,
+                        if sequence % 3 == 2 {
+                            Error::Cancelled
+                        } else {
+                            Error::CorruptRecord
+                        }
+                    );
+                }
+                _ => panic!("unexpected drain completion"),
+            }
+            assert!(io.poll_completion(&mut cx).is_pending());
+            drop(completion);
+            assert_eq!(
+                admission.used(ResourceClass::Plaintext),
+                (9 - sequence) as usize * 5
+            );
         }
+        assert!(matches!(drain.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
         assert_eq!(admission.used(ResourceClass::Plaintext), 0);
     }
 }

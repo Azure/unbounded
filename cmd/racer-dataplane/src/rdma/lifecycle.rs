@@ -244,12 +244,20 @@ struct Resource {
     stopping: bool,
     next_retry: Option<std::time::Instant>,
 }
+struct Activation {
+    devices: Vec<Rc<backend::DeviceHandle>>,
+    selected: Vec<(RailMapping, usize)>,
+    quotas: std::vec::IntoIter<Reservation>,
+    bytes: usize,
+    next: usize,
+}
 /// Construct only inside build_crypto, after its NativePort crossed threads.
 /// Rc native owners never cross threads, even during cancellation or shutdown.
 pub struct NativeService {
     environment: crate::runtime::environment::Environment,
     port: NativePort,
     resources: Vec<Option<Resource>>,
+    activation: Option<Activation>,
     cursor: usize,
     #[cfg(test)]
     simulation: Option<simulation::Simulation>,
@@ -261,6 +269,7 @@ impl NativeService {
             environment: crate::runtime::environment::Environment::current(),
             port,
             resources,
+            activation: None,
             cursor: 0,
             #[cfg(test)]
             simulation: simulation::current(),
@@ -269,14 +278,14 @@ impl NativeService {
     pub fn register_driver(&self, waker: &Waker) {
         self.port.shared.engine.register(waker);
     }
-    fn activate(&mut self, config: Configuration) -> Result<Vec<RailMapping>> {
+    fn begin_activation(&mut self, config: Configuration) -> Result<Option<Vec<RailMapping>>> {
         #[cfg(test)]
         let _environment = self.simulation.as_ref().map(simulation::Simulation::enter);
         if self.port.shared.closed.load(Ordering::Acquire) {
             return Err(Error::Unavailable);
         }
         if config.publication.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         }
         let discovered = backend::Verbs.discover()?;
         let descriptions = discovered
@@ -285,84 +294,120 @@ impl NativeService {
             .collect::<Result<Vec<_>>>()?;
         let selected = match_publication(&config.publication, &config.associations, &descriptions)?;
         if selected.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         }
         if selected.len() > self.resources.len() {
             return Err(Error::Overloaded);
         }
-        let devices: Vec<_> = discovered.into_iter().map(Rc::new).collect();
-        // Build into temporary owners so partial startup cannot publish readiness.
-        let mut provisioned = Vec::new();
-        for (i, quota) in config.quotas.into_iter().enumerate() {
-            let (rail, index) = &selected[i % selected.len()];
-            let device = devices[*index].clone();
-            let quota = Arc::new(quota);
-            let region =
-                backend::Region::new(device.clone(), config.bytes, Box::new(quota.clone()))?;
-            let qp = backend::QueuePairHandle::new(device.clone())?;
-            qp.probe_window()?;
-            let mut bytes = Vec::new();
-            bytes
-                .try_reserve_exact(config.bytes)
-                .map_err(|_| Error::Overloaded)?;
-            bytes.resize(config.bytes, 0);
-            provisioned.push((
-                rail.clone(),
-                Resource {
-                    device,
-                    region,
-                    qp: Some(qp),
-                    window: None,
-                    pending: None,
-                    stopping: false,
-                    next_retry: None,
-                },
-                bytes,
-                quota,
-            ));
+        self.activation = Some(Activation {
+            devices: discovered.into_iter().map(Rc::new).collect(),
+            selected,
+            quotas: config.quotas.into_iter(),
+            bytes: config.bytes,
+            next: 0,
+        });
+        Ok(None)
+    }
+    fn activate_slot(&mut self) -> Result<Option<Vec<RailMapping>>> {
+        if self.port.shared.closed.load(Ordering::Acquire) {
+            return Err(Error::Unavailable);
         }
-        let ready = selected
-            .iter()
-            .map(|(mapping, _)| mapping.clone())
-            .collect();
-        for (i, (rail, resource, bytes, quota)) in provisioned.into_iter().enumerate() {
-            let slot = &self.port.shared.slots[i];
-            let mut mailbox = slot.mailbox.lock().map_err(|_| Error::Io)?;
-            mailbox.rail = rail.rail;
-            mailbox.endpoint = Some(resource.qp.as_ref().unwrap().endpoint);
-            mailbox.bytes = bytes;
-            mailbox.quota = Some(quota);
-            self.resources[i] = Some(resource);
+        let activation = self.activation.as_mut().unwrap();
+        let i = activation.next;
+        let slot = &self.port.shared.slots[i];
+        let mut mailbox = match slot.mailbox.try_lock() {
+            Ok(mailbox) => mailbox,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::Io),
+        };
+        let (rail, index) = &activation.selected[i % activation.selected.len()];
+        let device = activation.devices[*index].clone();
+        let quota = Arc::new(
+            activation
+                .quotas
+                .next()
+                .ok_or(Error::InvalidConfiguration)?,
+        );
+        // Retain a quota observer even if registration/destruction fails. Partial
+        // resources stay IDLE and are fenced by the normal close/retry path when
+        // the I/O activation guard observes an error or is canceled/dropped.
+        mailbox.quota = Some(quota.clone());
+        mailbox
+            .bytes
+            .try_reserve_exact(activation.bytes)
+            .map_err(|_| Error::Overloaded)?;
+        mailbox.bytes.resize(activation.bytes, 0);
+        let region = backend::Region::new(device.clone(), activation.bytes, Box::new(quota))?;
+        self.resources[i] = Some(Resource {
+            device: device.clone(),
+            region,
+            qp: None,
+            window: None,
+            pending: None,
+            stopping: false,
+            next_retry: None,
+        });
+        let resource = self.resources[i].as_mut().unwrap();
+        resource.qp = Some(backend::QueuePairHandle::new(device)?);
+        let qp = resource.qp.as_ref().unwrap();
+        qp.probe_window()?;
+        mailbox.rail = rail.rail;
+        mailbox.endpoint = Some(qp.endpoint);
+        activation.next += 1;
+        if activation.next != self.resources.len() {
+            return Ok(None);
+        }
+        // No native work in this publication pass. No slot is claimable until
+        // every slot has successfully provisioned, and I/O awaits the result.
+        for slot in &self.port.shared.slots {
             slot.state.store(READY, Ordering::Release);
         }
-        Ok(ready)
+        Ok(Some(
+            activation
+                .selected
+                .iter()
+                .map(|(rail, _)| rail.clone())
+                .collect(),
+        ))
     }
-    /// Run at most budget slots. Each slot may execute one native syscall/job.
-    /// Calls may block this crypto role, but cannot block the paired I/O reactor.
+    /// Run at most budget steps: discovery, one slot's provisioning, or one slot's
+    /// normal progress/fence. Native provider calls (including discovery's bounded
+    /// port scan) cannot be preempted. This is a work bound, not a wall-time bound;
+    /// a provider may stall all siblings on this crypto thread, but not their I/O.
     pub fn poll_budgeted(&mut self, budget: usize) -> Result<()> {
         let _environment = self.environment.enter();
         if budget == 0 {
             return Ok(());
         }
-        let config = self
-            .port
-            .shared
-            .config
-            .lock()
-            .map_err(|_| Error::Io)?
-            .take();
-        if let Some(config) = config {
-            let result = self.activate(config);
-            *self.port.shared.activation.lock().map_err(|_| Error::Io)? = Some(result);
-            self.port.shared.io.wake();
-        }
         for _ in 0..budget.min(self.resources.len()) {
+            let result = if self.activation.is_some() {
+                Some(self.activate_slot())
+            } else {
+                let config = self
+                    .port
+                    .shared
+                    .config
+                    .lock()
+                    .map_err(|_| Error::Io)?
+                    .take();
+                config.map(|config| self.begin_activation(config))
+            };
+            if let Some(result) = result {
+                if !matches!(result, Ok(None)) {
+                    self.activation = None;
+                    *self.port.shared.activation.lock().map_err(|_| Error::Io)? =
+                        Some(result.map(|ready| ready.unwrap()));
+                    self.port.shared.io.wake();
+                }
+                continue;
+            }
             let index = self.cursor;
             self.cursor = (self.cursor + 1) % self.resources.len();
             self.drive(index);
         }
         if !self.port.shared.drained.load(Ordering::Acquire)
             && self.port.shared.closed.load(Ordering::Acquire)
+            && self.activation.is_none()
             && self.resources.iter().all(Option::is_none)
         {
             let mut drained = true;
@@ -549,7 +594,14 @@ impl NativeService {
         self.port.shared.io.wake();
     }
     pub fn drained(&self) -> bool {
-        self.resources.iter().all(Option::is_none)
+        self.activation.is_none()
+            && self
+                .port
+                .shared
+                .config
+                .lock()
+                .is_ok_and(|config| config.is_none())
+            && self.resources.iter().all(Option::is_none)
     }
 }
 impl Drop for NativeService {
@@ -601,7 +653,7 @@ impl<S: CryptoService> CryptoService for WithNative<S> {
             self.native.close();
             futures::future::poll_fn(|cx| {
                 self.native.register_driver(cx.waker());
-                self.native.poll_budgeted(32)?;
+                self.native.poll_budgeted(1)?;
                 if self.native.drained() {
                     std::task::Poll::Ready(Ok(()))
                 } else {
@@ -626,6 +678,10 @@ mod receive_tests;
 #[cfg(test)]
 #[path = "mailbox_tests.rs"]
 mod mailbox_tests;
+
+#[cfg(test)]
+#[path = "activation_tests.rs"]
+mod activation_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1048,6 +1104,8 @@ mod tests {
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(activate.as_mut().poll(&mut cx).is_pending());
         native.poll_budgeted(2).unwrap();
+        assert!(activate.as_mut().poll(&mut cx).is_pending());
+        native.poll_budgeted(1).unwrap();
         assert!(matches!(
             activate.as_mut().poll(&mut cx),
             std::task::Poll::Ready(Ok(_))
