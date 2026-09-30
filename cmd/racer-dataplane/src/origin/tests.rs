@@ -604,7 +604,10 @@ fn real_uds_bootstrap_head_and_pinned_page_reuse_without_context_retention() {
     let scope = scope();
     let reply = drive(&reactor, client.bootstrap_at(&endpoint, &context, &scope)).unwrap();
     assert_eq!(reply.metadata.expires_at.to_unix_millis().unwrap(), 1234);
-    assert_eq!(reply.metadata.content_type.as_ref().unwrap().as_str(), "text/plain");
+    assert_eq!(
+        reply.metadata.content_type.as_ref().unwrap().as_str(),
+        "text/plain"
+    );
     assert_eq!(
         reply.page_zero.as_ref().unwrap().plaintext.bytes().unwrap(),
         b"abc"
@@ -617,23 +620,95 @@ fn real_uds_bootstrap_head_and_pinned_page_reuse_without_context_retention() {
     context.authorization = None;
     context.metadata = None;
     let head = drive(
-            &reactor,
-            client.metadata_at(
-                &endpoint,
-                &context,
-                MetadataSelector::Pinned(page.version.etag.clone()),
-                &scope
-            )
-        ).unwrap();
+        &reactor,
+        client.metadata_at(
+            &endpoint,
+            &context,
+            MetadataSelector::Pinned(page.version.etag.clone()),
+            &scope,
+        ),
+    )
+    .unwrap();
     assert_eq!(head.metadata.length, 3);
-    assert_eq!(head.metadata.content_type.as_ref().unwrap().as_str(), "text/plain");
-    assert_eq!(admission.used(ResourceClass::Plaintext), 0, "HEAD must not allocate a body");
+    assert_eq!(
+        head.metadata.content_type.as_ref().unwrap().as_str(),
+        "text/plain"
+    );
+    assert_eq!(
+        admission.used(ResourceClass::Plaintext),
+        0,
+        "HEAD must not allocate a body"
+    );
     let received = drive(&reactor, client.page_at(&endpoint, &context, &page, &scope)).unwrap();
     assert_eq!(received.plaintext.bytes().unwrap(), b"abc");
-    assert_eq!(received.metadata.content_type.as_ref().unwrap().as_str(), "text/plain");
+    assert_eq!(
+        received.metadata.content_type.as_ref().unwrap().as_str(),
+        "text/plain"
+    );
     drop(received);
     assert_eq!(admission.used(ResourceClass::Plaintext), 0);
     client.pool.close();
+    assert_eq!(admission.used(ResourceClass::Connection), 0);
+    server.join().unwrap();
+}
+
+#[test]
+fn real_uds_head_progresses_when_page_plaintext_budget_is_exhausted() {
+    let (_path, listener, endpoint) = listen();
+    let (client, admission, reactor) = client();
+    let context = context();
+    let scope = scope();
+    let held = admission
+        .reserve(
+            Some(&context.object.cache),
+            ResourceClass::Plaintext,
+            admission.limits().plaintext_bytes.get(),
+        )
+        .unwrap();
+    let page = PageId {
+        version: crate::model::identity::ObjectVersion {
+            object: context.object.clone(),
+            etag: StrongEtag::parse(b"\"v\"").unwrap(),
+        },
+        number: PageNumber(0),
+    };
+    assert!(matches!(
+        block_on(client.bootstrap_at(&endpoint, &context, &scope)),
+        Err(Error::Overloaded)
+    ));
+    assert!(matches!(
+        block_on(client.page_at(&endpoint, &context, &page, &scope)),
+        Err(Error::Overloaded)
+    ));
+    assert_eq!(admission.used(ResourceClass::Connection), 0);
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    let server = thread::spawn(move || {
+        let mut stream = accept(&listener);
+        check_request(&receive(&mut stream), "HEAD", Some(b"\"v\""), None, true);
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nETag: \"v\"\r\nRacer-Expires-At: 1234\r\n\r\n").unwrap();
+    });
+    let reply = drive(
+        &reactor,
+        client.metadata_at(
+            &endpoint,
+            &context,
+            MetadataSelector::Pinned(page.version.etag.clone()),
+            &scope,
+        ),
+    )
+    .unwrap();
+    assert_eq!(reply.metadata.version, page.version);
+    assert_eq!(reply.metadata.length, 3);
+    assert!(reply.page_zero.is_none());
+    assert_eq!(
+        admission.used(ResourceClass::Plaintext),
+        admission.limits().plaintext_bytes.get()
+    );
+    drop(held);
+    client.pool.close();
+    assert_eq!(admission.used(ResourceClass::Plaintext), 0);
     assert_eq!(admission.used(ResourceClass::Connection), 0);
     server.join().unwrap();
 }
@@ -886,7 +961,10 @@ fn real_uds_bounds_raw_heads_even_with_a_larger_shared_codec() {
         ),
         Err(Error::BadGateway)
     ));
-    assert_eq!(admission.used(ResourceClass::RequestContext), infrastructure_bytes + client.io.retained_buffer_bytes());
+    assert_eq!(
+        admission.used(ResourceClass::RequestContext),
+        infrastructure_bytes + client.io.retained_buffer_bytes()
+    );
     assert_eq!(admission.used(ResourceClass::Connection), 0);
     server.join().unwrap();
 }
