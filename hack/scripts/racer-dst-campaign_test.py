@@ -85,20 +85,36 @@ class CampaignTests(unittest.TestCase):
 
     def test_build_once_and_discovery_requires_both_oracles(self):
         runner = FakeRunner()
-        artifact = json.dumps({"reason": "compiler-artifact", "profile": {"test": True},
-                               "executable": "binary"})
+        temp = tempfile.TemporaryDirectory(dir=ROOT / "tmp")
+        self.addCleanup(temp.cleanup)
+        runner.directory = Path(temp.name)
+
+        def build(command, environment, label, limit=None):
+            if label != "build":
+                return listing
+            target = command[command.index("--target-dir") + 1]
+            self.assertEqual(environment["CARGO_TARGET_DIR"], target)
+            artifact = Path(target) / "binary"
+            artifact.write_text("fake executable")
+            return json.dumps({"reason": "compiler-artifact", "profile": {"test": True},
+                               "executable": str(artifact)})
+
         listing = "\n".join(name + ": test" for name in ["regression_dst", *MODULE.GENERATED])
-        with patch.object(runner, "run", side_effect=[artifact, listing]) as run:
-            tests, binary = MODULE.discover(runner, ["cargo"], "target", {})
-        self.assertEqual(binary, "binary")
+        target = runner.directory / "target"
+        with patch.object(runner, "run", side_effect=build) as run:
+            tests, binary = MODULE.discover(runner, ["cargo"], target, {"CARGO_TARGET_DIR": "shared"})
+        self.assertEqual(Path(binary).parent, runner.directory / "executables")
         self.assertEqual(len(tests), 3)
         self.assertEqual(run.call_count, 2)
         self.assertIn("--no-run", run.call_args_list[0].args[0])
         self.assertEqual(run.call_args_list[0].kwargs["limit"], 300)
-        for output in ["", MODULE.GENERATED[0] + ": test"]:
-            with patch.object(runner, "run", side_effect=[artifact, output]), \
+        for index, output in enumerate(["", MODULE.GENERATED[0] + ": test"]):
+            listing = output
+            runner.directory = Path(temp.name) / str(index)
+            runner.directory.mkdir()
+            with patch.object(runner, "run", side_effect=build), \
                     self.assertRaisesRegex(MODULE.Failure, "both generated"):
-                MODULE.discover(runner, ["cargo"], "target", {})
+                MODULE.discover(runner, ["cargo"], target, {})
 
     def test_rejects_invalid_configuration(self):
         for option in ["--seconds", "--case-timeout"]:
@@ -133,6 +149,57 @@ class CommandTests(unittest.TestCase):
 
     def command(self, source):
         return self.runner.run([sys.executable, "-c", source], self.environment, "fake")
+
+    def test_discovery_freezes_artifact_before_listing_and_survives_replacement(self):
+        original_run = self.runner.run
+        artifacts = []
+        target = Path(self.temp.name) / "target"
+
+        def fake_build(command, environment, label, limit=None):
+            if label != "build":
+                # Delete the Cargo output before even listing tests: discovery
+                # and every later invocation must already use the snapshot.
+                artifacts[0].unlink()
+                return original_run(command, environment, label, limit)
+            private = Path(command[command.index("--target-dir") + 1])
+            self.assertEqual(environment["CARGO_TARGET_DIR"], str(private))
+            self.assertEqual(private.parent, target)
+            self.assertNotEqual(private, target)
+            artifact = private / "fake-test"
+            listing = "\n".join(name + ": test" for name in MODULE.GENERATED)
+            artifact.write_text(f"#!{sys.executable}\nimport sys\n"
+                                f"print({listing!r} if '--list' in sys.argv else "
+                                "'test result: ok. 2 passed; 0 failed; 0 ignored;')\n")
+            artifact.chmod(0o755)
+            artifacts.append(artifact)
+            return json.dumps({"reason": "compiler-artifact", "profile": {"test": True},
+                               "executable": str(artifact)})
+
+        with patch.object(self.runner, "run", side_effect=fake_build):
+            tests, binary = MODULE.discover(self.runner, ["cargo"], target,
+                                            dict(self.environment, CARGO_TARGET_DIR="shared"))
+        frozen = Path(binary)
+        self.assertEqual({executable for executable, _ in tests}, {binary})
+        artifacts[0].write_text("replacement would fail if executed")
+        MODULE.run_tests(self.runner, binary, MODULE.GENERATED, self.environment, "replaced")
+        artifacts[0].unlink()
+        MODULE.run_tests(self.runner, binary, MODULE.GENERATED, self.environment, "deleted")
+        self.assertTrue(frozen.is_file())
+        self.assertEqual(frozen.stat().st_mode & 0o777, 0o555)
+        progress = self.runner.progress.read_text()
+        for line in progress.splitlines():
+            if "reproduce:" in line:
+                self.assertIn(binary, line)
+                self.assertNotIn(str(artifacts[0]), line)
+
+    def test_artifact_outside_private_build_is_rejected(self):
+        artifact = Path(self.temp.name) / "shared-test"
+        artifact.write_text("shared")
+        output = json.dumps({"reason": "compiler-artifact", "profile": {"test": True},
+                             "executable": str(artifact)})
+        with patch.object(self.runner, "run", return_value=output), \
+                self.assertRaisesRegex(MODULE.Failure, "outside private target"):
+            MODULE.discover(self.runner, ["cargo"], Path(self.temp.name) / "target", {})
 
     def test_success_preserves_logs_and_reproduction(self):
         self.assertEqual(self.command("print('fake success')"), "fake success\n")

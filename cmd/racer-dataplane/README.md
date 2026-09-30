@@ -211,6 +211,23 @@ make racer-dataplane-dst-10m
 This requires Python 3.9+ and GNU `timeout`, in addition to the normal Rust and
 cgroup requirements below. The target builds the all-feature library/binary test
 executables once with two Cargo jobs, inside the mandatory 16 GiB/no-swap guard.
+Each campaign creates a unique `dst-campaign-*` Cargo target directory under
+`RACER_CARGO_TARGET_DIR` (the script's `--target-dir` root). Both Cargo's explicit
+target argument and its `CARGO_TARGET_DIR` environment variable point there;
+an inherited Cargo target setting cannot redirect the build to shared outputs.
+This deliberately does **not** reuse compiled dependencies from the shared target
+cache. A cold build may exceed 300 seconds and fail before testing starts; the
+runner neither extends that bound nor retries outside the guard.
+
+Before discovery, test executables are copied (not hard-linked) into the retained
+run directory's `executables/` folder. Discovery, all tests, and reproduction
+commands use only those copies. The private build directory closes the race
+between Cargo finishing and copying its outputs; artifacts reported outside it
+are rejected. Concurrent builds using the normal shared target cannot replace
+these campaign executables. Private build directories and frozen executables are
+retained for diagnosis and consume additional disk space; remove them manually
+only after the campaign finishes and they are no longer needed for reproduction.
+
 Build and discovery time are **excluded** from the 600-second campaign budget.
 Every discovered `dst` test runs once first, individually, without seed or step
 overrides. This preserves the default HTTP/native corpus coverage requirements

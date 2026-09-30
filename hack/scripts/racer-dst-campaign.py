@@ -8,9 +8,11 @@ import math
 import os
 from pathlib import Path
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -108,11 +110,19 @@ class Runner:
 
 
 def discover(runner, cargo, target, environment):
+    # Cargo's normal target paths can be replaced by another build after its
+    # build lock is released. A unique output tree owns the entire interval
+    # from compilation through snapshotting; no shared-cache copy race exists.
+    target_root = Path(target).resolve()
+    target_root.mkdir(parents=True, exist_ok=True)
+    private_target = Path(tempfile.mkdtemp(prefix="dst-campaign-", dir=target_root))
+    build_environment = dict(environment, CARGO_TARGET_DIR=str(private_target))
+    runner.report(f"PRIVATE BUILD target={private_target}; cold build, timeout=300s")
     output = runner.run([
         *cargo, "test", "--locked", "--manifest-path", "cmd/racer-dataplane/Cargo.toml",
-        "--target-dir", target, "--all-features", "--lib", "--bins", "--jobs", "2",
+        "--target-dir", str(private_target), "--all-features", "--lib", "--bins", "--jobs", "2",
         "--no-run", "--message-format=json",
-    ], environment, "build", limit=300)
+    ], build_environment, "build", limit=300)
     binaries = set()
     for line in output.splitlines():
         if not line.startswith("{"):
@@ -121,8 +131,22 @@ def discover(runner, cargo, target, environment):
         if (artifact.get("reason") == "compiler-artifact"
                 and artifact.get("profile", {}).get("test") and artifact.get("executable")):
             binaries.add(artifact["executable"])
+    snapshots = runner.directory.resolve() / "executables"
+    snapshots.mkdir()
+    frozen = []
+    for index, binary in enumerate(sorted(binaries)):
+        source = Path(binary).resolve(strict=True)
+        if not source.is_relative_to(private_target):
+            raise Failure(f"test artifact outside private target: {source}")
+        snapshot = snapshots / f"{index:02d}-{source.name}"
+        # Copy, never hard-link: later writes to Cargo's inode must not change
+        # discovery, seed runs, or the retained reproduction command.
+        shutil.copyfile(source, snapshot)
+        snapshot.chmod(0o555)
+        frozen.append(str(snapshot))
+        runner.report(f"SNAPSHOT source={source} executable={snapshot}")
     tests = []
-    for binary in sorted(binaries):
+    for binary in frozen:
         listing = runner.run([binary, "dst", "--list", "--format=terse"],
                              environment, "list", limit=30)
         tests.extend((binary, line.removesuffix(": test"))
