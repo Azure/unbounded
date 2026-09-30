@@ -1115,7 +1115,7 @@ impl WorkerApplication {
             .await?;
             // Recovery must consult the accepted cache UID set, not only secrets.
             self.recover_node(geometry, startup).await?;
-            self.refresh_snapshot(startup).await?;
+            self.refresh_snapshot(startup)?;
             self.activate_native(startup).await?;
             std::future::poll_fn(|cx| Poll::Ready(self.start_diagnostics(cx))).await?;
             self.task_scope = Some(scope(Duration::from_secs(365 * 24 * 3600))?);
@@ -1143,7 +1143,7 @@ impl WorkerApplication {
         })))
     }
 
-    async fn refresh_snapshot(&mut self, current_scope: &RequestScope) -> Result<()> {
+    fn refresh_snapshot(&mut self, current_scope: &RequestScope) -> Result<()> {
         let snapshot = self.snapshots.current()?;
         if self
             .snapshot_sequence
@@ -1187,207 +1187,6 @@ impl WorkerApplication {
         current_scope.check()?;
         self.caches = snapshot.caches.clone();
         self.snapshot_sequence = Some(snapshot.sequence);
-        Ok(())
-    }
-
-    async fn checkpoint(&self, deadline: &RequestScope) -> Result<()> {
-        let node = self.node.as_ref().ok_or(Error::InvalidConfiguration)?;
-        let mut image = match self.store.checkpoint.snapshot_shard().await {
-            Ok(image) => image,
-            Err(error) => {
-                node.checkpoint
-                    .lock()
-                    .map_err(|_| Error::Unavailable)?
-                    .result = Some(Err(error));
-                return Err(error);
-            }
-        };
-        image.index.entries.retain(|(page, entry)| {
-            self.caches
-                .iter()
-                .any(|c| c.id == page.version.object.cache)
-                && self
-                    .keys
-                    .lease(
-                        Some(&page.version.object.cache),
-                        entry.key_id,
-                        KeyPurpose::Page,
-                    )
-                    .is_ok()
-        });
-        image.index.metadata.retain(|m| {
-            self.caches.iter().any(|c| c.id == m.version.object.cache)
-                && self
-                    .keys
-                    .active(&m.version.object.cache, KeyPurpose::Page)
-                    .is_ok()
-        });
-        node.checkpoint
-            .lock()
-            .map_err(|_| Error::Unavailable)?
-            .shards
-            .push(image);
-        let mut publication: Option<Operation<'_, ()>> = None;
-        let result = std::future::poll_fn(|cx| {
-            if let Some(publish) = publication.as_mut() {
-                if let Poll::Ready(result) = std::pin::Pin::as_mut(publish).poll(cx) {
-                    node.checkpoint
-                        .lock()
-                        .map_err(|_| Error::Unavailable)?
-                        .result = Some(result);
-                    return Poll::Ready(result);
-                }
-                return Poll::Pending;
-            }
-            let mut cut = node.checkpoint.lock().map_err(|_| Error::Unavailable)?;
-            if let Some(result) = cut.result {
-                return Poll::Ready(result);
-            }
-            if cut.publishing {
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-            if let Err(error) = deadline.check() {
-                cut.result = Some(Err(error));
-                return Poll::Ready(Err(error));
-            }
-            if self.worker == node.control_worker && cut.shards.len() == node.count {
-                cut.publishing = true;
-                let shards = std::mem::take(&mut cut.shards);
-                drop(cut);
-                publication = Some(self.store.checkpoint.publish(shards));
-            }
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        })
-        .await;
-        self.store.checkpoint.finish_snapshot();
-        result
-    }
-
-    fn poll_checkpoint(&mut self, cx: &mut Context<'_>) -> Result<()> {
-        let Some(node) = &self.node else {
-            return Ok(());
-        };
-        if !self.started {
-            return Ok(());
-        }
-        let now = crate::runtime::environment::now();
-        if let Some(task) = self.checkpoint_task.as_mut() {
-            if let Poll::Ready(result) = task.as_mut().poll(cx) {
-                self.checkpoint_task = None;
-                let mut cut = node
-                    .periodic_checkpoint
-                    .lock()
-                    .map_err(|_| Error::Unavailable)?;
-                if result.is_ok() {
-                    cut.last_slot ^= 1;
-                }
-                cut.result = Some(result);
-            }
-        }
-        let mut cut = node
-            .periodic_checkpoint
-            .lock()
-            .map_err(|_| Error::Unavailable)?;
-        if cut.periodic_started.is_none() {
-            cut.periodic_started = Some(now);
-        }
-        if cut.periodic_generation == 0 || cut.periodic_finished == node.count {
-            if self.stopping {
-                return Ok(());
-            }
-            if now.saturating_duration_since(cut.periodic_started.unwrap()) < Duration::from_secs(5)
-            {
-                return Ok(());
-            }
-            cut.periodic_generation += 1;
-            cut.periodic_started = Some(now);
-            cut.periodic_finished = 0;
-            cut.shards.clear();
-            cut.result = None;
-            cut.publishing = false;
-        }
-        let generation = cut.periodic_generation;
-        if self.stopping && !cut.publishing {
-            cut.result = Some(Err(Error::Cancelled));
-        }
-        if cut.result.is_some() {
-            self.checkpoint_snapshot.take();
-            if self.checkpoint_completed != generation {
-                self.store.checkpoint.finish_snapshot();
-                self.checkpoint_generation = 0;
-                self.checkpoint_completed = generation;
-                cut.periodic_finished += 1;
-            }
-            return Ok(());
-        }
-        if self.checkpoint_generation != generation {
-            // Stop starting batches while existing SQEs drain, then freeze only
-            // this shard. No queue-idle requirement can starve a busy checkpoint.
-            if self.writer_task.is_some() {
-                return Ok(());
-            }
-            self.checkpoint_generation = generation;
-            self.checkpoint_snapshot = Some(
-                self.store
-                    .checkpoint
-                    .snapshot_incremental(self.checkpoint_budget / (4 * node.count)),
-            );
-        }
-        if let Some(snapshot) = self.checkpoint_snapshot.as_mut() {
-            drop(cut);
-            if let Poll::Ready(result) = snapshot.as_mut().poll(cx) {
-                self.checkpoint_snapshot = None;
-                let mut cut = node
-                    .periodic_checkpoint
-                    .lock()
-                    .map_err(|_| Error::Unavailable)?;
-                match result {
-                    Ok(shard) => {
-                        cut.shards.push(shard);
-                    }
-                    Err(error) => {
-                        cut.result = Some(Err(error));
-                    }
-                }
-            }
-            return Ok(());
-        }
-        if self.worker == node.control_worker && cut.shards.len() == node.count && !cut.publishing {
-            cut.publishing = true;
-            let shards = std::mem::take(&mut cut.shards);
-            let Some(sequence) = cut.last_sequence.checked_add(1) else {
-                cut.result = Some(Err(Error::Unavailable));
-                return Ok(());
-            };
-            cut.last_sequence = sequence;
-            let slot = cut.last_slot ^ 1;
-            drop(cut);
-            match self.store.checkpoint.publish_async(
-                shards,
-                self.runtime.reactor.clone(),
-                scope(self.timeout)?,
-                sequence,
-                slot,
-                self.checkpoint_budget,
-            ) {
-                Ok(task) => {
-                    let metrics = self.telemetry.metrics.clone();
-                    self.checkpoint_task = Some(Box::pin(async move {
-                        task.await?;
-                        metrics.set_gauge(Gauge::CheckpointSequence, sequence);
-                        Ok(())
-                    }));
-                }
-                Err(error) => {
-                    node.periodic_checkpoint
-                        .lock()
-                        .map_err(|_| Error::Unavailable)?
-                        .result = Some(Err(error))
-                }
-            }
-        }
         Ok(())
     }
 
@@ -1545,12 +1344,7 @@ impl WorkerApplication {
         }
         if !self.stopping {
             self.poll_control(cx)?;
-            let current_scope = scope(self.timeout)?;
-            let mut refresh = Box::pin(self.refresh_snapshot(&current_scope));
-            match refresh.as_mut().poll(cx) {
-                Poll::Ready(result) => result?,
-                Poll::Pending => return Err(Error::InvalidConfiguration),
-            }
+            self.refresh_snapshot(&scope(self.timeout)?)?;
         }
         let now = crate::runtime::environment::now();
         if now >= self.next_health {
