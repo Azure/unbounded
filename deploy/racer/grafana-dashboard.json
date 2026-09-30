@@ -49,7 +49,7 @@
     {
       "id": 3, "type": "stat", "title": "Ready dataplanes", "description": "Ready count among currently exported readiness series. Compare with deployment inventory; a vanished target does not export zero.",
       "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 4, "w": 6, "x": 12, "y": 1},
-      "fieldConfig": {"defaults": {"unit": "short", "decimals": 0, "noValue": "No data"}, "overrides": []},
+      "fieldConfig": {"defaults": {"unit": "none", "decimals": 0, "noValue": "No data"}, "overrides": []},
       "options": {"colorMode": "none", "graphMode": "none", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
       "targets": [{"refId": "A", "instant": true, "expr": "sum(racer_ready{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"})"}]
     },

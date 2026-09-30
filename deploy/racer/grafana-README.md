@@ -15,6 +15,12 @@ optional loadgen pulls, and shared-node resources. No generator is required.
   The current installation uses pod scrape annotations, dataplane port `19090`,
   Gantry port `9095`, and `/metrics`; these are installation choices, not new
   scrape jobs. This dashboard does not change Prometheus configuration.
+  Live pod metadata-only annotations do **not** survive pod replacement. Persist
+  equivalent `prometheus.io/scrape`, `prometheus.io/port`, and `prometheus.io/path`
+  annotations through the owning workload's pod template or supported overrides
+  during a **planned rollout**, not an immediate fleet rollout for this dashboard.
+  Scrape recovery for this installation patched existing pods only; no Prometheus
+  configuration, workload templates, or overrides were changed.
 - Namespace and node selectors support multiple values and All. Namespace
   initially selects `unbounded-system`; select All when components span namespaces.
 - Node-resource panels require current node-exporter series carrying a `node`
@@ -82,6 +88,25 @@ asynchronously, followed by the provider's polling interval. A `subPath` file
 mount does not receive updates; resolve that deployment difference before relying
 on polling. Provider configuration changes may require a Grafana restart; merely
 updating the dashboard JSON normally does not.
+
+### Grafana startup troubleshooting
+
+In the validated **Grafana 13.2.3** installation, a failed startup auto-update on
+`readOnlyRootFilesystem` unregistered the bundled Prometheus plugin. If the
+datasource plugin disappears, inspect startup logs and disable startup plugin
+installation/update on the Grafana Deployment with both environment settings:
+
+```text
+GF_PLUGINS_PREINSTALL_AUTO_UPDATE=false
+GF_PLUGINS_PREINSTALL_DISABLED=true
+```
+
+Keep the read-only filesystem protection. Also provide adequate Grafana memory:
+this installation required raising its limit from **512Mi to 1Gi** after an OOM.
+That is an observed recovery setting, not a universal sizing recommendation.
+The operational recovery changed the Grafana Deployment, not Prometheus config
+or Racer/Gantry workload templates. No generated deployment manifests are needed
+to import this dashboard.
 
 ## Access and validation
 

@@ -35,6 +35,10 @@ class DashboardContractTest(unittest.TestCase):
     def test_identity_and_layout(self):
         self.assertEqual(self.dashboard["uid"], "racer-performance")
         self.assertEqual(self.dashboard["refresh"], "1m")
+        ready = next(p for p in self.panels if p["id"] == 3)
+        # Preserve exact fleet counts: short/decimals=0 renders 1500 as 2 K.
+        self.assertEqual(ready["fieldConfig"]["defaults"]["unit"], "none")
+        self.assertEqual(ready["fieldConfig"]["defaults"]["decimals"], 0)
         self.assertGreaterEqual(len(self.panels), 24)
         self.assertLessEqual(len(self.panels), 30)
         ids = [p["id"] for p in self.dashboard["panels"]]
