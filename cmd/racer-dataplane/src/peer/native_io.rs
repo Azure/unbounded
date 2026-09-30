@@ -1055,7 +1055,15 @@ impl Transfers {
         let remote = SetupParameters::from_verified(&offer, binding.rail)?;
         let mut previous = signed_digest(&offer.signed)?;
         connection.next_round()?;
-        let prepared = match sessions.prepare(&offer.peer, binding.rail, scope).await {
+        let prepared = match sessions
+            .prepare_admitted(
+                &offer.peer,
+                binding.rail,
+                connection.peer_admission.clone(),
+                scope,
+            )
+            .await
+        {
             Ok(prepared) => prepared,
             Err(error) if recoverable(error) => {
                 return self

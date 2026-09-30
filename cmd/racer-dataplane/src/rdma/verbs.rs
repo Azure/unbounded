@@ -197,7 +197,14 @@ impl QueuePairHandle {
     pub(crate) fn new(device: Rc<DeviceHandle>) -> Result<Rc<Self>> {
         immediate(Self::poll_new(device))
     }
+    #[cfg(test)]
     pub(crate) fn poll_new(device: Rc<DeviceHandle>) -> Poll<Result<Rc<Self>>> {
+        Self::poll_new_admitted(device, None)
+    }
+    pub(crate) fn poll_new_admitted(
+        device: Rc<DeviceHandle>,
+        permit: Option<Arc<crate::peer::adaptive::Permit>>,
+    ) -> Poll<Result<Rc<Self>>> {
         if device.port.shared.closed.load(Ordering::Acquire)
             || device.generation != device.port.shared.generation.load(Ordering::Acquire)
         {
@@ -208,7 +215,7 @@ impl QueuePairHandle {
             if slot.state.load(Ordering::Acquire) != READY {
                 continue;
             }
-            let mailbox = match try_mailbox(&slot.mailbox) {
+            let mut mailbox = match try_mailbox(&slot.mailbox) {
                 Poll::Pending => {
                     contended = true;
                     continue;
@@ -226,6 +233,7 @@ impl QueuePairHandle {
                 continue;
             }
             let endpoint = mailbox.endpoint.ok_or(Error::Unavailable)?;
+            mailbox.peer_admission = permit;
             return Poll::Ready(Ok(Rc::new(Self {
                 lease: Rc::new(Lease {
                     slot: slot.clone(),

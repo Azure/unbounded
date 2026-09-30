@@ -36,6 +36,7 @@ pub(crate) enum Command {
     Invalidate,
 }
 pub(crate) struct Mailbox {
+    pub peer_admission: Option<Arc<crate::peer::adaptive::Permit>>,
     pub endpoint: Option<Endpoint>,
     pub rail: RailId,
     pub length: usize,
@@ -52,6 +53,18 @@ pub(crate) struct Slot {
     pub fenced: AtomicBool,
     pub mailbox: Mutex<Mailbox>,
     pub waiter: AtomicWaker,
+}
+impl Drop for Slot {
+    fn drop(&mut self) {
+        // Failed native teardown may intentionally outlive both paired roles.
+        // The bounded admission slot must quarantine with that DMA ownership.
+        if !self.fenced.load(Ordering::Acquire) {
+            let mailbox = self.mailbox.get_mut().unwrap_or_else(|e| e.into_inner());
+            if let Some(permit) = mailbox.peer_admission.take() {
+                std::mem::forget(permit);
+            }
+        }
+    }
 }
 pub(crate) struct Shared {
     pub slots: Vec<Arc<Slot>>,
@@ -102,6 +115,7 @@ pub fn pair(slots: usize) -> Result<(IoPort, NativePort)> {
                     released: AtomicBool::new(false),
                     fenced: AtomicBool::new(false),
                     mailbox: Mutex::new(Mailbox {
+                        peer_admission: None,
                         endpoint: None,
                         rail: RailId(0),
                         length: 0,
@@ -488,6 +502,7 @@ impl NativeService {
             resource.window = None;
             resource.qp = None; // CQ destruction on crypto, never I/O
             slot.fenced.store(true, Ordering::Release);
+            mailbox.peer_admission = None;
             mailbox.command = None;
             if mailbox.result.is_none() {
                 mailbox.result = Some(Err(Error::Cancelled));
@@ -723,6 +738,94 @@ mod tests {
             generation: io.shared.generation.load(Ordering::Acquire),
         }))
         .unwrap()
+    }
+    #[test]
+    fn admitted_native_claim_keeps_capacity_after_proxy_drop_until_service_fence() {
+        let (io, port) = pair(1).unwrap();
+        let io = Rc::new(io);
+        let mut native = NativeService::new(port);
+        let _charged = provision_test(&mut native, 0);
+        let metrics = crate::telemetry::metrics::Metrics::default();
+        let admission = crate::peer::adaptive::AdaptivePeers::new(
+            crate::peer::adaptive::Config {
+                total: 1,
+                per_peer: 1,
+            },
+            metrics.clone(),
+        )
+        .unwrap();
+        let peer = crate::model::identity::NodeId("native-peer".into());
+        let permit = admission.acquire(&peer).unwrap();
+        let std::task::Poll::Ready(Ok(qp)) = QueuePairHandle::poll_new_admitted(
+            Rc::new(DeviceHandle {
+                port: io.clone(),
+                rail: RailId(0),
+                generation: 1,
+            }),
+            Some(permit),
+        ) else {
+            panic!("prepared native slot");
+        };
+        backend::lifetime_tests::fail_stop(true);
+        drop(qp);
+        native.poll_budgeted(1).unwrap();
+        assert_eq!(
+            metrics.gauge(crate::telemetry::metrics::Gauge::PeerExchanges),
+            1
+        );
+        assert!(matches!(admission.acquire(&peer), Err(Error::Overloaded)));
+        backend::lifetime_tests::fail_stop(false);
+        native.resources[0].as_mut().unwrap().next_retry = None;
+        native.poll_budgeted(1).unwrap();
+        assert_eq!(
+            metrics.gauge(crate::telemetry::metrics::Gauge::PeerExchanges),
+            0
+        );
+    }
+
+    #[test]
+    fn failed_native_service_teardown_quarantines_adaptive_permit_after_both_roles_drop() {
+        let (io, port) = pair(1).unwrap();
+        let io = Rc::new(io);
+        let mut native = NativeService::new(port);
+        let charged = provision_test(&mut native, 0);
+        let metrics = crate::telemetry::metrics::Metrics::default();
+        let admission = crate::peer::adaptive::AdaptivePeers::new(
+            crate::peer::adaptive::Config {
+                total: 1,
+                per_peer: 1,
+            },
+            metrics.clone(),
+        )
+        .unwrap();
+        let peer = crate::model::identity::NodeId("native-quarantine".into());
+        let permit = admission.acquire(&peer).unwrap();
+        let std::task::Poll::Ready(Ok(qp)) = QueuePairHandle::poll_new_admitted(
+            Rc::new(DeviceHandle {
+                port: io.clone(),
+                rail: RailId(0),
+                generation: 1,
+            }),
+            Some(permit),
+        ) else {
+            panic!("prepared native slot");
+        };
+        mark_connected(&qp, &mut native);
+        let region = Region::acquire(&qp, 16).unwrap();
+        let (window, ticket) = qp.bind(region).unwrap();
+        native.poll_budgeted(1).unwrap();
+        drop((window, ticket));
+        backend::lifetime_tests::fail_stop(true);
+        drop(qp);
+        drop(native);
+        drop(io);
+        assert_eq!(charged.get(), 1, "failed teardown keeps native ownership");
+        assert_eq!(
+            metrics.gauge(crate::telemetry::metrics::Gauge::PeerExchanges),
+            1
+        );
+        assert!(matches!(admission.acquire(&peer), Err(Error::Overloaded)));
+        backend::lifetime_tests::fail_stop(false);
     }
     pub(super) fn mark_connected(qp: &QueuePairHandle, service: &mut NativeService) {
         qp.connect(qp.endpoint).unwrap();

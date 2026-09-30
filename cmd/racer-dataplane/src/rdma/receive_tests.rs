@@ -65,6 +65,18 @@ fn receive_case(readback: bool, terminal: Option<Error>, failed_fence: bool) {
     let mut native = NativeService::new(port);
     let charged = provision_test(&mut native, 0);
     let qp = claim(&io);
+    let peer_metrics = crate::telemetry::metrics::Metrics::default();
+    let peer_admission = crate::peer::adaptive::AdaptivePeers::new(
+        crate::peer::adaptive::Config {
+            total: 1,
+            per_peer: 1,
+        },
+        peer_metrics.clone(),
+    )
+    .unwrap();
+    let peer = crate::model::identity::NodeId("native-peer".into());
+    let permit = peer_admission.acquire(&peer).unwrap();
+    io.shared.slots[0].mailbox.lock().unwrap().peer_admission = Some(permit);
     mark_connected(&qp, &mut native);
     let signers = network(2);
     let session = SessionLease::test(qp.clone(), signers[0].node().clone());
@@ -217,6 +229,14 @@ fn receive_case(readback: bool, terminal: Option<Error>, failed_fence: bool) {
         // allocation and quota remain quarantined and the slot cannot be claimed.
         drop(session);
         drop(qp);
+        assert_eq!(
+            peer_metrics.gauge(crate::telemetry::metrics::Gauge::PeerExchanges),
+            1
+        );
+        assert!(matches!(
+            peer_admission.acquire(&peer),
+            Err(Error::Overloaded)
+        ));
         native.resources[0].as_mut().unwrap().next_retry = None;
         native.poll_budgeted(1).unwrap();
         assert_eq!(charged.get(), 1);
@@ -225,6 +245,10 @@ fn receive_case(readback: bool, terminal: Option<Error>, failed_fence: bool) {
         native.resources[0].as_mut().unwrap().next_retry = None;
         native.poll_budgeted(1).unwrap();
         assert_eq!(io.shared.slots[0].state.load(Ordering::Acquire), READY);
+        assert_eq!(
+            peer_metrics.gauge(crate::telemetry::metrics::Gauge::PeerExchanges),
+            0
+        );
         native.close();
         native.poll_budgeted(1).unwrap();
         assert!(native.drained());
