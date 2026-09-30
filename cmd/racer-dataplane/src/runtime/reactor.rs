@@ -284,6 +284,13 @@ enum KernelResult {
 }
 
 impl KernelResult {
+    fn observe_errno(&self, errno: &std::cell::Cell<Option<i32>>) {
+        if let Self::Value(value) = self {
+            if *value < 0 {
+                errno.set(value.checked_neg());
+            }
+        }
+    }
     fn value(self) -> Result<i32> {
         match self {
             Self::Value(value) if value >= 0 => Ok(value),
@@ -994,6 +1001,17 @@ impl Reactor {
         lease: L,
         scope: &'a RequestScope,
     ) -> Operation<'a, L> {
+        self.connect_with_observation(fd, address, lease, None, scope)
+    }
+    /// Preserve connect errno locally for attribution, without changing boundary errors.
+    pub(crate) fn connect_with_observation<'a, L: 'static>(
+        &'a self,
+        fd: Rc<OwnedFd>,
+        address: SocketAddress,
+        lease: L,
+        errno: Option<Rc<std::cell::Cell<Option<i32>>>>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, L> {
         Box::pin(async move {
             #[cfg(test)]
             let destination = address.clone();
@@ -1013,6 +1031,9 @@ impl Reactor {
             );
             self.submit(sqe, scope, false, move |result| {
                 drop((fd, address));
+                if let (Some(errno), Ok(result)) = (&errno, &result) {
+                    result.observe_errno(errno);
+                }
                 result?.value()?;
                 Ok(lease)
             })?
@@ -2093,6 +2114,26 @@ mod tests {
             );
             assert_eq!(drops.get(), 1);
         }
+    }
+
+    #[test]
+    fn connect_observation_retains_errno_before_generic_boundary_mapping() {
+        for errno in [
+            libc::ENOBUFS,
+            libc::ENOMEM,
+            libc::EADDRNOTAVAIL,
+            libc::ECONNREFUSED,
+            libc::ECONNRESET,
+        ] {
+            let observation = Cell::new(None);
+            let result = KernelResult::Value(-errno);
+            result.observe_errno(&observation);
+            assert_eq!(observation.get(), Some(errno));
+            assert_eq!(result.value(), Err(Error::Io));
+        }
+        let observation = Cell::new(None);
+        KernelResult::Value(0).observe_errno(&observation);
+        assert_eq!(observation.get(), None);
     }
 
     #[test]

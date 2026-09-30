@@ -112,6 +112,8 @@ impl AdaptivePeers {
                 .iter()
                 .find(|(_, p)| {
                     p.active == 0
+                        && !p.probe
+                        && p.retry.is_none_or(|retry| now >= retry)
                         && now.saturating_duration_since(p.updated) >= Duration::from_secs(60)
                 })
                 .map(|(n, _)| n.clone());
@@ -234,7 +236,9 @@ impl Drop for Permit {
         if self.probe {
             peer.probe = false;
             if peer.retry.is_some() {
-                peer.retry = Some(crate::runtime::environment::now() + BACKOFF);
+                let now = crate::runtime::environment::now();
+                peer.retry = Some(now + BACKOFF);
+                peer.updated = now;
             }
         }
         state.active -= 1;
@@ -247,6 +251,49 @@ impl Drop for Permit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn churn_cannot_evict_neutral_probe_backoff_with_old_update_time() {
+        let clock = crate::runtime::environment::SimulationClock::new(783);
+        let _env = clock.environment(0).enter();
+        let owner = AdaptivePeers::new(
+            Config {
+                total: 512,
+                per_peer: 1,
+            },
+            Metrics::default(),
+        )
+        .unwrap();
+        let node = NodeId("000-circuit".into());
+        let permit = owner.acquire(&node).unwrap();
+        permit.observe(Outcome::PeerFailure);
+        drop(permit);
+        let held: Vec<_> = (1..CAPACITY)
+            .map(|i| owner.acquire(&NodeId(i.to_string())).unwrap())
+            .collect();
+        clock.advance(Duration::from_secs(61));
+        let probe = owner.acquire(&node).unwrap();
+        drop(probe);
+        assert!(!owner.available(&node));
+        assert!(matches!(
+            owner.acquire(&NodeId("new".into())),
+            Err(Error::Overloaded)
+        ));
+        // Even a stale timestamp must not make an active backoff evictable.
+        owner
+            .state
+            .lock()
+            .unwrap()
+            .peers
+            .get_mut(&node)
+            .unwrap()
+            .updated = crate::runtime::environment::now() - Duration::from_secs(61);
+        assert!(matches!(
+            owner.acquire(&NodeId("new".into())),
+            Err(Error::Overloaded)
+        ));
+        assert!(owner.state.lock().unwrap().peers.contains_key(&node));
+        drop(held);
+    }
     #[test]
     fn shared_caps_local_pressure_and_completion_fences() {
         let metrics = Metrics::default();

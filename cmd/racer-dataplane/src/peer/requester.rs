@@ -286,12 +286,12 @@ impl Requester {
             } => {
                 self.forwarding
                     .verify_opaque(&authentication, length, binding)?;
-                // Error responses do not attest useful capacity, even when
-                // authenticated. Opaque success recovers only after body framing.
-                connection.peer_response_verified = matches!(
-                    authentication.original.head.start,
-                    crate::http::codec::StartLine::Response { status: 200..=299 }
-                );
+                // All Racer outcomes use HTTP 200. Inspect the authenticated
+                // outcome, exactly as the materialized path does, not HTTP status.
+                connection.peer_response_verified = crate::security::protocol::field(
+                    &authentication.original.head,
+                    "racer-outcome",
+                )? != "overloaded";
                 Ok(super::transfer::RelayResponse::Http {
                     authentication,
                     connection,
@@ -301,6 +301,9 @@ impl Requester {
         }
     }
 }
+#[cfg(test)]
+#[path = "requester_safety_tests.rs"]
+mod safety_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

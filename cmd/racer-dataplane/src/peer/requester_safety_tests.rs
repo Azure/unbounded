@@ -1,0 +1,212 @@
+//! Real socket exchange with the adaptive controller attached to routing/requester.
+use super::*;
+use crate::{
+    http::{
+        codec::Codec,
+        io::HttpIo,
+        pool::{ConnectionLease, HttpPool},
+    },
+    model::{identity::MembershipVersion, limits::ResourceClass},
+    peer::{
+        adaptive::{AdaptivePeers, Outcome},
+        transfer::RelayResponse,
+        wire::{LogicalCodec, PeerResponse, SecurityCodec, WireCodec},
+    },
+    runtime::{
+        admission::Admission,
+        reactor::{Descriptor, Reactor},
+    },
+    security::connection,
+    telemetry::metrics::{Event, Gauge, Metrics},
+    topology::{
+        health::LinkHealth,
+        membership::{Member, Membership},
+    },
+};
+use std::{
+    sync::Arc,
+    task::{Context, Poll},
+    time::{Duration, Instant},
+};
+
+#[test]
+fn attached_requester_verification_and_opaque_outcome_gate_real_probe_recovery() {
+    for opaque in [false, true] {
+        for case in ["overloaded", "corrupt", "miss"] {
+            probe_exchange(opaque, case);
+        }
+    }
+}
+
+fn probe_exchange(opaque: bool, case: &str) {
+    let signers = crate::peer::tests::signers();
+    let admission = Rc::new(Admission::new(
+        crate::test_support::cluster::config(false).limits,
+    ));
+    let reactor = Rc::new(Reactor::new(admission.clone()));
+    let io = Rc::new(HttpIo::with_admission(
+        reactor.clone(),
+        Codec::new(crate::peer::wire::MAX_ENVELOPE_HEAD, 0),
+        admission.clone(),
+    ));
+    let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2));
+    let codec = Rc::new(SecurityCodec::new(
+        admission.clone(),
+        Rc::new(crate::memory::pool::BufferPool::new(admission.clone())),
+    ));
+    let transfers = Rc::new(
+        Transfers::new(pool, io.clone(), None)
+            .with_wire(admission.clone(), codec.clone())
+            .with_signatures(signers[0].clone()),
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let membership = Arc::new(
+        Membership::validate(
+            MembershipVersion(1),
+            [0, 2]
+                .iter()
+                .map(|i| Member {
+                    node: signers[*i].node().clone(),
+                    shares: std::num::NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: address.clone(),
+                    rails: vec![],
+                    alignment_enabled: false,
+                })
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let metrics = Metrics::default();
+    let adaptive = AdaptivePeers::new(
+        crate::peer::adaptive::Config {
+            total: 1,
+            per_peer: 1,
+        },
+        metrics.clone(),
+    )
+    .unwrap();
+    let node = signers[2].node().clone();
+    let failed = adaptive.acquire(&node).unwrap();
+    failed.observe(Outcome::PeerFailure);
+    drop(failed);
+    std::thread::sleep(Duration::from_millis(260));
+    let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4).with_peer_admission(adaptive.clone()));
+    let forwarding = Rc::new(Forwarding::new(signers[0].clone()));
+    let requester = Requester::new(paths, Rc::new(Rails), forwarding.clone(), transfers)
+        .with_network(Rc::new(
+            crate::peer::PeerNetwork::new(
+                signers[0].node().clone(),
+                crate::control::snapshot::PublishedState::for_membership(membership.clone()),
+            )
+            .unwrap(),
+        ));
+    assert!(Arc::ptr_eq(requester.admission(), &adaptive));
+    let mut request = crate::peer::tests::request(&admission, 91);
+    let scope = RequestScope::new(
+        request.route.request,
+        Instant::now() + Duration::from_secs(3),
+    )
+    .unwrap();
+    request.route.deadline = scope.deadline;
+    request.origin.scope = scope.clone();
+    let (signed, _) = forwarding.sign_request(request).unwrap();
+    let server = async {
+        let fd = reactor
+            .accept(Rc::new(Descriptor::from(listener)), &scope)
+            .await?;
+        let conn = ConnectionLease::from_accepted(fd, &admission)?;
+        let conn = connection::accept(&io, conn, signers[2].clone(), &scope).await?;
+        let received = io.receive_head(conn, &scope).await?;
+        let (head, length) = WireCodec::decode(received.value, false)?;
+        assert_eq!(length, 0);
+        let auth = Forwarding::new(signers[2].clone());
+        let request = auth.verify_request(codec.request(head, &scope)?)?;
+        let outcome = if case == "overloaded" {
+            PeerResponse::Overloaded
+        } else {
+            PeerResponse::Miss
+        };
+        let mut response = auth.sign_response(request.binding(), outcome)?;
+        if case == "corrupt" {
+            // The session authenticates the outer frame, but the original proof
+            // no longer agrees with its signed application outcome.
+            let original = Arc::get_mut(&mut response.authentication.original).unwrap();
+            original
+                .head
+                .headers
+                .iter_mut()
+                .find(|h| h.name == "racer-outcome")
+                .unwrap()
+                .value = b"overloaded".to_vec();
+        }
+        let head = WireCodec::encode(&response.authentication, true, 0)?;
+        let sent = io.send_head(received.connection, head, &scope).await?;
+        drop(sent);
+        Ok::<_, Error>(())
+    };
+    let client = async {
+        if opaque {
+            requester
+                .exchange_relay(
+                    signed,
+                    membership,
+                    Rc::new(admission.reserve(None, ResourceClass::Relay, 1)?),
+                    &scope,
+                )
+                .await
+        } else {
+            requester
+                .exchange(signed, membership, &scope)
+                .await
+                .map(RelayResponse::Complete)
+        }
+    };
+    let mut work = Box::pin(async { futures::join!(client, server) });
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let (result, served) = loop {
+        assert!(
+            Instant::now() < scope.deadline.0,
+            "real peer safety watchdog"
+        );
+        if let Poll::Ready(result) = work.as_mut().poll(&mut cx) {
+            break result;
+        }
+        reactor.poll_budgeted(128).unwrap();
+        reactor.wait(Duration::from_millis(1)).unwrap();
+    };
+    served.unwrap();
+    drop(work);
+    if case == "corrupt" {
+        assert!(result.is_err());
+    } else {
+        match result.unwrap() {
+            RelayResponse::Http {
+                mut connection,
+                length,
+                ..
+            } => {
+                assert_eq!(length, 0);
+                assert_eq!(
+                    metrics.count(Event::PeerVerified),
+                    0,
+                    "headers cannot recover probe"
+                );
+                assert_eq!(metrics.gauge(Gauge::PeerExchanges), 1);
+                connection.finish_exchange().unwrap();
+                drop(connection);
+            }
+            RelayResponse::Complete(response) => assert_eq!(
+                matches!(response.response, PeerResponse::Overloaded),
+                case == "overloaded"
+            ),
+        }
+    }
+    assert_eq!(metrics.count(Event::PeerProbe), 1);
+    assert_eq!(
+        metrics.count(Event::PeerVerified),
+        u64::from(case == "miss")
+    );
+    assert_eq!(adaptive.available(&node), case == "miss");
+    assert_eq!(metrics.gauge(Gauge::PeerExchanges), 0);
+}
