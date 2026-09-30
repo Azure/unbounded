@@ -182,7 +182,7 @@ func TestServingCertificateProjectionAndRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if r.current.Load().certificate.Leaf.SerialNumber.Int64() != 2 {
+	if certificate, err := r.getCertificate(nil); err != nil || certificate.Leaf.SerialNumber.Int64() != 2 {
 		t.Fatal("atomic projection did not replace certificate")
 	}
 
@@ -281,7 +281,7 @@ func TestServingCertificateStandaloneTornPair(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if r.current.Load().certificate.Leaf.SerialNumber.Int64() != 2 {
+	if certificate, err := r.getCertificate(nil); err != nil || certificate.Leaf.SerialNumber.Int64() != 2 {
 		t.Fatal("pair did not recover")
 	}
 
@@ -317,7 +317,9 @@ func TestServingCertificateExpirationAndCancellation(t *testing.T) {
 		}
 
 		ctx, cancel := context.WithCancel(t.Context())
-		go r.run(ctx, time.Second)
+		done := make(chan struct{})
+
+		go func() { defer close(done); r.run(ctx, time.Second) }()
 		// Bad files do not invalidate a still-valid cached certificate.
 		if err := os.Remove(filepath.Join(dir, "tls.crt")); err != nil {
 			t.Fatal(err)
@@ -334,7 +336,8 @@ func TestServingCertificateExpirationAndCancellation(t *testing.T) {
 		}
 
 		cancel()
-		<-r.done
+		<-done
+
 		last := r.current.Load()
 
 		writeServingTestPair(t, dir, servingTestCertificate(t, 2, now, now.Add(time.Hour), nil, false))

@@ -25,8 +25,7 @@ import (
 const servingCertificatePollInterval = time.Second
 
 type servingCertificate struct {
-	certificate tls.Certificate
-	prefixes    []servingCertificatePrefix
+	prefixes []servingCertificatePrefix
 }
 
 type servingCertificatePrefix struct {
@@ -39,11 +38,10 @@ type servingCertificatePrefix struct {
 type servingCertificateReloader struct {
 	certificateFile, keyFile string
 	current                  atomic.Pointer[servingCertificate]
-	done                     chan struct{}
 }
 
 func newServingCertificateReloader(certificateFile, keyFile string) (*servingCertificateReloader, error) {
-	r := &servingCertificateReloader{certificateFile: certificateFile, keyFile: keyFile, done: make(chan struct{})}
+	r := &servingCertificateReloader{certificateFile: certificateFile, keyFile: keyFile}
 	if err := r.reload(); err != nil {
 		return nil, err
 	}
@@ -64,15 +62,11 @@ func (r *servingCertificateReloader) getCertificateAt(now time.Time) (*tls.Certi
 	return certificate.at(now)
 }
 
-func (c *servingCertificatePrefix) valid(now time.Time) bool {
-	return !now.Before(c.notBefore) && now.Before(c.notAfter)
-}
-
 func (c *servingCertificate) at(now time.Time) (*tls.Certificate, error) {
 	// Longest first: retain compatibility until its suffix expires, then use
 	// an already validated prefix. No file reads, parsing, or verification here.
 	for i := range c.prefixes {
-		if c.prefixes[i].valid(now) {
+		if prefix := &c.prefixes[i]; !now.Before(prefix.notBefore) && now.Before(prefix.notAfter) {
 			return &c.prefixes[i].certificate, nil
 		}
 	}
@@ -81,8 +75,6 @@ func (c *servingCertificate) at(now time.Time) (*tls.Certificate, error) {
 }
 
 func (r *servingCertificateReloader) run(ctx context.Context, interval time.Duration) {
-	defer close(r.done)
-
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -283,7 +275,7 @@ func validateServingCertificate(certificate tls.Certificate, now time.Time) (*se
 	}
 
 	certificate.Leaf = chain[0]
-	validated := &servingCertificate{certificate: certificate}
+	validated := &servingCertificate{}
 
 	for n := len(chain); n > 0; n-- {
 		// Only a cross-signed CA starts an optional compatibility suffix. Do
