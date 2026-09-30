@@ -1,0 +1,255 @@
+{
+  "id": null,
+  "uid": "racer-performance",
+  "title": "Racer Performance",
+  "description": "Serving throughput, latency, local cache lookups, admission pressure, optional verified image pulls, and node-wide resources. Five-minute rates suit 60-second scraping. Missing telemetry stays missing.",
+  "tags": ["racer", "gantry", "performance"],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "timezone": "browser",
+  "refresh": "1m",
+  "time": {"from": "now-1h", "to": "now"},
+  "annotations": {"list": []},
+  "templating": {
+    "list": [
+      {
+        "name": "namespace", "label": "Namespace", "type": "query",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "query": {"query": "label_values(up{job=\"kubernetes-pods\",app_kubernetes_io_name=~\"racer-dataplane|gantry|racer-loadgen\"}, namespace)", "refId": "NamespaceQuery"},
+        "current": {"text": ["unbounded-system"], "value": ["unbounded-system"]},
+        "multi": true, "includeAll": true, "allValue": ".*", "refresh": 1, "sort": 1, "options": []
+      },
+      {
+        "name": "node", "label": "Node", "type": "query",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "query": {"query": "label_values(up{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",app_kubernetes_io_name=~\"racer-dataplane|gantry|racer-loadgen\"}, node)", "refId": "NodeQuery"},
+        "current": {"text": ["All"], "value": ["$__all"]},
+        "multi": true, "includeAll": true, "allValue": ".*", "refresh": 1, "sort": 1, "options": []
+      }
+    ]
+  },
+  "panels": [
+    {"id": 100, "type": "row", "title": "Overview | availability before performance", "collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0}},
+    {
+      "id": 1, "type": "stat", "title": "Dataplane scrape success", "description": "Fraction of discovered dataplane targets answering scrapes. Removed targets disappear; this is not expected fleet coverage.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 4, "w": 6, "x": 0, "y": 1},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1, "noValue": "No data", "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}}, "overrides": []},
+      "options": {"colorMode": "value", "graphMode": "none", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "instant": true, "expr": "avg(up{job=\"kubernetes-pods\",app_kubernetes_io_name=\"racer-dataplane\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"})"}]
+    },
+    {
+      "id": 2, "type": "stat", "title": "Gantry scrape success", "description": "Fraction of discovered Gantry targets answering scrapes. Missing discovery is not healthy zero.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 4, "w": 6, "x": 6, "y": 1},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1, "noValue": "No data", "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}}, "overrides": []},
+      "options": {"colorMode": "value", "graphMode": "none", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "instant": true, "expr": "avg(up{job=\"kubernetes-pods\",app_kubernetes_io_name=\"gantry\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"})"}]
+    },
+    {
+      "id": 3, "type": "stat", "title": "Ready dataplanes", "description": "Ready count among currently exported readiness series. Compare with deployment inventory; a vanished target does not export zero.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 4, "w": 6, "x": 12, "y": 1},
+      "fieldConfig": {"defaults": {"unit": "short", "decimals": 0, "noValue": "No data"}, "overrides": []},
+      "options": {"colorMode": "none", "graphMode": "none", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "instant": true, "expr": "sum(racer_ready{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"})"}]
+    },
+    {
+      "id": 4, "type": "stat", "title": "Dataplane exchanges / sec", "description": "Client UDS exchange starts after header reception, not image pulls or peer RPCs.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 4, "w": 6, "x": 18, "y": 1},
+      "fieldConfig": {"defaults": {"unit": "ops", "noValue": "No data"}, "overrides": []},
+      "options": {"colorMode": "none", "graphMode": "none", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "instant": true, "expr": "sum(rate(racer_requests_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m]))"}]
+    },
+    {"id": 101, "type": "row", "title": "Serving | throughput and latency", "collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 5}},
+    {
+      "id": 5, "type": "timeseries", "title": "Downstream vs origin throughput", "description": "Distinct boundaries, never additive. Downstream bytes include partial/error bodies and are credited at handler exit; neither series proves verified goodput.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 6},
+      "fieldConfig": {"defaults": {"unit": "Bps", "min": 0, "noValue": "No data"}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}},
+      "targets": [
+        {"refId": "A", "legendFormat": "Downstream GET", "expr": "sum(rate(gantry_racer_mirror_bytes_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\",method=\"GET\"}[5m]))"},
+        {"refId": "B", "legendFormat": "Origin GET", "expr": "sum(rate(gantry_racer_origin_bytes_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m]))"}
+      ]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "GET responses by status and completion", "description": "Complete can include HTTP errors; 200/206 can still be aborted. Series are created on observation.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 6},
+      "fieldConfig": {"defaults": {"unit": "reqps", "min": 0, "noValue": "No data"}, "overrides": []},
+      "targets": [{"refId": "A", "legendFormat": "{{status}} / {{outcome}}", "expr": "sum by (status,outcome) (rate(gantry_racer_mirror_requests_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\",method=\"GET\"}[5m]))"}]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "GET handler latency | p50 / p95 / p99", "description": "Classic histogram estimates with coarse buckets. Includes downstream writes, final flush, errors, and aborts; not dataplane-only or whole-image latency.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0, "noValue": "No data"}, "overrides": []},
+      "targets": [
+        {"refId": "A", "legendFormat": "p50", "expr": "histogram_quantile(0.50, sum by (le) (rate(gantry_racer_mirror_duration_seconds_bucket{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\",method=\"GET\"}[5m])))"},
+        {"refId": "B", "legendFormat": "p95", "expr": "histogram_quantile(0.95, sum by (le) (rate(gantry_racer_mirror_duration_seconds_bucket{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\",method=\"GET\"}[5m])))"},
+        {"refId": "C", "legendFormat": "p99", "expr": "histogram_quantile(0.99, sum by (le) (rate(gantry_racer_mirror_duration_seconds_bucket{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\",method=\"GET\"}[5m])))"}
+      ]
+    },
+    {
+      "id": 8, "type": "bargauge", "title": "Top 10 serving nodes | current 5m rate", "description": "Instant ranking avoids thousands of historical node series. Bytes include partial responses.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 14},
+      "fieldConfig": {"defaults": {"unit": "Bps", "min": 0, "noValue": "No data"}, "overrides": []},
+      "options": {"orientation": "horizontal", "displayMode": "gradient", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "instant": true, "legendFormat": "{{node}}", "expr": "topk(10, sum by (node) (rate(gantry_racer_mirror_bytes_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\",method=\"GET\"}[5m])))"}]
+    },
+    {"id": 102, "type": "row", "title": "Cache and pressure | local work, admission, errors", "collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 22}},
+    {
+      "id": 9, "type": "timeseries", "title": "Page-source activity", "description": "Successful source-work events, including peer serving; not bytes, requests, or an exhaustive partition. Never derive a request hit ratio from these counters.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 23},
+      "fieldConfig": {"defaults": {"unit": "ops", "min": 0, "noValue": "No data"}, "overrides": []},
+      "targets": [
+        {"refId": "A", "legendFormat": "Memory", "expr": "sum(rate(racer_memory_hits_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m]))"},
+        {"refId": "B", "legendFormat": "Disk", "expr": "sum(rate(racer_disk_hits_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m]))"},
+        {"refId": "C", "legendFormat": "Peer", "expr": "sum(rate(racer_peer_hits_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m]))"},
+        {"refId": "D", "legendFormat": "Origin", "expr": "sum(rate(racer_origin_fills_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m]))"}
+      ]
+    },
+    {
+      "id": 10, "type": "timeseries", "title": "Local lookup hit ratios by tier", "description": "Hits / (hits + misses), excluding lookup errors. Presence is not successful subsequent I/O or validation. Idle denominators remain undefined.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 23},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1, "noValue": "No data"}, "overrides": []},
+      "targets": [
+        {"refId": "A", "legendFormat": "Plaintext", "expr": "sum(rate(racer_plaintext_lookup_hits_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m])) / (sum(rate(racer_plaintext_lookup_hits_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m])) + sum(rate(racer_plaintext_lookup_misses_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m])))"},
+        {"refId": "B", "legendFormat": "Ciphertext", "expr": "sum(rate(racer_ciphertext_lookup_hits_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m])) / (sum(rate(racer_ciphertext_lookup_hits_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m])) + sum(rate(racer_ciphertext_lookup_misses_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m])))"},
+        {"refId": "C", "legendFormat": "Pending", "expr": "sum(rate(racer_pending_lookup_hits_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m])) / (sum(rate(racer_pending_lookup_hits_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m])) + sum(rate(racer_pending_lookup_misses_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m])))"},
+        {"refId": "D", "legendFormat": "Disk index", "expr": "sum(rate(racer_disk_index_lookup_hits_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m])) / (sum(rate(racer_disk_index_lookup_hits_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m])) + sum(rate(racer_disk_index_lookup_misses_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m])))"}
+      ]
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "Dataplane outstanding work", "description": "Distinct activity gauges; do not add them or read as utilization. Pending disk entries do not include every abandoned kernel write.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 31},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0, "noValue": "No data"}, "overrides": []},
+      "targets": [
+        {"refId": "A", "legendFormat": "Requests", "expr": "sum(racer_active_requests{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"})"},
+        {"refId": "B", "legendFormat": "Fills", "expr": "sum(racer_active_fills{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"})"},
+        {"refId": "C", "legendFormat": "Deliveries", "expr": "sum(racer_active_deliveries{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"})"},
+        {"refId": "D", "legendFormat": "Pending disk writes", "expr": "sum(racer_pending_disk_writes{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"})"}
+      ]
+    },
+    {
+      "id": 12, "type": "timeseries", "title": "SDK admission queues", "description": "Gantry-side waiting calls by admission class, not Rust worker queues. Aggregate queue_depth is deliberately omitted to avoid double counting.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 31},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0, "noValue": "No data"}, "overrides": []},
+      "targets": [
+        {"refId": "A", "legendFormat": "Bulk", "expr": "sum(gantry_racer_sdk_bulk_queue_depth{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"})"},
+        {"refId": "B", "legendFormat": "Metadata", "expr": "sum(gantry_racer_sdk_metadata_queue_depth{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"})"},
+        {"refId": "C", "legendFormat": "Small objects", "expr": "sum(gantry_racer_sdk_small_object_queue_depth{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"})"}
+      ]
+    },
+    {
+      "id": 13, "type": "bargauge", "title": "Top 10 nodes | bulk admission occupancy", "description": "Occupied bulk SDK slots divided by effective bulk limits, summed per node. Zero limits are excluded. This is not CPU utilization.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 39},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1, "noValue": "No data"}, "overrides": []},
+      "options": {"orientation": "horizontal", "displayMode": "gradient", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "instant": true, "legendFormat": "{{node}}", "expr": "topk(10, sum by (node) (gantry_racer_sdk_active_bulk{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}) / (sum by (node) (gantry_racer_sdk_bulk_limit{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}) > 0))"}]
+    },
+    {
+      "id": 14, "type": "timeseries", "title": "Errors and backpressure events", "description": "Overlapping diagnostic events, not additive unique failures. Requests count starts while request errors count exits. Queue timeouts exclude some caller cancellations.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 39},
+      "fieldConfig": {"defaults": {"unit": "ops", "min": 0, "noValue": "No data"}, "overrides": []},
+      "targets": [
+        {"refId": "A", "legendFormat": "Unsuccessful exchanges", "expr": "sum(rate(racer_request_errors_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m]))"},
+        {"refId": "B", "legendFormat": "Dataplane overloads", "expr": "sum(rate(racer_overloads_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m]))"},
+        {"refId": "C", "legendFormat": "SDK queue rejections", "expr": "sum(rate(gantry_racer_sdk_queue_rejections_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m]))"},
+        {"refId": "D", "legendFormat": "SDK queue timeouts", "expr": "sum(rate(gantry_racer_sdk_queue_timeouts_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m]))"},
+        {"refId": "E", "legendFormat": "Local lookup errors", "expr": "sum(rate(racer_plaintext_lookup_errors_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m])) + sum(rate(racer_ciphertext_lookup_errors_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m])) + sum(rate(racer_pending_lookup_errors_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m])) + sum(rate(racer_disk_index_lookup_errors_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m]))"}
+      ]
+    },
+    {
+      "id": 15, "type": "timeseries", "title": "Persistence and corrupt-copy events", "description": "Publication is not fsync durability. Discards include cleanup/cancellation and exclude declined enqueues; these do not form a persistence success ratio.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 47},
+      "fieldConfig": {"defaults": {"unit": "ops", "min": 0, "noValue": "No data"}, "overrides": []},
+      "targets": [
+        {"refId": "A", "legendFormat": "Disk publications", "expr": "sum(rate(racer_disk_publications_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m]))"},
+        {"refId": "B", "legendFormat": "Dirty discards", "expr": "sum(rate(racer_dirty_discards_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m]))"},
+        {"refId": "C", "legendFormat": "Corrupt-copy misses", "expr": "sum(rate(racer_corrupt_misses_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m]))"}
+      ]
+    },
+    {
+      "id": 16, "type": "bargauge", "title": "Top 10 nodes | unsuccessful exchanges", "description": "Current five-minute unsuccessful exit rate, including cancellation and truncated delivery. No traffic normalization or invented zero for absent telemetry.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 47},
+      "fieldConfig": {"defaults": {"unit": "ops", "min": 0, "noValue": "No data"}, "overrides": []},
+      "options": {"orientation": "horizontal", "displayMode": "gradient", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "instant": true, "legendFormat": "{{node}}", "expr": "topk(10, sum by (node) (rate(racer_request_errors_total{job=\"kubernetes-pods\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m])))"}]
+    },
+    {"id": 103, "type": "row", "title": "Optional load generator | verified image-pull experience", "collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 55}},
+    {
+      "id": 17, "type": "timeseries", "title": "Verified goodput vs received throughput", "description": "Bytes/sec at two overlapping boundaries; never add them. Verified bytes are credited only at successful full-image completion with verification enabled; otherwise verified stays zero.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 56},
+      "fieldConfig": {"defaults": {"unit": "Bps", "min": 0, "noValue": "No data"}, "overrides": []},
+      "targets": [
+        {"refId": "A", "legendFormat": "Verified whole-image goodput", "expr": "sum(rate(racer_loadgen_verified_bytes_total{job=\"kubernetes-pods\",app_kubernetes_io_name=\"racer-loadgen\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m]))"},
+        {"refId": "B", "legendFormat": "Received, including failed pulls", "expr": "sum(rate(racer_loadgen_received_bytes_total{job=\"kubernetes-pods\",app_kubernetes_io_name=\"racer-loadgen\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m]))"}
+      ]
+    },
+    {
+      "id": 18, "type": "timeseries", "title": "Image pull completions by result", "description": "Full image attempts, not individual manifest/config/layer requests. Cancellation is distinct from error.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 56},
+      "fieldConfig": {"defaults": {"unit": "ops", "min": 0, "noValue": "No data"}, "overrides": []},
+      "targets": [{"refId": "A", "legendFormat": "{{result}}", "expr": "sum by (result) (rate(racer_loadgen_pulls_total{job=\"kubernetes-pods\",app_kubernetes_io_name=\"racer-loadgen\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"}[5m]))"}]
+    },
+    {
+      "id": 19, "type": "timeseries", "title": "Successful image pull latency | p50 / p95 / p99", "description": "Whole-image classic histogram estimates; excludes failed/canceled attempts. Buckets top out at 300 seconds before +Inf, limiting tail precision.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 64},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0, "noValue": "No data"}, "overrides": []},
+      "targets": [
+        {"refId": "A", "legendFormat": "p50", "expr": "histogram_quantile(0.50, sum by (le) (rate(racer_loadgen_pull_duration_seconds_bucket{job=\"kubernetes-pods\",app_kubernetes_io_name=\"racer-loadgen\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\",result=\"success\"}[5m])))"},
+        {"refId": "B", "legendFormat": "p95", "expr": "histogram_quantile(0.95, sum by (le) (rate(racer_loadgen_pull_duration_seconds_bucket{job=\"kubernetes-pods\",app_kubernetes_io_name=\"racer-loadgen\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\",result=\"success\"}[5m])))"},
+        {"refId": "C", "legendFormat": "p99", "expr": "histogram_quantile(0.99, sum by (le) (rate(racer_loadgen_pull_duration_seconds_bucket{job=\"kubernetes-pods\",app_kubernetes_io_name=\"racer-loadgen\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\",result=\"success\"}[5m])))"}
+      ]
+    },
+    {
+      "id": 20, "type": "timeseries", "title": "Successful request p95 by object kind", "description": "Request latency through body consumption for manifest, config, and layer. Not whole-image latency; no observations remain undefined.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 64},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0, "noValue": "No data"}, "overrides": []},
+      "targets": [{"refId": "A", "legendFormat": "{{kind}}", "expr": "histogram_quantile(0.95, sum by (le,kind) (rate(racer_loadgen_request_duration_seconds_bucket{job=\"kubernetes-pods\",app_kubernetes_io_name=\"racer-loadgen\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\",result=\"success\"}[5m])))"}]
+    },
+    {
+      "id": 21, "type": "timeseries", "title": "In-flight pulls vs applied concurrency", "description": "In-flight may temporarily exceed the applied limit while a concurrency decrease drains. These are counts, not CPU or SDK utilization.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 72},
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0, "noValue": "No data"}, "overrides": []},
+      "targets": [
+        {"refId": "A", "legendFormat": "In flight", "expr": "sum(racer_loadgen_in_flight{job=\"kubernetes-pods\",app_kubernetes_io_name=\"racer-loadgen\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"})"},
+        {"refId": "B", "legendFormat": "Applied concurrency", "expr": "sum(racer_loadgen_applied_concurrency{job=\"kubernetes-pods\",app_kubernetes_io_name=\"racer-loadgen\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\"})"}
+      ]
+    },
+    {
+      "id": 22, "type": "bargauge", "title": "Top 10 nodes | successful pull p95", "description": "Current per-node histogram tail estimates, not an average of pod percentiles. Instant top 10 limits fleet-scale cardinality.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 72},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0, "noValue": "No data"}, "overrides": []},
+      "options": {"orientation": "horizontal", "displayMode": "gradient", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "instant": true, "legendFormat": "{{node}}", "expr": "topk(10, histogram_quantile(0.95, sum by (node,le) (rate(racer_loadgen_pull_duration_seconds_bucket{job=\"kubernetes-pods\",app_kubernetes_io_name=\"racer-loadgen\",namespace=~\"${namespace:regex}\",node=~\"${node:regex}\",result=\"success\"}[5m]))))"}]
+    },
+    {"id": 104, "type": "row", "title": "Node resources | shared host, not Racer attribution; namespace does not apply", "collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 80}},
+    {
+      "id": 23, "type": "bargauge", "title": "Top 10 nodes | CPU non-idle", "description": "Node exporter: 1 - mean idle CPU fraction. Includes all workloads and iowait; not Racer CPU. Namespace does not filter host metrics. Requires node labels.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 81},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1, "noValue": "No data"}, "overrides": []},
+      "options": {"orientation": "horizontal", "displayMode": "gradient", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "instant": true, "legendFormat": "{{node}}", "expr": "topk(10, 1 - avg by (node) (rate(node_cpu_seconds_total{node!=\"\",node=~\"${node:regex}\",mode=\"idle\"}[5m])))"}]
+    },
+    {
+      "id": 24, "type": "bargauge", "title": "Top 10 nodes | memory unavailable", "description": "Node exporter: 1 - MemAvailable / MemTotal. Shared-host pressure, not Racer residency or cache occupancy. Namespace does not apply.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 81},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1, "noValue": "No data"}, "overrides": []},
+      "options": {"orientation": "horizontal", "displayMode": "gradient", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "instant": true, "legendFormat": "{{node}}", "expr": "topk(10, 1 - max by (node) (node_memory_MemAvailable_bytes{node!=\"\",node=~\"${node:regex}\"}) / (max by (node) (node_memory_MemTotal_bytes{node!=\"\",node=~\"${node:regex}\"}) > 0))"}]
+    },
+    {
+      "id": 25, "type": "bargauge", "title": "Top 10 nodes | NIC receive", "description": "Host receive bytes/sec on eth*/en* interfaces only, excluding typical loopback, bridge, and veth devices. Adjust interface allowlist for your hosts. Not Racer-only traffic; namespace does not apply.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 89},
+      "fieldConfig": {"defaults": {"unit": "Bps", "min": 0, "noValue": "No data"}, "overrides": []},
+      "options": {"orientation": "horizontal", "displayMode": "gradient", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "instant": true, "legendFormat": "{{node}}", "expr": "topk(10, sum by (node) (rate(node_network_receive_bytes_total{node!=\"\",node=~\"${node:regex}\",device=~\"eth[0-9]+|en.*\"}[5m])))"}]
+    },
+    {
+      "id": 26, "type": "bargauge", "title": "Top 10 nodes | NIC transmit", "description": "Host transmit bytes/sec on eth*/en* interfaces only. RX and TX are separate directions, not an estimate of useful serving throughput. Namespace does not apply.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"}, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 89},
+      "fieldConfig": {"defaults": {"unit": "Bps", "min": 0, "noValue": "No data"}, "overrides": []},
+      "options": {"orientation": "horizontal", "displayMode": "gradient", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"refId": "A", "instant": true, "legendFormat": "{{node}}", "expr": "topk(10, sum by (node) (rate(node_network_transmit_bytes_total{node!=\"\",node=~\"${node:regex}\",device=~\"eth[0-9]+|en.*\"}[5m])))"}]
+    }
+  ]
+}
