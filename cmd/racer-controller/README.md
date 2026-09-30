@@ -180,11 +180,16 @@ issuer/shared-key policy below:
 
 Credentials and rotation state commit together in `racer-controller-tls` under an
 optimistic lock before the operator derives public bootstrap trust from the
-committed Secret. Recognized legacy serving credentials migrate to weekly rotation
-with an old-root compatibility bridge. Routine renewals and rotations do not
-change either workload's pod template or trigger a rollout. An existing
-`unbounded-cloud.io/racer-tls-hash` annotation is preserved as an inert value,
-not recomputed. Config payload hashes still trigger workload rollouts.
+committed Secret. Serving credentials without the current rotation state are
+rejected, including the historical ten-year CA format; automatic migration is no
+longer supported. Before upgrading such an installation, use a version that still
+supports migration to commit current-format credentials, or arrange manual recovery
+of valid, consistent serving credentials, rotation state, and client trust. Do not
+delete the Secret or reset installation claims to force recreation. Routine renewals
+and rotations do not change either workload's pod template or trigger a rollout.
+The obsolete `unbounded-cloud.io/racer-tls-hash` annotation is no longer preserved;
+its removal can cause one controller rollout on upgrade. Config payload hashes
+still trigger workload rollouts.
 
 The reloader accepts a coherent certificate/key pair, retains the last valid pair
 on missing, malformed, or mixed-generation updates, and uses new credentials for

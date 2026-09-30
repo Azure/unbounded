@@ -261,7 +261,7 @@ func renewTLS(secret *corev1.Secret, namespace string, now time.Time) (*corev1.S
 		return nil, err
 	}
 
-	state, legacy, err := readTLSState(secret, ca, now)
+	state, err := readTLSState(secret, ca, now)
 	if err != nil {
 		return nil, err
 	}
@@ -283,7 +283,7 @@ func renewTLS(secret *corev1.Secret, namespace string, now time.Time) (*corev1.S
 		}
 	}
 
-	rotate := legacy || !now.Before(state.CreatedAt.Add(caRotationInterval))
+	rotate := !now.Before(state.CreatedAt.Add(caRotationInterval))
 	if rotate {
 		newKey, keyErr := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		if keyErr != nil {
@@ -503,43 +503,33 @@ func writeTLSState(secret *corev1.Secret, state tlsState) error {
 	return nil
 }
 
-func readTLSState(secret *corev1.Secret, ca *x509.Certificate, now time.Time) (tlsState, bool, error) {
+func readTLSState(secret *corev1.Secret, ca *x509.Certificate, now time.Time) (tlsState, error) {
 	state := tlsState{Version: 1}
 
 	data, exists := secret.Data[tlsStateKey]
 	if !exists {
-		_, previousExists := secret.Data[previousCAKey]
-		if _, marked := secret.Annotations[tlsStateAnnotation]; marked || previousExists {
-			return state, false, fmt.Errorf("missing Racer serving rotation state")
-		}
-
-		if ca.Subject.CommonName != "racer-serving-ca" || !ca.NotAfter.Equal(ca.NotBefore.Add(time.Hour+10*365*day)) {
-			return state, false, fmt.Errorf("missing Racer serving rotation state on non-legacy CA")
-		}
-		// Legacy Secrets have only one self-signed root. Rotate immediately,
-		// retaining it and cross-signing with its key before discarding that key.
-		return state, true, nil
+		return state, fmt.Errorf("missing Racer serving rotation state")
 	}
 
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 
 	if err := decoder.Decode(&state); err != nil {
-		return state, false, fmt.Errorf("invalid Racer serving rotation state: %w", err)
+		return state, fmt.Errorf("invalid Racer serving rotation state: %w", err)
 	}
 
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		return state, false, fmt.Errorf("trailing Racer serving rotation state")
+		return state, fmt.Errorf("trailing Racer serving rotation state")
 	}
 
 	if state.Version != 1 || secret.Annotations[tlsStateAnnotation] != "1" ||
 		!state.CreatedAt.Equal(ca.NotBefore.Add(time.Hour)) || state.CreatedAt.After(now) ||
 		!ca.NotAfter.Equal(state.CreatedAt.Add(caLifetime)) || len(state.Previous) > maxPreviousCAs {
-		return state, false, fmt.Errorf("invalid Racer serving rotation policy state")
+		return state, fmt.Errorf("invalid Racer serving rotation policy state")
 	}
 
 	if _, exists := secret.Data[previousCAKey]; !exists || !bytes.Equal(secret.Data[previousCAKey], previousRoots(state)) {
-		return state, false, fmt.Errorf("racer previous CA roots do not match rotation state")
+		return state, fmt.Errorf("racer previous CA roots do not match rotation state")
 	}
 
 	child := ca
@@ -547,12 +537,12 @@ func readTLSState(secret *corev1.Secret, ca *x509.Certificate, now time.Time) (t
 	for i, previous := range state.Previous {
 		root, err := singleCertificate(previous.Root)
 		if err != nil {
-			return state, false, err
+			return state, err
 		}
 
 		cross, err := singleCertificate(previous.Cross)
 		if err != nil {
-			return state, false, err
+			return state, err
 		}
 
 		expires := child.NotAfter
@@ -571,11 +561,11 @@ func readTLSState(secret *corev1.Secret, ca *x509.Certificate, now time.Time) (t
 			!cross.NotBefore.Equal(child.NotBefore) || !cross.NotAfter.Equal(expires) || !previous.RetireAt.Equal(retireAt) ||
 			!previous.RetireAt.After(child.NotBefore.Add(time.Hour)) ||
 			(i > 0 && !previous.RetireAt.Before(state.Previous[i-1].RetireAt)) {
-			return state, false, fmt.Errorf("invalid Racer previous CA compatibility chain")
+			return state, fmt.Errorf("invalid Racer previous CA compatibility chain")
 		}
 
 		child = root
 	}
 
-	return state, false, nil
+	return state, nil
 }

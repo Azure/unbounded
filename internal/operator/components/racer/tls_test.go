@@ -265,17 +265,11 @@ func TestTLSLegacyMigration(t *testing.T) {
 	delete(secret.Data, tlsStateKey)
 	delete(secret.Data, previousCAKey)
 	delete(secret.Annotations, tlsStateAnnotation)
+	before := secret.DeepCopy()
 	next, err := renewTLS(secret, "custom-system", now)
-	require.NoError(t, err)
-	require.NotEqual(t, secret.Data["ca.key"], next.Data["ca.key"])
-	require.Equal(t, secret.Data["ca.crt"], next.Data[previousCAKey])
-	require.NoError(t, verifyServing(t, next, secret.Data["ca.crt"], now))
-	require.NoError(t, verifyServing(t, next, next.Data["ca.crt"], now))
-	state := stateOf(t, next)
-	require.Equal(t, now.Add(trustOverlap), state.Previous[0].RetireAt)
-	unchanged, err := renewTLS(next, "custom-system", now)
-	require.NoError(t, err)
-	require.Nil(t, unchanged)
+	require.EqualError(t, err, "missing Racer serving rotation state")
+	require.Nil(t, next)
+	require.Equal(t, before, secret, "unsupported credentials must not be silently replaced")
 }
 
 func TestTLSCorruptionFailsClosed(t *testing.T) {
@@ -442,6 +436,12 @@ func TestTLSRotationDoesNotChangePodTemplates(t *testing.T) {
 				deployment.Spec.Template.Annotations["unbounded-cloud.io/racer-tls-hash"] = legacyHash
 				require.NoError(t, env.Client.Update(t.Context(), deployment))
 			}
+
+			// Compatibility metadata is removed on reconciliation, independently
+			// of TLS rotation. An old installation may roll once for this change.
+			persist(t, env, planPass(t, env))
+			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), deployment))
+			require.NotContains(t, deployment.Spec.Template.Annotations, "unbounded-cloud.io/racer-tls-hash")
 
 			beforeController, beforeDataplane := deployment.Spec.Template.DeepCopy(), ds.Spec.Template.DeepCopy()
 			now := time.Now().UTC().Truncate(time.Second)

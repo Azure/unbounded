@@ -234,17 +234,6 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 			annotations := map[string]string{
 				"unbounded-cloud.io/racer-config-hash": configHash,
 			}
-			// TLS reloads from the projected Secret without rolling pods. Preserve
-			// the legacy annotation as an inert value to avoid a migration rollout.
-			current := &appsv1.Deployment{}
-			if err := env.LiveReader().Get(ctx, objectKey(env, controllerName), current); err != nil && !apierrors.IsNotFound(err) {
-				return err
-			}
-
-			if hash, exists := current.Spec.Template.Annotations["unbounded-cloud.io/racer-tls-hash"]; exists {
-				annotations["unbounded-cloud.io/racer-tls-hash"] = hash
-			}
-
 			if err := unstructured.SetNestedStringMap(obj.Object, annotations, "spec", "template", "metadata", "annotations"); err != nil {
 				return err
 			}

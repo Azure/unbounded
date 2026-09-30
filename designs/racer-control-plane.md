@@ -704,19 +704,22 @@ deadlines, and versioned rotation state together. It retains no old private keys
 Each cross-certificate links a new CA to its predecessor, allowing a new leaf to
 verify against retained older trust without signing new leaves with old keys.
 Expired/retired suffixes are pruned rather than accumulating generations.
-Recognized legacy long-lived serving credentials migrate immediately, retaining
-the legacy public root and a bridge for the overlap, not its private key
-(`internal/operator/components/racer/tls.go:182-295`, `:428-508`).
+Serving credentials without current rotation state fail closed, including the
+historical ten-year CA format. Automatic legacy migration is no longer supported.
+Before upgrading an old installation, commit current-format credentials with a
+version that supports migration, or arrange manual recovery of consistent serving
+credentials, rotation state, and client trust. Never delete the Secret or reset
+installation claims to force recreation. Ordinary rotation still retains bounded
+previous public roots and cross-signed bridges, but no previous private keys.
 
 Create-if-absent or optimistic Secret patch commits before any derived trust is
 published. Subsequent reconciliation reads the committed Secret and publishes
 current plus retained previous roots in the bootstrap ConfigMap, so a losing
 write never publishes trust for uncommitted credentials. Neither controller nor
-dataplane pod templates change for routine TLS rotation. Any existing
-`unbounded-cloud.io/racer-tls-hash` stays unchanged as inert compatibility metadata;
-removing or recomputing it would cause an unnecessary rollout. Configuration hashes
-still roll workloads (`internal/operator/components/racer/tls.go:132-179`,
-`internal/operator/components/racer/racer.go:227-258`).
+dataplane pod templates change for routine TLS rotation. The obsolete
+`unbounded-cloud.io/racer-tls-hash` is no longer preserved, so removing it can cause
+one controller rollout on upgrade. Subsequent rotations do not change the pod
+template. Configuration hashes still roll workloads.
 
 Zero caches still pause provisioning and workload repair, but do not abandon
 retained serving credentials. Maintenance validates the permanent operator claim
