@@ -1521,32 +1521,105 @@ impl Harness {
         }
         let index = self.rng.pick(self.native_rules.len());
         let (operation, fault) = self.native_rules.swap_remove(index);
+        // Even a one-node generated topology needs a real peer payload path.
+        if self.nodes.len() == 1 {
+            self.add(None);
+        }
+        self.settle();
+        self.clock.advance(Duration::from_secs(26));
+        let object = self.object_id(5);
+        let candidates = self.ranked_nodes(&object);
+        let source = candidates[0];
+        let receiver = candidates[1];
+        self.update(5);
+        // Candidates probe predecessors CopyOnly before filling from origin.
+        // Warm the primary's exact version first, including in two-node clusters.
+        // The byte oracle remains independent of this injection-path selection.
+        let warm = self.request_on(5, true, false, source);
+        self.exchange(warm, false);
         self.fabric.fault(operation, fault);
         self.coverage.action("native-fault");
-        for _ in 0..32 {
-            self.update(5);
-            // Bootstrap now carries page zero over HTTP before its ETag is known.
-            // Exercise native fault injection with an explicitly pinned page.
-            let client = self.request(5, true, false);
-            self.exchange(client, true);
-            if self.fabric.pending_faults() == 0 {
-                *self
-                    .coverage
-                    .native_faults
-                    .entry(format!(
-                        "{operation:?}:{}",
-                        match fault {
-                            NativeFault::Reject => "reject",
-                            NativeFault::Delay(_) => "delay",
-                            NativeFault::Completion(_) => "completion",
-                        }
-                    ))
-                    .or_default() += 1;
-                self.coverage.action("native-fault-observed");
-                return;
+        let client = self.request_on(5, true, false, receiver);
+        self.exchange(client, true);
+        assert_eq!(self.fabric.pending_faults(), 0, "native fault not consumed");
+        *self
+            .coverage
+            .native_faults
+            .entry(format!(
+                "{operation:?}:{}",
+                match fault {
+                    NativeFault::Reject => "reject",
+                    NativeFault::Delay(_) => "delay",
+                    NativeFault::Completion(_) => "completion",
+                }
+            ))
+            .or_default() += 1;
+        self.coverage.action("native-fault-observed");
+    }
+
+    fn object_id(&self, object: usize) -> ObjectId {
+        ObjectId {
+            cache: self.definition(self.nodes[0].id).id,
+            key: CacheKey::parse_hex(key(object).as_bytes()).unwrap(),
+        }
+    }
+
+    fn ranked_nodes(&self, object: &ObjectId) -> Vec<usize> {
+        // Use a separate placement cache for fixture setup, not the byte oracle.
+        Placement::new(1)
+            .rank(
+                self.nodes[0]
+                    .app
+                    .snapshots
+                    .current()
+                    .unwrap()
+                    .membership
+                    .clone(),
+                object,
+                PageNumber(0),
+            )
+            .unwrap()
+            .ordered
+            .iter()
+            .map(|id| {
+                self.nodes
+                    .iter()
+                    .position(|n| &n.config.node == id)
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    fn recover_origin(&mut self) {
+        // Quiescence alone does not close a circuit. Neither does elapsed backoff:
+        // concurrent healthy requests would compete for its exclusive half-open
+        // probe. Complete real, serial origin I/O on every worker before resuming.
+        self.settle();
+        self.clock.advance(Duration::from_secs(26));
+        for node in 0..self.nodes.len() {
+            for worker in 0..self.nodes[node].workers.len() {
+                let object = (8..16384)
+                    .find(|&object| {
+                        let id = self.object_id(object);
+                        self.nodes[node].app.directory.metadata_owner(&id).unwrap()
+                            == WorkerId(worker as u16)
+                            && self.ranked_nodes(&id)[0] == node
+                    })
+                    .expect("bounded recovery key search");
+                // A new version prevents a local or peer metadata hit from
+                // impersonating origin recovery. HEAD has no concurrent page fill.
+                self.update(object);
+                let calls = self.catalog.borrow().calls;
+                let probe = self.request_on(object, true, true, node);
+                self.exchange(probe, false);
+                assert_eq!(
+                    self.catalog.borrow().calls,
+                    calls + 1,
+                    "recovery skipped origin"
+                );
             }
         }
-        panic!("native fault not consumed");
+        self.coverage.action("origin-recovered");
     }
 
     fn origin_fault(&mut self) {
@@ -1574,6 +1647,7 @@ impl Harness {
             "origin fault not consumed"
         );
         self.coverage.action("origin-fault");
+        self.recover_origin();
     }
 
     fn malformed_client(&mut self) {
@@ -2025,6 +2099,7 @@ impl Harness {
                     let client = self.request(2, false, false);
                     self.exchange(client, true);
                     self.coverage.action("connect-failure");
+                    self.recover_origin();
                 }
                 Action::DelayedWrite => {
                     self.sim.inject("write", Fault::Delay(3 + self.rng.pick(8)));
@@ -2377,6 +2452,79 @@ fn phase5_default_grace_staggered_nodes_and_periodic_checkpoint_traffic() {
 #[test]
 fn dst_generated_native_traffic_churn_oracle() {
     run_corpus(true);
+}
+
+#[test]
+fn dst_origin_recovery_completes_before_concurrent_healthy_reads() {
+    for native in [false, true] {
+        let sim = Simulation::new();
+        let _os = sim.enter();
+        let clock = SimulationClock::new(106);
+        let environment = clock.environment(0);
+        let _time = environment.enter();
+        let _strict = crate::runtime::environment::require_simulated();
+        let mut harness = Harness::new(106, sim, clock, native);
+        for object in 0..8 {
+            harness.update(object);
+        }
+        for _ in 0..3 {
+            harness.add(None);
+        }
+        for fault in [
+            OriginFault::DuplicateLength,
+            OriginFault::Truncate,
+            OriginFault::WrongEtag,
+            OriginFault::Reject,
+            OriginFault::Forbidden,
+        ] {
+            harness.origin_faults = vec![fault];
+            let failures = harness.coverage.failures;
+            harness.origin_fault();
+            assert!(
+                harness.coverage.failures > failures,
+                "fault did not fail a read"
+            );
+            let failures = harness.coverage.failures;
+            harness.traffic(8, false);
+            assert_eq!(harness.coverage.failures, failures);
+        }
+        assert_eq!(harness.coverage.actions["origin-recovered"], 5);
+        while !harness.nodes.is_empty() {
+            harness.remove(0);
+        }
+        assert_eq!(harness.sim.live_handles(), 0);
+        assert_eq!(harness.fabric.live_resources(), 0);
+    }
+}
+
+#[test]
+fn dst_native_faults_reach_warmed_peers_in_small_topologies() {
+    for nodes in [1, 2, 3] {
+        let sim = Simulation::new();
+        let _os = sim.enter();
+        let clock = SimulationClock::new(118);
+        let environment = clock.environment(0);
+        let _time = environment.enter();
+        let _strict = crate::runtime::environment::require_simulated();
+        let mut harness = Harness::new(118, sim, clock, true);
+        for _ in 0..nodes {
+            harness.add(None);
+        }
+        for _ in 0..9 {
+            harness.native_fault();
+            assert_eq!(harness.fabric.pending_faults(), 0);
+        }
+        // One complete rule bag covers Bind/Write/Invalidate x all three faults.
+        assert!(harness.native_rules.is_empty());
+        assert_eq!(harness.coverage.native_faults.len(), 9);
+        assert!(harness.coverage.native_faults.values().all(|&n| n == 1));
+        assert!(harness.coverage.native_writes > 0);
+        while !harness.nodes.is_empty() {
+            harness.remove(0);
+        }
+        assert_eq!(harness.sim.live_handles(), 0);
+        assert_eq!(harness.fabric.live_resources(), 0);
+    }
 }
 
 fn run_corpus(native: bool) {
