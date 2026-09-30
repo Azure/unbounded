@@ -383,6 +383,9 @@ fn assembled_peer_io_rejects_oversize_and_admission_pressure_before_submission()
             .unwrap();
         let baseline = admission.used(ResourceClass::RequestContext);
         let (socket, mut other) = UnixStream::pair().unwrap();
+        other
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
         let conn = ConnectionLease::from_accepted(socket.into(), admission).unwrap();
         let operation = async {
             if send {
@@ -404,6 +407,9 @@ fn assembled_peer_io_rejects_oversize_and_admission_pressure_before_submission()
                 Poll::Ready(Err(Error::Overloaded)),
                 "send={send}, available={available}"
             );
+            // The failed admission must close without sending even a partial head.
+            let mut byte = [0];
+            assert_eq!(other.read(&mut byte).unwrap(), 0);
         }
         assert_eq!(reactor.in_flight(), 0);
         io.reclaim_buffer();

@@ -21,7 +21,7 @@ struct ScriptedPeers {
     signing: Vec<Forwarding>,
     replies: RefCell<VecDeque<(NodeId, Reply)>>,
     calls: RefCell<Vec<(NodeId, bool, u32, u8, Instant)>>,
-    candidate_deadlines: RefCell<Vec<Instant>>,
+    local_deadlines: RefCell<Vec<(Instant, Instant)>>,
 }
 impl PeerClient for ScriptedPeers {
     fn request<'a>(
@@ -31,9 +31,11 @@ impl PeerClient for ScriptedPeers {
         scope: &'a RequestScope,
     ) -> Operation<'a, VerifiedResponse> {
         Box::pin(async move {
-            self.candidate_deadlines
-                .borrow_mut()
-                .push(scope.body_deadlines.expect("candidate time share").1);
+            let (overall, share) = scope.body_deadlines.expect("local candidate time share");
+            assert_eq!(overall, scope.deadline.0);
+            assert_eq!(overall, request.route.deadline.0);
+            assert_eq!(overall, request.origin.scope().deadline.0);
+            self.local_deadlines.borrow_mut().push((overall, share));
             let destination = request.route.destination.clone();
             self.calls.borrow_mut().push((
                 destination.clone(),
@@ -100,7 +102,7 @@ fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Ve
         signing: network(4).into_iter().map(Forwarding::new).collect(),
         replies: RefCell::new(VecDeque::new()),
         calls: RefCell::new(Vec::new()),
-        candidate_deadlines: RefCell::new(Vec::new()),
+        local_deadlines: RefCell::new(Vec::new()),
     });
     let mut dependencies = f.fill.dependencies.clone();
     dependencies.peers = peers.clone();
@@ -271,17 +273,12 @@ fn unusable_peer_copy_advances_to_alternate_or_authorized_origin() {
                         && *links == 4
                         && *deadline == f.scope.deadline.0)
             );
-            // Signed routes retain the original hard ceiling; only local candidate
-            // shares reserve fallback time. A fast unusable copy leaves more time
-            // for the next ranked attempt without renewing signed authority.
-            let candidate_deadlines = peers.candidate_deadlines.borrow();
-            assert_eq!(candidate_deadlines.len(), calls.len());
-            assert!(
-                candidate_deadlines
-                    .iter()
-                    .all(|deadline| *deadline < f.scope.deadline.0)
-            );
-            assert!(candidate_deadlines[0] < candidate_deadlines[1]);
+            // Both probes retain later candidates or local origin as a fallback.
+            // Only local time shares advance; signed authority never renews.
+            let deadlines = peers.local_deadlines.borrow();
+            assert_eq!(deadlines.len(), 2);
+            assert!(deadlines.iter().all(|(overall, share)| *share < *overall));
+            assert!(deadlines[0].1 < deadlines[1].1);
             let spent: u32 = calls.iter().map(|(_, _, credits, _, _)| 1 + credits).sum();
             assert_eq!(
                 budget.remaining_attempts(),
