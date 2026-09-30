@@ -11,10 +11,9 @@ use crate::{
     runtime::{
         admission::Admission,
         deadline::{Cancellation, RequestScope},
+        reactor::Descriptor,
     },
 };
-#[cfg(test)]
-use std::time::Instant;
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, VecDeque},
@@ -33,14 +32,6 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-
-#[path = "ownership.rs"]
-mod ownership;
-#[path = "readiness.rs"]
-mod readiness;
-#[path = "transition.rs"]
-mod transition;
-pub use transition::PreparedListeners;
 
 enum Listener {
     Real(UnixListener),
@@ -111,7 +102,7 @@ struct BoundListener {
     retired: Arc<crate::runtime::ingress::Retired>,
     basename: RefCell<String>,
     witness: Option<String>,
-    owner: Option<Rc<ownership::EndpointOwner>>,
+    owner: Option<Rc<EndpointOwner>>,
 }
 
 impl Drop for BoundListener {
@@ -162,7 +153,7 @@ struct Active {
 
 pub struct ClientListeners {
     generation: Rc<Cell<u64>>,
-    readiness: RefCell<readiness::ReadyListeners>,
+    readiness: RefCell<ReadyListeners>,
     sim_cursor: RefCell<Option<CacheId>>,
     ingress: Option<Arc<crate::runtime::ingress::Ingress>>,
     metrics: crate::telemetry::metrics::Metrics,
@@ -191,7 +182,7 @@ impl ClientListeners {
     ) -> Self {
         Self {
             generation: Rc::new(Cell::new(0)),
-            readiness: RefCell::new(readiness::ReadyListeners::default()),
+            readiness: RefCell::new(ReadyListeners::default()),
             sim_cursor: RefCell::new(None),
             ingress: None,
             metrics: crate::telemetry::metrics::Metrics::default(),
@@ -226,6 +217,8 @@ impl ClientListeners {
         self.ingress = Some(ingress);
         self
     }
+    /// Install either a locally accepted socket or a distributed ingress handoff.
+    /// A queued handoff may arrive after its listener generation was retired.
     pub(crate) fn install_connection(
         &self,
         connection: ConnectionLease,
@@ -306,10 +299,129 @@ impl ClientListeners {
     /// Dropping the returned transition restores the last-good owned paths.
     pub fn prepare<'a>(
         &'a self,
-        caches: &'a [CacheDefinition],
+        definitions: &'a [CacheDefinition],
         scope: &'a RequestScope,
     ) -> Operation<'a, PreparedListeners> {
-        transition::prepare(self, caches, scope)
+        Box::pin(async move {
+            scope.check()?;
+            crate::control::caches::validate_definitions(definitions)?;
+            if !self.accepting.get() {
+                return Err(Error::Unavailable);
+            }
+            if self.preparing.replace(true) {
+                return Err(Error::Overloaded);
+            }
+            let mut prepared = PreparedListeners {
+                generation: self.generation.clone(),
+                definitions: definitions.to_vec(),
+                target: self.listeners.clone(),
+                next: BTreeMap::new(),
+                replacements: Vec::new(),
+                preparing: self.preparing.clone(),
+                accepting: self.accepting.clone(),
+                cleanup: self.cleanup.clone(),
+                committed: false,
+            };
+            // Finish older deferred unlinks before reusing a removed cache name.
+            self.cleanup.borrow_mut().clear();
+            let old = self.listeners.borrow().clone();
+            // Commit must not allocate while adding deferred owners to the queue.
+            self.cleanup
+                .borrow_mut()
+                .try_reserve(
+                    old.len()
+                        .saturating_mul(2)
+                        .saturating_add(definitions.len()),
+                )
+                .map_err(|_| Error::Overloaded)?;
+            let mut pending = Vec::new();
+            // Bind and chmod every changed socket before touching any active pathname.
+            for definition in definitions {
+                scope.check()?;
+                if let Some(current) = old
+                    .get(&definition.id)
+                    .filter(|current| current.definition == *definition)
+                {
+                    if !owns(current, "socket") {
+                        return Err(Error::Io);
+                    }
+                    if let (Some(owner), Directory::Real(directory)) =
+                        (&current.owner, &current.directory)
+                    {
+                        owner.validate(directory)?;
+                    }
+                    prepared.next.insert(definition.id.clone(), current.clone());
+                    continue;
+                }
+                let mut random = [0; 16];
+                crate::runtime::environment::fill_random(&mut random)
+                    .map_err(|_| Error::Unavailable)?;
+                let temporary = format!(".racer-{:032x}", u128::from_ne_bytes(random));
+                let previous = old
+                    .values()
+                    .find(|current| current.definition.name == definition.name)
+                    .cloned();
+                let next = Rc::new(bind(
+                    &self.root,
+                    definition.clone(),
+                    &temporary,
+                    previous.as_deref(),
+                )?);
+                if let Some(previous) = &previous {
+                    if !owns(previous, "socket")
+                        || !same_directory(&previous.directory, &next.directory)?
+                    {
+                        return Err(Error::Io);
+                    }
+                } else if !absent(&next.directory, "socket") {
+                    return Err(Error::Io);
+                }
+                prepared.next.insert(definition.id.clone(), next.clone());
+                pending.push(Replacement {
+                    next,
+                    previous,
+                    temporary,
+                });
+                let mut yielded = false;
+                std::future::poll_fn(|cx| {
+                    if yielded {
+                        Poll::Ready(())
+                    } else {
+                        yielded = true;
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                })
+                .await;
+            }
+            for replacement in pending {
+                scope.check()?;
+                let next = &replacement.next;
+                if let Some(previous) = &replacement.previous {
+                    if !owns(previous, "socket") || !owns(next, &replacement.temporary) {
+                        return Err(Error::Io);
+                    }
+                    rename(
+                        &next.directory,
+                        &replacement.temporary,
+                        "socket",
+                        libc::RENAME_EXCHANGE,
+                    )?;
+                    *previous.basename.borrow_mut() = replacement.temporary.clone();
+                } else {
+                    rename(
+                        &next.directory,
+                        &replacement.temporary,
+                        "socket",
+                        libc::RENAME_NOREPLACE,
+                    )?;
+                }
+                *next.basename.borrow_mut() = "socket".into();
+                prepared.replacements.push(replacement);
+            }
+            scope.check()?;
+            Ok(prepared)
+        })
     }
     /// Called by the owning I/O worker alongside reactor completion polling.
     /// Work is bounded across accepts and futures; no background executor exists.
@@ -443,51 +555,11 @@ impl ClientListeners {
                         Err(Error::Overloaded) => break,
                         Err(error) => return Err(error),
                     };
-                    let cache = listener.definition.id.clone();
-                    let cancellation = Cancellation::new()?;
-                    let task_cancellation = cancellation.clone();
-                    let retired = listener.retired.clone();
-                    let task_retired = retired.clone();
-                    let idle = Rc::new(Cell::new(true));
-                    let task_idle = idle.clone();
-                    let timeout = self.request_timeout;
-                    let deadline = Rc::new(Cell::new(crate::runtime::environment::now() + timeout));
-                    let task_deadline = deadline.clone();
-                    let parser = self.parser.clone();
-                    let reads = self.reads.clone();
-                    let responses = self.responses.clone();
-                    let io = self.io.clone();
-                    let admission = self.admission.clone();
-                    let task_cache = cache.clone();
-                    let metrics = self.metrics.clone();
-                    let operation = Box::pin(async move {
-                        serve_connection(
-                            connection,
-                            &task_cache,
-                            &parser,
-                            &*reads,
-                            &responses,
-                            &io,
-                            &admission,
-                            task_cancellation,
-                            task_retired,
-                            task_idle,
-                            timeout,
-                            &metrics,
-                            task_deadline,
-                        )
-                        .await
-                    });
-                    self.active.borrow_mut().push_back(Active {
-                        runnable: crate::read::drivers::Runnable::new(),
-                        deadline,
-                        expired: None,
-                        cache,
-                        retired,
-                        idle,
-                        cancellation,
-                        operation,
-                    });
+                    self.install_connection(
+                        connection,
+                        listener.definition.id.clone(),
+                        listener.retired.clone(),
+                    )?;
                     // This operation has not been polled and cannot have registered
                     // an I/O wake yet. Continue promptly without exceeding the budget.
                     cx.waker().wake_by_ref();
@@ -576,7 +648,7 @@ impl ClientListeners {
 
     pub fn stop_admission(&self) {
         self.accepting.set(false);
-        *self.readiness.borrow_mut() = readiness::ReadyListeners::default();
+        *self.readiness.borrow_mut() = ReadyListeners::default();
         for (_, listener) in std::mem::take(&mut *self.listeners.borrow_mut()) {
             listener.retired.set(true);
             self.cleanup.borrow_mut().push_back(listener);
@@ -780,6 +852,244 @@ fn new_scope(timeout: Duration, cancellation: Cancellation) -> Result<RequestSco
     })
 }
 
+// Level-triggered listener index. Idle turns wait on one completion-owned poll.
+#[derive(Default)]
+struct ReadyListeners {
+    generation: u64,
+    fd: Option<Rc<Descriptor>>,
+    listeners: Vec<std::rc::Weak<BoundListener>>,
+    ready: VecDeque<usize>,
+    wait: Option<Operation<'static, u32>>,
+    scope: Option<RequestScope>,
+}
+impl Drop for ReadyListeners {
+    fn drop(&mut self) {
+        if let Some(scope) = &self.scope {
+            let _ = scope.cancel();
+        }
+    }
+}
+impl ReadyListeners {
+    fn next(
+        &mut self,
+        owner: &ClientListeners,
+        cx: &mut Context<'_>,
+        budget: usize,
+    ) -> Result<Option<Rc<BoundListener>>> {
+        if self.generation != owner.generation.get() {
+            if let Some(scope) = self.scope.take() {
+                scope.cancel()?;
+            }
+            self.wait.take();
+            self.ready.clear();
+            self.listeners = owner
+                .listeners
+                .borrow()
+                .values()
+                .map(Rc::downgrade)
+                .collect();
+            // SAFETY: epoll_create1 returns a uniquely owned descriptor.
+            let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+            if fd < 0 {
+                return Err(Error::Io);
+            }
+            let fd = Rc::new(unsafe { Descriptor::from_raw_fd(fd) });
+            for (index, listener) in self.listeners.iter().enumerate() {
+                let listener = listener.upgrade().ok_or(Error::Unavailable)?;
+                let socket = match &listener.listener {
+                    Listener::Real(socket) => socket,
+                    #[cfg(test)]
+                    _ => return Err(Error::InvalidConfiguration),
+                };
+                let mut event = libc::epoll_event {
+                    events: libc::EPOLLIN as u32,
+                    u64: index as u64,
+                };
+                // SAFETY: both descriptors and the initialized event live through ctl.
+                if unsafe {
+                    libc::epoll_ctl(
+                        fd.as_raw_fd(),
+                        libc::EPOLL_CTL_ADD,
+                        socket.as_raw_fd(),
+                        &mut event,
+                    )
+                } < 0
+                {
+                    return Err(Error::Io);
+                }
+            }
+            self.fd = Some(fd);
+            self.scope = Some(new_scope(
+                Duration::from_secs(365 * 24 * 3600),
+                Cancellation::new()?,
+            )?);
+            self.generation = owner.generation.get();
+        }
+        if let Some(index) = self.ready.pop_front() {
+            return Ok(self.listeners[index].upgrade());
+        }
+        if let Some(wait) = &mut self.wait {
+            match wait.as_mut().poll(cx) {
+                Poll::Pending => return Ok(None),
+                Poll::Ready(result) => {
+                    result?;
+                    self.wait.take();
+                }
+            }
+        }
+        let Some(fd) = &self.fd else {
+            return Ok(None);
+        };
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 64];
+        // SAFETY: events is writable for the bounded requested event count.
+        let count = unsafe {
+            libc::epoll_wait(
+                fd.as_raw_fd(),
+                events.as_mut_ptr(),
+                budget.clamp(1, 64) as i32,
+                0,
+            )
+        };
+        if count < 0 {
+            return Err(Error::Io);
+        }
+        self.ready.extend(
+            events[..count as usize]
+                .iter()
+                .map(|event| event.u64 as usize),
+        );
+        if let Some(index) = self.ready.pop_front() {
+            return Ok(self.listeners[index].upgrade());
+        }
+        let reactor = owner.io.reactor().clone();
+        let fd = fd.clone();
+        let scope = self.scope.as_ref().ok_or(Error::Internal)?.clone();
+        self.wait = Some(Box::pin(async move {
+            crate::runtime::listener::retry(&scope, || {
+                reactor.readiness_with_lease(fd.clone(), libc::POLLIN as u32, fd.clone(), &scope)
+            })
+            .await
+        }));
+        if let Some(wait) = &mut self.wait {
+            if let Poll::Ready(result) = wait.as_mut().poll(cx) {
+                result?;
+                self.wait.take();
+                cx.waker().wake_by_ref();
+            }
+        }
+        Ok(None)
+    }
+}
+
+// Worker-local listener preparation. Filesystem publication precedes control
+// publication; no new listener is accepted until the infallible memory swap.
+struct Replacement {
+    next: Rc<BoundListener>,
+    previous: Option<Rc<BoundListener>>,
+    temporary: String,
+}
+
+/// Owns prepared paths and sockets. Keep this on the listener's worker. Drop
+/// rolls back; commit performs no filesystem or network operations.
+pub struct PreparedListeners {
+    generation: Rc<Cell<u64>>,
+    definitions: Vec<CacheDefinition>,
+    target: Rc<RefCell<BTreeMap<CacheId, Rc<BoundListener>>>>,
+    next: BTreeMap<CacheId, Rc<BoundListener>>,
+    replacements: Vec<Replacement>,
+    preparing: Rc<Cell<bool>>,
+    accepting: Rc<Cell<bool>>,
+    cleanup: Rc<RefCell<VecDeque<Rc<BoundListener>>>>,
+    committed: bool,
+}
+
+impl PreparedListeners {
+    pub fn definitions(&self) -> &[CacheDefinition] {
+        &self.definitions
+    }
+
+    /// Infallible activation for CacheLifecycle::stage's prepared-resource handoff.
+    /// The application serializes prepare/commit with cache stop/drain operations.
+    /// Worker polling performs deferred pathname cleanup after this returns.
+    pub fn commit(mut self) {
+        self.generation.set(self.generation.get().wrapping_add(1));
+        let mut target = self.target.borrow_mut();
+        let mut cleanup = self.cleanup.borrow_mut();
+        if self.accepting.get() {
+            let previous = std::mem::replace(&mut *target, std::mem::take(&mut self.next));
+            for (id, listener) in previous {
+                if !target
+                    .get(&id)
+                    .is_some_and(|next| Rc::ptr_eq(next, &listener))
+                {
+                    listener.retired.set(true);
+                    cleanup.push_back(listener);
+                }
+            }
+        } else {
+            // Shutdown may overtake preparation, but must never revive admission.
+            for (_, listener) in std::mem::take(&mut self.next) {
+                listener.retired.set(true);
+                cleanup.push_back(listener);
+            }
+        }
+        for replacement in &self.replacements {
+            if let Some(previous) = &replacement.previous {
+                cleanup.push_back(previous.clone());
+            }
+        }
+        self.committed = true;
+    }
+}
+
+impl crate::control::caches::CacheTransition for PreparedListeners {
+    fn commit(self: Box<Self>) {
+        (*self).commit();
+    }
+}
+
+impl Drop for PreparedListeners {
+    fn drop(&mut self) {
+        if !self.committed {
+            for replacement in self.replacements.iter().rev() {
+                let next = &replacement.next;
+                if let Some(previous) = &replacement.previous {
+                    // Never exchange or unlink a foreign replacement inode. Under
+                    // exclusive directory ownership these checks also make rollback
+                    // independent of the caller's expired/canceled request scope.
+                    if owns(next, "socket") && owns(previous, &replacement.temporary) {
+                        if rename(
+                            &next.directory,
+                            "socket",
+                            &replacement.temporary,
+                            libc::RENAME_EXCHANGE,
+                        )
+                        .is_ok()
+                        {
+                            *next.basename.borrow_mut() = replacement.temporary.clone();
+                            *previous.basename.borrow_mut() = "socket".into();
+                        }
+                    } else if absent(&next.directory, "socket")
+                        && owns(previous, &replacement.temporary)
+                    {
+                        if rename(
+                            &next.directory,
+                            &replacement.temporary,
+                            "socket",
+                            libc::RENAME_NOREPLACE,
+                        )
+                        .is_ok()
+                        {
+                            *previous.basename.borrow_mut() = "socket".into();
+                        }
+                    }
+                }
+            }
+        }
+        self.preparing.set(false);
+    }
+}
+
 fn anchored(directory: &impl Anchor) -> PathBuf {
     directory.anchor()
 }
@@ -864,7 +1174,7 @@ fn bind(
             owner.validate(&directory)?;
             owner.clone()
         }
-        None => Rc::new(ownership::EndpointOwner::acquire(&directory)?),
+        None => Rc::new(EndpointOwner::acquire(&directory)?),
     };
     let path = anchored(&directory).join(basename);
     // Bind the witness first, so every crash after bind leaves recoverable proof.
@@ -928,2051 +1238,272 @@ fn allow_socket_access(
     // Apply explicitly so the process umask cannot restrict client access.
     fs::set_permissions(anchored(&socket), fs::Permissions::from_mode(0o666)).map_err(|_| Error::Io)
 }
+
+fn owns(listener: &BoundListener, basename: &str) -> bool {
+    #[cfg(test)]
+    if let Directory::Sim { sim, path } = &listener.directory {
+        return sim
+            .metadata(&path.join(basename))
+            .is_ok_and(|(inode, mode)| {
+                inode == listener.inode && mode as u32 & libc::S_IFMT == libc::S_IFSOCK
+            });
+    }
+    fs::symlink_metadata(anchored(&listener.directory).join(basename)).is_ok_and(|metadata| {
+        metadata.file_type().is_socket()
+            && metadata.dev() == listener.device
+            && metadata.ino() == listener.inode
+    })
+}
+
+fn absent(directory: &Directory, basename: &str) -> bool {
+    #[cfg(test)]
+    if let Directory::Sim { sim, path } = directory {
+        return sim
+            .metadata(&path.join(basename))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+    }
+    fs::symlink_metadata(anchored(directory).join(basename))
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
+
+fn same_directory(first: &Directory, second: &Directory) -> Result<bool> {
+    match (first, second) {
+        (Directory::Real(first), Directory::Real(second)) => {
+            let first = first.metadata().map_err(|_| Error::Io)?;
+            let second = second.metadata().map_err(|_| Error::Io)?;
+            Ok(first.dev() == second.dev() && first.ino() == second.ino())
+        }
+        #[cfg(test)]
+        (Directory::Sim { sim, path: first }, Directory::Sim { path: second, .. }) => {
+            Ok(sim.metadata(first).map_err(|_| Error::Io)?.0
+                == sim.metadata(second).map_err(|_| Error::Io)?.0)
+        }
+        #[cfg(test)]
+        _ => Ok(false),
+    }
+}
+
+fn rename(directory: &Directory, from: &str, to: &str, flags: u32) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_RENAME_AFTER.with(|remaining| match remaining.get() {
+        Some(0) => {
+            remaining.set(None);
+            true
+        }
+        Some(count) => {
+            remaining.set(Some(count - 1));
+            false
+        }
+        None => false,
+    }) {
+        return Err(Error::Io);
+    }
+    #[cfg(test)]
+    if let Directory::Sim { sim, path } = directory {
+        return sim
+            .rename(&path.join(from), &path.join(to), flags)
+            .map_err(|_| Error::Io);
+    }
+    let from = CString::new(from).map_err(|_| Error::InvalidConfiguration)?;
+    let to = CString::new(to).map_err(|_| Error::InvalidConfiguration)?;
+    // SAFETY: the owned directory pins both names; strings are NUL terminated.
+    if unsafe {
+        libc::renameat2(
+            directory.as_raw_fd(),
+            from.as_ptr(),
+            directory.as_raw_fd(),
+            to.as_ptr(),
+            flags,
+        )
+    } != 0
+    {
+        return Err(Error::Io);
+    }
+    Ok(())
+}
+
+// Persistent per-endpoint ownership. Never remove the lock inode, even on clean
+// shutdown. Socket hard links are crash witnesses, not connect-failure heuristics.
+const LOCK: &str = ".racer-client.lock";
+const WITNESS: &str = ".racer-owned-";
+
+struct EndpointOwner {
+    lock: File,
+    directory: File,
+}
+
+impl EndpointOwner {
+    fn acquire(directory: &File) -> Result<Self> {
+        let metadata = directory.metadata().map_err(|_| Error::Io)?;
+        // SAFETY: geteuid has no preconditions.
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+            return Err(Error::Io);
+        }
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(anchored(directory).join(LOCK))
+            .map_err(|_| Error::Io)?;
+        let metadata = lock.metadata().map_err(|_| Error::Io)?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o077 != 0
+        {
+            return Err(Error::Io);
+        }
+        // SAFETY: lock owns a valid descriptor. Nonblocking flock covers the entire
+        // listener lifetime and is released by the kernel on process death.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(Error::Io);
+        }
+        let owner = Self {
+            lock,
+            directory: directory.try_clone().map_err(|_| Error::Io)?,
+        };
+        owner.validate(directory)?;
+        owner.recover()?;
+        Ok(owner)
+    }
+
+    fn validate(&self, directory: &File) -> Result<()> {
+        let first = self.directory.metadata().map_err(|_| Error::Io)?;
+        let second = directory.metadata().map_err(|_| Error::Io)?;
+        let lock = self.lock.metadata().map_err(|_| Error::Io)?;
+        let current =
+            fs::symlink_metadata(anchored(directory).join(LOCK)).map_err(|_| Error::Io)?;
+        if first.dev() != second.dev()
+            || first.ino() != second.ino()
+            || !current.is_file()
+            || lock.dev() != current.dev()
+            || lock.ino() != current.ino()
+            || current.nlink() != 1
+        {
+            return Err(Error::Io);
+        }
+        Ok(())
+    }
+
+    fn recover(&self) -> Result<()> {
+        let directory = anchored(&self.directory);
+        let mut witnesses = Vec::new();
+        let mut temporary_paths = Vec::new();
+        for entry in fs::read_dir(&directory).map_err(|_| Error::Io)? {
+            let entry = entry.map_err(|_| Error::Io)?;
+            let name = entry.file_name();
+            if name.to_str().is_some_and(temporary_name) {
+                temporary_paths.push(entry.path());
+                continue;
+            }
+            let Some(name) = name.to_str().filter(|name| name.starts_with(WITNESS)) else {
+                continue;
+            };
+            let temporary = &name[WITNESS.len()..];
+            if !temporary_name(temporary) {
+                return Err(Error::Io);
+            }
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|_| Error::Io)?;
+            if !metadata.file_type().is_socket() {
+                return Err(Error::Io);
+            }
+            witnesses.push((name.to_owned(), metadata));
+        }
+        let socket = directory.join("socket");
+        let canonical = match fs::symlink_metadata(&socket) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err(Error::Io),
+        };
+        if canonical.as_ref().is_some_and(|canonical| {
+            !canonical.file_type().is_socket()
+                || !witnesses.iter().any(|(_, m)| same_inode(canonical, m))
+        }) {
+            return Err(Error::Io);
+        }
+        // Validate every witness before touching any path. A noncooperating live
+        // listener (including an inherited FD) remains protected without its lock.
+        for (name, _) in &witnesses {
+            refused(&directory.join(name))?;
+        }
+        for path in &temporary_paths {
+            let current = fs::symlink_metadata(path).map_err(|_| Error::Io)?;
+            if !current.file_type().is_socket()
+                || !witnesses.iter().any(|(_, m)| same_inode(&current, m))
+            {
+                return Err(Error::Io);
+            }
+        }
+        if canonical.is_some() {
+            fs::remove_file(socket).map_err(|_| Error::Io)?;
+        }
+        for path in temporary_paths {
+            fs::remove_file(path).map_err(|_| Error::Io)?;
+        }
+        for (name, _) in witnesses {
+            fs::remove_file(directory.join(name)).map_err(|_| Error::Io)?;
+        }
+        Ok(())
+    }
+}
+
+fn temporary_name(name: &str) -> bool {
+    name.len() == 39
+        && name.starts_with(".racer-")
+        && name[7..].bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn same_inode(first: &fs::Metadata, second: &fs::Metadata) -> bool {
+    first.dev() == second.dev() && first.ino() == second.ino()
+}
+
+fn refused(path: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: zero is a valid initial representation for sockaddr_un.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.len() >= address.sun_path.len() {
+        return Err(Error::Io);
+    }
+    address.sun_family = libc::AF_UNIX as _;
+    for (target, source) in address.sun_path.iter_mut().zip(bytes) {
+        *target = *source as _;
+    }
+    // SAFETY: socket has no pointer arguments; File owns the returned descriptor.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(Error::Io);
+    }
+    let socket = unsafe { File::from_raw_fd(fd) };
+    // SAFETY: address is initialized and its full size is supplied.
+    let result = unsafe {
+        libc::connect(
+            socket.as_raw_fd(),
+            (&address as *const libc::sockaddr_un).cast(),
+            std::mem::size_of_val(&address) as _,
+        )
+    };
+    if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECONNREFUSED) {
+        Ok(())
+    } else {
+        Err(Error::Io)
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static FAIL_CHMOD: Cell<bool> = const { Cell::new(false) };
+    static FAIL_RENAME_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
 }
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn simulated_listener_preparation_rollback_and_real_http_exchange() {
-        use crate::runtime::reactor::{Descriptor, SocketAddress, simulation::Simulation};
-        let sim = Simulation::new();
-        let _environment = sim.enter();
-        let admission = Rc::new(Admission::new(limits()));
-        let reactor = Rc::new(Reactor::new(admission.clone()));
-        let io = Rc::new(HttpIo::with_admission(
-            reactor.clone(),
-            Codec::new(32768, i64::MAX as u64),
-            admission.clone(),
-        ));
-        let delivery = Rc::new(Delivery::new(
-            Rc::new(PipePool::new(admission.clone(), reactor.clone())),
-            Duration::from_secs(2),
-        ));
-        let reads = Rc::new(Heads {
-            calls: Cell::new(0),
-        });
-        let listeners = ClientListeners::new(
-            reads.clone(),
-            RequestParser::new(32768),
-            Rc::new(Responses::new(io.clone(), delivery)),
-            io,
-            admission,
-        );
-        let definition = definition();
-        futures::executor::block_on(
-            listeners.reconcile(std::slice::from_ref(&definition), &scope()),
-        )
-        .unwrap();
-        let path = PathBuf::from("/run/racer/example/client/socket");
-        let inode = sim.metadata(&path).unwrap().0;
-        assert_eq!(sim.metadata(&path).unwrap().1 & 0o777, 0o666);
-        let mut changed = definition.clone();
-        changed.id = CacheId("00000000-0000-4000-8000-000000000003".into());
-        let prepared =
-            futures::executor::block_on(listeners.prepare(&[changed], &scope())).unwrap();
-        assert_ne!(sim.metadata(&path).unwrap().0, inode);
-        drop(prepared);
-        assert_eq!(sim.metadata(&path).unwrap().0, inode);
-        assert_eq!(sim.metadata(&path).unwrap().1 & 0o777, 0o666);
-        let client = sim.connect(SocketAddress::Unix(path)).unwrap();
-        let Descriptor::Sim(client) = client else {
-            unreachable!()
-        };
-        client.send(&request("HEAD", "")).unwrap();
-        let mut response = Vec::new();
-        let mut bytes = [0; 4096];
-        for _ in 0..1000 {
-            listeners
-                .poll_budgeted(
-                    &mut Context::from_waker(futures::task::noop_waker_ref()),
-                    16,
-                )
-                .unwrap();
-            reactor.poll_budgeted(16).unwrap();
-            match client.recv(&mut bytes) {
-                Ok(n) => response.extend_from_slice(&bytes[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
-                Err(e) => panic!("{e}"),
-            }
-            if response.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
-            }
-        }
-        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
-        assert_eq!(reads.calls.get(), 1);
-        drop(client);
-        listeners.stop_admission();
-        drop(listeners);
-        drop(reactor);
-        assert_eq!(sim.live_handles(), 0);
-    }
-    use crate::{
-        client::request::ClientRequest,
-        http::codec::Codec,
-        memory::{delivery::Delivery, pipe::PipePool},
-        model::{
-            identity::{ObjectVersion, StrongEtag},
-            limits::Limits,
-            metadata::{ExpiresAt, ObjectMetadata},
-        },
-        read::serve::ReadResponse,
-        runtime::reactor::Reactor,
-    };
-    use std::{
-        io::{Read, Write},
-        num::NonZeroUsize,
-        os::unix::net::UnixStream,
-        sync::atomic::{AtomicUsize, Ordering},
-        time::UNIX_EPOCH,
-    };
-
-    static NEXT_ROOT: AtomicUsize = AtomicUsize::new(0);
-    struct Root(PathBuf);
-    impl Root {
-        fn new() -> Self {
-            // Test files stay inside the shared worktree, even on unprivileged runs.
-            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
-                ".client-test-{}-{}",
-                std::process::id(),
-                NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir(&path).unwrap();
-            Self(path)
-        }
-    }
-    impl Drop for Root {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-    fn limits() -> Limits {
-        let n = NonZeroUsize::new(64).unwrap();
-        let bytes = NonZeroUsize::new(64 * 1024 * 1024).unwrap();
-        Limits {
-            plaintext_bytes: bytes,
-            ciphertext_bytes: bytes,
-            dirty_bytes: bytes,
-            registered_bytes: bytes,
-            request_context_bytes: bytes,
-            flights: n,
-            waiters_per_flight: n,
-            queue_entries: n,
-            connections_per_neighbor: n,
-            client_connections: n,
-            pipes: n,
-            range_window_pages: n,
-            header_bytes: NonZeroUsize::new(32768).unwrap(),
-            cached_rankings: n,
-            cached_paths: n,
-            retained_snapshots: n,
-            metadata_entries: n,
-            relay_transfers: n,
-        }
-    }
-    fn definition() -> CacheDefinition {
-        CacheDefinition {
-            id: CacheId("00000000-0000-4000-8000-000000000001".into()),
-            name: "example".into(),
-            client_socket: "/run/racer/example/client/socket".into(),
-            origin_socket: "/run/racer/example/origin/socket".into(),
-        }
-    }
-    fn scope() -> RequestScope {
-        new_scope(Duration::from_secs(5), Cancellation::new().unwrap()).unwrap()
-    }
-    struct Heads {
-        calls: Cell<usize>,
-    }
-    impl ReadService for Heads {
-        fn read<'a>(
-            &'a self,
-            request: ClientRequest,
-            scope: &'a RequestScope,
-        ) -> Operation<'a, ReadResponse> {
-            Box::pin(async move {
-                scope.check()?;
-                self.calls.set(self.calls.get() + 1);
-                Ok(ReadResponse {
-                    metadata: ObjectMetadata {
-                        content_type: None,
-                        version: ObjectVersion {
-                            object: request.origin.object,
-                            etag: StrongEtag::parse(b"\"v1\"")?,
-                        },
-                        length: 17,
-                        expires_at: ExpiresAt(UNIX_EPOCH + Duration::from_millis(1234)),
-                    },
-                    range: None,
-                    body: None,
-                })
-            })
-        }
-    }
-    struct Fixture {
-        root: Root,
-        listeners: ClientListeners,
-        reactor: Rc<Reactor>,
-        reads: Rc<Heads>,
-    }
-    impl Fixture {
-        fn new() -> Self {
-            Self::with_limits(limits())
-        }
-        fn with_limits(limits: Limits) -> Self {
-            let root = Root::new();
-            let admission = Rc::new(Admission::new(limits));
-            let reactor = Rc::new(Reactor::new(admission.clone()));
-            let io = Rc::new(HttpIo::with_admission(
-                reactor.clone(),
-                Codec::new(32768, i64::MAX as u64),
-                admission.clone(),
-            ));
-            let delivery = Rc::new(Delivery::new(
-                Rc::new(PipePool::new(admission.clone(), reactor.clone())),
-                Duration::from_secs(2),
-            ));
-            let reads = Rc::new(Heads {
-                calls: Cell::new(0),
-            });
-            let responses = Rc::new(Responses::new(io.clone(), delivery));
-            let mut listeners = ClientListeners::new(
-                reads.clone(),
-                RequestParser::new(32768),
-                responses,
-                io,
-                admission,
-            );
-            listeners.root = root.0.clone();
-            Self {
-                root,
-                listeners,
-                reactor,
-                reads,
-            }
-        }
-        fn reconcile(&self, caches: &[CacheDefinition]) -> Result<()> {
-            futures::executor::block_on(self.listeners.reconcile(caches, &scope()))
-        }
-        fn socket(&self) -> PathBuf {
-            self.root.0.join("example/client/socket")
-        }
-        fn assert_metrics(&self, requests: u64, errors: u64, active: u64) {
-            use crate::telemetry::metrics::{Event, Gauge};
-            assert_eq!(self.listeners.metrics.count(Event::Request), requests);
-            assert_eq!(self.listeners.metrics.count(Event::RequestError), errors);
-            assert_eq!(self.listeners.metrics.gauge(Gauge::ActiveRequests), active);
-        }
-        fn connect(&self) -> UnixStream {
-            // /proc keeps sun_path short even in deeply nested CI worktrees.
-            let directory = File::open(self.socket().parent().unwrap()).unwrap();
-            let stream = UnixStream::connect(anchored(&directory).join("socket")).unwrap();
-            stream.set_nonblocking(true).unwrap();
-            stream
-        }
-        fn pump(&self, budget: usize) {
-            self.listeners
-                .poll_budgeted(
-                    &mut Context::from_waker(futures::task::noop_waker_ref()),
-                    budget,
-                )
-                .unwrap();
-            self.reactor.poll_budgeted(64).unwrap();
-        }
-        fn receive(&self, socket: &mut UnixStream, eof: bool) -> Vec<u8> {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let mut output = Vec::new();
-            loop {
-                self.pump(16);
-                let mut bytes = [0; 8192];
-                match socket.read(&mut bytes) {
-                    Ok(0) => return output,
-                    Ok(n) => output.extend_from_slice(&bytes[..n]),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(error) => panic!("client read failed: {error}"),
-                }
-                if !eof && output.windows(4).any(|part| part == b"\r\n\r\n") {
-                    return output;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "client exchange did not complete"
-                );
-            }
-        }
-    }
-    fn request(method: &str, fields: &str) -> Vec<u8> {
-        let body = if method == "POST" {
-            "Content-Length: 0\r\n"
-        } else {
-            ""
-        };
-        format!(
-            "{method} /v2/objects/{} HTTP/1.1\r\nHost: racer\r\n{body}{fields}\r\n",
-            "0".repeat(64)
-        )
-        .into_bytes()
-    }
-
-    #[test]
-    fn client_listener_readiness_recovers_from_queue_pressure() {
-        let mut limits = limits();
-        limits.queue_entries = NonZeroUsize::new(8).unwrap();
-        let fixture = Fixture::with_limits(limits);
-        fixture.reconcile(&[definition()]).unwrap();
-        let scope = scope();
-        let (reader, _writer) = UnixStream::pair().unwrap();
-        let reader = Rc::new(crate::runtime::reactor::Descriptor::from(reader));
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        let mut pressure = Vec::new();
-        for _ in 0..8 {
-            let mut wait = fixture
-                .reactor
-                .readiness(reader.clone(), libc::POLLIN as u32, &scope);
-            assert!(wait.as_mut().poll(&mut cx).is_pending());
-            pressure.push(wait);
-        }
-        for _ in 0..32 {
-            fixture.listeners.poll_budgeted(&mut cx, 16).unwrap();
-            assert_eq!(fixture.reactor.in_flight(), 8);
-        }
-        drop(pressure);
-        let mut client = fixture.connect();
-        client
-            .write_all(&request("HEAD", "Connection: close\r\n"))
-            .unwrap();
-        assert!(
-            fixture
-                .receive(&mut client, true)
-                .starts_with(b"HTTP/1.1 200")
-        );
-    }
-
-    #[test]
-    fn crash_owner_child() {
-        let Ok(root) = std::env::var("RACER_SOCKET_CRASH_ROOT") else {
-            return;
-        };
-        let mut fixture = Fixture::new();
-        fs::remove_dir(&fixture.root.0).unwrap();
-        fixture.root.0 = root.into();
-        fixture.listeners.root = fixture.root.0.clone();
-        fixture.reconcile(&[definition()]).unwrap();
-        let mut changed = definition();
-        changed.id = CacheId("00000000-0000-4000-8000-000000000003".into());
-        let prepared = if std::env::var("RACER_SOCKET_CRASH_STAGE").unwrap() == "prepared" {
-            Some(
-                futures::executor::block_on(fixture.listeners.prepare(&[changed], &scope()))
-                    .unwrap(),
-            )
-        } else {
-            None
-        };
-        fs::write(fixture.root.0.join("ready"), b"ready").unwrap();
-        loop {
-            std::hint::black_box(&prepared);
-            std::thread::sleep(Duration::from_secs(1));
-        }
-    }
-
-    #[test]
-    fn sigkill_restart_recovers_committed_and_prepared_endpoints() {
-        use std::process::{Command, Stdio};
-        struct Child(std::process::Child);
-        impl Drop for Child {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
-        for stage in ["committed", "prepared"] {
-            let fixture = Fixture::new();
-            let mut child = Child(
-                Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        "client::listener::tests::crash_owner_child",
-                        "--nocapture",
-                    ])
-                    .env("RACER_SOCKET_CRASH_ROOT", &fixture.root.0)
-                    .env("RACER_SOCKET_CRASH_STAGE", stage)
-                    .stdout(Stdio::null())
-                    .spawn()
-                    .unwrap(),
-            );
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while !fixture.root.0.join("ready").exists() {
-                assert!(
-                    child.0.try_wait().unwrap().is_none(),
-                    "child exited before readiness"
-                );
-                assert!(Instant::now() < deadline, "child failed to bind");
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            let original = fs::metadata(fixture.socket()).unwrap();
-            let lock_path = fixture
-                .socket()
-                .parent()
-                .unwrap()
-                .join(".racer-client.lock");
-            let lock = fs::metadata(&lock_path).unwrap().ino();
-            assert_eq!(fixture.reconcile(&[definition()]), Err(Error::Io));
-            assert_eq!(
-                fs::metadata(fixture.socket()).unwrap().ino(),
-                original.ino()
-            );
-            child.0.kill().unwrap();
-            child.0.wait().unwrap();
-            assert!(
-                fixture.socket().exists(),
-                "SIGKILL must leave canonical socket"
-            );
-            fixture.reconcile(&[definition()]).unwrap();
-            assert_eq!(fs::metadata(&lock_path).unwrap().ino(), lock);
-            let mut socket = fixture.connect();
-            socket
-                .write_all(&request("HEAD", "Connection: close\r\n"))
-                .unwrap();
-            assert!(
-                fixture
-                    .receive(&mut socket, true)
-                    .starts_with(b"HTTP/1.1 200")
-            );
-            assert_eq!(
-                fs::read_dir(fixture.socket().parent().unwrap())
-                    .unwrap()
-                    .count(),
-                3
-            );
-            fixture.reconcile(&[]).unwrap();
-            assert!(!fixture.socket().exists());
-            assert_eq!(fs::metadata(&lock_path).unwrap().ino(), lock);
-            fixture.reconcile(&[definition()]).unwrap();
-        }
-    }
-
-    #[test]
-    fn endpoint_ownership_rejects_unsafe_locks_and_foreign_sockets() {
-        for kind in [
-            "symlink",
-            "hardlink",
-            "directory",
-            "fifo",
-            "permissions",
-            "writable-directory",
-            "foreign-live",
-            "foreign-stale",
-        ] {
-            let fixture = Fixture::new();
-            let directory = fixture.socket().parent().unwrap().to_owned();
-            fs::create_dir_all(&directory).unwrap();
-            fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
-            let lock = directory.join(".racer-client.lock");
-            let target = fixture.root.0.join("target");
-            fs::write(&target, b"preserve").unwrap();
-            fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
-            let mut foreign = None;
-            match kind {
-                "symlink" => std::os::unix::fs::symlink(&target, &lock).unwrap(),
-                "hardlink" => fs::hard_link(&target, &lock).unwrap(),
-                "directory" => fs::create_dir(&lock).unwrap(),
-                "fifo" => {
-                    let name = CString::new(lock.as_os_str().as_encoded_bytes()).unwrap();
-                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
-                }
-                "permissions" => {
-                    fs::write(&lock, b"preserve").unwrap();
-                    fs::set_permissions(&lock, fs::Permissions::from_mode(0o666)).unwrap();
-                }
-                "writable-directory" => {
-                    fs::set_permissions(&directory, fs::Permissions::from_mode(0o777)).unwrap()
-                }
-                _ => {
-                    let dir = File::open(&directory).unwrap();
-                    foreign = Some(UnixListener::bind(anchored(&dir).join("socket")).unwrap());
-                    if kind == "foreign-stale" {
-                        foreign.take();
-                    }
-                }
-            }
-            let before = fs::symlink_metadata(fixture.socket()).ok().map(|m| m.ino());
-            assert_eq!(fixture.reconcile(&[definition()]), Err(Error::Io), "{kind}");
-            assert_eq!(
-                fs::symlink_metadata(fixture.socket()).ok().map(|m| m.ino()),
-                before
-            );
-            assert_eq!(fs::read(&target).unwrap(), b"preserve");
-            drop(foreign);
-        }
-    }
-
-    #[test]
-    fn lock_replacement_and_live_witness_without_lock_are_refused() {
-        let fixture = Fixture::new();
-        fixture.reconcile(&[definition()]).unwrap();
-        let directory = File::open(fixture.socket().parent().unwrap()).unwrap();
-        let lock = anchored(&directory).join(".racer-client.lock");
-        fs::rename(&lock, anchored(&directory).join("old-lock")).unwrap();
-        assert!(ownership::EndpointOwner::acquire(&directory).is_err());
-        let mut changed = definition();
-        changed.id = CacheId("00000000-0000-4000-8000-000000000003".into());
-        assert_eq!(fixture.reconcile(&[changed]), Err(Error::Io));
-        let mut socket = fixture.connect();
-        socket
-            .write_all(&request("HEAD", "Connection: close\r\n"))
-            .unwrap();
-        assert!(
-            fixture
-                .receive(&mut socket, true)
-                .starts_with(b"HTTP/1.1 200")
-        );
-    }
-
-    #[test]
-    fn recovery_preserves_stale_foreign_inode_and_recovers_unpublished_witness() {
-        let fixture = Fixture::new();
-        let directory = fixture.root.0.join("example/client");
-        fs::create_dir_all(&directory).unwrap();
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
-        let directory = File::open(directory).unwrap();
-        let witness =
-            anchored(&directory).join(".racer-owned-.racer-00000000000000000000000000000000");
-        let stale = UnixListener::bind(&witness).unwrap();
-        // Parallel crash-owner tests spawn children. A concurrent fork can hold
-        // this CLOEXEC descriptor until exec, so dropping our alias alone does
-        // not guarantee a refused connection yet. Shut down the shared listener
-        // before dropping it to establish the stale-witness precondition.
-        assert_eq!(
-            unsafe { libc::shutdown(stale.as_raw_fd(), libc::SHUT_RDWR) },
-            0
-        );
-        drop(stale);
-        let socket = anchored(&directory).join("socket");
-        drop(UnixListener::bind(&socket).unwrap());
-        let inode = fs::metadata(&socket).unwrap().ino();
-        assert_eq!(fixture.reconcile(&[definition()]), Err(Error::Io));
-        assert_eq!(fs::metadata(&socket).unwrap().ino(), inode);
-        assert!(witness.exists());
-        fs::remove_file(socket).unwrap();
-        fixture.reconcile(&[definition()]).unwrap();
-        assert!(!witness.exists());
-        let mut socket = fixture.connect();
-        socket
-            .write_all(&request("HEAD", "Connection: close\r\n"))
-            .unwrap();
-        assert!(
-            fixture
-                .receive(&mut socket, true)
-                .starts_with(b"HTTP/1.1 200")
-        );
-    }
-
-    struct GatedRead {
-        wake: RefCell<Option<std::task::Waker>>,
-        inner: Rc<dyn ReadService>,
-        scopes: RefCell<Vec<RequestScope>>,
-        release: Cell<bool>,
-    }
-    impl ReadService for GatedRead {
-        fn read<'a>(
-            &'a self,
-            request: ClientRequest,
-            scope: &'a RequestScope,
-        ) -> Operation<'a, ReadResponse> {
-            Box::pin(async move {
-                self.scopes.borrow_mut().push(scope.clone());
-                std::future::poll_fn(|cx| {
-                    *self.wake.borrow_mut() = Some(cx.waker().clone());
-                    if let Err(error) = scope.check() {
-                        Poll::Ready(Err(error))
-                    } else if self.release.get() {
-                        Poll::Ready(Ok(()))
-                    } else {
-                        Poll::Pending
-                    }
-                })
-                .await?;
-                self.inner.read(request, scope).await
-            })
-        }
-    }
-
-    fn sleep_until(deadline: Instant) {
-        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
-    }
-
-    #[test]
-    fn configured_timeout_bounds_idle_partial_headers_and_keepalive() {
-        for mode in ["idle", "partial", "keepalive"] {
-            let mut fixture = Fixture::new();
-            assert_eq!(fixture.listeners.request_timeout(), Duration::from_secs(30));
-            let timeout = Duration::from_millis(200);
-            fixture.listeners = fixture.listeners.with_request_timeout(timeout);
-            fixture.reconcile(&[definition()]).unwrap();
-            let mut socket = fixture.connect();
-            if mode == "keepalive" {
-                socket.write_all(&request("HEAD", "")).unwrap();
-                assert!(
-                    fixture
-                        .receive(&mut socket, false)
-                        .starts_with(b"HTTP/1.1 200 ")
-                );
-            }
-            for _ in 0..16 {
-                fixture.pump(16);
-            }
-            assert_eq!(fixture.listeners.active_connections(), 1);
-            assert_no_head(&mut socket);
-            // Make progress inside the header budget, then cross its original
-            // deadline before a renewed budget could expire.
-            let started = Instant::now();
-            if mode == "partial" {
-                sleep_until(started + timeout / 2);
-                socket.write_all(b"HEAD /v1/objects/").unwrap();
-                for _ in 0..16 {
-                    fixture.pump(16);
-                }
-                assert_no_head(&mut socket);
-            }
-            sleep_until(started + timeout + Duration::from_millis(20));
-            for _ in 0..64 {
-                fixture.pump(16);
-            }
-            assert_eq!(fixture.listeners.active_connections(), 0, "{mode}");
-            assert_eq!(socket.read(&mut [0; 1]).unwrap(), 0, "{mode}");
-            assert_eq!(fixture.reads.calls.get(), usize::from(mode == "keepalive"));
-            assert_no_body_leases(&fixture);
-        }
-    }
-
-    #[test]
-    fn configured_timeout_starts_fresh_operations_after_headers_and_on_reuse() {
-        let mut fixture = Fixture::new();
-        let timeout = Duration::from_millis(500);
-        fixture.listeners = fixture.listeners.with_request_timeout(timeout);
-        let reads = Rc::new(GatedRead {
-            inner: fixture.reads.clone(),
-            scopes: RefCell::new(Vec::new()),
-            release: Cell::new(false),
-            wake: RefCell::new(None),
-        });
-        fixture.listeners.reads = reads.clone();
-        fixture.reconcile(&[definition()]).unwrap();
-        let mut socket = fixture.connect();
-        let head = request("HEAD", "");
-        socket.write_all(&head[..head.len() - 2]).unwrap();
-        for _ in 0..16 {
-            fixture.pump(16);
-        }
-        assert!(reads.scopes.borrow().is_empty());
-        std::thread::sleep(Duration::from_millis(100));
-        let before = Instant::now();
-        socket.write_all(b"\r\n").unwrap();
-        for _ in 0..16 {
-            fixture.pump(16);
-        }
-        let first = reads.scopes.borrow()[0].clone();
-        assert!(first.deadline.0 >= before + timeout);
-        assert!(first.deadline.0 <= Instant::now() + timeout);
-        reads.release.set(true);
-        if let Some(waker) = reads.wake.borrow().as_ref() {
-            waker.wake_by_ref();
-        }
-        assert!(
-            fixture
-                .receive(&mut socket, false)
-                .starts_with(b"HTTP/1.1 200 ")
-        );
-        reads.release.set(false);
-        socket.write_all(&head).unwrap();
-        for _ in 0..16 {
-            fixture.pump(16);
-        }
-        let second = reads.scopes.borrow()[1].clone();
-        assert_ne!(first.request, second.request);
-        assert!(second.deadline.0 > first.deadline.0);
-        assert_no_head(&mut socket);
-        sleep_until(second.deadline.0 + Duration::from_millis(20));
-        let output = fixture.receive(&mut socket, true);
-        assert!(output.starts_with(b"HTTP/1.1 503 "), "{output:?}");
-        assert!(output.ends_with(b"\r\n\r\n"));
-        assert_eq!(fixture.reads.calls.get(), 1);
-        assert_no_body_leases(&fixture);
-    }
-
-    #[test]
-    fn accepted_client_wakes_before_first_poll_and_blocked_clients_are_fair() {
-        use crate::test_support::WakeCounter;
-        use std::{sync::Arc, task::Waker};
-        let fixture = Fixture::new();
-        fixture.reconcile(&[definition()]).unwrap();
-        let _socket = fixture.connect();
-        let count = Arc::new(WakeCounter::default());
-        let waker = Waker::from(count.clone());
-        let mut cx = Context::from_waker(&waker);
-        assert_eq!(fixture.listeners.poll_budgeted(&mut cx, 0).unwrap(), 0);
-        assert_eq!(count.count(), 0);
-        assert_eq!(fixture.listeners.poll_budgeted(&mut cx, 1).unwrap(), 1);
-        assert_eq!(fixture.listeners.active_connections(), 1);
-        assert_eq!(
-            count.count(),
-            1,
-            "accepted task has no I/O registration yet"
-        );
-        // Replace the not-yet-polled socket operation with deterministic futures
-        // at the actual listener driver seam, avoiding kernel timing dependencies.
-        fixture.listeners.active.borrow_mut().clear();
-        fixture.listeners.accepting.set(false);
-        let order = Rc::new(RefCell::new(Vec::new()));
-        let mut senders = Vec::new();
-        for id in 0..3 {
-            let (send, mut receive) = futures::channel::oneshot::channel::<()>();
-            senders.push(send);
-            let order = order.clone();
-            fixture.listeners.active.borrow_mut().push_back(Active {
-                runnable: crate::read::drivers::Runnable::new(),
-                deadline: Rc::new(Cell::new(Instant::now() + Duration::from_secs(5))),
-                expired: None,
-                cache: definition().id,
-                retired: Arc::new(crate::runtime::ingress::Retired::default()),
-                idle: Rc::new(Cell::new(false)),
-                cancellation: Cancellation::new().unwrap(),
-                operation: Box::pin(std::future::poll_fn(move |cx| {
-                    order.borrow_mut().push(id);
-                    std::pin::Pin::new(&mut receive)
-                        .poll(cx)
-                        .map(|r| r.map_err(|_| Error::Unavailable))
-                })),
-            });
-        }
-        for _ in 0..6 {
-            assert_eq!(fixture.listeners.poll_budgeted(&mut cx, 1).unwrap(), 1);
-        }
-        assert_eq!(&*order.borrow(), &[0, 1, 2]);
-        assert_eq!(count.count(), 1, "blocked clients do not self-wake");
-        for active in fixture.listeners.active.borrow().iter() {
-            std::task::Wake::wake_by_ref(&active.runnable);
-        }
-        for _ in 0..3 {
-            fixture.listeners.poll_budgeted(&mut cx, 1).unwrap();
-        }
-        assert_eq!(&*order.borrow(), &[0, 1, 2, 0, 1, 2]);
-        assert_eq!(
-            count.count(),
-            4,
-            "only the three explicit notifications wake the worker"
-        );
-        std::thread::spawn(move || {
-            for send in senders {
-                send.send(()).unwrap();
-            }
-        })
-        .join()
-        .unwrap();
-        assert_eq!(
-            count.count(),
-            7,
-            "listener forwards the real completion waker"
-        );
-        assert_eq!(fixture.listeners.poll_budgeted(&mut cx, 2).unwrap(), 2);
-        assert_eq!(fixture.listeners.active_connections(), 1);
-        assert_eq!(fixture.listeners.poll_budgeted(&mut cx, 2).unwrap(), 1);
-        assert_eq!(fixture.listeners.active_connections(), 0);
-        let mut yielded = false;
-        fixture.listeners.active.borrow_mut().push_back(Active {
-            runnable: crate::read::drivers::Runnable::new(),
-            deadline: Rc::new(Cell::new(Instant::now() + Duration::from_secs(5))),
-            expired: None,
-            cache: definition().id,
-            retired: Arc::new(crate::runtime::ingress::Retired::default()),
-            idle: Rc::new(Cell::new(false)),
-            cancellation: Cancellation::new().unwrap(),
-            operation: Box::pin(std::future::poll_fn(move |cx| {
-                if yielded {
-                    Poll::Ready(Ok(()))
-                } else {
-                    yielded = true;
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
-            })),
-        });
-        assert_eq!(fixture.listeners.poll_budgeted(&mut cx, 1).unwrap(), 1);
-        assert_eq!(
-            count.count(),
-            8,
-            "cooperative client continuation reaches driver"
-        );
-        assert_eq!(fixture.listeners.poll_budgeted(&mut cx, 1).unwrap(), 1);
-        assert_eq!(fixture.listeners.active_connections(), 0);
-    }
-
-    struct Bodies {
-        admission: Rc<Admission>,
-        streams: crate::read::range_stream::RangeStreams,
-        late_failure: bool,
-        unseeded: bool,
-    }
-    impl ReadService for Bodies {
-        fn read<'a>(
-            &'a self,
-            request: ClientRequest,
-            scope: &'a RequestScope,
-        ) -> Operation<'a, ReadResponse> {
-            Box::pin(async move {
-                use crate::{
-                    memory::{
-                        page::PageResult,
-                        pool::{CiphertextBytes, CiphertextPage, VerifiedBytes, VerifiedPage},
-                    },
-                    model::{
-                        envelope::{KeyId, Nonce, PageEnvelope},
-                        identity::{MembershipVersion, PageId, PageNumber},
-                        limits::ResourceClass,
-                        range::{ByteRange, PAGE_BYTES},
-                    },
-                    topology::membership::Membership,
-                };
-                use std::sync::Arc;
-                let length = if self.late_failure { PAGE_BYTES + 1 } else { 5 };
-                let metadata = ObjectMetadata {
-                    content_type: None,
-                    version: ObjectVersion {
-                        object: request.origin.object.clone(),
-                        etag: StrongEtag::parse(b"\"v1\"")?,
-                    },
-                    length,
-                    expires_at: ExpiresAt(UNIX_EPOCH + Duration::from_millis(1234)),
-                };
-                let requested = match &request.kind {
-                    super::super::request::ReadKind::Subscription { range, .. } => {
-                        range.unwrap_or(ByteRange::From(0))
-                    }
-                    _ => ByteRange::Closed {
-                        first: 0,
-                        last: PAGE_BYTES - 1,
-                    },
-                };
-                let range = requested.resolve(length)?;
-                let page = PageId {
-                    version: metadata.version.clone(),
-                    number: PageNumber(0),
-                };
-                let bytes = if self.late_failure {
-                    vec![b'x'; PAGE_BYTES as usize]
-                } else {
-                    b"hello".to_vec()
-                };
-                let envelope = PageEnvelope {
-                    page: page.clone(),
-                    key_id: KeyId([0; 16]),
-                    nonce: Nonce([0; 24]),
-                    plaintext_length: bytes.len() as u32,
-                    ciphertext_length: bytes.len() as u32 + 16,
-                };
-                let plaintext = VerifiedPage {
-                    inner: Arc::new(VerifiedBytes {
-                        page,
-                        reservation: self.admission.reserve(
-                            None,
-                            ResourceClass::Plaintext,
-                            bytes.len(),
-                        )?,
-                        bytes,
-                    }),
-                };
-                let ciphertext = CiphertextPage {
-                    inner: Arc::new(CiphertextBytes {
-                        checksum: std::sync::OnceLock::new(),
-                        reservation: self.admission.reserve(
-                            None,
-                            ResourceClass::Ciphertext,
-                            envelope.ciphertext_length as usize,
-                        )?,
-                        bytes: vec![0; envelope.ciphertext_length as usize],
-                        envelope,
-                    }),
-                };
-                let seed = PageResult {
-                    metadata: metadata.clone(),
-                    plaintext,
-                    ciphertext,
-                };
-                let mut stream = self.streams.open_with_budget(
-                    metadata.clone(),
-                    range,
-                    request.origin,
-                    Arc::new(Membership::validate(MembershipVersion(1), vec![])?),
-                    scope.clone(),
-                    crate::read::flight::AcquisitionBudget::new(scope.deadline.0, 4, 4),
-                    if self.unseeded { None } else { Some(seed) },
-                )?;
-                if let super::super::request::ReadKind::Subscription {
-                    page_credits,
-                    byte_credits,
-                    ordered,
-                    ..
-                } = request.kind
-                {
-                    stream.configure_subscription(page_credits, byte_credits, ordered)?;
-                }
-                Ok(ReadResponse {
-                    metadata,
-                    range: Some(range),
-                    body: Some(stream),
-                })
-            })
-        }
-    }
-
-    #[test]
-    fn actual_uds_nonempty_range_and_late_failure_truncates() {
-        use crate::{
-            model::identity::WorkerId,
-            read::{dispatch::WorkerDirectory, range_stream::RangeStreams},
-            runtime::worker::WorkerMap,
-        };
-        use std::sync::Arc;
-        for (late_failure, fields, expected_range, expected_length, expected_body) in [
-            (
-                false,
-                "Range: bytes=0-16777215\r\n",
-                "bytes 0-4/5",
-                5,
-                b"hello".as_slice(),
-            ),
-            (
-                false,
-                "If-Match: \"v1\"\r\nRange: bytes=1-3\r\n",
-                "bytes 1-3/5",
-                3,
-                b"ell".as_slice(),
-            ),
-            (
-                false,
-                "If-Match: \"v1\"\r\nRange: bytes=2-\r\n",
-                "bytes 2-4/5",
-                3,
-                b"llo".as_slice(),
-            ),
-            (
-                false,
-                "If-Match: \"v1\"\r\nRange: bytes=-2\r\n",
-                "bytes 3-4/5",
-                2,
-                b"lo".as_slice(),
-            ),
-            (
-                true,
-                "If-Match: \"v1\"\r\nRange: bytes=16777214-16777216\r\n",
-                "bytes 16777214-16777216/16777217",
-                3,
-                b"xx".as_slice(),
-            ),
-        ] {
-            let mut fixture = Fixture::new();
-            let admission = fixture.listeners.admission.clone();
-            let failures = crate::telemetry::failures::Failures::default();
-            let observer = failures.observer(WorkerId(0));
-            let delivery = Rc::new(Delivery::new(
-                Rc::new(PipePool::new(admission.clone(), fixture.reactor.clone())),
-                Duration::from_secs(2),
-            ));
-            fixture.listeners.responses = Rc::new(
-                Responses::new(fixture.listeners.io.clone(), delivery.clone())
-                    .with_observer(observer.clone()),
-            );
-            let directory = Arc::new(
-                WorkerDirectory::new(
-                    Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
-                    vec![WorkerId(0)],
-                    4,
-                )
-                .unwrap(),
-            );
-            // Seed the first authenticated page; an unavailable owner for page one
-            // causes a real acquisition failure only after the first slice escaped.
-            fixture.listeners.reads = Rc::new(Bodies {
-                admission,
-                streams: RangeStreams::from_directory(directory, delivery, 1)
-                    .with_observer(observer),
-                late_failure,
-                unseeded: false,
-            });
-            fixture.reconcile(&[definition()]).unwrap();
-            let mut socket = fixture.connect();
-            socket
-                .write_all(&request("POST", &format!("{fields}Connection: close\r\n")))
-                .unwrap();
-            let output = fixture.receive(&mut socket, true);
-            let end = output
-                .windows(4)
-                .position(|part| part == b"\r\n\r\n")
-                .unwrap()
-                + 4;
-            let head = std::str::from_utf8(&output[..end])
-                .unwrap()
-                .to_ascii_lowercase();
-            assert!(head.starts_with("http/1.1 200"), "{head}");
-            assert!(head.contains("content-type: application/octet-stream\r\n"));
-            let overhead = if late_failure { 63 } else { 42 };
-            assert!(head.contains(&format!(
-                "content-length: {}\r\n",
-                expected_length + overhead
-            )));
-            let start: u64 = expected_range
-                .strip_prefix("bytes ")
-                .unwrap()
-                .split('-')
-                .next()
-                .unwrap()
-                .parse()
-                .unwrap();
-            assert!(head.contains(&format!("racer-range-start: {start}\r\n")));
-            assert_eq!(output[end], 1);
-            assert_eq!(
-                u64::from_be_bytes(output[end + 9..end + 17].try_into().unwrap()),
-                start
-            );
-            assert_eq!(
-                &output[end + 21..end + 21 + expected_body.len()],
-                expected_body
-            );
-            if late_failure {
-                assert_eq!(output.len(), end + 21 + expected_body.len());
-            } else {
-                assert_eq!(output.len(), end + 42 + expected_body.len());
-                assert_eq!(output[end + 21 + expected_body.len()], 2);
-            }
-            let mut diagnostics = String::new();
-            failures.write(&mut diagnostics).unwrap();
-            if late_failure {
-                assert!(
-                    diagnostics.contains("stage=NextSlice error=Unavailable"),
-                    "{diagnostics}"
-                );
-                assert!(
-                    diagnostics.contains("sent: 2, expected: 3"),
-                    "{diagnostics}"
-                );
-                assert!(
-                    diagnostics.contains("stage=PageDispatch error=Unavailable"),
-                    "{diagnostics}"
-                );
-            } else {
-                assert!(diagnostics.starts_with("total=0 "), "{diagnostics}");
-            }
-        }
-    }
-
-    #[test]
-    fn subscription_retains_delivered_page_until_release_and_rejects_invalid_releases() {
-        use crate::model::limits::ResourceClass;
-        for release in [Some((0u64, 2u32)), Some((0, 1)), Some((1, 2)), None] {
-            let (fixture, pipes) = body_fixture_with_large_page(4, false, true);
-            let mut socket = fixture.connect();
-            socket
-                .write_all(&request(
-                    "POST",
-                    "Range: bytes=16777214-16777216\r\nRacer-Page-Credits: 1\r\n",
-                ))
-                .unwrap();
-            let mut output = fixture.receive(&mut socket, false);
-            let end = output.windows(4).position(|b| b == b"\r\n\r\n").unwrap() + 4;
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while output.len() < end + 23 {
-                fixture.pump(16);
-                let mut bytes = [0; 4096];
-                match socket.read(&mut bytes) {
-                    Ok(0) => panic!("subscription closed before release"),
-                    Ok(n) => output.extend_from_slice(&bytes[..n]),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
-                    Err(e) => panic!("{e}"),
-                }
-                assert!(Instant::now() < deadline);
-            }
-            assert_eq!(&output[end + 21..], b"xx");
-            for _ in 0..32 {
-                fixture.pump(16);
-            }
-            assert_eq!(fixture.listeners.active_connections(), 1);
-            assert_eq!(
-                fixture.listeners.admission.used(ResourceClass::Plaintext),
-                crate::model::range::PAGE_BYTES as usize
-            );
-            let Some(release) = release else {
-                drop(socket);
-                for _ in 0..64 {
-                    fixture.pump(16);
-                }
-                assert_only_idle_pipes(&fixture, &pipes);
-                continue;
-            };
-            let mut bytes = [0; 12];
-            bytes[..8].copy_from_slice(&release.0.to_be_bytes());
-            bytes[8..].copy_from_slice(&release.1.to_be_bytes());
-            // Exercise fragmented release reception and retention of its prefix.
-            socket.write_all(&bytes[..5]).unwrap();
-            for _ in 0..16 {
-                fixture.pump(16);
-            }
-            assert_eq!(fixture.listeners.active_connections(), 1);
-            socket.write_all(&bytes[5..]).unwrap();
-            assert!(fixture.receive(&mut socket, true).is_empty());
-            // A valid release admits the unavailable next page; invalid releases
-            // close immediately. Neither path can emit Complete or leak the lease.
-            assert_only_idle_pipes(&fixture, &pipes);
-        }
-    }
-
-    fn body_fixture(queue: usize, unseeded: bool) -> (Fixture, Rc<PipePool>) {
-        body_fixture_with_large_page(queue, unseeded, false)
-    }
-
-    fn body_fixture_with_large_page(
-        queue: usize,
-        unseeded: bool,
-        large_page: bool,
-    ) -> (Fixture, Rc<PipePool>) {
-        use crate::{
-            model::identity::WorkerId,
-            read::{dispatch::WorkerDirectory, range_stream::RangeStreams},
-            runtime::worker::WorkerMap,
-        };
-        use std::sync::Arc;
-        let mut limits = limits();
-        limits.pipes = NonZeroUsize::new(1).unwrap();
-        limits.queue_entries = NonZeroUsize::new(queue).unwrap();
-        let mut fixture = Fixture::with_limits(limits);
-        let admission = fixture.listeners.admission.clone();
-        let pipes = Rc::new(PipePool::new(admission.clone(), fixture.reactor.clone()));
-        let delivery = Rc::new(Delivery::new(pipes.clone(), Duration::from_secs(2)));
-        let directory = Arc::new(
-            WorkerDirectory::new(
-                Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
-                vec![WorkerId(0)],
-                4,
-            )
-            .unwrap(),
-        );
-        fixture.listeners.responses = Rc::new(Responses::new(
-            fixture.listeners.io.clone(),
-            delivery.clone(),
-        ));
-        fixture.listeners.reads = Rc::new(Bodies {
-            admission,
-            streams: RangeStreams::from_directory(directory, delivery, 1),
-            late_failure: large_page,
-            unseeded,
-        });
-        fixture.reconcile(&[definition()]).unwrap();
-        (fixture, pipes)
-    }
-
-    fn start_body(fixture: &Fixture) -> UnixStream {
-        let mut socket = fixture.connect();
-        socket
-            .write_all(&request(
-                "POST",
-                "If-Match: \"v1\"\r\nRange: bytes=0-4\r\nConnection: close\r\n",
-            ))
-            .unwrap();
-        for _ in 0..16 {
-            fixture.pump(16);
-        }
-        socket
-    }
-
-    fn assert_no_head(socket: &mut UnixStream) {
-        assert_eq!(
-            socket.read(&mut [0; 1]).unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
-        );
-    }
-
-    fn assert_no_body_leases(fixture: &Fixture) {
-        use crate::model::limits::ResourceClass;
-        assert_eq!(fixture.listeners.active_connections(), 0);
-        for class in [
-            ResourceClass::Pipe,
-            ResourceClass::Plaintext,
-            ResourceClass::Ciphertext,
-            ResourceClass::Connection,
-        ] {
-            assert_eq!(fixture.listeners.admission.used(class), 0, "{class:?}");
-        }
-    }
-
-    fn assert_only_idle_pipes(fixture: &Fixture, pipes: &crate::memory::pipe::PipePool) {
-        fixture.listeners.admission.reclaim_buffers();
-        use crate::model::limits::ResourceClass;
-        assert_eq!(fixture.listeners.active_connections(), 0);
-        assert_eq!(
-            fixture.listeners.admission.used(ResourceClass::Pipe),
-            pipes.idle_count()
-        );
-        for class in [
-            ResourceClass::Plaintext,
-            ResourceClass::Ciphertext,
-            ResourceClass::Connection,
-        ] {
-            assert_eq!(fixture.listeners.admission.used(class), 0, "{class:?}");
-        }
-    }
-
-    #[test]
-    fn configured_timeout_is_not_renewed_by_response_or_stream_progress() {
-        let (mut fixture, _pipes) = body_fixture_with_large_page(2, false, true);
-        let timeout = Duration::from_millis(800);
-        fixture.listeners = fixture.listeners.with_request_timeout(timeout);
-        let reads = Rc::new(GatedRead {
-            inner: fixture.listeners.reads.clone(),
-            scopes: RefCell::new(Vec::new()),
-            release: Cell::new(false),
-            wake: RefCell::new(None),
-        });
-        fixture.listeners.reads = reads.clone();
-        let mut socket = fixture.connect();
-        socket
-            .write_all(&request(
-                "POST",
-                "If-Match: \"v1\"\r\nRange: bytes=0-16777215\r\nConnection: close\r\n",
-            ))
-            .unwrap();
-        for _ in 0..16 {
-            fixture.pump(16);
-        }
-        let scope = reads.scopes.borrow()[0].clone();
-        // Consume part of the total budget before committing response headers.
-        sleep_until(scope.deadline.0 - timeout / 2);
-        reads.release.set(true);
-        if let Some(waker) = reads.wake.borrow().as_ref() {
-            waker.wake_by_ref();
-        }
-        let mut output = fixture.receive(&mut socket, false);
-        assert!(output.starts_with(b"HTTP/1.1 200 "));
-        let head_end = output
-            .windows(4)
-            .position(|part| part == b"\r\n\r\n")
-            .unwrap()
-            + 4;
-        let mut bytes = [0; 8192];
-        // Keep making observable body progress without draining the whole page.
-        for _ in 0..4 {
-            loop {
-                fixture.pump(16);
-                match socket.read(&mut bytes) {
-                    Ok(n) if n != 0 => {
-                        output.extend_from_slice(&bytes[..n]);
-                        break;
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < scope.deadline.0);
-                    }
-                    result => panic!("expected streaming progress: {result:?}"),
-                }
-            }
-        }
-        assert!(output.len() > head_end);
-        assert_eq!(fixture.listeners.active_connections(), 1);
-        sleep_until(scope.deadline.0 + Duration::from_millis(20));
-        for _ in 0..64 {
-            fixture.pump(16);
-        }
-        // The initial budget is not renewed: it is no longer the body lifetime.
-        // Delivery remains live under its independent write-stall bound.
-        assert_eq!(fixture.listeners.active_connections(), 1);
-        output.extend(fixture.receive(&mut socket, true));
-        assert_eq!(
-            output.len() - head_end,
-            crate::model::range::PAGE_BYTES as usize + 42
-        );
-        assert!(
-            output[head_end + 21..output.len() - 21]
-                .iter()
-                .all(|byte| *byte == b'x')
-        );
-        assert_only_idle_pipes(&fixture, &_pipes);
-    }
-
-    #[test]
-    fn client_disconnect_cancels_pending_metadata_before_acquisition_deadline() {
-        let mut fixture = Fixture::new();
-        let reads = Rc::new(GatedRead {
-            inner: fixture.reads.clone(),
-            scopes: RefCell::new(Vec::new()),
-            release: Cell::new(false),
-            wake: RefCell::new(None),
-        });
-        fixture.listeners.reads = reads.clone();
-        fixture.reconcile(&[definition()]).unwrap();
-        let mut socket = fixture.connect();
-        socket.write_all(&request("HEAD", "")).unwrap();
-        for _ in 0..16 {
-            fixture.pump(16);
-        }
-        let scope = reads.scopes.borrow()[0].clone();
-        assert_eq!(scope.check(), Ok(()));
-        drop(socket);
-        for _ in 0..64 {
-            fixture.pump(16);
-        }
-        assert!(scope.cancellation.is_cancelled());
-        assert!(Instant::now() < scope.deadline.0);
-        assert_no_body_leases(&fixture);
-    }
-
-    #[test]
-    fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
-        // Duplex completion frames and the next response head may be in flight
-        // together, in addition to listener readiness. Keep reactor headroom
-        // while independently exercising the bounded FIFO pipe queue.
-        let (mut fixture, pipes) = body_fixture(4, false);
-        let failures = crate::telemetry::failures::Failures::default();
-        fixture.listeners.responses = Rc::new(
-            Responses::new(
-                fixture.listeners.io.clone(),
-                Rc::new(Delivery::new(pipes.clone(), Duration::from_secs(2))),
-            )
-            .with_observer(failures.observer(crate::model::identity::WorkerId(0))),
-        );
-        let held = pipes.acquire().unwrap();
-        let mut first = start_body(&fixture);
-        let mut second = start_body(&fixture);
-        let mut third = start_body(&fixture);
-        let mut fourth = start_body(&fixture);
-        assert_no_head(&mut first);
-        assert_no_head(&mut second);
-        assert_no_head(&mut third);
-        assert_no_head(&mut fourth);
-        let mut overflow = start_body(&fixture);
-        let output = fixture.receive(&mut overflow, true);
-        assert!(output.starts_with(b"HTTP/1.1 503 "), "{output:?}");
-        assert!(output.ends_with(b"\r\n\r\n"));
-        drop(held);
-        for socket in [&mut first, &mut second, &mut third, &mut fourth] {
-            let output = fixture.receive(socket, true);
-            let mut diagnostics = String::new();
-            failures.write(&mut diagnostics).unwrap();
-            assert!(
-                output.starts_with(b"HTTP/1.1 200 "),
-                "{output:?} {diagnostics}"
-            );
-            assert_eq!(&output[output.len() - 26..output.len() - 21], b"hello");
-        }
-        assert_only_idle_pipes(&fixture, &pipes);
-    }
-
-    #[test]
-    fn actual_uds_first_page_failure_is_complete_503() {
-        let (mut fixture, _pipes) = body_fixture(2, true);
-        let failures = crate::telemetry::failures::Failures::default();
-        let delivery = Rc::new(Delivery::new(_pipes.clone(), Duration::from_secs(2)));
-        fixture.listeners.responses = Rc::new(
-            Responses::new(fixture.listeners.io.clone(), delivery)
-                .with_observer(failures.observer(crate::model::identity::WorkerId(0))),
-        );
-        // No owner is installed for the unseeded first page.
-        let mut socket = start_body(&fixture);
-        let output = fixture.receive(&mut socket, true);
-        assert!(output.starts_with(b"HTTP/1.1 503 "), "{output:?}");
-        assert!(output.ends_with(b"\r\n\r\n"));
-        assert_only_idle_pipes(&fixture, &_pipes);
-        fixture.assert_metrics(1, 1, 0);
-        let mut diagnostics = String::new();
-        failures.write(&mut diagnostics).unwrap();
-        assert!(
-            diagnostics.contains("stage=FirstSlice error=Unavailable"),
-            "{diagnostics}"
-        );
-        assert!(!diagnostics.contains("stage=NextSlice"));
-    }
-
-    #[test]
-    fn actual_uds_waiting_deadline_and_cache_shutdown_release_all_leases() {
-        for cancel in [false, true] {
-            let (mut fixture, pipes) = body_fixture(2, false);
-            fixture.listeners = fixture
-                .listeners
-                .with_request_timeout(Duration::from_millis(200));
-            let held = pipes.acquire().unwrap();
-            let mut socket = start_body(&fixture);
-            assert_no_head(&mut socket);
-            fixture.assert_metrics(1, 0, 1);
-            if cancel {
-                fixture.listeners.cancel_cache(&definition().id).unwrap();
-            } else {
-                std::thread::sleep(Duration::from_millis(220));
-            }
-            let output = fixture.receive(&mut socket, true);
-            assert!(output.starts_with(b"HTTP/1.1 503 "), "{output:?}");
-            assert!(output.ends_with(b"\r\n\r\n"));
-            drop(held);
-            futures::executor::block_on(fixture.listeners.drain(&scope())).unwrap();
-            assert_only_idle_pipes(&fixture, &pipes);
-            fixture.assert_metrics(1, 1, 0);
-        }
-    }
-
-    #[test]
-    fn actual_uds_empty_bootstrap_and_cancelled_success() {
-        struct Empty(bool);
-        impl ReadService for Empty {
-            fn read<'a>(
-                &'a self,
-                request: ClientRequest,
-                scope: &'a RequestScope,
-            ) -> Operation<'a, ReadResponse> {
-                Box::pin(async move {
-                    if self.0 {
-                        scope.cancel()?;
-                    }
-                    Ok(ReadResponse {
-                        metadata: ObjectMetadata {
-                            content_type: None,
-                            version: ObjectVersion {
-                                object: request.origin.object,
-                                etag: StrongEtag::parse(b"\"\"")?,
-                            },
-                            length: 0,
-                            expires_at: ExpiresAt(UNIX_EPOCH),
-                        },
-                        range: None,
-                        body: None,
-                    })
-                })
-            }
-        }
-        let mut fixture = Fixture::new();
-        fixture.reconcile(&[definition()]).unwrap();
-        for cancelled in [false, true] {
-            fixture.listeners.reads = Rc::new(Empty(cancelled));
-            let mut socket = fixture.connect();
-            socket
-                .write_all(&request("POST", "Connection: close\r\n"))
-                .unwrap();
-            let output = fixture.receive(&mut socket, true);
-            let text = std::str::from_utf8(&output).unwrap().to_ascii_lowercase();
-            let status = if cancelled { 503 } else { 200 };
-            assert!(text.starts_with(&format!("http/1.1 {status}")), "{text}");
-            assert!(text.contains(if cancelled {
-                "content-length: 0\r\n"
-            } else {
-                "content-length: 21\r\n"
-            }));
-            assert!(!text.contains("content-range:"));
-            if cancelled {
-                assert!(text.ends_with("\r\n\r\n"));
-            } else {
-                assert_eq!(
-                    &output[output.len() - 21..],
-                    &[
-                        2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-                    ]
-                );
-            }
-            if !cancelled {
-                assert!(text.contains("etag: \"\"\r\n"));
-                assert!(text.contains("racer-expires-at: 0\r\n"));
-                assert!(text.contains("content-type: application/octet-stream\r\n"));
-            }
-            fixture.assert_metrics(if cancelled { 2 } else { 1 }, u64::from(cancelled), 0);
-        }
-    }
-
-    #[test]
-    fn actual_uds_head_keepalive_removal_and_accept_fairness() {
-        let fixture = Fixture::new();
-        assert!(!fixture.socket().exists());
-        fixture.reconcile(&[definition()]).unwrap();
-        assert_eq!(
-            fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
-            0o666
-        );
-        let mut idle = fixture.connect();
-        fixture.pump(1);
-        let mut socket = fixture.connect();
-        socket
-            .write_all(&request("HEAD", "If-Match: \"v1\"\r\n"))
-            .unwrap();
-        // A waiting idle connection must not monopolize a single-unit poll budget.
-        for _ in 0..8 {
-            fixture.pump(1);
-        }
-        assert_eq!(fixture.listeners.active_connections(), 2);
-        let first = fixture.receive(&mut socket, false);
-        let text = std::str::from_utf8(&first).unwrap().to_ascii_lowercase();
-        assert!(text.starts_with("http/1.1 200"));
-        assert!(text.contains("content-length: 17\r\n"));
-        assert!(text.contains("etag: \"v1\"\r\n"));
-        assert!(text.contains("racer-expires-at: 1234\r\n"));
-        assert!(text.ends_with("\r\n\r\n"));
-        socket.write_all(&request("HEAD", "")).unwrap();
-        fixture.receive(&mut socket, false);
-        assert_eq!(fixture.reads.calls.get(), 2);
-        fixture.reconcile(&[]).unwrap();
-        assert!(!fixture.socket().exists());
-        assert!(fixture.receive(&mut socket, true).is_empty());
-        assert!(fixture.receive(&mut idle, true).is_empty());
-        assert_eq!(fixture.reads.calls.get(), 2);
-    }
-
-    #[test]
-    fn actual_uds_errors_and_idle_drain() {
-        let fixture = Fixture::new();
-        fixture.reconcile(&[definition()]).unwrap();
-        for (method, fields, status, extra) in [
-            ("GET", "", "405", "allow: head, post\r\n"),
-            (
-                "POST",
-                "Range: bytes=2-1\r\n",
-                "400",
-                "content-length: 0\r\n",
-            ),
-            (
-                "HEAD",
-                "Authorization: \r\n",
-                "400",
-                "content-length: 0\r\n",
-            ),
-        ] {
-            let mut socket = fixture.connect();
-            socket.write_all(&request(method, fields)).unwrap();
-            let output = fixture.receive(&mut socket, true);
-            let text = std::str::from_utf8(&output).unwrap().to_ascii_lowercase();
-            assert!(text.starts_with(&format!("http/1.1 {status}")), "{text}");
-            assert!(text.contains(extra), "{text}");
-            assert!(text.ends_with("\r\n\r\n"));
-        }
-        assert_eq!(fixture.reads.calls.get(), 0);
-        let mut idle = fixture.connect();
-        fixture.pump(16);
-        fixture.pump(16);
-        fixture.listeners.stop_admission();
-        assert!(fixture.receive(&mut idle, true).is_empty());
-        futures::executor::block_on(fixture.listeners.drain(&scope())).unwrap();
-        assert_eq!(fixture.listeners.active_connections(), 0);
-    }
-
-    #[test]
-    fn actual_uds_rejected_raw_heads_receive_sdk_errors() {
-        let fixture = Fixture::new();
-        fixture.reconcile(&[definition()]).unwrap();
-        let mut oversized = request("HEAD", &format!("X-Padding: {}\r\n", "x".repeat(32768)));
-        // Hit the cap without sending beyond it: a full unterminated head is 431.
-        oversized.truncate(32768);
-        for (raw, status) in [
-            (request("HEAD", "Authorization:secret\r\n"), 400),
-            (request("HEAD", "Authorization:  secret\r\n"), 400),
-            (
-                request("HEAD", "Content-Length: 0\r\nContent-Length: 0\r\n"),
-                400,
-            ),
-            (request("HEAD", "Transfer-Encoding: chunked\r\n"), 400),
-            (oversized, 431),
-            (
-                request("HEAD", &format!("Racer-Metadata: {}\r\n", "x".repeat(8193))),
-                431,
-            ),
-        ] {
-            let mut socket = fixture.connect();
-            socket.write_all(&raw).unwrap();
-            let output = fixture.receive(&mut socket, true);
-            let text = std::str::from_utf8(&output).unwrap().to_ascii_lowercase();
-            assert!(text.starts_with(&format!("http/1.1 {status}")), "{text}");
-            assert!(text.contains("content-length: 0\r\n"));
-            assert!(text.ends_with("\r\n\r\n"));
-        }
-        assert_eq!(fixture.reads.calls.get(), 0);
-    }
-
-    #[test]
-    fn actual_uds_configured_head_cap_counts_only_wire_bytes() {
-        for limit in [512, super::super::request::MAX_HEAD_BYTES] {
-            let mut fixture = Fixture::new();
-            fixture.listeners.parser = RequestParser::new(limit);
-            fixture.reconcile(&[definition()]).unwrap();
-            for separator in ["", " ", "\t", "  "] {
-                let fields = format!(
-                    "Connection: close\r\nX:{separator}{}\r\n",
-                    "x".repeat(
-                        limit
-                            - request("HEAD", &format!("Connection: close\r\nX:{separator}\r\n"))
-                                .len()
-                    )
-                );
-                let raw = request("HEAD", &fields);
-                assert_eq!(raw.len(), limit);
-                let mut socket = fixture.connect();
-                socket.write_all(&raw).unwrap();
-                let output = fixture.receive(&mut socket, true);
-                assert!(output.starts_with(b"HTTP/1.1 200 "));
-            }
-            let admitted = fixture.reads.calls.get();
-            // Exhaust the raw cap on an unterminated head. Decoded value bytes
-            // alone would fit; only framing can reject this before dispatch.
-            let mut raw = request("HEAD", &format!("X:{}\r\n", "x".repeat(limit)));
-            raw.truncate(limit);
-            let mut socket = fixture.connect();
-            socket.write_all(&raw).unwrap();
-            let output = fixture.receive(&mut socket, true);
-            assert!(output.starts_with(b"HTTP/1.1 431 "));
-            assert_eq!(fixture.reads.calls.get(), admitted);
-        }
-    }
-
-    #[test]
-    fn actual_uds_configured_head_limit_counts_received_bytes() {
-        let mut fixture = Fixture::new();
-        let limit = 512;
-        fixture.listeners.parser = RequestParser::new(limit);
-        fixture.reconcile(&[definition()]).unwrap();
-        for separator in ["", " ", "\t", " \t"] {
-            let prefix = request("HEAD", &format!("X:{separator}"));
-            // Replace the request helper's final CRLF with field data and the
-            // complete terminator. Unknown-field whitespace stays on the wire.
-            let mut exact = prefix[..prefix.len() - 2].to_vec();
-            exact.resize(limit - 4, b'x');
-            exact.extend_from_slice(b"\r\n\r\n");
-            let mut socket = fixture.connect();
-            socket.write_all(&exact).unwrap();
-            let reply = fixture.receive(&mut socket, false);
-            assert!(reply.starts_with(b"HTTP/1.1 200 "));
-            drop(socket);
-
-            // This is the first limit bytes of a limit+1-byte head: the final
-            // LF lies beyond the configured cap, so framing must reject it.
-            exact.insert(exact.len() - 4, b'x');
-            exact.truncate(limit);
-            let mut socket = fixture.connect();
-            socket.write_all(&exact).unwrap();
-            let reply = fixture.receive(&mut socket, true);
-            assert!(reply.starts_with(b"HTTP/1.1 431 "));
-        }
-        assert_eq!(fixture.reads.calls.get(), 4);
-    }
-
-    #[test]
-    fn actual_uds_read_failures_and_immutable_result_validation() {
-        struct Failing(Error);
-        impl ReadService for Failing {
-            fn read<'a>(
-                &'a self,
-                _: ClientRequest,
-                scope: &'a RequestScope,
-            ) -> Operation<'a, ReadResponse> {
-                Box::pin(async move {
-                    if self.0 == Error::Cancelled {
-                        scope.cancel()?;
-                    }
-                    Err(self.0)
-                })
-            }
-        }
-        let mut fixture = Fixture::new();
-        fixture.reconcile(&[definition()]).unwrap();
-        for (error, fields, status, range) in [
-            (Error::NotFound, "", 404, None),
-            (Error::NotFound, "If-Match: \"v1\"\r\n", 412, None),
-            (
-                Error::UnsatisfiableRangeWithLength(17),
-                "",
-                416,
-                Some("content-range: bytes */17\r\n"),
-            ),
-            (Error::Cancelled, "", 503, None),
-            (Error::OriginRejected, "", 401, None),
-            (Error::OriginForbidden, "", 403, None),
-            (Error::Overloaded, "", 503, None),
-        ] {
-            fixture.listeners.reads = Rc::new(Failing(error));
-            let mut socket = fixture.connect();
-            socket.write_all(&request("HEAD", fields)).unwrap();
-            let output = fixture.receive(&mut socket, true);
-            let text = std::str::from_utf8(&output).unwrap().to_ascii_lowercase();
-            assert!(text.starts_with(&format!("http/1.1 {status}")), "{text}");
-            assert!(text.contains("content-length: 0\r\n"));
-            assert!(!text.contains("etag:") && !text.contains("racer-expires-at:"));
-            if let Some(range) = range {
-                assert!(text.contains(range));
-            }
-            assert!(text.ends_with("\r\n\r\n"));
-        }
-        struct WrongIdentity(bool);
-        fixture.assert_metrics(7, 7, 0);
-        assert_eq!(
-            fixture
-                .listeners
-                .metrics
-                .count(crate::telemetry::metrics::Event::Overload),
-            1
-        );
-        impl ReadService for WrongIdentity {
-            fn read<'a>(
-                &'a self,
-                mut request: ClientRequest,
-                _: &'a RequestScope,
-            ) -> Operation<'a, ReadResponse> {
-                Box::pin(async move {
-                    if self.0 {
-                        request.origin.object.key.0[0] ^= 1;
-                    }
-                    Ok(ReadResponse {
-                        metadata: ObjectMetadata {
-                            content_type: None,
-                            version: ObjectVersion {
-                                object: request.origin.object,
-                                etag: StrongEtag::parse(b"\"other\"")?,
-                            },
-                            length: 0,
-                            expires_at: ExpiresAt(UNIX_EPOCH),
-                        },
-                        range: None,
-                        body: None,
-                    })
-                })
-            }
-        }
-        for wrong_object in [true, false] {
-            fixture.listeners.reads = Rc::new(WrongIdentity(wrong_object));
-            let mut socket = fixture.connect();
-            socket
-                .write_all(&request(
-                    "HEAD",
-                    if wrong_object {
-                        ""
-                    } else {
-                        "If-Match: \"v1\"\r\n"
-                    },
-                ))
-                .unwrap();
-            let output = fixture.receive(&mut socket, true);
-            assert!(output.starts_with(b"HTTP/1.1 502"));
-        }
-    }
-
-    #[test]
-    fn prepared_transition_rolls_back_bind_chmod_and_drop() {
-        let fixture = Fixture::new();
-        fixture.reconcile(&[definition()]).unwrap();
-        let inode = fs::metadata(fixture.socket()).unwrap().ino();
-        let mut changed = definition();
-        changed.id = CacheId("00000000-0000-4000-8000-000000000003".into());
-        let mut added = definition();
-        added.id = CacheId("00000000-0000-4000-8000-000000000002".into());
-        added.name = "blocked".into();
-        added.client_socket = "/run/racer/blocked/client/socket".into();
-        added.origin_socket = "/run/racer/blocked/origin/socket".into();
-        fs::write(fixture.root.0.join("blocked"), b"foreign").unwrap();
-        assert!(
-            futures::executor::block_on(
-                fixture
-                    .listeners
-                    .prepare(&[changed.clone(), added], &scope())
-            )
-            .is_err()
-        );
-        assert_eq!(fs::metadata(fixture.socket()).unwrap().ino(), inode);
-        assert_eq!(
-            fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
-            0o666
-        );
-        FAIL_CHMOD.with(|fail| fail.set(true));
-        assert!(
-            futures::executor::block_on(fixture.listeners.prepare(&[changed.clone()], &scope()))
-                .is_err()
-        );
-        assert_eq!(fs::metadata(fixture.socket()).unwrap().ino(), inode);
-        assert_eq!(
-            fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
-            0o666
-        );
-        let prepared =
-            futures::executor::block_on(fixture.listeners.prepare(&[changed.clone()], &scope()))
-                .unwrap();
-        assert_ne!(fs::metadata(fixture.socket()).unwrap().ino(), inode);
-        assert_eq!(
-            fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
-            0o666
-        );
-        assert!(matches!(
-            futures::executor::block_on(fixture.listeners.prepare(&[], &scope())),
-            Err(Error::Overloaded)
-        ));
-        drop(prepared);
-        assert_eq!(fs::metadata(fixture.socket()).unwrap().ino(), inode);
-        assert_eq!(
-            fs::read_dir(fixture.socket().parent().unwrap())
-                .unwrap()
-                .count(),
-            3
-        );
-        let mut socket = fixture.connect();
-        socket.write_all(&request("HEAD", "")).unwrap();
-        assert!(
-            fixture
-                .receive(&mut socket, false)
-                .starts_with(b"HTTP/1.1 200")
-        );
-        let prepared =
-            futures::executor::block_on(fixture.listeners.prepare(&[changed], &scope())).unwrap();
-        prepared.commit();
-        fixture.pump(16);
-        assert_eq!(
-            fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
-            0o666
-        );
-        assert!(fixture.receive(&mut socket, true).is_empty());
-    }
-
-    #[test]
-    fn abandoned_prepare_future_removes_temporary_socket() {
-        let fixture = Fixture::new();
-        fixture.reconcile(&[definition()]).unwrap();
-        let inode = fs::metadata(fixture.socket()).unwrap().ino();
-        let mut changed = definition();
-        changed.id = CacheId("00000000-0000-4000-8000-000000000003".into());
-        let definitions = [changed];
-        let scope = scope();
-        let mut future = fixture.listeners.prepare(&definitions, &scope);
-        let waker = futures::task::noop_waker();
-        assert!(
-            future
-                .as_mut()
-                .poll(&mut Context::from_waker(&waker))
-                .is_pending()
-        );
-        assert_eq!(
-            fs::read_dir(fixture.socket().parent().unwrap())
-                .unwrap()
-                .count(),
-            5
-        );
-        drop(future);
-        assert_eq!(fs::metadata(fixture.socket()).unwrap().ino(), inode);
-        assert_eq!(
-            fs::read_dir(fixture.socket().parent().unwrap())
-                .unwrap()
-                .count(),
-            3
-        );
-        assert!(!fixture.listeners.preparing.get());
-    }
-
-    #[test]
-    fn prepared_rename_failure_restores_already_exchanged_paths() {
-        let fixture = Fixture::new();
-        fixture.reconcile(&[definition()]).unwrap();
-        let inode = fs::metadata(fixture.socket()).unwrap().ino();
-        let mut changed = definition();
-        changed.id = CacheId("00000000-0000-4000-8000-000000000003".into());
-        let mut added = definition();
-        added.id = CacheId("00000000-0000-4000-8000-000000000002".into());
-        added.name = "added".into();
-        added.client_socket = "/run/racer/added/client/socket".into();
-        added.origin_socket = "/run/racer/added/origin/socket".into();
-        transition::FAIL_RENAME_AFTER.with(|count| count.set(Some(1)));
-        assert!(
-            futures::executor::block_on(fixture.listeners.prepare(&[changed, added], &scope()))
-                .is_err()
-        );
-        assert_eq!(fs::metadata(fixture.socket()).unwrap().ino(), inode);
-        assert_eq!(
-            fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
-            0o666
-        );
-        assert_eq!(
-            fs::read_dir(fixture.socket().parent().unwrap())
-                .unwrap()
-                .count(),
-            3
-        );
-        assert_eq!(
-            fs::read_dir(fixture.root.0.join("added/client"))
-                .unwrap()
-                .count(),
-            1
-        );
-        let mut socket = fixture.connect();
-        socket
-            .write_all(&request("HEAD", "Connection: close\r\n"))
-            .unwrap();
-        assert!(
-            fixture
-                .receive(&mut socket, true)
-                .starts_with(b"HTTP/1.1 200")
-        );
-    }
-
-    #[test]
-    fn prepared_uid_reuse_and_foreign_replacement_are_inode_safe() {
-        let fixture = Fixture::new();
-        fixture.reconcile(&[definition()]).unwrap();
-        let origin = fixture.root.0.join("example/origin");
-        fs::create_dir(&origin).unwrap();
-        fs::write(origin.join("socket"), b"origin").unwrap();
-        let mut replacement = definition();
-        replacement.id = CacheId("00000000-0000-4000-8000-000000000002".into());
-        let prepared = futures::executor::block_on(
-            fixture.listeners.prepare(&[replacement.clone()], &scope()),
-        )
-        .unwrap();
-        prepared.commit();
-        fixture.pump(16);
-        let inode = fs::metadata(fixture.socket()).unwrap().ino();
-        assert!(
-            fixture
-                .listeners
-                .listeners
-                .borrow()
-                .contains_key(&replacement.id)
-        );
-        replacement.id = CacheId("00000000-0000-4000-8000-000000000003".into());
-        let prepared =
-            futures::executor::block_on(fixture.listeners.prepare(&[replacement], &scope()))
-                .unwrap();
-        fs::remove_file(fixture.socket()).unwrap();
-        fs::write(fixture.socket(), b"foreign").unwrap();
-        drop(prepared);
-        assert_eq!(fs::read(fixture.socket()).unwrap(), b"foreign");
-        assert_eq!(fs::read(origin.join("socket")).unwrap(), b"origin");
-        assert!(
-            fs::read_dir(fixture.socket().parent().unwrap())
-                .unwrap()
-                .any(|entry| entry.unwrap().metadata().unwrap().ino() == inode)
-        );
-    }
-
-    #[test]
-    fn removal_commit_drains_active_response_and_reused_uid_does_not_revive_old_keepalive() {
-        let mut fixture = Fixture::new();
-        let gated = Rc::new(GatedRead {
-            inner: fixture.reads.clone(),
-            scopes: RefCell::new(vec![]),
-            release: Cell::new(false),
-            wake: RefCell::new(None),
-        });
-        fixture.listeners.reads = gated.clone();
-        fixture.reconcile(&[definition()]).unwrap();
-        let mut socket = fixture.connect();
-        socket.write_all(&request("HEAD", "")).unwrap();
-        for _ in 0..16 {
-            fixture.pump(16);
-        }
-        assert_eq!(gated.scopes.borrow().len(), 1);
-        let operation_scope = gated.scopes.borrow()[0].clone();
-        fixture.reconcile(&[]).unwrap();
-        for _ in 0..16 {
-            fixture.pump(16);
-        }
-        assert!(operation_scope.check().is_ok());
-        assert_eq!(fixture.listeners.active_connections(), 1);
-        fixture.reconcile(&[definition()]).unwrap();
-        gated.release.set(true);
-        if let Some(waker) = gated.wake.borrow().as_ref() {
-            waker.wake_by_ref();
-        }
-        let response = fixture.receive(&mut socket, true);
-        assert!(response.starts_with(b"HTTP/1.1 200"));
-        assert_eq!(fixture.listeners.active_connections(), 0);
-        let mut new = fixture.connect();
-        new.write_all(&request("HEAD", "Connection: close\r\n"))
-            .unwrap();
-        assert!(fixture.receive(&mut new, true).starts_with(b"HTTP/1.1 200"));
-        assert_eq!(fixture.reads.calls.get(), 2);
-    }
-
-    #[test]
-    fn per_cache_cancellation_drains_active_read_and_keeps_other_cache() {
-        struct Waiting(Rc<Cell<usize>>);
-        impl ReadService for Waiting {
-            fn read<'a>(
-                &'a self,
-                _: ClientRequest,
-                scope: &'a RequestScope,
-            ) -> Operation<'a, ReadResponse> {
-                Box::pin(async move {
-                    self.0.set(self.0.get() + 1);
-                    std::future::poll_fn(|_| match scope.check() {
-                        Ok(()) => Poll::Pending,
-                        Err(error) => Poll::Ready(Err(error)),
-                    })
-                    .await
-                })
-            }
-        }
-        let mut fixture = Fixture::new();
-        let calls = Rc::new(Cell::new(0));
-        fixture.listeners.reads = Rc::new(Waiting(calls.clone()));
-        let mut other = definition();
-        other.id = CacheId("00000000-0000-4000-8000-000000000002".into());
-        other.name = "other".into();
-        other.client_socket = "/run/racer/other/client/socket".into();
-        other.origin_socket = "/run/racer/other/origin/socket".into();
-        fixture.reconcile(&[definition(), other.clone()]).unwrap();
-        let mut socket = fixture.connect();
-        socket.write_all(&request("HEAD", "")).unwrap();
-        for _ in 0..16 {
-            fixture.pump(16);
-        }
-        assert_eq!(calls.get(), 1);
-        assert_eq!(
-            fixture.listeners.active_connections_for(&definition().id),
-            1
-        );
-        fixture.listeners.cancel_cache(&definition().id).unwrap();
-        assert!(
-            fixture
-                .receive(&mut socket, true)
-                .starts_with(b"HTTP/1.1 503")
-        );
-        futures::executor::block_on(fixture.listeners.drain_cache(&definition().id, &scope()))
-            .unwrap();
-        assert_eq!(
-            fixture.listeners.active_connections_for(&definition().id),
-            0
-        );
-        assert!(fixture.listeners.listeners.borrow().contains_key(&other.id));
-        assert!(fixture.root.0.join("other/client/socket").exists());
-    }
-
-    #[test]
-    fn socket_lifecycle_rejects_symlinks_and_preserves_unowned_paths() {
-        let fixture = Fixture::new();
-        let origin = fixture.root.0.join("example/origin");
-        fs::create_dir_all(&origin).unwrap();
-        fs::write(origin.join("socket"), b"adapter owned").unwrap();
-        fixture.reconcile(&[definition()]).unwrap();
-        let mut updated = definition();
-        updated.id = CacheId("00000000-0000-4000-8000-000000000003".into());
-        fixture.reconcile(&[updated]).unwrap();
-        assert_eq!(
-            fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
-            0o666
-        );
-        // Replacing the pathname does not give us ownership of its replacement.
-        fs::remove_file(fixture.socket()).unwrap();
-        fs::write(fixture.socket(), b"replacement").unwrap();
-        fixture.reconcile(&[]).unwrap();
-        assert_eq!(fs::read(fixture.socket()).unwrap(), b"replacement");
-        assert_eq!(fs::read(origin.join("socket")).unwrap(), b"adapter owned");
-        assert_eq!(fixture.reconcile(&[definition()]), Err(Error::Io));
-        fs::remove_file(fixture.socket()).unwrap();
-        // The persistent lock deliberately survives endpoint removal. Move the
-        // whole directory aside to exercise replacement by a symlink.
-        fs::rename(
-            fixture.socket().parent().unwrap(),
-            fixture.root.0.join("old-client"),
-        )
-        .unwrap();
-        std::os::unix::fs::symlink(&origin, fixture.socket().parent().unwrap()).unwrap();
-        assert_eq!(fixture.reconcile(&[definition()]), Err(Error::Io));
-        assert_eq!(fs::read(origin.join("socket")).unwrap(), b"adapter owned");
-        let mut invalid = definition();
-        invalid.name = "../escape".into();
-        assert_eq!(fixture.reconcile(&[invalid]), Err(Error::InvalidRequest));
-    }
-}
+#[path = "listener_tests.rs"]
+mod tests;
