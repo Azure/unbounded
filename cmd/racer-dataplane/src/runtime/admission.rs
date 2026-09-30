@@ -79,17 +79,34 @@ pub struct Reservation {
     buffers: Weak<Mutex<Vec<(Vec<u8>, Reservation)>>>,
     stopped: Arc<AtomicBool>,
 }
+
+/// Wipe every allocated payload byte, including truncated and uninitialized tails.
+/// Leave the length empty so rejection can deallocate without exposing spare bytes.
+fn wipe_payload(bytes: &mut Vec<u8>) {
+    bytes.clear();
+    #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
+    if bytes.capacity() != 0 {
+        // SAFETY: this exclusive Vec<u8> owns capacity writable bytes. Passing the
+        // raw pointer does not construct a reference to uninitialized spare bytes.
+        // explicit_bzero initializes the entire range and cannot be elided even
+        // when the allocation is immediately freed. It uses libc's optimized wipe
+        // rather than a Rust memset that dead-store elimination could remove.
+        // GNU builds require glibc >= 2.25 (the Debian bookworm image has 2.36).
+        unsafe { libc::explicit_bzero(bytes.as_mut_ptr().cast(), bytes.capacity()) };
+    }
+    #[cfg(not(all(target_os = "linux", any(target_env = "gnu", target_env = "musl"))))]
+    {
+        use zeroize::Zeroize;
+        bytes.zeroize();
+    }
+}
+
 impl Reservation {
     /// Return only the final exclusive payload owner. The retained reservation
     /// accounts for idle capacity; at most two buffers survive per worker.
     pub(crate) fn recycle(&mut self, mut bytes: Vec<u8>) {
-        use zeroize::Zeroize;
-        // Vec::zeroize wipes initialized elements, then the entire capacity.
-        // u8 has no destructor: clear the length first to avoid wiping the live
-        // prefix twice. The full capacity (including truncated tails) is still
-        // securely zeroized before either pooling or deallocation.
-        bytes.clear();
-        bytes.zeroize();
+        // Wipe before every retention check, including non-pooling destruction.
+        wipe_payload(&mut bytes);
         if self.stopped.load(Ordering::Acquire) {
             return;
         }
@@ -108,7 +125,7 @@ impl Reservation {
         if pool.len() >= 2 {
             return;
         }
-        // SAFETY: Vec<u8>::zeroize above writes zero to the entire capacity,
+        // SAFETY: wipe_payload above writes zero to the entire capacity,
         // including previously uninitialized spare capacity. No allocation or
         // byte mutation intervenes. Record that initialized length while idle
         // so exact-capacity checkout needs no second zero-fill.
@@ -602,6 +619,73 @@ impl Admission {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn secure_payload_wipe_initializes_spare_capacity_and_preserves_geometry() {
+        for capacity in [0, 1, 15, 16, 17, 63, 64, 65, 4095, 4096, 4097] {
+            for initialized in [false, true] {
+                let mut bytes = Vec::with_capacity(capacity);
+                if initialized {
+                    bytes.resize(bytes.capacity(), 0xa7);
+                    bytes.truncate(capacity / 2);
+                }
+                let pointer = bytes.as_ptr();
+                let allocated = bytes.capacity();
+                super::wipe_payload(&mut bytes);
+                assert!(bytes.is_empty());
+                assert_eq!(bytes.capacity(), allocated);
+                assert_eq!(bytes.as_ptr(), pointer);
+                // SAFETY: wipe_payload initializes every byte of this allocation,
+                // including capacity that has never been part of the live length.
+                unsafe { bytes.set_len(allocated) };
+                assert!(bytes.iter().all(|byte| *byte == 0));
+                super::wipe_payload(&mut bytes);
+                assert!(bytes.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "release-only alternating full-capacity secure wipe comparison"]
+    fn secure_payload_wipe_benchmark() {
+        use std::{hint::black_box, time::Instant};
+        use zeroize::Zeroize;
+        assert!(!cfg!(debug_assertions), "run with --release");
+        const ITERATIONS: usize = 128;
+        for length in [1 << 20, 16 << 20, (16 << 20) + 16] {
+            let mut bytes = vec![0u8; length];
+            for sample in 0..6 {
+                for optimized in if sample % 2 == 0 {
+                    [false, true]
+                } else {
+                    [true, false]
+                } {
+                    let start = Instant::now();
+                    for _ in 0..ITERATIONS {
+                        bytes.fill(black_box(0xa7));
+                        black_box(&bytes);
+                        if optimized {
+                            super::wipe_payload(&mut bytes);
+                        } else {
+                            bytes.clear();
+                            bytes.zeroize();
+                        }
+                        // SAFETY: both primitives initialize the full capacity.
+                        unsafe { bytes.set_len(length) };
+                        black_box(&bytes);
+                    }
+                    let elapsed = start.elapsed();
+                    assert!(bytes.iter().all(|byte| *byte == 0));
+                    if sample != 0 {
+                        println!(
+                            "secure_wipe length={length} optimized={optimized} sample={sample} iterations={ITERATIONS} ns_per_op={:.0}",
+                            elapsed.as_nanos() as f64 / ITERATIONS as f64,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn recycled_truncated_capacity_is_zero_before_cross_cache_and_class_reuse() {
         let admission = Admission::new(crate::test_support::cluster::config(false).limits);
