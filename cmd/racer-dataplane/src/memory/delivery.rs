@@ -7,6 +7,7 @@
 //! transfers the entire connection/reader lease to the reactor, retaining admission
 //! through abandonment and the final completion fence. After backpressure, the
 //! rest of that page uses direct sends instead of repeating pipe drain round trips.
+//! Backpressured direct sends own immutable page views, not copied staging bytes.
 use super::{
     pipe::{PipeLease, PipePool},
     pool::VerifiedPage,
@@ -16,7 +17,10 @@ use crate::{
     error::{Error, Operation, Result},
     http::{io::OwnedBuffer, pool::ConnectionLease},
     model::range::PageSlice,
-    runtime::{deadline::RequestScope, reactor::IoBuffer},
+    runtime::{
+        deadline::RequestScope,
+        reactor::{IoBuffer, SendBuffer},
+    },
 };
 #[cfg(test)]
 use std::os::fd::AsRawFd;
@@ -28,6 +32,44 @@ use std::{future::poll_fn, io, rc::Rc, task::Poll, time::Duration};
 const SEND_CHUNK_BYTES: usize = 64 * 1024;
 const SEND_BUDGET_BYTES: usize = 256 * 1024;
 const SEND_BUDGET_CALLS: usize = 32;
+
+/// A fixed immutable view owns the full admitted page through the send fence.
+/// It deliberately implements no receive or mutable-buffer capability.
+struct PageSendRange {
+    page: VerifiedPage,
+    range: std::ops::Range<usize>,
+}
+
+impl PageSendRange {
+    fn new(page: VerifiedPage, range: std::ops::Range<usize>) -> Result<Self> {
+        if page.bytes().get(range.clone()).is_none() {
+            return Err(Error::InvalidRange);
+        }
+        Ok(Self { page, range })
+    }
+}
+
+impl crate::runtime::reactor::sealed::Sealed for PageSendRange {}
+impl SendBuffer for PageSendRange {
+    fn send_bytes(&self) -> Result<&[u8]> {
+        Ok(&self.page.bytes()[self.range.clone()])
+    }
+}
+
+enum DeliveryBuffer {
+    Pipe(OwnedBuffer),
+    Page(PageSendRange),
+}
+
+impl crate::runtime::reactor::sealed::Sealed for DeliveryBuffer {}
+impl SendBuffer for DeliveryBuffer {
+    fn send_bytes(&self) -> Result<&[u8]> {
+        match self {
+            Self::Pipe(buffer) => buffer.send_bytes(),
+            Self::Page(buffer) => buffer.send_bytes(),
+        }
+    }
+}
 
 pub struct Delivery {
     metrics: crate::telemetry::metrics::Metrics,
@@ -235,21 +277,20 @@ impl Delivery {
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         // Readiness currently retains only an FD, not connection
                         // admission. Instead submit one owned send on backpressure.
-                        // Drain copied pipe bytes into its accounted buffer before
-                        // submission. A partial send's unsent suffix is reconstructed
-                        // from the immutable page on the next iteration.
-                        let mut buffer = if copying {
+                        // Drain the first copied pipe into accounted storage. Later
+                        // sends own immutable page views, avoiding repeated staging
+                        // allocation, copy, and wipe. The reactor also retains the
+                        // entire reader/pipe/connection lease until its final fence.
+                        let buffer = if copying {
                             let start = reader.slice.offset as usize + reader.sent;
                             let count = reader.remaining().min(SEND_CHUNK_BYTES);
-                            OwnedBuffer::copy_from(
-                                self.pipes.admission(),
-                                &reader.page.bytes()[start..start + count],
-                            )?
+                            DeliveryBuffer::Page(PageSendRange::new(
+                                reader.page.clone(),
+                                start..start + count,
+                            )?)
                         } else {
-                            OwnedBuffer::new(self.pipes.admission(), reader.pipe.buffered())?
-                        };
-                        let count = buffer.bytes()?.len();
-                        if !copying {
+                            let count = reader.pipe.buffered();
+                            let mut buffer = OwnedBuffer::new(self.pipes.admission(), count)?;
                             match reader.pipe.try_read(buffer.bytes_mut()?) {
                                 Ok(read) if read == count && count != 0 => {}
                                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {
@@ -261,7 +302,9 @@ impl Delivery {
                             let _ = self
                                 .metrics
                                 .record(crate::telemetry::metrics::Event::DeliveryPipeDrain, 1);
-                        }
+                            DeliveryBuffer::Pipe(buffer)
+                        };
+                        let count = buffer.send_bytes()?.len();
                         let completion = self
                             .pipes
                             .reactor()
@@ -532,6 +575,233 @@ mod tests {
             },
             0
         );
+    }
+
+    fn thread_cpu() -> Duration {
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: clock_gettime initializes the live timespec on success.
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
+            0
+        );
+        Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+    }
+
+    #[test]
+    fn page_send_range_is_a_stable_admitted_immutable_subrange() {
+        let (admission, _, _) = setup(1, Duration::from_secs(1));
+        let page = page(&admission, b"prefix-selected-suffix".to_vec());
+        let weak = Arc::downgrade(&page.inner);
+        let pointer = page.bytes()[7..].as_ptr();
+        for range in [8..7, 0..23, usize::MAX..usize::MAX] {
+            assert!(matches!(
+                PageSendRange::new(page.clone(), range),
+                Err(Error::InvalidRange)
+            ));
+        }
+        let empty = PageSendRange::new(page.clone(), 22..22).unwrap();
+        assert!(empty.send_bytes().unwrap().is_empty());
+        drop(empty);
+        let view = PageSendRange::new(page, 7..15).unwrap();
+        assert_eq!(view.send_bytes().unwrap(), b"selected");
+        assert_eq!(view.send_bytes().unwrap().as_ptr(), pointer);
+        assert_eq!(admission.used(ResourceClass::Plaintext), 22);
+        let moved = Box::new(view);
+        assert_eq!(moved.send_bytes().unwrap().as_ptr(), pointer);
+        drop(moved);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+    }
+
+    #[test]
+    fn copying_http_send_keeps_full_admission_until_failure_fence() {
+        for failure in ["abandon", "cancel", "disconnect", "deadline", "drain"] {
+            let (admission, reactor, delivery) = setup(1, Duration::from_secs(2));
+            let page = page(&admission, vec![0x5a; 512 * 1024]);
+            let weak = Arc::downgrade(&page.inner);
+            let reader = delivery.attach(page, slice(7, 500 * 1024)).unwrap();
+            let (socket, mut peer) = UnixStream::pair().unwrap();
+            small_send_buffer(&socket);
+            peer.set_nonblocking(true).unwrap();
+            let mut connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+            connection.tx_remaining = Some(500 * 1024);
+            let mut scope = scope();
+            if failure == "deadline" {
+                scope.deadline = Deadline(Instant::now() + Duration::from_millis(100));
+            }
+            let mut operation = delivery.finish_to(reader, connection, &scope);
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            assert!(operation.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(weak.strong_count(), 1, "first send owns a pipe drain");
+            let start = Instant::now();
+            while weak.strong_count() == 1 {
+                assert!(start.elapsed() < Duration::from_secs(1));
+                loop {
+                    match peer.read(&mut [0; 8192]) {
+                        Ok(0) => panic!("unexpected EOF"),
+                        Ok(_) => {}
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(error) => panic!("{error}"),
+                    }
+                }
+                reactor.poll_budgeted(64).unwrap();
+                assert!(operation.as_mut().poll(&mut cx).is_pending());
+            }
+            assert_eq!(weak.strong_count(), 2, "reader and immutable send view");
+            assert_eq!(reactor.in_flight(), 1);
+            assert_eq!(admission.used(ResourceClass::Plaintext), 512 * 1024);
+            assert_eq!(admission.used(ResourceClass::Connection), 1);
+            assert!(matches!(delivery.pipes.acquire(), Err(Error::Overloaded)));
+            match failure {
+                "abandon" => {
+                    drop(operation);
+                    assert_eq!(weak.strong_count(), 2);
+                    assert_eq!(admission.used(ResourceClass::Plaintext), 512 * 1024);
+                    assert_eq!(admission.used(ResourceClass::Connection), 1);
+                    assert!(matches!(delivery.pipes.acquire(), Err(Error::Overloaded)));
+                    drive(&reactor, reactor.drain()).unwrap();
+                }
+                "drain" => {
+                    drive(&reactor, reactor.drain()).unwrap();
+                    assert!(matches!(drive(&reactor, operation), Err(Error::Cancelled)));
+                }
+                _ => {
+                    let expected = match failure {
+                        "cancel" => {
+                            scope.cancel().unwrap();
+                            Error::Cancelled
+                        }
+                        "disconnect" => {
+                            drop(peer);
+                            Error::Io
+                        }
+                        _ => Error::DeadlineExceeded,
+                    };
+                    assert!(matches!(drive(&reactor, operation), Err(error) if error == expected));
+                }
+            }
+            assert_eq!(reactor.in_flight(), 0);
+            assert!(weak.upgrade().is_none());
+            assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+            assert_eq!(admission.used(ResourceClass::Connection), 0);
+            assert!(delivery.pipes.acquire().is_ok());
+        }
+    }
+
+    /// Real TCP, bounded send queue, and receiver pacing force repeated owned sends.
+    /// Time only sender future/reactor turns, excluding receiver reads, validation,
+    /// and pacing. This is thread CPU, not total kernel/worker CPU or throughput.
+    /// Run with --ignored --nocapture --test-threads=1 before/after production edits.
+    #[test]
+    #[ignore = "local TCP delivery CPU benchmark"]
+    fn loopback_backpressure_thread_cpu() {
+        use std::net::{TcpListener, TcpStream};
+        const LENGTH: usize = 512 * 1024;
+        const PAGES: usize = 1024;
+        let (admission, reactor, delivery) = setup(1, Duration::from_secs(5));
+        let bytes: Vec<u8> = (0..LENGTH).map(|i| (i % 251) as u8).collect();
+        let page = page(&admission, bytes.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        socket.set_nodelay(true).unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let size: libc::c_int = 4096;
+        // SAFETY: the option pointer refers to a live, correctly sized integer.
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&size as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&size) as libc::socklen_t,
+                )
+            },
+            0
+        );
+        let mut connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+        let mut scratch = [0; 64 * 1024];
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        for sample in 0..4 {
+            let wall = Instant::now();
+            let mut cpu = Duration::ZERO;
+            let mut pending_turns = 0;
+            let drains = delivery
+                .metrics
+                .count(crate::telemetry::metrics::Event::DeliveryPipeDrain);
+            for _ in 0..PAGES {
+                let scope = scope();
+                connection.tx_remaining = Some(LENGTH as u64);
+                let reader = delivery
+                    .attach(page.clone(), slice(0, LENGTH as u32))
+                    .unwrap();
+                let mut operation = delivery.finish_to(reader, connection, &scope);
+                let mut completed = None;
+                let mut received = 0;
+                while completed.is_none() || received != LENGTH {
+                    assert!(wall.elapsed() < Duration::from_secs(60));
+                    let start = thread_cpu();
+                    reactor.poll_budgeted(64).unwrap();
+                    if completed.is_none() {
+                        if let Poll::Ready(result) = operation.as_mut().poll(&mut cx) {
+                            completed = Some(result.unwrap());
+                        } else if reactor.in_flight() != 0 {
+                            pending_turns += 1;
+                        }
+                    }
+                    cpu += thread_cpu() - start;
+                    loop {
+                        match peer.read(&mut scratch) {
+                            Ok(0) => panic!("unexpected EOF"),
+                            Ok(count) => {
+                                assert_eq!(&scratch[..count], &bytes[received..received + count]);
+                                received += count;
+                                let quick_ack: libc::c_int = 1;
+                                // SAFETY: live TCP socket and correctly sized option.
+                                assert_eq!(
+                                    unsafe {
+                                        libc::setsockopt(
+                                            peer.as_raw_fd(),
+                                            libc::IPPROTO_TCP,
+                                            libc::TCP_QUICKACK,
+                                            (&quick_ack as *const libc::c_int).cast(),
+                                            std::mem::size_of_val(&quick_ack) as libc::socklen_t,
+                                        )
+                                    },
+                                    0
+                                );
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                            Err(error) => panic!("{error}"),
+                        }
+                    }
+                    // Let TCP and completion processing progress without charging
+                    // busy polling or receiver pacing to the sender CPU sample.
+                    std::thread::sleep(Duration::from_micros(50));
+                }
+                connection = completed.unwrap();
+                assert_eq!(connection.tx_remaining, Some(0));
+                assert_eq!(reactor.in_flight(), 0);
+            }
+            let drains = delivery
+                .metrics
+                .count(crate::telemetry::metrics::Event::DeliveryPipeDrain)
+                - drains;
+            assert!(drains > 0 && pending_turns > PAGES);
+            eprintln!(
+                "delivery_tcp sample={sample} warmup={} bytes={} sender_cpu_ms={:.3} cpu_ns_per_byte={:.4} wall_ms={} pipe_drains={drains} pending_turns={pending_turns}",
+                sample == 0,
+                LENGTH * PAGES,
+                cpu.as_secs_f64() * 1000.0,
+                cpu.as_nanos() as f64 / (LENGTH * PAGES) as f64,
+                wall.elapsed().as_millis()
+            );
+        }
     }
 
     #[test]
@@ -1053,9 +1323,12 @@ mod tests {
     fn http_splice_and_backpressure_send_deliver_exactly_once() {
         let (admission, reactor, delivery) = setup(1, Duration::from_secs(2));
         let bytes: Vec<u8> = (0..512 * 1024).map(|i| (i % 251) as u8).collect();
-        let page = page(&admission, bytes.clone());
+        let mut backing = b"prefix!".to_vec();
+        backing.extend_from_slice(&bytes);
+        backing.extend_from_slice(b"suffix!");
+        let page = page(&admission, backing);
         let weak = Arc::downgrade(&page.inner);
-        let reader = delivery.attach(page, slice(0, bytes.len() as u32)).unwrap();
+        let reader = delivery.attach(page, slice(7, bytes.len() as u32)).unwrap();
         let (socket, mut peer) = UnixStream::pair().unwrap();
         small_send_buffer(&socket);
         peer.set_nonblocking(true).unwrap();
@@ -1070,6 +1343,7 @@ mod tests {
         let mut scratch = [0; 8192];
         let start = Instant::now();
         let mut completed = None;
+        let mut page_sends = 0;
         while received.len() != bytes.len() || completed.is_none() {
             assert!(start.elapsed() < Duration::from_secs(5));
             loop {
@@ -1085,8 +1359,15 @@ mod tests {
                 if let Poll::Ready(result) = operation.as_mut().poll(&mut cx) {
                     completed = Some(result.unwrap());
                 }
+                if weak.strong_count() == 2 {
+                    page_sends += 1;
+                }
             }
         }
+        assert!(
+            page_sends > 1,
+            "exercise repeated immutable page sends and short writes"
+        );
         assert_eq!(received, bytes);
         assert_eq!(completed.as_ref().unwrap().tx_remaining, Some(0));
         assert_eq!(
