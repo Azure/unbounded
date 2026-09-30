@@ -200,6 +200,12 @@ func applyTarget(plan *component.Plan, target Target) WorkloadResult {
 		return result
 	}
 
+	if err := normalizeDaemonSetStrategy(candidate, target.Contributors); err != nil {
+		result.Err = err
+
+		return result
+	}
+
 	result.VersionDrift = imageDrift(original, candidate)
 
 	stampAnnotations(candidate, hash, contributorSources(target.Contributors), result.VersionDrift)
