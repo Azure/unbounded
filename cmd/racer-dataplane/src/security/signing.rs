@@ -228,7 +228,10 @@ fn components(head: &MessageHead) -> Result<Vec<String>> {
     Ok(components)
 }
 fn signature_input(head: &MessageHead) -> Result<String> {
-    let components = components(head)?
+    signature_input_for_components(head, &components(head)?)
+}
+fn signature_input_for_components(head: &MessageHead, components: &[String]) -> Result<String> {
+    let components = components
         .iter()
         .map(|s| format!("\"{s}\""))
         .collect::<Vec<_>>()
@@ -245,12 +248,13 @@ fn signature_input(head: &MessageHead) -> Result<String> {
 /// verifier accepts only this canonical structured-field serialization, avoiding
 /// duplicate labels, unsupported parameters and alternate parsing ambiguity.
 pub fn signature_base(head: &MessageHead) -> Result<Vec<u8>> {
-    let input = signature_input(head)?;
+    let components = components(head)?;
+    let input = signature_input_for_components(head, &components)?;
     if field(head, "signature-input")? != format!("racer={input}") {
         return Err(Error::Unauthorized);
     }
     let mut lines = Vec::new();
-    for name in components(head)? {
+    for name in components {
         let value = match (name.as_str(), &head.start) {
             ("@method", StartLine::Request { method, .. }) => method.clone(),
             ("@request-target", StartLine::Request { target, .. }) => target.clone(),
@@ -423,6 +427,121 @@ pub(crate) mod tests {
         push(&mut head, "racer-kind", "test");
         head
     }
+    fn canonical_fixture(response: bool, fields: usize, value_bytes: usize) -> MessageHead {
+        let mut head = head(1);
+        if response {
+            head.start = StartLine::Response { status: 200 };
+        }
+        push(&mut head, "racer-timestamp", "1700000000123");
+        push(&mut head, "racer-signer", node(0).0);
+        for i in (0..fields).rev() {
+            push(
+                &mut head,
+                &format!("x-fixture-{i:02}"),
+                "a".repeat(value_bytes),
+            );
+        }
+        let input = signature_input(&head).unwrap();
+        push(&mut head, "signature-input", format!("racer={input}"));
+        push(&mut head, "signature", "racer=:fixture:");
+        head
+    }
+
+    #[test]
+    fn signature_base_preserves_order_case_and_rejects_invalid_components() {
+        for response in [false, true] {
+            let mut head = canonical_fixture(response, 8, 16);
+            let expected = signature_base(&head).unwrap();
+            assert_ne!(expected.last(), Some(&b'\n'));
+            head.headers.reverse();
+            for h in &mut head.headers {
+                h.name = h.name.to_ascii_uppercase();
+            }
+            assert_eq!(signature_base(&head).unwrap(), expected);
+            for fault in [
+                "duplicate",
+                "duplicate-input",
+                "duplicate-signature",
+                "leading",
+                "trailing",
+                "non-ascii",
+                "newline",
+                "bad-name",
+                "timestamp",
+                "signer",
+                "missing-input",
+                "coverage",
+                "oversized",
+            ] {
+                let mut head = canonical_fixture(response, 8, 16);
+                match fault {
+                    "duplicate" => push(&mut head, "X-Fixture-00", "duplicate"),
+                    "duplicate-input" => push(&mut head, "Signature-Input", "duplicate"),
+                    "duplicate-signature" => push(&mut head, "Signature", "duplicate"),
+                    "missing-input" => head.headers.retain(|h| h.name != "signature-input"),
+                    _ => {
+                        let (name, value) = match fault {
+                            "leading" => ("x-fixture-00", b" leading".to_vec()),
+                            "trailing" => ("x-fixture-00", b"trailing\t".to_vec()),
+                            "non-ascii" => ("x-fixture-00", vec![0xff]),
+                            "newline" => ("x-fixture-00", b"x\r\ny".to_vec()),
+                            "timestamp" => ("racer-timestamp", b"01700000000123".to_vec()),
+                            "signer" => ("racer-signer", b"not-a-uuid".to_vec()),
+                            "coverage" => ("signature-input", b"racer=()".to_vec()),
+                            "oversized" => (
+                                "x-fixture-00",
+                                vec![b'a'; crate::peer::wire::MAX_ENVELOPE_HEAD],
+                            ),
+                            "bad-name" => ("x-fixture-00", b"valid".to_vec()),
+                            _ => unreachable!(),
+                        };
+                        let field = head.headers.iter_mut().find(|h| h.name == name).unwrap();
+                        field.value = value;
+                        if fault == "bad-name" {
+                            field.name = "invalid name".into();
+                        }
+                    }
+                }
+                assert!(
+                    signature_base(&head).is_err(),
+                    "response={response} fault={fault}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "release-only canonical signature-base construction benchmark, no cryptography"]
+    fn signature_base_benchmark() {
+        use std::{hint::black_box, time::Instant};
+        assert!(!cfg!(debug_assertions), "run with --release");
+        for (label, fields, value_bytes) in
+            [("small", 0, 0), ("fields", 24, 64), ("envelope", 24, 4096)]
+        {
+            for response in [false, true] {
+                let head = canonical_fixture(response, fields, value_bytes);
+                let expected = signature_base(&head).unwrap();
+                const ITERATIONS: usize = 2000;
+                for sample in 0..6 {
+                    let start = Instant::now();
+                    for _ in 0..ITERATIONS {
+                        black_box(signature_base(black_box(&head)).unwrap());
+                    }
+                    let elapsed = start.elapsed();
+                    assert_eq!(signature_base(&head).unwrap(), expected);
+                    if sample != 0 {
+                        println!(
+                            "signature_base case={label} response={response} fields={} base_bytes={} sample={sample} iterations={ITERATIONS} ns_per_op={:.0}",
+                            head.headers.len(),
+                            expected.len(),
+                            elapsed.as_nanos() as f64 / ITERATIONS as f64
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn request_mac_rotates_and_rejects_missing_retired_or_mutated_tags() {
         use crate::control::wire::*;
