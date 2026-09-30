@@ -24,6 +24,35 @@ PODS = f"/api/v1/namespaces/{c.NAMESPACE}/pods"
 DS = [f"/apis/apps/v1/namespaces/{c.NAMESPACE}/daemonsets/{name}"
       for name in (c.HOST_DS, c.POD_DS)]
 SA = Path("/var/run/secrets/kubernetes.io/serviceaccount")
+LIST_PAGE_SIZE = 100
+LIST_MAX_PAGES = 500  # Preserve the previous 50,000-object listing capacity.
+
+
+def fields(obj, names):
+    return {name: obj[name] for name in names if name in obj}
+
+
+def inventory_item(path, item):
+    """Retain only snapshot inputs, without filtering identities or owner refs.
+
+    Labels cannot prove complete coverage of stale named DS pods. Keep every Pod
+    and every controller reference, including unrelated and malformed owners.
+    podIPs stays exact because snapshot rejects extra keys as well as extra IPs.
+    """
+    meta = fields(item["metadata"], ("name", "uid", "deletionTimestamp"))
+    if path == NODES:
+        return dict(metadata=meta, status=dict(addresses=[
+            fields(a, ("type", "address")) for a in item["status"]["addresses"]]))
+    meta.update(fields(item["metadata"], ("namespace",)))
+    if "ownerReferences" in item["metadata"]:
+        meta["ownerReferences"] = [fields(r, ("controller", "kind", "apiVersion", "name", "uid"))
+                                   for r in item["metadata"]["ownerReferences"]]
+    result = dict(metadata=meta)
+    # Unowned Pods may lack spec/status; do not invent defaults for missing fields.
+    for key, names in (("spec", ("nodeName", "hostNetwork")), ("status", ("podIP", "podIPs"))):
+        if key in item:
+            result[key] = fields(item[key], names)
+    return result
 
 
 class Deadline(Exception):
@@ -73,16 +102,19 @@ class API:
             conn.close()
 
     def listing(self, path):
+        c.require(path in (NODES, PODS), "not an inventory list")
         items, continuation, version = [], "", None
         seen = set()
-        for _ in range(100):
-            query = urllib.parse.urlencode(dict(limit=500, **({"continue": continuation} if continuation else {})))
+        for _ in range(LIST_MAX_PAGES):
+            query = urllib.parse.urlencode(dict(limit=LIST_PAGE_SIZE, **({"continue": continuation} if continuation else {})))
             page = self.request(path + "?" + query)
             rv = page["metadata"]["resourceVersion"]
             c.require(rv and (version is None or rv == version), "list snapshot changed")
             version = rv
-            items.extend(page["items"])
+            items.extend(inventory_item(path, item) for item in page["items"])
             continuation = page["metadata"].get("continue", "")
+            # Do not overlap a decoded full page with the next response/JSON parse.
+            del page
             if not continuation:
                 return items
             c.require(continuation not in seen, "pagination loop")

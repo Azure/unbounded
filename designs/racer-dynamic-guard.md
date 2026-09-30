@@ -6,6 +6,75 @@ are superseded by this final validation section; deployment gates remain explici
 
 ## Final validation and exact deployment gates
 
+### Publisher inventory memory fix
+
+The released watcher at `dfb028607a22ae1bde4c01c703640441dc067dfa`
+accumulated full decoded Nodes and namespace Pods before `contract.snapshot`.
+The adapter now projects each page before retaining it and releases the raw page
+before fetching another. `contract.snapshot` and its validation are unchanged.
+
+Retained fields are Node metadata name/UID/deletionTimestamp and address type/value;
+Pod metadata name/UID/deletionTimestamp/namespace, owner-reference
+controller/kind/apiVersion/name/UID, spec nodeName/hostNetwork, and status podIP/podIPs.
+`podIPs` retains the exact value, including any extra keys that must be rejected.
+No label selector is safe here: stale named DS owners and host DP on DENY11 must
+still be detected in the complete inventory. Labels, annotations, managedFields,
+Node images, containers, and readiness are not authority inputs.
+
+Requests use 100 items instead of 500 to leave more room beneath the unchanged
+16MiB response cap. The finite page budget is 500 instead of 100, preserving the
+nominal 50,000-object capacity. A large single object/page still fails closed;
+there is no truncation, retry bypass, or partial publication. RV consistency,
+continuation-loop rejection, both DS UID rechecks, both complete observations,
+20s freshness, 25s cycle alarm, UID/RV CAS, and narrow RBAC remain in force.
+
+One offline validation run on 2026-09-30:
+
+- `timeout --signal=TERM --kill-after=10s 60s python3 -B -m unittest -v
+  test_inventory test_adapters test_contract`: 23 tests passed.
+- `timeout --signal=TERM --kill-after=10s 120s python3 -B inventory_memory.py`:
+  fresh-process comparison against the exact released source, 1500 Nodes and
+  9000 namespace Pods, two full inventory passes. Synthetic Kubernetes-shaped
+  independently decoded JSON includes managedFields, Node images and Pod env/spec.
+  Each worker is capped at 1536MiB address space and 90 CPU seconds.
+
+| Implementation | Peak RSS MiB | Elapsed seconds | List requests | Largest page bytes |
+| --- | ---: | ---: | ---: | ---: |
+| Released negative control | 974.97 | 14.399 | 42 | 10,694,323 |
+| Page projection | 50.45 | 11.112 | 210 | 2,138,965 |
+
+Both published content digest
+`4b2afb2956716bc6cd47f25501dcd21b3faf3290510d092a9c3a75694c48f8bd`.
+The fixture checks released RSS exceeds 512MiB, projected RSS stays below 256MiB,
+and at least a threefold reduction. This is synthetic process RSS evidence, not
+a cgroup OOM replay, cluster measurement, or universal memory bound. Fixture clocks
+are fixed; real elapsed includes page generation. More API requests can exceed the
+unchanged real freshness budget under latency/throttling and must fail closed.
+
+Publisher-only operational refresh, **not executed by this change**:
+
+1. From the reviewed fix, use `render.py` with the existing trusted policy and
+   existing pinned Python/carrier digests, as a local review-only bundle. Its
+   `program` ConfigMap includes the Python sources (`render.py:23-28`); the watcher
+   executes `/guard/watcher.py` from that volume (`render.py:58-67`). No image build
+   is needed for this Python-only fix; the launcher and images are unchanged.
+2. Create a **new uniquely named immutable program ConfigMap**, for example
+   `racer-stage47-program-inventory-<fix-sha-prefix>`, using all six reviewed source
+   keys. Do not patch or delete/recreate the old immutable CM. Do not blindly apply
+   the renderer's full bundle or reuse its fixed program CM name for changed data.
+3. Review a narrowly scoped change to only
+   `Deployment/racer-stage47-source-owner`'s `program` volume ConfigMap name, using
+   the current Deployment UID/RV as preconditions. Preserve source CM UID/state,
+   policy, service account, RBAC, images, resource limits, and all other template
+   settings. Roll both publisher replicas to that new reference. Leave the host
+   guard DS, host-DP template, launcher, and existing program CM consumers untouched.
+4. Verify actual publisher-mounted source matches the fix, no new OOM restarts,
+   and a fresh exact1511 authority renews within the existing budgets. Failed or
+   partial collections must not renew. Source authority alone is not permission
+   for fleet activation: retain the independent fresh1500 proof and every-start
+   gates below. Retain the previous immutable CM for diagnosis; rolling back to
+   its code restores the known memory defect, not a demonstrated recovery path.
+
 ### Fresh-bootstrap crash recovery
 
 `bootstrap.py` now writes a root-owned0600, single-link regular-file intent in the

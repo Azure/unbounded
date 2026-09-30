@@ -136,8 +136,8 @@ class AdaptersTest(unittest.TestCase):
 
     def test_pagination_rejects_inconsistent_snapshot(self):
         api = w.API("never-connect")
-        responses = iter([dict(metadata=dict(resourceVersion="1", **{"continue": "next"}), items=[1]),
-                          dict(metadata=dict(resourceVersion="2"), items=[2])])
+        responses = iter([dict(metadata=dict(resourceVersion="1", **{"continue": "next"}), items=[]),
+                          dict(metadata=dict(resourceVersion="2"), items=[])])
         api.request = lambda path: next(responses)
         with self.assertRaises(ValueError):
             api.listing(w.NODES)
