@@ -129,6 +129,6 @@ func TestMixedNetworkIdentities(t *testing.T) {
 	require.NoError(t, reader.Delete(t.Context(), podnet))
 	ids, err = ReadDataplaneWorkloadIdentities(t.Context(), reader, "racer")
 	require.NoError(t, err)
-	require.Empty(t, ids.podUID)
-	require.Equal(t, host.UID, ids.hostUID)
+	require.Empty(t, ids.uids[1])
+	require.Equal(t, host.UID, ids.uids[0])
 }

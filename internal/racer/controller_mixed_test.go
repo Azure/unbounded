@@ -5,7 +5,6 @@ package racer
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http/httptest"
 	"testing"
@@ -16,8 +15,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	"github.com/Azure/unbounded/internal/racer/wire"
@@ -69,8 +70,17 @@ func TestMixedControllerTopologyLiveOwnership(t *testing.T) {
 	reconcileTopology(t, r, t.Context())
 	require.Len(t, r.Accepted, 1)
 	before := r.Accepted[testNodeUID]
-	r.APIReader = mixedFailReader{r.Client}
-	require.Error(t, r.reconcile(t.Context()))
+	r.APIReader = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*appsv1.DaemonSet); ok {
+				return errors.New("injected workload read failure")
+			}
+
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	_, err := r.Reconcile(t.Context(), ctrl.Request{})
+	require.Error(t, err)
 	require.Equal(t, before, r.Accepted[testNodeUID])
 	r.APIReader = r.Client
 	require.NoError(t, r.Delete(t.Context(), ds))
@@ -158,38 +168,41 @@ func TestMixedControllerEvents(t *testing.T) {
 }
 
 func TestMixedControllerMembership(t *testing.T) {
-	ids := DataplaneWorkloadIdentities{namespace: "racer", hostUID: testDaemonSetUID, podUID: "podnet"}
 	node := memberNode()
 	node.Annotations = map[string]string{enrolledSharesAnnotation: "8"}
 	host := memberPod("host", 1, "192.0.2.1")
 	host.OwnerReferences[0].Name = DataplaneDaemonSetName
 	pod := memberPod("pod", 2, "192.0.2.2")
-	pod.OwnerReferences[0].Name, pod.OwnerReferences[0].UID = PodNetworkDaemonSetName, ids.podUID
-	endpoint := func(pods []corev1.Pod, name string, port uint16) (string, error) {
-		return selectEndpoint(pods, ids.Owns, name, port)
-	}
-	before, _, err := reconcileMembers([]corev1.Node{node}, map[string][]corev1.Pod{node.Name: {host}}, endpoint, nil, 7443)
-	require.NoError(t, err)
-	after, _, err := reconcileMembers([]corev1.Node{node}, map[string][]corev1.Pod{node.Name: {host, pod}}, endpoint, before, 7443)
-	require.NoError(t, err)
+	pod.OwnerReferences[0].Name, pod.OwnerReferences[0].UID = PodNetworkDaemonSetName, "podnet"
+	hostDS := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: "racer", Name: DataplaneDaemonSetName, UID: testDaemonSetUID}}
+	podDS := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: "racer", Name: PodNetworkDaemonSetName, UID: "podnet"}}
+	r := initializedTopology(t, &node, &host, hostDS, podDS)
+	r.Config.PeerPort = 7443
+	reconcileTopology(t, r, t.Context())
+	require.NoError(t, r.Create(t.Context(), &pod))
+	reconcileTopology(t, r, t.Context())
+	after := r.Accepted
 	require.Len(t, after, 1)
 	require.Equal(t, uint32(8), after[testNodeUID].Shares)
 	require.Equal(t, "192.0.2.2:7443", after[testNodeUID].PeerEndpoint)
-	encoded, err := json.Marshal(after[testNodeUID])
-	require.NoError(t, err)
 
-	node.Annotations[admittedMemberAnnotation] = string(encoded)
-	ids.podUID = "recreated"
-	fallback, _, err := reconcileMembers([]corev1.Node{node}, map[string][]corev1.Pod{node.Name: {pod}}, endpoint, nil, 7443)
-	require.NoError(t, err)
-	require.Equal(t, after, fallback, "restart retains UID-bound last admitted endpoint")
+	require.NoError(t, r.Delete(t.Context(), &host))
+	require.NoError(t, r.Delete(t.Context(), podDS))
+	podDS.UID, podDS.ResourceVersion = "recreated", ""
+	require.NoError(t, r.Create(t.Context(), podDS))
+	r = Assemble(r.Config, r.Client, r.APIReader).Topology
+	reconcileTopology(t, r, t.Context())
+	require.Equal(t, after, r.Accepted, "restart retains UID-bound last admitted endpoint")
+	require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(&node), &node))
 	delete(node.Annotations, admittedMemberAnnotation)
-	rejected, _, err := reconcileMembers([]corev1.Node{node}, map[string][]corev1.Pod{node.Name: {pod}}, endpoint, nil, 7443)
-	require.NoError(t, err)
-	require.Empty(t, rejected, "stale owner cannot admit a new member")
+	require.NoError(t, r.Update(t.Context(), &node))
+	r = Assemble(r.Config, r.Client, r.APIReader).Topology
+	reconcileTopology(t, r, t.Context())
+	require.Empty(t, r.Accepted, "stale owner cannot admit a new member")
 
-	pod.OwnerReferences[0].UID = ids.hostUID
+	pod.OwnerReferences[0].UID = hostDS.UID
 	pod.OwnerReferences[0].Name = "arbitrary"
-	_, err = endpoint([]corev1.Pod{pod}, node.Name, 7443)
-	require.ErrorIs(t, err, wire.Unavailable)
+	require.NoError(t, r.Update(t.Context(), &pod))
+	reconcileTopology(t, r, t.Context())
+	require.Empty(t, r.Accepted, "a live UID with the wrong owner name cannot admit a member")
 }
