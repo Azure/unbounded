@@ -2,7 +2,7 @@
 //! queues, service times, placement, and page ownership are explicit abstractions.
 
 use crate::{
-    model::{identity::CacheId, limits::ResourceClass, range::PAGE_BYTES},
+    model::{CacheId, PAGE_BYTES, ResourceClass},
     runtime::admission::{Admission, Reservation},
 };
 use std::{

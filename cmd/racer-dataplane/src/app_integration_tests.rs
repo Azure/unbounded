@@ -143,7 +143,7 @@ pub(super) fn definition() -> crate::control::caches::CacheDefinition {
     let (client_socket, origin_socket) =
         crate::control::caches::canonical_socket_paths("app-lifecycle").unwrap();
     crate::control::caches::CacheDefinition {
-        id: crate::model::identity::CacheId("33333333-3333-4333-8333-333333333333".into()),
+        id: crate::model::CacheId("33333333-3333-4333-8333-333333333333".into()),
         name: "app-lifecycle".into(),
         client_socket,
         origin_socket,
@@ -159,7 +159,7 @@ pub(super) fn publication(
         schema_version: 1,
         cluster: config.cluster.clone(),
         sequence: wire::PublicationSequence(sequence),
-        membership_version: crate::model::identity::MembershipVersion(1),
+        membership_version: crate::model::MembershipVersion(1),
         members: vec![crate::topology::membership::Member {
             node: config.node.clone(),
             shares: std::num::NonZeroU32::new(1).unwrap(),
@@ -173,9 +173,7 @@ pub(super) fn publication(
 
 pub(super) fn page(app: &WorkerApplication) -> crate::memory::page::PageResult {
     use crate::memory::pool::{VerifiedBytes, VerifiedPage};
-    use crate::model::{
-        envelope::*, identity::*, limits::ResourceClass, metadata::VersionMetadata,
-    };
+    use crate::model::{ResourceClass, VersionMetadata, *};
     let version = ObjectVersion {
         object: ObjectId {
             cache: definition().id,
@@ -264,7 +262,7 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
             cache_keys: vec![wire::CacheEncryptionKey {
                 key: wire::CacheKeyRef {
                     cache: definition().id,
-                    id: crate::model::envelope::KeyId([7; 16]),
+                    id: crate::model::KeyId([7; 16]),
                     purpose: wire::CacheKeyPurpose::Page,
                 },
                 state: wire::CacheKeyState::Active,
@@ -351,7 +349,7 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
             .admission
             .reserve(
                 Some(&definition().id),
-                crate::model::limits::ResourceClass::DirtyCiphertext,
+                crate::model::ResourceClass::DirtyCiphertext,
                 19,
             )
             .unwrap();
@@ -772,7 +770,7 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
 
 #[test]
 fn removal_publication_finishes_locally_after_controller_disappears() {
-    use crate::model::{envelope::KeyId, identity::*, metadata::VersionMetadata};
+    use crate::model::{KeyId, VersionMetadata, *};
     let mut fixture = Fixture::new();
     let mut config = fixture.config.take().unwrap();
     let diagnostic_address = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1215,10 +1213,10 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
         .unwrap();
     assert_eq!(node.prepared.load(Ordering::Acquire), 2);
     assert!(node.observations.health.ready());
-    let cache = crate::model::identity::CacheId("33333333-3333-4333-8333-333333333333".into());
+    let cache = crate::model::CacheId("33333333-3333-4333-8333-333333333333".into());
     let key = wire::CacheKeyRef {
         cache: cache.clone(),
-        id: crate::model::envelope::KeyId([8; 16]),
+        id: crate::model::KeyId([8; 16]),
         purpose: wire::CacheKeyPurpose::Page,
     };
     let roots = (*keys.peer_trust_roots().unwrap()).clone();
@@ -1357,7 +1355,7 @@ impl Fixture {
             schema_version: 1,
             cluster: config.cluster.clone(),
             sequence: wire::PublicationSequence(1),
-            membership_version: crate::model::identity::MembershipVersion(1),
+            membership_version: crate::model::MembershipVersion(1),
             members: vec![crate::topology::membership::Member {
                 node: node.clone(),
                 shares: std::num::NonZeroU32::new(1).unwrap(),
@@ -1965,10 +1963,10 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     }
     // Retire an omitted epoch through the actual serving loop. Accepted crypto
     // retains its key and buffers, without pausing listeners or deleting checkpoints.
-    let cache = crate::model::identity::CacheId("33333333-3333-4333-8333-333333333333".into());
+    let cache = crate::model::CacheId("33333333-3333-4333-8333-333333333333".into());
     let reference = wire::CacheKeyRef {
         cache: cache.clone(),
-        id: crate::model::envelope::KeyId([7; 16]),
+        id: crate::model::KeyId([7; 16]),
         purpose: wire::CacheKeyPurpose::Page,
     };
     let roots = (*worker.keys.peer_trust_roots().unwrap()).clone();
@@ -1990,37 +1988,29 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
         .keys
         .lease(Some(&cache), reference.id, KeyPurpose::Page)
         .unwrap();
-    let page = crate::model::identity::PageId {
-        version: crate::model::identity::ObjectVersion {
-            object: crate::model::identity::ObjectId {
+    let page = crate::model::PageId {
+        version: crate::model::ObjectVersion {
+            object: crate::model::ObjectId {
                 cache: cache.clone(),
-                key: crate::model::identity::CacheKey([4; 32]),
+                key: crate::model::CacheKey([4; 32]),
             },
-            etag: crate::model::identity::StrongEtag::test_value("accepted"),
+            etag: crate::model::StrongEtag::test_value("accepted"),
         },
-        number: crate::model::identity::PageNumber(0),
+        number: crate::model::PageNumber(0),
     };
     let buffers = BufferPool::new(runtime.admission.clone());
     let plaintext = buffers
         .plaintext(
             runtime
                 .admission
-                .reserve(
-                    Some(&cache),
-                    crate::model::limits::ResourceClass::Plaintext,
-                    8,
-                )
+                .reserve(Some(&cache), crate::model::ResourceClass::Plaintext, 8)
                 .unwrap(),
             8,
         )
         .unwrap();
     let ciphertext = runtime
         .admission
-        .reserve(
-            Some(&cache),
-            crate::model::limits::ResourceClass::Ciphertext,
-            24,
-        )
+        .reserve(Some(&cache), crate::model::ResourceClass::Ciphertext, 24)
         .unwrap();
     let accepted_scope = scope(Duration::from_secs(10)).unwrap();
     let mut accepted = runtime.crypto.execute(
@@ -2118,7 +2108,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
         .admission
         .reserve(
             Some(&cache),
-            crate::model::limits::ResourceClass::DirtyCiphertext,
+            crate::model::ResourceClass::DirtyCiphertext,
             19,
         )
         .unwrap();

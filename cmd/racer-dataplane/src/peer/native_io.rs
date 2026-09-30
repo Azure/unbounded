@@ -7,7 +7,7 @@ use super::{
 use crate::{
     error::{Error, Result},
     http::pool::ConnectionLease,
-    model::identity::NodeId,
+    model::NodeId,
     rdma::{
         permission::{AuthenticatedDescriptor, COMPLETION_HEADER, DESCRIPTOR_HEADER},
         session::{SETUP_BINDING_HEADER, SETUP_HEADER, SetupParameters},
@@ -46,12 +46,7 @@ mod tests {
             pool::HttpPool,
         },
         memory::pool::BufferPool,
-        model::{
-            envelope::{KeyId, Nonce, PageEnvelope},
-            identity::*,
-            limits::ResourceClass,
-            metadata::{ExpiresAt, ObjectMetadata},
-        },
+        model::{ExpiresAt, KeyId, Nonce, ObjectMetadata, PageEnvelope, ResourceClass, *},
         rdma::{
             device::Devices, permission::Permissions, registered::RegisteredPool,
             session::Sessions, transfer::RdmaTransfer, verbs::Verbs,
@@ -83,7 +78,7 @@ mod tests {
             reactor.clone(),
             Codec::new(
                 super::super::wire::MAX_ENVELOPE_HEAD,
-                crate::model::range::PAGE_BYTES + 16,
+                crate::model::PAGE_BYTES + 16,
             ),
             admission.clone(),
         ));
@@ -446,7 +441,7 @@ mod tests {
                 reactor.clone(),
                 Codec::new(
                     super::super::wire::MAX_ENVELOPE_HEAD,
-                    crate::model::range::PAGE_BYTES + 16,
+                    crate::model::PAGE_BYTES + 16,
                 ),
                 admission.clone(),
             ));

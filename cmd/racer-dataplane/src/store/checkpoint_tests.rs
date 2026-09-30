@@ -22,7 +22,7 @@ fn async_retirement_rejects_frozen_cut_and_canceled_submission() {
         crate::test_support::cluster::config(false).limits,
     ))));
     let scope = RequestScope::new(
-        crate::model::identity::RequestId([202; 16]),
+        crate::model::RequestId([202; 16]),
         Instant::now() + Duration::from_secs(10),
     )
     .unwrap();
@@ -66,7 +66,7 @@ fn async_retirement_invalidation_fences_both_slots_and_preserves_failure() {
     reactor.init().unwrap();
     let scope = || {
         RequestScope::new(
-            crate::model::identity::RequestId([201; 16]),
+            crate::model::RequestId([201; 16]),
             Instant::now() + Duration::from_secs(10),
         )
         .unwrap()
@@ -102,7 +102,7 @@ fn async_retirement_invalidation_fences_both_slots_and_preserves_failure() {
     let fence_reactor = reactor.clone();
     drive(Box::pin(async move {
         fence_reactor
-            .file_fence(crate::model::identity::RequestId([201; 16]))
+            .file_fence(crate::model::RequestId([201; 16]))
             .await
     }))
     .unwrap();
@@ -285,8 +285,7 @@ fn legacy_and_extended_metadata_checkpoints_round_trip_without_data_loss() {
     );
     assert_eq!(CheckpointCodec.encode(&recovered).unwrap(), encoded);
     let value =
-        crate::model::metadata::ContentType::parse(b"application/vnd.oci.image.manifest.v1+json")
-            .unwrap();
+        crate::model::ContentType::parse(b"application/vnd.oci.image.manifest.v1+json").unwrap();
     for m in recovered.shards[0].index.metadata.iter_mut() {
         m.content_type = Some(value.clone());
     }
@@ -532,11 +531,11 @@ fn recovery_validates_before_mutation_seals_segments_and_filters_missing_keys() 
     let (index, segments) = state(8);
     let keep = descriptor("keep", 0);
     index
-        .publish_current(crate::model::metadata::ObjectMetadata {
+        .publish_current(crate::model::ObjectMetadata {
             content_type: None,
             version: keep.version.clone(),
             length: keep.length,
-            expires_at: crate::model::metadata::ExpiresAt(
+            expires_at: crate::model::ExpiresAt(
                 std::time::SystemTime::now() + std::time::Duration::from_secs(300),
             ),
         })

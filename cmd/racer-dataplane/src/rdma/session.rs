@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     error::{Error, Operation, Result},
-    model::identity::NodeId,
+    model::NodeId,
     security::{certificates::VerifiedPeer, signing::VerifiedHead},
     topology::rails::RailId,
 };
@@ -381,7 +381,7 @@ mod tests {
         use crate::{
             control::wire::{BundleGeneration, KeyringBundle, SCHEMA_VERSION},
             http::codec::{Header, MessageHead, StartLine},
-            model::identity::ClusterId,
+            model::ClusterId,
             security::{
                 certificates::Certificates,
                 identity::tests::{CLUSTER, NODE, issued},

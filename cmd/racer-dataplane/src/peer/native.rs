@@ -2,7 +2,7 @@
 use crate::{
     error::{Error, Result},
     http::codec::{Header, MessageHead, StartLine},
-    model::identity::{NodeId, TransferId},
+    model::{NodeId, TransferId},
     runtime::deadline::RequestScope,
     security::{
         forwarding::ForwardedHead,
@@ -107,7 +107,7 @@ impl Binding {
             }
             p::decode_binary(&h.value)?;
         }
-        if length > crate::model::range::PAGE_BYTES as usize + 16
+        if length > crate::model::PAGE_BYTES as usize + 16
             || (length != 0 && phase != Phase::Finish)
         {
             return Err(Error::InvalidRequest);
@@ -276,7 +276,7 @@ mod tests {
         let a = signer(&sender);
         let b = signer(&receiver);
         let scope = RequestScope::new(
-            crate::model::identity::RequestId([4; 16]),
+            crate::model::RequestId([4; 16]),
             std::time::Instant::now() + std::time::Duration::from_secs(30),
         )
         .unwrap();
@@ -347,7 +347,7 @@ mod tests {
     fn exact_signed_controls_reject_every_binding_substitution_and_unknown_field() {
         let nodes = crate::peer::tests::signers();
         let scope = RequestScope::new(
-            crate::model::identity::RequestId([4; 16]),
+            crate::model::RequestId([4; 16]),
             std::time::Instant::now() + std::time::Duration::from_secs(30),
         )
         .unwrap();
@@ -446,7 +446,7 @@ mod tests {
     #[test]
     fn control_extension_and_fallback_length_schema_is_closed() {
         let scope = RequestScope::new(
-            crate::model::identity::RequestId([4; 16]),
+            crate::model::RequestId([4; 16]),
             std::time::Instant::now() + std::time::Duration::from_secs(30),
         )
         .unwrap();

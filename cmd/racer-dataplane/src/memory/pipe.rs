@@ -7,7 +7,7 @@
 use crate::runtime::reactor::Descriptor as OwnedFd;
 use crate::{
     error::{Error, Operation, Result},
-    model::limits::ResourceClass,
+    model::ResourceClass,
     runtime::{
         admission::{Admission, Reservation},
         deadline::RequestScope,
@@ -513,7 +513,7 @@ fn syscall_count(value: isize) -> io::Result<usize> {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::model::limits::Limits;
+    use crate::model::Limits;
 
     pub(in crate::memory) fn admission(pipes: usize) -> Rc<Admission> {
         let small = std::num::NonZeroUsize::new(8).unwrap();
@@ -584,7 +584,7 @@ pub(super) mod tests {
 
     #[test]
     fn scheduled_acquisition_is_bounded_fifo_and_wakes_only_for_progress() {
-        use crate::{model::identity::RequestId, test_support::WakeCounter};
+        use crate::{model::RequestId, test_support::WakeCounter};
         use std::{
             sync::Arc,
             task::Context,
@@ -641,7 +641,7 @@ pub(super) mod tests {
 
     #[test]
     fn scheduled_wait_cancellation_deadline_stop_and_abandonment_release_admission() {
-        use crate::{model::identity::RequestId, test_support::WakeCounter};
+        use crate::{model::RequestId, test_support::WakeCounter};
         use std::{
             sync::Arc,
             task::Context,

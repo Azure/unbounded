@@ -8,7 +8,7 @@ use super::{
 };
 use crate::{
     error::{Error, Operation},
-    model::limits::ResourceClass,
+    model::ResourceClass,
     runtime::{admission::Admission, deadline::RequestScope},
     security::forwarding::Forwarding,
     topology::{membership::MembershipLease, paths::Paths},

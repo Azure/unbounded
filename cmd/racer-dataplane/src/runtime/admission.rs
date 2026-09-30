@@ -2,11 +2,7 @@
 use crate::runtime::collections::HashMap;
 use crate::{
     error::{Error, Result},
-    model::{
-        identity::CacheId,
-        limits::{Limits, ResourceClass},
-        range::PAGE_BYTES,
-    },
+    model::{CacheId, Limits, PAGE_BYTES, ResourceClass},
 };
 use std::{
     cell::RefCell,

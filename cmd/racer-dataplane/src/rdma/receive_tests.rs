@@ -4,12 +4,8 @@ use super::*;
 use crate::{
     http::codec::{Header, MessageHead, StartLine},
     model::{
-        envelope::{KeyId, Nonce, PageEnvelope},
-        identity::{
-            CacheId, CacheKey, ObjectId, ObjectVersion, PageId, PageNumber, RequestId, StrongEtag,
-            TransferId,
-        },
-        limits::ResourceClass,
+        CacheId, CacheKey, KeyId, Nonce, ObjectId, ObjectVersion, PageEnvelope, PageId, PageNumber,
+        RequestId, ResourceClass, StrongEtag, TransferId,
     },
     rdma::{
         device::Devices,

@@ -12,9 +12,8 @@ use crate::runtime::collections::HashMap;
 use crate::{
     error::{Error, Operation, Result},
     model::{
-        context::OriginContext,
-        identity::{ObjectId, ObjectVersion, PageId, PageNumber, StrongEtag},
-        metadata::{MetadataSelector, ObjectMetadata},
+        MetadataSelector, ObjectId, ObjectMetadata, ObjectVersion, OriginContext, PageId,
+        PageNumber, StrongEtag,
     },
     origin::client::Origin,
     peer::{
@@ -376,7 +375,7 @@ pub struct MetadataService {
 }
 impl MetadataService {
     /// Page completion handoff: immutable facts only, never fresh admission.
-    pub fn publish_version(&self, metadata: crate::model::metadata::VersionMetadata) -> Result<()> {
+    pub fn publish_version(&self, metadata: crate::model::VersionMetadata) -> Result<()> {
         self.storage.index.publish_version(metadata)
     }
 
@@ -504,7 +503,7 @@ impl MetadataService {
                     let mut nonce = [0; 16];
                     crate::runtime::environment::fill_random(&mut nonce)
                         .map_err(|_| Error::Unavailable)?;
-                    let attempt = crate::model::identity::AttemptId(nonce);
+                    let attempt = crate::model::AttemptId(nonce);
                     let sealed = self.credentials.seal(context, attempt, scope)?;
                     let owned_context =
                         self.credentials
@@ -1036,10 +1035,7 @@ fn validate_bootstrap_metadata(expected: &ObjectMetadata, actual: &ObjectMetadat
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::model::{
-        identity::{CacheId, CacheKey, WorkerId},
-        metadata::ExpiresAt,
-    };
+    use crate::model::{CacheId, CacheKey, ExpiresAt, WorkerId};
     use futures::task::noop_waker;
     use std::time::UNIX_EPOCH;
 
@@ -1073,7 +1069,7 @@ pub(crate) mod tests {
     ) -> Operation<'static, ()> {
         let deadline = service.deadlines.register(due).unwrap();
         let scope = RequestScope::new(
-            crate::model::identity::RequestId([0; 16]),
+            crate::model::RequestId([0; 16]),
             Instant::now() + Duration::from_secs(600),
         )
         .unwrap();
@@ -1099,7 +1095,7 @@ pub(crate) mod tests {
         let table = Rc::new(IngressDeadlines::default());
         let now = Instant::now();
         let due = now + Duration::from_secs(60);
-        let scope = RequestScope::new(crate::model::identity::RequestId([0; 16]), due).unwrap();
+        let scope = RequestScope::new(crate::model::RequestId([0; 16]), due).unwrap();
         let old = Arc::new(crate::test_support::WakeCounter::default());
         let latest = Arc::new(crate::test_support::WakeCounter::default());
         let later = table.register(due + Duration::from_secs(1)).unwrap();

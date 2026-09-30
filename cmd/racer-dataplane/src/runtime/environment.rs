@@ -287,7 +287,7 @@ impl SimulationClock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{error::Error, model::identity::RequestId, runtime::deadline::RequestScope};
+    use crate::{error::Error, model::RequestId, runtime::deadline::RequestScope};
     use std::time::Duration;
 
     #[test]

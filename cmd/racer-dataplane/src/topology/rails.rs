@@ -7,7 +7,7 @@ use super::{
 };
 use crate::{
     error::{Error, Result},
-    model::identity::PageId,
+    model::PageId,
 };
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct RailId(pub u16);
@@ -76,7 +76,7 @@ impl Rails {
         &self,
         route: &Route,
         page: &PageId,
-        local: &crate::model::identity::NodeId,
+        local: &crate::model::NodeId,
         discovered: &[RailMapping],
     ) -> Result<TransportPlan> {
         let plan = self.select(route, page)?;
@@ -93,7 +93,7 @@ impl Rails {
         &self,
         route: &Route,
         plan: &TransportPlan,
-        local: &crate::model::identity::NodeId,
+        local: &crate::model::NodeId,
         discovered: &[RailMapping],
     ) -> Result<bool> {
         if !route.nodes.contains(local) {
@@ -124,7 +124,7 @@ impl Rails {
 mod tests {
     use super::*;
     use crate::{
-        model::identity::*,
+        model::*,
         topology::{
             fixtures::{member, object},
             membership::Membership,

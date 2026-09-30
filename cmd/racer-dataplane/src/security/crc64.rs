@@ -82,7 +82,7 @@ mod tests {
 
     #[test]
     fn full_page_and_tag_match_independent_reference() {
-        let length = crate::model::range::PAGE_BYTES as usize + 16;
+        let length = crate::model::PAGE_BYTES as usize + 16;
         let bytes = random_bytes(length + 1);
         assert_equivalent(&bytes[1..]);
         // Exercise the library's streaming state across alignment boundaries too.

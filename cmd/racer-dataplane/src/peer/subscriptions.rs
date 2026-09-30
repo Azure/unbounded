@@ -7,9 +7,8 @@ use crate::{
     error::{Error, Result},
     memory::{page::CiphertextCopy, pool::CiphertextPage},
     model::{
-        MAX_FIELD_BYTES,
-        identity::{MembershipVersion, NodeId, ObjectVersion, PageId, PageNumber},
-        metadata::ObjectMetadata,
+        MAX_FIELD_BYTES, MembershipVersion, NodeId, ObjectMetadata, ObjectVersion, PageId,
+        PageNumber,
     },
 };
 use std::{
@@ -717,7 +716,7 @@ fn include_page(intervals: &[PageInterval], page: u64) -> Vec<PageInterval> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::identity::{CacheId, CacheKey, ObjectId, StrongEtag};
+    use crate::model::{CacheId, CacheKey, ObjectId, StrongEtag};
 
     fn subscription(id: u8, start: u64, end: u64) -> Subscription {
         Subscription {
@@ -931,11 +930,7 @@ mod tests {
     fn successful_fanout_shares_allocation_and_charges_each_receiver_once() {
         use crate::{
             memory::pool::BufferPool,
-            model::{
-                envelope::{KeyId, Nonce, PageEnvelope},
-                limits::ResourceClass,
-                metadata::ExpiresAt,
-            },
+            model::{ExpiresAt, KeyId, Nonce, PageEnvelope, ResourceClass},
             runtime::admission::Admission,
         };
         use std::{rc::Rc, time::UNIX_EPOCH};

@@ -13,7 +13,7 @@ use super::{
 };
 use crate::{
     error::{Error, Operation, Result},
-    model::envelope::KeyId,
+    model::KeyId,
 };
 use std::{
     cell::Cell,
@@ -36,8 +36,8 @@ impl Recovery {
     /// has no key ID, so it requires both a current cache UID and an active page key.
     pub fn filter_available(
         image: &mut CheckpointImage,
-        mut metadata_available: impl FnMut(&crate::model::identity::CacheId) -> bool,
-        mut available: impl FnMut(&crate::model::identity::CacheId, KeyId) -> bool,
+        mut metadata_available: impl FnMut(&crate::model::CacheId) -> bool,
+        mut available: impl FnMut(&crate::model::CacheId, KeyId) -> bool,
     ) {
         for shard in &mut image.shards {
             shard

@@ -9,7 +9,7 @@ use super::{
 use crate::{
     error::{Error, Operation, Result},
     memory::pool::{BufferPool, CiphertextPage},
-    model::{envelope::PageEnvelope, identity::TransferId, limits::ResourceClass},
+    model::{PageEnvelope, ResourceClass, TransferId},
     runtime::{admission::Admission, deadline::RequestScope},
     security::signing::VerifiedHead,
     topology::rails::RailId,

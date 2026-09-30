@@ -12,7 +12,7 @@
 //! ```no_run
 //! use racer_dataplane::{
 //!     error::Result,
-//!     model::{context::{OriginContext, PeerOriginContext}, identity::AttemptId},
+//!     model::{OriginContext, PeerOriginContext, AttemptId},
 //!     runtime::deadline::RequestScope,
 //!     security::credentials::CredentialCrypto,
 //! };
@@ -41,12 +41,8 @@ use super::{
 use crate::{
     error::{Error, Result},
     model::{
-        context::{
-            Authorization, EncryptedAuthorization, OpaqueMetadata, OriginContext, PeerOriginContext,
-        },
-        envelope::KeyId,
-        identity::{AttemptId, ObjectId, RequestId},
-        limits::ResourceClass,
+        AttemptId, Authorization, EncryptedAuthorization, KeyId, ObjectId, OpaqueMetadata,
+        OriginContext, PeerOriginContext, RequestId, ResourceClass,
     },
     runtime::{admission::Admission, deadline::RequestScope},
 };
@@ -116,16 +112,11 @@ impl CredentialCrypto {
         scope: &RequestScope,
     ) -> Result<ChargedOriginContext> {
         scope.check()?;
-        let metadata = context
-            .metadata
-            .as_ref()
-            .map(OpaqueMetadata::as_header)
-            .transpose()?;
+        let metadata = context.metadata.as_ref().map(OpaqueMetadata::as_header);
         let raw = context
             .authorization
             .as_ref()
-            .map(Authorization::expose_for_origin)
-            .transpose()?;
+            .map(Authorization::expose_for_origin);
         let size = bounds(&context.object, metadata, raw.map_or(0, <[u8]>::len))?;
         let reservation = self.admission.reserve(
             Some(&context.object.cache),
@@ -178,16 +169,11 @@ impl CredentialCrypto {
         scope: &RequestScope,
     ) -> Result<PeerOriginContext> {
         scope.check()?;
-        let metadata = context
-            .metadata
-            .as_ref()
-            .map(OpaqueMetadata::as_header)
-            .transpose()?;
+        let metadata = context.metadata.as_ref().map(OpaqueMetadata::as_header);
         let raw = context
             .authorization
             .as_ref()
-            .map(Authorization::expose_for_origin)
-            .transpose()?;
+            .map(Authorization::expose_for_origin);
         let size = bounds(&context.object, metadata, raw.map_or(0, <[u8]>::len) + 16)?;
         let reservation = self.admission.reserve(
             Some(&context.object.cache),
@@ -253,11 +239,7 @@ impl CredentialCrypto {
         {
             return Err(Error::Unauthorized);
         }
-        let metadata = context
-            .metadata
-            .as_ref()
-            .map(OpaqueMetadata::as_header)
-            .transpose()?;
+        let metadata = context.metadata.as_ref().map(OpaqueMetadata::as_header);
         let size = bounds(
             &context.object,
             metadata,
@@ -321,45 +303,31 @@ mod tests {
         ));
         let crypto = super::CredentialCrypto::new(keys, admission.clone());
         let scope = crate::runtime::deadline::RequestScope::new(
-            crate::model::identity::RequestId([4; 16]),
+            crate::model::RequestId([4; 16]),
             std::time::Instant::now() + std::time::Duration::from_secs(5),
         )
         .unwrap();
-        let context = crate::model::context::OriginContext {
-            object: crate::model::identity::ObjectId {
-                cache: crate::model::identity::CacheId(
-                    "00000000-0000-4000-8000-000000000001".into(),
-                ),
-                key: crate::model::identity::CacheKey([3; 32]),
+        let context = crate::model::OriginContext {
+            object: crate::model::ObjectId {
+                cache: crate::model::CacheId("00000000-0000-4000-8000-000000000001".into()),
+                key: crate::model::CacheKey([3; 32]),
             },
-            metadata: Some(
-                crate::model::context::OpaqueMetadata::from_header(b"meta\xff").unwrap(),
-            ),
-            authorization: Some(
-                crate::model::context::Authorization::from_header(b"opaque\x80").unwrap(),
-            ),
+            metadata: Some(crate::model::OpaqueMetadata::from_header(b"meta\xff").unwrap()),
+            authorization: Some(crate::model::Authorization::from_header(b"opaque\x80").unwrap()),
         };
         let first = crypto.local_context(&context, &scope).unwrap();
-        let used = admission.used(crate::model::limits::ResourceClass::RequestContext);
+        let used = admission.used(crate::model::ResourceClass::RequestContext);
         let second = crypto.local_context(&context, &scope).unwrap();
         assert_eq!(
-            admission.used(crate::model::limits::ResourceClass::RequestContext),
+            admission.used(crate::model::ResourceClass::RequestContext),
             2 * used
         );
         drop(context);
         assert_eq!(
-            first
-                .authorization
-                .as_ref()
-                .unwrap()
-                .expose_for_origin()
-                .unwrap(),
+            first.authorization.as_ref().unwrap().expose_for_origin(),
             b"opaque\x80"
         );
-        assert_eq!(
-            second.metadata.as_ref().unwrap().as_header().unwrap(),
-            b"meta\xff"
-        );
+        assert_eq!(second.metadata.as_ref().unwrap().as_header(), b"meta\xff");
         scope.cancel().unwrap();
         assert!(matches!(
             crypto.local_context(&first, &scope),
@@ -367,12 +335,12 @@ mod tests {
         ));
         drop((first, second));
         assert_eq!(
-            admission.used(crate::model::limits::ResourceClass::RequestContext),
+            admission.used(crate::model::ResourceClass::RequestContext),
             0
         );
     }
     use super::*;
-    use crate::model::identity::{CacheId, CacheKey};
+    use crate::model::{CacheId, CacheKey};
     fn scope() -> RequestScope {
         RequestScope::new(
             RequestId([1; 16]),
@@ -411,16 +379,11 @@ mod tests {
         drop(second);
         let clear = crypto.open(first, scope.request, attempt).unwrap();
         assert_eq!(
-            clear
-                .authorization
-                .as_ref()
-                .unwrap()
-                .expose_for_origin()
-                .unwrap(),
+            clear.authorization.as_ref().unwrap().expose_for_origin(),
             b"Bearer exact  \xfe"
         );
         assert_eq!(
-            clear.metadata.as_ref().unwrap().as_header().unwrap(),
+            clear.metadata.as_ref().unwrap().as_header(),
             b"opaque,  \xff"
         );
         assert!(admission.used(ResourceClass::RequestContext) > 0);
@@ -462,7 +425,7 @@ mod tests {
         let clear = crypto.open(sealed, scope.request, attempt).unwrap();
         assert!(clear.authorization.is_none());
         assert_eq!(
-            clear.metadata.as_ref().unwrap().as_header().unwrap(),
+            clear.metadata.as_ref().unwrap().as_header(),
             b"opaque,  \xff"
         );
         drop(clear);

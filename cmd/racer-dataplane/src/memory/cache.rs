@@ -6,12 +6,7 @@ use super::{
 use crate::runtime::collections::{HashMap, HashSet};
 use crate::{
     error::{Error, Result},
-    model::{
-        envelope::KeyId,
-        identity::{CacheId, ObjectVersion, PageId},
-        limits::ResourceClass,
-        metadata::VersionMetadata,
-    },
+    model::{CacheId, KeyId, ObjectVersion, PageId, ResourceClass, VersionMetadata},
 };
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
 #[derive(Default)]
@@ -183,12 +178,12 @@ impl MemoryCache {
         for (reservation, class, bytes) in [
             (
                 &page.plaintext.inner.reservation,
-                crate::model::limits::ResourceClass::Plaintext,
+                crate::model::ResourceClass::Plaintext,
                 page.plaintext.bytes().len(),
             ),
             (
                 &page.ciphertext.inner.reservation,
-                crate::model::limits::ResourceClass::Ciphertext,
+                crate::model::ResourceClass::Ciphertext,
                 page.ciphertext.bytes().len(),
             ),
         ] {
@@ -430,7 +425,7 @@ mod tests {
     use super::*;
     use crate::{
         memory::pool::tests::{admission, bundle, bundle_for},
-        model::{limits::ResourceClass, metadata::ExpiresAt},
+        model::{ExpiresAt, ResourceClass},
     };
     #[test]
     fn ciphertext_residency_is_distinct_bounded_and_conditionally_invalidated() {
@@ -598,7 +593,7 @@ mod tests {
             .bytes[0] ^= 1;
         assert_eq!(cache.publish(conflicting), Err(Error::CorruptRecord));
         let mut inconsistent = bundle(&admission, "v2");
-        inconsistent.metadata.version.etag = crate::model::identity::StrongEtag::test_value("v1");
+        inconsistent.metadata.version.etag = crate::model::StrongEtag::test_value("v1");
         assert_eq!(cache.publish(inconsistent), Err(Error::CorruptRecord));
         assert_eq!(cache.entries.borrow().len(), 1);
     }

@@ -1,7 +1,7 @@
 //! Monotonic deadlines and bounded cancellation notification registrations.
 use crate::{
     error::{Error, Result},
-    model::identity::RequestId,
+    model::RequestId,
 };
 use std::{
     sync::{

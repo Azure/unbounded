@@ -10,7 +10,7 @@ use crate::{
         io::HttpIo,
         pool::ConnectionLease,
     },
-    model::identity::NodeId,
+    model::NodeId,
     runtime::deadline::RequestScope,
 };
 use sha2::{Digest, Sha256};
@@ -321,7 +321,7 @@ pub(crate) mod tests {
             codec::Codec,
             pool::{Endpoint, HttpPool},
         },
-        model::{identity::RequestId, limits::ResourceClass},
+        model::{RequestId, ResourceClass},
         runtime::{admission::Admission, reactor::Reactor},
     };
     use std::{

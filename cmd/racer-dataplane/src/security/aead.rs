@@ -3,12 +3,7 @@ use super::keyring::{KeyPurpose, Keyring};
 use crate::{
     error::{Error, Operation, Result},
     memory::pool::{CiphertextBytes, CiphertextPage, PlaintextBuffer, VerifiedBytes, VerifiedPage},
-    model::{
-        envelope::{Nonce, PageEnvelope},
-        identity::PageId,
-        limits::ResourceClass,
-        range::PAGE_BYTES,
-    },
+    model::{Nonce, PAGE_BYTES, PageEnvelope, PageId, ResourceClass},
     runtime::{
         admission::Reservation,
         crypto::{
@@ -399,7 +394,7 @@ impl CryptoService for PageCryptoEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{envelope::KeyId, identity::*};
+    use crate::model::{KeyId, *};
     fn envelope() -> PageEnvelope {
         PageEnvelope {
             page: PageId {

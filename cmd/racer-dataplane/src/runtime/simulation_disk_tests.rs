@@ -67,7 +67,7 @@ fn partition_stalls_established_streams_and_connects_then_heals_without_loss() {
 }
 use crate::{
     error::{Error, Operation, Result},
-    model::identity::RequestId,
+    model::RequestId,
     runtime::{admission::Admission, deadline::RequestScope, reactor::Reactor},
 };
 use std::{
@@ -201,7 +201,7 @@ fn failed_sync_and_crash_during_pending_write_preserve_fences_and_other_disks() 
     let weak = Rc::downgrade(&a);
     let lease = r
         .admission
-        .reserve(None, crate::model::limits::ResourceClass::Connection, 1)
+        .reserve(None, crate::model::ResourceClass::Connection, 1)
         .unwrap();
     let mut write = r.write_at(a, 0, r.file_bytes(b"late").unwrap(), lease, &scope);
     assert!(poll(&mut write).is_pending());
@@ -218,11 +218,7 @@ fn failed_sync_and_crash_during_pending_write_preserve_fences_and_other_disks() 
     assert!(weak.upgrade().is_none());
     assert_eq!(read(&sim, "/a/file"), b"old");
     assert_eq!(read(&sim, "/b/file"), b"new");
-    assert_eq!(
-        r.admission
-            .used(crate::model::limits::ResourceClass::Connection),
-        0
-    );
+    assert_eq!(r.admission.used(crate::model::ResourceClass::Connection), 0);
     // A path-only open queued before crash cannot recreate lost names afterwards.
     sim.inject("open", Fault::Delay(2));
     let mut op = r.file_open(
@@ -525,7 +521,7 @@ fn invalid_fault_plans_and_extents_are_atomic_and_holes_are_zero() {
 #[test]
 fn direct_io_faults_check_address_offset_and_length_independently() {
     use crate::{
-        model::limits::ResourceClass,
+        model::ResourceClass,
         runtime::reactor::{IoBuffer, sealed},
         store::direct::{AlignedBuffer, DirectAlignment},
     };

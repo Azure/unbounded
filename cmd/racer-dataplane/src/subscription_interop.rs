@@ -22,7 +22,7 @@ mod topology;
 
 use error::Operation;
 use model::{
-    context::OriginContext, identity::*, limits::ResourceClass, metadata::*, range::PAGE_BYTES,
+    OriginContext, *, ResourceClass, *, PAGE_BYTES,
 };
 use runtime::{
     admission::{Admission, Reservation},

@@ -9,7 +9,7 @@ use super::{
 };
 use crate::{
     error::{Error, Operation, Result},
-    model::identity::{AttemptId, NodeId, RequestId},
+    model::{AttemptId, NodeId, RequestId},
     runtime::deadline::{Deadline, RequestScope},
 };
 use sha2::Digest;
@@ -30,7 +30,7 @@ pub struct Route {
 /// Signed forwarding state. Retries preserve deadline and consumed link budget.
 #[derive(Clone, Debug)]
 pub struct RouteBudget {
-    pub membership: crate::model::identity::MembershipVersion,
+    pub membership: crate::model::MembershipVersion,
     pub request: RequestId,
     pub attempt: AttemptId,
     pub destination: NodeId,
@@ -981,8 +981,8 @@ mod tests {
         assert!((9700..10_300).contains(&counts[0]), "{counts:?}");
     }
 
-    fn input_version() -> crate::model::identity::MembershipVersion {
-        crate::model::identity::MembershipVersion(1)
+    fn input_version() -> crate::model::MembershipVersion {
+        crate::model::MembershipVersion(1)
     }
 
     #[test]
@@ -1010,9 +1010,8 @@ mod tests {
         }
         let mut changed = members.members().to_vec();
         changed[83].shares = std::num::NonZeroU32::new(u32::MAX).unwrap();
-        let changed = Arc::new(
-            Membership::validate(crate::model::identity::MembershipVersion(2), changed).unwrap(),
-        );
+        let changed =
+            Arc::new(Membership::validate(crate::model::MembershipVersion(2), changed).unwrap());
         let request = budget(&changed, 1499, 4);
         assert_eq!(
             paths
@@ -1142,7 +1141,7 @@ mod tests {
         let n = 1500;
         let members = Arc::new(
             Membership::validate(
-                crate::model::identity::MembershipVersion(1),
+                crate::model::MembershipVersion(1),
                 (0..n)
                     .map(|i| {
                         let mut member = member(i, 4);

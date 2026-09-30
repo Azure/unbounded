@@ -4,7 +4,7 @@ use super::{
     segment::{SegmentId, SegmentState, Segments},
 };
 use crate::error::{Error, Operation, Result};
-use crate::model::identity::PageId;
+use crate::model::PageId;
 use crate::runtime::collections::HashSet;
 use std::{
     cell::{Cell, RefCell},
@@ -117,7 +117,7 @@ impl SegmentClock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{model::identity::WorkerId, store::direct::DirectAlignment};
+    use crate::{model::WorkerId, store::direct::DirectAlignment};
     #[test]
     fn busy_victim_waits_and_clock_makes_progress() {
         let segments = Rc::new(Segments::new(WorkerId(0), 512));

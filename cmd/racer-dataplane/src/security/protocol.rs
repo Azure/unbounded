@@ -4,11 +4,7 @@
 use crate::{
     error::{Error, Result},
     http::codec::{Header, MessageHead, StartLine},
-    model::{
-        identity::{NodeId, ObjectId, ObjectVersion},
-        metadata::ObjectMetadata,
-        range::PAGE_BYTES,
-    },
+    model::{NodeId, ObjectId, ObjectMetadata, ObjectVersion, PAGE_BYTES},
     peer::wire::{FetchMode, Operation, PeerRequest, PeerResponse},
     runtime::deadline::Deadline,
     topology::paths::RouteBudget,
@@ -199,7 +195,6 @@ pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
         .metadata
         .as_ref()
         .map(|m| m.as_header())
-        .transpose()?
         .is_some_and(|b| b.len() > 8192)
         || request
             .origin
@@ -277,10 +272,8 @@ pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
             object(&mut head, id)?;
             push(&mut head, "racer-operation", "metadata");
             match selector {
-                crate::model::metadata::MetadataSelector::Fresh => {
-                    push(&mut head, "racer-selector", "fresh")
-                }
-                crate::model::metadata::MetadataSelector::Pinned(etag) => {
+                crate::model::MetadataSelector::Fresh => push(&mut head, "racer-selector", "fresh"),
+                crate::model::MetadataSelector::Pinned(etag) => {
                     push(&mut head, "racer-selector", "pinned");
                     push(&mut head, "racer-etag", etag.as_str());
                 }
@@ -310,7 +303,7 @@ pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
         u8::from(request.origin.metadata.is_some()),
     );
     if let Some(metadata) = &request.origin.metadata {
-        push_binary(&mut head, "racer-metadata", metadata.as_header()?);
+        push_binary(&mut head, "racer-metadata", metadata.as_header());
     }
     push(
         &mut head,
@@ -466,7 +459,7 @@ pub(crate) fn grant_fields(
 fn page_fields(
     head: &mut MessageHead,
     m: &ObjectMetadata,
-    e: &crate::model::envelope::PageEnvelope,
+    e: &crate::model::PageEnvelope,
 ) -> Result<()> {
     m.immutable().validate_page(e)?;
     if e.plaintext_length.checked_add(16) != Some(e.ciphertext_length) {
@@ -499,7 +492,7 @@ fn page_fields(
 /// Canonical page metadata without materializing an opaque transit body.
 pub(crate) fn opaque_page_head(
     m: &ObjectMetadata,
-    e: &crate::model::envelope::PageEnvelope,
+    e: &crate::model::PageEnvelope,
     bootstrap: bool,
     binding: &[u8; 32],
     path: &[NodeId],

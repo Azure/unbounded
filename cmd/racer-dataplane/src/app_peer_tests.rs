@@ -5,11 +5,7 @@ use crate::{
         codec::{Codec, Header, MessageHead, StartLine},
         pool::ConnectionLease,
     },
-    model::{
-        identity::*,
-        limits::ResourceClass,
-        metadata::{ExpiresAt, MetadataSelector, ObjectMetadata},
-    },
+    model::{ExpiresAt, MetadataSelector, ObjectMetadata, ResourceClass, *},
     peer::wire::{
         self, FetchMode, LogicalCodec, Operation as PeerOperation, PeerRequest, PeerResponse,
         WireCodec,
@@ -212,17 +208,9 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
             attempt,
         )
         .unwrap();
+    assert_eq!(opened.metadata.as_ref().unwrap().as_header(), metadata);
     assert_eq!(
-        opened.metadata.as_ref().unwrap().as_header().unwrap(),
-        metadata
-    );
-    assert_eq!(
-        opened
-            .authorization
-            .as_ref()
-            .unwrap()
-            .expose_for_origin()
-            .unwrap(),
+        opened.authorization.as_ref().unwrap().expose_for_origin(),
         authorization
     );
     drop(opened);

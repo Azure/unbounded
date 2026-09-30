@@ -2,11 +2,7 @@
 use super::clock::Clock;
 use crate::{
     error::{Error, Operation, Result},
-    model::{
-        context::OriginContext,
-        identity::{ObjectId, PageId, PageNumber, StrongEtag},
-        metadata::MetadataSelector,
-    },
+    model::{MetadataSelector, ObjectId, OriginContext, PageId, PageNumber, StrongEtag},
     origin::{client::Origin, metadata::MetadataReply, page::OriginPage},
     read::candidates::OriginAuthority,
     runtime::deadline::{Deadline, RequestScope},
@@ -189,10 +185,7 @@ impl Origin for ScriptedOrigin {
 mod tests {
     use super::*;
     use crate::{
-        model::{
-            identity::{CacheId, CacheKey, ObjectVersion},
-            metadata::{ExpiresAt, ObjectMetadata},
-        },
+        model::{CacheId, CacheKey, ExpiresAt, ObjectMetadata, ObjectVersion},
         test_support::poll_once,
     };
     use std::{task::Poll, time::UNIX_EPOCH};

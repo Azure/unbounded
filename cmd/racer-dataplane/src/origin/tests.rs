@@ -3,9 +3,8 @@ use crate::{
     control::snapshot::PublishedState,
     http::codec::Codec,
     model::{
-        context::{Authorization, OpaqueMetadata},
-        identity::{CacheId, CacheKey, ClusterId, ObjectId, RequestId, StrongEtag},
-        limits::Limits,
+        Authorization, CacheId, CacheKey, ClusterId, Limits, ObjectId, OpaqueMetadata, RequestId,
+        StrongEtag,
     },
     runtime::reactor::Reactor,
 };
@@ -666,7 +665,7 @@ fn real_uds_head_progresses_when_page_plaintext_budget_is_exhausted() {
         )
         .unwrap();
     let page = PageId {
-        version: crate::model::identity::ObjectVersion {
+        version: crate::model::ObjectVersion {
             object: context.object.clone(),
             etag: StrongEtag::parse(b"\"v\"").unwrap(),
         },
@@ -791,7 +790,7 @@ fn real_uds_errors_preserve_credential_and_version_contracts() {
 #[test]
 fn public_operations_reject_wrong_authority_before_io() {
     use crate::{
-        model::identity::{MembershipVersion, NodeId},
+        model::{MembershipVersion, NodeId},
         peer::{
             requester::PeerClient,
             wire::{FetchMode, Operation as PeerOperation, PeerRequest, VerifiedResponse},
@@ -863,7 +862,7 @@ fn public_operations_reject_wrong_authority_before_io() {
         Err(Error::Unauthorized)
     ));
     let page = PageId {
-        version: crate::model::identity::ObjectVersion {
+        version: crate::model::ObjectVersion {
             object: context.object.clone(),
             etag: StrongEtag::parse(b"\"v\"").unwrap(),
         },
@@ -912,7 +911,7 @@ fn real_uds_final_page_consumes_supplied_budget_without_second_charge() {
         Err(Error::Overloaded)
     ));
     let page = PageId {
-        version: crate::model::identity::ObjectVersion {
+        version: crate::model::ObjectVersion {
             object: context.object.clone(),
             etag: StrongEtag::parse(b"\"v\"").unwrap(),
         },
@@ -1014,7 +1013,7 @@ fn reserved_page_rejects_foreign_or_mismatched_admission_before_io() {
     let (_, foreign, _) = self::client();
     let context = context();
     let page = PageId {
-        version: crate::model::identity::ObjectVersion {
+        version: crate::model::ObjectVersion {
             object: context.object.clone(),
             etag: StrongEtag::parse(b"\"v\"").unwrap(),
         },

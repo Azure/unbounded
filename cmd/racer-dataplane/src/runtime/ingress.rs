@@ -2,7 +2,7 @@
 use super::admission::{Admission, ConnectionAdmission, ConnectionReservation};
 use crate::{
     error::{Error, Result},
-    model::identity::{CacheId, WorkerId},
+    model::{CacheId, WorkerId},
 };
 use std::{
     collections::VecDeque,
@@ -171,7 +171,7 @@ impl Offer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::limits::ResourceClass;
+    use crate::model::ResourceClass;
     #[test]
     fn batch_pop_respects_budget_and_releases_unconsumed_entries() {
         let admission = Admission::new(crate::test_support::cluster::config(false).limits);

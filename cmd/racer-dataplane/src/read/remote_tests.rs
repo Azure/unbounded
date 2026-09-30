@@ -10,11 +10,7 @@ use crate::{
         pool::{ConnectionLease, HttpPool},
     },
     memory::pool::BufferPool,
-    model::{
-        context::OriginContext,
-        identity::*,
-        metadata::{ExpiresAt, MetadataSelector, ObjectMetadata},
-    },
+    model::{ExpiresAt, MetadataSelector, ObjectMetadata, OriginContext, *},
     peer::{
         PeerNetwork,
         relay::Relay,
@@ -409,10 +405,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let io = Rc::new(HttpIo::with_admission(
         reactor.clone(),
-        Codec::new(
-            wire::MAX_ENVELOPE_HEAD,
-            crate::model::range::PAGE_BYTES + 16,
-        ),
+        Codec::new(wire::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
         admission.clone(),
     ));
     let codec = Rc::new(wire::SecurityCodec::new(
@@ -452,10 +445,8 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     let calls = Rc::new(Cell::new(0));
     let metadata = ObjectMetadata {
         content_type: Some(
-            crate::model::metadata::ContentType::parse(
-                b"application/vnd.oci.image.manifest.v1+json",
-            )
-            .unwrap(),
+            crate::model::ContentType::parse(b"application/vnd.oci.image.manifest.v1+json")
+                .unwrap(),
         ),
         version: ObjectVersion {
             object: object.clone(),
@@ -607,7 +598,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
                                     pin: None,
                                     range: None,
                                     page_credits: 1,
-                                    byte_credits: crate::model::range::PAGE_BYTES,
+                                    byte_credits: crate::model::PAGE_BYTES,
                                     ordered: false,
                                 }
                             } else {

@@ -1204,7 +1204,7 @@ mod tests {
     #[test]
     fn native_services_activate_discovered_nodes_and_copy_through_io_proxies() {
         use crate::{
-            model::{identity::RequestId, limits::ResourceClass},
+            model::{RequestId, ResourceClass},
             rdma::{
                 device::{Devices, FabricPort},
                 lifecycle::{NativeService, pair},

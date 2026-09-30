@@ -3,7 +3,7 @@ use super::wire::{EnrollmentId, EnrollmentRequest, EnrollmentResponse};
 use super::{files, wire};
 use crate::{
     error::{Error, Operation, Result},
-    model::identity::{ClusterId, NodeId},
+    model::{ClusterId, NodeId},
     runtime::deadline::RequestScope,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -24,7 +24,7 @@ pub struct Enrollment {
     roots: RefCell<Vec<Vec<u8>>>,
     reactor: RefCell<Option<Rc<crate::runtime::reactor::Reactor>>>,
     busy: Cell<bool>,
-    previous: Cell<Option<crate::model::identity::RequestId>>,
+    previous: Cell<Option<crate::model::RequestId>>,
 }
 /// Non-exportable signing identity. Do not share private keys through cluster Secrets.
 #[derive(Clone)]
@@ -154,7 +154,7 @@ impl Enrollment {
         let mut scope = scope.clone();
         let mut id = [0; 16];
         crate::runtime::environment::fill_random(&mut id).map_err(|_| Error::Io)?;
-        scope.request = crate::model::identity::RequestId(id);
+        scope.request = crate::model::RequestId(id);
         self.previous.set(Some(scope.request));
         Ok((guard, scope))
     }

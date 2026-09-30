@@ -266,7 +266,7 @@ fn explicit_retirement_blocks_published_keys_without_external_fences() {
 fn active_crypto_operation_completes_after_rotation_with_its_original_key_lease() {
     use crate::{
         memory::pool::BufferPool,
-        model::{identity::*, limits::ResourceClass},
+        model::{ResourceClass, *},
         runtime::{
             crypto::{self, CryptoClient, CryptoInput, CryptoOutput},
             deadline::RequestScope,

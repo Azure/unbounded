@@ -22,13 +22,7 @@ use crate::{
         pool::{ConnectionLease, Endpoint, HttpPool},
     },
     memory::pool::{BufferPool, PlaintextBuffer},
-    model::{
-        context::OriginContext,
-        identity::{PageId, PageNumber},
-        limits::ResourceClass,
-        metadata::MetadataSelector,
-        range::PAGE_BYTES,
-    },
+    model::{MetadataSelector, OriginContext, PAGE_BYTES, PageId, PageNumber, ResourceClass},
     read::candidates::OriginAuthority,
     runtime::{
         admission::{Admission, Reservation},
@@ -414,7 +408,7 @@ impl Origin for OriginClient {
             let endpoint = self.endpoint(context)?;
             self.health
                 .run(
-                    &crate::model::identity::NodeId(format!("{endpoint:?}")),
+                    &crate::model::NodeId(format!("{endpoint:?}")),
                     self.bootstrap_reserved_at(&endpoint, context, reservation, scope),
                 )
                 .await
@@ -437,7 +431,7 @@ impl Origin for OriginClient {
             let endpoint = self.endpoint(context)?;
             self.health
                 .run(
-                    &crate::model::identity::NodeId(format!("{endpoint:?}")),
+                    &crate::model::NodeId(format!("{endpoint:?}")),
                     self.page_reserved_at(&endpoint, context, page, reservation, scope),
                 )
                 .await
@@ -455,7 +449,7 @@ impl Origin for OriginClient {
             let endpoint = self.endpoint(context)?;
             self.health
                 .run(
-                    &crate::model::identity::NodeId(format!("{endpoint:?}")),
+                    &crate::model::NodeId(format!("{endpoint:?}")),
                     self.bootstrap_at(&endpoint, context, scope),
                 )
                 .await
@@ -474,7 +468,7 @@ impl Origin for OriginClient {
             let endpoint = self.endpoint(context)?;
             self.health
                 .run(
-                    &crate::model::identity::NodeId(format!("{endpoint:?}")),
+                    &crate::model::NodeId(format!("{endpoint:?}")),
                     self.metadata_at(&endpoint, context, selector, scope),
                 )
                 .await
@@ -496,7 +490,7 @@ impl Origin for OriginClient {
             let endpoint = self.endpoint(context)?;
             self.health
                 .run(
-                    &crate::model::identity::NodeId(format!("{endpoint:?}")),
+                    &crate::model::NodeId(format!("{endpoint:?}")),
                     self.page_at(&endpoint, context, page, scope),
                 )
                 .await
@@ -525,12 +519,12 @@ fn request(context: &OriginContext, method: &str) -> Result<MessageHead> {
     let target = format!("/v1/objects/{}", context.object.key.to_hex());
     let mut headers = vec![header("Host", b"racer"), header("Content-Length", b"0")];
     if let Some(metadata) = &context.metadata {
-        let bytes = metadata.as_header()?;
+        let bytes = metadata.as_header();
         opaque(bytes)?;
         headers.push(header("Racer-Metadata", bytes));
     }
     if let Some(authorization) = &context.authorization {
-        let bytes = authorization.expose_for_origin()?;
+        let bytes = authorization.expose_for_origin();
         opaque(bytes)?;
         headers.push(header("Authorization", bytes));
     }
@@ -564,7 +558,7 @@ pub mod metadata {
     use crate::{
         error::{Error, Result},
         http::codec::MessageHead,
-        model::{identity::ObjectId, metadata::ObjectMetadata, range::PAGE_BYTES},
+        model::{ObjectId, ObjectMetadata, PAGE_BYTES},
     };
     pub struct MetadataReply {
         pub metadata: ObjectMetadata,
@@ -608,7 +602,7 @@ pub mod metadata {
         use super::*;
         use crate::{
             http::codec::{Header, StartLine},
-            model::identity::{CacheId, CacheKey},
+            model::{CacheId, CacheKey},
         };
         use std::time::{Duration, UNIX_EPOCH};
 
@@ -764,7 +758,7 @@ pub mod page {
         error::{Error, Result},
         http::codec::MessageHead,
         memory::pool::PlaintextBuffer,
-        model::{identity::PageId, metadata::ObjectMetadata, range::PAGE_BYTES},
+        model::{ObjectMetadata, PAGE_BYTES, PageId},
     };
     pub struct OriginPage {
         pub metadata: ObjectMetadata,
@@ -817,7 +811,7 @@ pub mod page {
         use super::*;
         use crate::{
             http::codec::{Header, StartLine},
-            model::identity::{CacheId, CacheKey, ObjectId, ObjectVersion, PageNumber, StrongEtag},
+            model::{CacheId, CacheKey, ObjectId, ObjectVersion, PageNumber, StrongEtag},
         };
 
         fn page() -> PageId {
@@ -887,10 +881,7 @@ mod protocol {
     use crate::{
         error::{Error, Result},
         http::codec::{MessageHead, StartLine},
-        model::{
-            identity::{ObjectId, ObjectVersion, StrongEtag},
-            metadata::{ExpiresAt, ObjectMetadata},
-        },
+        model::{ExpiresAt, ObjectId, ObjectMetadata, ObjectVersion, StrongEtag},
     };
 
     pub(super) fn field<'a>(head: &'a MessageHead, name: &str) -> Result<Option<&'a [u8]>> {
@@ -992,7 +983,7 @@ mod protocol {
             ],
         )?;
         if let Some(value) = field(head, "Racer-Content-Type")? {
-            crate::model::metadata::ContentType::parse(value).map_err(|_| Error::BadGateway)?;
+            crate::model::ContentType::parse(value).map_err(|_| Error::BadGateway)?;
         }
         for connection in head.values("Connection") {
             if connection
@@ -1054,7 +1045,7 @@ mod protocol {
             ExpiresAt::parse(required(head, "Racer-Expires-At")?).map_err(|_| Error::BadGateway)?;
         Ok(ObjectMetadata {
             content_type: field(head, "Racer-Content-Type")?
-                .map(crate::model::metadata::ContentType::parse)
+                .map(crate::model::ContentType::parse)
                 .transpose()
                 .map_err(|_| Error::BadGateway)?,
             version: ObjectVersion {
@@ -1096,8 +1087,8 @@ mod protocol {
         #[test]
         fn optional_content_type_is_validated_without_transport_substitution() {
             let object = ObjectId {
-                cache: crate::model::identity::CacheId("cache".into()),
-                key: crate::model::identity::CacheKey([0; 32]),
+                cache: crate::model::CacheId("cache".into()),
+                key: crate::model::CacheKey([0; 32]),
             };
             let base = MessageHead {
                 start: StartLine::Response { status: 200 },
@@ -1165,7 +1156,7 @@ mod protocol {
         fn numeric_headers_reject_padding_before_any_normalization() {
             use crate::{
                 http::codec::Codec,
-                model::identity::{CacheId, CacheKey},
+                model::{CacheId, CacheKey},
             };
             let object = ObjectId {
                 cache: CacheId("cache".into()),

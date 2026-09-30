@@ -5,13 +5,8 @@ use crate::{
     error::{Error, Result},
     memory::{page::CiphertextCopy, pool::BufferPool},
     model::{
-        envelope::{KeyId, Nonce, PageEnvelope},
-        identity::{
-            CacheId, CacheKey, ObjectId, ObjectVersion, PageId, PageNumber, RequestId, StrongEtag,
-            WorkerId,
-        },
-        limits::ResourceClass,
-        metadata::{ExpiresAt, ObjectMetadata},
+        CacheId, CacheKey, ExpiresAt, KeyId, Nonce, ObjectId, ObjectMetadata, ObjectVersion,
+        PageEnvelope, PageId, PageNumber, RequestId, ResourceClass, StrongEtag, WorkerId,
     },
     runtime::{
         admission::Admission,
@@ -286,7 +281,7 @@ fn incremental_checkpoint_budget_thaws_and_async_publication_roundtrips() {
 fn record_round_trip_preserves_ciphertext_zeroes_padding_and_rejects_torn_header() {
     let f = Fixture::new();
     let a = direct::DirectAlignment::validate(512, 512, 512).unwrap();
-    for length in [3, crate::model::range::PAGE_BYTES as usize] {
+    for length in [3, crate::model::PAGE_BYTES as usize] {
         let page = f.copy(9, length);
         let disk = a
             .extent(0, format::RecordCodec.logical_length(&page).unwrap())

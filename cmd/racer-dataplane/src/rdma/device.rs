@@ -7,7 +7,7 @@ use super::{
 };
 use crate::{
     error::{Error, Operation, Result},
-    model::limits::ResourceClass,
+    model::ResourceClass,
     runtime::{admission::Admission, deadline::RequestScope},
     topology::rails::{RailId, RailMapping},
 };

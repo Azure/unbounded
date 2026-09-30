@@ -2,7 +2,7 @@
 use super::certificates::{spiffe, verify_chain};
 use crate::{
     error::{Error, Result},
-    model::identity::{ClusterId, NodeId},
+    model::{ClusterId, NodeId},
 };
 use ed25519_dalek::{
     Signer, SigningKey,

@@ -2,7 +2,7 @@
 use super::keyring::Keyring;
 use crate::{
     error::{Error, Result},
-    model::identity::{ClusterId, NodeId},
+    model::{ClusterId, NodeId},
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 use rustls::{RootCertStore, pki_types::CertificateDer};

@@ -1678,7 +1678,7 @@ mod tests {
     use super::*;
     use crate::{
         error::{Error, Operation, Result},
-        model::{identity::RequestId, limits::ResourceClass},
+        model::{RequestId, ResourceClass},
         runtime::{admission::Admission, deadline::RequestScope, reactor::Reactor},
     };
     use std::{
@@ -2174,7 +2174,7 @@ mod tests {
 
     #[test]
     fn real_slab_open_is_sparse_exclusive_and_checks_direct_geometry() {
-        use crate::{model::identity::WorkerId, store::slab::Slabs};
+        use crate::{model::WorkerId, store::slab::Slabs};
         let sim = Simulation::new();
         let _environment = sim.enter();
         let r = Rc::new(reactor());

@@ -4,11 +4,7 @@ use super::flight::AcquisitionBudget;
 use crate::telemetry::failures::{Detail, Failure, Observer, Stage};
 use crate::{
     error::{Error, Operation, Result},
-    model::{
-        context::OriginContext,
-        identity::{AttemptId, NodeId, ObjectId, PageNumber},
-        metadata::MetadataSelector,
-    },
+    model::{AttemptId, MetadataSelector, NodeId, ObjectId, OriginContext, PageNumber},
     peer::{
         requester::PeerClient,
         wire::{
@@ -58,7 +54,7 @@ impl CandidatePolicy {
     /// which it is also primary. Backups are not speculatively contacted.
     pub(crate) async fn subscribe(
         &self,
-        version: crate::model::identity::ObjectVersion,
+        version: crate::model::ObjectVersion,
         demand: crate::peer::subscriptions::Demand,
         scheduler: &super::subscription::Scheduler,
         membership: MembershipLease,
@@ -852,10 +848,7 @@ mod tests {
         );
         assert_eq!(budget.remaining_links(), 4);
     }
-    use crate::model::{
-        identity::{CacheId, CacheKey, ObjectVersion, StrongEtag},
-        metadata::{ExpiresAt, ObjectMetadata},
-    };
+    use crate::model::{CacheId, CacheKey, ExpiresAt, ObjectMetadata, ObjectVersion, StrongEtag};
     fn object() -> ObjectId {
         ObjectId {
             cache: CacheId("33333333-3333-4333-8333-333333333333".into()),
@@ -897,8 +890,8 @@ mod tests {
         Rc<CredentialCrypto>,
     ) {
         use crate::{
-            model::identity::ClusterId,
-            model::identity::{MembershipVersion, RequestId},
+            model::ClusterId,
+            model::{MembershipVersion, RequestId},
             runtime::admission::Admission,
             security::keyring::{KeyEpochs, Keyring},
             topology::membership::{Member, Membership},
@@ -1153,7 +1146,7 @@ mod tests {
     }
     fn membership() -> MembershipLease {
         use crate::{
-            model::identity::MembershipVersion,
+            model::MembershipVersion,
             topology::membership::{Member, Membership},
         };
         std::sync::Arc::new(
@@ -1187,7 +1180,7 @@ mod tests {
     }
     fn scope() -> RequestScope {
         RequestScope::new(
-            crate::model::identity::RequestId([7; 16]),
+            crate::model::RequestId([7; 16]),
             Instant::now() + std::time::Duration::from_secs(60),
         )
         .unwrap()

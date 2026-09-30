@@ -89,10 +89,7 @@ impl DirectAlignment {
         if length == 0
             || !length.is_multiple_of(self.length)
             || reservation.amount() < length
-            || !matches!(
-                reservation.class(),
-                crate::model::limits::ResourceClass::Ciphertext
-            )
+            || !matches!(reservation.class(), crate::model::ResourceClass::Ciphertext)
         {
             return Err(Error::InvalidConfiguration);
         }
@@ -126,7 +123,7 @@ impl AlignedBuffer {
         self
     }
     pub(crate) fn rebind(&mut self, reservation: Reservation) -> Result<()> {
-        reservation.validate(crate::model::limits::ResourceClass::Ciphertext, self.length)?;
+        reservation.validate(crate::model::ResourceClass::Ciphertext, self.length)?;
         self.reservation = Some(reservation);
         Ok(())
     }
@@ -184,7 +181,7 @@ mod tests {
     #[test]
     fn aligned_pool_reuses_only_fenced_zeroed_admitted_storage() {
         use crate::{
-            model::{identity::CacheId, limits::ResourceClass},
+            model::{CacheId, ResourceClass},
             runtime::admission::Admission,
         };
         let admission = Admission::new(crate::test_support::cluster::config(false).limits);

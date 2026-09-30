@@ -4,10 +4,7 @@ use super::identity::SigningIdentity;
 use crate::{
     control::{enrollment::LocalSigningIdentity, wire::*},
     error::{Error, Result},
-    model::{
-        envelope::KeyId,
-        identity::{CacheId, ClusterId, NodeId},
-    },
+    model::{CacheId, ClusterId, KeyId, NodeId},
 };
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};

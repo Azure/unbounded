@@ -6,7 +6,7 @@ use racer_dataplane::{
         caches::{CacheDefinition, canonical_socket_paths},
         wire,
     },
-    model::identity::{CacheId, ClusterId, MembershipVersion, NodeId},
+    model::{CacheId, ClusterId, MembershipVersion, NodeId},
     topology::membership::Member,
 };
 use std::{num::NonZeroU32, time::SystemTime};

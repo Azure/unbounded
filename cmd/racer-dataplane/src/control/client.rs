@@ -77,7 +77,7 @@ fn enter(flag: &Cell<bool>) -> Result<Busy<'_>> {
     }
 }
 pub struct ControlProgress {
-    pub identity: Option<crate::model::identity::NodeId>,
+    pub identity: Option<crate::model::NodeId>,
     pub snapshot: Option<super::snapshot::SnapshotLease>,
     pub cache_events: Vec<CacheEvent>,
     pub next_attempt: Instant,
@@ -896,7 +896,7 @@ mod tests {
     use super::*;
     use crate::{
         control::{snapshot::PublishedState, testing},
-        model::identity::{ClusterId, NodeId},
+        model::{ClusterId, NodeId},
         security::keyring::KeyEpochs,
     };
     use std::sync::Arc;

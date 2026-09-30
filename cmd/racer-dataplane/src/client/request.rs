@@ -7,9 +7,8 @@ use crate::{
     error::{Error, Result},
     http::codec::{MessageHead, StartLine},
     model::{
-        context::{Authorization, OpaqueMetadata, OriginContext},
-        identity::{CacheId, CacheKey, ObjectId, StrongEtag},
-        range::{ByteRange, PAGE_BYTES},
+        Authorization, ByteRange, CacheId, CacheKey, ObjectId, OpaqueMetadata, OriginContext,
+        PAGE_BYTES, StrongEtag,
     },
 };
 
@@ -396,16 +395,11 @@ mod tests {
             assert_eq!(request.kind, expected);
             assert_eq!(request.origin.object.key, CacheKey([1; 32]));
             assert_eq!(
-                request.origin.metadata.unwrap().as_header().unwrap(),
+                request.origin.metadata.unwrap().as_header(),
                 b"opaque,\xff value"
             );
             assert_eq!(
-                request
-                    .origin
-                    .authorization
-                    .unwrap()
-                    .expose_for_origin()
-                    .unwrap(),
+                request.origin.authorization.unwrap().expose_for_origin(),
                 b"Scheme opaque \xfe"
             );
         }
@@ -647,7 +641,7 @@ mod tests {
         assert_eq!(used, raw.len());
         let parsed = parse(head).unwrap();
         assert_eq!(
-            parsed.origin.metadata.unwrap().as_header().unwrap(),
+            parsed.origin.metadata.unwrap().as_header(),
             b"opaque,\xff value"
         );
         for value in [

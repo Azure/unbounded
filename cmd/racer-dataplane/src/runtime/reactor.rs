@@ -18,7 +18,7 @@ use super::{
 };
 use crate::{
     error::{Error, Operation, Result},
-    model::limits::ResourceClass,
+    model::ResourceClass,
 };
 use io_uring::{IoUring, opcode, squeue, types};
 #[path = "descriptor.rs"]
@@ -1435,7 +1435,7 @@ mod tests {
         include!("reserved_submission_tests.rs");
     }
     use crate::{
-        model::{identity::RequestId, limits::Limits},
+        model::{Limits, RequestId},
         runtime::deadline::{Cancellation, Deadline},
     };
     use std::sync::atomic::{AtomicUsize, Ordering};

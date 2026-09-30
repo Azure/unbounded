@@ -10,11 +10,7 @@ use crate::{
 };
 use crate::{
     memory::pool::CiphertextPage,
-    model::{
-        context::PeerOriginContext,
-        identity::{ObjectId, PageId},
-        metadata::{MetadataSelector, ObjectMetadata},
-    },
+    model::{MetadataSelector, ObjectId, ObjectMetadata, PageId, PeerOriginContext},
     topology::paths::RouteBudget,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -146,7 +142,7 @@ impl WireCodec {
         body_length: usize,
     ) -> Result<MessageHead> {
         if authentication.hops.len() > MAX_HOPS
-            || body_length > crate::model::range::PAGE_BYTES as usize + 16
+            || body_length > crate::model::PAGE_BYTES as usize + 16
             || (!response && body_length != 0)
         {
             return Err(Error::InvalidRequest);
@@ -182,7 +178,7 @@ impl WireCodec {
             },
             headers,
         };
-        Codec::new(MAX_ENVELOPE_HEAD, crate::model::range::PAGE_BYTES + 16).encode_head(&head)?;
+        Codec::new(MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16).encode_head(&head)?;
         Ok(head)
     }
 
@@ -242,9 +238,7 @@ impl WireCodec {
             }
         }
         let length = length.ok_or(Error::InvalidRequest)?;
-        if !version
-            || length > crate::model::range::PAGE_BYTES as usize + 16
-            || (!response && length != 0)
+        if !version || length > crate::model::PAGE_BYTES as usize + 16 || (!response && length != 0)
         {
             return Err(Error::InvalidRequest);
         }
@@ -265,8 +259,8 @@ pub(crate) fn encode_signed(head: &SignedHead) -> Result<Vec<u8>> {
     if head.signature.len() != 64 {
         return Err(Error::InvalidRequest);
     }
-    let bytes = Codec::new(MAX_SIGNED_HEAD, crate::model::range::PAGE_BYTES + 16)
-        .encode_head(&head.head)?;
+    let bytes =
+        Codec::new(MAX_SIGNED_HEAD, crate::model::PAGE_BYTES + 16).encode_head(&head.head)?;
     let mut framed = Vec::with_capacity(bytes.len() + 64);
     framed.extend_from_slice(&head.signature);
     framed.extend_from_slice(&bytes);
@@ -281,7 +275,7 @@ pub(crate) fn decode_signed(bytes: &[u8]) -> Result<SignedHead> {
     if STANDARD.encode(&decoded).as_bytes() != bytes || decoded.len() <= 64 {
         return Err(Error::InvalidRequest);
     }
-    let (head, consumed) = Codec::new(MAX_SIGNED_HEAD, crate::model::range::PAGE_BYTES + 16)
+    let (head, consumed) = Codec::new(MAX_SIGNED_HEAD, crate::model::PAGE_BYTES + 16)
         .decode_head(&decoded[64..])?
         .ok_or(Error::InvalidRequest)?;
     if consumed != decoded.len() - 64 {

@@ -3,9 +3,8 @@ use racer_dataplane::{
     config::Config,
     memory::pool::BufferPool,
     model::{
-        envelope::{KeyId, Nonce, PageEnvelope},
-        identity::{CacheId, CacheKey, ObjectId, ObjectVersion, PageId, PageNumber, StrongEtag},
-        limits::ResourceClass,
+        CacheId, CacheKey, KeyId, Nonce, ObjectId, ObjectVersion, PageEnvelope, PageId, PageNumber,
+        ResourceClass, StrongEtag,
     },
     runtime::{admission::Admission, reactor::IoBuffer},
 };
@@ -177,7 +176,7 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
     use chacha20poly1305::{KeyInit, XChaCha20Poly1305, aead::AeadInOut};
     use racer_dataplane::{
         control::wire,
-        model::identity::{ClusterId, NodeId, RequestId, WorkerId},
+        model::{ClusterId, NodeId, RequestId, WorkerId},
         runtime::{
             crypto::{CryptoId, CryptoInput, pair},
             deadline::RequestScope,

@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     memory::pool::BufferPool,
-    model::{identity::*, limits::ResourceClass},
+    model::{ResourceClass, *},
     runtime::crypto::{CryptoInput, CryptoOutput},
     security::{
         aead::PageCryptoEngine,

@@ -11,10 +11,8 @@ use crate::{
     control::snapshot::SnapshotStore,
     error::{Error, Operation, Result},
     model::{
-        context::{OriginContext, PeerOriginContext},
-        identity::ObjectId,
-        metadata::{MetadataSelector, ObjectMetadata},
-        range::{ByteRange, ResolvedRange},
+        ByteRange, MetadataSelector, ObjectId, ObjectMetadata, OriginContext, PeerOriginContext,
+        ResolvedRange,
     },
     peer::{
         server::LocalPageService,
@@ -423,21 +421,21 @@ fn peer_error(error: Error) -> Result<PeerResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::identity::AttemptId;
+    use crate::model::AttemptId;
     #[test]
     fn remote_budget_charges_final_incoming_link_and_never_restores_attempts() {
         let now = crate::runtime::environment::now();
         let scope = RequestScope::new(
-            crate::model::identity::RequestId([1; 16]),
+            crate::model::RequestId([1; 16]),
             now + std::time::Duration::from_secs(60),
         )
         .unwrap();
         let mut route = crate::topology::paths::RouteBudget {
-            membership: crate::model::identity::MembershipVersion(1),
+            membership: crate::model::MembershipVersion(1),
             request: scope.request,
             attempt: AttemptId([2; 16]),
-            destination: crate::model::identity::NodeId("destination".into()),
-            visited: vec![crate::model::identity::NodeId("sender".into())],
+            destination: crate::model::NodeId("destination".into()),
+            visited: vec![crate::model::NodeId("sender".into())],
             remaining_links: 1,
             remaining_attempts: 0,
             deadline: scope.deadline,
@@ -464,10 +462,7 @@ mod tests {
             Err(Error::HopBudgetExhausted)
         ));
     }
-    use crate::model::{
-        identity::{CacheId, CacheKey, ObjectVersion, StrongEtag},
-        metadata::ExpiresAt,
-    };
+    use crate::model::{CacheId, CacheKey, ExpiresAt, ObjectVersion, StrongEtag};
     #[test]
     fn pinned_head_validation_never_accepts_current_version_substitution() {
         let object = ObjectId {

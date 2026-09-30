@@ -9,7 +9,7 @@ use crate::{
         pool::ConnectionLease,
     },
     memory::delivery::Delivery,
-    model::{metadata::ObjectMetadata, range::ResolvedRange},
+    model::{ObjectMetadata, ResolvedRange},
     read::serve::ReadResponse,
     runtime::deadline::RequestScope,
 };
@@ -85,7 +85,7 @@ impl Responses {
                 } else {
                     Some(
                         range
-                            .unwrap_or(crate::model::range::ByteRange::From(0))
+                            .unwrap_or(crate::model::ByteRange::From(0))
                             .resolve(response.metadata.length)
                             .map_err(|_| Error::BadGateway)?,
                     )
@@ -311,9 +311,7 @@ fn success_head(metadata: &ObjectMetadata, range: Option<ResolvedRange>) -> Resu
 mod tests {
     use super::*;
     use crate::model::{
-        identity::{CacheId, CacheKey, ObjectId, ObjectVersion, StrongEtag},
-        metadata::ExpiresAt,
-        range::ByteRange,
+        ByteRange, CacheId, CacheKey, ExpiresAt, ObjectId, ObjectVersion, StrongEtag,
     };
     use std::time::Duration;
 
@@ -363,10 +361,8 @@ mod tests {
     fn head_and_get_carry_optional_object_content_type() {
         let mut metadata = metadata(3);
         metadata.content_type = Some(
-            crate::model::metadata::ContentType::parse(
-                b"application/vnd.oci.image.manifest.v1+json",
-            )
-            .unwrap(),
+            crate::model::ContentType::parse(b"application/vnd.oci.image.manifest.v1+json")
+                .unwrap(),
         );
         for range in [None, Some(ByteRange::From(0).resolve(3).unwrap())] {
             let head = success_head(&metadata, range).unwrap();

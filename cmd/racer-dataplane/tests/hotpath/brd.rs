@@ -1,5 +1,5 @@
 //! An exclusively owned RAM disk. All mountpoints and device nodes are in target/.
-use racer_dataplane::model::limits::Limits;
+use racer_dataplane::model::Limits;
 use std::{fs, os::fd::AsRawFd, path::PathBuf, process::Command};
 
 const MIB: u64 = 1 << 20;

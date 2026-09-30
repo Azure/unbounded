@@ -10,12 +10,7 @@ use crate::runtime::collections::HashMap;
 use crate::{
     error::{Error, Operation, Result},
     memory::page::CiphertextCopy,
-    model::{
-        envelope::KeyId,
-        identity::{CacheId, ObjectVersion, PageId},
-        limits::ResourceClass,
-        metadata::VersionMetadata,
-    },
+    model::{CacheId, KeyId, ObjectVersion, PageId, ResourceClass, VersionMetadata},
     runtime::{
         admission::{Admission, Reservation},
         deadline::RequestScope,
@@ -166,8 +161,7 @@ impl StoreWriter {
             || !self.slabs.owns_reservation(&dirty)
             || dirty.cache() != Some(&page.metadata.version.object.cache)
             || dirty.amount() < page.ciphertext.bytes().len()
-            || logical
-                > crate::model::range::PAGE_BYTES as usize + super::format::MAX_HEADER_BYTES + 16
+            || logical > crate::model::PAGE_BYTES as usize + super::format::MAX_HEADER_BYTES + 16
         {
             return Err(Error::InvalidConfiguration);
         }

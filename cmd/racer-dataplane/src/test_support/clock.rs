@@ -288,8 +288,8 @@ mod tests {
     #[test]
     fn wall_time_drives_freshness_but_expired_versions_still_answer_pins() {
         use crate::model::{
-            identity::{CacheId, CacheKey, ObjectId, ObjectVersion, StrongEtag},
-            metadata::{CurrentVersion, ExpiresAt, VersionMetadata},
+            CacheId, CacheKey, CurrentVersion, ExpiresAt, ObjectId, ObjectVersion, StrongEtag,
+            VersionMetadata,
         };
         let clock = Clock::default();
         let descriptor = VersionMetadata {

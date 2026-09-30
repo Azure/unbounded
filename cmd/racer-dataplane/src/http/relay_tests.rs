@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     http::codec::{Codec, Header, MessageHead, StartLine},
     memory::pipe::PipePool,
-    model::{identity::RequestId, limits::ResourceClass},
+    model::{RequestId, ResourceClass},
     runtime::{admission::Admission, reactor::Reactor},
 };
 use std::{
@@ -83,7 +83,7 @@ impl Fixture {
         Self {
             io: HttpIo::with_admission(
                 reactor.clone(),
-                Codec::new(4096, crate::model::range::PAGE_BYTES + 16),
+                Codec::new(4096, crate::model::PAGE_BYTES + 16),
                 admission.clone(),
             ),
             pipes: PipePool::new(admission.clone(), reactor.clone()),
@@ -381,7 +381,7 @@ fn opaque_body_cpu_benchmark() {
                 let mut buffer = crate::peer::transfer::WireBuffer::reserved(
                     f.admission
                         .reserve(
-                            Some(&crate::model::identity::CacheId("bench".into())),
+                            Some(&crate::model::CacheId("bench".into())),
                             ResourceClass::Ciphertext,
                             length,
                         )
@@ -401,19 +401,19 @@ fn opaque_body_cpu_benchmark() {
                     buffer = done.buffer;
                 }
                 let (bytes, reservation) = buffer.into_parts();
-                let envelope = crate::model::envelope::PageEnvelope {
-                    page: crate::model::identity::PageId {
-                        version: crate::model::identity::ObjectVersion {
-                            object: crate::model::identity::ObjectId {
-                                cache: crate::model::identity::CacheId("bench".into()),
-                                key: crate::model::identity::CacheKey([0; 32]),
+                let envelope = crate::model::PageEnvelope {
+                    page: crate::model::PageId {
+                        version: crate::model::ObjectVersion {
+                            object: crate::model::ObjectId {
+                                cache: crate::model::CacheId("bench".into()),
+                                key: crate::model::CacheKey([0; 32]),
                             },
-                            etag: crate::model::identity::StrongEtag::test_value("v1"),
+                            etag: crate::model::StrongEtag::test_value("v1"),
                         },
-                        number: crate::model::identity::PageNumber(0),
+                        number: crate::model::PageNumber(0),
                     },
-                    key_id: crate::model::envelope::KeyId([0; 16]),
-                    nonce: crate::model::envelope::Nonce([0; 24]),
+                    key_id: crate::model::KeyId([0; 16]),
+                    nonce: crate::model::Nonce([0; 24]),
                     plaintext_length: (length - 16) as u32,
                     ciphertext_length: length as u32,
                 };

@@ -1,6 +1,6 @@
 //! Waiter election, cancellation, and actual-completion fencing scenarios.
 use super::*;
-use crate::model::identity::PageNumber;
+use crate::model::PageNumber;
 
 #[test]
 fn detached_copy_waiters_release_notifications_without_losing_live_wake() {
@@ -444,8 +444,7 @@ fn abandoned_drain_observer_and_expired_shutdown_cannot_release_work() {
     let operation = flights.retain_operation(&leader, ()).unwrap();
     let ticket = flights.abandon(leader).unwrap();
     assert!(poll(flights.finish_draining(ticket)).is_pending());
-    let expired =
-        RequestScope::new(crate::model::identity::RequestId([1; 16]), Instant::now()).unwrap();
+    let expired = RequestScope::new(crate::model::RequestId([1; 16]), Instant::now()).unwrap();
     assert!(matches!(
         poll(flights.drain(&expired)),
         Poll::Ready(Err(Error::DeadlineExceeded))

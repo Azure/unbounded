@@ -9,7 +9,7 @@ use super::{
 use crate::{
     error::{Error, Operation, Result},
     memory::{page::CiphertextCopy, pool::BufferPool},
-    model::{identity::PageId, limits::ResourceClass},
+    model::{PageId, ResourceClass},
     runtime::{deadline::RequestScope, reactor::IoBuffer},
 };
 use std::rc::Rc;
@@ -29,8 +29,8 @@ pub struct ReadToken {
 impl StoreReader {
     pub fn metadata(
         &self,
-        version: &crate::model::identity::ObjectVersion,
-    ) -> Result<Option<crate::model::metadata::VersionMetadata>> {
+        version: &crate::model::ObjectVersion,
+    ) -> Result<Option<crate::model::VersionMetadata>> {
         self.index.version(version)
     }
     pub fn new(

@@ -5,7 +5,7 @@ use crate::{
     error::{Error, Operation, Result},
     http::{io::HttpIo, pool::HttpPool},
     memory::pool::CiphertextPage,
-    model::limits::ResourceClass,
+    model::ResourceClass,
     rdma::transfer::RdmaTransfer,
     runtime::deadline::RequestScope,
     runtime::{
@@ -23,7 +23,7 @@ pub(crate) struct WireBuffer {
 }
 impl WireBuffer {
     pub(crate) fn new(admission: &Admission, length: usize) -> Result<Self> {
-        if length > crate::model::range::PAGE_BYTES as usize + 16 {
+        if length > crate::model::PAGE_BYTES as usize + 16 {
             return Err(Error::InvalidRequest);
         }
         let reservation = admission.reserve(None, ResourceClass::Ciphertext, length)?;
@@ -34,7 +34,7 @@ impl WireBuffer {
     }
     pub(crate) fn reserved(reservation: Reservation, length: usize) -> Result<Self> {
         reservation.validate(ResourceClass::Ciphertext, length)?;
-        if length > crate::model::range::PAGE_BYTES as usize + 16 {
+        if length > crate::model::PAGE_BYTES as usize + 16 {
             return Err(Error::InvalidRequest);
         }
         Ok(Self {
@@ -56,7 +56,7 @@ impl IoBuffer for WireBuffer {
     }
 }
 
-type ReclaimCiphertext = dyn Fn(&crate::model::identity::CacheId, usize);
+type ReclaimCiphertext = dyn Fn(&crate::model::CacheId, usize);
 
 /// Internal transport result: native delivery stays materialized; HTTP relay
 /// delivery owns an unfinished connection and its exact opaque body framing.
@@ -130,7 +130,7 @@ impl Transfers {
     }
     pub(crate) fn with_reclamation(
         mut self,
-        reclaim: impl Fn(&crate::model::identity::CacheId, usize) + 'static,
+        reclaim: impl Fn(&crate::model::CacheId, usize) + 'static,
     ) -> Self {
         self.reclaim = Some(Rc::new(reclaim));
         self
@@ -163,7 +163,7 @@ impl Transfers {
 
     pub fn send_scoped<'a>(
         &'a self,
-        destination: &'a crate::model::identity::NodeId,
+        destination: &'a crate::model::NodeId,
         session: &'a crate::rdma::session::SessionLease,
         page: CiphertextPage,
         descriptor: crate::rdma::permission::AuthenticatedDescriptor,
@@ -184,10 +184,10 @@ impl Transfers {
 
     pub fn prepare_receive<'a>(
         &'a self,
-        source: &'a crate::model::identity::NodeId,
+        source: &'a crate::model::NodeId,
         session: &'a crate::rdma::session::SessionLease,
-        envelope: &'a crate::model::envelope::PageEnvelope,
-        transfer: crate::model::identity::TransferId,
+        envelope: &'a crate::model::PageEnvelope,
+        transfer: crate::model::TransferId,
         scope: &'a RequestScope,
     ) -> Operation<'a, crate::rdma::permission::Grant> {
         Box::pin(async move {
@@ -207,7 +207,7 @@ impl Transfers {
         session: &'a crate::rdma::session::SessionLease,
         grant: crate::rdma::permission::Grant,
         completion: &'a crate::security::signing::VerifiedHead,
-        envelope: crate::model::envelope::PageEnvelope,
+        envelope: crate::model::PageEnvelope,
         scope: &'a RequestScope,
     ) -> Operation<'a, CiphertextPage> {
         Box::pin(async move {
@@ -485,8 +485,8 @@ impl Transfers {
     }
     pub fn send<'a>(
         &'a self,
-        _destination: &'a crate::model::identity::NodeId,
-        _transfer: crate::model::identity::TransferId,
+        _destination: &'a crate::model::NodeId,
+        _transfer: crate::model::TransferId,
         _plan: TransportPlan,
         _page: CiphertextPage,
         _scope: &'a RequestScope,
@@ -500,10 +500,10 @@ impl Transfers {
     }
     pub fn receive<'a>(
         &'a self,
-        _source: &'a crate::model::identity::NodeId,
-        _transfer: crate::model::identity::TransferId,
+        _source: &'a crate::model::NodeId,
+        _transfer: crate::model::TransferId,
         _plan: TransportPlan,
-        _envelope: crate::model::envelope::PageEnvelope,
+        _envelope: crate::model::PageEnvelope,
         _scope: &'a RequestScope,
     ) -> Operation<'a, CiphertextPage> {
         Box::pin(async move {
@@ -518,7 +518,7 @@ mod tests {
 
     #[test]
     fn wire_checkout_reuses_zeroed_payload_without_moving_or_releasing_its_charge() {
-        use crate::model::identity::CacheId;
+        use crate::model::CacheId;
         let admission = Admission::new(crate::test_support::cluster::config(false).limits);
         let first = CacheId("first".into());
         let second = CacheId("second".into());

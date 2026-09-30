@@ -7,7 +7,7 @@ use super::{
 };
 use crate::{
     error::{Error, Operation, Result},
-    model::identity::TransferId,
+    model::TransferId,
     runtime::deadline::{Deadline, RequestScope},
     security::signing::VerifiedHead,
 };

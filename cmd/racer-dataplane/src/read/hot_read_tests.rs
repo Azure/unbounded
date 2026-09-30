@@ -8,7 +8,7 @@ use crate::{
     },
     http::{codec::Codec, io::HttpIo},
     memory::{delivery::Delivery, pipe::PipePool},
-    model::{identity::MembershipVersion, range::ByteRange},
+    model::{ByteRange, MembershipVersion},
     peer::{
         PeerNetwork,
         requester::PeerTransport,

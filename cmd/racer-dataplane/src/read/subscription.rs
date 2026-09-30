@@ -1,10 +1,7 @@
 //! Compact, bounded node-wide subscription demand and page-credit accounting.
 use crate::{
     error::{Error, Result},
-    model::{
-        identity::{ObjectVersion, PageId, PageNumber},
-        range::{PAGE_BYTES, ResolvedRange},
-    },
+    model::{ObjectVersion, PAGE_BYTES, PageId, PageNumber, ResolvedRange},
 };
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -27,7 +24,7 @@ struct Demand {
 }
 struct State {
     contracts: BTreeMap<
-        (ObjectVersion, u64, crate::model::identity::NodeId),
+        (ObjectVersion, u64, crate::model::NodeId),
         (crate::peer::subscriptions::Subscription, std::time::Instant),
     >,
     selecting: BTreeSet<ObjectVersion>,
@@ -45,8 +42,8 @@ impl Scheduler {
     pub(crate) fn contract(
         &self,
         version: ObjectVersion,
-        membership: crate::model::identity::MembershipVersion,
-        provider: crate::model::identity::NodeId,
+        membership: crate::model::MembershipVersion,
+        provider: crate::model::NodeId,
         demand: crate::peer::subscriptions::Demand,
         deadline: std::time::Instant,
     ) -> Result<(crate::peer::subscriptions::Subscription, std::time::Instant)> {
@@ -645,10 +642,7 @@ impl Credits {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{
-        identity::{CacheId, CacheKey, ObjectId, StrongEtag},
-        range::ByteRange,
-    };
+    use crate::model::{ByteRange, CacheId, CacheKey, ObjectId, StrongEtag};
     fn version() -> ObjectVersion {
         ObjectVersion {
             object: ObjectId {
@@ -838,7 +832,7 @@ mod tests {
     #[test]
     fn production_aggregate_is_compact_exclusive_and_contracts_never_refill() {
         use crate::{
-            model::identity::{MembershipVersion, NodeId},
+            model::{MembershipVersion, NodeId},
             peer::subscriptions::PageInterval,
         };
         let scheduler = Scheduler::new(4);

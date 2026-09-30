@@ -1,6 +1,6 @@
 //! Versioned union of incoming/outgoing (radix*i+j)%N edges, excluding self and duplicates.
 use super::{RoutingAlgorithm, membership::MembershipLease};
-use crate::{error::Result, model::identity::NodeId};
+use crate::{error::Result, model::NodeId};
 pub struct Graph {
     membership: MembershipLease,
     algorithm: RoutingAlgorithm,

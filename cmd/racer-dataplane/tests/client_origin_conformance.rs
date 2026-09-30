@@ -14,12 +14,8 @@ use racer_dataplane::{
     },
     memory::{delivery::Delivery, pipe::PipePool},
     model::{
-        identity::{
-            CacheId, CacheKey, ObjectId, ObjectVersion, PageId, PageNumber, RequestId, StrongEtag,
-        },
-        limits::Limits,
-        metadata::{ExpiresAt, ObjectMetadata},
-        range::ByteRange,
+        ByteRange, CacheId, CacheKey, ExpiresAt, Limits, ObjectId, ObjectMetadata, ObjectVersion,
+        PageId, PageNumber, RequestId, StrongEtag,
     },
     origin::{metadata, page},
     read::serve::ReadResponse,
@@ -290,15 +286,8 @@ fn raw_uds_opaque_values_preserve_every_allowed_byte_and_exact_separator() {
                 .as_ref()
                 .unwrap()
                 .expose_for_origin()
-                .unwrap()
         } else {
-            parsed
-                .origin
-                .metadata
-                .as_ref()
-                .unwrap()
-                .as_header()
-                .unwrap()
+            parsed.origin.metadata.as_ref().unwrap().as_header()
         };
         assert_eq!(actual, value);
         for invalid in [
@@ -970,10 +959,7 @@ fn raw_uds_first_rust_acquisition_failure_returns_complete_503() {
 
 fn raw_uds_acquisition_failure(seed_first: bool) -> Vec<u8> {
     use racer_dataplane::{
-        model::{
-            identity::{MembershipVersion, WorkerId},
-            limits::ResourceClass,
-        },
+        model::{MembershipVersion, ResourceClass, WorkerId},
         read::{dispatch::WorkerDirectory, flight::AcquisitionBudget, range_stream::RangeStreams},
         runtime::worker::WorkerMap,
         topology::membership::Membership,
@@ -1112,10 +1098,7 @@ fn authenticated_first_page(
     use racer_dataplane::{
         control::wire,
         memory::{page::PageResult, pool::BufferPool},
-        model::{
-            identity::{NodeId, WorkerId},
-            limits::ResourceClass,
-        },
+        model::{NodeId, ResourceClass, WorkerId},
         runtime::{
             crypto::{CryptoClient, pair},
             worker::{CryptoRuntime, CryptoService},

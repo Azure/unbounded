@@ -10,12 +10,7 @@ use crate::telemetry::failures::{Detail, Failure, Observer, Stage};
 use crate::{
     error::{Error, Operation, Result},
     memory::delivery::{Delivery, ReaderLease},
-    model::{
-        context::OriginContext,
-        identity::{PageId, PageNumber},
-        metadata::ObjectMetadata,
-        range::ResolvedRange,
-    },
+    model::{ObjectMetadata, OriginContext, PageId, PageNumber, ResolvedRange},
     runtime::deadline::RequestScope,
     topology::membership::MembershipLease,
 };
@@ -744,9 +739,7 @@ fn validate_pin(expected: &ObjectMetadata, actual: &ObjectMetadata) -> Result<()
 mod tests {
     use super::*;
     use crate::model::{
-        identity::{CacheId, CacheKey, ObjectId, ObjectVersion, StrongEtag},
-        metadata::ExpiresAt,
-        range::{ByteRange, PAGE_BYTES},
+        ByteRange, CacheId, CacheKey, ExpiresAt, ObjectId, ObjectVersion, PAGE_BYTES, StrongEtag,
     };
     fn remaining_credits(budget: &RangeBudget) -> (u32, u8) {
         let RangeBudget::Shared(budget) = budget else {
@@ -758,7 +751,7 @@ mod tests {
     fn credit_starved_stream_never_holds_pipe_and_cancel_detaches_demand() {
         use crate::{
             memory::pipe::PipePool,
-            model::identity::{MembershipVersion, RequestId, WorkerId},
+            model::{MembershipVersion, RequestId, WorkerId},
             runtime::{admission::Admission, reactor::Reactor, worker::WorkerMap},
             topology::membership::Membership,
         };
@@ -890,7 +883,7 @@ mod tests {
     fn pending_client_window_never_restarts_failed_pages_and_honors_original_deadline() {
         use crate::{
             memory::pipe::PipePool,
-            model::identity::{MembershipVersion, RequestId, WorkerId},
+            model::{MembershipVersion, RequestId, WorkerId},
             runtime::{admission::Admission, reactor::Reactor, worker::WorkerMap},
             topology::membership::Membership,
         };
@@ -1146,11 +1139,7 @@ mod tests {
                 pipe::PipePool,
                 pool::{CiphertextBytes, CiphertextPage, VerifiedBytes, VerifiedPage},
             },
-            model::{
-                envelope::{KeyId, Nonce, PageEnvelope},
-                identity::{RequestId, WorkerId},
-                limits::ResourceClass,
-            },
+            model::{KeyId, Nonce, PageEnvelope, RequestId, ResourceClass, WorkerId},
             read::serve::ReadResponse,
             runtime::{admission::Admission, reactor::Reactor, worker::WorkerMap},
             topology::membership::Membership,
@@ -1211,9 +1200,8 @@ mod tests {
                     },
             )
             .unwrap();
-            let membership = Arc::new(
-                Membership::validate(crate::model::identity::MembershipVersion(1), vec![]).unwrap(),
-            );
+            let membership =
+                Arc::new(Membership::validate(crate::model::MembershipVersion(1), vec![]).unwrap());
             let mut ready = VecDeque::new();
             for number in 1..=4 {
                 let length = if number == 4 { 17 } else { PAGE_BYTES as usize };

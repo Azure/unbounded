@@ -1,5 +1,5 @@
 use super::membership::{Member, Membership, MembershipLease};
-use crate::model::identity::*;
+use crate::model::*;
 use std::{num::NonZeroU32, sync::Arc};
 
 // Independent Python hashlib + outgoing-edge BFS vectors. N=1500, source=0,

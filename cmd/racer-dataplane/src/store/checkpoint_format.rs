@@ -21,11 +21,8 @@ use crate::runtime::collections::{HashMap, HashSet};
 use crate::{
     error::{Error, Result},
     model::{
-        envelope::KeyId,
-        identity::{
-            CacheId, CacheKey, ObjectId, ObjectVersion, PageId, PageNumber, StrongEtag, WorkerId,
-        },
-        metadata::VersionMetadata,
+        CacheId, CacheKey, KeyId, ObjectId, ObjectVersion, PageId, PageNumber, StrongEtag,
+        VersionMetadata, WorkerId,
     },
 };
 use sha2::{Digest, Sha256};
@@ -58,13 +55,13 @@ impl CheckpointGeometry {
             .alignment()?
             .extent(
                 0,
-                crate::model::range::PAGE_BYTES as usize + 16 + super::format::MAX_HEADER_BYTES,
+                crate::model::PAGE_BYTES as usize + 16 + super::format::MAX_HEADER_BYTES,
             )?
             .length() as u64;
         let pages = self.segment_bytes / record;
         let usable = self.segment_count.saturating_sub(reserve as u64);
         Ok((
-            (usable * pages).min(page_entries as u64) * crate::model::range::PAGE_BYTES,
+            (usable * pages).min(page_entries as u64) * crate::model::PAGE_BYTES,
             usable * (self.segment_bytes - pages * record),
         ))
     }
@@ -537,10 +534,7 @@ impl<'a> Decoder<'a> {
             if value.is_empty() {
                 None
             } else {
-                Some(
-                    crate::model::metadata::ContentType::parse(value)
-                        .map_err(|_| Error::CorruptRecord)?,
-                )
+                Some(crate::model::ContentType::parse(value).map_err(|_| Error::CorruptRecord)?)
             }
         } else {
             None

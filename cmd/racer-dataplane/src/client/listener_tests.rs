@@ -4,7 +4,7 @@ use std::time::Instant;
 
 #[test]
 fn local_and_distributed_installs_drain_responses_and_retire_idle_generations() {
-    use crate::{model::identity::WorkerId, runtime::ingress::Ingress, test_support::WakeCounter};
+    use crate::{model::WorkerId, runtime::ingress::Ingress, test_support::WakeCounter};
     use std::task::Waker;
 
     for distributed in [false, true] {
@@ -85,7 +85,7 @@ fn local_and_distributed_installs_drain_responses_and_retire_idle_generations() 
 #[test]
 fn queued_handoffs_reject_retired_generations_and_stopped_receivers() {
     use crate::{
-        model::{identity::WorkerId, limits::ResourceClass},
+        model::{ResourceClass, WorkerId},
         runtime::ingress::Ingress,
     };
 
@@ -204,11 +204,7 @@ use crate::{
     client::request::ClientRequest,
     http::codec::Codec,
     memory::{delivery::Delivery, pipe::PipePool},
-    model::{
-        identity::{ObjectVersion, StrongEtag},
-        limits::Limits,
-        metadata::{ExpiresAt, ObjectMetadata},
-    },
+    model::{ExpiresAt, Limits, ObjectMetadata, ObjectVersion, StrongEtag},
     read::serve::ReadResponse,
     runtime::reactor::Reactor,
 };
@@ -310,7 +306,7 @@ struct Fixture {
 }
 impl Fixture {
     fn install_handoff(&self, ingress: &crate::runtime::ingress::Ingress) {
-        use crate::{model::identity::WorkerId, runtime::ingress::Kind};
+        use crate::{model::WorkerId, runtime::ingress::Kind};
         let [accepted] = ingress
             .pop_batch::<1>(WorkerId(1), futures::task::noop_waker_ref(), 1)
             .unwrap();
@@ -931,10 +927,8 @@ impl ReadService for Bodies {
                     pool::{CiphertextBytes, CiphertextPage, VerifiedBytes, VerifiedPage},
                 },
                 model::{
-                    envelope::{KeyId, Nonce, PageEnvelope},
-                    identity::{MembershipVersion, PageId, PageNumber},
-                    limits::ResourceClass,
-                    range::{ByteRange, PAGE_BYTES},
+                    ByteRange, KeyId, MembershipVersion, Nonce, PAGE_BYTES, PageEnvelope, PageId,
+                    PageNumber, ResourceClass,
                 },
                 topology::membership::Membership,
             };
@@ -1033,7 +1027,7 @@ impl ReadService for Bodies {
 #[test]
 fn actual_uds_nonempty_range_and_late_failure_truncates() {
     use crate::{
-        model::identity::WorkerId,
+        model::WorkerId,
         read::{dispatch::WorkerDirectory, range_stream::RangeStreams},
         runtime::worker::WorkerMap,
     };
@@ -1171,7 +1165,7 @@ fn actual_uds_nonempty_range_and_late_failure_truncates() {
 
 #[test]
 fn subscription_retains_delivered_page_until_release_and_rejects_invalid_releases() {
-    use crate::model::limits::ResourceClass;
+    use crate::model::ResourceClass;
     for release in [Some((0u64, 2u32)), Some((0, 1)), Some((1, 2)), None] {
         let (fixture, pipes) = body_fixture_with_large_page(4, false, true);
         let mut socket = fixture.connect();
@@ -1202,7 +1196,7 @@ fn subscription_retains_delivered_page_until_release_and_rejects_invalid_release
         assert_eq!(fixture.listeners.active_connections(), 1);
         assert_eq!(
             fixture.listeners.admission.used(ResourceClass::Plaintext),
-            crate::model::range::PAGE_BYTES as usize
+            crate::model::PAGE_BYTES as usize
         );
         let Some(release) = release else {
             drop(socket);
@@ -1239,7 +1233,7 @@ fn body_fixture_with_large_page(
     large_page: bool,
 ) -> (Fixture, Rc<PipePool>) {
     use crate::{
-        model::identity::WorkerId,
+        model::WorkerId,
         read::{dispatch::WorkerDirectory, range_stream::RangeStreams},
         runtime::worker::WorkerMap,
     };
@@ -1295,7 +1289,7 @@ fn assert_no_head(socket: &mut UnixStream) {
 }
 
 fn assert_no_body_leases(fixture: &Fixture) {
-    use crate::model::limits::ResourceClass;
+    use crate::model::ResourceClass;
     assert_eq!(fixture.listeners.active_connections(), 0);
     for class in [
         ResourceClass::Pipe,
@@ -1309,7 +1303,7 @@ fn assert_no_body_leases(fixture: &Fixture) {
 
 fn assert_only_idle_pipes(fixture: &Fixture, pipes: &crate::memory::pipe::PipePool) {
     fixture.listeners.admission.reclaim_buffers();
-    use crate::model::limits::ResourceClass;
+    use crate::model::ResourceClass;
     assert_eq!(fixture.listeners.active_connections(), 0);
     assert_eq!(
         fixture.listeners.admission.used(ResourceClass::Pipe),
@@ -1389,7 +1383,7 @@ fn configured_timeout_is_not_renewed_by_response_or_stream_progress() {
     output.extend(fixture.receive(&mut socket, true));
     assert_eq!(
         output.len() - head_end,
-        crate::model::range::PAGE_BYTES as usize + 42
+        crate::model::PAGE_BYTES as usize + 42
     );
     assert!(
         output[head_end + 21..output.len() - 21]
@@ -1438,7 +1432,7 @@ fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
             fixture.listeners.io.clone(),
             Rc::new(Delivery::new(pipes.clone(), Duration::from_secs(2))),
         )
-        .with_observer(failures.observer(crate::model::identity::WorkerId(0))),
+        .with_observer(failures.observer(crate::model::WorkerId(0))),
     );
     let held = pipes.acquire().unwrap();
     let mut first = start_body(&fixture);
@@ -1474,7 +1468,7 @@ fn actual_uds_first_page_failure_is_complete_503() {
     let delivery = Rc::new(Delivery::new(_pipes.clone(), Duration::from_secs(2)));
     fixture.listeners.responses = Rc::new(
         Responses::new(fixture.listeners.io.clone(), delivery)
-            .with_observer(failures.observer(crate::model::identity::WorkerId(0))),
+            .with_observer(failures.observer(crate::model::WorkerId(0))),
     );
     // No owner is installed for the unseeded first page.
     let mut socket = start_body(&fixture);

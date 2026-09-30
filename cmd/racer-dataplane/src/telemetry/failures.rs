@@ -3,10 +3,7 @@
 //! this ring. Object keys, ETags, headers, credentials, and payloads never enter it.
 use crate::{
     error::{Error, Result},
-    model::{
-        identity::{AttemptId, RequestId, WorkerId},
-        limits::ResourceClass,
-    },
+    model::{AttemptId, RequestId, ResourceClass, WorkerId},
     runtime::deadline::RequestScope,
 };
 use std::sync::{Arc, Mutex};

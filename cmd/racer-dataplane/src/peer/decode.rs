@@ -5,11 +5,8 @@ use crate::{
     http::codec::MessageHead,
     memory::pool::BufferPool,
     model::{
-        context::{EncryptedAuthorization, OpaqueMetadata, PeerOriginContext},
-        envelope::{KeyId, Nonce, PageEnvelope},
-        identity::*,
-        limits::ResourceClass,
-        metadata::{ExpiresAt, MetadataSelector, ObjectMetadata},
+        EncryptedAuthorization, ExpiresAt, KeyId, MetadataSelector, Nonce, ObjectMetadata,
+        OpaqueMetadata, PageEnvelope, PeerOriginContext, ResourceClass, *,
     },
     runtime::{admission::Admission, deadline::RequestScope},
     security::{forwarding::ForwardedHead, protocol as p},
@@ -114,7 +111,7 @@ fn metadata(head: &MessageHead) -> Result<ObjectMetadata> {
             }
             None
         }
-        Some(b"2") => Some(crate::model::metadata::ContentType::parse(
+        Some(b"2") => Some(crate::model::ContentType::parse(
             head.unique("racer-content-type")?
                 .ok_or(Error::InvalidRequest)?,
         )?),
@@ -252,10 +249,8 @@ mod metadata_tests {
         let path = [NodeId(crate::security::identity::tests::NODE.into())];
         for typed in [false, true] {
             if typed {
-                m.content_type = Some(
-                    crate::model::metadata::ContentType::parse(b"text/plain; charset=utf-8")
-                        .unwrap(),
-                );
+                m.content_type =
+                    Some(crate::model::ContentType::parse(b"text/plain; charset=utf-8").unwrap());
             }
             let head =
                 p::response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path).unwrap();

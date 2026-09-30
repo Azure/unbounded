@@ -338,8 +338,7 @@ fn select(
         if ids.len() != image.shards.len() || ids != geometry.keys().copied().collect() {
             return None;
         }
-        let available =
-            |cache: &crate::model::identity::CacheId| caches.iter().any(|c| &c.id == cache);
+        let available = |cache: &crate::model::CacheId| caches.iter().any(|c| &c.id == cache);
         Recovery::filter_available(
             &mut image,
             |cache| available(cache) && keys.active(cache, KeyPurpose::Page).is_ok(),
@@ -385,7 +384,7 @@ mod tests {
     }
     fn caches() -> Vec<crate::control::caches::CacheDefinition> {
         let mut cache = super::super::integration_tests::definition();
-        cache.id = crate::model::identity::CacheId(crate::security::identity::tests::CACHE.into());
+        cache.id = crate::model::CacheId(crate::security::identity::tests::CACHE.into());
         vec![cache]
     }
     fn image(sequence: u64, ids: &[WorkerId]) -> CheckpointImage {
@@ -437,9 +436,9 @@ mod tests {
             1
         );
         let mut oversized = image(3, &[WorkerId(0), WorkerId(1)]);
-        let object = crate::model::identity::ObjectId {
-            cache: crate::model::identity::CacheId(crate::security::identity::tests::CACHE.into()),
-            key: crate::model::identity::CacheKey([9; 32]),
+        let object = crate::model::ObjectId {
+            cache: crate::model::CacheId(crate::security::identity::tests::CACHE.into()),
+            key: crate::model::CacheKey([9; 32]),
         };
         let owner = node.workers.metadata_owner(&object).unwrap();
         let shard = oversized
@@ -448,17 +447,14 @@ mod tests {
             .find(|s| s.worker == owner)
             .unwrap();
         for version in 0..5 {
-            shard
-                .index
-                .metadata
-                .push(crate::model::metadata::VersionMetadata {
-                    content_type: None,
-                    version: crate::model::identity::ObjectVersion {
-                        object: object.clone(),
-                        etag: crate::model::identity::StrongEtag::test_value(&version.to_string()),
-                    },
-                    length: 0,
-                });
+            shard.index.metadata.push(crate::model::VersionMetadata {
+                content_type: None,
+                version: crate::model::ObjectVersion {
+                    object: object.clone(),
+                    etag: crate::model::StrongEtag::test_value(&version.to_string()),
+                },
+                length: 0,
+            });
         }
         assert_eq!(
             select(
@@ -488,7 +484,7 @@ mod tests {
     #[test]
     fn old_checkpoints_filter_removed_uids_unavailable_keys_and_standalone_metadata_before_install()
     {
-        use crate::model::{identity::*, metadata::VersionMetadata};
+        use crate::model::{VersionMetadata, *};
         use crate::store::{
             checkpoint_format::CheckpointCodec,
             index::{IndexedPage, RecordLocation},
@@ -534,7 +530,7 @@ mod tests {
                     location: append.location,
                 },
                 metadata: metadata.clone(),
-                key_id: crate::model::envelope::KeyId([1; 16]),
+                key_id: crate::model::KeyId([1; 16]),
             },
         ));
         drop(append);
@@ -569,7 +565,7 @@ mod tests {
         assert_eq!(retained.shards[0].index.entries.len(), 1);
         assert_eq!(retained.shards[0].index.metadata, vec![standalone]);
         let mut missing_page = decoded();
-        missing_page.shards[0].index.entries[0].1.key_id = crate::model::envelope::KeyId([99; 16]);
+        missing_page.shards[0].index.entries[0].1.key_id = crate::model::KeyId([99; 16]);
         let filtered = select(
             vec![missing_page],
             &geometry,
@@ -620,8 +616,7 @@ mod tests {
     #[test]
     fn ownership_and_capacity_are_checked_on_every_worker() {
         use crate::model::{
-            identity::{CacheId, CacheKey, ObjectId, ObjectVersion, StrongEtag},
-            metadata::VersionMetadata,
+            CacheId, CacheKey, ObjectId, ObjectVersion, StrongEtag, VersionMetadata,
         };
         let node = NodeState::default();
         let keys = crate::security::keyring::tests::keys();

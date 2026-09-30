@@ -10,12 +10,8 @@ use crate::{
         pool::{BufferPool, VerifiedBytes, VerifiedPage},
     },
     model::{
-        context::OriginContext,
-        envelope::{KeyId, Nonce, PageEnvelope},
-        identity::{
-            CacheKey, ObjectId, ObjectVersion, PageId, PageNumber, RequestId, StrongEtag, WorkerId,
-        },
-        metadata::{MetadataSelector, VersionMetadata},
+        CacheKey, KeyId, MetadataSelector, Nonce, ObjectId, ObjectVersion, OriginContext,
+        PageEnvelope, PageId, PageNumber, RequestId, StrongEtag, VersionMetadata, WorkerId,
     },
     origin::{client::Origin, metadata::MetadataReply, page::OriginPage},
     peer::{
@@ -531,10 +527,10 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
     let client = Rc::new(CryptoClient::new(port));
     let mut engine = PageCryptoEngine::new(CryptoRuntime { port: engine_port });
     let peers = Rc::new(NoTransport);
-    let node = crate::model::identity::NodeId(crate::security::identity::tests::NODE.into());
+    let node = crate::model::NodeId(crate::security::identity::tests::NODE.into());
     let membership = Arc::new(
         Membership::validate(
-            crate::model::identity::MembershipVersion(1),
+            crate::model::MembershipVersion(1),
             vec![Member {
                 node: node.clone(),
                 shares: NonZeroU32::new(1).unwrap(),

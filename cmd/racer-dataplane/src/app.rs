@@ -26,10 +26,7 @@ use crate::{
     error::{Error, Operation, Result},
     http::{io::HttpIo, pool::HttpPool},
     memory::{cache::MemoryCache, delivery::Delivery, pipe::PipePool, pool::BufferPool},
-    model::{
-        identity::{NodeId, RequestId, WorkerId},
-        limits::Limits,
-    },
+    model::{Limits, NodeId, RequestId, WorkerId},
     origin::client::{Origin, OriginClient},
     peer::{relay::Relay, requester::Requester, server::PeerServer, transfer::Transfers},
     rdma::{
@@ -264,7 +261,7 @@ fn partition_limits_with_cause(
         limits.registered_bytes = NonZeroUsize::new(node.registered_bytes.get() / workers)
             .ok_or_else(|| invalid("registered_bytes"))?;
     }
-    let page = crate::model::range::PAGE_BYTES as usize;
+    let page = crate::model::PAGE_BYTES as usize;
     let window = limits.range_window_pages.get();
     for (dimension, insufficient) in [
         (
@@ -301,7 +298,7 @@ fn partition_limits_with_cause(
     // The same partition also funds outbound progress. Per-neighbor concurrency
     // is a ceiling, not a promise of that many shared outbound slots.
     let admission = Admission::new(limits.clone());
-    if admission.limit(crate::model::limits::ResourceClass::ControlConnection) < 3 {
+    if admission.limit(crate::model::ResourceClass::ControlConnection) < 3 {
         return Err(invalid("control_connections"));
     }
     Ok(limits)
@@ -660,7 +657,7 @@ impl WorkerApplication {
             reactor.clone(),
             crate::http::codec::Codec::new(
                 crate::peer::wire::MAX_ENVELOPE_HEAD,
-                crate::model::range::PAGE_BYTES + 16,
+                crate::model::PAGE_BYTES + 16,
             ),
             admission.clone(),
         ));
@@ -768,7 +765,7 @@ impl WorkerApplication {
                 let memory = memory.clone();
                 let writer = writer.clone();
                 move |cache, amount| {
-                    let class = crate::model::limits::ResourceClass::Ciphertext;
+                    let class = crate::model::ResourceClass::Ciphertext;
                     for _ in 0..2 {
                         let Some((owner, bytes)) = admission.reclamation(cache, class, amount)
                         else {
@@ -1676,7 +1673,7 @@ pub(crate) mod tests {
     #[test]
     fn worker_sizing_funds_derived_connection_pools() {
         use crate::{
-            model::limits::ResourceClass,
+            model::ResourceClass,
             runtime::affinity::{CpuLocation, EffectiveTopology},
         };
         let config = Config::from_lookup_with_fabric_ports(|name| {
@@ -1985,7 +1982,7 @@ pub(crate) mod tests {
 
     #[test]
     fn multiworker_memberships_retire_after_request_leases_and_reuse_capacity() {
-        use crate::{model::identity::MembershipVersion, peer::PeerNetwork};
+        use crate::{model::MembershipVersion, peer::PeerNetwork};
         let mut publication = crate::control::wire::decode_publication(include_bytes!(
             "control/testdata/publication.json"
         ))

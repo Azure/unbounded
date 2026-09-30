@@ -11,7 +11,7 @@ mod sdk_connection_age;
 #[path = "process/throughput.rs"]
 mod throughput;
 
-use racer_dataplane::{model::range::PAGE_BYTES, store::checkpoint_format::CheckpointCodec};
+use racer_dataplane::{model::PAGE_BYTES, store::checkpoint_format::CheckpointCodec};
 use std::{
     collections::BTreeMap,
     ffi::CString,
@@ -483,7 +483,7 @@ fn enrolled_identity(
 ) -> racer_dataplane::control::enrollment::LocalSigningIdentity {
     use racer_dataplane::{
         control::{enrollment::Enrollment, wire},
-        model::identity::ClusterId,
+        model::ClusterId,
     };
     assert_eq!(
         control.enrollments.load(Ordering::Acquire),

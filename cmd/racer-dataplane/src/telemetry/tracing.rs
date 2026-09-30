@@ -1,7 +1,7 @@
 //! Structured request correlation with no arbitrary fields or header logging.
 use crate::{
     error::{Error, Result},
-    model::identity::{AttemptId, RequestId},
+    model::{AttemptId, RequestId},
 };
 use std::sync::{Arc, Mutex};
 pub const TRACE_CAPACITY: usize = 128;

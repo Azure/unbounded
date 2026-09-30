@@ -41,7 +41,7 @@ pub(crate) fn retry<'a, T: 'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{model::identity::RequestId, runtime::environment::SimulationClock};
+    use crate::{model::RequestId, runtime::environment::SimulationClock};
     use std::{
         cell::Cell,
         sync::{

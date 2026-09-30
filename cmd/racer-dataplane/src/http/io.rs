@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{
     error::{Error, Operation, Result},
-    model::limits::ResourceClass,
+    model::ResourceClass,
     runtime::{
         admission::{Admission, Reservation},
         deadline::RequestScope,
@@ -196,7 +196,7 @@ impl HttpIo {
                     .header_bytes
                     .get()
                     .min(super::codec::MAX_HEAD_BYTES),
-                crate::model::range::PAGE_BYTES + 16,
+                crate::model::PAGE_BYTES + 16,
             ),
             admission,
         );
@@ -838,7 +838,7 @@ mod tests {
             codec::{Codec, Header},
             pool::{Endpoint, HttpPool},
         },
-        model::identity::RequestId,
+        model::RequestId,
     };
     use std::{
         future::Future,
@@ -918,7 +918,7 @@ mod tests {
         peer.write_all(b"GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .unwrap();
         let received = drive(&reactor, io.receive_head(connection, &scope)).unwrap();
-        let length = 2 * crate::model::range::PAGE_BYTES as usize + 113;
+        let length = 2 * crate::model::PAGE_BYTES as usize + 113;
         let thread = std::thread::spawn(move || {
             peer.set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
@@ -989,7 +989,7 @@ mod tests {
     #[test]
     fn client_send_limit_does_not_relax_receive_or_page_transport_limits() {
         let (admission, reactor, _, scope) = setup();
-        let page_limit = crate::model::range::PAGE_BYTES + 16;
+        let page_limit = crate::model::PAGE_BYTES + 16;
         let page_io = HttpIo::with_admission(
             reactor.clone(),
             Codec::new(4096, page_limit),

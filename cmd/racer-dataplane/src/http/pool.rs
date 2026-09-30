@@ -3,7 +3,7 @@ use super::io::OwnedBuffer;
 use crate::runtime::reactor::Descriptor as OwnedFd;
 use crate::{
     error::{Error, Operation, Result},
-    model::limits::ResourceClass,
+    model::ResourceClass,
     runtime::{
         admission::{Admission, ConnectionReservation, Reservation},
         deadline::RequestScope,
@@ -26,7 +26,7 @@ pub enum Endpoint {
     Unix(PathBuf),
     /// Cache incarnation is pool identity; the name-derived path is only a dial address.
     Origin {
-        cache: crate::model::identity::CacheId,
+        cache: crate::model::CacheId,
         path: PathBuf,
     },
     /// Numeric IP:port only. DNS resolution is deliberately not performed on an
@@ -673,7 +673,7 @@ fn create_socket(endpoint: &Endpoint) -> Result<(OwnedFd, crate::runtime::reacto
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{model::identity::RequestId, test_support::WakeCounter};
+    use crate::{model::RequestId, test_support::WakeCounter};
     use std::{os::unix::net::UnixStream, sync::Arc, task::Context};
 
     fn scope() -> RequestScope {
@@ -987,7 +987,7 @@ mod tests {
         let (admission, _, mut pool) = setup();
         pool.max_endpoints = 1;
         let origin = |uid: usize| Endpoint::Origin {
-            cache: crate::model::identity::CacheId(format!("cache-{uid}")),
+            cache: crate::model::CacheId(format!("cache-{uid}")),
             path: "/unused/origin".into(),
         };
         let (first, _peer) = held(&pool, &origin(0));
@@ -1015,7 +1015,7 @@ mod tests {
     fn origin_cap_is_independent_of_peer_cap_and_idle_quota_is_reclaimed() {
         let (admission, _, pool) = setup();
         let origin = Endpoint::Origin {
-            cache: crate::model::identity::CacheId("cache".into()),
+            cache: crate::model::CacheId("cache".into()),
             path: "/unused/origin".into(),
         };
         let (first, _a) = held(&pool, &origin);
@@ -1049,7 +1049,7 @@ mod tests {
     fn metadata_bypasses_queued_pages_within_existing_origin_cap() {
         let (admission, _, pool) = setup();
         let endpoint = Endpoint::Origin {
-            cache: crate::model::identity::CacheId("cache".into()),
+            cache: crate::model::CacheId("cache".into()),
             path: "/unused/origin".into(),
         };
         let (first, _a) = held(&pool, &endpoint);
@@ -1120,7 +1120,7 @@ mod tests {
     #[test]
     fn opaque_staging_and_connection_reservations_survive_reactor_abandonment() {
         use super::super::io::OwnedBuffer;
-        use crate::model::identity::RequestId;
+        use crate::model::RequestId;
         use std::task::{Context, Poll};
         let admission = Rc::new(Admission::new(
             crate::test_support::cluster::config(false).limits,

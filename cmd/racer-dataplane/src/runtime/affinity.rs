@@ -10,7 +10,7 @@
 use crate::{
     config::Config,
     error::{Error, Result},
-    model::identity::WorkerId,
+    model::WorkerId,
     topology::rails::RailMapping,
 };
 use std::{

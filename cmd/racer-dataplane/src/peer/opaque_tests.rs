@@ -5,10 +5,7 @@ use crate::{
         io::{BufferRange, HttpIo},
         pool::{ConnectionLease, HttpPool},
     },
-    model::{
-        envelope::PageEnvelope,
-        metadata::{ExpiresAt, ObjectMetadata},
-    },
+    model::{ExpiresAt, ObjectMetadata, PageEnvelope},
     runtime::reactor::{IoBuffer, Reactor},
     security::connection,
     topology::{
@@ -92,10 +89,7 @@ fn exchange(
         .map(|(r, a)| {
             Rc::new(HttpIo::with_admission(
                 r.clone(),
-                Codec::new(
-                    wire::MAX_ENVELOPE_HEAD,
-                    crate::model::range::PAGE_BYTES + 16,
-                ),
+                Codec::new(wire::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
                 a.clone(),
             ))
         })
@@ -168,7 +162,7 @@ fn exchange(
     .with_opaque_relay(!materialized);
     let scope =
         RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(25)).unwrap();
-    let plaintext: Vec<_> = (0..crate::model::range::PAGE_BYTES as usize)
+    let plaintext: Vec<_> = (0..crate::model::PAGE_BYTES as usize)
         .map(|i| (i % 251) as u8)
         .collect();
     let cipher = XChaCha20Poly1305::new((&[7; 32]).into());
@@ -261,11 +255,9 @@ fn exchange(
             }
             if fragmented {
                 let head = conn.session.as_mut().unwrap().sign(head)?;
-                let mut encoded = Codec::new(
-                    wire::MAX_ENVELOPE_HEAD,
-                    crate::model::range::PAGE_BYTES + 16,
-                )
-                .encode_head(&head)?;
+                let mut encoded =
+                    Codec::new(wire::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16)
+                        .encode_head(&head)?;
                 encoded.extend_from_slice(&body[..173]);
                 for chunk in encoded.chunks(997) {
                     let mut buffer = ios[2].buffer(chunk.len())?;
@@ -469,7 +461,7 @@ fn opaque_relay_benchmark() {
 fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution() {
     use crate::security::{forwarding::ForwardedHead, protocol};
     fn copy(head: &crate::http::codec::MessageHead) -> crate::http::codec::MessageHead {
-        let codec = Codec::new(wire::MAX_SIGNED_HEAD, crate::model::range::PAGE_BYTES + 16);
+        let codec = Codec::new(wire::MAX_SIGNED_HEAD, crate::model::PAGE_BYTES + 16);
         let mut head = codec
             .decode_head(&codec.encode_head(head).unwrap())
             .unwrap()

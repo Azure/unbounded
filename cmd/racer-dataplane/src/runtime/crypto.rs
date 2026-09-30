@@ -34,7 +34,7 @@ use super::{
 use crate::{
     error::{Error, Operation, Result},
     memory::pool::{CiphertextPage, PlaintextBuffer, VerifiedPage},
-    model::identity::{PageId, WorkerId},
+    model::{PageId, WorkerId},
     security::keyring::KeyLease,
 };
 use std::{
@@ -826,12 +826,11 @@ mod tests {
                 let metrics = Metrics::default();
                 client.set_metrics(metrics.clone());
                 let scope = RequestScope::new(
-                    crate::model::identity::RequestId([0; 16]),
+                    crate::model::RequestId([0; 16]),
                     environment::now() + Duration::from_secs(10),
                 )
                 .unwrap();
-                let cache =
-                    crate::model::identity::CacheId("00000000-0000-4000-8000-000000000003".into());
+                let cache = crate::model::CacheId("00000000-0000-4000-8000-000000000003".into());
                 let lease = || {
                     keys.active(&cache, crate::security::keyring::KeyPurpose::Page)
                         .unwrap()
@@ -868,11 +867,7 @@ mod tests {
                     data = CryptoInput::Decrypt {
                         ciphertext,
                         plaintext: admission
-                            .reserve(
-                                Some(&cache),
-                                crate::model::limits::ResourceClass::Plaintext,
-                                1,
-                            )
+                            .reserve(Some(&cache), crate::model::ResourceClass::Plaintext, 1)
                             .unwrap(),
                     };
                 } else if mode == "failure" {
@@ -977,7 +972,7 @@ mod tests {
             crate::test_support::cluster::config(false).limits,
         ));
         let keys = keyring();
-        let cache = crate::model::identity::CacheId("00000000-0000-4000-8000-000000000003".into());
+        let cache = crate::model::CacheId("00000000-0000-4000-8000-000000000003".into());
         let lease = || {
             keys.active(&cache, crate::security::keyring::KeyPurpose::Page)
                 .unwrap()
@@ -1015,7 +1010,7 @@ mod tests {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             let scopes = [0, 1].map(|id| {
                 RequestScope::new(
-                    crate::model::identity::RequestId([id; 16]),
+                    crate::model::RequestId([id; 16]),
                     environment::now() + Duration::from_secs(10),
                 )
                 .unwrap()
@@ -1050,11 +1045,7 @@ mod tests {
                     CryptoInput::Decrypt {
                         ciphertext,
                         plaintext: admission
-                            .reserve(
-                                Some(&cache),
-                                crate::model::limits::ResourceClass::Plaintext,
-                                1,
-                            )
+                            .reserve(Some(&cache), crate::model::ResourceClass::Plaintext, 1)
                             .unwrap(),
                     }
                 } else {
@@ -1207,7 +1198,7 @@ mod tests {
     fn input(admission: &std::rc::Rc<crate::runtime::admission::Admission>) -> CryptoInput {
         use crate::{
             memory::pool::BufferPool,
-            model::{identity::*, limits::ResourceClass},
+            model::{ResourceClass, *},
         };
         let cache = CacheId("00000000-0000-4000-8000-000000000003".into());
         CryptoInput::Encrypt {
@@ -1238,7 +1229,7 @@ mod tests {
     #[test]
     fn engine_loss_reclaims_queued_owners_and_unblocks_drain() {
         use crate::{
-            model::{identity::RequestId, limits::ResourceClass},
+            model::{RequestId, ResourceClass},
             runtime::admission::Admission,
         };
         let admission = std::rc::Rc::new(Admission::new(
@@ -1265,7 +1256,7 @@ mod tests {
     #[test]
     fn accepted_cancellation_cannot_return_before_completion_consumption() {
         use crate::{
-            model::{identity::RequestId, limits::ResourceClass},
+            model::{RequestId, ResourceClass},
             runtime::admission::Admission,
         };
         let admission = std::rc::Rc::new(Admission::new(
@@ -1310,7 +1301,7 @@ mod tests {
     #[test]
     fn accepted_cancellation_waits_for_consumed_completion_not_notification() {
         use crate::{
-            model::{identity::RequestId, limits::ResourceClass},
+            model::{RequestId, ResourceClass},
             runtime::admission::Admission,
         };
         let admission = std::rc::Rc::new(Admission::new(
@@ -1371,7 +1362,7 @@ mod tests {
 
     #[test]
     fn accepted_deadline_expiry_waits_for_engine_completion() {
-        use crate::{model::identity::RequestId, runtime::admission::Admission};
+        use crate::{model::RequestId, runtime::admission::Admission};
         let admission = std::rc::Rc::new(Admission::new(
             crate::test_support::cluster::config(false).limits,
         ));
@@ -1404,7 +1395,7 @@ mod tests {
 
     #[test]
     fn abandoned_task_cannot_replace_worker_completion_wake() {
-        use crate::{model::identity::RequestId, runtime::admission::Admission};
+        use crate::{model::RequestId, runtime::admission::Admission};
         struct Count(AtomicUsize);
         impl std::task::Wake for Count {
             fn wake(self: Arc<Self>) {
@@ -1457,7 +1448,7 @@ mod tests {
 
     #[test]
     fn drain_scope_cancellation_wakes_even_with_unconsumed_result() {
-        use crate::{model::identity::RequestId, runtime::admission::Admission};
+        use crate::{model::RequestId, runtime::admission::Admission};
         struct Count(AtomicUsize);
         impl std::task::Wake for Count {
             fn wake(self: Arc<Self>) {
@@ -1590,7 +1581,7 @@ mod tests {
     pub(super) fn key() -> KeyLease {
         keyring()
             .active(
-                &crate::model::identity::CacheId("00000000-0000-4000-8000-000000000003".into()),
+                &crate::model::CacheId("00000000-0000-4000-8000-000000000003".into()),
                 crate::security::keyring::KeyPurpose::Page,
             )
             .unwrap()
@@ -1599,8 +1590,8 @@ mod tests {
     pub(super) fn keyring() -> crate::security::keyring::Keyring {
         use crate::{
             control::wire::*,
-            model::envelope::KeyId,
-            model::identity::{CacheId, ClusterId, NodeId},
+            model::KeyId,
+            model::{CacheId, ClusterId, NodeId},
             security::keyring::{KeyEpochs, Keyring},
         };
         let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
@@ -1636,7 +1627,7 @@ mod tests {
     fn abandoned_future_retains_buffers_key_and_permit_until_reaped() {
         use crate::{
             memory::pool::BufferPool,
-            model::{identity::*, limits::ResourceClass},
+            model::{ResourceClass, *},
             runtime::admission::Admission,
         };
         use std::{
@@ -1730,7 +1721,7 @@ mod tests {
     fn engine_drop_reclaims_queued_jobs_and_drain_finishes() {
         use crate::{
             memory::pool::BufferPool,
-            model::{identity::*, limits::ResourceClass},
+            model::{ResourceClass, *},
             runtime::admission::Admission,
         };
         use std::{
@@ -1793,7 +1784,7 @@ mod tests {
     fn original_scope_failure_is_returned_without_submission() {
         use crate::{
             memory::pool::BufferPool,
-            model::{identity::*, limits::ResourceClass},
+            model::{ResourceClass, *},
             runtime::admission::Admission,
         };
         use std::{rc::Rc, time::Instant};

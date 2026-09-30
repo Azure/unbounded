@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     error::{Error, Result},
-    model::identity::{ClusterId, MembershipVersion},
+    model::{ClusterId, MembershipVersion},
     topology::membership::{Membership, MembershipLease},
 };
 use sha2::{Digest, Sha256};
@@ -442,8 +442,7 @@ mod tests {
         let first = store.publish(publication(1)).unwrap();
         assert!(Arc::ptr_eq(&first, &store.publish(publication(1)).unwrap()));
         let mut changed = publication(1);
-        changed.caches[0].id =
-            crate::model::identity::CacheId("66666666-6666-4666-8666-666666666666".into());
+        changed.caches[0].id = crate::model::CacheId("66666666-6666-4666-8666-666666666666".into());
         assert!(matches!(store.publish(changed), Err(Error::Replay)));
         let mut next = publication(2);
         next.membership_version.0 = 2;

@@ -13,7 +13,7 @@ pub mod wire;
 
 use crate::{
     error::{Error, Result},
-    model::identity::{MembershipVersion, NodeId},
+    model::{MembershipVersion, NodeId},
     topology::membership::MembershipLease,
 };
 use std::sync::Arc;

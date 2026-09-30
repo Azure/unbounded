@@ -3,7 +3,7 @@
 use super::*;
 use crate::{
     control::{caches::CacheDefinition, wire},
-    model::{envelope::KeyId, identity::*, limits::ResourceClass, range::PAGE_BYTES},
+    model::{KeyId, PAGE_BYTES, ResourceClass, *},
     runtime::{
         environment::SimulationClock,
         reactor::{
@@ -2674,7 +2674,7 @@ fn dst_coverage_policy_and_aggregation() {
 
 #[test]
 fn completed_peer_dispatches_do_not_exhaust_worker_cancellation() {
-    use crate::model::{context::OriginContext, metadata::MetadataSelector};
+    use crate::model::{MetadataSelector, OriginContext};
     use crate::peer::wire::{FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse};
     use crate::topology::paths::RouteBudget;
     use futures::{Stream, stream::FuturesUnordered};

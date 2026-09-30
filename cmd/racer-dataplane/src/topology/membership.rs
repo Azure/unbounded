@@ -7,7 +7,7 @@
 use super::rails::RailMapping;
 use crate::{
     error::{Error, Result},
-    model::identity::{MembershipVersion, NodeId},
+    model::{MembershipVersion, NodeId},
 };
 use std::{net::SocketAddr, num::NonZeroU32, sync::Arc};
 

@@ -6,7 +6,7 @@ use crate::{
     control::caches::CacheDefinition,
     error::{Error, Operation, Result},
     http::{io::HttpIo, pool::ConnectionLease},
-    model::identity::{CacheId, RequestId},
+    model::{CacheId, RequestId},
     read::serve::ReadService,
     runtime::{
         admission::Admission,
@@ -481,13 +481,13 @@ impl ClientListeners {
         }
         let maximum = self
             .admission
-            .limit(crate::model::limits::ResourceClass::IngressConnection);
+            .limit(crate::model::ResourceClass::IngressConnection);
         // Reserve some acceptance opportunity even when all active readers wait.
         let attempts = budget.saturating_sub(worked).min(count);
         for _ in 0..attempts {
             if self
                 .admission
-                .used(crate::model::limits::ResourceClass::IngressConnection)
+                .used(crate::model::ResourceClass::IngressConnection)
                 >= maximum
                 && self.ingress.is_none()
             {
@@ -702,7 +702,7 @@ async fn serve_connection(
         // bounded representation until the read and every stream slice complete.
         let _context = admission.reserve(
             Some(cache),
-            crate::model::limits::ResourceClass::RequestContext,
+            crate::model::ResourceClass::RequestContext,
             super::request::MAX_HEAD_BYTES,
         )?;
         let idle_scope = new_scope(timeout, cancellation.clone())?;

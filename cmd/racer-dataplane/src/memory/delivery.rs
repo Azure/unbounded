@@ -16,7 +16,7 @@ use crate::runtime::reactor::Descriptor as OwnedFd;
 use crate::{
     error::{Error, Operation, Result},
     http::{io::OwnedBuffer, pool::ConnectionLease},
-    model::range::PageSlice,
+    model::PageSlice,
     runtime::{
         deadline::RequestScope,
         reactor::{IoBuffer, SendBuffer},
@@ -484,11 +484,8 @@ mod tests {
     use crate::{
         memory::{pipe::tests::admission, pool::VerifiedBytes},
         model::{
-            identity::{
-                CacheId, CacheKey, ObjectId, ObjectVersion, PageId, PageNumber, RequestId,
-                StrongEtag,
-            },
-            limits::ResourceClass,
+            CacheId, CacheKey, ObjectId, ObjectVersion, PageId, PageNumber, RequestId,
+            ResourceClass, StrongEtag,
         },
         runtime::{
             admission::Admission,

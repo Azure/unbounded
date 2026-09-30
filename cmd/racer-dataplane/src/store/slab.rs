@@ -6,11 +6,7 @@ use super::{
 use crate::runtime::reactor::Descriptor as OwnedFd;
 use crate::{
     error::{Error, Operation, Result},
-    model::{
-        identity::{CacheId, WorkerId},
-        limits::ResourceClass,
-        range::PAGE_BYTES,
-    },
+    model::{CacheId, PAGE_BYTES, ResourceClass, WorkerId},
     runtime::{
         admission::{Admission, Reservation},
         deadline::RequestScope,

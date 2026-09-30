@@ -10,7 +10,7 @@ use super::{
 use crate::{
     error::{Error, Result},
     http::codec::{Codec, MessageHead, StartLine},
-    model::identity::NodeId,
+    model::NodeId,
 };
 use sha2::{Digest, Sha256};
 #[cfg(test)]
@@ -74,7 +74,7 @@ impl Signatures {
             protocol::millis(crate::runtime::environment::wall_now())?,
         );
         if head.unique("racer-kind")? == Some(b"request".as_slice()) {
-            let cache = crate::model::identity::CacheId(field(&head, "racer-cache")?);
+            let cache = crate::model::CacheId(field(&head, "racer-cache")?);
             let key = self
                 .keys
                 .active(&cache, super::keyring::KeyPurpose::OriginCredentials)?;
@@ -117,13 +117,13 @@ impl Signatures {
         }
         protocol::uuid(&self.keys.cluster().0)?;
         if head.unique("racer-kind")? == Some(b"request".as_slice()) {
-            let cache = crate::model::identity::CacheId(field(head, "racer-cache")?);
+            let cache = crate::model::CacheId(field(head, "racer-cache")?);
             let id = protocol::decode_binary(field(head, "racer-mac-key")?.as_bytes())?
                 .try_into()
                 .map_err(|_| Error::Unauthorized)?;
             let key = self.keys.lease(
                 Some(&cache),
-                crate::model::envelope::KeyId(id),
+                crate::model::KeyId(id),
                 super::keyring::KeyPurpose::OriginCredentials,
             )?;
             let expected = super::mac::hmac(&*super::mac::request_key(&key)?, &mac_base(head)?);
@@ -326,7 +326,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::{
         control::wire::{BundleGeneration, KeyringBundle, SCHEMA_VERSION},
-        model::identity::ClusterId,
+        model::ClusterId,
         security::{identity::PendingIdentity, keyring::KeyEpochs},
     };
     use std::sync::Arc;
@@ -391,8 +391,8 @@ pub(crate) mod tests {
             .enumerate()
             .map(|(i, cache)| CacheEncryptionKey {
                 key: CacheKeyRef {
-                    cache: crate::model::identity::CacheId(cache),
-                    id: crate::model::envelope::KeyId([100 + i as u8; 16]),
+                    cache: crate::model::CacheId(cache),
+                    id: crate::model::KeyId([100 + i as u8; 16]),
                     purpose: CacheKeyPurpose::OriginCredentials,
                 },
                 state: CacheKeyState::Active,
@@ -403,7 +403,7 @@ pub(crate) mod tests {
     pub(crate) fn mac_test_key(cache: &str) -> Vec<crate::control::wire::CacheEncryptionKey> {
         let mut keys = mac_test_keys();
         keys.truncate(1);
-        keys[0].key.cache = crate::model::identity::CacheId(cache.into());
+        keys[0].key.cache = crate::model::CacheId(cache.into());
         keys
     }
     pub(crate) fn clone_head(head: &SignedHead) -> SignedHead {

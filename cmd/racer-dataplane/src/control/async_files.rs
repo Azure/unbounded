@@ -258,7 +258,7 @@ mod tests {
         let scope = testing::scope();
         let enrollment = |path| {
             let e = Enrollment::new(
-                crate::model::identity::ClusterId("11111111-1111-4111-8111-111111111111".into()),
+                crate::model::ClusterId("11111111-1111-4111-8111-111111111111".into()),
                 d.0.join("token"),
                 path,
             );
@@ -326,7 +326,7 @@ mod tests {
         for cut in 0..10 {
             testing::drive(&r, Box::pin(atomic_write(&r, &dir, "state", &old, &scope))).unwrap();
             let mut request = testing::scope();
-            request.request = crate::model::identity::RequestId([cut; 16]);
+            request.request = crate::model::RequestId([cut; 16]);
             let mut future = Box::pin(atomic_write(&r, &dir, "state", &new, &request));
             use std::future::Future;
             let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
@@ -382,7 +382,7 @@ mod tests {
         for stop in 0..12u8 {
             testing::drive(&r, Box::pin(atomic_write(&r, &dir, "state", &old, &scope))).unwrap();
             let mut turn = testing::scope();
-            turn.request = crate::model::identity::RequestId([stop; 16]);
+            turn.request = crate::model::RequestId([stop; 16]);
             let mut operation: crate::error::Operation<'_, ()> =
                 Box::pin(atomic_write(&r, &dir, "state", &new, &turn));
             let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
@@ -500,7 +500,7 @@ mod tests {
         for boundary in 0..12 {
             testing::drive(&r, Box::pin(atomic_write(&r, &dir, "state", &old, &scope))).unwrap();
             let mut turn = testing::scope();
-            turn.request = crate::model::identity::RequestId([boundary; 16]);
+            turn.request = crate::model::RequestId([boundary; 16]);
             let mut write: crate::error::Operation<'_, ()> =
                 Box::pin(atomic_write(&r, &dir, "state", &new, &turn));
             let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
@@ -551,7 +551,7 @@ mod tests {
         let d = testing::Directory::new();
         let scope = testing::scope();
         let e = Enrollment::new(
-            crate::model::identity::ClusterId("11111111-1111-4111-8111-111111111111".into()),
+            crate::model::ClusterId("11111111-1111-4111-8111-111111111111".into()),
             d.0.join("token"),
             d.0.join("identity"),
         );

@@ -205,7 +205,7 @@ mod tests {
     use super::*;
     use crate::{
         control::wire::{Publication, PublicationSequence},
-        model::{identity::MembershipVersion, limits::ResourceClass},
+        model::{MembershipVersion, ResourceClass},
         runtime::crypto::{self, CryptoClient},
         topology::{membership::Member, rails::RailId},
     };
@@ -265,7 +265,7 @@ mod tests {
         let limits = size_workers(&config.limits, &mut plan, config.enable_rdma).unwrap();
         assert_eq!(plan.pairs.len(), 5);
         let admission = Admission::new(limits.clone());
-        let page = crate::model::range::PAGE_BYTES as usize;
+        let page = crate::model::PAGE_BYTES as usize;
         for (class, floor) in [
             (ResourceClass::Plaintext, 3 * page),
             (
@@ -371,7 +371,7 @@ mod tests {
                 assert_eq!(partition.get(), node / expected);
             }
             assert_eq!(limits.connections_per_neighbor.get(), 16);
-            let floor = 3 * crate::model::range::PAGE_BYTES as usize;
+            let floor = 3 * crate::model::PAGE_BYTES as usize;
             config.limits.plaintext_bytes = NonZeroUsize::new(2 * floor).unwrap();
             let mut plan = make_plan(&config);
             let limits = size_workers(&config.limits, &mut plan, false).unwrap();
@@ -397,7 +397,7 @@ mod tests {
     fn resource_shortage_reduces_and_regroups_uneven_numa_workers() {
         use crate::runtime::affinity::{CpuLocation, EffectiveTopology};
         let mut config = default_config(false);
-        let floor = 3 * crate::model::range::PAGE_BYTES as usize;
+        let floor = 3 * crate::model::PAGE_BYTES as usize;
         for supported in 1..=10 {
             config.limits.plaintext_bytes = NonZeroUsize::new(supported * floor).unwrap();
             config.limits.ciphertext_bytes = NonZeroUsize::new(1024 * 1024 * 1024).unwrap();

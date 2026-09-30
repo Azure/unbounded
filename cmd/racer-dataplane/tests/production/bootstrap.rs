@@ -4,7 +4,7 @@
 //! acquisition, encryption, and persistence are production implementations.
 use super::*;
 use racer_dataplane::{
-    model::context::{Authorization, OpaqueMetadata, OriginContext},
+    model::{Authorization, OpaqueMetadata, OriginContext},
     peer::{
         server::LocalPageService,
         wire::{FetchMode, Operation, PeerRequest, PeerResponse},

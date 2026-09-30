@@ -1,5 +1,5 @@
 //! Canonical distributed hashes. Never use Rust's `Hash` encoding on the wire.
-use crate::model::identity::{ObjectId, PageNumber};
+use crate::model::{ObjectId, PageNumber};
 use sha2::{Digest, Sha256};
 
 pub(super) fn domain(name: &[u8]) -> Sha256 {

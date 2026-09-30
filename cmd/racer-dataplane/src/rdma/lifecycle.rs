@@ -976,8 +976,8 @@ mod tests {
     #[ignore = "requires built native ABI v2 adapter and zero usable type-2B ports"]
     fn native_no_device_activation_runs_on_paired_role_and_releases_quota() {
         use crate::{
-            model::identity::RequestId,
-            model::limits::ResourceClass,
+            model::RequestId,
+            model::ResourceClass,
             runtime::{admission::Admission, deadline::RequestScope},
         };
         assert!(
@@ -1031,8 +1031,8 @@ mod tests {
     #[test]
     fn dropped_activation_does_not_publish_readiness_or_release_accepted_quota_early() {
         use crate::{
-            model::identity::RequestId,
-            model::limits::ResourceClass,
+            model::RequestId,
+            model::ResourceClass,
             runtime::{admission::Admission, deadline::RequestScope},
         };
         let (io, port) = pair(1).unwrap();
@@ -1063,7 +1063,7 @@ mod tests {
     #[ignore = "requires operator-selected active type-2B provider; real pooled RC loopback"]
     fn native_available_provider_pooled_service_roundtrip() {
         use crate::{
-            model::identity::RequestId,
+            model::RequestId,
             runtime::{admission::Admission, deadline::RequestScope},
         };
         let name = std::env::var("RACER_RDMA_TEST_DEVICE")

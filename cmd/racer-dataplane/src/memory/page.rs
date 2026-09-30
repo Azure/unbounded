@@ -1,6 +1,6 @@
 //! Credential-free page results shared by fills, memory, and flight completion.
 use super::pool::{CiphertextPage, VerifiedPage};
-use crate::model::metadata::ObjectMetadata;
+use crate::model::ObjectMetadata;
 
 /// Retain all three values for the same version until the last reader releases
 /// them. Freshness-pointer eviction must not strand a cached page without length.
@@ -46,7 +46,7 @@ impl AcquiredPage {
             Self::Plaintext(page) => page.copy(),
         }
     }
-    pub fn validate_for(&self, page: &crate::model::identity::PageId) -> crate::error::Result<()> {
+    pub fn validate_for(&self, page: &crate::model::PageId) -> crate::error::Result<()> {
         if let Self::Plaintext(result) = self {
             return result.validate_for(page);
         }
@@ -66,7 +66,7 @@ impl From<PageResult> for AcquiredPage {
 impl PageResult {
     /// An internally consistent bundle still must match the requested flight page.
     /// This is structural validation, not a substitute for authentication.
-    pub fn validate_for(&self, page: &crate::model::identity::PageId) -> crate::error::Result<()> {
+    pub fn validate_for(&self, page: &crate::model::PageId) -> crate::error::Result<()> {
         if self.plaintext.page() != page {
             return Err(crate::error::Error::CorruptRecord);
         }
@@ -111,9 +111,9 @@ fn validate_ciphertext(
 
 fn validate_association(
     metadata: &ObjectMetadata,
-    plaintext_page: &crate::model::identity::PageId,
+    plaintext_page: &crate::model::PageId,
     plaintext_length: u64,
-    envelope: &crate::model::envelope::PageEnvelope,
+    envelope: &crate::model::PageEnvelope,
 ) -> crate::error::Result<()> {
     metadata.immutable().validate_page(envelope)?;
     if plaintext_page != &envelope.page || plaintext_length != u64::from(envelope.plaintext_length)
@@ -129,11 +129,8 @@ mod tests {
     use crate::{
         error::Error,
         model::{
-            envelope::{KeyId, Nonce, PageEnvelope},
-            identity::{
-                CacheId, CacheKey, ObjectId, ObjectVersion, PageId, PageNumber, StrongEtag,
-            },
-            metadata::ExpiresAt,
+            CacheId, CacheKey, ExpiresAt, KeyId, Nonce, ObjectId, ObjectVersion, PageEnvelope,
+            PageId, PageNumber, StrongEtag,
         },
     };
 

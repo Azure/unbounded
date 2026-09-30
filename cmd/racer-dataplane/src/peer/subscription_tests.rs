@@ -2,10 +2,7 @@ use super::*;
 use crate::{
     http::{codec::Codec, io::HttpIo},
     memory::page::CiphertextCopy,
-    model::{
-        envelope::PageEnvelope,
-        metadata::{ExpiresAt, ObjectMetadata},
-    },
+    model::{ExpiresAt, ObjectMetadata, PageEnvelope},
     peer::subscriptions::{Demand, PageInterval, Subscription, TransferGrant},
     runtime::reactor::Reactor,
     topology::{
@@ -40,7 +37,7 @@ fn subscribe(
             id: [id; 16],
             sequence: 0,
             page_budget: 2,
-            byte_budget: 2 * crate::model::range::PAGE_BYTES + 32,
+            byte_budget: 2 * crate::model::PAGE_BYTES + 32,
             version: ObjectVersion {
                 object: request.origin.object.clone(),
                 etag: StrongEtag::test_value("v1"),
@@ -53,8 +50,7 @@ fn subscribe(
 }
 
 fn copy(admission: &Rc<Admission>, page: PageId) -> CiphertextCopy {
-    let length =
-        (page.number.0 + 1) * crate::model::range::PAGE_BYTES - crate::model::range::PAGE_BYTES + 3;
+    let length = (page.number.0 + 1) * crate::model::PAGE_BYTES - crate::model::PAGE_BYTES + 3;
     let ciphertext = BufferPool::new(admission.clone())
         .ciphertext(
             admission
@@ -187,10 +183,7 @@ fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failure
         let server = server::PeerServer::new(
             Rc::new(HttpIo::with_admission(
                 Rc::new(Reactor::new(admission.clone())),
-                Codec::new(
-                    wire::MAX_ENVELOPE_HEAD,
-                    crate::model::range::PAGE_BYTES + 16,
-                ),
+                Codec::new(wire::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
                 admission.clone(),
             )),
             destination,
@@ -395,10 +388,7 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let io = Rc::new(HttpIo::with_admission(
         reactor.clone(),
-        Codec::new(
-            wire::MAX_ENVELOPE_HEAD,
-            crate::model::range::PAGE_BYTES + 16,
-        ),
+        Codec::new(wire::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
         admission.clone(),
     ));
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

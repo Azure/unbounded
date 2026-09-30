@@ -9,7 +9,7 @@
 use crate::runtime::collections::HashSet;
 use crate::{
     error::{Error, Result},
-    model::identity::CacheId,
+    model::CacheId,
 };
 use std::{cell::RefCell, collections::BTreeMap, path::PathBuf};
 #[derive(Clone, Debug, Eq, PartialEq)]

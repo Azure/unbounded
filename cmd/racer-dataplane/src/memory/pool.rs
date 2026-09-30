@@ -1,12 +1,7 @@
 //! Bounded immutable page leases. No buffers contain request credentials.
 use crate::{
     error::{Error, Result},
-    model::{
-        envelope::PageEnvelope,
-        identity::{CacheId, PageId},
-        limits::ResourceClass,
-        range::PAGE_BYTES,
-    },
+    model::{CacheId, PAGE_BYTES, PageEnvelope, PageId, ResourceClass},
     runtime::admission::{Admission, Reservation},
 };
 use std::{rc::Rc, sync::Arc};
@@ -247,11 +242,7 @@ impl crate::runtime::reactor::SendBuffer for CiphertextPage {
 pub(crate) mod tests {
     use super::*;
     use crate::{
-        model::{
-            envelope::{KeyId, Nonce},
-            identity::PageNumber,
-            metadata::VersionMetadata,
-        },
+        model::{KeyId, Nonce, PageNumber, VersionMetadata},
         runtime::reactor::IoBuffer,
     };
 
@@ -264,7 +255,7 @@ pub(crate) mod tests {
         admission: &Rc<Admission>,
         version: &str,
     ) -> super::super::page::PageResult {
-        use crate::model::identity::{CacheKey, ObjectId, ObjectVersion, StrongEtag};
+        use crate::model::{CacheKey, ObjectId, ObjectVersion, StrongEtag};
         bundle_for(
             admission,
             VersionMetadata {

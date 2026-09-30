@@ -7,7 +7,7 @@
 //! ```no_run
 //! use racer_dataplane::{
 //!     error::Result,
-//!     model::identity::NodeId,
+//!     model::NodeId,
 //!     peer::{server::LocalPageService, wire::{PeerRequest, VerifiedResponse}},
 //!     runtime::deadline::RequestScope,
 //!     security::forwarding::Forwarding,
@@ -48,7 +48,7 @@ use super::{
 use crate::{
     error::{Error, Result},
     http::codec::{MessageHead, StartLine},
-    model::identity::NodeId,
+    model::NodeId,
     peer::wire::{PeerRequest, PeerResponse, SignedRequest, SignedResponse},
     topology::paths::RouteBudget,
 };
@@ -108,7 +108,7 @@ impl VerifiedRequest {
     /// A provider may project its authenticated compact demand onto one selected
     /// page for the existing Fill implementation. This value must never be relayed
     /// or reverified: its immutable binding still names the full subscription.
-    pub(crate) fn select_page(mut self, page: crate::model::identity::PageId) -> Result<Self> {
+    pub(crate) fn select_page(mut self, page: crate::model::PageId) -> Result<Self> {
         use crate::peer::wire::{FetchMode, Operation};
         let Operation::Subscribe { subscription, mode } = &self.signed.request.operation else {
             return Err(Error::InvalidRequest);
@@ -748,11 +748,8 @@ mod tests {
     use super::*;
     use crate::{
         model::{
-            context::{EncryptedAuthorization, OpaqueMetadata, PeerOriginContext},
-            envelope::{KeyId, Nonce},
-            identity::*,
-            limits::{Limits, ResourceClass},
-            metadata::MetadataSelector,
+            EncryptedAuthorization, KeyId, Limits, MetadataSelector, Nonce, OpaqueMetadata,
+            PeerOriginContext, ResourceClass, *,
         },
         peer::wire::{FetchMode, Operation},
         runtime::{admission::Admission, deadline::RequestScope},
@@ -855,7 +852,7 @@ mod tests {
     #[test]
     fn bootstrap_binds_intent_empty_page_zero_length_and_destination() {
         use crate::memory::pool::tests::bundle_for;
-        use crate::model::metadata::{ExpiresAt, ObjectMetadata};
+        use crate::model::{ExpiresAt, ObjectMetadata};
         let mut request = request(90);
         request.operation = Operation::Bootstrap {
             object: request.origin.object.clone(),
@@ -1324,10 +1321,7 @@ mod tests {
     fn page_descriptor_fields_and_successful_response_are_bound_exactly() {
         use crate::{
             memory::pool::{CiphertextBytes, CiphertextPage},
-            model::{
-                envelope::PageEnvelope,
-                metadata::{ExpiresAt, ObjectMetadata},
-            },
+            model::{ExpiresAt, ObjectMetadata, PageEnvelope},
         };
         let signatures = network(3);
         let a = Forwarding::new(signatures[0].clone());
@@ -1415,11 +1409,7 @@ mod tests {
     fn validly_signed_page_must_match_the_requested_version_and_page() {
         use crate::{
             memory::pool::{CiphertextBytes, CiphertextPage},
-            model::{
-                envelope::PageEnvelope,
-                metadata::{ExpiresAt, ObjectMetadata},
-                range::PAGE_BYTES,
-            },
+            model::{ExpiresAt, ObjectMetadata, PAGE_BYTES, PageEnvelope},
         };
         let signatures = network(3);
         let sender = Forwarding::new(signatures[0].clone());
@@ -1614,7 +1604,7 @@ mod tests {
     }
     #[test]
     fn successful_metadata_must_match_original_object_pin_and_operation() {
-        use crate::model::metadata::{ExpiresAt, ObjectMetadata};
+        use crate::model::{ExpiresAt, ObjectMetadata};
         let signatures = network(3);
         let f: Vec<_> = signatures
             .iter()
@@ -1623,7 +1613,7 @@ mod tests {
         let (signed, _) = f[0].sign_request(request(1)).unwrap();
         let admitted = f[2].verify_request(signed).unwrap();
         let good = ObjectMetadata {
-            content_type: Some(crate::model::metadata::ContentType::parse(b"text/plain").unwrap()),
+            content_type: Some(crate::model::ContentType::parse(b"text/plain").unwrap()),
             version: ObjectVersion {
                 object: admitted.request().origin.object.clone(),
                 etag: StrongEtag::parse(b"\"version\"").unwrap(),
@@ -1654,8 +1644,7 @@ mod tests {
             "0"
         );
         if let PeerResponse::Metadata(metadata) = &mut signed.response {
-            metadata.content_type =
-                Some(crate::model::metadata::ContentType::parse(b"text/html").unwrap());
+            metadata.content_type = Some(crate::model::ContentType::parse(b"text/html").unwrap());
         }
         assert!(
             f[0].verify_response(signed, &binding).is_err(),
@@ -1676,7 +1665,7 @@ mod tests {
     }
     #[test]
     fn relay_cannot_assert_success_but_can_return_request_bound_errors() {
-        use crate::model::metadata::{ExpiresAt, ObjectMetadata};
+        use crate::model::{ExpiresAt, ObjectMetadata};
         let signatures = network(3);
         let requester = Forwarding::new(signatures[0].clone());
         let relay = Forwarding::new(signatures[1].clone());
@@ -1722,10 +1711,7 @@ mod tests {
     fn page_descriptor_range_nonce_and_exact_request_binding() {
         use crate::{
             memory::pool::{CiphertextBytes, CiphertextPage},
-            model::{
-                envelope::PageEnvelope,
-                metadata::{ExpiresAt, ObjectMetadata},
-            },
+            model::{ExpiresAt, ObjectMetadata, PageEnvelope},
         };
         let signatures = network(3);
         let requester = Forwarding::new(signatures[0].clone());

@@ -19,10 +19,7 @@ use super::{
 };
 use crate::{
     error::{Error, Operation, Result},
-    model::{
-        identity::{ObjectId, PageId, RequestId, WorkerId},
-        limits::Limits,
-    },
+    model::{Limits, ObjectId, PageId, RequestId, WorkerId},
 };
 use sha2::{Digest, Sha256};
 #[cfg(test)]
@@ -81,7 +78,7 @@ pub struct WorkerGroup<'a> {
 /// Rc-backed factories cannot cross the startup boundary:
 /// ```compile_fail
 /// use std::rc::Rc;
-/// use racer_dataplane::{error::Result, model::identity::WorkerId,
+/// use racer_dataplane::{error::Result, model::WorkerId,
 ///     runtime::worker::{WorkerFactory, WorkerRuntime, WorkerService,
 ///                       CryptoRuntime, CryptoService}};
 /// struct LocalFactory(Rc<()>);
@@ -1061,7 +1058,7 @@ mod tests {
 
     #[test]
     fn stable_assignment_ignores_etag_and_worker_input_order() {
-        use crate::model::identity::{CacheId, CacheKey, ObjectVersion, PageNumber, StrongEtag};
+        use crate::model::{CacheId, CacheKey, ObjectVersion, PageNumber, StrongEtag};
         let map = WorkerMap::new(vec![WorkerId(9), WorkerId(3), WorkerId(1)]).unwrap();
         let ordered = WorkerMap::new(vec![WorkerId(1), WorkerId(3), WorkerId(9)]).unwrap();
         let object = ObjectId {

@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::identity::RequestId;
+use crate::model::RequestId;
 use std::{
     io::{Read, Write as IoWrite},
     net::TcpStream,
@@ -276,7 +276,7 @@ fn diagnostic_accept_recovers_after_full_entry_table() {
 #[test]
 fn failure_endpoint_exports_full_ring_with_maximum_numeric_fields() {
     use crate::{
-        model::identity::{AttemptId, WorkerId},
+        model::{AttemptId, WorkerId},
         telemetry::failures::{CAPACITY, Detail, Failure, Stage},
     };
     let telemetry = Telemetry::default();
@@ -378,7 +378,7 @@ fn raw_endpoints_fragmentation_readiness_redaction_and_data_admission_stop() {
     assert_eq!(telemetry.tracing.snapshot(&mut [None; 1]).unwrap(), 0);
     telemetry
         .failures
-        .observer(crate::model::identity::WorkerId(1))
+        .observer(crate::model::WorkerId(1))
         .record(
             crate::telemetry::failures::Failure::new(
                 crate::telemetry::failures::Stage::NextSlice,

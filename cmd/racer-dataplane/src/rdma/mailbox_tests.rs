@@ -6,12 +6,8 @@ use crate::{
     http::codec::{Header, MessageHead, StartLine},
     memory::pool::BufferPool,
     model::{
-        envelope::{KeyId, Nonce, PageEnvelope},
-        identity::{
-            CacheId, CacheKey, ObjectId, ObjectVersion, PageId, PageNumber, RequestId, StrongEtag,
-            TransferId,
-        },
-        limits::ResourceClass,
+        CacheId, CacheKey, KeyId, Nonce, ObjectId, ObjectVersion, PageEnvelope, PageId, PageNumber,
+        RequestId, ResourceClass, StrongEtag, TransferId,
     },
     rdma::{
         device::Devices,
@@ -92,10 +88,7 @@ fn sessions_admit_64_neighbors_but_keep_per_neighbor_and_total_bounds() {
     let sessions = Sessions::new(devices, 1);
     // Synthetic live entries isolate session admission from the native QP pool.
     for i in 0..63 {
-        sessions.track_peer_test(
-            crate::model::identity::NodeId(format!("peer-{i}")),
-            qp.clone(),
-        );
+        sessions.track_peer_test(crate::model::NodeId(format!("peer-{i}")), qp.clone());
     }
     let scope = scope();
     let prepared = done(&mut sessions.prepare(&peer.peer, RailId(0), &scope));
@@ -104,7 +97,7 @@ fn sessions_admit_64_neighbors_but_keep_per_neighbor_and_total_bounds() {
         Poll::Ready(Err(Error::Overloaded))
     ));
     drop(prepared);
-    sessions.track_peer_test(crate::model::identity::NodeId("peer-63".into()), qp);
+    sessions.track_peer_test(crate::model::NodeId("peer-63".into()), qp);
     assert!(matches!(
         poll(&mut sessions.prepare(&peer.peer, RailId(0), &scope)),
         Poll::Ready(Err(Error::Overloaded))
@@ -382,7 +375,7 @@ fn contended_grant_cancel_expiry_and_drop_abort_without_submitting_bind() {
         let charged = provision_test(&mut native, 0);
         let qp = claim(&io);
         mark_connected(&qp, &mut native);
-        let session = SessionLease::test(qp.clone(), crate::model::identity::NodeId("peer".into()));
+        let session = SessionLease::test(qp.clone(), crate::model::NodeId("peer".into()));
         let admission = Rc::new(Admission::new(
             crate::test_support::cluster::config(true).limits,
         ));

@@ -22,11 +22,7 @@ use racer_dataplane::{
         pool::{ConnectionLease, HttpPool},
     },
     memory::{cache::MemoryCache, delivery::Delivery, pipe::PipePool, pool::BufferPool},
-    model::{
-        identity::*,
-        limits::{Limits, ResourceClass},
-        range::PAGE_BYTES,
-    },
+    model::{Limits, PAGE_BYTES, ResourceClass, *},
     origin::client::OriginClient,
     peer::{PeerNetwork, requester::Requester, transfer::Transfers},
     read::{

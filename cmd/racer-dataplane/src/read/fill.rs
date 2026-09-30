@@ -18,13 +18,7 @@ use crate::{
         page::{AcquiredPage, UnverifiedPage},
         pool::{BufferPool, CiphertextPage},
     },
-    model::{
-        context::OriginContext,
-        identity::PageId,
-        limits::ResourceClass,
-        metadata::{ObjectMetadata, VersionMetadata},
-        range::PAGE_BYTES,
-    },
+    model::{ObjectMetadata, OriginContext, PAGE_BYTES, PageId, ResourceClass, VersionMetadata},
     origin::client::Origin,
     peer::{
         requester::PeerClient,
@@ -90,14 +84,14 @@ impl Fill {
     }
     pub(crate) async fn select_subscription(
         &self,
-        version: crate::model::identity::ObjectVersion,
+        version: crate::model::ObjectVersion,
         demand: crate::peer::subscriptions::Demand,
         membership: MembershipLease,
         context: &OriginContext,
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
     ) -> Result<PageResult> {
-        let first = crate::model::identity::PageNumber(
+        let first = crate::model::PageNumber(
             demand
                 .intervals()
                 .first()
@@ -152,7 +146,7 @@ impl Fill {
         self.dependencies
             .metadata_owner
             .acquire(
-                crate::model::identity::PageId {
+                crate::model::PageId {
                     version,
                     number: first,
                 },
@@ -195,7 +189,7 @@ impl Fill {
     pub(crate) fn observe_peer_error(
         &self,
         scope: &RequestScope,
-        attempt: crate::model::identity::AttemptId,
+        attempt: crate::model::AttemptId,
         error: Error,
     ) {
         use crate::telemetry::failures::{Failure, Stage};
@@ -212,7 +206,7 @@ impl Fill {
     /// disturbing queued writes or unrelated idle pages. Failure rolls charges back.
     fn reserve_progress(
         &self,
-        cache: &crate::model::identity::CacheId,
+        cache: &crate::model::CacheId,
         persist: bool,
     ) -> Result<crate::runtime::admission::FillReservation> {
         let plaintext =
@@ -244,7 +238,7 @@ impl Fill {
 
     fn reserve_with_reclamation(
         &self,
-        cache: &crate::model::identity::CacheId,
+        cache: &crate::model::CacheId,
         class: ResourceClass,
         amount: usize,
     ) -> Result<Reservation> {
@@ -257,7 +251,7 @@ impl Fill {
 
     fn reserve_reclaiming(
         &self,
-        cache: &crate::model::identity::CacheId,
+        cache: &crate::model::CacheId,
         class: ResourceClass,
         amount: usize,
         reserve: impl Fn() -> Result<Reservation>,
@@ -299,10 +293,7 @@ impl Fill {
 
     /// Fresh metadata has no page identity yet. Admit its page-zero plaintext
     /// before origin I/O using the same bounded reclamation as ordinary fills.
-    pub(crate) fn reserve_bootstrap(
-        &self,
-        cache: &crate::model::identity::CacheId,
-    ) -> Result<Reservation> {
+    pub(crate) fn reserve_bootstrap(&self, cache: &crate::model::CacheId) -> Result<Reservation> {
         self.reserve_with_reclamation(cache, ResourceClass::Plaintext, PAGE_BYTES as usize)
     }
     pub fn new(dependencies: FillDependencies) -> Self {
@@ -323,9 +314,9 @@ impl Fill {
     /// Used by WorkerDirectory's bounded retained-metadata lookup on a pinned miss.
     pub fn retained_metadata<'a>(
         &'a self,
-        version: &'a crate::model::identity::ObjectVersion,
+        version: &'a crate::model::ObjectVersion,
         scope: &'a RequestScope,
-    ) -> Operation<'a, Option<crate::model::metadata::VersionMetadata>> {
+    ) -> Operation<'a, Option<crate::model::VersionMetadata>> {
         Box::pin(async move {
             scope.check()?;
             let mut found = None;
@@ -422,7 +413,7 @@ impl Fill {
     ) -> Operation<'a, PageResult> {
         let page = PageId {
             version: origin.metadata.version.clone(),
-            number: crate::model::identity::PageNumber(0),
+            number: crate::model::PageNumber(0),
         };
         Box::pin(async move {
             match self
@@ -697,7 +688,7 @@ impl Fill {
             return Err(Error::CorruptRecord);
         }
         use crate::{
-            model::{limits::ResourceClass, range::PAGE_BYTES},
+            model::{PAGE_BYTES, ResourceClass},
             runtime::reactor::IoBuffer,
         };
         if origin.plaintext.bytes()?.len()
@@ -1265,7 +1256,7 @@ fn validate_copy(copy: &crate::memory::page::CiphertextCopy, page: &PageId) -> R
 fn merge_metadata(
     found: &mut Option<VersionMetadata>,
     mut descriptor: VersionMetadata,
-    version: &crate::model::identity::ObjectVersion,
+    version: &crate::model::ObjectVersion,
 ) -> Result<()> {
     if &descriptor.version != version
         || found
@@ -1286,7 +1277,7 @@ mod integration_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::identity::{CacheId, CacheKey, ObjectId, ObjectVersion, StrongEtag};
+    use crate::model::{CacheId, CacheKey, ObjectId, ObjectVersion, StrongEtag};
     #[test]
     fn retained_metadata_never_substitutes_a_version_or_conflicting_length() {
         let version = ObjectVersion {
@@ -1359,7 +1350,7 @@ mod tests {
             &'a self,
             _: &'a crate::read::candidates::OriginAuthority,
             _: &'a OriginContext,
-            _: crate::model::metadata::MetadataSelector,
+            _: crate::model::MetadataSelector,
             _: &'a RequestScope,
         ) -> Operation<'a, crate::origin::metadata::MetadataReply> {
             Box::pin(async { panic!("pinned page acquisition does not refresh metadata") })
@@ -1395,7 +1386,7 @@ mod tests {
                         content_type: None,
                         version: page.version.clone(),
                         length: 3,
-                        expires_at: crate::model::metadata::ExpiresAt(std::time::UNIX_EPOCH),
+                        expires_at: crate::model::ExpiresAt(std::time::UNIX_EPOCH),
                     },
                     plaintext,
                 })
@@ -1419,7 +1410,7 @@ mod tests {
     }
     fn rig() -> Rig {
         use crate::{
-            model::identity::{MembershipVersion, PageNumber, WorkerId},
+            model::{MembershipVersion, PageNumber, WorkerId},
             runtime::{
                 crypto,
                 reactor::Reactor,
@@ -1471,7 +1462,7 @@ mod tests {
         let engine = PageCryptoEngine::new(CryptoRuntime { port: engine });
         let peers = Rc::new(NeverPeer);
         let candidates = Rc::new(CandidatePolicy::new(
-            crate::model::identity::NodeId(NODE.into()),
+            crate::model::NodeId(NODE.into()),
             Rc::new(Placement::new(8)),
             peers.clone(),
         ));
@@ -1507,7 +1498,7 @@ mod tests {
             Membership::validate(
                 MembershipVersion(1),
                 vec![Member {
-                    node: crate::model::identity::NodeId(NODE.into()),
+                    node: crate::model::NodeId(NODE.into()),
                     shares: std::num::NonZeroU32::new(4).unwrap(),
                     peer_endpoint: "127.0.0.1:8000".into(),
                     rails: vec![],
@@ -1570,7 +1561,7 @@ mod tests {
             authorization: None,
         };
         let scope = RequestScope::new(
-            crate::model::identity::RequestId([1; 16]),
+            crate::model::RequestId([1; 16]),
             std::time::Instant::now() + std::time::Duration::from_secs(30),
         )
         .unwrap();

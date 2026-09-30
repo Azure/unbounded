@@ -8,7 +8,7 @@ use super::{
 };
 use crate::{
     error::{Error, Operation, Result},
-    model::identity::{NodeId, ObjectId, PageNumber},
+    model::{NodeId, ObjectId, PageNumber},
 };
 use sha2::Digest;
 use std::{
@@ -353,7 +353,7 @@ impl Placement {
 mod tests {
     use super::*;
     use crate::{
-        model::identity::MembershipVersion,
+        model::MembershipVersion,
         topology::{
             fixtures::{member, membership, object},
             membership::Membership,
@@ -617,7 +617,7 @@ mod tests {
 
     #[test]
     fn scoped_cold_rank_cancels_between_bounded_quanta() {
-        use crate::{model::identity::RequestId, runtime::deadline::RequestScope};
+        use crate::{model::RequestId, runtime::deadline::RequestScope};
         let placement = Placement::with_memory_budget(4 * RANKING_BYTES);
         let members = membership(100_000);
         let scope = RequestScope::new(

@@ -25,7 +25,7 @@ impl Drop for Directory {
 }
 pub(super) fn scope() -> crate::runtime::deadline::RequestScope {
     crate::runtime::deadline::RequestScope::new(
-        crate::model::identity::RequestId([7; 16]),
+        crate::model::RequestId([7; 16]),
         std::time::Instant::now() + std::time::Duration::from_secs(10),
     )
     .unwrap()
@@ -55,7 +55,7 @@ pub(super) fn reactor() -> Option<std::rc::Rc<crate::runtime::reactor::Reactor>>
         Err(e) => panic!("io_uring setup: {e}"),
     }
     let n = std::num::NonZeroUsize::new(1024 * 1024).unwrap();
-    let limits = crate::model::limits::Limits {
+    let limits = crate::model::Limits {
         plaintext_bytes: n,
         ciphertext_bytes: n,
         dirty_bytes: n,
@@ -126,7 +126,7 @@ pub(super) fn issue(
     super::wire::EnrollmentResponse {
         schema_version: 1,
         cluster: request.cluster.clone(),
-        node: crate::model::identity::NodeId(node.into()),
+        node: crate::model::NodeId(node.into()),
         enrollment: request.enrollment.clone(),
         certificate_chain: vec![cert.der().to_vec()],
     }

@@ -94,7 +94,7 @@ fn snapshot_refresh_retries_cancelled_publication_and_applies_skipped_removal() 
             cache_keys: vec![wire::CacheEncryptionKey {
                 key: wire::CacheKeyRef {
                     cache: original.id.clone(),
-                    id: crate::model::envelope::KeyId([7; 16]),
+                    id: crate::model::KeyId([7; 16]),
                     purpose: wire::CacheKeyPurpose::Page,
                 },
                 state: wire::CacheKeyState::Active,
@@ -122,7 +122,7 @@ fn snapshot_refresh_retries_cancelled_publication_and_applies_skipped_removal() 
         .publish(integration_tests::publication(&config, 2, vec![]))
         .unwrap();
     let mut replacement = original.clone();
-    replacement.id = crate::model::identity::CacheId("55555555-5555-4555-8555-555555555555".into());
+    replacement.id = crate::model::CacheId("55555555-5555-4555-8555-555555555555".into());
     worker
         .snapshots
         .publish(integration_tests::publication(

@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     memory::page::CiphertextCopy,
-    model::identity::NodeId,
+    model::NodeId,
     peer::wire::{PeerRequest, VerifiedResponse},
     security::{
         forwarding::Forwarding,
@@ -76,7 +76,7 @@ impl PeerClient for ScriptedPeers {
 fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Vec<NodeId>) {
     f.membership = Arc::new(
         Membership::validate(
-            crate::model::identity::MembershipVersion(1),
+            crate::model::MembershipVersion(1),
             (0..4)
                 .map(|i| Member {
                     node: node(i),
@@ -144,7 +144,7 @@ fn unusable_copy(f: &Fixture, good: &CiphertextCopy, missing_key: bool) -> Ciphe
     let mut envelope = good.ciphertext.envelope().clone();
     let mut bytes = good.ciphertext.bytes().to_vec();
     if missing_key {
-        envelope.key_id = crate::model::envelope::KeyId([99; 16]);
+        envelope.key_id = crate::model::KeyId([99; 16]);
     } else {
         bytes[0] ^= 1;
     }

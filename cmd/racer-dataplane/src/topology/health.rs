@@ -2,7 +2,7 @@
 use super::hash;
 use crate::{
     error::{Error, Result},
-    model::identity::NodeId,
+    model::NodeId,
 };
 use sha2::Digest;
 use std::{
@@ -177,7 +177,7 @@ fn backoff(node: &NodeId, failures: u32) -> Duration {
 mod tests {
     use super::*;
     use crate::{
-        model::identity::PageNumber,
+        model::PageNumber,
         topology::{
             fixtures::{membership, object},
             placement::Placement,

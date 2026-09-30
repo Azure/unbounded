@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     error::{Error, Operation},
-    model::limits::ResourceClass,
+    model::ResourceClass,
     runtime::{admission::Admission, deadline::RequestScope},
     security::forwarding::Forwarding,
     topology::membership::MembershipLease,
@@ -88,7 +88,7 @@ impl PeerServer {
             let mut active = FuturesUnordered::new();
             let maximum = self
                 .admission
-                .limit(crate::model::limits::ResourceClass::IngressConnection);
+                .limit(crate::model::ResourceClass::IngressConnection);
             loop {
                 scope.check()?;
                 if let Some(ingress) = &self.ingress {
@@ -616,7 +616,7 @@ impl PeerServer {
                         .rank(
                             membership.clone(),
                             &subscription.version.object,
-                            crate::model::identity::PageNumber(number),
+                            crate::model::PageNumber(number),
                         )
                         .is_ok_and(|rank| rank.ordered.first() == Some(local))
                 },
@@ -797,7 +797,7 @@ fn header_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{model::identity::RequestId, test_support::clock::Clock};
+    use crate::{model::RequestId, test_support::clock::Clock};
     use futures::{channel::oneshot, stream::FuturesUnordered};
     use std::{
         cell::Cell,

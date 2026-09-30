@@ -7,11 +7,7 @@ use crate::{
         io::{HttpIo, OwnedBuffer},
         pool::ConnectionLease,
     },
-    model::{
-        identity::PageNumber,
-        metadata::ObjectMetadata,
-        range::{PAGE_BYTES, ResolvedRange},
-    },
+    model::{ObjectMetadata, PAGE_BYTES, PageNumber, ResolvedRange},
     read::{range_stream::RangeStream, serve::ReadResponse},
     runtime::{deadline::RequestScope, reactor::IoBuffer},
 };
@@ -311,7 +307,7 @@ mod tests {
     #[test]
     fn subscription_head_counts_partial_pages_and_empty_completion() {
         let metadata = super::super::tests::metadata(PAGE_BYTES + 10);
-        let range = crate::model::range::ByteRange::Closed {
+        let range = crate::model::ByteRange::Closed {
             first: PAGE_BYTES - 2,
             last: PAGE_BYTES + 3,
         }

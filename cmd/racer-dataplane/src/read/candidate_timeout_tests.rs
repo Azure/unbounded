@@ -1,9 +1,6 @@
 use super::*;
 use crate::{
-    model::{
-        identity::{MembershipVersion, ObjectVersion, RequestId, StrongEtag},
-        metadata::{ExpiresAt, ObjectMetadata},
-    },
+    model::{ExpiresAt, MembershipVersion, ObjectMetadata, ObjectVersion, RequestId, StrongEtag},
     security::{
         forwarding::Forwarding,
         signing::{Signatures, tests::network},
@@ -359,7 +356,7 @@ fn subscription_stall_must_leave_time_for_fixed_page_fallback() {
     assert!(matches!(poll(subscribe.as_mut()), Poll::Ready(Ok(None))));
     drop(subscribe);
     let operation = PeerOperation::Page {
-        page: crate::model::identity::PageId {
+        page: crate::model::PageId {
             version: version.clone(),
             number: PageNumber(0),
         },
@@ -401,7 +398,7 @@ fn subscription_stall_must_leave_time_for_fixed_page_fallback() {
     assert_eq!(first.sequence + 1, next.sequence);
     assert_eq!(first.page_budget - 1, next.page_budget);
     assert_eq!(
-        first.byte_budget - crate::model::range::PAGE_BYTES - 16,
+        first.byte_budget - crate::model::PAGE_BYTES - 16,
         next.byte_budget
     );
     assert_eq!(calls[0].signed_deadline, calls[2].signed_deadline);

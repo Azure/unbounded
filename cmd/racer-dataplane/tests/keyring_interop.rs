@@ -5,7 +5,7 @@
 use racer_dataplane::{
     control::{client::ControlEndpoint, enrollment::Enrollment, transport::*, wire},
     error::{Error, Operation},
-    model::identity::{ClusterId, RequestId},
+    model::{ClusterId, RequestId},
     runtime::{deadline::RequestScope, reactor::Descriptor},
 };
 use std::{

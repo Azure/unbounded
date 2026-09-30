@@ -8,10 +8,8 @@ use crate::{
     error::{Error, Result},
     memory::page::CiphertextCopy,
     model::{
-        envelope::{KeyId, Nonce, PageEnvelope},
-        identity::{CacheId, CacheKey, ObjectId, ObjectVersion, PageId, PageNumber, StrongEtag},
-        metadata::VersionMetadata,
-        range::PAGE_BYTES,
+        CacheId, CacheKey, KeyId, Nonce, ObjectId, ObjectVersion, PAGE_BYTES, PageEnvelope, PageId,
+        PageNumber, StrongEtag, VersionMetadata,
     },
     runtime::reactor::IoBuffer,
 };
@@ -230,7 +228,7 @@ impl RecordCodec {
             None
         } else {
             Some(
-                crate::model::metadata::ContentType::parse(r.take(content_type_length)?)
+                crate::model::ContentType::parse(r.take(content_type_length)?)
                     .map_err(|_| Error::CorruptRecord)?,
             )
         };
@@ -317,7 +315,7 @@ mod tests {
     use super::*;
     use crate::{
         memory::pool::{CiphertextBytes, CiphertextPage},
-        model::{limits::ResourceClass, metadata::ExpiresAt},
+        model::{ExpiresAt, ResourceClass},
         runtime::admission::Admission,
     };
     use std::{sync::Arc, time::UNIX_EPOCH};
@@ -856,8 +854,7 @@ mod tests {
     fn version_two_records_preserve_bounded_content_type_and_reject_malformed_values() {
         let admission = admission();
         let mut page = page(&admission, 3, 0, "cache", "v1");
-        page.metadata.content_type =
-            Some(crate::model::metadata::ContentType::parse(b"text/plain").unwrap());
+        page.metadata.content_type = Some(crate::model::ContentType::parse(b"text/plain").unwrap());
         let alignment = DirectAlignment::validate(512, 512, 512).unwrap();
         let encoded = RecordCodec
             .encode(

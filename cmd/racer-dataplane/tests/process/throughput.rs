@@ -726,7 +726,7 @@ fn production_blocked_control_progress() {
 
 fn owner_key(cache: &str, page: u64, owner: u16) -> u64 {
     use racer_dataplane::{
-        model::identity::{
+        model::{
             CacheId, CacheKey, ObjectId, ObjectVersion, PageId, PageNumber, StrongEtag, WorkerId,
         },
         runtime::worker::WorkerMap,
@@ -881,7 +881,7 @@ fn production_multicache_disk_baseline() {
 fn production_peer_and_failed_neighbor_progress() {
     use racer_dataplane::{
         control::wire,
-        model::identity::{CacheId, CacheKey, MembershipVersion, NodeId, ObjectId, PageNumber},
+        model::{CacheId, CacheKey, MembershipVersion, NodeId, ObjectId, PageNumber},
         topology::{
             membership::{Member, Membership},
             placement::Placement,
@@ -1018,7 +1018,7 @@ fn production_peer_and_failed_neighbor_progress() {
 #[ignore = "requires root, mount namespaces, io_uring and O_DIRECT; actual noncandidate subscription"]
 fn production_remote_bootstrap_one_get_and_empty() {
     use racer_dataplane::{
-        model::identity::{CacheId, CacheKey, MembershipVersion, NodeId, ObjectId, PageNumber},
+        model::{CacheId, CacheKey, MembershipVersion, NodeId, ObjectId, PageNumber},
         topology::{
             membership::{Member, Membership},
             placement::Placement,

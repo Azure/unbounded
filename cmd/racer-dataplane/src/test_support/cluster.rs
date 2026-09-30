@@ -3,10 +3,7 @@ use super::clock::{Clock, Schedule};
 use crate::{
     config::Config,
     error::{Error, Result},
-    model::{
-        identity::{ClusterId, NodeId},
-        limits::Limits,
-    },
+    model::{ClusterId, Limits, NodeId},
 };
 use std::{
     cell::RefCell,

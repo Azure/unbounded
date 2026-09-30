@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     error::{Error, Result},
-    model::identity::WorkerId,
+    model::WorkerId,
 };
 use std::{
     cell::{Cell, RefCell},

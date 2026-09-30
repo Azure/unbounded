@@ -1,6 +1,6 @@
 //! Assertions migrated from test_support::io onto production Entry ownership.
 use super::{tests::*, *};
-use crate::{error::Error, model::limits::ResourceClass};
+use crate::{error::Error, model::ResourceClass};
 use std::cell::Cell;
 
 struct Probe(Rc<Cell<usize>>);
@@ -12,10 +12,7 @@ impl Drop for Probe {
 
 #[test]
 fn immutable_ciphertext_send_shares_backing_and_retains_it_through_cancel_fences() {
-    use crate::model::{
-        identity::{CacheId, CacheKey, ObjectId, ObjectVersion, StrongEtag},
-        metadata::VersionMetadata,
-    };
+    use crate::model::{CacheId, CacheKey, ObjectId, ObjectVersion, StrongEtag, VersionMetadata};
     for cancel_first in [false, true] {
         let sim = Simulation::new();
         let _environment = sim.enter();

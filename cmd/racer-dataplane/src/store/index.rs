@@ -3,13 +3,12 @@ use super::{
     segment::{Generation, SegmentId},
     slab::SlabLocation,
 };
-use crate::model::envelope::KeyId;
+use crate::model::KeyId;
 use crate::runtime::collections::{HashMap, HashSet};
 use crate::{
     error::{Error, Result},
     model::{
-        identity::{ObjectId, ObjectVersion, PageId, WorkerId},
-        metadata::{CurrentVersion, ObjectMetadata, VersionMetadata},
+        CurrentVersion, ObjectId, ObjectMetadata, ObjectVersion, PageId, VersionMetadata, WorkerId,
     },
 };
 use std::{
@@ -119,7 +118,7 @@ impl Index {
         self.availability = Some(availability);
         self
     }
-    fn available(&self, cache: &crate::model::identity::CacheId) -> bool {
+    fn available(&self, cache: &crate::model::CacheId) -> bool {
         self.availability.as_ref().is_none_or(|a| a.metadata(cache))
     }
     pub fn worker(&self) -> WorkerId {
@@ -422,7 +421,7 @@ impl Index {
     pub fn segment_empty(&self, segment: SegmentId) -> bool {
         !self.state.borrow().reverse.contains_key(&segment)
     }
-    pub fn retire_key(&self, cache: &crate::model::identity::CacheId, key: KeyId) -> usize {
+    pub fn retire_key(&self, cache: &crate::model::CacheId, key: KeyId) -> usize {
         let mut s = self.state.borrow_mut();
         let pages: Vec<_> = s
             .pages
@@ -435,7 +434,7 @@ impl Index {
         }
         pages.len()
     }
-    pub fn remove_cache(&self, cache: &crate::model::identity::CacheId) {
+    pub fn remove_cache(&self, cache: &crate::model::CacheId) {
         let mut s = self.state.borrow_mut();
         let pages: Vec<_> = s
             .pages
@@ -510,20 +509,18 @@ mod tests {
         let legacy = descriptor("v1", 3);
         index.publish_version(legacy.clone()).unwrap();
         let mut typed = legacy.clone();
-        typed.content_type =
-            Some(crate::model::metadata::ContentType::parse(b"text/plain").unwrap());
+        typed.content_type = Some(crate::model::ContentType::parse(b"text/plain").unwrap());
         index.publish_version(typed.clone()).unwrap();
         index.publish_version(legacy).unwrap();
         assert_eq!(index.version(&typed.version).unwrap(), Some(typed.clone()));
         assert_eq!(typed.for_pin().content_type, typed.content_type);
         let mut conflict = typed.clone();
-        conflict.content_type =
-            Some(crate::model::metadata::ContentType::parse(b"text/html").unwrap());
+        conflict.content_type = Some(crate::model::ContentType::parse(b"text/html").unwrap());
         assert_eq!(index.publish_version(conflict), Err(Error::CorruptRecord));
     }
     use crate::{
         error::Error,
-        model::identity::{CacheId, CacheKey, StrongEtag},
+        model::{CacheId, CacheKey, StrongEtag},
     };
 
     fn descriptor(etag: &str, length: u64) -> VersionMetadata {
@@ -574,7 +571,7 @@ mod tests {
     fn indexed(metadata: VersionMetadata, segment: u64) -> (PageId, IndexedPage) {
         let page = PageId {
             version: metadata.version.clone(),
-            number: crate::model::identity::PageNumber(0),
+            number: crate::model::PageNumber(0),
         };
         (
             page,

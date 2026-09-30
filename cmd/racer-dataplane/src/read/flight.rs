@@ -19,7 +19,7 @@ use crate::runtime::collections::HashMap;
 use crate::{
     error::{Error, Operation, Result},
     memory::page::{AcquiredPage, PageResult, UnverifiedPage},
-    model::{context::OriginContext, identity::PageId, limits::ResourceClass},
+    model::{OriginContext, PageId, ResourceClass},
     runtime::{
         admission::{Admission, Reservation},
         deadline::RequestScope,
@@ -1428,9 +1428,7 @@ mod tests {
         assert_eq!(moved.route_links(), 8);
         assert_eq!(original.remaining_links(), 0);
     }
-    use crate::model::identity::{
-        CacheId, CacheKey, ObjectId, ObjectVersion, PageNumber, StrongEtag,
-    };
+    use crate::model::{CacheId, CacheKey, ObjectId, ObjectVersion, PageNumber, StrongEtag};
     use std::time::Duration;
 
     fn flights(limits: FlightLimits) -> Rc<Flights> {
@@ -1446,7 +1444,7 @@ mod tests {
     }
     fn scope() -> RequestScope {
         RequestScope::new(
-            crate::model::identity::RequestId([0; 16]),
+            crate::model::RequestId([0; 16]),
             Instant::now() + Duration::from_secs(60),
         )
         .unwrap()
@@ -1469,7 +1467,7 @@ mod tests {
     ) -> AcquisitionWaiter<'a> {
         let membership = std::sync::Arc::new(
             crate::topology::membership::Membership::validate(
-                crate::model::identity::MembershipVersion(1),
+                crate::model::MembershipVersion(1),
                 vec![],
             )
             .unwrap(),
@@ -1561,10 +1559,7 @@ mod tests {
     fn result(flights: &Flights, page: PageId) -> PageResult {
         use crate::{
             memory::pool::{CiphertextBytes, CiphertextPage, VerifiedBytes, VerifiedPage},
-            model::{
-                envelope::{KeyId, Nonce, PageEnvelope},
-                metadata::{ExpiresAt, ObjectMetadata},
-            },
+            model::{ExpiresAt, KeyId, Nonce, ObjectMetadata, PageEnvelope},
         };
         use std::sync::Arc;
         PageResult {

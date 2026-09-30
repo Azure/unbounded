@@ -3,7 +3,7 @@
 //! denotes the same immutable namespace; a different namespace requires a new UID.
 use crate::{
     control::snapshot::PublishedState,
-    model::{envelope::KeyId, identity::CacheId},
+    model::{CacheId, KeyId},
     security::keyring::{KeyPurpose, Keyring},
 };
 use std::{rc::Rc, sync::Arc};
@@ -38,7 +38,7 @@ pub(crate) fn for_caches(keys: Rc<Keyring>, caches: Vec<CacheId>) -> Rc<Availabi
             schema_version: SCHEMA_VERSION,
             cluster: keys.cluster().clone(),
             sequence: PublicationSequence(1),
-            membership_version: crate::model::identity::MembershipVersion(1),
+            membership_version: crate::model::MembershipVersion(1),
             members: vec![crate::topology::membership::Member {
                 node: keys.node().clone(),
                 shares: std::num::NonZeroU32::new(1).unwrap(),

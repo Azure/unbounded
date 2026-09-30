@@ -1,5 +1,5 @@
 use super::*;
-use racer_dataplane::model::limits::ResourceClass;
+use racer_dataplane::model::ResourceClass;
 use std::{
     fs,
     os::{fd::AsRawFd, unix::net::UnixListener},
@@ -108,13 +108,7 @@ fn sdk_client_to_rust_http_and_request_parser_over_uds() {
                 .unwrap();
             assert_eq!(parsed.origin.object.key, CacheKey([0; 32]));
             assert_eq!(
-                parsed
-                    .origin
-                    .metadata
-                    .as_ref()
-                    .unwrap()
-                    .as_header()
-                    .unwrap(),
+                parsed.origin.metadata.as_ref().unwrap().as_header(),
                 b"opaque,  bytes\xff"
             );
             assert_eq!(
@@ -123,8 +117,7 @@ fn sdk_client_to_rust_http_and_request_parser_over_uds() {
                     .authorization
                     .as_ref()
                     .unwrap()
-                    .expose_for_origin()
-                    .unwrap(),
+                    .expose_for_origin(),
                 b"fixture credential\x80"
             );
             assert_eq!(

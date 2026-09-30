@@ -55,7 +55,7 @@ mod tests {
             ]
         );
         let keys = super::super::keyring::tests::keys();
-        let cache = crate::model::identity::CacheId(super::super::identity::tests::CACHE.into());
+        let cache = crate::model::CacheId(super::super::identity::tests::CACHE.into());
         assert!(
             request_key(
                 &keys

@@ -5,10 +5,7 @@ use crate::{
         io::HttpIo,
         pool::{ConnectionLease, Endpoint, HttpPool},
     },
-    model::{
-        envelope::PageEnvelope,
-        metadata::{ExpiresAt, ObjectMetadata},
-    },
+    model::{ExpiresAt, ObjectMetadata, PageEnvelope},
     runtime::reactor::Reactor,
     telemetry::Telemetry,
 };
@@ -52,10 +49,7 @@ fn body_cases(cases: &[&str]) {
         let reactor = Rc::new(Reactor::new(admission.clone()));
         let io = Rc::new(HttpIo::with_admission(
             reactor.clone(),
-            Codec::new(
-                wire::MAX_ENVELOPE_HEAD,
-                crate::model::range::PAGE_BYTES + 16,
-            ),
+            Codec::new(wire::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
             admission.clone(),
         ));
         let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 1));

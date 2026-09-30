@@ -192,14 +192,14 @@ impl Requester {
             // falls back to HTTP before exporting a window when they disagree.
             let rail_hint = match &request.request.operation {
                 super::wire::Operation::Page { page, .. } => Some(page.clone()),
-                super::wire::Operation::Subscribe { subscription, .. } => {
-                    subscription.demand.intervals().first().map(|interval| {
-                        crate::model::identity::PageId {
-                            version: subscription.version.clone(),
-                            number: crate::model::identity::PageNumber(interval.start),
-                        }
-                    })
-                }
+                super::wire::Operation::Subscribe { subscription, .. } => subscription
+                    .demand
+                    .intervals()
+                    .first()
+                    .map(|interval| crate::model::PageId {
+                        version: subscription.version.clone(),
+                        number: crate::model::PageNumber(interval.start),
+                    }),
                 _ => None,
             };
             let plan = if let Some(page) = rail_hint {

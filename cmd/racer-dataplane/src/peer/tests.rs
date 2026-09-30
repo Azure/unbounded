@@ -9,11 +9,7 @@ use crate::{
     control::wire::{BundleGeneration, KeyringBundle, SCHEMA_VERSION},
     memory::pool::BufferPool,
     model::{
-        context::{EncryptedAuthorization, PeerOriginContext},
-        envelope::{KeyId, Nonce},
-        identity::*,
-        limits::ResourceClass,
-        metadata::MetadataSelector,
+        EncryptedAuthorization, KeyId, MetadataSelector, Nonce, PeerOriginContext, ResourceClass, *,
     },
     peer::wire::{
         FetchMode, LogicalCodec, Operation, PeerRequest, PeerResponse, SecurityCodec, WireCodec,
@@ -1142,10 +1138,7 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let io = Rc::new(HttpIo::with_admission(
         reactor.clone(),
-        Codec::new(
-            wire::MAX_ENVELOPE_HEAD,
-            crate::model::range::PAGE_BYTES + 16,
-        ),
+        Codec::new(wire::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
         admission.clone(),
     ));
     let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2));
@@ -1337,10 +1330,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
         let baseline = admission.used(ResourceClass::RequestContext);
         let io = Rc::new(HttpIo::with_admission(
             reactor.clone(),
-            Codec::new(
-                wire::MAX_ENVELOPE_HEAD,
-                crate::model::range::PAGE_BYTES + 16,
-            ),
+            Codec::new(wire::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
             admission.clone(),
         ));
         let (signers, _) = identities();
@@ -1482,10 +1472,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
             io::HttpIo,
             pool::{Endpoint, HttpPool},
         },
-        model::{
-            envelope::PageEnvelope,
-            metadata::{ExpiresAt, ObjectMetadata},
-        },
+        model::{ExpiresAt, ObjectMetadata, PageEnvelope},
         runtime::reactor::Reactor,
         security::{forwarding::ForwardedHead, protocol},
     };
@@ -1499,7 +1486,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let io = Rc::new(HttpIo::with_admission(
         reactor.clone(),
-        Codec::new(64 * 1024, crate::model::range::PAGE_BYTES + 16),
+        Codec::new(64 * 1024, crate::model::PAGE_BYTES + 16),
         admission.clone(),
     ));
     let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 1));
@@ -1787,10 +1774,7 @@ mod established_sessions {
             reactor.init().unwrap();
             let io = Rc::new(HttpIo::with_admission(
                 reactor.clone(),
-                Codec::new(
-                    wire::MAX_ENVELOPE_HEAD,
-                    crate::model::range::PAGE_BYTES + 16,
-                ),
+                Codec::new(wire::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
                 admission.clone(),
             ));
             let signers = signers();
@@ -1871,9 +1855,8 @@ mod established_sessions {
         fn frame(&self, large: bool) -> crate::http::codec::MessageHead {
             let mut request = request(&self.admission, 1);
             if large {
-                request.origin.metadata = Some(
-                    crate::model::context::OpaqueMetadata::from_header(&vec![b'm'; 8192]).unwrap(),
-                );
+                request.origin.metadata =
+                    Some(crate::model::OpaqueMetadata::from_header(&vec![b'm'; 8192]).unwrap());
                 request.origin.authorization.as_mut().unwrap().ciphertext = vec![5; 8208];
             }
             let (signed, _) = Forwarding::new(self.signers[0].clone())

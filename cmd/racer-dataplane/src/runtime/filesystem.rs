@@ -38,7 +38,7 @@ mod partial_tests {
     }
     fn scope() -> RequestScope {
         RequestScope::new(
-            crate::model::identity::RequestId([93; 16]),
+            crate::model::RequestId([93; 16]),
             Instant::now() + Duration::from_secs(10),
         )
         .unwrap()
@@ -178,7 +178,7 @@ fn value(result: Result<KernelResult>) -> Result<i32> {
 impl Reactor {
     /// Fence abandoned filesystem transactions before reusing their staging names.
     /// Callers allocate a distinct request ID for each transaction.
-    pub fn file_fence(&self, request: crate::model::identity::RequestId) -> Operation<'_, ()> {
+    pub fn file_fence(&self, request: crate::model::RequestId) -> Operation<'_, ()> {
         Box::pin(async move {
             let ids: Vec<_> = self
                 .state
@@ -462,7 +462,7 @@ mod buffer_tests {
             return;
         };
         let scope = RequestScope::new(
-            crate::model::identity::RequestId([38; 16]),
+            crate::model::RequestId([38; 16]),
             std::time::Instant::now() + Duration::from_secs(10),
         )
         .unwrap();
@@ -500,11 +500,8 @@ mod buffer_tests {
         assert_eq!(buffer.advance(0), Err(Error::Io));
         assert_eq!(buffer.advance(5), Err(Error::Io));
         drop(buffer);
-        let canceled = RequestScope::new(
-            crate::model::identity::RequestId([39; 16]),
-            scope.deadline.0,
-        )
-        .unwrap();
+        let canceled =
+            RequestScope::new(crate::model::RequestId([39; 16]), scope.deadline.0).unwrap();
         let mut stat = r.file_stat(fd.clone(), &canceled);
         assert!(poll(&mut stat).is_pending());
         canceled.cancel().unwrap();

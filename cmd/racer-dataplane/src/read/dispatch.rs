@@ -10,9 +10,8 @@ use crate::{
     client::request::ClientRequest,
     error::{Error, Operation, Result},
     model::{
-        context::{OriginContext, PeerOriginContext},
-        identity::{AttemptId, ObjectId, ObjectVersion, PageId, WorkerId},
-        metadata::{MetadataSelector, ObjectMetadata, VersionMetadata},
+        AttemptId, MetadataSelector, ObjectId, ObjectMetadata, ObjectVersion, OriginContext,
+        PageId, PeerOriginContext, VersionMetadata, WorkerId,
     },
     peer::{
         server::LocalPageService,
@@ -1034,7 +1033,7 @@ impl LocalPageService for Dispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::identity::{CacheId, CacheKey, RequestId, StrongEtag};
+    use crate::model::{CacheId, CacheKey, RequestId, StrongEtag};
     use std::time::{Duration, Instant};
 
     fn directory(capacity: usize) -> WorkerDirectory {
@@ -1140,7 +1139,7 @@ mod tests {
             let scope = scope();
             let page = PageId {
                 version: version(),
-                number: crate::model::identity::PageNumber(9),
+                number: crate::model::PageNumber(9),
             };
             let owner = directory.page_owner(&page).unwrap();
             let mut lookup = Box::pin(directory.cached_page(page.clone(), &scope));
@@ -1195,11 +1194,9 @@ mod tests {
             content_type: None,
         };
         let mut typed = legacy.clone();
-        typed.content_type =
-            Some(crate::model::metadata::ContentType::parse(b"text/plain").unwrap());
+        typed.content_type = Some(crate::model::ContentType::parse(b"text/plain").unwrap());
         let mut conflict = typed.clone();
-        conflict.content_type =
-            Some(crate::model::metadata::ContentType::parse(b"text/html").unwrap());
+        conflict.content_type = Some(crate::model::ContentType::parse(b"text/html").unwrap());
         let mut wrong_length = legacy.clone();
         wrong_length.length += 1;
         let mut wrong_version = legacy.clone();
@@ -1317,7 +1314,7 @@ mod tests {
                     sender
                         .submit(
                             WorkerId(0),
-                            Work::Publish(crate::model::metadata::VersionMetadata {
+                            Work::Publish(crate::model::VersionMetadata {
                                 content_type: None,
                                 version: version(),
                                 length: 0,
@@ -1481,7 +1478,7 @@ mod tests {
         let directory = directory(2);
         let mut page = PageId {
             version: version(),
-            number: crate::model::identity::PageNumber(0),
+            number: crate::model::PageNumber(0),
         };
         let owner = directory.metadata_owner(&page.version.object).unwrap();
         assert_eq!(directory.page_owner(&page).unwrap(), owner);

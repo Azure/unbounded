@@ -5,11 +5,8 @@ mod hot_reads;
 mod peer_copies;
 use crate::{
     model::{
-        identity::{
-            CacheId, CacheKey, ObjectId, ObjectVersion, PageNumber, RequestId, StrongEtag, WorkerId,
-        },
-        limits::ResourceClass,
-        metadata::ExpiresAt,
+        CacheId, CacheKey, ExpiresAt, ObjectId, ObjectVersion, PageNumber, RequestId,
+        ResourceClass, StrongEtag, WorkerId,
     },
     origin::{metadata::MetadataReply, page::OriginPage},
     read::dispatch::WorkerDirectory,
@@ -59,7 +56,7 @@ impl Origin for TestOrigin {
         &'a self,
         _: &'a super::super::candidates::OriginAuthority,
         _: &'a OriginContext,
-        _: crate::model::metadata::MetadataSelector,
+        _: crate::model::MetadataSelector,
         _: &'a RequestScope,
     ) -> Operation<'a, MetadataReply> {
         Box::pin(async { panic!("pinned page fill must not refresh metadata") })
@@ -148,12 +145,12 @@ impl Drop for Fixture {
 fn fixture() -> Fixture {
     fixture_with(3, None)
 }
-fn fixture_with(length: u64, limits: Option<crate::model::limits::Limits>) -> Fixture {
+fn fixture_with(length: u64, limits: Option<crate::model::Limits>) -> Fixture {
     fixture_with_availability(length, limits, false)
 }
 fn fixture_with_availability(
     length: u64,
-    limits: Option<crate::model::limits::Limits>,
+    limits: Option<crate::model::Limits>,
     check_availability: bool,
 ) -> Fixture {
     let mut config = crate::test_support::cluster::config(false);
@@ -227,10 +224,10 @@ fn fixture_with_availability(
         metadata: None,
         authorization: None,
     };
-    let node = crate::model::identity::NodeId("22222222-2222-4222-8222-222222222222".into());
+    let node = crate::model::NodeId("22222222-2222-4222-8222-222222222222".into());
     let membership = Arc::new(
         Membership::validate(
-            crate::model::identity::MembershipVersion(1),
+            crate::model::MembershipVersion(1),
             vec![Member {
                 node: node.clone(),
                 shares: NonZeroU32::new(4).unwrap(),
@@ -351,7 +348,7 @@ fn abandoned_metadata_does_not_cancel_shared_peer_scope() {
 
 fn abandoned_acquisition_preserves_peer_scope(metadata: bool) {
     use crate::{
-        model::metadata::MetadataSelector,
+        model::MetadataSelector,
         read::metadata::{MetadataDependencies, MetadataService},
     };
     {
@@ -486,7 +483,7 @@ fn completed_fill_waits_release_shared_cancellation_capacity() {
 
 #[test]
 fn selected_owner_reclaims_foreign_receive_charges_across_full_pages() {
-    use crate::model::range::PAGE_BYTES;
+    use crate::model::PAGE_BYTES;
     use std::num::NonZeroUsize;
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.plaintext_bytes = NonZeroUsize::new(2 * PAGE_BYTES as usize).unwrap();
@@ -940,7 +937,7 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
                 wire::*,
             },
             memory::{delivery::Delivery, pipe::PipePool},
-            model::range::ByteRange,
+            model::ByteRange,
             read::{
                 metadata::{MetadataDependencies, MetadataService},
                 range_stream::RangeStreams,
@@ -1006,7 +1003,7 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
                 pin: Some(f.page.version.etag.clone()),
                 range: Some(ByteRange::Closed { first: 0, last: 2 }),
                 page_credits: 1,
-                byte_credits: crate::model::range::PAGE_BYTES,
+                byte_credits: crate::model::PAGE_BYTES,
                 ordered,
             };
             let mut response = drive(
@@ -1129,7 +1126,7 @@ impl Origin for BootstrapOrigin {
         &'a self,
         _: &'a super::super::candidates::OriginAuthority,
         _: &'a OriginContext,
-        _: crate::model::metadata::MetadataSelector,
+        _: crate::model::MetadataSelector,
         _: &'a RequestScope,
     ) -> Operation<'a, MetadataReply> {
         Box::pin(async { panic!("bootstrap must not HEAD") })
@@ -1185,7 +1182,7 @@ impl Origin for BootstrapOrigin {
 
 #[test]
 fn bootstrap_rejection_re_elects_and_version_changes_never_mix_pages() {
-    use crate::model::metadata::MetadataSelector;
+    use crate::model::MetadataSelector;
     use crate::read::metadata::{BootstrapResult, MetadataDependencies, MetadataService};
     let mut f = fixture();
     let origin = Rc::new(BootstrapOrigin {
@@ -1265,7 +1262,7 @@ impl Origin for GatedMetadataOrigin {
         &'a self,
         _: &'a super::super::candidates::OriginAuthority,
         _: &'a OriginContext,
-        _: crate::model::metadata::MetadataSelector,
+        _: crate::model::MetadataSelector,
         _: &'a RequestScope,
     ) -> Operation<'a, MetadataReply> {
         self.calls.set(self.calls.get() + 1);
@@ -1286,7 +1283,7 @@ impl Origin for GatedMetadataOrigin {
 #[test]
 fn bootstrap_after_catalog_eviction_checks_cached_content_type_and_preserves_fresh_expiry() {
     use crate::{
-        model::metadata::{ContentType, MetadataSelector},
+        model::{ContentType, MetadataSelector},
         read::metadata::{BootstrapResult, MetadataDependencies, MetadataService},
     };
     for with_origin_page in [false, true] {
@@ -1446,7 +1443,7 @@ fn bootstrap_after_catalog_eviction_checks_cached_content_type_and_preserves_fre
 #[test]
 fn blocked_metadata_leader_and_follower_notify_without_spinning() {
     use crate::{
-        model::metadata::MetadataSelector,
+        model::MetadataSelector,
         read::metadata::{MetadataDependencies, MetadataService},
         test_support::WakeCounter,
     };
@@ -1547,7 +1544,7 @@ fn blocked_metadata_leader_and_follower_notify_without_spinning() {
 #[test]
 fn metadata_deadline_wakes_parked_follower_without_polling_gated_leader() {
     use crate::{
-        model::metadata::MetadataSelector,
+        model::MetadataSelector,
         read::metadata::{MetadataDependencies, MetadataService, tests::assert_ingress_counts},
         test_support::WakeCounter,
     };
@@ -1755,9 +1752,8 @@ fn concurrent_readers_share_origin_encryption_and_pending_original_ciphertext() 
 #[test]
 fn ciphertext_origin_fill_retains_verified_publication_without_a_plaintext_waiter() {
     let mut f = fixture();
-    f.context.authorization = Some(
-        crate::model::context::Authorization::from_header(b"test-supplier-credential").unwrap(),
-    );
+    f.context.authorization =
+        Some(crate::model::Authorization::from_header(b"test-supplier-credential").unwrap());
     let flights = f.fill.dependencies.flights.clone();
     let mut holder_budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
     let JoinedFlight::Waiter(holder) = flights
@@ -2396,7 +2392,7 @@ fn copy_only_miss_has_no_origin_side_effect_and_wrong_context_never_joins() {
 
 #[test]
 fn sequential_full_pages_reclaim_idle_bytes_and_preserve_busy_reader_leases() {
-    use crate::model::range::PAGE_BYTES;
+    use crate::model::PAGE_BYTES;
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.plaintext_bytes = std::num::NonZeroUsize::new(2 * PAGE_BYTES as usize).unwrap();
     limits.ciphertext_bytes = std::num::NonZeroUsize::new(4 * (PAGE_BYTES as usize + 16)).unwrap();
@@ -2483,7 +2479,7 @@ fn sequential_full_pages_reclaim_idle_bytes_and_preserve_busy_reader_leases() {
 fn bootstrap_admission_discards_queued_copy_before_evicting_idle_bundle() {
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.plaintext_bytes =
-        std::num::NonZeroUsize::new(crate::model::range::PAGE_BYTES as usize).unwrap();
+        std::num::NonZeroUsize::new(crate::model::PAGE_BYTES as usize).unwrap();
     let mut f = fixture_with(3, Some(limits));
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
     let result = drive(
@@ -2554,10 +2550,10 @@ fn retained_page(
                 admission
                     .reserve(Some(cache), ResourceClass::Ciphertext, 19)
                     .unwrap(),
-                crate::model::envelope::PageEnvelope {
+                crate::model::PageEnvelope {
                     page: id,
-                    key_id: crate::model::envelope::KeyId([1; 16]),
-                    nonce: crate::model::envelope::Nonce([2; 24]),
+                    key_id: crate::model::KeyId([1; 16]),
+                    nonce: crate::model::Nonce([2; 24]),
                     plaintext_length: 3,
                     ciphertext_length: 19,
                 },
@@ -2826,7 +2822,7 @@ fn canceled_supplier_retains_crypto_fence_before_replacement_origin_work() {
 
 #[test]
 fn sequential_full_pages_reclaim_idle_bytes_but_preserve_independent_reader() {
-    use crate::model::range::PAGE_BYTES;
+    use crate::model::PAGE_BYTES;
     use std::num::NonZeroUsize;
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.plaintext_bytes = NonZeroUsize::new(2 * PAGE_BYTES as usize).unwrap();
@@ -2909,7 +2905,7 @@ fn sequential_full_pages_reclaim_idle_bytes_but_preserve_independent_reader() {
 
 #[test]
 fn sequential_full_pages_reclaim_idle_bytes_and_preserve_a_busy_reader() {
-    use crate::model::range::PAGE_BYTES;
+    use crate::model::PAGE_BYTES;
     use std::num::NonZeroUsize;
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.plaintext_bytes = NonZeroUsize::new(2 * PAGE_BYTES as usize).unwrap();

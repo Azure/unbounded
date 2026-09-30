@@ -1,10 +1,7 @@
 //! Bounded HTTPS/JSON v1 and keyring bundle DTOs.
 use super::caches::CacheDefinition;
 use crate::{
-    model::{
-        envelope::KeyId,
-        identity::{CacheId, ClusterId, MembershipVersion, NodeId},
-    },
+    model::{CacheId, ClusterId, KeyId, MembershipVersion, NodeId},
     topology::membership::Member,
 };
 use std::time::Duration;

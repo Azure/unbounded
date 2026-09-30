@@ -165,7 +165,7 @@ pub struct ControlTransport {
 }
 pub struct ControlConnection {
     health: Rc<crate::topology::health::LinkHealth>,
-    endpoint: crate::model::identity::NodeId,
+    endpoint: crate::model::NodeId,
     charge: Option<Rc<crate::runtime::admission::ConnectionReservation>>,
     stream: ControlStream,
     fd: Rc<OwnedFd>,
@@ -311,7 +311,7 @@ impl ControlTransport {
         Box::pin(async move {
             self.health
                 .run(
-                    &crate::model::identity::NodeId(self.endpoint.url.clone()),
+                    &crate::model::NodeId(self.endpoint.url.clone()),
                     self.connect_inner(identity, scope),
                 )
                 .await
@@ -400,7 +400,7 @@ impl ControlTransport {
                 let charge = io
                     .reactor()
                     .map(|r| {
-                        r.reserve_connection(crate::model::limits::ResourceClass::ControlConnection)
+                        r.reserve_connection(crate::model::ResourceClass::ControlConnection)
                             .map(Rc::new)
                     })
                     .transpose()?;
@@ -443,7 +443,7 @@ impl ControlTransport {
             };
             let mut connection = ControlConnection {
                 health: self.health.clone(),
-                endpoint: crate::model::identity::NodeId(self.endpoint.url.clone()),
+                endpoint: crate::model::NodeId(self.endpoint.url.clone()),
                 charge,
                 stream,
                 fd,
@@ -1191,7 +1191,7 @@ pub(super) mod tests {
         let d = testing::Directory::new();
         let (ca, key) = testing::ca();
         let enrollment = Enrollment::new(
-            crate::model::identity::ClusterId("11111111-1111-4111-8111-111111111111".into()),
+            crate::model::ClusterId("11111111-1111-4111-8111-111111111111".into()),
             d.0.join("token"),
             d.0.join("identity"),
         );
@@ -1324,7 +1324,7 @@ pub(super) mod tests {
         transport
             .health
             .observe_at(
-                &crate::model::identity::NodeId(transport.endpoint.url.clone()),
+                &crate::model::NodeId(transport.endpoint.url.clone()),
                 crate::topology::health::LinkOutcome::Refused,
                 Instant::now() - Duration::from_secs(60),
             )
@@ -1624,7 +1624,7 @@ pub(super) mod tests {
         };
         let (peer_ca, peer_key) = testing::ca();
         let enrollment = Enrollment::new(
-            crate::model::identity::ClusterId("11111111-1111-4111-8111-111111111111".into()),
+            crate::model::ClusterId("11111111-1111-4111-8111-111111111111".into()),
             d.0.join("token"),
             d.0.join("identity"),
         );
@@ -1709,7 +1709,7 @@ pub(super) mod tests {
         let trust = d.0.join("trust.pem");
         std::fs::write(&trust, ca.pem()).unwrap();
         let enrollment = Enrollment::new(
-            crate::model::identity::ClusterId("11111111-1111-4111-8111-111111111111".into()),
+            crate::model::ClusterId("11111111-1111-4111-8111-111111111111".into()),
             d.0.join("token"),
             d.0.join("identity"),
         );
