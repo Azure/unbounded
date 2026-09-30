@@ -684,11 +684,24 @@ impl Rig {
         match self.dispatcher.read(request, scope).await {
             Ok(response) => {
                 self.responses.validate(&kind, &response)?;
-                drop(
-                    self.responses
-                        .send(received.connection, response, scope)
-                        .await?,
-                );
+                if kind.is_head() {
+                    drop(
+                        self.responses
+                            .send(received.connection, response, scope)
+                            .await?,
+                    );
+                } else {
+                    drop(
+                        self.responses
+                            .send_subscription_unobserved(
+                                received.connection,
+                                response,
+                                scope,
+                                TIMEOUT,
+                            )
+                            .await?,
+                    );
+                }
             }
             Err(error) => {
                 drop(
@@ -717,6 +730,18 @@ impl Rig {
         );
         reply.unwrap()
     }
+    fn subscribe(&self, fields: &str) -> Reply {
+        let (local, mut remote) = UnixStream::pair().unwrap();
+        let request = subscription_request(fields);
+        let reader = thread::spawn(move || {
+            remote.write_all(request.as_bytes()).unwrap();
+            receive_subscription(remote)
+        });
+        let result = self.drive(self.serve(local, &scope()));
+        let reply = reader.join();
+        assert_eq!(result, Ok(()), "origin calls: {:?}", self.adapter.calls());
+        reply.unwrap()
+    }
     fn flush(&self) {
         self.drive(std::future::poll_fn(|_| {
             if self.writer.is_idle() && self.writer_task.borrow().is_none() {
@@ -734,6 +759,191 @@ fn request(method: &str, fields: &str) -> String {
         "{method} /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\n{fields}\r\n",
         "ab".repeat(32)
     )
+}
+
+fn subscription_request(fields: &str) -> String {
+    format!(
+        "POST /v2/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nRacer-Ordered: 1\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: {P}\r\n{fields}\r\n",
+        "ab".repeat(32)
+    )
+}
+
+// Exercise real duplex credits with one outstanding page, not a legacy HTTP body.
+fn receive_subscription(mut stream: UnixStream) -> Reply {
+    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+    stream.set_write_timeout(Some(TIMEOUT)).unwrap();
+    let head = read_head(&mut stream).expect("subscription response head");
+    let fields = fields(&head);
+    let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    if status != 200 {
+        assert_eq!(fields["content-length"], "0");
+        return Reply {
+            status,
+            fields,
+            body: vec![],
+        };
+    }
+    assert_eq!(fields["connection"], "close");
+    let start: u64 = fields["racer-range-start"].parse().unwrap();
+    let end: u64 = fields["racer-range-end"].parse().unwrap();
+    let total: u64 = fields["racer-object-length"].parse().unwrap();
+    assert!(start <= end && end <= total);
+    let mut body = Vec::new();
+    let mut pages = 0;
+    loop {
+        let mut frame = [0; 21];
+        stream
+            .read_exact(&mut frame)
+            .expect("complete subscription frame");
+        let number = u64::from_be_bytes(frame[1..9].try_into().unwrap());
+        let offset = u64::from_be_bytes(frame[9..17].try_into().unwrap());
+        let length = u32::from_be_bytes(frame[17..].try_into().unwrap());
+        match frame[0] {
+            1 => {
+                assert_eq!(offset, start + body.len() as u64);
+                assert!(offset < end);
+                assert_eq!(number, offset / P);
+                assert_eq!(u64::from(length), (end - offset).min(P - offset % P));
+                assert!(length > 0);
+                let previous = body.len();
+                body.resize(previous + length as usize, 0);
+                stream
+                    .read_exact(&mut body[previous..])
+                    .expect("complete page payload");
+                pages += 1;
+                // The final completion retires remaining leases; only nonfinal
+                // pages need releases to admit the next page under one credit.
+                if offset + u64::from(length) < end {
+                    stream.write_all(&frame[1..9]).unwrap();
+                    stream.write_all(&frame[17..]).unwrap();
+                }
+            }
+            2 => {
+                assert_eq!((number, offset, length), (pages, end - start, 0));
+                assert_eq!(body.len() as u64, end - start);
+                assert_eq!(
+                    fields["content-length"].parse::<u64>().unwrap(),
+                    (pages + 1) * 21 + end - start
+                );
+                break;
+            }
+            kind => panic!("unexpected subscription frame {kind}"),
+        }
+    }
+    Reply {
+        status,
+        fields,
+        body,
+    }
+}
+
+fn check_subscription(reply: &Reply, version: u8, start: u64, end: u64, total: u64) {
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.fields["etag"], format!("\"v{version}\""));
+    assert_eq!(reply.fields["racer-range-start"], start.to_string());
+    assert_eq!(reply.fields["racer-range-end"], end.to_string());
+    assert_eq!(reply.fields["racer-object-length"], total.to_string());
+    assert_eq!(reply.body.len() as u64, end - start);
+    for (offset, value) in reply.body.iter().enumerate() {
+        assert_eq!(
+            *value,
+            byte(version, start + offset as u64),
+            "body offset {offset}"
+        );
+    }
+}
+
+#[test]
+fn v2_subscription_credits_persist_three_pages_and_serve_partial_disk_range_offline() {
+    let length = 2 * P + 113;
+    let rig = Rig::with_dirty_pages(length, false, 4, 2);
+    check_subscription(&rig.subscribe(""), 1, 0, length, length);
+    let calls = rig.adapter.calls();
+    assert_eq!(calls.len(), 4);
+    assert_eq!(calls[0].method, "HEAD");
+    assert_eq!(calls[0].pin, None);
+    for (number, call) in calls[1..].iter().enumerate() {
+        assert_eq!(call.method, "GET");
+        assert_eq!(call.pin.as_deref(), Some("\"v1\""));
+        let expected = format!(
+            "bytes={}-{}",
+            number as u64 * P,
+            (number as u64 + 1) * P - 1
+        );
+        assert_eq!(call.range.as_deref(), Some(expected.as_str()));
+    }
+    rig.flush();
+    assert_eq!(rig.writer.index().snapshot().unwrap().entries.len(), 3);
+    rig.adapter.offline();
+    assert!(rig.memory.evict_idle(usize::MAX).unwrap() > 0);
+    assert_eq!(rig.admission.used(ResourceClass::Plaintext), 0);
+    let start = P - 7;
+    let end = 2 * P + 13;
+    check_subscription(
+        &rig.subscribe(&format!(
+            "If-Match: \"v1\"\r\nRange: bytes={start}-{}\r\n",
+            end - 1
+        )),
+        1,
+        start,
+        end,
+        length,
+    );
+    assert_eq!(
+        rig.adapter.calls().len(),
+        4,
+        "disk hit contacted disabled origin"
+    );
+    rig.drive(rig.reactor.drain()).unwrap();
+    assert_eq!(rig.admission.used(ResourceClass::Flight), 0);
+    assert_eq!(rig.admission.used(ResourceClass::Waiter), 0);
+    rig.memory.evict_idle(usize::MAX).unwrap();
+    assert_eq!(rig.admission.used(ResourceClass::Plaintext), 0);
+}
+
+#[test]
+fn v2_subscription_zero_ttl_revalidates_metadata_without_losing_retained_pin() {
+    let rig = Rig::new(113, true, 4);
+    check_subscription(&rig.subscribe(""), 1, 0, 113, 113);
+    rig.flush();
+    rig.adapter.state.lock().unwrap().version = 2;
+    check_subscription(&rig.subscribe(""), 2, 0, 113, 113);
+    rig.flush();
+    let calls = rig.adapter.calls();
+    assert_eq!(calls.len(), 4);
+    assert_eq!(
+        calls.iter().map(|c| c.method.as_str()).collect::<Vec<_>>(),
+        ["HEAD", "GET", "HEAD", "GET"]
+    );
+    assert_eq!(rig.subscribe("If-Match: \"missing\"\r\n").status, 412);
+    assert_eq!(rig.adapter.calls().len(), 5);
+    rig.adapter.offline();
+    rig.memory.evict_idle(usize::MAX).unwrap();
+    check_subscription(&rig.subscribe("If-Match: \"v1\"\r\n"), 1, 0, 113, 113);
+    assert_eq!(rig.adapter.calls().len(), 5);
+}
+
+#[test]
+fn v2_empty_subscription_completes_without_pages_and_v1_get_is_rejected() {
+    let rig = Rig::new(0, true, 1);
+    check_subscription(&rig.subscribe(""), 1, 0, 0, 0);
+    assert_eq!(rig.adapter.calls().len(), 1);
+    assert_eq!(rig.adapter.calls()[0].method, "HEAD");
+    assert_eq!(rig.admission.used(ResourceClass::Plaintext), 0);
+    assert_eq!(rig.admission.used(ResourceClass::DirtyCiphertext), 0);
+    let (local, mut remote) = UnixStream::pair().unwrap();
+    remote
+        .write_all(request("GET", "Range: bytes=0-16777215\r\n").as_bytes())
+        .unwrap();
+    assert_eq!(
+        rig.drive(rig.serve(local, &scope())),
+        Err(Error::InvalidRequest)
+    );
+    assert_eq!(
+        rig.adapter.calls().len(),
+        1,
+        "rejected v1 GET reached origin"
+    );
 }
 struct Reply {
     status: u16,
