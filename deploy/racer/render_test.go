@@ -68,6 +68,10 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 				t.Fatal("dataplane defaults must fund the Rust peer relay progress floor at four workers")
 			}
 
+			if _, capped := dataplaneConfig.Data["RACER_MAX_THREADS"]; capped {
+				t.Fatal("dataplane defaults must leave worker sizing automatic")
+			}
+
 			for key, value := range config.Data {
 				t.Setenv(key, value)
 			}

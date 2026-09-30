@@ -11,7 +11,21 @@ data:
   # image upgrades; switching topologies requires coordinated restart and drain.
   # Native builds activate only trusted, published, NUMA-local hardware mappings.
   RACER_ENABLE_RDMA: "auto"
-  RACER_MAX_THREADS: "8"
+  # No thread cap by default: eligible physical cores, CPU quota, and resource budgets apply.
+  # I/O shards share NUMA-local crypto threads at approximately 2:1, using leftovers:
+  # eight eligible cores on one NUMA node give five I/O plus three crypto threads
+  # when budgets permit.
+  # Budgets are divided by the final I/O shard count, not the crypto thread count.
+  # RACER_ALLOW_SMT=true opts into logical CPUs; physical cores remain the default.
+  # Both policies support separate I/O and crypto threads sharing one allowed CPU.
+  # Optional total userspace thread cap: unsigned decimal >= 2 fitting usize,
+  # with no fixed 256-thread maximum. Kernel io_uring workers are not included.
+  # RACER_MAX_THREADS: "8"
+  # Existing ConfigMaps retain old caps. Delete the key (do not set it empty) and
+  # any explicit workload env override to adopt automatic sizing through envFrom.
+  # The operator preserves administrator data and hashes edits for managed rollout.
+  # Rebuild the operator to ship embedded defaults; regenerate standalone manifests
+  # with make racer-manifests instead of editing generated output.
   # Proposed during authenticated enrollment; explicit Node shares take precedence.
   RACER_SHARES: "4"
   # Independent node-wide catalog, page-index and checkpoint working-set budgets.

@@ -1,4 +1,10 @@
 //! Opt-in bottleneck probe, reusing the production graph fixture above.
+//!
+//! Automatic sizing has no historical four-shard cap. Count distinct crypto groups,
+//! and scale RAM-disk capacity and memory preflight with the selected I/O shards.
+//! Requests use v2 POST subscriptions with Page, Complete, and EOF validation and
+//! reconnect per request. Focused harness checks are not new performance results;
+//! historical paired-worker measurements do not characterize this shared policy.
 use super::*;
 use racer_dataplane::{
     config::{Config, DEFAULT_MAX_THREADS},

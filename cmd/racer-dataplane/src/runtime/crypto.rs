@@ -1,4 +1,5 @@
-//! Owned page-AEAD handoff between exactly one I/O thread and its paired engine.
+//! Owned page-AEAD handoff between one I/O shard and its crypto engine endpoint.
+//! Multiple endpoints can share a NUMA-local crypto execution thread.
 //!
 //! Queue ownership and completion admission are independent of waiting futures.
 //! Admission stays on I/O. Reserve a job slot AND its eventual completion slot
@@ -10,6 +11,16 @@
 //! Enqueue wakes crypto; completion wakes I/O; consumption wakes capacity waiters;
 //! close wakes both sides. Neither side spins or blocks awaiting the other. This
 //! is required even when both OS threads share one allowed CPU.
+//!
+//! Queue timing measures accepted submission to crypto dequeue, excluding permit
+//! waits and execution. I/O records each measured execution once on completion
+//! reap, including failed, canceled, or abandoned work reaching that path. Queued
+//! or in-flight work and engine loss without completion are not yet counted.
+//! The racer_crypto_{encrypt,decrypt}_queue_nanoseconds_{sum,count} counters yield
+//! mean wait in milliseconds as rate(sum) / rate(count) / 1e6. For a fleet mean,
+//! sum each rate across instances before dividing. Zero count rate has no defined
+//! mean; these counters provide neither percentiles nor current queue age or total
+//! request latency.
 
 #[cfg(test)]
 #[path = "crypto_measurement.rs"]
