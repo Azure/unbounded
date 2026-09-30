@@ -168,7 +168,10 @@ impl Sessions {
         }
         let mut live = self.live.borrow_mut();
         live.retain(|(_, qp)| !qp.stopped());
-        if live.len() >= self.per_neighbor.saturating_mul(36)
+        if live.len()
+            >= self
+                .per_neighbor
+                .saturating_mul(crate::topology::MAX_DEGREE)
             || live.iter().filter(|(node, _)| node == peer.node()).count() >= self.per_neighbor
         {
             return std::task::Poll::Ready(Err(Error::Overloaded));

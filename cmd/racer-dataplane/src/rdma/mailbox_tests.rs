@@ -76,6 +76,42 @@ fn header(name: &str, value: Vec<u8>) -> Header {
 }
 
 #[test]
+fn sessions_admit_64_neighbors_but_keep_per_neighbor_and_total_bounds() {
+    let signers = network(2);
+    let peer = verified(&signers, vec![]);
+    let (io, port) = pair(2).unwrap();
+    let io = Rc::new(io);
+    let mut native = NativeService::new(port);
+    provision_test(&mut native, 0);
+    provision_test(&mut native, 1);
+    let devices = Rc::new(Devices::test(io));
+    let qp = match QueuePairHandle::poll_new(devices.select(RailId(0)).unwrap().handle) {
+        Poll::Ready(Ok(qp)) => qp,
+        _ => panic!("fixture QP unavailable"),
+    };
+    let sessions = Sessions::new(devices, 1);
+    // Synthetic live entries isolate session admission from the native QP pool.
+    for i in 0..63 {
+        sessions.track_peer_test(
+            crate::model::identity::NodeId(format!("peer-{i}")),
+            qp.clone(),
+        );
+    }
+    let scope = scope();
+    let prepared = done(&mut sessions.prepare(&peer.peer, RailId(0), &scope));
+    assert!(matches!(
+        poll(&mut sessions.prepare(&peer.peer, RailId(0), &scope)),
+        Poll::Ready(Err(Error::Overloaded))
+    ));
+    drop(prepared);
+    sessions.track_peer_test(crate::model::identity::NodeId("peer-63".into()), qp);
+    assert!(matches!(
+        poll(&mut sessions.prepare(&peer.peer, RailId(0), &scope)),
+        Poll::Ready(Err(Error::Overloaded))
+    ));
+}
+
+#[test]
 fn signed_setup_waits_for_slot_and_connect_mailboxes_without_consuming_admission() {
     let signers = network(2);
     let peer = verified(&signers, vec![]);

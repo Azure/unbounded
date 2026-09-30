@@ -31,7 +31,7 @@ impl Drop for LinkProbe<'_> {
 
 // Preserve the scaffold's `Rc::new(LinkHealth)` expression with isolated state.
 #[allow(non_upper_case_globals, clippy::declare_interior_mutable_const)]
-pub const LinkHealth: LinkHealth = LinkHealth::new(36);
+pub const LinkHealth: LinkHealth = LinkHealth::new(super::MAX_DEGREE);
 
 struct Circuit {
     failures: u32,
@@ -306,5 +306,28 @@ mod tests {
         );
         health.retain_neighbors(&[]);
         assert_eq!(health.tracked_links(), 0);
+    }
+
+    #[test]
+    fn default_tracks_all_64_neighbors_without_eviction() {
+        let health = LinkHealth;
+        let now = Instant::now();
+        for i in 0..64 {
+            health
+                .observe_at(&NodeId(format!("peer-{i}")), LinkOutcome::Timeout, now)
+                .unwrap();
+        }
+        assert_eq!(health.tracked_links(), 64);
+        for i in 0..64 {
+            assert!(
+                !health
+                    .available_at(&NodeId(format!("peer-{i}")), now)
+                    .unwrap()
+            );
+        }
+        assert_eq!(
+            health.observe_at(&NodeId("overflow".into()), LinkOutcome::Timeout, now),
+            Err(Error::Overloaded)
+        );
     }
 }

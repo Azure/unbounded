@@ -4,9 +4,9 @@
 //! first-hop bit before its children expand. Complete the intersecting layer too:
 //! stopping at its first intersection would retain v2's sorted-UID bias. Before
 //! that layer the two balls are disjoint, so each intersection has minimum total
-//! distance. Store one meeting per first hop (at most 36), not one per full path.
+//! distance. Store one meeting per first hop (at most 64), not one per full path.
 //! Reconstruct one canonical witness per bit. Relays reselect at their own hop.
-use super::{graph::neighbor_positions, paths::PathKey};
+use super::{MAX_DEGREE, RoutingAlgorithm, graph::neighbor_positions_for, paths::PathKey};
 use crate::{
     error::{Error, Result},
     runtime::deadline::Deadline,
@@ -42,6 +42,7 @@ impl Wave {
 
 pub(super) struct EqualCostSearch {
     count: usize,
+    algorithm: RoutingAlgorithm,
     key: PathKey,
     neighbors: Vec<usize>,
     waves: [Wave; 2],
@@ -52,13 +53,22 @@ pub(super) struct EqualCostSearch {
     done: bool,
     #[cfg(test)]
     pub expansions: usize,
+    #[cfg(test)]
+    pub edges: usize,
 }
 
 impl EqualCostSearch {
-    pub(super) fn new(count: usize, key: &PathKey) -> Self {
-        let neighbors = neighbor_positions(count, key.from);
+    #[cfg(test)]
+    pub(super) fn visited_entries(&self) -> usize {
+        self.waves.iter().map(|wave| wave.visits.len()).sum()
+    }
+
+    pub(super) fn new(count: usize, key: &PathKey, algorithm: RoutingAlgorithm) -> Self {
+        let neighbors = neighbor_positions_for(count, key.from, algorithm);
+        assert!(neighbors.len() <= MAX_DEGREE);
         Self {
             count,
+            algorithm,
             key: key.clone(),
             meetings: vec![None; neighbors.len()],
             neighbors,
@@ -69,6 +79,8 @@ impl EqualCostSearch {
             done: key.from == key.to,
             #[cfg(test)]
             expansions: 0,
+            #[cfg(test)]
+            edges: 0,
         }
     }
 
@@ -90,7 +102,11 @@ impl EqualCostSearch {
             }
             let depth = self.waves[self.side].visits[&node].depth + 1;
             let first = self.waves[self.side].visits[&node].first;
-            for next in neighbor_positions(self.count, node) {
+            for next in neighbor_positions_for(self.count, node, self.algorithm) {
+                #[cfg(test)]
+                {
+                    self.edges += 1;
+                }
                 if self.key.visited.binary_search(&next).is_ok()
                     || (node == self.key.from && self.key.failed.binary_search(&next).is_ok())
                     || (next == self.key.from && self.key.failed.binary_search(&node).is_ok())
@@ -98,7 +114,7 @@ impl EqualCostSearch {
                     continue;
                 }
                 let bits = if self.side == 0 && node == self.key.from {
-                    1 << self.neighbors.binary_search(&next).unwrap()
+                    1u64 << self.neighbors.binary_search(&next).unwrap()
                 } else {
                     first
                 };
@@ -156,13 +172,12 @@ impl EqualCostSearch {
                 current = if depth == 1 {
                     self.key.from
                 } else {
-                    neighbor_positions(self.count, current)
+                    neighbor_positions_for(self.count, current, self.algorithm)
                         .into_iter()
                         .find(|candidate| {
-                            self.waves[0]
-                                .visits
-                                .get(candidate)
-                                .is_some_and(|v| v.depth + 1 == depth && v.first & (1 << bit) != 0)
+                            self.waves[0].visits.get(candidate).is_some_and(|v| {
+                                v.depth + 1 == depth && v.first & (1u64 << bit) != 0
+                            })
                         })
                         .ok_or(Error::Internal)?
                 };

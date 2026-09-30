@@ -24,6 +24,7 @@ use std::sync::Arc;
 pub struct PeerNetwork {
     pub local: NodeId,
     published: Arc<crate::control::snapshot::PublishedState>,
+    algorithm: crate::topology::RoutingAlgorithm,
 }
 
 impl PeerNetwork {
@@ -31,10 +32,26 @@ impl PeerNetwork {
         local: NodeId,
         published: Arc<crate::control::snapshot::PublishedState>,
     ) -> Result<Self> {
+        Self::with_algorithm(
+            local,
+            published,
+            crate::topology::RoutingAlgorithm::default(),
+        )
+    }
+
+    pub fn with_algorithm(
+        local: NodeId,
+        published: Arc<crate::control::snapshot::PublishedState>,
+        algorithm: crate::topology::RoutingAlgorithm,
+    ) -> Result<Self> {
         if local.0.is_empty() {
             return Err(Error::InvalidConfiguration);
         }
-        Ok(Self { local, published })
+        Ok(Self {
+            local,
+            published,
+            algorithm,
+        })
     }
 
     pub fn membership(&self, version: MembershipVersion) -> Result<MembershipLease> {
@@ -46,7 +63,7 @@ impl PeerNetwork {
         membership: &MembershipLease,
         node: &NodeId,
     ) -> Result<crate::http::pool::Endpoint> {
-        if !crate::topology::graph::Graph::new(membership.clone())
+        if !crate::topology::graph::Graph::with_algorithm(membership.clone(), self.algorithm)
             .neighbors(&self.local)?
             .contains(node)
         {

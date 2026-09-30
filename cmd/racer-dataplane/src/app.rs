@@ -674,9 +674,10 @@ impl WorkerApplication {
         let placement = Rc::new(Placement::with_memory_budget(
             limits.cached_rankings.get() * crate::topology::placement::RANKING_BYTES,
         ));
-        let network = Rc::new(crate::peer::PeerNetwork::new(
+        let network = Rc::new(crate::peer::PeerNetwork::with_algorithm(
             config.node.clone(),
             node.publications.clone(),
+            config.routing_algorithm,
         )?);
         let wire = Rc::new(crate::peer::wire::SecurityCodec::new(
             admission.clone(),

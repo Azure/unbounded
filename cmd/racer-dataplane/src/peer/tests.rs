@@ -1,8 +1,8 @@
 use super::*;
-#[path = "subscription_tests.rs"]
-mod hot_subscriptions;
 #[path = "body_progress_tests.rs"]
 mod body_progress;
+#[path = "subscription_tests.rs"]
+mod hot_subscriptions;
 #[path = "opaque_tests.rs"]
 mod opaque;
 use crate::{
@@ -818,6 +818,13 @@ fn v4_equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
     );
 }
 
+#[test]
+fn v5_equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
+    equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction(
+        crate::topology::RoutingAlgorithm::V5,
+    );
+}
+
 fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction(
     algorithm: crate::topology::RoutingAlgorithm,
 ) {
@@ -842,7 +849,9 @@ fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction(
                 .map(|(i, node)| Member {
                     node: NodeId(node),
                     shares: std::num::NonZeroU32::new(
-                        if algorithm == RoutingAlgorithm::V4 && i % 3 == 0 {
+                        if matches!(algorithm, RoutingAlgorithm::V4 | RoutingAlgorithm::V5)
+                            && i % 3 == 0
+                        {
                             1
                         } else {
                             4
@@ -858,7 +867,7 @@ fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction(
         .unwrap(),
     );
     let paths = Paths::with_algorithm(Rc::new(LinkHealth), 1, algorithm);
-    let health = Rc::new(LinkHealth::new(36));
+    let health = Rc::new(LinkHealth);
     let cold = Paths::with_algorithm(health.clone(), 0, algorithm);
     let mut selected = std::collections::BTreeSet::new();
     for attempt in 1..=32 {
@@ -1631,9 +1640,9 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
     let membership = Arc::new(
         Membership::validate(
             MembershipVersion(7),
-            (0..64)
+            (0..1500)
                 .map(|index| Member {
-                    node: NodeId(format!("node-{index:02}")),
+                    node: NodeId(format!("node-{index:06}")),
                     shares: std::num::NonZeroU32::new(1).unwrap(),
                     peer_endpoint: format!("127.0.0.1:{}", 8000 + index),
                     rails: vec![],
@@ -1655,6 +1664,35 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
     ));
     let neighbors = Graph::new(membership.clone()).neighbors(&local).unwrap();
     assert!(neighbors.len() < membership.members().len() - 1);
+    assert_eq!(neighbors.len(), 62);
+    for algorithm in [
+        crate::topology::RoutingAlgorithm::V2,
+        crate::topology::RoutingAlgorithm::V3,
+        crate::topology::RoutingAlgorithm::V4,
+        crate::topology::RoutingAlgorithm::V5,
+    ] {
+        let explicit = PeerNetwork::with_algorithm(
+            local.clone(),
+            Arc::new(crate::control::snapshot::PublishedState::default()),
+            algorithm,
+        )
+        .unwrap();
+        let radix = if algorithm == crate::topology::RoutingAlgorithm::V5 {
+            32
+        } else {
+            18
+        };
+        for (index, member) in membership.members().iter().enumerate() {
+            let expected = index != 0
+                && (0..radix)
+                    .any(|digit| digit % 1500 == index || (radix * index + digit) % 1500 == 0);
+            assert_eq!(
+                explicit.endpoint(&membership, &member.node).is_ok(),
+                expected,
+                "{algorithm:?} {index}"
+            );
+        }
+    }
     for member in membership.members() {
         let endpoint = network.endpoint(&membership, &member.node);
         if neighbors.contains(&member.node) {

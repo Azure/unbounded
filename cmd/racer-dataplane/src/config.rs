@@ -171,10 +171,11 @@ impl Config {
             "false" => false,
             _ => return Err(Error::InvalidConfiguration),
         };
-        let routing_algorithm = match text("RACER_ROUTING_ALGORITHM", Some("2"))?.as_str() {
+        let routing_algorithm = match text("RACER_ROUTING_ALGORITHM", Some("5"))?.as_str() {
             "2" => crate::topology::RoutingAlgorithm::V2,
             "3" => crate::topology::RoutingAlgorithm::V3,
             "4" => crate::topology::RoutingAlgorithm::V4,
+            "5" => crate::topology::RoutingAlgorithm::V5,
             _ => return Err(Error::InvalidConfiguration),
         };
         let peer_listen =
@@ -1154,7 +1155,7 @@ mod tests {
         assert!(!config.allow_smt);
         assert_eq!(
             config.routing_algorithm,
-            crate::topology::RoutingAlgorithm::V2
+            crate::topology::RoutingAlgorithm::V5
         );
         assert_eq!(config.node.0, UNRESOLVED_NODE_ID);
         assert!(!config.enable_rdma);
@@ -1219,6 +1220,7 @@ mod tests {
             ("2", RoutingAlgorithm::V2),
             ("3", RoutingAlgorithm::V3),
             ("4", RoutingAlgorithm::V4),
+            ("5", RoutingAlgorithm::V5),
         ] {
             assert_eq!(
                 parse(&[("RACER_ROUTING_ALGORITHM", value)])
@@ -1227,7 +1229,7 @@ mod tests {
                 expected
             );
         }
-        for value in ["", "1", "5", "03", " 3", "3 ", "auto"] {
+        for value in ["", "1", "6", "03", " 3", "3 ", "auto"] {
             assert!(parse(&[("RACER_ROUTING_ALGORITHM", value)]).is_err());
         }
     }

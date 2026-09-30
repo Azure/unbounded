@@ -2,7 +2,7 @@
 use super::{
     RoutingAlgorithm,
     equal_cost::EqualCostSearch,
-    graph::neighbor_positions,
+    graph::{neighbor_positions, neighbor_positions_for},
     hash,
     health::LinkHealth,
     membership::{Membership, MembershipLease},
@@ -136,7 +136,7 @@ impl Paths {
         self.health.clone()
     }
     pub fn new(health: Rc<LinkHealth>, capacity: usize) -> Self {
-        Self::with_algorithm(health, capacity, RoutingAlgorithm::V2)
+        Self::with_algorithm(health, capacity, RoutingAlgorithm::default())
     }
     pub fn with_algorithm(
         health: Rc<LinkHealth>,
@@ -170,7 +170,7 @@ impl Paths {
     }
 
     /// Same result as `shortest`, yielding after at most 32 vertex expansions.
-    /// Each expansion examines at most 36 edges. Dropping the future cancels it.
+    /// Each expansion examines at most 64 edges. Dropping the future cancels it.
     pub fn shortest_async<'a>(
         &'a self,
         membership: MembershipLease,
@@ -244,12 +244,13 @@ impl Paths {
             .collect::<Result<Vec<_>>>()?;
         visited.sort_unstable();
         let mut failed = Vec::new();
-        let neighbors: Vec<_> = neighbor_positions(membership.members().len(), source)
-            .into_iter()
-            .map(|position| membership.members()[position].node.clone())
-            .collect();
+        let neighbors: Vec<_> =
+            neighbor_positions_for(membership.members().len(), source, self.algorithm)
+                .into_iter()
+                .map(|position| membership.members()[position].node.clone())
+                .collect();
         self.health.retain_neighbors(&neighbors);
-        for neighbor in neighbor_positions(membership.members().len(), source) {
+        for neighbor in neighbor_positions_for(membership.members().len(), source, self.algorithm) {
             if !self
                 .health
                 .available(&membership.members()[neighbor].node)?
@@ -315,7 +316,7 @@ fn select_route(
 ) -> Result<Route> {
     let index = if alternatives.len() == 1 {
         0
-    } else if algorithm == RoutingAlgorithm::V4 {
+    } else if matches!(algorithm, RoutingAlgorithm::V4 | RoutingAlgorithm::V5) {
         weighted_index(&membership, alternatives, budget)?
     } else {
         let mut digest = hash::domain(b"racer/next-hop/v3\0");
@@ -334,7 +335,7 @@ fn select_route(
 
 /// Positive authenticated membership shares weight only the eligible next hop.
 /// Integer rejection sampling avoids modulo bias, floats, and platform variance.
-/// At most 36 u32 weights fit in u64. The retry cap bounds adversarial work; a
+/// At most 64 u32 weights fit in u64. The retry cap bounds adversarial work; a
 /// rejected draw never falls back to a biased choice. See the v4 contract.
 fn weighted_index(
     membership: &Membership,
@@ -390,8 +391,8 @@ impl RouteSearch {
     fn new(count: usize, key: &PathKey, algorithm: RoutingAlgorithm) -> Self {
         match algorithm {
             RoutingAlgorithm::V2 => Self::Legacy(Search::new(count, key)),
-            RoutingAlgorithm::V3 | RoutingAlgorithm::V4 => {
-                Self::EqualCost(EqualCostSearch::new(count, key))
+            RoutingAlgorithm::V3 | RoutingAlgorithm::V4 | RoutingAlgorithm::V5 => {
+                Self::EqualCost(EqualCostSearch::new(count, key, algorithm))
             }
         }
     }
@@ -561,11 +562,20 @@ mod tests {
 
     #[test]
     fn v3_all_equal_next_hops_match_independent_oracle() {
+        all_equal_next_hops_match_independent_oracle(RoutingAlgorithm::V3);
+    }
+
+    #[test]
+    fn v5_all_equal_next_hops_match_independent_oracle() {
+        all_equal_next_hops_match_independent_oracle(RoutingAlgorithm::V5);
+    }
+
+    fn all_equal_next_hops_match_independent_oracle(algorithm: RoutingAlgorithm) {
         for n in [37, 401, 1500] {
             let members = membership(n);
             for source in [0, 19, n - 1] {
-                let health = Rc::new(LinkHealth::new(36));
-                let paths = Paths::with_algorithm(health, 4, RoutingAlgorithm::V3);
+                let health = Rc::new(LinkHealth);
+                let paths = Paths::with_algorithm(health, 4, algorithm);
                 for to in (0..n).step_by(17).filter(|&to| to != source) {
                     for filtered in [false, true] {
                         let mut request = budget(&members, to, 4);
@@ -577,7 +587,7 @@ mod tests {
                                 .into_iter()
                                 .filter(|&v| v != source && v != to)
                                 .collect();
-                            key.failed = neighbor_positions(n, source)
+                            key.failed = neighbor_positions_for(n, source, algorithm)
                                 .into_iter()
                                 .step_by(2)
                                 .collect();
@@ -589,8 +599,16 @@ mod tests {
                         }
                         for links in [1, 2, 4] {
                             key.links = links;
-                            let expected = oracle(n, source, to, links, &key.visited, &key.failed);
-                            let mut search = EqualCostSearch::new(n, &key);
+                            let expected = oracle_for(
+                                n,
+                                source,
+                                to,
+                                links,
+                                &key.visited,
+                                &key.failed,
+                                algorithm,
+                            );
+                            let mut search = EqualCostSearch::new(n, &key, algorithm);
                             while !search.step(1, request.deadline).unwrap() {}
                             let alternatives = search.finish();
                             let Some(expected) = expected else {
@@ -601,23 +619,33 @@ mod tests {
                             let firsts: Vec<_> = alternatives.iter().map(|p| p[1]).collect();
                             let mut forbidden = key.visited.clone();
                             forbidden.push(source);
-                            let expected_firsts: Vec<_> = neighbor_positions(n, source)
-                                .into_iter()
-                                .filter(|next| {
-                                    !key.failed.contains(next)
-                                        && !key.visited.contains(next)
-                                        && oracle(n, *next, to, links - 1, &forbidden, &[])
+                            let expected_firsts: Vec<_> =
+                                neighbor_positions_for(n, source, algorithm)
+                                    .into_iter()
+                                    .filter(|next| {
+                                        !key.failed.contains(next)
+                                            && !key.visited.contains(next)
+                                            && oracle_for(
+                                                n,
+                                                *next,
+                                                to,
+                                                links - 1,
+                                                &forbidden,
+                                                &[],
+                                                algorithm,
+                                            )
                                             .is_some_and(|p| p.len() + 1 == expected.len())
-                                })
-                                .collect();
+                                    })
+                                    .collect();
                             assert_eq!(firsts, expected_firsts, "n={n} source={source} to={to}");
                             for positions in &alternatives {
-                                assert_route(
+                                assert_route_for(
                                     &members,
                                     &route(members.clone(), positions).nodes,
                                     &expected,
                                     &key.visited,
                                     &key.failed,
+                                    algorithm,
                                 );
                             }
                         }
@@ -629,7 +657,7 @@ mod tests {
 
     #[test]
     fn v3_cache_reselects_identity_and_recomputes_deterministically() {
-        assert_eq!(crate::topology::ALGORITHM_VERSION, 4);
+        assert_eq!(crate::topology::ALGORITHM_VERSION, 5);
         let members = membership(1500);
         let source = &members.members()[0].node;
         let paths = Paths::with_algorithm(Rc::new(LinkHealth), 2, RoutingAlgorithm::V3);
@@ -680,10 +708,168 @@ mod tests {
         health_cache_eviction_budget_and_deadline_regressions(RoutingAlgorithm::V4);
     }
 
+    #[test]
+    fn v5_health_cache_eviction_budget_and_deadline_regressions() {
+        health_cache_eviction_budget_and_deadline_regressions(RoutingAlgorithm::V5);
+    }
+
+    #[test]
+    fn v5_64th_first_hop_bit_survives_search_and_reconstruction() {
+        let algorithm = RoutingAlgorithm::V5;
+        let n = 100_000;
+        let members = membership(n);
+        let source = 19;
+        let neighbors = neighbor_positions_for(n, source, algorithm);
+        assert_eq!(neighbors.len(), 64);
+        let last = neighbors[63];
+        let paths = Paths::new(Rc::new(LinkHealth), 0);
+        let request = budget(&members, last, NORMAL_LINKS);
+        let mut key = paths
+            .key(&members, &members.members()[source].node, &request)
+            .unwrap();
+        // Only bit 63 remains eligible. Test direct and propagated witnesses.
+        key.failed = neighbors[..63].to_vec();
+        let next = neighbor_positions_for(n, last, algorithm)
+            .into_iter()
+            .find(|v| *v != source && !neighbors.contains(v))
+            .unwrap();
+        let third = neighbor_positions_for(n, next, algorithm)
+            .into_iter()
+            .find(|v| {
+                *v != source
+                    && *v != last
+                    && !neighbor_positions_for(n, last, algorithm).contains(v)
+            })
+            .unwrap();
+        for to in [last, next, third] {
+            key.to = to;
+            let expected = oracle_for(n, source, to, 4, &[], &key.failed, algorithm).unwrap();
+            for quantum in [1, SEARCH_QUANTUM] {
+                let mut search = EqualCostSearch::new(n, &key, algorithm);
+                while !search.step(quantum, request.deadline).unwrap() {}
+                let alternatives = search.finish().unwrap();
+                assert_eq!(alternatives.len(), 1);
+                assert_eq!(alternatives[0][1], last);
+                assert_route_for(
+                    &members,
+                    &route(members.clone(), &alternatives[0]).nodes,
+                    &expected,
+                    &[],
+                    &key.failed,
+                    algorithm,
+                );
+            }
+        }
+        key.failed = neighbors;
+        let mut search = EqualCostSearch::new(n, &key, algorithm);
+        while !search.step(1, request.deadline).unwrap() {}
+        assert_eq!(search.finish(), Err(Error::Unavailable));
+    }
+
+    #[test]
+    fn v5_default_reduces_hops_on_balanced_deterministic_pairs() {
+        let n = 1500;
+        let members = membership(n);
+        let paths = Paths::new(Rc::new(LinkHealth), 2);
+        assert_eq!(paths.algorithm, RoutingAlgorithm::V5);
+        assert_eq!(RoutingAlgorithm::default().radix(), 32);
+        assert_eq!((NORMAL_LINKS, FAILURE_LINKS), (4, 8));
+        let mut totals = [0usize; 2];
+        let mut improved = 0;
+        for source in 0..n {
+            // Coprime offset gives one flow per source and destination, across the entire membership.
+            let to = (source + 731) % n;
+            let legacy = oracle(n, source, to, 4, &[], &[]).unwrap();
+            let expected = oracle_for(n, source, to, 4, &[], &[], RoutingAlgorithm::V5).unwrap();
+            totals[0] += legacy.len() - 1;
+            totals[1] += expected.len() - 1;
+            improved += usize::from(expected.len() < legacy.len());
+            let request = budget(&members, to, NORMAL_LINKS);
+            let from = &members.members()[source].node;
+            let actual = paths.shortest(members.clone(), from, &request).unwrap();
+            assert_route_for(
+                &members,
+                &actual.nodes,
+                &expected,
+                &[],
+                &[],
+                RoutingAlgorithm::V5,
+            );
+            let scope = RequestScope::new(request.request, request.deadline.0).unwrap();
+            assert_eq!(
+                actual.nodes,
+                futures::executor::block_on(paths.shortest_async(
+                    members.clone(),
+                    from,
+                    &request,
+                    &scope
+                ))
+                .unwrap()
+                .nodes
+            );
+            if source < 100 {
+                let mut forwarded = request.clone();
+                let mut current = from.clone();
+                let mut links = 0;
+                while current != forwarded.destination {
+                    let route = paths
+                        .shortest(members.clone(), &current, &forwarded)
+                        .unwrap();
+                    let next = route.nodes[1].clone();
+                    let updated = forwarded.forwarded(&current, &next).unwrap();
+                    forwarded
+                        .validate_forwarded(&updated, &current, &next)
+                        .unwrap();
+                    forwarded = updated;
+                    current = next;
+                    links += 1;
+                }
+                assert_eq!(links + 1, expected.len());
+            }
+        }
+        eprintln!(
+            "balanced 1500 pairs: legacy links={}, v5 links={}, improved={improved}",
+            totals[0], totals[1]
+        );
+        assert!(totals[1] * 10 < totals[0] * 9, "{totals:?}");
+        assert!(improved > n / 3);
+    }
+
+    #[test]
+    fn v5_independent_hash_vectors_and_cache_reselection() {
+        let mut input = membership(1500).members().to_vec();
+        for (i, member) in input.iter_mut().enumerate() {
+            member.shares = std::num::NonZeroU32::new(if i % 3 == 0 { 1 } else { 4 }).unwrap();
+        }
+        let members = Arc::new(Membership::validate(input_version(), input).unwrap());
+        let cached = Paths::new(Rc::new(LinkHealth), 1);
+        let cold = Paths::new(Rc::new(LinkHealth), 0);
+        for (attempt, expected) in super::super::fixtures::V5_NEXT_HOPS {
+            let mut request = budget(&members, 1499, NORMAL_LINKS);
+            request.attempt = AttemptId(attempt.to_be_bytes());
+            let from = &members.members()[0].node;
+            let actual = cached.shortest(members.clone(), from, &request).unwrap();
+            assert_eq!(actual.nodes[1], members.members()[expected].node);
+            let scope = RequestScope::new(request.request, request.deadline.0).unwrap();
+            assert_eq!(
+                actual.nodes,
+                futures::executor::block_on(cold.shortest_async(
+                    members.clone(),
+                    from,
+                    &request,
+                    &scope
+                ))
+                .unwrap()
+                .nodes
+            );
+        }
+        assert_eq!(cached.cached_paths(), 1);
+    }
+
     fn health_cache_eviction_budget_and_deadline_regressions(algorithm: RoutingAlgorithm) {
         let members = membership(1500);
         let source = &members.members()[0].node;
-        let health = Rc::new(LinkHealth::new(36));
+        let health = Rc::new(LinkHealth);
         let paths = Paths::with_algorithm(health.clone(), 1, algorithm);
         let request = budget(&members, 1499, NORMAL_LINKS);
         let original = paths.shortest(members.clone(), source, &request).unwrap();
@@ -710,7 +896,7 @@ mod tests {
         let rerouted = paths.shortest(members.clone(), source, &request).unwrap();
         assert_ne!(rerouted.nodes[1], original.nodes[1]);
         assert_eq!(rerouted.nodes.len(), original.nodes.len());
-        for neighbor in neighbor_positions(1500, 0) {
+        for neighbor in neighbor_positions_for(1500, 0, algorithm) {
             health
                 .observe_at(
                     &members.members()[neighbor].node,
@@ -769,6 +955,7 @@ mod tests {
         assert_eq!(counts, [8000, 2000]);
         let max = u64::from(u32::MAX);
         assert_eq!(weighted_draw(u64::MAX, 36 * max, &[max; 36]), Some(5));
+        assert_eq!(weighted_draw(u64::MAX, 64 * max, &[max; 64]), Some(1));
 
         let mut input = membership(3).members().to_vec();
         input[1].shares = std::num::NonZeroU32::new(4).unwrap();
@@ -911,7 +1098,7 @@ mod tests {
         let key = paths
             .key(&members, &members.members()[0].node, &request)
             .unwrap();
-        let mut search = EqualCostSearch::new(100_000, &key);
+        let mut search = EqualCostSearch::new(100_000, &key, RoutingAlgorithm::V3);
         loop {
             let before = search.expansions;
             let done = search.step(7, request.deadline).unwrap();
@@ -1059,9 +1246,29 @@ mod tests {
         forbidden: &[usize],
         failed: &[usize],
     ) -> Option<Vec<usize>> {
+        oracle_for(
+            n,
+            source,
+            to,
+            links,
+            forbidden,
+            failed,
+            RoutingAlgorithm::V2,
+        )
+    }
+
+    fn oracle_for(
+        n: usize,
+        source: usize,
+        to: usize,
+        links: u8,
+        forbidden: &[usize],
+        failed: &[usize],
+        algorithm: RoutingAlgorithm,
+    ) -> Option<Vec<usize>> {
         // Independent edge construction from the graph definition, not the
         // production inverse-neighbor enumeration or bidirectional search.
-        let adjacency = oracle_graph(n);
+        let adjacency = oracle_graph_for(n, algorithm);
         let mut queue = VecDeque::from([vec![source]]);
         let mut seen = vec![false; n];
         seen[source] = true;
@@ -1090,10 +1297,20 @@ mod tests {
     }
 
     fn oracle_graph(n: usize) -> Vec<Vec<usize>> {
+        oracle_graph_for(n, RoutingAlgorithm::V2)
+    }
+
+    fn oracle_graph_for(n: usize, algorithm: RoutingAlgorithm) -> Vec<Vec<usize>> {
+        // Literal contract radices keep this oracle independent of production constants.
+        let radix = if algorithm == RoutingAlgorithm::V5 {
+            32
+        } else {
+            18
+        };
         let mut adjacency = vec![vec![]; n];
         for node in 0..n {
-            for digit in 0..18 {
-                let next = (18 * node + digit) % n;
+            for digit in 0..radix {
+                let next = (radix * node + digit) % n;
                 if next != node {
                     adjacency[node].push(next);
                     adjacency[next].push(node);
@@ -1114,6 +1331,29 @@ mod tests {
         forbidden: &[usize],
         failed: &[usize],
     ) {
+        assert_route_for(
+            members,
+            nodes,
+            expected,
+            forbidden,
+            failed,
+            RoutingAlgorithm::V2,
+        );
+    }
+
+    fn assert_route_for(
+        members: &MembershipLease,
+        nodes: &[NodeId],
+        expected: &[usize],
+        forbidden: &[usize],
+        failed: &[usize],
+        algorithm: RoutingAlgorithm,
+    ) {
+        let radix = if algorithm == RoutingAlgorithm::V5 {
+            32
+        } else {
+            18
+        };
         let positions: Vec<_> = nodes
             .iter()
             .map(|node| members.position(node).unwrap())
@@ -1126,9 +1366,9 @@ mod tests {
             assert!(!positions[..i].contains(node));
         }
         for pair in positions.windows(2) {
-            assert!((0..18).any(|digit| {
-                (18 * pair[0] + digit) % members.members().len() == pair[1]
-                    || (18 * pair[1] + digit) % members.members().len() == pair[0]
+            assert!((0..radix).any(|digit| {
+                (radix * pair[0] + digit) % members.members().len() == pair[1]
+                    || (radix * pair[1] + digit) % members.members().len() == pair[0]
             }));
             assert!(!(pair[0] == positions[0] && failed.contains(&pair[1])));
             assert!(!(pair[1] == positions[0] && failed.contains(&pair[0])));
@@ -1139,7 +1379,7 @@ mod tests {
     fn exhaustive_small_shortest_paths_and_deterministic_ties() {
         for n in 1..=42 {
             let members = membership(n);
-            let paths = Paths::new(Rc::new(LinkHealth), 16);
+            let paths = Paths::with_algorithm(Rc::new(LinkHealth), 16, RoutingAlgorithm::V2);
             for from in 0..n {
                 for to in 0..n {
                     let expected = oracle(n, from, to, 4, &[], &[]).unwrap();
@@ -1158,7 +1398,7 @@ mod tests {
         // Non-complete graphs exercise multi-hop suffix/prefix ties.
         for n in [63, 100, 321, 1000] {
             let members = membership(n);
-            let paths = Paths::new(Rc::new(LinkHealth), 0);
+            let paths = Paths::with_algorithm(Rc::new(LinkHealth), 0, RoutingAlgorithm::V2);
             for from in [0, n / 2, n - 1] {
                 for to in 0..n {
                     let expected = oracle(n, from, to, 4, &[], &[]).unwrap();
@@ -1193,7 +1433,7 @@ mod tests {
             (401, 37, 309, vec![37, 358, 309]),
         ] {
             let members = membership(n);
-            let paths = Paths::new(Rc::new(LinkHealth), 0);
+            let paths = Paths::with_algorithm(Rc::new(LinkHealth), 0, RoutingAlgorithm::V2);
             let request = budget(&members, to, NORMAL_LINKS);
             let key = paths
                 .key(&members, &members.members()[from].node, &request)
@@ -1210,7 +1450,7 @@ mod tests {
     fn failures_are_local_edges_not_global_node_exclusions() {
         let members = membership(1000);
         let health = Rc::new(LinkHealth::new(36));
-        let paths = Paths::new(health.clone(), 4);
+        let paths = Paths::with_algorithm(health.clone(), 4, RoutingAlgorithm::V2);
         let from = &members.members()[19].node;
         let neighbors = neighbor_positions(1000, 19);
         let to = neighbors[0];
@@ -1232,7 +1472,7 @@ mod tests {
             paths.shortest(members.clone(), from, &request).unwrap_err(),
             Error::Unavailable
         );
-        let isolated = Paths::new(Rc::new(LinkHealth), 1);
+        let isolated = Paths::with_algorithm(Rc::new(LinkHealth), 1, RoutingAlgorithm::V2);
         assert_eq!(
             isolated
                 .shortest(members.clone(), from, &request)
@@ -1339,7 +1579,7 @@ mod tests {
     fn hundred_thousand_nodes_work_bound_yield_and_cache_leases() {
         use std::task::Context;
         let members = membership(100_000);
-        let paths = Paths::new(Rc::new(LinkHealth), 2);
+        let paths = Paths::with_algorithm(Rc::new(LinkHealth), 2, RoutingAlgorithm::V2);
         for (from, to) in [(0, 99_999), (50_000, 17), (17, 80_003)] {
             let budget = budget(&members, to, 4);
             let scope = RequestScope::new(budget.request, budget.deadline.0).unwrap();
@@ -1400,7 +1640,7 @@ mod tests {
                     )
                     .unwrap();
             }
-            let paths = Paths::new(health, 2);
+            let paths = Paths::with_algorithm(health, 2, RoutingAlgorithm::V2);
             for destination in (0..n).step_by(7).filter(|to| *to != source) {
                 let forbidden: Vec<_> = [5, 18, 309]
                     .into_iter()
@@ -1446,7 +1686,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let paths = Paths::new(health, 1);
+        let paths = Paths::with_algorithm(health, 1, RoutingAlgorithm::V2);
         let source = &members.members()[0].node;
         let request = budget(&members, 80_003, 8);
         let scope = RequestScope::new(request.request, request.deadline.0).unwrap();
@@ -1515,7 +1755,9 @@ mod tests {
         let n = 100_000;
         let members = membership(n);
         let paths = Paths::new(Rc::new(LinkHealth), config.limits.cached_paths.get());
-        let adjacency = oracle_graph(n);
+        assert_eq!(config.routing_algorithm, RoutingAlgorithm::V5);
+        assert_eq!(paths.algorithm, RoutingAlgorithm::V5);
+        let adjacency = oracle_graph_for(n, RoutingAlgorithm::V5);
         for source in [0, 1, 17, 49_999, 99_999] {
             let mut distances = vec![u8::MAX; n];
             distances[source] = 0;
@@ -1530,7 +1772,9 @@ mod tests {
             }
             for distance in 0..=NORMAL_LINKS {
                 // Both ends of each distance bucket catch position-order effects.
-                let first = distances.iter().position(|&d| d == distance).unwrap();
+                let Some(first) = distances.iter().position(|&d| d == distance) else {
+                    continue;
+                };
                 let last = distances.iter().rposition(|&d| d == distance).unwrap();
                 for destination in [first, last] {
                     for links in [NORMAL_LINKS, FAILURE_LINKS] {
@@ -1538,29 +1782,28 @@ mod tests {
                         let scope = RequestScope::new(request.request, request.deadline.0).unwrap();
                         let from = &members.members()[source].node;
                         let key = paths.key(&members, from, &request).unwrap();
-                        let mut search = Search::new(n, &key);
-                        assert_eq!(
-                            search.waves.iter().map(|w| w.parents.len()).sum::<usize>(),
-                            2
-                        );
+                        let mut search = EqualCostSearch::new(n, &key, RoutingAlgorithm::V5);
+                        assert_eq!(search.visited_entries(), 2);
                         loop {
                             let before = search.expansions;
                             let done = search.step(7, request.deadline).unwrap();
                             assert!(search.expansions - before <= 7);
-                            assert!(search.edges <= 36 * search.expansions);
                             // Healthy distance <=4: only the two radius-one
                             // balls can be expanded; radius-two nodes are stored.
-                            assert!(search.expansions <= 2 * (1 + 36));
-                            for wave in &search.waves {
-                                assert!(wave.parents.len() <= 1 + 36 + 36 * 35);
-                                assert!(wave.queue.len() <= wave.parents.len());
-                            }
+                            assert!(search.expansions <= 2 * (1 + 64));
+                            assert!(search.edges <= 64 * search.expansions);
+                            assert!(search.visited_entries() <= 2 * (1 + 64 + 64 * 63));
                             if done {
                                 break;
                             }
                         }
                         let expected = search.finish().unwrap();
-                        assert_eq!(expected.len(), usize::from(distance) + 1);
+                        assert!(expected.len() <= 64);
+                        assert!(
+                            expected
+                                .iter()
+                                .all(|p| p.len() == usize::from(distance) + 1)
+                        );
                         let actual = futures::executor::block_on(paths.shortest_async(
                             members.clone(),
                             from,
@@ -1568,8 +1811,21 @@ mod tests {
                             &scope,
                         ))
                         .unwrap();
-                        assert_route(&members, &actual.nodes, &expected, &[], &[]);
-                        assert_eq!(actual.nodes, route(members.clone(), &expected).nodes);
+                        assert_route_for(
+                            &members,
+                            &actual.nodes,
+                            &expected[0],
+                            &[],
+                            &[],
+                            RoutingAlgorithm::V5,
+                        );
+                        assert_eq!(
+                            actual.nodes,
+                            paths
+                                .shortest(members.clone(), from, &request)
+                                .unwrap()
+                                .nodes
+                        );
                     }
                 }
             }
@@ -1586,7 +1842,7 @@ mod tests {
         let members = membership(n);
         // Isolate the destination with failed nodes in an internal fixture.
         // Exhausting either component must stop even with eight links left.
-        let paths = Paths::new(Rc::new(LinkHealth), 128);
+        let paths = Paths::with_algorithm(Rc::new(LinkHealth), 128, RoutingAlgorithm::V2);
         let source = &members.members()[80_003].node;
         let request = budget(&members, 0, FAILURE_LINKS);
         let mut key = paths.key(&members, source, &request).unwrap();
