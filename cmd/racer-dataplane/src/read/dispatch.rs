@@ -204,7 +204,7 @@ impl WorkerDirectory {
     ) -> Result<Option<PageResult>> {
         let owner = self.page_owner(&page)?;
         if self.is_local(owner) {
-            return self.local()?.cached_page(&page, scope);
+            return self.local()?.fill.cached_page(&page, scope);
         }
         match self
             .submit(owner, Work::Cached(page), scope, None)?
@@ -250,7 +250,7 @@ impl WorkerDirectory {
     ) -> Result<PageResult> {
         let owner = self.page_owner(&copy.ciphertext.envelope().page)?;
         if self.is_local(owner) {
-            return self.local()?.accept_selected(copy, scope).await;
+            return self.local()?.fill.accept_selected(copy, scope).await;
         }
         let receipt = self.submit(owner, Work::Selected(copy), scope, None)?;
         // Cancellation notifies the owner, but selection exclusivity must survive
@@ -402,7 +402,8 @@ impl WorkerDirectory {
         let mut attempt = [0; 16];
         attempt[8..].copy_from_slice(&sequence.to_be_bytes());
         self.local()?
-            .seal_context(context, AttemptId(attempt), scope)
+            .credentials
+            .seal(context, AttemptId(attempt), scope)
     }
     pub fn metadata_owner(&self, object: &ObjectId) -> Result<WorkerId> {
         self.map.metadata_owner(object)
@@ -507,7 +508,8 @@ impl WorkerDirectory {
             if self.is_local(owner) {
                 return self
                     .local()?
-                    .resolve_metadata(selector, membership, context, scope, budget)
+                    .metadata
+                    .resolve_with_budget(selector, membership, context, scope, budget)
                     .await;
             }
             let work = Work::Resolve(selector, membership, self.seal(context, scope)?);
@@ -516,16 +518,6 @@ impl WorkerDirectory {
                 _ => Err(Error::StaleFlight),
             }
         })
-    }
-    pub fn resolve_metadata_with_budget<'a>(
-        &'a self,
-        selector: MetadataSelector,
-        membership: MembershipLease,
-        context: &'a OriginContext,
-        scope: &'a RequestScope,
-        budget: &'a mut AcquisitionBudget,
-    ) -> Operation<'a, ObjectMetadata> {
-        self.resolve_with_budget(selector, membership, context, scope, budget)
     }
     pub fn acquire<'a>(
         &'a self,
@@ -543,6 +535,7 @@ impl WorkerDirectory {
             if self.is_local(owner) {
                 return self
                     .local()?
+                    .fill
                     .acquire(page, membership, context, scope, budget)
                     .await;
             }
@@ -572,11 +565,12 @@ impl WorkerDirectory {
         let owner = self.page_owner(&page)?;
         if self.is_local(owner) {
             let local = self.local()?;
-            let context = local.local_context(context, scope)?;
+            let context = local.credentials.local_context(context, scope)?;
             let scope = scope.clone();
             return Ok(Box::pin(async move {
                 let mut budget = budget;
                 let result = local
+                    .fill
                     .acquire(page.clone(), membership, &context, &scope, &mut budget)
                     .await
                     .and_then(|value| {
@@ -646,7 +640,7 @@ impl WorkerDirectory {
             scope.check()?;
             let owner = self.metadata_owner(&metadata.version.object)?;
             if self.is_local(owner) {
-                return self.local()?.publish_metadata(metadata);
+                return self.local()?.metadata.publish_version(metadata);
             }
             match self
                 .submit(owner, Work::Publish(metadata), scope, None)?
@@ -667,7 +661,7 @@ impl WorkerDirectory {
             let mut found: Option<VersionMetadata> = None;
             for mailbox in &self.mailboxes {
                 let value = if self.is_local(mailbox.worker) {
-                    Value::Retained(self.local()?.retained_metadata(version, scope).await?)
+                    Value::Retained(self.local()?.fill.retained_metadata(version, scope).await?)
                 } else {
                     self.submit(mailbox.worker, Work::Retained(version.clone()), scope, None)?
                         .await?
@@ -922,6 +916,7 @@ async fn execute(
         Work::Select(version, selection, membership, envelope) => {
             let context = local.open_context(envelope)?;
             let page = local
+                .fill
                 .select_subscription(
                     version,
                     selection.demand.clone(),
@@ -934,12 +929,17 @@ async fn execute(
             selection.complete(page.clone())?;
             Ok(Value::Page(page))
         }
-        Work::Selected(copy) => local.accept_selected(copy, scope).await.map(Value::Page),
-        Work::Cached(page) => local.cached_page(&page, scope).map(Value::Cached),
+        Work::Selected(copy) => local
+            .fill
+            .accept_selected(copy, scope)
+            .await
+            .map(Value::Page),
+        Work::Cached(page) => local.fill.cached_page(&page, scope).map(Value::Cached),
         Work::Resolve(selector, membership, envelope) => {
             let context = local.open_context(envelope)?;
             local
-                .resolve_metadata(
+                .metadata
+                .resolve_with_budget(
                     selector,
                     membership,
                     &context,
@@ -952,6 +952,7 @@ async fn execute(
         Work::Acquire(page, membership, envelope) => {
             let context = local.open_context(envelope)?;
             local
+                .fill
                 .acquire(
                     page,
                     membership,
@@ -965,6 +966,7 @@ async fn execute(
         Work::Ordered(page, membership, envelope, guard) => {
             let context = local.open_context(envelope)?;
             local
+                .fill
                 .acquire_ordered(
                     page,
                     membership,
@@ -977,10 +979,11 @@ async fn execute(
                 .map(Value::Page)
         }
         Work::Publish(metadata) => {
-            local.publish_metadata(metadata)?;
+            local.metadata.publish_version(metadata)?;
             Ok(Value::Published)
         }
         Work::Retained(version) => local
+            .fill
             .retained_metadata(&version, scope)
             .await
             .map(Value::Retained),

@@ -12,8 +12,8 @@ use crate::{
     error::{Error, Operation, Result},
     model::{
         context::{OriginContext, PeerOriginContext},
-        identity::{AttemptId, ObjectId, ObjectVersion, PageId},
-        metadata::{MetadataSelector, ObjectMetadata, VersionMetadata},
+        identity::ObjectId,
+        metadata::{MetadataSelector, ObjectMetadata},
         range::{ByteRange, ResolvedRange},
     },
     peer::{
@@ -40,10 +40,10 @@ pub trait ReadService {
 }
 pub struct Coordinator {
     snapshots: Rc<SnapshotStore>,
-    metadata: Rc<MetadataService>,
-    fill: Rc<Fill>,
+    pub(super) metadata: Rc<MetadataService>,
+    pub(super) fill: Rc<Fill>,
     streams: Rc<RangeStreams>,
-    credentials: Rc<CredentialCrypto>,
+    pub(super) credentials: Rc<CredentialCrypto>,
     availability: Option<Rc<crate::control::availability::Availability>>,
 }
 // Metadata/bootstrap allowance. Normal pinned client ranges admit bounded page
@@ -73,46 +73,6 @@ pub(crate) fn inherited_budget(
     Ok(budget)
 }
 impl Coordinator {
-    pub(crate) fn cached_page(
-        &self,
-        page: &PageId,
-        scope: &RequestScope,
-    ) -> Result<Option<super::fill::PageResult>> {
-        self.fill.cached_page(page, scope)
-    }
-    pub(crate) async fn select_subscription(
-        &self,
-        version: ObjectVersion,
-        demand: crate::peer::subscriptions::Demand,
-        membership: MembershipLease,
-        context: &OriginContext,
-        scope: &RequestScope,
-        budget: &mut AcquisitionBudget,
-    ) -> Result<super::fill::PageResult> {
-        self.fill
-            .select_subscription(version, demand, membership, context, scope, budget)
-            .await
-    }
-    pub(crate) async fn acquire_ordered(
-        &self,
-        page: crate::model::identity::PageId,
-        membership: MembershipLease,
-        context: &OriginContext,
-        scope: &RequestScope,
-        budget: &mut AcquisitionBudget,
-        guard: std::sync::Arc<super::subscription::FixedAcquisition>,
-    ) -> Result<super::fill::PageResult> {
-        self.fill
-            .acquire_ordered(page, membership, context, scope, budget, guard)
-            .await
-    }
-    pub(crate) async fn accept_selected(
-        &self,
-        copy: crate::memory::page::CiphertextCopy,
-        scope: &RequestScope,
-    ) -> Result<super::fill::PageResult> {
-        self.fill.accept_selected(copy, scope).await
-    }
     pub fn new(
         snapshots: Rc<SnapshotStore>,
         metadata: Rc<MetadataService>,
@@ -135,52 +95,6 @@ impl Coordinator {
     ) -> Self {
         self.availability = Some(availability);
         self
-    }
-    pub(crate) fn resolve_metadata<'a>(
-        &'a self,
-        selector: MetadataSelector,
-        membership: MembershipLease,
-        context: &'a OriginContext,
-        scope: &'a RequestScope,
-        budget: &'a mut AcquisitionBudget,
-    ) -> Operation<'a, ObjectMetadata> {
-        self.metadata
-            .resolve_with_budget(selector, membership, context, scope, budget)
-    }
-    pub(crate) fn acquire<'a>(
-        &'a self,
-        page: PageId,
-        membership: MembershipLease,
-        context: &'a OriginContext,
-        scope: &'a RequestScope,
-        budget: &'a mut AcquisitionBudget,
-    ) -> Operation<'a, super::fill::PageResult> {
-        self.fill.acquire(page, membership, context, scope, budget)
-    }
-    pub(crate) fn retained_metadata<'a>(
-        &'a self,
-        version: &'a ObjectVersion,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, Option<VersionMetadata>> {
-        self.fill.retained_metadata(version, scope)
-    }
-    pub(crate) fn publish_metadata(&self, metadata: VersionMetadata) -> Result<()> {
-        self.metadata.publish_version(metadata)
-    }
-    pub(crate) fn seal_context(
-        &self,
-        context: &OriginContext,
-        attempt: AttemptId,
-        scope: &RequestScope,
-    ) -> Result<PeerOriginContext> {
-        self.credentials.seal(context, attempt, scope)
-    }
-    pub(crate) fn local_context(
-        &self,
-        context: &OriginContext,
-        scope: &RequestScope,
-    ) -> Result<ChargedOriginContext> {
-        self.credentials.local_context(context, scope)
     }
     pub(crate) fn open_context(&self, envelope: PeerOriginContext) -> Result<ChargedOriginContext> {
         let request = envelope.request;
@@ -509,6 +423,7 @@ fn peer_error(error: Error) -> Result<PeerResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::identity::AttemptId;
     #[test]
     fn remote_budget_charges_final_incoming_link_and_never_restores_attempts() {
         let now = crate::runtime::environment::now();

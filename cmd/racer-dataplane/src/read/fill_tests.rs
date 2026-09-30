@@ -804,6 +804,15 @@ fn ciphertext_ready_promotes_once_for_concurrent_plaintext_readers() {
     assert!(Arc::ptr_eq(&a.plaintext.inner, &b.plaintext.inner));
     assert_eq!(metrics.count(Event::PageDecrypt), 1);
     assert_eq!(f.origin.calls.get(), 1);
+    // The elected promotion returns its transferred budget intact. Neither a
+    // ciphertext-only reader nor a coalesced plaintext reader starts a new route.
+    for budget in [&cipher_budget, &first_budget, &second_budget] {
+        assert_eq!(budget.remaining_attempts(), 8);
+        assert_eq!(budget.remaining_links(), 8);
+        assert_eq!(budget.deadline(), f.scope.deadline.0);
+    }
+    assert_eq!(metrics.gauge(Gauge::ActiveFills), 0);
+    assert_eq!(super::super::drivers::pending(), 0);
     drop(holder);
 }
 

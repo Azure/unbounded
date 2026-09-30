@@ -7,7 +7,8 @@
 use super::{
     candidates::{CandidatePolicy, CandidateResolution},
     flight::{
-        AcquisitionBudget, AcquisitionEvent, AcquisitionFailure, Flights, JoinedCopy, JoinedFlight,
+        AcquisitionBudget, AcquisitionEvent, AcquisitionFailure, AcquisitionWaiter, FlightLeader,
+        Flights, JoinedCopy, JoinedFlight,
     },
 };
 use crate::{
@@ -527,171 +528,161 @@ impl Fill {
                     }
                     AcquisitionEvent::Failed(error) => return Err(error),
                     AcquisitionEvent::Lead(leader) => {
-                        let ready = self.dependencies.flights.ciphertext_for(&leader)?;
-                        let ready = ready.or(self.metrics.lookup(
-                            LookupTier::Ciphertext,
-                            self.dependencies.memory.unverified(&page),
-                        )?);
-                        let driver_permit = super::drivers::reserve()?;
-                        let acquisition = waiter.acquisition(&leader)?;
-                        // The acquisition driver stays on this owner. Admit an
-                        // independent zeroizing context without crossing an AEAD domain.
-                        let owned_context = self
-                            .dependencies
-                            .credentials
-                            .local_context(acquisition.origin, acquisition.scope)?;
-                        // Peer callers may share a worker-lifetime cancellation
-                        // domain. Driver abandonment must cancel only this work.
-                        let caller_scope = acquisition.scope.clone();
-                        let caller_cancellation = caller_scope.cancellation.subscribe()?;
-                        let owned_scope =
-                            RequestScope::new(caller_scope.request, caller_scope.deadline.0)?;
-                        let operation = self
-                            .dependencies
-                            .flights
-                            .retain_operation(&leader, self.metrics.lease(Gauge::ActiveFills)?)?;
-                        let mut owned_budget = acquisition.budget.transfer();
-                        let owned_membership = acquisition.membership.clone();
-                        let owned_page = page.clone();
-                        let prefetched = prefetch.take();
-                        let fill = self.clone();
-                        let flights = self.dependencies.flights.clone();
-                        let (send, mut receive) = futures::channel::oneshot::channel();
-                        // A cancelled waiter may return before accepted origin,
-                        // peer, or crypto work. Keep selection excluded until
-                        // this elected driver's actual completion, not its reply.
-                        let completion_guard = guard.clone();
-                        driver_permit.submit(Box::pin(async move {
-                            let _completion_guard = completion_guard;
-                            let mut work = Box::pin(async {
-                                let (ready, prefetched) = match prefetched {
-                                    Some(Prefetch::Ciphertext(copy)) => {
-                                        (ready.or(Some(copy)), None)
-                                    }
-                                    other => (ready, other),
-                                };
-                                if let Some(copy) = ready {
-                                    if !plaintext {
-                                        return Ok(AcquiredPage::Ciphertext(copy));
-                                    }
-                                    let reservation =
-                                        fill.reserve_bootstrap(&owned_page.version.object.cache)?;
-                                    match fill
-                                        .decrypt(
-                                            &owned_page,
-                                            copy.copy.clone(),
-                                            reservation,
-                                            &owned_scope,
-                                        )
-                                        .await
-                                    {
-                                        Ok(result) => {
-                                            fill.publish(result.clone(), None, &owned_scope)
-                                                .await?;
-                                            return Ok(result.into());
-                                        }
-                                        Err(Error::CorruptRecord | Error::MissingKey) => {
-                                            fill.dependencies.memory.invalidate_ciphertext(&copy);
-                                            flights.discard_ciphertext(&leader)?;
-                                            if let Some(token) = copy.disk_token {
-                                                fill.dependencies.disk.invalidate(&token)?;
-                                            }
-                                        }
-                                        Err(error) => return Err(error),
-                                    }
-                                }
-                                if let Some(Prefetch::Origin(origin)) = prefetched {
-                                    fill.admit_bootstrap(
-                                        origin,
-                                        &owned_page,
-                                        owned_membership,
-                                        &owned_scope,
-                                    )
-                                    .await
-                                    .map(AcquiredPage::from)
-                                } else {
-                                    fill.acquire_once(
-                                        &owned_page,
-                                        owned_membership,
-                                        &owned_context,
-                                        &owned_scope,
-                                        &mut owned_budget,
-                                        plaintext,
-                                    )
-                                    .await
-                                }
-                            });
-                            let result = std::future::poll_fn(|cx| {
-                                if !caller_scope.cancellation.is_cancelled() {
-                                    caller_cancellation.register(cx.waker());
-                                }
-                                if !owned_scope.cancellation.is_cancelled()
-                                    && (caller_scope.check().is_err()
-                                        || operation.cancellation_requested())
-                                {
-                                    let _ = owned_scope.cancel();
-                                }
-                                work.as_mut().poll(cx)
-                            })
-                            .await;
-                            drop(work);
-                            operation.complete()?;
-                            match result {
-                                Ok(result) => {
-                                    if let AcquiredPage::Ciphertext(copy) = &result {
-                                        match fill
-                                            .dependencies
-                                            .memory
-                                            .publish_ciphertext(copy.clone())
-                                        {
-                                            Ok(())
-                                            | Err(
-                                                Error::Overloaded
-                                                | Error::MissingKey
-                                                | Error::Unavailable,
-                                            ) => {}
-                                            Err(error) => return Err(error),
-                                        }
-                                    }
-                                    let _ = flights.publish_acquired(leader, result);
-                                }
-                                Err(Error::OriginRejected) => {
-                                    let _ =
-                                        flights.fail(leader, AcquisitionFailure::OriginRejected);
-                                }
-                                Err(Error::OriginForbidden) => {
-                                    let _ =
-                                        flights.fail(leader, AcquisitionFailure::OriginForbidden);
-                                }
-                                Err(error) => {
-                                    let _ =
-                                        flights.fail(leader, AcquisitionFailure::Terminal(error));
-                                }
-                            }
-                            let _ = send.send(owned_budget);
-                            Ok(())
-                        }));
-                        use std::future::Future;
-                        let remaining = std::future::poll_fn(|cx| {
-                            super::drivers::poll(cx, 64);
-                            acquisition.cancellation.register(cx.waker());
-                            acquisition.scope.check()?;
-                            match std::pin::Pin::new(&mut receive).poll(cx) {
-                                std::task::Poll::Ready(Ok(value)) => {
-                                    std::task::Poll::Ready(Ok(value))
-                                }
-                                std::task::Poll::Ready(Err(_)) => {
-                                    std::task::Poll::Ready(Err(Error::Unavailable))
-                                }
-                                std::task::Poll::Pending => std::task::Poll::Pending,
-                            }
-                        })
+                        self.drive_elected_acquisition(
+                            &page,
+                            leader,
+                            &mut waiter,
+                            &mut prefetch,
+                            plaintext,
+                            guard.clone(),
+                        )
                         .await?;
-                        *acquisition.budget = remaining;
                     }
                 }
             }
         })
+    }
+
+    /// Transfer elected work to the worker driver. The caller only waits for its
+    /// remaining budget; dropping that wait cannot release accepted work or the
+    /// ordered-selection guard before the operation completes.
+    async fn drive_elected_acquisition(
+        &self,
+        page: &PageId,
+        leader: FlightLeader,
+        waiter: &mut AcquisitionWaiter<'_>,
+        prefetch: &mut Option<Prefetch>,
+        plaintext: bool,
+        completion_guard: Option<Arc<super::subscription::FixedAcquisition>>,
+    ) -> Result<()> {
+        use std::future::Future;
+
+        let ready = self.dependencies.flights.ciphertext_for(&leader)?;
+        let ready = ready.or(self.metrics.lookup(
+            LookupTier::Ciphertext,
+            self.dependencies.memory.unverified(page),
+        )?);
+        let driver_permit = super::drivers::reserve()?;
+        let acquisition = waiter.acquisition(&leader)?;
+        // The driver stays on this owner. Admit an independent zeroizing context
+        // without crossing an AEAD domain.
+        let owned_context = self
+            .dependencies
+            .credentials
+            .local_context(acquisition.origin, acquisition.scope)?;
+        // Peer callers may share a worker-lifetime cancellation domain. Driver
+        // abandonment must cancel only this work.
+        let caller_scope = acquisition.scope.clone();
+        let caller_cancellation = caller_scope.cancellation.subscribe()?;
+        let owned_scope = RequestScope::new(caller_scope.request, caller_scope.deadline.0)?;
+        let operation = self
+            .dependencies
+            .flights
+            .retain_operation(&leader, self.metrics.lease(Gauge::ActiveFills)?)?;
+        let mut owned_budget = acquisition.budget.transfer();
+        let owned_membership = acquisition.membership.clone();
+        let owned_page = page.clone();
+        let prefetched = prefetch.take();
+        let fill = self.clone();
+        let flights = self.dependencies.flights.clone();
+        let (send, mut receive) = futures::channel::oneshot::channel();
+        driver_permit.submit(Box::pin(async move {
+            let _completion_guard = completion_guard;
+            let mut work = Box::pin(async {
+                let (ready, prefetched) = match prefetched {
+                    Some(Prefetch::Ciphertext(copy)) => (ready.or(Some(copy)), None),
+                    other => (ready, other),
+                };
+                if let Some(copy) = ready {
+                    if !plaintext {
+                        return Ok(AcquiredPage::Ciphertext(copy));
+                    }
+                    let reservation = fill.reserve_bootstrap(&owned_page.version.object.cache)?;
+                    match fill
+                        .decrypt(&owned_page, copy.copy.clone(), reservation, &owned_scope)
+                        .await
+                    {
+                        Ok(result) => {
+                            fill.publish(result.clone(), None, &owned_scope).await?;
+                            return Ok(result.into());
+                        }
+                        Err(Error::CorruptRecord | Error::MissingKey) => {
+                            fill.dependencies.memory.invalidate_ciphertext(&copy);
+                            flights.discard_ciphertext(&leader)?;
+                            if let Some(token) = copy.disk_token {
+                                fill.dependencies.disk.invalidate(&token)?;
+                            }
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                if let Some(Prefetch::Origin(origin)) = prefetched {
+                    fill.admit_bootstrap(origin, &owned_page, owned_membership, &owned_scope)
+                        .await
+                        .map(AcquiredPage::from)
+                } else {
+                    fill.acquire_once(
+                        &owned_page,
+                        owned_membership,
+                        &owned_context,
+                        &owned_scope,
+                        &mut owned_budget,
+                        plaintext,
+                    )
+                    .await
+                }
+            });
+            let result = std::future::poll_fn(|cx| {
+                if !caller_scope.cancellation.is_cancelled() {
+                    caller_cancellation.register(cx.waker());
+                }
+                if !owned_scope.cancellation.is_cancelled()
+                    && (caller_scope.check().is_err() || operation.cancellation_requested())
+                {
+                    let _ = owned_scope.cancel();
+                }
+                work.as_mut().poll(cx)
+            })
+            .await;
+            drop(work);
+            operation.complete()?;
+            match result {
+                Ok(result) => {
+                    if let AcquiredPage::Ciphertext(copy) = &result {
+                        match fill.dependencies.memory.publish_ciphertext(copy.clone()) {
+                            Ok(())
+                            | Err(Error::Overloaded | Error::MissingKey | Error::Unavailable) => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    let _ = flights.publish_acquired(leader, result);
+                }
+                Err(Error::OriginRejected) => {
+                    let _ = flights.fail(leader, AcquisitionFailure::OriginRejected);
+                }
+                Err(Error::OriginForbidden) => {
+                    let _ = flights.fail(leader, AcquisitionFailure::OriginForbidden);
+                }
+                Err(error) => {
+                    let _ = flights.fail(leader, AcquisitionFailure::Terminal(error));
+                }
+            }
+            let _ = send.send(owned_budget);
+            Ok(())
+        }));
+        let remaining = std::future::poll_fn(|cx| {
+            super::drivers::poll(cx, 64);
+            acquisition.cancellation.register(cx.waker());
+            acquisition.scope.check()?;
+            match std::pin::Pin::new(&mut receive).poll(cx) {
+                std::task::Poll::Ready(Ok(value)) => std::task::Poll::Ready(Ok(value)),
+                std::task::Poll::Ready(Err(_)) => std::task::Poll::Ready(Err(Error::Unavailable)),
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        })
+        .await?;
+        *acquisition.budget = remaining;
+        Ok(())
     }
 
     async fn admit_bootstrap(
