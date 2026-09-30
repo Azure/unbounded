@@ -19,7 +19,7 @@ const REQUESTS: usize = 128;
 const SWEEPS: usize = 4;
 const MIB: u64 = 1 << 20;
 
-fn default_plan() -> AffinityPlan {
+fn default_config() -> Config {
     // Parse real defaults without inheriting ambient RACER_* overrides or loading files.
     let (config, _) = Config::from_lookup_with_fabric_ports(|name| {
         Ok(match name {
@@ -30,28 +30,41 @@ fn default_plan() -> AffinityPlan {
     })
     .unwrap();
     assert_eq!(config.max_threads, DEFAULT_MAX_THREADS);
+    config
+}
+
+fn default_plan() -> AffinityPlan {
+    let config = default_config();
     let topology = EffectiveTopology::discover().unwrap();
     println!(
         "allowed_cpus={:?} cpu_quota={:?} default_max_threads={DEFAULT_MAX_THREADS}",
         topology.cpus, topology.quota
     );
     let plan = AffinityPlan::from_topology(&config, topology, &[]).unwrap();
-    // app::partition_limits' default, non-RDMA progress floors admit all <=4 pairs.
+    // This component fixture supplies per-shard budgets, not production's
+    // aggregate budget partitioning and worker reduction.
     let n = plan.pairs.len();
-    assert!(n <= 4);
-    assert!(config.limits.plaintext_bytes.get() / n >= 3 * P as usize);
-    assert!(
-        config.limits.ciphertext_bytes.get() / n
-            >= 3 * (P as usize + 16) + racer_dataplane::store::format::MAX_HEADER_BYTES
+    assert!(n > 0);
+    println!(
+        "host_default_io_shards={n} crypto_threads={} layout={:?}",
+        plan.crypto_groups().len(),
+        plan.pairs
     );
-    assert!(config.limits.dirty_bytes.get() / n >= P as usize + 16);
-    println!("host_default_pairs={n} layout={:?}", plan.pairs);
     plan
 }
 
+fn owned_plan(plan: &AffinityPlan) -> AffinityPlan {
+    AffinityPlan {
+        pairs: plan.pairs.clone(),
+        // Automatic mode already has room for the driver; finite caps need one
+        // extra slot without changing any I/O-to-crypto assignments.
+        max_threads: plan.max_threads.saturating_add(1),
+    }
+}
+
 // A full encrypted page plus its header allows three records per 64 MiB segment.
-// Include one warm page per owner and one free segment; aggregate sparse lengths
-// stay <=3 GiB, so even complete allocation leaves space on the 4 GiB filesystem.
+// Include one warm page per owner and one free segment. The RAM disk grows with
+// aggregate sparse lengths and retains filesystem headroom.
 fn slab_bytes(workers: usize) -> u64 {
     ((REQUESTS.div_ceil(workers) + 1).div_ceil(3) + 1) as u64 * 64 * MIB
 }
@@ -181,7 +194,12 @@ impl Service {
                                     rig.responses.validate(&kind, &response)?;
                                     let sent = rig
                                         .responses
-                                        .send(received.connection, response, &scope)
+                                        .send_subscription_unobserved(
+                                            received.connection,
+                                            response,
+                                            &scope,
+                                            TIMEOUT,
+                                        )
                                         .await;
                                     if let Err(error) = &sent {
                                         *failures
@@ -191,12 +209,8 @@ impl Service {
                                     }
                                     lease = sent?;
                                     if !lease.is_reusable() {
-                                        // send can now return a fully written error
-                                        // head when first-slice admission fails.
-                                        *failures
-                                            .borrow_mut()
-                                            .entry("response:rejected-before-body".into())
-                                            .or_default() += 1;
+                                        // Subscriptions close after Complete. The
+                                        // client validates status and framing.
                                         return Ok(());
                                     }
                                 }
@@ -312,7 +326,7 @@ fn get(client: &mut BufReader<UnixStream>, key: usize, verify: bool) -> std::io:
     use std::io::BufRead;
     write!(
         client.get_mut(),
-        "GET /v1/objects/{key:064x} HTTP/1.1\r\nHost: racer\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nIf-Match: \"v1\"\r\nRange: bytes=0-16777215\r\n\r\n"
+        "POST /v2/objects/{key:064x} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\nRacer-Ordered: 1\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nIf-Match: \"v1\"\r\nRange: bytes=0-16777215\r\nConnection: close\r\n\r\n"
     )?;
     let mut head = String::new();
     loop {
@@ -331,19 +345,31 @@ fn get(client: &mut BufReader<UnixStream>, key: usize, verify: bool) -> std::io:
     let status: u16 = head.split_whitespace().nth(1).unwrap().parse().unwrap();
     let fields = fields(&head);
     let length: usize = fields["content-length"].parse().unwrap();
-    if status == 206 {
-        assert_eq!(length, P as usize);
+    if status == 200 {
+        assert_eq!(length, P as usize + 42);
         assert_eq!(fields["etag"], "\"v1\"");
-        assert_eq!(fields["content-range"], format!("bytes 0-{}/{P}", P - 1));
+        assert_eq!(fields["racer-object-length"], P.to_string());
+        assert_eq!(fields["racer-range-start"], "0");
+        assert_eq!(fields["racer-range-end"], P.to_string());
+        assert_eq!(fields["connection"], "close");
+        let mut frame = [0; 21];
+        client.read_exact(&mut frame)?;
+        assert_eq!(frame[0], 1);
+        assert_eq!(&frame[1..17], &[0; 16]);
+        assert_eq!(
+            u32::from_be_bytes(frame[17..].try_into().unwrap()),
+            P as u32
+        );
     } else {
         assert!(length <= 32768);
     }
     let mut scratch = [0; 64 << 10];
     let mut offset = 0;
+    let length = if status == 200 { P as usize } else { length };
     while offset < length {
         let n = scratch.len().min(length - offset);
         client.read_exact(&mut scratch[..n])?;
-        if status == 206 {
+        if status == 200 {
             if verify {
                 for (i, value) in scratch[..n].iter().enumerate() {
                     assert_eq!(*value, byte(1, (offset + i) as u64));
@@ -355,12 +381,21 @@ fn get(client: &mut BufReader<UnixStream>, key: usize, verify: bool) -> std::io:
         }
         offset += n;
     }
+    if status == 200 {
+        let mut complete = [0; 21];
+        client.read_exact(&mut complete)?;
+        assert_eq!(complete[0], 2);
+        assert_eq!(u64::from_be_bytes(complete[1..9].try_into().unwrap()), 1);
+        assert_eq!(u64::from_be_bytes(complete[9..17].try_into().unwrap()), P);
+        assert_eq!(&complete[17..], &[0; 4]);
+        assert_eq!(client.read(&mut scratch[..1])?, 0);
+    }
     Ok(status)
 }
 
 #[test]
 fn balanced_workload_covers_owners_without_multiplying_pages() {
-    for workers in 1..=4 {
+    for workers in [1, 2, 4, 5, 16, 128, 256] {
         let map = WorkerMap::new((0..workers as u16).map(WorkerId).collect()).unwrap();
         let keys = balanced_keys(&map, workers, REQUESTS + workers);
         assert_eq!(
@@ -373,20 +408,71 @@ fn balanced_workload_covers_owners_without_multiplying_pages() {
                 WorkerId((index % workers) as u16)
             );
         }
-        assert!(slab_bytes(workers) * workers as u64 <= 3 << 30);
+        assert!(slab_bytes(workers) >= 128 * MIB);
     }
+}
+
+#[test]
+fn automatic_and_capped_plans_preserve_shared_and_explicit_paired_crypto() {
+    use racer_dataplane::runtime::affinity::CpuLocation;
+    let mut config = default_config();
+    let topology = EffectiveTopology {
+        cpus: (0..12)
+            .map(|cpu| CpuLocation {
+                cpu,
+                package: 0,
+                core: cpu,
+                numa_node: Some(0),
+            })
+            .collect(),
+        quota: None,
+        nics: vec![],
+    };
+    for (cap, io, crypto) in [(usize::MAX, 8, 4), (8, 5, 3), (2, 1, 1)] {
+        config.max_threads = cap;
+        let plan = AffinityPlan::from_topology(&config, topology.clone(), &[]).unwrap();
+        let owned = owned_plan(&plan);
+        assert_eq!(owned.pairs.len(), io);
+        assert_eq!(owned.crypto_groups().len(), crypto);
+        assert_eq!(owned.max_threads, cap.saturating_add(1));
+        assert!(io + crypto + 1 <= owned.max_threads);
+        assert_eq!(owned.crypto_groups(), plan.crypto_groups());
+    }
+    config.max_threads = 1;
+    assert!(AffinityPlan::from_topology(&config, topology.clone(), &[]).is_err());
+    config.max_threads = 2;
+    // Legacy fixtures can still explicitly assign a different crypto CPU to
+    // every I/O shard; shared execution is determined by CPU identity only.
+    let mut paired = AffinityPlan::from_topology(&config, topology.clone(), &[]).unwrap();
+    let first = paired.pairs[0].clone();
+    paired.pairs = (0..4)
+        .map(|worker| {
+            let mut pair = first.clone();
+            pair.worker = WorkerId(worker);
+            pair.io = topology.cpus[usize::from(worker) * 2].clone();
+            pair.crypto = topology.cpus[usize::from(worker) * 2 + 1].clone();
+            pair
+        })
+        .collect();
+    paired.max_threads = 8;
+    assert_eq!(
+        owned_plan(&paired).crypto_groups(),
+        vec![vec![0], vec![1], vec![2], vec![3]]
+    );
+    assert_eq!(owned_plan(&paired).max_threads, 9);
 }
 
 #[test]
 fn shared_directory_routes_cold_and_offline_reads_to_both_owners() {
     let mut plan = default_plan();
-    // Even a one-CPU host can execute two fixture pairs sharing allowed CPUs.
+    // Even a one-CPU host can execute two I/O shards sharing one crypto thread.
     // This is a routing test, not a benchmark sizing override.
     let mut second = plan.pairs[0].clone();
     second.worker = WorkerId(1);
     plan.pairs.truncate(1);
     plan.pairs.push(second);
-    plan.max_threads = 5;
+    plan.max_threads = 4; // Two I/O threads, one crypto thread, and the caller.
+    assert_eq!(plan.crypto_groups(), vec![vec![0, 1]]);
     let ids = vec![WorkerId(0), WorkerId(1)];
     let map = Arc::new(WorkerMap::new(ids.clone()).unwrap());
     let keys = balanced_keys(&map, 2, 2);
@@ -410,7 +496,7 @@ fn shared_directory_routes_cold_and_offline_reads_to_both_owners() {
     group.start(factory, &scope()).unwrap();
     for (owner, key) in keys.iter().enumerate() {
         let mut client = connect(&commands[1 - owner]);
-        assert_eq!(get(&mut client, *key, true).unwrap(), 206);
+        assert_eq!(get(&mut client, *key, true).unwrap(), 200);
     }
     let initial = inspect_all(&commands, true);
     for stats in &initial {
@@ -426,7 +512,7 @@ fn shared_directory_routes_cold_and_offline_reads_to_both_owners() {
     inspect_all(&commands, false);
     for (owner, key) in keys.iter().enumerate() {
         let mut client = connect(&commands[1 - owner]);
-        assert_eq!(get(&mut client, *key, true).unwrap(), 206);
+        assert_eq!(get(&mut client, *key, true).unwrap(), 200);
     }
     for (owner, stats) in inspect_all(&commands, false).iter().enumerate() {
         assert_eq!(
@@ -475,11 +561,9 @@ fn run_case(root: &std::path::Path, default: &AffinityPlan, mode: &str, concurre
         })
         .collect();
     // Owned startup needs a slot for the benchmark driver (worker.rs::start).
-    // Preserve the production-selected pairs/CPUs; this does not add a worker.
-    let plan = AffinityPlan {
-        pairs: default.pairs.clone(),
-        max_threads: default.max_threads + 1,
-    };
+    // Preserve the production-selected assignments/CPUs; this adds no worker.
+    let plan = owned_plan(default);
+    let crypto_threads = plan.crypto_groups().len();
     let factory = Arc::new(Factory {
         root: root.into(),
         commands: Mutex::new(receivers),
@@ -489,14 +573,14 @@ fn run_case(root: &std::path::Path, default: &AffinityPlan, mode: &str, concurre
     let mut group = WorkerGroup::new(plan);
     group.start(factory, &scope()).unwrap();
     println!(
-        "case={mode} concurrency={concurrency} pairs={workers} worker_threads={} driver_threads=1 plaintext_MiB_per_worker=256 ciphertext_MiB_per_worker=512 dirty_MiB_per_worker=128 page_MiB=16",
-        workers * 2
+        "case={mode} concurrency={concurrency} io_shards={workers} crypto_threads={crypto_threads} worker_threads={} driver_threads=1 plaintext_MiB_per_worker=256 ciphertext_MiB_per_worker=512 dirty_MiB_per_worker=128 page_MiB=16",
+        workers + crypto_threads
     );
     // Warm connections/crypto and fully validate fixture bytes outside timing.
     let warm_count = if mode == "disk" { REQUESTS } else { workers };
     for (index, key) in keys.iter().take(warm_count).enumerate() {
         let mut warm = connect(&commands[(index + 1) % workers]);
-        assert_eq!(get(&mut warm, *key, true).unwrap(), 206);
+        assert_eq!(get(&mut warm, *key, true).unwrap(), 200);
         inspect_all(&commands, false);
     }
     let initial = inspect_all(&commands, mode == "disk");
@@ -504,7 +588,7 @@ fn run_case(root: &std::path::Path, default: &AffinityPlan, mode: &str, concurre
     for (owner, stats) in initial.iter().enumerate() {
         let expected = (owner..warm_count).step_by(workers).count();
         assert_eq!(stats.records, expected, "preload must reach its real owner");
-        assert!(stats.origin_calls > 0);
+        assert_eq!(stats.origin_calls > 0, expected > 0);
     }
     if mode != "fill" {
         for commands in &commands {
@@ -539,11 +623,9 @@ fn run_case(root: &std::path::Path, default: &AffinityPlan, mode: &str, concurre
                         };
                         let start = Instant::now();
                         let status = get(&mut client, key, false);
-                        let reconnect = !matches!(status, Ok(206));
                         samples.push((status, start.elapsed()));
-                        if reconnect {
-                            client = connect(commands);
-                        }
+                        // Every subscription ends with Complete and transport EOF.
+                        client = connect(commands);
                     }
                     samples
                 }));
@@ -554,7 +636,7 @@ fn run_case(root: &std::path::Path, default: &AffinityPlan, mode: &str, concurre
             for handle in handles {
                 for (status, latency) in handle.join().unwrap() {
                     match status {
-                        Ok(206) => samples.push(latency),
+                        Ok(200) => samples.push(latency),
                         Ok(status) => *failures.entry(format!("HTTP-{status}")).or_default() += 1,
                         Err(error) => {
                             *failures.entry(format!("{:?}", error.kind())).or_default() += 1

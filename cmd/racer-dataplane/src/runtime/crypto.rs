@@ -941,6 +941,247 @@ mod tests {
     }
 
     #[test]
+    fn shared_worker_encrypt_queue_measurements() {
+        shared_worker_queue_measurements(false);
+    }
+
+    #[test]
+    fn shared_worker_decrypt_queue_measurements() {
+        shared_worker_queue_measurements(true);
+    }
+
+    fn shared_worker_queue_measurements(decrypt: bool) {
+        use crate::{
+            runtime::environment::{self, SimulationClock},
+            security::aead::PageCryptoEngine,
+            telemetry::metrics::{Event::*, Metrics},
+        };
+        use std::time::Duration;
+
+        let clock = SimulationClock::new(43);
+        let env = clock.environment(0);
+        let _env = env.enter();
+        let _strict = environment::require_simulated();
+        let admission = std::rc::Rc::new(crate::runtime::admission::Admission::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let keys = keyring();
+        let cache = crate::model::identity::CacheId("00000000-0000-4000-8000-000000000003".into());
+        let lease = || {
+            keys.active(&cache, crate::security::keyring::KeyPurpose::Page)
+                .unwrap()
+        };
+        let events = if decrypt {
+            [
+                CryptoDecryptStarted,
+                CryptoDecryptSuccess,
+                CryptoDecryptFailure,
+                CryptoDecryptBytes,
+                CryptoDecryptExecutionCount,
+                CryptoDecryptExecutionNs,
+                CryptoDecryptQueueCount,
+                CryptoDecryptQueueNs,
+            ]
+        } else {
+            [
+                CryptoEncryptStarted,
+                CryptoEncryptSuccess,
+                CryptoEncryptFailure,
+                CryptoEncryptBytes,
+                CryptoEncryptExecutionCount,
+                CryptoEncryptExecutionNs,
+                CryptoEncryptQueueCount,
+                CryptoEncryptQueueNs,
+            ]
+        };
+        let opposite_queue = if decrypt {
+            [CryptoEncryptQueueCount, CryptoEncryptQueueNs]
+        } else {
+            [CryptoDecryptQueueCount, CryptoDecryptQueueNs]
+        };
+
+        for mode in ["success", "failure", "cancel", "abandon"] {
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            let scopes = [0, 1].map(|id| {
+                RequestScope::new(
+                    crate::model::identity::RequestId([id; 16]),
+                    environment::now() + Duration::from_secs(10),
+                )
+                .unwrap()
+            });
+            let make_input = |scope: &RequestScope, corrupt: bool| {
+                let mut data = input(&admission);
+                if decrypt {
+                    let (setup, _setup_engine) =
+                        pair(WorkerId(2), 0, NonZeroUsize::new(1).unwrap());
+                    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+                    let Poll::Ready(Ok(permit)) = setup.poll_reserve(
+                        &mut cx,
+                        CryptoId {
+                            worker: WorkerId(2),
+                            generation: 0,
+                            sequence: 0,
+                        },
+                    ) else {
+                        panic!("setup permit")
+                    };
+                    let result =
+                        PageCryptoEngine::process(permit.job(data, lease(), scope.clone()));
+                    let CryptoOutcome::Completed(CryptoOutput::Encrypted(plain, mut ciphertext)) =
+                        result.outcome
+                    else {
+                        panic!("setup encryption")
+                    };
+                    drop(plain);
+                    if corrupt {
+                        Arc::get_mut(&mut ciphertext.inner).unwrap().bytes[0] ^= 1;
+                    }
+                    CryptoInput::Decrypt {
+                        ciphertext,
+                        plaintext: admission
+                            .reserve(
+                                Some(&cache),
+                                crate::model::limits::ResourceClass::Plaintext,
+                                1,
+                            )
+                            .unwrap(),
+                    }
+                } else {
+                    if corrupt {
+                        if let CryptoInput::Encrypt { page, .. } = &mut data {
+                            page.version.object.cache.0 = "wrong".into();
+                        }
+                    }
+                    data
+                }
+            };
+            let (other_io, mut other_engine) = pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
+            let (waiting_io, mut waiting_engine) =
+                pair(WorkerId(1), 0, NonZeroUsize::new(1).unwrap());
+            // Occupy capacity without submitting: the target really parks before
+            // admission, rather than merely being created after a clock advance.
+            let Poll::Ready(Ok(blocker)) = waiting_io.poll_reserve(
+                &mut cx,
+                CryptoId {
+                    worker: WorkerId(1),
+                    generation: 0,
+                    sequence: 0,
+                },
+            ) else {
+                panic!("capacity blocker")
+            };
+            let other = CryptoClient::new(other_io);
+            let waiting = CryptoClient::new(waiting_io);
+            let other_metrics = Metrics::default();
+            let waiting_metrics = Metrics::default();
+            other.set_metrics(other_metrics.clone());
+            waiting.set_metrics(waiting_metrics.clone());
+            let mut future = Some(waiting.execute(
+                make_input(&scopes[1], mode == "failure"),
+                lease(),
+                &scopes[1],
+            ));
+            assert!(future.as_mut().unwrap().as_mut().poll(&mut cx).is_pending());
+            assert_eq!(waiting.pending.borrow().len(), 1);
+            assert!(waiting.waiters.borrow().is_empty());
+            clock.advance(Duration::from_millis(100));
+            assert!(future.as_mut().unwrap().as_mut().poll(&mut cx).is_pending());
+            assert!(waiting_engine.poll_job(&mut cx).is_pending());
+            drop(blocker);
+            assert!(future.as_mut().unwrap().as_mut().poll(&mut cx).is_pending());
+            assert!(waiting.pending.borrow().is_empty());
+            assert_eq!(waiting.waiters.borrow().len(), 1);
+
+            let mut other_future =
+                other.execute(make_input(&scopes[0], false), lease(), &scopes[0]);
+            assert!(other_future.as_mut().poll(&mut cx).is_pending());
+            if mode == "cancel" {
+                scopes[1].cancel().unwrap();
+                assert!(future.as_mut().unwrap().as_mut().poll(&mut cx).is_pending());
+            } else if mode == "abandon" {
+                drop(future.take());
+            }
+
+            // One execution service thread, manually interleaved: service the
+            // other shard for 7ms before dequeuing the already-submitted target.
+            // Real AEAD has zero virtual cost; set its measured service interval
+            // explicitly, following the single-pair measurement test above.
+            for (engine, worker, service_ms) in [
+                (&mut other_engine, WorkerId(0), 7),
+                (&mut waiting_engine, WorkerId(1), 5),
+            ] {
+                let Poll::Ready(Ok(Some(job))) = engine.poll_job(&mut cx) else {
+                    panic!("submitted job")
+                };
+                assert_eq!(job.id().worker, worker);
+                let mut completion = PageCryptoEngine::process(job);
+                assert_eq!(completion.permit.measurement.execution_ns, Some(0));
+                let start = environment::now();
+                clock.advance(Duration::from_millis(service_ms));
+                completion.permit.executed(start);
+                assert!(engine.complete(completion).is_ok());
+            }
+            // Neither the target's own 5ms execution nor this 11ms delay before
+            // I/O reaping belongs in its submit-to-dequeue queue measurement.
+            clock.advance(Duration::from_millis(11));
+            for event in events {
+                assert_eq!(other_metrics.count(event), 0, "before reap {event:?}");
+                assert_eq!(waiting_metrics.count(event), 0, "before reap {event:?}");
+            }
+            other.poll_budgeted(1).unwrap();
+            for event in events {
+                assert_eq!(
+                    waiting_metrics.count(event),
+                    0,
+                    "other shard reaped {event:?}"
+                );
+            }
+            waiting.poll_budgeted(1).unwrap();
+            assert!(matches!(
+                other_future.as_mut().poll(&mut cx),
+                Poll::Ready(Ok(_))
+            ));
+            if let Some(mut future) = future {
+                match (mode, future.as_mut().poll(&mut cx)) {
+                    ("success", Poll::Ready(Ok(_)))
+                    | ("failure", Poll::Ready(Err(_)))
+                    | ("cancel", Poll::Ready(Err(Error::Cancelled))) => {}
+                    _ => panic!("unexpected {mode} result"),
+                }
+            }
+            let success = u64::from(mode == "success" || mode == "abandon");
+            // Repeated drains must not duplicate either shard's observations,
+            // even when delivery was canceled or abandoned before execution.
+            for _ in 0..3 {
+                other.poll_budgeted(1).unwrap();
+                waiting.poll_budgeted(1).unwrap();
+                for ((event, other_expected), waiting_expected) in events
+                    .into_iter()
+                    .zip([1, 1, 0, 1, 1, 7_000_000, 1, 0])
+                    .zip([1, success, 1 - success, success, 1, 5_000_000, 1, 7_000_000])
+                {
+                    assert_eq!(
+                        other_metrics.count(event),
+                        other_expected,
+                        "other {mode} {event:?}"
+                    );
+                    assert_eq!(
+                        waiting_metrics.count(event),
+                        waiting_expected,
+                        "waiting {mode} {event:?}"
+                    );
+                }
+                for event in opposite_queue {
+                    assert_eq!(other_metrics.count(event), 0);
+                    assert_eq!(waiting_metrics.count(event), 0);
+                }
+                assert_eq!(other.outstanding(), 0);
+                assert_eq!(waiting.outstanding(), 0);
+            }
+        }
+    }
+
+    #[test]
     fn duration_saturates_without_host_time_in_dst() {
         use crate::runtime::environment::{self, SimulationClock};
         let clock = SimulationClock::new(19);

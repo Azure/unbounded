@@ -21,15 +21,19 @@ struct ScriptedPeers {
     signing: Vec<Forwarding>,
     replies: RefCell<VecDeque<(NodeId, Reply)>>,
     calls: RefCell<Vec<(NodeId, bool, u32, u8, Instant)>>,
+    candidate_deadlines: RefCell<Vec<Instant>>,
 }
 impl PeerClient for ScriptedPeers {
     fn request<'a>(
         &'a self,
         request: PeerRequest,
         _: crate::topology::membership::MembershipLease,
-        _: &'a RequestScope,
+        scope: &'a RequestScope,
     ) -> Operation<'a, VerifiedResponse> {
         Box::pin(async move {
+            self.candidate_deadlines
+                .borrow_mut()
+                .push(scope.body_deadlines.expect("candidate time share").1);
             let destination = request.route.destination.clone();
             self.calls.borrow_mut().push((
                 destination.clone(),
@@ -96,6 +100,7 @@ fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Ve
         signing: network(4).into_iter().map(Forwarding::new).collect(),
         replies: RefCell::new(VecDeque::new()),
         calls: RefCell::new(Vec::new()),
+        candidate_deadlines: RefCell::new(Vec::new()),
     });
     let mut dependencies = f.fill.dependencies.clone();
     dependencies.peers = peers.clone();
@@ -264,11 +269,19 @@ fn unusable_peer_copy_advances_to_alternate_or_authorized_origin() {
                     .iter()
                     .all(|(_, copy, _, links, deadline)| *copy == rank.is_some()
                         && *links == 4
-                        && *deadline < f.scope.deadline.0)
+                        && *deadline == f.scope.deadline.0)
             );
-            // Both probes retain later candidates or local origin as a fallback.
-            // A fast unusable copy leaves more time for the next ranked attempt.
-            assert!(calls[0].4 < calls[1].4);
+            // Signed routes retain the original hard ceiling; only local candidate
+            // shares reserve fallback time. A fast unusable copy leaves more time
+            // for the next ranked attempt without renewing signed authority.
+            let candidate_deadlines = peers.candidate_deadlines.borrow();
+            assert_eq!(candidate_deadlines.len(), calls.len());
+            assert!(
+                candidate_deadlines
+                    .iter()
+                    .all(|deadline| *deadline < f.scope.deadline.0)
+            );
+            assert!(candidate_deadlines[0] < candidate_deadlines[1]);
             let spent: u32 = calls.iter().map(|(_, _, credits, _, _)| 1 + credits).sum();
             assert_eq!(
                 budget.remaining_attempts(),

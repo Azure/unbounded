@@ -3,9 +3,11 @@ use racer_dataplane::model::limits::Limits;
 use std::{fs, os::fd::AsRawFd, path::PathBuf, process::Command};
 
 const MIB: u64 = 1 << 20;
-const DEVICE: u64 = 4096 * MIB;
+fn device_bytes(workers: usize, slab_bytes: u64) -> u64 {
+    (4096 * MIB).max(slab_bytes * workers as u64 + 1024 * MIB)
+}
 
-fn memory_budget(workers: usize, limits: &Limits) -> (u64, u64) {
+fn memory_budget(workers: usize, limits: &Limits, slab_bytes: u64) -> (u64, u64) {
     // Resident plaintext/cache, ciphertext including slab/crypto staging, dirty
     // retention, registered allowance (unused here), and request contexts. Some
     // dimensions overlap; adding them is deliberately conservative.
@@ -25,17 +27,18 @@ fn memory_budget(workers: usize, limits: &Limits) -> (u64, u64) {
     // materializes all payloads. Global: allocator retention plus 128 clients'
     // stacks, two 64 KiB buffers apiece and kernel socket buffers.
     let auxiliary = workers as u64 * 512 * MIB + 2048 * MIB + 512 * MIB;
-    let envelope = DEVICE + admitted + auxiliary;
+    let envelope = device_bytes(workers, slab_bytes) + admitted + auxiliary;
     (envelope, (16 << 30).max(envelope * 2))
 }
 
 pub fn preflight(workers: usize, limits: &Limits, slab_bytes: u64) {
-    assert!((1..=4).contains(&workers));
+    assert!(workers > 0);
+    let device = device_bytes(workers, slab_bytes);
     assert!(
-        slab_bytes * workers as u64 <= 3 << 30,
+        slab_bytes * workers as u64 <= device - (1 << 30),
         "aggregate slab capacity must leave 1 GiB for ext4/headroom"
     );
-    let (envelope, required) = memory_budget(workers, limits);
+    let (envelope, required) = memory_budget(workers, limits, slab_bytes);
     let info = fs::read_to_string("/proc/meminfo").unwrap();
     let available = info
         .lines()
@@ -48,7 +51,8 @@ pub fn preflight(workers: usize, limits: &Limits, slab_bytes: u64) {
         .unwrap()
         * 1024;
     println!(
-        "memory_preflight workers={workers} device_MiB=4096 slab_capacity_MiB={} plaintext_total_MiB={} ciphertext_total_MiB={} dirty_total_MiB={} context_total_MiB={} auxiliary_MiB={} envelope_MiB={} required_available_MiB={} host_available_MiB={}",
+        "memory_preflight workers={workers} device_MiB={} slab_capacity_MiB={} plaintext_total_MiB={} ciphertext_total_MiB={} dirty_total_MiB={} context_total_MiB={} auxiliary_MiB={} envelope_MiB={} required_available_MiB={} host_available_MiB={}",
+        device / MIB,
         slab_bytes * workers as u64 / MIB,
         limits.plaintext_bytes.get() as u64 * workers as u64 / MIB,
         limits.ciphertext_bytes.get() as u64 * workers as u64 / MIB,
@@ -161,7 +165,7 @@ impl Brd {
             "modprobe",
             "brd",
             "rd_nr=1",
-            "rd_size=4194304",
+            &format!("rd_size={}", device_bytes(workers, slab_bytes) / 1024),
             "max_part=1",
         ]);
         fixture.loaded = true;
@@ -223,12 +227,19 @@ impl Brd {
 #[test]
 fn memory_envelope_scales_with_workers_and_retains_headroom() {
     let limits = super::budgets();
-    let (one, one_required) = memory_budget(1, &limits);
-    let (four, four_required) = memory_budget(4, &limits);
+    let (one, one_required) = memory_budget(1, &limits, super::slab_bytes(1));
+    let (four, four_required) = memory_budget(4, &limits, super::slab_bytes(4));
     assert!(four > one);
     assert!(one_required >= 16 << 30);
     assert_eq!(four_required, four * 2);
     assert_eq!(four, 12416 * MIB + 4 * 16);
+    for workers in [5, 16, 128, 256] {
+        let slab = super::slab_bytes(workers);
+        assert!(device_bytes(workers, slab) >= slab * workers as u64 + 1024 * MIB);
+        let (envelope, required) = memory_budget(workers, &limits, slab);
+        assert!(envelope > four);
+        assert_eq!(required, envelope * 2);
+    }
 }
 impl Drop for Brd {
     fn drop(&mut self) {

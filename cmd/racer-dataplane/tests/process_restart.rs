@@ -44,6 +44,73 @@ const P: u64 = PAGE_BYTES;
 const LENGTH: u64 = 2 * P + 113;
 const TIMEOUT: Duration = Duration::from_secs(30);
 
+// Historical profiles call I/O shard counts "pairs". Preserve their 1/2/4-shard
+// workloads, but budget shared crypto rather than doubling every shard count.
+fn profile_thread_cap(io_shards: usize) -> usize {
+    assert!([1, 2, 4].contains(&io_shards));
+    io_shards + io_shards.div_ceil(2)
+}
+
+fn profile_plan(io_shards: usize) -> racer_dataplane::runtime::affinity::AffinityPlan {
+    use racer_dataplane::{config::Config, runtime::affinity::AffinityPlan};
+    let (config, _) = Config::from_lookup_with_fabric_ports(|name| {
+        Ok(match name {
+            "RACER_CLUSTER_ID" => Some(CLUSTER.into()),
+            "RACER_CONTROL_ENDPOINT" => Some("https://controller.invalid:443".into()),
+            "RACER_MAX_THREADS" => Some(profile_thread_cap(io_shards).to_string()),
+            _ => None,
+        })
+    })
+    .unwrap();
+    let plan = AffinityPlan::discover(&config).unwrap();
+    assert_eq!(
+        plan.pairs.len(),
+        io_shards,
+        "host CPU/quota/NUMA placement cannot provide requested I/O shards"
+    );
+    plan
+}
+
+#[test]
+fn capped_profiles_count_io_shards_and_unique_crypto_threads() {
+    use racer_dataplane::{
+        config::Config,
+        runtime::affinity::{AffinityPlan, CpuLocation, EffectiveTopology},
+    };
+    let (mut config, _) = Config::from_lookup_with_fabric_ports(|name| {
+        Ok(match name {
+            "RACER_CLUSTER_ID" => Some(CLUSTER.into()),
+            "RACER_CONTROL_ENDPOINT" => Some("https://controller.invalid:443".into()),
+            _ => None,
+        })
+    })
+    .unwrap();
+    for (io, crypto, cap) in [(1, 1, 2), (2, 1, 3), (4, 2, 6)] {
+        config.max_threads = profile_thread_cap(io);
+        assert_eq!(config.max_threads, cap);
+        let plan = AffinityPlan::from_topology(
+            &config,
+            EffectiveTopology {
+                cpus: (0..8)
+                    .map(|cpu| CpuLocation {
+                        cpu,
+                        package: 0,
+                        core: cpu,
+                        numa_node: Some(0),
+                    })
+                    .collect(),
+                quota: None,
+                nics: vec![],
+            },
+            &[],
+        )
+        .unwrap();
+        assert_eq!(plan.pairs.len(), io);
+        assert_eq!(plan.crypto_groups().len(), crypto);
+        assert_eq!(io + crypto, cap);
+    }
+}
+
 struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
@@ -88,6 +155,7 @@ impl Process {
         incarnation: usize,
         profile: Option<&throughput::Profile>,
     ) -> (Self, Vec<Origin>) {
+        let expected_plan = profile.map(|profile| profile_plan(profile.pairs));
         // This fixture gives each process fresh runtime sockets and shares identity/
         // and slabs/. It does not cover stale sockets on deployment's hostPath.
         let run = scratch.0.join(format!("run-{incarnation}"));
@@ -139,8 +207,8 @@ impl Process {
         ] {
             command.env(name, scratch.0.join(path));
         }
-        if let Some(profile) = profile {
-            command.env("RACER_MAX_THREADS", (profile.pairs * 2).to_string());
+        if let Some(plan) = &expected_plan {
+            command.env("RACER_MAX_THREADS", plan.max_threads.to_string());
         } else {
             command.envs([
                 ("RACER_MAX_THREADS", "2"),
@@ -226,7 +294,7 @@ impl Process {
             );
             thread::sleep(Duration::from_millis(20));
         }
-        if let Some(profile) = profile {
+        if let Some(plan) = &expected_plan {
             let names: Vec<_> = fs::read_dir(format!("/proc/{}/task", process.child.id()))
                 .unwrap()
                 .map(|task| fs::read_to_string(task.unwrap().path().join("comm")).unwrap())
@@ -236,16 +304,21 @@ impl Process {
                     .iter()
                     .filter(|name| name.starts_with("racer-crypto-"))
                     .count(),
-                profile.pairs,
-                "host CPU/quota or progress floors reduced requested pairs: {names:?}"
+                plan.crypto_groups().len(),
+                "crypto execution groups differ from planned placement: {names:?}"
             );
             assert_eq!(
                 names
                     .iter()
                     .filter(|name| name.starts_with("racer-io-"))
                     .count(),
-                profile.pairs - 1,
-                "caller owns worker zero: {names:?}"
+                plan.pairs.len() - 1,
+                "caller owns worker zero; progress floors must fund requested I/O shards: {names:?}"
+            );
+            assert_eq!(
+                names.len(),
+                plan.pairs.len() + plan.crypto_groups().len(),
+                "whole-process thread count must match the capped plan: {names:?}"
             );
         }
         (process, origins)
