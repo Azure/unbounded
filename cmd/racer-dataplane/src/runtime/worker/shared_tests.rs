@@ -442,7 +442,9 @@ fn shared_crypto_borrowed_run_counts_caller_and_restores_affinity() {
     let mut group = WorkerGroup::new(plan);
     let before = current_cpus().unwrap();
     let mut scope = scope();
-    scope.deadline = Deadline(Instant::now() + Duration::from_millis(50));
+    // Leave startup enough room under concurrent builds: this scenario checks
+    // deadline-driven teardown after all eight jobs, not startup latency.
+    scope.deadline = Deadline(Instant::now() + Duration::from_secs(1));
     assert_eq!(
         group.run_with_scope(&factory, &scope),
         Err(Error::DeadlineExceeded)
