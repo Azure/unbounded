@@ -186,50 +186,44 @@ impl Service {
                     let failures = self.failures.clone();
                     let requests = self.requests.clone();
                     self.clients.push_back(Box::pin(async move {
-                        let mut lease =
-                            ConnectionLease::from_accepted(socket.into(), &rig.admission)?;
-                        loop {
-                            let scope = scope();
-                            let received = rig.io.receive_head(lease, &scope).await?;
-                            let request = RequestParser::new(32768)
-                                .parse(&CacheId(CACHE.into()), received.value)?;
-                            let kind = request.kind.clone();
-                            requests.set(requests.get() + 1);
-                            match rig.dispatcher.read(request, &scope).await {
-                                Ok(response) => {
-                                    rig.responses.validate(&kind, &response)?;
-                                    let sent = rig
-                                        .responses
-                                        .send_subscription_unobserved(
-                                            received.connection,
-                                            response,
-                                            &scope,
-                                            TIMEOUT,
-                                        )
-                                        .await;
-                                    if let Err(error) = &sent {
-                                        *failures
-                                            .borrow_mut()
-                                            .entry(format!("body:{error:?}"))
-                                            .or_default() += 1;
-                                    }
-                                    lease = sent?;
-                                    if !lease.is_reusable() {
-                                        // Subscriptions close after Complete. The
-                                        // client validates status and framing.
-                                        return Ok(());
-                                    }
-                                }
-                                Err(error) => {
+                        let lease = ConnectionLease::from_accepted(socket.into(), &rig.admission)?;
+                        let scope = scope();
+                        let received = rig.io.receive_head(lease, &scope).await?;
+                        let request = RequestParser::new(32768)
+                            .parse(&CacheId(CACHE.into()), received.value)?;
+                        let kind = request.kind.clone();
+                        requests.set(requests.get() + 1);
+                        match rig.dispatcher.read(request, &scope).await {
+                            Ok(response) => {
+                                rig.responses.validate(&kind, &response)?;
+                                let sent = rig
+                                    .responses
+                                    .send_subscription_unobserved(
+                                        received.connection,
+                                        response,
+                                        &scope,
+                                        TIMEOUT,
+                                    )
+                                    .await;
+                                if let Err(error) = &sent {
                                     *failures
                                         .borrow_mut()
-                                        .entry(format!("read:{error:?}"))
+                                        .entry(format!("body:{error:?}"))
                                         .or_default() += 1;
-                                    rig.responses
-                                        .send_error(received.connection, error, &scope)
-                                        .await?;
-                                    return Ok(());
                                 }
+                                // Every v2 subscription closes after completion.
+                                drop(sent?);
+                                Ok(())
+                            }
+                            Err(error) => {
+                                *failures
+                                    .borrow_mut()
+                                    .entry(format!("read:{error:?}"))
+                                    .or_default() += 1;
+                                rig.responses
+                                    .send_error(received.connection, error, &scope)
+                                    .await?;
+                                Ok(())
                             }
                         }
                     }));
@@ -350,9 +344,9 @@ fn get(client: &mut BufReader<UnixStream>, key: usize, verify: bool) -> std::io:
     }
     let status: u16 = head.split_whitespace().nth(1).unwrap().parse().unwrap();
     let fields = fields(&head);
-    let length: usize = fields["content-length"].parse().unwrap();
-    if status == 200 {
-        assert_eq!(length, P as usize + 42);
+    let wire_length: usize = fields["content-length"].parse().unwrap();
+    let length = if status == 200 {
+        assert_eq!(wire_length, P as usize + 42);
         assert_eq!(fields["etag"], "\"v1\"");
         assert_eq!(fields["racer-object-length"], P.to_string());
         assert_eq!(fields["racer-range-start"], "0");
@@ -366,12 +360,13 @@ fn get(client: &mut BufReader<UnixStream>, key: usize, verify: bool) -> std::io:
             u32::from_be_bytes(frame[17..].try_into().unwrap()),
             P as u32
         );
+        P as usize
     } else {
-        assert!(length <= 32768);
-    }
+        assert_eq!(wire_length, 0);
+        wire_length
+    };
     let mut scratch = [0; 64 << 10];
     let mut offset = 0;
-    let length = if status == 200 { P as usize } else { length };
     while offset < length {
         let n = scratch.len().min(length - offset);
         client.read_exact(&mut scratch[..n])?;
@@ -617,11 +612,12 @@ fn run_case(root: &std::path::Path, default: &AffinityPlan, mode: &str, concurre
                 let keys = &keys;
                 let barrier = &barrier;
                 handles.push(threads.spawn(move || {
-                    let mut client = connect(commands);
                     let mut samples = Vec::new();
                     barrier.wait();
                     barrier.wait();
                     for index in (client_index..REQUESTS).step_by(concurrency) {
+                        // V2 completion closes each subscription after success.
+                        let mut client = connect(commands);
                         let key = match mode {
                             "memory" => keys[(index + 1) % workers],
                             "disk" => keys[(index + 1) % REQUESTS],
@@ -630,8 +626,6 @@ fn run_case(root: &std::path::Path, default: &AffinityPlan, mode: &str, concurre
                         let start = Instant::now();
                         let status = get(&mut client, key, false);
                         samples.push((status, start.elapsed()));
-                        // Every subscription ends with Complete and transport EOF.
-                        client = connect(commands);
                     }
                     samples
                 }));
