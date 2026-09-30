@@ -93,6 +93,34 @@ func TestReplicaObservedHighWaterWithoutImage(t *testing.T) {
 				if err := p.Install(&base); err == nil {
 					t.Fatal("install bypassed observed high-water")
 				}
+
+				// Exercise the public serving boundary, not only store readiness:
+				// rejected authority must not expose even the previously valid image.
+				request := httptest.NewRequest(http.MethodGet, wire.SnapshotPath, nil)
+				request.TLS = f.requestState(t)
+				response := httptest.NewRecorder()
+				f.a.Server.Handler().ServeHTTP(response, request)
+
+				if response.Code != http.StatusServiceUnavailable {
+					t.Fatalf("invalid authority still served snapshot: %d", response.Code)
+				}
+
+				// Restoring the last valid authority permits a new reconcile/CAS,
+				// without forgetting the observed watermark or reusing revoked bytes.
+				setVersion(newer)
+				runKeys(t, f.a.Keyring)
+
+				recovered := reconcileTopology(t, f.a.Topology, f.ctx)
+				if recovered.Version().Sequence != newer.Sequence+1 || recovered.Version().MembershipVersion != newer.MembershipVersion {
+					t.Fatal("recovery reset counters or changed unchanged membership")
+				}
+
+				response = httptest.NewRecorder()
+				f.a.Server.Handler().ServeHTTP(response, request.Clone(f.ctx))
+
+				if response.Code != http.StatusOK || response.Body.String() != recovered.Encoding() {
+					t.Fatalf("reconciled authority not served: %d", response.Code)
+				}
 			})
 		}
 	}

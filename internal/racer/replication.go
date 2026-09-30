@@ -157,38 +157,6 @@ func (r *Replication) observe(ctx context.Context) {
 	r.Lifecycle.SetIssuerReady(trustErr == nil)
 }
 
-// confirm never promotes a hash to an image. It only renews the freshness of an
-// already validated image when all durable counters and hashes still match.
-func (p *Publications) confirm(record VersionRecord) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if err := p.observeLocked(record); err != nil {
-		return err
-	}
-
-	if p.current != nil && record == p.current.record && !p.suspended {
-		p.confirmed = time.Now()
-	}
-
-	return nil
-}
-
-// observed is independent of installed bytes, including before the first image.
-// Suspension never forgets this high-water mark. Skipped versions may return to
-// earlier hashes, but counters and unchanged membership versions must agree.
-func (p *Publications) observeLocked(record VersionRecord) error {
-	old := p.observed
-	if !record.valid() || old.Sequence != 0 && (record.Cluster != old.Cluster || record.Sequence < old.Sequence || record.MembershipVersion < old.MembershipVersion || record.Sequence == old.Sequence && record != old || record.MembershipVersion == old.MembershipVersion && record.MembershipHash != old.MembershipHash || uint64(record.MembershipVersion-old.MembershipVersion) > uint64(record.Sequence-old.Sequence)) {
-		p.suspendLocked()
-		return wire.Conflict
-	}
-
-	p.observed = record
-
-	return nil
-}
-
 // installReplica is the alternate proof to publisher CAS: bounded canonical
 // decoding plus exact authoritative durable confirmation, never a trusted hash
 // supplied by the remote peer. No blob is persisted.
