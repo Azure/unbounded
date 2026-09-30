@@ -4,9 +4,13 @@
 package racer
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -61,6 +65,11 @@ func TestBootstrapAuthoritativeBindings(t *testing.T) {
 	for _, scenario := range []string{"success", "audience", "not authenticated", "review error", "username", "sa uid", "pod uid", "missing bound pod", "ambiguous bound pod", "node extra", "node extra uid", "recreated pod", "recreated sa", "recreated ds", "owner name", "owner kind", "owner not controller", "pod sa", "unscheduled", "terminal pod", "excluded node", "deleted node", "api failure", "canceled", "expired token", "duplicate bearer"} {
 		t.Run(scenario, func(t *testing.T) {
 			a, status, token := authFixture(t)
+			runKeys(t, a.Keyring)
+			reconcileTopology(t, a.Topology, t.Context())
+			a.Lifecycle.leader, a.Lifecycle.synced = t.Context(), true
+			a.Lifecycle.SetServingReady(true)
+			_, enrollment, _ := issuanceRequest(t, a.Keyring)
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -159,20 +168,52 @@ func TestBootstrapAuthoritativeBindings(t *testing.T) {
 				cancel()
 			}
 
-			req := httptest.NewRequest("POST", wire.BootstrapPath, nil)
+			body, err := wire.EncodeBootstrapRequest(enrollment)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			req := httptest.NewRequestWithContext(ctx, http.MethodPost, wire.BootstrapPath, bytes.NewReader(body))
+			req.TLS = &tls.ConnectionState{HandshakeComplete: true}
+			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("Authorization", "Bearer "+token)
 
 			if scenario == "duplicate bearer" {
 				req.Header.Add("Authorization", "Bearer "+token)
 			}
 
-			identity, err := a.Server.Bootstrap.Authenticate(ctx, req)
+			w := httptest.NewRecorder()
+			a.Server.Handler().ServeHTTP(w, req)
+
 			if scenario == "success" {
-				if err != nil || identity.node != wire.NodeID(testNodeUID) || identity.cluster != a.Server.Config.Cluster || !identity.expires.After(time.Now()) {
-					t.Fatalf("identity: %+v %v", identity, err)
+				issued := decodeIssuedResponse(t, responseBody(t, w.Result(), nil, http.StatusOK))
+
+				leaf, err := x509.ParseCertificate(issued.CertificateChain[0])
+				if err != nil || issued.Node != wire.NodeID(testNodeUID) || issued.Cluster != a.Server.Config.Cluster || !leaf.NotAfter.After(time.Now()) {
+					t.Fatalf("issued identity: %+v %v", issued, err)
 				}
-			} else if err == nil || identity.node != "" {
-				t.Fatalf("unauthorized identity: %+v %v", identity, err)
+			} else {
+				want := http.StatusForbidden
+
+				switch scenario {
+				case "audience", "not authenticated", "review error", "missing bound pod", "ambiguous bound pod", "expired token", "duplicate bearer":
+					want = http.StatusUnauthorized
+				case "api failure", "canceled":
+					want = http.StatusServiceUnavailable
+				}
+
+				responseBody(t, w.Result(), nil, want)
+
+				var node corev1.Node
+				if scenario != "deleted node" {
+					if err := a.Topology.Get(t.Context(), client.ObjectKey{Name: "worker"}, &node); err != nil {
+						t.Fatal(err)
+					}
+
+					if node.Annotations[enrolledSharesAnnotation] != "" {
+						t.Fatal("rejected enrollment persisted shares")
+					}
+				}
 			}
 		})
 	}

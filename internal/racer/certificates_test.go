@@ -28,6 +28,17 @@ func testIssuer(r *KeyringReconciler) *Issuer {
 	return &Issuer{APIReader: r.APIReader, Config: r.Config, Trust: r.Trust, CatalogGate: r.CatalogGate, Now: r.Now}
 }
 
+// TrustRoots is a test adapter for authoritative signing observations. Production
+// serving uses local Trust; only issuance and reconciliation read durable roots.
+func (i *Issuer) TrustRoots(ctx context.Context) (*x509.CertPool, error) {
+	state, err := i.loadSigning(ctx, i.now())
+	if err != nil {
+		return nil, err
+	}
+
+	return state.roots, nil
+}
+
 func issuanceRequest(t *testing.T, r *KeyringReconciler) (NodeIdentity, wire.BootstrapRequest, ed25519.PublicKey) {
 	t.Helper()
 

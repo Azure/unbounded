@@ -10,11 +10,20 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
+	"encoding/json"
 	"math/big"
+	"net/http"
 	"net/url"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
+	authv1 "k8s.io/api/authentication/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/unbounded/internal/racer/wire"
@@ -182,18 +191,6 @@ func (i *Issuer) now() time.Time {
 	return time.Now().UTC().Truncate(time.Second)
 }
 
-// TrustRoots returns a newly owned pool from authoritative committed credentials.
-// Issuance and reconciliation use authoritative credentials; serving uses Trust.
-// This pool is unrelated to deployment-provided HTTPS server trust.
-func (i *Issuer) TrustRoots(ctx context.Context) (*x509.CertPool, error) {
-	state, err := i.loadSigning(ctx, i.now())
-	if err != nil {
-		return nil, err
-	}
-
-	return state.roots, nil
-}
-
 // Issuance can also observe invalid durable authority. It may withdraw trust,
 // but only controller reconciliation can install or restore serving trust.
 func (i *Issuer) loadSigning(ctx context.Context, now time.Time) (signingState, error) {
@@ -353,4 +350,237 @@ func AuthenticateCertificate(ctx context.Context, trust *Trust, cfg Config, stat
 	}
 
 	return NodeIdentity{cluster: cfg.Cluster, node: node, expires: expires}, nil
+}
+
+type Bootstrap struct {
+	Client    client.Client
+	APIReader client.Reader
+	Config    Config
+	Issuer    *Issuer
+}
+
+// Authenticate performs TokenReview for racer-control, checks the live bound Pod
+// UID and authorized ServiceAccount/workload, and resolves its assigned Node UID.
+// Token contents, CSR contents, and requested names are not authority on their own.
+func (b *Bootstrap) Authenticate(ctx context.Context, r *http.Request) (NodeIdentity, error) {
+	if err := ctx.Err(); err != nil {
+		return NodeIdentity{}, err
+	}
+
+	if b.Client == nil || b.APIReader == nil {
+		return NodeIdentity{}, wire.Unavailable
+	}
+
+	values := r.Header.Values("Authorization")
+	if len(values) != 1 {
+		return NodeIdentity{}, wire.Unauthenticated
+	}
+
+	scheme, token, ok := strings.Cut(values[0], " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") || token == "" || strings.ContainsAny(token, " \t\r\n,") || len(token) > b.Config.Limits.HeaderBytes {
+		return NodeIdentity{}, wire.Unauthenticated
+	}
+
+	review := &authv1.TokenReview{Spec: authv1.TokenReviewSpec{Token: token, Audiences: []string{wire.TokenAudience}}}
+	if err := b.Client.Create(ctx, review); err != nil {
+		return NodeIdentity{}, wire.Unavailable
+	}
+
+	status := review.Status
+	if !status.Authenticated || status.Error != "" || !slices.Contains(status.Audiences, wire.TokenAudience) {
+		return NodeIdentity{}, wire.Unauthenticated
+	}
+
+	if status.User.Username != "system:serviceaccount:"+b.Config.Namespace+":"+b.Config.DataplaneServiceAccount {
+		return NodeIdentity{}, wire.Forbidden
+	}
+	// TokenReview authenticates the token. Its JWT expiration is used only to
+	// shorten authorization, never to establish identity or extend validity.
+	expires, err := tokenExpiration(token)
+	if err != nil {
+		return NodeIdentity{}, err
+	}
+
+	podName, podUID := singleExtra(status.User, "pod-name"), singleExtra(status.User, "pod-uid")
+	if podName == "" || podUID == "" || status.User.UID == "" {
+		return NodeIdentity{}, wire.Unauthenticated
+	}
+
+	var pod corev1.Pod
+	if err := b.APIReader.Get(ctx, client.ObjectKey{Namespace: b.Config.Namespace, Name: podName}, &pod); err != nil {
+		return NodeIdentity{}, authorizationError(err)
+	}
+
+	if string(pod.UID) != podUID {
+		return NodeIdentity{}, wire.Forbidden
+	}
+
+	if err := authorizePod(ctx, b.APIReader, b.Config, &pod, status.User.UID); err != nil {
+		return NodeIdentity{}, err
+	}
+
+	var node corev1.Node
+	if err := b.APIReader.Get(ctx, client.ObjectKey{Name: pod.Spec.NodeName}, &node); err != nil {
+		return NodeIdentity{}, authorizationError(err)
+	}
+
+	if !authorizedNode(&node) {
+		return NodeIdentity{}, wire.Forbidden
+	}
+	// Newer API servers return node binding extras. When present they must
+	// agree, but older servers' Pod-bound TokenReviews need not include them.
+	for key, want := range map[string]string{"node-name": node.Name, "node-uid": string(node.UID)} {
+		if _, present := status.User.Extra["authentication.kubernetes.io/"+key]; present && singleExtra(status.User, key) != want {
+			return NodeIdentity{}, wire.Forbidden
+		}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return NodeIdentity{}, err
+	}
+
+	if !time.Now().Before(expires) {
+		return NodeIdentity{}, wire.Unauthenticated
+	}
+
+	return NodeIdentity{cluster: b.Config.Cluster, node: wire.NodeID(node.UID), nodeName: node.Name, expires: expires}, nil
+}
+
+func singleExtra(user authv1.UserInfo, key string) string {
+	values := user.Extra["authentication.kubernetes.io/"+key]
+	if len(values) != 1 {
+		return ""
+	}
+
+	return values[0]
+}
+
+func tokenExpiration(token string) (time.Time, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return time.Time{}, wire.Unauthenticated
+	}
+
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return time.Time{}, wire.Unauthenticated
+	}
+
+	var claims struct {
+		Expiration int64 `json:"exp"`
+	}
+	if json.Unmarshal(payload, &claims) != nil || claims.Expiration <= 0 {
+		return time.Time{}, wire.Unauthenticated
+	}
+
+	expires := time.Unix(claims.Expiration, 0)
+	if !time.Now().Before(expires) {
+		return time.Time{}, wire.Unauthenticated
+	}
+
+	return expires, nil
+}
+
+// Enroll validates CSR proof of possession and binds the issued identity to the
+// token, not caller-provided SANs. Every issuance uses a token, including renewal.
+// Retries correlate by enrollment ID; there is no persistent receipt ledger.
+// The returned bytes are the issuer's bounded, validated JSON response.
+func (b *Bootstrap) Enroll(ctx context.Context, r *http.Request, request wire.BootstrapRequest) ([]byte, error) {
+	identity, err := b.Authenticate(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+
+	if b.Issuer == nil {
+		return nil, wire.Unavailable
+	}
+
+	ctx, cancel := context.WithDeadline(ctx, identity.expires)
+	defer cancel()
+
+	response, err := b.Issuer.Issue(ctx, identity, request)
+	if err != nil {
+		return nil, err
+	}
+	// Resolve the same live UID again before persisting an authenticated proposal.
+	// The annotation is a proposal only; explicit administrator shares win.
+	var live corev1.Node
+	if err := b.APIReader.Get(ctx, client.ObjectKey{Name: identity.nodeName}, &live); err != nil {
+		return nil, err
+	}
+
+	node := &live
+	if wire.NodeID(node.UID) == identity.node {
+		if !authorizedNode(node) {
+			return nil, wire.Forbidden
+		}
+
+		shares := request.Shares
+		if shares == 0 {
+			shares = wire.DefaultShares
+		}
+
+		value := strconv.FormatUint(uint64(shares), 10)
+		if node.Annotations[enrolledSharesAnnotation] != value {
+			before := node.DeepCopy()
+			if node.Annotations == nil {
+				node.Annotations = map[string]string{}
+			}
+
+			node.Annotations[enrolledSharesAnnotation] = value
+			if err := b.Client.Patch(ctx, node, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+				return nil, err
+			}
+		}
+
+		return response, nil
+	}
+
+	return nil, wire.Forbidden
+}
+
+func authorizationError(err error) error {
+	if apierrors.IsNotFound(err) {
+		return wire.Forbidden
+	}
+
+	return wire.Unavailable
+}
+
+func authorizedNode(node *corev1.Node) bool {
+	_, excluded := node.Labels[wire.ExclusionLabel]
+	return node.Name != "" && wire.ValidUUID(string(node.UID)) && node.DeletionTimestamp == nil && !excluded
+}
+
+// The configured namespace/name designate the managed workload. A Pod must be
+// controlled by that exact current DaemonSet UID, not just carry matching labels.
+func authorizePod(ctx context.Context, reader client.Reader, cfg Config, pod *corev1.Pod, serviceAccountUID string) error {
+	if pod.Namespace != cfg.Namespace || pod.UID == "" || pod.DeletionTimestamp != nil || pod.Spec.NodeName == "" || pod.Spec.ServiceAccountName != cfg.DataplaneServiceAccount || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+		return wire.Forbidden
+	}
+
+	owner := metav1.GetControllerOf(pod)
+	if owner == nil || owner.APIVersion != "apps/v1" || owner.Kind != "DaemonSet" || !slices.Contains(managedWorkloadNames(cfg), owner.Name) || owner.UID == "" {
+		return wire.Forbidden
+	}
+
+	owns, err := readManagedWorkloadOwnership(ctx, reader, cfg)
+	if err != nil {
+		return authorizationError(err)
+	}
+
+	if !owns(pod) {
+		return wire.Forbidden
+	}
+
+	var sa corev1.ServiceAccount
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: cfg.Namespace, Name: cfg.DataplaneServiceAccount}, &sa); err != nil {
+		return authorizationError(err)
+	}
+
+	if sa.UID == "" || sa.DeletionTimestamp != nil || serviceAccountUID != "" && string(sa.UID) != serviceAccountUID {
+		return wire.Forbidden
+	}
+
+	return ctx.Err()
 }
