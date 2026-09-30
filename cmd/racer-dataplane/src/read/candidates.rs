@@ -41,6 +41,7 @@ pub enum ProbeOutcome {
     UnusableCopy,
 }
 pub struct CandidatePolicy {
+    attempt_timeout: std::time::Duration,
     observer: Observer,
     node: NodeId,
     placement: Rc<Placement>,
@@ -135,6 +136,7 @@ impl CandidatePolicy {
     }
     pub fn new(node: NodeId, placement: Rc<Placement>, peers: Rc<dyn PeerClient>) -> Self {
         Self {
+            attempt_timeout: std::time::Duration::from_secs(30),
             observer: Observer::default(),
             node,
             placement,
@@ -146,6 +148,12 @@ impl CandidatePolicy {
 
     pub(crate) fn with_observer(mut self, observer: Observer) -> Self {
         self.observer = observer;
+        self
+    }
+
+    /// Bound each local peer exchange independently of the signed operation ceiling.
+    pub(crate) fn with_attempt_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.attempt_timeout = timeout;
         self
     }
     /// Composition hook: shares the same admission and credential domain as Fill.
@@ -473,16 +481,18 @@ impl CandidatePolicy {
         }
         let now = crate::runtime::environment::now();
         let overall = budget.begin_peer_attempt(now, scope.deadline.0, links)?;
-        // Share bounds idle fallback; known slow bodies also reserve one share
-        // for an affordable alternative without changing the signed ceiling.
+        // Share bounds idle fallback. A separate nonrenewable local cap bounds
+        // every exchange, even when no alternative is affordable.
         // Sign the original hard ceiling before sending; it never renews.
         let deadline = now + (overall - now) / remaining_opportunities.max(1);
+        let attempt_end = now + self.attempt_timeout.min(overall - now);
         // The local exchange may time out before the signed contract. Shortening
         // the latter per attempt would make a later update renew provider authority.
         let signed_deadline = overall;
         // A clone shares cancellation: timing it out would cancel the caller too.
         let mut attempt_scope = RequestScope::new(scope.request, overall)?;
-        attempt_scope.set_candidate_idle(deadline - now)?;
+        attempt_scope.set_candidate_idle((deadline - now).min(attempt_end - now))?;
+        attempt_scope.set_candidate_total(attempt_end)?;
         attempt_scope.body_deadlines = Some((overall, deadline));
         let attempts = if matches!(mode, FetchMode::Acquire) {
             // Reserve remote acquisition credits from the same original call.
@@ -494,17 +504,25 @@ impl CandidatePolicy {
         } else {
             0
         };
+        let mut complete_by = attempt_end;
         if remaining_opportunities > 1
             && budget.remaining_attempts() > 0
             && budget.remaining_links() >= crate::topology::paths::FAILURE_LINKS
         {
-            // Keep at least half the post-observation interval for this body,
-            // including the two-opportunity subscription/fixed-page case.
+            // Reserve at most half the original post-share interval for fallback,
+            // including subscription/fixed-page fallback. The local cap may be tighter.
             let reserve = (deadline - now).min((overall - deadline) / 2);
             if !reserve.is_zero() {
-                attempt_scope.reserve_candidate_fallback(deadline - now, overall - reserve)?;
+                complete_by = complete_by.min(overall - reserve);
             }
         }
+        // Observe actual known-length body progress, not checkout/head latency.
+        // Even a last candidate should not occupy the whole budget if its measured
+        // rate cannot finish in time. Healthy bodies may exceed the idle share.
+        let observation = (deadline - now)
+            .min((attempt_end - now) / 3)
+            .max(std::time::Duration::from_nanos(1));
+        attempt_scope.set_candidate_body_budget(observation, complete_by)?;
         let mut bytes = [0; 16];
         crate::runtime::environment::fill_random(&mut bytes).map_err(|_| Error::Unavailable)?;
         let attempt = AttemptId(bytes);

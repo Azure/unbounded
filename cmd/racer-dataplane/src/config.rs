@@ -60,6 +60,8 @@ pub struct Config {
     /// Per-cache, per-worker origin HTTP cap, separate from peer connections.
     pub origin_connections_per_cache: NonZeroUsize,
     pub request_timeout: Duration,
+    /// Nonrenewable local peer-exchange cap; never serialized as authority.
+    pub peer_attempt_timeout: Duration,
     pub reader_stall_timeout: Duration,
     pub shutdown_timeout: Duration,
 }
@@ -207,6 +209,8 @@ impl Config {
         let segment_bytes = number("RACER_SEGMENT_BYTES", 64 * MIB)?;
         let free_segment_reserve = to_usize(number("RACER_FREE_SEGMENT_RESERVE", 2)?)?;
         let request_timeout = Duration::from_millis(number("RACER_REQUEST_TIMEOUT_MS", 30_000)?);
+        let peer_attempt_timeout =
+            Duration::from_millis(number("RACER_PEER_ATTEMPT_TIMEOUT_MS", 30_000)?);
         let reader_stall_timeout =
             Duration::from_millis(number("RACER_READER_STALL_TIMEOUT_MS", 10_000)?);
         let shutdown_timeout = Duration::from_millis(number("RACER_SHUTDOWN_TIMEOUT_MS", 30_000)?);
@@ -268,6 +272,7 @@ impl Config {
             limits,
             origin_connections_per_cache,
             request_timeout,
+            peer_attempt_timeout,
             reader_stall_timeout,
             shutdown_timeout,
         };
@@ -411,6 +416,7 @@ impl Config {
         }
         for (timeout, maximum) in [
             (self.request_timeout, Duration::from_secs(86_400)),
+            (self.peer_attempt_timeout, Duration::from_secs(86_400)),
             (self.reader_stall_timeout, self.request_timeout),
             (self.shutdown_timeout, Duration::from_secs(3600)),
         ] {
@@ -1166,6 +1172,7 @@ mod tests {
         assert_eq!(config.free_segment_reserve, 2);
         assert!(config.diagnostics_listen.ip().is_loopback());
         assert_eq!(config.request_timeout, Duration::from_secs(30));
+        assert_eq!(config.peer_attempt_timeout, Duration::from_secs(30));
         assert_eq!(config.origin_connections_per_cache.get(), 8);
         assert_eq!(config.limits.connections_per_neighbor.get(), 2);
         assert_eq!(config.validate(), Ok(()));
@@ -1705,6 +1712,9 @@ mod tests {
         for (name, value) in [
             ("RACER_REQUEST_TIMEOUT_MS", "0"),
             ("RACER_REQUEST_TIMEOUT_MS", "86400001"),
+            ("RACER_PEER_ATTEMPT_TIMEOUT_MS", "0"),
+            ("RACER_PEER_ATTEMPT_TIMEOUT_MS", "86400001"),
+            ("RACER_PEER_ATTEMPT_TIMEOUT_MS", "18446744073709551615"),
             ("RACER_READER_STALL_TIMEOUT_MS", "0"),
             ("RACER_READER_STALL_TIMEOUT_MS", "30001"),
             ("RACER_SHUTDOWN_TIMEOUT_MS", "0"),
@@ -1721,5 +1731,21 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn peer_attempt_timeout_is_independent_and_validates_programmatic_config() {
+        let mut config = parse(&[
+            ("RACER_REQUEST_TIMEOUT_MS", "10"),
+            ("RACER_READER_STALL_TIMEOUT_MS", "1"),
+            ("RACER_PEER_ATTEMPT_TIMEOUT_MS", "6000"),
+        ])
+        .unwrap();
+        assert_eq!(config.peer_attempt_timeout, Duration::from_secs(6));
+        assert_eq!(config.validate(), Ok(()));
+        config.peer_attempt_timeout = Duration::ZERO;
+        assert_eq!(config.validate(), Err(Error::InvalidConfiguration));
+        config.peer_attempt_timeout = Duration::from_millis(86_400_001);
+        assert_eq!(config.validate(), Err(Error::InvalidConfiguration));
     }
 }

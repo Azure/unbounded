@@ -30,11 +30,24 @@ fn known_body_reserve_keeps_healthy_progress_but_bounds_slow_progress() {
     body_cases(&["reserved_progress", "reserved_slow"]);
 }
 
+#[test]
+fn local_total_cap_bounds_progress_and_pending_body_without_shortening_wire_authority() {
+    body_cases(&["capped_progress", "capped_trickle", "capped_stall"]);
+}
+
 fn body_cases(cases: &[&str]) {
     for &case in cases {
         let idle = matches!(
             case,
-            "progress" | "stall" | "hard" | "idle_cancel" | "reserved_progress" | "reserved_slow"
+            "progress"
+                | "stall"
+                | "hard"
+                | "idle_cancel"
+                | "reserved_progress"
+                | "reserved_slow"
+                | "capped_progress"
+                | "capped_trickle"
+                | "capped_stall"
         );
         let telemetry = Telemetry::default();
         let admission = Rc::new(Admission::new(
@@ -89,8 +102,15 @@ fn body_cases(cases: &[&str]) {
         }
         if matches!(case, "reserved_progress" | "reserved_slow") {
             scope
-                .reserve_candidate_fallback(share - start, start + Duration::from_millis(700))
+                .set_candidate_body_budget(share - start, start + Duration::from_millis(700))
                 .unwrap();
+        }
+        if matches!(case, "capped_progress" | "capped_trickle" | "capped_stall") {
+            scope
+                .set_candidate_total(start + Duration::from_millis(500))
+                .unwrap();
+            // The capped stall starts near the cap, before its idle alarm expires.
+            // Other cases retain their original idle/projection policy.
         }
         let auth = Forwarding::new(signers[0].clone());
         let (signed, binding) = auth.sign_request(local).unwrap();
@@ -193,15 +213,17 @@ fn body_cases(cases: &[&str]) {
                 if end == 4096 && case == "eof" {
                     return Ok::<_, Error>(());
                 }
-                if end == 4096 && case == "stall" {
+                if (end == 4096 && case == "stall") || (end == 8192 && case == "capped_stall") {
                     futures::future::pending::<()>().await;
                 }
                 next = Instant::now()
-                    + Duration::from_millis(if matches!(case, "hard" | "reserved_slow") {
-                        30
-                    } else {
-                        10
-                    });
+                    + Duration::from_millis(
+                        if matches!(case, "hard" | "reserved_slow" | "capped_trickle") {
+                            30
+                        } else {
+                            10
+                        },
+                    );
             }
             Ok::<_, Error>(())
         };
@@ -221,17 +243,20 @@ fn body_cases(cases: &[&str]) {
             assert!(Instant::now() < fixture_end, "bounded body fixture");
             std::thread::sleep(Duration::from_micros(100));
         };
-        if matches!(case, "success" | "progress" | "reserved_progress") {
+        if matches!(
+            case,
+            "success" | "progress" | "reserved_progress" | "capped_progress"
+        ) {
             let response = auth.verify_response(result.unwrap(), &binding).unwrap();
             assert!(
                 matches!(response.response(), PeerResponse::Page { ciphertext, .. } if ciphertext.bytes().len() == 8208)
             );
-            if matches!(case, "progress" | "reserved_progress") {
+            if matches!(case, "progress" | "reserved_progress" | "capped_progress") {
                 assert!(Instant::now() > share && Instant::now() < original);
             }
         } else {
             assert!(
-                matches!(result, Err(e) if e == match case { "share" | "stall" | "hard" | "reserved_slow" => Error::DeadlineExceeded, "cancel" | "idle_cancel" => Error::Cancelled, _ => Error::Io }),
+                matches!(result, Err(e) if e == match case { "share" | "stall" | "hard" | "reserved_slow" | "capped_trickle" | "capped_stall" => Error::DeadlineExceeded, "cancel" | "idle_cancel" => Error::Cancelled, _ => Error::Io }),
                 "{case}"
             );
         }
@@ -239,7 +264,10 @@ fn body_cases(cases: &[&str]) {
         drop(server);
         let mut text = String::new();
         telemetry.failures.write(&mut text).unwrap();
-        if matches!(case, "success" | "progress" | "reserved_progress") {
+        if matches!(
+            case,
+            "success" | "progress" | "reserved_progress" | "capped_progress"
+        ) {
             assert_eq!(text, "total=0 retained=0 capacity=128\n");
         } else {
             assert!(
@@ -281,6 +309,13 @@ fn body_cases(cases: &[&str]) {
             assert_eq!(field(if idle { "orig=" } else { "share=" }), field("sig="));
             if case == "stall" {
                 assert!(field("now=") - field("l=") >= 250);
+            }
+            if matches!(case, "capped_trickle" | "capped_stall") {
+                assert!(Instant::now() >= start + Duration::from_millis(500));
+                assert!(Instant::now() < original);
+                // The stalled body's last chunk precedes expiry by less than
+                // the idle allowance, proving total-cap rather than idle expiry.
+                assert!(field("now=") - field("l=") < 250, "{text}");
             }
             if case == "share" {
                 assert!(field("now=") >= field("share="));

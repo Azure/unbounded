@@ -1,12 +1,82 @@
 //! Assertions migrated from test_support::io onto production Entry ownership.
 use super::{tests::*, *};
 use crate::{error::Error, model::ResourceClass};
-use std::cell::Cell;
+use std::{cell::Cell, time::Duration};
 
 struct Probe(Rc<Cell<usize>>);
 impl Drop for Probe {
     fn drop(&mut self) {
         self.0.set(self.0.get() + 1);
+    }
+}
+
+#[test]
+fn candidate_total_cancels_pending_receive_without_bytes_and_retains_both_fences() {
+    for cancel_first in [false, true] {
+        let clock = crate::runtime::environment::SimulationClock::new(99);
+        let _clock = clock.environment(0).enter();
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let r = reactor();
+        r.init().unwrap();
+        let baseline = r.admission.used(ResourceClass::RequestContext);
+        let start = crate::runtime::environment::now();
+        let request = crate::runtime::deadline::RequestScope::new(
+            crate::model::RequestId([99; 16]),
+            start + Duration::from_secs(60),
+        )
+        .unwrap();
+        request
+            .set_candidate_total(start + Duration::from_secs(3))
+            .unwrap();
+        request.set_candidate_idle(Duration::from_secs(10)).unwrap();
+        let (fd, peer) = sim.socket_pair();
+        let fd = Rc::new(fd);
+        let weak = Rc::downgrade(&fd);
+        let drops = Rc::new(Cell::new(0));
+        let mut recv = r.recv(
+            fd,
+            r.file_buffer(8).unwrap(),
+            Probe(drops.clone()),
+            &request,
+        );
+        assert!(poll(&mut recv).is_pending());
+        clock.advance(Duration::from_secs(2));
+        request.candidate_progress().unwrap();
+        assert_eq!(r.poll_budgeted(1), Ok(0));
+        clock.advance(Duration::from_secs(1));
+        // No new bytes and no explicit cancellation: the reactor scans local caps.
+        assert_eq!(r.poll_budgeted(1), Ok(0));
+        assert!(!request.cancellation.is_cancelled());
+        assert_eq!(request.deadline.0, start + Duration::from_secs(60));
+        if !cancel_first {
+            r.state
+                .borrow_mut()
+                .simulation
+                .as_mut()
+                .unwrap()
+                .completed
+                .borrow_mut()
+                .swap(0, 1);
+        }
+        assert_eq!(r.poll_budgeted(1), Ok(1));
+        assert!(poll(&mut recv).is_pending());
+        assert_eq!(drops.get(), 0);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(r.in_flight(), 1);
+        assert!(r.admission.used(ResourceClass::RequestContext) > baseline);
+        assert_eq!(r.poll_budgeted(1), Ok(1));
+        assert!(matches!(
+            poll(&mut recv),
+            std::task::Poll::Ready(Err(Error::DeadlineExceeded))
+        ));
+        drop(recv);
+        assert_eq!(drops.get(), 1);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(r.in_flight(), 0);
+        assert_eq!(r.admission.used(ResourceClass::RequestContext), baseline);
+        drop(peer);
+        assert_eq!(sim.live_handles(), 0);
     }
 }
 

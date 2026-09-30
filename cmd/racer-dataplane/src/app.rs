@@ -800,6 +800,7 @@ impl WorkerApplication {
         );
         let candidates = Rc::new(
             CandidatePolicy::new(config.node.clone(), placement.clone(), requester.clone())
+                .with_attempt_timeout(config.peer_attempt_timeout)
                 .with_observer(admission.observer()),
         );
         candidates.set_publications(node.publications.clone());

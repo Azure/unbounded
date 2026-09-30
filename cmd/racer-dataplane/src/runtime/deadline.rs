@@ -19,6 +19,7 @@ pub struct Cancellation {
 }
 struct State {
     canceled: AtomicBool,
+    candidate_total: OnceLock<Instant>,
     candidate_idle: OnceLock<Mutex<(std::time::Duration, Instant)>>,
     candidate_body: OnceLock<Mutex<CandidateBody>>,
     waiters: Mutex<Vec<Waker>>,
@@ -26,7 +27,7 @@ struct State {
 }
 struct CandidateBody {
     observation: std::time::Duration,
-    fallback_at: Instant,
+    complete_by: Instant,
     first: Option<(Instant, usize)>,
     expired: bool,
 }
@@ -58,6 +59,7 @@ impl Cancellation {
         Ok(Self {
             state: Arc::new(State {
                 canceled: AtomicBool::new(false),
+                candidate_total: OnceLock::new(),
                 candidate_idle: OnceLock::new(),
                 candidate_body: OnceLock::new(),
                 waiters: Mutex::new(Vec::new()),
@@ -134,6 +136,22 @@ pub struct RequestScope {
     pub(crate) body_deadlines: Option<(Instant, Instant)>,
 }
 impl RequestScope {
+    /// Local peer-exchange cap, including checkout and verification in the exchange.
+    /// Set once; phase/body progress cannot renew it or change signed authority.
+    pub(crate) fn set_candidate_total(&self, expires: Instant) -> Result<()> {
+        self.check()?;
+        // A cap may elapse while setting up the exchange. Install it as expired,
+        // not invalid input; the next scope check rejects work without renewal.
+        if expires > self.deadline.0 {
+            return Err(Error::InvalidRequest);
+        }
+        self.cancellation
+            .state
+            .candidate_total
+            .set(expires)
+            .map_err(|_| Error::Internal)
+    }
+
     /// Local alarm only. The immutable hard deadline is what credentials and
     /// routes sign; neither phase completion nor body progress can extend it.
     pub(crate) fn set_candidate_idle(&self, allowance: std::time::Duration) -> Result<()> {
@@ -158,13 +176,14 @@ impl RequestScope {
         Ok(())
     }
 
-    /// Local-only reserve for an affordable alternative, never signed authority.
-    pub(crate) fn reserve_candidate_fallback(
+    /// Local known-body completion budget, even without an affordable alternative.
+    /// May reserve fallback time, but never changes signed authority.
+    pub(crate) fn set_candidate_body_budget(
         &self,
         observation: std::time::Duration,
-        fallback_at: Instant,
+        complete_by: Instant,
     ) -> Result<()> {
-        if observation.is_zero() || fallback_at >= self.deadline.0 {
+        if observation.is_zero() || complete_by > self.deadline.0 {
             return Err(Error::InvalidRequest);
         }
         self.cancellation
@@ -172,7 +191,7 @@ impl RequestScope {
             .candidate_body
             .set(Mutex::new(CandidateBody {
                 observation,
-                fallback_at,
+                complete_by,
                 first: None,
                 expired: false,
             }))
@@ -198,8 +217,8 @@ impl RequestScope {
             let elapsed = now.saturating_duration_since(first).as_nanos();
             let delivered = received.saturating_sub(initial) as u128;
             let remaining = (total - received) as u128;
-            let available = body.fallback_at.saturating_duration_since(now).as_nanos();
-            if now >= body.fallback_at
+            let available = body.complete_by.saturating_duration_since(now).as_nanos();
+            if now >= body.complete_by
                 || (elapsed >= body.observation.as_nanos()
                     && remaining.saturating_mul(elapsed) > delivered.saturating_mul(available))
             {
@@ -224,11 +243,16 @@ impl RequestScope {
         } else if crate::runtime::environment::now() >= self.deadline.0 {
             Err(Error::DeadlineExceeded)
         } else {
+            if let Some(expires) = self.cancellation.state.candidate_total.get()
+                && crate::runtime::environment::now() >= *expires
+            {
+                return Err(Error::DeadlineExceeded);
+            }
             if let Some(body) = self.cancellation.state.candidate_body.get() {
                 let body = body.lock().map_err(|_| Error::Unavailable)?;
                 if body.expired
                     || (body.first.is_some()
-                        && crate::runtime::environment::now() >= body.fallback_at)
+                        && crate::runtime::environment::now() >= body.complete_by)
                 {
                     return Err(Error::DeadlineExceeded);
                 }
@@ -251,6 +275,83 @@ mod tests {
     use super::*;
     use std::{sync::atomic::AtomicUsize, task::Wake, time::Duration};
     #[test]
+    fn candidate_total_survives_body_completion_and_never_changes_authority() {
+        let clock = crate::runtime::environment::SimulationClock::new(97);
+        let _env = clock.environment(0).enter();
+        let start = crate::runtime::environment::now();
+        let scope =
+            RequestScope::new(RequestId([97; 16]), start + Duration::from_secs(60)).unwrap();
+        let signed = crate::security::protocol::encode_deadline(scope.deadline).unwrap();
+        scope
+            .set_candidate_total(start + Duration::from_secs(30))
+            .unwrap();
+        scope.set_candidate_idle(Duration::from_secs(10)).unwrap();
+        scope
+            .set_candidate_body_budget(Duration::from_secs(10), start + Duration::from_secs(20))
+            .unwrap();
+        scope.candidate_body_progress(10, 80).unwrap();
+        for received in (20..=80).step_by(10) {
+            clock.advance(Duration::from_secs(2));
+            scope.candidate_body_progress(received, 80).unwrap();
+        }
+        clock.advance(Duration::from_secs(7));
+        scope.candidate_progress().unwrap();
+        assert_eq!(
+            scope.set_candidate_total(start + Duration::from_secs(40)),
+            Err(Error::Internal)
+        );
+        clock.advance(Duration::from_secs(9));
+        assert_eq!(scope.check(), Err(Error::DeadlineExceeded));
+        assert_eq!(
+            scope.candidate_body_progress(80, 80),
+            Err(Error::DeadlineExceeded)
+        );
+        assert_eq!(
+            crate::security::protocol::encode_deadline(scope.deadline).unwrap(),
+            signed
+        );
+    }
+
+    #[test]
+    fn candidate_body_budget_accepts_original_ceiling_and_rejects_invalid_bounds() {
+        let clock = crate::runtime::environment::SimulationClock::new(98);
+        let _env = clock.environment(0).enter();
+        let start = crate::runtime::environment::now();
+        let end = start + Duration::from_secs(30);
+        let scope = RequestScope::new(RequestId([98; 16]), end).unwrap();
+        assert_eq!(
+            scope.set_candidate_total(end + Duration::from_secs(1)),
+            Err(Error::InvalidRequest)
+        );
+        assert_eq!(
+            scope.set_candidate_body_budget(Duration::ZERO, end),
+            Err(Error::InvalidRequest)
+        );
+        assert_eq!(
+            scope.set_candidate_body_budget(Duration::from_secs(10), end + Duration::from_secs(1)),
+            Err(Error::InvalidRequest)
+        );
+        scope
+            .set_candidate_body_budget(Duration::from_secs(10), end)
+            .unwrap();
+        scope.candidate_body_progress(1, 1000).unwrap();
+        scope.candidate_body_progress(2, 1000).unwrap();
+        clock.advance(Duration::from_secs(10));
+        assert_eq!(
+            scope.candidate_body_progress(3, 1000),
+            Err(Error::DeadlineExceeded)
+        );
+        assert_eq!(scope.check(), Err(Error::DeadlineExceeded));
+        assert_eq!(
+            scope.candidate_body_progress(1000, 1000),
+            Err(Error::DeadlineExceeded)
+        );
+        let elapsed = RequestScope::new(RequestId([99; 16]), end).unwrap();
+        elapsed.set_candidate_total(start).unwrap();
+        assert_eq!(elapsed.check(), Err(Error::DeadlineExceeded));
+    }
+
+    #[test]
     fn candidate_body_reserve_keeps_healthy_progress_and_ignores_unknown_lengths() {
         let clock = crate::runtime::environment::SimulationClock::new(91);
         let _env = clock.environment(0).enter();
@@ -259,7 +360,7 @@ mod tests {
             RequestScope::new(RequestId([91; 16]), start + Duration::from_secs(30)).unwrap();
         healthy.set_candidate_idle(Duration::from_secs(10)).unwrap();
         healthy
-            .reserve_candidate_fallback(Duration::from_secs(10), start + Duration::from_secs(20))
+            .set_candidate_body_budget(Duration::from_secs(10), start + Duration::from_secs(20))
             .unwrap();
         healthy.candidate_body_progress(10, 80).unwrap();
         for received in (20..=80).step_by(10) {
@@ -278,7 +379,7 @@ mod tests {
             scope.set_candidate_idle(Duration::from_secs(10)).unwrap();
             if reserve {
                 scope
-                    .reserve_candidate_fallback(
+                    .set_candidate_body_budget(
                         Duration::from_secs(10),
                         now + Duration::from_secs(20),
                     )
@@ -290,7 +391,7 @@ mod tests {
                     // Unknown-length/non-body progress has no rate prediction.
                     scope.candidate_progress().unwrap();
                 } else {
-                    // No alternative: retain a trickle until the original ceiling.
+                    // Unconfigured low-level scope retains its original ceiling.
                     scope.candidate_body_progress(received, usize::MAX).unwrap();
                 }
             }
@@ -308,7 +409,7 @@ mod tests {
             RequestScope::new(RequestId([93; 16]), start + Duration::from_secs(30)).unwrap();
         scope.set_candidate_idle(Duration::from_secs(10)).unwrap();
         scope
-            .reserve_candidate_fallback(Duration::from_secs(10), start + Duration::from_secs(20))
+            .set_candidate_body_budget(Duration::from_secs(10), start + Duration::from_secs(20))
             .unwrap();
         clock.advance(Duration::from_secs(9));
         scope.candidate_body_progress(1, usize::MAX).unwrap();

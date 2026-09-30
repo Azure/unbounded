@@ -284,6 +284,7 @@ fn slow_body_without_alternative_or_failure_route_credit_keeps_original_ceiling(
         let original = crate::runtime::environment::now() + Duration::from_secs(30);
         f.scope = RequestScope::new(RequestId([95; 16]), original).unwrap();
         f.budget = AcquisitionBudget::new(original, 16, links);
+        f.peers.fenced.set(false);
         let operation = f.operation();
         let mut request = Box::pin(f.policy.request(
             &f.candidates.membership,
@@ -297,12 +298,75 @@ fn slow_body_without_alternative_or_failure_route_credit_keeps_original_ceiling(
         ));
         assert!(poll(request.as_mut()).is_pending());
         let first = f.peers.calls.borrow()[0].scope.clone();
-        for received in 1..=14 {
+        first.candidate_body_progress(1, 1000).unwrap();
+        for received in 2..=5 {
             clock.advance(Duration::from_secs(2));
             first.candidate_body_progress(received, 1000).unwrap();
             assert!(poll(request.as_mut()).is_pending());
         }
+        // The original signed ceiling is retained, but known-body ETA now bounds
+        // a trickle even without another affordable route. Expiry still fences.
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(
+            first.candidate_body_progress(6, 1000),
+            Err(Error::DeadlineExceeded)
+        );
+        assert!(poll(request.as_mut()).is_pending());
+        assert!(first.cancellation.is_cancelled());
         assert_eq!(first.deadline.0, original);
+        assert_eq!(f.scope.check(), Ok(()));
+        assert_eq!(f.peers.calls.borrow()[0].signed_deadline, original);
+        f.peers.fenced.set(true);
+        assert!(matches!(
+            poll(request.as_mut()),
+            Poll::Ready(Err(Error::Unavailable))
+        ));
+        drop(request);
+        assert_eq!(f.peers.calls.borrow().len(), 1);
+        assert_eq!(f.budget.remaining_links(), links - 4);
+        assert_eq!(
+            f.peers.calls.borrow()[0].attempts + 1 + f.budget.remaining_attempts(),
+            16
+        );
+    }
+}
+
+#[test]
+fn known_healthy_body_outlives_share_with_or_without_affordable_fallback() {
+    for links in [4, 24] {
+        let clock = crate::runtime::environment::SimulationClock::new_at(
+            100,
+            Instant::now(),
+            std::time::SystemTime::now(),
+        );
+        let _env = clock.environment(0).enter();
+        let mut f = Fixture::new(None, 1, false);
+        let start = crate::runtime::environment::now();
+        let original = start + Duration::from_secs(30);
+        f.scope = RequestScope::new(RequestId([100; 16]), original).unwrap();
+        f.budget = AcquisitionBudget::new(original, 16, links);
+        let operation = f.operation();
+        let mut request = Box::pin(f.policy.request(
+            &f.candidates.membership,
+            &f.candidates.ordered[0],
+            &f.context,
+            &operation,
+            FetchMode::Acquire,
+            &f.scope,
+            &mut f.budget,
+            3,
+        ));
+        assert!(poll(request.as_mut()).is_pending());
+        let first = f.peers.calls.borrow()[0].scope.clone();
+        first.candidate_body_progress(10, 80).unwrap();
+        for received in (20..=80).step_by(10) {
+            clock.advance(Duration::from_secs(2));
+            first.candidate_body_progress(received, 80).unwrap();
+            assert!(poll(request.as_mut()).is_pending());
+            assert!(!first.cancellation.is_cancelled());
+        }
+        assert!(crate::runtime::environment::now() > first.body_deadlines.unwrap().1);
+        assert_eq!(f.peers.calls.borrow()[0].signed_deadline, original);
         f.scope.cancel().unwrap();
         assert!(matches!(
             poll(request.as_mut()),
@@ -310,8 +374,116 @@ fn slow_body_without_alternative_or_failure_route_credit_keeps_original_ceiling(
         ));
         drop(request);
         assert_eq!(f.peers.calls.borrow().len(), 1);
-        assert_eq!(f.budget.remaining_links(), links - 4);
     }
+}
+
+#[test]
+fn configured_total_cap_never_renews_or_accepts_late_success() {
+    let clock = crate::runtime::environment::SimulationClock::new_at(
+        96,
+        Instant::now(),
+        std::time::SystemTime::now(),
+    );
+    let _env = clock.environment(0).enter();
+    let mut f = Fixture::new(None, 1, true);
+    let original = crate::runtime::environment::now() + Duration::from_secs(60);
+    f.scope = RequestScope::new(RequestId([96; 16]), original).unwrap();
+    f.budget = AcquisitionBudget::new(original, 16, 24);
+    f.policy = f.policy.with_attempt_timeout(Duration::from_secs(6));
+    f.peers.fenced.set(false);
+    let operation = f.operation();
+    let mut request = Box::pin(f.policy.request(
+        &f.candidates.membership,
+        &f.candidates.ordered[0],
+        &f.context,
+        &operation,
+        FetchMode::Acquire,
+        &f.scope,
+        &mut f.budget,
+        1,
+    ));
+    assert!(poll(request.as_mut()).is_pending());
+    let first = f.peers.calls.borrow()[0].scope.clone();
+    for _ in 0..5 {
+        clock.advance(Duration::from_secs(1));
+        // Checkout/head or unknown-length progress cannot renew the total cap.
+        first.candidate_progress().unwrap();
+        assert!(poll(request.as_mut()).is_pending());
+    }
+    clock.advance(Duration::from_secs(1));
+    assert_eq!(first.candidate_progress(), Err(Error::DeadlineExceeded));
+    assert!(poll(request.as_mut()).is_pending());
+    assert!(first.cancellation.is_cancelled());
+    assert_eq!(f.scope.check(), Ok(()));
+    assert_eq!(first.deadline.0, original);
+    assert_eq!(f.peers.calls.borrow()[0].signed_deadline, original);
+    f.peers.fenced.set(true);
+    assert!(matches!(
+        poll(request.as_mut()),
+        Poll::Ready(Err(Error::Unavailable))
+    ));
+    drop(request);
+    assert_eq!(f.peers.calls.borrow().len(), 1);
+    assert_eq!(f.budget.remaining_links(), 20);
+    assert_eq!(f.budget.remaining_attempts(), 0);
+    assert_eq!(f.budget.deadline(), original);
+}
+
+#[test]
+fn retries_get_independent_local_caps_but_never_extend_overall_authority() {
+    let clock = crate::runtime::environment::SimulationClock::new_at(
+        101,
+        Instant::now(),
+        std::time::SystemTime::now(),
+    );
+    let _env = clock.environment(0).enter();
+    let mut f = Fixture::new(None, 3, false);
+    let original = crate::runtime::environment::now() + Duration::from_secs(15);
+    f.scope = RequestScope::new(RequestId([101; 16]), original).unwrap();
+    f.budget = AcquisitionBudget::new(original, 16, 24);
+    f.policy = f.policy.with_attempt_timeout(Duration::from_secs(6));
+    let operation = f.operation();
+    let mut resolve = Box::pin(f.policy.resolve_with_budget(
+        f.candidates,
+        &f.context,
+        operation,
+        &f.scope,
+        &mut f.budget,
+    ));
+    assert!(poll(resolve.as_mut()).is_pending());
+    for (index, seconds) in [6, 6, 3].into_iter().enumerate() {
+        assert_eq!(f.peers.calls.borrow().len(), index + 1);
+        let child = f.peers.calls.borrow()[index].scope.clone();
+        for _ in 1..seconds {
+            clock.advance(Duration::from_secs(1));
+            child.candidate_progress().unwrap();
+            assert!(poll(resolve.as_mut()).is_pending());
+        }
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(child.candidate_progress(), Err(Error::DeadlineExceeded));
+        let result = poll(resolve.as_mut());
+        if index < 2 {
+            assert!(result.is_pending());
+            assert_eq!(f.scope.check(), Ok(()));
+        } else {
+            assert!(matches!(result, Poll::Ready(Err(Error::DeadlineExceeded))));
+        }
+        assert!(child.cancellation.is_cancelled());
+    }
+    drop(resolve);
+    let calls = f.peers.calls.borrow();
+    assert!(
+        calls
+            .iter()
+            .all(|call| call.signed_deadline == original && call.scope.deadline.0 == original)
+    );
+    assert_eq!(
+        calls.iter().map(|call| call.attempts + 1).sum::<u32>() + f.budget.remaining_attempts(),
+        16
+    );
+    assert_eq!(f.budget.remaining_links(), 4);
+    assert_eq!(f.budget.deadline(), original);
+    assert!(!f.scope.cancellation.is_cancelled());
 }
 
 #[test]
