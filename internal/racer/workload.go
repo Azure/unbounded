@@ -4,17 +4,135 @@
 package racer
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/url"
+	"slices"
 	"strconv"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/utils/ptr"
 
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
+
+// WorkloadConfig contains only the inputs needed to build the dataplane DaemonSet.
+// Controller limits, rotation policy, serving TLS, and durable state are independent.
+type WorkloadConfig struct {
+	Cluster                 wire.ClusterID
+	Namespace               string
+	ControlURL              string
+	BootstrapTrustConfigMap string
+	DataplaneImage          string
+	PeerPort                uint16
+	HostNetwork             bool
+	PodNetworkNodes         []string
+	// Zero preserves the legacy automatic diagnostics port (9090, or 9091).
+	DiagnosticsPort         uint16
+	DataplaneServiceAccount string
+	DaemonSetName           string
+}
+
+// WorkloadConfigFromLookup reads operator deployment wiring without loading or
+// validating controller runtime configuration. Shared settings retain the same defaults.
+func WorkloadConfigFromLookup(lookup func(string) (string, bool)) (WorkloadConfig, error) {
+	env := func(key, fallback string) string {
+		if value, ok := lookup(key); ok {
+			return value
+		}
+
+		return fallback
+	}
+
+	port, err := strconv.ParseUint(env("RACER_PEER_PORT", "8082"), 10, 16)
+	if err != nil {
+		return WorkloadConfig{}, fmt.Errorf("RACER_PEER_PORT: %w", wire.InvalidRequest)
+	}
+
+	hostNetwork := env("RACER_HOST_NETWORK", "false")
+	if hostNetwork != "true" && hostNetwork != "false" {
+		return WorkloadConfig{}, fmt.Errorf("RACER_HOST_NETWORK must be true or false: %w", wire.InvalidRequest)
+	}
+
+	var diagnosticsPort uint64
+	if value, ok := lookup("RACER_DIAGNOSTICS_PORT"); ok {
+		diagnosticsPort, err = strconv.ParseUint(value, 10, 16)
+		if err != nil || diagnosticsPort < 1024 {
+			return WorkloadConfig{}, fmt.Errorf("RACER_DIAGNOSTICS_PORT must be 1024..65535: %w", wire.InvalidRequest)
+		}
+	}
+
+	var podNetworkNodes []string
+	if value, ok := lookup("RACER_POD_NETWORK_NODES"); ok {
+		if err := json.Unmarshal([]byte(value), &podNetworkNodes); err != nil || podNetworkNodes == nil {
+			return WorkloadConfig{}, fmt.Errorf("RACER_POD_NETWORK_NODES must be a JSON array: %w", wire.InvalidRequest)
+		}
+	}
+
+	cfg := WorkloadConfig{
+		Cluster:                 wire.ClusterID(env("RACER_CLUSTER_ID", "")),
+		Namespace:               env("POD_NAMESPACE", "unbounded-system"),
+		ControlURL:              env("RACER_CONTROL_URL", ""),
+		BootstrapTrustConfigMap: env("RACER_BOOTSTRAP_TRUST_CONFIGMAP", "racer-bootstrap-trust"),
+		DataplaneImage:          env("RACER_DATAPLANE_IMAGE", ""),
+		PeerPort:                uint16(port),
+		HostNetwork:             hostNetwork == "true",
+		PodNetworkNodes:         podNetworkNodes,
+		DiagnosticsPort:         uint16(diagnosticsPort),
+		DataplaneServiceAccount: env("RACER_DATAPLANE_SERVICE_ACCOUNT", "racer-dataplane"),
+		DaemonSetName:           env("RACER_DAEMONSET_NAME", "racer-dataplane"),
+	}
+
+	return cfg, cfg.Validate()
+}
+
+func (c WorkloadConfig) Validate() error {
+	if len(c.PodNetworkNodes) != 0 && (!c.HostNetwork || c.DaemonSetName != DataplaneDaemonSetName) {
+		return fmt.Errorf("pod network exceptions require host networking and the fixed dataplane name: %w", wire.InvalidRequest)
+	}
+
+	seen := make(map[string]bool, len(c.PodNetworkNodes))
+	for _, node := range c.PodNetworkNodes {
+		if len(validation.IsDNS1123Subdomain(node)) != 0 || seen[node] {
+			return fmt.Errorf("pod network nodes must be unique valid node names: %w", wire.InvalidRequest)
+		}
+
+		seen[node] = true
+	}
+
+	if !wire.ValidUUID(string(c.Cluster)) || len(validation.IsDNS1123Label(c.Namespace)) != 0 || c.PeerPort < 1024 {
+		return fmt.Errorf("cluster, namespace, or peer port: %w", wire.InvalidRequest)
+	}
+
+	if c.DiagnosticsPort != 0 && (c.DiagnosticsPort < 1024 || c.DiagnosticsPort == c.PeerPort) {
+		return fmt.Errorf("diagnostics port must be 1024..65535 and distinct from peer port: %w", wire.InvalidRequest)
+	}
+
+	for _, name := range []string{c.DaemonSetName, c.BootstrapTrustConfigMap, c.DataplaneServiceAccount} {
+		if len(validation.IsDNS1123Subdomain(name)) != 0 {
+			return fmt.Errorf("resource name: %w", wire.InvalidRequest)
+		}
+	}
+
+	u, err := url.Parse(c.ControlURL)
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawPath != "" || (u.Path != "" && u.Path != "/") || strings.TrimSpace(c.DataplaneImage) == "" {
+		return fmt.Errorf("workload endpoint or image: %w", wire.InvalidRequest)
+	}
+
+	if u.Port() != "" {
+		port, err := strconv.ParseUint(u.Port(), 10, 16)
+		if err != nil || port == 0 {
+			return fmt.Errorf("workload endpoint port: %w", wire.InvalidRequest)
+		}
+	}
+
+	return nil
+}
 
 // DesiredDaemonSet declares the token audience, controller trust projection,
 // node-private identity and slab storage, socket mounts, and exclusion affinity.
@@ -253,4 +371,57 @@ func DesiredDaemonSet(c WorkloadConfig) (*appsv1.DaemonSet, error) {
 	}
 
 	return ds, nil
+}
+
+// DesiredDaemonSets builds steady-state placement, not a safe migration plan.
+// The operator must additionally exclude occupied destination nodes until every
+// source Pod, including terminating Pods, has disappeared.
+func DesiredDaemonSets(c WorkloadConfig) ([]*appsv1.DaemonSet, error) {
+	if err := c.Validate(); err != nil {
+		return nil, err
+	}
+
+	nodes := slices.Clone(c.PodNetworkNodes)
+	slices.Sort(nodes)
+
+	c.PodNetworkNodes = nil
+
+	host, err := DesiredDaemonSet(c)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(nodes) == 0 {
+		return []*appsv1.DaemonSet{host}, nil
+	}
+
+	c.HostNetwork = false
+	c.DaemonSetName = PodNetworkDaemonSetName
+
+	pod, err := DesiredDaemonSet(c)
+	if err != nil {
+		return nil, err
+	}
+
+	// The existing selector is immutable. Use a distinct app value, not an
+	// additional label that would still match the original workload selector.
+	pod.Labels["app.kubernetes.io/name"] = PodNetworkDaemonSetName
+	pod.Spec.Selector.MatchLabels["app.kubernetes.io/name"] = PodNetworkDaemonSetName
+	pod.Spec.Template.Labels["app.kubernetes.io/name"] = PodNetworkDaemonSetName
+	hostSelector := host.Spec.Template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	podSelector := pod.Spec.Template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	base := podSelector.NodeSelectorTerms[0].DeepCopy()
+	podSelector.NodeSelectorTerms = nil
+	// Field selectors accept one value per requirement. Host exclusions are
+	// ANDed; each pod-network node gets an OR term retaining the base constraints.
+	for _, node := range nodes {
+		hostSelector.NodeSelectorTerms[0].MatchFields = append(hostSelector.NodeSelectorTerms[0].MatchFields, corev1.NodeSelectorRequirement{
+			Key: "metadata.name", Operator: corev1.NodeSelectorOpNotIn, Values: []string{node},
+		})
+		term := base.DeepCopy()
+		term.MatchFields = []corev1.NodeSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{node}}}
+		podSelector.NodeSelectorTerms = append(podSelector.NodeSelectorTerms, *term)
+	}
+
+	return []*appsv1.DaemonSet{host, pod}, nil
 }
