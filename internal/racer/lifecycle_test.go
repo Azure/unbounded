@@ -6,6 +6,8 @@ package racer
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -88,12 +90,12 @@ func TestLifecycleReadyNotifications(t *testing.T) {
 		{name: "serving", set: (*Lifecycle).SetServingReady},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := initializedTopology(t)
-			reconcileTopology(t, r, t.Context())
-			l := newLifecycle(r.Publications)
-			l.leader, l.synced = t.Context(), true
-			l.SetIssuerReady(true)
-			l.SetServingReady(true)
+			// Keep the historical test name, but observe readiness through HTTP:
+			// the removed notification channel had no production subscriber.
+			f := newServingFixture(t)
+			l := f.a.Lifecycle
+			handler := f.a.Server.Handler()
+
 			tc.set(l, false)
 
 			for _, step := range []struct {
@@ -110,11 +112,17 @@ func TestLifecycleReadyNotifications(t *testing.T) {
 				t.Run(step.name, func(t *testing.T) {
 					tc.set(l, step.ready)
 
+					r := httptest.NewRequest(http.MethodGet, wire.SnapshotPath, nil)
+					r.TLS = f.requestState(t)
+					w := httptest.NewRecorder()
+					handler.ServeHTTP(w, r)
+
+					want := http.StatusServiceUnavailable
 					if step.ready {
-						require.NoError(t, l.Ready(nil))
-					} else {
-						require.ErrorIs(t, l.Ready(nil), wire.Unavailable)
+						want = http.StatusOK
 					}
+
+					responseBody(t, w.Result(), nil, want)
 				})
 			}
 		})
@@ -140,74 +148,82 @@ func TestLifecycleFollowerWithPublicationRemainsUnready(t *testing.T) {
 }
 
 func TestLifecycleGatesAndCancellation(t *testing.T) {
-	r := initializedTopology(t)
+	synctest.Test(t, func(t *testing.T) {
+		r := initializedTopology(t)
 
-	l := newLifecycle(r.Publications)
-	if l.NeedLeaderElection() || l.Ready(nil) == nil {
-		t.Fatal("follower ready")
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	syncCache := make(chan struct{})
-	l.waitForCacheSync = func(ctx context.Context) bool {
-		select {
-		case <-ctx.Done():
-			return false
-		case <-syncCache:
-			return true
+		l := newLifecycle(r.Publications)
+		if l.NeedLeaderElection() || l.Ready(nil) == nil {
+			t.Fatal("follower ready")
 		}
-	}
-	started := make(chan error, 1)
 
-	go func() { started <- l.Start(ctx) }()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 
-	l.SetIssuerReady(true)
-	l.SetServingReady(true)
-	reconcileTopology(t, r, ctx)
+		syncCache := make(chan struct{})
+		l.waitForCacheSync = func(ctx context.Context) bool {
+			select {
+			case <-ctx.Done():
+				return false
+			case <-syncCache:
+				return true
+			}
+		}
+		started := make(chan error, 1)
 
-	if l.Ready(nil) == nil {
-		t.Fatal("ready before synchronized inputs")
-	}
+		go func() { started <- l.Start(ctx) }()
 
-	close(syncCache)
+		l.SetIssuerReady(true)
+		l.SetServingReady(true)
+		reconcileTopology(t, r, ctx)
 
-	require.Eventually(t, func() bool { return l.Ready(nil) == nil }, 5*time.Second, time.Millisecond)
+		if l.Ready(nil) == nil {
+			t.Fatal("ready before synchronized inputs")
+		}
 
-	if err := l.Ready(nil); err != nil {
-		t.Fatal(err)
-	}
+		close(syncCache)
+		synctest.Wait()
 
-	l.SetIssuerReady(false)
+		if err := l.Ready(nil); err != nil {
+			t.Fatal(err)
+		}
 
-	if l.Ready(nil) == nil {
-		t.Fatal("ready without usable issuer")
-	}
+		l.SetIssuerReady(false)
 
-	l.SetIssuerReady(true)
-	l.SetServingReady(false)
+		if l.Ready(nil) == nil {
+			t.Fatal("ready without usable issuer")
+		}
 
-	if l.Ready(nil) == nil {
-		t.Fatal("ready without listener")
-	}
+		l.SetIssuerReady(true)
+		l.SetServingReady(false)
 
-	cancel()
+		if l.Ready(nil) == nil {
+			t.Fatal("ready without listener")
+		}
 
-	if err := <-started; err != nil {
-		t.Fatal(err)
-	}
+		cancel()
 
-	l.SetIssuerReady(true)
-	l.SetServingReady(true)
+		if err := <-started; err != nil {
+			t.Fatal(err)
+		}
 
-	if l.Ready(nil) == nil {
-		t.Fatal("old leadership resurrected")
-	}
+		l.SetIssuerReady(true)
+		l.SetServingReady(true)
 
-	if err := l.Start(context.Background()); !errors.Is(err, wire.Conflict) {
-		t.Fatalf("leadership restarted: %v", err)
-	}
+		if l.Ready(nil) == nil {
+			t.Fatal("old leadership resurrected")
+		}
+
+		request, stop := l.LeaderContext(t.Context())
+		defer stop()
+
+		if !errors.Is(request.Err(), context.Canceled) {
+			t.Fatalf("request resurrected: %v", request.Err())
+		}
+
+		if err := l.Start(context.Background()); !errors.Is(err, wire.Conflict) {
+			t.Fatalf("leadership restarted: %v", err)
+		}
+	})
 }
 
 func TestLifecycleWaitsForPublicationAndCancelsBeforeStartup(t *testing.T) {
@@ -223,16 +239,35 @@ func TestLifecycleWaitsForPublicationAndCancelsBeforeStartup(t *testing.T) {
 
 		go func() { done <- l.Start(ctx) }()
 
-		synctest.Wait()
 		l.SetIssuerReady(true)
 		l.SetServingReady(true)
-		require.ErrorIs(t, l.Ready(nil), wire.Unavailable, "ready without publication")
+		synctest.Wait()
+
+		waitCtx, stop := context.WithCancel(context.Background())
+		stop()
+
+		request, stopRequest := l.LeaderContext(waitCtx)
+		defer stopRequest()
+
+		if !errors.Is(request.Err(), context.Canceled) {
+			t.Fatalf("request ignores cancellation: %v", request.Err())
+		}
+
+		if err := l.Ready(nil); !errors.Is(err, wire.Unavailable) {
+			t.Fatalf("ready without publication: %v", err)
+		}
 
 		reconcileTopology(t, r, ctx)
-		require.NoError(t, l.Ready(nil))
+
+		if err := l.Ready(nil); err != nil {
+			t.Fatal(err)
+		}
 
 		cancel()
-		require.NoError(t, <-done)
+
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
 		require.ErrorIs(t, l.Ready(nil), wire.Unavailable)
 
 		beforeStartup := newLifecycle(r.Publications)
@@ -270,6 +305,79 @@ func TestInitialEnqueueEmptyInputsAndCoalescing(t *testing.T) {
 
 	if err := initialEnqueue().Start(ctx, q); !errors.Is(err, context.Canceled) || q.Len() != 0 {
 		t.Fatalf("canceled startup queued: %v", err)
+	}
+}
+
+func TestLifecycleHTTPStartupAdmission(t *testing.T) {
+	for _, scenario := range []string{"synchronized", "cache failed", "canceled during sync"} {
+		t.Run(scenario, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newServingFixture(t)
+				l := newLifecycle(f.a.Server.Publications)
+				f.a.Server.Lifecycle = l
+				l.SetIssuerReady(true)
+				l.SetServingReady(true)
+
+				syncCache := make(chan struct{})
+				l.waitForCacheSync = func(ctx context.Context) bool {
+					select {
+					case <-ctx.Done():
+						return false
+					case <-syncCache:
+						return scenario == "synchronized"
+					}
+				}
+
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+
+				done := make(chan error, 1)
+
+				go func() { done <- l.Start(ctx) }()
+
+				synctest.Wait()
+
+				handler := f.a.Server.Handler()
+				request := httptest.NewRequest(http.MethodGet, wire.SnapshotPath, nil)
+				request.TLS = f.requestState(t)
+				before := httptest.NewRecorder()
+				handler.ServeHTTP(before, request)
+				responseBody(t, before.Result(), nil, http.StatusServiceUnavailable)
+
+				if scenario == "canceled during sync" {
+					cancel()
+				} else {
+					close(syncCache)
+				}
+
+				synctest.Wait()
+
+				after := httptest.NewRecorder()
+				handler.ServeHTTP(after, request)
+
+				want := http.StatusServiceUnavailable
+				if scenario == "synchronized" {
+					want = http.StatusOK
+				}
+
+				responseBody(t, after.Result(), nil, want)
+
+				cancel()
+
+				err := <-done
+				if scenario == "cache failed" {
+					if !errors.Is(err, wire.Unavailable) {
+						t.Fatalf("cache failure: %v", err)
+					}
+				} else if err != nil {
+					t.Fatal(err)
+				}
+
+				stopped := httptest.NewRecorder()
+				handler.ServeHTTP(stopped, request)
+				responseBody(t, stopped.Result(), nil, http.StatusServiceUnavailable)
+			})
+		})
 	}
 }
 
