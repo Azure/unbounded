@@ -1479,18 +1479,6 @@ def host_image() -> HostImage:
             packages=["curl", "jq", "ca-certificates", "net-tools"],
             network_interface="eth0",
         )
-    if HOST_BASE_OS in {"centosstream9", "centosstream10"}:
-        version = HOST_BASE_OS.removeprefix("centosstream")
-        return HostImage(
-            url=HOST_IMAGE_URL
-            or f"https://cloud.centos.org/centos/{version}-stream/x86_64/images/"
-            f"CentOS-Stream-GenericCloud-{version}-latest.x86_64.qcow2",
-            file_name=f"centos-stream-{version}-cloud-amd64.qcow2",
-            backing_format="qcow2",
-            sudo_group="wheel",
-            packages=["curl", "jq", "ca-certificates", "net-tools"],
-            network_interface="eth0" if version == "9" else "ens3",
-        )
 
     die(
         f"Unsupported HOST_BASE_OS {HOST_BASE_OS!r}; "
