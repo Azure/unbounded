@@ -171,7 +171,7 @@ pub(super) fn publication(
     }
 }
 
-fn page(app: &WorkerApplication) -> crate::memory::page::PageResult {
+pub(super) fn page(app: &WorkerApplication) -> crate::memory::page::PageResult {
     use crate::memory::pool::{VerifiedBytes, VerifiedPage};
     use crate::model::{
         envelope::*, identity::*, limits::ResourceClass, metadata::VersionMetadata,
