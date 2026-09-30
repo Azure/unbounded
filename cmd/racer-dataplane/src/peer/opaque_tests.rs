@@ -137,16 +137,15 @@ fn exchange(
     let pool = Rc::new(HttpPool::new(reactors[1].clone(), admissions[1].clone(), 1));
     let transfers = Rc::new(
         transfer::Transfers::new(pool.clone(), ios[1].clone(), None)
-            .with_wire(admissions[1].clone(), Rc::new(codec(&admissions[1]))),
+            .with_wire(admissions[1].clone(), Rc::new(codec(&admissions[1])))
+            .with_signatures(signers[1].clone()),
     );
-    let handshake = Rc::new(handshake::Handshake::new(signers[1].clone(), None));
     let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4));
     let requester = Rc::new(
         requester::Requester::new(
             paths.clone(),
             Rc::new(Rails),
             auth.clone(),
-            handshake.clone(),
             transfers.clone(),
         )
         .with_network(network.clone()),
@@ -164,7 +163,7 @@ fn exchange(
     )
     .with_network(network)
     .with_wire(Rc::new(codec(&admissions[1])))
-    .with_handshake(handshake)
+    .with_signatures(signers[1].clone())
     .with_transfers(transfers)
     .with_opaque_relay(!materialized);
     let scope =

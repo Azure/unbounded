@@ -1,6 +1,5 @@
 //! Correlated logical requests with monotonic budgets, attempts, and cancellation.
 use super::{
-    handshake::Handshake,
     transfer::Transfers,
     wire::{PeerRequest, SignedRequest, SignedResponse, VerifiedResponse},
 };
@@ -85,10 +84,8 @@ impl Requester {
         paths: Rc<Paths>,
         rails: Rc<Rails>,
         forwarding: Rc<Forwarding>,
-        handshake: Rc<Handshake>,
         transfers: Rc<Transfers>,
     ) -> Self {
-        transfers.set_signatures(handshake.signatures.clone());
         Self {
             observer: Observer::default(),
             health: paths.link_health(),

@@ -1,6 +1,5 @@
 //! Peer transport interfaces injected into reads; local service injected into server.
 pub(crate) mod decode;
-pub mod handshake;
 mod native;
 mod native_io;
 pub mod relay;

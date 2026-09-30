@@ -17,7 +17,6 @@ use crate::{
     },
     peer::{
         PeerNetwork,
-        handshake::Handshake,
         relay::Relay,
         requester::{PeerTransport, Requester},
         server::{LocalPageService, PeerServer},
@@ -426,7 +425,8 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
             io.clone(),
             None,
         )
-        .with_wire(admission.clone(), codec.clone()),
+        .with_wire(admission.clone(), codec.clone())
+        .with_signatures(a.signatures.clone()),
     );
     let source_network = Rc::new(PeerNetwork::new(source.clone(), source_publications).unwrap());
     let destination_membership =
@@ -438,11 +438,6 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         )
         .unwrap(),
     );
-    let handshake = |id: &Identity, _network: Rc<PeerNetwork>| {
-        Rc::new(Handshake::new(id.signatures.clone(), None))
-    };
-    let source_handshake = handshake(a, source_network.clone());
-    let destination_handshake = handshake(b, destination_network.clone());
     let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 8));
     let auth = Rc::new(Forwarding::new(b.signatures.clone()));
     let relay = Rc::new(
@@ -521,13 +516,12 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     )
     .with_network(destination_network)
     .with_wire(codec)
-    .with_handshake(destination_handshake);
+    .with_signatures(b.signatures.clone());
     let requester = Rc::new(
         Requester::new(
             paths,
             Rc::new(Rails),
             Rc::new(Forwarding::new(a.signatures.clone())),
-            source_handshake,
             transfers,
         )
         .with_network(source_network),

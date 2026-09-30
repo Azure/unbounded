@@ -46,7 +46,7 @@ pub struct PeerServer {
     relay: Rc<Relay>,
     network: Option<Rc<super::PeerNetwork>>,
     wire: Option<Rc<dyn super::wire::LogicalCodec>>,
-    handshake: Option<Rc<super::handshake::Handshake>>,
+    signatures: Option<Rc<crate::security::signing::Signatures>>,
     reactor: Option<Rc<crate::runtime::reactor::Reactor>>,
     transfers: Option<Rc<super::transfer::Transfers>>,
     request_timeout: Duration,
@@ -186,7 +186,7 @@ impl PeerServer {
             relay,
             network: None,
             wire: None,
-            handshake: None,
+            signatures: None,
             reactor: None,
             transfers: None,
             request_timeout: Duration::from_secs(30),
@@ -226,8 +226,8 @@ impl PeerServer {
         self.wire = Some(wire);
         self
     }
-    pub fn with_handshake(mut self, handshake: Rc<super::handshake::Handshake>) -> Self {
-        self.handshake = Some(handshake);
+    pub fn with_signatures(mut self, signatures: Rc<crate::security::signing::Signatures>) -> Self {
+        self.signatures = Some(signatures);
         self
     }
 
@@ -251,10 +251,9 @@ impl PeerServer {
                 crate::runtime::environment::now(),
             )?;
             let signatures = self
-                .handshake
+                .signatures
                 .as_ref()
                 .ok_or(Error::InvalidConfiguration)?
-                .signatures
                 .clone();
             let connection = if connection.session.is_none() {
                 let mut connection = connection;
@@ -1300,7 +1299,7 @@ mod tests {
         use crate::{
             http::{codec::Codec, io::HttpIo, pool::ConnectionLease},
             memory::pool::BufferPool,
-            peer::{handshake::Handshake, requester::PeerTransport, wire::SecurityCodec},
+            peer::{requester::PeerTransport, wire::SecurityCodec},
             runtime::{environment::SimulationClock, reactor::Reactor},
             security::connection::tests::{finish, hello},
             topology::{health::LinkHealth, paths::Paths},
@@ -1406,7 +1405,7 @@ mod tests {
                             admission.clone(),
                             Rc::new(BufferPool::new(admission.clone())),
                         )))
-                        .with_handshake(Rc::new(Handshake::new(signers[1].clone(), None)))
+                        .with_signatures(signers[1].clone())
                         .with_request_timeout(Duration::from_secs(if end == "handshake-cap" {
                             60
                         } else {

@@ -31,10 +31,7 @@ use crate::{
         limits::Limits,
     },
     origin::client::{Origin, OriginClient},
-    peer::{
-        handshake::Handshake, relay::Relay, requester::Requester, server::PeerServer,
-        transfer::Transfers,
-    },
+    peer::{relay::Relay, requester::Requester, server::PeerServer, transfer::Transfers},
     rdma::{
         device::Devices, permission::Permissions, registered::RegisteredPool, session::Sessions,
         transfer::RdmaTransfer, verbs::Verbs,
@@ -764,6 +761,7 @@ impl WorkerApplication {
             buffers.clone(),
         ));
         let transfers = Transfers::new(http.clone(), io.clone(), rdma.clone())
+            .with_signatures(signatures.clone())
             .with_wire(admission.clone(), wire.clone())
             .with_reclamation({
                 let admission = admission.clone();
@@ -790,17 +788,10 @@ impl WorkerApplication {
             Some(sessions) => transfers.with_native(signatures.clone(), sessions.clone()),
             None => transfers,
         });
-        let handshake = Rc::new(Handshake::new(signatures.clone(), sessions));
         let requester = Rc::new(
-            Requester::new(
-                paths.clone(),
-                rails,
-                forwarding.clone(),
-                handshake.clone(),
-                transfers.clone(),
-            )
-            .with_network(network.clone())
-            .with_observer(admission.observer()),
+            Requester::new(paths.clone(), rails, forwarding.clone(), transfers.clone())
+                .with_network(network.clone())
+                .with_observer(admission.observer()),
         );
         let candidates = Rc::new(
             CandidatePolicy::new(config.node.clone(), placement.clone(), requester.clone())
@@ -894,7 +885,7 @@ impl WorkerApplication {
         .with_network(network.clone())
         .with_opaque_relay(config.opaque_relay)
         .with_wire(wire)
-        .with_handshake(handshake)
+        .with_signatures(signatures)
         .with_transfers(transfers)
         .with_pipes(pipes.clone())
         .with_reactor(reactor.clone());

@@ -61,8 +61,8 @@ fn body_cases(cases: &[&str]) {
         let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 1));
         let signers = signers();
         let transfers = transfer::Transfers::new(pool.clone(), io.clone(), None)
-            .with_wire(admission.clone(), Rc::new(codec(&admission)));
-        transfers.set_signatures(signers[0].clone());
+            .with_wire(admission.clone(), Rc::new(codec(&admission)))
+            .with_signatures(signers[0].clone());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let start = Instant::now();

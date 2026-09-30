@@ -594,17 +594,14 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
                     io,
                     None,
                 )
-                .with_wire(admission, codec),
+                .with_wire(admission, codec)
+                .with_signatures(signers[i].clone()),
             );
             let requester = Rc::new(
                 crate::peer::requester::Requester::new(
                     Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
                     Rc::new(crate::topology::rails::Rails),
                     Rc::new(Forwarding::new(signers[i].clone())),
-                    Rc::new(crate::peer::handshake::Handshake::new(
-                        signers[i].clone(),
-                        None,
-                    )),
                     transfers,
                 )
                 .with_network(Rc::new(
@@ -658,10 +655,7 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
     .with_network(network)
     .with_reactor(fixtures[2].reactor.clone())
     .with_wire(codec)
-    .with_handshake(Rc::new(crate::peer::handshake::Handshake::new(
-        signers[2].clone(),
-        None,
-    )));
+    .with_signatures(signers[2].clone());
     let serving_scope = RequestScope::new(
         RequestId([99; 16]),
         Instant::now() + Duration::from_secs(30),

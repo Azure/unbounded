@@ -69,9 +69,15 @@ pub enum RelayResponse {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Capabilities {
+    pub rdma: bool,
+    pub scoped_grants: bool,
+}
+
 pub struct Transfers {
     reclaim: Option<Rc<ReclaimCiphertext>>,
-    signatures: std::cell::RefCell<Option<Rc<crate::security::signing::Signatures>>>,
+    signatures: Option<Rc<crate::security::signing::Signatures>>,
     #[cfg(test)]
     pub(super) native_completions: std::cell::Cell<usize>,
     #[cfg(test)]
@@ -95,7 +101,7 @@ impl Transfers {
     pub fn new(http: Rc<HttpPool>, io: Rc<HttpIo>, rdma: Option<Rc<RdmaTransfer>>) -> Self {
         Self {
             reclaim: None,
-            signatures: std::cell::RefCell::new(None),
+            signatures: None,
             #[cfg(test)]
             native_completions: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -114,7 +120,7 @@ impl Transfers {
         signatures: Rc<crate::security::signing::Signatures>,
         sessions: Rc<crate::rdma::session::Sessions>,
     ) -> Self {
-        self.set_signatures(signatures.clone());
+        self.signatures = Some(signatures.clone());
         self.native = Some((signatures, sessions));
         self
     }
@@ -129,15 +135,17 @@ impl Transfers {
         self.reclaim = Some(Rc::new(reclaim));
         self
     }
-    pub(crate) fn set_signatures(&self, signatures: Rc<crate::security::signing::Signatures>) {
-        *self.signatures.borrow_mut() = Some(signatures);
+    /// Configure connection authentication before sharing this transport with callers.
+    pub fn with_signatures(mut self, signatures: Rc<crate::security::signing::Signatures>) -> Self {
+        self.signatures = Some(signatures);
+        self
     }
     /// Route selection alone never authorizes RDMA. A matching, live authenticated
     /// single-use session and transfer-scoped grant are both required.
     pub fn select(
         &self,
         proposed: TransportPlan,
-        capabilities: super::handshake::Capabilities,
+        capabilities: Capabilities,
         session: Option<&crate::rdma::session::SessionLease>,
     ) -> TransportPlan {
         match proposed {
@@ -266,11 +274,7 @@ impl Transfers {
                     .max(1),
             )?;
             let mut head = WireCodec::encode(&request.authentication, false, 0)?;
-            let signatures = self
-                .signatures
-                .borrow()
-                .clone()
-                .ok_or(Error::InvalidConfiguration)?;
+            let signatures = self.signatures.clone().ok_or(Error::InvalidConfiguration)?;
             let peer = crate::security::signing::receiver(
                 &request
                     .authentication

@@ -450,20 +450,20 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
     let server = server::PeerServer::new(io.clone(), destination, admission.clone(), local, relay)
         .with_network(network(C))
         .with_wire(codec.clone())
-        .with_handshake(Rc::new(handshake::Handshake::new(signers[2].clone(), None)));
+        .with_signatures(signers[2].clone());
     let transfers = Rc::new(
         transfer::Transfers::new(
             Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2)),
             io,
             None,
         )
-        .with_wire(admission.clone(), codec),
+        .with_wire(admission.clone(), codec)
+        .with_signatures(signers[0].clone()),
     );
     let requester = requester::Requester::new(
         paths,
         Rc::new(Rails),
         Rc::new(Forwarding::new(signers[0].clone())),
-        Rc::new(handshake::Handshake::new(signers[0].clone(), None)),
         transfers,
     )
     .with_network(network(A));

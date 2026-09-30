@@ -638,7 +638,6 @@ fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
         )
         .unwrap(),
     );
-    let handshake = handshake::Handshake::new(signers[2].clone(), None);
     drop(transfers);
     let response_lease = network.membership(MembershipVersion(1)).unwrap();
     drop(network);
@@ -668,7 +667,6 @@ fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
     p::push(&mut reply, "racer-rdma", 0);
     p::push_binary(&mut reply, "racer-request-binding", &binding);
     let reply = signers[2].sign(reply).unwrap();
-    drop(handshake);
     assert!(
         weak.upgrade().is_some(),
         "pending reply retains ingress lease"
@@ -961,7 +959,8 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
     let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2));
     let transfers = Rc::new(
         transfer::Transfers::new(pool, io, None)
-            .with_wire(admission.clone(), Rc::new(codec(&admission))),
+            .with_wire(admission.clone(), Rc::new(codec(&admission)))
+            .with_signatures(signers[0].clone()),
     );
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = closed.local_addr().unwrap().to_string();
@@ -992,7 +991,6 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
         paths.clone(),
         Rc::new(Rails),
         Rc::new(Forwarding::new(signers[0].clone())),
-        Rc::new(handshake::Handshake::new(signers[0].clone(), None)),
         transfers,
     )
     .with_network(Rc::new(
@@ -1152,13 +1150,28 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
     ));
     let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2));
     let codec = Rc::new(codec(&admission));
-    let transfers = Rc::new(
-        transfer::Transfers::new(pool, io.clone(), None)
-            .with_wire(admission.clone(), codec.clone()),
-    );
+    let transfers = transfer::Transfers::new(pool, io.clone(), None)
+        .with_wire(admission.clone(), codec.clone());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
+    // A wire codec alone does not enable authenticated transport. Fail before
+    // opening a socket, then configure authentication explicitly for the TCP flow.
+    let unsigned = request(&admission, 1);
+    let scope = unsigned.origin.scope().clone();
+    let (signed, _) = Forwarding::new(signers[0].clone())
+        .sign_request_to(unsigned, &NodeId(C.into()))
+        .unwrap();
+    assert!(matches!(
+        futures::executor::block_on(transfers.exchange(
+            crate::http::pool::Endpoint::Peer(address.to_string()),
+            signed,
+            &scope,
+        )),
+        Err(Error::InvalidConfiguration)
+    ));
+    assert_eq!(admission.used(ResourceClass::Connection), 0);
+    let transfers = Rc::new(transfers.with_signatures(signers[0].clone()));
     let membership = Arc::new(
         Membership::validate(
             MembershipVersion(1),
@@ -1194,8 +1207,6 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
         )
         .unwrap(),
     );
-    let source_handshake = Rc::new(handshake::Handshake::new(signers[0].clone(), None));
-    let destination_handshake = Rc::new(handshake::Handshake::new(signers[2].clone(), None));
     let destination_auth = Rc::new(Forwarding::new(signers[2].clone()));
     let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4));
     let relay = Rc::new(
@@ -1217,13 +1228,12 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
     .with_request_timeout(Duration::from_secs(5))
     .with_network(destination_network)
     .with_wire(codec)
-    .with_handshake(destination_handshake);
+    .with_signatures(signers[2].clone());
     let health = paths.link_health();
     let requester = requester::Requester::new(
         paths,
         Rc::new(Rails),
         Rc::new(Forwarding::new(signers[0].clone())),
-        source_handshake,
         transfers,
     )
     .with_network(source_network);
@@ -1356,7 +1366,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
         } else {
             Duration::from_millis(30)
         })
-        .with_handshake(Rc::new(handshake::Handshake::new(signers[2].clone(), None)));
+        .with_signatures(signers[2].clone());
         let scope = RequestScope::new(
             RequestId([7; 16]),
             Instant::now()
@@ -1495,8 +1505,8 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 1));
     let signers = signers();
     let transfers = transfer::Transfers::new(pool, io.clone(), None)
-        .with_wire(admission.clone(), Rc::new(codec(&admission)));
-    transfers.set_signatures(signers[0].clone());
+        .with_wire(admission.clone(), Rc::new(codec(&admission)))
+        .with_signatures(signers[0].clone());
     let buffers = BufferPool::new(admission.clone());
     let version = ObjectVersion {
         object: ObjectId {
@@ -1622,7 +1632,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
             crate::topology::rails::TransportPlan::Rdma {
                 rail: crate::topology::rails::RailId(0)
             },
-            handshake::Capabilities {
+            transfer::Capabilities {
                 rdma: true,
                 scoped_grants: true
             },
@@ -1824,7 +1834,7 @@ mod established_sessions {
                 server::PeerServer::new(io.clone(), forwarding, admission.clone(), service, relay)
                     .with_network(network)
                     .with_wire(Rc::new(codec(&admission)))
-                    .with_handshake(Rc::new(handshake::Handshake::new(signers[2].clone(), None)));
+                    .with_signatures(signers[2].clone());
             Self {
                 admission,
                 reactor,

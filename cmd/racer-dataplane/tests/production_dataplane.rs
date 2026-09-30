@@ -26,7 +26,7 @@ use racer_dataplane::{
         range::PAGE_BYTES,
     },
     origin::client::OriginClient,
-    peer::{PeerNetwork, handshake::Handshake, requester::Requester, transfer::Transfers},
+    peer::{PeerNetwork, requester::Requester, transfer::Transfers},
     read::{
         candidates::CandidatePolicy,
         dispatch::{Dispatcher, WorkerDirectory, WorkerEndpoint},
@@ -527,14 +527,13 @@ impl Rig {
         let certificates = Rc::new(Certificates::new(ClusterId(CLUSTER.into()), keys.clone()));
         let signatures = Rc::new(Signatures::new(keys.clone(), certificates));
         let forwarding = Rc::new(Forwarding::new(signatures.clone()));
-        let transfers = Rc::new(Transfers::new(http.clone(), io.clone(), None));
-        let handshake = Rc::new(Handshake::new(signatures, None));
+        let transfers =
+            Rc::new(Transfers::new(http.clone(), io.clone(), None).with_signatures(signatures));
         let peers = Rc::new(
             Requester::new(
                 Rc::new(Paths::new(Rc::new(LinkHealth), 64)),
                 Rc::new(Rails),
                 forwarding,
-                handshake,
                 transfers,
             )
             .with_network(network),
