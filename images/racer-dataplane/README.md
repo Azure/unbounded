@@ -32,3 +32,30 @@ identity, and `/run/racer` mounts.
 
 See [deployment requirements](../../cmd/racer-dataplane/DEPLOYMENT.md) for storage,
 kernel policy, mounts, CPU/memory budgets, and current RDMA activation limits.
+
+## Dispatch a heap-profiling image
+
+The image workflow accepts an optional boolean `heap_profiling`, defaulting to
+`false`. Enable it only for `racer-dataplane`; other image names are rejected when
+it is enabled. For example, from a checkout of the repository:
+
+```sh
+gh workflow run images.yaml --ref <branch-or-tag> \
+  -f image=racer-dataplane -f platforms=linux/amd64 -F heap_profiling=true
+```
+
+This builds and pushes `ghcr.io/<owner>/racer-dataplane:<full-commit-sha>` with
+`RACER_HEAP_PROFILING=true`, enabling the Cargo `heap-profiling` feature, release
+debug information, and libunwind. It does not deploy the image or configure a
+Parca scrape. The tag has no profiling suffix, so dispatching again at the same
+commit with a different profiling setting overwrites that tag. Pin the resulting
+digest when deploying. Omit `platforms` to build both `linux/amd64` and
+`linux/arm64`. Omitting `heap_profiling` (or setting it to `false`) and tag-triggered
+builds retain the normal non-profiling behavior.
+
+Validate the workflow without building or pushing images:
+
+```sh
+timeout --signal=TERM --kill-after=10s 300s \
+  python3 -B -m unittest discover -s hack/scripts -p test_images_workflow.py
+```
