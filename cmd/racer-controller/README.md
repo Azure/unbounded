@@ -150,7 +150,11 @@ absent and preserves administrator data. Only installation wiring in `racer-conf
 an optimistic merge patch. Config payload hashes roll the consuming workload.
 Use the existing `unbounded-component-overrides` ConfigMap with `component: racer` and
 `kind: Deployment` or `kind: DaemonSet` for resources, environment, devices,
-scheduling, mounts, and RDMA. Invalid overrides withhold affected workload writes;
+scheduling, mounts, and RDMA. Racer DaemonSet entries require an explicit
+`name: racer-dataplane` or `name: racer-dataplane-podnet`. Add the host workload name
+to historical nameless entries before upgrading; nameless entries are rejected
+and both Racer DaemonSet writes are withheld, not broadened to both workloads.
+Invalid overrides withhold affected workload writes;
 removing valid overrides returns those fields to defaults through SSA.
 Deleting the last ClusterCache retains resources and pauses workload management,
 not all TLS maintenance. For an established installation with a validated permanent

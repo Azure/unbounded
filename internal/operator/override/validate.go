@@ -123,6 +123,10 @@ func validateEntry(sourced SourcedEntry) []string {
 
 	problems = append(problems, validateSites(entry, known, component.perSite)...)
 
+	if entry.Component == "racer" && entry.Kind == "DaemonSet" && entry.Name == "" {
+		problems = append(problems, "name is required for Racer DaemonSet overrides; select racer-dataplane or racer-dataplane-podnet explicitly")
+	}
+
 	if !entry.HasWork() {
 		problems = append(problems, "entry changes nothing; set patch, extraArgs, or both")
 	}

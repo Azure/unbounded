@@ -281,8 +281,8 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 			// TLS, metadata, allocator overhead and filesystem cache are additional.
 			container.Resources.Requests = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi")}
 
-			// Override affinity is intersected with every operator term. Legacy
-			// kind-only overrides target the host workload, not the pod-network one.
+			// Override affinity is intersected with every operator term. Overrides
+			// must name the host or pod-network workload explicitly.
 			op := component.Operation{Kind: component.OpApply, Object: component.ToUnstructured(ds), Component: name, Overridable: true}
 			for _, dependency := range plan.Operations {
 				if dependency.Object.GetKind() != "Deployment" {

@@ -73,10 +73,12 @@ Every key in the ConfigMap is parsed as an independent document, so you can spli
 by concern or by ownership.
 
 An entry can include `name` alongside `component` and `kind` to select an exact
-workload name. For Racer, a legacy `component: racer`, `kind: DaemonSet` entry
-without `name` continues to target only `racer-dataplane`. It does not target
-`racer-dataplane-podnet`. Use an explicit `name: racer-dataplane-podnet` entry for
-pod-network tuning. In particular, host-only underlay guard init containers and
+workload name. Racer `kind: DaemonSet` entries require an explicit name:
+`name: racer-dataplane` for the host workload or `name: racer-dataplane-podnet`
+for pod-network tuning. Historical nameless Racer DaemonSet entries are rejected,
+not applied to both workloads. Add `name: racer-dataplane` to those entries before
+upgrading; otherwise both Racer DaemonSet writes are withheld until the invalid
+entry is corrected. In particular, host-only underlay guard init containers and
 host-only affinity must remain on `racer-dataplane`; do not copy them to podnet.
 Required affinity is intersected with every operator term, including migration
 interlocks, and cannot broaden the operator's placement.

@@ -131,12 +131,13 @@ func TestEnvtestRacerMixedMigration(t *testing.T) {
 
 	config.Data["RACER_HOST_NETWORK"] = "true"
 	require.NoError(t, c.Update(ctx, config))
-	// A legacy kind-only host guard must survive mixed-mode SSA and must never
+	// An explicitly named host guard must survive mixed-mode SSA and must never
 	// land on podnet. Two user OR terms exercise all-term intersection.
 	document := `apiVersion: overrides.unbounded-cloud.io/v1alpha1
 overrides:
   - component: racer
     kind: DaemonSet
+    name: racer-dataplane
     addInitContainers: [underlay-guard]
     patch:
       spec:

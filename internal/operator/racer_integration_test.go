@@ -158,6 +158,7 @@ func integrationRacerOverrides(t *testing.T, c client.Client, key func(string) c
 overrides:
   - component: racer
     kind: DaemonSet
+    name: racer-dataplane
     patch:
       spec:
         template:

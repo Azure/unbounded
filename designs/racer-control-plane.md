@@ -621,7 +621,10 @@ Projection requires a kubelet and remains deployment verification.
 - The operator preserves existing ConfigMap payloads, repairs only installation
   wiring under optimistic concurrency, and hashes configuration for rollouts.
   SSA removes fields introduced by overrides when those overrides are removed;
-  invalid overrides withhold affected workloads. The immutable legacy selector is
+  invalid overrides withhold affected workloads. Racer DaemonSet overrides must
+  name `racer-dataplane` or `racer-dataplane-podnet` explicitly. Historical nameless
+  host overrides are rejected and withhold both DaemonSets until corrected; they
+  never broaden onto podnet. The immutable legacy selector is
   preserved, permitting adoption without DaemonSet recreation. Racer has no
   workload write path or mutation grant.
 - The managed service account has no API RBAC binding and automatic token mounting
@@ -762,8 +765,9 @@ timeout --signal=TERM --kill-after=10s 300s cargo test control::transport::tests
 ```
 
 The operator tests exercise weekly fresh keys, bounded old-root compatibility,
-legacy migration, delayed renewal/CA expiry, corrupt state, create/CAS races and
-lost responses, unchanged workload templates including legacy hash preservation,
+rejection of historical credentials without rotation state, delayed renewal/CA
+expiry, corrupt state, create/CAS races and lost responses, removal of the obsolete
+TLS hash annotation followed by unchanged workload templates during rotation,
 and claim-checked retained TLS/trust maintenance. These use fake Kubernetes clients,
 not a live API server (`internal/operator/components/racer/tls_test.go`,
 `internal/operator/components/racer/retained_tls_test.go`). Server tests exercise

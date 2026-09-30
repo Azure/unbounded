@@ -55,8 +55,8 @@ type Entry struct {
 	// Kind is Deployment or DaemonSet.
 	Kind string `yaml:"kind"`
 
-	// Name optionally selects an exact workload. Legacy Racer DaemonSet entries
-	// without a name target only racer-dataplane, never the pod-network workload.
+	// Name selects an exact workload. It is required for Racer DaemonSet entries
+	// to distinguish racer-dataplane from the pod-network workload.
 	Name string `json:"Name,omitempty" yaml:"name,omitempty"`
 
 	// Sites selects which Sites to affect, for per-Site components only.

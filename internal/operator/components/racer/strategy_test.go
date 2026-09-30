@@ -51,7 +51,12 @@ overrides:
         updateStrategy: ` + strategy + "\n"})
 	require.NoError(t, err)
 	require.Empty(t, problems)
-	require.NoError(t, override.ValidateErr(entries))
+
+	if name == "" {
+		require.ErrorContains(t, override.ValidateErr(entries), "name is required for Racer DaemonSet overrides")
+	} else {
+		require.NoError(t, override.ValidateErr(entries))
+	}
 
 	return entries
 }
@@ -62,7 +67,16 @@ func TestDaemonSetOnDeleteOverride(t *testing.T) {
 			env := testEnv(t)
 			plan := strategyPlan(t, env)
 			host, pod := plan.Operations[0].Object.DeepCopy(), plan.Operations[1].Object.DeepCopy()
+
 			entries := strategyEntries(t, name, "{type: OnDelete}")
+			if name == "" {
+				// Rejected entries must never reach Apply, whose input is validated.
+				require.Equal(t, host, plan.Operations[0].Object)
+				require.Equal(t, pod, plan.Operations[1].Object)
+
+				return
+			}
+
 			report := override.Apply(plan, entries, nil)
 			require.NoError(t, report.Err())
 			require.Len(t, report.Workloads, 1)
