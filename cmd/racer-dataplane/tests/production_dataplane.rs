@@ -866,7 +866,9 @@ fn check_subscription(reply: &Reply, version: u8, start: u64, end: u64, total: u
 #[test]
 fn v2_subscription_credits_persist_three_pages_and_serve_partial_disk_range_offline() {
     let length = 2 * P + 113;
-    let rig = Rig::with_dirty_pages(length, false, 4, 2);
+    // Fund every page independently of asynchronous write completion. Dirty-only
+    // pressure intentionally skips persistence and is covered by separate tests.
+    let rig = Rig::with_dirty_pages(length, false, 4, 3);
     check_subscription(&rig.subscribe(""), 1, 0, length, length);
     let calls = rig.adapter.calls();
     assert_eq!(calls.len(), 4);
