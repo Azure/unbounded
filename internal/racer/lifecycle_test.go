@@ -10,6 +10,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -87,43 +88,32 @@ func TestLifecycleReadyNotifications(t *testing.T) {
 		{name: "serving", set: (*Lifecycle).SetServingReady},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			l := newLifecycle(NewPublications())
+			r := initializedTopology(t)
+			reconcileTopology(t, r, t.Context())
+			l := newLifecycle(r.Publications)
+			l.leader, l.synced = t.Context(), true
+			l.SetIssuerReady(true)
+			l.SetServingReady(true)
+			tc.set(l, false)
 
 			for _, step := range []struct {
-				name   string
-				ready  bool
-				notify bool
+				name  string
+				ready bool
 			}{
 				{name: "initial false"},
-				{name: "become ready", ready: true, notify: true},
+				{name: "become ready", ready: true},
 				{name: "remain ready", ready: true},
-				{name: "withdraw readiness", notify: true},
+				{name: "withdraw readiness"},
 				{name: "remain unready"},
-				{name: "restore readiness", ready: true, notify: true},
+				{name: "restore readiness", ready: true},
 			} {
 				t.Run(step.name, func(t *testing.T) {
-					changed := l.changed
 					tc.set(l, step.ready)
 
-					select {
-					case <-changed:
-						if !step.notify {
-							t.Fatal("unchanged readiness notified subscribers")
-						}
-					default:
-						if step.notify {
-							t.Fatal("readiness transition did not notify subscribers")
-						}
-					}
-
-					if !step.notify && l.changed != changed {
-						t.Fatal("unchanged readiness replaced the subscription")
-					}
-
-					select {
-					case <-l.changed:
-						t.Fatal("new subscription is already closed")
-					default:
+					if step.ready {
+						require.NoError(t, l.Ready(nil))
+					} else {
+						require.ErrorIs(t, l.Ready(nil), wire.Unavailable)
 					}
 				})
 			}
@@ -183,12 +173,7 @@ func TestLifecycleGatesAndCancellation(t *testing.T) {
 
 	close(syncCache)
 
-	waitCtx, stopWait := context.WithTimeout(ctx, 5*time.Second)
-	defer stopWait()
-
-	if err := l.Wait(waitCtx); err != nil {
-		t.Fatal(err)
-	}
+	require.Eventually(t, func() bool { return l.Ready(nil) == nil }, 5*time.Second, time.Millisecond)
 
 	if err := l.Ready(nil); err != nil {
 		t.Fatal(err)
@@ -207,10 +192,6 @@ func TestLifecycleGatesAndCancellation(t *testing.T) {
 		t.Fatal("ready without listener")
 	}
 
-	if err := l.Wait(waitCtx); err != nil {
-		t.Fatalf("listener gate requires listener: %v", err)
-	}
-
 	cancel()
 
 	if err := <-started; err != nil {
@@ -224,62 +205,43 @@ func TestLifecycleGatesAndCancellation(t *testing.T) {
 		t.Fatal("old leadership resurrected")
 	}
 
-	if err := l.Wait(context.Background()); !errors.Is(err, context.Canceled) {
-		t.Fatalf("wait resurrected: %v", err)
-	}
-
 	if err := l.Start(context.Background()); !errors.Is(err, wire.Conflict) {
 		t.Fatalf("leadership restarted: %v", err)
 	}
 }
 
 func TestLifecycleWaitsForPublicationAndCancelsBeforeStartup(t *testing.T) {
-	r := initializedTopology(t)
-	l := newLifecycle(r.Publications)
-	l.waitForCacheSync = func(context.Context) bool { return true }
+	synctest.Test(t, func(t *testing.T) {
+		r := initializedTopology(t)
+		l := newLifecycle(r.Publications)
+		l.waitForCacheSync = func(context.Context) bool { return true }
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
 
-	done := make(chan error, 1)
+		done := make(chan error, 1)
 
-	go func() { done <- l.Start(ctx) }()
+		go func() { done <- l.Start(ctx) }()
 
-	l.SetIssuerReady(true)
+		synctest.Wait()
+		l.SetIssuerReady(true)
+		l.SetServingReady(true)
+		require.ErrorIs(t, l.Ready(nil), wire.Unavailable, "ready without publication")
 
-	waitCtx, stop := context.WithCancel(context.Background())
-	stop()
+		reconcileTopology(t, r, ctx)
+		require.NoError(t, l.Ready(nil))
 
-	if err := l.Wait(waitCtx); !errors.Is(err, context.Canceled) {
-		t.Fatalf("wait ignores request cancellation: %v", err)
-	}
+		cancel()
+		require.NoError(t, <-done)
+		require.ErrorIs(t, l.Ready(nil), wire.Unavailable)
 
-	ready := make(chan error, 1)
-
-	go func() { ready <- l.Wait(ctx) }()
-
-	select {
-	case err := <-ready:
-		t.Fatalf("ready without publication: %v", err)
-	default:
-	}
-
-	reconcileTopology(t, r, ctx)
-
-	select {
-	case err := <-ready:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("publication notification lost")
-	}
-
-	cancel()
-
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
+		beforeStartup := newLifecycle(r.Publications)
+		beforeStartup.waitForCacheSync = func(ctx context.Context) bool { return ctx.Err() == nil }
+		require.NoError(t, beforeStartup.Start(ctx))
+		beforeStartup.SetIssuerReady(true)
+		beforeStartup.SetServingReady(true)
+		require.ErrorIs(t, beforeStartup.Ready(nil), wire.Unavailable, "canceled startup became ready")
+	})
 }
 
 func TestInitialEnqueueEmptyInputsAndCoalescing(t *testing.T) {

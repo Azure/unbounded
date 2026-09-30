@@ -20,13 +20,12 @@ type Lifecycle struct {
 	synced           bool
 	issuer           bool
 	serving          bool
-	changed          chan struct{}
 	publications     *Publications
 	waitForCacheSync func(context.Context) bool
 }
 
 func newLifecycle(p *Publications) *Lifecycle {
-	return &Lifecycle{publications: p, changed: make(chan struct{})}
+	return &Lifecycle{publications: p}
 }
 
 func (*Lifecycle) NeedLeaderElection() bool { return false }
@@ -57,8 +56,6 @@ func (l *Lifecycle) LeaderContext(parent context.Context) (context.Context, cont
 	return ctx, func() { stop(); cancel() }
 }
 
-func (l *Lifecycle) notifyLocked() { close(l.changed); l.changed = make(chan struct{}) }
-
 func (l *Lifecycle) Start(ctx context.Context) error {
 	l.mu.Lock()
 	if l.started {
@@ -68,13 +65,11 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 
 	l.started, l.leader = true, ctx
 	l.publications.bindProcess(ctx)
-	l.notifyLocked()
 	l.mu.Unlock()
 
 	defer func() {
 		l.mu.Lock()
 		l.synced, l.issuer, l.serving = false, false, false
-		l.notifyLocked()
 		l.mu.Unlock()
 	}()
 
@@ -88,7 +83,6 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 
 	l.mu.Lock()
 	l.synced = ctx.Err() == nil
-	l.notifyLocked()
 	l.mu.Unlock()
 	<-ctx.Done()
 
@@ -98,76 +92,24 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 // SetIssuerReady must be reset on loss of usable signing material/trust.
 func (l *Lifecycle) SetIssuerReady(ready bool) {
 	l.mu.Lock()
-	if l.issuer != ready {
-		l.issuer = ready
-		l.notifyLocked()
-	}
+	l.issuer = ready
 	l.mu.Unlock()
 }
 
 // SetServingReady is set only after the authenticated listener is accepting.
 func (l *Lifecycle) SetServingReady(ready bool) {
 	l.mu.Lock()
-	if l.serving != ready {
-		l.serving = ready
-		l.notifyLocked()
-	}
+	l.serving = ready
 	l.mu.Unlock()
-}
-
-func (l *Lifecycle) readyLocked(serving bool) error {
-	if l.leader == nil || l.leader.Err() != nil || !l.synced || !l.issuer || serving && !l.serving {
-		return wire.Unavailable
-	}
-
-	return nil
 }
 
 func (l *Lifecycle) Ready(_ *http.Request) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if err := l.readyLocked(true); err != nil {
-		return err
+	if l.leader == nil || l.leader.Err() != nil || !l.synced || !l.issuer || !l.serving {
+		return wire.Unavailable
 	}
 
 	return l.publications.Ready(nil)
-}
-
-// Wait waits for synchronized inputs, issuer/trust, and a validated publication.
-// Listener startup deliberately does not use this public readiness gate.
-func (l *Lifecycle) Wait(ctx context.Context) error {
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
-		l.mu.Lock()
-		err := l.readyLocked(false)
-		changed := l.changed
-
-		var stopped <-chan struct{}
-		if l.leader != nil {
-			stopped = l.leader.Done()
-		}
-
-		_, published, publicationErr := l.publications.CurrentAndSubscribe()
-		if err == nil {
-			err = publicationErr
-		}
-		l.mu.Unlock()
-
-		if err == nil {
-			return nil
-		}
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-stopped:
-			return context.Canceled
-		case <-changed:
-		case <-published:
-		}
-	}
 }

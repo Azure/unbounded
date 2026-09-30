@@ -18,10 +18,7 @@ const (
 	MaxPublicationBytes = 64 * 1024 * 1024
 	MaxMembers          = 100_000
 	PollWait            = 30 * time.Second
-	RetryMin            = time.Second
-	RetryMax            = 30 * time.Second
 	CertificateLifetime = 24 * time.Hour
-	RenewAfter          = 16 * time.Hour
 	DefaultShares       = 4
 	SharesAnnotation    = "racer.unbounded-cloud.io/shares"
 	RailsAnnotation     = "racer.unbounded-cloud.io/rails"
