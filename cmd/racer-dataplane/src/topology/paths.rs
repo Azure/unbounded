@@ -118,6 +118,7 @@ struct PathCache {
 }
 
 pub struct Paths {
+    pub(crate) peer_admission: Option<Arc<crate::peer::adaptive::AdaptivePeers>>,
     algorithm: RoutingAlgorithm,
     health: Rc<LinkHealth>,
     capacity: usize,
@@ -132,6 +133,13 @@ impl Drop for SearchAdmission<'_> {
     }
 }
 impl Paths {
+    pub(crate) fn with_peer_admission(
+        mut self,
+        admission: Arc<crate::peer::adaptive::AdaptivePeers>,
+    ) -> Self {
+        self.peer_admission = Some(admission);
+        self
+    }
     pub fn link_health(&self) -> Rc<LinkHealth> {
         self.health.clone()
     }
@@ -145,6 +153,7 @@ impl Paths {
     ) -> Self {
         Self {
             algorithm,
+            peer_admission: None,
             health,
             capacity,
             cache: RefCell::new(PathCache::default()),
@@ -254,6 +263,10 @@ impl Paths {
             if !self
                 .health
                 .available(&membership.members()[neighbor].node)?
+                || self
+                    .peer_admission
+                    .as_ref()
+                    .is_some_and(|a| !a.available(&membership.members()[neighbor].node))
             {
                 failed.push(neighbor);
             }
@@ -942,6 +955,36 @@ mod tests {
                 .nodes,
             vec![source.clone()]
         );
+    }
+
+    #[test]
+    fn adaptive_shared_failure_invalidates_each_workers_route_choice() {
+        let members = membership(1500);
+        let shared =
+            crate::peer::adaptive::AdaptivePeers::new(Default::default(), Default::default())
+                .unwrap();
+        let paths = Paths::with_algorithm(Rc::new(LinkHealth), 4, RoutingAlgorithm::V5)
+            .with_peer_admission(shared.clone());
+        let other = Paths::with_algorithm(Rc::new(LinkHealth), 4, RoutingAlgorithm::V5)
+            .with_peer_admission(shared.clone());
+        let from = &members.members()[0].node;
+        let request = budget(&members, 1499, NORMAL_LINKS);
+        let before = paths.shortest(members.clone(), from, &request).unwrap();
+        assert_eq!(
+            other
+                .shortest(members.clone(), from, &request)
+                .unwrap()
+                .nodes,
+            before.nodes
+        );
+        let permit = shared.acquire(&before.nodes[1]).unwrap();
+        permit.observe(crate::peer::adaptive::Outcome::PeerFailure);
+        for worker in [&paths, &other] {
+            let after = worker.shortest(members.clone(), from, &request).unwrap();
+            assert_ne!(after.nodes[1], before.nodes[1]);
+            assert_eq!(after.nodes.last(), before.nodes.last());
+            assert!(after.nodes.len() - 1 <= request.remaining_links as usize);
+        }
     }
 
     #[test]

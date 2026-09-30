@@ -186,6 +186,29 @@ impl VerifiedResponse {
     }
 }
 impl Forwarding {
+    /// Retain the locally emitted route for verification at the transport boundary.
+    /// Response verification still authenticates the original signature and path.
+    pub(crate) fn outbound_binding(&self, request: &SignedRequest) -> Result<RequestBinding> {
+        let route = RouteState::from_budget(&request.request.route)?;
+        if route.visited.last() != Some(self.signatures.node()) {
+            return Err(Error::Unauthorized);
+        }
+        Ok(RequestBinding {
+            original: request.authentication.original.clone(),
+            path: route.visited,
+            deadline: route.deadline,
+        })
+    }
+    pub(crate) fn verify_opaque(
+        &self,
+        auth: &ForwardedHead,
+        length: usize,
+        request: &RequestBinding,
+    ) -> Result<()> {
+        let expected = crate::peer::decode::opaque_response_head(&auth.original.head, length)?;
+        self.verify_response_head(auth, &expected, request)?;
+        Ok(())
+    }
     pub fn new(signatures: Rc<Signatures>) -> Self {
         Self { signatures }
     }

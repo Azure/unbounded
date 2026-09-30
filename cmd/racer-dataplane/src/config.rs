@@ -27,6 +27,7 @@ const MAX_ENTRIES: usize = 1_048_576;
 const MAX_FABRIC_FILE_BYTES: usize = 65_536;
 
 pub struct Config {
+    pub peer_admission: crate::peer::adaptive::Config,
     pub shares: std::num::NonZeroU32,
     pub disk_page_entries: NonZeroUsize,
     pub checkpoint_bytes: NonZeroUsize,
@@ -194,6 +195,10 @@ impl Config {
             value.parse().map_err(|_| Error::InvalidConfiguration)
         };
         let max_threads = to_usize(number("RACER_MAX_THREADS", DEFAULT_MAX_THREADS as u64)?)?;
+        let peer_admission = crate::peer::adaptive::Config {
+            total: to_usize(number("RACER_PEER_INFLIGHT_MAX", 256)?)?,
+            per_peer: to_usize(number("RACER_PEER_PER_NEIGHBOR_MAX", 32)?)?,
+        };
         let shares = std::num::NonZeroU32::new(
             u32::try_from(number("RACER_SHARES", 4)?).map_err(|_| Error::InvalidConfiguration)?,
         )
@@ -239,6 +244,7 @@ impl Config {
         let disk_page_entries = limit("RACER_DISK_PAGE_ENTRIES", 65536)?;
         let checkpoint_bytes = limit("RACER_CHECKPOINT_BYTES", 64 * MIB)?;
         let config = Self {
+            peer_admission,
             shares,
             disk_page_entries,
             checkpoint_bytes,
@@ -272,6 +278,7 @@ impl Config {
     /// Check arithmetic and progress reserves; filesystem alignment is additionally
     /// discovered and checked by store::slab at open, not guessed from this config.
     pub fn validate(&self) -> Result<()> {
+        self.peer_admission.validate()?;
         if self.disk_page_entries.get() > MAX_ENTRIES
             || self.checkpoint_bytes.get() > 512 * MIB as usize
         {
@@ -1163,6 +1170,25 @@ mod tests {
         assert_eq!(config.limits.connections_per_neighbor.get(), 2);
         assert_eq!(config.validate(), Ok(()));
         assert!(parse(&[("RACER_ENABLE_RDMA", "true"), ("RACER_MAX_THREADS", "7")]).is_ok());
+    }
+
+    #[test]
+    fn peer_admission_environment_is_bounded_and_node_scoped() {
+        let config = parse(&[
+            ("RACER_PEER_INFLIGHT_MAX", "8"),
+            ("RACER_PEER_PER_NEIGHBOR_MAX", "2"),
+        ])
+        .unwrap();
+        assert_eq!(config.peer_admission.total, 8);
+        assert_eq!(config.peer_admission.per_peer, 2);
+        for overrides in [
+            vec![("RACER_PEER_INFLIGHT_MAX", "0")],
+            vec![("RACER_PEER_INFLIGHT_MAX", "65537")],
+            vec![("RACER_PEER_PER_NEIGHBOR_MAX", "0")],
+            vec![("RACER_PEER_PER_NEIGHBOR_MAX", "257")],
+        ] {
+            assert!(parse(&overrides).is_err());
+        }
     }
 
     #[test]

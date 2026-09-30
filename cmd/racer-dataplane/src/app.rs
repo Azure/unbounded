@@ -106,6 +106,7 @@ pub struct Application {
 /// Shared immutable-publication and partitioned-admission roots. No Rc worker
 /// graph crosses a thread. Worker zero alone drives enrollment/control reloads.
 pub struct NodeState {
+    peer_admission: Arc<crate::peer::adaptive::AdaptivePeers>,
     subscriptions: Arc<crate::peer::subscriptions::Subscriptions>,
     ingress: Arc<crate::runtime::ingress::Ingress>,
     metrics: Vec<(WorkerId, crate::telemetry::metrics::Metrics)>,
@@ -141,19 +142,26 @@ impl Default for NodeState {
 }
 impl NodeState {
     fn new(workers: Vec<WorkerId>, capacity: usize) -> Result<Self> {
+        Self::with_peer_admission(workers, capacity, Default::default())
+    }
+    fn with_peer_admission(
+        workers: Vec<WorkerId>,
+        capacity: usize,
+        peer_config: crate::peer::adaptive::Config,
+    ) -> Result<Self> {
         let count = workers.len();
         let map = Arc::new(WorkerMap::new(workers.clone())?);
+        let metrics = crate::telemetry::metrics::Metrics::for_workers(count)?;
+        let peer_admission =
+            crate::peer::adaptive::AdaptivePeers::new(peer_config, metrics[0].clone())?;
         Ok(Self {
+            peer_admission,
             ingress: Arc::new(crate::runtime::ingress::Ingress::new(&workers)),
             subscriptions: Arc::new(crate::peer::subscriptions::Subscriptions::new(
                 Default::default(),
             )?),
             publications: Arc::new(PublishedState::default()),
-            metrics: workers
-                .iter()
-                .copied()
-                .zip(crate::telemetry::metrics::Metrics::for_workers(count)?)
-                .collect(),
+            metrics: workers.iter().copied().zip(metrics).collect(),
             failures: crate::telemetry::failures::Failures::default(),
             keys: Arc::new(KeyEpochs::default()),
             control_worker: WorkerId(0),
@@ -187,9 +195,10 @@ impl Application {
         log_worker_plan("planned", &plan);
         self.limits = size_workers(&self.config.limits, &mut plan, self.config.enable_rdma)?;
         log_worker_plan("final", &plan);
-        self.node = Arc::new(NodeState::new(
+        self.node = Arc::new(NodeState::with_peer_admission(
             plan.pairs.iter().map(|p| p.worker).collect(),
             self.limits.queue_entries.get(),
+            self.config.peer_admission,
         )?);
         if self.config.enable_rdma {
             self.node.native.place(&plan)?;
@@ -506,6 +515,8 @@ impl Drop for SignalGuard {
 /// Node-level control events enter through bounded worker commands. Mutable state
 /// is not implicitly made global by Arc/Mutex or by a background async runtime.
 pub struct WorkerApplication {
+    #[cfg(test)]
+    peer_requester: Rc<Requester>,
     ingress_peers: futures::stream::FuturesUnordered<Operation<'static, ()>>,
     next_health: std::time::Instant,
     environment: crate::runtime::environment::Environment,
@@ -730,11 +741,14 @@ impl WorkerApplication {
             (None, None, None)
         };
 
-        let paths = Rc::new(Paths::with_algorithm(
-            Rc::new(LinkHealth),
-            limits.cached_paths.get(),
-            config.routing_algorithm,
-        ));
+        let paths = Rc::new(
+            Paths::with_algorithm(
+                Rc::new(LinkHealth),
+                limits.cached_paths.get(),
+                config.routing_algorithm,
+            )
+            .with_peer_admission(node.peer_admission.clone()),
+        );
         let placement = Rc::new(Placement::with_memory_budget(
             limits.cached_rankings.get() * crate::topology::placement::RANKING_BYTES,
         ));
@@ -856,8 +870,13 @@ impl WorkerApplication {
             .with_availability(availability),
         );
         let relay = Rc::new(
-            Relay::new(paths, forwarding.clone(), requester, admission.clone())
-                .with_network(network.clone()),
+            Relay::new(
+                paths,
+                forwarding.clone(),
+                requester.clone(),
+                admission.clone(),
+            )
+            .with_network(network.clone()),
         );
         let dispatcher = Rc::new(Dispatcher::new(
             worker,
@@ -913,6 +932,8 @@ impl WorkerApplication {
         telemetry.health = node.observations.health.clone();
         Ok(Self {
             ingress_peers: futures::stream::FuturesUnordered::new(),
+            #[cfg(test)]
+            peer_requester: requester,
             http,
             environment,
             drivers,

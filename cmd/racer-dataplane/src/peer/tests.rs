@@ -97,7 +97,7 @@ pub(super) fn signers() -> Vec<Rc<Signatures>> {
     let (signers, _) = identities();
     signers
 }
-fn request(admission: &Admission, attempt: u8) -> PeerRequest {
+pub(super) fn request(admission: &Admission, attempt: u8) -> PeerRequest {
     let scope =
         RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(30)).unwrap();
     let object = ObjectId {
@@ -1196,7 +1196,10 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
         .unwrap(),
     );
     let destination_auth = Rc::new(Forwarding::new(signers[2].clone()));
-    let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4));
+    let metrics = crate::telemetry::metrics::Metrics::default();
+    let adaptive =
+        super::adaptive::AdaptivePeers::new(Default::default(), metrics.clone()).unwrap();
+    let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4).with_peer_admission(adaptive));
     let relay = Rc::new(
         relay::Relay::new(
             paths.clone(),
@@ -1254,6 +1257,18 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
         reactor.wait(Duration::from_millis(1)).unwrap();
     };
     assert!(matches!(response.response(), PeerResponse::Miss));
+    assert_eq!(
+        metrics.count(crate::telemetry::metrics::Event::PeerAdmissionAccepted),
+        1
+    );
+    assert_eq!(
+        metrics.count(crate::telemetry::metrics::Event::PeerVerified),
+        1
+    );
+    assert_eq!(
+        metrics.gauge(crate::telemetry::metrics::Gauge::PeerExchanges),
+        0
+    );
     assert_eq!(
         health.tracked_links(),
         0,

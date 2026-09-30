@@ -62,6 +62,37 @@ fn worker_servers_share_one_node_wide_subscription_owner() {
 }
 
 #[test]
+fn worker_requesters_share_configured_admission_and_production_metrics() {
+    use crate::telemetry::metrics::{Event, Gauge};
+    let mut config = crate::test_support::cluster::config(false);
+    config.peer_admission = crate::peer::adaptive::Config {
+        total: 2,
+        per_peer: 1,
+    };
+    let node = Arc::new(
+        NodeState::with_peer_admission(vec![WorkerId(0), WorkerId(1)], 16, config.peer_admission)
+            .unwrap(),
+    );
+    let (first, _, _) = local_worker(&config, &node, 0);
+    let (second, _, _) = local_worker(&config, &node, 1);
+    let a = first.peer_requester.admission();
+    let b = second.peer_requester.admission();
+    assert!(Arc::ptr_eq(a, b));
+    assert!(Arc::ptr_eq(a, &node.peer_admission));
+    let peer = NodeId("test-peer".into());
+    let permit = a.acquire(&peer).unwrap();
+    assert!(matches!(b.acquire(&peer), Err(Error::Overloaded)));
+    assert_eq!(node.metrics[1].1.count(Event::PeerAdmissionAccepted), 1);
+    assert_eq!(node.metrics[1].1.count(Event::PeerAdmissionRejected), 1);
+    assert_eq!(node.metrics[1].1.gauge(Gauge::PeerExchanges), 1);
+    assert_eq!(node.metrics[1].1.gauge(Gauge::PeerAdmissionLimit), 2);
+    permit.observe(crate::peer::adaptive::Outcome::PeerFailure);
+    assert!(!b.available(&peer));
+    drop(permit);
+    assert_eq!(node.metrics[1].1.gauge(Gauge::PeerExchanges), 0);
+}
+
+#[test]
 fn distributed_peer_listener_recovers_from_queue_pressure() {
     let mut config = crate::test_support::cluster::config(false);
     config.limits.queue_entries = NonZeroUsize::new(8).unwrap();

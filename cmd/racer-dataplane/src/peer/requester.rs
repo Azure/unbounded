@@ -79,6 +79,10 @@ pub struct Requester {
     network: Rc<super::PeerNetwork>,
 }
 impl Requester {
+    #[cfg(test)]
+    pub(crate) fn admission(&self) -> &std::sync::Arc<super::adaptive::AdaptivePeers> {
+        self.paths.peer_admission.as_ref().unwrap()
+    }
     pub fn new(
         paths: Rc<Paths>,
         forwarding: Rc<Forwarding>,
@@ -210,27 +214,156 @@ impl Requester {
                 crate::topology::rails::TransportPlan::Http
             };
             let _probe = self.health.acquire(&next)?;
+            let permit = self
+                .paths
+                .peer_admission
+                .as_ref()
+                .map(|a| a.acquire(&next))
+                .transpose()?;
+            let binding = self.forwarding.outbound_binding(&request)?;
+            let socket_failure = Rc::new(std::cell::Cell::new(false));
             let response = self
                 .transfers
-                .exchange_inner(endpoint, request, plan, relay, &scope)
+                .exchange_inner(
+                    endpoint,
+                    request,
+                    plan,
+                    relay,
+                    permit.clone(),
+                    socket_failure.clone(),
+                    &scope,
+                )
                 .await;
-            // A signed application response (including miss, 401 or 403) proves
-            // the immediate transport works. It is verified by the logical owner.
+            // Receiving a signed envelope is not proof. Recover only after the
+            // complete reverse chain and original request binding are verified.
+            let response = response.and_then(|response| self.verify_exchange(response, &binding));
             use crate::topology::health::LinkOutcome;
             let outcome = match &response {
-                Ok(_) => Some(LinkOutcome::Success),
-                Err(Error::Io | Error::Unavailable) => Some(LinkOutcome::Refused),
-                Err(Error::DeadlineExceeded) => Some(LinkOutcome::Timeout),
-                Err(Error::CorruptRecord | Error::InvalidRequest) => {
-                    Some(LinkOutcome::ProtocolFailure)
-                }
+                Ok(super::transfer::RelayResponse::Complete(_)) => Some(LinkOutcome::Success),
+                Err(_) if permit.is_none() && socket_failure.get() => Some(LinkOutcome::Refused),
+                // Unavailable/deadline/protocol errors can arise locally or at a
+                // downstream node. Do not blame an immediate peer without evidence.
                 _ => None,
             };
             if let Some(outcome) = outcome {
                 self.health.observe(&next, outcome)?;
             }
+            if let Some(permit) = permit {
+                permit.observe(match &response {
+                    // A downstream overload is not attributable to the immediate
+                    // peer. It also must not increase its admission or recover a probe.
+                    Ok(super::transfer::RelayResponse::Complete(response))
+                        if matches!(response.response, super::wire::PeerResponse::Overloaded) =>
+                    {
+                        super::adaptive::Outcome::Neutral
+                    }
+                    Ok(super::transfer::RelayResponse::Complete(_)) => {
+                        super::adaptive::Outcome::Verified
+                    }
+                    Err(Error::Overloaded) => super::adaptive::Outcome::LocalPressure,
+                    _ => super::adaptive::Outcome::Neutral,
+                });
+            }
             drop(membership);
             response
         })
+    }
+
+    fn verify_exchange(
+        &self,
+        response: super::transfer::RelayResponse,
+        binding: &crate::security::forwarding::RequestBinding,
+    ) -> crate::error::Result<super::transfer::RelayResponse> {
+        match response {
+            super::transfer::RelayResponse::Complete(response) => self
+                .forwarding
+                .verify_response(response, binding)
+                .map(|verified| super::transfer::RelayResponse::Complete(verified.into_signed())),
+            super::transfer::RelayResponse::Http {
+                authentication,
+                mut connection,
+                length,
+            } => {
+                self.forwarding
+                    .verify_opaque(&authentication, length, binding)?;
+                // Error responses do not attest useful capacity, even when
+                // authenticated. Opaque success recovers only after body framing.
+                connection.peer_response_verified = matches!(
+                    authentication.original.head.start,
+                    crate::http::codec::StartLine::Response { status: 200..=299 }
+                );
+                Ok(super::transfer::RelayResponse::Http {
+                    authentication,
+                    connection,
+                    length,
+                })
+            }
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn invalid_response_never_recovers_half_open_peer() {
+        use crate::{
+            model::NodeId,
+            peer::wire::PeerResponse,
+            telemetry::metrics::{Event, Metrics},
+            topology::health::LinkHealth,
+        };
+        let clock = crate::runtime::environment::SimulationClock::new(782);
+        let _env = clock.environment(0).enter();
+        let signers = crate::peer::tests::signers();
+        let admission = Rc::new(crate::runtime::admission::Admission::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let reactor = Rc::new(crate::runtime::reactor::Reactor::new(admission.clone()));
+        let io = Rc::new(crate::http::io::HttpIo::with_admission(
+            reactor.clone(),
+            crate::http::codec::Codec::new(crate::peer::wire::MAX_ENVELOPE_HEAD, 0),
+            admission.clone(),
+        ));
+        let pool = Rc::new(crate::http::pool::HttpPool::new(
+            reactor,
+            admission.clone(),
+            2,
+        ));
+        let forwarding = Rc::new(Forwarding::new(signers[0].clone()));
+        let requester = Requester::new(
+            Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
+            forwarding.clone(),
+            Rc::new(Transfers::new(pool, io, None)),
+            Rc::new(
+                super::super::PeerNetwork::new(signers[0].node().clone(), Default::default())
+                    .unwrap(),
+            ),
+        );
+        let metrics = Metrics::default();
+        let adaptive =
+            super::super::adaptive::AdaptivePeers::new(Default::default(), metrics.clone())
+                .unwrap();
+        let node: NodeId = signers[2].node().clone();
+        let permit = adaptive.acquire(&node).unwrap();
+        permit.observe(super::super::adaptive::Outcome::PeerFailure);
+        drop(permit);
+        clock.advance(std::time::Duration::from_secs(1));
+        let probe = adaptive.acquire(&node).unwrap();
+        let request = crate::peer::tests::request(&admission, 81);
+        let (signed, binding) = forwarding.sign_request(request).unwrap();
+        let destination = Forwarding::new(signers[2].clone());
+        let admitted = destination.verify_request(signed).unwrap();
+        let mut response = destination
+            .sign_response(admitted.binding(), PeerResponse::Miss)
+            .unwrap();
+        response.response = PeerResponse::Overloaded;
+        let result = requester.verify_exchange(
+            super::super::transfer::RelayResponse::Complete(response),
+            &binding,
+        );
+        assert!(result.is_err());
+        assert_eq!(metrics.count(Event::PeerVerified), 0);
+        drop(probe);
+        assert!(!adaptive.available(&node));
     }
 }

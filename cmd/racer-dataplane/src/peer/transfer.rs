@@ -58,6 +58,62 @@ impl IoBuffer for WireBuffer {
 
 type ReclaimCiphertext = dyn Fn(&crate::model::CacheId, usize);
 
+/// Only errors from an actual socket operation with a live scope are link
+/// evidence. Checkout, local allocation, decoding and deadline expiry are not.
+fn observe_socket<T>(
+    result: Result<T>,
+    permit: &Option<std::sync::Arc<super::adaptive::Permit>>,
+    failure: &Rc<std::cell::Cell<bool>>,
+    scope: &RequestScope,
+) -> Result<T> {
+    if matches!(&result, Err(Error::Io)) && scope.check().is_ok() {
+        failure.set(true);
+        if let Some(permit) = permit {
+            permit.observe(super::adaptive::Outcome::PeerFailure);
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+#[test]
+fn adaptive_socket_attribution_ignores_local_pressure_and_expired_scope() {
+    let scope = RequestScope::new(
+        crate::model::identity::RequestId([91; 16]),
+        crate::runtime::environment::now() + std::time::Duration::from_secs(10),
+    )
+    .unwrap();
+    let owner =
+        super::adaptive::AdaptivePeers::new(Default::default(), Default::default()).unwrap();
+    let node = crate::model::identity::NodeId("peer".into());
+    let permit = Some(owner.acquire(&node).unwrap());
+    let failed = Rc::new(std::cell::Cell::new(false));
+    for error in [
+        Error::Overloaded,
+        Error::Unavailable,
+        Error::DeadlineExceeded,
+        Error::Cancelled,
+        Error::InvalidRequest,
+    ] {
+        assert_eq!(
+            observe_socket::<()>(Err(error), &permit, &failed, &scope),
+            Err(error)
+        );
+        assert!(!failed.get());
+        assert!(owner.available(&node));
+    }
+    assert_eq!(
+        observe_socket::<()>(Err(Error::Io), &permit, &failed, &scope),
+        Err(Error::Io)
+    );
+    assert!(failed.get());
+    assert!(!owner.available(&node));
+    failed.set(false);
+    scope.cancel().unwrap();
+    let _ = observe_socket::<()>(Err(Error::Io), &permit, &failed, &scope);
+    assert!(!failed.get());
+}
+
 /// Internal transport result: native delivery stays materialized; HTTP relay
 /// delivery owns an unfinished connection and its exact opaque body framing.
 pub enum RelayResponse {
@@ -238,7 +294,15 @@ impl Transfers {
     ) -> Operation<'a, SignedResponse> {
         Box::pin(async move {
             match self
-                .exchange_inner(endpoint, request, plan, None, scope)
+                .exchange_inner(
+                    endpoint,
+                    request,
+                    plan,
+                    None,
+                    None,
+                    Rc::new(std::cell::Cell::new(false)),
+                    scope,
+                )
                 .await?
             {
                 RelayResponse::Complete(response) => Ok(response),
@@ -252,6 +316,8 @@ impl Transfers {
         request: SignedRequest,
         plan: TransportPlan,
         relay: Option<Rc<Reservation>>,
+        peer_admission: Option<std::sync::Arc<super::adaptive::Permit>>,
+        failure: Rc<std::cell::Cell<bool>>,
         scope: &'a RequestScope,
     ) -> Operation<'a, RelayResponse> {
         Box::pin(async move {
@@ -288,9 +354,16 @@ impl Transfers {
                 Stage::PeerCheckout,
                 scope,
                 self.http
-                    .checkout_relay(&endpoint, relay.clone(), scope)
+                    .checkout_peer(
+                        &endpoint,
+                        relay.clone(),
+                        peer_admission.clone(),
+                        Some(failure.clone()),
+                        scope,
+                    )
                     .await,
             )?;
+            connection.peer_admission = peer_admission.clone();
             connection.relay_reservation = relay.clone();
             // Connection and handshake get separate bounded idle allowances.
             // No header byte can renew the request/head allowance.
@@ -304,10 +377,15 @@ impl Transfers {
                 observer.result(
                     Stage::PeerHandshake,
                     scope,
-                    crate::security::connection::connect(
-                        &self.io, connection, signatures, &peer, scope,
-                    )
-                    .await,
+                    observe_socket(
+                        crate::security::connection::connect(
+                            &self.io, connection, signatures, &peer, scope,
+                        )
+                        .await,
+                        &peer_admission,
+                        &failure,
+                        scope,
+                    ),
                 )?
             };
             let native = self.accept_native(&request, plan, scope)?;
@@ -318,12 +396,22 @@ impl Transfers {
             let sent = observer.result(
                 Stage::PeerHead,
                 scope,
-                self.io.send_head(connection, head, scope).await,
+                observe_socket(
+                    self.io.send_head(connection, head, scope).await,
+                    &peer_admission,
+                    &failure,
+                    scope,
+                ),
             )?;
             let mut received = observer.result(
                 Stage::PeerHead,
                 scope,
-                self.io.receive_head(sent.connection, scope).await,
+                observe_socket(
+                    self.io.receive_head(sent.connection, scope).await,
+                    &peer_admission,
+                    &failure,
+                    scope,
+                ),
             )?;
             let control = super::native::detach(&mut received.value)?;
             let relay_context = if relay.is_some() {
@@ -433,12 +521,12 @@ impl Transfers {
                         Ok(completion) => completion,
                         Err(error) => {
                             record(error, offset, first, last, reads);
-                            return Err(error);
+                            return observe_socket(Err(error), &peer_admission, &failure, scope);
                         }
                     };
                     if completion.bytes == 0 || completion.bytes > length - offset {
                         record(Error::Io, offset, first, last, reads);
-                        return Err(Error::Io);
+                        return observe_socket(Err(Error::Io), &peer_admission, &failure, scope);
                     }
                     offset += completion.bytes;
                     let now = crate::runtime::environment::now();

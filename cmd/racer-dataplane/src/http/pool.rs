@@ -99,6 +99,9 @@ struct ReturnToPool {
 /// Exclusive connection ownership follows every submitted operation into the
 /// reactor. Drop is a pool return only after explicit successful finish_exchange.
 pub struct ConnectionLease {
+    // Follows submitted I/O and opaque bodies through the actual completion fence.
+    pub(crate) peer_admission: Option<std::sync::Arc<crate::peer::adaptive::Permit>>,
+    pub(crate) peer_response_verified: bool,
     #[cfg(test)]
     pub(crate) relay_fallback: bool,
     #[cfg(test)]
@@ -140,6 +143,8 @@ impl ConnectionLease {
     ) -> Self {
         Self {
             fd,
+            peer_admission: None,
+            peer_response_verified: false,
             #[cfg(test)]
             relay_fallback: false,
             #[cfg(test)]
@@ -179,6 +184,12 @@ impl ConnectionLease {
     /// Unexpected pipelined/read-ahead data prevents pool return.
     pub fn finish_exchange(&mut self) -> Result<()> {
         self.next_round()?;
+        if self.peer_response_verified {
+            if let Some(permit) = &self.peer_admission {
+                permit.observe(crate::peer::adaptive::Outcome::Verified);
+            }
+            self.peer_response_verified = false;
+        }
         self.reusable = !self.close;
         Ok(())
     }
@@ -313,11 +324,31 @@ impl HttpPool {
         relay: Option<Rc<Reservation>>,
         scope: &'a RequestScope,
     ) -> Operation<'a, ConnectionLease> {
+        self.checkout_peer(endpoint, relay, None, None, scope)
+    }
+    pub(crate) fn checkout_peer<'a>(
+        &'a self,
+        endpoint: &'a Endpoint,
+        relay: Option<Rc<Reservation>>,
+        peer: Option<std::sync::Arc<crate::peer::adaptive::Permit>>,
+        failure: Option<Rc<std::cell::Cell<bool>>>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, ConnectionLease> {
         Box::pin(async move {
             scope.check()?;
             let (mut connection, address) = self.prepare_connection(endpoint)?;
             connection.relay_reservation = relay;
-            self.connect(connection, address, scope).await
+            connection.peer_admission = peer.clone();
+            let result = self.connect(connection, address, scope).await;
+            if matches!(&result, Err(Error::Io)) && scope.check().is_ok() {
+                if let Some(failure) = failure {
+                    failure.set(true);
+                }
+                if let Some(peer) = peer {
+                    peer.observe(crate::peer::adaptive::Outcome::PeerFailure);
+                }
+            }
+            result
         })
     }
 

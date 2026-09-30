@@ -1,4 +1,5 @@
 //! Peer transport interfaces injected into reads; local service injected into server.
+pub mod adaptive;
 pub(crate) mod decode;
 mod native;
 mod native_io;

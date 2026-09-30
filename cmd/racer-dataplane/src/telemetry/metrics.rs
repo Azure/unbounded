@@ -5,8 +5,8 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-pub const EVENT_COUNT: usize = 50;
-pub const GAUGE_COUNT: usize = 11;
+pub const EVENT_COUNT: usize = 57;
+pub const GAUGE_COUNT: usize = 13;
 #[derive(Clone, Copy)]
 pub(crate) enum LookupTier {
     Plaintext,
@@ -55,6 +55,13 @@ impl Default for Metrics {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
 pub enum Event {
+    PeerAdmissionAccepted,
+    PeerAdmissionRejected,
+    PeerCircuitRejected,
+    PeerProbe,
+    PeerVerified,
+    PeerLinkFailure,
+    PeerLocalPressure,
     Request,
     RequestError,
     MemoryHit,
@@ -107,6 +114,13 @@ pub enum Event {
     DiskIndexLookupError,
 }
 pub const EVENTS: [Event; EVENT_COUNT] = [
+    Event::PeerAdmissionAccepted,
+    Event::PeerAdmissionRejected,
+    Event::PeerCircuitRejected,
+    Event::PeerProbe,
+    Event::PeerVerified,
+    Event::PeerLinkFailure,
+    Event::PeerLocalPressure,
     Event::Request,
     Event::RequestError,
     Event::MemoryHit,
@@ -161,6 +175,13 @@ pub const EVENTS: [Event; EVENT_COUNT] = [
 impl Event {
     pub fn name(self) -> &'static str {
         match self {
+            Self::PeerAdmissionAccepted => "racer_peer_admission_accepted_total",
+            Self::PeerAdmissionRejected => "racer_peer_admission_rejected_total",
+            Self::PeerCircuitRejected => "racer_peer_circuit_rejected_total",
+            Self::PeerProbe => "racer_peer_probes_total",
+            Self::PeerVerified => "racer_peer_verified_responses_total",
+            Self::PeerLinkFailure => "racer_peer_link_failures_total",
+            Self::PeerLocalPressure => "racer_peer_local_pressure_total",
             Self::Request => "racer_requests_total",
             Self::RequestError => "racer_request_errors_total",
             Self::MemoryHit => "racer_memory_hits_total",
@@ -217,6 +238,8 @@ impl Event {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
 pub enum Gauge {
+    PeerAdmissionLimit,
+    PeerExchanges,
     DiagnosticConnections,
     ActiveRequests,
     ActiveFills,
@@ -230,6 +253,8 @@ pub enum Gauge {
     CheckpointSequence,
 }
 pub const GAUGES: [Gauge; GAUGE_COUNT] = [
+    Gauge::PeerAdmissionLimit,
+    Gauge::PeerExchanges,
     Gauge::DiagnosticConnections,
     Gauge::ActiveRequests,
     Gauge::ActiveFills,
@@ -245,6 +270,8 @@ pub const GAUGES: [Gauge; GAUGE_COUNT] = [
 impl Gauge {
     pub fn name(self) -> &'static str {
         match self {
+            Self::PeerAdmissionLimit => "racer_peer_admission_limit",
+            Self::PeerExchanges => "racer_peer_exchanges_active",
             Self::DiagnosticConnections => "racer_diagnostic_connections",
             Self::ActiveRequests => "racer_active_requests",
             Self::ActiveFills => "racer_active_fills",
