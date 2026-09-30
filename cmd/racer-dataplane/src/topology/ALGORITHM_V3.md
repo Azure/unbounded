@@ -89,10 +89,10 @@ including failed links, visited nodes, and insufficient remaining links.
 
 ## Deployment, compatibility and A/B
 
-`ALGORITHM_VERSION=3` means latest supported specification, not wire negotiation.
-`RACER_ROUTING_ALGORITHM` defaults to `2`; exactly `3` enables this selector at
-worker construction. Upgrade all participating **racer-dataplane images** with
-the setting absent/2 first. No controller, operator, Gantry, or client image
+`ALGORITHM_VERSION=5` means latest supported specification, not wire negotiation.
+`RACER_ROUTING_ALGORITHM` now defaults to `5`; exactly `3` enables this legacy selector at
+worker construction. To preserve radix18, upgrade all participating **racer-dataplane images** with
+the setting explicitly `2`, `3`, or `4`, never absent. No controller, operator, Gantry, or client image
 change is required; membership counters are not algorithm versions. No cluster
 changes or image pushes are part of this implementation.
 
@@ -100,11 +100,13 @@ After image rollout, explicitly set `RACER_ROUTING_ALGORITHM=3` through the
 preserved dataplane ConfigMap or deployment environment and coordinate restart
 of participating dataplanes. Wait for rollout and old transfers to drain before
 an A/B window. Each sender signs its locally selected receiver; intermediate
-mixed-version operation does not change signature verification or graph edges,
+mixed v2/v3 operation does not change signature verification or graph edges,
 but is not an all-v3 fairness measurement and may have different witness rail
 plans. There is no negotiated v3 capability. Old images ignore this unknown
 setting and still route v2, so verify image coverage, not just configuration.
 Rollback the setting to `2` and restart before rolling back images.
+V5 changes graph edges and requires a coordinated topology switch and drain;
+see `ALGORITHM_V5.md`. The legacy mixed-selector discussion does not apply to V5.
 
 The deterministic production-path model uses 1500 SHA-derived UID-like members,
 144000 equal-sized transfers (96 per source and owner), and replans at every hop.

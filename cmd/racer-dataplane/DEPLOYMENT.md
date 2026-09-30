@@ -16,6 +16,15 @@ Default dataplane requests are 1 CPU and 1 GiB memory; there is no default memor
 limit because the runtime budgets below do not bound whole-process RSS. HostPath
 slabs are host capacity, not a Kubernetes ephemeral-storage quota.
 
+Routing now defaults to V5 (radix32, at most 64 neighbors). Before upgrading a
+legacy cluster, explicitly pin `RACER_ROUTING_ALGORITHM` to its existing `2`, `3`,
+or `4` setting in the preserved dataplane ConfigMap. An absent setting now means
+V5. Mixed radix18/radix32 operation is not negotiated: quiesce and drain transfers,
+coordinate the V5 setting/restart across all participating dataplanes, verify
+coverage, then resume traffic. See the complete
+[V5 rollout contract](src/topology/ALGORITHM_V5.md#coordinated-rollout-required).
+Socket budgets and normal four-link/failure eight-link budgets are unchanged.
+
 ## Release artifacts
 
 Use Linux, Rust/Cargo 1.96.0 (the image toolchain), and a C toolchain for the Rust

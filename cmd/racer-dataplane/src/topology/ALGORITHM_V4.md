@@ -1,6 +1,7 @@
 # Racer routing algorithm v4: capacity-weighted shortest next hops
 
-Opt in with exactly `RACER_ROUTING_ALGORITHM=4`. Default remains 2. V2 and
+Select explicitly with `RACER_ROUTING_ALGORITHM=4`. Default is now 5; see
+`ALGORITHM_V5.md` for its coordinated topology rollout requirement. V2 and
 v3 choices, placement hashing, radix-18 graph, degree <=36, endpoints, rails,
 authentication, deadlines, visited-node exclusion, and link budgets are unchanged.
 Use the complete eligible shortest-next-hop set and canonical witnesses defined
@@ -57,7 +58,7 @@ Weights are 1 at positions 83 and 833, otherwise 4. T=42, counter=0:
 
 ## Compatibility and deployment boundary
 
-`ALGORITHM_VERSION=4` is a supported-specification constant, not negotiation.
+`ALGORITHM_VERSION=5` is the latest supported-specification constant, not negotiation.
 There is no topology-v3 wire header at this base revision. Signed route headers
 encode membership, request/attempt, destination, visited list, links, acquisition
 attempt budget and deadline (`security/protocol.rs:175-191`). The existing peer
@@ -68,7 +69,7 @@ must not send an existing signature to a different receiver.
 Selection is read at process startup, not carried in membership or negotiated.
 A future use requires compatible images on all participating dataplanes, explicit
 coordinated setting/restart, verified image/config coverage and old-transfer drain.
-Mixed selectors retain graph/signature/budget safety but are not an all-v4 model
+Mixed v2/v3/v4 selectors retain graph/signature/budget safety but are not an all-v4 model
 or fairness result. Older images supporting the setting reject unknown value 4.
 Do not infer algorithm adoption from a membership counter. Roll back the setting
 before older images. No build, image push, restart, deployment, or annotation

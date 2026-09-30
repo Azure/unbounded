@@ -1,8 +1,8 @@
 # Racer topology algorithm v2
 
-This document specifies algorithm version 2, still the production default.
-The latest supported `ALGORITHM_VERSION` is now 3; see `ALGORITHM_V3.md` for the
-opt-in routing contract and rollout. Hash domains, field order,
+This document specifies algorithm version 2, retained by explicit selection.
+The latest supported `ALGORITHM_VERSION` is now 5; see `ALGORITHM_V5.md` for the
+default routing contract and coordinated rollout. Hash domains, field order,
 integer arithmetic, ordering, and tie rules are interoperability contracts.
 Changing them requires a new algorithm version and coordinated deployment.
 Membership wire versions are snapshot counters, not algorithm versions.

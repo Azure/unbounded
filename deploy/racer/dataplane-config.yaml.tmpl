@@ -7,6 +7,8 @@ metadata:
   namespace: {{ .Namespace | default "unbounded-system" }}
 data:
   # Defaults match the Rust runtime. Existing administrator data is preserved.
+  # Absent RACER_ROUTING_ALGORITHM selects V5 (radix32). Pin 2/3/4 before legacy
+  # image upgrades; switching topologies requires coordinated restart and drain.
   # Native builds activate only trusted, published, NUMA-local hardware mappings.
   RACER_ENABLE_RDMA: "auto"
   RACER_MAX_THREADS: "8"

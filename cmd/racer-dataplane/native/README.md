@@ -66,7 +66,7 @@ includes the rounded-up pinned final page.
   registered memory. It returns ciphertext, never verified plaintext. The normal
   AEAD pipeline must authenticate it before publication/client delivery.
 - Every transfer uses a fresh QP and window. No reusable MR rkey is exported.
-  Session count is capped per neighbor and across 36 neighbors; each QP has a
+  Session count is capped per neighbor and across `MAX_DEGREE` (64) neighbors; each QP has a
   bounded CQ and pending table. Registered allocations are preprovisioned and
   charged with their staging buffers through `Admission::reserve(Registered)`.
   The receive output separately reserves ciphertext quota.
