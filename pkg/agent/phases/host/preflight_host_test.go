@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/preflight"
@@ -112,9 +113,16 @@ func TestAgentInstallDirsProbeIsCreatable(t *testing.T) {
 func TestAgentInstallDirsTracksTheBinaryPath(t *testing.T) {
 	t.Parallel()
 
+	if goalstates.PlannedHostPaths() != goalstates.ResolveHostPaths() {
+		t.Skip("this host has an agent installation that has not been migrated to the host root")
+	}
+
+	paths, err := goalstates.ResolvedAgentUpgradePaths()
+	require.NoError(t, err)
+
 	dirs := agentInstallDirs()
 	assert.Len(t, dirs, 1)
-	assert.Equal(t, filepath.Dir(goalstates.DaemonBinaryPath), dirs[0])
+	assert.Equal(t, filepath.Dir(paths.BinaryPath), dirs[0])
 }
 
 func TestCheckExistingDeploymentCleanHost(t *testing.T) {
@@ -125,6 +133,33 @@ func TestCheckExistingDeploymentCleanHost(t *testing.T) {
 	results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps).Check(context.Background())
 
 	assert.Equal(t, preflight.SeverityOK, results[0].Severity)
+}
+
+// TestCheckExistingDeploymentFindsTheRecoveryScriptUnderEitherRoot covers a
+// host installed by an older release. Preflight does not migrate the host root,
+// so the recovery script is found under the legacy root, not through the new
+// one.
+func TestCheckExistingDeploymentFindsTheRecoveryScriptUnderEitherRoot(t *testing.T) {
+	t.Parallel()
+
+	for _, script := range []string{
+		goalstates.ResolveHostPaths().DaemonRecoveryScript,
+		"/usr/local/bin/unbounded-agent-daemon-recovery.sh",
+	} {
+		t.Run(script, func(t *testing.T) {
+			t.Parallel()
+
+			deps := defaultHostCheckDeps()
+			deps.stat = statOnlyExists(script)
+			deps.outputCmd = outputWith("", errors.New("not found"))
+
+			results := checkExistingDeployment(slog.New(slog.DiscardHandler), deps).Check(context.Background())
+
+			require.Len(t, results, 1)
+			assert.Equal(t, preflight.SeverityError, results[0].Severity)
+			assert.Contains(t, results[0].Message, script)
+		})
+	}
 }
 
 func TestCheckExistingDeploymentDetectsMachineRegistration(t *testing.T) {

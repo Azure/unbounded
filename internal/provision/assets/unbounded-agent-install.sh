@@ -85,13 +85,18 @@ curl -fsSL "${AGENT_URL}" | tar -xz -C "${tmp_dir}" unbounded-agent
 AGENT_BIN="${tmp_dir}/unbounded-agent"
 chmod 0755 "${AGENT_BIN}"
 
-# Seed the daemon binary path when nothing usable is there yet. The agent
-# version is selected independently of this script - by AGENT_VERSION, by
-# AGENT_URL, or by the default of tracking the latest published release - so an
-# installer that relied on the agent to install its own binary would silently
-# break every agent released before that behavior existed. Such an agent never
-# writes the binary, and bootstrap then fails at daemon setup with no indication
-# that the installer and the agent disagree.
+# Seed the daemon binary path used by agents up to v0.8.0. The agent version is
+# selected independently of this script - by AGENT_VERSION, by AGENT_URL, or by
+# the default of tracking the latest published release - so it may be one that
+# never writes its own binary and looks for it at /usr/local/bin.
+#
+# The seed is placed for every agent, because nothing here can tell them apart
+# without running the binary. A newer agent installs itself under
+# /opt/unbounded, does not count a lone binary here as an installation, and
+# removes it once the daemon is running.
+#
+# A read-only /usr/local/bin is not an error. Agents up to v0.8.0 do not
+# support such hosts, and newer agents do not need the seed.
 #
 # The test follows symlinks on purpose. On a host this installation already owns
 # the path resolves through the compatibility symlink to a live blue-green slot,
@@ -100,8 +105,9 @@ chmod 0755 "${AGENT_BIN}"
 # would otherwise write through it to a stale location.
 AGENT_BIN_TARGET="/usr/local/bin/unbounded-agent"
 if [ ! -x "${AGENT_BIN_TARGET}" ]; then
-    rm -f "${AGENT_BIN_TARGET}"
-    install -m 0755 "${AGENT_BIN}" "${AGENT_BIN_TARGET}"
+    if ! { rm -f "${AGENT_BIN_TARGET}" && install -m 0755 "${AGENT_BIN}" "${AGENT_BIN_TARGET}"; } 2>/dev/null; then
+        echo "Not seeding ${AGENT_BIN_TARGET}: it is not writable. Only agents up to v0.8.0 use it."
+    fi
 fi
 
 _START_ARGS=""

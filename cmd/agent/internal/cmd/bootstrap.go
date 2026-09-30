@@ -17,6 +17,7 @@ import (
 	"github.com/Azure/unbounded/internal/fsutil"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
+	"github.com/Azure/unbounded/pkg/agent/hostroot"
 	"github.com/Azure/unbounded/pkg/agent/phases"
 	"github.com/Azure/unbounded/pkg/agent/phases/host"
 	"github.com/Azure/unbounded/pkg/agent/phases/nodestart"
@@ -97,6 +98,10 @@ func (s *agentStages) ResolveInputs(ctx context.Context) error {
 }
 
 func (s *agentStages) PrepareHost(ctx context.Context) error {
+	if err := hostroot.Prepare(ctx, s.log, "bin", "libexec"); err != nil {
+		return err
+	}
+
 	if err := daemon.InstallBootstrapBinary(); err != nil {
 		return err
 	}
@@ -107,7 +112,7 @@ func (s *agentStages) PrepareHost(ctx context.Context) error {
 		return err
 	}
 
-	return fsutil.SyncFilesystems("/etc", "/usr/local", installstate.DefaultDirectory)
+	return fsutil.SyncFilesystems("/etc", hostroot.Resolve(), installstate.DefaultDirectory)
 }
 
 // Credentials must be resolved on every unfinished attempt, but TPM prerequisites
@@ -172,7 +177,7 @@ func (s *agentStages) PrepareRootFS(ctx context.Context) error {
 		return err
 	}
 
-	return fsutil.SyncFilesystems(s.gs.RootFS.MachineDir, "/usr/local", goalstates.SystemdSystemDir, goalstates.SystemdNSpawnDir)
+	return fsutil.SyncFilesystems(s.gs.RootFS.MachineDir, hostroot.Resolve(), goalstates.SystemdSystemDir, goalstates.SystemdNSpawnDir)
 }
 
 // nodeStartTask composes the work that brings the node up.
@@ -239,7 +244,7 @@ func (s *agentStages) EnsureDaemonInstalled(ctx context.Context) error {
 		return err
 	}
 
-	return fsutil.SyncFilesystems("/usr/local", goalstates.AgentConfigDir, goalstates.SystemdSystemDir)
+	return fsutil.SyncFilesystems(hostroot.Resolve(), goalstates.AgentConfigDir, goalstates.SystemdSystemDir)
 }
 
 func (s *agentStages) VerifyInstalled(ctx context.Context) error {

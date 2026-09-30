@@ -102,7 +102,11 @@ class ReliabilityTests(unittest.TestCase):
                         e2e.reinstall_agent(cfg)
                 else:
                     e2e.reinstall_agent(cfg)
-                run.assert_called_once_with(cfg)
+                # reinstall=True is what keeps this on the same disk. Without
+                # it an Ignition host replaces the disk and reboots, which
+                # changes the boot id this test is checking and turns a
+                # same-disk assertion into a fresh-install one.
+                run.assert_called_once_with(cfg, reinstall=True)
 
     def test_recovered_hostname_needs_done_correct_host_and_marker(self):
         warning = f"Failed to set the hostname to {e2e.VM_NAME} ({e2e.VM_NAME})"
@@ -168,7 +172,8 @@ class ReliabilityTests(unittest.TestCase):
                         active -= 1
                     if fail and index == 0:
                         raise RuntimeError("failed guest")
-                with patch.dict(e2e.os.environ, {"CONFIG_SCENARIO_WORKERS":"2"}), patch.object(e2e, "VM_DIR", Path(directory)), patch.object(e2e, "patch_kind_control_plane_node_ip"), patch.object(e2e, "discover_node_configs", return_value=configs), patch.object(e2e, "mirror_oci_refs_to_local_registry", side_effect=lambda x:x), patch.object(e2e, "prepare_agent_artifacts", return_value="url"), patch.object(e2e, "HTTPServer"), patch.object(e2e, "validate_kube_proxy"), patch.object(e2e, "_validate_node_config_scenario", side_effect=scenario):
+                # The configuration suite does not run on an Ignition host.
+                with patch.object(e2e, "HOST_BASE_OS", "ubuntu2404"), patch.dict(e2e.os.environ, {"CONFIG_SCENARIO_WORKERS":"2"}), patch.object(e2e, "VM_DIR", Path(directory)), patch.object(e2e, "patch_kind_control_plane_node_ip"), patch.object(e2e, "discover_node_configs", return_value=configs), patch.object(e2e, "mirror_oci_refs_to_local_registry", side_effect=lambda x:x), patch.object(e2e, "prepare_agent_artifacts", return_value="url"), patch.object(e2e, "HTTPServer"), patch.object(e2e, "validate_kube_proxy"), patch.object(e2e, "_validate_node_config_scenario", side_effect=scenario):
                     if fail:
                         with self.assertRaises(SystemExit):
                             e2e.validate_node_config_scenarios()

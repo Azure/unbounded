@@ -64,6 +64,10 @@ type nodeOperator interface {
 	// RestartAgentDaemon restarts the host-side agent daemon after an upgrade
 	// operation has been recorded as complete.
 	RestartAgentDaemon(context.Context, *slog.Logger) error
+	// ReconcileHostRoot moves the agent's files to the host root on a host an
+	// older agent installed, once that cannot strand a rollback, and finishes
+	// an interrupted move. The caller holds installation ownership.
+	ReconcileHostRoot(context.Context, *slog.Logger, *ActiveMachine) error
 }
 
 type nspawnNodeOperator struct{}
@@ -92,7 +96,8 @@ func (nspawnNodeOperator) FindActiveMachine(log *slog.Logger) (*ActiveMachine, e
 		// If the sidecar file is missing, log a warning so operators
 		// know the integrity check was skipped.
 		if _, statErr := os.Stat(checksumPath); errors.Is(statErr, os.ErrNotExist) {
-			log.Warn("no checksum sidecar found, skipping integrity check",
+			log.Warn(
+				"no checksum sidecar found, skipping integrity check",
 				"config_path", path,
 				"checksum_path", checksumPath,
 			)
@@ -251,7 +256,8 @@ func (nspawnNodeOperator) RepaveNode(
 	oldMachine := active.Name
 	newMachine := goalstates.AlternateMachine(oldMachine)
 
-	log.Info("starting node repave",
+	log.Info(
+		"starting node repave",
 		"old_machine", oldMachine,
 		"new_machine", newMachine,
 		"old_version", active.Config.Cluster.Version,
@@ -269,7 +275,8 @@ func (nspawnNodeOperator) RepaveNode(
 		return fmt.Errorf("resolve machine goal state: %w", err)
 	}
 
-	err = phases.Serial(log,
+	err = phases.Serial(
+		log,
 		rootfs.DownloadContainerImageArchives(log, containerImageArchives),
 		rootfs.Provision(log, gs.RootFS),
 		nodestop.StopNode(log, oldMachine),
@@ -284,7 +291,8 @@ func (nspawnNodeOperator) RepaveNode(
 		return err
 	}
 
-	log.Info("node repave completed",
+	log.Info(
+		"node repave completed",
 		"active_machine", newMachine,
 		"version", newCfg.Cluster.Version,
 	)
@@ -303,4 +311,8 @@ func (nspawnNodeOperator) RestartAgentDaemon(ctx context.Context, log *slog.Logg
 	}
 
 	return nil
+}
+
+func (op nspawnNodeOperator) ReconcileHostRoot(ctx context.Context, log *slog.Logger, active *ActiveMachine) error {
+	return reconcileHostRoot(ctx, log, newHostRootHost(log, active, op))
 }

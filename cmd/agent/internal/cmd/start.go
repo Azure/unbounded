@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Azure/unbounded/cmd/agent/internal/bootstrap"
+	"github.com/Azure/unbounded/cmd/agent/internal/daemon"
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/internal/version"
@@ -33,6 +34,10 @@ func newCmdStart(cmdCtx *CommandContext) *cobra.Command {
 				"version", version.Version,
 				"commit", version.GitCommit,
 			)
+
+			if err := daemon.MigrateHostRoot(cmdCtx.Logger); err != nil {
+				return err
+			}
 
 			cfg, err := loadConfig(cmdCtx.Logger)
 			if err != nil {

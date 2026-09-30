@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/Azure/unbounded/cmd/agent/internal/daemon"
 	"github.com/Azure/unbounded/pkg/agent/config"
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
 	"github.com/Azure/unbounded/pkg/agent/nspawnlifecycle"
@@ -47,6 +48,10 @@ func newCmdNSpawnLifecyclePhase(
 			}
 
 			cmdCtx.Setup()
+
+			if err := daemon.MigrateHostRoot(cmdCtx.Logger); err != nil {
+				return err
+			}
 
 			return run(cmd.Context(), cmdCtx.Logger, args[0])
 		},

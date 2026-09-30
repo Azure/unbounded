@@ -24,7 +24,7 @@ The path set is represented by `goalstates.AgentUpgradePaths`.
 
 | Field | Purpose |
 |-------|---------|
-| `BinaryPath` | Compatibility path, normally `/usr/local/bin/unbounded-agent`. |
+| `BinaryPath` | Compatibility path, normally `/opt/unbounded/bin/unbounded-agent`. |
 | `BluePath` | First blue-green binary slot. |
 | `GreenPath` | Second blue-green binary slot. |
 | `CurrentPath` | Symlink used by the systemd daemon unit. |
@@ -32,10 +32,46 @@ The path set is represented by `goalstates.AgentUpgradePaths`.
 | `SignalPath` | Single JSON signal file for pending and failure state. |
 | `CurrentTargetPath` | Resolved current binary target for one operation. |
 
-`goalstates.ResolvedAgentUpgradePaths()` resolves environment overrides and
-stores the resolved `CurrentPath` target in `CurrentTargetPath`. If
-`CurrentPath` does not exist, the compatibility `BinaryPath` is used as the
-current target. `NextTargetPath()` then chooses the inactive slot:
+`goalstates.ResolvedAgentUpgradePaths()` resolves the slots under the host
+root, applies environment overrides, and stores the resolved `CurrentPath`
+target in `CurrentTargetPath`. If `CurrentPath` does not exist, the
+compatibility `BinaryPath` is used as the current target.
+
+The host root is `/opt/unbounded`, resolved through symlinks before any path is
+built from it. On a host installed by a release before the host root, the agent
+links `/opt/unbounded` to `/usr/local`, where that release put its files, before
+it resolves anything. The slots then resolve to the paths that release wrote,
+so the resolved current target still compares equal to one of them, and the
+units that release wrote stay valid.
+
+The link lasts while the older release can still be rolled back to. Each daemon
+start on a linked host records the SHA-256 of its own binary in
+`/etc/unbounded/agent/host-root-agents`; older releases never do. Once the
+current and last-good targets are both recorded, and no AgentUpgrade signal is
+pending, the daemon moves the files into a real `/opt/unbounded` under
+installation ownership:
+
+1. Copy the layout from `/usr/local` into `/opt/unbounded.staging`, recreating
+   the slot links with targets under `/opt/unbounded`, and write a `.moving`
+   marker into the copy last.
+2. Remove the link and rename the copy into place, then restore SELinux labels.
+3. Rewrite the nspawn lifecycle hooks, the daemon and recovery units, the
+   recovery script and the LocalDNS network unit, and reload systemd.
+4. Remove the layout from `/usr/local`, then the `.moving` marker and the
+   digest record.
+5. Restart the daemon, whose running binary was removed.
+
+A start that finds the `.moving` marker resumes at step 3. One that finds a
+staging copy beside a link discards it and starts over. The files under
+`/usr/local` stay in place until the units stop naming them, so the daemon unit
+can start at every step.
+
+After the move, the last-good binary is a release that knows the host root, so
+automatic rollback is unaffected. An AgentUpgrade to a release up to v0.8.0 is
+not supported and not refused: that release looks for its files under
+`/usr/local`, so its own next upgrade fails to resolve the current binary.
+
+`NextTargetPath()` chooses the inactive slot:
 
 ```text
 current target == BluePath  -> next target = GreenPath

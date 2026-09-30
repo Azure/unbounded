@@ -59,9 +59,10 @@ func TestResolvedAgentUpgradePaths_UsesDefaultsForBlankOverrides(t *testing.T) {
 	paths, err := ResolvedAgentUpgradePaths()
 	require.NoError(t, err)
 
-	assert.Equal(t, DaemonBinaryPath, paths.BinaryPath)
-	assert.Equal(t, DaemonBinaryBluePath, paths.BluePath)
-	assert.Equal(t, DaemonAgentUpgradeSignalPath, paths.SignalPath)
+	binDir := ResolveHostPaths().BinDir
+	assert.Equal(t, filepath.Join(binDir, "unbounded-agent"), paths.BinaryPath)
+	assert.Equal(t, filepath.Join(binDir, "unbounded-agent-blue"), paths.BluePath)
+	assert.Equal(t, DaemonAgentUpgradeSignalPath, paths.SignalPath, "the signal is state in the config directory, not part of the layout")
 }
 
 func TestAgentUpgradePathsNextTargetPathUsesGreenWhenCurrentIsBlue(t *testing.T) {

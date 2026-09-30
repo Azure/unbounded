@@ -35,6 +35,9 @@ Both possible nspawn machine names (kube1 and kube2) are stopped and removed.`,
 				"commit", version.GitCommit,
 			)
 
+			// No host root migration: teardown sweeps both roots, so it works
+			// on a host the migration refuses, which is when an operator is
+			// told to run reset.
 			return resetAgent(cmdCtx.Logger).Do(ctx)
 		},
 	}

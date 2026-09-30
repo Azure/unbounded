@@ -23,16 +23,41 @@ const (
 	// DaemonUnit is the systemd unit name for the unbounded-agent daemon.
 	DaemonUnit = "unbounded-agent-daemon.service"
 
+	// NFTablesFlushUnit clears stale firewall rules before the nspawn machines
+	// start.
+	NFTablesFlushUnit = "nftables-flush.service"
+
 	// DaemonRecoveryUnit is the systemd recovery unit for the agent daemon.
 	DaemonRecoveryUnit = "unbounded-agent-daemon-recovery.service"
 
-	DaemonBinaryPath             = "/usr/local/bin/unbounded-agent"
-	DaemonBinaryBluePath         = "/usr/local/bin/unbounded-agent-blue"
-	DaemonBinaryGreenPath        = "/usr/local/bin/unbounded-agent-green"
-	DaemonBinaryCurrentPath      = "/usr/local/bin/unbounded-agent-current"
-	DaemonBinaryLastGoodPath     = "/usr/local/bin/unbounded-agent-last-good"
-	NSpawnLifecycleBinaryPath    = "/usr/local/bin/unbounded-agent-nspawn-lifecycle"
-	DaemonRecoveryScriptPath     = "/usr/local/bin/unbounded-agent-daemon-recovery.sh"
+	// FirstBootBootstrapUnit is the unit an Ignition config installs to bootstrap
+	// the agent on boot.
+	//
+	// Named here rather than in the command that writes it because reset has to
+	// remove it, and the two live in packages that cannot import each other. A
+	// name that drifted between them would leave the unit enabled on a host that
+	// had been reset, which re-bootstraps it on the next boot.
+	FirstBootBootstrapUnit = "unbounded-agent-bootstrap.service"
+
+	// The agent's host-side files under hostroot.LegacyPath, where agents
+	// released before hostroot.Path installed them.
+	//
+	// Deprecated: on hosts installed since, these files are elsewhere. Use
+	// ResolvedAgentUpgradePaths and ResolveHostPaths, which follow the host root.
+	DaemonBinaryPath = "/usr/local/bin/unbounded-agent"
+	// Deprecated: use ResolvedAgentUpgradePaths.
+	DaemonBinaryBluePath = "/usr/local/bin/unbounded-agent-blue"
+	// Deprecated: use ResolvedAgentUpgradePaths.
+	DaemonBinaryGreenPath = "/usr/local/bin/unbounded-agent-green"
+	// Deprecated: use ResolvedAgentUpgradePaths.
+	DaemonBinaryCurrentPath = "/usr/local/bin/unbounded-agent-current"
+	// Deprecated: use ResolvedAgentUpgradePaths.
+	DaemonBinaryLastGoodPath = "/usr/local/bin/unbounded-agent-last-good"
+	// Deprecated: use ResolveHostPaths.
+	NSpawnLifecycleBinaryPath = "/usr/local/bin/unbounded-agent-nspawn-lifecycle"
+	// Deprecated: use ResolveHostPaths.
+	DaemonRecoveryScriptPath = "/usr/local/bin/unbounded-agent-daemon-recovery.sh"
+
 	DaemonAgentUpgradeSignalPath = AgentConfigDir + "/agent-upgrade-signal"
 	DaemonAgentUpgradeLockPath   = "/run/unbounded-agent-upgrade.lock"
 

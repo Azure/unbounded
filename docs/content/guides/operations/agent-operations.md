@@ -87,7 +87,7 @@ After a successful operation, confirm the agent version on the host:
 
 ```bash
 # From the host
-unbounded-agent version
+/opt/unbounded/bin/unbounded-agent version
 
 # From the cluster, check the machine status
 kubectl describe machine worker-01
@@ -132,7 +132,7 @@ The daemon marks the operation complete before stopping its own running unit.
 If you have SSH or console access to the host, you can reset directly:
 
 ```bash
-sudo unbounded-agent reset
+sudo /opt/unbounded/bin/unbounded-agent reset
 ```
 
 This is the inverse of `unbounded-agent start` and performs the same cleanup as
