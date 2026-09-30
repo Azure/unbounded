@@ -114,7 +114,7 @@ impl Responses {
         response: ReadResponse,
         scope: &'a RequestScope,
     ) -> Operation<'a, ConnectionLease> {
-        self.send_inner(connection, response, scope, None, None)
+        self.send_inner(connection, response, scope, None)
     }
 
     pub(crate) fn send_observed<'a>(
@@ -123,15 +123,8 @@ impl Responses {
         response: ReadResponse,
         scope: &'a RequestScope,
         observation: &'a mut crate::telemetry::metrics::RequestMetrics,
-        page_timeout: Duration,
     ) -> Operation<'a, ConnectionLease> {
-        self.send_inner(
-            connection,
-            response,
-            scope,
-            Some(observation),
-            Some(page_timeout),
-        )
+        self.send_inner(connection, response, scope, Some(observation))
     }
 
     fn send_inner<'a>(
@@ -140,7 +133,6 @@ impl Responses {
         mut response: ReadResponse,
         scope: &'a RequestScope,
         mut observation: Option<&'a mut crate::telemetry::metrics::RequestMetrics>,
-        page_timeout: Option<Duration>,
     ) -> Operation<'a, ConnectionLease> {
         Box::pin(async move {
             scope.check()?;
@@ -179,9 +171,6 @@ impl Responses {
             connection = self.io.send_head(connection, head, scope).await?.connection;
             let mut sent = 0u64;
             if let Some(stream) = response.body.as_mut() {
-                if let Some(timeout) = page_timeout {
-                    stream.enable_progress(timeout);
-                }
                 loop {
                     let reader = match first.take() {
                         Some(reader) => reader,
@@ -200,16 +189,7 @@ impl Responses {
                     if length == 0 || length > expected - sent {
                         return Err(Error::BadGateway);
                     }
-                    let written = if page_timeout.is_some() {
-                        let mut write = self.delivery.finish_progressing(reader, connection, scope);
-                        std::future::poll_fn(|cx| {
-                            stream.poll_prefetch(cx);
-                            write.as_mut().poll(cx)
-                        })
-                        .await
-                    } else {
-                        self.delivery.finish_to(reader, connection, scope).await
-                    };
+                    let written = self.delivery.finish_to(reader, connection, scope).await;
                     connection = written.inspect_err(|&error| {
                         self.observer.record(
                             Failure::new(Stage::ClientWrite, error)

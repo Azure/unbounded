@@ -1165,7 +1165,7 @@ mod tests {
         for (capped, progressing, subscription) in [
             (true, false, false),
             (false, false, false),
-            (false, true, false),
+            (false, true, true),
             (false, false, true),
         ] {
             let clock = crate::runtime::environment::SimulationClock::new(55);
@@ -1386,20 +1386,11 @@ mod tests {
                             response,
                             &scope,
                             &mut observation,
-                            Duration::from_secs(30),
-                        )
-                        .await
-                        .map(drop)
-                } else if progressing {
-                    let metrics = crate::telemetry::metrics::Metrics::default();
-                    let mut observation = metrics.request()?;
-                    responses
-                        .send_observed(
-                            head.connection,
-                            response,
-                            &scope,
-                            &mut observation,
-                            Duration::from_millis(30),
+                            if progressing {
+                                Duration::from_millis(30)
+                            } else {
+                                Duration::from_secs(30)
+                            },
                         )
                         .await
                         .map(drop)

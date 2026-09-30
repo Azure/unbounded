@@ -137,6 +137,8 @@ Full peer close signals shared cancellation while preserving completion owners;
 request write-half shutdown cannot return credits and is not a supported substitute
 for release frames on a progressing subscription. The unobserved
 `Responses::send` and explicit aggregate-budget APIs retain absolute deadlines.
+The observed non-subscription response path serves validated HEAD requests; it
+does not enable progressing raw range delivery.
 
 `Responses::send` prepares the first slice before writing success headers. A
 first-slice acquisition/admission failure sends the mapped error head and returns

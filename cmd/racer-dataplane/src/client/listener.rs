@@ -733,7 +733,7 @@ async fn serve_connection(
         let mut send = if matches!(kind, super::request::ReadKind::Subscription { .. }) {
             responses.send_subscription(connection, response, scope, &mut observation, timeout)
         } else {
-            responses.send_observed(connection, response, scope, &mut observation, timeout)
+            responses.send_observed(connection, response, scope, &mut observation)
         };
         let result = std::future::poll_fn(|cx| {
             if socket.peer_disconnected() {
