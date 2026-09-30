@@ -141,6 +141,7 @@ func validateEntry(sourced SourcedEntry) []string {
 	problems = append(problems, validateAddNames("addInitContainers", entry.AddInitContainers)...)
 	problems = append(problems, reportAddedContainers(entry)...)
 	problems = append(problems, validatePatch(entry.Patch)...)
+	problems = append(problems, validateDaemonSetStrategy(entry)...)
 	problems = append(problems, reportTypedFieldConflicts(entry)...)
 
 	return problems
