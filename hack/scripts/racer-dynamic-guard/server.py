@@ -1,6 +1,7 @@
 """Single-threaded root UDS startup gate plus bounded periodic reconciliation."""
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,15 @@ import contract as c
 import local
 import watcher as w
 
+POLL_SECONDS = 10
+PROOF_MAX_AGE = 15
+
+
+def next_poll_at(node, now):
+    # Stable per-node phase spreads fleet polls without extending the interval.
+    phase = int.from_bytes(hashlib.sha256(node.encode()).digest()[:8], "big") / 2**64 * POLL_SECONDS
+    return (int((now - phase) // POLL_SECONDS) + 1) * POLL_SECONDS + phase
+
 
 def pinned(policy, cm, node, own):
     c.require(cm["metadata"]["uid"] == policy["sourceUID"], "source CM recreated")
@@ -24,13 +34,45 @@ def pinned(policy, cm, node, own):
     return row["uid"]
 
 
-def reconcile(api, host, policy, node):
+def reconcile(api, host, policy, node, cache=None):
+    if cache is not None:
+        cache.clear()
+    observed, observed_wall = time.monotonic(), host.clock()
     cm = api.request(w.CM)  # Direct read for EVERY startup, never a proof-file ack.
     uid = pinned(policy, cm, node, host.own)
-    return host.tick(cm, node, uid)
+    proof = host.tick(cm, node, uid)
+    if cache is not None:
+        cache.update(cm=cm, proof=dict(proof), observed=observed, observed_wall=observed_wall)
+    return proof
 
 
-def respond(connection, api, host, policy, node):
+def status(host, policy, node, cache):
+    """Read-only kernel proof; only successful direct reads populate this cache."""
+    def authority():
+        c.require(cache and 0 <= time.monotonic() - cache["observed"] <= PROOF_MAX_AGE
+                  and 0 <= host.clock() - cache["observed_wall"] <= PROOF_MAX_AGE,
+                  "API observation too old")
+        return w.authority(cache["cm"], int(host.clock()))
+
+    c.require(os.stat("/proc/self/ns/net").st_ino == 0xF0000000, "not host netns")
+    a, sources = authority()
+    uid = pinned(policy, cache["cm"], node, host.own)
+    proof = dict(cache["proof"])
+    c.require(proof == dict(node=node, nodeUID=uid, ip=host.own,
+                  bootID=Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+                  sequence=a["sequence"], contentDigest=a["contentDigest"], valid_until=a["valid_until"]),
+              "cached proof identity/content drift")
+    c.require(dict(name=node, uid=uid, ip=host.own) in a["generation"]["body"]["nodes"], "node drift")
+    with host.lock():
+        host.verify_policy()
+        c.require(local.members(host.run(["ipset", "save", "R47_PEERS"]), "R47_PEERS") == sources, "peer set drift")
+        c.require(local.members(host.run(["ipset", "save", "R47_FRESH"]), "R47_FRESH", True) == [host.own], "admission expired")
+        authority()  # Check age and original expiry again after kernel commands.
+        proof.update(verified=int(host.clock()), sourceVerified=cache["observed_wall"])
+        return proof
+
+
+def respond(connection, api, host, policy, node, cache=None):
     pid, uid, gid = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
     c.require(uid == 0 and node not in c.DENY11, "root host DP only; DENY11")
     connection.settimeout(2)
@@ -40,9 +82,13 @@ def respond(connection, api, host, policy, node):
         c.require(piece and len(data) + len(piece) <= 1024, "invalid startup request")
         data += piece
     request = json.loads(data)
+    if request == {"ready": node}:
+        proof = status(host, policy, node, cache)
+        connection.sendall((c.canonical(proof) + "\n").encode())
+        return
     c.require(set(request) == {"nonce", "node"} and request["node"] == node
               and re.fullmatch("[0-9a-f]{64}", request["nonce"]), "invalid nonce/node")
-    proof = reconcile(api, host, policy, node)
+    proof = reconcile(api, host, policy, node, cache)
     c.require(proof["valid_until"] > int(time.time()) + 2, "proof expired before reply")
     proof.pop("ip")
     proof["nonce"] = request["nonce"]
@@ -87,22 +133,26 @@ def main():
         listener.settimeout(1)
         end = time.monotonic() + args.seconds if args.seconds else float("inf")
         next_poll, initialized = 0, False
+        cache = {}  # Never restore readiness authority from durable proof.json.
         while end - time.monotonic() >= 25:
             try:
                 signal.alarm(25)
-                if not initialized:
-                    bootstrap.install(host, api.request(w.CM), policy, node, bootstrap.listeners())
-                    initialized = True
                 if time.monotonic() >= next_poll:
-                    reconcile(api, host, policy, node)
-                    next_poll = time.monotonic() + 5
+                    next_poll = next_poll_at(node, time.monotonic())
+                    if not initialized:
+                        bootstrap.install(host, api.request(w.CM), policy, node, bootstrap.listeners())
+                        initialized = True
+                    reconcile(api, host, policy, node, cache)
+                    next_poll = next_poll_at(node, time.monotonic())
                 try:
                     connection, _ = listener.accept()
                 except socket.timeout:
                     continue
                 with connection:
-                    respond(connection, api, host, policy, node)
+                    c.require(initialized, "bootstrap incomplete")
+                    respond(connection, api, host, policy, node, cache)
             except Exception:
+                cache.clear()
                 # Kernel timer enforces expiry even if cleanup or process fails.
                 signal.alarm(10)
                 try:

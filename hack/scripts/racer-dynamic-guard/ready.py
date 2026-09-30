@@ -5,6 +5,9 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
+import stat
+import struct
 import time
 
 import contract as c
@@ -13,21 +16,30 @@ import server
 import watcher as w
 
 
-def active(api, host, policy, node):
+def active(host, policy, node):
     c.require(os.stat("/proc/self/ns/net").st_ino == 0xF0000000, "not host netns")
-    cm = api.request(w.CM)
-    uid = server.pinned(policy, cm, node, host.own)
-    a, sources = w.authority(cm, int(host.clock()))
-    with host.lock():
-        host.verify_policy()
-        c.require(dict(name=node, uid=uid, ip=host.own) in a["generation"]["body"]["nodes"], "node drift")
-        c.require(local.members(host.run(["ipset", "save", "R47_PEERS"]), "R47_PEERS") == sources, "peer set drift")
-        c.require(local.members(host.run(["ipset", "save", "R47_FRESH"]), "R47_FRESH", True) == [host.own], "admission expired")
-        w.authority(cm, int(host.clock()))
-        return dict(node=node, nodeUID=uid, ip=host.own,
-                    bootID=Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
-                    sequence=a["sequence"], contentDigest=a["contentDigest"],
-                    valid_until=a["valid_until"], verified=int(host.clock()))
+    for path, kind in ((host.directory, stat.S_ISDIR), (host.directory / "start.sock", stat.S_ISSOCK)):
+        info = path.lstat()
+        c.require(kind(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o077, "unsafe guard socket")
+    with socket.socket(socket.AF_UNIX) as connection:
+        connection.settimeout(15)
+        connection.connect(str(host.directory / "start.sock"))
+        _, uid, _ = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        c.require(uid == 0, "nonroot guard")
+        connection.sendall((c.canonical(dict(ready=node)) + "\n").encode())
+        data = b""
+        while b"\n" not in data:
+            piece = connection.recv(4097 - len(data))
+            c.require(piece and len(data) + len(piece) <= 4096, "invalid readiness response")
+            data += piece
+    proof = json.loads(data)
+    now = host.clock()
+    c.require(proof["node"] == node and proof["nodeUID"] == policy["nodes"][node]["uid"]
+              and proof["ip"] == host.own == policy["nodes"][node]["ip"]
+              and proof["bootID"] == Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+              and now < proof["valid_until"] and 0 <= now - proof["verified"] <= server.PROOF_MAX_AGE
+              and 0 <= now - proof["sourceVerified"] <= server.PROOF_MAX_AGE, "stale/wrong readiness proof")
+    return proof
 
 
 def fleet(cm, proofs, nodes, now):
@@ -42,7 +54,8 @@ def fleet(cm, proofs, nodes, now):
         n = inventory[name]
         c.require(p["nodeUID"] == n["metadata"]["uid"] and p["bootID"] == n["status"]["nodeInfo"]["bootID"]
                   and p["sequence"] == a["sequence"] and p["contentDigest"] == a["contentDigest"]
-                  and now < p["valid_until"] and 0 <= now - p["verified"] <= 30,
+                  and now < p["valid_until"] and 0 <= now - p["verified"] <= 30
+                  and 0 <= now - p["sourceVerified"] <= server.PROOF_MAX_AGE,
                   "stale/wrong node boot or source generation proof")
         c.require(dict(name=name, uid=p["nodeUID"], ip=p["ip"]) in a["generation"]["body"]["nodes"], "authority node drift")
     return dict(verified=1500, sequence=a["sequence"], contentDigest=a["contentDigest"])
@@ -61,4 +74,4 @@ if __name__ == "__main__":
     else:
         policy = json.loads(Path(args.policy).read_text())
         host = local.Host(os.environ["NODE_IP"], policy["monitors"])
-        print(json.dumps(active(w.API(source_uid=policy["sourceUID"]), host, policy, os.environ["NODE_NAME"])))
+        print(json.dumps(active(host, policy, os.environ["NODE_NAME"])))

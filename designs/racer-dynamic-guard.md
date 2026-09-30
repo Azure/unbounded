@@ -6,6 +6,74 @@ are superseded by this final validation section; deployment gates remain explici
 
 ## Final validation and exact deployment gates
 
+### Guard polling and bounded readiness proof
+
+The authorized polling optimization supersedes the older fresh-API readiness
+description and 5s poll target below. `server.py` polls on a 10s schedule with a
+stable SHA-256-derived per-node phase. Initial bootstrap and every DP startup
+still fetch directly from the API; startup still invokes locked `Host.tick`.
+The unchanged launcher nonce/node request cannot select the readiness path.
+
+Readiness sends the distinct `{"ready": node}` request on the same private root
+UDS. The server revalidates its in-memory CM authority, source UID, pinned node
+UID/IP, current boot, sequence/content/expiry, exact live rules and1511 peer set,
+and a live local freshness entry under the host lock. Only a successful direct
+API fetch plus kernel reconciliation populates that memory. API age is measured
+from **before** the fetch, using both monotonic and wall clocks, and must be at
+most15s before and after kernel checks. No durable proof is restored on restart.
+Errors invalidate the cache and retain the existing admission-close/expiry path.
+
+Readiness does not fetch the API, invoke tick, write a proof file, change an ipset,
+or renew API observation time or authority expiry. `verified` records the current
+kernel check; separate `sourceVerified` retains the API observation time. The
+client authenticates root socket ownership/peer credentials and checks returned
+identity/boot/expiry/age. Offline fleet verification now also requires
+`sourceVerified`<=15s, so collect new proofs; old proof JSON without that field is
+not accepted. Fleet still requires exact1500 on the supplied current generation.
+
+A missed update can leave readiness on the prior observation for at most15s, not
+instantaneous revocation. Fresh API reads of an unchanged authority cannot extend
+its original60s validity. `Host.tick`, kernel NEW gate, authority publication,
+1511 membership, DENY11, and startup authorization are unchanged. Kernel timeout
+remains the backstop even if the server dies or stops polling. The nominal healthy
+steady-state load is1500/10 =150 source GET/s, rather than1500/5 +1500/10 =450;
+startup/bootstrap reads and publisher traffic are additional. This is arithmetic,
+not a measured live rate or a guarantee under delays. Slow operations fail proof
+age checks rather than extending freshness; no image build is needed.
+
+Focused offline validation, 2026-09-30: one run of
+`timeout --signal=TERM --kill-after=10s 300s python3 -B -m unittest -v
+test_ready test_start test_adapters` passed25 tests. Coverage includes repeated
+readiness without fetch/renewal,15s boundary and delayed checks, missed content
+update, original authority expiry after a recent read, boot/UID/content/source
+drift, kernel peer/timeout drift, API failure, empty restart cache, authenticated
+readiness client, every-start fresh fetch/tick, and distributed10s schedule.
+Scoped `make fmt` on the unchanged adjacent launcher passed with0 issues.
+No broad-suite repeat, image build, live kernel test, or cluster mutation occurred.
+
+Guard-only canary path, **not executed by this change**:
+
+1. Render locally using the existing trusted policy and pinned images. Create a
+   new uniquely named immutable program CM, such as
+   `racer-stage47-program-polling-<fix-sha-prefix>`, with all six source keys.
+   Do not patch/recreate the old immutable CM or apply the entire renderer bundle.
+2. Under a separately authorized rollout, preserve the guard DS UID/RV and all
+   settings except its `program` CM reference. Use a reviewed OnDelete canary
+   rollout so only the selected guard Pod is replaced initially, never introduce
+   a second guard writer on the node. Preserve policy/source UID, RBAC, resources,
+   NET_RAW/NET_ADMIN/SYS_CHROOT, images, DP template/launcher, and publisher refs.
+3. Check actual mounted sources, current boot/source/kernel proof and exact1511,
+   stable readiness over multiple polls, source age<=15s, original expiry, and
+   source GET rate. In a permitted isolated canary exercise missed updates/API
+   failure and guard/DP restart: stale readiness must fail, expired NEW must close,
+   and every DP start must require fresh API plus kernel verification. Unit tests
+   do not establish these live behaviors. Do not interrupt shared fleet authority
+   or application load without separate operational authorization.
+4. Expand only after those checks; collect exact1500 fresh proofs against current
+   Nodes/source using the updated fleet verifier before claiming fleet completion.
+   Keep the previous CM for rollback via the same controlled Pod replacement.
+   A rollback restores higher API load, not a remedy for publisher budget failures.
+
 ### Publisher inventory memory fix
 
 The released watcher at `dfb028607a22ae1bde4c01c703640441dc067dfa`
@@ -160,13 +228,13 @@ the application, a host reboot, or fleet deployment.
   kindest/node cache used; ipset installed only inside ephemeral container. No
   image built, no host package installed, no hostNetwork, all containers removed.
   Test does not assert established-peer application behavior or reboot success.
-- `ready.py` actively reads current pinned CM, validates identity/freshness, locks,
-  verifies exact rules and1511 membership plus live timeout admission, and emits
-  current boot-bound proof. Renderer wires it as readiness, not a cached ack.
+- `ready.py` queries the root UDS for bounded-age API authority plus an active
+  kernel check, as described above. Renderer wires it as readiness, not a saved ack.
 - `ready.py --fleet <json>` verifies1500 unique fresh node/boot/source-content proofs
   against supplied current Nodes and source CM. Parent supplies trusted freshly
   collected proofs; this verifier does not collect, mutate or pretend files are
-  authenticated by themselves. All proofs must be <=30s old and unexpired.
+  authenticated by themselves. Kernel proofs must be <=30s old and unexpired;
+  their API observation must also be <=15s old.
 
 Deployment gates (parent-owned, no implicit permission):
 
@@ -257,7 +325,7 @@ there is no permissive fallback or retry loop. Directory0700/socket0600 root own
 are required. Current tests validate proof fields, not full exec/signal integration.
 
 `server.py` provides single-threaded root-credential UDS service plus periodic
-reconciliation. Every request reads the source CM directly, validates immutable
+reconciliation. Every startup request reads the source CM directly, validates immutable
 sourceUID and bootstrap NodeUID/IP pins, and invokes locked kernel verification
 before responding. UID0 is trusted per the approved root DP requirement, not a
 unique Pod authentication mechanism. It rejects DENY11 independently. No extra
