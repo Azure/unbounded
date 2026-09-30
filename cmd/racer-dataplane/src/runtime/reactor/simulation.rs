@@ -13,14 +13,11 @@ use std::{
 
 thread_local! { static CURRENT: RefCell<Option<Simulation>> = const { RefCell::new(None) }; }
 
-#[path = "simulation_disk.rs"]
 mod disk;
 pub use disk::{CrashDisk, DiskState};
 #[cfg(test)]
-#[path = "simulation_disk_tests.rs"]
 mod disk_tests;
 #[cfg(test)]
-#[path = "simulation_io_tests.rs"]
 mod io_tests;
 
 /// Labels new outbound streams with their owning node's listening endpoint.

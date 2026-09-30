@@ -1041,7 +1041,6 @@ fn drive_crypto_group(
 }
 
 #[cfg(test)]
-#[path = "worker_shared_tests.rs"]
 mod shared_tests;
 
 #[cfg(test)]

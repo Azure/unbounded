@@ -23,7 +23,6 @@
 //! request latency.
 
 #[cfg(test)]
-#[path = "crypto_measurement.rs"]
 mod measurement;
 
 use super::{

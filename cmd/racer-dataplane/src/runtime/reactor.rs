@@ -21,12 +21,10 @@ use crate::{
     model::ResourceClass,
 };
 use io_uring::{IoUring, opcode, squeue, types};
-#[path = "descriptor.rs"]
 pub mod descriptor;
 use Descriptor as OwnedFd;
 pub use descriptor::Descriptor;
 #[cfg(test)]
-#[path = "simulation.rs"]
 pub mod simulation;
 
 // Only the selected backend constructs a submission, so simulated handles cannot
@@ -53,7 +51,6 @@ enum Submission {
     Sim(simulation::Op),
 }
 // Control-owned filesystem extension; shares this reactor's completion fences.
-#[path = "filesystem.rs"]
 pub mod filesystem;
 use std::{
     cell::{Cell, RefCell},
@@ -1428,12 +1425,8 @@ fn encode_address(
 #[cfg(test)]
 mod tests {
     use super::*;
-    mod empty_submit_tests {
-        include!("empty_submit_tests.rs");
-    }
-    mod reserved_submission_tests {
-        include!("reserved_submission_tests.rs");
-    }
+    mod empty_submit_tests;
+    mod reserved_submission_tests;
     use crate::{
         model::{Limits, RequestId},
         runtime::deadline::{Cancellation, Deadline},
