@@ -40,8 +40,9 @@ fn drive<T>(reactor: &Reactor, future: impl Future<Output = T>) -> T {
 fn application() -> (WorkerApplication, WorkerRuntime, PageCryptoEngine) {
     let mut config = crate::test_support::cluster::config(false);
     // One fixture represents both ends of eight nodes' sockets. Fund those
-    // ingress leases plus the reserved outbound/control partition explicitly.
-    config.limits.client_connections = NonZeroUsize::new(32).unwrap();
+    // ingress leases plus the reserved outbound/control partition explicitly,
+    // including the shared fixture's 16-connection neighbor cap.
+    config.limits.client_connections = NonZeroUsize::new(64).unwrap();
     config.limits.header_bytes = NonZeroUsize::new(32 * 1024).unwrap();
     config.limits.range_window_pages = NonZeroUsize::new(1).unwrap();
     // Use the exact worker progress floor rather than the generous fixture budget.
@@ -273,6 +274,9 @@ fn peer_worker_partition_rejects_underfunding_and_reduces_worker_count() {
     config.max_threads = 4;
     config.limits.range_window_pages = NonZeroUsize::new(1).unwrap();
     config.limits.connections_per_neighbor = NonZeroUsize::new(1).unwrap();
+    // Fund control progress on all three planned shards so only context bytes
+    // determine which worker counts pass the boundary assertions below.
+    config.limits.client_connections = NonZeroUsize::new(36).unwrap();
     let floor = wire::MIN_REQUEST_CONTEXT_BYTES + 4 * config.limits.header_bytes.get();
     for budget in [128 * 1024, floor - 1, floor, 2 * floor - 1, 2 * floor] {
         config.limits.request_context_bytes = NonZeroUsize::new(budget).unwrap();
@@ -301,7 +305,7 @@ fn peer_worker_partition_rejects_underfunding_and_reduces_worker_count() {
             &[],
         )
         .unwrap();
-        assert_eq!(plan.pairs.len(), 2);
+        assert_eq!(plan.pairs.len(), 3);
         let result = size_workers(&config.limits, &mut plan, false);
         if budget < floor {
             assert!(matches!(result, Err(Error::InvalidConfiguration)));
@@ -315,7 +319,7 @@ fn peer_worker_partition_rejects_underfunding_and_reduces_worker_count() {
 
 #[test]
 fn assembled_peer_io_rejects_oversize_and_admission_pressure_before_submission() {
-    use std::io::Write;
+    use std::io::{Read, Write};
     let (app, runtime, _engine) = application();
     let io = app.peers.transport_io();
     let admission = &runtime.admission;
@@ -351,8 +355,25 @@ fn assembled_peer_io_rejects_oversize_and_admission_pressure_before_submission()
     writer.join().unwrap();
     io.reclaim_buffer();
     assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
-    // No I/O or signing begins when receive staging or send scratch cannot fit.
-    for (send, available) in [(false, 4096 - 1), (true, 2 * wire::MAX_ENVELOPE_HEAD - 1)] {
+    let response = || MessageHead {
+        start: StartLine::Response { status: 200 },
+        headers: vec![Header {
+            name: "content-length".into(),
+            value: b"0".to_vec(),
+        }],
+    };
+    let encoded = Codec::new(wire::MAX_ENVELOPE_HEAD, 0)
+        .encode_head(&response())
+        .unwrap();
+    let send_budget = wire::MAX_ENVELOPE_HEAD + encoded.len();
+    // Send scratch uses the head cap, but staging uses the actual encoded size.
+    // Insufficient receive staging, send scratch, or send staging rejects before I/O.
+    for (send, available, succeeds) in [
+        (false, 4096 - 1, false),
+        (true, wire::MAX_ENVELOPE_HEAD - 1, false),
+        (true, send_budget - 1, false),
+        (true, send_budget, true),
+    ] {
         let held = admission
             .reserve(
                 None,
@@ -361,28 +382,29 @@ fn assembled_peer_io_rejects_oversize_and_admission_pressure_before_submission()
             )
             .unwrap();
         let baseline = admission.used(ResourceClass::RequestContext);
-        let (socket, _other) = UnixStream::pair().unwrap();
+        let (socket, mut other) = UnixStream::pair().unwrap();
         let conn = ConnectionLease::from_accepted(socket.into(), admission).unwrap();
-        let result = if send {
-            drive(
-                reactor,
-                io.send_head(
-                    conn,
-                    MessageHead {
-                        start: StartLine::Response { status: 200 },
-                        headers: vec![Header {
-                            name: "content-length".into(),
-                            value: b"0".to_vec(),
-                        }],
-                    },
-                    &scope,
-                ),
-            )
-            .map(|_| ())
-        } else {
-            drive(reactor, io.receive_head(conn, &scope)).map(|_| ())
+        let operation = async {
+            if send {
+                io.send_head(conn, response(), &scope).await.map(|_| ())
+            } else {
+                io.receive_head(conn, &scope).await.map(|_| ())
+            }
         };
-        assert_eq!(result, Err(Error::Overloaded));
+        if succeeds {
+            assert_eq!(drive(reactor, operation), Ok(()));
+            let mut received = vec![0; encoded.len()];
+            other.read_exact(&mut received).unwrap();
+            assert_eq!(received, encoded);
+        } else {
+            let mut operation = std::pin::pin!(operation);
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            assert_eq!(
+                operation.as_mut().poll(&mut cx),
+                Poll::Ready(Err(Error::Overloaded)),
+                "send={send}, available={available}"
+            );
+        }
         assert_eq!(reactor.in_flight(), 0);
         io.reclaim_buffer();
         assert_eq!(admission.used(ResourceClass::RequestContext), baseline);

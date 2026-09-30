@@ -1,4 +1,4 @@
-//! Native lifecycle endpoints share the existing I/O/crypto worker pair.
+//! Native lifecycle endpoints remain per I/O shard, even with shared crypto threads.
 use super::*;
 use crate::rdma::{
     device::FabricPort,
@@ -233,7 +233,10 @@ mod tests {
             .filter(|(key, _)| key.starts_with("RACER_"))
             .map(|(key, value)| (key, value.trim_end_matches('"')))
             .collect();
-        assert_eq!(values.len(), 14);
+        assert_eq!(
+            values.len(),
+            13 + usize::from(values.contains_key("RACER_MAX_THREADS"))
+        );
         let (config, _) = Config::from_lookup_with_fabric_ports(|name| {
             Ok(values
                 .get(name)
@@ -246,7 +249,13 @@ mod tests {
         })
         .unwrap();
         assert!(!config.enable_rdma);
-        assert_eq!(config.max_threads, 8);
+        assert_eq!(
+            config.max_threads,
+            values
+                .get("RACER_MAX_THREADS")
+                .map(|value| value.parse::<usize>().unwrap())
+                .unwrap_or(crate::config::DEFAULT_MAX_THREADS)
+        );
         assert_eq!(config.slab_bytes, 1024 * 1024 * 1024);
         assert_eq!(
             config.limits.request_context_bytes,
@@ -254,7 +263,7 @@ mod tests {
         );
         let mut plan = four_pair_plan(&config);
         let limits = size_workers(&config.limits, &mut plan, config.enable_rdma).unwrap();
-        assert_eq!(plan.pairs.len(), 4);
+        assert_eq!(plan.pairs.len(), 5);
         let admission = Admission::new(limits.clone());
         let page = crate::model::range::PAGE_BYTES as usize;
         for (class, floor) in [
@@ -275,12 +284,12 @@ mod tests {
             drop(reservation);
             assert_eq!(admission.used(class), 0);
         }
-        assert_eq!(limits.plaintext_bytes.get(), 64 * 1024 * 1024);
-        assert_eq!(limits.ciphertext_bytes.get(), 64 * 1024 * 1024);
-        assert_eq!(limits.dirty_bytes.get(), 32 * 1024 * 1024);
-        assert_eq!(limits.request_context_bytes.get(), 16 * 1024 * 1024);
+        assert_eq!(limits.plaintext_bytes.get(), 256 * 1024 * 1024 / 5);
+        assert_eq!(limits.ciphertext_bytes.get(), 256 * 1024 * 1024 / 5);
+        assert_eq!(limits.dirty_bytes.get(), 128 * 1024 * 1024 / 5);
+        assert_eq!(limits.request_context_bytes.get(), 64 * 1024 * 1024 / 5);
         assert_eq!(admission.used(ResourceClass::Registered), 0);
-        // Reducing thread cap or quotas keeps whole pairs and re-partitions the
+        // Reducing thread cap or quotas keeps local groups and re-partitions the
         // node budget. An impossible byte floor must fail rather than deadlock.
         let mut too_small = config.limits.clone();
         too_small.plaintext_bytes = NonZeroUsize::new(3 * page - 1).unwrap();
@@ -306,14 +315,14 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(plan.pairs.len(), 4);
+        assert_eq!(plan.pairs.len(), 5);
         plan
     }
 
     #[test]
     fn smt_startup_final_count_partitions_live_budgets_and_obeys_memory_floors() {
         use crate::runtime::affinity::{CpuLocation, EffectiveTopology};
-        for (allow_smt, expected) in [(false, 2), (true, 4)] {
+        for (allow_smt, expected) in [(false, 3), (true, 5)] {
             let (mut config, _) = Config::from_lookup_with_fabric_ports(|name| {
                 Ok(match name {
                     "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
@@ -369,6 +378,12 @@ mod tests {
             assert_eq!(plan.pairs.len(), 2);
             assert_eq!(limits.plaintext_bytes.get(), floor);
             assert_eq!(limits.relay_transfers.get(), 128);
+            assert_eq!(plan.crypto_groups(), vec![vec![0, 1]]);
+            assert!(
+                plan.pairs
+                    .iter()
+                    .all(|pair| pair.io.numa_node == pair.crypto.numa_node)
+            );
             assert_eq!(
                 plan.pairs.iter().map(|p| p.worker).collect::<Vec<_>>(),
                 vec![WorkerId(0), WorkerId(1)]
@@ -379,13 +394,91 @@ mod tests {
     }
 
     #[test]
+    fn resource_shortage_reduces_and_regroups_uneven_numa_workers() {
+        use crate::runtime::affinity::{CpuLocation, EffectiveTopology};
+        let mut config = default_config(false);
+        let floor = 3 * crate::model::range::PAGE_BYTES as usize;
+        for supported in 1..=10 {
+            config.limits.plaintext_bytes = NonZeroUsize::new(supported * floor).unwrap();
+            config.limits.ciphertext_bytes = NonZeroUsize::new(1024 * 1024 * 1024).unwrap();
+            config.limits.dirty_bytes = NonZeroUsize::new(1024 * 1024 * 1024).unwrap();
+            config.limits.request_context_bytes = NonZeroUsize::new(1024 * 1024 * 1024).unwrap();
+            let mut plan = AffinityPlan::from_topology(
+                &config,
+                EffectiveTopology {
+                    cpus: (0..16)
+                        .map(|cpu| CpuLocation {
+                            cpu,
+                            core: cpu,
+                            package: 0,
+                            numa_node: Some(usize::from(cpu >= 7)),
+                        })
+                        .collect(),
+                    quota: None,
+                    nics: vec![],
+                },
+                &[],
+            )
+            .unwrap();
+            assert_eq!(plan.pairs.len(), 11);
+            let limits = size_workers(&config.limits, &mut plan, false).unwrap();
+            assert_eq!(plan.pairs.len(), supported);
+            assert_eq!(limits.plaintext_bytes.get(), floor);
+            assert!(
+                plan.pairs
+                    .iter()
+                    .all(|pair| pair.io.numa_node == pair.crypto.numa_node)
+            );
+            for node in [Some(0), Some(1)] {
+                let io = plan
+                    .pairs
+                    .iter()
+                    .filter(|pair| pair.io.numa_node == node)
+                    .count();
+                let crypto = plan
+                    .crypto_groups()
+                    .iter()
+                    .filter(|group| plan.pairs[group[0]].crypto.numa_node == node)
+                    .count();
+                // The original seven-core node has two crypto CPUs; shrinking
+                // never invents more even when rounding five I/O shards upward.
+                assert_eq!(
+                    crypto,
+                    io.div_ceil(2).min(if node == Some(0) { 2 } else { 3 })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_endpoints_remain_per_io_with_shared_crypto_placement() {
+        let config = default_config(true);
+        let mut plan = four_pair_plan(&config);
+        let limits = size_workers(&config.limits, &mut plan, true).unwrap();
+        assert!(plan.crypto_groups().len() < plan.pairs.len());
+        let native = NativePairs::default();
+        native.place(&plan).unwrap();
+        native
+            .prepare(plan.pairs.iter().map(|pair| pair.worker), &limits)
+            .unwrap();
+        for pair in &plan.pairs {
+            assert_eq!(
+                native.numa(pair.worker).unwrap(),
+                Some(pair.crypto.numa_node)
+            );
+            assert!(native.io(pair.worker).unwrap().is_some());
+            assert!(native.io(pair.worker).unwrap().is_none());
+        }
+    }
+
+    #[test]
     fn default_worker_sizing_funds_native_slots_within_node_budgets() {
         let config = default_config(true);
         assert_eq!(config.limits.registered_bytes.get(), 128 * 1024 * 1024);
         let mut plan = four_pair_plan(&config);
         let limits = size_workers(&config.limits, &mut plan, true).unwrap();
         assert_eq!(plan.pairs.len(), 3);
-        assert_eq!(plan.max_threads, 8);
+        assert_eq!(plan.max_threads, usize::MAX);
         for (worker, pair) in plan.pairs.iter().enumerate() {
             assert_eq!(pair.worker, WorkerId(worker as u16));
         }
@@ -496,11 +589,11 @@ mod tests {
             config.limits.registered_bytes = NonZeroUsize::new(budget).unwrap();
             let mut plan = four_pair_plan(&config);
             let limits = size_workers(&config.limits, &mut plan, false).unwrap();
-            assert_eq!(plan.pairs.len(), 4);
+            assert_eq!(plan.pairs.len(), 5);
             assert_eq!(limits.registered_bytes, config.limits.registered_bytes);
             assert_eq!(
                 limits.plaintext_bytes.get(),
-                config.limits.plaintext_bytes.get() / 4
+                config.limits.plaintext_bytes.get() / 5
             );
             // Native sizing must still honor all the existing non-native floors.
             config.limits.pipes = NonZeroUsize::new(2).unwrap();

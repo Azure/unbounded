@@ -194,7 +194,9 @@ impl Application {
     pub fn run(mut self) -> Result<()> {
         self.config.validate()?;
         let mut plan = AffinityPlan::discover(&self.config)?;
+        log_worker_plan("planned", &plan);
         self.limits = size_workers(&self.config.limits, &mut plan, self.config.enable_rdma)?;
+        log_worker_plan("final", &plan);
         self.node = Arc::new(NodeState::new(
             plan.pairs.iter().map(|p| p.worker).collect(),
             self.limits.queue_entries.get(),
@@ -230,59 +232,137 @@ fn scope(timeout: Duration) -> Result<RequestScope> {
 
 /// Divide aggregate resource dimensions, preserving per-operation protocol caps.
 /// Replay is a single node-wide table, so every handle uses the same node cap.
+#[cfg(test)]
 fn partition_limits(node: &Limits, workers: usize, rdma: bool) -> Result<Limits> {
+    partition_limits_with_cause(node, workers, rdma).map_err(|(_, error)| error)
+}
+
+fn partition_limits_with_cause(
+    node: &Limits,
+    workers: usize,
+    rdma: bool,
+) -> std::result::Result<Limits, (&'static str, Error)> {
+    let invalid = |dimension| (dimension, Error::InvalidConfiguration);
     if workers == 0 {
-        return Err(Error::InvalidConfiguration);
+        return Err(invalid("io_workers"));
     }
     let mut limits = node.clone();
-    for value in [
-        &mut limits.plaintext_bytes,
-        &mut limits.ciphertext_bytes,
-        &mut limits.dirty_bytes,
-        &mut limits.request_context_bytes,
-        &mut limits.flights,
-        &mut limits.queue_entries,
-        &mut limits.client_connections,
-        &mut limits.pipes,
-        &mut limits.cached_rankings,
-        &mut limits.cached_paths,
-        &mut limits.metadata_entries,
-        &mut limits.relay_transfers,
+    for (dimension, value) in [
+        ("plaintext_bytes", &mut limits.plaintext_bytes),
+        ("ciphertext_bytes", &mut limits.ciphertext_bytes),
+        ("dirty_bytes", &mut limits.dirty_bytes),
+        ("request_context_bytes", &mut limits.request_context_bytes),
+        ("flights", &mut limits.flights),
+        ("queue_entries", &mut limits.queue_entries),
+        ("client_connections", &mut limits.client_connections),
+        ("pipes", &mut limits.pipes),
+        ("cached_rankings", &mut limits.cached_rankings),
+        ("cached_paths", &mut limits.cached_paths),
+        ("metadata_entries", &mut limits.metadata_entries),
+        ("relay_transfers", &mut limits.relay_transfers),
     ] {
-        *value = NonZeroUsize::new(value.get() / workers).ok_or(Error::InvalidConfiguration)?;
+        *value = NonZeroUsize::new(value.get() / workers).ok_or_else(|| invalid(dimension))?;
     }
     if rdma {
         limits.registered_bytes = NonZeroUsize::new(node.registered_bytes.get() / workers)
-            .ok_or(Error::InvalidConfiguration)?;
+            .ok_or_else(|| invalid("registered_bytes"))?;
     }
     let page = crate::model::range::PAGE_BYTES as usize;
     let window = limits.range_window_pages.get();
-    if limits.plaintext_bytes.get() < (window + 1) * page
-        || limits.ciphertext_bytes.get()
-            < (window + 1) * (page + 16) + crate::store::format::MAX_HEADER_BYTES
-        || limits.dirty_bytes.get() < page + 16
-        || rdma && native::slot_count(&limits)? == 0
-        || limits.request_context_bytes.get()
-            < crate::peer::wire::MIN_REQUEST_CONTEXT_BYTES
-                + 4 * limits.header_bytes.get().max(crate::model::MAX_FIELD_BYTES)
-        || limits.queue_entries.get() < 2
-        || limits.client_connections < limits.connections_per_neighbor
-    {
-        return Err(Error::InvalidConfiguration);
+    for (dimension, insufficient) in [
+        (
+            "plaintext_bytes",
+            limits.plaintext_bytes.get() < (window + 1) * page,
+        ),
+        (
+            "ciphertext_bytes",
+            limits.ciphertext_bytes.get()
+                < (window + 1) * (page + 16) + crate::store::format::MAX_HEADER_BYTES,
+        ),
+        ("dirty_bytes", limits.dirty_bytes.get() < page + 16),
+        (
+            "registered_bytes",
+            rdma && native::slot_count(&limits).map_err(|error| ("registered_bytes", error))? == 0,
+        ),
+        (
+            "request_context_bytes",
+            limits.request_context_bytes.get()
+                < crate::peer::wire::MIN_REQUEST_CONTEXT_BYTES
+                    + 4 * limits.header_bytes.get().max(crate::model::MAX_FIELD_BYTES),
+        ),
+        ("queue_entries", limits.queue_entries.get() < 2),
+        (
+            "client_connections",
+            limits.client_connections < limits.connections_per_neighbor,
+        ),
+    ] {
+        if insufficient {
+            return Err(invalid(dimension));
+        }
+    }
+    // Snapshot polling, renewal, and key delivery need independent control slots.
+    // The same partition also funds outbound progress. Per-neighbor concurrency
+    // is a ceiling, not a promise of that many shared outbound slots.
+    let admission = Admission::new(limits.clone());
+    if admission.limit(crate::model::limits::ResourceClass::ControlConnection) < 3 {
+        return Err(invalid("control_connections"));
     }
     Ok(limits)
 }
 
+fn log_worker_plan(stage: &str, plan: &AffinityPlan) {
+    let groups = plan.crypto_groups();
+    eprintln!(
+        "racer-dataplane: stage=worker-plan state={stage} io_workers={} crypto_workers={}",
+        plan.pairs.len(),
+        groups.len()
+    );
+    for indices in groups {
+        let crypto = &plan.pairs[indices[0]].crypto;
+        let io = indices
+            .iter()
+            .map(|&index| {
+                let pair = &plan.pairs[index];
+                (pair.worker.0, pair.io.cpu, pair.io.numa_node)
+            })
+            .collect::<Vec<_>>();
+        eprintln!(
+            "racer-dataplane: stage=worker-placement state={stage} crypto_cpu={} crypto_numa={:?} io_worker_cpu_numa={io:?}",
+            crypto.cpu, crypto.numa_node
+        );
+    }
+}
+
 fn size_workers(node: &Limits, plan: &mut AffinityPlan, rdma: bool) -> Result<Limits> {
-    // Every pair needs page progress reserves and, when enabled, a complete native
-    // slot including aligned registered and staging buffers. Reduce pairs to fit.
+    // Every I/O shard needs page progress reserves and, when enabled, a complete
+    // native slot including aligned registered and staging buffers. Reduce shards
+    // first, then rebalance shared crypto execution on the surviving NUMA nodes.
+    let mut count = plan.pairs.len();
+    let mut limiting_resource = None;
     loop {
-        match partition_limits(node, plan.pairs.len(), rdma) {
-            Ok(limits) => return Ok(limits),
-            Err(_) if plan.pairs.len() > 1 => {
-                plan.pairs.pop();
+        match partition_limits_with_cause(node, count, rdma) {
+            Ok(limits) => {
+                if count != plan.pairs.len() {
+                    eprintln!(
+                        "racer-dataplane: stage=worker-sizing planned_io={} final_io={count} limiting_resource={}",
+                        plan.pairs.len(),
+                        limiting_resource.unwrap_or("unknown")
+                    );
+                    plan.reduce_workers(count);
+                }
+                return Ok(limits);
             }
-            Err(error) => return Err(error),
+            Err((dimension, _)) if count > 1 => {
+                // The last rejected count identifies a binding resource floor.
+                limiting_resource = Some(dimension);
+                count -= 1;
+            }
+            Err((dimension, error)) => {
+                eprintln!(
+                    "racer-dataplane: stage=worker-sizing io_workers={count} limiting_resource={dimension} error={error:?}"
+                );
+                return Err(error);
+            }
         }
     }
 }
@@ -1754,6 +1834,158 @@ pub(crate) mod tests {
         crypto::{self, CryptoClient},
         reactor::Reactor,
     };
+
+    #[test]
+    fn worker_sizing_reports_specific_resource_floor() {
+        let base = Config::from_lookup_with_fabric_ports(|name| {
+            Ok(match name {
+                "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
+                "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
+                "RACER_ENABLE_RDMA" => Some("false".into()),
+                _ => None,
+            })
+        })
+        .unwrap()
+        .0
+        .limits;
+        assert!(partition_limits_with_cause(&base, 1, false).is_ok());
+        assert_eq!(
+            partition_limits_with_cause(&base, 0, false).err(),
+            Some(("io_workers", Error::InvalidConfiguration))
+        );
+        for dimension in [
+            "plaintext_bytes",
+            "ciphertext_bytes",
+            "dirty_bytes",
+            "request_context_bytes",
+            "queue_entries",
+            "client_connections",
+            "registered_bytes",
+            "pipes",
+        ] {
+            let mut limits = base.clone();
+            let value = match dimension {
+                "plaintext_bytes" => &mut limits.plaintext_bytes,
+                "ciphertext_bytes" => &mut limits.ciphertext_bytes,
+                "dirty_bytes" => &mut limits.dirty_bytes,
+                "request_context_bytes" => &mut limits.request_context_bytes,
+                "queue_entries" => &mut limits.queue_entries,
+                "client_connections" => &mut limits.client_connections,
+                "registered_bytes" => &mut limits.registered_bytes,
+                _ => &mut limits.pipes,
+            };
+            *value = NonZeroUsize::new(1).unwrap();
+            let workers = if dimension == "pipes" { 2 } else { 1 };
+            let rdma = dimension == "registered_bytes";
+            assert_eq!(
+                partition_limits_with_cause(&limits, workers, rdma).err(),
+                Some((dimension, Error::InvalidConfiguration)),
+                "{dimension}"
+            );
+            if rdma {
+                assert!(partition_limits_with_cause(&limits, workers, false).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn worker_sizing_funds_derived_connection_pools() {
+        use crate::{
+            model::limits::ResourceClass,
+            runtime::affinity::{CpuLocation, EffectiveTopology},
+        };
+        let config = Config::from_lookup_with_fabric_ports(|name| {
+            Ok(match name {
+                "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
+                "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
+                "RACER_ENABLE_RDMA" => Some("false".into()),
+                "RACER_CLIENT_CONNECTIONS" => Some("16".into()),
+                _ => None,
+            })
+        })
+        .unwrap()
+        .0;
+        let make_plan = || {
+            AffinityPlan::from_topology(
+                &config,
+                EffectiveTopology {
+                    cpus: (0..8)
+                        .map(|cpu| CpuLocation {
+                            cpu,
+                            package: 0,
+                            core: cpu,
+                            numa_node: Some(0),
+                        })
+                        .collect(),
+                    quota: None,
+                    nics: vec![],
+                },
+                &[],
+            )
+            .unwrap()
+        };
+        let mut plan = make_plan();
+        assert_eq!(plan.pairs.len(), 5);
+        for workers in 2..=5 {
+            // This cause feeds the production worker-sizing diagnostic, including
+            // the last rejected count before reduction succeeds.
+            assert_eq!(
+                partition_limits_with_cause(&config.limits, workers, false).err(),
+                Some(("control_connections", Error::InvalidConfiguration))
+            );
+        }
+        let limits = size_workers(&config.limits, &mut plan, false).unwrap();
+        assert_eq!(plan.pairs.len(), 1);
+        assert_eq!(plan.crypto_groups(), vec![vec![0]]);
+        assert_eq!(limits.client_connections.get(), 16);
+
+        for (connections, neighbor, cause) in [
+            (3, 2, Some("control_connections")),
+            (11, 2, Some("control_connections")),
+            (12, 2, None),
+            (15, 4, None),
+            (16, 4, None),
+        ] {
+            let mut node = config.limits.clone();
+            node.client_connections = NonZeroUsize::new(connections).unwrap();
+            node.connections_per_neighbor = NonZeroUsize::new(neighbor).unwrap();
+            let result = partition_limits_with_cause(&node, 1, false);
+            if let Some(cause) = cause {
+                assert_eq!(result.err(), Some((cause, Error::InvalidConfiguration)));
+                assert!(matches!(
+                    size_workers(&node, &mut make_plan(), false),
+                    Err(Error::InvalidConfiguration)
+                ));
+                continue;
+            }
+            let admission = Admission::new(result.unwrap());
+            let control = (0..3)
+                .map(|_| {
+                    admission
+                        .reserve_connection(ResourceClass::ControlConnection)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let outbound_count = neighbor.min(admission.limit(ResourceClass::OutboundConnection));
+            let outbound = (0..outbound_count)
+                .map(|_| {
+                    admission
+                        .reserve_connection(ResourceClass::OutboundConnection)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let ingress = admission
+                .reserve_connection(ResourceClass::IngressConnection)
+                .unwrap();
+            assert_eq!(
+                admission.used(ResourceClass::Connection),
+                3 + outbound_count + 1
+            );
+            assert!(admission.used(ResourceClass::Connection) <= connections);
+            drop((control, outbound, ingress));
+            assert_eq!(admission.used(ResourceClass::Connection), 0);
+        }
+    }
 
     pub(crate) fn wake_test_worker() -> WorkerApplication {
         let config = crate::test_support::cluster::config(false);

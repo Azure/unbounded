@@ -1,14 +1,11 @@
 //! CPU/cpuset discovery and NIC-local role assignment before workers start.
 //!
-//! Each logical worker has exactly two threads: one reactor and one crypto thread.
-//! Prefer separate physical cores in the same NIC-local NUMA node. On a one-CPU
-//! cpuset, pin both threads to that CPU and use bounded work with wakeable waits.
-//! Size complete pairs using allowed CPUs, applicable cgroup quotas, and the total
-//! thread cap (eight by default). An odd spare CPU does not create a partial pair.
+//! I/O shards share NUMA-local crypto threads at approximately a 2:1 ratio.
+//! Use every eligible physical core unless CPU or resource budgets limit workers.
+//! On a one-CPU cpuset, pin both roles to that CPU to preserve progress.
 //! Quotas limit execution time, not CPU affinity. Keep rail selection deterministic
 //! across nodes; local pair placement must not change the page's selected rail.
-//! Opt-in SMT counts allowed logical CPUs and never reuses a CPU. Reactors prefer
-//! distinct physical cores; crypto roles prefer their reactor's available sibling.
+//! Opt-in SMT counts allowed logical CPUs. Reactors prefer distinct physical cores.
 
 use crate::{
     config::Config,
@@ -17,7 +14,7 @@ use crate::{
     topology::rails::RailMapping,
 };
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs,
     num::NonZeroU64,
     path::{Path, PathBuf},
@@ -52,6 +49,7 @@ pub struct NicLocality {
     pub numa_node: Option<usize>,
 }
 
+#[derive(Clone)]
 pub struct EffectiveTopology {
     /// Online CPUs intersected with process affinity and effective cpuset.
     pub cpus: Vec<CpuLocation>,
@@ -59,9 +57,9 @@ pub struct EffectiveTopology {
     pub nics: Vec<NicLocality>,
 }
 
-/// Exactly two roles by construction. The default prefers distinct physical
-/// cores; SMT prefers siblings with unique logical CPUs. NIC locality never
-/// overrides the deterministic end-to-end rail.
+/// One I/O shard and its crypto execution placement. Equal crypto CPU IDs across
+/// assignments explicitly identify the same execution thread, not duplicate threads.
+/// NIC locality never overrides the deterministic end-to-end rail.
 #[derive(Clone, Debug)]
 pub struct WorkerPair {
     pub worker: WorkerId,
@@ -80,7 +78,7 @@ impl WorkerPair {
 }
 
 pub struct AffinityPlan {
-    /// Unique WorkerIds, complete pairs only. Control/diagnostics run on I/O.
+    /// Per-I/O assignments with unique WorkerIds. Control/diagnostics run on I/O.
     pub pairs: Vec<WorkerPair>,
     /// Whole-process budget. `run` uses its caller as the first reactor. Owned
     /// startup must reserve one additional slot for the calling thread.
@@ -88,8 +86,7 @@ pub struct AffinityPlan {
 }
 
 /// Pure sizing policy, not hardware discovery or a claim that threads have started.
-/// Count physical cores rather than SMT siblings; floor odd/fractional capacity
-/// to complete pairs, except that any positive CPU budget supports one pair.
+/// Count I/O shards using the same physical-core and NUMA policy as placement.
 pub fn pair_count(max_threads: usize, topology: &EffectiveTopology) -> Result<usize> {
     pair_count_with_policy(max_threads, topology, false)
 }
@@ -99,44 +96,15 @@ fn pair_count_with_policy(
     topology: &EffectiveTopology,
     allow_smt: bool,
 ) -> Result<usize> {
-    if max_threads < 2 || topology.cpus.is_empty() {
-        return Err(Error::InvalidConfiguration);
-    }
-    let logical = topology
-        .cpus
-        .iter()
-        .map(|cpu| cpu.cpu)
-        .collect::<HashSet<_>>()
-        .len();
-    if logical != topology.cpus.len() || (allow_smt && logical < 2) {
-        return Err(Error::InvalidConfiguration);
-    }
-    let cores = if allow_smt {
-        logical
-    } else {
-        topology
-            .cpus
-            .iter()
-            .map(|cpu| (cpu.package, cpu.core))
-            .collect::<HashSet<_>>()
-            .len()
-    };
-    let quota_cores = topology
-        .quota
-        .map(|quota| {
-            usize::try_from(quota.quota.get() / quota.period.get())
-                .unwrap_or(usize::MAX)
-                .max(1)
-        })
-        .unwrap_or(cores);
-    // WorkerId is u16; every pair needs its own stable shard ID.
-    Ok((max_threads / 2)
-        .min((cores.min(quota_cores) / 2).max(1))
-        .min(usize::from(u16::MAX) + 1))
+    Ok(
+        AffinityPlan::place_with_policy(max_threads, topology.clone(), &[], allow_smt)?
+            .pairs
+            .len(),
+    )
 }
 
 impl AffinityPlan {
-    /// Honor allowed CPUs, quotas, and the total thread cap; always form full pairs.
+    /// Honor allowed CPUs, quotas, and the total thread cap.
     pub fn discover(config: &Config) -> Result<Self> {
         Self::from_topology(config, EffectiveTopology::discover()?, &[])
     }
@@ -176,9 +144,23 @@ impl AffinityPlan {
         rails: &[RailMapping],
         allow_smt: bool,
     ) -> Result<Self> {
-        let count = pair_count_with_policy(max_threads, &topology, allow_smt)?;
+        if max_threads < 2 || topology.cpus.is_empty() {
+            return Err(Error::InvalidConfiguration);
+        }
+        let quota = topology.quota.map(|quota| {
+            usize::try_from(quota.quota.get() / quota.period.get())
+                .unwrap_or(usize::MAX)
+                .max(1)
+        });
         let mut cpus = topology.cpus;
         cpus.sort_by_key(|cpu| cpu.cpu);
+        if cpus.windows(2).any(|pair| pair[0].cpu == pair[1].cpu) {
+            return Err(Error::InvalidConfiguration);
+        }
+        if !allow_smt {
+            let mut cores = HashSet::new();
+            cpus.retain(|cpu| cores.insert((cpu.package, cpu.core)));
+        }
         let mut nics = topology.nics;
         nics.sort_by(|a, b| a.device.cmp(&b.device));
         // RailMapping carries a fabric label, not a local device identifier. NUMA
@@ -187,117 +169,88 @@ impl AffinityPlan {
             nic.numa_node.is_some()
                 && (rails.is_empty() || rails.iter().any(|rail| rail.numa_node == nic.numa_node))
         });
-        if allow_smt {
-            return Self::place_smt(max_threads, count, &cpus, &nics);
+        let capacity = quota.unwrap_or(cpus.len()).min(cpus.len());
+        let mut remaining = max_threads;
+        let mut available = capacity;
+        let mut nodes = BTreeMap::<_, Vec<_>>::new();
+        for cpu in cpus {
+            nodes.entry(cpu.numa_node).or_default().push(cpu);
         }
-        let mut used = HashSet::new();
-        let mut pairs = Vec::with_capacity(count);
-        for index in 0..count {
-            let nic = nics.get(index % nics.len().max(1)).cloned();
-            let node = nic.as_ref().and_then(|nic| nic.numa_node);
-            let mut choose = || {
-                let cpu = cpus
-                    .iter()
-                    .min_by_key(|cpu| {
-                        (
-                            used.contains(&(cpu.package, cpu.core)),
-                            node.is_some() && cpu.numa_node != node,
-                            cpu.cpu,
-                        )
-                    })
-                    .expect("nonempty topology")
-                    .clone();
-                used.insert((cpu.package, cpu.core));
-                cpu
+        let mut nodes = nodes.into_iter().collect::<Vec<_>>();
+        nodes.sort_by_key(|(node, _)| (!nics.iter().any(|nic| nic.numa_node == *node), *node));
+        let mut pairs = Vec::new();
+        for (node, local) in nodes {
+            if remaining < 2 || available == 0 {
+                break;
+            }
+            // Prefer physical-core diversity among the reactors even with SMT.
+            let mut cores = HashSet::new();
+            let mut ordered = local
+                .into_iter()
+                .map(|cpu| (!cores.insert((cpu.package, cpu.core)), cpu))
+                .collect::<Vec<_>>();
+            ordered.sort_by_key(|(sibling, cpu)| (*sibling, cpu.cpu));
+            let mut local = ordered.into_iter().map(|(_, cpu)| cpu).collect::<Vec<_>>();
+            let count = local.len().min(remaining).min(available);
+            local.truncate(count);
+            // Nearest integral 2:1 split, spending both remainder cores when
+            // n % 3 == 2 (eight cores become five I/O plus three crypto).
+            let crypto_count = ((count + 1) / 3).max(1);
+            let io_count = count.saturating_sub(crypto_count).max(1);
+            let crypto = if count == 1 {
+                &local[..]
+            } else {
+                &local[io_count..]
             };
-            let io = choose();
-            let crypto = choose();
-            let nic = nic
-                .filter(|nic| io.numa_node == nic.numa_node && crypto.numa_node == nic.numa_node);
-            pairs.push(WorkerPair {
-                worker: WorkerId(index as u16),
-                io,
-                crypto,
-                nic,
-            });
+            let nic = nics.iter().find(|nic| nic.numa_node == node).cloned();
+            for (index, io) in local[..io_count].iter().enumerate() {
+                if pairs.len() > usize::from(u16::MAX) {
+                    break;
+                }
+                pairs.push(WorkerPair {
+                    worker: WorkerId(pairs.len() as u16),
+                    io: io.clone(),
+                    crypto: crypto[index % crypto.len()].clone(),
+                    nic: nic.clone(),
+                });
+            }
+            remaining -= count.max(2);
+            available -= count;
         }
         Ok(Self { pairs, max_threads })
     }
 
-    fn place_smt(
-        max_threads: usize,
-        count: usize,
-        cpus: &[CpuLocation],
-        nics: &[NicLocality],
-    ) -> Result<Self> {
-        let mut used_cpus = HashSet::new();
-        let mut reactor_cores = HashSet::new();
-        let mut reactors = Vec::with_capacity(count);
-        // Reserve all reactors before assigning crypto so an asymmetric cpuset
-        // cannot spend a reactor's only distinct core on an earlier crypto role.
-        for index in 0..count {
-            let nic = nics.get(index % nics.len().max(1)).cloned();
-            let node = nic.as_ref().and_then(|nic| nic.numa_node);
-            let io = cpus
-                .iter()
-                .filter(|cpu| !used_cpus.contains(&cpu.cpu))
-                .min_by_key(|cpu| {
-                    (
-                        reactor_cores.contains(&(cpu.package, cpu.core)),
-                        node.is_some() && cpu.numa_node != node,
-                        cpu.cpu,
-                    )
-                })
-                .ok_or(Error::InvalidConfiguration)?
-                .clone();
-            used_cpus.insert(io.cpu);
-            reactor_cores.insert((io.package, io.core));
-            reactors.push((io, nic));
+    /// Deterministic execution groups ordered by crypto CPU, then pair index.
+    pub fn crypto_groups(&self) -> Vec<Vec<usize>> {
+        let mut groups = BTreeMap::<usize, Vec<usize>>::new();
+        for (index, pair) in self.pairs.iter().enumerate() {
+            groups.entry(pair.crypto.cpu).or_default().push(index);
         }
-        // Reserve available siblings before fallback can consume another pair's
-        // sibling. Topology may expose unequal numbers of threads per core.
-        let siblings = reactors
-            .iter()
-            .map(|(io, _)| {
-                let sibling = cpus
-                    .iter()
-                    .find(|cpu| {
-                        !used_cpus.contains(&cpu.cpu)
-                            && (cpu.package, cpu.core) == (io.package, io.core)
-                    })
-                    .cloned();
-                if let Some(cpu) = &sibling {
-                    used_cpus.insert(cpu.cpu);
-                }
-                sibling
-            })
-            .collect::<Vec<_>>();
-        let mut pairs = Vec::with_capacity(count);
-        for (index, ((io, nic), sibling)) in reactors.into_iter().zip(siblings).enumerate() {
-            let crypto = sibling
-                .or_else(|| {
-                    cpus.iter()
-                        .filter(|cpu| !used_cpus.contains(&cpu.cpu))
-                        .min_by_key(|cpu| {
-                            (
-                                io.numa_node.is_some() && cpu.numa_node != io.numa_node,
-                                cpu.cpu,
-                            )
-                        })
-                        .cloned()
-                })
-                .ok_or(Error::InvalidConfiguration)?;
-            used_cpus.insert(crypto.cpu);
-            let nic = nic
-                .filter(|nic| io.numa_node == nic.numa_node && crypto.numa_node == nic.numa_node);
-            pairs.push(WorkerPair {
-                worker: WorkerId(index as u16),
-                io,
-                crypto,
-                nic,
-            });
+        groups.into_values().collect()
+    }
+
+    /// Drop unfunded I/O shards and rebalance their surviving local crypto groups.
+    /// Never add threads or move an assignment across a known NUMA boundary.
+    pub(crate) fn reduce_workers(&mut self, count: usize) {
+        self.pairs.truncate(count);
+        let mut nodes = BTreeMap::<_, Vec<usize>>::new();
+        for (index, pair) in self.pairs.iter().enumerate() {
+            nodes.entry(pair.io.numa_node).or_default().push(index);
         }
-        Ok(Self { pairs, max_threads })
+        for indices in nodes.into_values() {
+            let mut crypto = BTreeMap::new();
+            for &index in &indices {
+                let cpu = &self.pairs[index].crypto;
+                crypto.entry(cpu.cpu).or_insert_with(|| cpu.clone());
+            }
+            let crypto = crypto
+                .into_values()
+                .take(indices.len().div_ceil(2))
+                .collect::<Vec<_>>();
+            for (offset, index) in indices.into_iter().enumerate() {
+                self.pairs[index].crypto = crypto[offset % crypto.len()].clone();
+            }
+        }
     }
 }
 
@@ -628,19 +581,165 @@ mod tests {
     }
 
     #[test]
+    fn one_through_nine_fill_eligible_cores_with_local_shared_crypto() {
+        for (cores, io, crypto) in [
+            (1, 1, 1),
+            (2, 1, 1),
+            (3, 2, 1),
+            (4, 3, 1),
+            (5, 3, 2),
+            (6, 4, 2),
+            (7, 5, 2),
+            (8, 5, 3),
+            (9, 6, 3),
+        ] {
+            for smt in [false, true] {
+                let plan =
+                    AffinityPlan::place_with_policy(usize::MAX, topology(cores, None), &[], smt)
+                        .unwrap();
+                assert_eq!(plan.pairs.len(), io, "cores={cores}, smt={smt}");
+                assert_eq!(plan.crypto_groups().len(), crypto);
+                let assigned = plan
+                    .pairs
+                    .iter()
+                    .flat_map(|pair| [pair.io.cpu, pair.crypto.cpu])
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(assigned, (0..cores).collect());
+                assert!(
+                    plan.pairs
+                        .iter()
+                        .all(|pair| pair.io.numa_node == pair.crypto.numa_node)
+                );
+                if cores > 1 {
+                    assert!(plan.pairs.iter().all(|pair| pair.io.cpu != pair.crypto.cpu));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uneven_numa_nodes_never_borrow_crypto_and_quota_is_global() {
+        for sizes in [
+            vec![1, 1],
+            vec![1, 7],
+            vec![2, 5, 9],
+            vec![4, 4],
+            vec![1, 1, 1],
+        ] {
+            let mut hardware = topology(sizes.iter().sum(), None);
+            let mut offset = 0;
+            for (node, size) in sizes.iter().enumerate() {
+                for cpu in &mut hardware.cpus[offset..offset + size] {
+                    cpu.numa_node = Some(node);
+                }
+                offset += size;
+            }
+            for quota in [None, Some((1, 2)), Some((3, 1)), Some((7, 1))] {
+                let mut hardware = hardware.clone();
+                hardware.quota = quota.map(|(q, p)| CpuQuota {
+                    quota: NonZeroU64::new(q).unwrap(),
+                    period: NonZeroU64::new(p).unwrap(),
+                });
+                let capacity = quota
+                    .map_or(offset, |(q, p)| (q / p).max(1) as usize)
+                    .min(offset);
+                let plan = AffinityPlan::place(usize::MAX, hardware, &[]).unwrap();
+                assert!(
+                    plan.pairs
+                        .iter()
+                        .all(|pair| pair.io.numa_node == pair.crypto.numa_node)
+                );
+                let assigned = plan
+                    .pairs
+                    .iter()
+                    .flat_map(|pair| [pair.io.cpu, pair.crypto.cpu])
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(assigned.len(), capacity);
+                for group in plan.crypto_groups() {
+                    assert!(
+                        group.iter().all(|index| plan.pairs[*index].crypto.cpu
+                            == plan.pairs[group[0]].crypto.cpu)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_caps_bound_execution_threads_even_with_singleton_numa_nodes() {
+        for sizes in [vec![1, 1, 1], vec![1, 8], vec![4, 5], vec![8, 1]] {
+            for cap in 2..=12 {
+                let mut hardware = topology(sizes.iter().sum(), None);
+                let mut offset = 0;
+                for (node, size) in sizes.iter().enumerate() {
+                    for cpu in &mut hardware.cpus[offset..offset + size] {
+                        cpu.numa_node = Some(node);
+                    }
+                    offset += size;
+                }
+                let plan = AffinityPlan::place(cap, hardware, &[]).unwrap();
+                assert!(!plan.pairs.is_empty());
+                assert!(plan.pairs.len() + plan.crypto_groups().len() <= cap);
+                assert!(
+                    plan.pairs
+                        .iter()
+                        .all(|pair| pair.io.numa_node == pair.crypto.numa_node)
+                );
+            }
+        }
+        let plan = AffinityPlan::place(usize::MAX, topology(300, None), &[]).unwrap();
+        assert_eq!(plan.pairs.len(), 200);
+        assert_eq!(plan.crypto_groups().len(), 100);
+    }
+
+    #[test]
+    fn crypto_groups_are_cpu_sorted_and_reduction_rebalances_locally() {
+        let mut hardware = topology(16, None);
+        for cpu in &mut hardware.cpus {
+            cpu.numa_node = Some(cpu.cpu / 8);
+        }
+        let mut plan = AffinityPlan::place(usize::MAX, hardware, &[]).unwrap();
+        assert_eq!(
+            plan.crypto_groups(),
+            vec![
+                vec![0, 3],
+                vec![1, 4],
+                vec![2],
+                vec![5, 8],
+                vec![6, 9],
+                vec![7]
+            ]
+        );
+        plan.reduce_workers(7);
+        assert_eq!(
+            plan.crypto_groups(),
+            vec![vec![0, 3], vec![1, 4], vec![2], vec![5, 6]]
+        );
+        assert!(
+            plan.pairs
+                .iter()
+                .all(|pair| pair.io.numa_node == pair.crypto.numa_node)
+        );
+        plan.reduce_workers(2);
+        assert_eq!(plan.crypto_groups(), vec![vec![0, 1]]);
+        plan.pairs.reverse();
+        assert_eq!(plan.crypto_groups(), vec![vec![0, 1]]);
+    }
+
+    #[test]
     fn sizing_always_budgets_full_pairs_including_single_cpu() {
         for (cap, cores, expected) in [
             (8, 1, 1),
             (8, 2, 1),
-            (8, 3, 1),
-            (8, 7, 3),
-            (7, 8, 3),
-            (3, 8, 1),
+            (8, 3, 2),
+            (8, 7, 5),
+            (7, 8, 5),
+            (3, 8, 2),
             (2, 1, 1),
         ] {
             assert_eq!(pair_count(cap, &topology(cores, None)), Ok(expected));
         }
-        assert_eq!(pair_count(DEFAULT_MAX_THREADS, &topology(64, None)), Ok(4));
+        assert_eq!(pair_count(DEFAULT_MAX_THREADS, &topology(64, None)), Ok(43));
         assert_eq!(
             pair_count(1, &topology(4, None)),
             Err(Error::InvalidConfiguration)
@@ -653,7 +752,7 @@ mod tests {
 
     #[test]
     fn effective_quota_and_physical_cores_limit_pairs() {
-        for (quota, period, expected) in [(1, 2, 1), (3, 1, 1), (7, 2, 1), (4, 1, 2), (9, 1, 4)] {
+        for (quota, period, expected) in [(1, 2, 1), (3, 1, 2), (7, 2, 2), (4, 1, 3), (9, 1, 5)] {
             assert_eq!(
                 pair_count(8, &topology(16, Some((quota, period)))),
                 Ok(expected)
@@ -663,13 +762,13 @@ mod tests {
         for cpu in &mut smt.cpus {
             cpu.core /= 2;
         }
-        assert_eq!(pair_count(8, &smt), Ok(2));
+        assert_eq!(pair_count(8, &smt), Ok(3));
         // Core zero on different packages is not an SMT sibling.
         for cpu in &mut smt.cpus {
             cpu.package = cpu.cpu;
             cpu.core = 0;
         }
-        assert_eq!(pair_count(8, &smt), Ok(4));
+        assert_eq!(pair_count(8, &smt), Ok(5));
     }
 
     #[test]
@@ -694,7 +793,7 @@ mod tests {
                 .iter()
                 .map(|p| (p.io.cpu, p.crypto.cpu))
                 .collect::<Vec<_>>(),
-            vec![(0, 1), (2, 3)]
+            vec![(0, 3), (1, 3), (2, 3)]
         );
         let plan = AffinityPlan::place_with_policy(8, hardware, &[], true).unwrap();
         assert_eq!(
@@ -702,23 +801,23 @@ mod tests {
                 .iter()
                 .map(|p| (p.io.cpu, p.crypto.cpu))
                 .collect::<Vec<_>>(),
-            vec![(0, 4), (1, 5), (2, 6), (3, 7)]
+            vec![(0, 5), (1, 6), (2, 7), (3, 5), (4, 6)]
         );
-        assert_eq!(plan.max_threads, DEFAULT_MAX_THREADS);
+        assert_eq!(plan.max_threads, 8);
     }
 
     #[test]
     fn smt_sizing_honors_quotas_caps_and_complete_unique_pairs() {
         for (cap, logical, quota, expected) in [
-            (8, 8, None, 4),
-            (8, 64, None, 4),
-            (7, 8, None, 3),
-            (8, 7, None, 3),
-            (8, 3, None, 1),
+            (8, 8, None, 5),
+            (8, 64, None, 5),
+            (7, 8, None, 5),
+            (8, 7, None, 5),
+            (8, 3, None, 2),
             (2, 8, None, 1),
-            (8, 8, Some((7, 2)), 1),
-            (8, 8, Some((4, 1)), 2),
-            (8, 8, Some((7, 1)), 3),
+            (8, 8, Some((7, 2)), 2),
+            (8, 8, Some((4, 1)), 3),
+            (8, 8, Some((7, 1)), 5),
             (8, 8, Some((1, 2)), 1),
         ] {
             let mut hardware = topology(logical, quota);
@@ -732,10 +831,12 @@ mod tests {
                 .iter()
                 .flat_map(|p| [p.io.cpu, p.crypto.cpu])
                 .collect::<BTreeSet<_>>();
-            assert_eq!(assigned.len(), 2 * expected);
+            let capacity = quota.map_or(logical, |(q, p)| (q / p).max(1) as usize);
+            assert_eq!(assigned.len(), logical.min(cap).min(capacity));
+            assert!(plan.pairs.len() + plan.crypto_groups().len() <= cap);
             assert!(assigned.iter().all(|cpu| *cpu < logical));
         }
-        for (cap, logical) in [(1, 8), (8, 0), (8, 1)] {
+        for (cap, logical) in [(1, 8), (8, 0)] {
             assert!(
                 AffinityPlan::place_with_policy(cap, topology(logical, None), &[], true).is_err()
             );
@@ -790,11 +891,12 @@ mod tests {
                     .iter()
                     .map(|p| (p.io.cpu, p.crypto.cpu))
                     .collect::<Vec<_>>(),
-                vec![(2, 22), (8, 26), (10, 18), (14, 30)]
+                vec![(2, 22), (10, 26), (18, 22), (8, 30), (14, 30)]
             );
             for (index, pair) in plan.pairs.iter().enumerate() {
                 assert_eq!(pair.worker, WorkerId(index as u16));
-                assert_eq!(pair.nic.is_some(), index != 1);
+                assert!(pair.nic.is_some());
+                assert_eq!(pair.io.numa_node, pair.crypto.numa_node);
             }
         }
         // All subsets model irregular allowed intersections, including SMT-only
@@ -817,7 +919,7 @@ mod tests {
                 &[],
                 true,
             );
-            if ids.len() < 2 {
+            if ids.is_empty() {
                 assert!(result.is_err());
                 continue;
             }
@@ -827,7 +929,7 @@ mod tests {
                 .iter()
                 .flat_map(|p| [p.io.cpu, p.crypto.cpu])
                 .collect::<BTreeSet<_>>();
-            assert_eq!(assigned.len(), 2 * (ids.len() / 2));
+            assert_eq!(assigned.len(), ids.len());
             assert!(assigned.is_subset(&ids));
             let reactor_cores = plan
                 .pairs
@@ -839,7 +941,28 @@ mod tests {
                 .filter(|cpu| ids.contains(&cpu.cpu))
                 .map(|cpu| (cpu.package, cpu.core))
                 .collect::<HashSet<_>>();
-            assert_eq!(reactor_cores.len(), plan.pairs.len().min(cores.len()));
+            assert!(reactor_cores.len() <= cores.len());
+            assert!(
+                plan.pairs
+                    .iter()
+                    .all(|pair| pair.io.numa_node == pair.crypto.numa_node)
+            );
+            for node in [Some(0), Some(1)] {
+                let local_cores = cores
+                    .iter()
+                    .filter(|(package, _)| Some(*package) == node)
+                    .count();
+                let local_reactors = plan
+                    .pairs
+                    .iter()
+                    .filter(|pair| pair.io.numa_node == node)
+                    .count();
+                let distinct = reactor_cores
+                    .iter()
+                    .filter(|(package, _)| Some(*package) == node)
+                    .count();
+                assert_eq!(distinct, local_reactors.min(local_cores));
+            }
         }
     }
 
@@ -893,8 +1016,8 @@ mod tests {
         });
         let plan = AffinityPlan::place(4, hardware, &[]).unwrap();
         assert_eq!(plan.pairs[0].io.cpu, 4);
-        assert_eq!(plan.pairs[0].crypto.cpu, 5);
-        assert_eq!(plan.pairs[1].io.cpu, 6);
+        assert_eq!(plan.pairs[0].crypto.cpu, 7);
+        assert_eq!(plan.pairs[1].io.cpu, 5);
         assert_eq!(plan.pairs[1].crypto.cpu, 7);
         let mut duplicate = topology(2, None);
         duplicate.cpus[1].cpu = 0;
@@ -921,7 +1044,9 @@ mod tests {
             let discovered = EffectiveTopology::discover().unwrap();
             assert_eq!(discovered.cpus.len(), 1);
             assert_eq!(discovered.cpus[0].cpu, cpu);
-            assert!(AffinityPlan::place_with_policy(8, discovered, &[], true).is_err());
+            let plan = AffinityPlan::place_with_policy(8, discovered, &[], true).unwrap();
+            assert_eq!(plan.pairs.len(), 1);
+            assert_eq!(plan.pairs[0].io.cpu, plan.pairs[0].crypto.cpu);
             set_cpus(&allowed).unwrap();
         })
         .join()

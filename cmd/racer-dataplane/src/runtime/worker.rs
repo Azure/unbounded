@@ -4,8 +4,8 @@
 //! must never cross threads; only bounded commands and completion-safe leases do.
 //! Drain flights before changing the worker map; no live remapping is implied.
 //!
-//! Each worker is an I/O/crypto thread pair. The I/O thread owns the service graph,
-//! flights, storage shard, and admission. Page AEAD runs on the paired crypto thread
+//! Each worker is an I/O shard. The I/O thread owns the service graph,
+//! flights, storage shard, and admission. Page AEAD runs on a shared crypto thread
 //! through bounded owned job/completion messages, retaining buffers and key leases
 //! until completion even after cancellation. Queue wakeups and completion capacity
 //! must permit progress when both threads share one CPU.
@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 #[cfg(test)]
 use std::time::Instant;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     marker::PhantomData,
     num::NonZeroUsize,
     rc::Rc,
@@ -39,6 +39,8 @@ use std::{
 };
 
 const WORK_BUDGET: usize = 64;
+// A large page is synchronous work. Yield to sibling shards after each job.
+const CRYPTO_QUANTUM: usize = 1;
 // Deadline checks, nonblocking accepts, and bounded round-robin passes still need
 // a tick when no registered completion or cooperative continuation wakes us.
 const IDLE_WAIT: Duration = Duration::from_millis(1);
@@ -59,6 +61,8 @@ pub struct WorkerRuntime {
 pub struct CryptoRuntime {
     pub port: CryptoPort,
 }
+type IoShard = (usize, WorkerPair, IoCryptoPort);
+type CryptoShard = (usize, WorkerId, CryptoPort);
 pub struct WorkerMap {
     workers: Vec<WorkerId>,
 }
@@ -139,6 +143,8 @@ pub trait CryptoService {
     /// forward this to CryptoPort::register_driver; lifecycle futures register
     /// their Context waker while polling the port themselves.
     fn register_driver(&self, _waker: &Waker) {}
+    /// Lifecycle futures share an executor with sibling shards. Each poll must
+    /// do bounded work and yield rather than blocking for another shard.
     fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()>;
     fn poll_budgeted(&mut self, work_budget: usize) -> Result<()>;
     /// After submission close, complete every accepted job while I/O reaps results.
@@ -185,7 +191,7 @@ impl<'a> WorkerGroup<'a> {
     pub fn new(plan: AffinityPlan) -> Self {
         Self {
             plan,
-            control: Arc::new(Control::new(0, false)),
+            control: Arc::new(Control::new(0, 0, false)),
             threads: Vec::new(),
             generation: 0,
             borrowed: PhantomData,
@@ -193,8 +199,8 @@ impl<'a> WorkerGroup<'a> {
     }
     /// Independent startup requires an owned recipe: borrowed factories are only
     /// supported by `run`/`run_with_scope`, whose scoped threads cannot escape.
-    /// The caller remains a userspace thread, so complete pairs must fit in
-    /// max_threads - 1. An eight-thread plan with four pairs must use `run`.
+    /// The caller remains a userspace thread, so I/O plus unique crypto threads
+    /// must fit in max_threads - 1. A fully occupied plan must use `run`.
     pub fn start(
         &mut self,
         factory: Arc<dyn WorkerFactory + Send>,
@@ -211,21 +217,19 @@ impl<'a> WorkerGroup<'a> {
     ) -> Result<()> {
         self.prepare(false)?;
         let limits = factory.limits();
-        for (index, pair) in self.plan.pairs.iter().cloned().enumerate() {
-            let (io, engine) = match allocate(pair.worker, self.generation, limits.queue_entries) {
-                Ok(ports) => ports,
-                Err(error) => {
-                    self.control.fail(error);
-                    break;
-                }
-            };
+        let mut launched = vec![false; self.plan.pairs.len()];
+        for indices in self.plan.crypto_groups() {
+            let (ios, engines) = self.allocate_group(&indices, limits.queue_entries, &mut allocate);
+            if engines.is_empty() {
+                break;
+            }
             let control = self.control.clone();
             let recipe = factory.clone();
             let startup = scope.clone();
-            let placement = pair.clone();
+            let cpu = self.plan.pairs[indices[0]].crypto.cpu;
             match thread::Builder::new()
-                .name(format!("racer-crypto-{}", pair.worker.0))
-                .spawn(move || crypto_thread(&*recipe, placement, engine, startup, control, index))
+                .name(format!("racer-crypto-{cpu}"))
+                .spawn(move || crypto_thread(&*recipe, cpu, engines, startup, control))
             {
                 Ok(handle) => self.threads.push(handle),
                 Err(_) => {
@@ -233,23 +237,32 @@ impl<'a> WorkerGroup<'a> {
                     break;
                 }
             }
-            let control = self.control.clone();
-            let recipe = factory.clone();
-            let startup = scope.clone();
-            let limits = limits.clone();
-            match thread::Builder::new()
-                .name(format!("racer-io-{}", pair.worker.0))
-                .spawn(move || io_thread(&*recipe, pair, io, limits, startup, control, index))
-            {
-                Ok(handle) => self.threads.push(handle),
-                Err(_) => {
-                    self.control.close_io(index);
-                    self.control.fence_io(index);
-                    self.control.fail(Error::Io);
-                    break;
+            for (index, pair, io) in ios {
+                let control = self.control.clone();
+                let recipe = factory.clone();
+                let startup = scope.clone();
+                let limits = limits.clone();
+                match thread::Builder::new()
+                    .name(format!("racer-io-{}", pair.worker.0))
+                    .spawn(move || io_thread(&*recipe, pair, io, limits, startup, control, index))
+                {
+                    Ok(handle) => {
+                        self.threads.push(handle);
+                        launched[index] = true;
+                    }
+                    Err(_) => {
+                        self.control.close_io(index);
+                        self.control.fence_io(index);
+                        self.control.fail(Error::Io);
+                        break;
+                    }
                 }
+            }
+            if self.control.result().is_err() {
+                break;
             }
         }
+        self.close_unlaunched(&launched);
         let result = self
             .control
             .wait_for(scope, |state| state.ready == state.total);
@@ -278,7 +291,7 @@ impl<'a> WorkerGroup<'a> {
         self.control
             .wait_for(scope, |state| state.done == state.total)
     }
-    /// Join both OS threads of every pair, including partially started pairs.
+    /// Join every I/O and unique crypto OS thread, including partial startup.
     /// Cannot succeed while a service can still access its retained resources.
     pub fn join(&mut self) -> Result<()> {
         self.control.set_phase(Phase::Shutdown);
@@ -319,7 +332,7 @@ impl<'a> WorkerGroup<'a> {
             .plan
             .pairs
             .len()
-            .checked_mul(2)
+            .checked_add(self.plan.crypto_groups().len())
             .and_then(|n| n.checked_add(usize::from(!caller_is_worker)))
             .ok_or(Error::InvalidConfiguration)?;
         if threads > self.plan.max_threads {
@@ -327,10 +340,24 @@ impl<'a> WorkerGroup<'a> {
         }
         let allowed = current_cpus()?;
         let mut workers = HashSet::new();
+        let mut crypto_locations = HashMap::new();
         for pair in &self.plan.pairs {
             if !workers.insert(pair.worker)
                 || !allowed.contains(&pair.io.cpu)
                 || !allowed.contains(&pair.crypto.cpu)
+            {
+                return Err(Error::InvalidConfiguration);
+            }
+            if matches!((pair.io.numa_node, pair.crypto.numa_node), (Some(io), Some(crypto)) if io != crypto)
+            {
+                return Err(Error::InvalidConfiguration);
+            }
+            // Public plan literals bypass discovery. One execution CPU must have
+            // one consistent topology record across all of its shared shards.
+            let location = (pair.crypto.package, pair.crypto.core, pair.crypto.numa_node);
+            if crypto_locations
+                .insert(pair.crypto.cpu, location)
+                .is_some_and(|previous| previous != location)
             {
                 return Err(Error::InvalidConfiguration);
             }
@@ -339,8 +366,45 @@ impl<'a> WorkerGroup<'a> {
             .generation
             .checked_add(1)
             .ok_or(Error::InvalidConfiguration)?;
-        self.control = Arc::new(Control::new(self.plan.pairs.len() * 2, caller_is_worker));
+        self.control = Arc::new(Control::new(
+            self.plan.pairs.len(),
+            self.plan.crypto_groups().len(),
+            caller_is_worker,
+        ));
         Ok(())
+    }
+
+    fn allocate_group(
+        &self,
+        indices: &[usize],
+        capacity: NonZeroUsize,
+        allocate: &mut impl FnMut(WorkerId, u64, NonZeroUsize) -> Result<(IoCryptoPort, CryptoPort)>,
+    ) -> (Vec<IoShard>, Vec<CryptoShard>) {
+        let mut ios = Vec::new();
+        let mut engines = Vec::new();
+        for &index in indices {
+            let pair = self.plan.pairs[index].clone();
+            match allocate(pair.worker, self.generation, capacity) {
+                Ok((io, engine)) => {
+                    engines.push((index, pair.worker, engine));
+                    ios.push((index, pair, io));
+                }
+                Err(error) => {
+                    self.control.fail(error);
+                    break;
+                }
+            }
+        }
+        (ios, engines)
+    }
+
+    fn close_unlaunched(&self, launched: &[bool]) {
+        for (index, launched) in launched.iter().enumerate() {
+            if !launched {
+                self.control.close_io(index);
+                self.control.fence_io(index);
+            }
+        }
     }
 
     fn run_inner(
@@ -366,50 +430,58 @@ impl<'a> WorkerGroup<'a> {
         thread::scope(|threads| {
             let mut handles = Vec::new();
             let mut first_io = None;
-            for (index, pair) in self.plan.pairs.iter().cloned().enumerate() {
-                let (io, engine) =
-                    match allocate(pair.worker, self.generation, limits.queue_entries) {
-                        Ok(ports) => ports,
-                        Err(error) => {
-                            self.control.fail(error);
+            let mut launched = vec![false; self.plan.pairs.len()];
+            for indices in self.plan.crypto_groups() {
+                let (ios, engines) =
+                    self.allocate_group(&indices, limits.queue_entries, &mut allocate);
+                if engines.is_empty() {
+                    break;
+                }
+                let control = self.control.clone();
+                let startup = scope.clone();
+                let cpu = self.plan.pairs[indices[0]].crypto.cpu;
+                match thread::Builder::new()
+                    .name(format!("racer-crypto-{cpu}"))
+                    .spawn_scoped(threads, move || {
+                        crypto_thread(factory, cpu, engines, startup, control)
+                    }) {
+                    Ok(handle) => handles.push(handle),
+                    Err(_) => {
+                        self.control.fail(Error::Io);
+                        break;
+                    }
+                }
+                for (index, pair, io) in ios {
+                    if index == 0 {
+                        first_io = Some((pair, io));
+                        launched[index] = true;
+                        continue;
+                    }
+                    let control = self.control.clone();
+                    let startup = scope.clone();
+                    let limits = limits.clone();
+                    match thread::Builder::new()
+                        .name(format!("racer-io-{}", pair.worker.0))
+                        .spawn_scoped(threads, move || {
+                            io_thread(factory, pair, io, limits, startup, control, index)
+                        }) {
+                        Ok(handle) => {
+                            handles.push(handle);
+                            launched[index] = true;
+                        }
+                        Err(_) => {
+                            self.control.close_io(index);
+                            self.control.fence_io(index);
+                            self.control.fail(Error::Io);
                             break;
                         }
-                    };
-                let control = self.control.clone();
-                let startup = scope.clone();
-                let placement = pair.clone();
-                match thread::Builder::new()
-                    .name(format!("racer-crypto-{}", pair.worker.0))
-                    .spawn_scoped(threads, move || {
-                        crypto_thread(factory, placement, engine, startup, control, index)
-                    }) {
-                    Ok(handle) => handles.push(handle),
-                    Err(_) => {
-                        self.control.fail(Error::Io);
-                        break;
                     }
                 }
-                if index == 0 {
-                    first_io = Some((pair, io));
-                    continue;
-                }
-                let control = self.control.clone();
-                let startup = scope.clone();
-                let limits = limits.clone();
-                match thread::Builder::new()
-                    .name(format!("racer-io-{}", pair.worker.0))
-                    .spawn_scoped(threads, move || {
-                        io_thread(factory, pair, io, limits, startup, control, index)
-                    }) {
-                    Ok(handle) => handles.push(handle),
-                    Err(_) => {
-                        self.control.close_io(index);
-                        self.control.fence_io(index);
-                        self.control.fail(Error::Io);
-                        break;
-                    }
+                if self.control.result().is_err() {
+                    break;
                 }
             }
+            self.close_unlaunched(&launched);
             if let Some((pair, io)) = first_io {
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     io_thread(
@@ -453,11 +525,13 @@ enum Phase {
 
 struct State {
     phase: Phase,
+    // Lifecycle counters count actual execution threads, not service instances.
     total: usize,
     ready: usize,
     drained: usize,
     done: usize,
     error: Option<Error>,
+    // Handshake/fence state remains indexed by I/O shard.
     crypto_ready: Vec<bool>,
     io_closed: Vec<bool>,
     io_fenced: Vec<bool>,
@@ -471,18 +545,18 @@ struct Control {
 }
 
 impl Control {
-    fn new(total: usize, auto_shutdown: bool) -> Self {
+    fn new(io_count: usize, crypto_count: usize, auto_shutdown: bool) -> Self {
         Self {
             state: Mutex::new(State {
                 phase: Phase::Running,
-                total,
+                total: io_count + crypto_count,
                 ready: 0,
                 drained: 0,
                 done: 0,
                 error: None,
-                crypto_ready: vec![false; total / 2],
-                io_closed: vec![false; total / 2],
-                io_fenced: vec![false; total / 2],
+                crypto_ready: vec![false; io_count],
+                io_closed: vec![false; io_count],
+                io_fenced: vec![false; io_count],
                 auto_shutdown,
                 check_scope: false,
             }),
@@ -815,86 +889,163 @@ fn io_thread(
 
 fn crypto_thread(
     factory: &dyn WorkerFactory,
-    pair: WorkerPair,
-    port: CryptoPort,
+    cpu: usize,
+    ports: Vec<CryptoShard>,
     startup: RequestScope,
     control: Arc<Control>,
-    index: usize,
 ) {
     let _exit = ThreadExit {
         control: control.clone(),
         io: None,
     };
-    if let Err(error) = pin_cpu(pair.crypto.cpu) {
+    if let Err(error) = pin_cpu(cpu) {
         control.fail(error);
         return;
     }
     let waker = Waker::from(Arc::new(ThreadWake(thread::current(), None)));
-    port.register_driver(&waker);
-    let mut service = match factory.build_crypto(pair.worker, CryptoRuntime { port }) {
-        Ok(service) => service,
-        Err(error) => {
-            control.fail(error);
-            return;
+    let mut services = Vec::new();
+    // Native contexts and other !Send service state are constructed and destroyed
+    // here, never on the spawning thread. A later build failure must still tear
+    // down every already-built service.
+    for (index, worker, port) in ports {
+        port.register_driver(&waker);
+        match factory.build_crypto(worker, CryptoRuntime { port }) {
+            Ok(service) => services.push((index, service)),
+            Err(error) => {
+                control.fail(error);
+                break;
+            }
         }
-    };
-    service.register_driver(&waker);
-    let started = drive(
-        service.start(&startup),
-        None,
-        &startup,
-        &control,
-        true,
-        &waker,
-    );
-    if started.is_ok() {
-        let mut state = control.lock();
-        state.crypto_ready[index] = true;
-        state.ready += 1;
-        control.changed.notify_all();
-    } else {
-        record(&control, started);
     }
-    // Keep driving accepted jobs throughout I/O drain, even after an error.
-    while !control.lock().io_closed[index] {
-        service.register_driver(&waker);
-        record(&control, service.poll_budgeted(WORK_BUDGET));
-        thread::park_timeout(IDLE_WAIT);
-    }
-    let teardown = lifecycle_scope().unwrap_or_else(|_| startup.clone());
-    service.register_driver(&waker);
-    record(
-        &control,
-        drive(
-            service.drain(&teardown),
-            None,
-            &teardown,
-            &control,
-            false,
-            &waker,
-        ),
-    );
-    // Completion publication is not consumption. Keep the engine alive until
-    // I/O has reaped every accepted job's completion and released its permit.
-    while !control.lock().io_fenced[index] {
-        service.register_driver(&waker);
-        record(&control, service.poll_budgeted(WORK_BUDGET));
-        thread::park_timeout(IDLE_WAIT);
+    record(&control, startup.cancellation.register(&waker));
+    let mut ready = false;
+    let indices = services.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+    {
+        let operations = services
+            .iter_mut()
+            .map(|(index, service)| {
+                crypto_shard(*index, &mut **service, &startup, &control, &waker)
+            })
+            .collect();
+        drive_crypto_group(operations, &control, &waker, || {
+            let mut state = control.lock();
+            if !ready
+                && !indices.is_empty()
+                && indices.iter().all(|index| state.crypto_ready[*index])
+            {
+                state.ready += 1;
+                ready = true;
+                control.changed.notify_all();
+            }
+        });
     }
     control.drained();
-    service.register_driver(&waker);
-    record(
-        &control,
-        drive(
-            service.shutdown(&teardown),
-            None,
-            &teardown,
-            &control,
-            false,
-            &waker,
-        ),
-    );
+    let teardown = lifecycle_scope().unwrap_or_else(|_| startup.clone());
+    let operations = services
+        .iter_mut()
+        .map(|(_, service)| {
+            service.register_driver(&waker);
+            service.shutdown(&teardown)
+        })
+        .collect();
+    drive_crypto_group(operations, &control, &waker, || {});
 }
+
+fn crypto_shard<'a>(
+    index: usize,
+    service: &'a mut dyn CryptoService,
+    startup: &'a RequestScope,
+    control: &'a Control,
+    waker: &'a Waker,
+) -> Operation<'a, ()> {
+    Box::pin(async move {
+        service.register_driver(waker);
+        let started = {
+            let mut operation = service.start(startup);
+            std::future::poll_fn(|cx| {
+                startup.check()?;
+                if control.lock().phase != Phase::Running {
+                    return Poll::Ready(Err(Error::Cancelled));
+                }
+                operation.as_mut().poll(cx)
+            })
+            .await
+        };
+        if started.is_ok() {
+            control.lock().crypto_ready[index] = true;
+            control.changed.notify_all();
+        } else {
+            record(control, started);
+        }
+        // One page per poll, including during I/O drain and after errors. Once
+        // submissions close, the service's cooperative drain flushes any backend
+        // work. Sibling shards remain runnable while that future is pending.
+        std::future::poll_fn(|_| {
+            service.register_driver(waker);
+            record(control, service.poll_budgeted(CRYPTO_QUANTUM));
+            if control.lock().io_closed[index] {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        let teardown = lifecycle_scope().unwrap_or_else(|_| startup.clone());
+        service.register_driver(waker);
+        record(control, service.drain(&teardown).await);
+        // Publication is not consumption. Keep native state alive until I/O has
+        // reaped every completion, including abandoned/canceled jobs.
+        std::future::poll_fn(|_| {
+            service.register_driver(waker);
+            record(control, service.poll_budgeted(CRYPTO_QUANTUM));
+            if control.lock().io_fenced[index] {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        Ok(())
+    })
+}
+
+/// Poll every shard once per pass, rotating the first shard. Never block on one
+/// shard's start/drain/shutdown future while another shard needs engine progress.
+fn drive_crypto_group(
+    operations: Vec<Operation<'_, ()>>,
+    control: &Control,
+    waker: &Waker,
+    mut after_pass: impl FnMut(),
+) {
+    let mut operations = operations.into_iter().map(Some).collect::<Vec<_>>();
+    let mut remaining = operations.len();
+    let mut first = 0;
+    let mut passes = 0;
+    let mut cx = Context::from_waker(waker);
+    while remaining != 0 {
+        for offset in 0..operations.len() {
+            let index = (first + offset) % operations.len();
+            if let Some(operation) = &mut operations[index] {
+                if let Poll::Ready(result) = operation.as_mut().poll(&mut cx) {
+                    record(control, result);
+                    operations[index] = None;
+                    remaining -= 1;
+                }
+            }
+        }
+        after_pass();
+        first = (first + 1) % operations.len();
+        passes += 1;
+        if remaining != 0 && passes == WORK_BUDGET {
+            thread::park_timeout(IDLE_WAIT);
+            passes = 0;
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "worker_shared_tests.rs"]
+mod shared_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1119,6 +1270,51 @@ mod tests {
     }
 
     #[test]
+    fn prepare_rejects_known_numa_mismatch() {
+        let (mut group, _) = fixture(3);
+        group.plan.pairs[0].io.numa_node = Some(0);
+        group.plan.pairs[0].crypto.numa_node = Some(1);
+        assert_eq!(group.prepare(false), Err(Error::InvalidConfiguration));
+        assert_eq!(group.generation, 0);
+    }
+
+    #[test]
+    fn prepare_rejects_contradictory_shared_crypto_metadata() {
+        for dimension in 0..3 {
+            let (mut group, _) = fixture(4);
+            let mut second = group.plan.pairs[0].clone();
+            second.worker = WorkerId(1);
+            match dimension {
+                0 => second.crypto.package += 1,
+                1 => second.crypto.core += 1,
+                _ => second.crypto.numa_node = Some(1),
+            }
+            group.plan.pairs.push(second);
+            assert_eq!(group.prepare(false), Err(Error::InvalidConfiguration));
+            assert_eq!(group.generation, 0);
+        }
+    }
+
+    #[test]
+    fn prepare_accepts_colocated_io_and_unknown_numa() {
+        for (io, crypto) in [
+            (None, None),
+            (Some(0), None),
+            (None, Some(0)),
+            (Some(0), Some(0)),
+        ] {
+            let (mut group, _) = fixture(4);
+            group.plan.pairs[0].io.numa_node = io;
+            group.plan.pairs[0].crypto.numa_node = crypto;
+            let mut second = group.plan.pairs[0].clone();
+            second.worker = WorkerId(1);
+            group.plan.pairs.push(second);
+            group.prepare(false).unwrap();
+            assert_eq!(group.control.lock().total, 3);
+        }
+    }
+
+    #[test]
     fn owned_start_drains_and_joins_both_pinned_local_services() {
         let (mut group, factory) = fixture(3);
         let events = factory.events.clone();
@@ -1234,11 +1430,7 @@ mod tests {
                 if worker == WorkerId(0) {
                     return crypto::try_pair(worker, generation, capacity);
                 }
-                // Ensure rollback covers a live local graph, not merely spawned threads.
-                while !events.lock().unwrap().contains(&"io-start") {
-                    scope.check()?;
-                    thread::sleep(IDLE_WAIT);
-                }
+                // Group endpoints are allocated before its owning thread starts.
                 Err(Error::Overloaded)
             },
         );
@@ -1246,9 +1438,7 @@ mod tests {
         assert!(group.threads.is_empty());
         assert_eq!(group.control.lock().done, 2);
         let events = events.lock().unwrap();
-        assert!(events.contains(&"io-stop"));
-        assert!(events.contains(&"io-drain"));
-        assert!(events.contains(&"io-shutdown"));
+        assert!(!events.contains(&"io-build"));
         assert!(events.contains(&"crypto-shutdown"));
     }
 
@@ -1269,10 +1459,6 @@ mod tests {
             scoped.run_with_allocator(&factory, &scope, false, |worker, generation, capacity| {
                 if worker == WorkerId(0) {
                     return crypto::try_pair(worker, generation, capacity);
-                }
-                while !factory.events.lock().unwrap().contains(&"crypto-start") {
-                    scope.check()?;
-                    thread::sleep(IDLE_WAIT);
                 }
                 Err(Error::Overloaded)
             });

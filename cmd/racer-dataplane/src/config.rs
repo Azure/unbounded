@@ -1,6 +1,6 @@
 //! Environment and deployment configuration, validated before startup.
 //!
-//! Default to at most eight total userspace threads (four I/O/crypto worker pairs).
+//! Default to all eligible physical cores, subject to CPU and resource budgets.
 //! Shares and rail alignment come exclusively from accepted controller membership.
 
 use crate::runtime::collections::HashSet;
@@ -22,7 +22,7 @@ use std::{
     time::Duration,
 };
 
-pub const DEFAULT_MAX_THREADS: usize = 8;
+pub const DEFAULT_MAX_THREADS: usize = usize::MAX;
 /// Not a Node UID. Only verified enrollment/local identity recovery may replace it.
 pub const UNRESOLVED_NODE_ID: &str = "";
 const MIB: u64 = 1024 * 1024;
@@ -39,10 +39,10 @@ pub struct Config {
     /// not from a caller-provided UID or the Downward API's node name.
     /// from_env leaves this as UNRESOLVED_NODE_ID; validation is not authentication.
     pub node: NodeId,
-    /// Total thread cap, minimum two; odd caps round down to complete worker pairs.
+    /// Total thread cap, minimum two; usize::MAX means no configured ceiling.
     /// Control and diagnostics run on I/O threads within this budget.
     pub max_threads: usize,
-    /// Opt into logical-CPU sizing and unique pinned roles, preferring SMT pairs.
+    /// Opt into logical-CPU sizing instead of one eligible CPU per physical core.
     pub allow_smt: bool,
     pub routing_algorithm: crate::topology::RoutingAlgorithm,
     pub enable_rdma: bool,
@@ -283,7 +283,7 @@ impl Config {
         }
         if !valid_uuid(&self.cluster.0)
             || (self.node.0 != UNRESOLVED_NODE_ID && !valid_uuid(&self.node.0))
-            || !(2..=256).contains(&self.max_threads)
+            || self.max_threads < 2
         {
             return Err(Error::InvalidConfiguration);
         }
@@ -356,7 +356,7 @@ impl Config {
                 .ok_or(Error::InvalidConfiguration)?;
         }
         // Node-wide budgets are partitioned after affinity discovery. Integration
-        // must recheck progress floors per worker and reduce pairs if necessary.
+        // must recheck progress floors per I/O shard and reduce workers if necessary.
         if bytes > 256 * 1024 * MIB || bytes > isize::MAX as u64 {
             return Err(Error::InvalidConfiguration);
         }
@@ -1150,7 +1150,7 @@ mod tests {
     #[test]
     fn defaults_are_bounded_and_identity_is_unresolved() {
         let config = parse(&[]).unwrap();
-        assert_eq!(config.max_threads, 8);
+        assert_eq!(config.max_threads, usize::MAX);
         assert!(!config.allow_smt);
         assert_eq!(
             config.routing_algorithm,
@@ -1487,8 +1487,16 @@ mod tests {
         for value in ["TRUE", "1", "yes", " false"] {
             assert!(parse(&[("RACER_ENABLE_RDMA", value)]).is_err());
         }
-        for value in ["0", "1", "257", "18446744073709551615"] {
+        for value in ["0", "1"] {
             assert!(parse(&[("RACER_MAX_THREADS", value)]).is_err());
+        }
+        for value in [2, 7, 257, usize::MAX] {
+            assert_eq!(
+                parse(&[("RACER_MAX_THREADS", &value.to_string())])
+                    .unwrap()
+                    .max_threads,
+                value
+            );
         }
     }
 
