@@ -34,7 +34,7 @@ def bundle(policy, python_image, carrier_image):
     volumes = [dict(name="program", configMap=dict(name=c.PROGRAM_CM)),
                dict(name="policy", configMap=dict(name=c.POLICY_CM))]
     security = dict(runAsUser=0, runAsGroup=0, allowPrivilegeEscalation=False, readOnlyRootFilesystem=True,
-                    capabilities=dict(drop=["ALL"], add=["NET_ADMIN", "SYS_CHROOT"]),
+                    capabilities=dict(drop=["ALL"], add=["NET_ADMIN", "SYS_CHROOT", "NET_RAW"]),
                     seccompProfile=dict(type="RuntimeDefault"))
     guard_mounts = mounts + [dict(name="host", mountPath="/host", readOnly=True),
                              dict(name="state", mountPath="/run/racer-guard"),

@@ -37,6 +37,20 @@ class StartTest(unittest.TestCase):
         self.assertEqual(c.PROGRAM_CM, ds["volumes"][0]["configMap"]["name"])
         self.assertNotIn("annotations", result["objects"][-1]["spec"]["template"]["metadata"])
         self.assertEqual("DirectoryOrCreate", ds["volumes"][3]["hostPath"]["type"])
+        security = ds["containers"][0]["securityContext"]
+        self.assertEqual(dict(drop=["ALL"], add=["NET_ADMIN", "SYS_CHROOT", "NET_RAW"]),
+                         security["capabilities"])
+        self.assertFalse(security.get("privileged", False))
+        self.assertFalse(security["allowPrivilegeEscalation"])
+        self.assertTrue(security["readOnlyRootFilesystem"])
+        self.assertEqual(dict(type="RuntimeDefault"), security["seccompProfile"])
+        publisher = result["objects"][2]["spec"]["template"]["spec"]["containers"][0]["securityContext"]
+        self.assertEqual(dict(drop=["ALL"]), publisher["capabilities"])
+        self.assertFalse(publisher.get("privileged", False))
+        self.assertFalse(publisher["allowPrivilegeEscalation"])
+        for fragment in (result["hostDPFragment"], result["hostDPOverride"]["patch"]["spec"]["template"]["spec"]):
+            for container in fragment["containers"] + fragment["initContainers"]:
+                self.assertNotIn("securityContext", container)
 
     def setUp(self):
         self.api = FakeAPI()
