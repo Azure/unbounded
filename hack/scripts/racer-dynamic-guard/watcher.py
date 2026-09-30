@@ -24,8 +24,9 @@ PODS = f"/api/v1/namespaces/{c.NAMESPACE}/pods"
 DS = [f"/apis/apps/v1/namespaces/{c.NAMESPACE}/daemonsets/{name}"
       for name in (c.HOST_DS, c.POD_DS)]
 SA = Path("/var/run/secrets/kubernetes.io/serviceaccount")
-LIST_PAGE_SIZE = 100
-LIST_MAX_PAGES = 500  # Preserve the previous 50,000-object listing capacity.
+# Projection and raw-page release bound retention without multiplying API calls.
+LIST_PAGE_SIZE = 500
+LIST_MAX_PAGES = 100  # Preserve the 50,000-object listing capacity.
 
 
 def fields(obj, names):

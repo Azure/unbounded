@@ -21,14 +21,18 @@ No label selector is safe here: stale named DS owners and host DP on DENY11 must
 still be detected in the complete inventory. Labels, annotations, managedFields,
 Node images, containers, and readiness are not authority inputs.
 
-Requests use 100 items instead of 500 to leave more room beneath the unchanged
-16MiB response cap. The finite page budget is 500 instead of 100, preserving the
-nominal 50,000-object capacity. A large single object/page still fails closed;
+Requests again use 500 items with a finite budget of 100 pages, preserving the
+nominal 50,000-object capacity (`watcher.py:27-29`). The intermediate projected
+publisher used 100 items/500 pages; the operator reported no OOM but a 24.110s
+two-inventory collection, exceeding the unchanged 20s freshness budget. Restoring
+500 avoids five times as many list requests without undoing projection or raw-page
+release (`watcher.py:115-118`). The unchanged 16MiB response cap is a separate byte
+bound, not a guarantee that every 500 objects fit. A large object/page still fails closed;
 there is no truncation, retry bypass, or partial publication. RV consistency,
 continuation-loop rejection, both DS UID rechecks, both complete observations,
 20s freshness, 25s cycle alarm, UID/RV CAS, and narrow RBAC remain in force.
 
-One offline validation run on 2026-09-30:
+Historical offline memory-fix validation on 2026-09-30 (not repeated for pagination):
 
 - `timeout --signal=TERM --kill-after=10s 60s python3 -B -m unittest -v
   test_inventory test_adapters test_contract`: 23 tests passed.
@@ -51,6 +55,33 @@ a cgroup OOM replay, cluster measurement, or universal memory bound. Fixture clo
 are fixed; real elapsed includes page generation. More API requests can exceed the
 unchanged real freshness budget under latency/throttling and must fail closed.
 
+Pagination follow-up, one offline run on 2026-09-30:
+
+- `timeout --signal=TERM --kill-after=10s 60s python3 -B -m unittest -v
+  test_inventory test_adapters`: 19 tests passed in 1.144s. New focused assertions
+  require 42 list calls for two 1500-Node/9000-Pod passes (not 210), preserve the
+  50,000-object capacity, accept a 16MiB response and reject 16MiB+1 while closing
+  the connection. Existing projection/security, raw-page-release, RV/continuation,
+  DS identity, second-pass drift, and freshness rejection tests also pass.
+- Existing `inventory_memory.worker("projected")` executed **once**, under external
+  `timeout --signal=TERM --kill-after=10s 120s`, retaining its 1536MiB address-space
+  and 90 CPU-second limits. No released negative-control or full-suite repeat.
+  The wrapper asserted RSS<=512MiB, 42 list calls, max page<=16MiB and the exact
+  content digest above. Result: **118.125MiB peak RSS**, 14.996s synthetic elapsed,
+  **42 list calls**, largest response **10,694,323 bytes** versus 16,777,216 cap
+  (6,082,893 bytes headroom). Same 1511-source authority and digest.
+- Scoped `make fmt` on the adjacent launcher passed with 0 issues and no Go changes.
+
+This fixture supports 500-item pages for the modeled object sizes, not arbitrary
+Kubernetes objects or a universal 512MiB memory guarantee. Retention remains the
+projected inventory plus one bounded decoded raw page; the old full-inventory
+retention has not returned. JSON expansion and larger metadata can consume more
+RSS than wire bytes; oversize responses still fail closed (`watcher.py:95-97`).
+The fixed fixture clock does not establish live freshness. The 20s relist budget,
+25s alarm and 60s authority validity remain unchanged (`watcher.py:168,178,207`),
+as do security, UID/RV CAS, RBAC and resource limits. Live timing must be verified
+by the operator after the separately authorized refresh, not inferred here.
+
 Publisher-only operational refresh, **not executed by this change**:
 
 1. From the reviewed fix, use `render.py` with the existing trusted policy and
@@ -59,7 +90,7 @@ Publisher-only operational refresh, **not executed by this change**:
    executes `/guard/watcher.py` from that volume (`render.py:58-67`). No image build
    is needed for this Python-only fix; the launcher and images are unchanged.
 2. Create a **new uniquely named immutable program ConfigMap**, for example
-   `racer-stage47-program-inventory-<fix-sha-prefix>`, using all six reviewed source
+   `racer-stage47-program-pagination-<fix-sha-prefix>`, using all six reviewed source
    keys. Do not patch or delete/recreate the old immutable CM. Do not blindly apply
    the renderer's full bundle or reuse its fixed program CM name for changed data.
 3. Review a narrowly scoped change to only
@@ -73,7 +104,9 @@ Publisher-only operational refresh, **not executed by this change**:
    partial collections must not renew. Source authority alone is not permission
    for fleet activation: retain the independent fresh1500 proof and every-start
    gates below. Retain the previous immutable CM for diagnosis; rolling back to
-   its code restores the known memory defect, not a demonstrated recovery path.
+   a prior 100-item projected program preserves the memory fix but restores the
+   observed freshness failure; the original released program restores the memory
+   defect. Neither is a demonstrated recovery path.
 
 ### Fresh-bootstrap crash recovery
 

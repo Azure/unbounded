@@ -37,10 +37,40 @@ class PagedAPI(FakeAPI):
     @staticmethod
     def assert_query(params):
         assert set(params) <= {"limit", "continue"}
-        assert params["limit"] == ["100"]
+        assert params["limit"] == ["500"]
 
 
 class InventoryTest(unittest.TestCase):
+    def test_two_pass_list_call_budget(self):
+        api = PagedAPI()
+        api.pods.extend(dict(metadata=dict(name=f"unrelated-{i}", uid=f"uid-{i}"))
+                        for i in range(9000 - len(api.pods)))
+        self.assertEqual("published", w.cycle(api, "holder", lambda: 100))
+        self.assertEqual(42, len(api.queries))  # 2 * (1500/500 + 9000/500), not 210.
+        self.assertEqual(100, w.LIST_MAX_PAGES)
+        self.assertEqual(50000, w.LIST_PAGE_SIZE * w.LIST_MAX_PAGES)
+        self.assertEqual(1511, len(w.authority(api.cm, 101)[1]))
+
+    def test_response_byte_limit_unchanged(self):
+        limit = 16 * 1024 * 1024
+        for size in (limit, limit + 1):
+            with self.subTest(size=size):
+                connection = mock.MagicMock()
+                response = connection.getresponse.return_value
+                response.status = 200
+                response.read.return_value = b"{}" + b" " * (size - 2)
+                with mock.patch.object(w.Path, "read_text", return_value="offline-token"), \
+                        mock.patch.object(w.ssl, "create_default_context"), \
+                        mock.patch.object(w.http.client, "HTTPSConnection", return_value=connection):
+                    api = w.API("offline")
+                    if size == limit:
+                        self.assertEqual({}, api.request(w.NODES + "?limit=500"))
+                    else:
+                        with self.assertRaisesRegex(ValueError, "API response exceeds limit"):
+                            api.request(w.NODES + "?limit=500")
+                response.read.assert_called_once_with(limit + 1)
+                connection.close.assert_called_once()
+
     def test_projected_snapshot_matches_full_inputs(self):
         api = PagedAPI()
         api.pods.append(dict(metadata=dict(ownerReferences=[])))
