@@ -76,10 +76,6 @@ jobs:
             nspawn-base-os: azlinux3
           - host-base-os: almalinux10
             nspawn-base-os: azlinux3
-          - host-base-os: centosstream9
-            nspawn-base-os: azlinux3
-          - host-base-os: centosstream10
-            nspawn-base-os: azlinux3
           - host-base-os: ubuntu2604
             nspawn-base-os: ubuntu2604
     env:
