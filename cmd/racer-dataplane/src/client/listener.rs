@@ -1751,7 +1751,6 @@ mod tests {
                     super::super::request::ReadKind::Subscription { range, .. } => {
                         range.unwrap_or(ByteRange::From(0))
                     }
-                    super::super::request::ReadKind::Pinned { range, .. } => *range,
                     _ => ByteRange::Closed {
                         first: 0,
                         last: PAGE_BYTES - 1,

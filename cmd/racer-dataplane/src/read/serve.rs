@@ -3,7 +3,7 @@
 use super::{
     fill::Fill,
     flight::AcquisitionBudget,
-    metadata::{BootstrapResult, MetadataService},
+    metadata::MetadataService,
     range_stream::{RangeStream, RangeStreams},
 };
 use crate::{
@@ -12,9 +12,9 @@ use crate::{
     error::{Error, Operation, Result},
     model::{
         context::{OriginContext, PeerOriginContext},
-        identity::{AttemptId, ObjectId, ObjectVersion, PageId, PageNumber},
+        identity::{AttemptId, ObjectId, ObjectVersion, PageId},
         metadata::{MetadataSelector, ObjectMetadata, VersionMetadata},
-        range::{ByteRange, PAGE_BYTES, ResolvedRange},
+        range::{ByteRange, ResolvedRange},
     },
     peer::{
         server::LocalPageService,
@@ -146,17 +146,6 @@ impl Coordinator {
     ) -> Operation<'a, ObjectMetadata> {
         self.metadata
             .resolve_with_budget(selector, membership, context, scope, budget)
-    }
-    pub(crate) fn bootstrap<'a>(
-        &'a self,
-        selector: MetadataSelector,
-        membership: MembershipLease,
-        context: &'a OriginContext,
-        scope: &'a RequestScope,
-        budget: &'a mut AcquisitionBudget,
-    ) -> Operation<'a, BootstrapResult> {
-        self.metadata
-            .bootstrap_with_budget(selector, membership, context, scope, budget)
     }
     pub(crate) fn acquire<'a>(
         &'a self,
@@ -305,97 +294,6 @@ impl Coordinator {
                         metadata,
                         range: None,
                         body: None,
-                    })
-                }
-                ReadKind::Bootstrap => {
-                    let bootstrap = directory
-                        .bootstrap_with_budget(
-                            MetadataSelector::Fresh,
-                            membership.clone(),
-                            &origin,
-                            scope,
-                            &mut budget,
-                        )
-                        .await?;
-                    match bootstrap {
-                        BootstrapResult::Empty(metadata) => {
-                            validate_metadata(&metadata, &origin.object, &MetadataSelector::Fresh)?;
-                            if metadata.length != 0 {
-                                return Err(Error::CorruptRecord);
-                            }
-                            Ok(ReadResponse {
-                                metadata,
-                                range: None,
-                                body: None,
-                            })
-                        }
-                        BootstrapResult::Page(page) => {
-                            let metadata = page.metadata.clone();
-                            validate_metadata(&metadata, &origin.object, &MetadataSelector::Fresh)?;
-                            page.validate_for(&PageId {
-                                version: metadata.version.clone(),
-                                number: PageNumber(0),
-                            })?;
-                            let range = resolve_range(
-                                ByteRange::Closed {
-                                    first: 0,
-                                    last: PAGE_BYTES - 1,
-                                },
-                                metadata.length,
-                            )?;
-                            let body = self.streams.open_with_budget(
-                                metadata.clone(),
-                                range,
-                                origin,
-                                membership,
-                                scope.clone(),
-                                budget,
-                                Some(page),
-                            )?;
-                            Ok(ReadResponse {
-                                metadata,
-                                range: Some(range),
-                                body: Some(body),
-                            })
-                        }
-                    }
-                }
-                ReadKind::Pinned { etag, range } => {
-                    let selector = MetadataSelector::Pinned(etag);
-                    let metadata = directory
-                        .resolve_with_budget(
-                            selector.clone(),
-                            membership.clone(),
-                            &origin,
-                            scope,
-                            &mut budget,
-                        )
-                        .await?;
-                    validate_metadata(&metadata, &origin.object, &selector)?;
-                    let range = resolve_range(range, metadata.length)?;
-                    let body = if client_pages {
-                        self.streams.open(
-                            metadata.clone(),
-                            range,
-                            origin,
-                            membership,
-                            scope.clone(),
-                        )?
-                    } else {
-                        self.streams.open_with_budget(
-                            metadata.clone(),
-                            range,
-                            origin,
-                            membership,
-                            scope.clone(),
-                            budget,
-                            None,
-                        )?
-                    };
-                    Ok(ReadResponse {
-                        metadata,
-                        range: Some(range),
-                        body: Some(body),
                     })
                 }
             }

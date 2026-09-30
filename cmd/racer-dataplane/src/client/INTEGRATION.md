@@ -99,8 +99,8 @@ response completion. Removed cache generations cannot begin another request.
 Wire reads use `POST /v2/objects/{canonical key}` with `Host: racer` and mandatory
 `Content-Length: 0`. GET is not accepted. HEAD remains available for metadata on
 both v1 and v2 paths. `ReadKind::Subscription` carries optional strong `pin`,
-optional `range`, `page_credits`, `byte_credits`, and `ordered`. The legacy enum
-variants remain internal only. `ReadService::read` receives the original opaque
+optional `range`, `page_credits`, `byte_credits`, and `ordered`. Body reads use only
+subscriptions; `ReadService::read` receives the original opaque
 context. Return the complete immutable object identity and exact resolved range
 with its `RangeStream`; only an empty, un-ranged object has no stream.
 

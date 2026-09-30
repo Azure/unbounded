@@ -101,25 +101,6 @@ impl Responses {
                     return Err(Error::BadGateway);
                 }
             }
-            ReadKind::Bootstrap if response.metadata.length == 0 => {
-                if response.range.is_some() || response.body.is_some() {
-                    return Err(Error::BadGateway);
-                }
-            }
-            ReadKind::Bootstrap | ReadKind::Pinned { .. } => {
-                let range = match kind {
-                    ReadKind::Pinned { range, .. } => *range,
-                    _ => crate::model::range::ByteRange::Closed {
-                        first: 0,
-                        last: crate::model::range::PAGE_BYTES - 1,
-                    },
-                }
-                .resolve(response.metadata.length)
-                .map_err(|_| Error::BadGateway)?;
-                if response.range != Some(range) || response.body.is_none() {
-                    return Err(Error::BadGateway);
-                }
-            }
         }
         success_head(&response.metadata, response.range)?;
         Ok(())

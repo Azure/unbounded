@@ -22,11 +22,6 @@ pub enum ReadKind {
     HeadPinned {
         etag: StrongEtag,
     },
-    Bootstrap,
-    Pinned {
-        etag: StrongEtag,
-        range: ByteRange,
-    },
     Subscription {
         pin: Option<StrongEtag>,
         range: Option<ByteRange>,
@@ -43,7 +38,7 @@ impl ReadKind {
 
     pub fn pin(&self) -> Option<&StrongEtag> {
         match self {
-            Self::HeadPinned { etag } | Self::Pinned { etag, .. } => Some(etag),
+            Self::HeadPinned { etag } => Some(etag),
             Self::Subscription { pin, .. } => pin.as_ref(),
             _ => None,
         }

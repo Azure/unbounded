@@ -992,19 +992,14 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
             fill.dependencies.credentials.clone(),
         ));
         let mut endpoint = owners.install(WorkerId(0), coordinator.clone()).unwrap();
-        for kind in [
-            ReadKind::Pinned {
-                etag: f.page.version.etag.clone(),
-                range: ByteRange::Closed { first: 0, last: 2 },
-            },
-            ReadKind::Subscription {
+        for ordered in [false, true] {
+            let kind = ReadKind::Subscription {
                 pin: Some(f.page.version.etag.clone()),
                 range: Some(ByteRange::Closed { first: 0, last: 2 }),
                 page_credits: 1,
                 byte_credits: crate::model::range::PAGE_BYTES,
-                ordered: false,
-            },
-        ] {
+                ordered,
+            };
             let mut response = drive(
                 coordinator.read(
                     ClientRequest {

@@ -197,7 +197,7 @@ fn remote_candidate_uses_actual_requester_signatures_and_inherited_credits() {
 fn remote_origin_absence_preserves_fresh_404_pinned_412_and_later_cached_version() {
     for case in [
         Absence::Fresh,
-        Absence::Bootstrap,
+        Absence::Subscription,
         Absence::Pinned,
         Absence::CachedPin,
     ] {
@@ -329,7 +329,7 @@ fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
 #[derive(Clone, Copy)]
 enum Absence {
     Fresh,
-    Bootstrap,
+    Subscription,
     Pinned,
     CachedPin,
 }
@@ -553,7 +553,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
             requester
         };
     let ingress_calls = Rc::new(Cell::new(0));
-    let ingress = matches!(absence, Some(Absence::Fresh | Absence::Bootstrap)).then(|| {
+    let ingress = matches!(absence, Some(Absence::Fresh | Absence::Subscription)).then(|| {
         metadata_coordinator(
             &source,
             &membership,
@@ -608,8 +608,14 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
                     .read_with_budget(
                         ClientRequest {
                             origin: context,
-                            kind: if matches!(absence, Some(Absence::Bootstrap)) {
-                                ReadKind::Bootstrap
+                            kind: if matches!(absence, Some(Absence::Subscription)) {
+                                ReadKind::Subscription {
+                                    pin: None,
+                                    range: None,
+                                    page_credits: 1,
+                                    byte_credits: crate::model::range::PAGE_BYTES,
+                                    ordered: false,
+                                }
                             } else {
                                 ReadKind::Head
                             },
@@ -702,8 +708,8 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         0,
         "noncandidate ingress cannot call origin"
     );
-    if let Some(case @ (Absence::Fresh | Absence::Bootstrap | Absence::Pinned)) = absence {
-        let expected = if matches!(case, Absence::Fresh | Absence::Bootstrap) {
+    if let Some(case @ (Absence::Fresh | Absence::Subscription | Absence::Pinned)) = absence {
+        let expected = if matches!(case, Absence::Fresh | Absence::Subscription) {
             Error::NotFound
         } else {
             Error::VersionUnavailable
@@ -721,7 +727,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         );
         assert!(matches!(responses.error_head(expected).unwrap().start,
                 crate::http::codec::StartLine::Response { status }
-                if status == if matches!(case, Absence::Fresh | Absence::Bootstrap) { 404 } else { 412 }));
+                if status == if matches!(case, Absence::Fresh | Absence::Subscription) { 404 } else { 412 }));
     } else if forbidden {
         assert!(matches!(result, Err(Error::OriginForbidden)));
     } else {
@@ -759,7 +765,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         assert_eq!(
             copy_calls.borrow().len(),
             match case {
-                Absence::Fresh | Absence::Bootstrap => 0,
+                Absence::Fresh | Absence::Subscription => 0,
                 Absence::Pinned => 0,
                 Absence::CachedPin => 1,
             }

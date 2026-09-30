@@ -3,7 +3,6 @@
 use super::{
     fill::PageResult,
     flight::AcquisitionBudget,
-    metadata::BootstrapResult,
     serve::{Coordinator, ReadResponse, ReadService},
 };
 use crate::runtime::collections::HashMap;
@@ -75,7 +74,6 @@ enum Work {
     Selected(crate::memory::page::CiphertextCopy),
     Cached(PageId),
     Resolve(MetadataSelector, MembershipLease, PeerOriginContext),
-    Bootstrap(MetadataSelector, MembershipLease, PeerOriginContext),
     Acquire(PageId, MembershipLease, PeerOriginContext),
     Ordered(
         PageId,
@@ -89,7 +87,6 @@ enum Work {
 }
 enum Value {
     Metadata(ObjectMetadata),
-    Bootstrap(BootstrapResult),
     Page(PageResult),
     Cached(Option<PageResult>),
     Published,
@@ -530,29 +527,6 @@ impl WorkerDirectory {
     ) -> Operation<'a, ObjectMetadata> {
         self.resolve_with_budget(selector, membership, context, scope, budget)
     }
-    pub fn bootstrap_with_budget<'a>(
-        &'a self,
-        selector: MetadataSelector,
-        membership: MembershipLease,
-        context: &'a OriginContext,
-        scope: &'a RequestScope,
-        budget: &'a mut AcquisitionBudget,
-    ) -> Operation<'a, BootstrapResult> {
-        Box::pin(async move {
-            let owner = self.metadata_owner(&context.object)?;
-            if self.is_local(owner) {
-                return self
-                    .local()?
-                    .bootstrap(selector, membership, context, scope, budget)
-                    .await;
-            }
-            let work = Work::Bootstrap(selector, membership, self.seal(context, scope)?);
-            match self.budgeted(owner, work, scope, budget).await? {
-                Value::Bootstrap(value) => Ok(value),
-                _ => Err(Error::StaleFlight),
-            }
-        })
-    }
     pub fn acquire<'a>(
         &'a self,
         page: PageId,
@@ -974,19 +948,6 @@ async fn execute(
                 )
                 .await
                 .map(Value::Metadata)
-        }
-        Work::Bootstrap(selector, membership, envelope) => {
-            let context = local.open_context(envelope)?;
-            local
-                .bootstrap(
-                    selector,
-                    membership,
-                    &context,
-                    scope,
-                    budget.ok_or(Error::StaleFlight)?,
-                )
-                .await
-                .map(Value::Bootstrap)
         }
         Work::Acquire(page, membership, envelope) => {
             let context = local.open_context(envelope)?;
