@@ -65,7 +65,8 @@ impl Entries {
     }
 }
 pub struct MemoryCache {
-    pool: Rc<BufferPool>,
+    // BufferPool is only an admission handle; do not retain a second Rc layer.
+    pool: BufferPool,
     entries: RefCell<Entries>,
     ciphertext_entries: RefCell<BTreeMap<PageId, super::page::UnverifiedPage>>,
     ciphertext_cursor: RefCell<Option<PageId>>,
@@ -74,7 +75,7 @@ pub struct MemoryCache {
 impl MemoryCache {
     pub fn new(pool: Rc<BufferPool>) -> Self {
         Self {
-            pool,
+            pool: (*pool).clone(),
             entries: RefCell::new(Entries::default()),
             ciphertext_entries: RefCell::new(BTreeMap::new()),
             ciphertext_cursor: RefCell::new(None),

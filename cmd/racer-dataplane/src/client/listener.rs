@@ -961,7 +961,7 @@ impl ReadyListeners {
         let fd = fd.clone();
         let scope = self.scope.as_ref().ok_or(Error::Internal)?.clone();
         self.wait = Some(Box::pin(async move {
-            crate::runtime::listener::retry(&scope, || {
+            crate::runtime::retry_listener(&scope, || {
                 reactor.readiness_with_lease(fd.clone(), libc::POLLIN as u32, fd.clone(), &scope)
             })
             .await

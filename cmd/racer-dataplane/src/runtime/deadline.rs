@@ -85,7 +85,9 @@ impl Cancellation {
             wake,
         })
     }
-    /// Register before checking cancellation. Identical executor wakers coalesce.
+    /// Scope-lifetime worker wake. Identical executor wakers coalesce.
+    /// Operation-lifetime waiters must use subscribe so dropping one operation
+    /// cannot detach another operation that shares its executor waker.
     pub fn register(&self, waker: &Waker) -> Result<()> {
         let mut waiters = self.state.waiters.lock().map_err(|_| Error::Unavailable)?;
         if self.is_cancelled() {
@@ -99,16 +101,6 @@ impl Cancellation {
             }
             waiters.push(waker.clone());
         }
-        Ok(())
-    }
-    /// Release an operation-specific registration on detach. Worker-global
-    /// registrations should instead live for the entire request scope.
-    pub fn unregister(&self, waker: &Waker) -> Result<()> {
-        self.state
-            .waiters
-            .lock()
-            .map_err(|_| Error::Unavailable)?
-            .retain(|old| !old.will_wake(waker));
         Ok(())
     }
     pub fn cancel(&self) -> Result<()> {

@@ -6,6 +6,7 @@ use crate::{
 };
 use std::{rc::Rc, sync::Arc};
 
+#[derive(Clone)]
 pub struct BufferPool {
     admission: Rc<Admission>,
 }

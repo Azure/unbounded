@@ -677,8 +677,11 @@ fn drive(
     waker: &Waker,
 ) -> Result<()> {
     let mut cx = Context::from_waker(waker);
-    if startup {
-        scope.cancellation.register(waker)?;
+    let cancellation = startup
+        .then(|| scope.cancellation.subscribe())
+        .transpose()?;
+    if let Some(cancellation) = &cancellation {
+        cancellation.register(waker);
     }
     let mut error = None;
     loop {

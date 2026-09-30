@@ -209,7 +209,7 @@ fn serve<'a>(
                 }
             }
             if accepting.is_none() && io.resources.active.get() < MAX_CONNECTIONS {
-                accepting = Some(crate::runtime::listener::retry(scope, || {
+                accepting = Some(crate::runtime::retry_listener(scope, || {
                     io.reactor.accept_reserved(
                         listener.clone(),
                         Some(io.resources.submissions.clone()),

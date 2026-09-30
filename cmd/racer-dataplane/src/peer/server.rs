@@ -92,7 +92,7 @@ impl PeerServer {
             loop {
                 scope.check()?;
                 if let Some(ingress) = &self.ingress {
-                    crate::runtime::listener::retry(scope, || {
+                    crate::runtime::retry_listener(scope, || {
                         reactor.readiness_with_lease(fd.clone(), libc::POLLIN as u32, (), scope)
                     })
                     .await?;
@@ -136,7 +136,7 @@ impl PeerServer {
                     continue;
                 }
                 let accepted = next_accepted(
-                    crate::runtime::listener::retry(scope, || reactor.accept(fd.clone(), scope)),
+                    crate::runtime::retry_listener(scope, || reactor.accept(fd.clone(), scope)),
                     &mut active,
                     scope,
                 )

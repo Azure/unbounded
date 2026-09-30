@@ -481,7 +481,6 @@ struct Waiter {
     waker: Waker,
     abandoned: bool,
     result: Option<CryptoCompletion>,
-    scope: RequestScope,
 }
 struct Registration<'a> {
     client: &'a CryptoClient,
@@ -595,7 +594,6 @@ impl CryptoClient {
                         waker: cx.waker().clone(),
                         abandoned: false,
                         result: None,
-                        scope: scope.clone(),
                     },
                 );
                 Poll::Ready(())
