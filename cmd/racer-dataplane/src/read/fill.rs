@@ -35,7 +35,7 @@ use crate::{
     },
     security::{aead::PageCrypto, credentials::CredentialCrypto},
     store::{reader::StoreReader, writer::StoreWriter},
-    telemetry::metrics::{Event, Gauge, Metrics},
+    telemetry::metrics::{Event, Gauge, LookupTier, Metrics},
     topology::membership::MembershipLease,
 };
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
@@ -78,7 +78,9 @@ impl Fill {
         scope: &RequestScope,
     ) -> Result<Option<PageResult>> {
         scope.check()?;
-        let result = self.dependencies.memory.get(page)?;
+        let result = self
+            .metrics
+            .lookup(LookupTier::Plaintext, self.dependencies.memory.get(page))?;
         if let Some(result) = &result {
             result.validate_for(page)?;
             self.metrics.record(Event::MemoryHit, 1)?;
@@ -489,7 +491,10 @@ impl Fill {
             if page.version.object != context.object {
                 return Err(Error::InvalidRequest);
             }
-            if let Some(result) = self.dependencies.memory.get(&page)? {
+            if let Some(result) = self
+                .metrics
+                .lookup(LookupTier::Plaintext, self.dependencies.memory.get(&page))?
+            {
                 result.validate_for(&page)?;
                 self.metrics.record(Event::MemoryHit, 1)?;
                 return Ok(result.into());
@@ -523,7 +528,10 @@ impl Fill {
                     AcquisitionEvent::Failed(error) => return Err(error),
                     AcquisitionEvent::Lead(leader) => {
                         let ready = self.dependencies.flights.ciphertext_for(&leader)?;
-                        let ready = ready.or(self.dependencies.memory.unverified(&page)?);
+                        let ready = ready.or(self.metrics.lookup(
+                            LookupTier::Ciphertext,
+                            self.dependencies.memory.unverified(&page),
+                        )?);
                         let driver_permit = super::drivers::reserve()?;
                         let acquisition = waiter.acquisition(&leader)?;
                         // The acquisition driver stays on this owner. Admit an
@@ -753,12 +761,18 @@ impl Fill {
     ) -> Operation<'a, Option<(ObjectMetadata, CiphertextPage)>> {
         Box::pin(async move {
             scope.check()?;
-            if let Some(copy) = self.dependencies.memory.ciphertext(page)? {
+            if let Some(copy) = self.metrics.lookup(
+                LookupTier::Ciphertext,
+                self.dependencies.memory.ciphertext(page),
+            )? {
                 validate_copy(&copy, page)?;
                 self.metrics.record(Event::MemoryHit, 1)?;
                 return Ok(Some((copy.metadata, copy.ciphertext)));
             }
-            if let Some(copy) = self.dependencies.writer.copy_only(page)? {
+            if let Some(copy) = self.metrics.lookup(
+                LookupTier::Pending,
+                self.dependencies.writer.copy_only(page),
+            )? {
                 validate_copy(&copy, page)?;
                 self.metrics.record(Event::MemoryHit, 1)?;
                 return Ok(Some((copy.metadata, copy.ciphertext)));
@@ -895,7 +909,10 @@ impl Fill {
         } else {
             None
         };
-        let local = self.dependencies.writer.copy_only(page)?;
+        let local = self.metrics.lookup(
+            LookupTier::Pending,
+            self.dependencies.writer.copy_only(page),
+        )?;
         let (local, token) = match local {
             Some(copy) => (Some(copy), None),
             None => match self

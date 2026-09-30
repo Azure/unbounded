@@ -5,8 +5,15 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-pub const EVENT_COUNT: usize = 38;
+pub const EVENT_COUNT: usize = 50;
 pub const GAUGE_COUNT: usize = 11;
+#[derive(Clone, Copy)]
+pub(crate) enum LookupTier {
+    Plaintext,
+    Ciphertext,
+    Pending,
+    DiskIndex,
+}
 /// Clones retain their writer shard; reads aggregate the fixed node registry.
 #[derive(Clone)]
 pub struct Metrics {
@@ -86,6 +93,18 @@ pub enum Event {
     CryptoDecryptExecutionNs,
     CryptoDecryptQueueCount,
     CryptoDecryptQueueNs,
+    PlaintextLookupHit,
+    PlaintextLookupMiss,
+    PlaintextLookupError,
+    CiphertextLookupHit,
+    CiphertextLookupMiss,
+    CiphertextLookupError,
+    PendingLookupHit,
+    PendingLookupMiss,
+    PendingLookupError,
+    DiskIndexLookupHit,
+    DiskIndexLookupMiss,
+    DiskIndexLookupError,
 }
 pub const EVENTS: [Event; EVENT_COUNT] = [
     Event::Request,
@@ -126,6 +145,18 @@ pub const EVENTS: [Event; EVENT_COUNT] = [
     Event::CryptoDecryptExecutionNs,
     Event::CryptoDecryptQueueCount,
     Event::CryptoDecryptQueueNs,
+    Event::PlaintextLookupHit,
+    Event::PlaintextLookupMiss,
+    Event::PlaintextLookupError,
+    Event::CiphertextLookupHit,
+    Event::CiphertextLookupMiss,
+    Event::CiphertextLookupError,
+    Event::PendingLookupHit,
+    Event::PendingLookupMiss,
+    Event::PendingLookupError,
+    Event::DiskIndexLookupHit,
+    Event::DiskIndexLookupMiss,
+    Event::DiskIndexLookupError,
 ];
 impl Event {
     pub fn name(self) -> &'static str {
@@ -168,6 +199,18 @@ impl Event {
             Self::CryptoDecryptExecutionNs => "racer_crypto_decrypt_execution_nanoseconds_sum",
             Self::CryptoDecryptQueueCount => "racer_crypto_decrypt_queue_nanoseconds_count",
             Self::CryptoDecryptQueueNs => "racer_crypto_decrypt_queue_nanoseconds_sum",
+            Self::PlaintextLookupHit => "racer_plaintext_lookup_hits_total",
+            Self::PlaintextLookupMiss => "racer_plaintext_lookup_misses_total",
+            Self::PlaintextLookupError => "racer_plaintext_lookup_errors_total",
+            Self::CiphertextLookupHit => "racer_ciphertext_lookup_hits_total",
+            Self::CiphertextLookupMiss => "racer_ciphertext_lookup_misses_total",
+            Self::CiphertextLookupError => "racer_ciphertext_lookup_errors_total",
+            Self::PendingLookupHit => "racer_pending_lookup_hits_total",
+            Self::PendingLookupMiss => "racer_pending_lookup_misses_total",
+            Self::PendingLookupError => "racer_pending_lookup_errors_total",
+            Self::DiskIndexLookupHit => "racer_disk_index_lookup_hits_total",
+            Self::DiskIndexLookupMiss => "racer_disk_index_lookup_misses_total",
+            Self::DiskIndexLookupError => "racer_disk_index_lookup_errors_total",
         }
     }
 }
@@ -253,6 +296,42 @@ impl Drop for GaugeLease {
     }
 }
 impl Metrics {
+    /// Observe only an executed synchronous presence probe, preserving its result.
+    pub(crate) fn lookup<T>(
+        &self,
+        tier: LookupTier,
+        result: Result<Option<T>>,
+    ) -> Result<Option<T>> {
+        let events = match tier {
+            LookupTier::Plaintext => [
+                Event::PlaintextLookupHit,
+                Event::PlaintextLookupMiss,
+                Event::PlaintextLookupError,
+            ],
+            LookupTier::Ciphertext => [
+                Event::CiphertextLookupHit,
+                Event::CiphertextLookupMiss,
+                Event::CiphertextLookupError,
+            ],
+            LookupTier::Pending => [
+                Event::PendingLookupHit,
+                Event::PendingLookupMiss,
+                Event::PendingLookupError,
+            ],
+            LookupTier::DiskIndex => [
+                Event::DiskIndexLookupHit,
+                Event::DiskIndexLookupMiss,
+                Event::DiskIndexLookupError,
+            ],
+        };
+        let outcome = match &result {
+            Ok(Some(_)) => 0,
+            Ok(None) => 1,
+            Err(_) => 2,
+        };
+        let _ = self.record(events[outcome], 1);
+        result
+    }
     /// Allocate a fixed registry at startup, with one event writer per worker.
     /// No registration, locking, or registry reference-count changes on record.
     pub(crate) fn for_workers(count: usize) -> Result<Vec<Self>> {
@@ -348,6 +427,58 @@ impl Metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lookup_outcomes_preserve_results_and_export_fixed_series() {
+        let metrics = Metrics::default();
+        for (tier, hit, miss, error) in [
+            (
+                LookupTier::Plaintext,
+                Event::PlaintextLookupHit,
+                Event::PlaintextLookupMiss,
+                Event::PlaintextLookupError,
+            ),
+            (
+                LookupTier::Ciphertext,
+                Event::CiphertextLookupHit,
+                Event::CiphertextLookupMiss,
+                Event::CiphertextLookupError,
+            ),
+            (
+                LookupTier::Pending,
+                Event::PendingLookupHit,
+                Event::PendingLookupMiss,
+                Event::PendingLookupError,
+            ),
+            (
+                LookupTier::DiskIndex,
+                Event::DiskIndexLookupHit,
+                Event::DiskIndexLookupMiss,
+                Event::DiskIndexLookupError,
+            ),
+        ] {
+            assert_eq!(metrics.lookup(tier, Ok(Some(7))), Ok(Some(7)));
+            assert_eq!(metrics.lookup::<u8>(tier, Ok(None)), Ok(None));
+            for failure in [
+                crate::error::Error::CorruptRecord,
+                crate::error::Error::Io,
+                crate::error::Error::MissingKey,
+            ] {
+                assert_eq!(metrics.lookup::<u8>(tier, Err(failure)), Err(failure));
+            }
+            assert_eq!(metrics.count(hit), 1);
+            assert_eq!(metrics.count(miss), 1);
+            assert_eq!(metrics.count(error), 3);
+            let mut output = String::new();
+            metrics.write_prometheus(&mut output).unwrap();
+            assert!(output.contains(&format!(
+                "# TYPE {} counter\n{} 1\n",
+                hit.name(),
+                hit.name()
+            )));
+            assert!(output.contains(&format!("{} 1\n", miss.name())));
+            assert!(output.contains(&format!("{} 3\n", error.name())));
+        }
+    }
     #[test]
     fn request_drop_counts_failure_once_and_workers_share_counters() {
         let mut workers = Metrics::for_workers(2).unwrap();

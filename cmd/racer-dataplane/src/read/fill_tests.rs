@@ -202,13 +202,17 @@ fn fixture_with_availability(
         .open_now()
         .expect("read fixture filesystem supports direct slab alignment");
     let clock = Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1));
-    let disk = Rc::new(StoreReader::new(
-        clock,
-        index.clone(),
-        segments.clone(),
-        slabs.clone(),
-        buffers.clone(),
-    ));
+    let metrics = Metrics::default();
+    let disk = Rc::new(
+        StoreReader::new(
+            clock,
+            index.clone(),
+            segments.clone(),
+            slabs.clone(),
+            buffers.clone(),
+        )
+        .with_metrics(metrics.clone()),
+    );
     let writer = StoreWriter::new(index, segments, slabs);
     let writer = Rc::new(if check_availability {
         writer.with_availability(availability.clone())
@@ -297,7 +301,8 @@ fn fixture_with_availability(
         credentials,
         admission,
         metadata_owner,
-    });
+    })
+    .with_metrics(metrics);
     Fixture {
         keys,
         reactor,
@@ -1893,6 +1898,9 @@ fn cold_disk_fixture() -> Fixture {
 #[test]
 fn concurrent_cold_disk_copy_only_shares_io_and_retains_original_ciphertext() {
     let mut f = cold_disk_fixture();
+    let disk_hits = f.fill.metrics.count(Event::DiskIndexLookupHit);
+    let cipher_misses = f.fill.metrics.count(Event::CiphertextLookupMiss);
+    let pending_misses = f.fill.metrics.count(Event::PendingLookupMiss);
     let context_baseline = f
         .fill
         .dependencies
@@ -1923,6 +1931,19 @@ fn concurrent_cold_disk_copy_only_shares_io_and_retains_original_ciphertext() {
         .unwrap();
     assert!(Arc::ptr_eq(&first.1.inner, &hot.1.inner));
     assert_eq!(f.fill.metrics.count(Event::DiskHit), 1);
+    assert_eq!(
+        f.fill.metrics.count(Event::DiskIndexLookupHit),
+        disk_hits + 1
+    );
+    assert_eq!(
+        f.fill.metrics.count(Event::CiphertextLookupMiss),
+        cipher_misses + 2
+    );
+    assert_eq!(
+        f.fill.metrics.count(Event::PendingLookupMiss),
+        pending_misses + 2
+    );
+    assert_eq!(f.fill.metrics.count(Event::CiphertextLookupHit), 1);
     assert_eq!(f.fill.metrics.count(Event::PageDecrypt), 0);
     assert_eq!(f.origin.calls.get(), 0);
     assert_eq!(f.reactor.in_flight(), 0);
@@ -2009,6 +2030,99 @@ fn copy_only_miss_releases_shared_scope_subscriptions_across_cohorts() {
         assert_eq!(super::super::drivers::pending(), 0);
     }
     assert_eq!(f.origin.calls.get(), 0);
+    assert_eq!(f.fill.metrics.count(Event::CiphertextLookupMiss), 1100);
+    assert_eq!(f.fill.metrics.count(Event::PendingLookupMiss), 1100);
+    assert_eq!(f.fill.metrics.count(Event::DiskIndexLookupMiss), 1100);
+    assert_eq!(f.fill.metrics.count(Event::DiskIndexLookupHit), 0);
+}
+
+#[test]
+fn cancelled_before_lookup_has_no_outcome() {
+    let f = fixture();
+    f.scope.cancel().unwrap();
+    assert!(matches!(
+        f.fill.cached_page(&f.page, &f.scope),
+        Err(Error::Cancelled)
+    ));
+    assert!(matches!(
+        futures::executor::block_on(f.fill.copy_only(&f.page, &f.scope)),
+        Err(Error::Cancelled)
+    ));
+    for event in [
+        Event::PlaintextLookupHit,
+        Event::PlaintextLookupMiss,
+        Event::PlaintextLookupError,
+        Event::CiphertextLookupHit,
+        Event::CiphertextLookupMiss,
+        Event::CiphertextLookupError,
+        Event::PendingLookupMiss,
+        Event::DiskIndexLookupMiss,
+    ] {
+        assert_eq!(f.fill.metrics.count(event), 0);
+    }
+}
+
+#[test]
+fn lookup_plaintext_and_pending_hits_do_not_probe_disk() {
+    let mut f = fixture();
+    assert!(f.fill.cached_page(&f.page, &f.scope).unwrap().is_none());
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+    let page = drive(
+        f.fill.acquire(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut budget,
+        ),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    assert!(f.fill.cached_page(&f.page, &f.scope).unwrap().is_some());
+    assert_eq!(f.fill.metrics.count(Event::PlaintextLookupHit), 1);
+    assert_eq!(f.fill.metrics.count(Event::PlaintextLookupMiss), 2);
+    drop(page);
+    f.fill.dependencies.memory.evict_idle(usize::MAX).unwrap();
+    // The pending writer protects its shared ciphertext from idle eviction.
+    // Remove only memory lookup references to exercise the pending boundary.
+    f.fill
+        .dependencies
+        .memory
+        .remove_cache(&f.context.object.cache)
+        .unwrap();
+    assert!(
+        f.fill
+            .dependencies
+            .memory
+            .ciphertext(&f.page)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        f.fill
+            .dependencies
+            .writer
+            .copy_only(&f.page)
+            .unwrap()
+            .is_some()
+    );
+    let disk_misses = f.fill.metrics.count(Event::DiskIndexLookupMiss);
+    assert!(
+        drive(
+            f.fill.copy_only(&f.page, &f.scope),
+            &mut f.engine,
+            &f.crypto
+        )
+        .unwrap()
+        .is_some()
+    );
+    assert_eq!(f.fill.metrics.count(Event::PendingLookupHit), 1);
+    assert_eq!(
+        f.fill.metrics.count(Event::DiskIndexLookupMiss),
+        disk_misses
+    );
+    assert_eq!(f.fill.metrics.count(Event::DiskIndexLookupHit), 0);
 }
 
 #[test]

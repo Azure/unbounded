@@ -86,6 +86,51 @@ disappears until retained fill work is fenced.
 The existing `racer_live`, `racer_ready`, and `racer_diagnostic_*` series remain
 available. Diagnostics do not increment client request counters.
 
+## Local cache lookup ratios
+
+`racer_{plaintext,ciphertext,pending,disk_index}_lookup_{hits,misses,errors}_total`
+are twelve fixed, label-free counters. Each executed synchronous probe records
+exactly one outcome: `Ok(Some)` is a hit, `Ok(None)` is a miss, and `Err` is an
+error. The denominator for an ordinary hit ratio is hits plus misses, not the
+existing page-source counters. Errors are excluded, not treated as absence.
+
+Boundaries are Fill's plaintext memory probes (cached-page and acquisition),
+ciphertext memory probes (elected acquisition and CopyOnly), pending-writer
+probes (acquisition and CopyOnly), and StoreReader's initial page-index probe.
+The disk-index recheck after I/O is excluded. A disk-index hit means a mapping
+was found, not that disk I/O, framing, or later AEAD validation succeeded.
+Likewise, memory/pending hits describe presence before subsequent validation.
+Failures after these boundaries do not rewrite the observed lookup outcome.
+Cancellation before a probe produces no lookup; these probes do not await.
+Absence includes entries hidden/removed by the existing cache/key availability
+filters; these APIs return `None`, not `MissingKey`. Pending and disk-index
+probes currently cannot return `Err`; their error series remain zero unless
+that API contract changes. CopyOnly's ciphertext probe checks both verified
+memory (via its internal plaintext probe) and unverified ciphertext as one
+logical probe; that internal plaintext probe is not counted separately.
+
+Followers count their own executed memory/pending probes, but flight joins and
+deliveries do not invent lookups. Coalesced disk reads probe the index only once.
+Plaintext and ciphertext paths, including peer-serving CopyOnly, share these
+explicit representation boundaries. Metadata lookups, peer RPCs, subscriptions,
+origin fills, and flight-table probes are excluded. These are local lookup
+ratios, not end-to-end request hit ratios or authenticated-byte success ratios.
+All existing page-source metrics retain their original semantics.
+
+For example, aggregate the plaintext lookup hit ratio across targets with:
+
+```promql
+sum(rate(racer_plaintext_lookup_hits_total[5m]))
+/
+(sum(rate(racer_plaintext_lookup_hits_total[5m]))
+ + sum(rate(racer_plaintext_lookup_misses_total[5m])))
+```
+
+Replace `plaintext` with `ciphertext`, `pending`, or `disk_index` for the other
+boundaries. A zero denominator is undefined (NaN), not a zero-percent hit ratio.
+Monitor `sum(rate(racer_disk_index_lookup_errors_total[5m]))` separately; it
+does not include errors occurring after the initial index probe.
+
 ## Bounds and runtime integration constraint
 
 HTTP/1.1 GET `/healthz`, `/readyz`, `/metrics`, and `/debug/failures` are served.

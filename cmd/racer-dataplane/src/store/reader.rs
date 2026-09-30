@@ -83,7 +83,10 @@ impl StoreReader {
     ) -> Operation<'a, Option<(CiphertextCopy, ReadToken)>> {
         Box::pin(async move {
             scope.check()?;
-            let entry = match self.index.lookup(page)? {
+            let entry = match self.metrics.lookup(
+                crate::telemetry::metrics::LookupTier::DiskIndex,
+                self.index.lookup(page),
+            )? {
                 Some(e) => e,
                 None => return Ok(None),
             };
