@@ -1,5 +1,4 @@
 //! Waiter election, cancellation, and actual-completion fencing scenarios.
-use super::tests::{budget, failed, fence, flights, join, lead, origin, page_result, poll, scope};
 use super::*;
 use crate::model::identity::PageNumber;
 
@@ -164,7 +163,7 @@ fn worker_poll_drives_owned_completion_after_waiter_disappears() {
     let operation = flights.retain_operation(&leader, ()).unwrap();
     let (send, receive) = futures::channel::oneshot::channel::<()>();
     let worker = flights.clone();
-    super::super::drivers::spawn(Box::pin(async move {
+    crate::read::drivers::spawn(Box::pin(async move {
         receive.await.map_err(|_| Error::Io)?;
         operation.complete()?;
         assert_eq!(
@@ -180,7 +179,7 @@ fn worker_poll_drives_owned_completion_after_waiter_disappears() {
     send.send(()).unwrap();
     flights.poll_budgeted(1).unwrap();
     assert!(flights.table.borrow().entries.is_empty());
-    assert_eq!(super::super::drivers::pending(), 0);
+    assert_eq!(crate::read::drivers::pending(), 0);
 }
 
 #[test]

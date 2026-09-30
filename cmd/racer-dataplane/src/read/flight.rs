@@ -1399,11 +1399,11 @@ fn validate_context(page: &PageId, context: &OriginContext) -> Result<()> {
 }
 
 #[cfg(test)]
-#[path = "flight_lifecycle_tests.rs"]
-mod lifecycle_tests;
-
-#[cfg(test)]
+#[path = "."]
 mod tests {
+    #[path = "flight_lifecycle_tests.rs"]
+    mod lifecycle_tests;
+
     use super::*;
     #[test]
     fn failure_ceiling_is_inherited_without_allocating_additional_links() {
@@ -1433,7 +1433,7 @@ mod tests {
     };
     use std::time::Duration;
 
-    pub(super) fn flights(limits: FlightLimits) -> Rc<Flights> {
+    fn flights(limits: FlightLimits) -> Rc<Flights> {
         Rc::new(
             Flights::with_limits(
                 Rc::new(Admission::new(
@@ -1444,24 +1444,24 @@ mod tests {
             .unwrap(),
         )
     }
-    pub(super) fn scope() -> RequestScope {
+    fn scope() -> RequestScope {
         RequestScope::new(
             crate::model::identity::RequestId([0; 16]),
             Instant::now() + Duration::from_secs(60),
         )
         .unwrap()
     }
-    pub(super) fn origin() -> OriginContext {
+    fn origin() -> OriginContext {
         OriginContext {
             object: fence().page.version.object,
             metadata: None,
             authorization: None,
         }
     }
-    pub(super) fn budget() -> AcquisitionBudget {
+    fn budget() -> AcquisitionBudget {
         AcquisitionBudget::new(Instant::now() + Duration::from_secs(60), 3, 8)
     }
-    pub(super) fn join<'a>(
+    fn join<'a>(
         flights: &Rc<Flights>,
         context: &'a OriginContext,
         scope: &'a RequestScope,
@@ -1484,24 +1484,24 @@ mod tests {
             }
         }
     }
-    pub(super) fn poll<T>(mut future: Operation<'_, T>) -> Poll<Result<T>> {
+    fn poll<T>(mut future: Operation<'_, T>) -> Poll<Result<T>> {
         future
             .as_mut()
             .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
     }
-    pub(super) fn lead(waiter: &mut AcquisitionWaiter<'_>) -> FlightLeader {
+    fn lead(waiter: &mut AcquisitionWaiter<'_>) -> FlightLeader {
         match poll(waiter.wait()) {
             Poll::Ready(Ok(AcquisitionEvent::Lead(leader))) => leader,
             _ => panic!("expected election"),
         }
     }
-    pub(super) fn failed(waiter: &mut AcquisitionWaiter<'_>, expected: Error) {
+    fn failed(waiter: &mut AcquisitionWaiter<'_>, expected: Error) {
         assert!(
             matches!(poll(waiter.wait()), Poll::Ready(Ok(AcquisitionEvent::Failed(error))) if error == expected)
         );
     }
 
-    pub(super) fn page_result(flights: &Flights) -> PageResult {
+    fn page_result(flights: &Flights) -> PageResult {
         result(flights, fence().page)
     }
 
@@ -1878,7 +1878,7 @@ mod tests {
         assert_eq!(moved.remaining_links() + child.remaining_links(), 6);
     }
 
-    pub(super) fn fence() -> Fence {
+    fn fence() -> Fence {
         Fence {
             owner: Rc::new(()),
             page: PageId {

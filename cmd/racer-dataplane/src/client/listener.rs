@@ -167,7 +167,6 @@ pub struct ClientListeners {
     cleanup: Rc<RefCell<VecDeque<Rc<BoundListener>>>>,
     active: RefCell<VecDeque<Active>>,
     accepting: Rc<Cell<bool>>,
-    accept_cursor: Cell<usize>,
     accept_turn: Cell<bool>,
     root: PathBuf,
     request_timeout: Duration,
@@ -196,7 +195,6 @@ impl ClientListeners {
             cleanup: Rc::new(RefCell::new(VecDeque::new())),
             active: RefCell::new(VecDeque::new()),
             accepting: Rc::new(Cell::new(true)),
-            accept_cursor: Cell::new(0),
             accept_turn: Cell::new(true),
             root: PathBuf::from("/run/racer"),
             request_timeout: Duration::from_secs(30),
@@ -570,8 +568,6 @@ impl ClientListeners {
             }
             worked += 1;
         }
-        self.accept_cursor
-            .set((self.accept_cursor.get() + attempts) % count);
         Ok(worked + cleaned)
     }
 
