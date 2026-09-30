@@ -1,5 +1,4 @@
 //! Bounded HTTPS/JSON v1 and keyring bundle DTOs.
-//! See CONTROL_API.md for field encoding, bounds, authentication, and retry policy.
 use super::caches::CacheDefinition;
 use crate::{
     model::{
@@ -128,7 +127,7 @@ pub struct KeyringBundle {
     pub cache_keys: Vec<CacheEncryptionKey>,
 }
 
-/// Wire errors use snake_case codes and the HTTP statuses specified in CONTROL_API.md.
+/// Wire errors use snake_case codes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProtocolFailure {
     InvalidRequest,

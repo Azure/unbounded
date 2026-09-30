@@ -73,13 +73,7 @@ Every key in the ConfigMap is parsed as an independent document, so you can spli
 by concern or by ownership.
 
 An entry can include `name` alongside `component` and `kind` to select an exact
-workload name. Racer `kind: DaemonSet` entries require an explicit name:
-`name: racer-dataplane` for the host workload or `name: racer-dataplane-podnet`
-for pod-network tuning. Historical nameless Racer DaemonSet entries are rejected,
-not applied to both workloads. Add `name: racer-dataplane` to those entries before
-upgrading; otherwise both Racer DaemonSet writes are withheld until the invalid
-entry is corrected. In particular, host-only underlay guard init containers and
-host-only affinity must remain on `racer-dataplane`; do not copy them to podnet.
+workload name.
 Required affinity is intersected with every operator term, including migration
 interlocks, and cannot broaden the operator's placement.
 
@@ -258,9 +252,7 @@ After merging validated overrides, the operator removes its inherited
 even as `{}` or in a separate contributing entry, is rejected; `null` and deletion
 directives remain forbidden. RollingUpdate settings are otherwise unchanged.
 Removing the override restores the operator's default strategy. This does not
-delete Pods or bypass scheduling and migration guards. To target only Racer's
-host-network workload, use `name: racer-dataplane`; a separately named
-`racer-dataplane-podnet` override is unaffected.
+delete Pods or bypass scheduling and migration guards.
 
 Values are checked against the type Kubernetes requires. Writing `containers:`
 as a mapping rather than a list, or `nodeSelector:` as a list rather than a

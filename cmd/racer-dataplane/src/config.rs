@@ -2,7 +2,6 @@
 //!
 //! Default to at most eight total userspace threads (four I/O/crypto worker pairs).
 //! Shares and rail alignment come exclusively from accepted controller membership.
-//! See ../CONFIGURATION.md for environment names, defaults, and startup obligations.
 
 use crate::runtime::collections::HashSet;
 use crate::{

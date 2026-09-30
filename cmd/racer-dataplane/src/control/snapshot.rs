@@ -427,8 +427,8 @@ mod tests {
                 .unwrap();
         p.sequence.0 = sequence;
         p.membership_version.0 = 1;
-        // Lifecycle tests do not depend on the separately documented topology
-        // Unicode-fabric mismatch. Wire fixture parity is tested in codec.rs.
+        // Lifecycle tests do not depend on the topology Unicode-fabric mismatch.
+        // Wire fixture parity is tested in codec.rs.
         for member in &mut p.members {
             for rail in &mut member.rails {
                 rail.fabric = "fabric-a".into();

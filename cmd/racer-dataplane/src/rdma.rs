@@ -3,7 +3,7 @@
 //! Public contracts always compile; native FFI implementation is gated by `rdma`.
 //! Attach the bounded lifecycle endpoints, activate `Devices` against publication,
 //! and run `WithNative` on the existing crypto role. Serving I/O turns only consume
-//! mailboxes and drive `Sessions::progress`. See `native/INTEGRATION.md`.
+//! mailboxes and drive `Sessions::progress`.
 mod backend;
 pub mod device;
 pub mod lifecycle;

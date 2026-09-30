@@ -75,7 +75,7 @@ func readInstallation(ctx context.Context, reader client.Reader, cfg Config, fre
 }
 
 // InitializeVersion never retries marker CAS or counter creation, including
-// ambiguous transport failures. See the initialization crash table in the design.
+// ambiguous transport failures.
 func (r *TopologyReconciler) InitializeVersion(ctx context.Context) error {
 	return initializeVersion(ctx, r.Client, r.APIReader, r.Config)
 }

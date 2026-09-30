@@ -237,7 +237,7 @@ def main():
             r.kubectl("scale", "deployment/unbounded-operator", "--replicas=1")
         elif args.phase == "cleanup-delete":
             r.kubectl("delete", f"daemonset/{CLEANUP}", "--ignore-not-found", "--wait=false")
-        r.note(f"phase={args.phase} complete error=none next=next documented phase")
+        r.note(f"phase={args.phase} complete error=none next=select next phase")
     except Exception as exc:
         r.note(f"phase={args.phase} failed error={exc!r} next=inspect live state; do not restart completed phases")
         if isinstance(exc, subprocess.CalledProcessError):

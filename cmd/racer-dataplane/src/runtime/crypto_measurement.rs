@@ -380,7 +380,7 @@ fn lifecycle(size: usize, rotating: bool, paired: bool, operation: &str) {
 }
 
 #[test]
-#[ignore = "release-only bounded crypto measurement; see designs/racer-crypto-performance.md"]
+#[ignore = "release-only bounded crypto measurement"]
 fn crypto_measurement() {
     assert!(!cfg!(debug_assertions), "run with --release");
     provenance();

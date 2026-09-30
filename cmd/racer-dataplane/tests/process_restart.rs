@@ -1,5 +1,5 @@
-//! Real executable restart coverage. Run explicitly as root on Linux; see
-//! process/README.md. All writable state lives beneath this crate's target/.
+//! Real executable restart coverage. Run explicitly as root on Linux.
+//! All writable state lives beneath this crate's target/.
 #![cfg(target_os = "linux")]
 
 #[path = "process/control.rs"]
@@ -572,7 +572,7 @@ impl Drop for Origin {
 }
 
 #[test]
-#[ignore = "requires root, private mount namespaces, io_uring and O_DIRECT; see process/README.md"]
+#[ignore = "requires root, private mount namespaces, io_uring and O_DIRECT"]
 fn graceful_process_restart_recovers_encrypted_multipage_pin_without_origin() {
     let scratch = Scratch::new();
     let control = control::Control::start(&scratch.0);
@@ -651,7 +651,7 @@ fn graceful_process_restart_recovers_encrypted_multipage_pin_without_origin() {
 }
 
 #[test]
-#[ignore = "requires root, private mount namespaces, io_uring and O_DIRECT; see process/README.md"]
+#[ignore = "requires root, private mount namespaces, io_uring and O_DIRECT"]
 fn interrupted_process_restart_refetches_safely_after_partial_origin_body() {
     let scratch = Scratch::new();
     let control = control::Control::start(&scratch.0);
@@ -736,7 +736,7 @@ fn interrupted_process_restart_refetches_safely_after_partial_origin_body() {
 }
 
 #[test]
-#[ignore = "requires root, private mount namespaces, io_uring and O_DIRECT; see process/README.md"]
+#[ignore = "requires root, private mount namespaces, io_uring and O_DIRECT"]
 fn periodic_checkpoint_sigkill_recovers_older_pages_and_bounds_recent_loss() {
     let scratch = Scratch::new();
     let control = control::Control::start(&scratch.0);

@@ -1,4 +1,4 @@
-//! Independent client v2 and origin v1 wire checks against CLIENT_ORIGIN_API.md.
+//! Independent client v2 and origin v1 wire checks.
 //! These exercise production HTTP/parser/writer components over real Unix sockets;
 //! they do not substitute for an Application/Coordinator end-to-end deployment.
 use racer_dataplane::{

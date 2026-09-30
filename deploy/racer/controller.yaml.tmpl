@@ -9,7 +9,7 @@ spec:
   replicas: 3
   # Every synchronized replica becomes ready. Retain Recreate for migration from
   # old leaders without snapshot replication; new followers cannot sync from them.
-  # This intentionally interrupts control service. See the controller README.
+  # This intentionally interrupts control service.
   strategy:
     type: Recreate
     # Clear API-defaulted RollingUpdate settings when updating an existing install.
