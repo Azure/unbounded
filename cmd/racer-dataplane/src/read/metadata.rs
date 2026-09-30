@@ -39,6 +39,7 @@ use std::{
 
 const MAX_WAITERS: usize = 64;
 const MAX_REFRESH_ATTEMPTS: usize = 8;
+#[cfg(test)]
 const MAX_BOOTSTRAP_ATTEMPTS: usize = 3;
 const DEFAULT_ATTEMPTS: u32 = 32;
 const DEFAULT_LINKS: u8 = 96;
@@ -351,7 +352,8 @@ fn caller_budget_failure(error: Error, budget: &AcquisitionBudget) -> bool {
     ) || (error == Error::Unavailable && budget.remaining_attempts() == 0)
 }
 /// An empty bootstrap is metadata-only: it never constructs an encrypted page.
-pub enum BootstrapResult {
+#[cfg(test)]
+pub(crate) enum BootstrapResult {
     Empty(ObjectMetadata),
     Page(super::fill::PageResult),
 }
@@ -891,12 +893,14 @@ impl MetadataService {
             }
         })
     }
-    /// Runs on the page-zero owner. Resolve metadata, then acquire page zero via
+    /// Regression helper retaining plaintext bootstrap checks; production peers use
+    /// bootstrap_peer. Resolve metadata, then acquire page zero via
     /// the same Fill as pinned reads. Require identical version AND total length;
     /// bounded version-change retries happen before any response headers escape.
     /// Missing pinned descriptors may use owners.retained_metadata before probing
     /// peers/origin; fresh admission must still revalidate an absent/expired pointer.
-    pub fn bootstrap<'a>(
+    #[cfg(test)]
+    pub(crate) fn bootstrap<'a>(
         &'a self,
         selector: MetadataSelector,
         membership: MembershipLease,
@@ -911,7 +915,8 @@ impl MetadataService {
         })
     }
 
-    pub fn bootstrap_with_budget<'a>(
+    #[cfg(test)]
+    fn bootstrap_with_budget<'a>(
         &'a self,
         selector: MetadataSelector,
         membership: MembershipLease,
