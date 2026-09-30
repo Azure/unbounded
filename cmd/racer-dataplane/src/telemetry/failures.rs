@@ -285,7 +285,7 @@ mod tests {
         failures.write(&mut text).unwrap();
         assert_eq!(text.lines().count(), CAPACITY + 1);
         assert!(
-            text.len() <= crate::telemetry::server::MAX_RESPONSE_BYTES - 256,
+            text.len() <= crate::telemetry::MAX_RESPONSE_BYTES - 256,
             "{}",
             text.len()
         );

@@ -91,7 +91,7 @@ impl Health {
 mod tests {
     use super::*;
     use std::time::Duration;
-    pub(super) fn resources(now: Instant) -> Resources {
+    fn resources(now: Instant) -> Resources {
         Resources {
             workers_usable: true,
             storage_usable: true,
@@ -103,62 +103,37 @@ mod tests {
         }
     }
     #[test]
-    fn readiness_is_fail_closed_and_expires_without_updates() {
+    fn observation_and_credential_expiry_are_inclusive() {
         let now = crate::runtime::environment::now();
         let health = Health::default();
-        assert!(health.live());
-        assert!(!health.ready());
-        assert_eq!(health.transition(State::Ready), Err(Error::Unavailable));
         let good = resources(now);
         health.observe(good).unwrap();
         health.transition(State::Ready).unwrap();
-        assert!(health.ready());
+        assert_eq!(
+            health
+                .state_at(now + Duration::from_secs(5) - Duration::from_nanos(1))
+                .unwrap(),
+            State::Ready
+        );
         assert_eq!(
             health.state_at(now + Duration::from_secs(5)).unwrap(),
             State::Degraded
         );
-        for bad in [
-            Resources {
-                workers_usable: false,
+        health
+            .observe(Resources {
+                observed_until: Some(now + Duration::from_secs(20)),
                 ..good
-            },
-            Resources {
-                storage_usable: false,
-                ..good
-            },
-            Resources {
-                listeners_usable: false,
-                ..good
-            },
-            Resources {
-                membership_usable: false,
-                ..good
-            },
-            Resources {
-                admission_usable: false,
-                ..good
-            },
-            Resources {
-                credentials_valid_until: Some(now),
-                ..good
-            },
-            Resources {
-                observed_until: None,
-                ..good
-            },
-        ] {
-            health.observe(bad).unwrap();
-            assert!(!health.ready());
-            assert!(health.live());
-        }
-        health.observe(good).unwrap();
-        assert!(health.ready());
-        health.transition(State::Draining).unwrap();
-        assert!(!health.ready());
-        assert!(health.live());
-        assert!(health.transition(State::Ready).is_err());
-        health.transition(State::Stopped).unwrap();
-        assert!(!health.live());
-        assert!(health.transition(State::Starting).is_err());
+            })
+            .unwrap();
+        assert_eq!(
+            health
+                .state_at(now + Duration::from_secs(10) - Duration::from_nanos(1))
+                .unwrap(),
+            State::Ready
+        );
+        assert_eq!(
+            health.state_at(now + Duration::from_secs(10)).unwrap(),
+            State::Degraded
+        );
     }
 }

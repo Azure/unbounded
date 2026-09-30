@@ -98,8 +98,8 @@ fn assert_response(response: &[u8], status: &str, body: Option<&str>) {
         assert_eq!(actual_body, body);
     }
 }
-fn good_resources() -> super::super::health::Resources {
-    super::super::health::Resources {
+fn good_resources() -> health::Resources {
+    health::Resources {
         workers_usable: true,
         storage_usable: true,
         listeners_usable: true,
@@ -111,6 +111,110 @@ fn good_resources() -> super::super::health::Resources {
 }
 
 #[test]
+fn resource_and_lifecycle_changes_are_observable_at_both_health_endpoints() {
+    let (_, reactor, io) = setup();
+    let telemetry = Telemetry::default();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let scope = scope();
+    let mut server = telemetry.serve_listener_with_io(listener, io, &scope);
+    let mut observe = |ready: bool, live: bool| {
+        for (path, healthy, body) in [
+            (
+                "/readyz",
+                ready,
+                if ready { "ready\n" } else { "not ready\n" },
+            ),
+            ("/healthz", live, if live { "ok\n" } else { "not live\n" }),
+        ] {
+            let response = exchange_raw(
+                address,
+                format!("GET {path} HTTP/1.1\r\nHost: local\r\n\r\n").as_bytes(),
+                &mut server,
+                &reactor,
+            );
+            assert_response(
+                &response,
+                if healthy {
+                    "200 OK"
+                } else {
+                    "503 Service Unavailable"
+                },
+                Some(body),
+            );
+        }
+    };
+    observe(false, true);
+    assert_eq!(
+        telemetry.health.transition(health::State::Ready),
+        Err(Error::Unavailable)
+    );
+    let good = good_resources();
+    telemetry.health.observe(good).unwrap();
+    telemetry.health.transition(health::State::Ready).unwrap();
+    observe(true, true);
+    for bad in [
+        health::Resources {
+            workers_usable: false,
+            ..good
+        },
+        health::Resources {
+            storage_usable: false,
+            ..good
+        },
+        health::Resources {
+            listeners_usable: false,
+            ..good
+        },
+        health::Resources {
+            membership_usable: false,
+            ..good
+        },
+        health::Resources {
+            admission_usable: false,
+            ..good
+        },
+        health::Resources {
+            credentials_valid_until: Some(Instant::now()),
+            ..good
+        },
+        health::Resources {
+            credentials_valid_until: None,
+            ..good
+        },
+        health::Resources {
+            observed_until: Some(Instant::now()),
+            ..good
+        },
+        health::Resources {
+            observed_until: None,
+            ..good
+        },
+    ] {
+        telemetry.health.observe(bad).unwrap();
+        observe(false, true);
+        telemetry.health.observe(good).unwrap();
+        observe(true, true);
+    }
+    telemetry
+        .health
+        .transition(health::State::Draining)
+        .unwrap();
+    observe(false, true);
+    assert_eq!(
+        telemetry.health.transition(health::State::Ready),
+        Err(Error::Unavailable)
+    );
+    telemetry.health.transition(health::State::Stopped).unwrap();
+    observe(false, false);
+    assert_eq!(
+        telemetry.health.transition(health::State::Starting),
+        Err(Error::Unavailable)
+    );
+    finish(server, &scope, &reactor);
+}
+
+#[test]
 fn diagnostic_probe_and_monitors_progress_under_sustained_queue_pressure() {
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.queue_entries = std::num::NonZeroUsize::new(8).unwrap();
@@ -119,10 +223,7 @@ fn diagnostic_probe_and_monitors_progress_under_sustained_queue_pressure() {
     let io = Rc::new(DiagnosticIo::attach(reactor.clone(), admission.clone()).unwrap());
     let telemetry = Telemetry::default();
     telemetry.health.observe(good_resources()).unwrap();
-    telemetry
-        .health
-        .transition(super::super::health::State::Ready)
-        .unwrap();
+    telemetry.health.transition(health::State::Ready).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let scope = scope();
@@ -199,7 +300,7 @@ fn diagnostic_probe_and_monitors_progress_under_sustained_queue_pressure() {
     // Isolation must not turn genuinely stale/unusable health into a ready result.
     telemetry
         .health
-        .observe(super::super::health::Resources {
+        .observe(health::Resources {
             observed_until: Some(Instant::now()),
             ..good_resources()
         })
@@ -235,10 +336,7 @@ fn diagnostic_accept_recovers_after_full_entry_table() {
     let io = Rc::new(DiagnosticIo::attach(reactor.clone(), admission.clone()).unwrap());
     let telemetry = Telemetry::default();
     telemetry.health.observe(good_resources()).unwrap();
-    telemetry
-        .health
-        .transition(super::super::health::State::Ready)
-        .unwrap();
+    telemetry.health.transition(health::State::Ready).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let scope = scope();
@@ -346,10 +444,7 @@ fn raw_endpoints_fragmentation_readiness_redaction_and_data_admission_stop() {
     let response = exchange_raw(address, get("/readyz").as_bytes(), &mut server, &reactor);
     assert_response(&response, "503 Service Unavailable", Some("not ready\n"));
     telemetry.health.observe(good_resources()).unwrap();
-    telemetry
-        .health
-        .transition(super::super::health::State::Ready)
-        .unwrap();
+    telemetry.health.transition(health::State::Ready).unwrap();
     let response = exchange_raw(address, get("/readyz").as_bytes(), &mut server, &reactor);
     assert_response(&response, "200 OK", Some("ready\n"));
     // Stopping local admission overrides even a still-valid ready observation.
@@ -358,7 +453,7 @@ fn raw_endpoints_fragmentation_readiness_redaction_and_data_admission_stop() {
     assert_response(&response, "503 Service Unavailable", Some("not ready\n"));
     telemetry
         .health
-        .observe(super::super::health::Resources {
+        .observe(health::Resources {
             credentials_valid_until: Some(Instant::now()),
             ..good_resources()
         })
@@ -499,7 +594,7 @@ fn slow_socket_does_not_block_probes_and_abandonment_keeps_quota_until_fenced() 
 #[test]
 fn fixed_parser_and_worst_case_response_bounds() {
     let telemetry = Telemetry::default();
-    for event in super::super::metrics::EVENTS {
+    for event in metrics::EVENTS {
         telemetry.metrics.record(event, u64::MAX).unwrap();
     }
     let mut bytes = [0; MAX_RESPONSE_BYTES];
