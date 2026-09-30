@@ -441,7 +441,7 @@ impl Transfers {
                     first.get_or_insert(now);
                     last = Some(now);
                     reads = reads.saturating_add(1);
-                    if let Err(error) = scope.candidate_progress() {
+                    if let Err(error) = scope.candidate_body_progress(offset, length) {
                         record(error, offset, first, last, reads);
                         return Err(error);
                     }

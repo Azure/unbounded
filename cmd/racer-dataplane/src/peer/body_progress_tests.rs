@@ -28,9 +28,17 @@ fn progressing_body_completes_past_share_stall_and_trickle_are_bounded() {
     body_cases(&["progress", "stall", "hard", "idle_cancel"]);
 }
 
+#[test]
+fn known_body_reserve_keeps_healthy_progress_but_bounds_slow_progress() {
+    body_cases(&["reserved_progress", "reserved_slow"]);
+}
+
 fn body_cases(cases: &[&str]) {
     for &case in cases {
-        let idle = matches!(case, "progress" | "stall" | "hard" | "idle_cancel");
+        let idle = matches!(
+            case,
+            "progress" | "stall" | "hard" | "idle_cancel" | "reserved_progress" | "reserved_slow"
+        );
         let telemetry = Telemetry::default();
         let admission = Rc::new(Admission::new(
             crate::test_support::cluster::config(false).limits,
@@ -84,6 +92,11 @@ fn body_cases(cases: &[&str]) {
         scope.body_deadlines = Some((original, share));
         if idle {
             scope.set_candidate_idle(share - start).unwrap();
+        }
+        if matches!(case, "reserved_progress" | "reserved_slow") {
+            scope
+                .reserve_candidate_fallback(share - start, start + Duration::from_millis(700))
+                .unwrap();
         }
         let auth = Forwarding::new(signers[0].clone());
         let (signed, binding) = auth.sign_request(local).unwrap();
@@ -189,7 +202,12 @@ fn body_cases(cases: &[&str]) {
                 if end == 4096 && case == "stall" {
                     futures::future::pending::<()>().await;
                 }
-                next = Instant::now() + Duration::from_millis(if case == "hard" { 30 } else { 10 });
+                next = Instant::now()
+                    + Duration::from_millis(if matches!(case, "hard" | "reserved_slow") {
+                        30
+                    } else {
+                        10
+                    });
             }
             Ok::<_, Error>(())
         };
@@ -209,17 +227,17 @@ fn body_cases(cases: &[&str]) {
             assert!(Instant::now() < fixture_end, "bounded body fixture");
             std::thread::sleep(Duration::from_micros(100));
         };
-        if matches!(case, "success" | "progress") {
+        if matches!(case, "success" | "progress" | "reserved_progress") {
             let response = auth.verify_response(result.unwrap(), &binding).unwrap();
             assert!(
                 matches!(response.response(), PeerResponse::Page { ciphertext, .. } if ciphertext.bytes().len() == 8208)
             );
-            if case == "progress" {
+            if matches!(case, "progress" | "reserved_progress") {
                 assert!(Instant::now() > share && Instant::now() < original);
             }
         } else {
             assert!(
-                matches!(result, Err(e) if e == match case { "share" | "stall" | "hard" => Error::DeadlineExceeded, "cancel" | "idle_cancel" => Error::Cancelled, _ => Error::Io }),
+                matches!(result, Err(e) if e == match case { "share" | "stall" | "hard" | "reserved_slow" => Error::DeadlineExceeded, "cancel" | "idle_cancel" => Error::Cancelled, _ => Error::Io }),
                 "{case}"
             );
         }
@@ -227,7 +245,7 @@ fn body_cases(cases: &[&str]) {
         drop(server);
         let mut text = String::new();
         telemetry.failures.write(&mut text).unwrap();
-        if matches!(case, "success" | "progress") {
+        if matches!(case, "success" | "progress" | "reserved_progress") {
             assert_eq!(text, "total=0 retained=0 capacity=128\n");
         } else {
             assert!(

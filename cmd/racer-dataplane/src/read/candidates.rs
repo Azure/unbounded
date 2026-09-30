@@ -477,7 +477,8 @@ impl CandidatePolicy {
         }
         let now = crate::runtime::environment::now();
         let overall = budget.begin_peer_attempt(now, scope.deadline.0, links)?;
-        // Share bounds no-progress fallback, not a progressing body's lifetime.
+        // Share bounds idle fallback; known slow bodies also reserve one share
+        // for an affordable alternative without changing the signed ceiling.
         // Sign the original hard ceiling before sending; it never renews.
         let deadline = now + (overall - now) / remaining_opportunities.max(1);
         // The local exchange may time out before the signed contract. Shortening
@@ -497,6 +498,17 @@ impl CandidatePolicy {
         } else {
             0
         };
+        if remaining_opportunities > 1
+            && budget.remaining_attempts() > 0
+            && budget.remaining_links() >= crate::topology::paths::FAILURE_LINKS
+        {
+            // Keep at least half the post-observation interval for this body,
+            // including the two-opportunity subscription/fixed-page case.
+            let reserve = (deadline - now).min((overall - deadline) / 2);
+            if !reserve.is_zero() {
+                attempt_scope.reserve_candidate_fallback(deadline - now, overall - reserve)?;
+            }
+        }
         let mut bytes = [0; 16];
         crate::runtime::environment::fill_random(&mut bytes).map_err(|_| Error::Unavailable)?;
         let attempt = AttemptId(bytes);

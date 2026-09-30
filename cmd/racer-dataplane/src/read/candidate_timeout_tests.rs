@@ -211,6 +211,113 @@ fn expire(deadline: Instant) {
 }
 
 #[test]
+fn continuously_slow_candidate_reserves_fenced_fallback_and_conserves_credits() {
+    let clock = crate::runtime::environment::SimulationClock::new_at(
+        94,
+        Instant::now(),
+        std::time::SystemTime::now(),
+    );
+    let _env = clock.environment(0).enter();
+    let mut f = Fixture::new(None, 1, true);
+    let original = crate::runtime::environment::now() + Duration::from_secs(30);
+    f.scope = RequestScope::new(RequestId([94; 16]), original).unwrap();
+    f.budget = AcquisitionBudget::new(original, 16, 24);
+    f.peers.fenced.set(false);
+    let operation = f.operation();
+    let mut resolve = Box::pin(f.policy.resolve_with_budget(
+        f.candidates,
+        &f.context,
+        operation,
+        &f.scope,
+        &mut f.budget,
+    ));
+    assert!(poll(resolve.as_mut()).is_pending());
+    let first = f.peers.calls.borrow()[0].scope.clone();
+    first.candidate_body_progress(1, 1000).unwrap();
+    for received in 2..=10 {
+        clock.advance(Duration::from_secs(1));
+        first.candidate_body_progress(received, 1000).unwrap();
+        assert!(poll(resolve.as_mut()).is_pending());
+    }
+    clock.advance(Duration::from_secs(1));
+    assert_eq!(
+        first.candidate_body_progress(11, 1000),
+        Err(Error::DeadlineExceeded)
+    );
+    assert!(poll(resolve.as_mut()).is_pending());
+    assert!(first.cancellation.is_cancelled());
+    assert_eq!(
+        f.peers.calls.borrow().len(),
+        1,
+        "accepted I/O must fence first"
+    );
+    assert_eq!(f.scope.check(), Ok(()));
+    f.peers.fenced.set(true);
+    assert!(matches!(
+        poll(resolve.as_mut()),
+        Poll::Ready(Ok(CandidateResolution::Copy(_)))
+    ));
+    drop(resolve);
+    let calls = f.peers.calls.borrow();
+    assert_eq!(calls.len(), 2);
+    assert!(calls.iter().all(|call| call.signed_deadline == original));
+    assert_eq!(
+        calls.iter().map(|call| call.links).collect::<Vec<_>>(),
+        vec![4, 8]
+    );
+    assert_eq!(
+        calls.iter().map(|call| call.attempts + 1).sum::<u32>() + f.budget.remaining_attempts(),
+        16
+    );
+    assert_eq!(f.budget.remaining_links(), 12);
+    assert_eq!(f.budget.deadline(), original);
+    assert!(crate::runtime::environment::now() < original);
+}
+
+#[test]
+fn slow_body_without_alternative_or_failure_route_credit_keeps_original_ceiling() {
+    for (opportunities, links) in [(1, 24), (3, 4)] {
+        let clock = crate::runtime::environment::SimulationClock::new_at(
+            95,
+            Instant::now(),
+            std::time::SystemTime::now(),
+        );
+        let _env = clock.environment(0).enter();
+        let mut f = Fixture::new(None, 1, false);
+        let original = crate::runtime::environment::now() + Duration::from_secs(30);
+        f.scope = RequestScope::new(RequestId([95; 16]), original).unwrap();
+        f.budget = AcquisitionBudget::new(original, 16, links);
+        let operation = f.operation();
+        let mut request = Box::pin(f.policy.request(
+            &f.candidates.membership,
+            &f.candidates.ordered[0],
+            &f.context,
+            &operation,
+            FetchMode::Acquire,
+            &f.scope,
+            &mut f.budget,
+            opportunities,
+        ));
+        assert!(poll(request.as_mut()).is_pending());
+        let first = f.peers.calls.borrow()[0].scope.clone();
+        for received in 1..=14 {
+            clock.advance(Duration::from_secs(2));
+            first.candidate_body_progress(received, 1000).unwrap();
+            assert!(poll(request.as_mut()).is_pending());
+        }
+        assert_eq!(first.deadline.0, original);
+        f.scope.cancel().unwrap();
+        assert!(matches!(
+            poll(request.as_mut()),
+            Poll::Ready(Err(Error::Cancelled))
+        ));
+        drop(request);
+        assert_eq!(f.peers.calls.borrow().len(), 1);
+        assert_eq!(f.budget.remaining_links(), links - 4);
+    }
+}
+
+#[test]
 fn subscription_stall_must_leave_time_for_fixed_page_fallback() {
     let mut f = Fixture::new(Some(1), 1, false);
     f.peers.fenced.set(false);
