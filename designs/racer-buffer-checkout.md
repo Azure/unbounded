@@ -1,5 +1,15 @@
 # Racer initialized buffer checkout
 
+> Historical report. As of 2026-09-30, the primitive described below is
+> superseded on Linux GNU/musl by full-capacity, non-elidable
+> `libc::explicit_bzero` (`cmd/racer-dataplane/src/runtime/admission.rs:83-132`).
+> Other targets retain `clear` plus `Vec::zeroize`. The initialized-checkout,
+> admission, and completion-fence contracts remain; the measurements below
+> describe the earlier primitive, not the current implementation. See
+> [Racer I/O CPU results](racer-io-cpu.md) for the new measurements and combined
+> validation limitations. Custom GNU builds require glibc 2.25 or newer for
+> this symbol, in addition to any other toolchain/runtime requirements.
+
 ## Scope and safety
 
 One item based directly on `aba97ad02367259fe2a609d7256795ca22a2fb7f`, in

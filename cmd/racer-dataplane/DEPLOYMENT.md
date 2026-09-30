@@ -21,6 +21,15 @@ slabs are host capacity, not a Kubernetes ephemeral-storage quota.
 Use Linux, Rust/Cargo 1.96.0 (the image toolchain), and a C toolchain for the Rust
 `ring` dependency. No verbs development package is needed for a Rust-only build.
 
+Custom Linux GNU builds must link and run with **glibc 2.25 or newer** for the
+non-elidable `explicit_bzero` payload-wipe symbol
+(`src/runtime/admission.rs:83-101`). This is a minimum for that symbol, not a
+guarantee that a binary built against a newer toolchain/libc runs on glibc 2.25;
+check all linked runtime requirements. The configured Debian bookworm build
+and runtime images satisfy it (`../../images/racer-dataplane/Containerfile:4-5`).
+Linux musl selects its libc `explicit_bzero` binding but was not cross-target
+validated in this optimization; other targets retain the zeroize fallback.
+
 ```sh
 make racer-dataplane-build
 # bin/racer-dataplane; Cargo intermediates in bin/racer-cargo/
