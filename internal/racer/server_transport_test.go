@@ -401,7 +401,7 @@ func TestTLSSlowSnapshotWriteDeadline(t *testing.T) {
 	}
 }
 
-func TestTLSRevocationWhilePolling(t *testing.T) {
+func TestTLSNodeExclusionRemovesRoutingMembershipWhilePolling(t *testing.T) {
 	f := newServingFixture(t)
 	endpoint := f.start(t)
 	c := f.client(t, &f.certificate)
@@ -442,6 +442,6 @@ func TestTLSRevocationWhilePolling(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("revoked poll did not wake")
+		t.Fatal("routing membership poll did not wake after exclusion")
 	}
 }

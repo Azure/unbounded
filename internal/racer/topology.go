@@ -301,13 +301,6 @@ func readManagedWorkloadIdentities(ctx context.Context, reader client.Reader, cf
 	return ids, nil
 }
 
-// Keep the authorization caller compatible while topology uses the snapshot
-// directly. There is only one ownership implementation for both callers.
-func readManagedWorkloadOwnership(ctx context.Context, reader client.Reader, cfg Config) (func(*corev1.Pod) bool, error) {
-	ids, err := readManagedWorkloadIdentities(ctx, reader, cfg)
-	return ids.Owns, err
-}
-
 // Owns checks ownership only. Callers retain their Pod, Node, service-account,
 // token and readiness-independent membership checks.
 func (ids DataplaneWorkloadIdentities) Owns(pod *corev1.Pod) bool {
@@ -562,11 +555,6 @@ func reconcileMembers(nodes []corev1.Node, podsByNode map[string][]corev1.Pod, o
 	}
 
 	return result, diagnostics, nil
-}
-
-// CanonicalSocketPaths validates a safe name and the complete Linux UDS length.
-func CanonicalSocketPaths(name string) (clientPath, originPath string, err error) {
-	return wire.CanonicalSocketPaths(name)
 }
 
 // BuildCatalog derives identities from UIDs and paths from names, sorted by UID.

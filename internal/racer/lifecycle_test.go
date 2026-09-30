@@ -81,7 +81,7 @@ func TestLifecycleLeaderContext(t *testing.T) {
 	}
 }
 
-func TestLifecycleReadyNotifications(t *testing.T) {
+func TestLifecycleHTTPReadinessTransitions(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		set  func(*Lifecycle, bool)
@@ -90,8 +90,6 @@ func TestLifecycleReadyNotifications(t *testing.T) {
 		{name: "serving", set: (*Lifecycle).SetServingReady},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			// Keep the historical test name, but observe readiness through HTTP:
-			// the removed notification channel had no production subscriber.
 			f := newServingFixture(t)
 			l := f.a.Lifecycle
 			handler := f.a.Server.Handler()
@@ -129,7 +127,7 @@ func TestLifecycleReadyNotifications(t *testing.T) {
 	}
 }
 
-func TestLifecycleFollowerWithPublicationRemainsUnready(t *testing.T) {
+func TestLifecycleFollowerWithValidatedPublicationIsReady(t *testing.T) {
 	r := initializedTopology(t)
 	reconcileTopology(t, r, t.Context())
 
@@ -226,7 +224,7 @@ func TestLifecycleGatesAndCancellation(t *testing.T) {
 	})
 }
 
-func TestLifecycleWaitsForPublicationAndCancelsBeforeStartup(t *testing.T) {
+func TestLifecycleRequiresPublicationAndHonorsRequestCancellation(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		r := initializedTopology(t)
 		l := newLifecycle(r.Publications)
@@ -243,10 +241,10 @@ func TestLifecycleWaitsForPublicationAndCancelsBeforeStartup(t *testing.T) {
 		l.SetServingReady(true)
 		synctest.Wait()
 
-		waitCtx, stop := context.WithCancel(context.Background())
+		requestCtx, stop := context.WithCancel(context.Background())
 		stop()
 
-		request, stopRequest := l.LeaderContext(waitCtx)
+		request, stopRequest := l.LeaderContext(requestCtx)
 		defer stopRequest()
 
 		if !errors.Is(request.Err(), context.Canceled) {

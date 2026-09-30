@@ -555,21 +555,24 @@ func authorizedNode(node *corev1.Node) bool {
 // The configured namespace/name designate the managed workload. A Pod must be
 // controlled by that exact current DaemonSet UID, not just carry matching labels.
 func authorizePod(ctx context.Context, reader client.Reader, cfg Config, pod *corev1.Pod, serviceAccountUID string) error {
-	if pod.Namespace != cfg.Namespace || pod.UID == "" || pod.DeletionTimestamp != nil || pod.Spec.NodeName == "" || pod.Spec.ServiceAccountName != cfg.DataplaneServiceAccount || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+	if pod.Namespace != cfg.Namespace || pod.UID == "" || pod.DeletionTimestamp != nil ||
+		pod.Spec.NodeName == "" || pod.Spec.ServiceAccountName != cfg.DataplaneServiceAccount ||
+		pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
 		return wire.Forbidden
 	}
 
 	owner := metav1.GetControllerOf(pod)
-	if owner == nil || owner.APIVersion != "apps/v1" || owner.Kind != "DaemonSet" || !slices.Contains(managedWorkloadNames(cfg), owner.Name) || owner.UID == "" {
+	if owner == nil || owner.APIVersion != "apps/v1" || owner.Kind != "DaemonSet" ||
+		!slices.Contains(managedWorkloadNames(cfg), owner.Name) || owner.UID == "" {
 		return wire.Forbidden
 	}
 
-	owns, err := readManagedWorkloadOwnership(ctx, reader, cfg)
+	ownership, err := readManagedWorkloadIdentities(ctx, reader, cfg)
 	if err != nil {
 		return authorizationError(err)
 	}
 
-	if !owns(pod) {
+	if !ownership.Owns(pod) {
 		return wire.Forbidden
 	}
 

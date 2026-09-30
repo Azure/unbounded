@@ -21,6 +21,11 @@ func catalogCache(name string, uid types.UID) racerv1.ClusterCache {
 	return racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: name, UID: uid}}
 }
 
+// CanonicalSocketPaths keeps these tests on the production wire validation boundary.
+func CanonicalSocketPaths(name string) (clientPath, originPath string, err error) {
+	return wire.CanonicalSocketPaths(name)
+}
+
 func TestCanonicalSocketPaths(t *testing.T) {
 	for _, name := range []string{"a", "cache-a", "cache.a", strings.Repeat("a", 63) + "." + strings.Repeat("b", 18)} {
 		client, origin, err := CanonicalSocketPaths(name)

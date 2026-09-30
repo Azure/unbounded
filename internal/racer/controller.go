@@ -3,6 +3,10 @@
 
 // Package racer implements the Racer server using controller-runtime directly.
 // Constructors compose only; serving requires locally validated replicated state.
+// Run and Assemble in controller.go wire the process; Initialize in publications.go
+// is the explicit one-shot setup path. Topology and keyring own leader writes;
+// replication, trust, authentication, and server own replica-local serving.
+// workload.go provides the operator's pure builders; wire owns protocol encoding.
 package racer
 
 import (
@@ -353,7 +357,9 @@ func (c Config) Validate() error {
 		}
 	}
 
-	if c.VersionConfigMapName == c.InstallationConfigMapName || c.Limits.MaxPolls <= 0 || c.Limits.MaxConcurrentWrites <= 0 || c.Limits.MaxConcurrentBootstrap <= 0 || c.Limits.HeaderBytes <= 0 || c.Limits.WriteTimeout <= 0 || c.Limits.ShutdownTimeout <= 0 {
+	if c.VersionConfigMapName == c.InstallationConfigMapName ||
+		c.Limits.MaxPolls <= 0 || c.Limits.MaxConcurrentWrites <= 0 || c.Limits.MaxConcurrentBootstrap <= 0 ||
+		c.Limits.HeaderBytes <= 0 || c.Limits.WriteTimeout <= 0 || c.Limits.ShutdownTimeout <= 0 {
 		return fmt.Errorf("resource names or limits: %w", wire.InvalidRequest)
 	}
 
@@ -364,7 +370,9 @@ func (c Config) Validate() error {
 		return fmt.Errorf("certificate lifetime: %w", wire.InvalidRequest)
 	}
 
-	if c.IssuerSecretName == c.KeyringSecretName || c.Rotation.PrepareFor <= 0 || c.Rotation.Interval < c.Rotation.PrepareFor || c.Rotation.RetainFor < lifetime || c.Rotation.Interval > 365*24*time.Hour || c.Rotation.RetainFor > 365*24*time.Hour {
+	if c.IssuerSecretName == c.KeyringSecretName ||
+		c.Rotation.PrepareFor <= 0 || c.Rotation.Interval < c.Rotation.PrepareFor || c.Rotation.RetainFor < lifetime ||
+		c.Rotation.Interval > 365*24*time.Hour || c.Rotation.RetainFor > 365*24*time.Hour {
 		return fmt.Errorf("credential names or rotation policy: %w", wire.InvalidRequest)
 	}
 
@@ -380,7 +388,10 @@ func (c Config) snapshotMaxAge() time.Duration {
 }
 
 func (c Config) validateReplication() error {
-	if len(validation.IsDNS1123Subdomain(c.PodName)) != 0 || c.PodUID == "" || len(validation.IsDNS1123Subdomain(c.ControllerServiceAccount)) != 0 || len(validation.IsDNS1123Subdomain(c.ReplicationServerName)) != 0 || c.ReplicationPort == 0 || c.ReplicationTokenFile == "" || c.ReplicationTrustFile == "" {
+	if len(validation.IsDNS1123Subdomain(c.PodName)) != 0 || c.PodUID == "" ||
+		len(validation.IsDNS1123Subdomain(c.ControllerServiceAccount)) != 0 ||
+		len(validation.IsDNS1123Subdomain(c.ReplicationServerName)) != 0 || c.ReplicationPort == 0 ||
+		c.ReplicationTokenFile == "" || c.ReplicationTrustFile == "" {
 		return fmt.Errorf("replication requires POD_NAME, POD_UID, controller identity, TLS trust, token, server name, and port: %w", wire.InvalidRequest)
 	}
 

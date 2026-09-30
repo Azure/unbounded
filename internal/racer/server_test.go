@@ -382,7 +382,7 @@ func TestHTTPSCertificateRejectionAndRecovery(t *testing.T) {
 	}
 }
 
-func TestPooledTLSRechecksLiveAuthorizationAndExpiry(t *testing.T) {
+func TestPooledTLSIgnoresWorkloadChangesButRejectsExpiry(t *testing.T) {
 	for _, scenario := range []string{"excluded", "recreated node", "pod gone", "expired"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newServingFixture(t)
