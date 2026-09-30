@@ -74,7 +74,7 @@ def status(host, policy, node, cache):
 
 def respond(connection, api, host, policy, node, cache=None):
     pid, uid, gid = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
-    c.require(uid == 0 and node not in c.DENY11, "root host DP only; DENY11")
+    c.require(uid == 0, "root guard client only")
     connection.settimeout(2)
     data = b""
     while b"\n" not in data:
@@ -86,6 +86,8 @@ def respond(connection, api, host, policy, node, cache=None):
         proof = status(host, policy, node, cache)
         connection.sendall((c.canonical(proof) + "\n").encode())
         return
+    # All 1500 guards need readiness; DENY11 excludes only host DP startup.
+    c.require(node not in c.DENY11, "host DP startup denied; DENY11")
     c.require(set(request) == {"nonce", "node"} and request["node"] == node
               and re.fullmatch("[0-9a-f]{64}", request["nonce"]), "invalid nonce/node")
     proof = reconcile(api, host, policy, node, cache)

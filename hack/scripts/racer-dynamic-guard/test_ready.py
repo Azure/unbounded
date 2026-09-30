@@ -40,7 +40,21 @@ class StatusTest(unittest.TestCase):
     def setUp(self):
         self.api = FakeAPI()
         w.cycle(self.api, "leader", lambda: 100)
+        real_stat = server.os.stat
+        def stat(path, *args, **kwargs):
+            if path == "/proc/self/ns/net":
+                return SimpleNamespace(st_ino=0xF0000000)
+            return real_stat(path, *args, **kwargs)
+        for patch in (mock.patch.object(server.os, "stat", side_effect=stat),
+                      mock.patch.object(server.time, "monotonic", side_effect=lambda: self.now),
+                      mock.patch.object(server.time, "time", side_effect=lambda: self.now)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.api.request = mock.Mock(wraps=self.api.request)
         row = next(n for n in self.api.nodes if n["metadata"]["name"] not in c.DENY11)
+        self.prepare_node(row)
+
+    def prepare_node(self, row):
         self.node, self.uid = row["metadata"]["name"], row["metadata"]["uid"]
         self.ip = row["status"]["addresses"][0]["address"]
         self.now = 110
@@ -66,18 +80,80 @@ class StatusTest(unittest.TestCase):
                           bootID=Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
                           sequence=self.a["sequence"], contentDigest=self.a["contentDigest"], valid_until=160)
         self.host.tick = mock.Mock(return_value=self.proof)
-        for patch in (mock.patch.object(server.os, "stat", return_value=SimpleNamespace(st_ino=0xF0000000)),
-                      mock.patch.object(server.time, "monotonic", side_effect=lambda: self.now),
-                      mock.patch.object(server.time, "time", side_effect=lambda: self.now)):
-            patch.start()
-            self.addCleanup(patch.stop)
-        self.api.request = mock.Mock(wraps=self.api.request)
         self.cache = {}
         server.reconcile(self.api, self.host, self.policy, self.node, self.cache)
         self.host.tick.reset_mock()
 
     def status(self):
         return server.status(self.host, self.policy, self.node, self.cache)
+
+    def connection(self, request, uid=0):
+        connection = mock.Mock()
+        connection.getsockopt.return_value = struct.pack("3i", 1, uid, uid)
+        connection.recv.return_value = c.canonical(request).encode() + b"\n"
+        return connection
+
+    def test_deny11_readiness_allowed_but_startup_denied(self):
+        rows = [n for n in self.api.nodes if n["metadata"]["name"] in c.DENY11]
+        self.assertEqual(11, len(rows))
+        for row in rows:
+            with self.subTest(node=row["metadata"]["name"]):
+                self.prepare_node(row)
+                original = copy.deepcopy(self.cache)
+                self.api.request.reset_mock()
+                connection = self.connection(dict(ready=self.node))
+                server.respond(connection, self.api, self.host, self.policy, self.node, self.cache)
+                self.assertEqual(dict(self.proof, verified=110, sourceVerified=110),
+                                 json.loads(connection.sendall.call_args.args[0]))
+                self.assertEqual(4, self.host.run.call_count)
+                for request in (dict(node=self.node, nonce="a" * 64),
+                                dict(ready=self.node, node=self.node, nonce="a" * 64),
+                                dict(ready="another-node")):
+                    connection = self.connection(request)
+                    with self.assertRaisesRegex(ValueError, "DENY11"):
+                        server.respond(connection, self.api, self.host, self.policy, self.node, self.cache)
+                    connection.sendall.assert_not_called()
+                self.api.request.assert_not_called()
+                self.host.tick.assert_not_called()
+                self.assertEqual(original, self.cache)
+
+    def test_deny11_readiness_still_requires_current_proof(self):
+        row = next(n for n in self.api.nodes if n["metadata"]["name"] in c.DENY11)
+        for failure in ("age", "source", "boot", "kernel", "empty"):
+            with self.subTest(failure=failure):
+                self.prepare_node(row)
+                self.api.request.reset_mock()
+                if failure == "age":
+                    self.now = 125.001
+                elif failure == "source":
+                    self.cache["cm"]["metadata"]["uid"] = "recreated"
+                elif failure == "boot":
+                    self.cache["proof"]["bootID"] = "previous-boot"
+                elif failure == "kernel":
+                    self.fresh = self.fresh.replace("timeout 20", "timeout 0")
+                else:
+                    self.cache.clear()
+                connection = self.connection(dict(ready=self.node))
+                with self.assertRaises(ValueError):
+                    server.respond(connection, self.api, self.host, self.policy, self.node, self.cache)
+                connection.sendall.assert_not_called()
+                self.api.request.assert_not_called()
+                self.host.tick.assert_not_called()
+                self.api.cm["metadata"]["uid"] = "cm"
+
+    def test_uds_requests_require_root(self):
+        for row in (next(n for n in self.api.nodes if n["metadata"]["name"] in c.DENY11),
+                    next(n for n in self.api.nodes if n["metadata"]["name"] not in c.DENY11)):
+            self.prepare_node(row)
+            for request in (dict(ready=self.node), dict(node=self.node, nonce="a" * 64)):
+                with self.subTest(node=self.node, request=request):
+                    connection = self.connection(request, uid=65532)
+                    with self.assertRaisesRegex(ValueError, "root"):
+                        server.respond(connection, self.api, self.host, self.policy, self.node, self.cache)
+                    connection.recv.assert_not_called()
+                    connection.sendall.assert_not_called()
+                    self.host.run.assert_not_called()
+                    self.host.tick.assert_not_called()
 
     def test_readiness_never_fetches_or_renews_and_checks_live_kernel_each_time(self):
         original = copy.deepcopy(self.cache)
