@@ -156,6 +156,3 @@ impl Relay {
         })
     }
 }
-#[cfg(test)]
-mod tests { /* Transit-only buffers, reverse-link failure, budgets, opaque credentials. */
-}

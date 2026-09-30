@@ -45,7 +45,7 @@ pub struct PeerServer {
     local: Rc<dyn LocalPageService>,
     relay: Rc<Relay>,
     network: Option<Rc<super::PeerNetwork>>,
-    wire: Option<Rc<dyn super::wire::LogicalCodec>>,
+    wire: Option<Rc<super::wire::SecurityCodec>>,
     signatures: Option<Rc<crate::security::signing::Signatures>>,
     reactor: Option<Rc<crate::runtime::reactor::Reactor>>,
     transfers: Option<Rc<super::transfer::Transfers>>,
@@ -222,7 +222,7 @@ impl PeerServer {
         self.network = Some(network);
         self
     }
-    pub fn with_wire(mut self, wire: Rc<dyn super::wire::LogicalCodec>) -> Self {
+    pub fn with_wire(mut self, wire: Rc<super::wire::SecurityCodec>) -> Self {
         self.wire = Some(wire);
         self
     }

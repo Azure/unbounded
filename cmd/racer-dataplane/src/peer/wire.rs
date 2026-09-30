@@ -103,33 +103,6 @@ pub const MAX_ENVELOPE_HEAD: usize = (MAX_HOPS + 1) * (MAX_SIGNED_HEAD * 2);
 /// Runtime admission still rejects concurrent work when this shared budget is full.
 pub const MIN_REQUEST_CONTEXT_BYTES: usize = 8 * MAX_ENVELOPE_HEAD;
 
-/// Logical fields are decoded by the canonical security profile, not inferred
-/// from unauthenticated transport headers. This bridge also owns charged decoding.
-pub trait LogicalCodec {
-    fn request(
-        &self,
-        authentication: ForwardedHead,
-        scope: &crate::runtime::deadline::RequestScope,
-    ) -> Result<SignedRequest>;
-    fn response(
-        &self,
-        authentication: ForwardedHead,
-        body: Vec<u8>,
-        scope: &crate::runtime::deadline::RequestScope,
-    ) -> Result<SignedResponse>;
-    /// Transfer the completed receive allocation's charge into the decoded page.
-    fn response_reserved(
-        &self,
-        authentication: ForwardedHead,
-        body: Vec<u8>,
-        reservation: Option<crate::runtime::admission::Reservation>,
-        scope: &crate::runtime::deadline::RequestScope,
-    ) -> Result<SignedResponse> {
-        let result = self.response(authentication, body, scope);
-        drop(reservation);
-        result
-    }
-}
 pub use super::decode::SecurityCodec;
 
 /// Versioned HTTP envelope. Signed header values and signatures are preserved using

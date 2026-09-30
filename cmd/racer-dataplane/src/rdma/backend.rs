@@ -8,7 +8,6 @@ use std::{
     ffi::{CStr, c_char, c_int, c_void},
     ptr::NonNull,
     rc::Rc,
-    task::{Context, Poll, Waker},
 };
 
 pub struct Verbs;
@@ -373,6 +372,7 @@ impl Region {
         }
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn copy_to(&self) -> Result<Vec<u8>> {
         if self.busy.get() {
             return Err(Error::Unavailable);
@@ -410,19 +410,10 @@ impl Drop for Window {
 #[derive(Default)]
 struct TicketState {
     result: Cell<Option<Result<()>>>,
-    waker: RefCell<Option<Waker>>,
 }
 #[derive(Clone)]
 pub(crate) struct Ticket(Rc<TicketState>);
 impl Ticket {
-    pub(crate) fn poll(&self, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if let Some(result) = self.0.result.get() {
-            Poll::Ready(result)
-        } else {
-            *self.0.waker.borrow_mut() = Some(cx.waker().clone());
-            Poll::Pending
-        }
-    }
     pub(crate) fn result(&self) -> Option<Result<()>> {
         self.0.result.get()
     }
@@ -442,9 +433,6 @@ impl Pending {
             region.busy.set(false);
         }
         self.ticket.0.result.set(Some(result));
-        if let Some(waker) = self.ticket.0.waker.borrow_mut().take() {
-            waker.wake();
-        }
     }
 }
 
@@ -520,6 +508,7 @@ impl QueuePairHandle {
         self.connected.set(true);
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn device(&self) -> &Rc<DeviceHandle> {
         &self.device
     }
@@ -537,9 +526,11 @@ impl QueuePairHandle {
     pub(crate) fn ready(&self) -> bool {
         self.connected.get() && !self.stopped.get() && !self.terminating.get()
     }
+    #[cfg(test)]
     pub(crate) fn stopped(&self) -> bool {
         self.stopped.get()
     }
+    #[cfg(test)]
     pub(crate) fn expire_at(&self, deadline: std::time::Instant) {
         self.expires.set(Some(deadline));
     }

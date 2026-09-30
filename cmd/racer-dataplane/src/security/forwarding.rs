@@ -1112,7 +1112,7 @@ mod tests {
 
         // Real wire framing and canonical logical decode retain the effective
         // balance independently of the immutable original signed ceiling.
-        use crate::peer::wire::{LogicalCodec, SecurityCodec, WireCodec};
+        use crate::peer::wire::{SecurityCodec, WireCodec};
         let scope = forwarded.request.origin.scope().clone();
         let admission = Rc::new(Admission::new(
             crate::test_support::cluster::config(false).limits,

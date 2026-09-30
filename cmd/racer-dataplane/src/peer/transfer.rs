@@ -1,5 +1,5 @@
 //! Transport-neutral ciphertext lifecycle, selecting HTTP or authenticated RDMA.
-use super::wire::{LogicalCodec, PeerResponse, SignedRequest, SignedResponse, WireCodec};
+use super::wire::{PeerResponse, SecurityCodec, SignedRequest, SignedResponse, WireCodec};
 use crate::telemetry::failures::{BodyProgress, Detail, Failure, Stage, timestamp};
 use crate::{
     error::{Error, Operation, Result},
@@ -87,7 +87,7 @@ pub struct Transfers {
     pub(super) http: Rc<HttpPool>,
     pub(super) io: Rc<HttpIo>,
     pub(super) rdma: Option<Rc<RdmaTransfer>>,
-    pub(super) wire: Option<(Rc<Admission>, Rc<dyn LogicalCodec>)>,
+    pub(super) wire: Option<(Rc<Admission>, Rc<SecurityCodec>)>,
     pub(super) native: Option<(
         Rc<crate::security::signing::Signatures>,
         Rc<crate::rdma::session::Sessions>,
@@ -124,7 +124,7 @@ impl Transfers {
         self.native = Some((signatures, sessions));
         self
     }
-    pub fn with_wire(mut self, admission: Rc<Admission>, codec: Rc<dyn LogicalCodec>) -> Self {
+    pub fn with_wire(mut self, admission: Rc<Admission>, codec: Rc<SecurityCodec>) -> Self {
         self.wire = Some((admission, codec));
         self
     }

@@ -507,14 +507,12 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     .with_network(destination_network)
     .with_wire(codec)
     .with_signatures(b.signatures.clone());
-    let requester = Rc::new(
-        Requester::new(
-            paths,
-            Rc::new(Forwarding::new(a.signatures.clone())),
-            transfers,
-        )
-        .with_network(source_network),
-    );
+    let requester = Rc::new(Requester::new(
+        paths,
+        Rc::new(Forwarding::new(a.signatures.clone())),
+        transfers,
+        source_network,
+    ));
     let requester: Rc<dyn crate::peer::requester::PeerClient> =
         if matches!(absence, Some(Absence::Pinned)) {
             Rc::new(PinnedFallback {

@@ -525,14 +525,12 @@ impl Rig {
         let forwarding = Rc::new(Forwarding::new(signatures.clone()));
         let transfers =
             Rc::new(Transfers::new(http.clone(), io.clone(), None).with_signatures(signatures));
-        let peers = Rc::new(
-            Requester::new(
-                Rc::new(Paths::new(Rc::new(LinkHealth), 64)),
-                forwarding.clone(),
-                transfers,
-            )
-            .with_network(network),
-        );
+        let peers = Rc::new(Requester::new(
+            Rc::new(Paths::new(Rc::new(LinkHealth), 64)),
+            forwarding.clone(),
+            transfers,
+            network,
+        ));
         let candidates = Rc::new(CandidatePolicy::new(
             NodeId(NODE.into()),
             Rc::new(Placement::new(64)),

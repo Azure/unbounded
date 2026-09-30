@@ -17,6 +17,7 @@ use std::{
     time::{Duration, UNIX_EPOCH},
 };
 
+/// Decode the canonical security profile while retaining charged body ownership.
 pub struct SecurityCodec {
     admission: Rc<Admission>,
     buffers: Rc<BufferPool>,
@@ -385,8 +386,8 @@ fn route(head: &MessageHead) -> Result<RouteBudget> {
         deadline: p::decode_deadline(p::number(head, "racer-route-deadline")?)?,
     })
 }
-impl LogicalCodec for SecurityCodec {
-    fn request(
+impl SecurityCodec {
+    pub fn request(
         &self,
         authentication: ForwardedHead,
         scope: &RequestScope,
@@ -491,7 +492,7 @@ impl LogicalCodec for SecurityCodec {
             request,
         })
     }
-    fn response(
+    pub fn response(
         &self,
         authentication: ForwardedHead,
         body: Vec<u8>,
@@ -499,7 +500,8 @@ impl LogicalCodec for SecurityCodec {
     ) -> Result<SignedResponse> {
         self.response_reserved(authentication, body, None, scope)
     }
-    fn response_reserved(
+    /// Transfer the completed receive allocation's charge into the decoded page.
+    pub fn response_reserved(
         &self,
         authentication: ForwardedHead,
         body: Vec<u8>,

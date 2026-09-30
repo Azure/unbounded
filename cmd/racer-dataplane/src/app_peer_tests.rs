@@ -7,8 +7,7 @@ use crate::{
     },
     model::{ExpiresAt, MetadataSelector, ObjectMetadata, ResourceClass, *},
     peer::wire::{
-        self, FetchMode, LogicalCodec, Operation as PeerOperation, PeerRequest, PeerResponse,
-        WireCodec,
+        self, FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse, WireCodec,
     },
     security::{
         connection,

@@ -11,9 +11,7 @@ use crate::{
     model::{
         EncryptedAuthorization, KeyId, MetadataSelector, Nonce, PeerOriginContext, ResourceClass, *,
     },
-    peer::wire::{
-        FetchMode, LogicalCodec, Operation, PeerRequest, PeerResponse, SecurityCodec, WireCodec,
-    },
+    peer::wire::{FetchMode, Operation, PeerRequest, PeerResponse, SecurityCodec, WireCodec},
     runtime::{
         admission::Admission,
         deadline::{Deadline, RequestScope},
@@ -986,14 +984,14 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
         paths.clone(),
         Rc::new(Forwarding::new(signers[0].clone())),
         transfers,
-    )
-    .with_network(Rc::new(
-        PeerNetwork::new(
-            NodeId(A.into()),
-            crate::control::snapshot::PublishedState::for_membership(members.clone()),
-        )
-        .unwrap(),
-    ));
+        Rc::new(
+            PeerNetwork::new(
+                NodeId(A.into()),
+                crate::control::snapshot::PublishedState::for_membership(members.clone()),
+            )
+            .unwrap(),
+        ),
+    );
     let original = request(&admission, 1);
     let budget = super::search_budget(&original.route, &NodeId(A.into())).unwrap();
     let scope = original.origin.scope().clone();
@@ -1224,8 +1222,8 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
         paths,
         Rc::new(Forwarding::new(signers[0].clone())),
         transfers,
-    )
-    .with_network(source_network);
+        source_network,
+    );
     let local = request(&admission, 1);
     let scope = local.origin.scope().clone();
     let listener_scope = RequestScope::new(

@@ -76,22 +76,23 @@ pub struct Requester {
     paths: Rc<Paths>,
     forwarding: Rc<Forwarding>,
     transfers: Rc<Transfers>,
-    network: Option<Rc<super::PeerNetwork>>,
+    network: Rc<super::PeerNetwork>,
 }
 impl Requester {
-    pub fn new(paths: Rc<Paths>, forwarding: Rc<Forwarding>, transfers: Rc<Transfers>) -> Self {
+    pub fn new(
+        paths: Rc<Paths>,
+        forwarding: Rc<Forwarding>,
+        transfers: Rc<Transfers>,
+        network: Rc<super::PeerNetwork>,
+    ) -> Self {
         Self {
             observer: Observer::default(),
             health: paths.link_health(),
             paths,
             forwarding,
             transfers,
-            network: None,
+            network,
         }
-    }
-    pub fn with_network(mut self, network: Rc<super::PeerNetwork>) -> Self {
-        self.network = Some(network);
-        self
     }
     pub(crate) fn with_observer(mut self, observer: Observer) -> Self {
         self.observer = observer;
@@ -110,7 +111,7 @@ impl PeerClient for Requester {
         Box::pin(async move {
             let scope = super::request_scope(&request, scope)?;
             super::check_membership(&request, &membership)?;
-            let network = self.network.as_ref().ok_or(Error::InvalidConfiguration)?;
+            let network = &self.network;
             let search_budget = super::search_budget(&request.route, &network.local)?;
             let route = self.observer.result(
                 Stage::PeerRoute,
@@ -169,7 +170,7 @@ impl Requester {
         Box::pin(async move {
             let scope = super::request_scope(&request.request, scope)?;
             super::check_membership(&request.request, &membership)?;
-            let network = self.network.as_ref().ok_or(Error::InvalidConfiguration)?;
+            let network = &self.network;
             let budget = &request.request.route;
             let signed_head = request
                 .authentication
@@ -232,7 +233,4 @@ impl Requester {
             response
         })
     }
-}
-#[cfg(test)]
-mod tests { /* Late attempts, connection ordering, retry budgets, cancellation. */
 }

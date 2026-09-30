@@ -776,9 +776,13 @@ impl WorkerApplication {
             None => transfers,
         });
         let requester = Rc::new(
-            Requester::new(paths.clone(), forwarding.clone(), transfers.clone())
-                .with_network(network.clone())
-                .with_observer(admission.observer()),
+            Requester::new(
+                paths.clone(),
+                forwarding.clone(),
+                transfers.clone(),
+                network.clone(),
+            )
+            .with_observer(admission.observer()),
         );
         let candidates = Rc::new(
             CandidatePolicy::new(config.node.clone(), placement.clone(), requester.clone())

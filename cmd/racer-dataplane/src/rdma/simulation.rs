@@ -837,6 +837,7 @@ unsafe extern "C" fn poll(qp: *mut c_void, out: *mut Completion, capacity: u32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::task::{Context, Poll};
 
     fn connected(
         sim: &Simulation,

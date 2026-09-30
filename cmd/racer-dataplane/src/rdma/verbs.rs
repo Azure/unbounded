@@ -184,7 +184,6 @@ impl Ticket {
     }
 }
 pub struct QueuePairHandle {
-    device: Rc<DeviceHandle>,
     lease: Rc<Lease>,
     pub endpoint: Endpoint,
     connecting: RefCell<Option<Ticket>>,
@@ -228,7 +227,6 @@ impl QueuePairHandle {
             }
             let endpoint = mailbox.endpoint.ok_or(Error::Unavailable)?;
             return Poll::Ready(Ok(Rc::new(Self {
-                device: device.clone(),
                 lease: Rc::new(Lease {
                     slot: slot.clone(),
                     shared: device.port.shared.clone(),
@@ -290,9 +288,6 @@ impl QueuePairHandle {
         *self.connecting.borrow_mut() =
             Some(ready!(self.poll_submit(Command::Connect(remote), None))?);
         Poll::Ready(Ok(()))
-    }
-    pub(crate) fn device(&self) -> &Rc<DeviceHandle> {
-        &self.device
     }
     pub(crate) fn ready(&self) -> bool {
         self.connected.get()

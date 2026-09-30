@@ -453,8 +453,8 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
         paths,
         Rc::new(Forwarding::new(signers[0].clone())),
         transfers,
-    )
-    .with_network(network(A));
+        network(A),
+    );
     let request = subscribe(&admission, A, 1, 8, FetchMode::CopyOnly);
     let scope = request.origin.scope().clone();
     let server_work = async {
