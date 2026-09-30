@@ -57,15 +57,25 @@ fn runtime_codec_accepts_server_vectors() {
     assert_eq!(membership, fixture("membership.json"));
     decode_publication(runtime::encode_publication(&p).unwrap().as_slice()).unwrap();
 
+    let encoded = runtime::encode_publication(&p).unwrap();
+    assert_eq!(
+        runtime::encode_publication(&runtime::decode_publication(&encoded).unwrap()).unwrap(),
+        encoded
+    );
+
     let request = runtime::decode_enrollment_request(&fixture("bootstrap-request.json")).unwrap();
     let encoded = runtime::encode_enrollment_request(&request).unwrap();
+    assert_eq!(encoded, fixture("bootstrap-request.json"));
     decode_enrollment_request(encoded.as_slice()).unwrap();
     let response =
         runtime::decode_enrollment_response(&fixture("bootstrap-response.json")).unwrap();
     let encoded = runtime::encode_enrollment_response(&response).unwrap();
+    assert_eq!(encoded, fixture("bootstrap-response.json"));
     decode_enrollment_response(encoded.as_slice()).unwrap();
     let bundle = runtime::decode_bundle(&fixture("bundle.json")).unwrap();
-    decode_bundle(runtime::encode_bundle(&bundle).unwrap().as_slice()).unwrap();
+    let encoded = runtime::encode_bundle(&bundle).unwrap();
+    assert_eq!(encoded, fixture("bundle.json"));
+    decode_bundle(encoded.as_slice()).unwrap();
 }
 
 #[test]
@@ -81,6 +91,20 @@ fn shared_rejection_vectors() {
             1,
         );
         assert_ne!(input, mutated, "mutation did not match: {name}");
+        // Exercise the production codec as well as the reference codec below.
+        use crate::control::wire as runtime;
+        let result = match file {
+            "publication.json" => runtime::decode_publication(mutated.as_bytes()).map(|_| ()),
+            "bundle.json" => runtime::decode_bundle(mutated.as_bytes()).map(|_| ()),
+            "bootstrap-request.json" => {
+                runtime::decode_enrollment_request(mutated.as_bytes()).map(|_| ())
+            }
+            "bootstrap-response.json" => {
+                runtime::decode_enrollment_response(mutated.as_bytes()).map(|_| ())
+            }
+            _ => panic!("unknown vector"),
+        };
+        assert!(result.is_err(), "runtime accepted {name}");
         let expected = decode_error(format!(r#"{{"code":{}}}"#, case["code"]).as_bytes())
             .unwrap()
             .code;

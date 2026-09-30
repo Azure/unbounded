@@ -58,6 +58,41 @@ mod tests {
     use crate::control::{files, testing};
     use std::os::unix::fs::symlink;
     #[test]
+    fn bundle_installation_is_idempotent_and_rejects_rollback() {
+        use crate::security::keyring::{KeyEpochs, KeyPurpose};
+        use std::sync::Arc;
+
+        let publication =
+            wire::decode_publication(include_bytes!("testdata/publication.json")).unwrap();
+        let keys = Rc::new(Keyring::new(
+            publication.cluster,
+            publication.members[0].node.clone(),
+            Arc::new(KeyEpochs::default()),
+        ));
+        let installer = BundleInstaller::new(keys.clone());
+        let (ca, _) = testing::ca();
+        let mut bundle = wire::decode_bundle(include_bytes!("testdata/bundle.json")).unwrap();
+        bundle.generation = BundleGeneration(1);
+        bundle.peer_trust_roots = vec![ca.der().to_vec()];
+        // The shared fixture repeats material across purposes. Keep only page keys,
+        // since production security correctly rejects cross-purpose key reuse.
+        bundle.cache_keys.truncate(2);
+        let cache = bundle.cache_keys[0].key.cache.clone();
+        for _ in 0..2 {
+            assert_eq!(
+                installer.install(bundle.clone()).unwrap().0,
+                BundleGeneration(1)
+            );
+            assert!(keys.active(&cache, KeyPurpose::Page).is_ok());
+        }
+        assert!(wire::decode_bundle(b"{}").is_err());
+        bundle.generation = BundleGeneration(0);
+        assert!(installer.install(bundle).is_err());
+        assert_eq!(installer.generation(), Some(BundleGeneration(1)));
+        assert!(keys.active(&cache, KeyPurpose::Page).is_ok());
+    }
+
+    #[test]
     fn coherent_projection_rejects_partial_and_escaping_links() {
         let d = testing::Directory::new();
         std::fs::create_dir(d.0.join("epoch-a")).unwrap();
