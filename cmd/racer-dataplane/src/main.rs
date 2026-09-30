@@ -2,6 +2,13 @@
 
 use racer_dataplane::{app::Application, config::Config, error::Result, rdma::device::FabricPort};
 
+mod heap_profile;
+
+// Keep this out of lib.rs: integration tests may install their own allocator.
+#[cfg(feature = "heap-profiling")]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn main() -> std::process::ExitCode {
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -12,9 +19,11 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-fn run() -> Result<()> {
+fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let _heap_profile = heap_profile::start_from_env()?;
     let (config, fabric_ports) = Config::from_env_with_fabric_ports()?;
-    assemble(config, fabric_ports)?.run()
+    assemble(config, fabric_ports)?.run()?;
+    Ok(())
 }
 
 fn assemble(config: Config, fabric_ports: Vec<FabricPort>) -> Result<Application> {

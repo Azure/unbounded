@@ -11,6 +11,8 @@ default = []
 rdma = []
 # Opt-in standalone client interoperability fixture with crate-private test hooks.
 subscription-interop = []
+# Binary-only jemalloc allocator and dedicated, opt-in pprof HTTP listener.
+heap-profiling = ["dep:jemalloc_pprof", "dep:tikv-jemallocator"]
 
 [[test]]
 name = "subscription_interop"
@@ -28,6 +30,7 @@ futures = "0.3"
 getrandom = "0.2"
 httparse = "1"
 io-uring = "0.7"
+jemalloc_pprof = { version = "0.9", optional = true, features = ["symbolize"] }
 libc = "0.2"
 # chacha20poly1305/zeroize does not enable Poly1305 state wiping. Unify its
 # transitive dependency with this explicit feature until upstream forwards it.
@@ -38,8 +41,13 @@ rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+tikv-jemallocator = { version = "0.7", optional = true, features = ["profiling_libunwind"] }
 x509-parser = { version = "0.16", features = ["verify"] }
 zeroize = "1"
+
+[dev-dependencies]
+flate2 = "1"
+prost = "0.14"
 
 # Full-page crypto and exhaustive topology checks dominate unoptimized test runs.
 # Keep debug assertions, overflow checks, and debug info while optimizing hot loops.
