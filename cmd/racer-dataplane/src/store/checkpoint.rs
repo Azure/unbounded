@@ -4,7 +4,7 @@
 //! finishes each snapshot even on failure. Write/rename provides no fsync durability.
 use super::{
     checkpoint_format::{
-        CHECKPOINT_VERSION, CheckpointCodec, CheckpointGeometry, CheckpointImage, ShardImage,
+        self, CHECKPOINT_VERSION, CheckpointGeometry, CheckpointImage, ShardImage,
     },
     index::Index,
     recovery::read_candidates,
@@ -212,7 +212,7 @@ impl Checkpointer {
             // Replace the slot opposite the newest valid image, including after a
             // torn newer publication. The surviving valid generation stays intact.
             let slot = newest.map_or(0, |(slot, _)| 1 - slot);
-            let bytes = CheckpointCodec.encode(&CheckpointImage {
+            let bytes = checkpoint_format::encode(&CheckpointImage {
                 version: CHECKPOINT_VERSION,
                 sequence,
                 shards,
@@ -258,13 +258,12 @@ impl Checkpointer {
         }
         let directory = self.directory.clone();
         Ok(Box::pin(async move {
-            let bytes = CheckpointCodec
-                .encode_incremental(&CheckpointImage {
-                    version: CHECKPOINT_VERSION,
-                    sequence,
-                    shards,
-                })
-                .await?;
+            let bytes = checkpoint_format::encode_incremental(&CheckpointImage {
+                version: CHECKPOINT_VERSION,
+                sequence,
+                shards,
+            })
+            .await?;
             if bytes.len() > budget / 2 {
                 return Err(Error::Overloaded);
             }

@@ -670,32 +670,4 @@ mod tests {
         assert!(index.current(&m.version.object).unwrap().is_none());
         assert_eq!(index.version(&m.version).unwrap(), Some(m));
     }
-
-    // Compile the complete recovery -> disk copy -> memory -> pending write path.
-    // No fake buffers, alignment proof, or successful operational stub is needed.
-    fn page_metadata_api_contract(
-        snapshot: IndexSnapshot,
-        index: &Index,
-        page: PageId,
-        entry: IndexedPage,
-        result: crate::read::fill::PageResult,
-        memory: &crate::memory::cache::MemoryCache,
-        writer: &crate::store::writer::StoreWriter,
-        dirty: crate::runtime::admission::Reservation,
-    ) -> Result<()> {
-        snapshot.validate_metadata()?;
-        index.restore(snapshot)?;
-        index.publish(page.clone(), entry)?;
-        let _: Option<IndexedPage> = index.lookup(&page)?;
-        let _: Option<VersionMetadata> = index.version(&page.version)?;
-        let copy = result.copy();
-        memory.publish(result.clone())?;
-        let _: Option<crate::read::fill::PageResult> = memory.get(&page)?;
-        writer.enqueue(copy, dirty)?;
-        let _: Option<crate::memory::page::CiphertextCopy> = writer.copy_only(&page)?;
-        Ok(())
-    }
-
-    // Duplicate writes, reverse membership, and actual restore/eviction behavior
-    // remain tests for the storage implementation, not simulated by this scaffold.
 }

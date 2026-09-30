@@ -5,7 +5,7 @@
 use super::{
     checkpoint::CHECKPOINT_NAMES,
     checkpoint_format::{
-        CheckpointCodec, CheckpointGeometry, CheckpointImage, MAX_CHECKPOINT_BYTES, ShardImage,
+        self, CheckpointGeometry, CheckpointImage, MAX_CHECKPOINT_BYTES, ShardImage,
     },
     direct::DirectAlignment,
     index::{Index, IndexSnapshot},
@@ -198,7 +198,7 @@ pub(crate) fn read_candidates(directory: &Path) -> Result<Vec<(usize, Checkpoint
             let bytes = sim
                 .read_file(&directory.join(name))
                 .map_err(|_| Error::Io)?;
-            if let Ok(image) = CheckpointCodec.decode(&bytes) {
+            if let Ok(image) = checkpoint_format::decode(&bytes) {
                 candidates.push((slot, image));
             }
             continue;
@@ -227,7 +227,7 @@ pub(crate) fn read_candidates(directory: &Path) -> Result<Vec<(usize, Checkpoint
         file.take(MAX_CHECKPOINT_BYTES as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| Error::Io)?;
-        if let Ok(image) = CheckpointCodec.decode(&bytes) {
+        if let Ok(image) = checkpoint_format::decode(&bytes) {
             candidates.push((slot, image));
         }
     }

@@ -1171,7 +1171,7 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
 fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
     use crate::{
         runtime::affinity::{EffectiveTopology, WorkerPair},
-        store::checkpoint_format::CheckpointCodec,
+        store::checkpoint_format,
     };
     let mut fixture = Fixture::new();
     let mut config = fixture.config.take().unwrap();
@@ -1259,7 +1259,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
     group.shutdown(&shutdown).unwrap();
     group.join().unwrap();
     let bytes = std::fs::read(fixture.directory.join("slabs/checkpoint.0")).unwrap();
-    let image = CheckpointCodec.decode(&bytes).unwrap();
+    let image = checkpoint_format::decode(&bytes).unwrap();
     let mut workers: Vec<_> = image.shards.iter().map(|shard| shard.worker.0).collect();
     workers.sort_unstable();
     assert_eq!(workers, vec![0, 1]);

@@ -262,7 +262,7 @@ fn incremental_checkpoint_budget_thaws_and_async_publication_roundtrips() {
     drive(&f.reactor, task).unwrap();
     f.store.checkpoint.finish_snapshot();
     let bytes = std::fs::read(f._directory.0.join("checkpoint.1")).unwrap();
-    let image = checkpoint_format::CheckpointCodec.decode(&bytes).unwrap();
+    let image = checkpoint_format::decode(&bytes).unwrap();
     assert_eq!(image.sequence, 7);
     assert_eq!(image.shards[0].index.entries.len(), 1);
     let geometry = checkpoint_format::CheckpointGeometry::new(
@@ -283,19 +283,15 @@ fn record_round_trip_preserves_ciphertext_zeroes_padding_and_rejects_torn_header
     let a = direct::DirectAlignment::validate(512, 512, 512).unwrap();
     for length in [3, crate::model::PAGE_BYTES as usize] {
         let page = f.copy(9, length);
-        let disk = a
-            .extent(0, format::RecordCodec.logical_length(&page).unwrap())
-            .unwrap();
+        let disk = a.extent(0, format::logical_length(&page).unwrap()).unwrap();
         let reserve = f
             .admission
             .reserve(None, ResourceClass::Ciphertext, disk.length())
             .unwrap();
         let buffer = a.allocate(disk.length(), reserve).unwrap();
         assert_eq!(buffer.bytes().unwrap().as_ptr() as usize % a.memory(), 0);
-        let mut encoded = format::RecordCodec
-            .encode(&page, segment::Generation(7), a, buffer)
-            .unwrap();
-        let parsed = format::RecordCodec.parse(&encoded.buffer, disk).unwrap();
+        let mut encoded = format::encode(&page, segment::Generation(7), a, buffer).unwrap();
+        let parsed = format::parse(&encoded.buffer, disk).unwrap();
         assert_eq!(
             &encoded.buffer.bytes().unwrap()[parsed.ciphertext.clone()],
             page.ciphertext.bytes()
@@ -307,19 +303,13 @@ fn record_round_trip_preserves_ciphertext_zeroes_padding_and_rejects_torn_header
                 .all(|b| *b == 0)
         );
         assert_eq!(
-            format::RecordCodec
-                .decode(&encoded.buffer, &encoded.header)
-                .unwrap(),
+            format::decode(&encoded.buffer, &encoded.header).unwrap(),
             *page.ciphertext.envelope()
         );
         encoded.header.generation = segment::Generation(8);
-        assert!(
-            format::RecordCodec
-                .decode(&encoded.buffer, &encoded.header)
-                .is_err()
-        );
+        assert!(format::decode(&encoded.buffer, &encoded.header).is_err());
         encoded.buffer.bytes_mut().unwrap()[24] ^= 1;
-        assert!(format::RecordCodec.parse(&encoded.buffer, disk).is_err());
+        assert!(format::parse(&encoded.buffer, disk).is_err());
     }
 }
 #[test]
@@ -442,7 +432,7 @@ fn index_capacity_rejection_preserves_segments_and_releases_all_charges_without_
     let mut malformed = f.copy(5, 64);
     malformed.metadata.length = 0;
     assert_eq!(
-        format::RecordCodec.logical_length(&malformed),
+        format::logical_length(&malformed),
         Err(Error::CorruptRecord)
     );
     // Capacity rejection precedes even header validation/length calculation.
@@ -672,9 +662,7 @@ fn stored_payload_and_tag_corruption_fail_mandatory_checksum() {
                 .read(location.location, staging, lease, &request),
         )
         .unwrap();
-        let parsed = super::format::RecordCodec
-            .parse(&stored, location.location.extent)
-            .unwrap();
+        let parsed = super::format::parse(&stored, location.location.extent).unwrap();
         assert_eq!(parsed.header.format_version, super::format::FORMAT_VERSION);
         assert_eq!(parsed.checksum, page.ciphertext.checksum());
         let offset = if corrupt_tag {

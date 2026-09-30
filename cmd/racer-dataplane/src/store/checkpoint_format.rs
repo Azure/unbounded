@@ -193,203 +193,199 @@ pub struct CheckpointImage {
     pub shards: Vec<ShardImage>,
 }
 
-pub struct CheckpointCodec;
-impl CheckpointCodec {
-    pub fn encode(&self, image: &CheckpointImage) -> Result<Vec<u8>> {
-        let mut encode = Box::pin(self.encode_incremental(image));
-        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-        loop {
-            if let std::task::Poll::Ready(result) =
-                std::future::Future::poll(encode.as_mut(), &mut cx)
-            {
-                return result;
-            }
+pub fn encode(image: &CheckpointImage) -> Result<Vec<u8>> {
+    let mut encode = Box::pin(encode_incremental(image));
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        if let std::task::Poll::Ready(result) = std::future::Future::poll(encode.as_mut(), &mut cx)
+        {
+            return result;
         }
     }
-    pub async fn encode_incremental(&self, image: &CheckpointImage) -> Result<Vec<u8>> {
-        validate_image(image)?;
-        let mut out = Encoder(Vec::new());
-        out.bytes(MAGIC)?;
-        out.u32(image.version)?;
-        out.u32(0)?; // Reserved flags.
-        out.u64(image.sequence)?;
-        out.u64(0)?; // Total encoded length, filled before hashing.
-        out.count(image.shards.len())?;
-        let mut shards: Vec<_> = image.shards.iter().collect();
-        shards.sort_by_key(|shard| shard.worker.0);
-        for shard in shards {
-            out.bytes(&shard.worker.0.to_le_bytes())?;
-            let g = shard.geometry;
-            for value in [
-                g.slab_bytes,
-                g.segment_bytes,
-                g.segment_count,
-                g.memory_alignment,
-                g.offset_alignment,
-                g.length_alignment,
-            ] {
-                out.u64(value)?;
-            }
-            out.count(shard.segments.len())?;
-            let mut segments: Vec<_> = shard.segments.iter().collect();
-            segments.sort_by_key(|segment| segment.id.0);
-            for (i, segment) in segments.into_iter().enumerate() {
-                if i % 128 == 0 {
-                    super::checkpoint::cooperative_turn().await;
-                }
-                out.u64(segment.id.0)?;
-                out.u64(segment.generation.0)?;
-                out.bytes(&[match segment.state {
-                    SegmentState::Free => 0,
-                    SegmentState::Open => 1,
-                    SegmentState::Sealed => 2,
-                    SegmentState::Evicting => 3,
-                }])?;
-                out.u64(segment.used_bytes)?;
-            }
-            out.count(shard.index.entries.len())?;
-            let mut entries: Vec<_> = shard.index.entries.iter().collect();
-            entries.sort_by(|(a, _), (b, _)| {
-                version_key(&a.version)
-                    .cmp(&version_key(&b.version))
-                    .then(a.number.0.cmp(&b.number.0))
-            });
-            for (i, (page, entry)) in entries.into_iter().enumerate() {
-                if i % 128 == 0 {
-                    super::checkpoint::cooperative_turn().await;
-                }
-                out.descriptor(&entry.metadata, image.version)?;
-                out.u64(page.number.0)?;
-                out.bytes(&entry.key_id.0)?;
-                out.u64(entry.location.segment.0)?;
-                out.u64(entry.location.generation.0)?;
-                out.u64(entry.location.location.slab.0)?;
-                out.u64(entry.location.location.extent.offset())?;
-                out.u64(entry.location.location.extent.length() as u64)?;
-            }
-            out.count(shard.index.metadata.len())?;
-            let mut metadata: Vec<_> = shard.index.metadata.iter().collect();
-            metadata.sort_by(|a, b| version_key(&a.version).cmp(&version_key(&b.version)));
-            for (i, metadata) in metadata.into_iter().enumerate() {
-                if i % 128 == 0 {
-                    super::checkpoint::cooperative_turn().await;
-                }
-                out.descriptor(metadata, image.version)?;
-            }
+}
+pub async fn encode_incremental(image: &CheckpointImage) -> Result<Vec<u8>> {
+    validate_image(image)?;
+    let mut out = Encoder(Vec::new());
+    out.bytes(MAGIC)?;
+    out.u32(image.version)?;
+    out.u32(0)?; // Reserved flags.
+    out.u64(image.sequence)?;
+    out.u64(0)?; // Total encoded length, filled before hashing.
+    out.count(image.shards.len())?;
+    let mut shards: Vec<_> = image.shards.iter().collect();
+    shards.sort_by_key(|shard| shard.worker.0);
+    for shard in shards {
+        out.bytes(&shard.worker.0.to_le_bytes())?;
+        let g = shard.geometry;
+        for value in [
+            g.slab_bytes,
+            g.segment_bytes,
+            g.segment_count,
+            g.memory_alignment,
+            g.offset_alignment,
+            g.length_alignment,
+        ] {
+            out.u64(value)?;
         }
-        let length = out
-            .0
-            .len()
-            .checked_add(DIGEST_BYTES)
-            .ok_or(Error::CorruptRecord)?;
-        out.0[24..32].copy_from_slice(&(length as u64).to_le_bytes());
-        let digest = Sha256::digest(&out.0);
-        out.0.extend_from_slice(&digest);
-        Ok(out.0)
+        out.count(shard.segments.len())?;
+        let mut segments: Vec<_> = shard.segments.iter().collect();
+        segments.sort_by_key(|segment| segment.id.0);
+        for (i, segment) in segments.into_iter().enumerate() {
+            if i % 128 == 0 {
+                super::checkpoint::cooperative_turn().await;
+            }
+            out.u64(segment.id.0)?;
+            out.u64(segment.generation.0)?;
+            out.bytes(&[match segment.state {
+                SegmentState::Free => 0,
+                SegmentState::Open => 1,
+                SegmentState::Sealed => 2,
+                SegmentState::Evicting => 3,
+            }])?;
+            out.u64(segment.used_bytes)?;
+        }
+        out.count(shard.index.entries.len())?;
+        let mut entries: Vec<_> = shard.index.entries.iter().collect();
+        entries.sort_by(|(a, _), (b, _)| {
+            version_key(&a.version)
+                .cmp(&version_key(&b.version))
+                .then(a.number.0.cmp(&b.number.0))
+        });
+        for (i, (page, entry)) in entries.into_iter().enumerate() {
+            if i % 128 == 0 {
+                super::checkpoint::cooperative_turn().await;
+            }
+            out.descriptor(&entry.metadata, image.version)?;
+            out.u64(page.number.0)?;
+            out.bytes(&entry.key_id.0)?;
+            out.u64(entry.location.segment.0)?;
+            out.u64(entry.location.generation.0)?;
+            out.u64(entry.location.location.slab.0)?;
+            out.u64(entry.location.location.extent.offset())?;
+            out.u64(entry.location.location.extent.length() as u64)?;
+        }
+        out.count(shard.index.metadata.len())?;
+        let mut metadata: Vec<_> = shard.index.metadata.iter().collect();
+        metadata.sort_by(|a, b| version_key(&a.version).cmp(&version_key(&b.version)));
+        for (i, metadata) in metadata.into_iter().enumerate() {
+            if i % 128 == 0 {
+                super::checkpoint::cooperative_turn().await;
+            }
+            out.descriptor(metadata, image.version)?;
+        }
     }
+    let length = out
+        .0
+        .len()
+        .checked_add(DIGEST_BYTES)
+        .ok_or(Error::CorruptRecord)?;
+    out.0[24..32].copy_from_slice(&(length as u64).to_le_bytes());
+    let digest = Sha256::digest(&out.0);
+    out.0.extend_from_slice(&digest);
+    Ok(out.0)
+}
 
-    /// Reject truncation, trailing data, unknown versions, and malformed allocations.
-    /// No payload files are read and no live shard is modified by decoding.
-    pub fn decode(&self, bytes: &[u8]) -> Result<CheckpointImage> {
-        if bytes.len() < HEADER_BYTES + 4 + DIGEST_BYTES || bytes.len() > MAX_CHECKPOINT_BYTES {
-            return Err(Error::CorruptRecord);
-        }
-        let (body, digest) = bytes.split_at(bytes.len() - DIGEST_BYTES);
-        if &Sha256::digest(body)[..] != digest {
-            return Err(Error::CorruptRecord);
-        }
-        let mut input = Decoder(body);
-        if input.take(8)? != MAGIC {
-            return Err(Error::CorruptRecord);
-        }
-        let version = input.u32()?;
-        if !matches!(version, 1 | 2) || input.u32()? != 0 {
-            return Err(Error::CorruptRecord);
-        }
-        let sequence = input.u64()?;
-        if input.u64()? != bytes.len() as u64 {
-            return Err(Error::CorruptRecord);
-        }
-        let count = input.count(MAX_SHARDS, 62)?;
-        let mut shards = Vec::new();
+/// Reject truncation, trailing data, unknown versions, and malformed allocations.
+/// No payload files are read and no live shard is modified by decoding.
+pub fn decode(bytes: &[u8]) -> Result<CheckpointImage> {
+    if bytes.len() < HEADER_BYTES + 4 + DIGEST_BYTES || bytes.len() > MAX_CHECKPOINT_BYTES {
+        return Err(Error::CorruptRecord);
+    }
+    let (body, digest) = bytes.split_at(bytes.len() - DIGEST_BYTES);
+    if &Sha256::digest(body)[..] != digest {
+        return Err(Error::CorruptRecord);
+    }
+    let mut input = Decoder(body);
+    if input.take(8)? != MAGIC {
+        return Err(Error::CorruptRecord);
+    }
+    let version = input.u32()?;
+    if !matches!(version, 1 | 2) || input.u32()? != 0 {
+        return Err(Error::CorruptRecord);
+    }
+    let sequence = input.u64()?;
+    if input.u64()? != bytes.len() as u64 {
+        return Err(Error::CorruptRecord);
+    }
+    let count = input.count(MAX_SHARDS, 62)?;
+    let mut shards = Vec::new();
+    for _ in 0..count {
+        let worker = WorkerId(u16::from_le_bytes(input.array()?));
+        let geometry = CheckpointGeometry {
+            slab_bytes: input.u64()?,
+            segment_bytes: input.u64()?,
+            segment_count: input.u64()?,
+            memory_alignment: input.u64()?,
+            offset_alignment: input.u64()?,
+            length_alignment: input.u64()?,
+        };
+        geometry.validate()?;
+        let count = input.count(MAX_ITEMS, 25)?;
+        let mut segments = Vec::new();
         for _ in 0..count {
-            let worker = WorkerId(u16::from_le_bytes(input.array()?));
-            let geometry = CheckpointGeometry {
-                slab_bytes: input.u64()?,
-                segment_bytes: input.u64()?,
-                segment_count: input.u64()?,
-                memory_alignment: input.u64()?,
-                offset_alignment: input.u64()?,
-                length_alignment: input.u64()?,
-            };
-            geometry.validate()?;
-            let count = input.count(MAX_ITEMS, 25)?;
-            let mut segments = Vec::new();
-            for _ in 0..count {
-                segments.push(SegmentSnapshot {
-                    id: SegmentId(input.u64()?),
-                    generation: Generation(input.u64()?),
-                    state: match input.take(1)?[0] {
-                        0 => SegmentState::Free,
-                        1 => SegmentState::Open,
-                        2 => SegmentState::Sealed,
-                        3 => SegmentState::Evicting,
-                        _ => return Err(Error::CorruptRecord),
-                    },
-                    used_bytes: input.u64()?,
-                });
-            }
-            let count = input.count(MAX_ITEMS, 112)?;
-            let mut entries = Vec::new();
-            for _ in 0..count {
-                let metadata = input.descriptor(version)?;
-                let page = PageId {
-                    version: metadata.version.clone(),
-                    number: PageNumber(input.u64()?),
-                };
-                let key_id = KeyId(input.array()?);
-                let segment = SegmentId(input.u64()?);
-                let generation = Generation(input.u64()?);
-                let slab = SlabId(input.u64()?);
-                let offset = input.u64()?;
-                let length = usize::try_from(input.u64()?).map_err(|_| Error::CorruptRecord)?;
-                let extent = DirectExtent::checked(offset, length)?;
-                entries.push((
-                    page,
-                    IndexedPage {
-                        metadata,
-                        key_id,
-                        location: RecordLocation {
-                            segment,
-                            generation,
-                            location: SlabLocation { slab, extent },
-                        },
-                    },
-                ));
-            }
-            let count = input.count(MAX_ITEMS, 48)?;
-            let mut metadata = Vec::new();
-            for _ in 0..count {
-                metadata.push(input.descriptor(version)?);
-            }
-            shards.push(ShardImage {
-                worker,
-                geometry,
-                index: IndexSnapshot { entries, metadata },
-                segments,
+            segments.push(SegmentSnapshot {
+                id: SegmentId(input.u64()?),
+                generation: Generation(input.u64()?),
+                state: match input.take(1)?[0] {
+                    0 => SegmentState::Free,
+                    1 => SegmentState::Open,
+                    2 => SegmentState::Sealed,
+                    3 => SegmentState::Evicting,
+                    _ => return Err(Error::CorruptRecord),
+                },
+                used_bytes: input.u64()?,
             });
         }
-        if !input.0.is_empty() {
-            return Err(Error::CorruptRecord);
+        let count = input.count(MAX_ITEMS, 112)?;
+        let mut entries = Vec::new();
+        for _ in 0..count {
+            let metadata = input.descriptor(version)?;
+            let page = PageId {
+                version: metadata.version.clone(),
+                number: PageNumber(input.u64()?),
+            };
+            let key_id = KeyId(input.array()?);
+            let segment = SegmentId(input.u64()?);
+            let generation = Generation(input.u64()?);
+            let slab = SlabId(input.u64()?);
+            let offset = input.u64()?;
+            let length = usize::try_from(input.u64()?).map_err(|_| Error::CorruptRecord)?;
+            let extent = DirectExtent::checked(offset, length)?;
+            entries.push((
+                page,
+                IndexedPage {
+                    metadata,
+                    key_id,
+                    location: RecordLocation {
+                        segment,
+                        generation,
+                        location: SlabLocation { slab, extent },
+                    },
+                },
+            ));
         }
-        let image = CheckpointImage {
-            version,
-            sequence,
-            shards,
-        };
-        validate_image(&image)?;
-        Ok(image)
+        let count = input.count(MAX_ITEMS, 48)?;
+        let mut metadata = Vec::new();
+        for _ in 0..count {
+            metadata.push(input.descriptor(version)?);
+        }
+        shards.push(ShardImage {
+            worker,
+            geometry,
+            index: IndexSnapshot { entries, metadata },
+            segments,
+        });
     }
+    if !input.0.is_empty() {
+        return Err(Error::CorruptRecord);
+    }
+    let image = CheckpointImage {
+        version,
+        sequence,
+        shards,
+    };
+    validate_image(&image)?;
+    Ok(image)
 }
 
 fn validate_descriptor(metadata: &VersionMetadata) -> Result<()> {

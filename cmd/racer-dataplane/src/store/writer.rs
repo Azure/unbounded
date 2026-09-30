@@ -1,7 +1,7 @@
 //! Bounded dirty copies persist asynchronously, with publication after full I/O.
 use super::{
     eviction::SegmentClock,
-    format::RecordCodec,
+    format,
     index::{Index, IndexedPage, RecordLocation},
     segment::Segments,
     slab::Slabs,
@@ -156,7 +156,7 @@ impl StoreWriter {
             self.index
                 .preflight_capacity(&page.ciphertext.envelope().page)?;
         }
-        let logical = RecordCodec.logical_length(&page)?;
+        let logical = format::logical_length(&page)?;
         if !matches!(dirty.class(), ResourceClass::DirtyCiphertext)
             || !self.slabs.owns_reservation(&dirty)
             || dirty.cache() != Some(&page.metadata.version.object.cache)
@@ -408,9 +408,7 @@ impl StoreWriter {
         // Capacity is owned across the await, including invalidation/replacement.
         let index_ticket = self.index.reserve_page(self.clock.borrow().is_some())?;
         let alignment = self.slabs.alignment()?;
-        let disk_bytes = alignment
-            .extent(0, RecordCodec.logical_length(page)?)?
-            .length();
+        let disk_bytes = alignment.extent(0, format::logical_length(page)?)?.length();
         let (staging, dirty, ticket) = {
             let mut pending = self.pending.borrow_mut();
             let entry = pending.get_mut(id).ok_or(Error::Unavailable)?;
@@ -438,7 +436,7 @@ impl StoreWriter {
             location: append.location,
         };
         let _publication_lease = self.segments.lease(location.segment, location.generation)?;
-        let encoded = RecordCodec.encode_at(
+        let encoded = format::encode_at(
             page,
             location.generation,
             alignment,

@@ -1,7 +1,7 @@
 //! Lease a mapping before await, validate framing, and return original ciphertext.
 //! AEAD is owned by fill; a read token permits conditional invalidation on failure.
 use super::{
-    format::RecordCodec,
+    format,
     index::{Index, RecordLocation},
     segment::Segments,
     slab::Slabs,
@@ -137,7 +137,7 @@ impl StoreReader {
                 }
                 Err(e) => return Err(e),
             };
-            let decoded = match RecordCodec.parse(&buffer, entry.location.location.extent) {
+            let decoded = match format::parse(&buffer, entry.location.location.extent) {
                 Ok(d) => d,
                 Err(_) => {
                     self.corrupt_miss();

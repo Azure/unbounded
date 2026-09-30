@@ -486,7 +486,7 @@ mod tests {
     {
         use crate::model::{VersionMetadata, *};
         use crate::store::{
-            checkpoint_format::CheckpointCodec,
+            checkpoint_format,
             index::{IndexedPage, RecordLocation},
             segment::Segments,
         };
@@ -540,8 +540,8 @@ mod tests {
         standalone.length = 0;
         old.shards[0].index.metadata.push(standalone.clone());
         // Both historical slots survive. Decode their exact bytes, as restart does.
-        let bytes = CheckpointCodec.encode(&old).unwrap();
-        let decoded = || CheckpointCodec.decode(&bytes).unwrap();
+        let bytes = checkpoint_format::encode(&old).unwrap();
+        let decoded = || checkpoint_format::decode(&bytes).unwrap();
         let removed = select(
             vec![decoded(), decoded()],
             &geometry,

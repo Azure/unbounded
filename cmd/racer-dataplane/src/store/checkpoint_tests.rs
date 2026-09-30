@@ -248,8 +248,8 @@ fn resign(bytes: &mut [u8]) {
 fn binary_round_trip_retains_locations_keys_metadata_and_is_send() {
     fn assert_send<T: Send>() {}
     assert_send::<ShardImage>();
-    let encoded = CheckpointCodec.encode(&image(7)).unwrap();
-    let decoded = CheckpointCodec.decode(&encoded).unwrap();
+    let encoded = checkpoint_format::encode(&image(7)).unwrap();
+    let decoded = checkpoint_format::decode(&encoded).unwrap();
     assert_eq!(decoded.sequence, 7);
     assert_eq!(&encoded[..8], b"RACERCP\0");
     assert_eq!(&encoded[8..12], &CHECKPOINT_VERSION.to_le_bytes());
@@ -266,15 +266,15 @@ fn binary_round_trip_retains_locations_keys_metadata_and_is_send() {
             .iter()
             .any(|metadata| metadata == &descriptor("empty", 0))
     );
-    assert_eq!(CheckpointCodec.encode(&decoded).unwrap(), encoded);
+    assert_eq!(checkpoint_format::encode(&decoded).unwrap(), encoded);
 }
 
 #[test]
 fn legacy_and_extended_metadata_checkpoints_round_trip_without_data_loss() {
     let mut legacy = image(9);
     legacy.version = 1;
-    let encoded = CheckpointCodec.encode(&legacy).unwrap();
-    let mut recovered = CheckpointCodec.decode(&encoded).unwrap();
+    let encoded = checkpoint_format::encode(&legacy).unwrap();
+    let mut recovered = checkpoint_format::decode(&encoded).unwrap();
     assert_eq!(recovered.version, 1);
     assert!(
         recovered.shards[0]
@@ -283,7 +283,7 @@ fn legacy_and_extended_metadata_checkpoints_round_trip_without_data_loss() {
             .iter()
             .all(|m| m.content_type.is_none())
     );
-    assert_eq!(CheckpointCodec.encode(&recovered).unwrap(), encoded);
+    assert_eq!(checkpoint_format::encode(&recovered).unwrap(), encoded);
     let value =
         crate::model::ContentType::parse(b"application/vnd.oci.image.manifest.v1+json").unwrap();
     for m in recovered.shards[0].index.metadata.iter_mut() {
@@ -293,12 +293,12 @@ fn legacy_and_extended_metadata_checkpoints_round_trip_without_data_loss() {
         entry.metadata.content_type = Some(value.clone());
     }
     assert!(
-        CheckpointCodec.encode(&recovered).is_err(),
+        checkpoint_format::encode(&recovered).is_err(),
         "v1 cannot silently lose metadata"
     );
     recovered.version = CHECKPOINT_VERSION;
-    let extended = CheckpointCodec.encode(&recovered).unwrap();
-    let decoded = CheckpointCodec.decode(&extended).unwrap();
+    let extended = checkpoint_format::encode(&recovered).unwrap();
+    let decoded = checkpoint_format::decode(&extended).unwrap();
     assert_eq!(
         decoded.shards[0].index.entries[0].1.metadata.content_type,
         Some(value.clone())
@@ -310,7 +310,7 @@ fn legacy_and_extended_metadata_checkpoints_round_trip_without_data_loss() {
             .iter()
             .all(|m| m.content_type == Some(value.clone()))
     );
-    assert_eq!(CheckpointCodec.encode(&decoded).unwrap(), extended);
+    assert_eq!(checkpoint_format::encode(&decoded).unwrap(), extended);
 }
 
 #[test]
@@ -326,7 +326,7 @@ fn empty_cut_has_stable_version_one_binary_vector() {
             segments: segments.snapshot().unwrap(),
         }],
     };
-    let bytes = CheckpointCodec.encode(&image).unwrap();
+    let bytes = checkpoint_format::encode(&image).unwrap();
     assert_eq!(bytes.len(), 180);
     let digest: String = bytes[148..]
         .iter()
@@ -345,15 +345,15 @@ fn metadata_order_does_not_affect_encoding_and_cross_shard_conflicts_fail() {
         .index
         .metadata
         .push(descriptor("another", 1));
-    let first = CheckpointCodec.encode(&image).unwrap();
+    let first = checkpoint_format::encode(&image).unwrap();
     image.shards[0].index.metadata.reverse();
-    assert_eq!(CheckpointCodec.encode(&image).unwrap(), first);
+    assert_eq!(checkpoint_format::encode(&image).unwrap(), first);
     let mut other = shard();
     other.worker = WorkerId(1);
     other.index.entries.clear();
     other.index.metadata = vec![descriptor("v1", 18)];
     image.shards.push(other);
-    assert!(CheckpointCodec.encode(&image).is_err());
+    assert!(checkpoint_format::encode(&image).is_err());
 }
 
 #[test]
@@ -361,14 +361,14 @@ fn newer_incompatible_geometry_or_catalog_falls_back_and_keys_filter_on_load() {
     let directory = Directory::new();
     fs::write(
         directory.0.join("checkpoint.0"),
-        CheckpointCodec.encode(&image(1)).unwrap(),
+        checkpoint_format::encode(&image(1)).unwrap(),
     )
     .unwrap();
     let mut newer = image(2);
     newer.shards[0].geometry.memory_alignment = 8192;
     fs::write(
         directory.0.join("checkpoint.1"),
-        CheckpointCodec.encode(&newer).unwrap(),
+        checkpoint_format::encode(&newer).unwrap(),
     )
     .unwrap();
     let (index, segments) = state(1);
@@ -384,7 +384,7 @@ fn newer_incompatible_geometry_or_catalog_falls_back_and_keys_filter_on_load() {
     newer.shards[0].index.metadata.push(descriptor("extra", 0));
     fs::write(
         directory.0.join("checkpoint.1"),
-        CheckpointCodec.encode(&newer).unwrap(),
+        checkpoint_format::encode(&newer).unwrap(),
     )
     .unwrap();
     assert_eq!(
@@ -404,7 +404,7 @@ fn oversized_sparse_files_and_symlinks_are_rejected_without_payload_reads() {
     file.set_len(MAX_CHECKPOINT_BYTES as u64 + 1).unwrap();
     fs::write(
         directory.0.join("payload"),
-        CheckpointCodec.encode(&image(3)).unwrap(),
+        checkpoint_format::encode(&image(3)).unwrap(),
     )
     .unwrap();
     symlink(
@@ -423,44 +423,44 @@ fn oversized_sparse_files_and_symlinks_are_rejected_without_payload_reads() {
 
 #[test]
 fn malformed_hash_version_length_counts_and_trailing_bytes_are_rejected() {
-    let encoded = CheckpointCodec.encode(&image(1)).unwrap();
+    let encoded = checkpoint_format::encode(&image(1)).unwrap();
     for cut in [0, 7, 31, encoded.len() - 1] {
-        assert!(CheckpointCodec.decode(&encoded[..cut]).is_err());
+        assert!(checkpoint_format::decode(&encoded[..cut]).is_err());
     }
     let mut corrupt = encoded.clone();
     corrupt[20] ^= 1;
-    assert!(CheckpointCodec.decode(&corrupt).is_err());
+    assert!(checkpoint_format::decode(&corrupt).is_err());
     for (offset, value) in [(8, 3u32), (12, 1), (32, u32::MAX)] {
         let mut corrupt = encoded.clone();
         corrupt[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
         resign(&mut corrupt);
-        assert!(CheckpointCodec.decode(&corrupt).is_err());
+        assert!(checkpoint_format::decode(&corrupt).is_err());
     }
     let mut corrupt = encoded.clone();
     corrupt[24..32].copy_from_slice(&1u64.to_le_bytes());
     resign(&mut corrupt);
-    assert!(CheckpointCodec.decode(&corrupt).is_err());
+    assert!(checkpoint_format::decode(&corrupt).is_err());
     let mut corrupt = encoded;
     corrupt.push(0);
-    assert!(CheckpointCodec.decode(&corrupt).is_err());
+    assert!(checkpoint_format::decode(&corrupt).is_err());
 }
 
 #[test]
 fn invalid_generation_bounds_duplicates_and_descriptor_conflicts_are_rejected() {
     let mut bad = image(1);
     bad.shards[0].index.entries[0].1.location.generation.0 += 1;
-    assert!(CheckpointCodec.encode(&bad).is_err());
+    assert!(checkpoint_format::encode(&bad).is_err());
     let mut bad = image(1);
     bad.shards[0].index.entries[0].1.location.location.extent =
         DirectExtent::checked(SEGMENT_BYTES, 4096).unwrap();
-    assert!(CheckpointCodec.encode(&bad).is_err());
+    assert!(checkpoint_format::encode(&bad).is_err());
     let mut bad = image(1);
     let duplicate = bad.shards[0].index.entries[0].clone();
     bad.shards[0].index.entries.push(duplicate);
-    assert!(CheckpointCodec.encode(&bad).is_err());
+    assert!(checkpoint_format::encode(&bad).is_err());
     let mut bad = image(1);
     bad.shards[0].index.metadata.push(descriptor("v1", 18));
-    assert!(CheckpointCodec.encode(&bad).is_err());
+    assert!(checkpoint_format::encode(&bad).is_err());
 }
 
 #[test]
@@ -470,7 +470,7 @@ fn overlapping_mappings_are_rejected_and_retirement_invalidates_both_slots() {
     overlapping.0.version.object.key = CacheKey([8; 32]);
     overlapping.1.metadata.version = overlapping.0.version.clone();
     bad.shards[0].index.entries.push(overlapping);
-    assert!(CheckpointCodec.encode(&bad).is_err());
+    assert!(checkpoint_format::encode(&bad).is_err());
     let directory = Directory::new();
     let (index, segments) = state(8);
     let checkpointer = Checkpointer::new(directory.0.clone(), index, segments);
@@ -505,7 +505,7 @@ fn alternating_publication_falls_back_to_valid_older_cut_and_ignores_temp_and_pa
     fs::write(directory.0.join("checkpoint.1"), b"torn").unwrap();
     fs::write(
         directory.0.join(".checkpoint.tmp"),
-        CheckpointCodec.encode(&image(99)).unwrap(),
+        checkpoint_format::encode(&image(99)).unwrap(),
     )
     .unwrap();
     fs::write(directory.0.join("slab.0"), b"payload must not be scanned").unwrap();
@@ -685,3 +685,4 @@ fn outstanding_lease_and_wrong_worker_cannot_partially_install() {
             .is_some()
     );
 }
+use crate::store::checkpoint_format;

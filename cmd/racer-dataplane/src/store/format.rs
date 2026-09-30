@@ -40,254 +40,243 @@ pub struct DecodedRecord {
     pub ciphertext: std::ops::Range<usize>,
     pub checksum: u64,
 }
-pub struct RecordCodec;
 struct RecordLayout {
     header_bytes: usize,
     logical_bytes: usize,
 }
-impl RecordCodec {
-    fn layout(&self, page: &CiphertextCopy, generation: Generation) -> Result<RecordLayout> {
-        let envelope = page.ciphertext.envelope();
-        let metadata = page.metadata.immutable();
-        metadata.validate_page(envelope)?;
-        if generation.0 == 0
-            || envelope.plaintext_length == 0
-            || u64::from(envelope.plaintext_length) > PAGE_BYTES
-            || envelope.ciphertext_length
-                != envelope
-                    .plaintext_length
-                    .checked_add(16)
-                    .ok_or(Error::CorruptRecord)?
-            || page.ciphertext.bytes().len() != envelope.ciphertext_length as usize
-        {
-            return Err(Error::CorruptRecord);
-        }
-        let cache = envelope.page.version.object.cache.0.as_bytes();
-        let etag = envelope.page.version.etag.as_bytes();
-        if cache.is_empty()
-            || cache.len() > MAX_ID_BYTES
-            || etag.is_empty()
-            || etag.len() > MAX_ETAG_BYTES
-        {
-            return Err(Error::CorruptRecord);
-        }
-        let header_bytes = HEADER_PREFIX_BYTES
-            .checked_add(8)
-            .ok_or(Error::CorruptRecord)?
-            .checked_add(cache.len())
-            .and_then(|len| len.checked_add(etag.len()))
-            .and_then(|len| {
-                len.checked_add(
-                    metadata
-                        .content_type
-                        .as_ref()
-                        .map_or(4, |v| 4 + v.as_bytes().len()),
-                )
-            })
-            .and_then(|len| len.checked_add(HEADER_DIGEST_BYTES))
-            .filter(|&len| len <= MAX_HEADER_BYTES)
-            .ok_or(Error::CorruptRecord)?;
-        let logical_bytes = header_bytes
-            .checked_add(page.ciphertext.bytes().len())
-            .ok_or(Error::CorruptRecord)?;
-        Ok(RecordLayout {
-            header_bytes,
-            logical_bytes,
-        })
+fn layout(page: &CiphertextCopy, generation: Generation) -> Result<RecordLayout> {
+    let envelope = page.ciphertext.envelope();
+    let metadata = page.metadata.immutable();
+    metadata.validate_page(envelope)?;
+    if generation.0 == 0
+        || envelope.plaintext_length == 0
+        || u64::from(envelope.plaintext_length) > PAGE_BYTES
+        || envelope.ciphertext_length
+            != envelope
+                .plaintext_length
+                .checked_add(16)
+                .ok_or(Error::CorruptRecord)?
+        || page.ciphertext.bytes().len() != envelope.ciphertext_length as usize
+    {
+        return Err(Error::CorruptRecord);
     }
-    fn header_bytes(
-        &self,
-        page: &CiphertextCopy,
-        generation: Generation,
-        layout: &RecordLayout,
-    ) -> Vec<u8> {
-        let envelope = page.ciphertext.envelope();
-        let cache = envelope.page.version.object.cache.0.as_bytes();
-        let etag = envelope.page.version.etag.as_bytes();
-        let mut out = Vec::with_capacity(layout.header_bytes);
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-        out.extend_from_slice(&(layout.header_bytes as u32).to_le_bytes());
-        out.extend_from_slice(&generation.0.to_le_bytes());
-        out.extend_from_slice(&page.metadata.length.to_le_bytes());
-        out.extend_from_slice(&envelope.page.number.0.to_le_bytes());
-        out.extend_from_slice(&envelope.plaintext_length.to_le_bytes());
-        out.extend_from_slice(&envelope.ciphertext_length.to_le_bytes());
-        out.extend_from_slice(&envelope.key_id.0);
-        out.extend_from_slice(&envelope.nonce.0);
-        out.extend_from_slice(&envelope.page.version.object.key.0);
-        out.extend_from_slice(&(cache.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(etag.len() as u32).to_le_bytes());
-        out.extend_from_slice(cache);
-        out.extend_from_slice(etag);
-        out.extend_from_slice(&page.ciphertext.checksum().to_le_bytes());
-        out.extend_from_slice(
-            &(page
-                .metadata
-                .content_type
-                .as_ref()
-                .map_or(0, |v| v.as_bytes().len()) as u32)
-                .to_le_bytes(),
-        );
-        if let Some(content_type) = &page.metadata.content_type {
-            out.extend_from_slice(content_type.as_bytes());
-        }
-        debug_assert_eq!(out.len() + HEADER_DIGEST_BYTES, layout.header_bytes);
-        let digest = Sha256::digest(&out);
-        out.extend_from_slice(&digest);
-        out
+    let cache = envelope.page.version.object.cache.0.as_bytes();
+    let etag = envelope.page.version.etag.as_bytes();
+    if cache.is_empty()
+        || cache.len() > MAX_ID_BYTES
+        || etag.is_empty()
+        || etag.len() > MAX_ETAG_BYTES
+    {
+        return Err(Error::CorruptRecord);
     }
-    pub fn logical_length(&self, page: &CiphertextCopy) -> Result<usize> {
-        Ok(self.layout(page, Generation(1))?.logical_bytes)
-    }
-    pub fn encode(
-        &self,
-        page: &CiphertextCopy,
-        generation: Generation,
-        alignment: DirectAlignment,
-        buffer: AlignedBuffer,
-    ) -> Result<EncodedRecord> {
-        self.encode_at(page, generation, alignment, 0, buffer)
-    }
-    pub fn encode_at(
-        &self,
-        page: &CiphertextCopy,
-        generation: Generation,
-        alignment: DirectAlignment,
-        offset: u64,
-        mut buffer: AlignedBuffer,
-    ) -> Result<EncodedRecord> {
-        let layout = self.layout(page, generation)?;
-        let logical_bytes = layout.logical_bytes;
-        let extent = alignment.extent(offset, logical_bytes)?;
-        alignment.check(extent, &buffer)?;
-        let header = self.header_bytes(page, generation, &layout);
-        let bytes = buffer.bytes_mut()?;
-        bytes[..header.len()].copy_from_slice(&header);
-        bytes[header.len()..logical_bytes].copy_from_slice(page.ciphertext.bytes());
-        bytes[logical_bytes..].fill(0);
-        Ok(EncodedRecord {
-            header: RecordHeader {
-                format_version: FORMAT_VERSION,
-                generation,
-                envelope: page.ciphertext.envelope().clone(),
-                metadata: page.metadata.immutable(),
-                logical_bytes: logical_bytes as u64,
-                extent,
-            },
-            buffer,
-        })
-    }
-    pub fn parse(&self, buffer: &AlignedBuffer, extent: DirectExtent) -> Result<DecodedRecord> {
-        self.parse_bytes(buffer.bytes()?, extent)
-    }
-    pub fn parse_bytes(&self, bytes: &[u8], extent: DirectExtent) -> Result<DecodedRecord> {
-        if bytes.len() != extent.length() {
-            return Err(Error::CorruptRecord);
-        }
-        let mut r = Decoder { bytes, at: 0 };
-        if r.take(8)? != MAGIC {
-            return Err(Error::CorruptRecord);
-        }
-        let format_version = r.u32()?;
-        if format_version != FORMAT_VERSION {
-            return Err(Error::CorruptRecord);
-        }
-        let header_len = r.u32()? as usize;
-        if !(160..=MAX_HEADER_BYTES).contains(&header_len) || header_len > bytes.len() {
-            return Err(Error::CorruptRecord);
-        }
-        let digest = Sha256::digest(&bytes[..header_len - 32]);
-        if digest[..] != bytes[header_len - 32..header_len] {
-            return Err(Error::CorruptRecord);
-        }
-        r.bytes = &bytes[..header_len - 32];
-        let generation = Generation(r.u64()?);
-        let length = r.u64()?;
-        let number = PageNumber(r.u64()?);
-        let plaintext_length = r.u32()?;
-        let ciphertext_length = r.u32()?;
-        let key_id = KeyId(r.array()?);
-        let nonce = Nonce(r.array()?);
-        let key = CacheKey(r.array()?);
-        let cache_len = r.u32()? as usize;
-        let etag_len = r.u32()? as usize;
-        if cache_len == 0 || cache_len > MAX_ID_BYTES || etag_len == 0 || etag_len > MAX_ETAG_BYTES
-        {
-            return Err(Error::CorruptRecord);
-        }
-        let cache = CacheId(
-            std::str::from_utf8(r.take(cache_len)?)
-                .map_err(|_| Error::CorruptRecord)?
-                .to_owned(),
-        );
-        let etag = StrongEtag::parse(r.take(etag_len)?).map_err(|_| Error::CorruptRecord)?;
-        let checksum = r.u64()?;
-        let content_type_length = r.u32()? as usize;
-        let content_type = if content_type_length == 0 {
-            None
-        } else {
-            Some(
-                crate::model::ContentType::parse(r.take(content_type_length)?)
-                    .map_err(|_| Error::CorruptRecord)?,
+    let header_bytes = HEADER_PREFIX_BYTES
+        .checked_add(8)
+        .ok_or(Error::CorruptRecord)?
+        .checked_add(cache.len())
+        .and_then(|len| len.checked_add(etag.len()))
+        .and_then(|len| {
+            len.checked_add(
+                metadata
+                    .content_type
+                    .as_ref()
+                    .map_or(4, |v| 4 + v.as_bytes().len()),
             )
-        };
-        if r.at != r.bytes.len()
-            || generation.0 == 0
-            || plaintext_length == 0
-            || u64::from(plaintext_length) > PAGE_BYTES
-            || plaintext_length.checked_add(16) != Some(ciphertext_length)
-        {
-            return Err(Error::CorruptRecord);
-        }
-        let version = ObjectVersion {
-            object: ObjectId { cache, key },
-            etag,
-        };
-        let metadata = VersionMetadata {
-            content_type,
-            version: version.clone(),
-            length,
-        };
-        let envelope = PageEnvelope {
-            page: PageId { version, number },
-            key_id,
-            nonce,
-            plaintext_length,
-            ciphertext_length,
-        };
-        metadata.validate_page(&envelope)?;
-        let logical_bytes = header_len
-            .checked_add(ciphertext_length as usize)
-            .ok_or(Error::CorruptRecord)?;
-        if logical_bytes > bytes.len() {
-            return Err(Error::CorruptRecord);
-        }
-        Ok(DecodedRecord {
-            header: RecordHeader {
-                format_version,
-                generation,
-                envelope,
-                metadata,
-                logical_bytes: logical_bytes as u64,
-                extent,
-            },
-            ciphertext: header_len..logical_bytes,
-            checksum,
         })
+        .and_then(|len| len.checked_add(HEADER_DIGEST_BYTES))
+        .filter(|&len| len <= MAX_HEADER_BYTES)
+        .ok_or(Error::CorruptRecord)?;
+    let logical_bytes = header_bytes
+        .checked_add(page.ciphertext.bytes().len())
+        .ok_or(Error::CorruptRecord)?;
+    Ok(RecordLayout {
+        header_bytes,
+        logical_bytes,
+    })
+}
+fn header_bytes(page: &CiphertextCopy, generation: Generation, layout: &RecordLayout) -> Vec<u8> {
+    let envelope = page.ciphertext.envelope();
+    let cache = envelope.page.version.object.cache.0.as_bytes();
+    let etag = envelope.page.version.etag.as_bytes();
+    let mut out = Vec::with_capacity(layout.header_bytes);
+    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&(layout.header_bytes as u32).to_le_bytes());
+    out.extend_from_slice(&generation.0.to_le_bytes());
+    out.extend_from_slice(&page.metadata.length.to_le_bytes());
+    out.extend_from_slice(&envelope.page.number.0.to_le_bytes());
+    out.extend_from_slice(&envelope.plaintext_length.to_le_bytes());
+    out.extend_from_slice(&envelope.ciphertext_length.to_le_bytes());
+    out.extend_from_slice(&envelope.key_id.0);
+    out.extend_from_slice(&envelope.nonce.0);
+    out.extend_from_slice(&envelope.page.version.object.key.0);
+    out.extend_from_slice(&(cache.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(etag.len() as u32).to_le_bytes());
+    out.extend_from_slice(cache);
+    out.extend_from_slice(etag);
+    out.extend_from_slice(&page.ciphertext.checksum().to_le_bytes());
+    out.extend_from_slice(
+        &(page
+            .metadata
+            .content_type
+            .as_ref()
+            .map_or(0, |v| v.as_bytes().len()) as u32)
+            .to_le_bytes(),
+    );
+    if let Some(content_type) = &page.metadata.content_type {
+        out.extend_from_slice(content_type.as_bytes());
     }
-    pub fn decode(&self, buffer: &AlignedBuffer, expected: &RecordHeader) -> Result<PageEnvelope> {
-        let actual = self.parse(buffer, expected.extent)?.header;
-        if actual.format_version != expected.format_version
-            || actual.generation != expected.generation
-            || actual.envelope != expected.envelope
-            || actual.metadata != expected.metadata
-            || actual.logical_bytes != expected.logical_bytes
-        {
-            return Err(Error::CorruptRecord);
-        }
-        Ok(actual.envelope)
+    debug_assert_eq!(out.len() + HEADER_DIGEST_BYTES, layout.header_bytes);
+    let digest = Sha256::digest(&out);
+    out.extend_from_slice(&digest);
+    out
+}
+pub fn logical_length(page: &CiphertextCopy) -> Result<usize> {
+    Ok(layout(page, Generation(1))?.logical_bytes)
+}
+pub fn encode(
+    page: &CiphertextCopy,
+    generation: Generation,
+    alignment: DirectAlignment,
+    buffer: AlignedBuffer,
+) -> Result<EncodedRecord> {
+    encode_at(page, generation, alignment, 0, buffer)
+}
+pub fn encode_at(
+    page: &CiphertextCopy,
+    generation: Generation,
+    alignment: DirectAlignment,
+    offset: u64,
+    mut buffer: AlignedBuffer,
+) -> Result<EncodedRecord> {
+    let layout = layout(page, generation)?;
+    let logical_bytes = layout.logical_bytes;
+    let extent = alignment.extent(offset, logical_bytes)?;
+    alignment.check(extent, &buffer)?;
+    let header = header_bytes(page, generation, &layout);
+    let bytes = buffer.bytes_mut()?;
+    bytes[..header.len()].copy_from_slice(&header);
+    bytes[header.len()..logical_bytes].copy_from_slice(page.ciphertext.bytes());
+    bytes[logical_bytes..].fill(0);
+    Ok(EncodedRecord {
+        header: RecordHeader {
+            format_version: FORMAT_VERSION,
+            generation,
+            envelope: page.ciphertext.envelope().clone(),
+            metadata: page.metadata.immutable(),
+            logical_bytes: logical_bytes as u64,
+            extent,
+        },
+        buffer,
+    })
+}
+pub fn parse(buffer: &AlignedBuffer, extent: DirectExtent) -> Result<DecodedRecord> {
+    parse_bytes(buffer.bytes()?, extent)
+}
+pub fn parse_bytes(bytes: &[u8], extent: DirectExtent) -> Result<DecodedRecord> {
+    if bytes.len() != extent.length() {
+        return Err(Error::CorruptRecord);
     }
+    let mut r = Decoder { bytes, at: 0 };
+    if r.take(8)? != MAGIC {
+        return Err(Error::CorruptRecord);
+    }
+    let format_version = r.u32()?;
+    if format_version != FORMAT_VERSION {
+        return Err(Error::CorruptRecord);
+    }
+    let header_len = r.u32()? as usize;
+    if !(160..=MAX_HEADER_BYTES).contains(&header_len) || header_len > bytes.len() {
+        return Err(Error::CorruptRecord);
+    }
+    let digest = Sha256::digest(&bytes[..header_len - 32]);
+    if digest[..] != bytes[header_len - 32..header_len] {
+        return Err(Error::CorruptRecord);
+    }
+    r.bytes = &bytes[..header_len - 32];
+    let generation = Generation(r.u64()?);
+    let length = r.u64()?;
+    let number = PageNumber(r.u64()?);
+    let plaintext_length = r.u32()?;
+    let ciphertext_length = r.u32()?;
+    let key_id = KeyId(r.array()?);
+    let nonce = Nonce(r.array()?);
+    let key = CacheKey(r.array()?);
+    let cache_len = r.u32()? as usize;
+    let etag_len = r.u32()? as usize;
+    if cache_len == 0 || cache_len > MAX_ID_BYTES || etag_len == 0 || etag_len > MAX_ETAG_BYTES {
+        return Err(Error::CorruptRecord);
+    }
+    let cache = CacheId(
+        std::str::from_utf8(r.take(cache_len)?)
+            .map_err(|_| Error::CorruptRecord)?
+            .to_owned(),
+    );
+    let etag = StrongEtag::parse(r.take(etag_len)?).map_err(|_| Error::CorruptRecord)?;
+    let checksum = r.u64()?;
+    let content_type_length = r.u32()? as usize;
+    let content_type = if content_type_length == 0 {
+        None
+    } else {
+        Some(
+            crate::model::ContentType::parse(r.take(content_type_length)?)
+                .map_err(|_| Error::CorruptRecord)?,
+        )
+    };
+    if r.at != r.bytes.len()
+        || generation.0 == 0
+        || plaintext_length == 0
+        || u64::from(plaintext_length) > PAGE_BYTES
+        || plaintext_length.checked_add(16) != Some(ciphertext_length)
+    {
+        return Err(Error::CorruptRecord);
+    }
+    let version = ObjectVersion {
+        object: ObjectId { cache, key },
+        etag,
+    };
+    let metadata = VersionMetadata {
+        content_type,
+        version: version.clone(),
+        length,
+    };
+    let envelope = PageEnvelope {
+        page: PageId { version, number },
+        key_id,
+        nonce,
+        plaintext_length,
+        ciphertext_length,
+    };
+    metadata.validate_page(&envelope)?;
+    let logical_bytes = header_len
+        .checked_add(ciphertext_length as usize)
+        .ok_or(Error::CorruptRecord)?;
+    if logical_bytes > bytes.len() {
+        return Err(Error::CorruptRecord);
+    }
+    Ok(DecodedRecord {
+        header: RecordHeader {
+            format_version,
+            generation,
+            envelope,
+            metadata,
+            logical_bytes: logical_bytes as u64,
+            extent,
+        },
+        ciphertext: header_len..logical_bytes,
+        checksum,
+    })
+}
+pub fn decode(buffer: &AlignedBuffer, expected: &RecordHeader) -> Result<PageEnvelope> {
+    let actual = parse(buffer, expected.extent)?.header;
+    if actual.format_version != expected.format_version
+        || actual.generation != expected.generation
+        || actual.envelope != expected.envelope
+        || actual.metadata != expected.metadata
+        || actual.logical_bytes != expected.logical_bytes
+    {
+        return Err(Error::CorruptRecord);
+    }
+    Ok(actual.envelope)
 }
 struct Decoder<'a> {
     bytes: &'a [u8],
@@ -427,7 +416,7 @@ mod tests {
             };
             let mut page = page(&admission, length, number, &cache, &etag);
             let alignment = DirectAlignment::validate(geometry.0, geometry.1, geometry.2).unwrap();
-            let logical = RecordCodec.logical_length(&page).unwrap();
+            let logical = logical_length(&page).unwrap();
             assert_eq!(logical, LegacyCodec.logical_length(&page).unwrap() + 12);
             assert_eq!(
                 logical,
@@ -436,9 +425,8 @@ mod tests {
             let extent = alignment.extent(offset, logical).unwrap();
             let mut staging = buffer(&admission, alignment, extent.length());
             staging.bytes_mut().unwrap().fill(0xa5);
-            let mut encoded = RecordCodec
-                .encode_at(&page, Generation(u64::MAX), alignment, offset, staging)
-                .unwrap();
+            let mut encoded =
+                encode_at(&page, Generation(u64::MAX), alignment, offset, staging).unwrap();
             let legacy = LegacyCodec
                 .encode_at(
                     &page,
@@ -453,22 +441,19 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(
-                RecordCodec
-                    .parse(&encoded.buffer, encoded.header.extent)
+                parse(&encoded.buffer, encoded.header.extent)
                     .unwrap()
                     .header
                     .envelope,
                 *page.ciphertext.envelope()
             );
             assert!(matches!(
-                RecordCodec.parse(&legacy.buffer, legacy.header.extent),
+                parse(&legacy.buffer, legacy.header.extent),
                 Err(Error::CorruptRecord)
             ));
             assert_eq!(encoded.header.extent, extent);
             assert_eq!(
-                RecordCodec
-                    .decode(&encoded.buffer, &encoded.header)
-                    .unwrap(),
+                decode(&encoded.buffer, &encoded.header).unwrap(),
                 *page.ciphertext.envelope()
             );
             drop(legacy);
@@ -492,11 +477,9 @@ mod tests {
                 inner.envelope.ciphertext_length += 1;
                 page.metadata.length += 1;
             }
-            encoded = RecordCodec
-                .encode_at(&page, Generation(9), alignment, offset, encoded.buffer)
-                .unwrap();
+            encoded = encode_at(&page, Generation(9), alignment, offset, encoded.buffer).unwrap();
             let bytes = encoded.buffer.bytes().unwrap();
-            let decoded = RecordCodec.parse(&encoded.buffer, extent).unwrap();
+            let decoded = parse(&encoded.buffer, extent).unwrap();
             assert_eq!(&bytes[decoded.ciphertext.clone()], page.ciphertext.bytes());
             assert!(bytes[decoded.ciphertext.end..].iter().all(|&b| b == 0));
             assert_eq!(decoded.header.generation, Generation(9));
@@ -577,23 +560,19 @@ mod tests {
         for mutate in mutations {
             let mut page = page(&admission, 3, 0, "cache", "v1");
             mutate(&mut page);
-            assert_eq!(RecordCodec.logical_length(&page), Err(Error::CorruptRecord));
-            assert_eq!(
-                RecordCodec.logical_length(&page),
-                LegacyCodec.logical_length(&page)
-            );
+            assert_eq!(logical_length(&page), Err(Error::CorruptRecord));
+            assert_eq!(logical_length(&page), LegacyCodec.logical_length(&page));
             let baseline = admission.used(ResourceClass::Ciphertext);
             for generation in [Generation(0), Generation(1)] {
                 // Bad offset/size must not mask the record error.
-                let actual = RecordCodec
-                    .encode_at(
-                        &page,
-                        generation,
-                        alignment,
-                        1,
-                        buffer(&admission, alignment, 1024),
-                    )
-                    .err();
+                let actual = encode_at(
+                    &page,
+                    generation,
+                    alignment,
+                    1,
+                    buffer(&admission, alignment, 1024),
+                )
+                .err();
                 let legacy = LegacyCodec
                     .encode_at(
                         &page,
@@ -621,44 +600,40 @@ mod tests {
             UNIX_EPOCH + std::time::Duration::from_nanos(1),
         ] {
             page.metadata.expires_at = ExpiresAt(expiry);
-            assert_eq!(RecordCodec.logical_length(&page), Ok(200));
+            assert_eq!(logical_length(&page), Ok(200));
             assert_eq!(
-                RecordCodec.logical_length(&page),
+                logical_length(&page),
                 LegacyCodec.logical_length(&page).map(|length| length + 12)
             );
-            let encoded = RecordCodec
-                .encode(
-                    &page,
-                    Generation(7),
-                    alignment,
-                    buffer(&admission, alignment, 512),
-                )
-                .unwrap();
+            let encoded = encode(
+                &page,
+                Generation(7),
+                alignment,
+                buffer(&admission, alignment, 512),
+            )
+            .unwrap();
             assert_eq!(
-                RecordCodec
-                    .parse(&encoded.buffer, encoded.header.extent)
+                parse(&encoded.buffer, encoded.header.extent)
                     .unwrap()
                     .header
                     .metadata,
                 page.metadata.immutable()
             );
             assert_eq!(
-                RecordCodec
-                    .parse(&encoded.buffer, encoded.header.extent)
+                parse(&encoded.buffer, encoded.header.extent)
                     .unwrap()
                     .checksum,
                 page.ciphertext.checksum()
             );
             assert_eq!(
-                RecordCodec
-                    .encode_at(
-                        &page,
-                        Generation(0),
-                        alignment,
-                        1,
-                        buffer(&admission, alignment, 512)
-                    )
-                    .err(),
+                encode_at(
+                    &page,
+                    Generation(0),
+                    alignment,
+                    1,
+                    buffer(&admission, alignment, 512)
+                )
+                .err(),
                 Some(Error::CorruptRecord)
             );
         }
@@ -695,9 +670,7 @@ mod tests {
                     .unwrap(),
             ));
             assert_eq!(
-                RecordCodec
-                    .encode_at(&page, Generation(1), alignment, offset, staging)
-                    .err(),
+                encode_at(&page, Generation(1), alignment, offset, staging).err(),
                 Some(expected)
             );
             assert_eq!(
@@ -738,7 +711,7 @@ mod tests {
                 ),
             ] {
                 let page = page(&admission, length, 0, &cache, &etag);
-                let logical = RecordCodec.logical_length(&page).unwrap();
+                let logical = logical_length(&page).unwrap();
                 let extent = alignment.extent(4096, logical).unwrap();
                 let mut staging = Some(buffer(&admission, alignment, extent.length()));
                 staging.as_mut().unwrap().bytes_mut().unwrap().fill(0xa5);
@@ -762,7 +735,7 @@ mod tests {
                                     if legacy {
                                         LegacyCodec.logical_length(black_box(page))
                                     } else {
-                                        RecordCodec.logical_length(black_box(page))
+                                        logical_length(black_box(page))
                                     }
                                     .unwrap(),
                                 );
@@ -778,7 +751,7 @@ mod tests {
                                         buffer,
                                     )
                                 } else {
-                                    RecordCodec.encode_at(
+                                    encode_at(
                                         page,
                                         black_box(Generation(7)),
                                         black_box(alignment),
@@ -834,10 +807,7 @@ mod tests {
             )
             .unwrap();
         let mut expected = unhex(GOLDEN_LOGICAL);
-        assert_eq!(
-            RecordCodec.logical_length(&page).unwrap(),
-            expected.len() + 12
-        );
+        assert_eq!(logical_length(&page).unwrap(), expected.len() + 12);
         expected.resize(512, 0);
         assert_eq!(encoded.buffer.bytes().unwrap(), expected);
         assert_eq!(
@@ -845,7 +815,7 @@ mod tests {
             unhex(GOLDEN_RECORD_SHA256)
         );
         assert!(matches!(
-            RecordCodec.parse(&encoded.buffer, encoded.header.extent),
+            parse(&encoded.buffer, encoded.header.extent),
             Err(Error::CorruptRecord)
         ));
     }
@@ -856,17 +826,14 @@ mod tests {
         let mut page = page(&admission, 3, 0, "cache", "v1");
         page.metadata.content_type = Some(crate::model::ContentType::parse(b"text/plain").unwrap());
         let alignment = DirectAlignment::validate(512, 512, 512).unwrap();
-        let encoded = RecordCodec
-            .encode(
-                &page,
-                Generation(7),
-                alignment,
-                buffer(&admission, alignment, 512),
-            )
-            .unwrap();
-        let parsed = RecordCodec
-            .parse(&encoded.buffer, encoded.header.extent)
-            .unwrap();
+        let encoded = encode(
+            &page,
+            Generation(7),
+            alignment,
+            buffer(&admission, alignment, 512),
+        )
+        .unwrap();
+        let parsed = parse(&encoded.buffer, encoded.header.extent).unwrap();
         assert_eq!(parsed.header.format_version, FORMAT_VERSION);
         assert_eq!(parsed.header.metadata, page.metadata.immutable());
         assert_eq!(parsed.checksum, page.ciphertext.checksum());
@@ -883,7 +850,7 @@ mod tests {
         let digest = Sha256::digest(&version_two[..header - 32]);
         version_two[header - 32..header].copy_from_slice(&digest);
         assert!(matches!(
-            RecordCodec.parse_bytes(&version_two, encoded.header.extent),
+            parse_bytes(&version_two, encoded.header.extent),
             Err(Error::CorruptRecord)
         ));
         let mut corrupted = encoded.buffer.bytes().unwrap().to_vec();
@@ -895,11 +862,7 @@ mod tests {
         let end = u32::from_le_bytes(corrupted[12..16].try_into().unwrap()) as usize;
         let digest = Sha256::digest(&corrupted[..end - 32]);
         corrupted[end - 32..end].copy_from_slice(&digest);
-        assert!(
-            RecordCodec
-                .parse_bytes(&corrupted, encoded.header.extent)
-                .is_err()
-        );
+        assert!(parse_bytes(&corrupted, encoded.header.extent).is_err());
     }
 
     #[test]
@@ -907,14 +870,13 @@ mod tests {
         let admission = admission();
         let page = page(&admission, 3, 0, "cache", "v1");
         let alignment = DirectAlignment::validate(512, 512, 512).unwrap();
-        let encoded = RecordCodec
-            .encode(
-                &page,
-                Generation(7),
-                alignment,
-                buffer(&admission, alignment, 512),
-            )
-            .unwrap();
+        let encoded = encode(
+            &page,
+            Generation(7),
+            alignment,
+            buffer(&admission, alignment, 512),
+        )
+        .unwrap();
         let original = encoded.buffer.bytes().unwrap();
         assert_eq!(&original[8..12], &4u32.to_le_bytes());
         let header_len = u32::from_le_bytes(original[12..16].try_into().unwrap()) as usize;
@@ -945,7 +907,7 @@ mod tests {
             }
             let digest = Sha256::digest(&bytes[..header_len - 32]);
             bytes[header_len - 32..header_len].copy_from_slice(&digest);
-            let parsed = RecordCodec.parse_bytes(&bytes, encoded.header.extent);
+            let parsed = parse_bytes(&bytes, encoded.header.extent);
             if version == FORMAT_VERSION {
                 assert_eq!(parsed.unwrap().checksum, page.ciphertext.checksum());
             } else {
@@ -966,14 +928,14 @@ mod tests {
         let digest = Sha256::digest(&missing_crc[..shorter_header - 32]);
         missing_crc[shorter_header - 32..shorter_header].copy_from_slice(&digest);
         assert!(matches!(
-            RecordCodec.parse_bytes(&missing_crc, encoded.header.extent),
+            parse_bytes(&missing_crc, encoded.header.extent),
             Err(Error::CorruptRecord)
         ));
 
         let mut damaged_crc = original.to_vec();
         damaged_crc[crc_offset] ^= 1;
         assert!(matches!(
-            RecordCodec.parse_bytes(&damaged_crc, encoded.header.extent),
+            parse_bytes(&damaged_crc, encoded.header.extent),
             Err(Error::CorruptRecord)
         ));
     }
@@ -1071,20 +1033,12 @@ mod tests {
     fn malformed_frames_are_rejected_without_unbounded_allocations() {
         for len in [1, 16, 512] {
             let bytes = vec![0; len];
-            assert!(
-                RecordCodec
-                    .parse_bytes(&bytes, DirectExtent::checked(0, len).unwrap())
-                    .is_err()
-            );
+            assert!(parse_bytes(&bytes, DirectExtent::checked(0, len).unwrap()).is_err());
         }
         let mut bytes = vec![0; 512];
         bytes[..8].copy_from_slice(MAGIC);
         bytes[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
         bytes[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert!(
-            RecordCodec
-                .parse_bytes(&bytes, DirectExtent::checked(0, 512).unwrap())
-                .is_err()
-        );
+        assert!(parse_bytes(&bytes, DirectExtent::checked(0, 512).unwrap()).is_err());
     }
 }
