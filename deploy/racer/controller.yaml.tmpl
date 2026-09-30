@@ -23,6 +23,9 @@ spec:
         app: racer-controller
     spec:
       serviceAccountName: racer-controller
+      securityContext:
+        # Kubelet needs an explicit UID to own the 0400 projected replication token.
+        runAsUser: 65532
       containers:
         - name: controller
           image: {{ .ControllerImage | default "ghcr.io/azure/racer-controller:latest" }}

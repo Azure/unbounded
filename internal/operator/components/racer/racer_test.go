@@ -600,6 +600,53 @@ func TestAdmissionFailureGatesBindingAndWorkloads(t *testing.T) {
 	}
 }
 
+func TestControllerReplicationTokenOwnership(t *testing.T) {
+	env := testEnv(t, cache("cache"))
+	initialize(t, env)
+	persist(t, env, planPass(t, env))
+
+	deployment := &appsv1.Deployment{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), deployment))
+	pod := deployment.Spec.Template.Spec
+	// Kubelet needs an explicit UID, not just the image USER, to assign ownership
+	// of the owner-readable projected ServiceAccount token.
+	require.NotNil(t, pod.SecurityContext)
+	require.NotNil(t, pod.SecurityContext.RunAsUser)
+	require.EqualValues(t, 65532, *pod.SecurityContext.RunAsUser)
+	require.Nil(t, pod.SecurityContext.FSGroup, "do not widen token access through a volume group")
+	require.Equal(t, controllerName, pod.ServiceAccountName)
+	require.Empty(t, pod.InitContainers)
+	require.Len(t, pod.Containers, 1)
+	controller := pod.Containers[0]
+	require.Equal(t, "controller", controller.Name)
+
+	if controller.SecurityContext != nil {
+		require.Nil(t, controller.SecurityContext.RunAsUser, "controller must inherit the pod token owner")
+	}
+
+	require.Contains(t, controller.VolumeMounts, corev1.VolumeMount{
+		Name: "replication-token", MountPath: "/var/run/secrets/racer-controller", ReadOnly: true,
+	})
+
+	var projection *corev1.ProjectedVolumeSource
+
+	for _, volume := range pod.Volumes {
+		if volume.Name == "replication-token" {
+			projection = volume.Projected
+		}
+	}
+
+	require.NotNil(t, projection)
+	require.NotNil(t, projection.DefaultMode)
+	require.EqualValues(t, 0o400, *projection.DefaultMode)
+	require.Len(t, projection.Sources, 1)
+	token := projection.Sources[0].ServiceAccountToken
+	require.NotNil(t, token)
+	require.Equal(t, "racer-controller-replication", token.Audience)
+	require.Equal(t, "token", token.Path)
+	require.Equal(t, "/var/run/secrets/racer-controller/"+token.Path, configuration(t, env).ReplicationTokenFile)
+}
+
 func TestReplicationWiringUpgradePreservesFreshnessPolicy(t *testing.T) {
 	env := testEnv(t, cache("cache"))
 	initialize(t, env)
