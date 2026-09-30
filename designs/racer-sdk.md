@@ -722,9 +722,9 @@ contract and must not be reused as replacement performance or deployed acceptanc
 ## Superseded throughput options
 
 ClientConfig.PageWindow now sets default subscription page credits; zero selects
-two, and every subscription still owns one connection. PrefetchBootstrap remains
-an unused configuration field, not an alternate request path. The old concurrent
-GET window and SDK splice implementations have been removed. Historical results
+two, and every subscription still owns one connection. The unused
+PrefetchBootstrap field and Gantry configuration setting have been removed. The
+old concurrent GET window and SDK splice implementations have been removed. Historical results
 in [throughput integration](racer-throughput-integration.md) do not establish the
-replacement subscription's throughput (`pkg/racersdk/client.go:18-26,241-255`,
-`pkg/racersdk/subscription.go:72-99`, `pkg/racersdk/http_transfer.go:8-14`).
+replacement subscription's throughput (`pkg/racersdk/client.go:238-262`,
+`pkg/racersdk/subscription.go:80-105`, `pkg/racersdk/http_transfer.go:8-14`).

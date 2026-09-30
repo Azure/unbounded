@@ -74,7 +74,6 @@ type Config struct {
 	RacerDialTimeout                  time.Duration `yaml:"racer_dial_timeout"`
 	RacerBodyReadTimeout              time.Duration `yaml:"racer_body_read_timeout"`
 	RacerPageWindow                   int           `yaml:"racer_page_window"`
-	RacerPrefetchBootstrap            bool          `yaml:"racer_prefetch_bootstrap"`
 	RacerHTTPMaxConnections           int           `yaml:"racer_http_max_connections"`
 	RacerOriginMaxConnections         int           `yaml:"racer_origin_max_connections"`
 	RacerOriginConcurrentRequests     int           `yaml:"racer_origin_concurrent_requests"`
@@ -678,7 +677,6 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setDur("RACER_DIAL_TIMEOUT", &c.RacerDialTimeout)
 	setDur("RACER_BODY_READ_TIMEOUT", &c.RacerBodyReadTimeout)
 	setInt("RACER_PAGE_WINDOW", &c.RacerPageWindow)
-	setBool("RACER_PREFETCH_BOOTSTRAP", &c.RacerPrefetchBootstrap)
 	setInt("RACER_HTTP_MAX_CONNECTIONS", &c.RacerHTTPMaxConnections)
 	setInt("RACER_ORIGIN_MAX_CONNECTIONS", &c.RacerOriginMaxConnections)
 	setInt("RACER_ORIGIN_CONCURRENT_REQUESTS", &c.RacerOriginConcurrentRequests)
@@ -782,7 +780,6 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.DurationVar(&c.RacerDialTimeout, "racer-dial-timeout", c.RacerDialTimeout, "Racer UDS dial timeout (0 uses SDK default)")
 	fs.DurationVar(&c.RacerBodyReadTimeout, "racer-body-read-timeout", c.RacerBodyReadTimeout, "Racer bounded body read timeout (0 uses SDK default)")
 	fs.IntVar(&c.RacerPageWindow, "racer-page-window", c.RacerPageWindow, "Racer subscription page credits (1-64; 0 selects two)")
-	fs.BoolVar(&c.RacerPrefetchBootstrap, "racer-prefetch-bootstrap", c.RacerPrefetchBootstrap, "Deprecated: subscriptions always prefetch within page credits")
 	fs.IntVar(&c.RacerHTTPMaxConnections, "racer-http-max-connections", c.RacerHTTPMaxConnections, "Racer mirror accepted TCP connection limit (0 uses 512)")
 	fs.IntVar(&c.RacerOriginMaxConnections, "racer-origin-max-connections", c.RacerOriginMaxConnections, "Racer origin accepted connection limit (0 uses 128)")
 	fs.IntVar(&c.RacerOriginConcurrentRequests, "racer-origin-concurrent-requests", c.RacerOriginConcurrentRequests, "Racer origin concurrent GET callback and body limit (0 uses 64)")

@@ -458,12 +458,12 @@ func TestGetReadAheadReleaseFailureCleanup(t *testing.T) {
 }
 
 type orderedCloseSignal struct {
-	io.ReadCloser
+	io.Closer
 	closed chan struct{}
 }
 
 func (b orderedCloseSignal) Close() error {
-	err := b.ReadCloser.Close()
+	err := b.Closer.Close()
 	close(b.closed)
 
 	return err

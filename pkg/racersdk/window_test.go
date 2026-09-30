@@ -96,6 +96,8 @@ func TestValueWindowOrderedAndBounded(t *testing.T) {
 }
 
 func TestBootstrapPrefetchUsesOnlySpareAdmission(t *testing.T) {
+	// The old bootstrap option is gone. Subscription read-ahead needs only one
+	// admission slot, regardless of the configured page credits.
 	entered := make(chan struct{}, 2)
 	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		streamResponseHead(w, 0, 4*int64(PageSize), 4*int64(PageSize), `"v"`)
@@ -107,7 +109,6 @@ func TestBootstrapPrefetchUsesOnlySpareAdmission(t *testing.T) {
 	}))
 	c := testClient(t, path, 3)
 	c.config.PageWindow = 3
-	c.config.PrefetchBootstrap = true
 
 	v, err := c.Get(context.Background(), Request{})
 	if err != nil {
@@ -119,7 +120,7 @@ func TestBootstrapPrefetchUsesOnlySpareAdmission(t *testing.T) {
 		select {
 		case <-entered:
 		case <-time.After(3 * time.Second):
-			t.Fatal("prefetch waited for bootstrap body")
+			t.Fatal("subscription waited for its body")
 		}
 	}
 

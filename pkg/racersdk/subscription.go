@@ -137,7 +137,7 @@ func (c *Client) OpenPages(ctx context.Context, request Request, options ...Read
 		pool = &c.smallPool
 	}
 
-	v, err := c.admit(ctx, pool, r)
+	v, err := c.admit(ctx, pool)
 	if err != nil {
 		return nil, err
 	}

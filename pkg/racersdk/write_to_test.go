@@ -4,10 +4,12 @@
 package racersdk
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -58,18 +60,21 @@ func (w *copyDestination) Write(p []byte) (int, error) {
 	return w.Buffer.Write(p)
 }
 
-// Deterministic source chunking tests the copy loop separately from Unix packet
-// sizes. It still uses the production Value state machine and admission cleanup.
+// Exercise copying through the supported subscription transport, including page
+// verification, ordered delivery, and admission cleanup.
 func copyTestValue(t *testing.T, source io.ReadCloser, length int64) *Value {
 	t.Helper()
-	c := testClient(t, "unused", 1)
+	t.Cleanup(func() { closeBody(source) })
+	path := clientPeer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		streamResponseHead(w, 0, length, length, `"v"`)
+		_, _ = io.Copy(w, source)
+	}))
+	c := testClient(t, path, 1)
 
-	v, err := c.admit(context.Background(), &c.bulk, OriginRequest{})
+	v, err := c.Get(t.Context(), Request{})
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	v.body, v.remaining, v.end = source, length, length
 
 	t.Cleanup(func() { closeBody(v) })
 
@@ -144,39 +149,51 @@ func TestWriteToWriterFailures(t *testing.T) {
 	}
 }
 
-type copyFinalErrorReader struct{ err error }
-
-func (r copyFinalErrorReader) Read(p []byte) (int, error) { return copy(p, "data"), r.err }
-
-type noProgressReader struct{}
-
-func (noProgressReader) Read([]byte) (int, error) { return 0, nil }
-
 func TestWriteToPartialReadErrorsAndNoProgress(t *testing.T) {
-	sentinel := errors.New("source failed")
-	for _, sourceErr := range []error{sentinel, io.EOF} {
-		v := copyTestValue(t, io.NopCloser(copyFinalErrorReader{err: sourceErr}), 5)
+	// Incomplete pages and a missing Complete frame never expose unverified
+	// bytes. Source errors cross the wire as truncation, not Go error identities.
+	for _, payload := range []string{"dat", "data"} {
+		c := rawSubscriptionClient(t, func(conn net.Conn, _ *bufio.Reader, _ []byte) {
+			_, _ = io.WriteString(conn, subscriptionHead(4, 0, 4))
+			_ = fakeSubscriptionFrame(conn, 1, 0, 0, 4)
+			_, _ = io.WriteString(conn, payload)
+		})
+
+		v, err := c.Get(t.Context(), Request{})
+		if err != nil {
+			t.Fatal(err)
+		}
 
 		var dst bytes.Buffer
 
 		n, err := v.WriteTo(&dst)
-
-		want := sourceErr
-		if sourceErr == io.EOF {
-			want = io.ErrUnexpectedEOF
-		}
-
-		if n != 4 || dst.String() != "data" || !errors.Is(err, want) {
+		if n != 0 || dst.Len() != 0 || !errors.Is(err, io.ErrUnexpectedEOF) {
 			t.Fatal(n, err, dst.String())
 		}
 
-		if _, err := v.Read(nil); !errors.Is(err, want) {
+		if _, err := v.Read(nil); !errors.Is(err, io.ErrUnexpectedEOF) {
 			t.Fatal("source error not terminal", err)
 		}
 	}
 
-	v := copyTestValue(t, io.NopCloser(noProgressReader{}), 1)
-	if n, err := v.WriteTo(io.Discard); n != 0 || !errors.Is(err, io.ErrNoProgress) {
+	// No progress on a subscription is bounded by its context, rather than a
+	// synthetic reader repeatedly returning (0, nil).
+	c := rawSubscriptionClient(t, func(conn net.Conn, reader *bufio.Reader, _ []byte) {
+		_, _ = io.WriteString(conn, subscriptionHead(1, 0, 1))
+		_, _ = reader.ReadByte()
+	})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	v, err := c.Get(ctx, Request{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cancel()
+
+	if n, err := v.WriteTo(io.Discard); n != 0 || !errors.Is(err, context.Canceled) {
 		t.Fatal(n, err)
 	}
 }

@@ -250,7 +250,6 @@ func racerClientConfig(c *config.Config, cache racersdk.CacheName) racersdk.Clie
 		MaxConnAge:      c.RacerMaxConnAge,
 		IdleConnTimeout: c.RacerIdleConnTimeout, DialTimeout: c.RacerDialTimeout,
 		BodyReadTimeout: c.RacerBodyReadTimeout, PageWindow: c.RacerPageWindow,
-		PrefetchBootstrap: c.RacerPrefetchBootstrap,
 	}
 }
 

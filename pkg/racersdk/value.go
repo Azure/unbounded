@@ -16,23 +16,21 @@ const copyBufferSize = 32 * 1024
 // consume it using Read or WriteTo (including io.Copy); Metadata and Close may be called
 // concurrently. A Value must not be copied. Construct it with Client.Get.
 type Value struct {
-	stream    *PageStream
-	ordered   *orderedRead
-	mu        sync.Mutex
-	client    *Client
-	pool      *connectionPool
-	ctx       context.Context
-	cancel    context.CancelFunc
-	stop      func() bool
-	body      io.ReadCloser
-	terminal  error
-	finished  chan struct{}
-	slot      bool
-	metadata  Metadata
-	request   OriginRequest
-	remaining int64
-	offset    int64
-	end       int64
+	stream   *PageStream
+	ordered  *orderedRead
+	mu       sync.Mutex
+	client   *Client
+	pool     *connectionPool
+	ctx      context.Context
+	cancel   context.CancelFunc
+	stop     func() bool
+	body     io.Closer
+	terminal error
+	finished chan struct{}
+	slot     bool
+	metadata Metadata
+	offset   int64
+	end      int64
 }
 
 // Metadata returns the immutable total-size/tag/expiry snapshot, never a
@@ -74,7 +72,6 @@ func (v *Value) finish(err error) {
 	v.terminal = err
 	body, slot, stop, ordered := v.body, v.slot, v.stop, v.ordered
 	v.body, v.slot, v.stop = nil, false, nil
-	v.request = OriginRequest{}
 	v.mu.Unlock()
 
 	if stop != nil {
@@ -105,83 +102,15 @@ func (v *Value) finish(err error) {
 // Read consumes ordered page leases. An incomplete page is never exposed.
 // A terminal error never restarts the version or opens another subscription.
 func (v *Value) Read(p []byte) (int, error) {
-	if v.stream != nil {
-		return v.readPages(p)
-	}
-
-	if err := v.err(); err != nil {
-		return 0, err
-	}
-
-	if v.ctx == nil {
-		return 0, failure(ErrorClosed, "value", nil)
-	}
-
-	if err := v.ctx.Err(); err != nil {
-		v.finish(ioFailure("read", err))
-		return 0, v.err()
-	}
-
-	if len(p) == 0 {
-		return 0, nil
-	}
-
-	if v.remaining == 0 {
-		v.mu.Lock()
-		body := v.body
-		v.body = nil
-		v.mu.Unlock()
-		closeBody(body)
-
-		v.finish(io.EOF)
-
-		return 0, v.err()
-	}
-
-	v.mu.Lock()
-	body, terminal := v.body, v.terminal
-	v.mu.Unlock()
-
-	if terminal != nil {
-		return 0, terminal
-	}
-
-	if int64(len(p)) > v.remaining {
-		p = p[:v.remaining]
-	}
-
-	n, err := body.Read(p)
-
-	v.remaining -= int64(n)
-
-	v.offset += int64(n)
-	if err == io.EOF {
-		if v.remaining != 0 {
-			err = io.ErrUnexpectedEOF
-		} else {
-			err = nil
-		}
-	}
-
-	if err != nil {
-		if v.ctx.Err() != nil {
-			err = v.ctx.Err()
-		}
-
-		v.finish(ioFailure("read", err))
-
-		return n, v.err()
-	}
-
-	return n, nil
-}
-
-func (v *Value) readPages(p []byte) (int, error) {
 	if err := v.err(); err != nil {
 		// Cancellation publishes the error before joining the receiver. A
 		// consumer observing it must also wait for admission/storage cleanup.
 		v.finish(err)
 		return 0, err
+	}
+
+	if v.stream == nil {
+		return 0, failure(ErrorClosed, "value", nil)
 	}
 
 	if err := v.ctx.Err(); err != nil {
@@ -222,10 +151,6 @@ func (v *Value) Close() error {
 // If those blocked writers exhaust scratch admission, WriteTo returns
 // ErrorUnavailable. Cancellation cannot interrupt an arbitrary destination Write.
 func (v *Value) WriteTo(w io.Writer) (int64, error) {
-	return v.writeTo(w)
-}
-
-func (v *Value) writeTo(w io.Writer) (int64, error) {
 	if _, err := v.Read(nil); err != nil {
 		if err == io.EOF {
 			return 0, nil
@@ -235,7 +160,8 @@ func (v *Value) writeTo(w io.Writer) (int64, error) {
 	}
 
 	c := v.client
-	if sink, ok := w.(*FDSink); ok && v.stream != nil {
+
+	if sink, ok := w.(*FDSink); ok {
 		done := make(chan struct{})
 		stop := context.AfterFunc(v.ctx, func() {
 			defer close(done)
@@ -287,15 +213,11 @@ func (v *Value) writeTo(w io.Writer) (int64, error) {
 
 	var written int64
 
-	empty := 0
-
 	for {
 		buffer := buf[:]
 
 		n, readErr := v.Read(buffer)
 		if n > 0 {
-			empty = 0
-
 			nw, writeErr := w.Write(buf[:n])
 			if nw < 0 || nw > n {
 				nw = 0
@@ -317,12 +239,6 @@ func (v *Value) writeTo(w io.Writer) (int64, error) {
 
 			if nw != n {
 				return written, io.ErrShortWrite
-			}
-		} else if readErr == nil {
-			empty++
-			if empty == 100 {
-				v.finish(ioFailure("copy", io.ErrNoProgress))
-				return written, v.err()
 			}
 		}
 

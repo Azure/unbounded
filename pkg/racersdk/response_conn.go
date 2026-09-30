@@ -168,65 +168,15 @@ func (c *Client) closeIdleConnections() {
 	}
 }
 
-// responseBody owns one exchange. Close interrupts reads; only a fully consumed,
-// validated frame is reusable. It never drains, retries, or parses body bytes.
+// responseBody owns a connection lease. Close interrupts subscription reads;
+// only validated, bodyless HEAD responses can return to the idle pool.
 type responseBody struct {
-	mu        sync.Mutex
-	client    *Client
-	pool      *connectionPool
-	conn      *pooledConn
-	remaining int64
-	reusable  bool
-	closed    bool
-}
-
-func (b *responseBody) Read(p []byte) (int, error) {
-	b.mu.Lock()
-	if b.closed {
-		b.mu.Unlock()
-		return 0, failure(ErrorClosed, "body", nil)
-	}
-
-	remaining := b.remaining
-	b.mu.Unlock()
-
-	if remaining == 0 {
-		return 0, io.EOF
-	}
-
-	p = p[:min(int64(len(p)), remaining)]
-
-	if err := b.beginRead(); err != nil {
-		return 0, err
-	}
-
-	n, err := b.conn.reader.Read(p)
-	if clearErr := b.endRead(); err == nil {
-		err = clearErr
-	}
-
-	b.client.stats.bytesRead.Add(uint64(n))
-	b.mu.Lock()
-
-	b.remaining -= int64(n)
-	if err == io.EOF && b.remaining != 0 {
-		err = io.ErrUnexpectedEOF
-	}
-
-	if err != nil {
-		b.reusable = false
-	}
-	b.mu.Unlock()
-
-	return n, err
-}
-
-func (b *responseBody) beginRead() error {
-	return b.conn.SetReadDeadline(time.Now().Add(b.client.config.BodyReadTimeout))
-}
-
-func (b *responseBody) endRead() error {
-	return b.conn.SetReadDeadline(time.Time{})
+	mu       sync.Mutex
+	client   *Client
+	pool     *connectionPool
+	conn     *pooledConn
+	reusable bool
+	closed   bool
 }
 
 func (b *responseBody) Close() error {
@@ -238,7 +188,7 @@ func (b *responseBody) Close() error {
 	}
 
 	b.closed = true
-	if b.reusable && b.remaining == 0 && b.conn.reader.Buffered() == 0 {
+	if b.reusable && b.conn.reader.Buffered() == 0 {
 		b.client.recycle(b.pool, b.conn)
 		return nil
 	}
@@ -246,20 +196,20 @@ func (b *responseBody) Close() error {
 	return b.conn.Close()
 }
 
-func (v *Value) open(r OriginRequest, snapshot *Metadata) (Metadata, int64, error) {
+func (v *Value) openHead(r OriginRequest) (Metadata, error) {
 	head, err := requestHead(r)
 	if err != nil {
-		return Metadata{}, 0, err
+		return Metadata{}, err
 	}
 
 	for attempt := range 2 {
-		result, started, reused, err := v.exchange(head, r, snapshot, attempt != 0)
+		result, started, reused, err := v.exchangeHead(head, r, attempt != 0)
 		if err == nil {
-			return result.metadata, result.length, nil
+			return result.metadata, nil
 		}
 
 		if attempt != 0 || !reused || started || v.ctx.Err() != nil || !staleConnectionError(err) {
-			return Metadata{}, 0, err
+			return Metadata{}, err
 		}
 
 		v.mu.Lock()
@@ -279,13 +229,13 @@ func staleConnectionError(err error) bool {
 	return errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
 }
 
-func (v *Value) exchange(head []byte, r OriginRequest, snapshot *Metadata, fresh bool) (result wireResponse, started, reused bool, err error) {
+func (v *Value) exchangeHead(head []byte, r OriginRequest, fresh bool) (result wireResponse, started, reused bool, err error) {
 	conn, reused, err := v.client.connection(v.ctx, v.pool, fresh)
 	if err != nil {
 		return result, false, reused, err
 	}
 
-	body := &responseBody{client: v.client, pool: v.pool, conn: conn, remaining: -1}
+	body := &responseBody{client: v.client, pool: v.pool, conn: conn}
 	v.mu.Lock()
 	if v.terminal != nil {
 		err := v.terminal
@@ -330,13 +280,9 @@ func (v *Value) exchange(head []byte, r OriginRequest, snapshot *Metadata, fresh
 		return result, started, reused, ioFailure("exchange", err)
 	}
 
-	result, err = parseResponseHead(head, r, snapshot)
+	result, err = parseResponseHead(head, r, nil)
 	if err != nil {
 		return result, true, reused, err
-	}
-
-	if v.pool == &v.client.smallPool && result.metadata.Size > PageSize {
-		return result, true, reused, failure(ErrorInvalidArgument, "small object size", nil)
 	}
 
 	if err := conn.SetDeadline(time.Time{}); err != nil {
@@ -344,7 +290,6 @@ func (v *Value) exchange(head []byte, r OriginRequest, snapshot *Metadata, fresh
 	}
 
 	body.mu.Lock()
-	body.remaining = result.length
 	body.reusable = !result.close
 	body.mu.Unlock()
 

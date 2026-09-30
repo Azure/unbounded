@@ -542,7 +542,8 @@ func TestConnectionAgeUnusableResponsesDoNotRotate(t *testing.T) {
 
 			switch mode {
 			case "partial":
-				body.remaining = 1
+				// An incomplete HEAD never marks its connection reusable.
+				body.reusable = false
 			case "close", "failed":
 				body.reusable = false
 			case "surplus":

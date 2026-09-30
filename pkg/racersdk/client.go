@@ -15,10 +15,7 @@ import (
 // ClientConfig selects a cache and bounds a Client's resources. Zero numeric
 // fields select defaults; negative values and a zero Cache are invalid.
 type ClientConfig struct {
-	// PrefetchBootstrap is ignored. Subscriptions always prefetch within credits.
-	// Deprecated: configure ReadOptions credits instead.
-	PrefetchBootstrap bool
-	Cache             CacheName
+	Cache CacheName
 	// MaxConnections bounds bulk connections and live Values (default 64).
 	MaxConnections int
 	// PageWindow selects default subscription page credits (zero selects two).
@@ -164,7 +161,7 @@ func newClient(config ClientConfig, path string) (*Client, error) {
 }
 
 // admit bounds waiters before allocating a Value, derived context, or callback.
-func (c *Client) admit(ctx context.Context, pool *connectionPool, r OriginRequest) (*Value, error) {
+func (c *Client) admit(ctx context.Context, pool *connectionPool) (*Value, error) {
 	c.mu.Lock()
 	closed := c.closed || c.ctx == nil
 	c.mu.Unlock()
@@ -230,7 +227,7 @@ func (c *Client) admit(ctx context.Context, pool *connectionPool, r OriginReques
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
-	v := &Value{client: c, pool: pool, ctx: ctx, cancel: cancel, request: r, slot: true, finished: make(chan struct{})}
+	v := &Value{client: c, pool: pool, ctx: ctx, cancel: cancel, slot: true, finished: make(chan struct{})}
 	c.active[v] = struct{}{}
 	c.mu.Unlock()
 	stopPending(v, context.AfterFunc(ctx, func() { v.finish(ioFailure("value", ctx.Err())) }))
@@ -268,25 +265,21 @@ func (c *Client) Get(ctx context.Context, request Request, options ...ReadOption
 // Stat obtains fresh full-object metadata using HEAD on separately reserved
 // connections, so long-lived bulk streams cannot starve metadata requests.
 func (c *Client) Stat(ctx context.Context, request Request) (Metadata, error) {
-	return c.stat(ctx, request, ETag{})
-}
-
-func (c *Client) stat(ctx context.Context, request Request, pin ETag) (Metadata, error) {
 	if ctx == nil {
 		return Metadata{}, failure(ErrorInvalidArgument, "stat", nil)
 	}
 
-	r := OriginRequest{key: request.Key, context: request.Context, operation: OperationHead, pin: pin}
+	r := OriginRequest{key: request.Key, context: request.Context, operation: OperationHead}
 	if err := validateRequest(r); err != nil {
 		return Metadata{}, err
 	}
 
-	v, err := c.admit(ctx, &c.metadataPool, r)
+	v, err := c.admit(ctx, &c.metadataPool)
 	if err != nil {
 		return Metadata{}, err
 	}
 
-	m, _, err := v.open(r, nil)
+	m, err := v.openHead(r)
 	if err != nil {
 		v.finish(err)
 		return Metadata{}, v.err()

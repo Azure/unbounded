@@ -53,7 +53,6 @@ Gantry exposes the following YAML settings, matching `--racer-...` flags and
 | `racer_dial_timeout` | `5s` | Bound UDS connection establishment |
 | `racer_body_read_timeout` | `60s` | Bound an active body read or bounded socket transfer, not total object lifetime |
 | `racer_page_window` | `0` | Default subscription page credits; zero selects two, explicit range 1..64 |
-| `racer_prefetch_bootstrap` | `false` | Unused compatibility setting; no bootstrap or continuation client requests |
 | `racer_http_max_connections` | `512` | Bound accepted public mirror connections |
 
 The public Racer mirror also has a 30-second HTTP idle timeout and a 32 KiB

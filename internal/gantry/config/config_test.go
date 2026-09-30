@@ -76,6 +76,21 @@ func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 	}
 }
 
+func TestRemovedRacerPrefetchBootstrapFlag(t *testing.T) {
+	c := NewDefault()
+	flags := flag.NewFlagSet("test", flag.ContinueOnError)
+	flags.SetOutput(new(bytes.Buffer))
+	c.BindFlags(flags)
+
+	if flags.Lookup("racer-prefetch-bootstrap") != nil {
+		t.Fatal("removed no-op flag is still registered")
+	}
+
+	if err := flags.Parse([]string{"--racer-prefetch-bootstrap=true"}); err == nil {
+		t.Fatal("removed no-op flag was accepted")
+	}
+}
+
 func TestChairCapacityConfig(t *testing.T) {
 	t.Run("environment", func(t *testing.T) {
 		c := NewDefault()
