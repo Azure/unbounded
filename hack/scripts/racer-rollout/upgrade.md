@@ -45,8 +45,11 @@ inventory), `plan.diff`, and the SHA-256 approval token. Review all three output
 The required override targets are Racer's Deployment (container `controller`),
 both named Racer DaemonSets (container `dataplane`), and Gantry's DaemonSet
 (container `gantry`). Missing, duplicate, unfamiliar targets, missing container
-images, duplicate YAML keys, or anchors in edited documents fail closed. Only
-image scalar spans are rewritten; surrounding YAML and comments are retained.
+images, duplicate YAML keys, or aliases sharing an edited image or its containing
+structure fail closed. Unrelated anchors and aliases (such as shared volumes or
+environment variables) are preserved. Only image scalar spans are rewritten;
+surrounding YAML and comments are retained, and the result is checked semantically
+to prove that no other fields changed.
 The live Racer and Gantry workload layouts are validated but not directly
 replaced: the operator reconciles those workloads from the image overrides.
 The operator Deployment's `controller` container is upgraded directly.

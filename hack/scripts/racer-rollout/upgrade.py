@@ -61,8 +61,10 @@ def named_container(pod, name):
     return matches[0]
 
 
-def yaml_node(node, *path):
+def yaml_node(node, *path, aliased=()):
     for key in path:
+        if node.start_mark.index in aliased:
+            raise ValueError("YAML anchors/aliases cannot share an edited image or its containing structure")
         if isinstance(key, int):
             node = node.value[key]
         else:
@@ -70,6 +72,8 @@ def yaml_node(node, *path):
             if len(matches) != 1:
                 raise ValueError(f"expected one YAML key {key}")
             node = matches[0]
+    if node.start_mark.index in aliased:
+        raise ValueError("YAML anchors/aliases cannot share an edited image or its containing structure")
     return node
 
 
@@ -82,6 +86,16 @@ def upgrade_overrides(data, images):
             raise ValueError(f"{key}: expected overrides document")
         expected = copy.deepcopy(doc)
         root = yaml.compose(text, Loader=StrictLoader)
+        # Composed aliases point back to the anchor's node and source span.
+        # Reject shared nodes along an image path, not unrelated env/volume aliases.
+        # deepcopy also preserves sharing, so the semantic check alone is not enough.
+        anchors = {}
+        aliased = set()
+        for event in yaml.parse(text, Loader=StrictLoader):
+            if isinstance(event, yaml.AliasEvent):
+                aliased.add(anchors[event.anchor])
+            elif getattr(event, "anchor", None):
+                anchors[event.anchor] = event.start_mark.index
         edits = []
         for index, entry in enumerate(expected["overrides"]):
             component = entry.get("component")
@@ -95,17 +109,15 @@ def upgrade_overrides(data, images):
             container = named_container(pod, role)
             container["image"] = images[role]
             ci = pod["containers"].index(container)
-            node = yaml_node(root, "overrides", index, "patch", "spec", "template", "spec", "containers", ci, "image")
+            node = yaml_node(root, "overrides", index, "patch", "spec", "template", "spec", "containers", ci, "image", aliased=aliased)
             if not isinstance(node, yaml.ScalarNode) or node.style in ("|", ">"):
                 raise ValueError("image must be a plain or quoted YAML scalar")
             edits.append((node.start_mark.index, node.end_mark.index, json.dumps(images[role])))
             found.add(target)
-        if edits and any(isinstance(token, (yaml.tokens.AnchorToken, yaml.tokens.AliasToken)) for token in yaml.scan(text)):
-            raise ValueError(f"{key}: YAML anchors/aliases are unsupported for image edits")
         for start, end, replacement in sorted(edits, reverse=True):
             text = text[:start] + replacement + text[end:]
         if yaml.load(text, Loader=StrictLoader) != expected:
-            raise ValueError(f"{key}: image edit affected other fields (YAML aliases are unsupported)")
+            raise ValueError(f"{key}: image edit affected other fields")
         result[key] = text
     if found != set(OVERRIDES):
         raise ValueError(f"missing required override targets: {set(OVERRIDES) - found}")

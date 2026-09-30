@@ -108,6 +108,50 @@ class ImageOnlyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "anchors/aliases"):
             upgrade.upgrade_overrides(data, IMAGES)
 
+    def test_live_override_aliases_preserve_all_non_image_bytes_and_values(self):
+        text = Path(__file__).with_name("testdata").joinpath("upgrade-aliases.yaml").read_text()
+        data = {"racer-v2.yaml": text, "net.yaml": overrides()["net.yaml"]}
+        original = copy.deepcopy(data)
+        new = upgrade.upgrade_overrides(data, IMAGES)
+        expected_text = text
+        for old, role in (("old-controller", "controller"), ("'old-dataplane'", "dataplane"),
+                          ('"old-podnet"', "dataplane"), ("old-gantry", "gantry")):
+            expected_text = expected_text.replace("image: " + old, "image: " + json.dumps(IMAGES[role]))
+        self.assertEqual(new, {**data, "racer-v2.yaml": expected_text})
+        expected = yaml.safe_load(text)
+        for entry in expected["overrides"]:
+            container = entry["patch"]["spec"]["template"]["spec"]["containers"][0]
+            container["image"] = IMAGES[container["name"]]
+        self.assertEqual(yaml.safe_load(new["racer-v2.yaml"]), expected)
+        self.assertEqual(data, original)
+        self.assertEqual(upgrade.upgrade_overrides(new, IMAGES), new)
+        objects = inventory()
+        objects[0]["data"] = data
+        changes = upgrade.build_changes(objects, IMAGES)
+        self.assertEqual(len(changes), 5)
+        self.assertEqual(changes[0]["after"]["data"], new)
+
+    def test_image_alias_to_external_scalar_is_rejected(self):
+        data = overrides()
+        data["racer.yaml"] = "unrelated: &shared old\n" + data["racer.yaml"].replace("image: old", "image: *shared", 1)
+        with self.assertRaisesRegex(ValueError, "anchors/aliases"):
+            upgrade.upgrade_overrides(data, IMAGES)
+
+    def test_shared_image_ancestors_are_rejected(self):
+        for field in ("patch", "spec", "containers"):
+            with self.subTest(field=field):
+                data = overrides()
+                data["racer.yaml"] = data["racer.yaml"].replace(field + ":\n", field + ": &shared\n", 1)
+                data["racer.yaml"] += "unrelated: *shared\n"
+                with self.assertRaisesRegex(ValueError, "anchors/aliases"):
+                    upgrade.upgrade_overrides(data, IMAGES)
+
+    def test_unreferenced_image_anchor_is_safe(self):
+        data = overrides()
+        data["racer.yaml"] = data["racer.yaml"].replace("image: old", "image: &unused old", 1)
+        new = upgrade.upgrade_overrides(data, IMAGES)
+        self.assertEqual(yaml.safe_load(new["racer.yaml"])["overrides"][0]["patch"]["spec"]["template"]["spec"]["containers"][0]["image"], IMAGES["controller"])
+
     def test_workloads_change_only_images_no_reconciliation_or_config_changes(self):
         objects = inventory()
         original = copy.deepcopy(objects)
