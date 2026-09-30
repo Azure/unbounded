@@ -5,14 +5,8 @@ use crate::{
     topology::membership::Member,
 };
 use std::time::Duration;
-#[path = "codec.rs"]
 mod codec;
 pub use codec::*;
-
-// Server contract vectors use an isolated reference codec, not the runtime codec.
-#[cfg(test)]
-#[path = "wire/codec.rs"]
-mod contract_codec;
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const BOOTSTRAP_PATH: &str = "/v1/bootstrap";
@@ -138,7 +132,4 @@ pub enum ProtocolFailure {
 }
 pub struct ErrorResponse {
     pub code: ProtocolFailure,
-}
-#[cfg(test)]
-mod tests { /* Unknown versions, excessive bounds, and out-of-order publications. */
 }

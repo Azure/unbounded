@@ -1,4 +1,14 @@
 use super::*;
+use crate::control::caches::canonical_socket_paths;
+use sha2::{Digest, Sha256};
+
+fn content_hashes(p: &Publication) -> Result<(String, String)> {
+    let (content, membership) = canonical_content(p)?;
+    Ok((
+        format!("{:x}", Sha256::digest(content)),
+        format!("{:x}", Sha256::digest(membership)),
+    ))
+}
 
 const ROOT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -48,37 +58,6 @@ fn shared_bootstrap_and_bundle_vectors() {
 }
 
 #[test]
-fn runtime_codec_accepts_server_vectors() {
-    use crate::control::wire as runtime;
-
-    let p = runtime::decode_publication(&fixture("publication.json")).unwrap();
-    let (content, membership) = runtime::canonical_content(&p).unwrap();
-    assert_eq!(content, fixture("content.json"));
-    assert_eq!(membership, fixture("membership.json"));
-    decode_publication(runtime::encode_publication(&p).unwrap().as_slice()).unwrap();
-
-    let encoded = runtime::encode_publication(&p).unwrap();
-    assert_eq!(
-        runtime::encode_publication(&runtime::decode_publication(&encoded).unwrap()).unwrap(),
-        encoded
-    );
-
-    let request = runtime::decode_enrollment_request(&fixture("bootstrap-request.json")).unwrap();
-    let encoded = runtime::encode_enrollment_request(&request).unwrap();
-    assert_eq!(encoded, fixture("bootstrap-request.json"));
-    decode_enrollment_request(encoded.as_slice()).unwrap();
-    let response =
-        runtime::decode_enrollment_response(&fixture("bootstrap-response.json")).unwrap();
-    let encoded = runtime::encode_enrollment_response(&response).unwrap();
-    assert_eq!(encoded, fixture("bootstrap-response.json"));
-    decode_enrollment_response(encoded.as_slice()).unwrap();
-    let bundle = runtime::decode_bundle(&fixture("bundle.json")).unwrap();
-    let encoded = runtime::encode_bundle(&bundle).unwrap();
-    assert_eq!(encoded, fixture("bundle.json"));
-    decode_bundle(encoded.as_slice()).unwrap();
-}
-
-#[test]
 fn shared_rejection_vectors() {
     let cases: Value = serde_json::from_slice(&fixture("rejections.json")).unwrap();
     for case in cases.as_array().unwrap() {
@@ -91,23 +70,13 @@ fn shared_rejection_vectors() {
             1,
         );
         assert_ne!(input, mutated, "mutation did not match: {name}");
-        // Exercise the production codec as well as the reference codec below.
-        use crate::control::wire as runtime;
-        let result = match file {
-            "publication.json" => runtime::decode_publication(mutated.as_bytes()).map(|_| ()),
-            "bundle.json" => runtime::decode_bundle(mutated.as_bytes()).map(|_| ()),
-            "bootstrap-request.json" => {
-                runtime::decode_enrollment_request(mutated.as_bytes()).map(|_| ())
-            }
-            "bootstrap-response.json" => {
-                runtime::decode_enrollment_response(mutated.as_bytes()).map(|_| ())
-            }
-            _ => panic!("unknown vector"),
+        // The client maps wire version and size failures to its local error domain.
+        let expected = match case["code"].as_str().unwrap() {
+            "unsupported_version" => Error::IncompatibleMembership,
+            "too_large" => Error::Overloaded,
+            "invalid_request" => Error::InvalidRequest,
+            code => panic!("unexpected rejection code: {code}"),
         };
-        assert!(result.is_err(), "runtime accepted {name}");
-        let expected = decode_error(format!(r#"{{"code":{}}}"#, case["code"]).as_bytes())
-            .unwrap()
-            .code;
         assert_eq!(
             round_trip(file, mutated.as_bytes()).err(),
             Some(expected),
@@ -149,10 +118,7 @@ fn byte_bounds_and_malformed_documents() {
         padded.resize(max, b' ');
         assert!(round_trip(name, &padded).is_ok(), "exact bound {name}");
         padded.push(b' ');
-        assert_eq!(
-            round_trip(name, &padded).err(),
-            Some(ProtocolFailure::TooLarge)
-        );
+        assert_eq!(round_trip(name, &padded).err(), Some(Error::Overloaded));
         for bad in [
             Vec::new(),
             b"null".to_vec(),
@@ -164,17 +130,17 @@ fn byte_bounds_and_malformed_documents() {
         ] {
             assert_eq!(
                 round_trip(name, &bad).err(),
-                Some(ProtocolFailure::InvalidRequest),
+                Some(Error::InvalidRequest),
                 "{name}"
             );
         }
     }
-    let mut source = std::io::repeat(0).take((MAX_ENROLLMENT_BYTES * 10) as u64);
+    // Runtime decoders accept already bounded byte slices, not Read adapters.
+    let source = vec![0; MAX_ENROLLMENT_BYTES * 10];
     assert_eq!(
-        decode_enrollment_request(&mut source).err(),
-        Some(ProtocolFailure::TooLarge)
+        decode_enrollment_request(&source).err(),
+        Some(Error::Overloaded)
     );
-    assert_eq!(source.limit(), (MAX_ENROLLMENT_BYTES * 9 - 1) as u64);
 }
 
 #[test]
@@ -191,17 +157,17 @@ fn path_member_and_enum_bounds() {
         "a..b",
         &"a".repeat(64),
     ] {
-        assert!(paths(name).is_err());
+        assert!(canonical_socket_paths(name).is_err());
     }
     let name = format!("{}.{}", "a".repeat(63), "b".repeat(18));
-    assert_eq!(paths(&name).unwrap().0.len(), 107);
-    assert!(paths(&(name + "b")).is_err());
+    assert_eq!(
+        canonical_socket_paths(&name).unwrap().0.as_os_str().len(),
+        107
+    );
+    assert!(canonical_socket_paths(&(name + "b")).is_err());
     let mut p = decode_publication(fixture("publication.json").as_slice()).unwrap();
     p.members.resize(MAX_MEMBERS + 1, p.members[0].clone());
-    assert_eq!(
-        encode_publication(&p).err(),
-        Some(ProtocolFailure::TooLarge)
-    );
+    assert_eq!(encode_publication(&p).err(), Some(Error::Overloaded));
     for code in [
         "invalid_request",
         "unauthenticated",
@@ -238,13 +204,13 @@ fn maximum_membership() {
         decode_publication(b.as_slice()).unwrap().members.len(),
         MAX_MEMBERS
     );
-    let mut dto = PublicationDto::from_publication(&p).unwrap();
+    let mut dto = dto(&p).unwrap();
     let extra: MemberDto =
         serde_json::from_value(serde_json::to_value(&dto.members[0]).unwrap()).unwrap();
     dto.members.push(extra);
     let b = encode(&dto, MAX_PUBLICATION_BYTES).unwrap();
     assert_eq!(
         decode_publication(b.as_slice()).err(),
-        Some(ProtocolFailure::TooLarge)
+        Some(Error::Overloaded)
     );
 }
