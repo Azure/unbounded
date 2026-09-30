@@ -384,6 +384,7 @@ help: ## Show this help
 	@echo "  racer-dataplane-build             Build the locked Rust release binary into bin/"
 	@echo "  racer-dataplane-test              Run Rust library and binary unit tests (RACER_TEST_ARGS)"
 	@echo "  racer-dataplane-dst               Run DST-filtered Rust tests under 16 GiB/no-swap cgroup limits"
+	@echo "  racer-dataplane-dst-10m            Build once, then run a 600-second DST campaign with fresh seeds"
 	@echo "  racer-dataplane-contention        Run metadata contention tests under 16 GiB/no-swap cgroup limits"
 	@echo "  racer-dataplane-native-build      Build the optional real-libibverbs adapter into bin/"
 	@echo "  racer-dataplane-native-install    Install adapter (DESTDIR, RACER_PREFIX, RACER_LIBDIR)"
@@ -586,7 +587,7 @@ racer-controller-build: ## Build the Racer controller without lint/test
 	@mkdir -p bin
 	$(GOBUILD) -o bin/racer-controller ./cmd/racer-controller
 
-.PHONY: racer-dataplane-build racer-dataplane-test racer-dataplane-dst racer-dataplane-contention racer-dataplane-native-build racer-dataplane-native-install image-racer-dataplane-local
+.PHONY: racer-dataplane-build racer-dataplane-test racer-dataplane-dst racer-dataplane-dst-10m racer-dataplane-contention racer-dataplane-native-build racer-dataplane-native-install image-racer-dataplane-local
 racer-dataplane-test: ## Run Rust unit tests with all features; pass filters/options via RACER_TEST_ARGS
 	$(RACER_CARGO) test --locked --manifest-path cmd/racer-dataplane/Cargo.toml \
 		--target-dir "$(RACER_CARGO_TARGET_DIR)" --all-features --lib --bins -- $(RACER_TEST_ARGS)
@@ -597,6 +598,13 @@ racer-dataplane-dst: ## Run DST tests with cgroup v2 memory <= 16 GiB and swap d
 	bash hack/scripts/memory-safe-run.sh -- $(RACER_CARGO) test --locked \
 		--manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" \
 		--all-features "$(RACER_DST_FILTER)" -- --test-threads=1 $(RACER_TEST_ARGS)
+
+# Keep compilation inside the same fail-closed cgroup gate as the DST runner.
+racer-dataplane-dst-10m: ## Build once, then run 600 seconds of default and distinct-seed DSTs
+	@test -z "$(RACER_TEST_ARGS)" -a "$(RACER_DST_FILTER)" = dst || \
+		{ echo "racer-dataplane-dst-10m does not accept test arguments or filters" >&2; exit 1; }
+	bash hack/scripts/memory-safe-run.sh -- python3 hack/scripts/racer-dst-campaign.py \
+		--target-dir "$(RACER_CARGO_TARGET_DIR)" -- $(RACER_CARGO)
 
 # Keep compilation inside the same fail-closed cgroup gate as the DST runner.
 racer-dataplane-contention: ## Run metadata contention tests with bounded memory and compilation jobs

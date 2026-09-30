@@ -202,6 +202,51 @@ scenario and fidelity tests have been integrated.
 
 ## Generated datapath DST
 
+For a ten-minute campaign, run:
+
+```sh
+make racer-dataplane-dst-10m
+```
+
+This requires Python 3.9+ and GNU `timeout`, in addition to the normal Rust and
+cgroup requirements below. The target builds the all-feature library/binary test
+executables once with two Cargo jobs, inside the mandatory 16 GiB/no-swap guard.
+Build and discovery time are **excluded** from the 600-second campaign budget.
+Every discovered `dst` test runs once first, individually, without seed or step
+overrides. This preserves the default HTTP/native corpus coverage requirements
+and all matching regression tests. The remaining budget runs distinct custom
+seeds `100,101,102,...`, each in both HTTP and native generated oracles, with the
+default full action cycle and exact replay checks. It does not keep replaying
+the unchanged default corpus. It reports the number of fully completed seed pairs;
+there is no guaranteed seed count on slower machines.
+
+The budget stops admission of new seed pairs, not healthy tests. The final pair
+finishes gracefully, so campaign time is at least 600 seconds on success and at
+most 900 seconds plus a ten-second termination grace and small runner overhead.
+Build has a separate 300-second bound. Each baseline test and each custom seed
+pair has its own 300-second TERM timeout and ten-second KILL grace, **inside** the
+guarded scope so test descendants are cleaned up even when systemd creates it.
+A timed-out command is always a failure, not successful budget exhaustion.
+An incomplete baseline, no completed custom pair, a failed oracle, ignored tests,
+or a missing test is also a failure. Known failing seeds are not skipped.
+
+Logs are retained under `tmp/racer-dst-campaign/<timestamp>-<pid>/`, including
+build output, each test invocation, and `progress.log` with exact reproduction
+commands, baseline progress, and completed custom seed-pair/mode-run counts.
+Failures stop immediately; a partially completed pair is not counted. Replay on
+the same revision with the printed command, or use `RACER_DST_SEEDS=<seed>` with
+the existing target below. The campaign rejects `RACER_DST_*` environment overrides
+and `RACER_TEST_ARGS`; it cannot be narrowed to silently omit required coverage.
+
+For runner development only, the script supports `--seconds` (up to 600) and
+`--case-timeout` (up to 300), passed before `-- cargo`. Shorter budgets retain all
+baseline and failure requirements. Focused fake-command tests do not build Rust:
+
+```sh
+timeout --signal=TERM --kill-after=10s 300s \
+  python3 hack/scripts/racer-dst-campaign_test.py
+```
+
 Run both HTTP and connected-native generated-traffic oracles with the normal `dst`
 test filter. The target invokes the wrapper to verify a cgroup-v2 limit of at most
 16 GiB and zero swap for the entire build/test process tree. It fails before
