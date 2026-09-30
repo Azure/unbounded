@@ -151,7 +151,11 @@ func TestServeTeardownClosesSlowTLSWrite(t *testing.T) {
 
 			done := make(chan error, 1)
 
-			go func() { done <- f.a.Server.serve(f.ctx, listener, f.a.Server.tlsConfig(f.ctx, f.serverCertificate)) }()
+			config := f.a.Server.tlsConfigWithCertificate(f.ctx, func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+				return &f.serverCertificate, nil
+			})
+
+			go func() { done <- f.a.Server.serve(f.ctx, listener, config) }()
 
 			conn, err := tls.Dial("tcp", listener.Addr().String(), &tls.Config{RootCAs: f.roots, MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{f.certificate}})
 			if err != nil {

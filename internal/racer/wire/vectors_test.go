@@ -33,7 +33,12 @@ func TestSharedPublicationVector(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	p, m, err := CanonicalContent(v)
+	candidate, err := NewCanonicalCandidate(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p, m, err := candidate.canonicalContent()
 	if err != nil {
 		t.Fatal(err)
 	}

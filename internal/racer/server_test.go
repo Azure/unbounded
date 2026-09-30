@@ -118,7 +118,9 @@ func (f *servingFixture) start(t *testing.T) string {
 
 	s := httptest.NewUnstartedServer(f.a.Server.Handler())
 	s.Config.ConnContext = connectionContext
-	s.TLS = f.a.Server.tlsConfig(f.ctx, f.serverCertificate)
+	s.TLS = f.a.Server.tlsConfigWithCertificate(f.ctx, func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+		return &f.serverCertificate, nil
+	})
 	s.StartTLS()
 	t.Cleanup(s.Close)
 
@@ -1061,7 +1063,11 @@ func TestLeaderCancellationClosesActiveTLSPoll(t *testing.T) {
 
 	done := make(chan error, 1)
 
-	go func() { done <- f.a.Server.serve(f.ctx, listener, f.a.Server.tlsConfig(f.ctx, f.serverCertificate)) }()
+	config := f.a.Server.tlsConfigWithCertificate(f.ctx, func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+		return &f.serverCertificate, nil
+	})
+
+	go func() { done <- f.a.Server.serve(f.ctx, listener, config) }()
 
 	c := f.client(t, &f.certificate)
 

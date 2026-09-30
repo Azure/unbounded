@@ -66,18 +66,9 @@ func (c CanonicalCandidate) EncodePublication(sequence Sequence, membership Memb
 	return encode(v, MaxPublicationBytes)
 }
 
-// CanonicalContent returns counter-free canonical JSON for durable version CAS.
+// canonicalContent returns counter-free canonical JSON for durable version CAS.
 // The membership document includes schema and cluster, and every member input.
 // Input counters may be zero because callers hash candidates before assigning them.
-func CanonicalContent(v Publication) (content, membership []byte, err error) {
-	c, err := NewCanonicalCandidate(v)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return c.canonicalContent()
-}
-
 func (c CanonicalCandidate) canonicalContent() (content, membership []byte, err error) {
 	v := c.publication
 	if err := validateHeader(v.SchemaVersion, v.Cluster); err != nil {

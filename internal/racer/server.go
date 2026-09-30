@@ -77,10 +77,6 @@ func (s *Server) TLSConfig(ctx context.Context) (*tls.Config, error) {
 	return s.tlsConfigWithCertificate(ctx, reloader.getCertificate), nil
 }
 
-func (s *Server) tlsConfig(ctx context.Context, certificate tls.Certificate) *tls.Config {
-	return s.tlsConfigWithCertificate(ctx, func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return &certificate, nil })
-}
-
 func (s *Server) tlsConfigWithCertificate(ctx context.Context, certificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)) *tls.Config {
 	base := &tls.Config{MinVersion: tls.VersionTLS13, GetCertificate: certificate, ClientAuth: tls.VerifyClientCertIfGiven, SessionTicketsDisabled: true, NextProtos: []string{"http/1.1"}}
 	base.GetConfigForClient = func(_ *tls.ClientHelloInfo) (*tls.Config, error) {
