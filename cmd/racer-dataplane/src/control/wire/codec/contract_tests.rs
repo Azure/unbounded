@@ -106,6 +106,55 @@ fn hash_semantics() {
 }
 
 #[test]
+fn local_publications_share_wire_validation_and_normalization() {
+    let original = decode_publication(&fixture("publication.json")).unwrap();
+    let mut unsorted = original.clone();
+    unsorted.members.reverse();
+    for member in &mut unsorted.members {
+        member.rails.reverse();
+    }
+    let normalized = validate_publication(&unsorted).unwrap();
+    assert_eq!(
+        encode_publication(&normalized).unwrap(),
+        encode_publication(&original).unwrap()
+    );
+    for mutation in 0..8 {
+        let mut candidate = original.clone();
+        match mutation {
+            0 => candidate.schema_version += 1,
+            1 => candidate.cluster.0 = "invalid".into(),
+            2 => candidate.sequence.0 = 0,
+            3 => candidate.membership_version.0 = 0,
+            4 => candidate.members.push(candidate.members[0].clone()),
+            5 => candidate.members[0].peer_endpoint = "host:443".into(),
+            6 => {
+                let member = candidate
+                    .members
+                    .iter_mut()
+                    .find(|m| !m.rails.is_empty())
+                    .unwrap();
+                let duplicate = member.rails[0].clone();
+                member.rails.push(duplicate);
+            }
+            _ => candidate.caches[0].client_socket = "/unexpected/socket".into(),
+        }
+        let bytes = encode(&dto(&candidate).unwrap(), MAX_PUBLICATION_BYTES).unwrap();
+        let expected = decode_publication(&bytes).err();
+        assert!(expected.is_some(), "mutation {mutation}");
+        assert_eq!(
+            validate_publication(&candidate).err(),
+            expected,
+            "mutation {mutation}"
+        );
+        assert_eq!(
+            encode_publication(&candidate).err(),
+            expected,
+            "mutation {mutation}"
+        );
+    }
+}
+
+#[test]
 fn byte_bounds_and_malformed_documents() {
     for (name, max) in [
         ("publication.json", MAX_PUBLICATION_BYTES),

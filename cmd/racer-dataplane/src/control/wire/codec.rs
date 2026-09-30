@@ -310,7 +310,7 @@ pub fn encode_enrollment_response(r: &EnrollmentResponse) -> Result<Vec<u8>> {
     decode_enrollment_response(&b)?;
     Ok(b)
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Rail {
     rail: u16,
     fabric: String,
@@ -326,7 +326,7 @@ fn nonnull_optional<'de, D: serde::Deserializer<'de>>(
 ) -> std::result::Result<Option<u32>, D::Error> {
     u32::deserialize(d).map(Some)
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct MemberDto {
     node: String,
     shares: u32,
@@ -334,14 +334,14 @@ struct MemberDto {
     rails: Vec<Rail>,
     alignment_enabled: bool,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Cache {
     id: String,
     name: String,
     client_socket: String,
     origin_socket: String,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct PublicationDto {
     schema_version: u32,
     cluster: String,
@@ -360,6 +360,11 @@ pub fn decode_publication(b: &[u8]) -> Result<Publication> {
         return Err(Error::Overloaded);
     }
     let p: PublicationDto = serde_json::from_value(value).map_err(|_| Error::InvalidRequest)?;
+    publication_from_dto(p)
+}
+
+/// Validate both decoded wire publications and direct in-process candidates.
+fn publication_from_dto(p: PublicationDto) -> Result<Publication> {
     header(p.schema_version, &p.cluster)?;
     let sequence = PublicationSequence(counter(&p.sequence)?);
     let membership_version = MembershipVersion(counter(&p.membership_version)?);
@@ -477,15 +482,28 @@ pub fn encode_publication(p: &Publication) -> Result<Vec<u8>> {
     if p.members.len() > MAX_MEMBERS {
         return Err(Error::Overloaded);
     }
-    let b = encode(&dto(p)?, MAX_PUBLICATION_BYTES)?;
-    decode_publication(&b)?;
+    let d = dto(p)?;
+    let b = encode(&d, MAX_PUBLICATION_BYTES)?;
+    publication_from_dto(d)?;
     Ok(b)
+}
+
+/// Validate and normalize a local publication without decoding JSON again.
+pub(crate) fn validate_publication(p: &Publication) -> Result<Publication> {
+    if p.members.len() > MAX_MEMBERS {
+        return Err(Error::Overloaded);
+    }
+    let d = dto(p)?;
+    // Preserve the wire byte bound even for callers that bypass decoding.
+    encode(&d, MAX_PUBLICATION_BYTES)?;
+    publication_from_dto(d)
 }
 pub fn canonical_content(p: &Publication) -> Result<(Vec<u8>, Vec<u8>)> {
     let mut d = dto(p)?;
     d.sequence = "1".into();
     d.membership_version = "1".into();
-    decode_publication(&encode(&d, MAX_PUBLICATION_BYTES)?)?;
+    encode(&d, MAX_PUBLICATION_BYTES)?;
+    publication_from_dto(d.clone())?;
     #[derive(Serialize)]
     struct Content<'a> {
         schema_version: u32,
@@ -578,7 +596,8 @@ pub fn apply_delta(base: &Publication, bytes: &[u8]) -> Result<Publication> {
     original.caches = d.caches;
     original.sequence = d.sequence;
     original.membership_version = d.membership_version;
-    let next = decode_publication(&encode(&original, MAX_PUBLICATION_BYTES)?)?;
+    encode(&original, MAX_PUBLICATION_BYTES)?;
+    let next = publication_from_dto(original)?;
     if content_hash(&next)? != d.content_hash {
         return Err(Error::Replay);
     }

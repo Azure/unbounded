@@ -171,9 +171,7 @@ impl SnapshotStore {
         if publication.cluster != self.cluster {
             return Err(Error::Unauthorized);
         }
-        // The codec is also the validator for direct, in-process publications.
-        let publication =
-            super::wire::decode_publication(&super::wire::encode_publication(&publication)?)?;
+        let publication = super::wire::validate_publication(&publication)?;
         let (content, membership) = super::wire::canonical_content(&publication)?;
         let content_hash: [u8; 32] = Sha256::digest(content).into();
         let membership_hash: [u8; 32] = Sha256::digest(membership).into();
