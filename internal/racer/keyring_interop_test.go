@@ -98,6 +98,11 @@ func TestRustKeyringInterop(t *testing.T) {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 
+	// No manager runs in this fixture. Keep authority observations fresh through
+	// Cargo startup and the full no-change poll without relaxing freshness gates.
+	refresh := time.NewTicker(time.Second)
+	defer refresh.Stop()
+
 	rotated := false
 
 	for {
@@ -114,6 +119,9 @@ func TestRustKeyringInterop(t *testing.T) {
 			}
 
 			return
+		case <-refresh.C:
+			runKeys(t, f.a.Keyring)
+			reconcileTopology(t, f.a.Topology, f.ctx)
 		case <-ticker.C:
 			if rotated {
 				continue
