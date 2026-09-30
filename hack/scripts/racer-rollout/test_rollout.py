@@ -1,4 +1,5 @@
 import copy
+import json
 import unittest
 from unittest.mock import patch
 
@@ -80,6 +81,45 @@ class TransformTest(unittest.TestCase):
         self.assertEqual(set(init["securityContext"]["capabilities"]["add"]), {"NET_ADMIN", "NET_RAW", "SYS_CHROOT"})
         self.assertTrue(init["volumeMounts"][0]["readOnly"])
         self.assertIn("240s", init["command"])
+
+
+class RolloutOrderTest(unittest.TestCase):
+    def runner(self, phases, replicas=0):
+        runner = object.__new__(rollout.Runner)
+        runner.get = unittest.mock.Mock(return_value={"spec": {"replicas": replicas}})
+        runner.kubectl = unittest.mock.Mock(return_value=json.dumps({
+            "items": [{"status": {"phase": phase}} for phase in phases],
+        }))
+        return runner
+
+    def test_terminal_operator_pods_do_not_block(self):
+        self.runner(["Succeeded", "Failed"]).stopped()
+        self.runner([]).stopped()
+
+    def test_nonterminal_operator_pods_block(self):
+        for phase in ("Pending", "Running", "Unknown", None):
+            with self.subTest(phase=phase):
+                with self.assertRaisesRegex(RuntimeError, "pods still present"):
+                    self.runner(["Succeeded", phase]).stopped()
+
+    def test_desired_operator_replicas_still_block(self):
+        with self.assertRaisesRegex(RuntimeError, "run stop first"):
+            self.runner([], replicas=1).stopped()
+
+    def test_stop_wait_excludes_terminal_pods(self):
+        runner = self.runner(["Failed", "Succeeded"])
+        runner.stop()
+        wait = runner.kubectl.call_args_list[1]
+        self.assertEqual(wait.args[0], "wait")
+        self.assertIn("--field-selector=status.phase!=Succeeded,status.phase!=Failed", wait.args)
+        self.assertEqual(wait.kwargs["seconds"], 50)
+
+    def test_controller_rolls_only_through_new_operator(self):
+        self.assertFalse(any(name == "racer-controller" or role == "controller"
+                             for _, name, role, _ in rollout.ROLLOUT_TARGETS))
+        result = yaml.safe_load(rollout.transform_overrides(overrides())["racer.yaml"])
+        controller = result["overrides"][0]["patch"]["spec"]["template"]["spec"]["containers"][0]
+        self.assertEqual(controller["image"], rollout.IMAGES["controller"])
 
 
 class FirewallTest(unittest.TestCase):

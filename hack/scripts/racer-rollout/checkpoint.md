@@ -23,3 +23,19 @@ Next mutating phase: stage only hack/scripts/racer-rollout and commit
 Deadline: five minutes; heartbeat: command before/after; success: one commit,
 clean assigned branch. No live cluster writes, no image builds, no load changes.
 Parent retains the existing worktree for integration and executes README phases.
+
+2026-09-30T06:54:14Z: before follow-up apply_patch. Parent reports operator scaled
+to zero, with only old terminal pods left; previous wait timed out on those pods.
+Next: ignore terminal operator pods and defer controller image change until the
+new operator installs its wiring. Deadline three minutes, heartbeat each command,
+success focused tests and a new commit. No cluster writes by this worker.
+
+2026-09-30T06:55:00Z: follow-up implemented; all 13 tests passed via
+`timeout --signal=TERM --kill-after=10s 45s python3 -B -m unittest discover -s hack/scripts/racer-rollout -p 'test_*.py' -v`.
+`timeout --signal=TERM --kill-after=10s 15s git diff --check` passed.
+Required scoped make fmt (45s bound, same launcher scope recorded above) ran
+gofumpt; lint failed on the same Go export-data v4/v2 incompatibility. No Go edits.
+Next mutation: stage the four changed rollout files and create a new commit with
+`timeout --signal=TERM --kill-after=10s 60s git commit -m "fix(ops): ignore terminal pods and defer controller rollout"`.
+No cluster commands executed. Parent can continue writers with the fixed script;
+completed operator scale-down need not be repeated.

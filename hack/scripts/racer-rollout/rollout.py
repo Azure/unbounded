@@ -23,6 +23,17 @@ TOOLS = "ghcr.io/azure/racer-guard@sha256:8d8447cf368e245dcc9e276f1cad311496f2d2
 VOLUMES = {"guard-launch", "guard-socket", "stage47-code", "stage47-host", "stage47-lock"}
 INITS = {"guard-launch-copy", "underlay-guard"}
 CLEANUP = "racer-firewall-cleanup"
+ACTIVE_PODS = "status.phase!=Succeeded,status.phase!=Failed"
+ROLLOUT_TARGETS = (
+    ("deploy", "unbounded-operator", "operator", NS),
+    # The new operator installs controller wiring and the override image together.
+    ("ds", "racer-dataplane", "dataplane", NS),
+    ("ds", "racer-dataplane-podnet", "dataplane", NS),
+    ("ds", "gantry", "gantry", NS),
+    ("ds", "racer-loadgen", "loadgen", NS),
+    ("deploy", "racer-loadgen-client", "loadgen", NS),
+    ("ds", "racer-loadgen", "loadgen", "racer-loadgen"),
+)
 
 
 def guard_key(key):
@@ -141,8 +152,14 @@ class Runner:
         if operator["spec"].get("replicas", 1) != 0:
             raise RuntimeError("run stop first")
         pods = json.loads(self.kubectl("get", "pods", "-l", "app.kubernetes.io/name=unbounded-operator", "-o", "json"))
-        if pods["items"]:
+        if any(pod.get("status", {}).get("phase") not in ("Succeeded", "Failed") for pod in pods["items"]):
             raise RuntimeError("operator pods still present; inspect and finish stop")
+
+    def stop(self):
+        self.kubectl("scale", "deployment/unbounded-operator", "--replicas=0")
+        self.kubectl("wait", "--for=delete", "pod", "-l", "app.kubernetes.io/name=unbounded-operator",
+                     f"--field-selector={ACTIVE_PODS}", "--timeout=40s", seconds=50)
+        self.stopped()
 
     def configure(self):
         self.stopped()
@@ -191,9 +208,7 @@ def main():
     r.note(f"phase={args.phase} deadline=285s heartbeat<=60s before error=none")
     try:
         if args.phase == "stop":
-            r.kubectl("scale", "deployment/unbounded-operator", "--replicas=0")
-            r.kubectl("wait", "--for=delete", "pod", "-l", "app.kubernetes.io/name=unbounded-operator", "--timeout=40s", seconds=50)
-            r.stopped()
+            r.stop()
         elif args.phase == "writers":
             r.stopped()
             for target in ("deployment/racer-stage47-source-owner", "daemonset/racer-stage47-guard"):
@@ -213,16 +228,7 @@ def main():
         elif args.phase == "configure":
             r.configure()
         elif args.phase == "rollout":
-            for kind, name, role, ns in (
-                ("deploy", "unbounded-operator", "operator", NS),
-                ("deploy", "racer-controller", "controller", NS),
-                ("ds", "racer-dataplane", "dataplane", NS),
-                ("ds", "racer-dataplane-podnet", "dataplane", NS),
-                ("ds", "gantry", "gantry", NS),
-                ("ds", "racer-loadgen", "loadgen", NS),
-                ("deploy", "racer-loadgen-client", "loadgen", NS),
-                ("ds", "racer-loadgen", "loadgen", "racer-loadgen"),
-            ):
+            for kind, name, role, ns in ROLLOUT_TARGETS:
                 r.workload(kind, name, role, ns)
         elif args.phase == "start":
             operator = r.get("deploy", "unbounded-operator")

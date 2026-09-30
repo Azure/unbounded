@@ -6,6 +6,11 @@ Keep load at its existing C0 setting until the parent chooses to resume measurem
 The script never changes load settings, replica counts (except the operator),
 host/pod-network placement, tuning, durable identity, slabs, or unrelated overrides.
 All three existing loadgen workloads are pinned, including the separate namespace.
+Terminal operator pods (Succeeded/Failed, including old Evicted pods) do not block
+the stop phase; nonterminal pods still do. The rollout phase deliberately leaves
+the live racer-controller Deployment unchanged. After start, the new operator
+installs its controller token/CA wiring and the authoritative image override
+together, avoiding a new controller running with old wiring.
 
 Use the same state directory throughout. It holds timestamped command checkpoints
 and pre-change workload/ConfigMap backups (not Secrets). Every phase has a 285s
