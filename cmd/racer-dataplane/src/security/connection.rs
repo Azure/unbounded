@@ -532,7 +532,19 @@ pub(crate) mod tests {
         }
     }
     #[test]
-    pub(crate) fn loopback_mutual_authentication_pool_reuse_and_fresh_reconnect() {
+    fn concurrent_workers_complete_independent_connection_handshakes() {
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(loopback_mutual_authentication_pool_reuse_and_fresh_reconnect)
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn loopback_mutual_authentication_pool_reuse_and_fresh_reconnect() {
         let n = super::super::signing::tests::network(2);
         let admission = Rc::new(Admission::new(
             crate::test_support::cluster::config(false).limits,
@@ -645,7 +657,8 @@ pub(crate) mod tests {
             assert!(verify(&n[0], bad, Some(n[1].node()), "challenge", true).is_err());
         }
     }
-    pub(crate) fn handshake_codec_bounds() {
+    #[test]
+    fn handshake_codec_bounds() {
         let n = super::super::signing::tests::network(2);
         let h = head(
             &n[1],
