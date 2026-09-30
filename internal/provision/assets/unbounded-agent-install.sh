@@ -85,27 +85,28 @@ curl -fsSL "${AGENT_URL}" | tar -xz -C "${tmp_dir}" unbounded-agent
 AGENT_BIN="${tmp_dir}/unbounded-agent"
 chmod 0755 "${AGENT_BIN}"
 
-# Seed the daemon binary path for an agent released before the host root. The
-# agent version is selected independently of this script - by AGENT_VERSION, by
-# AGENT_URL, or by the default of tracking the latest published release - so it
-# may be one that never writes its own binary and looks for it at
-# /usr/local/bin. An agent that answers host-root installs itself under the host
-# root, and seeding /usr/local/bin for it would make a fresh host look like one
-# installed by an older agent.
+# Seed the daemon binary path used by agents up to v0.8.0. The agent version is
+# selected independently of this script - by AGENT_VERSION, by AGENT_URL, or by
+# the default of tracking the latest published release - so it may be one that
+# never writes its own binary and looks for it at /usr/local/bin.
+#
+# The seed is placed for every agent, because nothing here can tell them apart
+# without running the binary. A newer agent installs itself under
+# /opt/unbounded, does not count a lone binary here as an installation, and
+# removes it once the daemon is running.
+#
+# A read-only /usr/local/bin is not an error. Agents up to v0.8.0 do not
+# support such hosts, and newer agents do not need the seed.
 #
 # The test follows symlinks on purpose. On a host this installation already owns
 # the path resolves through the compatibility symlink to a live blue-green slot,
 # so it is left untouched and admission still runs from the staged executable
 # above. A dangling link resolves to nothing and is replaced, because install
 # would otherwise write through it to a stale location.
-if ! "${AGENT_BIN}" host-root >/dev/null 2>&1; then
-    AGENT_BIN_TARGET="/usr/local/bin/unbounded-agent"
-    if [ ! -x "${AGENT_BIN_TARGET}" ]; then
-        rm -f "${AGENT_BIN_TARGET}"
-        if ! install -m 0755 "${AGENT_BIN}" "${AGENT_BIN_TARGET}"; then
-            echo "unbounded-agent ${_version_desc} predates /opt/unbounded and needs a writable /usr/local/bin; use a newer release" >&2
-            exit 1
-        fi
+AGENT_BIN_TARGET="/usr/local/bin/unbounded-agent"
+if [ ! -x "${AGENT_BIN_TARGET}" ]; then
+    if ! { rm -f "${AGENT_BIN_TARGET}" && install -m 0755 "${AGENT_BIN}" "${AGENT_BIN_TARGET}"; } 2>/dev/null; then
+        echo "Not seeding ${AGENT_BIN_TARGET}: it is not writable. Only agents up to v0.8.0 use it."
     fi
 fi
 

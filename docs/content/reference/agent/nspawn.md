@@ -346,7 +346,7 @@ The container operates in the host's network namespace (`VirtualEthernet=no`):
 | `/etc/systemd/nspawn/<MachineName>.nspawn` | nspawn configuration file. |
 | `/etc/systemd/system/systemd-nspawn@<MachineName>.service.d/override.conf` | Systemd service override. |
 | `/etc/systemd/system/unbounded-agent-regenerate-config@<MachineName>.service` | Host-side retrying oneshot unit that regenerates host-side configuration before machine start. |
-| `/opt/unbounded/bin/unbounded-agent-nspawn-lifecycle` | Lifecycle command binary retained across daemon binary rollback. On a host installed by an earlier release, `/opt/unbounded` is a link to `/usr/local`. |
+| `/opt/unbounded/bin/unbounded-agent-nspawn-lifecycle` | Lifecycle command binary retained across daemon binary rollback. On a host installed by a release up to v0.8.0, `/opt/unbounded` is a link to `/usr/local` until the agent moves the files; see [Where the agent installs]({{< relref "guides/agent#where-the-agent-installs" >}}). |
 | `/run/host-nvidia/<index>/` | (Inside container) Read-only bind-mount of host NVIDIA library directories. |
 
 ## See Also

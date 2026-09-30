@@ -4,6 +4,9 @@
 package provision
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -45,22 +48,17 @@ func TestUnboundedAgentInstallScript(t *testing.T) {
 	require.Contains(t, script, "preflight ${_START_ARGS}")
 	require.Contains(t, script, "0|false|no|FALSE|NO|False|No")
 
-	// The installer must place the agent binary itself for an agent released
-	// before the host root. The agent version is selected independently of this
-	// script, including the default of tracking the latest published release,
-	// and such an agent never installs its own binary and looks for it at
+	// The installer must place the agent binary itself for an agent up to
+	// v0.8.0. The agent version is selected independently of this script,
+	// including the default of tracking the latest published release, and such
+	// an agent never installs its own binary and looks for it at
 	// /usr/local/bin.
 	require.Contains(t, script, `AGENT_BIN_TARGET="/usr/local/bin/unbounded-agent"`)
 	require.Contains(t, script, `install -m 0755 "${AGENT_BIN}" "${AGENT_BIN_TARGET}"`)
 
-	// Only for such an agent. One that answers host-root installs itself under
-	// the host root, and a binary seeded at /usr/local/bin would make the fresh
-	// host look like one installed by an older agent, which it migrates as one.
-	require.Contains(t, script, `if ! "${AGENT_BIN}" host-root >/dev/null 2>&1; then`)
-	require.Less(t,
-		strings.Index(script, `if ! "${AGENT_BIN}" host-root`),
-		strings.Index(script, `AGENT_BIN_TARGET="/usr/local/bin/unbounded-agent"`),
-		"the seeding must be inside the host-root check")
+	// The script never runs the downloaded binary to decide whether to seed.
+	// Asking it would make every later release answer the question.
+	require.NotContains(t, script, `"${AGENT_BIN}" host-root`)
 
 	// It must not clobber a live binary. The test follows symlinks so a host
 	// this installation already owns resolves through the compatibility symlink
@@ -79,6 +77,71 @@ func TestUnboundedAgentInstallScript(t *testing.T) {
 
 	// Whatever is staged must still be cleaned up.
 	require.Contains(t, script, `trap 'rm -rf "${tmp_dir}"' EXIT`)
+}
+
+// TestUnboundedAgentInstallScriptSeed runs the block of the install script that
+// seeds /usr/local/bin, with that directory moved under a temporary one.
+func TestUnboundedAgentInstallScriptSeed(t *testing.T) {
+	t.Parallel()
+
+	script := UnboundedAgentInstallScript()
+	start := strings.Index(script, `AGENT_BIN_TARGET="/usr/local/bin/unbounded-agent"`)
+	require.GreaterOrEqual(t, start, 0)
+
+	const end = "\n    fi\nfi\n"
+
+	length := strings.Index(script[start:], end)
+	require.Positive(t, length)
+
+	block := script[start : start+length+len(end)]
+
+	run := func(t *testing.T, binDir string) string {
+		t.Helper()
+
+		agent := filepath.Join(t.TempDir(), "unbounded-agent")
+		require.NoError(t, os.WriteFile(agent, []byte("#!/bin/sh\necho staged\n"), 0o755))
+
+		cmd := exec.Command("bash", "-eo", "pipefail", "-c", strings.ReplaceAll(block, "/usr/local/bin", binDir))
+
+		cmd.Env = append(os.Environ(), "AGENT_BIN="+agent)
+		out, err := cmd.CombinedOutput()
+		require.NoError(t, err, "the seed must never fail the install: %s", out)
+
+		return string(out)
+	}
+
+	t.Run("seeds a writable directory", func(t *testing.T) {
+		t.Parallel()
+
+		binDir := t.TempDir()
+		run(t, binDir)
+
+		got, err := os.ReadFile(filepath.Join(binDir, "unbounded-agent"))
+		require.NoError(t, err)
+		require.Contains(t, string(got), "echo staged")
+	})
+
+	t.Run("keeps an executable already there", func(t *testing.T) {
+		t.Parallel()
+
+		binDir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(binDir, "unbounded-agent"), []byte("#!/bin/sh\necho live\n"), 0o755))
+		run(t, binDir)
+
+		got, err := os.ReadFile(filepath.Join(binDir, "unbounded-agent"))
+		require.NoError(t, err)
+		require.Contains(t, string(got), "echo live")
+	})
+
+	// A directory that cannot be written to stands in for a read-only
+	// /usr/local/bin. A missing one fails the same way for root, which a
+	// permission bit would not.
+	t.Run("tolerates a directory it cannot write", func(t *testing.T) {
+		t.Parallel()
+
+		out := run(t, filepath.Join(t.TempDir(), "missing"))
+		require.Contains(t, out, "Not seeding")
+	})
 }
 
 func TestUnboundedAgentUninstallScript(t *testing.T) {

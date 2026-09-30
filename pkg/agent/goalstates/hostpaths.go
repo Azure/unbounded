@@ -80,17 +80,48 @@ func hostPathsUnder(root string) HostPaths {
 // under hostroot.LegacyPath identifies an unbounded-agent installation from
 // before the host root; pass them to hostroot.Migrate.
 //
-// They are the daemon's binary layout only. The installer scripts are written
-// under the legacy root on fresh hosts too, and a helper left behind by an
-// older reset is not an installation.
+// They are the daemon's blue-green binary layout only, which every released
+// agent since v0.1.4 creates when it installs. The plain binary is left out:
+// install scripts seed it under the legacy root on fresh hosts too, for agents
+// up to v0.8.0, so on its own it is not an installation. Neither are the
+// installer scripts, which cloud-init writes on fresh hosts, or a helper left
+// behind by an older reset.
 func HostRootMarkers() []string {
+	return []string{
+		filepath.Join("bin", daemonBinaryBlueName),
+		filepath.Join("bin", daemonBinaryGreenName),
+		filepath.Join("bin", daemonBinaryCurrentName),
+		filepath.Join("bin", daemonBinaryLastGoodName),
+	}
+}
+
+// LegacySeedFile returns where install scripts seed the agent binary for
+// agents up to v0.8.0, relative to hostroot.LegacyPath. Current agents do not
+// use it, and remove it from a host installed under the host root.
+func LegacySeedFile() string {
+	return filepath.Join("bin", daemonBinaryName)
+}
+
+// HostLayout returns every file of the agent's own host-side layout, relative
+// to the host root. Moving a host installed by an older agent copies these
+// from the legacy root.
+func HostLayout() []string {
 	return []string{
 		filepath.Join("bin", daemonBinaryName),
 		filepath.Join("bin", daemonBinaryBlueName),
 		filepath.Join("bin", daemonBinaryGreenName),
 		filepath.Join("bin", daemonBinaryCurrentName),
 		filepath.Join("bin", daemonBinaryLastGoodName),
+		filepath.Join("bin", nspawnLifecycleName),
+		filepath.Join("bin", daemonRecoveryScriptName),
+		filepath.Join("libexec", localDNSNetworkHelperName),
 	}
+}
+
+// LegacyLayoutFiles returns the agent's layout under hostroot.LegacyPath, for
+// removing it once a host has been moved to the host root.
+func LegacyLayoutFiles() []string {
+	return layoutFilesUnder(hostroot.LegacyPath)
 }
 
 // Base names of the installer scripts. The cloud-init variant and netboot write
@@ -128,23 +159,20 @@ func ownedHostFilesUnder(root, legacy string) []string {
 		files = append(files, layoutFilesUnder(legacy)...)
 	}
 
-	return append(files,
+	return append(
+		files,
 		filepath.Join(legacy, "bin", agentInstallScriptName),
 		filepath.Join(legacy, "bin", agentUninstallScriptName),
 	)
 }
 
 func layoutFilesUnder(root string) []string {
-	paths := hostPathsUnder(root)
+	layout := HostLayout()
 
-	return []string{
-		filepath.Join(paths.BinDir, daemonBinaryName),
-		filepath.Join(paths.BinDir, daemonBinaryBlueName),
-		filepath.Join(paths.BinDir, daemonBinaryGreenName),
-		filepath.Join(paths.BinDir, daemonBinaryCurrentName),
-		filepath.Join(paths.BinDir, daemonBinaryLastGoodName),
-		paths.NSpawnLifecycleBinary,
-		paths.DaemonRecoveryScript,
-		paths.LocalDNSNetworkHelper,
+	files := make([]string, 0, len(layout))
+	for _, rel := range layout {
+		files = append(files, filepath.Join(root, rel))
 	}
+
+	return files
 }

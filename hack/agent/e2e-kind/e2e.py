@@ -1376,6 +1376,12 @@ def read_daemon_last_good_target() -> str:
     return ssh_capture(_resolve_daemon_link(DAEMON_BINARY_LAST_GOOD)).strip()
 
 
+def _slot(path: str) -> str:
+    """Return which blue-green slot *path* is, whichever root it is under."""
+
+    return os.path.basename(path)
+
+
 def wait_for_daemon_current_target(expected_target: str, timeout_secs: int = 180) -> None:
     """Wait for the daemon current symlink to point to *expected_target*."""
 
@@ -1501,10 +1507,9 @@ def _build_failing_agent_tarball(tarball: Path) -> None:
 
 
 def _build_daemon_failing_agent_tarball(tarball: Path) -> None:
-    """Package an executable that passes preflight but fails as the daemon.
+    """Package an executable that passes verification but fails as the daemon.
 
-    It answers host-root the way a current agent does, resolving the host root
-    through any symlink, so that verification accepts it and the failure comes
+    It answers version, which is all verification runs, so the failure comes
     from the daemon.
     """
 
@@ -1516,32 +1521,8 @@ def _build_daemon_failing_agent_tarball(tarball: Path) -> None:
         "    echo unbounded-agent e2e-daemon-failing\n"
         "    exit 0\n"
         "fi\n"
-        "if [ \"${1:-}\" = \"host-root\" ]; then\n"
-        f"    readlink -m {HOST_ROOT}\n"
-        "    exit 0\n"
-        "fi\n"
         "echo failing upgraded agent daemon >&2\n"
         "exit 42\n",
-    )
-
-
-def _build_legacy_agent_tarball(tarball: Path) -> None:
-    """Package an executable that behaves like an agent released before the host root.
-
-    It answers version and has no host-root command, which is all verification
-    can see of the difference.
-    """
-
-    _build_script_agent_tarball(
-        tarball,
-        "agent-upgrade-legacy",
-        "#!/bin/sh\n"
-        "if [ \"${1:-}\" = \"version\" ]; then\n"
-        "    echo unbounded-agent e2e-legacy\n"
-        "    exit 0\n"
-        "fi\n"
-        "echo \"unknown command \\\"${1:-}\\\"\" >&2\n"
-        "exit 1\n",
     )
 
 
@@ -4815,7 +4796,7 @@ def validate_reset_cleanup() -> None:
     """
     log(f"Verifying reset removed the agent's files under {HOST_ROOT} and {LEGACY_HOST_ROOT}...")
 
-    must_be_absent = [HOST_ROOT]
+    must_be_absent = [HOST_ROOT, HOST_ROOT_STAGING]
     for root in (HOST_ROOT, LEGACY_HOST_ROOT):
         must_be_absent.extend([
             f"{root}/bin/unbounded-agent",
@@ -5328,7 +5309,15 @@ def validate_host_agent_upgrade() -> None:
 LEGACY_LAYOUT = [
     "unbounded-agent", "unbounded-agent-blue", "unbounded-agent-green",
     "unbounded-agent-current", "unbounded-agent-last-good",
+    "unbounded-agent-nspawn-lifecycle", "unbounded-agent-daemon-recovery.sh",
 ]
+
+# What moving a host from the legacy root leaves while it is under way: the
+# copy beside the host root, the marker inside it once it is in place, and the
+# record of agents that know the host root, which only a linked host keeps.
+HOST_ROOT_STAGING = f"{HOST_ROOT}.staging"
+HOST_ROOT_MOVING_MARKER = f"{HOST_ROOT}/.moving"
+HOST_ROOT_AGENTS = "/etc/unbounded/agent/host-root-agents"
 
 
 def _daemon_unit_runs(binary_dir: str) -> None:
@@ -5353,12 +5342,38 @@ def _log_selinux_denials() -> None:
             log(f"  {line}")
 
 
-def validate_host_root() -> None:
-    """Assert a host installed by this build keeps the agent under the host root.
+def _legacy_layout_present() -> list[str]:
+    """Return the agent files still present under the legacy root."""
 
-    Nothing may be installed under the legacy root: the install script seeds it
-    only for an agent released before the host root, and a fresh host that
-    carried the legacy layout would be migrated to it by the next agent.
+    paths = [f"{LEGACY_HOST_ROOT}/bin/{name}" for name in LEGACY_LAYOUT]
+    paths.append(f"{LEGACY_HOST_ROOT}/libexec/unbounded-localdns-network")
+    checks = " ; ".join(f'if [ -e "{p}" ] || [ -L "{p}" ]; then echo "{p}"; fi' for p in paths)
+    return ssh_capture(f"sudo sh -c '{checks}'").split()
+
+
+def _wait_for_legacy_layout_gone(timeout_secs: int = 120) -> None:
+    """Wait for the legacy root to hold none of the agent's files.
+
+    On a fresh host that is the binary the install script seeds for older
+    agents, which the daemon removes once it is running.
+    """
+
+    deadline = time.monotonic() + timeout_secs
+    while True:
+        present = _legacy_layout_present()
+        if not present:
+            return
+        if time.monotonic() > deadline:
+            die(f"agent files are still under the legacy root: {present}")
+        time.sleep(5)
+
+
+def validate_host_root() -> None:
+    """Assert the host keeps the agent under a real directory at the host root.
+
+    Nothing may be left under the legacy root. The install script seeds the
+    daemon binary there for agents up to v0.8.0, and the daemon removes it once
+    it is running, so this waits for that before it looks.
 
     On an SELinux host the directories the agent creates start with the label of
     /opt, which is not the one policy gives them, so they are checked against
@@ -5369,8 +5384,9 @@ def validate_host_root() -> None:
     if state != "dir":
         die(f"{HOST_ROOT} is {state!r}; a host installed by this build must have a real directory there")
 
+    _wait_for_legacy_layout_gone()
+
     bin_dir = resolve_on_host(DAEMON_BIN_DIR)
-    legacy = " ".join(f"{LEGACY_HOST_ROOT}/bin/{name}" for name in LEGACY_LAYOUT)
     script = textwrap.dedent(f"""
         set -eu
         for d in {HOST_ROOT} {HOST_ROOT}/bin {HOST_ROOT}/libexec; do
@@ -5382,8 +5398,8 @@ def validate_host_root() -> None:
             {bin_dir}/*) ;;
             *) echo "current binary $current is not under {bin_dir}"; exit 1 ;;
         esac
-        for f in {legacy}; do
-            if [ -e "$f" ] || [ -L "$f" ]; then echo "$f exists under the legacy root"; exit 1; fi
+        for f in {HOST_ROOT_STAGING} {HOST_ROOT_MOVING_MARKER}; do
+            if [ -e "$f" ]; then echo "$f is left from a move"; exit 1; fi
         done
         if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled && command -v restorecon >/dev/null 2>&1; then
             relabel=$(restorecon -nvR {HOST_ROOT})
@@ -5414,17 +5430,19 @@ def validate_host_root_legacy() -> None:
     log(f"Legacy layout is installed under {LEGACY_HOST_ROOT}")
 
 
-def validate_host_root_migrated() -> None:
+def validate_host_root_linked() -> None:
     """Assert the host root is linked to the legacy root and the layout is unchanged.
 
-    The link is all the migration adds. The units and the recovery script keep
-    naming the legacy paths, so an older agent rolled back to still finds its
-    files, and the slots compare equal to the targets the older agent wrote.
+    While the current or last-good binary is an agent released before the host
+    root, the host keeps its files under the legacy root and only gains the
+    link. The units and the recovery script keep naming the legacy paths, so an
+    older agent rolled back to still finds its files, and the slots compare
+    equal to the targets the older agent wrote.
     """
 
     state = host_root_state()
     if state != f"link:{LEGACY_HOST_ROOT}":
-        die(f"{HOST_ROOT} is {state!r}; a migrated host must link it to {LEGACY_HOST_ROOT}")
+        die(f"{HOST_ROOT} is {state!r}; a host with an older agent in a slot must link it to {LEGACY_HOST_ROOT}")
 
     current = read_daemon_current_target()
     if not current.startswith(f"{LEGACY_HOST_ROOT}/bin/"):
@@ -5433,6 +5451,73 @@ def validate_host_root_migrated() -> None:
     _daemon_unit_runs(f"{LEGACY_HOST_ROOT}/bin")
     _log_selinux_denials()
     log(f"{HOST_ROOT} links to {LEGACY_HOST_ROOT}, and the legacy layout is unchanged")
+
+
+def _daemon_executable() -> str:
+    """Return the resolved executable of the running daemon, or ''."""
+
+    return ssh_capture_quiet(
+        "sudo sh -c 'pid=$(systemctl show -p MainPID --value unbounded-agent-daemon.service); "
+        '[ "${pid:-0}" -gt 0 ] && readlink -f /proc/$pid/exe\''
+    ).stdout.strip()
+
+
+def validate_host_root_moved() -> None:
+    """Assert a host an older agent installed has been moved to the host root.
+
+    The daemon moves the files once neither the current nor the last-good binary
+    predates the host root, which is at the first start after the AgentUpgrade
+    that follows the last older agent out of the slots. It rewrites the units,
+    removes the legacy files, and restarts itself from the host root.
+    """
+
+    log(f"Waiting for the agent's files to move to {HOST_ROOT}...")
+    deadline = time.monotonic() + 300
+    while True:
+        state = host_root_state()
+        moving = ssh_capture_quiet(f"sudo test -e {HOST_ROOT_MOVING_MARKER}").returncode == 0
+        if state == "dir" and not moving:
+            break
+        if time.monotonic() > deadline:
+            die(f"{HOST_ROOT} is {state!r}{' with the move unfinished' if moving else ''}; "
+                "the host was not moved to the host root")
+        time.sleep(5)
+
+    bin_dir = resolve_on_host(DAEMON_BIN_DIR)
+
+    log("Waiting for the daemon to run from the host root...")
+    deadline = time.monotonic() + 180
+    while True:
+        executable = _daemon_executable()
+        if executable.startswith(f"{bin_dir}/"):
+            break
+        if time.monotonic() > deadline:
+            die(f"daemon runs {executable!r}, not a binary under {bin_dir}")
+        time.sleep(5)
+
+    validate_host_root()
+
+    last_good = read_daemon_last_good_target()
+    if not last_good.startswith(f"{bin_dir}/"):
+        die(f"last-good binary resolves to {last_good!r}, not under {bin_dir}")
+
+    helper = f"{bin_dir}/unbounded-agent-nspawn-lifecycle"
+    hooks = ssh_capture_quiet(
+        "sudo sh -c 'grep -h nspawn-lifecycle "
+        "/etc/systemd/system/systemd-nspawn@*.service.d/override.conf "
+        "/etc/systemd/system/unbounded-agent-regenerate-config@*.service 2>/dev/null'"
+    ).stdout.splitlines()
+    if not hooks:
+        die("found no nspawn lifecycle hooks in the machine's units")
+    stale = [line for line in hooks if helper not in line]
+    if stale:
+        die(f"nspawn lifecycle hooks do not all run {helper}: {stale}")
+
+    if ssh_capture_quiet(f"sudo test -e {HOST_ROOT_AGENTS}").returncode == 0:
+        die(f"{HOST_ROOT_AGENTS} is only kept while the host root is linked")
+
+    wait_for_node_ready(AGENT_MACHINE_NAME)
+    log(f"The agent's files moved from {LEGACY_HOST_ROOT} to {HOST_ROOT}, and the units follow them")
 
 
 def run_legacy_agent(node_config: NodeConfig) -> None:
@@ -5498,9 +5583,11 @@ def _download_legacy_agent_tarball() -> Path:
 def validate_agent_downgrade_to_legacy() -> None:
     """Validate AgentUpgrade back to the last release before the host root.
 
-    On a migrated host the host root is the legacy root, which every agent finds,
-    so this is an ordinary upgrade. What it proves is that the migration left
-    nothing an older agent cannot run with.
+    It runs while the host is still linked to the legacy root, where every agent
+    finds its files, so this is an ordinary upgrade. What it proves is that the
+    link left nothing an older agent cannot run with, and that the host is not
+    moved while the older agent could still be rolled back to. After the move
+    this is not supported, and not checked.
     """
 
     before_current = read_daemon_current_target()
@@ -5520,7 +5607,7 @@ def validate_agent_downgrade_to_legacy() -> None:
     if LEGACY_AGENT_VERSION.lstrip("v") not in version_output:
         die(f"current daemon is not {LEGACY_AGENT_VERSION}: {version_output!r}")
 
-    validate_host_root_migrated()
+    validate_host_root_linked()
     wait_for_node_ready(AGENT_MACHINE_NAME)
     log("============================================")
     log(f"  Downgrade to {LEGACY_AGENT_VERSION} validation PASSED")
@@ -5553,9 +5640,12 @@ def validate_agent_upgrade_operation() -> None:
     log(f"Current daemon binary after upgrade: {after_current}")
     log(f"Last-good daemon binary after upgrade: {last_good}")
 
-    if after_current == before_current:
+    # Slots are compared by name. On a host an older agent installed, the
+    # daemon this upgrade starts may move the files from the legacy root to the
+    # host root, which changes the directory but not which slot is which.
+    if _slot(after_current) == _slot(before_current):
         die(f"AgentUpgrade did not switch the daemon current symlink (still points to {after_current})")
-    if last_good != before_current:
+    if _slot(last_good) != _slot(before_current):
         die(f"last-good symlink mismatch: got {last_good!r}, expected {before_current!r}")
 
     log("============================================")
@@ -5586,22 +5676,6 @@ def validate_agent_upgrade_rollback() -> None:
         die(f"unexpected broken AgentUpgrade failure message: {broken_status.get('message')!r}")
     if read_daemon_current_target() != previous_good:
         die("broken AgentUpgrade changed current daemon binary symlink")
-
-    # An agent released before the host root would look for its files under the
-    # legacy root, where a host installed under the host root has none. On a
-    # host linked to the legacy root every agent finds them, so the check only
-    # applies here.
-    if host_root_state() == "dir":
-        legacy_operation_name = f"e2e-agent-upgrade-legacy-{int(time.time())}"
-        legacy_tarball = VM_DIR / "unbounded-agent-upgrade-legacy.tar.gz"
-        _build_legacy_agent_tarball(legacy_tarball)
-        legacy_operation = _serve_agent_upgrade_tarball(
-            legacy_tarball, legacy_operation_name, expect_complete=False)
-        legacy_message = legacy_operation.get("status", {}).get("message", "")
-        if "predates the host root" not in legacy_message:
-            die(f"AgentUpgrade to an agent without host-root was not refused: {legacy_message!r}")
-        if read_daemon_current_target() != previous_good:
-            die("refused AgentUpgrade changed current daemon binary symlink")
 
     operation_name = f"e2e-agent-upgrade-rollback-{int(time.time())}"
     tarball = VM_DIR / "unbounded-agent-upgrade-daemon-bad.tar.gz"
@@ -6171,15 +6245,18 @@ SUITES: dict[str, list[str]] = {
                   "validate-node-reboot-operation", "validate-workload", "validate-node-repave-upgrade"],
     "configuration": ["validate-node-configs"],
     "fresh-bootstrap": ["run-agent", "wait-for-node", "validate-workload"],
-    # A host installed before the host root: the first upgrade links the host
-    # root to the legacy root, the host keeps working across a reboot, upgrades
-    # and a return to the older release, and reset removes the link with the
-    # files.
+    # A host installed before the host root. The first upgrade links the host
+    # root to the legacy root and leaves the files there, because the older
+    # release is still last-good. The host keeps working across a reboot and a
+    # return to the older release. The upgrade after the one that follows the
+    # older release out of the slots moves the files to the host root, and the
+    # moved host survives a reboot and resets cleanly.
     "migration": ["run-legacy-agent", "wait-for-node", "validate-host-root-legacy",
-                  "validate-agent-upgrade-operation", "validate-host-root-migrated", "validate-host-reboot",
-                  "validate-agent-upgrade-operation", "validate-host-root-migrated",
-                  "validate-agent-downgrade-to-legacy", "validate-agent-upgrade-operation",
-                  "validate-host-root-migrated", "reset-agent"],
+                  "validate-agent-upgrade-operation", "validate-host-root-linked", "validate-host-reboot",
+                  "validate-host-root-linked", "validate-agent-downgrade-to-legacy",
+                  "validate-agent-upgrade-operation", "validate-host-root-linked",
+                  "validate-agent-upgrade-operation", "validate-host-root-moved", "validate-host-reboot",
+                  "validate-host-root", "reset-agent"],
     "bootstrap-recovery": ["run-agent-recovery", "wait-for-node", "validate-workload",
                            "validate-node-repave-upgrade", "validate-bootstrap-repair"],
 }
@@ -6262,7 +6339,8 @@ COMMANDS: dict[str, Command] = {
     "reset-agent": _without_node_config(reset_agent),
     "validate-host-root": _without_node_config(validate_host_root),
     "validate-host-root-legacy": _without_node_config(validate_host_root_legacy),
-    "validate-host-root-migrated": _without_node_config(validate_host_root_migrated),
+    "validate-host-root-linked": _without_node_config(validate_host_root_linked),
+    "validate-host-root-moved": _without_node_config(validate_host_root_moved),
     "run-legacy-agent": run_legacy_agent,
     "validate-agent-downgrade-to-legacy": _without_node_config(validate_agent_downgrade_to_legacy),
     "cleanup": _without_node_config(cleanup),

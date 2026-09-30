@@ -96,10 +96,14 @@ The `migration` suite starts from a host installed by the last release before
 the host root, `LEGACY_AGENT_VERSION` (default `v0.8.0`), fetched from its
 GitHub release by the install script. An AgentUpgrade to this build must link
 `/opt/unbounded` to `/usr/local` and leave that release's layout and units as
-they were. The host then reboots, upgrades again, returns to the older release,
-and upgrades once more before a reset, which must remove the link along with
-the files. The older release cannot be installed on an immutable host, so the
-suite needs a cloud-init host:
+they were, because the older release is now last-good and a rollback needs
+them. The host then reboots, returns to the older release, and upgrades to this
+build again, staying linked throughout. The next upgrade leaves no older release
+in either slot, and the daemon it starts must move the files into a real
+`/opt/unbounded`, point the units at them, remove them from `/usr/local`, and
+restart itself from there. The moved host reboots, then resets, which must
+leave neither root behind. The older release cannot be installed on an
+immutable host, so the suite needs a cloud-init host:
 
 ```sh
 HOST_BASE_OS=ubuntu2404 E2E_SUITE=migration KEEP_ENV=1 \

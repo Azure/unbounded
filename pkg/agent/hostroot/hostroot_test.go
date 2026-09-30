@@ -15,7 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var testMarkers = []string{"bin/unbounded-agent", "bin/unbounded-agent-current"}
+var testMarkers = []string{"bin/unbounded-agent-blue", "bin/unbounded-agent-current"}
 
 type layout struct {
 	root, legacy string
@@ -82,7 +82,7 @@ func TestMigrate(t *testing.T) {
 		},
 		{
 			name:     "legacy installation is linked",
-			setup:    func(t *testing.T, l layout) { touch(t, filepath.Join(l.legacy, "bin/unbounded-agent")) },
+			setup:    func(t *testing.T, l layout) { touch(t, filepath.Join(l.legacy, "bin/unbounded-agent-blue")) },
 			wantLink: true,
 		},
 		{
@@ -99,17 +99,32 @@ func TestMigrate(t *testing.T) {
 			setup: func(t *testing.T, l layout) { touch(t, filepath.Join(l.legacy, "bin/unbounded-agent-install.sh")) },
 		},
 		{
+			// Install scripts seed the plain binary for agents up to v0.8.0
+			// on every host that allows it.
+			name:  "a seeded binary on its own is not an installation",
+			setup: func(t *testing.T, l layout) { touch(t, filepath.Join(l.legacy, "bin/unbounded-agent")) },
+		},
+		{
+			name: "a move that has not finished is left to finish",
+			setup: func(t *testing.T, l layout) {
+				touch(t, filepath.Join(l.root, "bin/unbounded-agent-blue"))
+				touch(t, filepath.Join(l.root, movingMarker))
+				touch(t, filepath.Join(l.legacy, "bin/unbounded-agent-blue"))
+			},
+			wantDir: true,
+		},
+		{
 			name: "a new installation is left alone",
 			setup: func(t *testing.T, l layout) {
-				touch(t, filepath.Join(l.root, "bin/unbounded-agent"))
+				touch(t, filepath.Join(l.root, "bin/unbounded-agent-blue"))
 			},
 			wantDir: true,
 		},
 		{
 			name: "installations under both roots are refused",
 			setup: func(t *testing.T, l layout) {
-				touch(t, filepath.Join(l.root, "bin/unbounded-agent"))
-				touch(t, filepath.Join(l.legacy, "bin/unbounded-agent"))
+				touch(t, filepath.Join(l.root, "bin/unbounded-agent-blue"))
+				touch(t, filepath.Join(l.legacy, "bin/unbounded-agent-blue"))
 			},
 			wantErr: "installed under both",
 			wantDir: true,
@@ -118,7 +133,7 @@ func TestMigrate(t *testing.T) {
 			name: "a legacy installation beside an empty root directory is refused",
 			setup: func(t *testing.T, l layout) {
 				require.NoError(t, os.MkdirAll(l.root, 0o755))
-				touch(t, filepath.Join(l.legacy, "bin/unbounded-agent"))
+				touch(t, filepath.Join(l.legacy, "bin/unbounded-agent-blue"))
 			},
 			wantErr: "also exists",
 			wantDir: true,
@@ -126,7 +141,7 @@ func TestMigrate(t *testing.T) {
 		{
 			name: "a migrated host stays migrated",
 			setup: func(t *testing.T, l layout) {
-				touch(t, filepath.Join(l.legacy, "bin/unbounded-agent"))
+				touch(t, filepath.Join(l.legacy, "bin/unbounded-agent-blue"))
 				require.NoError(t, os.MkdirAll(filepath.Dir(l.root), 0o755))
 				require.NoError(t, os.Symlink(l.legacy, l.root))
 			},
@@ -224,7 +239,7 @@ func TestPlanned(t *testing.T) {
 		t.Parallel()
 
 		l := newLayout(t)
-		touch(t, filepath.Join(l.legacy, "bin/unbounded-agent"))
+		touch(t, filepath.Join(l.legacy, "bin/unbounded-agent-blue"))
 		assert.Equal(t, canonical(l.legacy), planned(l.root, l.legacy, testMarkers))
 		_, err := os.Lstat(l.root)
 		assert.ErrorIs(t, err, os.ErrNotExist, "planning must not change the host")
@@ -234,7 +249,7 @@ func TestPlanned(t *testing.T) {
 		t.Parallel()
 
 		l := newLayout(t)
-		touch(t, filepath.Join(l.legacy, "bin/unbounded-agent"))
+		touch(t, filepath.Join(l.legacy, "bin/unbounded-agent-blue"))
 		require.NoError(t, migrate(discard(), l.root, l.legacy, testMarkers))
 		assert.Equal(t, canonical(l.legacy), planned(l.root, l.legacy, testMarkers))
 	})
@@ -266,7 +281,7 @@ func TestPrepareLeavesAMigratedHostAlone(t *testing.T) {
 	t.Parallel()
 
 	l := newLayout(t)
-	touch(t, filepath.Join(l.legacy, "bin/unbounded-agent"))
+	touch(t, filepath.Join(l.legacy, "bin/unbounded-agent-blue"))
 	require.NoError(t, migrate(discard(), l.root, l.legacy, testMarkers))
 
 	relabeled := false
@@ -326,6 +341,23 @@ func TestRemove(t *testing.T) {
 			wantRoot:   true,
 			wantLegacy: true,
 		},
+		{
+			name: "an unfinished move's marker does not keep the root",
+			setup: func(t *testing.T, l layout) {
+				require.NoError(t, os.MkdirAll(filepath.Join(l.root, "bin"), 0o755))
+				touch(t, filepath.Join(l.root, movingMarker))
+			},
+			wantLegacy: true,
+		},
+		{
+			name: "a staging copy is removed with the link",
+			setup: func(t *testing.T, l layout) {
+				require.NoError(t, os.MkdirAll(filepath.Dir(l.root), 0o755))
+				require.NoError(t, os.Symlink(l.legacy, l.root))
+				touch(t, filepath.Join(l.root+stagingSuffix, "bin/unbounded-agent-blue"))
+			},
+			wantLegacy: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -339,6 +371,9 @@ func TestRemove(t *testing.T) {
 
 			_, err := os.Lstat(l.root)
 			assert.Equal(t, tt.wantRoot, err == nil, "root present")
+
+			_, err = os.Lstat(l.root + stagingSuffix)
+			assert.ErrorIs(t, err, os.ErrNotExist, "a staging copy never survives reset")
 
 			_, err = os.Stat(filepath.Join(l.legacy, "bin"))
 			assert.Equal(t, tt.wantLegacy, err == nil, "legacy root untouched")

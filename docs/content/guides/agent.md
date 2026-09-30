@@ -202,21 +202,45 @@ The agent keeps its own host-side files under `/opt/unbounded`: the daemon
 binaries and helper scripts in `/opt/unbounded/bin`, and the LocalDNS network
 helper in `/opt/unbounded/libexec`. Paths inside the nspawn machine are always
 relative to the machine directory, and `/etc/unbounded/agent` and
-`/var/lib/unbounded` are separate.
+`/var/lib/unbounded` are separate. `/opt/unbounded/bin` is not on the default
+`PATH`, so run the agent on the host as `/opt/unbounded/bin/unbounded-agent`.
 
-Earlier releases installed these files under `/usr/local`. On a host installed
-by one of them, the first command of a newer agent that changes the host links
-`/opt/unbounded` to `/usr/local`. That happens when the daemon starts after an
-AgentUpgrade, or when `start` or `agent-upgrade` runs. The files stay where
-they are and the units that run them are unchanged, so the host can still be
-returned to the earlier release. `unbounded-agent reset` removes the agent's
-files from both locations, and the link.
+Releases up to v0.8.0 installed these files under `/usr/local`. A host installed
+by one of them moves to `/opt/unbounded` in two stages:
+
+1. **Linked.** The first command of a newer agent that changes the host links
+   `/opt/unbounded` to `/usr/local`. That happens when the daemon starts after
+   an AgentUpgrade, when `start` or `agent-upgrade` runs, or when an nspawn
+   lifecycle hook runs. The files stay where they are and the units that run
+   them are unchanged. The older release is still the last-good binary, so the
+   daemon can roll back to it, and an AgentUpgrade back to it works.
+2. **Moved.** Once neither the current nor the last-good binary is from v0.8.0
+   or earlier, the daemon copies the files into a real `/opt/unbounded`,
+   rewrites the units to use them, removes them from `/usr/local`, and restarts
+   itself. That is at the first daemon start after the AgentUpgrade that
+   follows the older release out of the last-good slot. To move a host that is
+   not due another upgrade, apply the release it already runs as an
+   AgentUpgrade. A move that is interrupted is finished or started over at the
+   next daemon start.
+
+`unbounded-agent reset` removes the agent's files from both locations, and the
+link or the directory, at any stage.
+
+After the move, releases up to v0.8.0 cannot run on the host, and an
+AgentUpgrade to one is not supported. Nothing refuses it: the operation reports
+success, and the next AgentUpgrade fails because that release looks for its
+files under `/usr/local`. To recover, copy a newer release's `unbounded-agent`
+binary to the host and run `sudo ./unbounded-agent agent-upgrade` with it, or
+run `sudo ./unbounded-agent reset` with it and bootstrap the host again.
 
 The agent refuses to run on a host that has an installation under both
 locations, or an installation under `/usr/local` beside an existing
-`/opt/unbounded` directory. Run `unbounded-agent reset` first. On a host
-installed under `/opt/unbounded`, an AgentUpgrade to an earlier release is
-refused, because that release would look for its files under `/usr/local`.
+`/opt/unbounded` directory, except while a move between them is under way. Run
+`unbounded-agent reset` first.
+
+The install script also places the agent binary at
+`/usr/local/bin/unbounded-agent` where it can, because releases up to v0.8.0
+look for it there. Newer releases do not use it, and the daemon removes it.
 
 ### Immutable hosts (read-only /usr)
 

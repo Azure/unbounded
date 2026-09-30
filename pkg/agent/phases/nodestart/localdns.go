@@ -112,13 +112,40 @@ func (s *setupLocalDNSNetwork) Do(ctx context.Context) error {
 		return nil
 	}
 
+	if err := WriteLocalDNSNetworkFiles(s.goalState); err != nil {
+		return err
+	}
+
+	if err := executil.RunCmd(ctx, s.log, executil.Systemctl(), "daemon-reload"); err != nil {
+		return fmt.Errorf("reload systemd for LocalDNS: %w", err)
+	}
+
+	if err := executil.RunCmd(ctx, s.log, executil.Systemctl(), "restart", goalstates.LocalDNSNetworkUnit); err != nil {
+		return fmt.Errorf("start LocalDNS network unit: %w", err)
+	}
+
+	return nil
+}
+
+// WriteLocalDNSNetworkFiles writes the LocalDNS network helper under the host
+// root, the unit that runs it, and the nspawn ordering drop-in, without
+// reloading systemd or running the unit. It does nothing when LocalDNS is
+// disabled.
+//
+// Moving a host to the host root uses it on its own: the unit has to name the
+// helper's new path, but the network it configures is already in place.
+func WriteLocalDNSNetworkFiles(goalState *goalstates.NodeStart) error {
+	if !goalState.LocalDNS.Enabled {
+		return nil
+	}
+
 	// The unit names the helper, so both are written from one resolution.
 	helper := goalstates.ResolveHostPaths().LocalDNSNetworkHelper
 
 	data := map[string]string{
-		"MachineName":       s.goalState.MachineName,
-		"NodeListenerIP":    s.goalState.LocalDNS.NodeListenerIP.String(),
-		"ClusterListenerIP": s.goalState.LocalDNS.ClusterListenerIP.String(),
+		"MachineName":       goalState.MachineName,
+		"NodeListenerIP":    goalState.LocalDNS.NodeListenerIP.String(),
+		"ClusterListenerIP": goalState.LocalDNS.ClusterListenerIP.String(),
 		"NetworkHelper":     helper,
 	}
 
@@ -143,17 +170,9 @@ func (s *setupLocalDNSNetwork) Do(ctx context.Context) error {
 
 	dropIn := []byte("[Unit]\nRequires=" + goalstates.LocalDNSNetworkUnit + "\nAfter=" + goalstates.LocalDNSNetworkUnit + "\n")
 
-	dropInPath := filepath.Join(goalstates.SystemdSystemDir, "systemd-nspawn@"+s.goalState.MachineName+".service.d", "10-localdns.conf")
+	dropInPath := filepath.Join(goalstates.SystemdSystemDir, "systemd-nspawn@"+goalState.MachineName+".service.d", "10-localdns.conf")
 	if err := utilio.WriteFile(dropInPath, dropIn, 0o644); err != nil {
 		return fmt.Errorf("write LocalDNS nspawn ordering: %w", err)
-	}
-
-	if err := executil.RunCmd(ctx, s.log, executil.Systemctl(), "daemon-reload"); err != nil {
-		return fmt.Errorf("reload systemd for LocalDNS: %w", err)
-	}
-
-	if err := executil.RunCmd(ctx, s.log, executil.Systemctl(), "restart", goalstates.LocalDNSNetworkUnit); err != nil {
-		return fmt.Errorf("start LocalDNS network unit: %w", err)
 	}
 
 	return nil

@@ -38,7 +38,6 @@ func TestLegacyHostPathsMatchTheReleasedLayout(t *testing.T) {
 	assert.Equal(t, "/usr/local/libexec/unbounded-localdns-network", legacy.LocalDNSNetworkHelper)
 
 	for _, pinned := range []string{
-		DaemonBinaryPath,         //nolint:staticcheck // The released value is what is being pinned.
 		DaemonBinaryBluePath,     //nolint:staticcheck // The released value is what is being pinned.
 		DaemonBinaryGreenPath,    //nolint:staticcheck // The released value is what is being pinned.
 		DaemonBinaryCurrentPath,  //nolint:staticcheck // The released value is what is being pinned.
@@ -46,7 +45,16 @@ func TestLegacyHostPathsMatchTheReleasedLayout(t *testing.T) {
 	} {
 		rel, err := filepath.Rel("/usr/local", pinned)
 		assert.NoError(t, err)
-		assert.Contains(t, HostRootMarkers(), rel, "a released binary path must identify a legacy installation")
+		assert.Contains(t, HostRootMarkers(), rel, "a released slot path must identify a legacy installation")
+	}
+
+	seed, err := filepath.Rel("/usr/local", DaemonBinaryPath) //nolint:staticcheck // The released value is what is being pinned.
+	assert.NoError(t, err)
+	assert.Equal(t, seed, LegacySeedFile(), "install scripts seed the path released agents look for")
+
+	legacyLayout := LegacyLayoutFiles()
+	for _, rel := range HostLayout() {
+		assert.Contains(t, legacyLayout, filepath.Join("/usr/local", rel))
 	}
 }
 
@@ -58,9 +66,14 @@ func TestHostRootMarkersAreTheBinaryLayout(t *testing.T) {
 
 	markers := HostRootMarkers()
 
-	assert.Len(t, markers, 5)
+	assert.Len(t, markers, 4)
 	assert.NotContains(t, markers, filepath.Join("bin", agentInstallScriptName), "cloud-init writes it on fresh hosts")
 	assert.NotContains(t, markers, filepath.Join("bin", nspawnLifecycleName), "an older reset can leave it behind")
+	assert.NotContains(t, markers, LegacySeedFile(), "install scripts seed it on fresh hosts")
+
+	for _, marker := range markers {
+		assert.Contains(t, HostLayout(), marker, "a marker is part of the layout a move copies")
+	}
 }
 
 func TestOwnedHostFilesUnder(t *testing.T) {

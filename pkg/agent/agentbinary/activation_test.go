@@ -14,8 +14,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/Azure/unbounded/pkg/agent/hostroot"
 )
 
 type fakeDaemonService struct {
@@ -103,7 +101,7 @@ func TestPreflightHostDaemonActivationInitialLayoutDoesNotMutate(t *testing.T) {
 	dir := t.TempDir()
 	layout := testActivationLayout(dir)
 	legacy := []byte("#!/bin/sh\nexit 0\n")
-	candidate := []byte(candidateAgent())
+	candidate := []byte("#!/bin/sh\n[ \"$1\" = version ]\n")
 
 	require.NoError(t, os.WriteFile(layout.BinaryPath, legacy, 0o755))
 
@@ -136,7 +134,7 @@ func TestPreflightHostDaemonActivationInitialLayoutDoesNotMutate(t *testing.T) {
 func TestPreflightHostDaemonActivationRejectsUnstagedCandidate(t *testing.T) {
 	dir := t.TempDir()
 	layout := testActivationLayout(dir)
-	writeExecutable(t, layout.BinaryPath, candidateAgent())
+	writeExecutable(t, layout.BinaryPath, "#!/bin/sh\n[ \"$1\" = version ]\n")
 
 	_, err := PreflightHostDaemonActivation(context.Background(), ActivationOptions{
 		Layout:        layout,
@@ -157,7 +155,7 @@ func TestPreflightHostDaemonActivationRejectsAliasedTargetSlot(t *testing.T) {
 	require.NoError(t, os.Symlink(layout.CurrentPath, layout.BinaryPath))
 
 	candidatePath := filepath.Join(dir, "candidate")
-	writeExecutable(t, candidatePath, candidateAgent())
+	writeExecutable(t, candidatePath, "#!/bin/sh\n[ \"$1\" = version ]\n")
 
 	_, err := PreflightHostDaemonActivation(context.Background(), ActivationOptions{
 		Layout:        layout,
@@ -172,7 +170,7 @@ func TestActivateHostDaemonInitializesAndActivatesCandidate(t *testing.T) {
 	dir := t.TempDir()
 	layout := testActivationLayout(dir)
 	legacy := []byte("#!/bin/sh\nexit 0\n")
-	candidate := []byte(candidateAgent())
+	candidate := []byte("#!/bin/sh\n[ \"$1\" = version ]\n")
 
 	require.NoError(t, os.WriteFile(layout.BinaryPath, legacy, 0o755))
 
@@ -204,7 +202,7 @@ func TestActivateHostDaemonAdoptsCurrentLinkToSingleBinary(t *testing.T) {
 	dir := t.TempDir()
 	layout := testActivationLayout(dir)
 	legacy := []byte("#!/bin/sh\nexit 0\n")
-	candidate := []byte(candidateAgent())
+	candidate := []byte("#!/bin/sh\n[ \"$1\" = version ]\n")
 
 	require.NoError(t, os.WriteFile(layout.BinaryPath, legacy, 0o755))
 	require.NoError(t, os.Symlink(layout.BinaryPath, layout.CurrentPath))
@@ -232,7 +230,7 @@ func TestActivateHostDaemonRepairsMissingCurrentLink(t *testing.T) {
 	dir := t.TempDir()
 	layout := testActivationLayout(dir)
 	legacy := []byte("#!/bin/sh\nexit 0\n")
-	candidate := []byte(candidateAgent())
+	candidate := []byte("#!/bin/sh\n[ \"$1\" = version ]\n")
 
 	require.NoError(t, os.WriteFile(layout.BluePath, legacy, 0o755))
 	require.NoError(t, os.Symlink(layout.BluePath, layout.LastGoodPath))
@@ -265,7 +263,7 @@ func TestActivateHostDaemonSwitchesExistingLayout(t *testing.T) {
 	require.NoError(t, os.Symlink(layout.CurrentPath, layout.BinaryPath))
 
 	candidatePath := filepath.Join(dir, "candidate")
-	writeExecutable(t, candidatePath, candidateAgent())
+	writeExecutable(t, candidatePath, "#!/bin/sh\n[ \"$1\" = version ]\n")
 
 	service := &fakeDaemonService{}
 	result, err := ActivateHostDaemon(context.Background(), discardLogger(), ActivationOptions{
@@ -294,7 +292,7 @@ func TestActivateHostDaemonRejectsDirectoryDestinationDuringPreflight(t *testing
 	require.NoError(t, os.Mkdir(layout.BinaryPath, 0o755))
 
 	candidatePath := filepath.Join(dir, "candidate")
-	writeExecutable(t, candidatePath, candidateAgent())
+	writeExecutable(t, candidatePath, "#!/bin/sh\n[ \"$1\" = version ]\n")
 
 	service := &fakeDaemonService{}
 	_, err := ActivateHostDaemon(context.Background(), discardLogger(), ActivationOptions{
@@ -319,7 +317,7 @@ func TestActivateHostDaemonAllowsMissingCompatibilityPath(t *testing.T) {
 	require.NoError(t, os.Symlink(layout.BluePath, layout.LastGoodPath))
 
 	candidatePath := filepath.Join(dir, "candidate")
-	writeExecutable(t, candidatePath, candidateAgent())
+	writeExecutable(t, candidatePath, "#!/bin/sh\n[ \"$1\" = version ]\n")
 
 	result, err := ActivateHostDaemon(context.Background(), discardLogger(), ActivationOptions{
 		Layout:        layout,
@@ -336,7 +334,7 @@ func TestActivateHostDaemonAllowsMissingCompatibilityPath(t *testing.T) {
 func TestActivateHostDaemonIdenticalCandidatePreservesLastGood(t *testing.T) {
 	dir := t.TempDir()
 	layout := testActivationLayout(dir)
-	active := candidateAgent()
+	active := "#!/bin/sh\n[ \"$1\" = version ]\n"
 	writeExecutable(t, layout.BluePath, active)
 	writeExecutable(t, layout.GreenPath, "#!/bin/sh\nexit 0\n")
 	require.NoError(t, os.Symlink(layout.BluePath, layout.CurrentPath))
@@ -362,7 +360,7 @@ func TestActivateHostDaemonIdenticalCandidatePreservesLastGood(t *testing.T) {
 func TestActivateHostDaemonIdenticalCandidateRepairsMissingLastGood(t *testing.T) {
 	dir := t.TempDir()
 	layout := testActivationLayout(dir)
-	active := candidateAgent()
+	active := "#!/bin/sh\n[ \"$1\" = version ]\n"
 	writeExecutable(t, layout.BluePath, active)
 	require.NoError(t, os.Symlink(layout.BluePath, layout.CurrentPath))
 	require.NoError(t, os.Symlink(layout.CurrentPath, layout.BinaryPath))
@@ -392,7 +390,7 @@ func TestActivateHostDaemonRollsBackUnhealthyCandidate(t *testing.T) {
 	require.NoError(t, os.Symlink(layout.CurrentPath, layout.BinaryPath))
 
 	candidatePath := filepath.Join(dir, "candidate")
-	writeExecutable(t, candidatePath, candidateAgent())
+	writeExecutable(t, candidatePath, "#!/bin/sh\n[ \"$1\" = version ]\n")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	service := &fakeDaemonService{
@@ -422,7 +420,7 @@ func TestActivateHostDaemonReportsUnsuccessfulRollback(t *testing.T) {
 	require.NoError(t, os.Symlink(layout.CurrentPath, layout.BinaryPath))
 
 	candidatePath := filepath.Join(dir, "candidate")
-	writeExecutable(t, candidatePath, candidateAgent())
+	writeExecutable(t, candidatePath, "#!/bin/sh\n[ \"$1\" = version ]\n")
 
 	service := &fakeDaemonService{restartErr: errors.New("restart failed")}
 	result, err := ActivateHostDaemon(context.Background(), discardLogger(), ActivationOptions{
@@ -472,10 +470,4 @@ func mustReadFile(t *testing.T, path string) []byte {
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
-}
-
-// candidateAgent is a fake agent that passes Verify: it answers version, and
-// host-root with the root this host resolves.
-func candidateAgent() string {
-	return "#!/bin/sh\n" + hostRootAnswer(hostroot.Resolve()) + "[ \"$1\" = version ]\n"
 }
