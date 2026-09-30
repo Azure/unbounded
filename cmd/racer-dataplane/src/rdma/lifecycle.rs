@@ -689,7 +689,7 @@ mod tests {
     use crate::rdma::{
         device::Devices,
         session::Sessions,
-        verbs::{DeviceHandle, QueuePairHandle, Region, Verbs},
+        verbs::{DeviceHandle, QueuePairHandle, Region},
     };
     use std::task::Context;
 
@@ -797,7 +797,7 @@ mod tests {
         let written = healthy.write(source, 4096, 17).unwrap();
         native.poll_budgeted(2).unwrap();
         failed.expire_at(std::time::Instant::now());
-        let sessions = Sessions::new(Rc::new(Devices::new(Rc::new(Verbs))), 2);
+        let sessions = Sessions::new(Rc::new(Devices::new()), 2);
         sessions.track_test(failed.clone());
         sessions.track_test(healthy.clone());
         backend::lifetime_tests::fail_stop(true);
@@ -870,7 +870,7 @@ mod tests {
         provision_test(&mut native, 1);
         let first = claim(&io);
         mark_connected(&first, &mut native);
-        let sessions = Sessions::new(Rc::new(Devices::new(Rc::new(Verbs))), 2);
+        let sessions = Sessions::new(Rc::new(Devices::new()), 2);
         sessions.track_test(first.clone());
         let mut cut = sessions.fence_cut();
         let second = claim(&io);
@@ -906,7 +906,7 @@ mod tests {
         native.poll_budgeted(2).unwrap();
         backend::lifetime_tests::complete(1, 10, u32::MAX);
         native.poll_budgeted(2).unwrap();
-        let sessions = Sessions::new(Rc::new(Devices::new(Rc::new(Verbs))), 2);
+        let sessions = Sessions::new(Rc::new(Devices::new()), 2);
         sessions.track_test(failed.clone());
         sessions.track_test(healthy.clone());
         assert!(sessions.progress().is_ok());
@@ -952,7 +952,7 @@ mod tests {
         provision_test(&mut native, 1);
         let first = claim(&io);
         mark_connected(&first, &mut native);
-        let sessions = Sessions::new(Rc::new(Devices::new(Rc::new(Verbs))), 2);
+        let sessions = Sessions::new(Rc::new(Devices::new()), 2);
         sessions.track_test(first.clone());
         let mut cut = sessions.fence_cut();
         let later = claim(&io);
@@ -987,7 +987,7 @@ mod tests {
                 .is_empty()
         );
         let (io, port) = pair(1).unwrap();
-        let devices = Devices::new(Rc::new(Verbs));
+        let devices = Devices::new();
         devices.attach(io).unwrap();
         let admission = Admission::new(crate::test_support::cluster::config(true).limits);
         let scope = RequestScope::new(
@@ -1036,7 +1036,7 @@ mod tests {
             runtime::{admission::Admission, deadline::RequestScope},
         };
         let (io, port) = pair(1).unwrap();
-        let devices = Devices::new(Rc::new(Verbs));
+        let devices = Devices::new();
         devices.attach(io).unwrap();
         let admission = Admission::new(crate::test_support::cluster::config(true).limits);
         let scope = RequestScope::new(
@@ -1085,7 +1085,7 @@ mod tests {
             numa_node: selected.numa_node(),
         };
         let (io, port) = pair(2).unwrap();
-        let devices = Devices::new(Rc::new(Verbs));
+        let devices = Devices::new();
         devices.attach(io).unwrap();
         let admission = Admission::new(crate::test_support::cluster::config(true).limits);
         let scope = RequestScope::new(

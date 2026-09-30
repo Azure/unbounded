@@ -9,11 +9,9 @@ use crate::{
     },
     rdma::{
         device::Devices,
-        permission::{COMPLETION_HEADER, Permissions, completion_bytes},
-        registered::RegisteredPool,
+        permission::{COMPLETION_HEADER, completion_bytes},
         session::{SessionLease, Sessions},
         transfer::RdmaTransfer,
-        verbs::Verbs,
     },
     runtime::{admission::Admission, deadline::RequestScope, environment},
     security::signing::tests::network,
@@ -70,16 +68,12 @@ fn receive_case(readback: bool, terminal: Option<Error>, failed_fence: bool) {
     mark_connected(&qp, &mut native);
     let signers = network(2);
     let session = SessionLease::test(qp.clone(), signers[0].node().clone());
-    let devices = Rc::new(Devices::new(Rc::new(Verbs)));
+    let devices = Rc::new(Devices::new());
     let sessions = Rc::new(Sessions::new(devices.clone(), 1));
     let admission = Rc::new(Admission::new(
         crate::test_support::cluster::config(true).limits,
     ));
-    let transfer = RdmaTransfer::new(
-        sessions,
-        Rc::new(RegisteredPool::new(devices, admission.clone())),
-        Rc::new(Permissions),
-    );
+    let transfer = RdmaTransfer::new(sessions);
     let envelope = PageEnvelope {
         page: PageId {
             version: ObjectVersion {

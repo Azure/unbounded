@@ -16,7 +16,6 @@ use std::{future::poll_fn, rc::Rc, task::Poll};
 
 pub const DESCRIPTOR_HEADER: &str = "racer-rdma-descriptor";
 pub const COMPLETION_HEADER: &str = "racer-rdma-completion";
-pub struct Permissions;
 pub struct Grant {
     transfer: TransferId,
     buffer: Option<RegisteredLease>,
@@ -98,9 +97,8 @@ impl AuthenticatedDescriptor {
         Ok(())
     }
 }
-impl Permissions {
-    pub fn grant<'a>(
-        &'a self,
+impl Grant {
+    pub fn bind<'a>(
         session: &'a SessionLease,
         buffer: RegisteredLease,
         transfer: TransferId,
@@ -139,15 +137,6 @@ impl Permissions {
                 deadline,
                 binding: session.binding(),
             })
-        })
-    }
-    pub fn revoke_and_fence(&self, mut grant: Grant) -> Operation<'_, RegisteredLease> {
-        Box::pin(async move {
-            // Terminal destruction is deliberately used even after a successful
-            // local invalidation. It fences writes already admitted by the RNIC.
-            // A single-use QP prevents that fence from canceling unrelated pages.
-            futures::future::poll_fn(|cx| grant.qp.poll_stopped(cx)).await?;
-            grant.buffer.take().ok_or(Error::InvalidRequest)
         })
     }
 }

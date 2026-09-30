@@ -3,7 +3,7 @@ use super::*;
 use crate::{
     memory::pool::BufferPool,
     model::{ResourceClass, *},
-    rdma::{device::Devices, verbs::Verbs},
+    rdma::device::Devices,
     runtime::{admission::Admission, crypto, worker::CryptoRuntime},
     security::{aead::PageCryptoEngine, keyring::KeyPurpose},
 };
@@ -27,7 +27,7 @@ fn fixture(
         let _environment = sim.enter();
         NativeService::new(port)
     };
-    let devices = Devices::new(Rc::new(Verbs));
+    let devices = Devices::new();
     devices.attach(io).unwrap();
     let admission = Admission::new(crate::test_support::cluster::config(true).limits);
     let scope = RequestScope::new(

@@ -40,14 +40,6 @@ fn immediate<T>(poll: Poll<Result<T>>) -> Result<T> {
     }
 }
 
-pub struct Verbs;
-impl Verbs {
-    /// Serving workers must use Devices::activate; synchronous discovery is not
-    /// supported here. The real discovery operation lives on NativeService.
-    pub fn discover(&self) -> Result<Vec<DeviceHandle>> {
-        Err(Error::Unavailable)
-    }
-}
 pub struct DeviceHandle {
     pub(crate) port: Rc<IoPort>,
     pub(crate) rail: crate::topology::rails::RailId,

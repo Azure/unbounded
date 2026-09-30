@@ -11,8 +11,8 @@ use crate::{
     },
     rdma::{
         device::Devices,
-        permission::{AuthenticatedDescriptor, DESCRIPTOR_HEADER, Permissions},
-        registered::RegisteredPool,
+        permission::{AuthenticatedDescriptor, DESCRIPTOR_HEADER, Grant},
+        registered::RegisteredLease,
         session::{SETUP_BINDING_HEADER, SETUP_HEADER, SessionLease, Sessions},
         transfer::RdmaTransfer,
         verbs::{QueuePairHandle, Region},
@@ -214,12 +214,7 @@ fn sender_case(terminal: Option<Error>) {
     let admission = Rc::new(Admission::new(
         crate::test_support::cluster::config(true).limits,
     ));
-    let buffers = Rc::new(RegisteredPool::new(devices.clone(), admission.clone()));
-    let transfer = RdmaTransfer::new(
-        Rc::new(Sessions::new(devices, 2)),
-        buffers.clone(),
-        Rc::new(Permissions),
-    );
+    let transfer = RdmaTransfer::new(Rc::new(Sessions::new(devices, 2)));
     let mut scope = scope();
     if terminal == Some(Error::DeadlineExceeded) {
         scope.deadline.0 = environment::now() + Duration::from_secs(1);
@@ -307,15 +302,14 @@ fn sender_case(terminal: Option<Error>) {
     let qp = claim(&io);
     mark_connected(&qp, &mut native);
     let session = SessionLease::test(qp.clone(), signers[0].node().clone());
-    let mut buffer = done(&mut buffers.acquire_for(&session, 32, &scope));
+    let mut buffer = done(&mut RegisteredLease::acquire(&session, 32, &scope));
     let mut copy = buffer.copy_from(&[0x5a; 32], &scope);
     let guard = io.shared.slots[0].mailbox.lock().unwrap();
     assert!(poll(&mut copy).is_pending());
     drop(guard);
     done(&mut copy);
     drop(copy);
-    let permissions = Permissions;
-    let mut bind = permissions.grant(&session, buffer, id, &scope);
+    let mut bind = Grant::bind(&session, buffer, id, &scope);
     let guard = io.shared.slots[0].mailbox.lock().unwrap();
     assert!(poll(&mut bind).is_pending());
     assert!(!io.shared.slots[0].cancel.load(Ordering::Acquire));
@@ -376,21 +370,16 @@ fn contended_grant_cancel_expiry_and_drop_abort_without_submitting_bind() {
         let qp = claim(&io);
         mark_connected(&qp, &mut native);
         let session = SessionLease::test(qp.clone(), crate::model::NodeId("peer".into()));
-        let admission = Rc::new(Admission::new(
-            crate::test_support::cluster::config(true).limits,
-        ));
-        let buffers = RegisteredPool::new(Rc::new(Devices::test(io.clone())), admission);
         let mut scope = scope();
         assert!(matches!(
-            poll(&mut buffers.acquire_for(&session, 33, &scope)),
+            poll(&mut RegisteredLease::acquire(&session, 33, &scope)),
             Poll::Ready(Err(Error::Overloaded))
         ));
-        let buffer = done(&mut buffers.acquire_for(&session, 32, &scope));
+        let buffer = done(&mut RegisteredLease::acquire(&session, 32, &scope));
         if mode == 1 {
             scope.deadline.0 = environment::now() + Duration::from_secs(1);
         }
-        let permissions = Permissions;
-        let mut bind = permissions.grant(&session, buffer, TransferId([1; 16]), &scope);
+        let mut bind = Grant::bind(&session, buffer, TransferId([1; 16]), &scope);
         let guard = io.shared.slots[0].mailbox.lock().unwrap();
         assert!(poll(&mut bind).is_pending());
         match mode {

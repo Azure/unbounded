@@ -47,10 +47,7 @@ mod tests {
         },
         memory::pool::BufferPool,
         model::{ExpiresAt, KeyId, Nonce, ObjectMetadata, PageEnvelope, ResourceClass, *},
-        rdma::{
-            device::Devices, permission::Permissions, registered::RegisteredPool,
-            session::Sessions, transfer::RdmaTransfer, verbs::Verbs,
-        },
+        rdma::{device::Devices, session::Sessions, transfer::RdmaTransfer},
         runtime::{admission::Admission, reactor::Reactor},
         security::{protocol as p, signing::Signatures},
     };
@@ -67,13 +64,9 @@ mod tests {
         admission: &Rc<Admission>,
         reactor: &Rc<Reactor>,
     ) -> Transfers {
-        let devices = Rc::new(Devices::new(Rc::new(Verbs)));
+        let devices = Rc::new(Devices::new());
         let sessions = Rc::new(Sessions::new(devices.clone(), 2));
-        let rdma = Rc::new(RdmaTransfer::new(
-            sessions.clone(),
-            Rc::new(RegisteredPool::new(devices, admission.clone())),
-            Rc::new(Permissions),
-        ));
+        let rdma = Rc::new(RdmaTransfer::new(sessions.clone()));
         let io = Rc::new(HttpIo::with_admission(
             reactor.clone(),
             Codec::new(
@@ -429,14 +422,10 @@ mod tests {
             .unwrap();
         let make = |signatures: Rc<Signatures>| {
             let (io, port) = pair(2).unwrap();
-            let devices = Rc::new(Devices::new(Rc::new(Verbs)));
+            let devices = Rc::new(Devices::new());
             devices.attach(io).unwrap();
             let sessions = Rc::new(Sessions::new(devices.clone(), 2));
-            let rdma = Rc::new(RdmaTransfer::new(
-                sessions.clone(),
-                Rc::new(RegisteredPool::new(devices.clone(), admission.clone())),
-                Rc::new(Permissions),
-            ));
+            let rdma = Rc::new(RdmaTransfer::new(sessions.clone()));
             let http = Rc::new(HttpIo::with_admission(
                 reactor.clone(),
                 Codec::new(

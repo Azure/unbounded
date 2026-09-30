@@ -29,10 +29,7 @@ use crate::{
     model::{Limits, NodeId, RequestId, WorkerId},
     origin::client::{Origin, OriginClient},
     peer::{relay::Relay, requester::Requester, server::PeerServer, transfer::Transfers},
-    rdma::{
-        device::Devices, permission::Permissions, registered::RegisteredPool, session::Sessions,
-        transfer::RdmaTransfer, verbs::Verbs,
-    },
+    rdma::{device::Devices, session::Sessions, transfer::RdmaTransfer},
     read::{
         candidates::CandidatePolicy,
         dispatch::{Dispatcher, WorkerDirectory, WorkerEndpoint},
@@ -720,7 +717,7 @@ impl WorkerApplication {
         };
 
         let (sessions, rdma, devices) = if config.enable_rdma {
-            let devices = Rc::new(Devices::new(Rc::new(Verbs)));
+            let devices = Rc::new(Devices::new());
             if let Some(port) = node.native.io(worker)? {
                 devices.attach(port)?;
             }
@@ -728,12 +725,7 @@ impl WorkerApplication {
                 devices.clone(),
                 config.limits.connections_per_neighbor.get(),
             ));
-            let registered = Rc::new(RegisteredPool::new(devices.clone(), admission.clone()));
-            let transfer = Rc::new(RdmaTransfer::new(
-                sessions.clone(),
-                registered,
-                Rc::new(Permissions),
-            ));
+            let transfer = Rc::new(RdmaTransfer::new(sessions.clone()));
             (Some(sessions), Some(transfer), Some(devices))
         } else {
             (None, None, None)

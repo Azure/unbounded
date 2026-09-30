@@ -1230,7 +1230,7 @@ mod tests {
                 let _environment = node.enter();
                 NativeService::new(port)
             };
-            let devices = Devices::new(Rc::new(verbs::Verbs));
+            let devices = Devices::new();
             devices.attach(io).unwrap();
             let mut activation = devices.activate(
                 vec![RailMapping {

@@ -1,35 +1,23 @@
 //! Registered allocations carry their physical quota through the terminal fence.
 use super::{
-    device::Devices,
     session::SessionLease,
     verbs::{Region, wait},
 };
 use crate::{
     error::{Error, Operation, Result},
-    runtime::{admission::Admission, deadline::RequestScope},
+    runtime::deadline::RequestScope,
     topology::rails::RailId,
 };
 use std::rc::Rc;
 
 pub const MAX_CIPHERTEXT: usize = 16 * 1024 * 1024 + 16;
-pub struct RegisteredPool {
-    devices: Rc<Devices>,
-    admission: Rc<Admission>,
-}
 pub struct RegisteredLease {
     pub(crate) region: Rc<Region>,
     pub(crate) rail: RailId,
 }
-impl RegisteredPool {
-    pub fn new(devices: Rc<Devices>, admission: Rc<Admission>) -> Self {
-        Self { devices, admission }
-    }
-    pub fn acquire(&self, _rail: RailId, _length: usize) -> Result<RegisteredLease> {
-        // Registered resources are preprovisioned and bound to a session slot.
-        Err(Error::Unavailable)
-    }
-    pub fn acquire_for<'a>(
-        &'a self,
+impl RegisteredLease {
+    /// Acquire the registered buffer preprovisioned for this session slot.
+    pub fn acquire<'a>(
         session: &'a SessionLease,
         length: usize,
         scope: &'a RequestScope,

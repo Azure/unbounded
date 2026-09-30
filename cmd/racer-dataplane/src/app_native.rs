@@ -520,7 +520,7 @@ mod tests {
                 .unwrap()
                 .expect("funded native worker");
             assert_eq!(port.capacity(), 1);
-            let devices = Devices::new(Rc::new(Verbs));
+            let devices = Devices::new();
             devices.attach(port).unwrap();
             let admission = Admission::new(limits.clone());
             let startup = scope(Duration::from_secs(10)).unwrap();
@@ -642,7 +642,7 @@ mod tests {
             .unwrap();
         let port = native.io(WorkerId(0)).unwrap().unwrap();
         assert_eq!(port.capacity(), 2);
-        let devices = Devices::new(Rc::new(Verbs));
+        let devices = Devices::new();
         devices.attach(port).unwrap();
         let admission = Admission::new(limits);
         let held = admission

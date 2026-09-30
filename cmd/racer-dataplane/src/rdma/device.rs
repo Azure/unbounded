@@ -1,10 +1,6 @@
 //! Match discovered ports to trusted local fabric associations and publication.
 //! Fabric strings are opaque labels: a GID or enumeration order is never a label.
-use super::{
-    backend,
-    lifecycle::IoPort,
-    verbs::{DeviceHandle, Verbs},
-};
+use super::{backend, lifecycle::IoPort, verbs::DeviceHandle};
 use crate::{
     error::{Error, Operation, Result},
     model::ResourceClass,
@@ -14,7 +10,6 @@ use crate::{
 use std::{cell::RefCell, rc::Rc};
 
 pub struct Devices {
-    _verbs: Rc<Verbs>,
     port: RefCell<Option<Rc<IoPort>>>,
     selected: RefCell<Vec<Device>>,
     mappings: RefCell<Vec<RailMapping>>,
@@ -23,13 +18,6 @@ pub struct Devices {
 pub struct Device {
     pub(crate) handle: Rc<DeviceHandle>,
     pub rail: RailId,
-}
-#[derive(Clone, Debug)]
-pub struct RailPort {
-    pub rail: RailId,
-    pub device: String,
-    pub port: u8,
-    pub gid: [u8; 16],
 }
 /// Administrator-provided local association. Publication only contains an opaque
 /// fabric name and NUMA hint; it cannot identify a physical NIC by itself.
@@ -109,7 +97,7 @@ pub fn match_publication(
 impl Devices {
     #[cfg(test)]
     pub(crate) fn test(port: std::rc::Rc<IoPort>) -> Self {
-        let devices = Self::new(std::rc::Rc::new(Verbs));
+        let devices = Self::new();
         devices.selected.borrow_mut().push(Device {
             handle: std::rc::Rc::new(DeviceHandle {
                 port: port.clone(),
@@ -124,9 +112,8 @@ impl Devices {
         *devices.port.borrow_mut() = Some(port);
         devices
     }
-    pub fn new(verbs: Rc<Verbs>) -> Self {
+    pub fn new() -> Self {
         Self {
-            _verbs: verbs,
             port: RefCell::new(None),
             selected: RefCell::new(Vec::new()),
             mappings: RefCell::new(Vec::new()),
@@ -217,14 +204,6 @@ impl Devices {
             Ok(mappings)
         })
     }
-    /// Old synchronous activation cannot safely provision a serving worker.
-    pub fn configure(&self, mappings: &[RailPort]) -> Result<()> {
-        if mappings.is_empty() {
-            Ok(())
-        } else {
-            Err(Error::Unavailable)
-        }
-    }
     pub fn select(&self, rail: RailId) -> Result<Device> {
         self.selected
             .borrow()
@@ -284,11 +263,9 @@ mod tests {
     use super::*;
     #[test]
     fn unconfigured_rails_require_http() {
-        let devices = Devices::new(Rc::new(Verbs));
+        let devices = Devices::new();
         assert!(!devices.ready(RailId(0)));
         assert!(devices.select(RailId(0)).is_err());
-        assert!(devices.configure(&[]).is_ok());
-        assert!(!devices.ready(RailId(0)));
     }
     #[test]
     fn discovery_never_invents_fabric_matches_and_rejects_ambiguity() {

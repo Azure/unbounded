@@ -1,8 +1,8 @@
 //! Ciphertext-only movement. Control exchange supplies signed per-transfer grants;
 //! failed attempts are fenced before the peer owner starts a new HTTP attempt.
 use super::{
-    permission::{AuthenticatedDescriptor, Grant, Permissions, completion_bytes},
-    registered::{RegisteredLease, RegisteredPool},
+    permission::{AuthenticatedDescriptor, Grant, completion_bytes},
+    registered::RegisteredLease,
     session::{SessionLease, Sessions},
     verbs::QueuePairHandle,
 };
@@ -19,8 +19,6 @@ use std::{future::poll_fn, rc::Rc, task::Poll};
 
 pub struct RdmaTransfer {
     sessions: Rc<Sessions>,
-    buffers: Rc<RegisteredPool>,
-    permissions: Rc<Permissions>,
 }
 /// Produced only by a successful native write CQE. Sign this header as part of
 /// the request-bound HTTP control response; the ciphertext is not hashed here.
@@ -46,35 +44,14 @@ impl RdmaTransfer {
     pub fn register_driver(&self, waker: &std::task::Waker) {
         self.sessions.register_driver(waker);
     }
-    pub fn new(
-        sessions: Rc<Sessions>,
-        buffers: Rc<RegisteredPool>,
-        permissions: Rc<Permissions>,
-    ) -> Self {
-        Self {
-            sessions,
-            buffers,
-            permissions,
-        }
+    pub fn new(sessions: Rc<Sessions>) -> Self {
+        Self { sessions }
     }
     pub fn ready(&self, rail: RailId) -> bool {
         self.sessions.ready(rail)
     }
     pub fn progress(&self) -> Result<usize> {
         self.sessions.progress()
-    }
-    /// Compatibility surface: no descriptor means no authority to write. The
-    /// caller must choose HTTP or use send_to with a verified scoped capability.
-    pub fn send<'a>(
-        &'a self,
-        _session: &'a SessionLease,
-        _page: CiphertextPage,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, ()> {
-        Box::pin(async move {
-            scope.check()?;
-            Err(Error::Unavailable)
-        })
     }
     pub fn send_to<'a>(
         &'a self,
@@ -94,10 +71,7 @@ impl RdmaTransfer {
             session.claim()?;
             session.qp.expire_at(scope.deadline.0);
             let _abort = AbortOnDrop(session.qp.clone());
-            let mut buffer = self
-                .buffers
-                .acquire_for(session, page.bytes().len(), scope)
-                .await?;
+            let mut buffer = RegisteredLease::acquire(session, page.bytes().len(), scope).await?;
             buffer.copy_from(page.bytes(), scope).await?;
             let ticket = super::verbs::wait(scope, |cx| {
                 session.qp.register_waiter(cx);
@@ -141,13 +115,10 @@ impl RdmaTransfer {
         Box::pin(async move {
             scope.check()?;
             validate_envelope(envelope)?;
-            let buffer = self
-                .buffers
-                .acquire_for(session, envelope.ciphertext_length as usize, scope)
-                .await?;
-            self.permissions
-                .grant(session, buffer, transfer, scope)
-                .await
+            let buffer =
+                RegisteredLease::acquire(session, envelope.ciphertext_length as usize, scope)
+                    .await?;
+            Grant::bind(session, buffer, transfer, scope).await
         })
     }
     /// This handoff requires a signed completion and returns ciphertext only.
@@ -181,17 +152,6 @@ impl RdmaTransfer {
     pub fn fence_cut(&self) -> Operation<'static, ()> {
         self.sessions.fence_cut()
     }
-    pub fn receive<'a>(
-        &'a self,
-        _session: &'a SessionLease,
-        _envelope: PageEnvelope,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, CiphertextPage> {
-        Box::pin(async move {
-            scope.check()?;
-            Err(Error::Unavailable)
-        })
-    }
 }
 fn validate_envelope(envelope: &PageEnvelope) -> Result<()> {
     if envelope.plaintext_length == 0
@@ -201,8 +161,4 @@ fn validate_envelope(envelope: &PageEnvelope) -> Result<()> {
         return Err(Error::InvalidRange);
     }
     Ok(())
-}
-#[cfg(test)]
-mod tests {
-    // Native completion ordering and cancellation are tested at the ownership boundary.
 }
