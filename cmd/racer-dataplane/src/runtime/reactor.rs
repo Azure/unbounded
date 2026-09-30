@@ -111,12 +111,18 @@ pub enum SocketAddress {
 
 const CANCEL_BIT: u64 = 1 << 63;
 const MAX_WAIT: Duration = Duration::from_millis(10);
+// Linux UAPI: the only setup flag enabled by init. Unknown flags fail closed.
+const SETUP_CQSIZE: u32 = 1 << 3;
 
 struct State {
     ring: Option<IoUring>,
     wake: Option<Arc<HostFd>>,
     #[cfg(test)]
     simulation: Option<simulation::Driver>,
+    #[cfg(test)]
+    submit_attempts: usize,
+    #[cfg(test)]
+    submit_result: Option<std::io::Result<usize>>,
     ring_reservation: Option<Reservation>,
     entries: BTreeMap<IoId, Entry>,
     next: u64,
@@ -413,6 +419,10 @@ impl Reactor {
                 wake: None,
                 #[cfg(test)]
                 simulation: simulation::Simulation::current().map(simulation::Driver::new),
+                #[cfg(test)]
+                submit_attempts: 0,
+                #[cfg(test)]
+                submit_result: None,
                 ring_reservation: None,
                 entries: BTreeMap::new(),
                 next: 1,
@@ -1098,7 +1108,7 @@ impl Reactor {
     /// Sleep until a CQE/external wake, bounded by both duration and a 10ms timer
     /// fallback for producers that cannot yet attach the eventfd wake endpoint.
     pub fn wait(&self, duration: Duration) -> Result<()> {
-        let state = self.state.borrow();
+        let mut state = self.state.borrow_mut();
         // Service polling can queue SQEs after poll_budgeted. Submit once before
         // sleeping so that work can produce the CQEs we wait for. Transient errors
         // defer progress to the next worker turn; completion/cancel budgets stay
@@ -1202,16 +1212,36 @@ impl State {
         let cqe = self.ring.as_mut()?.completion().next()?;
         Some((cqe.user_data(), KernelResult::Value(cqe.result())))
     }
-    fn submit_pending(&self) -> Result<()> {
+    fn submit_pending(&mut self) -> Result<()> {
         #[cfg(test)]
         if let Some(driver) = &self.simulation {
+            // This advances simulated kernel execution, not just SQ consumption.
+            // Guard tests below use real rings rather than this simulation path.
             driver.submit();
             return Ok(());
         }
-        match &self.ring {
-            Some(ring) => submission_result(ring.submit()),
-            None => Ok(()),
+        let Some(ring) = &mut self.ring else {
+            return Ok(());
+        };
+        let flags = ring_setup_flags(ring.params());
+        let required = {
+            // A fresh safe view observes the shared head, including consumption
+            // after partial submissions or transient errors. No dirty bit can
+            // substitute for the actual remaining SQ occupancy.
+            let sq = ring.submission();
+            submission_required(flags, sq.is_empty(), sq.cq_overflow(), sq.taskrun())
+        }; // Drop the SQ view before submitting.
+        if !required {
+            return Ok(());
         }
+        #[cfg(test)]
+        {
+            self.submit_attempts += 1;
+            if let Some(result) = self.submit_result.take() {
+                return submission_result(result);
+            }
+        }
+        submission_result(ring.submit())
     }
 
     fn take_fence_wakers(&mut self, target: Option<IoId>) -> Vec<Waker> {
@@ -1262,6 +1292,26 @@ impl From<i32> for KernelResult {
     fn from(value: i32) -> Self {
         Self::Value(value)
     }
+}
+
+fn ring_setup_flags(params: &io_uring::Parameters) -> u32 {
+    // io-uring 0.7 documents Parameters as repr(transparent) over Linux
+    // io_uring_params. Its third u32 is flags, after sq_entries and cq_entries.
+    // There are no public getters for COOP_TASKRUN, TASKRUN_FLAG or DEFER_TASKRUN.
+    // SAFETY: this reads an initialized, aligned u32 within that documented ABI;
+    // it neither accesses the mapped queues nor aliases a mutable reference.
+    unsafe {
+        (params as *const io_uring::Parameters)
+            .cast::<u32>()
+            .add(2)
+            .read()
+    }
+}
+
+fn submission_required(setup_flags: u32, empty: bool, cq_overflow: bool, taskrun: bool) -> bool {
+    // Only the normal interrupt-driven mode is supported for suppression.
+    // SQPOLL, IOPOLL, all task-run modes and future flags retain ring.submit().
+    setup_flags & !SETUP_CQSIZE != 0 || !empty || cq_overflow || taskrun
 }
 
 fn submission_result(result: std::io::Result<usize>) -> Result<()> {
@@ -1378,6 +1428,9 @@ fn encode_address(
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod empty_submit_tests {
+        include!("empty_submit_tests.rs");
+    }
     mod reserved_submission_tests {
         include!("reserved_submission_tests.rs");
     }
@@ -1573,6 +1626,7 @@ mod tests {
         assert!(retained > baseline);
 
         reactor.wait(Duration::ZERO).unwrap();
+        assert_eq!(reactor.state.borrow().submit_attempts, 1);
         {
             let mut state = reactor.state.borrow_mut();
             let ring = state.ring.as_mut().unwrap();
@@ -1602,6 +1656,7 @@ mod tests {
         assert_ne!(descriptor.revents & libc::POLLIN, 0);
         reactor.wait(Duration::ZERO).unwrap();
         assert_eq!(reactor.poll_budgeted(0).unwrap(), 0);
+        assert_eq!(reactor.state.borrow().submit_attempts, 1);
         assert_eq!(
             reactor
                 .state
