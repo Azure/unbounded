@@ -134,6 +134,10 @@ def configuration(obj):
     result.pop("status", None)
     for key in ("resourceVersion", "managedFields", "generation"):
         result["metadata"].pop(key, None)
+    if result.get("apiVersion") == "apps/v1" and result.get("kind") == "DaemonSet":
+        # apps/v1 conversion exposes the server-owned TemplateGeneration here.
+        # Like metadata.generation, it increments when an image changes the template.
+        result["metadata"].get("annotations", {}).pop("deprecated.daemonset.template.generation", None)
     return result
 
 

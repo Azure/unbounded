@@ -75,7 +75,11 @@ targets for that phase, rejects UID/configuration drift, then server-dry-runs
 the replacements before sending real PUTs. Unexpected admission changes in the
 dry-run response fail closed as well. Admission policy can still change after
 the dry-run, so the parent must inspect actual results. Only status, managedFields,
-resourceVersion, and generation may drift since review. A fresh resourceVersion
+resourceVersion, generation, and the server-owned top-level
+`deprecated.daemonset.template.generation` annotation on `apps/v1` DaemonSets
+may drift since review. Kubernetes increments that annotation when the pod
+template changes, including image upgrades. No other annotations (including pod
+template annotations) are ignored. A fresh resourceVersion
 from the validated GET is retained in each PUT, so concurrent changes fail
 rather than being overwritten. All live metadata, including annotations and UID,
 is retained; status is omitted from the main-resource PUT. Replacements are not

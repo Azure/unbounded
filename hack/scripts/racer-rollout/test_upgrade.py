@@ -266,6 +266,85 @@ class ApplyTests(unittest.TestCase):
             self.runner.apply("apply-operator", self.approval)
         self.assertEqual(self.runner.kubectl.call_count, 2)
 
+    def loadgen_admission(self, mutate=None):
+        annotation = "deprecated.daemonset.template.generation"
+        for obj in self.objects:
+            if obj["kind"] == "DaemonSet":
+                obj["metadata"]["annotations"][annotation] = "26"
+        self.plan["changes"] = upgrade.build_changes(self.objects, IMAGES)
+        self.write_plan()
+        live = {upgrade.identity(obj): copy.deepcopy(obj) for obj in self.objects}
+
+        def kubectl(*args, namespace, payload=None):
+            if args[0] == "get":
+                return copy.deepcopy(live[(args[1], namespace, args[2])])
+            admitted = copy.deepcopy(payload)
+            if admitted["kind"] == "DaemonSet":
+                admitted["metadata"]["annotations"][annotation] = "27"
+            if "--dry-run=server" in args:
+                if mutate:
+                    mutate(admitted)
+            else:
+                live[upgrade.identity(admitted)] = admitted
+            return admitted
+
+        self.runner.kubectl = Mock(side_effect=kubectl)
+
+    def test_daemonset_template_generation_admission_and_completed_retry(self):
+        self.loadgen_admission()
+        original = copy.deepcopy(self.plan)
+        self.runner.apply("apply-loadgen", self.approval)
+        calls = self.runner.kubectl.call_args_list
+        self.assertEqual([call.args[0] for call in calls], ["get"] * 3 + ["replace"] * 6)
+        self.assertTrue(all("--dry-run=server" in call.args for call in calls[3:6]))
+        self.assertTrue(all("--dry-run=server" not in call.args for call in calls[6:]))
+        for call in calls[6:]:
+            replacement = call.kwargs["payload"]
+            if replacement["kind"] == "DaemonSet":
+                self.assertEqual(replacement["metadata"]["annotations"]["deprecated.daemonset.template.generation"], "26")
+        self.assertEqual(self.plan, original)
+        self.runner.kubectl.reset_mock()
+        self.runner.apply("apply-loadgen", self.approval)
+        self.assertEqual([call.args[0] for call in self.runner.kubectl.call_args_list], ["get"] * 3)
+
+    def test_daemonset_counter_does_not_hide_other_admission_changes(self):
+        def annotation(obj):
+            obj["metadata"]["annotations"]["guard"] = "changed"
+
+        def template_annotation(obj):
+            obj["spec"]["template"]["metadata"]["annotations"]["deprecated.daemonset.template.generation"] = "27"
+
+        def args(obj):
+            obj["spec"]["template"]["spec"]["containers"][0]["args"] = ["--verify=false"]
+
+        def uid(obj):
+            obj["metadata"]["uid"] = "changed"
+
+        for mutate in (annotation, template_annotation, args, uid):
+            with self.subTest(mutate=mutate.__name__):
+                self.loadgen_admission(mutate)
+                with self.assertRaisesRegex(ValueError, "server dry-run changed configuration"):
+                    self.runner.apply("apply-loadgen", self.approval)
+                self.assertTrue(all(call.args[0] == "get" or "--dry-run=server" in call.args
+                                    for call in self.runner.kubectl.call_args_list))
+
+    def test_template_generation_normalization_is_scoped_and_nonmutating(self):
+        annotation = "deprecated.daemonset.template.generation"
+        for kind, api in (("DaemonSet", "apps/v1"), ("Deployment", "apps/v1"), ("DaemonSet", "other/v1")):
+            with self.subTest(kind=kind, api=api):
+                old = workload(kind, "racer-loadgen", "loadgen")
+                old["apiVersion"] = api
+                old["metadata"]["annotations"][annotation] = "3"
+                new = copy.deepcopy(old)
+                new["metadata"]["annotations"][annotation] = "4"
+                original = copy.deepcopy(new)
+                equal = upgrade.configuration(old) == upgrade.configuration(new)
+                self.assertEqual(equal, kind == "DaemonSet" and api == "apps/v1")
+                self.assertEqual(new, original)
+        bare = workload("DaemonSet", "racer-loadgen", "loadgen")
+        del bare["metadata"]["annotations"]
+        self.assertNotIn("annotations", upgrade.configuration(bare)["metadata"])
+
     def test_all_loadgen_drift_checked_before_any_write(self):
         live = copy.deepcopy(self.objects[7])
         live["spec"]["template"]["spec"]["containers"][0]["args"] = ["--catalog-images=1"]
