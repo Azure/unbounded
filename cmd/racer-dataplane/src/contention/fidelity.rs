@@ -551,6 +551,8 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
             node,
             Rc::new(Placement::new(8)),
             peers,
+            Rc::new(CredentialCrypto::new(keys.clone(), real.clone())),
+            Arc::new(Default::default()),
         )),
         flights: Rc::new(Flights::new(real.clone())),
         crypto: Rc::new(PageCrypto::new(keys.clone(), client.clone())),

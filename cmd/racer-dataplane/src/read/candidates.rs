@@ -20,8 +20,10 @@ use crate::{
     },
 };
 #[cfg(test)]
+use std::cell::RefCell;
+#[cfg(test)]
 use std::time::Instant;
-use std::{cell::RefCell, rc::Rc};
+use std::{rc::Rc, sync::Arc};
 
 pub struct OriginAuthority {
     membership: MembershipLease,
@@ -47,8 +49,8 @@ pub struct CandidatePolicy {
     node: NodeId,
     placement: Rc<Placement>,
     peers: Rc<dyn PeerClient>,
-    credentials: RefCell<Option<Rc<CredentialCrypto>>>,
-    published: RefCell<Option<std::sync::Arc<crate::control::snapshot::PublishedState>>>,
+    credentials: Rc<CredentialCrypto>,
+    published: Arc<crate::control::snapshot::PublishedState>,
 }
 #[derive(Default, Clone, Copy)]
 pub(crate) struct HedgeContinuation {
@@ -336,7 +338,13 @@ impl CandidatePolicy {
             Some(_) => Ok(None),
         }
     }
-    pub fn new(node: NodeId, placement: Rc<Placement>, peers: Rc<dyn PeerClient>) -> Self {
+    pub fn new(
+        node: NodeId,
+        placement: Rc<Placement>,
+        peers: Rc<dyn PeerClient>,
+        credentials: Rc<CredentialCrypto>,
+        published: Arc<crate::control::snapshot::PublishedState>,
+    ) -> Self {
         Self {
             hedge: None,
             attempt_timeout: std::time::Duration::from_secs(30),
@@ -344,8 +352,8 @@ impl CandidatePolicy {
             node,
             placement,
             peers,
-            credentials: RefCell::new(None),
-            published: RefCell::new(None),
+            credentials,
+            published,
         }
     }
 
@@ -362,16 +370,6 @@ impl CandidatePolicy {
     pub(crate) fn with_attempt_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.attempt_timeout = timeout;
         self
-    }
-    /// Composition hook: shares the same admission and credential domain as Fill.
-    pub fn set_credentials(&self, credentials: Rc<CredentialCrypto>) {
-        *self.credentials.borrow_mut() = Some(credentials);
-    }
-    pub fn set_publications(
-        &self,
-        published: std::sync::Arc<crate::control::snapshot::PublishedState>,
-    ) {
-        *self.published.borrow_mut() = Some(published);
     }
 
     pub fn candidates(
@@ -503,14 +501,7 @@ impl CandidatePolicy {
                 return Err(Error::InvalidRequest);
             }
             if continuation.stale {
-                let latest = self
-                    .published
-                    .borrow()
-                    .as_ref()
-                    .ok_or(Error::IncompatibleMembership)?
-                    .current()?
-                    .membership
-                    .clone();
+                let latest = self.published.current()?.membership.clone();
                 if retried || latest.version.0 <= candidates.membership.version.0 {
                     return Err(Error::IncompatibleMembership);
                 }
@@ -619,14 +610,7 @@ impl CandidatePolicy {
                             if retried {
                                 return Err(Error::IncompatibleMembership);
                             }
-                            let latest = self
-                                .published
-                                .borrow()
-                                .as_ref()
-                                .ok_or(Error::IncompatibleMembership)?
-                                .current()?
-                                .membership
-                                .clone();
+                            let latest = self.published.current()?.membership.clone();
                             if latest.version.0 <= candidates.membership.version.0 {
                                 return Err(Error::IncompatibleMembership);
                             }
@@ -884,7 +868,7 @@ impl CandidatePolicy {
         let mut bytes = [0; 16];
         crate::runtime::environment::fill_random(&mut bytes).map_err(|_| Error::Unavailable)?;
         let attempt = AttemptId(bytes);
-        let credentials = self.credentials.borrow().clone().ok_or(Error::MissingKey)?;
+        let credentials = &self.credentials;
         // Sealing is synchronous, but can still use up a very short time share.
         let mut signed_scope = attempt_scope.clone();
         signed_scope.deadline.0 = signed_deadline;
@@ -1195,8 +1179,13 @@ mod tests {
         }
         let (membership, placement, context, scope, credentials) = fixture();
         let peers = Rc::new(Routes(RefCell::new(Vec::new())));
-        let policy = CandidatePolicy::new(NodeId("outside".into()), placement, peers.clone());
-        policy.set_credentials(credentials);
+        let policy = CandidatePolicy::new(
+            NodeId("outside".into()),
+            placement,
+            peers.clone(),
+            credentials,
+            Arc::new(Default::default()),
+        );
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
         let result = futures::executor::block_on(
             policy.resolve_with_budget(
@@ -1327,8 +1316,13 @@ mod tests {
             calls: RefCell::new(vec![]),
             error: Error::Unavailable,
         });
-        let policy = CandidatePolicy::new(ordered[2].clone(), placement, peer.clone());
-        policy.set_credentials(credentials);
+        let policy = CandidatePolicy::new(
+            ordered[2].clone(),
+            placement,
+            peer.clone(),
+            credentials,
+            Arc::new(Default::default()),
+        );
         let candidates = policy
             .candidates(membership, &context.object, PageNumber(0))
             .unwrap();
@@ -1371,8 +1365,13 @@ mod tests {
             .rank(membership.clone(), &context.object, PageNumber(0))
             .unwrap()
             .ordered;
-        let policy = CandidatePolicy::new(ordered[1].clone(), placement.clone(), peer.clone());
-        policy.set_credentials(credentials.clone());
+        let policy = CandidatePolicy::new(
+            ordered[1].clone(),
+            placement.clone(),
+            peer.clone(),
+            credentials.clone(),
+            Arc::new(Default::default()),
+        );
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 4, 8);
         let result = futures::executor::block_on(
             policy.resolve_with_budget(
@@ -1394,8 +1393,13 @@ mod tests {
             calls: RefCell::new(vec![]),
             error: Error::Unavailable,
         });
-        let policy = CandidatePolicy::new(NodeId("outside".into()), placement, peer.clone());
-        policy.set_credentials(credentials);
+        let policy = CandidatePolicy::new(
+            NodeId("outside".into()),
+            placement,
+            peer.clone(),
+            credentials,
+            Arc::new(Default::default()),
+        );
         let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
         let result = futures::executor::block_on(
             policy.resolve_with_budget(
@@ -1553,8 +1557,13 @@ mod tests {
             node.clone(),
             std::sync::Arc::new(KeyEpochs::default()),
         ));
-        let policy = CandidatePolicy::new(node, Rc::new(Placement::new(8)), peers);
-        policy.set_credentials(Rc::new(CredentialCrypto::new(keys, admission)));
+        let policy = CandidatePolicy::new(
+            node,
+            Rc::new(Placement::new(8)),
+            peers,
+            Rc::new(CredentialCrypto::new(keys, admission)),
+            Arc::new(Default::default()),
+        );
         policy
     }
     fn scope() -> RequestScope {

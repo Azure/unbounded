@@ -255,9 +255,6 @@ impl Fill {
         self.reserve_with_reclamation(cache, ResourceClass::Plaintext, PAGE_BYTES as usize)
     }
     pub fn new(dependencies: FillDependencies) -> Self {
-        dependencies
-            .candidates
-            .set_credentials(dependencies.credentials.clone());
         Self {
             dependencies,
             metrics: Metrics::default(),

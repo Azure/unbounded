@@ -151,7 +151,13 @@ fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Ve
         local_deadlines: RefCell::new(Vec::new()),
     });
     let mut dependencies = f.fill.dependencies.clone();
-    dependencies.candidates = Rc::new(CandidatePolicy::new(local, placement, peers.clone()));
+    dependencies.candidates = Rc::new(CandidatePolicy::new(
+        local,
+        placement,
+        peers.clone(),
+        dependencies.credentials.clone(),
+        Arc::new(Default::default()),
+    ));
     f.fill = Fill::new(dependencies);
     (peers, ordered)
 }
@@ -191,6 +197,8 @@ fn hedged_plaintext_validates_aead_and_preserves_singleflight_and_original_credi
                 node(peers.local),
                 Rc::new(Placement::new(16)),
                 peers.clone(),
+                deps.credentials.clone(),
+                Arc::new(Default::default()),
             )
             .with_hedges(hedges),
         );
@@ -274,6 +282,8 @@ fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
                 node(peers.local),
                 Rc::new(Placement::new(16)),
                 peers.clone(),
+                deps.credentials.clone(),
+                Arc::new(Default::default()),
             )
             .with_hedges(hedges),
         );
@@ -374,6 +384,8 @@ fn enable_hedge(f: &mut Fixture, peers: &Rc<ScriptedPeers>) -> crate::telemetry:
             node(peers.local),
             Rc::new(Placement::new(16)),
             peers.clone(),
+            deps.credentials.clone(),
+            Arc::new(Default::default()),
         )
         .with_hedges(hedges),
     );
@@ -459,9 +471,18 @@ fn hedge_stale_membership_refreshes_once_without_fresh_credits() {
                 )
                 .unwrap(),
             );
-            f.fill.dependencies.candidates.set_publications(
-                crate::control::snapshot::PublishedState::for_membership(latest.clone()),
+            let mut deps = f.fill.dependencies.clone();
+            deps.candidates = Rc::new(
+                CandidatePolicy::new(
+                    node(peers.local),
+                    Rc::new(Placement::new(16)),
+                    peers.clone(),
+                    deps.credentials.clone(),
+                    crate::control::snapshot::PublishedState::for_membership(latest.clone()),
+                )
+                .with_hedges(deps.candidates.hedge_owner().unwrap().clone()),
             );
+            f.fill = Fill::new(deps);
             let next = f
                 .fill
                 .dependencies
@@ -700,8 +721,13 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
                 mesh: mesh.clone(),
                 local: i,
             });
-            let mut policy =
-                CandidatePolicy::new(node(i), Rc::new(Placement::new(16)), peers.clone());
+            let mut policy = CandidatePolicy::new(
+                node(i),
+                Rc::new(Placement::new(16)),
+                peers.clone(),
+                f.fill.dependencies.credentials.clone(),
+                Arc::new(Default::default()),
+            );
             if i == source {
                 policy = policy.with_hedges(
                     super::super::super::hedge::Hedges::new(

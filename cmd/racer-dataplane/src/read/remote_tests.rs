@@ -537,11 +537,13 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
             ingress_calls.clone(),
         )
     });
-    let policy = CandidatePolicy::new(source, placement, requester);
-    policy.set_credentials(Rc::new(CredentialCrypto::new(
-        a.keys.clone(),
-        admission.clone(),
-    )));
+    let policy = CandidatePolicy::new(
+        source,
+        placement,
+        requester,
+        Rc::new(CredentialCrypto::new(a.keys.clone(), admission.clone())),
+        Arc::new(Default::default()),
+    );
     let context = OriginContext {
         object: object.clone(),
         metadata: None,
@@ -977,6 +979,8 @@ fn metadata_coordinator_with_newer_publication(
         node.clone(),
         Rc::new(Placement::new(16)),
         peers.clone(),
+        credentials.clone(),
+        Arc::new(Default::default()),
     ));
     let origin = Rc::new(MissingOrigin(calls));
     let owners = Arc::new(

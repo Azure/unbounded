@@ -375,7 +375,6 @@ impl MetadataService {
         capacity: usize,
         storage: MetadataDependencies,
     ) -> Self {
-        candidates.set_credentials(credentials.clone());
         Self {
             candidates,
             origin,

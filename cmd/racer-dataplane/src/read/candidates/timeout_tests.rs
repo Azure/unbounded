@@ -173,8 +173,13 @@ impl Fixture {
             fenced: Cell::new(true),
             late_success,
         });
-        let policy = CandidatePolicy::new(local, placement, peers.clone());
-        policy.set_credentials(credentials);
+        let policy = CandidatePolicy::new(
+            local,
+            placement,
+            peers.clone(),
+            credentials,
+            Arc::new(Default::default()),
+        );
         let scope =
             RequestScope::new(RequestId([3; 16]), Instant::now() + Duration::from_secs(1)).unwrap();
         let budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);

@@ -743,12 +743,17 @@ impl WorkerApplication {
             .with_observer(admission.observer()),
         );
         let candidates = Rc::new(
-            CandidatePolicy::new(config.node.clone(), placement.clone(), requester.clone())
-                .with_hedges(hedges)
-                .with_attempt_timeout(config.peer_attempt_timeout)
-                .with_observer(admission.observer()),
+            CandidatePolicy::new(
+                config.node.clone(),
+                placement.clone(),
+                requester.clone(),
+                credentials.clone(),
+                node.publications.clone(),
+            )
+            .with_hedges(hedges)
+            .with_attempt_timeout(config.peer_attempt_timeout)
+            .with_observer(admission.observer()),
         );
-        candidates.set_publications(node.publications.clone());
         let origin: Rc<dyn Origin> = Rc::new(OriginClient::new(
             snapshots.clone(),
             http.clone(),

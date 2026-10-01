@@ -548,10 +548,13 @@ impl Rig {
             transfers,
             network,
         ));
+        let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
         let candidates = Rc::new(CandidatePolicy::new(
             NodeId(NODE.into()),
             Rc::new(Placement::new(64)),
             peers.clone(),
+            credentials.clone(),
+            Arc::new(Default::default()),
         ));
         let origin = Rc::new(
             OriginClient::new(
@@ -580,7 +583,6 @@ impl Rig {
                 )
             }
         };
-        let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
         let flights = Rc::new(Flights::new(admission.clone()));
         let fill = Rc::new(Fill::new(FillDependencies {
             memory: memory.clone(),

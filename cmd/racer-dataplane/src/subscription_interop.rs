@@ -213,6 +213,8 @@ pub fn go_sdk_subscription_server() {
         keys.node().clone(),
         Rc::new(topology::placement::Placement::new(16)),
         peers.clone(),
+        credentials.clone(),
+        Arc::new(Default::default()),
     ));
     let origin = Rc::new(GeneratedOrigin(buffers.clone()));
     let memory = Rc::new(MemoryCache::new(buffers.clone()));

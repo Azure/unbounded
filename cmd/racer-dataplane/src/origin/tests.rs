@@ -37,6 +37,20 @@ fn context() -> OriginContext {
 fn scope() -> RequestScope {
     RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(5)).unwrap()
 }
+fn credentials(admission: Rc<Admission>) -> Rc<crate::security::credentials::CredentialCrypto> {
+    use crate::security::{
+        credentials::CredentialCrypto,
+        keyring::{KeyEpochs, Keyring},
+    };
+    Rc::new(CredentialCrypto::new(
+        Rc::new(Keyring::new(
+            ClusterId("cluster".into()),
+            crate::model::NodeId("local".into()),
+            Arc::new(KeyEpochs::default()),
+        )),
+        admission,
+    ))
+}
 fn client() -> (OriginClient, Rc<Admission>, Rc<Reactor>) {
     let n = NonZeroUsize::new(32).unwrap();
     let bytes = NonZeroUsize::new(4 * PAGE_BYTES as usize).unwrap();
@@ -250,6 +264,8 @@ fn real_uds_root_remapping_keeps_public_authority_and_http_validation() {
         candidates.ordered[0].clone(),
         Rc::new(Placement::new(2)),
         Rc::new(NoPeers),
+        credentials(admission.clone()),
+        Arc::new(PublishedState::default()),
     );
     let scope = scope();
     let CandidateResolution::Origin(authority) = block_on(policy.resolve(
@@ -842,7 +858,13 @@ fn public_operations_reject_wrong_authority_before_io() {
         )
         .unwrap(),
     );
-    let policy = CandidatePolicy::new(node, Rc::new(Placement::new(2)), Rc::new(NoPeers));
+    let policy = CandidatePolicy::new(
+        node,
+        Rc::new(Placement::new(2)),
+        Rc::new(NoPeers),
+        credentials(client().1),
+        Arc::new(PublishedState::default()),
+    );
     let context = context();
     let scope = scope();
     let candidates = policy

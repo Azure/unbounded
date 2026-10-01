@@ -133,6 +133,8 @@ fn coordinator(
         signer.node().clone(),
         Rc::new(Placement::new(64)),
         peers.clone(),
+        deps.credentials.clone(),
+        Arc::new(Default::default()),
     ));
     let owners = deps.metadata_owner.clone();
     let fill = Rc::new(Fill::new(deps));

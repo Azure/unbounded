@@ -269,6 +269,8 @@ fn fixture_with_availability(
         node,
         Rc::new(Placement::new(16)),
         peers.clone(),
+        credentials.clone(),
+        Arc::new(Default::default()),
     ));
     // Deliberately uninstalled catalog owner: publication must retain page-local
     // metadata and still complete when the optional catalog is unavailable.
