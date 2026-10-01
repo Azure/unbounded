@@ -522,7 +522,14 @@ pub(super) fn page(app: &WorkerApplication) -> crate::memory::page::PageResult {
                 .unwrap(),
             PageEnvelope {
                 page: id,
-                key_id: KeyId([7; 16]),
+                key_id: app
+                    .keys
+                    .active(
+                        &definition().id,
+                        crate::security::identity::KeyPurpose::Page,
+                    )
+                    .map(|key| key.id())
+                    .unwrap_or_else(|_| KeyId::from_generation(2, 7).unwrap()),
                 nonce: Nonce([2; 24]),
                 plaintext_length: 3,
                 ciphertext_length: 19,

@@ -84,7 +84,7 @@ fn snapshot_refresh_retries_canceled_publication_and_applies_skipped_removal() {
             cache_keys: vec![wire::CacheEncryptionKey {
                 key: wire::CacheKeyRef {
                     cache: original.id.clone(),
-                    id: crate::model::KeyId([7; 16]),
+                    id: crate::model::KeyId::from_generation(1, 7).unwrap(),
                     purpose: wire::CacheKeyPurpose::Page,
                 },
                 state: wire::CacheKeyState::Active,

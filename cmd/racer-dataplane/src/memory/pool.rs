@@ -305,7 +305,7 @@ pub(crate) mod tests {
                     .unwrap(),
                 PageEnvelope {
                     page,
-                    key_id: KeyId([1; 16]),
+                    key_id: KeyId::from_generation(1, 1).unwrap(),
                     nonce: Nonce([2; 24]),
                     plaintext_length: 3,
                     ciphertext_length: 19,

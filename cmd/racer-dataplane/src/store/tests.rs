@@ -135,7 +135,7 @@ impl Fixture {
                 version: version.clone(),
                 number: PageNumber(0),
             },
-            key_id: KeyId([1; 16]),
+            key_id: KeyId::from_generation(1, 1).unwrap(),
             nonce: Nonce([2; 24]),
             plaintext_length: length as u32,
             ciphertext_length: length as u32 + 16,
@@ -153,7 +153,7 @@ impl Fixture {
                 content_type: None,
                 version,
                 length: length as u64,
-                expires_at: ExpiresAt(std::time::UNIX_EPOCH),
+                expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
             },
             ciphertext: self
                 .pool

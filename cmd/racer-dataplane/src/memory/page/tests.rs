@@ -38,7 +38,7 @@ fn shared_result_rejects_mixed_metadata_plaintext_and_ciphertext() {
             etag: StrongEtag::test_value("v1"),
         },
         length: 3,
-        expires_at: ExpiresAt(std::time::UNIX_EPOCH),
+        expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
     };
     let page = PageId {
         version: metadata.version.clone(),

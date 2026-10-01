@@ -516,7 +516,7 @@ mod tests {
                 },
                 number: PageNumber(7),
             },
-            key_id: KeyId([1; 16]),
+            key_id: KeyId::from_generation(1, 1).unwrap(),
             nonce: Nonce([2; 24]),
             plaintext_length: 5,
             ciphertext_length: 21,
@@ -580,7 +580,8 @@ mod tests {
     fn libsodium_independent_known_answer() {
         // Independently generated with libsodium 1.0.18
         // crypto_aead_xchacha20poly1305_ietf_encrypt, not this Rust implementation.
-        let descriptor = envelope();
+        let mut descriptor = envelope();
+        descriptor.key_id = KeyId([1; 16]); // Frozen independent AAD vector, not installed.
         let mut bytes = b"hello".to_vec();
         XChaCha20Poly1305::new((&[7; 32]).into())
             .encrypt_in_place(
@@ -671,6 +672,7 @@ mod tests {
         let cipher = XChaCha20Poly1305::new((&[7; 32]).into());
         for (sequence, (length, expected)) in vectors.into_iter().enumerate() {
             let mut descriptor = envelope();
+            descriptor.key_id = KeyId([1; 16]); // Frozen independent AAD vector.
             descriptor.plaintext_length = length as u32;
             descriptor.ciphertext_length = length as u32 + 16;
             let cache = &descriptor.page.version.object.cache;
@@ -692,6 +694,19 @@ mod tests {
                 expected,
                 "length={length}"
             );
+            // Exercise the engine with an installable current key ID, while
+            // retaining the independent historical AAD known-answer assertion.
+            descriptor.key_id = keys.active(cache, KeyPurpose::Page).unwrap().id();
+            let (output, tag_out) = encrypted.split_at_mut(length);
+            let tag = cipher
+                .encrypt_inout_detached(
+                    (&descriptor.nonce.0).into(),
+                    &page_aad(&descriptor).unwrap(),
+                    InOutBuf::new(&raw, output).unwrap(),
+                )
+                .unwrap();
+            tag_out.copy_from_slice(&tag);
+            let current_digest = Sha256::digest(&encrypted);
             let original = pool
                 .ciphertext(
                     admission
@@ -735,7 +750,7 @@ mod tests {
             };
             assert_eq!(clear.bytes(), raw);
             assert_eq!(original.bytes().as_ptr(), pointer);
-            assert_eq!(format!("{:x}", Sha256::digest(original.bytes())), expected);
+            assert_eq!(Sha256::digest(original.bytes()), current_digest);
             assert_eq!(admission.used(ResourceClass::Plaintext), length);
             assert_eq!(admission.used(ResourceClass::Ciphertext), length + 16);
             drop(completion);

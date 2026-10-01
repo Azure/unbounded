@@ -176,7 +176,7 @@ fn shard() -> ShardImage {
                     location: lease.location,
                 },
                 metadata,
-                key_id: KeyId([1; 16]),
+                key_id: KeyId::from_generation(1, 1).unwrap(),
             },
         )
         .unwrap();
@@ -333,7 +333,7 @@ fn binary_round_trip_retains_locations_keys_metadata_and_is_send() {
     assert_eq!(shard.geometry, geometry());
     let (_, entry) = &shard.index.entries[0];
     assert_eq!(entry.metadata, descriptor("v1", 17));
-    assert_eq!(entry.key_id, KeyId([1; 16]));
+    assert_eq!(entry.key_id, KeyId::from_generation(1, 1).unwrap());
     assert_eq!(entry.location.location.extent.length(), 4096);
     assert!(
         shard
@@ -623,7 +623,7 @@ fn recovery_validates_before_mutation_seals_segments_and_filters_missing_keys() 
             content_type: None,
             version: keep.version.clone(),
             length: keep.length,
-            expires_at: crate::model::ExpiresAt(
+            expires_at: crate::model::ExpiresAt::test_time(
                 std::time::SystemTime::now() + std::time::Duration::from_secs(300),
             ),
         })

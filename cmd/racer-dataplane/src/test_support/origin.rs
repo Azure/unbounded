@@ -332,7 +332,7 @@ fn serve(mut stream: UnixStream, state: &Mutex<State>, stop: &AtomicBool) {
             std::str::from_utf8(metadata.version.etag.as_bytes()).unwrap(),
             metadata
                 .expires_at
-                .0
+                .as_system_time()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_millis()

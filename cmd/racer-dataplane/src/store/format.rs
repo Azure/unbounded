@@ -567,10 +567,10 @@ mod tests {
         let alignment = DirectAlignment::validate(512, 512, 512).unwrap();
         for expiry in [
             UNIX_EPOCH,
-            UNIX_EPOCH - std::time::Duration::from_secs(1),
-            UNIX_EPOCH + std::time::Duration::from_nanos(1),
+            UNIX_EPOCH + std::time::Duration::from_secs(1),
+            UNIX_EPOCH + std::time::Duration::from_millis(1),
         ] {
-            page.metadata.expires_at = ExpiresAt(expiry);
+            page.metadata.expires_at = ExpiresAt::from_system_time(expiry).unwrap();
             assert_eq!(logical_length(&page), Ok(200));
             let encoded = encode(
                 &page,

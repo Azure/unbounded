@@ -245,7 +245,7 @@ mod tests {
         };
         let current = CurrentVersion {
             version: descriptor.version.clone(),
-            expires_at: ExpiresAt(clock.wall() + Duration::from_secs(2)),
+            expires_at: ExpiresAt::test_time(clock.wall() + Duration::from_secs(2)),
         };
         assert_eq!(
             current
@@ -258,7 +258,10 @@ mod tests {
         clock.advance(Duration::from_secs(2)).unwrap();
         assert_eq!(current.resolve(&descriptor, clock.wall()), Ok(None));
         assert_eq!(descriptor.for_pin().length, 42);
-        assert_eq!(descriptor.for_pin().expires_at, ExpiresAt(UNIX_EPOCH));
+        assert_eq!(
+            descriptor.for_pin().expires_at,
+            ExpiresAt::from_system_time(UNIX_EPOCH).unwrap()
+        );
         let monotonic = clock.now();
         let revision = clock.wall_revision();
         clock.jump_wall(UNIX_EPOCH).unwrap();

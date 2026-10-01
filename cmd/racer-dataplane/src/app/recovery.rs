@@ -569,7 +569,7 @@ mod tests {
                     location: append.location,
                 },
                 metadata: metadata.clone(),
-                key_id: crate::model::KeyId([1; 16]),
+                key_id: crate::model::KeyId::from_generation(1, 1).unwrap(),
             },
         ));
         drop(append);

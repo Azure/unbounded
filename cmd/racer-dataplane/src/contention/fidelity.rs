@@ -138,7 +138,7 @@ fn allocated_page(
             reserved.ciphertext,
             PageEnvelope {
                 page: id,
-                key_id: KeyId([1; 16]),
+                key_id: KeyId::from_generation(1, 1).unwrap(),
                 nonce: Nonce([2; 24]),
                 plaintext_length: length as u32,
                 ciphertext_length: (length + 16) as u32,

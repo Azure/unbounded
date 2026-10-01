@@ -16,7 +16,7 @@ fn raw_uds_late_rust_acquisition_failure_never_appends_second_status() {
             etag: StrongEtag::parse(b"\"v1\"").unwrap(),
         },
         length: 3 * PAGE_BYTES + 13,
-        expires_at: ExpiresAt(UNIX_EPOCH),
+        expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
     };
     let worker = fixture.worker.as_ref().unwrap();
     worker.origin.set_version(metadata.clone());
@@ -86,7 +86,7 @@ fn coordinator_enforces_pinned_head_and_unsatisfiable_range_length() {
                 etag: StrongEtag::parse(b"\"v1\"").unwrap(),
             },
             length,
-            expires_at: ExpiresAt(UNIX_EPOCH),
+            expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
         });
         let method = if status == "416" { "POST" } else { "HEAD" };
         let mut socket = fixture.connect();

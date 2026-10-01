@@ -43,7 +43,7 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
             cache_keys: vec![wire::CacheEncryptionKey {
                 key: wire::CacheKeyRef {
                     cache: definition().id,
-                    id: crate::model::KeyId([7; 16]),
+                    id: crate::model::KeyId::from_generation(2, 7).unwrap(),
                     purpose: wire::CacheKeyPurpose::Page,
                 },
                 state: wire::CacheKeyState::Active,
@@ -570,7 +570,7 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
             cache_keys: vec![wire::CacheEncryptionKey {
                 key: wire::CacheKeyRef {
                     cache: keep.id.clone(),
-                    id: KeyId([9; 16]),
+                    id: KeyId::from_generation(2, 9).unwrap(),
                     purpose: wire::CacheKeyPurpose::Page,
                 },
                 state: wire::CacheKeyState::Active,
@@ -974,7 +974,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
     let cache = crate::model::CacheId("33333333-3333-4333-8333-333333333333".into());
     let key = wire::CacheKeyRef {
         cache: cache.clone(),
-        id: crate::model::KeyId([8; 16]),
+        id: crate::model::KeyId::from_generation(2, 8).unwrap(),
         purpose: wire::CacheKeyPurpose::Page,
     };
     let roots = (*keys.peer_trust_roots().unwrap()).clone();
@@ -1355,7 +1355,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     let cache = crate::model::CacheId("33333333-3333-4333-8333-333333333333".into());
     let reference = wire::CacheKeyRef {
         cache: cache.clone(),
-        id: crate::model::KeyId([7; 16]),
+        id: crate::model::KeyId::from_generation(2, 7).unwrap(),
         purpose: wire::CacheKeyPurpose::Page,
     };
     let roots = (*worker.keys.peer_trust_roots().unwrap()).clone();

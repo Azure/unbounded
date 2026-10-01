@@ -83,7 +83,7 @@ fn page() -> PageId {
 fn envelope(size: usize) -> PageEnvelope {
     PageEnvelope {
         page: page(),
-        key_id: KeyId([1; 16]),
+        key_id: KeyId::from_generation(1, 1).unwrap(),
         nonce: Nonce([2; 24]),
         plaintext_length: size as u32,
         ciphertext_length: size as u32 + 16,

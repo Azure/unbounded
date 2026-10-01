@@ -65,7 +65,7 @@ impl Control {
         let keys: Vec<_> = caches.iter().flat_map(|(cache, _)| [("page", 7u8), ("origin_credentials", 8u8)].into_iter().map(move |(purpose, id)| {
             let mut material = [0; 32];
             getrandom::getrandom(&mut material).unwrap();
-            serde_json::json!({"cache": cache, "id": STANDARD.encode([id; 16]), "purpose": purpose, "state": "active", "material": STANDARD.encode(material)})
+            serde_json::json!({"cache": cache, "id": STANDARD.encode(racer_dataplane::model::KeyId::from_generation(1, id as u32).unwrap().0), "purpose": purpose, "state": "active", "material": STANDARD.encode(material)})
         })).collect();
         let bundle = serde_json::json!({"schema_version": 1, "cluster": CLUSTER, "generation": "1", "peer_trust_roots": [STANDARD.encode(ca.der())], "cache_keys": keys});
         let bundle_bytes = serde_json::to_vec(&bundle).unwrap();

@@ -828,6 +828,13 @@ fn fixture_keys() -> (Rc<Keyring>, Rc<Keyring>) {
         .iter_mut()
         .enumerate()
     {
+        key["id"] = base64::engine::general_purpose::STANDARD
+            .encode(
+                racer_dataplane::model::KeyId::from_generation(1, i as u32 + 1)
+                    .unwrap()
+                    .0,
+            )
+            .into();
         key["material"] = base64::engine::general_purpose::STANDARD
             .encode([i as u8 + 7; 32])
             .into();
@@ -977,7 +984,7 @@ impl Bootstrap {
                             "racer-expires-at".into(),
                             metadata
                                 .expires_at
-                                .0
+                                .as_system_time()
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap()
                                 .as_millis()

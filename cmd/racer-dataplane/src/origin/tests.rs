@@ -379,7 +379,8 @@ fn shared_adapter_controls_real_head_bootstrap_pin_and_rejection() {
         },
         length: 3,
         content_type: None,
-        expires_at: ExpiresAt(std::time::UNIX_EPOCH + Duration::from_secs(1234)),
+        expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH + Duration::from_secs(1234))
+            .unwrap(),
     };
     let adapter = AdapterOrigin::new("cache-a", metadata.clone());
     let client = remap(client, adapter.root.clone()).unwrap();

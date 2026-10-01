@@ -656,7 +656,9 @@ impl Harness {
         let (mut app, runtime, engine) =
             test_support::local_worker_with_fabric(&config, &node, 0, fabric_ports);
         let crypto = node.native.crypto(WorkerId(0), engine).unwrap();
-        app.keys.install(self.bundle(&config, 1)).unwrap();
+        app.keys
+            .install(self.bundle(&config, u64::from(self.key_epoch) + 1))
+            .unwrap();
         app.keys
             .install_signing_identity(self.identity(&config, id))
             .unwrap();
@@ -781,11 +783,11 @@ impl Harness {
         definition.id = CacheId(format!("33333333-3333-4333-8333-{:012x}", self.cache_epoch));
         definition
     }
-    fn bundle(&self, config: &Config, generation: u64) -> wire::KeyringBundle {
+    fn bundle(&self, config: &Config, _generation: u64) -> wire::KeyringBundle {
         wire::KeyringBundle {
             schema_version: 1,
             cluster: config.cluster.clone(),
-            generation: wire::BundleGeneration(generation),
+            generation: wire::BundleGeneration(u64::from(self.key_epoch) + 1),
             peer_trust_roots: vec![self.ca.der().to_vec()],
             cache_keys: [
                 wire::CacheKeyPurpose::Page,
@@ -796,7 +798,11 @@ impl Harness {
             .map(|(i, purpose)| wire::CacheEncryptionKey {
                 key: wire::CacheKeyRef {
                     cache: self.definition(0).id,
-                    id: KeyId([7 + i as u8 + self.key_epoch * 2; 16]),
+                    id: KeyId::from_generation(
+                        u64::from(self.key_epoch) + 1,
+                        7 + i as u32 + u32::from(self.key_epoch) * 2,
+                    )
+                    .unwrap(),
                     purpose,
                 },
                 state: wire::CacheKeyState::Active,

@@ -485,7 +485,7 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
                 content_type: None,
                 version: ObjectVersion { object, etag: pin },
                 length: 42,
-                expires_at: ExpiresAt(std::time::SystemTime::now()),
+                expires_at: ExpiresAt::test_time(std::time::SystemTime::now()),
             }),
         )
         .unwrap();

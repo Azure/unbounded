@@ -535,7 +535,7 @@ pub mod metadata {
             assert_eq!(metadata.length, 0);
             assert_eq!(metadata.version.etag.as_bytes(), b"\"v,\\1\"");
             assert_eq!(
-                metadata.expires_at.0,
+                metadata.expires_at.as_system_time(),
                 UNIX_EPOCH + Duration::from_millis(1234)
             );
             assert_eq!(
@@ -638,7 +638,7 @@ pub mod metadata {
                     .unwrap();
                 let result = validate(&head, &object());
                 if expiry == "0" {
-                    assert_eq!(result.unwrap().expires_at.0, UNIX_EPOCH);
+                    assert_eq!(result.unwrap().expires_at.as_system_time(), UNIX_EPOCH);
                 } else {
                     assert_eq!(result, Err(Error::BadGateway), "expiry={expiry:?}");
                 }

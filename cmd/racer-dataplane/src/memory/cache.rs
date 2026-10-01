@@ -477,7 +477,10 @@ mod tests {
         let copy = cache.ciphertext(&id).unwrap().unwrap();
         assert_eq!(copy.ciphertext.envelope(), &original);
         assert_eq!(copy.ciphertext.bytes(), &[2; 19]);
-        assert_eq!(copy.metadata.expires_at, ExpiresAt(std::time::UNIX_EPOCH));
+        assert_eq!(
+            copy.metadata.expires_at,
+            ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap()
+        );
         assert_eq!(
             cache.metadata(&id.version).unwrap(),
             Some(copy.metadata.immutable())

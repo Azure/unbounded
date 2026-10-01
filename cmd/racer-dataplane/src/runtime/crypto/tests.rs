@@ -414,7 +414,7 @@ pub(super) fn keyring() -> crate::security::identity::Keyring {
         cache_keys: vec![CacheEncryptionKey {
             key: CacheKeyRef {
                 cache: cache.clone(),
-                id: KeyId([1; 16]),
+                id: KeyId::from_generation(1, 1).unwrap(),
                 purpose: CacheKeyPurpose::Page,
             },
             state: CacheKeyState::Active,

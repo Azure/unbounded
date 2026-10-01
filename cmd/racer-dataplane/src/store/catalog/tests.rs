@@ -55,7 +55,7 @@ fn metadata_only_checkpoint_preserves_empty_and_old_versions_without_freshness()
     assert_eq!(snapshot.metadata[0].for_pin().length, 17);
     assert_eq!(snapshot.metadata[1].for_pin().length, 0);
     assert_eq!(
-        snapshot.metadata[0].for_pin().expires_at.0,
+        snapshot.metadata[0].for_pin().expires_at.as_system_time(),
         std::time::UNIX_EPOCH
     );
 }
@@ -83,7 +83,7 @@ fn indexed(metadata: VersionMetadata, segment: u64) -> (PageId, IndexedPage) {
         page,
         IndexedPage {
             metadata,
-            key_id: KeyId([1; 16]),
+            key_id: KeyId::from_generation(1, 1).unwrap(),
             location: RecordLocation {
                 segment: SegmentId(segment),
                 generation: Generation(1),
@@ -157,7 +157,14 @@ fn restore_is_atomic_and_drops_freshness() {
     let index = Index::new(WorkerId(0), 2, crate::test_support::availability());
     let m = descriptor("v1", 17);
     let mut current = m.for_pin();
-    current.expires_at.0 = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    current.expires_at = crate::model::ExpiresAt::from_unix_millis(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 60_000,
+    )
+    .unwrap();
     index.publish_current(current).unwrap();
     assert!(index.current(&m.version.object).unwrap().is_some());
     let bad = IndexSnapshot {
