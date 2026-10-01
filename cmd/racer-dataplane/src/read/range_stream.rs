@@ -523,6 +523,65 @@ pub(super) mod tests {
     use crate::model::{
         ByteRange, CacheId, CacheKey, ExpiresAt, ObjectId, ObjectVersion, PAGE_BYTES, StrongEtag,
     };
+    use crate::{
+        memory::pipe::PipePool,
+        model::{MembershipVersion, RequestId, ResourceClass, WorkerId},
+        runtime::{admission::Admission, reactor::Reactor, worker::WorkerMap},
+        topology::membership::Membership,
+    };
+
+    struct Fixture {
+        admission: Rc<Admission>,
+        pipes: Rc<PipePool>,
+        streams: RangeStreams,
+    }
+
+    impl Fixture {
+        fn new(limits: crate::model::Limits, capacity: usize) -> Self {
+            let admission = Rc::new(Admission::new(limits));
+            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let pipes = Rc::new(PipePool::new(admission.clone(), reactor));
+            let directory = Arc::new(
+                WorkerDirectory::new(
+                    Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
+                    vec![WorkerId(0)],
+                    capacity,
+                )
+                .unwrap(),
+            );
+            let streams = RangeStreams::new(
+                directory,
+                Rc::new(Delivery::new(pipes.clone(), Duration::from_secs(30))),
+                capacity,
+            );
+            Self {
+                admission,
+                pipes,
+                streams,
+            }
+        }
+
+        fn open(
+            &self,
+            metadata: &ObjectMetadata,
+            range: ResolvedRange,
+            scope: RequestScope,
+        ) -> RangeStream {
+            self.streams
+                .open(
+                    metadata.clone(),
+                    range,
+                    OriginContext {
+                        object: metadata.version.object.clone(),
+                        metadata: None,
+                        authorization: None,
+                    },
+                    Arc::new(Membership::validate(MembershipVersion(1), vec![]).unwrap()),
+                    scope,
+                )
+                .unwrap()
+        }
+    }
     fn remaining_credits(budget: &RangeBudget) -> (u32, u8) {
         let RangeBudget::Shared(budget) = budget else {
             panic!("expected aggregate budget")
@@ -577,32 +636,8 @@ pub(super) mod tests {
 
     #[test]
     fn retained_boundary_slices_keep_full_plaintext_charged_until_exact_release() {
-        use crate::{
-            memory::pipe::PipePool,
-            model::{MembershipVersion, RequestId, ResourceClass, WorkerId},
-            runtime::{admission::Admission, reactor::Reactor, worker::WorkerMap},
-            topology::membership::Membership,
-        };
-        let admission = Rc::new(Admission::new(
-            crate::test_support::cluster::config(false).limits,
-        ));
-        let reactor = Rc::new(Reactor::new(admission.clone()));
-        let directory = Arc::new(
-            WorkerDirectory::new(
-                Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
-                vec![WorkerId(0)],
-                2,
-            )
-            .unwrap(),
-        );
-        let streams = RangeStreams::new(
-            directory,
-            Rc::new(Delivery::new(
-                Rc::new(PipePool::new(admission.clone(), reactor)),
-                Duration::from_secs(30),
-            )),
-            2,
-        );
+        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
+        let admission = &f.admission;
         let mut metadata = metadata();
         metadata.length = 2 * PAGE_BYTES;
         let range = ByteRange::Closed {
@@ -613,19 +648,7 @@ pub(super) mod tests {
         .unwrap();
         let scope = RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(60))
             .unwrap();
-        let mut stream = streams
-            .open(
-                metadata.clone(),
-                range,
-                OriginContext {
-                    object: metadata.version.object.clone(),
-                    metadata: None,
-                    authorization: None,
-                },
-                Arc::new(Membership::validate(MembershipVersion(1), vec![]).unwrap()),
-                scope,
-            )
-            .unwrap();
+        let mut stream = f.open(&metadata, range, scope);
         for number in 0..2 {
             stream.ready.push_back((
                 PageNumber(number),
@@ -680,33 +703,14 @@ pub(super) mod tests {
 
     #[test]
     fn later_page_pipe_wait_survives_temporary_polls_and_cleans_up() {
-        use crate::{
-            memory::pipe::PipePool,
-            model::{MembershipVersion, RequestId, ResourceClass, WorkerId},
-            runtime::{admission::Admission, reactor::Reactor, worker::WorkerMap},
-            test_support::WakeCounter,
-            topology::membership::Membership,
-        };
+        use crate::test_support::WakeCounter;
         for ordered in [false, true] {
             for mode in ["release", "cancel", "drop"] {
                 let mut limits = crate::test_support::cluster::config(false).limits;
                 limits.pipes = std::num::NonZeroUsize::new(1).unwrap();
-                let admission = Rc::new(Admission::new(limits));
-                let reactor = Rc::new(Reactor::new(admission.clone()));
-                let pipes = Rc::new(PipePool::new(admission.clone(), reactor));
-                let directory = Arc::new(
-                    WorkerDirectory::new(
-                        Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
-                        vec![WorkerId(0)],
-                        2,
-                    )
-                    .unwrap(),
-                );
-                let streams = RangeStreams::new(
-                    directory,
-                    Rc::new(Delivery::new(pipes.clone(), Duration::from_secs(30))),
-                    2,
-                );
+                let f = Fixture::new(limits, 2);
+                let admission = &f.admission;
+                let pipes = &f.pipes;
                 let metadata = metadata();
                 let scope =
                     RequestScope::new(RequestId([8; 16]), Instant::now() + Duration::from_secs(60))
@@ -714,19 +718,7 @@ pub(super) mod tests {
                 let range = ByteRange::From(PAGE_BYTES - 1)
                     .resolve(metadata.length)
                     .unwrap();
-                let mut stream = streams
-                    .open(
-                        metadata.clone(),
-                        range,
-                        OriginContext {
-                            object: metadata.version.object.clone(),
-                            metadata: None,
-                            authorization: None,
-                        },
-                        Arc::new(Membership::validate(MembershipVersion(1), vec![]).unwrap()),
-                        scope.clone(),
-                    )
-                    .unwrap();
+                let mut stream = f.open(&metadata, range, scope.clone());
                 for number in 0..2 {
                     stream.ready.push_back((
                         PageNumber(number),
@@ -829,47 +821,15 @@ pub(super) mod tests {
     }
     #[test]
     fn credit_starved_stream_never_holds_pipe_and_cancel_detaches_demand() {
-        use crate::{
-            memory::pipe::PipePool,
-            model::{MembershipVersion, RequestId, WorkerId},
-            runtime::{admission::Admission, reactor::Reactor, worker::WorkerMap},
-            topology::membership::Membership,
-        };
-        let admission = Rc::new(Admission::new(
-            crate::test_support::cluster::config(false).limits,
-        ));
-        let reactor = Rc::new(Reactor::new(admission.clone()));
-        let pipes = Rc::new(PipePool::new(admission.clone(), reactor));
-        let directory = Arc::new(
-            WorkerDirectory::new(
-                Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
-                vec![WorkerId(0)],
-                1,
-            )
-            .unwrap(),
-        );
-        let streams = RangeStreams::new(
-            directory.clone(),
-            Rc::new(Delivery::new(pipes.clone(), Duration::from_secs(30))),
-            1,
-        );
+        let f = Fixture::new(crate::test_support::cluster::config(false).limits, 1);
+        let admission = &f.admission;
+        let pipes = &f.pipes;
+        let directory = &f.streams.directory;
         let metadata = metadata();
         let range = ByteRange::From(0).resolve(metadata.length).unwrap();
         let scope = RequestScope::new(RequestId([7; 16]), Instant::now() + Duration::from_secs(60))
             .unwrap();
-        let mut stream = streams
-            .open(
-                metadata.clone(),
-                range,
-                OriginContext {
-                    object: metadata.version.object.clone(),
-                    metadata: None,
-                    authorization: None,
-                },
-                Arc::new(Membership::validate(MembershipVersion(1), vec![]).unwrap()),
-                scope.clone(),
-            )
-            .unwrap();
+        let mut stream = f.open(&metadata, range, scope.clone());
         stream.configure_subscription(1, PAGE_BYTES, false).unwrap();
         // Model a delivered page still owned by a slow caller.
         let demand = stream.subscription.as_mut().unwrap();
@@ -966,51 +926,19 @@ pub(super) mod tests {
     }
     #[test]
     fn pending_client_window_never_restarts_failed_pages_and_honors_original_deadline() {
-        use crate::{
-            memory::pipe::PipePool,
-            model::{MembershipVersion, RequestId, WorkerId},
-            runtime::{admission::Admission, reactor::Reactor, worker::WorkerMap},
-            topology::membership::Membership,
-        };
         use std::{cell::Cell, time::Duration};
         for expire in [false, true] {
-            let admission = Rc::new(Admission::new(
-                crate::test_support::cluster::config(false).limits,
-            ));
-            let reactor = Rc::new(Reactor::new(admission.clone()));
-            let streams = RangeStreams::new(
-                Arc::new(
-                    WorkerDirectory::new(
-                        Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
-                        vec![WorkerId(0)],
-                        2,
-                    )
-                    .unwrap(),
-                ),
-                Rc::new(Delivery::new(
-                    Rc::new(PipePool::new(admission, reactor)),
-                    Duration::from_secs(30),
-                )),
-                2,
-            );
+            let f = Fixture::new(crate::test_support::cluster::config(false).limits, 2);
             let mut metadata = metadata();
             metadata.length = 100 * PAGE_BYTES;
             let scope =
                 RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(60))
                     .unwrap();
-            let mut stream = streams
-                .open(
-                    metadata.clone(),
-                    ByteRange::From(0).resolve(metadata.length).unwrap(),
-                    OriginContext {
-                        object: metadata.version.object,
-                        metadata: None,
-                        authorization: None,
-                    },
-                    Arc::new(Membership::validate(MembershipVersion(1), vec![]).unwrap()),
-                    scope.clone(),
-                )
-                .unwrap();
+            let mut stream = f.open(
+                &metadata,
+                ByteRange::From(0).resolve(metadata.length).unwrap(),
+                scope.clone(),
+            );
             stream
                 .configure_subscription(2, 2 * PAGE_BYTES, true)
                 .unwrap();
