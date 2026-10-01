@@ -290,9 +290,11 @@ impl DemandLease {
             return Poll::Pending;
         }
         let mut intervals = Vec::new();
-        for demand in state.demands.values().filter(|other| {
-            !other.credits.ordered && other.version == version && other.eligible(other.next)
-        }) {
+        // The ticket belongs to this reader. Including disjoint lower demand
+        // lets a provider spend every turn on somebody else's oldest page.
+        // Completion still fans out to all eligible overlapping readers.
+        {
+            let demand = &state.demands[&self.id];
             if !demand.turn || demand.selected.len() >= 63 {
                 intervals.push(PageInterval {
                     start: demand.next,
@@ -325,7 +327,7 @@ impl DemandLease {
                 merged.push(interval);
             }
         }
-        // Fragmented aggregates fail explicitly instead of dropping distant demand.
+        // Fragmented demand fails explicitly instead of dropping distant pages.
         let demand = WireDemand::new(merged).map_err(|_| Error::Overloaded)?;
         if !state.selecting.insert(version.clone()) {
             return Poll::Pending;
@@ -860,13 +862,7 @@ mod tests {
         };
         assert_eq!(
             selection.demand.intervals(),
-            &[
-                PageInterval { start: 0, end: 1 },
-                PageInterval {
-                    start: 900_000,
-                    end: 900_001
-                }
-            ]
+            &[PageInterval { start: 0, end: 1 }]
         );
         assert!(second.poll_next(&mut cx).is_pending());
         let deadline = crate::runtime::environment::now() + std::time::Duration::from_secs(30);
@@ -904,6 +900,57 @@ mod tests {
             std::task::Poll::Ready(Ok(Next::Select(_)))
         ));
     }
+    #[test]
+    fn production_ticket_cannot_be_spent_on_rotating_disjoint_low_readers() {
+        use std::task::Poll;
+        let scheduler = Scheduler::new(3);
+        let length = 1000 * PAGE_BYTES;
+        let mut high = scheduler
+            .register(
+                version(),
+                ByteRange::From(900 * PAGE_BYTES).resolve(length).unwrap(),
+                1,
+                PAGE_BYTES,
+                false,
+            )
+            .unwrap();
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        for low_page in 0..32 {
+            let mut low = scheduler
+                .register(
+                    version(),
+                    ByteRange::Closed {
+                        first: low_page * PAGE_BYTES,
+                        last: (low_page + 1) * PAGE_BYTES - 1,
+                    }
+                    .resolve(length)
+                    .unwrap(),
+                    1,
+                    PAGE_BYTES,
+                    false,
+                )
+                .unwrap();
+            let Poll::Ready(Ok(Next::Select(selection))) = low.poll_next(&mut cx) else {
+                panic!()
+            };
+            assert!(high.poll_next(&mut cx).is_pending());
+            drop(selection);
+            assert!(low.poll_next(&mut cx).is_pending());
+            let Poll::Ready(Ok(Next::Select(selection))) = high.poll_next(&mut cx) else {
+                panic!("oldest ticket must run")
+            };
+            assert_eq!(
+                selection.demand.intervals(),
+                &[crate::peer::subscriptions::PageInterval {
+                    start: 900,
+                    end: 901
+                }]
+            );
+            assert!(!selection.demand.contains(low_page));
+            drop((selection, low));
+        }
+    }
+
     #[test]
     fn pending_and_delivered_share_exact_once_credit() {
         let mut credits = Credits::new(2, 2 * PAGE_BYTES, false).unwrap();
