@@ -75,7 +75,7 @@ Thus the cap is not a promise that all resource teardown finishes at that instan
 
 Only a singleflight leader's plaintext fixed-page acquisition at a noncandidate
 can try a pair. The first two ranked candidates must be distinct, healthy direct
-neighbors, with at least ten attempt and eighteen link credits available. Direct
+neighbors, with at least six attempt and ten link credits available. Direct
 neighbor eligibility is checked against the topology, not inferred from distinct
 final destinations (`D/read/candidates.rs:66-95`, `D/peer.rs:61-75`).
 
@@ -110,13 +110,16 @@ changes (`D/read/candidates.rs:128-153,805-837`). After a failed pair, continuat
 skips the consumed primary, keeps the secondary's CopyOnly miss eligible for a
 later Acquire, and reserves the receiver's actual predecessor-plus-origin costs.
 The pair spends three attempts/two links; rank1 fallback reserves three attempts
-and eight links (two remote attempts), and rank2 reserves four attempts/eight links
-(three remote attempts). Time sharing does not divide those remote credits again.
+and eight links (two remote attempts). This funds at least one cold authorized
+fallback under the production eight-attempt/sixteen-link page budget. Rank2 needs
+four additional attempts/eight links (three remote attempts) and is sent only if
+the remaining original budget fully covers it; otherwise it is skipped without
+sending an underfunded request. Time sharing does not divide remote credits again.
 At the receiving candidate, constrained inherited link pools are partitioned
 across remaining CopyOnly predecessor probes, keeping origin attempts intact.
-The normal eight-attempt/sixteen-link page budget therefore **suppresses hedging**;
-no default budget is raised and no credits are created. The opt-in path requires
-an already larger original budget. It does not restart candidate zero in the same membership or launch
+No default budget is raised and no credits are created. Enabling hedge slots is
+usable with the normal page budget when topology/memory/adaptive gates permit.
+It does not restart candidate zero in the same membership or launch
 another pair. An authenticated stale response from either contender enters the
 ordinary single newer-membership refresh using remaining credits; another stale
 response is terminal (`D/read/candidates.rs:498-633`).
@@ -268,3 +271,15 @@ The subsequent receiver-funding/parser correction passed all **172 read tests**
 and the RDMA-feature all-target compile check. The focused hedge set passed
 **22 tests** before the additional crypto-wait test, which passed in the read
 suite. These are bounded local semantic tests, not cluster or hardware validation.
+
+The final usefulness correction reserves at least one cold fallback, not both.
+Its coordinator regression obtains the rank-1 budget from the production
+`RangeBudget::ClientPages::next_page` path, observes one hedge launch, then actual
+receiver predecessor probing and exactly one origin encryption. Rank 2 retains
+the larger-budget cold regression. An all-miss 8/16 test proves no underfunded
+rank-2 request is sent and the unused 2 attempts/6 links remain. App composition tests
+verify that the configured node-shared hedge owner reaches each worker's actual
+Coordinator/Fill/CandidatePolicy, rather than a test-only replacement controller.
+Validation passed 24 focused hedge tests, all 173 read tests, Rust formatting,
+diff checks, and RDMA-feature all-target compilation. No cluster or load actions
+were performed and no page-budget default was increased.

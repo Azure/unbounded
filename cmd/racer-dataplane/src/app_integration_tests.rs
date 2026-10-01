@@ -98,10 +98,18 @@ fn workers_share_configured_page_hedge_slots_and_bytes() {
     let mut config = crate::test_support::cluster::config(false);
     config.page_hedge.slots = 1;
     let node = Arc::new(NodeState::default());
-    let (_first, _, _) = local_worker(&config, &node, 0);
+    let (first, _, _) = local_worker(&config, &node, 0);
     let owner = node.hedges.get().unwrap().clone();
     let (mut second, _, _) = local_worker(&config, &node, 1);
     assert!(Arc::ptr_eq(&owner, node.hedges.get().unwrap()));
+    assert!(Arc::ptr_eq(
+        &owner,
+        first.coordinator.hedge_owner().unwrap()
+    ));
+    assert!(Arc::ptr_eq(
+        &owner,
+        second.coordinator.hedge_owner().unwrap()
+    ));
     let permit = owner.acquire().unwrap();
     let wake = Arc::new(crate::test_support::WakeCounter::default());
     let waker = std::task::Waker::from(wake.clone());

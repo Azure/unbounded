@@ -30,6 +30,13 @@ enum RangeBudget {
     ProgressingPages { timeout: Duration },
     Shared(AcquisitionBudget),
 }
+#[cfg(test)]
+pub(crate) fn client_page_budget_for_test(deadline: Instant) -> AcquisitionBudget {
+    RangeBudget::ClientPages { deadline }
+        .next_page(false)
+        .unwrap()
+        .unwrap()
+}
 impl RangeBudget {
     fn next_page(&mut self, pending: bool) -> Result<Option<AcquisitionBudget>> {
         match self {

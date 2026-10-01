@@ -71,6 +71,10 @@ pub(crate) fn inherited_budget(
     Ok(budget)
 }
 impl Coordinator {
+    #[cfg(test)]
+    pub(crate) fn hedge_owner(&self) -> Option<&std::sync::Arc<super::hedge::Hedges>> {
+        self.fill.hedge_owner()
+    }
     pub fn new(
         snapshots: Rc<SnapshotStore>,
         metadata: Rc<MetadataService>,

@@ -59,6 +59,10 @@ pub(crate) struct HedgeContinuation {
     pub bounded_routes: bool,
 }
 impl CandidatePolicy {
+    #[cfg(test)]
+    pub(crate) fn hedge_owner(&self) -> Option<&std::sync::Arc<super::hedge::Hedges>> {
+        self.hedge.as_ref()
+    }
     /// Only Fill's plaintext fixed-page path calls this. Direct HTTP destinations
     /// prove independent first hops. Drain both attempts before releasing escrow.
     pub(crate) async fn hedge_page<'a, T: 'a>(
@@ -79,10 +83,11 @@ impl CandidatePolicy {
             && !self.is_candidate(candidates)
             && candidates.ordered.len() >= 2
             && candidates.ordered[0] != candidates.ordered[1]
-            // Primary(2) + duplicate(1) + rank1(sender+probe+origin=3)
-            // + rank2(sender+two probes+origin=4). Routes reserve1+1+8+8.
-            && budget.remaining_attempts() >= 10
-            && budget.remaining_links() >= 18
+            // Preserve ONE cold fallback: primary(2) + duplicate(1) +
+            // rank1(sender+probe+origin=3), with links1+1+8. Additional
+            // candidates are attempted only when the original remainder funds them.
+            && budget.remaining_attempts() >= 6
+            && budget.remaining_links() >= 10
             && candidates.ordered[..2]
                 .iter()
                 .all(|n| self.peers.direct_hedge_available(&candidates.membership, n));
@@ -572,10 +577,15 @@ impl CandidatePolicy {
                     let remaining = (count - index) as u8;
                     Some(budget.partition(1, (budget.remaining_links() / remaining).min(4))?)
                 } else if continuation.bounded_routes {
-                    let mut child = budget.partition(
-                        if rank.is_some() { 1 } else { index as u32 + 2 },
-                        if rank.is_some() { 4 } else { 8 },
-                    )?;
+                    let attempts = if rank.is_some() { 1 } else { index as u32 + 2 };
+                    let links = if rank.is_some() { 4 } else { 8 };
+                    if budget.remaining_attempts() < attempts || budget.remaining_links() < links {
+                        // Never send an Acquire whose receiving coordinator cannot
+                        // probe its predecessors and still exercise origin authority.
+                        saw_transient = true;
+                        break;
+                    }
+                    let mut child = budget.partition(attempts, links)?;
                     // Receiver needs incoming link plus all predecessor routes.
                     // A rank2 cold fill cannot execute with a four-link envelope.
                     if rank.is_none() {

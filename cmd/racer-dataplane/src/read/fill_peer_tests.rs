@@ -287,8 +287,8 @@ fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
         });
         let mut budget = AcquisitionBudget::new(
             f.scope.deadline.0,
-            if reason == "credits" { 8 } else { 10 },
-            if reason == "credits" { 16 } else { 18 },
+            if reason == "credits" { 5 } else { 10 },
+            if reason == "credits" { 9 } else { 18 },
         );
         let before = (
             budget.remaining_attempts(),
@@ -529,6 +529,31 @@ fn hedge_continuation_preserves_version_failure_and_never_restarts_consumed_prim
 }
 
 #[test]
+fn hedge_default_budget_never_sends_underfunded_second_cold_fallback() {
+    let mut f = fixture();
+    let (peers, ordered) = install_peers(&mut f, None);
+    let metrics = enable_hedge(&mut f, &peers);
+    peers.primary_polls.set(40);
+    peers.replies.borrow_mut().extend([
+        (ordered[0].clone(), Reply::Miss),
+        (ordered[1].clone(), Reply::Miss),
+        (ordered[1].clone(), Reply::Miss),
+    ]);
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+    assert!(matches!(
+        acquire(&mut f, &mut budget),
+        Err(Error::Unavailable)
+    ));
+    assert_eq!(peers.calls.borrow().len(), 3);
+    assert_eq!(metrics.count(Event::PageHedgeStarted), 1);
+    assert_eq!(
+        (budget.remaining_attempts(), budget.remaining_links()),
+        (2, 6)
+    );
+    assert_eq!(budget.deadline(), f.scope.deadline.0);
+}
+
+#[test]
 fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_original_budget() {
     use crate::{
         control::{
@@ -643,6 +668,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
         }
     }
     for target_rank in [1usize, 2] {
+        let hedge_metrics = crate::telemetry::metrics::Metrics::default();
         let mut fixtures: Vec<_> = (0..4).map(|_| fixture()).collect();
         let (_, ordered) = install_peers(&mut fixtures[0], None);
         let membership = fixtures[0].membership.clone();
@@ -675,7 +701,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
                             delay: Duration::from_nanos(1),
                             bytes: super::super::super::hedge::DUPLICATE_BYTES,
                         },
-                        Default::default(),
+                        hedge_metrics.clone(),
                     )
                     .unwrap(),
                 );
@@ -736,7 +762,18 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
             endpoints.push(owners.install(WorkerId(0), coordinator.clone()).unwrap());
             mesh.nodes.borrow_mut().push(coordinator);
         }
-        let mut budget = AcquisitionBudget::new(fixtures[source].scope.deadline.0, 10, 18);
+        let (attempts, links) = if target_rank == 1 { (8, 16) } else { (10, 18) };
+        let mut budget = if target_rank == 1 {
+            super::super::super::range_stream::client_page_budget_for_test(
+                fixtures[source].scope.deadline.0,
+            )
+        } else {
+            AcquisitionBudget::new(fixtures[source].scope.deadline.0, attempts, links)
+        };
+        assert_eq!(
+            (budget.remaining_attempts(), budget.remaining_links()),
+            (attempts, links)
+        );
         let source_fill = fixtures[source].fill.clone();
         let page = fixtures[source].page.clone();
         let context = OriginContext {
@@ -777,6 +814,11 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
         );
         drop(read);
         assert_eq!(fixtures[target].origin.calls.get(), 1);
+        assert_eq!(
+            hedge_metrics.count(Event::PageHedgeStarted),
+            1,
+            "real 8/16 rank1 read launches optional hedge"
+        );
         for (i, f) in fixtures.iter().enumerate() {
             if i != target {
                 assert_eq!(f.origin.calls.get(), 0);
@@ -799,7 +841,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
                     && *attempts == target_rank as u32 + 1
                     && *links == 8)
         );
-        assert!(budget.remaining_attempts() <= 10 && budget.remaining_links() <= 18);
+        assert!(budget.remaining_attempts() <= attempts && budget.remaining_links() <= links);
         drop(endpoints);
     }
 }

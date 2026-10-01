@@ -15,8 +15,9 @@
 //! Pair exchanges have a local one-third-remaining cap; signed authority stays
 //! unchanged. Serial continuation skips the consumed primary, keeps the CopyOnly
 //! secondary eligible for Acquire, and preserves credits for later candidates.
-//! Receiver predecessor/origin work requires ten original attempts/eighteen links;
-//! the standard eight/sixteen allowance suppresses hedging, without budget inflation.
+//! One authorized cold fallback requires six original attempts/ten links; the
+//! standard eight/sixteen allowance can hedge without budget inflation. A second
+//! cold fallback needs additional original credits and is skipped if underfunded.
 //! A valid winner waits for the losing exchange/crypto fence before return:
 //! this can limit the latency benefit and is not an early-publication implementation.
 use crate::{

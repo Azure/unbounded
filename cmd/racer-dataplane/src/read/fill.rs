@@ -67,6 +67,10 @@ enum Prefetch {
     Ciphertext(UnverifiedPage),
 }
 impl Fill {
+    #[cfg(test)]
+    pub(crate) fn hedge_owner(&self) -> Option<&std::sync::Arc<super::hedge::Hedges>> {
+        self.dependencies.candidates.hedge_owner()
+    }
     pub(crate) fn cached_page(
         &self,
         page: &PageId,
