@@ -1371,6 +1371,11 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
         model::{ExpiresAt, ObjectMetadata, PageEnvelope},
         runtime::reactor::Reactor,
         security::{forwarding::ForwardedHead, protocol},
+        topology::{
+            membership::{Member, Membership},
+            rails::{self, RailId, RailMapping, TransportPlan},
+            routing::Route,
+        },
     };
     use std::{
         net::TcpListener,
@@ -1447,6 +1452,31 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
     let expected = body.clone();
+    let membership = Arc::new(
+        Membership::validate(
+            MembershipVersion(1),
+            [A, C]
+                .into_iter()
+                .map(|node| Member {
+                    node: NodeId(node.into()),
+                    shares: std::num::NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: listener.local_addr().unwrap().to_string(),
+                    rails: vec![RailMapping {
+                        rail: RailId(0),
+                        fabric: "fabric".into(),
+                        numa_node: None,
+                    }],
+                    alignment_enabled: true,
+                    site: "same-site".into(),
+                })
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let route = Route {
+        membership: membership.clone(),
+        nodes: vec![NodeId(A.into()), NodeId(C.into())],
+    };
     let scope =
         RequestScope::new(RequestId([7; 16]), Instant::now() + Duration::from_secs(30)).unwrap();
     let server = async {
@@ -1461,7 +1491,12 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
         let mut conn =
             crate::security::connection::accept(&io, conn, signers[2].clone(), &scope).await?;
         for attempt in 0..3 {
-            conn = io.receive_head(conn, &scope).await?.connection;
+            let mut received = io.receive_head(conn, &scope).await?;
+            assert!(
+                transport::detach(&mut received.value)?.is_none(),
+                "no native control without capability"
+            );
+            conn = received.connection;
             conn = io
                 .send_head(
                     conn,
@@ -1484,7 +1519,18 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     };
     let client = async {
         for attempt in 0..3 {
-            let local = request(&admission, attempt);
+            let mut local = request(&admission, attempt);
+            let page = match &response {
+                PeerResponse::Page { ciphertext, .. } => ciphertext.envelope().page.clone(),
+                _ => unreachable!(),
+            };
+            let plan =
+                rails::select_hop(&route, &page, &NodeId(A.into()), &NodeId(C.into())).unwrap();
+            assert_eq!(plan, TransportPlan::Rdma { rail: RailId(0) });
+            local.operation = Operation::Page {
+                page,
+                mode: FetchMode::CopyOnly,
+            };
             let scope = local.origin.scope().clone();
             let (signed, _) = Forwarding::new(signers[0].clone())
                 .sign_request(local)
@@ -1492,19 +1538,24 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
             // A proposed native route without native capability must complete the
             // real signed exchange over HTTP, not merely pass a selector test.
             let result = transfers
-                .exchange_planned(
+                .exchange_inner(
                     endpoint.clone(),
                     signed,
-                    crate::topology::rails::TransportPlan::Rdma {
-                        rail: crate::topology::rails::RailId(0),
-                    },
+                    plan,
+                    Some(membership.clone()),
+                    None,
+                    None,
+                    Rc::new(std::cell::Cell::new(false)),
                     &scope,
                 )
                 .await;
             if attempt == 2 {
                 assert!(result.is_err());
             } else {
-                match result.unwrap().response {
+                let transport::RelayResponse::Complete(response) = result.unwrap() else {
+                    panic!("requester must receive a complete HTTP body")
+                };
+                match response.response {
                     PeerResponse::Page { ciphertext, .. } => {
                         assert_eq!(ciphertext.bytes(), expected)
                     }

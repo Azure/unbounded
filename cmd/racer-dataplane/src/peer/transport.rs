@@ -1242,40 +1242,6 @@ impl Transfers {
     }
     /// The signed envelope and HTTP ciphertext share one exclusive pooled socket.
     /// A failed/abandoned exchange is never marked reusable.
-    pub fn exchange<'a>(
-        &'a self,
-        endpoint: crate::http::connection::Endpoint,
-        request: SignedRequest,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, SignedResponse> {
-        self.exchange_planned(endpoint, request, TransportPlan::Http, scope)
-    }
-    pub fn exchange_planned<'a>(
-        &'a self,
-        endpoint: crate::http::connection::Endpoint,
-        request: SignedRequest,
-        plan: TransportPlan,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, SignedResponse> {
-        Box::pin(async move {
-            match self
-                .exchange_inner(
-                    endpoint,
-                    request,
-                    plan,
-                    None,
-                    None,
-                    None,
-                    Rc::new(std::cell::Cell::new(false)),
-                    scope,
-                )
-                .await?
-            {
-                RelayResponse::Complete(response) => Ok(response),
-                RelayResponse::Http { .. } => Err(Error::Internal),
-            }
-        })
-    }
     pub(crate) fn exchange_inner<'a>(
         &'a self,
         endpoint: crate::http::connection::Endpoint,
@@ -1383,10 +1349,10 @@ impl Transfers {
                     .await,
                 )?
             };
-            // Legacy callers without an authenticated membership lease are HTTP-only.
             if let Some(timing) = timing.as_deref_mut() {
                 timing.end(1);
             }
+            // Native response verification requires an authenticated membership lease.
             let native = if membership.is_some() {
                 self.accept_native(&request, plan, scope)?
             } else {

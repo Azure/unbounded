@@ -306,7 +306,7 @@ impl BodyFixture {
             None,
             None,
             None,
-            Rc::new(std::cell::Cell::new(false)),
+            Rc::new(Cell::new(false)),
             Some(&mut timing),
             &scope,
         );
@@ -330,7 +330,7 @@ impl BodyFixture {
             "success" | "progress" | "reserved_progress" | "capped_progress"
         ) {
             let transport::RelayResponse::Complete(response) = result.unwrap() else {
-                panic!()
+                panic!("requester must receive a complete HTTP body")
             };
             let response = auth.verify_response(response, &binding).unwrap();
             timing.success(&response);
