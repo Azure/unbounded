@@ -785,7 +785,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(chosen.sequence, 1);
-        let live = Index::new(WorkerId(0), 1);
+        let live = Index::new(WorkerId(0), 1, crate::test_support::availability());
         live.set_page_capacity(16).unwrap();
         live.restore(chosen.shards.into_iter().next().unwrap().index)
             .unwrap();
