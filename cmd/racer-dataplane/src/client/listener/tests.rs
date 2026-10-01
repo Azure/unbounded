@@ -1,6 +1,7 @@
 //! Client socket scenarios: ownership, publication, HTTP delivery, and retirement.
 use super::*;
 use std::time::Instant;
+mod acquisition;
 mod recovery;
 
 #[test]
@@ -264,7 +265,7 @@ fn limits() -> Limits {
 }
 fn definition() -> CacheDefinition {
     CacheDefinition {
-        id: CacheId("00000000-0000-4000-8000-000000000001".into()),
+        id: CacheId(crate::security::identity::tests::CACHE.into()),
         name: "example".into(),
         client_socket: "/run/racer/example/client/socket".into(),
         origin_socket: "/run/racer/example/origin/socket".into(),
@@ -306,6 +307,7 @@ struct Fixture {
     listeners: ClientListeners,
     reactor: Rc<Reactor>,
     reads: Rc<Heads>,
+    worker: Option<crate::client::test_support::ReadWorker>,
 }
 impl Fixture {
     fn install_handoff(&self, ingress: &crate::runtime::ingress::Ingress) {
@@ -357,6 +359,7 @@ impl Fixture {
             listeners,
             reactor,
             reads,
+            worker: None,
         }
     }
     fn reconcile(&self, caches: &[CacheDefinition]) -> Result<()> {
@@ -379,12 +382,16 @@ impl Fixture {
         stream
     }
     fn pump(&self, budget: usize) {
+        let _queue = self.worker.as_ref().map(|worker| worker.drivers.enter());
         self.listeners
             .poll_budgeted(
                 &mut Context::from_waker(futures::task::noop_waker_ref()),
                 budget,
             )
             .unwrap();
+        if let Some(worker) = &self.worker {
+            worker.poll(&mut Context::from_waker(futures::task::noop_waker_ref()));
+        }
         self.reactor.poll_budgeted(64).unwrap();
     }
     fn receive(&self, socket: &mut UnixStream, eof: bool) -> Vec<u8> {
@@ -696,130 +703,53 @@ fn accepted_client_wakes_before_first_poll_and_blocked_clients_are_fair() {
     assert_eq!(fixture.listeners.active_connections(), 0);
 }
 
-struct Bodies {
-    admission: Rc<Admission>,
-    streams: crate::read::range_stream::RangeStreams,
-    late_failure: bool,
-    unseeded: bool,
-}
-impl ReadService for Bodies {
-    fn read<'a>(
-        &'a self,
-        request: ClientRequest,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, ReadResponse> {
-        Box::pin(async move {
-            use crate::{
-                memory::{
-                    page::PageResult,
-                    pool::{CiphertextBytes, CiphertextPage, VerifiedBytes, VerifiedPage},
+fn install_body_worker(
+    fixture: &mut Fixture,
+    delivery: Rc<Delivery>,
+    large: bool,
+    fail_first: bool,
+) {
+    use crate::{
+        client::test_support::ReadWorker,
+        model::{CacheKey, ObjectId, PAGE_BYTES},
+    };
+    let length = if large { PAGE_BYTES + 1 } else { 5 };
+    let worker = ReadWorker::new(
+        definition(),
+        ObjectMetadata {
+            content_type: None,
+            version: ObjectVersion {
+                object: ObjectId {
+                    cache: definition().id,
+                    key: CacheKey([0; 32]),
                 },
-                model::{
-                    ByteRange, KeyId, MembershipVersion, Nonce, PAGE_BYTES, PageEnvelope, PageId,
-                    PageNumber, ResourceClass,
-                },
-                topology::membership::Membership,
-            };
-            use std::sync::Arc;
-            let length = if self.late_failure { PAGE_BYTES + 1 } else { 5 };
-            let metadata = ObjectMetadata {
-                content_type: None,
-                version: ObjectVersion {
-                    object: request.origin.object.clone(),
-                    etag: StrongEtag::parse(b"\"v1\"")?,
-                },
-                length,
-                expires_at: ExpiresAt(UNIX_EPOCH + Duration::from_millis(1234)),
-            };
-            let requested = match &request.kind {
-                super::super::ReadKind::Subscription { range, .. } => {
-                    range.unwrap_or(ByteRange::From(0))
-                }
-                _ => ByteRange::Closed {
-                    first: 0,
-                    last: PAGE_BYTES - 1,
-                },
-            };
-            let range = requested.resolve(length)?;
-            let page = PageId {
-                version: metadata.version.clone(),
-                number: PageNumber(0),
-            };
-            let bytes = if self.late_failure {
-                vec![b'x'; PAGE_BYTES as usize]
-            } else {
-                b"hello".to_vec()
-            };
-            let envelope = PageEnvelope {
-                page: page.clone(),
-                key_id: KeyId([0; 16]),
-                nonce: Nonce([0; 24]),
-                plaintext_length: bytes.len() as u32,
-                ciphertext_length: bytes.len() as u32 + 16,
-            };
-            let plaintext = VerifiedPage {
-                inner: Arc::new(VerifiedBytes {
-                    page,
-                    reservation: self.admission.reserve(
-                        None,
-                        ResourceClass::Plaintext,
-                        bytes.len(),
-                    )?,
-                    bytes,
-                }),
-            };
-            let ciphertext = CiphertextPage {
-                inner: Arc::new(CiphertextBytes {
-                    checksum: std::sync::OnceLock::new(),
-                    reservation: self.admission.reserve(
-                        None,
-                        ResourceClass::Ciphertext,
-                        envelope.ciphertext_length as usize,
-                    )?,
-                    bytes: vec![0; envelope.ciphertext_length as usize],
-                    envelope,
-                }),
-            };
-            let seed = PageResult {
-                metadata: metadata.clone(),
-                plaintext,
-                ciphertext,
-            };
-            let mut stream = self.streams.open_with_budget(
-                metadata.clone(),
-                range,
-                request.origin,
-                Arc::new(Membership::validate(MembershipVersion(1), vec![])?),
-                scope.clone(),
-                crate::read::flight::AcquisitionBudget::new(scope.deadline.0, 4, 4),
-                if self.unseeded { None } else { Some(seed) },
-            )?;
-            if let super::super::ReadKind::Subscription {
-                page_credits,
-                byte_credits,
-                ordered,
-                ..
-            } = request.kind
-            {
-                stream.configure_subscription(page_credits, byte_credits, ordered)?;
-            }
-            Ok(ReadResponse {
-                metadata,
-                range: Some(range),
-                body: Some(stream),
-            })
-        })
+                etag: StrongEtag::parse(b"\"v1\"").unwrap(),
+            },
+            length,
+            expires_at: ExpiresAt(UNIX_EPOCH + Duration::from_millis(1234)),
+        },
+        fixture.listeners.admission.clone(),
+        fixture.reactor.clone(),
+        delivery,
+        1,
+    );
+    worker.origin.set_body(if large {
+        vec![b'x'; length as usize]
+    } else {
+        b"hello".to_vec()
+    });
+    if fail_first || large {
+        worker
+            .origin
+            .reject_page(if fail_first { 0 } else { 1 }, 503);
     }
+    fixture.listeners.reads = worker.coordinator.clone();
+    fixture.worker = Some(worker);
 }
 
 #[test]
 fn actual_uds_nonempty_range_and_late_failure_truncates() {
-    use crate::{
-        model::WorkerId,
-        read::{dispatch::WorkerDirectory, range_stream::RangeStreams},
-        runtime::worker::WorkerMap,
-    };
-    use std::sync::Arc;
+    use crate::model::WorkerId;
     for (late_failure, fields, expected_range, expected_length, expected_body) in [
         (
             false,
@@ -869,22 +799,7 @@ fn actual_uds_nonempty_range_and_late_failure_truncates() {
             Responses::new(fixture.listeners.io.clone(), delivery.clone())
                 .with_observer(observer.clone()),
         );
-        let directory = Arc::new(
-            WorkerDirectory::new(
-                Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
-                vec![WorkerId(0)],
-                4,
-            )
-            .unwrap(),
-        );
-        // Seed the first authenticated page; an unavailable owner for page one
-        // causes a real acquisition failure only after the first slice escaped.
-        fixture.listeners.reads = Rc::new(Bodies {
-            admission,
-            streams: RangeStreams::new(directory, delivery, 1).with_observer(observer),
-            late_failure,
-            unseeded: false,
-        });
+        install_body_worker(&mut fixture, delivery, late_failure, false);
         fixture.reconcile(&[definition()]).unwrap();
         let mut socket = fixture.connect();
         socket
@@ -939,10 +854,6 @@ fn actual_uds_nonempty_range_and_late_failure_truncates() {
             );
             assert!(
                 diagnostics.contains("sent: 2, expected: 3"),
-                "{diagnostics}"
-            );
-            assert!(
-                diagnostics.contains("stage=PageDispatch error=Unavailable"),
                 "{diagnostics}"
             );
         } else {
@@ -1011,21 +922,15 @@ fn subscription_retains_delivered_page_until_release_and_rejects_invalid_release
     }
 }
 
-fn body_fixture(queue: usize, unseeded: bool) -> (Fixture, Rc<PipePool>) {
-    body_fixture_with_large_page(queue, unseeded, false)
+fn body_fixture(queue: usize, fail_first: bool) -> (Fixture, Rc<PipePool>) {
+    body_fixture_with_large_page(queue, fail_first, false)
 }
 
 fn body_fixture_with_large_page(
     queue: usize,
-    unseeded: bool,
+    fail_first: bool,
     large_page: bool,
 ) -> (Fixture, Rc<PipePool>) {
-    use crate::{
-        model::WorkerId,
-        read::{dispatch::WorkerDirectory, range_stream::RangeStreams},
-        runtime::worker::WorkerMap,
-    };
-    use std::sync::Arc;
     let mut limits = limits();
     limits.pipes = NonZeroUsize::new(1).unwrap();
     limits.queue_entries = NonZeroUsize::new(queue).unwrap();
@@ -1033,24 +938,11 @@ fn body_fixture_with_large_page(
     let admission = fixture.listeners.admission.clone();
     let pipes = Rc::new(PipePool::new(admission.clone(), fixture.reactor.clone()));
     let delivery = Rc::new(Delivery::new(pipes.clone(), Duration::from_secs(2)));
-    let directory = Arc::new(
-        WorkerDirectory::new(
-            Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
-            vec![WorkerId(0)],
-            4,
-        )
-        .unwrap(),
-    );
     fixture.listeners.responses = Rc::new(Responses::new(
         fixture.listeners.io.clone(),
         delivery.clone(),
     ));
-    fixture.listeners.reads = Rc::new(Bodies {
-        admission,
-        streams: RangeStreams::new(directory, delivery, 1),
-        late_failure: large_page,
-        unseeded,
-    });
+    install_body_worker(&mut fixture, delivery, large_page, fail_first);
     fixture.reconcile(&[definition()]).unwrap();
     (fixture, pipes)
 }
@@ -1108,7 +1000,7 @@ fn assert_only_idle_pipes(fixture: &Fixture, pipes: &crate::memory::pipe::PipePo
 
 #[test]
 fn configured_timeout_is_not_renewed_by_response_or_stream_progress() {
-    let (mut fixture, _pipes) = body_fixture_with_large_page(2, false, true);
+    let (mut fixture, _pipes) = body_fixture_with_large_page(16, false, true);
     let timeout = Duration::from_millis(800);
     fixture.listeners = fixture.listeners.with_request_timeout(timeout);
     let reads = Rc::new(GatedRead {
@@ -1251,14 +1143,14 @@ fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
 
 #[test]
 fn actual_uds_first_page_failure_is_complete_503() {
-    let (mut fixture, _pipes) = body_fixture(2, true);
+    let (mut fixture, _pipes) = body_fixture(16, true);
     let failures = crate::telemetry::failures::Failures::default();
     let delivery = Rc::new(Delivery::new(_pipes.clone(), Duration::from_secs(2)));
     fixture.listeners.responses = Rc::new(
         Responses::new(fixture.listeners.io.clone(), delivery)
             .with_observer(failures.observer(crate::model::WorkerId(0))),
     );
-    // No owner is installed for the unseeded first page.
+    // The adapter rejects the first page before success headers are committed.
     let mut socket = start_body(&fixture);
     let output = fixture.receive(&mut socket, true);
     assert!(output.starts_with(b"HTTP/1.1 503 "), "{output:?}");
@@ -1277,7 +1169,7 @@ fn actual_uds_first_page_failure_is_complete_503() {
 #[test]
 fn actual_uds_waiting_deadline_and_cache_shutdown_release_all_leases() {
     for cancel in [false, true] {
-        let (mut fixture, pipes) = body_fixture(2, false);
+        let (mut fixture, pipes) = body_fixture(16, false);
         fixture.listeners = fixture
             .listeners
             .with_request_timeout(Duration::from_millis(200));

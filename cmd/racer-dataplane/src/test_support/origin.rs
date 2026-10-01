@@ -48,6 +48,7 @@ struct State {
     body: Option<Vec<u8>>,
     calls: Vec<Call>,
     rejections: BTreeMap<RequestKind, VecDeque<u16>>,
+    rejected_pages: BTreeMap<u64, u16>,
     blocked: BTreeSet<RequestKind>,
     blocked_pages: BTreeSet<u64>,
     delays: BTreeMap<RequestKind, Duration>,
@@ -90,6 +91,7 @@ impl AdapterOrigin {
             body: None,
             calls: vec![],
             rejections: BTreeMap::new(),
+            rejected_pages: BTreeMap::new(),
             blocked: BTreeSet::new(),
             blocked_pages: BTreeSet::new(),
             delays: BTreeMap::new(),
@@ -169,6 +171,15 @@ impl AdapterOrigin {
             .entry(kind)
             .or_default()
             .push_back(status);
+    }
+    /// Reject every GET for this page, including retries, without failing HEAD.
+    pub fn reject_page(&self, page: u64, status: u16) {
+        assert!((400..600).contains(&status));
+        self.state
+            .lock()
+            .unwrap()
+            .rejected_pages
+            .insert(page, status);
     }
     pub fn block(&self, kind: RequestKind) {
         self.state.lock().unwrap().blocked.insert(kind);
@@ -281,7 +292,16 @@ fn serve(mut stream: UnixStream, state: &Mutex<State>, stop: &AtomicBool) {
         thread::sleep(Duration::from_millis(1));
     }
     let mut state = state.lock().unwrap();
-    let rejected = state.rejections.entry(kind).or_default().pop_front();
+    let rejected = state
+        .rejections
+        .entry(kind)
+        .or_default()
+        .pop_front()
+        .or_else(|| {
+            (!head)
+                .then(|| state.rejected_pages.get(&call.page).copied())
+                .flatten()
+        });
     let metadata = &state.metadata;
     let status = rejected.unwrap_or_else(|| {
         if call

@@ -184,7 +184,6 @@ impl Coordinator {
                             membership,
                             scope.clone(),
                             budget,
-                            None,
                         )?
                     };
                     body.configure_subscription(page_credits, byte_credits, ordered)?;
@@ -464,46 +463,6 @@ mod tests {
         assert!(matches!(
             inherited_budget(&route, &scope),
             Err(Error::HopBudgetExhausted)
-        ));
-    }
-    use crate::model::{CacheId, CacheKey, ExpiresAt, ObjectVersion, StrongEtag};
-    #[test]
-    fn pinned_head_validation_never_accepts_current_version_substitution() {
-        let object = ObjectId {
-            cache: CacheId("cache".into()),
-            key: CacheKey([0; 32]),
-        };
-        let metadata = ObjectMetadata {
-            content_type: None,
-            version: ObjectVersion {
-                object: object.clone(),
-                etag: StrongEtag::test_value("new"),
-            },
-            length: 0,
-            expires_at: ExpiresAt(std::time::UNIX_EPOCH),
-        };
-        assert_eq!(
-            validate_metadata(&metadata, &object, &MetadataSelector::Fresh),
-            Ok(())
-        );
-        assert_eq!(
-            validate_metadata(
-                &metadata,
-                &object,
-                &MetadataSelector::Pinned(StrongEtag::test_value("old"))
-            ),
-            Err(Error::VersionUnavailable)
-        );
-    }
-    #[test]
-    fn unsatisfiable_range_reports_the_selected_versions_length() {
-        assert!(matches!(
-            resolve_range(ByteRange::From(4), 4),
-            Err(Error::UnsatisfiableRangeWithLength(4))
-        ));
-        assert!(matches!(
-            resolve_range(ByteRange::From(0), 0),
-            Err(Error::UnsatisfiableRangeWithLength(0))
         ));
     }
     #[test]

@@ -136,10 +136,9 @@ impl RangeStreams {
         let budget = RangeBudget::ClientPages {
             deadline: scope.deadline.0,
         };
-        self.open_budget(metadata, range, context, membership, scope, budget, None)
+        self.open_budget(metadata, range, context, membership, scope, budget)
     }
-    /// Bootstrap supplies its already acquired page zero. The same original
-    /// budget then belongs to the stream, with no retry/fanout reset.
+    /// The original aggregate budget belongs to the stream, with no retry/fanout reset.
     #[allow(clippy::too_many_arguments)]
     pub fn open_with_budget(
         &self,
@@ -149,7 +148,6 @@ impl RangeStreams {
         membership: MembershipLease,
         scope: RequestScope,
         budget: AcquisitionBudget,
-        seed: Option<PageResult>,
     ) -> Result<RangeStream> {
         self.open_budget(
             metadata,
@@ -158,7 +156,6 @@ impl RangeStreams {
             membership,
             scope,
             RangeBudget::Shared(budget),
-            seed,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -170,7 +167,6 @@ impl RangeStreams {
         membership: MembershipLease,
         scope: RequestScope,
         budget: RangeBudget,
-        seed: Option<PageResult>,
     ) -> Result<RangeStream> {
         scope.check()?;
         if self.window_pages == 0 {
@@ -183,7 +179,7 @@ impl RangeStreams {
             return Err(Error::InvalidRange);
         }
         let first = range.first_page();
-        let mut stream = RangeStream {
+        Ok(RangeStream {
             prefetch_error: None,
             selected_ready: None,
             selection: None,
@@ -202,13 +198,7 @@ impl RangeStreams {
             next_page: Some(first),
             ready: VecDeque::new(),
             terminated: false,
-        };
-        if let Some(seed) = seed {
-            stream.validate(&seed, first)?;
-            stream.ready.push_back((first, WindowPage::Ready(Ok(seed))));
-            stream.advance(first);
-        }
-        Ok(stream)
+        })
     }
 }
 impl RangeStream {
@@ -221,19 +211,13 @@ impl RangeStream {
         if self.subscription.is_some() {
             return Err(Error::InvalidRequest);
         }
-        let mut demand = self.directory.subscriptions.register(
+        let demand = self.directory.subscriptions.register(
             self.metadata.version.clone(),
             self.range,
             pages,
             bytes,
             ordered,
         )?;
-        // Seeded streams are used by fixtures; production resolves metadata without bootstrap.
-        for (number, _) in &self.ready {
-            if demand.select() != Some(*number) {
-                return Err(Error::InvalidRequest);
-            }
-        }
         // Ordered concurrency also respects the configured acquisition window:
         // a large client lease allowance must not create an I/O admission burst.
         // Unordered selection retains its existing credit-driven behavior.
@@ -412,7 +396,7 @@ impl RangeStream {
                 }
                 return result;
             }
-            if self.subscription.is_some() && self.ready.is_empty() {
+            if self.subscription.is_some() {
                 return self.next_subscription_slice().await;
             }
             if self.ready.is_empty() && self.next_page.is_none() {
@@ -426,20 +410,6 @@ impl RangeStream {
                 self.terminate();
                 return Err(error);
             }
-            if self.ready.is_empty() {
-                if let Some(demand) = &self.subscription {
-                    if demand.exhausted() {
-                        self.terminated = true;
-                        self.next_page = None;
-                        return Ok(None);
-                    }
-                    if !demand.ready_to_select() {
-                        // A credit-starved subscriber must not hold the shared
-                        // delivery pipe while waiting for its own release frame.
-                        std::future::pending::<()>().await;
-                    }
-                }
-            }
             // Schedule delivery before starting more page work. Waiting requests
             // cannot pin newly acquired pages merely to discover pipe exhaustion.
             let pipe = match self.delivery.admit(&operation_scope).await {
@@ -451,101 +421,11 @@ impl RangeStream {
                     return Err(error);
                 }
             };
-            while self.ready.len() < self.window_pages {
-                if self
-                    .subscription
-                    .as_ref()
-                    .is_some_and(|demand| demand.exhausted())
-                {
-                    self.next_page = None;
-                    break;
-                }
-                if self.subscription.is_none() && self.next_page.is_none() {
-                    break;
-                }
-                let child = match self.budget.next_page(!self.ready.is_empty()) {
-                    Ok(Some(child)) => child,
-                    Ok(None) => break,
-                    Err(error) => {
-                        self.observer.record(
-                            Failure::new(Stage::RangeBudget, error).request(&operation_scope),
-                        );
-                        self.terminate();
-                        return Err(error);
-                    }
-                };
-                let number = if let Some(demand) = self.subscription.as_mut() {
-                    let Some(number) = demand.select() else {
-                        if demand.exhausted() {
-                            self.next_page = None;
-                        }
-                        self.budget.complete(child)?;
-                        break;
-                    };
-                    number
-                } else {
-                    let Some(number) = self.next_page else {
-                        self.budget.complete(child)?;
-                        break;
-                    };
-                    number
-                };
-                let page = PageId {
-                    version: self.metadata.version.clone(),
-                    number,
-                };
-                let mut page_scope = operation_scope.clone();
-                page_scope.deadline.0 = child.deadline();
-                let result = self.directory.start_page(
-                    page,
-                    self.membership.clone(),
-                    &self.context,
-                    &page_scope,
-                    child,
-                );
-                let failed = result.is_err();
-                let entry = match result {
-                    Ok(future) => WindowPage::Waiting(future),
-                    Err(error) => {
-                        self.observer.record(
-                            Failure::new(Stage::PageDispatch, error)
-                                .request(&page_scope)
-                                .detail(Detail::Page(number.0)),
-                        );
-                        WindowPage::Ready(Err(error))
-                    }
-                };
-                if failed {
-                    self.next_page = None;
-                } else if self.subscription.is_none() {
-                    self.advance(number);
-                }
-                self.ready.push_back((number, entry));
+            if let Err(error) = self.admit_window(&operation_scope) {
+                self.terminate();
+                return Err(error);
             }
-            if self.ready.is_empty() && self.next_page.is_some() {
-                // Only an exact client release can make credit available again.
-                std::future::pending::<()>().await;
-            }
-            let unordered = self
-                .subscription
-                .as_ref()
-                .is_some_and(|demand| !demand.ordered());
-            poll_fn(|cx| {
-                let result = poll_window(&mut self.ready, &mut self.budget, cx);
-                if unordered {
-                    if let Some(index) = self
-                        .ready
-                        .iter()
-                        .position(|(_, page)| matches!(page, WindowPage::Ready(_)))
-                    {
-                        let page = self.ready.remove(index).unwrap();
-                        self.ready.push_front(page);
-                        return Poll::Ready(());
-                    }
-                }
-                result
-            })
-            .await;
+            poll_fn(|cx| poll_window(&mut self.ready, &mut self.budget, cx)).await;
             if let Err(error) = operation_scope.check() {
                 self.terminate();
                 return Err(error);
@@ -564,11 +444,6 @@ impl RangeStream {
             let lease = result.and_then(|result| {
                 let attach = (|| {
                     self.validate(&result, number)?;
-                    if let Some(demand) = self.subscription.as_mut() {
-                        demand.completed(number);
-                        demand.issued(number)?;
-                        self.retained.insert(number, result.plaintext.clone());
-                    }
                     let slice = self
                         .range
                         .slice_at(result.plaintext.page().number)?
@@ -586,6 +461,50 @@ impl RangeStream {
                 }
             }
         })
+    }
+    /// Non-subscription ranges acquire an ordered sliding window. Subscription
+    /// scheduling uses poll_ordered/poll_selection and never enters this path.
+    fn admit_window(&mut self, scope: &RequestScope) -> Result<()> {
+        while self.ready.len() < self.window_pages {
+            let Some(number) = self.next_page else { break };
+            let Some(child) = self.observer.result(
+                Stage::RangeBudget,
+                scope,
+                self.budget.next_page(!self.ready.is_empty()),
+            )?
+            else {
+                break;
+            };
+            let page = PageId {
+                version: self.metadata.version.clone(),
+                number,
+            };
+            let mut page_scope = scope.clone();
+            page_scope.deadline.0 = child.deadline();
+            let entry = match self.directory.start_page(
+                page,
+                self.membership.clone(),
+                &self.context,
+                &page_scope,
+                child,
+            ) {
+                Ok(future) => {
+                    self.advance(number);
+                    WindowPage::Waiting(future)
+                }
+                Err(error) => {
+                    self.observer.record(
+                        Failure::new(Stage::PageDispatch, error)
+                            .request(&page_scope)
+                            .detail(Detail::Page(number.0)),
+                    );
+                    self.next_page = None;
+                    WindowPage::Ready(Err(error))
+                }
+            };
+            self.ready.push_back((number, entry));
+        }
+        Ok(())
     }
     pub fn cancel(&mut self) -> Operation<'_, ()> {
         Box::pin(async move {
@@ -1121,14 +1040,10 @@ mod tests {
                 Codec,
                 connection::{ConnectionLease, HttpIo},
             },
-            memory::{
-                pipe::PipePool,
-                pool::{CiphertextBytes, CiphertextPage, VerifiedBytes, VerifiedPage},
-            },
-            model::{KeyId, Nonce, PageEnvelope, RequestId, ResourceClass, WorkerId},
+            memory::pipe::PipePool,
+            model::{RequestId, ResourceClass},
             read::ReadResponse,
-            runtime::{admission::Admission, reactor::Reactor, worker::WorkerMap},
-            topology::membership::Membership,
+            runtime::{admission::Admission, reactor::Reactor},
         };
         use std::{
             io::{Read, Write},
@@ -1166,16 +1081,25 @@ mod tests {
                 Rc::new(PipePool::new(admission.clone(), reactor.clone())),
                 Duration::from_secs(30),
             ));
-            let directory = Arc::new(
-                WorkerDirectory::new(
-                    Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
-                    vec![WorkerId(0)],
-                    8,
-                )
-                .unwrap(),
-            );
             let mut metadata = metadata();
             metadata.length = total;
+            metadata.version.object.cache = CacheId(crate::security::identity::tests::CACHE.into());
+            let (client_socket, origin_socket) =
+                crate::control::caches::canonical_socket_paths("framing").unwrap();
+            let worker = crate::client::test_support::ReadWorker::new(
+                crate::control::caches::CacheDefinition {
+                    id: metadata.version.object.cache.clone(),
+                    name: "framing".into(),
+                    client_socket,
+                    origin_socket,
+                },
+                metadata.clone(),
+                admission.clone(),
+                reactor.clone(),
+                delivery.clone(),
+                4,
+            );
+            let _queue = worker.drivers.enter();
             let scope = RequestScope::new(
                 RequestId([7; 16]),
                 crate::runtime::environment::now()
@@ -1186,87 +1110,21 @@ mod tests {
                     },
             )
             .unwrap();
-            let membership =
-                Arc::new(Membership::validate(crate::model::MembershipVersion(1), vec![]).unwrap());
-            let mut ready = VecDeque::new();
-            for number in 1..=4 {
-                let length = if number == 4 { 17 } else { PAGE_BYTES as usize };
-                let page = PageId {
-                    version: metadata.version.clone(),
-                    number: PageNumber(number),
-                };
-                let plaintext = VerifiedPage {
-                    inner: Arc::new(VerifiedBytes {
-                        page: page.clone(),
-                        bytes: vec![number as u8; length],
-                        reservation: admission
-                            .reserve(
-                                Some(&metadata.version.object.cache),
-                                ResourceClass::Plaintext,
-                                length,
-                            )
-                            .unwrap(),
-                    }),
-                };
-                let ciphertext = CiphertextPage {
-                    inner: Arc::new(CiphertextBytes {
-                        checksum: std::sync::OnceLock::new(),
-                        envelope: PageEnvelope {
-                            page,
-                            key_id: KeyId([1; 16]),
-                            nonce: Nonce([2; 24]),
-                            plaintext_length: length as u32,
-                            ciphertext_length: length as u32 + 16,
-                        },
-                        bytes: vec![0; length + 16],
-                        reservation: admission
-                            .reserve(
-                                Some(&metadata.version.object.cache),
-                                ResourceClass::Ciphertext,
-                                length + 16,
-                            )
-                            .unwrap(),
-                    }),
-                };
-                ready.push_back((
-                    PageNumber(number),
-                    WindowPage::Ready(Ok(PageResult {
-                        metadata: metadata.clone(),
-                        plaintext,
-                        ciphertext,
-                    })),
-                ));
-            }
-            let mut stream = RangeStream {
-                prefetch_error: None,
-                selected_ready: None,
-                selection: None,
-                retained: std::collections::BTreeMap::new(),
-                subscription: None,
-                observer: Observer::default(),
-                metadata: metadata.clone(),
-                range,
-                context: OriginContext {
-                    object: metadata.version.object.clone(),
-                    metadata: None,
-                    authorization: None,
-                },
-                membership,
-                scope: scope.clone(),
-                directory,
-                delivery: delivery.clone(),
-                window_pages: 4,
-                budget: if progressing {
-                    RangeBudget::ClientPages {
-                        deadline: scope.deadline.0,
-                    }
-                } else {
-                    RangeBudget::Shared(AcquisitionBudget::new(scope.deadline.0, 0, 0))
-                },
-                next_page: None,
-                ready,
-                terminated: false,
-            };
+            let membership = worker.membership.clone();
+            let mut stream = worker
+                .streams
+                .open(
+                    metadata.clone(),
+                    range,
+                    OriginContext {
+                        object: metadata.version.object.clone(),
+                        metadata: None,
+                        authorization: None,
+                    },
+                    membership,
+                    scope.clone(),
+                )
+                .unwrap();
             if subscription {
                 stream
                     .configure_subscription(4, 4 * PAGE_BYTES, false)
@@ -1278,6 +1136,8 @@ mod tests {
                 body: Some(stream),
             };
             let responses = Responses::new(io.clone(), delivery);
+            let headers_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reader_headers = headers_sent.clone();
             let (server, mut client) = UnixStream::pair().unwrap();
             let reader = std::thread::spawn(move || {
                 client
@@ -1297,12 +1157,16 @@ mod tests {
                     head.push(byte[0]);
                 }
                 assert!(!capped);
+                reader_headers.store(true, std::sync::atomic::Ordering::Release);
                 let head = String::from_utf8(head).unwrap();
-                assert!(head.starts_with(if subscription {
-                    "HTTP/1.1 200"
-                } else {
-                    "HTTP/1.1 206"
-                }));
+                assert!(
+                    head.starts_with(if subscription {
+                        "HTTP/1.1 200"
+                    } else {
+                        "HTTP/1.1 206"
+                    }),
+                    "subscription={subscription} progressing={progressing}: {head}"
+                );
                 assert!(head.contains(&format!(
                     "Content-Length: {}\r\n",
                     3 * PAGE_BYTES + 17 + if subscription { 5 * 21 } else { 0 }
@@ -1360,11 +1224,7 @@ mod tests {
                             response,
                             &scope,
                             &mut observation,
-                            if progressing {
-                                Duration::from_millis(30)
-                            } else {
-                                Duration::from_secs(30)
-                            },
+                            Duration::from_secs(30),
                         )
                         .await
                         .map(drop)
@@ -1382,8 +1242,9 @@ mod tests {
                     break result;
                 }
                 reactor.poll_budgeted(128).unwrap();
+                worker.poll(&mut cx);
                 reactor.wait(Duration::from_millis(1)).unwrap();
-                if progressing {
+                if progressing && headers_sent.load(std::sync::atomic::Ordering::Acquire) {
                     clock.advance(Duration::from_millis(1));
                 }
             };
@@ -1393,6 +1254,16 @@ mod tests {
                 result.unwrap();
             }
             reader.join().unwrap();
+            // Dropping a capped response detaches waiters, but accepted worker
+            // acquisitions and crypto completions still need their owner polled.
+            let drain_deadline = Instant::now() + Duration::from_secs(5);
+            while worker.drivers.pending() != 0 || reactor.in_flight() != 0 {
+                worker.poll(&mut cx);
+                reactor.poll_budgeted(128).unwrap();
+                reactor.wait(Duration::from_millis(1)).unwrap();
+                assert!(Instant::now() < drain_deadline, "read worker did not drain");
+            }
+            worker.poll(&mut cx);
             admission.reclaim_buffers();
             if progressing {
                 assert!(
