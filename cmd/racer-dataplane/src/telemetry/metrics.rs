@@ -1,7 +1,7 @@
-//! Fixed series only. Callers cannot supply metric names or label values.
-use crate::error::Result;
+//! Fixed metric names; only installed runtime worker IDs are exposed as labels.
+use crate::{error::Result, model::identity::WorkerId, runtime::admission::AdmissionUsage};
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicU64, Ordering},
 };
 
@@ -30,11 +30,13 @@ struct Registry {
 #[repr(align(64))]
 struct Counters {
     events: [AtomicU64; EVENT_COUNT],
+    admission: OnceLock<(WorkerId, AdmissionUsage)>,
 }
 impl Default for Counters {
     fn default() -> Self {
         Self {
             events: std::array::from_fn(|_| AtomicU64::new(0)),
+            admission: OnceLock::new(),
         }
     }
 }
@@ -296,6 +298,13 @@ impl Drop for GaugeLease {
     }
 }
 impl Metrics {
+    /// Install once during worker assembly, not on the admission hot path.
+    pub(crate) fn observe_admission(&self, worker: WorkerId, usage: AdmissionUsage) -> Result<()> {
+        self.registry.shards[self.shard]
+            .admission
+            .set((worker, usage))
+            .map_err(|_| crate::error::Error::InvalidConfiguration)
+    }
     /// Observe only an executed synchronous presence probe, preserving its result.
     pub(crate) fn lookup<T>(
         &self,
@@ -421,12 +430,150 @@ impl Metrics {
                 self.gauge(gauge)
             )?;
         }
+        // Only runtime worker IDs are labels. Read the authority's actual charge,
+        // including pooled ciphertext capacity, without sampling on worker polls.
+        // A stalled worker therefore remains observable from another worker.
+        const QUOTAS: [&str; 4] = [
+            "racer_worker_relay_used",
+            "racer_worker_relay_limit",
+            "racer_worker_ciphertext_used_bytes",
+            "racer_worker_ciphertext_limit_bytes",
+        ];
+        if self
+            .registry
+            .shards
+            .iter()
+            .any(|s| s.admission.get().is_some())
+        {
+            for name in QUOTAS {
+                writeln!(out, "# TYPE {name} gauge")?;
+            }
+            for shard in &self.registry.shards {
+                if let Some((worker, usage)) = shard.admission.get() {
+                    let (relay_used, relay_limit) = usage.relay();
+                    let (ciphertext_used, ciphertext_limit) = usage.ciphertext();
+                    for (name, value) in QUOTAS.into_iter().zip([
+                        relay_used,
+                        relay_limit,
+                        ciphertext_used,
+                        ciphertext_limit,
+                    ]) {
+                        writeln!(out, "{name}{{worker=\"{}\"}} {value}", worker.0)?;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{model::limits::ResourceClass, runtime::admission::Admission};
+
+    #[test]
+    fn worker_quota_gauges_follow_authoritative_reservations() {
+        let workers = Metrics::for_workers(2).unwrap();
+        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
+        let other = Admission::new(crate::test_support::cluster::config(false).limits);
+        workers[0]
+            .observe_admission(WorkerId(7), admission.usage())
+            .unwrap();
+        workers[1]
+            .observe_admission(WorkerId(19), other.usage())
+            .unwrap();
+        assert!(matches!(
+            workers[0].observe_admission(WorkerId(20), other.usage()),
+            Err(crate::error::Error::InvalidConfiguration)
+        ));
+        let scrape = || {
+            let mut output = String::new();
+            workers[1].write_prometheus(&mut output).unwrap();
+            output
+        };
+        let relay_limit = admission.limit(ResourceClass::Relay);
+        let ciphertext_limit = admission.limit(ResourceClass::Ciphertext);
+        let idle = scrape();
+        for worker in [7, 19] {
+            for (name, value) in [
+                ("relay_used", 0),
+                ("relay_limit", relay_limit),
+                ("ciphertext_used_bytes", 0),
+                ("ciphertext_limit_bytes", ciphertext_limit),
+            ] {
+                assert!(idle.contains(&format!(
+                    "racer_worker_{name}{{worker=\"{worker}\"}} {value}\n"
+                )));
+            }
+        }
+        let relay = admission
+            .reserve(None, ResourceClass::Relay, relay_limit)
+            .unwrap();
+        let mut ciphertext = admission
+            .reserve(None, ResourceClass::Ciphertext, ciphertext_limit)
+            .unwrap();
+        let full = scrape();
+        for (name, value) in [
+            ("relay_used", relay_limit),
+            ("ciphertext_used_bytes", ciphertext_limit),
+        ] {
+            assert!(full.contains(&format!("racer_worker_{name}{{worker=\"7\"}} {value}\n")));
+            assert!(full.contains(&format!("racer_worker_{name}{{worker=\"19\"}} 0\n")));
+        }
+        for class in [ResourceClass::Relay, ResourceClass::Ciphertext] {
+            assert!(matches!(
+                admission.reserve(None, class, 1),
+                Err(crate::error::Error::Overloaded)
+            ));
+        }
+        assert_eq!(scrape(), full, "rejection must not change quota gauges");
+        let split = ciphertext.split(8).unwrap();
+        assert_eq!(scrape(), full, "splitting retains the total charge");
+        drop(split);
+        ciphertext.shrink(16).unwrap();
+        assert!(scrape().contains("racer_worker_ciphertext_used_bytes{worker=\"7\"} 16\n"));
+        admission.stop();
+        drop(admission);
+        assert!(scrape().contains("racer_worker_ciphertext_used_bytes{worker=\"7\"} 16\n"));
+        std::thread::spawn(move || drop((relay, ciphertext)))
+            .join()
+            .unwrap();
+        assert_eq!(
+            scrape(),
+            idle,
+            "final release remains visible after owner exit"
+        );
+        assert_eq!(
+            idle.lines()
+                .filter(|line| line.contains("{worker="))
+                .count(),
+            8
+        );
+        assert!(!idle.contains("request="));
+    }
+
+    #[test]
+    fn worker_quota_gauges_include_recycled_ciphertext_capacity() {
+        let metrics = Metrics::default();
+        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
+        metrics
+            .observe_admission(WorkerId(0), admission.usage())
+            .unwrap();
+        let mut reservation = admission
+            .reserve(None, ResourceClass::Ciphertext, 1 << 20)
+            .unwrap();
+        let bytes = reservation.buffer(1 << 20).unwrap();
+        reservation.recycle(bytes);
+        drop(reservation);
+        let mut output = String::new();
+        metrics.write_prometheus(&mut output).unwrap();
+        assert!(output.contains("racer_worker_ciphertext_used_bytes{worker=\"0\"} 1048576\n"));
+        admission.stop();
+        output.clear();
+        metrics.write_prometheus(&mut output).unwrap();
+        assert!(output.contains("racer_worker_ciphertext_used_bytes{worker=\"0\"} 0\n"));
+    }
+
     #[test]
     fn lookup_outcomes_preserve_results_and_export_fixed_series() {
         let metrics = Metrics::default();
