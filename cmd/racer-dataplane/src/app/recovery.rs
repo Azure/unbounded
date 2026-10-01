@@ -245,28 +245,35 @@ impl WorkerApplication {
         })
         .await?;
         if self.worker == node.control_worker {
-            let candidates = crate::store::checkpoint::read_candidates(&self.slab_directory);
+            let candidates =
+                crate::store::checkpoint::candidates(&self.slab_directory, self.checkpoint_budget);
             let mut cut = node.recovery.lock().map_err(|_| Error::Unavailable)?;
             match candidates {
                 Ok(candidates) => {
-                    if let Some((slot, newest)) =
-                        candidates.iter().max_by_key(|(_, image)| image.sequence)
-                    {
+                    let mut newest = None;
+                    let images = candidates.map(|(slot, image)| {
+                        newest.get_or_insert((slot, image.sequence));
+                        image
+                    });
+                    let selected = select(
+                        images,
+                        &cut.geometry,
+                        &node.workers,
+                        (
+                            self.store.writer.index().page_capacity(),
+                            self.store.writer.index().metadata_capacity(),
+                        ),
+                        &self.keys,
+                        &self.snapshots.current()?.caches,
+                    );
+                    if let Some((slot, sequence)) = newest {
                         let mut periodic = node
                             .periodic_checkpoint
                             .lock()
                             .map_err(|_| Error::Unavailable)?;
-                        periodic.last_sequence = newest.sequence;
-                        periodic.last_slot = *slot;
+                        periodic.last_sequence = sequence;
+                        periodic.last_slot = slot;
                     }
-                    let selected = select(
-                        candidates.into_iter().map(|(_, image)| image).collect(),
-                        &cut.geometry,
-                        &node.workers,
-                        self.store.writer.index().page_capacity(),
-                        &self.keys,
-                        &self.snapshots.current()?.caches,
-                    );
                     cut.shards = selected.map_or_else(HashMap::default, |image| {
                         image.shards.into_iter().map(|s| (s.worker, s)).collect()
                     });
@@ -323,46 +330,70 @@ impl WorkerApplication {
 }
 
 fn select(
-    mut candidates: Vec<CheckpointImage>,
+    candidates: impl IntoIterator<Item = CheckpointImage>,
     geometry: &HashMap<WorkerId, CheckpointGeometry>,
     workers: &WorkerDirectory,
-    capacity: usize,
+    (page_capacity, metadata_capacity): (usize, usize),
     keys: &Keyring,
     caches: &[crate::control::state::CacheDefinition],
 ) -> Option<CheckpointImage> {
-    candidates.sort_by_key(|image| std::cmp::Reverse(image.sequence));
-    candidates.into_iter().find_map(|mut image| {
-        let ids: HashSet<_> = image.shards.iter().map(|s| s.worker).collect();
-        if ids.len() != image.shards.len() || ids != geometry.keys().copied().collect() {
+    // The disk scanner supplies newest-first images, never retaining a second
+    // decoded candidate while validating the first.
+    candidates.into_iter().find_map(|image| {
+        let sequence = image.sequence;
+        let selected = validate_candidate(
+            image,
+            geometry,
+            workers,
+            (page_capacity, metadata_capacity),
+            keys,
+            caches,
+        );
+        if selected.is_none() {
+            eprintln!("racer: skipping incompatible checkpoint sequence {sequence}");
+        }
+        selected
+    })
+}
+
+fn validate_candidate(
+    mut image: CheckpointImage,
+    geometry: &HashMap<WorkerId, CheckpointGeometry>,
+    workers: &WorkerDirectory,
+    (page_capacity, metadata_capacity): (usize, usize),
+    keys: &Keyring,
+    caches: &[crate::control::state::CacheDefinition],
+) -> Option<CheckpointImage> {
+    let ids: HashSet<_> = image.shards.iter().map(|s| s.worker).collect();
+    if ids.len() != image.shards.len() || ids != geometry.keys().copied().collect() {
+        return None;
+    }
+    let available = |cache: &crate::model::CacheId| caches.iter().any(|c| &c.id == cache);
+    Recovery::filter_available(
+        &mut image,
+        |cache| available(cache) && keys.active(cache, KeyPurpose::Page).is_ok(),
+        |cache, id| available(cache) && keys.lease(Some(cache), id, KeyPurpose::Page).is_ok(),
+    );
+    for shard in &image.shards {
+        if geometry.get(&shard.worker) != Some(&shard.geometry) || shard.validate().is_err() {
             return None;
         }
-        let available = |cache: &crate::model::CacheId| caches.iter().any(|c| &c.id == cache);
-        Recovery::filter_available(
-            &mut image,
-            |cache| available(cache) && keys.active(cache, KeyPurpose::Page).is_ok(),
-            |cache, id| available(cache) && keys.lease(Some(cache), id, KeyPurpose::Page).is_ok(),
-        );
-        for shard in &image.shards {
-            if geometry.get(&shard.worker) != Some(&shard.geometry) || shard.validate().is_err() {
-                return None;
-            }
-            let index = Index::new(shard.worker, capacity);
-            index.set_page_capacity(capacity).ok()?;
-            index.validate_snapshot(&shard.index).ok()?;
-            if shard
-                .index
-                .entries
-                .iter()
-                .any(|(page, _)| workers.page_owner(page) != Ok(shard.worker))
-                || shard.index.metadata.iter().any(|metadata| {
-                    workers.metadata_owner(&metadata.version.object) != Ok(shard.worker)
-                })
-            {
-                return None;
-            }
+        let index = Index::new(shard.worker, metadata_capacity);
+        index.set_page_capacity(page_capacity).ok()?;
+        index.validate_snapshot(&shard.index).ok()?;
+        if shard
+            .index
+            .entries
+            .iter()
+            .any(|(page, _)| workers.page_owner(page) != Ok(shard.worker))
+            || shard.index.metadata.iter().any(|metadata| {
+                workers.metadata_owner(&metadata.version.object) != Ok(shard.worker)
+            })
+        {
+            return None;
         }
-        Some(image)
-    })
+    }
+    Some(image)
 }
 
 #[cfg(test)]
@@ -422,15 +453,22 @@ mod tests {
             .into_iter()
             .collect();
         let candidates = vec![
-            image(1, &[WorkerId(0), WorkerId(1)]),
-            image(2, &[WorkerId(0)]),
-            image(3, &[WorkerId(0), WorkerId(0)]),
             image(4, &[WorkerId(0), WorkerId(2)]),
+            image(3, &[WorkerId(0), WorkerId(0)]),
+            image(2, &[WorkerId(0)]),
+            image(1, &[WorkerId(0), WorkerId(1)]),
         ];
         assert_eq!(
-            select(candidates, &geometry, &node.workers, 4, &keys, &caches())
-                .unwrap()
-                .sequence,
+            select(
+                candidates,
+                &geometry,
+                &node.workers,
+                (4, 4),
+                &keys,
+                &caches()
+            )
+            .unwrap()
+            .sequence,
             1
         );
         let mut oversized = image(3, &[WorkerId(0), WorkerId(1)]);
@@ -459,7 +497,7 @@ mod tests {
                 vec![oversized, image(1, &[WorkerId(0), WorkerId(1)])],
                 &geometry,
                 &node.workers,
-                4,
+                (4, 4),
                 &keys,
                 &caches()
             )
@@ -472,7 +510,7 @@ mod tests {
                 vec![image(2, &[WorkerId(0)])],
                 &geometry,
                 &node.workers,
-                4,
+                (4, 4),
                 &keys,
                 &caches()
             )
@@ -543,7 +581,7 @@ mod tests {
             vec![decoded(), decoded()],
             &geometry,
             &node.workers,
-            16,
+            (16, 16),
             &keys,
             &[],
         )
@@ -554,7 +592,7 @@ mod tests {
             vec![decoded()],
             &geometry,
             &node.workers,
-            16,
+            (16, 16),
             &keys,
             &caches,
         )
@@ -567,7 +605,7 @@ mod tests {
             vec![missing_page],
             &geometry,
             &node.workers,
-            16,
+            (16, 16),
             &keys,
             &caches,
         )
@@ -586,7 +624,7 @@ mod tests {
             vec![decoded()],
             &geometry,
             &node.workers,
-            16,
+            (16, 16),
             &keys,
             &caches,
         )
@@ -646,13 +684,139 @@ mod tests {
                 vec![wrong, image(1, &[WorkerId(0), WorkerId(1)])],
                 &geometry,
                 &node.workers,
-                4,
+                (4, 4),
                 &keys,
                 &caches()
             )
             .unwrap()
             .sequence,
             1
+        );
+    }
+
+    #[test]
+    fn configured_tiny_recovery_budget_starts_cold_and_completes_installation() {
+        use super::super::test_support::{ControlFixture, local_worker, publication};
+        for budget in [1, 64 * 1024 * 1024] {
+            let mut fixture = ControlFixture::new();
+            let mut config = fixture.config.take().unwrap();
+            config.checkpoint_bytes = std::num::NonZeroUsize::new(budget).unwrap();
+            let node = Arc::new(NodeState::new(vec![WorkerId(0)], 16).unwrap());
+            let (app, _runtime, _crypto) = local_worker(&config, &node, 0);
+            app.snapshots
+                .publish(publication(&config, 1, vec![]))
+                .unwrap();
+            futures::executor::block_on(app.store.open()).unwrap();
+            let shard = futures::executor::block_on(app.store.checkpoint.snapshot_shard()).unwrap();
+            let geometry = shard.geometry;
+            app.store.checkpoint.finish_snapshot();
+            let bytes = crate::store::checkpoint::encode(&CheckpointImage {
+                version: CHECKPOINT_VERSION,
+                sequence: 9,
+                shards: vec![shard],
+            })
+            .unwrap();
+            std::fs::write(config.slab_directory.join("checkpoint.0"), bytes).unwrap();
+            futures::executor::block_on(
+                app.recover_node(geometry, &scope(Duration::from_secs(5)).unwrap()),
+            )
+            .unwrap();
+            let cut = node.recovery.lock().unwrap();
+            assert!(cut.selected && cut.installed.contains(&WorkerId(0)));
+            assert!(cut.failure.is_none());
+            assert_eq!(
+                node.periodic_checkpoint.lock().unwrap().last_sequence,
+                if budget == 1 { 0 } else { 9 }
+            );
+            assert!(
+                app.store
+                    .writer
+                    .index()
+                    .snapshot()
+                    .unwrap()
+                    .entries
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_live_catalog_and_page_capacities_select_an_installable_cut() {
+        let node = NodeState::new(vec![WorkerId(0)], 16).unwrap();
+        let keys = crate::security::keyring::tests::keys();
+        let geometry = [(WorkerId(0), geometry())].into_iter().collect();
+        let candidate = |sequence, count| {
+            let mut cut = image(sequence, &[WorkerId(0)]);
+            for n in 0..count {
+                cut.shards[0]
+                    .index
+                    .metadata
+                    .push(crate::model::VersionMetadata {
+                        content_type: None,
+                        version: crate::model::ObjectVersion {
+                            object: crate::model::ObjectId {
+                                cache: caches()[0].id.clone(),
+                                key: crate::model::CacheKey([0; 32]),
+                            },
+                            etag: crate::model::StrongEtag::test_value(&n.to_string()),
+                        },
+                        length: 0,
+                    });
+            }
+            cut
+        };
+        // Real mismatch: page capacity admits two descriptors but the live
+        // catalog admits only one. Previously selection succeeded, install failed.
+        let chosen = select(
+            vec![candidate(2, 2), candidate(1, 1)],
+            &geometry,
+            &node.workers,
+            (16, 1),
+            &keys,
+            &caches(),
+        )
+        .unwrap();
+        assert_eq!(chosen.sequence, 1);
+        let live = Index::new(WorkerId(0), 1);
+        live.set_page_capacity(16).unwrap();
+        live.restore(chosen.shards.into_iter().next().unwrap().index)
+            .unwrap();
+        // The inverse mismatch must not discard a catalog that is larger than
+        // the page index. Zero catalog capacity can still accept an empty cut.
+        assert_eq!(
+            select(
+                vec![candidate(2, 2)],
+                &geometry,
+                &node.workers,
+                (1, 2),
+                &keys,
+                &caches()
+            )
+            .unwrap()
+            .sequence,
+            2
+        );
+        assert!(
+            select(
+                vec![candidate(2, 1)],
+                &geometry,
+                &node.workers,
+                (16, 0),
+                &keys,
+                &caches()
+            )
+            .is_none()
+        );
+        assert!(
+            select(
+                vec![candidate(1, 0)],
+                &geometry,
+                &node.workers,
+                (16, 0),
+                &keys,
+                &caches()
+            )
+            .is_some()
         );
     }
 }

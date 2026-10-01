@@ -211,10 +211,11 @@ impl Checkpointer {
     /// The coordinator must keep all owners frozen until this operation completes.
     pub fn publish(&self, shards: Vec<ShardImage>) -> Operation<'_, ()> {
         Box::pin(async move {
-            let candidates = read_candidates(&self.directory)?;
-            let newest = candidates.iter().max_by_key(|(_, image)| image.sequence);
-            let sequence = match newest {
-                Some((_, image)) => image.sequence.checked_add(1).ok_or(Error::Unavailable)?,
+            let newest = candidates(&self.directory, MAX_CHECKPOINT_BYTES)?
+                .next()
+                .map(|(slot, image)| (slot, image.sequence));
+            let sequence = match &newest {
+                Some((_, sequence)) => sequence.checked_add(1).ok_or(Error::Unavailable)?,
                 None => 1,
             };
             // Replace the slot opposite the newest valid image, including after a
@@ -456,27 +457,21 @@ impl Recovery {
     ) -> Operation<'a, Option<CheckpointImage>> {
         Box::pin(async move {
             let geometry = self.geometry.get();
-            let mut candidates = read_candidates(&self.directory)?;
-            for (_, image) in &mut candidates {
+            let mut candidates = candidates(&self.directory, MAX_CHECKPOINT_BYTES)?;
+            Ok(candidates.find_map(|(_, mut image)| {
                 for shard in &mut image.shards {
                     filter_keys(shard, available);
                 }
-            }
-            candidates.retain(|(_, image)| {
-                image.shards.iter().all(|shard| {
+                let valid = image.shards.iter().all(|shard| {
                     shard.geometry.matches_alignment(alignment)
                         && geometry.is_none_or(|expected| shard.geometry == expected)
                 }) && image
                     .shards
                     .iter()
                     .find(|shard| shard.worker == self.index.worker())
-                    .is_some_and(|shard| self.index.validate_snapshot(&shard.index).is_ok())
-            });
-            let image = candidates
-                .into_iter()
-                .max_by_key(|(_, image)| image.sequence)
-                .map(|(_, image)| image);
-            Ok(image)
+                    .is_some_and(|shard| self.index.validate_snapshot(&shard.index).is_ok());
+                valid.then_some(image)
+            }))
         })
     }
 
@@ -540,75 +535,148 @@ fn filter_keys(shard: &mut ShardImage, available: Option<&[KeyId]>) {
     }
 }
 
-/// Read only the two bounded metadata files. Nonregular files and torn, oversized,
-/// incompatible, or checksum-invalid images are rejected independently.
-pub(crate) fn read_candidates(directory: &Path) -> Result<Vec<(usize, CheckpointImage)>> {
-    let mut candidates = Vec::new();
-    for (slot, name) in CHECKPOINT_NAMES.iter().enumerate() {
-        #[cfg(test)]
-        if let Some(sim) = crate::runtime::reactor::simulation::Simulation::current() {
-            let fd = match sim.open(
-                None,
-                &directory.join(name),
-                libc::O_RDONLY | libc::O_NOFOLLOW,
-            ) {
-                Ok(fd) => fd,
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
-                    ) || e.raw_os_error() == Some(libc::ELOOP) =>
-                {
-                    continue;
-                }
-                Err(_) => return Err(Error::Io),
-            };
-            let crate::runtime::reactor::Descriptor::Sim(handle) = fd else {
-                unreachable!()
-            };
-            let stat = handle.stat().map_err(|_| Error::Io)?;
-            if stat.stx_mode as u32 & libc::S_IFMT != libc::S_IFREG
-                || stat.stx_size > MAX_CHECKPOINT_BYTES as u64
-            {
-                continue;
-            }
-            let bytes = sim
-                .read_file(&directory.join(name))
-                .map_err(|_| Error::Io)?;
-            if let Ok(image) = decode(&bytes) {
-                candidates.push((slot, image));
-            }
-            continue;
+/// Probe only fixed-size headers, then decode one slot at a time, newest first.
+/// Callers must discard a rejected image before advancing. An inaccessible storage
+/// directory is fatal; individual checkpoint files are disposable hints. Slab
+/// opening/validation remains independently fatal during Store::open.
+pub(crate) fn candidates(directory: &Path, budget: usize) -> Result<Candidates> {
+    // Preserve missing-directory cold starts for the standalone store API.
+    match CandidateFile::open(directory, true) {
+        Ok(_) => (),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Candidates {
+                slots: vec![],
+                budget,
+            });
         }
-        let file = match OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(directory.join(name))
-        {
-            Ok(file) => file,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
-                ) || error.raw_os_error() == Some(libc::ELOOP) =>
-            {
-                continue;
-            }
-            Err(_) => return Err(Error::Io),
-        };
-        let metadata = file.metadata().map_err(|_| Error::Io)?;
-        if !metadata.is_file() || metadata.len() > MAX_CHECKPOINT_BYTES as u64 {
-            continue;
-        }
-        let mut bytes = Vec::new();
-        file.take(MAX_CHECKPOINT_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| Error::Io)?;
-        if let Ok(image) = decode(&bytes) {
-            candidates.push((slot, image));
+        Err(e) => {
+            eprintln!("racer: checkpoint storage directory unavailable: {e}");
+            return Err(Error::Io);
         }
     }
-    Ok(candidates)
+    let mut slots = Vec::with_capacity(CHECKPOINT_NAMES.len());
+    for (slot, name) in CHECKPOINT_NAMES.iter().enumerate() {
+        let result = (|| -> std::io::Result<_> {
+            let mut file = CandidateFile::open(&directory.join(name), false)?;
+            let length = file.length()?;
+            if length < 68 || length > MAX_CHECKPOINT_BYTES as u64 || length > budget as u64 {
+                return Err(std::io::Error::other(
+                    "checkpoint encoded size exceeds recovery budget or format limit",
+                ));
+            }
+            let mut header = [0; 32];
+            file.read_exact(&mut header)?;
+            let sequence = sequence_hint(&header)
+                .map_err(|_| std::io::Error::other("invalid checkpoint header"))?;
+            Ok((slot, sequence, file, length as usize, header))
+        })();
+        match result {
+            Ok(candidate) => slots.push(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => eprintln!("racer: skipping checkpoint slot {slot}: {e}"),
+        }
+    }
+    slots.sort_by_key(|(_, sequence, ..)| *sequence);
+    Ok(Candidates { slots, budget })
+}
+
+pub(crate) struct Candidates {
+    slots: Vec<(usize, u64, CandidateFile, usize, [u8; 32])>,
+    budget: usize,
+}
+
+impl Iterator for Candidates {
+    type Item = (usize, CheckpointImage);
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some((slot, _, mut file, length, header)) = self.slots.pop() {
+            // Length is checked before reserving. read_exact never grows this
+            // buffer if the file grows; an extra stack byte detects that race.
+            let result = (|| -> Result<CheckpointImage> {
+                let mut bytes = Vec::new();
+                bytes
+                    .try_reserve_exact(length)
+                    .map_err(|_| Error::Overloaded)?;
+                bytes.resize(length, 0);
+                bytes[..32].copy_from_slice(&header);
+                file.read_exact(&mut bytes[32..]).map_err(|_| Error::Io)?;
+                if file.read(&mut [0]).map_err(|_| Error::Io)? != 0 {
+                    return Err(Error::CorruptRecord);
+                }
+                decode_with_budget(&bytes, self.budget)
+            })();
+            match result {
+                Ok(image) => return Some((slot, image)),
+                Err(e) => {
+                    eprintln!("racer: skipping checkpoint slot {slot} during read/decode: {e}")
+                }
+            }
+        }
+        None
+    }
+}
+
+enum CandidateFile {
+    Real(std::fs::File),
+    #[cfg(test)]
+    Sim(crate::runtime::reactor::simulation::Handle, u64),
+}
+impl CandidateFile {
+    fn open(path: &Path, directory: bool) -> std::io::Result<Self> {
+        let flags =
+            libc::O_NOFOLLOW | libc::O_NONBLOCK | if directory { libc::O_DIRECTORY } else { 0 };
+        #[cfg(test)]
+        if let Some(sim) = crate::runtime::reactor::simulation::Simulation::current() {
+            let crate::runtime::reactor::Descriptor::Sim(handle) =
+                sim.open(None, path, libc::O_RDONLY | flags)?
+            else {
+                unreachable!()
+            };
+            return Ok(Self::Sim(handle, 0));
+        }
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(flags)
+            .open(path)
+            .map(Self::Real)
+    }
+    fn length(&self) -> std::io::Result<u64> {
+        let (regular, length) = match self {
+            Self::Real(file) => {
+                let m = file.metadata()?;
+                (m.is_file(), m.len())
+            }
+            #[cfg(test)]
+            Self::Sim(handle, _) => {
+                let m = handle.stat()?;
+                (
+                    m.stx_mode as u32 & libc::S_IFMT == libc::S_IFREG,
+                    m.stx_size,
+                )
+            }
+        };
+        if !regular {
+            return Err(std::io::Error::other("checkpoint is not a regular file"));
+        }
+        Ok(length)
+    }
+}
+impl Read for CandidateFile {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Real(file) => file.read(bytes),
+            #[cfg(test)]
+            Self::Sim(handle, offset) => {
+                let n = handle.file_read(*offset, bytes)?;
+                *offset += n as u64;
+                Ok(n)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn read_candidates(directory: &Path) -> Result<Vec<(usize, CheckpointImage)>> {
+    Ok(candidates(directory, MAX_CHECKPOINT_BYTES)?.collect())
 }
 
 // Bounded, versioned binary checkpoints. SHA-256 covers the header and body.

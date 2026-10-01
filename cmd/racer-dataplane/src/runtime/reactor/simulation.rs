@@ -1162,7 +1162,7 @@ impl Handle {
         }
         Ok(())
     }
-    fn file_read(&self, offset: u64, bytes: &mut [u8]) -> io::Result<usize> {
+    pub(crate) fn file_read(&self, offset: u64, bytes: &mut [u8]) -> io::Result<usize> {
         let limit = match self.sim.0.borrow_mut().fault("read") {
             Some(Fault::Errno(n)) => return Err(errno(n)),
             Some(Fault::Short(n)) => n,

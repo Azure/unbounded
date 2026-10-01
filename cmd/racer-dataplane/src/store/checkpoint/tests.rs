@@ -218,6 +218,122 @@ fn resign(bytes: &mut [u8]) {
 }
 
 #[test]
+fn recovery_budget_accounts_for_decoded_strings_vectors_and_validation_before_decode() {
+    let bytes = encode(&image(1)).unwrap();
+    let required = recovery_memory(&bytes, usize::MAX).unwrap();
+    assert!(required > bytes.len());
+    assert!(matches!(
+        decode_with_budget(&bytes, bytes.len()),
+        Err(Error::Overloaded)
+    ));
+    assert!(matches!(
+        decode_with_budget(&bytes, required - 1),
+        Err(Error::Overloaded)
+    ));
+    assert_eq!(decode_with_budget(&bytes, required).unwrap().sequence, 1);
+    // Even a checksum-valid geometry may not inflate isolated validation tables
+    // beyond the encoded segment count.
+    let mut malformed = bytes.clone();
+    malformed[54..62].copy_from_slice(&1_000_000u64.to_le_bytes());
+    resign(&mut malformed);
+    assert!(matches!(
+        recovery_memory(&malformed, usize::MAX),
+        Err(Error::CorruptRecord)
+    ));
+    for length in 0..68 {
+        assert!(decode_with_budget(&bytes[..length], 1).is_err());
+    }
+}
+
+#[test]
+fn recovery_downsize_falls_back_or_starts_cold_without_retaining_two_images() {
+    use crate::store::checkpoint::candidates;
+    let directory = Directory::new();
+    let older = encode(&image(1)).unwrap();
+    let mut newer = image(2);
+    for n in 0..20 {
+        newer.shards[0]
+            .index
+            .metadata
+            .push(descriptor(&format!("extra-{n}"), 0));
+    }
+    let newer = encode(&newer).unwrap();
+    fs::write(directory.0.join("checkpoint.0"), &older).unwrap();
+    fs::write(directory.0.join("checkpoint.1"), &newer).unwrap();
+    let budget = recovery_memory(&older, usize::MAX).unwrap();
+    // Both encoded files fit; only the older decoded image fits.
+    assert!(newer.len() < budget);
+    assert_eq!(
+        candidates(&directory.0, budget)
+            .unwrap()
+            .next()
+            .unwrap()
+            .1
+            .sequence,
+        1
+    );
+    for tiny in [0, 1, older.len(), budget - 1] {
+        assert!(candidates(&directory.0, tiny).unwrap().next().is_none());
+    }
+    assert_eq!(
+        candidates(&directory.0, MAX_CHECKPOINT_BYTES)
+            .unwrap()
+            .next()
+            .unwrap()
+            .1
+            .sequence,
+        2
+    );
+}
+
+#[test]
+fn unreadable_slot_is_disposable_but_storage_directory_failure_is_fatal() {
+    use crate::store::checkpoint::candidates;
+    use std::os::fd::AsRawFd;
+    let directory = Directory::new();
+    fs::write(directory.0.join("checkpoint.1"), encode(&image(1)).unwrap()).unwrap();
+    // Opening a Unix socket as a file fails even when tests run as root.
+    let dir = fs::File::open(&directory.0).unwrap();
+    let _socket = std::os::unix::net::UnixListener::bind(format!(
+        "/proc/self/fd/{}/checkpoint.0",
+        dir.as_raw_fd()
+    ))
+    .unwrap();
+    assert_eq!(
+        candidates(&directory.0, MAX_CHECKPOINT_BYTES)
+            .unwrap()
+            .next()
+            .unwrap()
+            .1
+            .sequence,
+        1
+    );
+    assert!(matches!(
+        candidates(&directory.0.join("checkpoint.1"), MAX_CHECKPOINT_BYTES),
+        Err(Error::Io)
+    ));
+}
+
+#[test]
+fn candidate_read_failure_tries_older_slot() {
+    use crate::{
+        runtime::reactor::simulation::{Fault, Simulation},
+        store::checkpoint::candidates,
+    };
+    let sim = Simulation::new();
+    let _environment = sim.enter();
+    let path = PathBuf::from("/recovery-budget-test");
+    sim.write_file(&path.join("checkpoint.0"), &encode(&image(1)).unwrap())
+        .unwrap();
+    sim.write_file(&path.join("checkpoint.1"), &encode(&image(2)).unwrap())
+        .unwrap();
+    let mut scan = candidates(&path, MAX_CHECKPOINT_BYTES).unwrap();
+    sim.inject("read", Fault::Errno(libc::EIO));
+    assert_eq!(scan.next().unwrap().1.sequence, 1);
+    assert!(scan.next().is_none());
+}
+
+#[test]
 fn binary_round_trip_retains_locations_keys_metadata_and_is_send() {
     fn assert_send<T: Send>() {}
     assert_send::<ShardImage>();
