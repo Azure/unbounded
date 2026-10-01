@@ -895,3 +895,88 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
         endpoint.uninstall().unwrap();
     }
 }
+#[test]
+fn origin_fill_preserves_ciphertext_for_memory_and_pending_candidate_copy() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    let result = drive(
+        f.fill.acquire(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut budget,
+        ),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    assert_eq!(result.plaintext.bytes(), b"abc");
+    assert_eq!(f.origin.calls.get(), 1);
+    assert_eq!(budget.remaining_attempts(), 7);
+    let copy = futures::executor::block_on(f.fill.copy_only(&f.page, &f.scope))
+        .unwrap()
+        .unwrap();
+    assert_eq!(copy.1.bytes(), result.ciphertext.bytes());
+    assert_eq!(copy.1.envelope().nonce, result.ciphertext.envelope().nonce);
+    let pending = f
+        .fill
+        .dependencies
+        .writer
+        .copy_only(&f.page)
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.ciphertext.bytes(), result.ciphertext.bytes());
+    let second = drive(
+        f.fill.acquire(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut budget,
+        ),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    assert_eq!(second.ciphertext.bytes(), result.ciphertext.bytes());
+    assert_eq!(f.origin.calls.get(), 1);
+    assert_eq!(f.fill.metrics.count(Event::OriginFill), 1);
+    assert_eq!(f.fill.metrics.count(Event::MemoryHit), 2);
+    assert_eq!(f.fill.metrics.count(Event::DiskHit), 0);
+    assert_eq!(f.fill.metrics.count(Event::PeerHit), 0);
+    assert_eq!(f.fill.metrics.gauge(Gauge::ActiveFills), 0);
+    f.reactor.init().unwrap();
+    futures::executor::block_on(f.fill.dependencies.writer.open()).unwrap();
+    drive_disk(&f, f.fill.dependencies.writer.progress(1, &f.scope)).unwrap();
+    drop((result, second, copy, pending));
+    assert!(f.fill.dependencies.memory.evict_idle(usize::MAX).unwrap() > 0);
+    let disk_copy = drive_disk(&f, f.fill.copy_only(&f.page, &f.scope))
+        .unwrap()
+        .unwrap();
+    assert_eq!(disk_copy.0.version, f.page.version);
+    let disk_result = drive(
+        f.fill.acquire(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut budget,
+        ),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    assert_eq!(disk_result.plaintext.bytes(), b"abc");
+    // CopyOnly retains the disk ciphertext, so plaintext acquisition promotes
+    // that same allocation instead of reading the disk again.
+    assert_eq!(f.fill.metrics.count(Event::DiskHit), 1);
+    assert!(Arc::ptr_eq(
+        &disk_copy.1.inner,
+        &disk_result.ciphertext.inner
+    ));
+    assert_eq!(f.fill.metrics.count(Event::OriginFill), 1);
+    assert_eq!(f.fill.metrics.count(Event::MemoryHit), 2);
+}
