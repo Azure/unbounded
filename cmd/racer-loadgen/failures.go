@@ -11,6 +11,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/opencontainers/go-digest"
 )
 
 type failureReason uint8
@@ -51,10 +53,34 @@ func (r failureReason) String() string {
 // Preserve errors.Is/As and the original returned diagnostic, but never emit
 // that diagnostic in logs or labels: transport errors may contain URLs/secrets.
 type pullFailure struct {
-	err    error
-	reason failureReason
-	kind   string
-	status int
+	err       error
+	reason    failureReason
+	kind      string
+	status    int
+	integrity *integrityEvidence
+}
+
+// Only populated after a full-size HTTP 200 response fails verification.
+// Keep object identity out of metric labels and never retain payload or URLs.
+type integrityEvidence struct {
+	expectedDigest string
+	actualDigest   string
+	expectedSize   int64
+	receivedSize   int64
+}
+
+// Validate at the logging boundary, including a length bound before parsing.
+func safeSHA256(value string) string {
+	if len(value) != len("sha256:")+64 {
+		return "invalid"
+	}
+
+	d := digest.Digest(value)
+	if d.Validate() != nil || d.Algorithm() != digest.SHA256 {
+		return "invalid"
+	}
+
+	return value
 }
 
 func (e *pullFailure) Error() string { return e.err.Error() }
@@ -132,5 +158,18 @@ func (p *puller) reportPullFailure(err error, now time.Time, logger *slog.Logger
 		}
 	}
 
-	logger.Warn("image pull failed", "reason", reason.String(), "kind", kind, "http_status", status, "suppressed", suppressed)
+	attrs := []any{"reason", reason.String(), "kind", kind, "http_status", status, "suppressed", suppressed}
+	if reason == failureDigest && failure != nil && failure.integrity != nil {
+		evidence := failure.integrity
+		expected := safeSHA256(evidence.expectedDigest)
+		attrs = append(attrs, slog.Group("integrity",
+			slog.String("content_digest", expected),
+			slog.String("expected_digest", expected),
+			slog.String("actual_digest", safeSHA256(evidence.actualDigest)),
+			slog.Int64("expected_size", evidence.expectedSize),
+			slog.Int64("received_size", evidence.receivedSize),
+		))
+	}
+
+	logger.Warn("image pull failed", attrs...)
 }

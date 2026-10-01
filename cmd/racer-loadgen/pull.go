@@ -258,13 +258,15 @@ func (p *puller) fetch(ctx context.Context, kind string, desc ocispec.Descriptor
 	start := time.Now()
 	reason, status := failureTransport, 0
 
+	var integrity *integrityEvidence
+
 	defer func() {
 		if ctx.Err() != nil {
 			err = ctx.Err()
 		}
 
 		if err != nil {
-			err = &pullFailure{err: err, reason: reason, kind: kind, status: status}
+			err = &pullFailure{err: err, reason: reason, kind: kind, status: status, integrity: integrity}
 		}
 
 		result := pullResult(err)
@@ -328,6 +330,11 @@ func (p *puller) fetch(ctx context.Context, kind string, desc ocispec.Descriptor
 
 	if p.opts.Verify && actual != desc.Digest.String() {
 		reason = failureDigest
+		integrity = &integrityEvidence{
+			expectedDigest: desc.Digest.String(), actualDigest: actual,
+			expectedSize: desc.Size, receivedSize: n,
+		}
+
 		return fmt.Errorf("%s %s: digest mismatch (received %s)", kind, desc.Digest, actual)
 	}
 

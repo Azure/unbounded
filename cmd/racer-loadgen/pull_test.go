@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -249,6 +250,19 @@ func TestPullResponseFailures(t *testing.T) {
 						"short": "incomplete", "long": "size_mismatch", "corrupt": "digest_mismatch",
 					}
 					require.Equal(t, reasons[mode], classifyFailure(err).String())
+
+					var failure *pullFailure
+					require.ErrorAs(t, err, &failure)
+
+					if mode == "corrupt" {
+						require.Equal(t, &integrityEvidence{
+							expectedDigest: desc.Digest.String(), actualDigest: digest.FromBytes(data).String(),
+							expectedSize: desc.Size, receivedSize: int64(len(data)),
+						}, failure.integrity)
+					} else {
+						require.Nil(t, failure.integrity)
+					}
+
 					require.Equal(t, float64(1), testutil.ToFloat64(metrics.pullFailures.WithLabelValues(reasons[mode])))
 					require.Equal(t, 1, testutil.CollectAndCount(metrics.pullFailures))
 					require.Equal(t, float64(1), testutil.ToFloat64(metrics.requests.WithLabelValues(kind, "error")))
