@@ -786,143 +786,14 @@ impl HttpIo {
         }));
         loop {
             scope.check()?;
-            let wait = {
-                let mut state = state.borrow_mut();
-                let s = &mut *state;
-                if s.destination.fd.peer_read_closed() {
-                    return Err(Error::Io);
-                }
-                let mut wait = None;
-                // Bound synchronous work per poll so a hot link cannot monopolize
-                // the worker. Drain each chunk before receiving the next one.
-                for _ in 0..32 {
-                    let remaining = s.source.rx_remaining.ok_or(Error::InvalidRequest)? as usize;
-                    if s.pending.is_empty() && s.pipe.buffered() == 0 && remaining == 0 {
-                        break;
-                    }
-                    let writing = !s.pending.is_empty() || s.pipe.buffered() != 0;
-                    let result = if !s.pending.is_empty() {
-                        s.destination
-                            .fd
-                            .try_send(&s.fallback.as_ref().unwrap().bytes()?[s.pending.clone()])
-                    } else if s.pipe.buffered() != 0 {
-                        #[cfg(test)]
-                        if s.fallback_at
-                            .is_some_and(|threshold| remaining <= threshold)
-                            && !s.copied
-                        {
-                            s.copied =
-                                unsupported(&std::io::Error::from_raw_os_error(libc::EOPNOTSUPP));
-                        }
-                        if s.copied {
-                            if s.fallback.is_none() {
-                                s.fallback = Some(self.buffer(MAX_PIPE_BYTES)?);
-                            }
-                            let n = s
-                                .pipe
-                                .try_read(s.fallback.as_mut().unwrap().bytes_mut()?)
-                                .map_err(|_| Error::Io)?;
-                            s.pending = 0..n;
-                            continue;
-                        }
-                        s.pipe.try_splice_connection(&s.destination)
-                    } else if let Some((ahead, range)) = s.source.read_ahead.take() {
-                        let count = remaining.min(range.len());
-                        if s.fallback.is_none() {
-                            s.fallback = Some(self.buffer(MAX_PIPE_BYTES)?);
-                        }
-                        // Read-ahead may have a large head allocation but the tail
-                        // is bounded by the receive growth step. Consume in chunks.
-                        let count = count.min(MAX_PIPE_BYTES);
-                        s.fallback.as_mut().unwrap().bytes_mut()?[..count]
-                            .copy_from_slice(&ahead.bytes()?[range.start..range.start + count]);
-                        if range.len() > count {
-                            s.source.read_ahead = Some((ahead, range.start + count..range.end));
-                        }
-                        s.pending = 0..count;
-                        s.source.rx_remaining = Some((remaining - count) as u64);
-                        continue;
-                    } else if s.copied {
-                        if s.fallback.is_none() {
-                            s.fallback = Some(self.buffer(MAX_PIPE_BYTES)?);
-                        }
-                        s.source.fd.try_recv(
-                            &mut s.fallback.as_mut().unwrap().bytes_mut()?
-                                [..remaining.min(MAX_PIPE_BYTES)],
-                        )
-                    } else {
-                        s.pipe.try_splice_from(&s.source.fd, remaining)
-                    };
-                    match result {
-                        Ok(0) => return Err(Error::Io),
-                        Ok(n) => {
-                            if writing {
-                                if !s.pending.is_empty() {
-                                    s.pending.start += n;
-                                }
-                                s.destination.tx_remaining = Some(
-                                    s.destination.tx_remaining.ok_or(Error::InvalidRequest)?
-                                        - n as u64,
-                                );
-                            } else {
-                                s.source.rx_remaining = Some((remaining - n) as u64);
-                                if s.copied {
-                                    s.pending = 0..n;
-                                }
-                            }
-                        }
-                        Err(error) if unsupported(&error) => {
-                            s.copied = true;
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => (),
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            wait = Some((
-                                if writing {
-                                    s.destination.socket()
-                                } else {
-                                    s.source.socket()
-                                },
-                                if writing { libc::POLLOUT } else { libc::POLLIN },
-                            ));
-                            break;
-                        }
-                        Err(_) => return Err(Error::Io),
-                    }
-                }
+            let wait = self.relay_chunk(&state)?;
+            {
+                let s = state.borrow();
                 if s.source.rx_remaining == Some(0) && s.destination.tx_remaining == Some(0) {
                     break;
                 }
-                wait
-            };
-            if let Some((fd, interest)) = wait {
-                // A bounded poll interval also notices reverse disconnect while
-                // the downstream source is silent. It never extends the deadline.
-                let mut tick = scope.clone();
-                tick.deadline.0 = tick
-                    .deadline
-                    .0
-                    .min(crate::runtime::environment::now() + Duration::from_millis(10));
-                match self
-                    .reactor()
-                    .readiness_with_lease(fd, interest as u32, state.clone(), &tick)
-                    .await
-                {
-                    Ok(_) | Err(Error::DeadlineExceeded) => (),
-                    Err(error) => return Err(error),
-                }
-            } else {
-                let mut yielded = false;
-                std::future::poll_fn(|cx| {
-                    if yielded {
-                        Poll::Ready(())
-                    } else {
-                        yielded = true;
-                        cx.waker().wake_by_ref();
-                        Poll::Pending
-                    }
-                })
-                .await;
             }
+            self.wait_relay_progress(state.clone(), wait, scope).await?;
         }
         scope.check()?;
         let mut state = Rc::try_unwrap(state)
@@ -932,6 +803,149 @@ impl HttpIo {
         finish(&mut state.source, &mut state.destination)?;
         state.destination.relay_reservation = None;
         Ok(state.destination)
+    }
+
+    /// Make bounded synchronous progress, draining each chunk before receiving more.
+    fn relay_chunk(&self, state: &RefCell<Transit>) -> Result<Option<(Rc<Descriptor>, i16)>> {
+        let mut state = state.borrow_mut();
+        let s = &mut *state;
+        if s.destination.fd.peer_read_closed() {
+            return Err(Error::Io);
+        }
+        let mut wait = None;
+        // Bound synchronous work per poll so a hot link cannot monopolize
+        // the worker. Drain each chunk before receiving the next one.
+        for _ in 0..32 {
+            let remaining = s.source.rx_remaining.ok_or(Error::InvalidRequest)? as usize;
+            if s.pending.is_empty() && s.pipe.buffered() == 0 && remaining == 0 {
+                break;
+            }
+            let writing = !s.pending.is_empty() || s.pipe.buffered() != 0;
+            let result = if !s.pending.is_empty() {
+                s.destination
+                    .fd
+                    .try_send(&s.fallback.as_ref().unwrap().bytes()?[s.pending.clone()])
+            } else if s.pipe.buffered() != 0 {
+                #[cfg(test)]
+                if s.fallback_at
+                    .is_some_and(|threshold| remaining <= threshold)
+                    && !s.copied
+                {
+                    s.copied = unsupported(&std::io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+                }
+                if s.copied {
+                    if s.fallback.is_none() {
+                        s.fallback = Some(self.buffer(MAX_PIPE_BYTES)?);
+                    }
+                    let n = s
+                        .pipe
+                        .try_read(s.fallback.as_mut().unwrap().bytes_mut()?)
+                        .map_err(|_| Error::Io)?;
+                    s.pending = 0..n;
+                    continue;
+                }
+                s.pipe.try_splice_connection(&s.destination)
+            } else if let Some((ahead, range)) = s.source.read_ahead.take() {
+                let count = remaining.min(range.len());
+                if s.fallback.is_none() {
+                    s.fallback = Some(self.buffer(MAX_PIPE_BYTES)?);
+                }
+                // Read-ahead may have a large head allocation but the tail
+                // is bounded by the receive growth step. Consume in chunks.
+                let count = count.min(MAX_PIPE_BYTES);
+                s.fallback.as_mut().unwrap().bytes_mut()?[..count]
+                    .copy_from_slice(&ahead.bytes()?[range.start..range.start + count]);
+                if range.len() > count {
+                    s.source.read_ahead = Some((ahead, range.start + count..range.end));
+                }
+                s.pending = 0..count;
+                s.source.rx_remaining = Some((remaining - count) as u64);
+                continue;
+            } else if s.copied {
+                if s.fallback.is_none() {
+                    s.fallback = Some(self.buffer(MAX_PIPE_BYTES)?);
+                }
+                s.source.fd.try_recv(
+                    &mut s.fallback.as_mut().unwrap().bytes_mut()?[..remaining.min(MAX_PIPE_BYTES)],
+                )
+            } else {
+                s.pipe.try_splice_from(&s.source.fd, remaining)
+            };
+            match result {
+                Ok(0) => return Err(Error::Io),
+                Ok(n) => {
+                    if writing {
+                        if !s.pending.is_empty() {
+                            s.pending.start += n;
+                        }
+                        s.destination.tx_remaining = Some(
+                            s.destination.tx_remaining.ok_or(Error::InvalidRequest)? - n as u64,
+                        );
+                    } else {
+                        s.source.rx_remaining = Some((remaining - n) as u64);
+                        if s.copied {
+                            s.pending = 0..n;
+                        }
+                    }
+                }
+                Err(error) if unsupported(&error) => {
+                    s.copied = true;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => (),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    wait = Some((
+                        if writing {
+                            s.destination.socket()
+                        } else {
+                            s.source.socket()
+                        },
+                        if writing { libc::POLLOUT } else { libc::POLLIN },
+                    ));
+                    break;
+                }
+                Err(_) => return Err(Error::Io),
+            }
+        }
+        Ok(wait)
+    }
+
+    /// Readiness retains both connections and the pipe until the reactor fences it.
+    async fn wait_relay_progress(
+        &self,
+        state: Rc<RefCell<Transit>>,
+        wait: Option<(Rc<Descriptor>, i16)>,
+        scope: &RequestScope,
+    ) -> Result<()> {
+        if let Some((fd, interest)) = wait {
+            // A bounded poll interval also notices reverse disconnect while
+            // the downstream source is silent. It never extends the deadline.
+            let mut tick = scope.clone();
+            tick.deadline.0 = tick
+                .deadline
+                .0
+                .min(crate::runtime::environment::now() + Duration::from_millis(10));
+            match self
+                .reactor()
+                .readiness_with_lease(fd, interest as u32, state.clone(), &tick)
+                .await
+            {
+                Ok(_) | Err(Error::DeadlineExceeded) => (),
+                Err(error) => return Err(error),
+            }
+        } else {
+            let mut yielded = false;
+            std::future::poll_fn(|cx| {
+                if yielded {
+                    Poll::Ready(())
+                } else {
+                    yielded = true;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            })
+            .await;
+        }
+        Ok(())
     }
 }
 fn finish(source: &mut ConnectionLease, destination: &mut ConnectionLease) -> Result<()> {

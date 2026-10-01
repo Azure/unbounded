@@ -363,9 +363,7 @@ fn private_abi_layout_matches_c_static_assertions() {
 #[test]
 #[ignore = "requires the installed native adapter and a host with zero usable RDMA ports"]
 fn native_no_device() {
-    let devices = Verbs
-        .discover()
-        .expect("native adapter must be installed for this test");
+    let devices = super::discover().expect("native adapter must be installed for this test");
     assert!(devices.is_empty(), "this is not a no-device host");
 }
 
@@ -373,7 +371,7 @@ fn native_no_device() {
 #[test]
 #[ignore = "requires an active type-2B provider; exercises real loopback RC DMA"]
 fn native_available_provider_write_bind_invalidate_and_fence() {
-    let devices = Verbs.discover().expect("native adapter unavailable");
+    let devices = super::discover().expect("native adapter unavailable");
     let name = std::env::var("RACER_RDMA_TEST_DEVICE").expect("explicitly select a test device");
     let device = Rc::new(
         devices

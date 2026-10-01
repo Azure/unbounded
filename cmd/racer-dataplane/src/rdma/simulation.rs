@@ -851,7 +851,7 @@ mod tests {
             .with_devices(vec![Device::new("sim0", [1; 16])])
             .unwrap();
         let _scope = node.enter();
-        let device = Rc::new(Verbs.discover().unwrap().remove(0));
+        let device = Rc::new(super::super::discover().unwrap().remove(0));
         let sender = NativeQueuePair::new(device.clone()).unwrap();
         let receiver = NativeQueuePair::new(device.clone()).unwrap();
         sender.connect(receiver.endpoint).unwrap();
@@ -1159,10 +1159,10 @@ mod tests {
             .unwrap();
         let _environment = node.enter();
         sim.fault(Operation::Discover, Fault::Reject);
-        assert!(matches!(Verbs.discover(), Err(Error::Unavailable)));
+        assert!(matches!(super::super::discover(), Err(Error::Unavailable)));
         sim.fault(Operation::Open, Fault::Reject);
-        assert!(Verbs.discover().unwrap().is_empty());
-        assert_eq!(Verbs.discover().unwrap().len(), 1);
+        assert!(super::super::discover().unwrap().is_empty());
+        assert_eq!(super::super::discover().unwrap().len(), 1);
         assert_eq!(sim.live_resources(), 0);
     }
 
@@ -1177,13 +1177,13 @@ mod tests {
                 }])
                 .unwrap();
             let scope = node.enter();
-            let device = Rc::new(Verbs.discover().unwrap().remove(0));
+            let device = Rc::new(super::super::discover().unwrap().remove(0));
             assert_eq!(device.numa_node(), Some(7));
             {
                 let _empty = sim.enter();
-                assert!(Verbs.discover().unwrap().is_empty());
+                assert!(super::super::discover().unwrap().is_empty());
             }
-            assert_eq!(Verbs.discover().unwrap().len(), 1);
+            assert_eq!(super::super::discover().unwrap().len(), 1);
             let region = NativeRegion::new(device, 32, lifetime_tests::quota().0).unwrap();
             let address = region.address();
             drop(scope);

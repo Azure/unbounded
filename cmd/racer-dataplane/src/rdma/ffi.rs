@@ -13,8 +13,6 @@ use std::{
     sync::Arc,
 };
 
-pub struct Verbs;
-
 #[cfg(test)]
 // Simulation implements this private ABI and must share the unsafe owner boundary.
 #[path = "simulation.rs"]
@@ -250,56 +248,54 @@ impl Drop for NativeDevice {
     }
 }
 
-impl Verbs {
-    pub fn discover(&self) -> Result<Vec<NativeDevice>> {
-        #[cfg(test)]
-        let api = match simulation::current() {
-            Some(_) => simulation::api(),
-            None => Api::load()?,
-        };
-        #[cfg(not(test))]
-        let api = Api::load()?;
-        let mut ports = [Port {
-            name: [0; 64],
-            gid: [0; 16],
-            mtu: 0,
-            lid: 0,
-            port: 0,
-            link_layer: 0,
-        }; 64];
-        let count = unsafe { (api.discover)(ports.as_mut_ptr(), ports.len() as u32) };
-        if count < 0 || count as usize > ports.len() {
-            return Err(Error::Unavailable);
-        }
-        let mut devices = Vec::new();
-        for port in &ports[..count as usize] {
-            if !port.name.contains(&0) {
-                return Err(Error::Io);
-            }
-            let name = unsafe { CStr::from_ptr(port.name.as_ptr()) }
-                .to_str()
-                .map_err(|_| Error::Io)?
-                .to_owned();
-            let Some(raw) = NonNull::new(unsafe { (api.open)(port.name.as_ptr()) }) else {
-                continue;
-            };
-            devices.push(NativeDevice {
-                api: api.clone(),
-                raw,
-                name,
-                endpoint: Endpoint {
-                    gid: port.gid,
-                    qpn: 0,
-                    psn: 0,
-                    mtu: port.mtu,
-                    lid: port.lid,
-                    port: port.port,
-                    link_layer: port.link_layer,
-                },
-            });
-        }
-        Ok(devices)
+pub fn discover() -> Result<Vec<NativeDevice>> {
+    #[cfg(test)]
+    let api = match simulation::current() {
+        Some(_) => simulation::api(),
+        None => Api::load()?,
+    };
+    #[cfg(not(test))]
+    let api = Api::load()?;
+    let mut ports = [Port {
+        name: [0; 64],
+        gid: [0; 16],
+        mtu: 0,
+        lid: 0,
+        port: 0,
+        link_layer: 0,
+    }; 64];
+    let count = unsafe { (api.discover)(ports.as_mut_ptr(), ports.len() as u32) };
+    if count < 0 || count as usize > ports.len() {
+        return Err(Error::Unavailable);
     }
+    let mut devices = Vec::new();
+    for port in &ports[..count as usize] {
+        if !port.name.contains(&0) {
+            return Err(Error::Io);
+        }
+        let name = unsafe { CStr::from_ptr(port.name.as_ptr()) }
+            .to_str()
+            .map_err(|_| Error::Io)?
+            .to_owned();
+        let Some(raw) = NonNull::new(unsafe { (api.open)(port.name.as_ptr()) }) else {
+            continue;
+        };
+        devices.push(NativeDevice {
+            api: api.clone(),
+            raw,
+            name,
+            endpoint: Endpoint {
+                gid: port.gid,
+                qpn: 0,
+                psn: 0,
+                mtu: port.mtu,
+                lid: port.lid,
+                port: port.port,
+                link_layer: port.link_layer,
+            },
+        });
+    }
+    Ok(devices)
 }
 
 /// Native memory is never referenced while remotely writable or locally in flight.
@@ -736,7 +732,7 @@ mod tests {
     }
     #[test]
     fn optional_runtime_never_fabricates_a_device() {
-        match Verbs.discover() {
+        match discover() {
             Ok(devices) => {
                 for d in devices {
                     assert!(!d.name.is_empty());

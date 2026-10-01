@@ -718,7 +718,7 @@ impl NativeService {
         if config.publication.is_empty() {
             return Ok(Some(Vec::new()));
         }
-        let discovered = ffi::Verbs.discover()?;
+        let discovered = ffi::discover()?;
         let descriptions = discovered
             .iter()
             .map(super::discovered_port)
@@ -1493,12 +1493,7 @@ mod tests {
             model::ResourceClass,
             runtime::{admission::Admission, deadline::RequestScope},
         };
-        assert!(
-            ffi::Verbs
-                .discover()
-                .expect("real adapter must load")
-                .is_empty()
-        );
+        assert!(ffi::discover().expect("real adapter must load").is_empty());
         let (io, port) = pair(1).unwrap();
         let devices = Devices::new();
         devices.attach(io).unwrap();
@@ -1581,7 +1576,7 @@ mod tests {
         };
         let name = std::env::var("RACER_RDMA_TEST_DEVICE")
             .expect("select native test provider explicitly");
-        let ports = ffi::Verbs.discover().expect("real native adapter");
+        let ports = ffi::discover().expect("real native adapter");
         let selected = ports
             .iter()
             .find(|d| d.name == name)

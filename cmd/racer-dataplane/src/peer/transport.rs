@@ -444,6 +444,31 @@ impl Transfers {
                 .send_fallback(connection, response, &binding, peer, previous, scope)
                 .await;
         }
+        self.send_native_page(
+            connection, response, &binding, peer, &session, grant, previous, scope,
+        )
+        .await
+    }
+
+    /// The established session stays owned by the caller through completion or fencing.
+    async fn send_native_page(
+        &self,
+        mut connection: ConnectionLease,
+        response: &SignedResponse,
+        binding: &Binding,
+        peer: &NodeId,
+        session: &crate::rdma::SessionLease,
+        grant: VerifiedHead,
+        mut previous: [u8; 32],
+        scope: &RequestScope,
+    ) -> Result<(ConnectionLease, bool)> {
+        let signatures = &self.signatures;
+        let rdma = self.rdma.as_ref().ok_or(Error::Unavailable)?;
+        let (PeerResponse::Page { ciphertext, .. } | PeerResponse::Selected { ciphertext, .. }) =
+            &response.response
+        else {
+            return Err(Error::InvalidRequest);
+        };
         let descriptor =
             AuthenticatedDescriptor::from_verified(&grant, &session, binding.transfer)?;
         let native_deadline = native_scope(scope);
@@ -694,8 +719,6 @@ impl Transfers {
     ) -> Result<SignedResponse> {
         let sessions = self.native.as_ref().ok_or(Error::InvalidConfiguration)?;
         let signatures = &self.signatures;
-        let rdma = self.rdma.as_ref().ok_or(Error::Unavailable)?;
-        let (admission, _) = &self.wire;
         binding.response = envelope_digest(&authentication)?;
         let (offer, _) = binding.verify(
             signatures,
@@ -772,6 +795,36 @@ impl Transfers {
             }
             Err(error) => return Err(error),
         };
+        self.receive_native_page(
+            connection,
+            authentication,
+            &binding,
+            &peer,
+            &session,
+            metadata,
+            envelope,
+            previous,
+            scope,
+        )
+        .await
+    }
+
+    /// Grant, completion, and final acknowledgment share the established session owner.
+    async fn receive_native_page(
+        &self,
+        mut connection: ConnectionLease,
+        authentication: ForwardedHead,
+        binding: &Binding,
+        peer: &NodeId,
+        session: &crate::rdma::SessionLease,
+        metadata: crate::model::ObjectMetadata,
+        envelope: crate::model::PageEnvelope,
+        mut previous: [u8; 32],
+        scope: &RequestScope,
+    ) -> Result<SignedResponse> {
+        let signatures = &self.signatures;
+        let rdma = self.rdma.as_ref().ok_or(Error::Unavailable)?;
+        let (admission, _) = &self.wire;
         let native_deadline = native_scope(scope);
         if let Err(error) = session.wait_ready(&native_deadline).await {
             fence(&session, scope).await?;
