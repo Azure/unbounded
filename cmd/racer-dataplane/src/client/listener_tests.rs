@@ -123,7 +123,9 @@ fn queued_handoffs_reject_retired_generations_and_stopped_receivers() {
                 .used(ResourceClass::IngressConnection),
             0
         );
-        assert_eq!(socket.read(&mut [0; 1]).unwrap(), 0);
+        // A concurrent fork can briefly retain the closed socket until exec.
+        // Wait for EOF through the same bounded path as other real UDS tests.
+        assert!(worker.receive(&mut socket, true).is_empty());
         assert_eq!(worker.reads.calls.get(), 0);
         assert_no_body_leases(&worker);
     }
