@@ -79,8 +79,10 @@ impl CandidatePolicy {
             && !self.is_candidate(candidates)
             && candidates.ordered.len() >= 2
             && candidates.ordered[0] != candidates.ordered[1]
-            && budget.remaining_attempts() >= 7
-            && budget.remaining_links() >= 16
+            // Primary(2) + duplicate(1) + rank1(sender+probe+origin=3)
+            // + rank2(sender+two probes+origin=4). Routes reserve1+1+8+8.
+            && budget.remaining_attempts() >= 10
+            && budget.remaining_links() >= 18
             && candidates.ordered[..2]
                 .iter()
                 .all(|n| self.peers.direct_hedge_available(&candidates.membership, n));
@@ -144,6 +146,7 @@ impl CandidatePolicy {
                     &mut primary_budget,
                     3,
                     true,
+                    false,
                 )
                 .await?;
             if matches!(response.response(), PeerResponse::StaleMembership) {
@@ -204,6 +207,7 @@ impl CandidatePolicy {
                     &mut secondary_budget,
                     3,
                     true,
+                    false,
                 )
                 .await?;
             if matches!(response.response(), PeerResponse::StaleMembership) {
@@ -236,7 +240,9 @@ impl CandidatePolicy {
                 | Error::Io
                 | Error::Overloaded
                 | Error::CorruptRecord
-                | Error::MissingKey,
+                | Error::MissingKey
+                | Error::InvalidRequest
+                | Error::HeaderTooLarge,
             ) => Ok(None),
             Err(error) => Err(error),
         }
@@ -557,27 +563,31 @@ impl CandidatePolicy {
                 } else {
                     FetchMode::Acquire
                 };
-                let mut bounded = if continuation.bounded_routes {
-                    // A previous hedge already consumed its primary. Spend no
-                    // more than four links here and retain an Acquire+origin
-                    // allowance for every remaining nonlocal candidate.
-                    Some(
-                        budget.partition(
-                            budget
-                                .remaining_attempts()
-                                .saturating_sub(
-                                    (count - index - 1) as u32 * if rank.is_some() { 1 } else { 2 },
-                                )
-                                .max(1),
-                            budget.remaining_links().min(4),
-                        )?,
-                    )
+                let mut bounded = if rank.is_some()
+                    && budget.remaining_links() < (count - index) as u8 * budget.route_links()
+                {
+                    // Receiver CopyOnly predecessor probes share the inherited
+                    // route pool; the first must not consume every link after
+                    // an incoming eight-link envelope selected failure routing.
+                    let remaining = (count - index) as u8;
+                    Some(budget.partition(1, (budget.remaining_links() / remaining).min(4))?)
+                } else if continuation.bounded_routes {
+                    let mut child = budget.partition(
+                        if rank.is_some() { 1 } else { index as u32 + 2 },
+                        if rank.is_some() { 4 } else { 8 },
+                    )?;
+                    // Receiver needs incoming link plus all predecessor routes.
+                    // A rank2 cold fill cannot execute with a four-link envelope.
+                    if rank.is_none() {
+                        child.note_route_failure();
+                    }
+                    Some(child)
                 } else {
                     None
                 };
                 let request_budget = bounded.as_mut().unwrap_or(&mut *budget);
                 let response = self
-                    .request(
+                    .request_mode(
                         &candidates.membership,
                         destination,
                         context,
@@ -586,6 +596,8 @@ impl CandidatePolicy {
                         scope,
                         request_budget,
                         (count - index + usize::from(rank.is_some())) as u32,
+                        false,
+                        continuation.bounded_routes,
                     )
                     .await;
                 if let Some(bounded) = bounded {
@@ -782,6 +794,7 @@ impl CandidatePolicy {
             budget,
             remaining_opportunities,
             false,
+            false,
         )
         .await
     }
@@ -796,6 +809,7 @@ impl CandidatePolicy {
         budget: &mut AcquisitionBudget,
         remaining_opportunities: u32,
         direct: bool,
+        funded_remote: bool,
     ) -> Result<VerifiedResponse> {
         check_budget(scope, budget)?;
         // Reserve the complete permitted route before sending. Lost responses cannot
@@ -827,9 +841,13 @@ impl CandidatePolicy {
         let attempts = if matches!(mode, FetchMode::Acquire) {
             // Reserve remote acquisition credits from the same original call.
             // Without a signed response receipt unused remote credits stay spent.
-            let credits = budget
-                .remaining_attempts()
-                .div_ceil(remaining_opportunities.max(1));
+            let credits = if funded_remote {
+                budget.remaining_attempts()
+            } else {
+                budget
+                    .remaining_attempts()
+                    .div_ceil(remaining_opportunities.max(1))
+            };
             budget.partition(credits, 0)?.remaining_attempts()
         } else {
             0

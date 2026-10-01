@@ -194,8 +194,8 @@ fn hedged_plaintext_validates_aead_and_preserves_singleflight_and_original_credi
             .with_hedges(hedges),
         );
         f.fill = Fill::new(deps);
-        let mut first_budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
-        let mut second_budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+        let mut first_budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
+        let mut second_budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
         let (first, second) = drive(
             async {
                 futures::join!(
@@ -231,11 +231,11 @@ fn hedged_plaintext_validates_aead_and_preserves_singleflight_and_original_credi
         assert_eq!(first_budget.deadline(), f.scope.deadline.0);
         assert_eq!(
             first_budget.remaining_attempts() + second_budget.remaining_attempts(),
-            13
+            17
         );
         assert_eq!(
             first_budget.remaining_links() + second_budget.remaining_links(),
-            30
+            34
         );
         assert!(
             peers
@@ -287,8 +287,8 @@ fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
         });
         let mut budget = AcquisitionBudget::new(
             f.scope.deadline.0,
-            if reason == "credits" { 6 } else { 8 },
-            16,
+            if reason == "credits" { 8 } else { 10 },
+            if reason == "credits" { 16 } else { 18 },
         );
         let before = (
             budget.remaining_attempts(),
@@ -417,7 +417,7 @@ fn hedge_stalled_primary_copy_miss_keeps_time_and_credits_for_later_acquire() {
                 .push_back((ordered[2].clone(), Reply::Copy(good)));
         }
         let start = crate::runtime::environment::now();
-        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
         let result = acquire(&mut f, &mut budget).unwrap();
         assert_eq!(result.plaintext.bytes(), b"abc");
         assert!(peers.canceled_primary.get());
@@ -431,7 +431,7 @@ fn hedge_stalled_primary_copy_miss_keeps_time_and_credits_for_later_acquire() {
         assert!(!calls[2].1);
         assert_eq!(calls[0].3, 1);
         assert_eq!(calls[1].3, 1);
-        assert!(calls[2..].iter().all(|c| c.3 <= 4));
+        assert!(calls[2..].iter().all(|c| c.3 == 8));
         assert!(
             calls[2..].iter().all(|c| c.2 >= 1),
             "later Acquire keeps origin-attempt capacity"
@@ -486,7 +486,7 @@ fn hedge_stale_membership_refreshes_once_without_fresh_credits() {
                     Reply::Copy(good)
                 },
             )]);
-            let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+            let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
             let result = acquire(&mut f, &mut budget);
             if stale_again {
                 assert!(matches!(result, Err(Error::IncompatibleMembership)));
@@ -497,7 +497,7 @@ fn hedge_stale_membership_refreshes_once_without_fresh_credits() {
                 peers.calls.borrow().len(),
                 if secondary_stale { 3 } else { 2 }
             );
-            assert!(budget.remaining_attempts() < 8 && budget.remaining_links() < 16);
+            assert!(budget.remaining_attempts() < 10 && budget.remaining_links() < 18);
             assert_eq!(budget.deadline(), f.scope.deadline.0);
             assert_eq!(
                 metrics.count(Event::PageHedgeStarted),
@@ -518,7 +518,7 @@ fn hedge_continuation_preserves_version_failure_and_never_restarts_consumed_prim
             .cloned()
             .map(|node| (node, Reply::VersionUnavailable)),
     );
-    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
     assert!(matches!(
         acquire(&mut f, &mut budget),
         Err(Error::VersionUnavailable)
@@ -526,6 +526,282 @@ fn hedge_continuation_preserves_version_failure_and_never_restarts_consumed_prim
     assert_eq!(peers.calls.borrow().len(), 3);
     assert_eq!(metrics.count(Event::PageHedgeStarted), 0);
     assert_eq!(budget.deadline(), f.scope.deadline.0);
+}
+
+#[test]
+fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_original_budget() {
+    use crate::{
+        control::{
+            snapshot::{PublishedState, SnapshotStore},
+            wire::{Publication, PublicationSequence, SCHEMA_VERSION},
+        },
+        memory::{delivery::Delivery, pipe::PipePool},
+        peer::server::LocalPageService,
+        read::{
+            metadata::{MetadataDependencies, MetadataService},
+            range_stream::RangeStreams,
+            serve::Coordinator,
+        },
+    };
+    struct Mesh {
+        signing: Vec<Forwarding>,
+        nodes: RefCell<Vec<Rc<Coordinator>>>,
+        calls: RefCell<Vec<(NodeId, NodeId, bool, u32, u8)>>,
+        unavailable: RefCell<Vec<NodeId>>,
+        admissions: Vec<Rc<crate::runtime::admission::Admission>>,
+    }
+    struct Peer {
+        mesh: Rc<Mesh>,
+        local: usize,
+    }
+    impl PeerClient for Peer {
+        fn direct_hedge_available(&self, _: &MembershipLease, _: &NodeId) -> bool {
+            true
+        }
+        fn request_direct<'a>(
+            &'a self,
+            r: PeerRequest,
+            m: MembershipLease,
+            s: &'a RequestScope,
+        ) -> Operation<'a, VerifiedResponse> {
+            self.request(r, m, s)
+        }
+        fn request<'a>(
+            &'a self,
+            request: PeerRequest,
+            membership: MembershipLease,
+            scope: &'a RequestScope,
+        ) -> Operation<'a, VerifiedResponse> {
+            Box::pin(async move {
+                let destination = request.route.destination.clone();
+                let copy = matches!(
+                    request.operation,
+                    PeerOperation::Page {
+                        mode: FetchMode::CopyOnly,
+                        ..
+                    }
+                );
+                self.mesh.calls.borrow_mut().push((
+                    node(self.local),
+                    destination.clone(),
+                    copy,
+                    request.route.remaining_attempts,
+                    request.route.remaining_links,
+                ));
+                let remote = (0..4).find(|i| node(*i) == destination).unwrap();
+                let (signed, binding) = self.mesh.signing[self.local].sign_request(request)?;
+                let admitted = self.mesh.signing[remote].verify_request(signed)?;
+                let reply_binding = admitted.binding().clone();
+                if self.mesh.calls.borrow().len() == 1 {
+                    let mut polls = 0;
+                    std::future::poll_fn(|cx| {
+                        polls += 1;
+                        if polls >= 4 {
+                            Poll::Ready(())
+                        } else {
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                    })
+                    .await;
+                }
+                let response = if self.mesh.unavailable.borrow().contains(&destination) {
+                    PeerResponse::Unavailable
+                } else {
+                    let coordinator = self.mesh.nodes.borrow()[remote].clone();
+                    coordinator.serve_peer(admitted, membership, scope).await?
+                };
+                // Match wire reception: the requester owns ciphertext admission,
+                // not the destination's allocation from this in-process mesh.
+                let response = match response {
+                    PeerResponse::Page {
+                        metadata,
+                        ciphertext,
+                    } => {
+                        let admission = &self.mesh.admissions[self.local];
+                        let copy = crate::memory::pool::BufferPool::new(admission.clone())
+                            .ciphertext(
+                                admission.reserve(
+                                    Some(&metadata.version.object.cache),
+                                    ResourceClass::Ciphertext,
+                                    ciphertext.bytes().len(),
+                                )?,
+                                ciphertext.envelope().clone(),
+                                ciphertext.bytes().to_vec(),
+                            )?;
+                        PeerResponse::Page {
+                            metadata,
+                            ciphertext: copy,
+                        }
+                    }
+                    other => other,
+                };
+                let response = self.mesh.signing[remote].sign_response(&reply_binding, response);
+                let response = response?;
+                self.mesh.signing[self.local].verify_response(response, &binding)
+            })
+        }
+    }
+    for target_rank in [1usize, 2] {
+        let mut fixtures: Vec<_> = (0..4).map(|_| fixture()).collect();
+        let (_, ordered) = install_peers(&mut fixtures[0], None);
+        let membership = fixtures[0].membership.clone();
+        let source = (0..4).find(|i| !ordered.contains(&node(*i))).unwrap();
+        let target = (0..4).find(|i| node(*i) == ordered[target_rank]).unwrap();
+        let mesh = Rc::new(Mesh {
+            signing: network(4).into_iter().map(Forwarding::new).collect(),
+            nodes: RefCell::new(Vec::new()),
+            calls: RefCell::new(Vec::new()),
+            unavailable: RefCell::new(ordered[..target_rank].to_vec()),
+            admissions: fixtures
+                .iter()
+                .map(|f| f.fill.dependencies.admission.clone())
+                .collect(),
+        });
+        let mut endpoints = Vec::new();
+        for (i, f) in fixtures.iter_mut().enumerate() {
+            f.membership = membership.clone();
+            let peers: Rc<dyn PeerClient> = Rc::new(Peer {
+                mesh: mesh.clone(),
+                local: i,
+            });
+            let mut policy =
+                CandidatePolicy::new(node(i), Rc::new(Placement::new(16)), peers.clone());
+            if i == source {
+                policy = policy.with_hedges(
+                    super::super::super::hedge::Hedges::new(
+                        super::super::super::hedge::Config {
+                            slots: 1,
+                            delay: Duration::from_nanos(1),
+                            bytes: super::super::super::hedge::DUPLICATE_BYTES,
+                        },
+                        Default::default(),
+                    )
+                    .unwrap(),
+                );
+            }
+            let mut deps = f.fill.dependencies.clone();
+            deps.peers = peers.clone();
+            deps.candidates = Rc::new(policy);
+            f.fill = Fill::new(deps);
+            let fill = Rc::new(f.fill.clone());
+            let snapshots = Rc::new(SnapshotStore::new(
+                f.keys.cluster().clone(),
+                Arc::new(PublishedState::default()),
+                4,
+            ));
+            snapshots
+                .publish(Publication {
+                    schema_version: SCHEMA_VERSION,
+                    cluster: f.keys.cluster().clone(),
+                    sequence: PublicationSequence(1),
+                    membership_version: membership.version,
+                    members: membership.members().to_vec(),
+                    caches: vec![crate::control::caches::CacheDefinition {
+                        id: f.context.object.cache.clone(),
+                        name: "cold".into(),
+                        client_socket: "/run/racer/cold/client/socket".into(),
+                        origin_socket: "/run/racer/cold/origin/socket".into(),
+                    }],
+                })
+                .unwrap();
+            let owners = fill.dependencies.metadata_owner.clone();
+            let metadata = Rc::new(MetadataService::new(
+                fill.dependencies.candidates.clone(),
+                f.origin.clone(),
+                peers,
+                fill.dependencies.credentials.clone(),
+                16,
+                MetadataDependencies {
+                    index: Rc::new(Index::new(WorkerId(0), 16)),
+                    owners: owners.clone(),
+                    fill: fill.clone(),
+                },
+            ));
+            let delivery = Rc::new(Delivery::new(
+                Rc::new(PipePool::new(
+                    fill.dependencies.admission.clone(),
+                    f.reactor.clone(),
+                )),
+                Duration::from_secs(10),
+            ));
+            let streams = Rc::new(RangeStreams::new(fill.clone(), owners.clone(), delivery, 1));
+            let coordinator = Rc::new(Coordinator::new(
+                snapshots,
+                metadata,
+                fill.clone(),
+                streams,
+                fill.dependencies.credentials.clone(),
+            ));
+            endpoints.push(owners.install(WorkerId(0), coordinator.clone()).unwrap());
+            mesh.nodes.borrow_mut().push(coordinator);
+        }
+        let mut budget = AcquisitionBudget::new(fixtures[source].scope.deadline.0, 10, 18);
+        let source_fill = fixtures[source].fill.clone();
+        let page = fixtures[source].page.clone();
+        let context = OriginContext {
+            object: fixtures[source].context.object.clone(),
+            metadata: None,
+            authorization: None,
+        };
+        let scope = fixtures[source].scope.clone();
+        let mut read =
+            Box::pin(source_fill.acquire(page, membership, &context, &scope, &mut budget));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut result = None;
+        for _ in 0..512 {
+            super::super::super::drivers::poll(&mut cx, 64);
+            for f in &mut fixtures {
+                f.engine.poll_budgeted(64).unwrap();
+                f.crypto.poll_budgeted(64).unwrap();
+            }
+            if let Poll::Ready(done) = read.as_mut().poll(&mut cx) {
+                result = Some(done);
+                break;
+            }
+        }
+        assert_eq!(
+            result
+                .expect("bounded cold coordinator read")
+                .unwrap_or_else(|e| panic!(
+                    "cold rank{target_rank} failed {e:?}; calls={:?}; origin={:?}",
+                    mesh.calls.borrow(),
+                    fixtures
+                        .iter()
+                        .map(|f| f.origin.calls.get())
+                        .collect::<Vec<_>>()
+                ))
+                .plaintext
+                .bytes(),
+            b"abc"
+        );
+        drop(read);
+        assert_eq!(fixtures[target].origin.calls.get(), 1);
+        for (i, f) in fixtures.iter().enumerate() {
+            if i != target {
+                assert_eq!(f.origin.calls.get(), 0);
+            }
+        }
+        let calls = mesh.calls.borrow();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(from, _, copy, _, _)| *from == node(target) && *copy)
+                .count(),
+            target_rank
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(from, to, copy, attempts, links)| *from == node(source)
+                    && *to == node(target)
+                    && !copy
+                    && *attempts == target_rank as u32 + 1
+                    && *links == 8)
+        );
+        assert!(budget.remaining_attempts() <= 10 && budget.remaining_links() <= 18);
+        drop(endpoints);
+    }
 }
 
 #[test]
@@ -573,7 +849,7 @@ fn hedge_full_page_exact_plaintext_quotas_suppress_before_spending_serial_credit
                 .borrow_mut()
                 .push_back((ordered[1].clone(), Reply::Copy(copy)));
         }
-        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
         let result = acquire(&mut f, &mut budget).unwrap();
         assert_eq!(result.plaintext.bytes().len(), PAGE_BYTES as usize);
         assert_eq!(peers.calls.borrow().len(), if pages == 4 { 2 } else { 1 });
@@ -650,7 +926,7 @@ fn hedge_authenticated_metadata_conflict_cannot_win_over_retained_descriptor() {
             (ordered[0].clone(), Reply::Copy(good)),
             (ordered[1].clone(), Reply::Copy(bad)),
         ]);
-        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
         let result = acquire(&mut f, &mut budget).unwrap();
         assert_eq!(result.metadata.length, PAGE_BYTES + 3);
         assert_eq!(result.metadata.content_type, retained.metadata.content_type);
@@ -678,7 +954,7 @@ fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
         page: f.page.clone(),
         mode: FetchMode::Acquire,
     };
-    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
     let mut continuation = super::super::super::candidates::HedgeContinuation::default();
     let scopes = RefCell::new(Vec::<RequestScope>::new());
     let primary_canceled = Cell::new(false);
@@ -734,6 +1010,48 @@ fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
     assert!(primary_canceled.get());
     assert_eq!(f.crypto.outstanding(), 0);
     assert_eq!(metrics.count(Event::PageHedgeWon), 1);
+}
+
+#[test]
+fn hedge_child_cancellation_removes_crypto_admission_wait_without_canceling_accepted_job() {
+    let mut limits = crate::test_support::cluster::config(false).limits;
+    limits.queue_entries = std::num::NonZeroUsize::new(1).unwrap();
+    let mut f = fixture_with(3, Some(limits));
+    let copy = encrypted_copy(&mut f);
+    let child = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+    let mut accepted = Box::pin(f.fill.decrypt(
+        &f.page,
+        copy.clone(),
+        f.fill.reserve_bootstrap(&f.context.object.cache).unwrap(),
+        &f.scope,
+    ));
+    let mut waiting = Box::pin(f.fill.decrypt(
+        &f.page,
+        copy,
+        f.fill.reserve_bootstrap(&f.context.object.cache).unwrap(),
+        &child,
+    ));
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(accepted.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.crypto.outstanding(), 1);
+    assert!(waiting.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(f.crypto.outstanding(), 1);
+    child.cancel().unwrap();
+    assert!(matches!(
+        waiting.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::Cancelled))
+    ));
+    drop(waiting);
+    assert!(!f.scope.cancellation.is_cancelled());
+    assert_eq!(f.crypto.outstanding(), 1);
+    f.engine.poll_budgeted(8).unwrap();
+    f.crypto.poll_budgeted(8).unwrap();
+    assert!(matches!(
+        accepted.as_mut().poll(&mut cx),
+        Poll::Ready(Ok(_))
+    ));
+    drop(accepted);
+    assert_eq!(f.crypto.outstanding(), 0);
 }
 
 fn unusable_copy(f: &Fixture, good: &CiphertextCopy, missing_key: bool) -> CiphertextCopy {

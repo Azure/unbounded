@@ -75,7 +75,7 @@ Thus the cap is not a promise that all resource teardown finishes at that instan
 
 Only a singleflight leader's plaintext fixed-page acquisition at a noncandidate
 can try a pair. The first two ranked candidates must be distinct, healthy direct
-neighbors, with at least seven attempt and sixteen link credits available. Direct
+neighbors, with at least ten attempt and eighteen link credits available. Direct
 neighbor eligibility is checked against the topology, not inferred from distinct
 final destinations (`D/read/candidates.rs:66-95`, `D/peer.rs:61-75`).
 
@@ -108,8 +108,15 @@ nonrenewable local caps of at most one-third of the remaining original time
 (also bounded by the configured attempt cap). Signed overall authority never
 changes (`D/read/candidates.rs:128-153,805-837`). After a failed pair, continuation
 skips the consumed primary, keeps the secondary's CopyOnly miss eligible for a
-later Acquire, caps serial routes at four links, and reserves attempts for later
-candidates. It does not restart candidate zero in the same membership or launch
+later Acquire, and reserves the receiver's actual predecessor-plus-origin costs.
+The pair spends three attempts/two links; rank1 fallback reserves three attempts
+and eight links (two remote attempts), and rank2 reserves four attempts/eight links
+(three remote attempts). Time sharing does not divide those remote credits again.
+At the receiving candidate, constrained inherited link pools are partitioned
+across remaining CopyOnly predecessor probes, keeping origin attempts intact.
+The normal eight-attempt/sixteen-link page budget therefore **suppresses hedging**;
+no default budget is raised and no credits are created. The opt-in path requires
+an already larger original budget. It does not restart candidate zero in the same membership or launch
 another pair. An authenticated stale response from either contender enters the
 ordinary single newer-membership refresh using remaining credits; another stale
 response is terminal (`D/read/candidates.rs:498-633`).
@@ -125,6 +132,16 @@ candidate, primary and secondary stale refresh, full 16 MiB pages at exact
 32/48/64 MiB quotas, AEAD-valid conflicting length/content type, and accepted
 crypto cancellation/fencing (`D/read/fill_peer_tests.rs:386-751`). Existing
 singleflight and immutable-deadline assertions remain in place.
+
+Malformed contender-local HTTP/wire parsing (`InvalidRequest`, `HeaderTooLarge`)
+cannot veto an independently valid primary; authorization failure and parent
+cancellation remain terminal. The race still drains submitted work. Regression
+tests drive the production HTTP/wire decoders, including both contenders ready
+in one poll, and cancel a crypto-admission waiter while retaining a different
+accepted crypto job. The cold-fallback regression connects four actual
+coordinators through an in-process signed transport, re-admits received
+ciphertext under the requester quota, and verifies cold rank1/rank2 predecessor
+probes reach real origin encryption. It does not substitute cached-success replies.
 
 **No fleet-global distributed hedge budget is implemented.** The owner is local
 `Arc`/`Mutex` state, not a distributed coordinator (`D/read/hedge.rs:58-108`,
@@ -246,3 +263,8 @@ again after the final credit-reserve assertion. `cargo check --all-targets
 --features rdma`, Rust formatting, and diff checks passed. No cluster or load
 commands ran. `make fmt` was not repeated under the user's explicit instruction
 because its installed Go-toolchain mismatch is unchanged.
+
+The subsequent receiver-funding/parser correction passed all **172 read tests**
+and the RDMA-feature all-target compile check. The focused hedge set passed
+**22 tests** before the additional crypto-wait test, which passed in the read
+suite. These are bounded local semantic tests, not cluster or hardware validation.

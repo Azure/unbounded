@@ -15,6 +15,8 @@
 //! Pair exchanges have a local one-third-remaining cap; signed authority stays
 //! unchanged. Serial continuation skips the consumed primary, keeps the CopyOnly
 //! secondary eligible for Acquire, and preserves credits for later candidates.
+//! Receiver predecessor/origin work requires ten original attempts/eighteen links;
+//! the standard eight/sixteen allowance suppresses hedging, without budget inflation.
 //! A valid winner waits for the losing exchange/crypto fence before return:
 //! this can limit the latency benefit and is not an early-publication implementation.
 use crate::{
@@ -267,6 +269,10 @@ fn recoverable(error: Error) -> bool {
             | Error::CorruptRecord
             | Error::MissingKey
             | Error::Cancelled
+            // Malformed framing is local to that contender, not authority to
+            // cancel another independently authenticated usable page.
+            | Error::InvalidRequest
+            | Error::HeaderTooLarge
     )
 }
 
@@ -294,6 +300,78 @@ mod tests {
             Metrics::default(),
         )
         .unwrap()
+    }
+    #[test]
+    fn malformed_speculative_http_and_wire_heads_do_not_veto_valid_primary() {
+        for kind in ["invalid", "large", "wire"] {
+            for same_poll in [false, true] {
+                let clock = SimulationClock::new(933);
+                let _env = clock.environment(0).enter();
+                let owner = controller(1, DUPLICATE_BYTES);
+                let permit = owner.acquire().unwrap();
+                let a = scope();
+                let b = scope();
+                let parent = scope();
+                let ready = Cell::new(false);
+                let malformed_ready = Cell::new(false);
+                let primary = std::future::poll_fn(|_| {
+                    if ready.get() {
+                        Poll::Ready(Ok(42))
+                    } else {
+                        Poll::Pending
+                    }
+                });
+                let secondary = async {
+                    std::future::poll_fn(|_| {
+                        if malformed_ready.get() {
+                            Poll::Ready(())
+                        } else {
+                            Poll::Pending
+                        }
+                    })
+                    .await;
+                    let codec =
+                        crate::http::codec::Codec::new(if kind == "large" { 8 } else { 4096 }, 0);
+                    let bytes: &[u8] = if kind == "invalid" {
+                        b"not-http\r\n\r\n"
+                    } else {
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+                    };
+                    let parsed = codec.decode_head(bytes);
+                    let error = match parsed {
+                        Err(e) => e,
+                        Ok(Some((head, _))) => crate::peer::wire::WireCodec::decode(head, true)
+                            .err()
+                            .expect("missing signed wire envelope"),
+                        _ => panic!("complete malformed frame"),
+                    };
+                    assert!(matches!(
+                        error,
+                        Error::InvalidRequest | Error::HeaderTooLarge
+                    ));
+                    Err(error)
+                };
+                let mut work = Box::pin(race(primary, secondary, &a, &b, &parent, &permit));
+                let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+                assert!(work.as_mut().poll(&mut cx).is_pending());
+                clock.advance(Duration::from_millis(10));
+                // Start both contenders and park them before the readiness turn.
+                assert!(work.as_mut().poll(&mut cx).is_pending());
+                malformed_ready.set(true);
+                if same_poll {
+                    ready.set(true);
+                }
+                let result = work.as_mut().poll(&mut cx);
+                if same_poll {
+                    assert_eq!(result, Poll::Ready(Ok(42)));
+                } else {
+                    assert!(result.is_pending());
+                    assert!(!a.cancellation.is_cancelled());
+                    ready.set(true);
+                    assert_eq!(work.as_mut().poll(&mut cx), Poll::Ready(Ok(42)));
+                }
+            }
+        }
     }
     #[test]
     fn fast_primary_never_launches_secondary_or_records_duplicate_bytes() {
