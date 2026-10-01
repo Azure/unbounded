@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 const (
@@ -56,6 +58,8 @@ type Member struct {
 	PeerEndpoint     string `json:"peer_endpoint"`
 	Rails            []Rail `json:"rails"`
 	AlignmentEnabled bool   `json:"alignment_enabled"`
+	// Site is the RDMA boundary. Empty means HTTP-only, not a shared default site.
+	Site string `json:"site,omitempty"`
 }
 
 type CacheDefinition struct {
@@ -338,7 +342,7 @@ func validatePublication(v Publication, counters bool) error {
 		return true
 	}
 	for _, m := range v.Members {
-		if !consume(len(m.Node)) || !consume(len(m.PeerEndpoint)) {
+		if !consume(len(m.Node)) || !consume(len(m.PeerEndpoint)) || !consume(len(m.Site)) {
 			return TooLarge
 		}
 
@@ -357,7 +361,7 @@ func validatePublication(v Publication, counters bool) error {
 
 	nodes := map[NodeID]bool{}
 	for _, m := range v.Members {
-		if !ValidUUID(string(m.Node)) || nodes[m.Node] || m.Shares == 0 {
+		if !ValidUUID(string(m.Node)) || nodes[m.Node] || m.Shares == 0 || len(validation.IsValidLabelValue(m.Site)) != 0 {
 			return InvalidRequest
 		}
 

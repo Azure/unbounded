@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	machinav1 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
@@ -333,7 +334,19 @@ func (ids DataplaneWorkloadIdentities) Owns(pod *corev1.Pod) bool {
 const (
 	enrolledSharesAnnotation = "racer.unbounded-cloud.io/enrolled-shares"
 	admittedMemberAnnotation = "racer.unbounded-cloud.io/last-admitted-member"
+	deprecatedSiteLabel      = "net.unbounded-cloud.io/site"
 )
+
+// nodeSite follows net's canonical-first, nonempty deprecated-label fallback.
+// Read current labels independently of retained annotations: removal must revoke
+// the old RDMA boundary even when hardware annotations are malformed.
+func nodeSite(node *corev1.Node) string {
+	if site := node.Labels[machinav1.MachineSiteLabelKey]; site != "" {
+		return site
+	}
+
+	return node.Labels[deprecatedSiteLabel]
+}
 
 // AcceptedMembers is backed by per-Node UID-bound last-admitted annotations.
 type AcceptedMembers map[wire.NodeID]wire.Member
@@ -465,8 +478,10 @@ func selectEndpoint(pods []corev1.Pod, ownership DataplaneWorkloadIdentities, no
 // ReconcileMembers preserves admitted values across gaps using UID-bound Node
 // annotations on restart. Never-admitted nodes with unavailable or malformed
 // required inputs are omitted. Deletion and exclusion remove membership.
-// Annotations are accepted as one unit, independently of the endpoint. The caller
-// installs the returned history only after the candidate publication commits.
+// Annotations are accepted as one unit, independently of the endpoint. Site is
+// always derived from current labels, never from admitted history, so a
+// malformed annotation cannot retain a removed or changed RDMA boundary.
+// The caller installs returned history only after the candidate publication commits.
 // Inputs and nested accepted state are never mutated or aliased by the result.
 // Accepted must contain only previously committed results from this function.
 // The caller supplies installation-namespace Pods grouped by assigned node name.
@@ -537,7 +552,7 @@ func reconcileMembers(nodes []corev1.Node, podsByNode map[string][]corev1.Pod, o
 			continue
 		}
 
-		member := wire.Member{Node: id, Shares: attributes.Shares, Rails: attributes.Rails, AlignmentEnabled: attributes.AlignmentEnabled, PeerEndpoint: endpoint}
+		member := wire.Member{Node: id, Shares: attributes.Shares, Rails: attributes.Rails, AlignmentEnabled: attributes.AlignmentEnabled, PeerEndpoint: endpoint, Site: nodeSite(node)}
 
 		member.Rails = append([]wire.Rail{}, member.Rails...)
 		for j := range member.Rails {

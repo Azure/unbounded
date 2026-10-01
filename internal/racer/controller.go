@@ -39,6 +39,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
+	machinav1 "github.com/Azure/unbounded/api/machina/v1alpha3"
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
@@ -547,6 +548,12 @@ func nodeChanges() predicate.Predicate {
 		_, excludedB := b.GetLabels()[wire.ExclusionLabel]
 		if a.GetUID() != b.GetUID() || a.GetName() != b.GetName() || excludedA != excludedB {
 			return false
+		}
+
+		for _, key := range []string{machinav1.MachineSiteLabelKey, deprecatedSiteLabel} {
+			if a.GetLabels()[key] != b.GetLabels()[key] {
+				return false
+			}
 		}
 
 		for _, key := range []string{wire.SharesAnnotation, wire.RailsAnnotation, wire.AlignmentAnnotation, enrolledSharesAnnotation} {
