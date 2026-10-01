@@ -404,15 +404,14 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         admission.clone(),
         Rc::new(BufferPool::new(admission.clone())),
     ));
-    let transfers = Rc::new(
-        Transfers::new(
-            Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2)),
-            io.clone(),
-            None,
-        )
-        .with_wire(admission.clone(), codec.clone())
-        .with_signatures(a.signatures.clone()),
-    );
+    let transfers = Rc::new(Transfers::new(
+        Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2)),
+        io.clone(),
+        None,
+        admission.clone(),
+        codec.clone(),
+        a.signatures.clone(),
+    ));
     let source_network = Rc::new(PeerNetwork::new(source.clone(), source_publications).unwrap());
     let destination_membership =
         Arc::new(Membership::validate(membership.version, membership.members().to_vec()).unwrap());

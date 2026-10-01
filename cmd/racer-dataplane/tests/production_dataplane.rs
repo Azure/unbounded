@@ -523,8 +523,17 @@ impl Rig {
         let certificates = Rc::new(Certificates::new(ClusterId(CLUSTER.into()), keys.clone()));
         let signatures = Rc::new(Signatures::new(keys.clone(), certificates));
         let forwarding = Rc::new(Forwarding::new(signatures.clone()));
-        let transfers =
-            Rc::new(Transfers::new(http.clone(), io.clone(), None).with_signatures(signatures));
+        let transfers = Rc::new(Transfers::new(
+            http.clone(),
+            io.clone(),
+            None,
+            admission.clone(),
+            Rc::new(racer_dataplane::peer::wire::SecurityCodec::new(
+                admission.clone(),
+                buffers.clone(),
+            )),
+            signatures,
+        ));
         let peers = Rc::new(Requester::new(
             Rc::new(Paths::new(Rc::new(LinkHealth), 64)),
             forwarding.clone(),

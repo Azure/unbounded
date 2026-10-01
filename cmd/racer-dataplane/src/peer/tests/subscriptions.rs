@@ -434,15 +434,14 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
     let server = server::PeerServer::new(io.clone(), destination, admission.clone(), local, relay)
         .with_wire(codec.clone())
         .with_signatures(signers[2].clone());
-    let transfers = Rc::new(
-        transfer::Transfers::new(
-            Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2)),
-            io,
-            None,
-        )
-        .with_wire(admission.clone(), codec)
-        .with_signatures(signers[0].clone()),
-    );
+    let transfers = Rc::new(transfer::Transfers::new(
+        Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2)),
+        io,
+        None,
+        admission.clone(),
+        codec,
+        signers[0].clone(),
+    ));
     let requester = Requester::new(
         paths,
         Rc::new(Forwarding::new(signers[0].clone())),

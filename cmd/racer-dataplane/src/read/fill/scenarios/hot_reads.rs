@@ -581,19 +581,18 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
                 Codec::new(crate::peer::wire::MAX_ENVELOPE_HEAD, PAGE_BYTES + 16),
                 admission.clone(),
             ));
-            let transfers = Rc::new(
-                crate::peer::transfer::Transfers::new(
-                    Rc::new(crate::http::pool::HttpPool::new(
-                        reactor,
-                        admission.clone(),
-                        4,
-                    )),
-                    io,
-                    None,
-                )
-                .with_wire(admission, codec)
-                .with_signatures(signers[i].clone()),
-            );
+            let transfers = Rc::new(crate::peer::transfer::Transfers::new(
+                Rc::new(crate::http::pool::HttpPool::new(
+                    reactor,
+                    admission.clone(),
+                    4,
+                )),
+                io,
+                None,
+                admission,
+                codec,
+                signers[i].clone(),
+            ));
             let requester = Rc::new(crate::peer::Requester::new(
                 Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
                 Rc::new(Forwarding::new(signers[i].clone())),

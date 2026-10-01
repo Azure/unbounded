@@ -132,7 +132,7 @@ pub struct Capabilities {
 
 pub struct Transfers {
     reclaim: Option<Rc<ReclaimCiphertext>>,
-    signatures: Option<Rc<crate::security::signing::Signatures>>,
+    signatures: Rc<crate::security::signing::Signatures>,
     #[cfg(test)]
     pub(super) native_completions: std::cell::Cell<usize>,
     #[cfg(test)]
@@ -142,7 +142,7 @@ pub struct Transfers {
     pub(super) http: Rc<HttpPool>,
     pub(super) io: Rc<HttpIo>,
     pub(super) rdma: Option<Rc<RdmaTransfer>>,
-    pub(super) wire: Option<(Rc<Admission>, Rc<SecurityCodec>)>,
+    pub(super) wire: (Rc<Admission>, Rc<SecurityCodec>),
     pub(super) native: Option<(
         Rc<crate::security::signing::Signatures>,
         Rc<crate::rdma::session::Sessions>,
@@ -153,10 +153,26 @@ impl Transfers {
     pub(crate) fn transport_io(&self) -> &Rc<HttpIo> {
         &self.io
     }
-    pub fn new(http: Rc<HttpPool>, io: Rc<HttpIo>, rdma: Option<Rc<RdmaTransfer>>) -> Self {
+    /// Authentication and charged decoding are mandatory, even for HTTP-only peers.
+    ///
+    /// ```compile_fail
+    /// use racer_dataplane::{http::{io::HttpIo, pool::HttpPool}, peer::transfer::Transfers};
+    /// use std::rc::Rc;
+    /// fn unsigned(pool: Rc<HttpPool>, io: Rc<HttpIo>) {
+    ///     let _ = Transfers::new(pool, io, None);
+    /// }
+    /// ```
+    pub fn new(
+        http: Rc<HttpPool>,
+        io: Rc<HttpIo>,
+        rdma: Option<Rc<RdmaTransfer>>,
+        admission: Rc<Admission>,
+        codec: Rc<SecurityCodec>,
+        signatures: Rc<crate::security::signing::Signatures>,
+    ) -> Self {
         Self {
             reclaim: None,
-            signatures: None,
+            signatures,
             #[cfg(test)]
             native_completions: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -166,21 +182,12 @@ impl Transfers {
             http,
             io,
             rdma,
-            wire: None,
+            wire: (admission, codec),
             native: None,
         }
     }
-    pub fn with_native(
-        mut self,
-        signatures: Rc<crate::security::signing::Signatures>,
-        sessions: Rc<crate::rdma::session::Sessions>,
-    ) -> Self {
-        self.signatures = Some(signatures.clone());
-        self.native = Some((signatures, sessions));
-        self
-    }
-    pub fn with_wire(mut self, admission: Rc<Admission>, codec: Rc<SecurityCodec>) -> Self {
-        self.wire = Some((admission, codec));
+    pub fn with_native(mut self, sessions: Rc<crate::rdma::session::Sessions>) -> Self {
+        self.native = Some((self.signatures.clone(), sessions));
         self
     }
     pub(crate) fn with_reclamation(
@@ -188,11 +195,6 @@ impl Transfers {
         reclaim: impl Fn(&crate::model::CacheId, usize) + 'static,
     ) -> Self {
         self.reclaim = Some(Rc::new(reclaim));
-        self
-    }
-    /// Configure connection authentication before sharing this transport with callers.
-    pub fn with_signatures(mut self, signatures: Rc<crate::security::signing::Signatures>) -> Self {
-        self.signatures = Some(signatures);
         self
     }
     /// Route selection alone never authorizes RDMA. A matching, live authenticated
@@ -266,7 +268,7 @@ impl Transfers {
         scope: &'a RequestScope,
     ) -> Operation<'a, CiphertextPage> {
         Box::pin(async move {
-            let (admission, _) = self.wire.as_ref().ok_or(Error::InvalidConfiguration)?;
+            let (admission, _) = &self.wire;
             self.rdma
                 .as_ref()
                 .ok_or(Error::Unavailable)?
@@ -321,7 +323,7 @@ impl Transfers {
     ) -> Operation<'a, RelayResponse> {
         Box::pin(async move {
             scope.check()?;
-            let (admission, codec) = self.wire.as_ref().ok_or(Error::InvalidConfiguration)?;
+            let (admission, codec) = &self.wire;
             let head_size = std::iter::once(request.authentication.original.as_ref())
                 .chain(request.authentication.hops.iter())
                 .try_fold(0usize, |total, signed| {
@@ -339,7 +341,7 @@ impl Transfers {
                     .max(1),
             )?;
             let mut head = WireCodec::encode(&request.authentication, false, 0)?;
-            let signatures = self.signatures.clone().ok_or(Error::InvalidConfiguration)?;
+            let signatures = self.signatures.clone();
             let peer = crate::security::signing::receiver(
                 &request
                     .authentication

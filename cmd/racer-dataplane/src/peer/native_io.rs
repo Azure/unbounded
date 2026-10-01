@@ -75,15 +75,14 @@ mod tests {
             Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2)),
             io,
             Some(rdma),
-        )
-        .with_wire(
             admission.clone(),
             Rc::new(super::super::wire::SecurityCodec::new(
                 admission.clone(),
                 Rc::new(BufferPool::new(admission.clone())),
             )),
+            signatures.clone(),
         )
-        .with_native(signatures, sessions)
+        .with_native(sessions)
     }
     #[test]
     fn real_socket_signed_offer_falls_back_when_local_provider_is_unavailable() {
@@ -434,15 +433,14 @@ mod tests {
                 Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2)),
                 http,
                 Some(rdma),
-            )
-            .with_wire(
                 admission.clone(),
                 Rc::new(super::super::wire::SecurityCodec::new(
                     admission.clone(),
                     Rc::new(BufferPool::new(admission.clone())),
                 )),
+                signatures.clone(),
             )
-            .with_native(signatures, sessions);
+            .with_native(sessions);
             (devices, NativeService::new(port), transfer)
         };
         let (receive_devices, mut receive_engine, receiver) = make(signers[0].clone());
@@ -1004,7 +1002,7 @@ impl Transfers {
         length: usize,
         scope: &RequestScope,
     ) -> Result<(ConnectionLease, WireBuffer)> {
-        let (admission, _) = self.wire.as_ref().ok_or(Error::InvalidConfiguration)?;
+        let (admission, _) = &self.wire;
         let mut buffer = WireBuffer::new(admission, length)?;
         let mut offset = 0;
         while offset < length {
@@ -1036,7 +1034,7 @@ impl Transfers {
     ) -> Result<SignedResponse> {
         let (signatures, sessions) = self.native.as_ref().ok_or(Error::InvalidConfiguration)?;
         let rdma = self.rdma.as_ref().ok_or(Error::Unavailable)?;
-        let (admission, _) = self.wire.as_ref().ok_or(Error::InvalidConfiguration)?;
+        let (admission, _) = &self.wire;
         binding.response = native::envelope_digest(&authentication)?;
         let (offer, _) = binding.verify(
             signatures,
@@ -1284,7 +1282,7 @@ impl Transfers {
             .read_ciphertext(received.connection, length, scope)
             .await?;
         let (bytes, _reservation) = buffer.into_parts();
-        let (_, codec) = self.wire.as_ref().ok_or(Error::InvalidConfiguration)?;
+        let (_, codec) = &self.wire;
         let response = codec.response(authentication, bytes, scope)?;
         connection.finish_exchange()?;
         Ok(response)

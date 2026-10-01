@@ -435,26 +435,11 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
 #[test]
 fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
     use crate::{
-        http::{Codec, MessageHead, StartLine, io::HttpIo, pool::HttpPool},
-        runtime::reactor::Reactor,
+        http::{MessageHead, StartLine},
         security::{protocol as p, signing::signed_digest},
         topology::membership::{Member, Membership},
     };
     let signers = signers();
-    let admission = Rc::new(Admission::new(
-        crate::test_support::cluster::config(false).limits,
-    ));
-    let reactor = Rc::new(Reactor::new(admission.clone()));
-    let io = Rc::new(HttpIo::with_admission(
-        reactor.clone(),
-        Codec::new(65536, 16777232),
-        admission.clone(),
-    ));
-    let transfers = Rc::new(transfer::Transfers::new(
-        Rc::new(HttpPool::new(reactor, admission, 2)),
-        io,
-        None,
-    ));
     let membership = Arc::new(
         Membership::validate(
             MembershipVersion(1),
@@ -480,7 +465,6 @@ fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
         )
         .unwrap(),
     );
-    drop(transfers);
     let response_lease = network.membership(MembershipVersion(1)).unwrap();
     drop(network);
     let mut head = MessageHead {
@@ -798,11 +782,14 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
         admission.clone(),
     ));
     let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2));
-    let transfers = Rc::new(
-        transfer::Transfers::new(pool, io, None)
-            .with_wire(admission.clone(), Rc::new(codec(&admission)))
-            .with_signatures(signers[0].clone()),
-    );
+    let transfers = Rc::new(transfer::Transfers::new(
+        pool,
+        io,
+        None,
+        admission.clone(),
+        Rc::new(codec(&admission)),
+        signers[0].clone(),
+    ));
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = closed.local_addr().unwrap().to_string();
     drop(closed);
@@ -986,28 +973,19 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
     ));
     let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2));
     let codec = Rc::new(codec(&admission));
-    let transfers = transfer::Transfers::new(pool, io.clone(), None)
-        .with_wire(admission.clone(), codec.clone());
+    let transfers = Rc::new(transfer::Transfers::new(
+        pool,
+        io.clone(),
+        None,
+        admission.clone(),
+        codec.clone(),
+        signers[0].clone(),
+    ));
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
-    // A wire codec alone does not enable authenticated transport. Fail before
-    // opening a socket, then configure authentication explicitly for the TCP flow.
-    let unsigned = request(&admission, 1);
-    let scope = unsigned.origin.scope().clone();
-    let (signed, _) = Forwarding::new(signers[0].clone())
-        .sign_request_to(unsigned, &NodeId(C.into()))
-        .unwrap();
-    assert!(matches!(
-        futures::executor::block_on(transfers.exchange(
-            crate::http::pool::Endpoint::Peer(address.to_string()),
-            signed,
-            &scope,
-        )),
-        Err(Error::InvalidConfiguration)
-    ));
+    // Missing authentication is rejected by the constructor's compile-fail test.
     assert_eq!(admission.used(ResourceClass::Connection), 0);
-    let transfers = Rc::new(transfers.with_signatures(signers[0].clone()));
     let membership = Arc::new(
         Membership::validate(
             MembershipVersion(1),
@@ -1338,9 +1316,14 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     ));
     let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 1));
     let signers = signers();
-    let transfers = transfer::Transfers::new(pool, io.clone(), None)
-        .with_wire(admission.clone(), Rc::new(codec(&admission)))
-        .with_signatures(signers[0].clone());
+    let transfers = transfer::Transfers::new(
+        pool,
+        io.clone(),
+        None,
+        admission.clone(),
+        Rc::new(codec(&admission)),
+        signers[0].clone(),
+    );
     let buffers = BufferPool::new(admission.clone());
     let version = ObjectVersion {
         object: ObjectId {

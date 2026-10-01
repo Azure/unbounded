@@ -128,11 +128,14 @@ fn exchange(
     );
     let auth = Rc::new(Forwarding::new(signers[1].clone()));
     let pool = Rc::new(HttpPool::new(reactors[1].clone(), admissions[1].clone(), 1));
-    let transfers = Rc::new(
-        transfer::Transfers::new(pool.clone(), ios[1].clone(), None)
-            .with_wire(admissions[1].clone(), Rc::new(codec(&admissions[1])))
-            .with_signatures(signers[1].clone()),
-    );
+    let transfers = Rc::new(transfer::Transfers::new(
+        pool.clone(),
+        ios[1].clone(),
+        None,
+        admissions[1].clone(),
+        Rc::new(codec(&admissions[1])),
+        signers[1].clone(),
+    ));
     let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4));
     let requester = Rc::new(Requester::new(
         paths.clone(),
