@@ -18,7 +18,7 @@ use racer_dataplane::{
         PageId, PageNumber, RequestId, StrongEtag,
     },
     origin::{metadata, page},
-    read::serve::ReadResponse,
+    read::ReadResponse,
     runtime::{
         admission::Admission,
         deadline::RequestScope,

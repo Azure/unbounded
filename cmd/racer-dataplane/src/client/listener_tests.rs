@@ -205,7 +205,7 @@ use crate::{
     http::codec::Codec,
     memory::{delivery::Delivery, pipe::PipePool},
     model::{ExpiresAt, Limits, ObjectMetadata, ObjectVersion, StrongEtag},
-    read::serve::ReadResponse,
+    read::ReadResponse,
     runtime::reactor::Reactor,
 };
 use std::{
@@ -2049,6 +2049,15 @@ fn removal_commit_drains_active_response_and_reused_uid_does_not_revive_old_keep
     });
     fixture.listeners.reads = gated.clone();
     fixture.reconcile(&[definition()]).unwrap();
+    // Model the descriptor reference inherited by a concurrent fork before exec.
+    // Releasing the endpoint must not wait for that unrelated reference to close.
+    let inherited_lock = fixture.listeners.listeners.borrow()[&definition().id]
+        .owner
+        .as_ref()
+        .unwrap()
+        .lock
+        .try_clone()
+        .unwrap();
     let mut socket = fixture.connect();
     socket.write_all(&request("HEAD", "")).unwrap();
     for _ in 0..16 {
@@ -2063,6 +2072,7 @@ fn removal_commit_drains_active_response_and_reused_uid_does_not_revive_old_keep
     assert!(operation_scope.check().is_ok());
     assert_eq!(fixture.listeners.active_connections(), 1);
     fixture.reconcile(&[definition()]).unwrap();
+    drop(inherited_lock);
     gated.release.set(true);
     if let Some(waker) = gated.wake.borrow().as_ref() {
         waker.wake_by_ref();

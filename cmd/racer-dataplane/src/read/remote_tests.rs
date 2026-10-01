@@ -155,7 +155,7 @@ impl LocalPageService for CandidateService {
                     ..
                 }
             ));
-            let inherited = super::serve::inherited_budget(&logical.route, scope)?;
+            let inherited = super::inherited_budget(&logical.route, scope)?;
             assert_eq!(
                 inherited.remaining_attempts(),
                 logical.route.remaining_attempts
@@ -755,7 +755,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
 }
 
 struct OwnedCoordinator {
-    coordinator: Rc<super::serve::Coordinator>,
+    coordinator: Rc<super::Coordinator>,
     _endpoint: super::dispatch::WorkerEndpoint,
 }
 
@@ -809,7 +809,7 @@ impl LocalPageService for OwnedCoordinator {
 }
 
 struct MissingOrigin(Rc<Cell<usize>>);
-impl crate::origin::client::Origin for MissingOrigin {
+impl crate::origin::Origin for MissingOrigin {
     fn metadata<'a>(
         &'a self,
         authority: &'a super::candidates::OriginAuthority,
@@ -903,10 +903,7 @@ fn metadata_coordinator(
     reactor: Rc<Reactor>,
     peers: Rc<dyn crate::peer::requester::PeerClient>,
     calls: Rc<Cell<usize>>,
-) -> (
-    Rc<super::serve::Coordinator>,
-    super::dispatch::WorkerEndpoint,
-) {
+) -> (Rc<super::Coordinator>, super::dispatch::WorkerEndpoint) {
     metadata_coordinator_with_newer_publication(
         node, membership, keys, admission, reactor, peers, calls, false,
     )
@@ -921,10 +918,7 @@ fn metadata_coordinator_with_newer_publication(
     peers: Rc<dyn crate::peer::requester::PeerClient>,
     calls: Rc<Cell<usize>>,
     newer_publication: bool,
-) -> (
-    Rc<super::serve::Coordinator>,
-    super::dispatch::WorkerEndpoint,
-) {
+) -> (Rc<super::Coordinator>, super::dispatch::WorkerEndpoint) {
     use crate::{
         control::{
             snapshot::{PublishedState, SnapshotStore},
@@ -1038,7 +1032,7 @@ fn metadata_coordinator_with_newer_publication(
         delivery,
         2,
     ));
-    let coordinator = Rc::new(super::serve::Coordinator::new(
+    let coordinator = Rc::new(super::Coordinator::new(
         snapshots,
         metadata,
         fill,

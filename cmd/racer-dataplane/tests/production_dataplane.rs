@@ -23,16 +23,16 @@ use racer_dataplane::{
     },
     memory::{cache::MemoryCache, delivery::Delivery, pipe::PipePool, pool::BufferPool},
     model::{Limits, PAGE_BYTES, ResourceClass, *},
-    origin::client::OriginClient,
+    origin::OriginClient,
     peer::{PeerNetwork, requester::Requester, transfer::Transfers},
     read::{
+        Coordinator, ReadService,
         candidates::CandidatePolicy,
         dispatch::{Dispatcher, WorkerDirectory, WorkerEndpoint},
         fill::{Fill, FillDependencies},
         flight::Flights,
         metadata::{MetadataDependencies, MetadataService},
         range_stream::RangeStreams,
-        serve::{Coordinator, ReadService},
     },
     runtime::{
         admission::Admission,

@@ -8,7 +8,7 @@ use crate::{
         pool::ConnectionLease,
     },
     model::{ObjectMetadata, PAGE_BYTES, PageNumber, ResolvedRange},
-    read::{range_stream::RangeStream, serve::ReadResponse},
+    read::{ReadResponse, range_stream::RangeStream},
     runtime::{deadline::RequestScope, reactor::IoBuffer},
 };
 use std::{

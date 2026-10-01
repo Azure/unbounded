@@ -3,7 +3,7 @@ use super::clock::Clock;
 use crate::{
     error::{Error, Operation, Result},
     model::{MetadataSelector, ObjectId, OriginContext, PageId, PageNumber, StrongEtag},
-    origin::{client::Origin, metadata::MetadataReply, page::OriginPage},
+    origin::{Origin, metadata::MetadataReply, page::OriginPage},
     read::candidates::OriginAuthority,
     runtime::deadline::{Deadline, RequestScope},
 };

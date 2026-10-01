@@ -7,7 +7,7 @@ use crate::{
     error::{Error, Operation, Result},
     http::{io::HttpIo, pool::ConnectionLease},
     model::{CacheId, RequestId},
-    read::serve::ReadService,
+    read::ReadService,
     runtime::{
         admission::Admission,
         deadline::{Cancellation, RequestScope},
@@ -1326,6 +1326,16 @@ const WITNESS: &str = ".racer-owned-";
 struct EndpointOwner {
     lock: File,
     directory: File,
+}
+
+impl Drop for EndpointOwner {
+    fn drop(&mut self) {
+        // A concurrent process spawn can inherit this open file description until
+        // exec closes CLOEXEC descriptors. Explicitly release our ownership rather
+        // than waiting for that unrelated child to close its inherited reference.
+        // BoundListener unlinks its owned paths before dropping this last owner.
+        unsafe { libc::flock(self.lock.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 impl EndpointOwner {

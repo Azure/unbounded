@@ -13,7 +13,7 @@ use crate::{
         CacheKey, KeyId, MetadataSelector, Nonce, ObjectId, ObjectVersion, OriginContext,
         PageEnvelope, PageId, PageNumber, RequestId, StrongEtag, VersionMetadata, WorkerId,
     },
-    origin::{client::Origin, metadata::MetadataReply, page::OriginPage},
+    origin::{Origin, metadata::MetadataReply, page::OriginPage},
     peer::{
         requester::PeerClient,
         wire::{PeerRequest, VerifiedResponse},

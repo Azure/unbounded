@@ -1,10 +1,6 @@
 //! Bounded node-local handoffs. Only owned commands and immutable results cross
 //! threads; the coordinator, futures, delivery leases, and streams stay local.
-use super::{
-    fill::PageResult,
-    flight::AcquisitionBudget,
-    serve::{Coordinator, ReadResponse, ReadService},
-};
+use super::{Coordinator, ReadResponse, ReadService, fill::PageResult, flight::AcquisitionBudget};
 use crate::runtime::collections::HashMap;
 use crate::{
     client::request::ClientRequest,
@@ -489,7 +485,7 @@ impl WorkerDirectory {
         scope: &'a RequestScope,
     ) -> Operation<'a, ObjectMetadata> {
         Box::pin(async move {
-            let mut budget = super::serve::default_budget(scope);
+            let mut budget = super::default_budget(scope);
             self.resolve_with_budget(selector, membership, context, scope, &mut budget)
                 .await
         })

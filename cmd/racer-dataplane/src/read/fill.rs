@@ -19,7 +19,7 @@ use crate::{
         pool::{BufferPool, CiphertextPage},
     },
     model::{ObjectMetadata, OriginContext, PAGE_BYTES, PageId, ResourceClass, VersionMetadata},
-    origin::client::Origin,
+    origin::Origin,
     peer::{
         requester::PeerClient,
         wire::{FetchMode, Operation as PeerOperation, PeerResponse},

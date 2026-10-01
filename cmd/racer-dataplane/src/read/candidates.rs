@@ -421,7 +421,7 @@ impl CandidatePolicy {
         scope: &'a RequestScope,
     ) -> Operation<'a, CandidateResolution> {
         Box::pin(async move {
-            let mut budget = super::serve::default_budget(scope);
+            let mut budget = super::default_budget(scope);
             self.resolve_with_budget(candidates, context, operation, scope, &mut budget)
                 .await
         })

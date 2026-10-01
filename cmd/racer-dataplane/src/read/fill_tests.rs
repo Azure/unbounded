@@ -939,9 +939,9 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
             memory::{delivery::Delivery, pipe::PipePool},
             model::ByteRange,
             read::{
+                Coordinator, ReadService,
                 metadata::{MetadataDependencies, MetadataService},
                 range_stream::RangeStreams,
-                serve::{Coordinator, ReadService},
             },
         };
         let snapshots = Rc::new(SnapshotStore::new(

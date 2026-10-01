@@ -16,9 +16,9 @@ use crate::{
         wire::{PeerRequest, SignedRequest, SignedResponse, VerifiedResponse},
     },
     read::{
+        Coordinator, ReadService,
         metadata::{MetadataDependencies, MetadataService},
         range_stream::RangeStreams,
-        serve::{Coordinator, ReadService},
     },
     security::{
         forwarding::Forwarding,

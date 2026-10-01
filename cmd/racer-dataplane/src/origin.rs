@@ -3,12 +3,6 @@
 //!
 //! Credentials are only origin-fetch context, never Racer authorization. Do not
 //! persist headers or retain them in pooled connections after an operation ends.
-// Keep the public import paths while the request flow and its wire validation
-// live together. Only the socket scenarios are in a separate test file.
-pub mod client {
-    pub use super::{Origin, OriginClient};
-}
-
 use self::{metadata::MetadataReply, page::OriginPage};
 use crate::{
     control::{
@@ -549,7 +543,6 @@ fn opaque(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 #[cfg(test)]
-#[path = "origin/tests.rs"]
 mod tests;
 
 /// HEAD/initial-GET validation; empty objects produce metadata without a page.

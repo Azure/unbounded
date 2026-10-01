@@ -10,7 +10,7 @@ use crate::{
     },
     memory::delivery::Delivery,
     model::{ObjectMetadata, ResolvedRange},
-    read::serve::ReadResponse,
+    read::ReadResponse,
     runtime::deadline::RequestScope,
 };
 use std::{

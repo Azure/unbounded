@@ -15,7 +15,7 @@ use crate::{
         MetadataSelector, ObjectId, ObjectMetadata, ObjectVersion, OriginContext, PageId,
         PageNumber, StrongEtag,
     },
-    origin::client::Origin,
+    origin::Origin,
     peer::{
         requester::PeerClient,
         wire::{FetchMode, Operation as PeerOperation, PeerResponse},

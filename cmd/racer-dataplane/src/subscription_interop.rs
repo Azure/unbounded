@@ -61,7 +61,7 @@ fn metadata(context: &OriginContext) -> ObjectMetadata {
         expires_at: ExpiresAt(UNIX_EPOCH),
     }
 }
-impl origin::client::Origin for GeneratedOrigin {
+impl origin::Origin for GeneratedOrigin {
     fn metadata<'a>(
         &'a self,
         _: &'a read::candidates::OriginAuthority,
@@ -140,7 +140,7 @@ fn go_sdk_subscription_server() {
         flight::Flights,
         metadata::{MetadataDependencies, MetadataService},
         range_stream::RangeStreams,
-        serve::Coordinator,
+        Coordinator,
     };
     use security::{
         aead::{PageCrypto, PageCryptoEngine},

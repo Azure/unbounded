@@ -1147,7 +1147,7 @@ mod tests {
                 pool::{CiphertextBytes, CiphertextPage, VerifiedBytes, VerifiedPage},
             },
             model::{KeyId, Nonce, PageEnvelope, RequestId, ResourceClass, WorkerId},
-            read::serve::ReadResponse,
+            read::ReadResponse,
             runtime::{admission::Admission, reactor::Reactor, worker::WorkerMap},
             topology::membership::Membership,
         };
