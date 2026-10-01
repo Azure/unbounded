@@ -7,6 +7,45 @@ description: "All flags, environment variables, ConfigMap settings, and tuning g
 This document describes all configuration options for unbounded-net components.
 For a conceptual introduction, see [Networking Concepts]({{< relref "concepts/networking" >}}).
 
+## Supported Kubernetes baseline
+
+Unbounded requires Kubernetes **1.34 or newer**, with the control plane and
+worker versions following Kubernetes' supported version-skew policy. Earlier
+Kubernetes releases and upgrades from pre-release Unbounded resource layouts
+are not supported.
+
+The controller publishes a `discovery.k8s.io/v1` EndpointSlice for its
+selectorless Service. Operator activation requires that slice to identify a
+ready Pod by `targetRef`, including its UID, belonging to the controller
+Deployment. A missing reference or a v1 Endpoints object alone cannot activate
+webhook or aggregated API registrations.
+Kubernetes 1.34's
+[APIService availability controller](https://github.com/kubernetes/kubernetes/blob/v1.34.0/staging/src/k8s.io/kube-aggregator/pkg/controllers/status/remote/remote_available_controller.go)
+reads EndpointSlices directly; there is no need for an Endpoints compatibility
+object on the supported baseline.
+
+The baseline also includes authenticated service-account identity metadata:
+`authentication.kubernetes.io/pod-name`, `pod-uid`, `node-name`, and `node-uid`
+in TokenReview `status.user.extra` for scheduled Pod-bound tokens carrying
+those identities. Kubernetes' `ServiceAccountTokenPodNodeInfo` feature is GA
+and locked enabled since 1.32, so it does not require an optional feature gate
+on 1.34. Node UID is optional upstream if unavailable when the token is issued;
+clients requiring all identities must reject an incomplete token rather than
+infer missing values. Secret-based service-account tokens are not a substitute
+for projected Pod-bound tokens.
+
+Verified against Kubernetes v1.34.0 source:
+[feature gates](https://github.com/kubernetes/kubernetes/blob/v1.34.0/pkg/features/kube_features.go),
+[bound token claims and validation](https://github.com/kubernetes/kubernetes/blob/v1.34.0/pkg/serviceaccount/claims.go),
+and [authenticated user extras](https://github.com/kubernetes/kubernetes/blob/v1.34.0/staging/src/k8s.io/apiserver/pkg/authentication/serviceaccount/util.go).
+This is a source-level compatibility check, not a live-cluster certification.
+
+Use matching current controller, node agent, and CLI versions. The CLI consumes
+the summary response (`nodeSummaries`), not older full-node overview responses.
+Namespace discovery checks the current kubeconfig namespace and
+`unbounded-system`; use `--namespace` for a custom installation. Installation
+does not reserve historical namespace names or configure a migration reaper.
+
 ## Runtime Configuration
 
 Both the controller and node agent load runtime settings from a shared YAML

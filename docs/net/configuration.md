@@ -4,6 +4,25 @@
 
 This document describes all configuration options for unbounded-net components.
 
+## Supported Kubernetes baseline
+
+Unbounded supports Kubernetes **1.34 or newer**. Use current matching controller,
+node agent, and CLI versions; pre-release resource migrations are not supported.
+Operator activation uses only `discovery.k8s.io/v1` EndpointSlices and requires
+a Pod `targetRef` with a UID. It does not fall back to v1 Endpoints or accept
+unattributed endpoint addresses.
+
+The baseline includes the Pod/node TokenReview extras used with projected
+Pod-bound service-account tokens. `ServiceAccountTokenPodNodeInfo` is GA and
+locked enabled since Kubernetes 1.32; node UID remains optional upstream when
+unavailable at issuance. See the
+[supported baseline and source verification](../content/reference/networking/configuration.md#supported-kubernetes-baseline)
+for the exact identity fields and Kubernetes v1.34.0 references.
+
+The CLI requires `nodeSummaries` in cluster overview responses. Namespace
+discovery probes only the kubeconfig namespace and `unbounded-system`; explicit
+`--namespace` supports custom installations without historical namespace bans.
+
 ## Runtime Configuration
 
 Both binaries now load runtime settings from a shared YAML file mounted from the `unbounded-net-config` ConfigMap.
