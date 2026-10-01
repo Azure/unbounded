@@ -392,8 +392,9 @@ func integrationCatalogCapacity(t *testing.T, c client.Client) {
 	// Use a root-heavy valid policy to exercise real admission with a small
 	// catalog. Unit tests above run the default maximum through repeated cycles.
 	// Reserve generations by activation interval, not interval plus preparation.
-	// 302 roots fit the wire budget; 602 roots would reject initialization itself.
-	a.Keyring.Config.Rotation = RotationPolicy{Interval: time.Hour, PrepareFor: time.Hour, RetainFor: 300 * time.Hour}
+	// 381 roots leave room for a small catalog with two symmetric generations;
+	// 382 roots would leave no capacity for a complete active/prepared key pair.
+	a.Keyring.Config.Rotation = RotationPolicy{Interval: time.Hour, PrepareFor: time.Hour, RetainFor: 379 * time.Hour}
 
 	a.Topology.Config = a.Keyring.Config
 	if err := a.Recover(t.Context(), a.Topology.Client); err != nil {
