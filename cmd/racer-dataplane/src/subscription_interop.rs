@@ -88,15 +88,6 @@ impl origin::Origin for GeneratedOrigin {
             })
         })
     }
-    fn page<'a>(
-        &'a self,
-        _: &'a read::candidates::OriginAuthority,
-        _: &'a OriginContext,
-        _: &'a PageId,
-        _: &'a RequestScope,
-    ) -> Operation<'a, origin::page::OriginPage> {
-        Box::pin(async { panic!("Fill must supply bounded plaintext reservation") })
-    }
     fn page_reserved<'a>(
         &'a self,
         authority: &'a read::candidates::OriginAuthority,

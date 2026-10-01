@@ -288,15 +288,6 @@ impl Origin for GatedMetadataOrigin {
         let receive = self.receive.borrow_mut().take().unwrap();
         Box::pin(async move { receive.await.map_err(|_| Error::Unavailable) })
     }
-    fn page<'a>(
-        &'a self,
-        _: &'a OriginAuthority,
-        _: &'a OriginContext,
-        _: &'a PageId,
-        _: &'a RequestScope,
-    ) -> Operation<'a, OriginPage> {
-        Box::pin(async { panic!("metadata-only refresh") })
-    }
 }
 
 #[test]

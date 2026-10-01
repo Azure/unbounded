@@ -37,6 +37,42 @@ fn context() -> OriginContext {
 fn scope() -> RequestScope {
     RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(5)).unwrap()
 }
+
+// Endpoint-level socket scenarios allocate here; production callers supply their
+// existing reservation through the Origin trait's reserved operations.
+impl OriginClient {
+    async fn bootstrap_at(
+        &self,
+        endpoint: &Endpoint,
+        context: &OriginContext,
+        scope: &RequestScope,
+    ) -> Result<MetadataReply> {
+        scope.check()?;
+        let reservation = self.admission.reserve(
+            Some(&context.object.cache),
+            ResourceClass::Plaintext,
+            PAGE_BYTES as usize,
+        )?;
+        self.bootstrap_reserved_at(endpoint, context, reservation, scope)
+            .await
+    }
+
+    async fn page_at(
+        &self,
+        endpoint: &Endpoint,
+        context: &OriginContext,
+        page: &PageId,
+        scope: &RequestScope,
+    ) -> Result<OriginPage> {
+        let reservation = self.admission.reserve(
+            Some(&context.object.cache),
+            ResourceClass::Plaintext,
+            PAGE_BYTES as usize,
+        )?;
+        self.page_reserved_at(endpoint, context, page, reservation, scope)
+            .await
+    }
+}
 fn credentials(admission: Rc<Admission>) -> Rc<crate::security::credentials::CredentialCrypto> {
     use crate::security::{
         credentials::CredentialCrypto,
@@ -945,10 +981,20 @@ fn public_operations_reject_wrong_authority_before_io() {
         block_on(client.metadata(&authority, &wrong, MetadataSelector::Fresh, &scope)),
         Err(Error::Unauthorized)
     ));
+    let reserve = || {
+        admission
+            .reserve(
+                Some(&context.object.cache),
+                ResourceClass::Plaintext,
+                PAGE_BYTES as usize,
+            )
+            .unwrap()
+    };
     assert!(matches!(
-        block_on(client.bootstrap(&authority, &wrong, &scope)),
+        block_on(client.bootstrap_reserved(&authority, &wrong, reserve(), &scope)),
         Err(Error::Unauthorized)
     ));
+    assert_eq!(admission.used(ResourceClass::Plaintext), 0);
     let page = PageId {
         version: crate::model::ObjectVersion {
             object: context.object.clone(),
@@ -957,7 +1003,7 @@ fn public_operations_reject_wrong_authority_before_io() {
         number: PageNumber(1),
     };
     assert!(matches!(
-        block_on(client.page(&authority, &context, &page, &scope)),
+        block_on(client.page_reserved(&authority, &context, &page, reserve(), &scope)),
         Err(Error::Unauthorized)
     ));
     assert_eq!(admission.used(ResourceClass::Connection), 0);

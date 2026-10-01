@@ -64,15 +64,6 @@ impl Origin for TestOrigin {
     ) -> Operation<'a, MetadataReply> {
         Box::pin(async { panic!("pinned page fill must not refresh metadata") })
     }
-    fn page<'a>(
-        &'a self,
-        _: &'a super::super::candidates::OriginAuthority,
-        _: &'a OriginContext,
-        _: &'a PageId,
-        _: &'a RequestScope,
-    ) -> Operation<'a, OriginPage> {
-        Box::pin(async { panic!("fill must transfer its existing plaintext reservation") })
-    }
     fn page_reserved<'a>(
         &'a self,
         authority: &'a super::super::candidates::OriginAuthority,

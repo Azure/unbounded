@@ -473,15 +473,6 @@ impl Origin for NoTransport {
     ) -> Operation<'a, MetadataReply> {
         Box::pin(async { panic!("bootstrap fixture already owns origin metadata") })
     }
-    fn page<'a>(
-        &'a self,
-        _: &'a OriginAuthority,
-        _: &'a OriginContext,
-        _: &'a PageId,
-        _: &'a RequestScope,
-    ) -> Operation<'a, OriginPage> {
-        Box::pin(async { panic!("bootstrap fixture already owns origin bytes") })
-    }
 }
 
 fn scope() -> RequestScope {

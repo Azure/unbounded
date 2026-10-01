@@ -46,15 +46,6 @@ pub trait Origin {
         reservation: Reservation,
         scope: &'a RequestScope,
     ) -> Operation<'a, OriginPage>;
-    /// Fresh page-zero acquisition. Implementations may return metadata only.
-    fn bootstrap<'a>(
-        &'a self,
-        authority: &'a OriginAuthority,
-        context: &'a OriginContext,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, MetadataReply> {
-        self.metadata(authority, context, MetadataSelector::Fresh, scope)
-    }
     fn metadata<'a>(
         &'a self,
         authority: &'a OriginAuthority,
@@ -62,13 +53,6 @@ pub trait Origin {
         selector: MetadataSelector,
         scope: &'a RequestScope,
     ) -> Operation<'a, MetadataReply>;
-    fn page<'a>(
-        &'a self,
-        authority: &'a OriginAuthority,
-        context: &'a OriginContext,
-        page: &'a PageId,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, OriginPage>;
 }
 pub struct OriginClient {
     health: crate::topology::health::LinkHealth,
@@ -115,22 +99,6 @@ impl OriginClient {
             buffers,
             socket_root: root,
         })
-    }
-
-    async fn bootstrap_at(
-        &self,
-        endpoint: &Endpoint,
-        context: &OriginContext,
-        scope: &RequestScope,
-    ) -> Result<MetadataReply> {
-        scope.check()?;
-        let reservation = self.admission.reserve(
-            Some(&context.object.cache),
-            ResourceClass::Plaintext,
-            PAGE_BYTES as usize,
-        )?;
-        self.bootstrap_reserved_at(endpoint, context, reservation, scope)
-            .await
     }
 
     async fn bootstrap_reserved_at(
@@ -257,22 +225,6 @@ impl OriginClient {
             metadata,
             page_zero: None,
         })
-    }
-
-    async fn page_at(
-        &self,
-        endpoint: &Endpoint,
-        context: &OriginContext,
-        page: &PageId,
-        scope: &RequestScope,
-    ) -> Result<OriginPage> {
-        let reservation = self.admission.reserve(
-            Some(&context.object.cache),
-            ResourceClass::Plaintext,
-            PAGE_BYTES as usize,
-        )?;
-        self.page_reserved_at(endpoint, context, page, reservation, scope)
-            .await
     }
 
     async fn page_reserved_at(
@@ -422,24 +374,6 @@ impl Origin for OriginClient {
                 .await
         })
     }
-    fn bootstrap<'a>(
-        &'a self,
-        authority: &'a OriginAuthority,
-        context: &'a OriginContext,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, MetadataReply> {
-        Box::pin(async move {
-            scope.check()?;
-            authority.validate(&context.object, PageNumber(0))?;
-            let endpoint = self.endpoint(context)?;
-            self.health
-                .run(
-                    &crate::model::NodeId(format!("{endpoint:?}")),
-                    self.bootstrap_at(&endpoint, context, scope),
-                )
-                .await
-        })
-    }
     fn metadata<'a>(
         &'a self,
         authority: &'a OriginAuthority,
@@ -455,28 +389,6 @@ impl Origin for OriginClient {
                 .run(
                     &crate::model::NodeId(format!("{endpoint:?}")),
                     self.metadata_at(&endpoint, context, selector, scope),
-                )
-                .await
-        })
-    }
-    fn page<'a>(
-        &'a self,
-        authority: &'a OriginAuthority,
-        context: &'a OriginContext,
-        page: &'a PageId,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, OriginPage> {
-        Box::pin(async move {
-            scope.check()?;
-            if context.object != page.version.object {
-                return Err(Error::Unauthorized);
-            }
-            authority.validate(&page.version.object, page.number)?;
-            let endpoint = self.endpoint(context)?;
-            self.health
-                .run(
-                    &crate::model::NodeId(format!("{endpoint:?}")),
-                    self.page_at(&endpoint, context, page, scope),
                 )
                 .await
         })
