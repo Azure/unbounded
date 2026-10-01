@@ -285,12 +285,14 @@ fn fixture_with_availability(
         )
         .unwrap(),
     );
-    let flights = Flights::new(admission.clone());
-    let flights = Rc::new(if check_availability {
-        flights.with_availability(availability)
-    } else {
-        flights
-    });
+    let flights = Rc::new(Flights::new(
+        admission.clone(),
+        if check_availability {
+            availability
+        } else {
+            crate::control::availability::Availability::permissive_for_tests()
+        },
+    ));
     let fill = Fill::new(FillDependencies {
         memory,
         buffers,
@@ -1066,6 +1068,7 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
             fill.clone(),
             streams,
             fill.dependencies.credentials.clone(),
+            crate::control::availability::Availability::permissive_for_tests(),
         ));
         let mut endpoint = owners.install(WorkerId(0), coordinator.clone()).unwrap();
         for ordered in [false, true] {

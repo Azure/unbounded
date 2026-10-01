@@ -54,7 +54,7 @@ pub struct Coordinator {
     pub(super) fill: Rc<Fill>,
     streams: Rc<RangeStreams>,
     pub(super) credentials: Rc<CredentialCrypto>,
-    availability: Option<Rc<crate::control::availability::Availability>>,
+    availability: Rc<crate::control::availability::Availability>,
 }
 // Metadata/bootstrap allowance. Normal pinned client ranges admit bounded page
 // acquisitions separately; this is not a ceiling on successful pages delivered.
@@ -93,6 +93,7 @@ impl Coordinator {
         fill: Rc<Fill>,
         streams: Rc<RangeStreams>,
         credentials: Rc<CredentialCrypto>,
+        availability: Rc<crate::control::availability::Availability>,
     ) -> Self {
         Self {
             snapshots,
@@ -100,15 +101,8 @@ impl Coordinator {
             fill,
             streams,
             credentials,
-            availability: None,
+            availability,
         }
-    }
-    pub fn with_availability(
-        mut self,
-        availability: Rc<crate::control::availability::Availability>,
-    ) -> Self {
-        self.availability = Some(availability);
-        self
     }
     pub(crate) fn open_context(&self, envelope: PeerOriginContext) -> Result<ChargedOriginContext> {
         let request = envelope.request;
@@ -139,10 +133,7 @@ impl Coordinator {
                 .caches
                 .iter()
                 .any(|c| c.id == request.origin.object.cache)
-                || self
-                    .availability
-                    .as_ref()
-                    .is_some_and(|a| !a.metadata(&request.origin.object.cache))
+                || !self.availability.metadata(&request.origin.object.cache)
             {
                 return Err(Error::Unavailable);
             }
@@ -269,10 +260,7 @@ impl LocalPageService for Coordinator {
                 .caches
                 .iter()
                 .any(|c| c.id == object.cache)
-                || self
-                    .availability
-                    .as_ref()
-                    .is_some_and(|a| !a.metadata(&object.cache))
+                || !self.availability.metadata(&object.cache)
             {
                 return Ok(PeerResponse::Miss);
             }

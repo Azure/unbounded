@@ -640,8 +640,7 @@ impl WorkerApplication {
             buffers.clone(),
             "/run/racer",
         )?);
-        let flights =
-            Rc::new(Flights::new(admission.clone()).with_availability(availability.clone()));
+        let flights = Rc::new(Flights::new(admission.clone(), availability.clone()));
         let (coordinator, metadata) = Self::assemble_reads(
             config,
             &node,
@@ -806,10 +805,14 @@ impl WorkerApplication {
             )
             .with_observer(admission.observer()),
         );
-        let coordinator = Rc::new(
-            Coordinator::new(snapshots, metadata.clone(), fill, streams, credentials)
-                .with_availability(availability),
-        );
+        let coordinator = Rc::new(Coordinator::new(
+            snapshots,
+            metadata.clone(),
+            fill,
+            streams,
+            credentials,
+            availability,
+        ));
         (coordinator, metadata)
     }
 

@@ -198,7 +198,10 @@ fn destination_exchange(order: CompletionOrder) {
         },
         number: PageNumber(0),
     };
-    let flights = Rc::new(Flights::new(admission.clone()));
+    let flights = Rc::new(Flights::new(
+        admission.clone(),
+        crate::control::availability::Availability::permissive_for_tests(),
+    ));
     let service = Rc::new(PendingPage {
         flights: flights.clone(),
         page: page.clone(),

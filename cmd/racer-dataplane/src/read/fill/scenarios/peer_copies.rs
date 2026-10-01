@@ -792,6 +792,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
                 fill.clone(),
                 streams,
                 fill.dependencies.credentials.clone(),
+                crate::control::availability::Availability::permissive_for_tests(),
             ));
             endpoints.push(owners.install(WorkerId(0), coordinator.clone()).unwrap());
             mesh.nodes.borrow_mut().push(coordinator);

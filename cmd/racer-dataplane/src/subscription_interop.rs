@@ -201,11 +201,12 @@ impl SubscriptionFixture {
         reactor.init().unwrap();
         let buffers = BufferPool::new(admission.clone());
         let keys = Rc::new(interop_keys());
-        let snapshots = Rc::new(SnapshotStore::new(
-            keys.cluster().clone(),
-            Arc::new(PublishedState::default()),
-            2,
+        let published = Arc::new(PublishedState::default());
+        let availability = Rc::new(control::availability::Availability::new(
+            published.clone(),
+            keys.clone(),
         ));
+        let snapshots = Rc::new(SnapshotStore::new(keys.cluster().clone(), published, 2));
         let (client_socket, origin_socket) =
             control::caches::canonical_socket_paths("interop").unwrap();
         let cache = CacheDefinition {
@@ -283,7 +284,7 @@ impl SubscriptionFixture {
             writer: writer.clone(),
             origin: origin.clone(),
             candidates: candidates.clone(),
-            flights: Rc::new(Flights::new(admission.clone())),
+            flights: Rc::new(Flights::new(admission.clone(), availability.clone())),
             crypto: Rc::new(PageCrypto::new(keys, crypto.clone())),
             credentials: credentials.clone(),
             admission: admission.clone(),
@@ -311,6 +312,7 @@ impl SubscriptionFixture {
             fill,
             streams,
             credentials,
+            availability,
         ));
         let endpoint = directory.install(WorkerId(0), coordinator.clone()).unwrap();
         let io = Rc::new(http::connection::HttpIo::with_admission(

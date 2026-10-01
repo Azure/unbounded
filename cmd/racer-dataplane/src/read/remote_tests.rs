@@ -960,7 +960,10 @@ fn metadata_coordinator_with_newer_publication(
         writer,
         origin: origin.clone(),
         candidates: candidates.clone(),
-        flights: Rc::new(super::flight::Flights::new(admission.clone())),
+        flights: Rc::new(super::flight::Flights::new(
+            admission.clone(),
+            crate::control::availability::Availability::permissive_for_tests(),
+        )),
         crypto: Rc::new(PageCrypto::new(keys, Rc::new(CryptoClient::new(port)))),
         credentials: credentials.clone(),
         admission: admission.clone(),
@@ -992,6 +995,7 @@ fn metadata_coordinator_with_newer_publication(
         fill,
         streams,
         credentials,
+        crate::control::availability::Availability::permissive_for_tests(),
     ));
     let endpoint = owners.install(WorkerId(0), coordinator.clone()).unwrap();
     (coordinator, endpoint)

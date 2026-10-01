@@ -476,7 +476,7 @@ impl Rig {
             4,
         ));
         let snapshot = snapshots.publish(fixture_publication()).unwrap();
-        let network = Rc::new(PeerNetwork::new(NodeId(NODE.into()), published).unwrap());
+        let network = Rc::new(PeerNetwork::new(NodeId(NODE.into()), published.clone()).unwrap());
         let certificates = Rc::new(Certificates::new(ClusterId(CLUSTER.into()), keys.clone()));
         let signatures = Rc::new(Signatures::new(keys.clone(), certificates));
         let forwarding = Rc::new(Forwarding::new(signatures.clone()));
@@ -532,7 +532,11 @@ impl Rig {
                 )
             }
         };
-        let flights = Rc::new(Flights::new(admission.clone()));
+        let availability = Rc::new(racer_dataplane::control::availability::Availability::new(
+            published.clone(),
+            keys.clone(),
+        ));
+        let flights = Rc::new(Flights::new(admission.clone(), availability.clone()));
         let fill = Rc::new(Fill::new(FillDependencies {
             memory: memory.clone(),
             buffers,
@@ -572,6 +576,7 @@ impl Rig {
             fill,
             streams,
             credentials,
+            availability,
         ));
         let endpoint = RefCell::new(directory.install(worker, coordinator.clone()).unwrap());
         let bootstrap = Bootstrap::new(

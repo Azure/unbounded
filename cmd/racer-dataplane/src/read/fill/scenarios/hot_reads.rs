@@ -168,6 +168,7 @@ fn coordinator(
         fill.clone(),
         streams,
         fill.dependencies.credentials.clone(),
+        crate::control::availability::Availability::permissive_for_tests(),
     ));
     let endpoint = owners.install(WorkerId(0), local.clone()).unwrap();
     (local, endpoint, published)

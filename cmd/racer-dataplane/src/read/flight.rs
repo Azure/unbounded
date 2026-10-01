@@ -38,7 +38,7 @@ use std::{
 
 pub struct Flights {
     admission: Rc<Admission>,
-    availability: Option<Rc<crate::control::availability::Availability>>,
+    availability: Rc<crate::control::availability::Availability>,
     owner: Rc<()>,
     limits: FlightLimits,
     table: RefCell<Table>,
@@ -582,7 +582,10 @@ impl CopyWaiter<'_> {
 }
 
 impl Flights {
-    pub fn new(admission: Rc<Admission>) -> Self {
+    pub fn new(
+        admission: Rc<Admission>,
+        availability: Rc<crate::control::availability::Availability>,
+    ) -> Self {
         let limits = FlightLimits {
             entries: admission.limits().flights.get(),
             waiters_per_flight: admission.limits().waiters_per_flight.get(),
@@ -591,14 +594,18 @@ impl Flights {
         };
         Self {
             admission,
-            availability: None,
+            availability,
             owner: Rc::new(()),
             limits,
             table: RefCell::new(Table::default()),
         }
     }
 
-    pub fn with_limits(admission: Rc<Admission>, limits: FlightLimits) -> Result<Self> {
+    pub fn with_limits(
+        admission: Rc<Admission>,
+        availability: Rc<crate::control::availability::Availability>,
+        limits: FlightLimits,
+    ) -> Result<Self> {
         if limits.entries == 0
             || limits.waiters_per_flight == 0
             || limits.operations_per_flight == 0
@@ -608,27 +615,17 @@ impl Flights {
         }
         Ok(Self {
             admission,
-            availability: None,
+            availability,
             owner: Rc::new(()),
             limits,
             table: RefCell::new(Table::default()),
         })
     }
 
-    pub fn with_availability(
-        mut self,
-        availability: Rc<crate::control::availability::Availability>,
-    ) -> Self {
-        self.availability = Some(availability);
-        self
-    }
-
     // Only new registrations consult current admission. Existing waiters and
     // completion owners retain their result, even after its key is retired.
     fn admit_join(&self, page: &PageId, entry: Option<&Entry>) -> Result<()> {
-        let Some(availability) = &self.availability else {
-            return Ok(());
-        };
+        let availability = &self.availability;
         if !availability.cache(&page.version.object.cache) {
             return Err(Error::Unavailable);
         }
@@ -1432,6 +1429,7 @@ mod tests {
                 Rc::new(Admission::new(
                     crate::test_support::cluster::config(false).limits,
                 )),
+                crate::control::availability::Availability::permissive_for_tests(),
                 limits,
             )
             .unwrap(),

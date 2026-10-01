@@ -576,7 +576,10 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
             Rc::new(CredentialCrypto::new(keys.clone(), real.clone())),
             Arc::new(Default::default()),
         )),
-        flights: Rc::new(Flights::new(real.clone())),
+        flights: Rc::new(Flights::new(
+            real.clone(),
+            crate::control::availability::Availability::permissive_for_tests(),
+        )),
         crypto: Rc::new(PageCrypto::new(keys.clone(), client.clone())),
         credentials: Rc::new(CredentialCrypto::new(keys, real.clone())),
         admission: real.clone(),
