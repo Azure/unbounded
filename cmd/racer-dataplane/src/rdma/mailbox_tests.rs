@@ -11,9 +11,9 @@ use crate::{
     },
     rdma::{
         Devices, RdmaTransfer, RegisteredLease,
+        lifecycle::{QueuePairHandle, Region},
         permission::{AuthenticatedDescriptor, DESCRIPTOR_HEADER, Grant},
         session::{SETUP_BINDING_HEADER, SETUP_HEADER, SessionLease, Sessions},
-        verbs::{QueuePairHandle, Region},
     },
     runtime::{admission::Admission, environment},
     security::signing::{Signatures, VerifiedHead, tests::network},
@@ -122,7 +122,7 @@ fn signed_setup_waits_for_slot_and_connect_mailboxes_without_consuming_admission
     let prepared = done(&mut prepare);
     drop(prepare);
     let remote = done(&mut sessions.prepare(&peer.peer, RailId(0), &scope));
-    let device = Rc::new(crate::rdma::verbs::DeviceHandle {
+    let device = Rc::new(crate::rdma::lifecycle::DeviceHandle {
         port: io.clone(),
         rail: RailId(0),
         generation: io.shared.generation.load(Ordering::Acquire),
@@ -509,7 +509,7 @@ fn poisoned_mailbox_is_terminal_io_error_not_contention() {
         panic!("poison test mailbox");
     });
     assert!(matches!(
-        crate::rdma::verbs::try_mailbox(&mutex),
+        crate::rdma::lifecycle::try_mailbox(&mutex),
         Poll::Ready(Err(Error::Io))
     ));
 }

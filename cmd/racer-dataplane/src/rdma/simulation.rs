@@ -1199,9 +1199,8 @@ mod tests {
         use crate::{
             model::{RequestId, ResourceClass},
             rdma::{
-                Devices, FabricPort,
+                Devices, FabricPort, lifecycle,
                 lifecycle::{NativeService, pair},
-                verbs,
             },
             runtime::{admission::Admission, deadline::RequestScope},
             topology::rails::{RailId, RailMapping},
@@ -1253,7 +1252,7 @@ mod tests {
             ));
             drop(activation);
             let qp =
-                verbs::QueuePairHandle::new(devices.select(RailId(0)).unwrap().handle).unwrap();
+                lifecycle::QueuePairHandle::new(devices.select(RailId(0)).unwrap().handle).unwrap();
             nodes.push((native, devices, qp));
         }
         let (mut left, devices_left, sender) = nodes.remove(0);
@@ -1265,12 +1264,12 @@ mod tests {
         sender.progress().unwrap();
         receiver.progress().unwrap();
         assert!(sender.ready() && receiver.ready());
-        let target = verbs::Region::acquire(&receiver, 17).unwrap();
+        let target = lifecycle::Region::acquire(&receiver, 17).unwrap();
         let (window, bind) = receiver.bind(target.clone()).unwrap();
         right.poll_budgeted(1).unwrap();
         right.poll_budgeted(1).unwrap();
         assert_eq!(bind.result(), Some(Ok(())));
-        let source = verbs::Region::acquire(&sender, 17).unwrap();
+        let source = lifecycle::Region::acquire(&sender, 17).unwrap();
         source.copy_from(&[0xa5; 17]).unwrap();
         let write = sender
             .write(source.clone(), window.address.get(), window.key.get())

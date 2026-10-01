@@ -8,13 +8,11 @@ mod ffi;
 pub mod lifecycle;
 pub mod permission;
 pub mod session;
-pub mod verbs;
 
 use self::{
-    lifecycle::IoPort,
+    lifecycle::{DeviceHandle, IoPort, QueuePairHandle, Region, wait},
     permission::{AuthenticatedDescriptor, Grant, completion_bytes},
     session::{SessionLease, Sessions},
-    verbs::{DeviceHandle, QueuePairHandle, Region, wait},
 };
 use crate::{
     error::{Error, Operation, Result},

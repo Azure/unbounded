@@ -2,7 +2,7 @@
 //! terminal QP destruction fences remote writes before registered memory reuse.
 use super::{
     Devices,
-    verbs::{Endpoint, QueuePairHandle},
+    lifecycle::{Endpoint, QueuePairHandle},
 };
 use crate::{
     error::{Error, Operation, Result},
@@ -162,7 +162,7 @@ impl Sessions {
         permit: Option<std::sync::Arc<crate::peer::adaptive::Permit>>,
         scope: &'a crate::runtime::deadline::RequestScope,
     ) -> Operation<'a, PreparedSession> {
-        Box::pin(super::verbs::wait(scope, move |cx| {
+        Box::pin(super::lifecycle::wait(scope, move |cx| {
             self.register_driver(cx.waker());
             self.poll_prepare(peer, rail, permit.clone())
         }))
@@ -295,7 +295,7 @@ impl PreparedSession {
                 return Err(Error::Replay);
             }
             let endpoint = remote.endpoint()?;
-            super::verbs::wait(scope, |cx| {
+            super::lifecycle::wait(scope, |cx| {
                 self.qp.register_waiter(cx);
                 self.qp.poll_connect(endpoint)
             })

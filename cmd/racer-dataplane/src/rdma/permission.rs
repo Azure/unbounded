@@ -2,8 +2,8 @@
 //! invalidation plus terminal QP destruction precedes any CPU access or reuse.
 use super::{
     MAX_CIPHERTEXT, RegisteredLease,
+    lifecycle::{QueuePairHandle, Ticket, Window},
     session::{SessionLease, signed_value},
-    verbs::{QueuePairHandle, Ticket, Window},
 };
 use crate::{
     error::{Error, Operation, Result},
@@ -121,7 +121,7 @@ impl Grant {
                 }
             }
             let mut abort = Abort(Some(&session.qp));
-            let (window, bound) = super::verbs::wait(scope, |cx| {
+            let (window, bound) = super::lifecycle::wait(scope, |cx| {
                 session.qp.register_waiter(cx);
                 session.qp.poll_bind(buffer.region.clone())
             })
