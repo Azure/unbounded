@@ -201,40 +201,6 @@ impl Fill {
     pub(crate) fn record_peer_bootstrap(&self) -> Result<()> {
         self.metrics.record(Event::PeerBootstrap, 1)
     }
-    /// Admit required memory first; dirty-only saturation skips persistence without
-    /// disturbing queued writes or unrelated idle pages. Failure rolls charges back.
-    fn reserve_progress(
-        &self,
-        cache: &crate::model::CacheId,
-        persist: bool,
-    ) -> Result<crate::runtime::admission::FillReservation> {
-        let plaintext =
-            self.reserve_with_reclamation(cache, ResourceClass::Plaintext, PAGE_BYTES as usize)?;
-        let ciphertext = self.reserve_with_reclamation(
-            cache,
-            ResourceClass::Ciphertext,
-            PAGE_BYTES as usize + 16,
-        )?;
-        let dirty = if persist {
-            match self.dependencies.admission.reserve(
-                Some(cache),
-                ResourceClass::DirtyCiphertext,
-                PAGE_BYTES as usize + 16,
-            ) {
-                Ok(dirty) => Some(dirty),
-                Err(Error::Overloaded) => None,
-                Err(error) => return Err(error),
-            }
-        } else {
-            None
-        };
-        Ok(crate::runtime::admission::FillReservation {
-            plaintext,
-            ciphertext,
-            dirty,
-        })
-    }
-
     fn reserve_with_reclamation(
         &self,
         cache: &crate::model::CacheId,

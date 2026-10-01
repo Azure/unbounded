@@ -261,7 +261,7 @@ fn global_plaintext_deficit_counts_plaintext_not_combined_bundle_bytes() {
 
 #[test]
 fn dirty_only_pressure_skips_persistence_without_flushing_memory_or_queue() {
-    let f = fixture();
+    let mut f = fixture();
     let cache = &f.context.object.cache;
     let page = retained_page(&f, cache, "queued", ResourceClass::Plaintext, 3, true);
     let deps = &f.fill.dependencies;
@@ -273,8 +273,22 @@ fn dirty_only_pressure_skips_persistence_without_flushing_memory_or_queue() {
             deps.admission.limit(ResourceClass::DirtyCiphertext) - 19,
         )
         .unwrap();
-    let reservation = f.fill.reserve_progress(cache, true).unwrap();
-    assert!(reservation.dirty.is_none());
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+    let result = drive(
+        f.fill.acquire(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut budget,
+        ),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    assert_eq!(result.plaintext.bytes(), b"abc");
+    assert_eq!(f.origin.calls.get(), 1);
+    assert!(deps.writer.copy_only(&f.page).unwrap().is_none());
     assert!(deps.memory.get(&page).unwrap().is_some());
     assert!(deps.writer.copy_only(&page).unwrap().is_some());
     assert_eq!(deps.writer.discarded_count(), 0);

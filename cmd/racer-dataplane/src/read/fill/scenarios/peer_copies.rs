@@ -328,24 +328,20 @@ fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
 }
 
 fn encrypted_copy(f: &mut Fixture) -> CiphertextCopy {
-    let reservation = f
-        .fill
-        .reserve_progress(&f.context.object.cache, false)
+    let admission = &f.fill.dependencies.admission;
+    let plaintext = admission
+        .reserve(Some(&f.context.object.cache), ResourceClass::Plaintext, 3)
         .unwrap();
-    let mut plaintext = f
-        .fill
-        .dependencies
-        .buffers
-        .plaintext(reservation.plaintext, 3)
+    let ciphertext = admission
+        .reserve(Some(&f.context.object.cache), ResourceClass::Ciphertext, 19)
         .unwrap();
+    let mut plaintext = f.fill.dependencies.buffers.plaintext(plaintext, 3).unwrap();
     plaintext.bytes_mut().unwrap().copy_from_slice(b"abc");
     let (_, ciphertext) = drive(
-        f.fill.dependencies.crypto.encrypt(
-            f.page.clone(),
-            plaintext,
-            reservation.ciphertext,
-            &f.scope,
-        ),
+        f.fill
+            .dependencies
+            .crypto
+            .encrypt(f.page.clone(), plaintext, ciphertext, &f.scope),
         &mut f.engine,
         &f.crypto,
     )
