@@ -581,7 +581,7 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
                 Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD, PAGE_BYTES + 16),
                 admission.clone(),
             ));
-            let transfers = Rc::new(crate::peer::transfer::Transfers::new(
+            let transfers = Rc::new(crate::peer::transport::Transfers::new(
                 Rc::new(crate::http::pool::HttpPool::new(
                     reactor,
                     admission.clone(),

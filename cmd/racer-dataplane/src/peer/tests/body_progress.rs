@@ -67,7 +67,7 @@ fn body_cases(cases: &[&str]) {
         ));
         let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 1));
         let signers = signers();
-        let transfers = transfer::Transfers::new(
+        let transfers = transport::Transfers::new(
             pool.clone(),
             io.clone(),
             None,

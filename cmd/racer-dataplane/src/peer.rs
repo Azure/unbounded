@@ -7,11 +7,11 @@ pub mod server;
 pub mod subscriptions;
 #[cfg(test)]
 mod tests;
-pub mod transfer;
+pub mod transport;
 
 use self::{
     protocol::{PeerRequest, SignedRequest, SignedResponse, VerifiedRequest, VerifiedResponse},
-    transfer::Transfers,
+    transport::Transfers,
 };
 use crate::telemetry::failures::{Observer, Stage};
 use crate::{
@@ -177,7 +177,7 @@ impl Relay {
     ) -> Operation<'a, SignedResponse> {
         Box::pin(async move {
             match self.forward_inner(request, membership, None, scope).await? {
-                transfer::RelayResponse::Complete(response) => Ok(response),
+                transport::RelayResponse::Complete(response) => Ok(response),
                 _ => Err(Error::Internal),
             }
         })
@@ -189,7 +189,7 @@ impl Relay {
         membership: MembershipLease,
         relay: Option<Rc<crate::runtime::admission::Reservation>>,
         scope: &'a RequestScope,
-    ) -> Operation<'a, transfer::RelayResponse> {
+    ) -> Operation<'a, transport::RelayResponse> {
         Box::pin(async move {
             let scope = request_scope(request.request(), scope)?;
             check_membership(request.request(), &membership)?;
@@ -239,7 +239,7 @@ impl Relay {
                     .exchange_relay(outbound, membership, reservation, &scope)
                     .await?
             } else {
-                transfer::RelayResponse::Complete(
+                transport::RelayResponse::Complete(
                     self.transport
                         .exchange(outbound, membership, &scope)
                         .await?,
@@ -247,13 +247,13 @@ impl Relay {
             };
             scope.check()?;
             match response {
-                transfer::RelayResponse::Complete(response) => {
+                transport::RelayResponse::Complete(response) => {
                     let response = self.forwarding.verify_response(response, &binding)?;
                     self.forwarding
                         .append_response(response, &previous)
-                        .map(transfer::RelayResponse::Complete)
+                        .map(transport::RelayResponse::Complete)
                 }
-                transfer::RelayResponse::Http {
+                transport::RelayResponse::Http {
                     authentication,
                     connection,
                     length,
@@ -264,7 +264,7 @@ impl Relay {
                         &binding,
                         &previous,
                     )?;
-                    Ok(transfer::RelayResponse::Http {
+                    Ok(transport::RelayResponse::Http {
                         authentication,
                         connection,
                         length,
@@ -335,11 +335,11 @@ pub trait PeerTransport {
         membership: MembershipLease,
         reservation: Rc<crate::runtime::admission::Reservation>,
         scope: &'a RequestScope,
-    ) -> Operation<'a, transfer::RelayResponse> {
+    ) -> Operation<'a, transport::RelayResponse> {
         Box::pin(async move {
             let response = self.exchange(request, membership, scope).await;
             drop(reservation);
-            response.map(transfer::RelayResponse::Complete)
+            response.map(transport::RelayResponse::Complete)
         })
     }
     /// Use this exact lease for the signed route; never resolve its version again.
@@ -456,7 +456,7 @@ impl PeerTransport for Requester {
         membership: MembershipLease,
         reservation: Rc<crate::runtime::admission::Reservation>,
         scope: &'a RequestScope,
-    ) -> Operation<'a, transfer::RelayResponse> {
+    ) -> Operation<'a, transport::RelayResponse> {
         self.exchange_inner(request, membership, Some(reservation), scope)
     }
     fn exchange<'a>(
@@ -470,7 +470,7 @@ impl PeerTransport for Requester {
                 .exchange_inner(request, membership, None, scope)
                 .await?
             {
-                transfer::RelayResponse::Complete(response) => Ok(response),
+                transport::RelayResponse::Complete(response) => Ok(response),
                 _ => Err(Error::Internal),
             }
         })
@@ -483,7 +483,7 @@ impl Requester {
         membership: MembershipLease,
         relay: Option<Rc<crate::runtime::admission::Reservation>>,
         scope: &'a RequestScope,
-    ) -> Operation<'a, transfer::RelayResponse> {
+    ) -> Operation<'a, transport::RelayResponse> {
         self.exchange_inner_mode(request, membership, relay, scope, false)
     }
     fn exchange_inner_mode<'a>(
@@ -493,7 +493,7 @@ impl Requester {
         relay: Option<Rc<crate::runtime::admission::Reservation>>,
         scope: &'a RequestScope,
         direct_http: bool,
-    ) -> Operation<'a, transfer::RelayResponse> {
+    ) -> Operation<'a, transport::RelayResponse> {
         Box::pin(async move {
             let scope = request_scope(&request.request, scope)?;
             check_membership(&request.request, &membership)?;

@@ -15,7 +15,7 @@ use crate::{
         PeerNetwork, PeerTransport, Relay, Requester,
         protocol::{self, FetchMode, PeerResponse, SignedRequest, SignedResponse, VerifiedRequest},
         server::{LocalPageService, PeerServer},
-        transfer::Transfers,
+        transport::Transfers,
     },
     runtime::{admission::Admission, deadline::RequestScope, reactor::Reactor},
     security::{

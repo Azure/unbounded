@@ -46,7 +46,7 @@ pub struct PeerServer {
     relay: Rc<Relay>,
     wire: Rc<super::protocol::SecurityCodec>,
     signatures: Rc<crate::security::signing::Signatures>,
-    transfers: Option<Rc<super::transfer::Transfers>>,
+    transfers: Option<Rc<super::transport::Transfers>>,
     request_timeout: Duration,
 }
 impl PeerServer {
@@ -196,7 +196,7 @@ impl PeerServer {
         self.request_timeout = timeout;
         self
     }
-    pub fn with_transfers(mut self, transfers: Rc<super::transfer::Transfers>) -> Self {
+    pub fn with_transfers(mut self, transfers: Rc<super::transport::Transfers>) -> Self {
         self.transfers = Some(transfers);
         self
     }
@@ -325,7 +325,7 @@ impl PeerServer {
                     // Pipe pressure is a signed overload before any success head
                     // is sent. No queue holds a downstream body waiting for quota.
                     let result = result.and_then(|response| {
-                        if matches!(&response, super::transfer::RelayResponse::Http { length, .. } if *length != 0) {
+                        if matches!(&response, super::transport::RelayResponse::Http { length, .. } if *length != 0) {
                             let mut pipe = self.pipes.acquire()?;
                             pipe.prepare_transit();
                             received.connection.relay_pipe = Some(pipe);
@@ -338,7 +338,7 @@ impl PeerServer {
                         result,
                     );
                     match result {
-                        Ok(super::transfer::RelayResponse::Http {
+                        Ok(super::transport::RelayResponse::Http {
                             authentication,
                             connection,
                             length,
@@ -360,7 +360,7 @@ impl PeerServer {
                                 .relay_body(downstream, connection, pipe, &request_scope)
                                 .await;
                         }
-                        Ok(super::transfer::RelayResponse::Complete(response)) => response,
+                        Ok(super::transport::RelayResponse::Complete(response)) => response,
                         Err(Error::Overloaded) => self
                             .forwarding
                             .sign_response(&binding, PeerResponse::Overloaded)?,

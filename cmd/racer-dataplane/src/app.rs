@@ -28,7 +28,7 @@ use crate::{
     memory::{cache::MemoryCache, delivery::Delivery, pipe::PipePool, pool::BufferPool},
     model::{Limits, NodeId, RequestId, WorkerId},
     origin::{Origin, OriginClient},
-    peer::{Relay, Requester, server::PeerServer, transfer::Transfers},
+    peer::{Relay, Requester, server::PeerServer, transport::Transfers},
     rdma::{Devices, RdmaTransfer, session::Sessions},
     read::{
         Coordinator,

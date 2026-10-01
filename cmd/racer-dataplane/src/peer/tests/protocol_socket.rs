@@ -784,7 +784,7 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
         admission.clone(),
     ));
     let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2));
-    let transfers = Rc::new(transfer::Transfers::new(
+    let transfers = Rc::new(transport::Transfers::new(
         pool,
         io,
         None,
@@ -975,7 +975,7 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
     ));
     let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2));
     let codec = Rc::new(codec(&admission));
-    let transfers = Rc::new(transfer::Transfers::new(
+    let transfers = Rc::new(transport::Transfers::new(
         pool,
         io.clone(),
         None,
@@ -1318,7 +1318,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     ));
     let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 1));
     let signers = signers();
-    let transfers = transfer::Transfers::new(
+    let transfers = transport::Transfers::new(
         pool,
         io.clone(),
         None,
@@ -1451,7 +1451,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
             crate::topology::rails::TransportPlan::Rdma {
                 rail: crate::topology::rails::RailId(0)
             },
-            transfer::Capabilities {
+            transport::Capabilities {
                 rdma: true,
                 scoped_grants: true
             },

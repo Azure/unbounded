@@ -442,7 +442,7 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
         codec.clone(),
         signers[2].clone(),
     );
-    let transfers = Rc::new(transfer::Transfers::new(
+    let transfers = Rc::new(transport::Transfers::new(
         Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2)),
         io,
         None,

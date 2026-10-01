@@ -128,7 +128,7 @@ fn exchange(
     );
     let auth = Rc::new(Forwarding::new(signers[1].clone()));
     let pool = Rc::new(HttpPool::new(reactors[1].clone(), admissions[1].clone(), 1));
-    let transfers = Rc::new(transfer::Transfers::new(
+    let transfers = Rc::new(transport::Transfers::new(
         pool.clone(),
         ios[1].clone(),
         None,

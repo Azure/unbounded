@@ -378,7 +378,7 @@ fn opaque_body_cpu_benchmark() {
             let started_cpu = cpu();
             if materialized {
                 let mut source = source;
-                let mut buffer = crate::peer::transfer::WireBuffer::reserved(
+                let mut buffer = crate::peer::transport::WireBuffer::reserved(
                     f.admission
                         .reserve(
                             Some(&crate::model::CacheId("bench".into())),

@@ -156,7 +156,7 @@ impl Transfers {
     /// Authentication and charged decoding are mandatory, even for HTTP-only peers.
     ///
     /// ```compile_fail
-    /// use racer_dataplane::{http::{io::HttpIo, pool::HttpPool}, peer::transfer::Transfers};
+    /// use racer_dataplane::{http::{io::HttpIo, pool::HttpPool}, peer::transport::Transfers};
     /// use std::rc::Rc;
     /// fn unsigned(pool: Rc<HttpPool>, io: Rc<HttpIo>) {
     ///     let _ = Transfers::new(pool, io, None);

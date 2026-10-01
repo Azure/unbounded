@@ -2,7 +2,7 @@
 use super::{
     native::{self, Binding, Phase, extension},
     protocol::{PeerResponse, SignedRequest, SignedResponse, WireCodec},
-    transfer::{Transfers, WireBuffer},
+    transport::{Transfers, WireBuffer},
 };
 use crate::{
     error::{Error, Result},
