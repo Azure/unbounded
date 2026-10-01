@@ -33,6 +33,8 @@ fn duplex_release_partial_frame_survives_delivery_to_next_slice_transition() {
 }
 
 fn run(mode: &str) {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let clock = crate::runtime::environment::SimulationClock::new(311);
     let environment = clock.environment(0);
     let _clock = environment.enter();
@@ -368,7 +370,9 @@ fn run(mode: &str) {
     independent_client
         .set_read_timeout(Some(Duration::from_secs(1)))
         .unwrap();
-    let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+    let mut connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+    // Model a sent one-byte response head for this independent delivery fixture.
+    connection.tx_remaining = Some(1);
     let mut finish = delivery.finish_to(other, connection, &other_scope);
     let mut finished = false;
     for _ in 0..1024 {
