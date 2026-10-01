@@ -4,6 +4,170 @@ use crate::{client::response::Responses, http::connection::ConnectionLease};
 use std::io::{Read, Write};
 
 #[test]
+fn duplex_exact_release_before_final_send_cqe_is_provisional() {
+    use crate::runtime::reactor::simulation::{Fault, Simulation};
+    for mode in ["valid", "duplicate", "malformed", "short", "drop"] {
+        let sim = Simulation::new();
+        let _sim = sim.enter();
+        let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+        let _owner = queue.enter();
+        let signers = network(1);
+        let mut f = fixture();
+        f.reactor.init().unwrap();
+        let membership = Arc::new(
+            Membership::validate(
+                MembershipVersion(1),
+                vec![Member {
+                    node: signers[0].node().clone(),
+                    shares: NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: "127.0.0.1:8000".into(),
+                    rails: vec![],
+                    alignment_enabled: false,
+                    site: String::new(),
+                }],
+            )
+            .unwrap(),
+        );
+        let (local, mut endpoint, _publication) =
+            coordinator(&f, &signers[0], &membership, Rc::new(NoPeer));
+        let response = futures::executor::block_on(local.read(
+            ClientRequest {
+                kind: ReadKind::Subscription {
+                    pin: Some(f.page.version.etag.clone()),
+                    range: None,
+                    page_credits: 1,
+                    byte_credits: PAGE_BYTES,
+                    ordered: true,
+                },
+                origin: OriginContext {
+                    object: f.context.object.clone(),
+                    metadata: None,
+                    authorization: None,
+                },
+            },
+            &f.scope,
+        ))
+        .unwrap();
+        let admission = f.fill.dependencies.admission.clone();
+        let delivery = Rc::new(Delivery::new(
+            Rc::new(PipePool::new(admission.clone(), f.reactor.clone())),
+            Duration::from_secs(30),
+        ));
+        let io = Rc::new(HttpIo::with_admission(
+            f.reactor.clone(),
+            Codec::new(32768, i64::MAX as u64),
+            admission.clone(),
+        ));
+        let responses = Responses::new(io, delivery);
+        let (socket, client) = sim.socket_pair();
+        let connection = ConnectionLease::from_accepted(socket, &admission).unwrap();
+        let mut send = responses.send_subscription_unobserved(
+            connection,
+            response,
+            &f.scope,
+            Duration::from_secs(30),
+        );
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut bytes = Vec::new();
+        let mut pump = |endpoint: &mut crate::read::dispatch::WorkerEndpoint| {
+            endpoint.poll(&mut cx, 64).unwrap();
+            crate::read::drivers::poll(&mut cx, 64);
+            f.engine.poll_budgeted(64).unwrap();
+            f.crypto.poll_budgeted(64).unwrap();
+            f.reactor.poll_budgeted(64).unwrap();
+        };
+        let mut poll_cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut head_end = None;
+        for _ in 0..1024 {
+            assert!(send.as_mut().poll(&mut poll_cx).is_pending());
+            pump(&mut endpoint);
+            let mut scratch = [0; 32768];
+            if let Ok(n) = client.try_recv(&mut scratch) {
+                bytes.extend_from_slice(&scratch[..n]);
+            }
+            head_end = bytes
+                .windows(4)
+                .position(|b| b == b"\r\n\r\n")
+                .map(|i| i + 4);
+            if head_end.is_some_and(|n| bytes.len() == n + 21) {
+                break;
+            }
+        }
+        let end = head_end.unwrap();
+        assert_eq!(bytes.len(), end + 21);
+        // Force the payload's final owned send, execute it, but withhold its CQE.
+        sim.inject("splice", Fault::Errno(libc::EOPNOTSUPP));
+        sim.inject("send", Fault::Errno(libc::EAGAIN));
+        sim.inject("send", Fault::HoldCompletion(40));
+        if mode == "short" {
+            sim.set_max_chunk(2);
+        }
+        let mut payload = [0; 3];
+        let mut received = None;
+        for _ in 0..8 {
+            assert!(send.as_mut().poll(&mut poll_cx).is_pending());
+            pump(&mut endpoint);
+            if let Ok(n) = client.try_recv(&mut payload) {
+                received = Some(n);
+                break;
+            }
+        }
+        let n = received.expect("final send executed before held completion");
+        assert_eq!(n, if mode == "short" { 2 } else { 3 });
+        assert_eq!(&payload[..n], &b"abc"[..n]);
+        assert!(f.reactor.in_flight() > 0);
+        assert_eq!(admission.used(ResourceClass::Pipe), 1);
+        sim.set_max_chunk(usize::MAX);
+        let mut release = [0; 12];
+        release[8..].copy_from_slice(&(if mode == "malformed" { 2u32 } else { 3 }).to_be_bytes());
+        assert_eq!(client.try_send(&release).unwrap(), 12);
+        if mode == "duplicate" {
+            assert_eq!(client.try_send(&release).unwrap(), 12);
+        }
+        let observed = send.as_mut().poll(&mut poll_cx);
+        if matches!(mode, "duplicate" | "malformed") {
+            assert!(matches!(observed, Poll::Ready(Err(Error::InvalidRequest))));
+        } else {
+            assert!(observed.is_pending());
+        }
+        assert_eq!(
+            admission.used(ResourceClass::Pipe),
+            1,
+            "release cannot drop CQE owners"
+        );
+        if mode == "drop" || matches!(mode, "duplicate" | "malformed") {
+            drop(send);
+            for _ in 0..128 {
+                pump(&mut endpoint);
+            }
+        } else {
+            let mut result = None;
+            for _ in 0..128 {
+                pump(&mut endpoint);
+                if let Poll::Ready(value) = send.as_mut().poll(&mut poll_cx) {
+                    result = Some(value);
+                    break;
+                }
+            }
+            let result = result.expect("held CQE eventually observed");
+            if mode == "short" {
+                assert!(matches!(result, Err(Error::InvalidRequest)));
+            } else {
+                assert!(result.is_ok());
+            }
+            drop(send);
+        }
+        for _ in 0..128 {
+            pump(&mut endpoint);
+        }
+        assert_eq!(f.reactor.in_flight(), 0);
+        assert_eq!(admission.used(ResourceClass::Pipe), 0);
+        assert_eq!(admission.used(ResourceClass::Connection), 0);
+        endpoint.uninstall().unwrap();
+    }
+}
+
+#[test]
 fn duplex_release_replenishes_acquisition_while_next_page_write_is_blocked() {
     run("valid");
 }

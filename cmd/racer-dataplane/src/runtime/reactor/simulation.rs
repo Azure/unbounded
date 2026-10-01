@@ -58,6 +58,9 @@ pub enum Fault {
     Errno(i32),
     Short(usize),
     Delay(usize),
+    /// Execute normally, then retain the actual result for this many driver turns.
+    /// Bytes are visible to the peer while production CQE owners remain pinned.
+    HoldCompletion(usize),
 }
 
 #[derive(Debug)]
@@ -183,7 +186,7 @@ impl World {
             0,
             match fault {
                 Fault::Errno(n) => -(n as i64),
-                Fault::Short(n) | Fault::Delay(n) => n as i64,
+                Fault::Short(n) | Fault::Delay(n) | Fault::HoldCompletion(n) => n as i64,
             },
         );
         Some(fault)
@@ -1547,6 +1550,8 @@ struct Pending {
     delay: usize,
     limit: usize,
     error: Option<i32>,
+    hold: usize,
+    result: Option<KernelResult>,
     disk_generation: u64,
     disk_paths: Vec<PathBuf>,
 }
@@ -1573,11 +1578,14 @@ impl Driver {
             delay: 0,
             limit: usize::MAX,
             error: None,
+            hold: 0,
+            result: None,
         };
         match fault {
             Some(Fault::Errno(n)) => pending.error = Some(n),
             Some(Fault::Short(n)) => pending.limit = n,
             Some(Fault::Delay(n)) => pending.delay = n,
+            Some(Fault::HoldCompletion(n)) => pending.hold = n,
             None => (),
         }
         self.sim
@@ -1587,7 +1595,13 @@ impl Driver {
         self.pending.borrow_mut().insert(id, pending);
     }
     pub fn cancel(&mut self, id: u64) {
-        let removed = self.pending.borrow_mut().remove(&id).is_some();
+        let mut pending = self.pending.borrow_mut();
+        // An executed operation cannot be canceled retroactively, nor may its
+        // held CQE be replaced with ECANCELED and release the owners early.
+        let removed = pending.get(&id).is_some_and(|p| p.result.is_none());
+        if removed {
+            pending.remove(&id);
+        }
         let mut completed = self.completed.borrow_mut();
         // Deliberately emit cancel first, exercising the shared two-CQE fence.
         completed.push_back((
@@ -1606,6 +1620,17 @@ impl Driver {
         let mut pending = self.pending.borrow_mut();
         let mut done = Vec::new();
         for (&id, operation) in pending.iter_mut() {
+            if operation.result.is_some() {
+                if operation.hold != 0 {
+                    operation.hold -= 1;
+                    continue;
+                }
+                self.completed
+                    .borrow_mut()
+                    .push_back((id, operation.result.take().unwrap()));
+                done.push(id);
+                continue;
+            }
             if operation.delay != 0 {
                 operation.delay -= 1;
                 continue;
@@ -1656,8 +1681,12 @@ impl Driver {
                         id,
                         value,
                     );
-                    self.completed.borrow_mut().push_back((id, result));
-                    done.push(id);
+                    if operation.hold != 0 {
+                        operation.result = Some(result);
+                    } else {
+                        self.completed.borrow_mut().push_back((id, result));
+                        done.push(id);
+                    }
                 }
             }
         }

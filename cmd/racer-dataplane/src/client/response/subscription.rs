@@ -63,6 +63,7 @@ struct Releases {
     bytes: [u8; 12],
     used: usize,
     ahead: Option<(OwnedBuffer, std::ops::Range<usize>)>,
+    provisional: bool,
 }
 impl Releases {
     fn poll(
@@ -71,6 +72,7 @@ impl Releases {
         socket: &std::rc::Rc<crate::runtime::reactor::Descriptor>,
         stream: &mut RangeStream,
         outstanding: &mut BTreeMap<PageNumber, u32>,
+        current: Option<(crate::model::PageSlice, &crate::memory::delivery::FinalSend)>,
     ) -> Result<bool> {
         let mut released = false;
         // At most 64 releases per turn, even for malicious input.
@@ -102,14 +104,23 @@ impl Releases {
             if self.used == 12 {
                 let number = PageNumber(u64::from_be_bytes(self.bytes[..8].try_into().unwrap()));
                 let length = u32::from_be_bytes(self.bytes[8..].try_into().unwrap());
-                let expected = outstanding.get(&number).ok_or(Error::InvalidRequest)?;
-                if *expected != length {
+                if let Some(expected) = outstanding.get(&number) {
+                    if *expected != length {
+                        return Err(Error::InvalidRequest);
+                    }
+                    stream.release_page(number, length)?;
+                    outstanding.remove(&number);
+                    released = true;
+                } else if let Some((slice, state)) = current {
+                    if slice.page != number || slice.length != length || self.provisional {
+                        return Err(Error::InvalidRequest);
+                    }
+                    state.provisional_release()?;
+                    self.provisional = true;
+                } else {
                     return Err(Error::InvalidRequest);
                 }
-                stream.release_page(number, length)?;
-                outstanding.remove(&number);
                 self.used = 0;
-                released = true;
             }
         }
         cx.waker().wake_by_ref();
@@ -202,6 +213,7 @@ impl Responses {
                 bytes: [0; 12],
                 used: 0,
                 ahead: connection.read_ahead.take(),
+                provisional: false,
             };
             let mut outstanding = BTreeMap::new();
             let mut sent = 0;
@@ -222,7 +234,8 @@ impl Responses {
                             if let Err(error) = progress_scope.check() {
                                 return Poll::Ready(Err(error));
                             }
-                            if let Err(error) = releases.poll(cx, &socket, stream, &mut outstanding)
+                            if let Err(error) =
+                                releases.poll(cx, &socket, stream, &mut outstanding, None)
                             {
                                 return Poll::Ready(Err(error));
                             }
@@ -279,6 +292,7 @@ impl Responses {
                         .ok_or(Error::BadGateway)?;
                     // Acquisition owns no delivery pipe and continues even while
                     // the page frame or payload is blocked on this socket.
+                    let final_send = crate::memory::delivery::FinalSend::default();
                     let mut write = Box::pin(async {
                         let connection = send_frame(
                             &self.io,
@@ -288,17 +302,24 @@ impl Responses {
                         )
                         .await?;
                         self.delivery
-                            .finish_progressing(reader, connection, &progress_scope)
+                            .finish_subscription(reader, connection, &progress_scope, &final_send)
                             .await
                     });
                     let mut ready: Option<Operation<'_, u32>> = None;
                     let result = std::future::poll_fn(|cx| {
-                        // Observe write completion before accepting releases. The
-                        // current page is not releasable until its full delivery.
+                        // A peer can see the final bytes before we observe their
+                        // CQE. Retain one exact provisional release, without
+                        // releasing credit or any I/O owner before full completion.
                         if let Poll::Ready(result) = write.as_mut().poll(cx) {
                             return Poll::Ready(result);
                         }
-                        if let Err(error) = releases.poll(cx, &socket, stream, &mut outstanding) {
+                        if let Err(error) = releases.poll(
+                            cx,
+                            &socket,
+                            stream,
+                            &mut outstanding,
+                            Some((slice, &final_send)),
+                        ) {
                             return Poll::Ready(Err(error));
                         }
                         // No release can replenish credit until a previous page
@@ -342,7 +363,11 @@ impl Responses {
                     })
                     .await?;
                     connection = result;
-                    outstanding.insert(slice.page, slice.length);
+                    if std::mem::take(&mut releases.provisional) {
+                        stream.release_page(slice.page, slice.length)?;
+                    } else {
+                        outstanding.insert(slice.page, slice.length);
+                    }
                     sent += u64::from(slice.length);
                     pages += 1;
                 }

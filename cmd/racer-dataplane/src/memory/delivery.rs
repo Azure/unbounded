@@ -33,6 +33,19 @@ const SEND_CHUNK_BYTES: usize = 64 * 1024;
 const SEND_BUDGET_BYTES: usize = 256 * 1024;
 const SEND_BUDGET_CALLS: usize = 32;
 
+/// One current final send, never an admission to release its CQE-owned leases.
+#[derive(Default)]
+pub(crate) struct FinalSend(std::cell::Cell<Option<bool>>);
+impl FinalSend {
+    pub(crate) fn provisional_release(&self) -> Result<()> {
+        if self.0.get() != Some(false) {
+            return Err(Error::InvalidRequest);
+        }
+        self.0.set(Some(true));
+        Ok(())
+    }
+}
+
 /// A fixed immutable view owns the full admitted page through the send fence.
 /// It deliberately implements no receive or mutable-buffer capability.
 struct PageSendRange {
@@ -164,7 +177,7 @@ impl Delivery {
         connection: ConnectionLease,
         scope: &'a RequestScope,
     ) -> Operation<'a, ConnectionLease> {
-        self.finish_to_inner(reader, connection, scope, false)
+        self.finish_to_inner(reader, connection, scope, false, None)
     }
 
     /// Client body writes are bounded by lack of socket progress, not total
@@ -175,7 +188,17 @@ impl Delivery {
         connection: ConnectionLease,
         scope: &'a RequestScope,
     ) -> Operation<'a, ConnectionLease> {
-        self.finish_to_inner(reader, connection, scope, true)
+        self.finish_to_inner(reader, connection, scope, true, None)
+    }
+
+    pub(crate) fn finish_subscription<'a>(
+        &'a self,
+        reader: ReaderLease,
+        connection: ConnectionLease,
+        scope: &'a RequestScope,
+        final_send: &'a FinalSend,
+    ) -> Operation<'a, ConnectionLease> {
+        self.finish_to_inner(reader, connection, scope, true, Some(final_send))
     }
 
     fn finish_to_inner<'a>(
@@ -184,6 +207,7 @@ impl Delivery {
         mut connection: ConnectionLease,
         scope: &'a RequestScope,
         progressing: bool,
+        final_send: Option<&'a FinalSend>,
     ) -> Operation<'a, ConnectionLease> {
         // Also protect abandonment before the returned future's first poll.
         connection.begin_io();
@@ -266,6 +290,9 @@ impl Delivery {
                             DeliveryBuffer::Pipe(buffer)
                         };
                         let count = buffer.send_bytes()?.len();
+                        if let Some(state) = final_send {
+                            state.0.set((count == reader.remaining()).then_some(false));
+                        }
                         let completion = self
                             .pipes
                             .reactor()
@@ -277,6 +304,12 @@ impl Delivery {
                             )
                             .await?;
                         (reader, connection) = completion.lease;
+                        if let Some(state) = final_send {
+                            let released = state.0.replace(None) == Some(true);
+                            if released && completion.bytes != count {
+                                return Err(Error::InvalidRequest);
+                            }
+                        }
                         if completion.bytes > count {
                             return Err(Error::Io);
                         }
