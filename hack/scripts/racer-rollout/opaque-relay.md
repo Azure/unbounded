@@ -9,7 +9,7 @@ or edits affecting unrelated alias consumers fail closed. This is not a generic
 environment editor.
 
 Production reachability: `cmd/racer-dataplane/src/config.rs:168-172` parses the
-setting, `src/app.rs:886` installs it, and `src/peer/server.rs:319-385` selects
+setting, `src/app.rs:898` installs it, and `src/peer/server.rs:319-385` selects
 ciphertext streaming only for intermediate HTTP hops without an admitted native
 transfer. The bounded pipe path is `src/http/relay.rs:36-136`; correctness tests at
 `src/peer/opaque_tests.rs:378-425,440-452` check payload equality, decryption,

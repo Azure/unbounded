@@ -1,6 +1,6 @@
 //! Process entry point. Configuration and application lifecycle own all resources.
 
-use racer_dataplane::{app::Application, config::Config, error::Result, rdma::FabricPort};
+use racer_dataplane::{app::Application, config::Config};
 
 mod heap_profile;
 
@@ -22,17 +22,16 @@ fn main() -> std::process::ExitCode {
 fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let _heap_profile = heap_profile::start_from_env()?;
     let (config, fabric_ports) = Config::from_env_with_fabric_ports()?;
-    assemble(config, fabric_ports)?.run()?;
+    Application::assemble(config)?
+        .with_fabric_ports(fabric_ports)?
+        .run()?;
     Ok(())
-}
-
-fn assemble(config: Config, fabric_ports: Vec<FabricPort>) -> Result<Application> {
-    Application::assemble(config)?.with_fabric_ports(fabric_ports)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use racer_dataplane::rdma::FabricPort;
 
     #[test]
     fn executable_builder_defaults_to_no_associations_and_rejects_invalid_input() {
@@ -48,7 +47,7 @@ mod tests {
                 },
                 |_| panic!("no projected source selected"),
             )
-            .and_then(|(config, ports)| assemble(config, ports));
+            .and_then(|(config, ports)| Application::assemble(config)?.with_fabric_ports(ports));
             match value {
                 None | Some("[]") => assert!(result.unwrap().fabric_ports().is_empty()),
                 _ => assert!(matches!(
@@ -79,7 +78,10 @@ mod tests {
                     }])
                 },
             ).unwrap();
-            let app = assemble(config, ports).unwrap();
+            let app = Application::assemble(config)
+                .unwrap()
+                .with_fabric_ports(ports)
+                .unwrap();
             assert_eq!(app.fabric_ports().len(), 1);
             let port = &app.fabric_ports()[0];
             assert_eq!(port.fabric, "production-a");

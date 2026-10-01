@@ -33,7 +33,7 @@ memory PSI avg10. This is one transient sample, not a fleet bound or headroom
 approval. Racer had no container memory limit in the inspected DS, and the
 same node's Racer working set was 9588101120 at 22:51:24Z. Window acquisition
 floors and per-worker partitioning still apply (`src/config.rs:382-407` and
-`src/app.rs:250-278`, relative to `cmd/racer-dataplane`). No budget is raised.
+`src/app.rs:236-306`, relative to `cmd/racer-dataplane`). No budget is raised.
 
 This follows the bounded concurrency/integrity intent in `~/design.md:23-39,53`.
 The existing implementation differs from that design's client splice example

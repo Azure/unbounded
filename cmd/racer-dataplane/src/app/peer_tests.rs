@@ -1,5 +1,169 @@
 //! Exercise assembled peer I/O, including socket session signatures and full paths.
+use super::integration_tests::local_worker;
 use super::*;
+
+#[test]
+fn assembly_applies_configured_client_request_timeout() {
+    for timeout in [Duration::from_millis(250), Duration::from_secs(45)] {
+        let mut config = crate::test_support::cluster::config(false);
+        config.request_timeout = timeout;
+        config.reader_stall_timeout = timeout;
+        let (app, _, _) = local_worker(&config, &Arc::new(NodeState::default()), 0);
+        assert_eq!(app.clients.request_timeout(), timeout);
+    }
+}
+
+#[test]
+fn worker_servers_share_one_node_wide_subscription_owner() {
+    let config = crate::test_support::cluster::config(false);
+    let node = Arc::new(NodeState::default());
+    let (first, _, _) = local_worker(&config, &node, 0);
+    let (second, _, _) = local_worker(&config, &node, 1);
+    assert!(Arc::ptr_eq(
+        first.peers.subscription_owner(),
+        second.peers.subscription_owner()
+    ));
+    assert!(Arc::ptr_eq(
+        first.peers.subscription_owner(),
+        &node.subscriptions
+    ));
+}
+
+#[test]
+fn worker_requesters_share_configured_admission_and_production_metrics() {
+    use crate::telemetry::metrics::{Event, Gauge};
+    let mut config = crate::test_support::cluster::config(false);
+    config.peer_admission = crate::peer::adaptive::Config {
+        total: 2,
+        per_peer: 1,
+    };
+    let node = Arc::new(
+        NodeState::with_peer_admission(vec![WorkerId(0), WorkerId(1)], 16, config.peer_admission)
+            .unwrap(),
+    );
+    let (first, _, _) = local_worker(&config, &node, 0);
+    let (second, _, _) = local_worker(&config, &node, 1);
+    let a = first.peer_requester.admission();
+    let b = second.peer_requester.admission();
+    let peer = NodeId("test-peer".into());
+    let permit = a.acquire(&peer).unwrap();
+    assert!(matches!(b.acquire(&peer), Err(Error::Overloaded)));
+    assert_eq!(node.metrics[1].1.count(Event::PeerAdmissionAccepted), 1);
+    assert_eq!(node.metrics[1].1.count(Event::PeerAdmissionRejected), 1);
+    assert_eq!(node.metrics[1].1.gauge(Gauge::PeerExchanges), 1);
+    assert_eq!(node.metrics[1].1.gauge(Gauge::PeerAdmissionLimit), 2);
+    permit.observe(crate::peer::adaptive::Outcome::PeerFailure);
+    assert!(!b.available(&peer));
+    drop(permit);
+    assert_eq!(node.metrics[1].1.gauge(Gauge::PeerExchanges), 0);
+}
+
+#[test]
+fn workers_share_configured_page_hedge_slots_and_bytes() {
+    let clock = crate::runtime::environment::SimulationClock::new(907);
+    let _environment = clock.environment(0).enter();
+    let mut config = crate::test_support::cluster::config(false);
+    config.page_hedge.slots = 1;
+    let node = Arc::new(NodeState::default());
+    let (first, _, _) = local_worker(&config, &node, 0);
+    let owner = first.coordinator.hedge_owner().unwrap();
+    let (mut second, _, _) = local_worker(&config, &node, 1);
+    let permit = owner.acquire().unwrap();
+    let wake = Arc::new(crate::test_support::WakeCounter::default());
+    let waker = std::task::Waker::from(wake.clone());
+    let mut cx = Context::from_waker(&waker);
+    assert!(permit.delay(&mut cx).is_pending());
+    clock.advance(config.page_hedge.delay);
+    // No listener/checkpoint startup in this composition-only fixture. Alarms
+    // must still wake before unrelated unstarted services report unavailable.
+    assert_eq!(second.poll_services(&mut cx, 1), Err(Error::Unavailable));
+    assert!(wake.count() > 0);
+    assert!(permit.delay(&mut cx).is_ready());
+    assert!(matches!(
+        second.coordinator.hedge_owner().unwrap().acquire(),
+        Err(Error::Overloaded)
+    ));
+    drop(permit);
+    assert!(second.coordinator.hedge_owner().unwrap().acquire().is_ok());
+}
+
+#[test]
+fn distributed_peer_listener_recovers_from_queue_pressure() {
+    let mut config = crate::test_support::cluster::config(false);
+    config.limits.queue_entries = NonZeroUsize::new(8).unwrap();
+    let node = Arc::new(NodeState::default());
+    let (app, runtime, _) = local_worker(&config, &node, 0);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let scope = scope(Duration::from_secs(5)).unwrap();
+    let mut serving = app.peers.listen(address, &scope);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let reader = Rc::new(crate::runtime::reactor::Descriptor::from(reader));
+    let mut pressure = Vec::new();
+    for _ in 0..8 {
+        let mut wait = runtime
+            .reactor
+            .readiness(reader.clone(), libc::POLLIN as u32, &scope);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        pressure.push(wait);
+    }
+    for _ in 0..32 {
+        assert!(serving.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(runtime.reactor.in_flight(), 8);
+    }
+    let _client = std::net::TcpStream::connect(address).unwrap();
+    drop(pressure);
+    let until = Instant::now() + Duration::from_secs(2);
+    loop {
+        assert!(serving.as_mut().poll(&mut cx).is_pending());
+        runtime.reactor.poll_budgeted(64).unwrap();
+        if let Some(accepted) = node
+            .ingress
+            .pop_batch::<1>(WorkerId(0), cx.waker(), 1)
+            .unwrap()[0]
+            .take()
+        {
+            assert!(matches!(accepted.kind, crate::runtime::ingress::Kind::Peer));
+            break;
+        }
+        assert!(Instant::now() < until, "distributed peer accept stalled");
+        runtime.reactor.wait(Duration::from_millis(1)).unwrap();
+    }
+    scope.cancel().unwrap();
+    loop {
+        runtime.reactor.poll_budgeted(64).unwrap();
+        if let Poll::Ready(result) = serving.as_mut().poll(&mut cx) {
+            assert_eq!(result, Err(Error::Cancelled));
+            break;
+        }
+        assert!(Instant::now() < until, "peer cancellation stalled");
+        runtime.reactor.wait(Duration::from_millis(1)).unwrap();
+    }
+}
+
+#[test]
+fn assembly_uses_node_metrics_for_sparse_worker_ids() {
+    use crate::telemetry::metrics::{Event, Gauge};
+    let config = crate::test_support::cluster::config(false);
+    let node = Arc::new(NodeState::new(vec![WorkerId(9), WorkerId(2)], 16).unwrap());
+    let (first, _, _) = local_worker(&config, &node, 9);
+    let (second, _, _) = local_worker(&config, &node, 2);
+    first.telemetry.metrics.record(Event::MemoryHit, 2).unwrap();
+    second
+        .telemetry
+        .metrics
+        .record(Event::MemoryHit, 3)
+        .unwrap();
+    let request = first.telemetry.metrics.request().unwrap();
+    assert_eq!(second.telemetry.metrics.count(Event::MemoryHit), 5);
+    assert_eq!(second.telemetry.metrics.gauge(Gauge::ActiveRequests), 1);
+    drop(first);
+    drop(request);
+    assert_eq!(second.telemetry.metrics.count(Event::RequestError), 1);
+    assert_eq!(second.telemetry.metrics.gauge(Gauge::ActiveRequests), 0);
+}
 use crate::{
     http::{Codec, Header, MessageHead, StartLine, connection::ConnectionLease},
     model::{ExpiresAt, MetadataSelector, ObjectMetadata, ResourceClass, *},

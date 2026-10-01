@@ -20,6 +20,9 @@ use std::{cell::RefCell, collections::BTreeMap};
 const MAX_NODES: usize = 32;
 const MAX_TURNS: usize = 100_000;
 
+mod scenarios;
+mod traffic;
+
 #[derive(Clone, Copy, Debug)]
 enum Action {
     AddNode,
@@ -540,17 +543,6 @@ struct LocalWorker {
     runtime: WorkerRuntime,
     crypto: Box<dyn CryptoService>,
 }
-impl std::ops::Deref for Node {
-    type Target = LocalWorker;
-    fn deref(&self) -> &LocalWorker {
-        &self.workers[0]
-    }
-}
-impl std::ops::DerefMut for Node {
-    fn deref_mut(&mut self) -> &mut LocalWorker {
-        &mut self.workers[0]
-    }
-}
 impl Node {
     fn poll(&mut self, budget: usize) {
         for worker in &mut self.workers {
@@ -928,7 +920,7 @@ impl Harness {
                 integration_tests::publication(&node.config, self.generation, vec![definition]);
             p.membership_version = MembershipVersion(self.generation);
             p.members = members.clone();
-            node.app.snapshots.publish(p).unwrap();
+            node.workers[0].app.snapshots.publish(p).unwrap();
         }
     }
     fn tick(&mut self) {
@@ -972,7 +964,7 @@ impl Harness {
                 })
                 .count();
             self.coverage.relay_turns += usize::from(
-                self.nodes[index]
+                self.nodes[index].workers[0]
                     .runtime
                     .admission
                     .used(ResourceClass::Relay)
@@ -1001,14 +993,14 @@ impl Harness {
                 .disk()
                 .crash_under(std::path::Path::new(&format!("/dst/node-{}", node.id)))
                 .unwrap();
-            node.app.directory.simulation_crash();
+            node.workers[0].app.directory.simulation_crash();
             for worker in &mut node.workers {
                 if let Some(endpoint) = &mut worker.app.endpoint {
                     endpoint.simulation_crash();
                 }
                 worker.app.drivers.simulation_crash();
             }
-            node.app.directory.simulation_crash();
+            node.workers[0].app.directory.simulation_crash();
         } else {
             lifecycle(&mut node.workers, &shutdown, Lifecycle::Drain);
             // Production checkpoint publication promises an atomic logical cut,
@@ -1229,8 +1221,8 @@ impl Harness {
             .get("complete:read")
             .copied()
             .unwrap_or(0);
-        for node in self.nodes.iter().flat_map(|n| &n.workers) {
-            node.app.memory.evict_idle(usize::MAX).unwrap();
+        for worker in self.nodes.iter().flat_map(|n| &n.workers) {
+            worker.app.memory.evict_idle(usize::MAX).unwrap();
         }
         // Construct requests from independent version facts even with origin offline.
         self.catalog.borrow_mut().current.insert(2, version.clone());
@@ -1276,12 +1268,16 @@ impl Harness {
     fn peer_outage(&mut self) {
         let index = self.rng.pick(self.nodes.len());
         let address = self.nodes[index].config.peer_listen;
-        let listener_scope = self.nodes[index].app.listener_scope.take().unwrap();
+        let listener_scope = self.nodes[index].workers[0]
+            .app
+            .listener_scope
+            .take()
+            .unwrap();
         listener_scope.cancel().unwrap();
-        self.nodes[index].app.peer_task.take();
+        self.nodes[index].workers[0].app.peer_task.take();
         let endpoint = crate::http::connection::Endpoint::Peer(address.to_string());
         for node in &self.nodes {
-            node.app.http.invalidate(&endpoint);
+            node.workers[0].app.http.invalidate(&endpoint);
         }
         // Fence the listener-owned accept and receive operations before probing.
         for _ in 0..8 {
@@ -1290,13 +1286,14 @@ impl Harness {
         self.coverage.action("peer-outage");
         self.traffic(2, true);
         let node = &mut self.nodes[index];
-        let peers = node.app.peers.clone();
+        let peers = node.workers[0].app.peers.clone();
         let listener_scope = scope(Duration::from_secs(365 * 24 * 3600)).unwrap();
         let peer_scope = listener_scope.clone();
-        node.app.listener_scope = Some(listener_scope);
-        node.app.peer_task = Some(Box::pin(
-            async move { peers.listen(address, &peer_scope).await },
-        ));
+        node.workers[0].app.listener_scope = Some(listener_scope);
+        node.workers[0].app.peer_task =
+            Some(Box::pin(
+                async move { peers.listen(address, &peer_scope).await },
+            ));
         self.tick();
         self.coverage.action("peer-heal");
         self.traffic(1, false);
@@ -1424,15 +1421,15 @@ impl Harness {
             .map(|n| self.bundle(&n.config, self.generation + 1000))
             .collect();
         for (node, bundle) in self.nodes.iter_mut().zip(bundles) {
-            node.app.keys.install(bundle).unwrap();
-            node.app.control = node.control.clone();
+            node.workers[0].app.keys.install(bundle).unwrap();
+            node.workers[0].app.control = node.control.clone();
         }
         // Key admission changes synchronously; existing native/crypto owners
         // continue through their own completion protocol during normal ticks.
         self.tick();
         for node in &mut self.nodes {
-            node.app.control = None;
-            node.app.control_task.take();
+            node.workers[0].app.control = None;
+            node.workers[0].app.control_task.take();
         }
         self.coverage.action("key-retirement");
     }
@@ -1442,10 +1439,10 @@ impl Harness {
         let members = self.members();
         let mut staged = Vec::new();
         for node in &mut self.nodes {
-            node.app.control = node.control.clone();
+            node.workers[0].app.control = node.control.clone();
             staged.push(caches::CachePublication {
-                node: node.app.node.as_ref().unwrap().clone(),
-                listeners: node.app.prepared_listeners.clone(),
+                node: node.workers[0].app.node.as_ref().unwrap().clone(),
+                listeners: node.workers[0].app.prepared_listeners.clone(),
                 capacity: node.config.limits.metadata_entries.get(),
             });
         }
@@ -1462,7 +1459,8 @@ impl Harness {
                             integration_tests::publication(&node.config, self.generation, vec![]);
                         publication.membership_version = MembershipVersion(self.generation);
                         publication.members = members.clone();
-                        node.app
+                        node.workers[0]
+                            .app
                             .snapshots
                             .publish_staged(publication, Some(transition))
                             .unwrap();
@@ -1482,7 +1480,13 @@ impl Harness {
         self.key_retirement();
         self.publish();
         for node in &mut self.nodes {
-            let definitions = node.app.snapshots.current().unwrap().caches.clone();
+            let definitions = node.workers[0]
+                .app
+                .snapshots
+                .current()
+                .unwrap()
+                .caches
+                .clone();
             let LocalWorker {
                 app,
                 runtime,
@@ -1567,7 +1571,7 @@ impl Harness {
         // Use a separate placement cache for fixture setup, not the byte oracle.
         Placement::new(1)
             .rank(
-                self.nodes[0]
+                self.nodes[0].workers[0]
                     .app
                     .snapshots
                     .current()
@@ -1600,7 +1604,11 @@ impl Harness {
                 let object = (8..16384)
                     .find(|&object| {
                         let id = self.object_id(object);
-                        self.nodes[node].app.directory.metadata_owner(&id).unwrap()
+                        self.nodes[node].workers[0]
+                            .app
+                            .directory
+                            .metadata_owner(&id)
+                            .unwrap()
                             == WorkerId(worker as u16)
                             && self.ranked_nodes(&id)[0] == node
                     })
@@ -1730,7 +1738,7 @@ impl Harness {
         };
         let receiver = self.rng.pick(self.nodes.len());
         let sender = (receiver + 1) % self.nodes.len();
-        let keys = self.nodes[sender].app.keys.clone();
+        let keys = self.nodes[sender].workers[0].app.keys.clone();
         let certificates = Rc::new(Certificates::new(
             self.nodes[sender].config.cluster.clone(),
             keys.clone(),
@@ -2032,246 +2040,6 @@ impl Harness {
             client.end - client.first
         };
     }
-
-    fn generated(&mut self, steps: usize) {
-        for object in 0..8 {
-            self.update(object);
-        }
-        let initial = 2 + self.rng.pick(MAX_NODES - 1);
-        for _ in 0..initial {
-            self.add(None);
-        }
-        let mut actions = Vec::new();
-        for step in 0..steps {
-            if actions.is_empty() {
-                actions.extend_from_slice(WEIGHTED_ACTIONS);
-            }
-            let selected = self.rng.pick(actions.len());
-            let action = actions.swap_remove(selected);
-            self.coverage.trace.record(format!(
-                "step:{step}:{action:?}:{}:{}",
-                self.nodes.len(),
-                self.rng.0
-            ));
-            eprintln!(
-                "dst seed={} step={step} action={action:?} nodes={}",
-                self.seed,
-                self.nodes.len()
-            );
-            match action {
-                Action::AddNode if self.nodes.len() < MAX_NODES => self.add(None),
-                Action::RemoveNode if self.nodes.len() > 1 => {
-                    let index = self.rng.pick(self.nodes.len());
-                    self.remove(index);
-                }
-                Action::Update => {
-                    let object = self.rng.pick(8);
-                    self.update(object);
-                }
-                Action::Evict => {
-                    self.settle();
-                    for worker in self.nodes.iter().flat_map(|n| &n.workers) {
-                        worker.app.memory.evict_idle(usize::MAX).unwrap();
-                    }
-                    self.coverage.action("evict");
-                    self.traffic(1, false);
-                }
-                Action::Restart => {
-                    let index = self.rng.pick(self.nodes.len());
-                    let id = self.remove(index);
-                    self.add(Some(id));
-                }
-                Action::ShortIo => {
-                    let operation = if self.rng.pick(2) == 0 {
-                        "send"
-                    } else {
-                        "recv"
-                    };
-                    self.sim
-                        .inject(operation, Fault::Short(1 + self.rng.pick(128)));
-                    *self.coverage.injected.entry(operation.into()).or_default() += 1;
-                    self.coverage.action("short-io");
-                    self.traffic(1, false);
-                }
-                Action::ConnectFailure => {
-                    self.sim.inject("connect", Fault::Errno(libc::ECONNREFUSED));
-                    *self.coverage.injected.entry("connect".into()).or_default() += 1;
-                    // A fresh unpinned object requires an origin connection even
-                    // when every peer already has a cached copy of the old version.
-                    self.update(2);
-                    let client = self.request(2, false, false);
-                    self.exchange(client, true);
-                    self.coverage.action("connect-failure");
-                    self.recover_origin();
-                }
-                Action::DelayedWrite => {
-                    self.sim.inject("write", Fault::Delay(3 + self.rng.pick(8)));
-                    *self.coverage.injected.entry("write".into()).or_default() += 1;
-                    self.update(3);
-                    let client = self.request(3, false, false);
-                    self.exchange(client, false);
-                    self.coverage.action("delayed-write");
-                }
-                Action::ClientCancel => {
-                    let mut client = self.request(1, false, false);
-                    // Send the request without consuming the response, ensuring
-                    // real socket backpressure regardless of the generated path.
-                    for _ in 0..MAX_TURNS {
-                        if client.sent == client.request.len() {
-                            break;
-                        }
-                        if let Ok(n) =
-                            handle(client.fd.as_ref().unwrap()).send(&client.request[client.sent..])
-                        {
-                            client.sent += n;
-                        }
-                        self.tick();
-                    }
-                    for _ in 0..256 {
-                        self.tick();
-                    }
-                    for _ in 0..1 + self.rng.pick(32) {
-                        self.tick();
-                        if client.poll() {
-                            break;
-                        }
-                    }
-                    self.sim.disconnect(client.fd.as_ref().unwrap()).unwrap();
-                    client.fd.take();
-                    self.settle();
-                    self.coverage.action("client-cancel");
-                }
-                Action::PeerOutage => self.peer_outage(),
-                Action::InflightCrash => {
-                    self.crash_inflight();
-                }
-                Action::OldPin => {
-                    // Warm the ingress before mutation. This old pin is provably
-                    // retained, so unavailability cannot excuse a failed read.
-                    let object = 2 + self.rng.pick(6);
-                    let node = self.rng.pick(self.nodes.len());
-                    let warm = self.request_on(object, false, false, node);
-                    self.exchange(warm, false);
-                    let client = self.request_on(object, true, false, node);
-                    self.update(object);
-                    self.exchange(client, false);
-                    self.coverage.action("old-pin");
-                }
-                Action::FailedDirtyWrite => {
-                    self.sim.inject("write", Fault::Errno(libc::EIO));
-                    *self.coverage.injected.entry("write".into()).or_default() += 1;
-                    self.update(4);
-                    let client = self.request(4, false, false);
-                    self.exchange(client, false);
-                    self.coverage.action("failed-dirty-write");
-                }
-                Action::InflightMembership if self.nodes.len() < MAX_NODES => {
-                    let mut client = self.request(1, false, false);
-                    self.tick();
-                    let complete = client.poll();
-                    self.add(None);
-                    if complete {
-                        self.check(&client, false);
-                        client.fd.take();
-                        self.settle();
-                    } else {
-                        self.exchange(client, false);
-                    }
-                    self.coverage.action("inflight-membership");
-                }
-                Action::Partition if self.nodes.len() > 1 => self.partition_traffic(),
-                Action::WallJump => {
-                    let wall = crate::runtime::environment::wall_now();
-                    let amount = Duration::from_secs(1 + self.rng.pick(120) as u64);
-                    self.clock.set_wall_time(if self.rng.pick(2) == 0 {
-                        wall + amount
-                    } else {
-                        wall - amount
-                    });
-                    self.traffic(1, true);
-                    // Replay admission retains a wall high-water mark. Recovery
-                    // advances past it; rolling back again is not a healthy clock.
-                    self.clock.advance(Duration::from_secs(121));
-                    let (anchor, wall_anchor) = crate::runtime::environment::clock_anchor();
-                    self.clock.set_wall_time(
-                        wall_anchor + crate::runtime::environment::now().duration_since(anchor),
-                    );
-                    self.coverage.action("wall-jump");
-                }
-                Action::OriginFault => self.origin_fault(),
-                Action::MalformedClient => self.malformed_client(),
-                Action::KeyRetirement => self.key_retirement(),
-                Action::CacheRecreate => self.cache_recreate(),
-                Action::NativeFault if self.native => self.native_fault(),
-                Action::PeerSecurity if self.nodes.len() > 1 => self.peer_security(),
-                Action::DiskCorruption => self.disk_corruption(),
-                Action::PendingWriteCrash => self.crash_pending_write(),
-                // Gated actions keep their slot and use ordinary traffic instead
-                // of resampling, preserving both weights and random draws.
-                Action::Traffic
-                | Action::AddNode
-                | Action::RemoveNode
-                | Action::InflightMembership
-                | Action::Partition
-                | Action::NativeFault
-                | Action::PeerSecurity => {
-                    let count = 1 + self.rng.pick(4);
-                    self.coverage.action("traffic");
-                    self.traffic(count, false);
-                }
-            }
-            self.coverage.trace.checkpoint();
-        }
-        // Recovery liveness is a mandatory oracle obligation, independent of the
-        // generator's action mix: every current object must still be readable.
-        for object in 0..8 {
-            let client = self.request(object, false, false);
-            self.exchange(client, false);
-        }
-        for node in &self.nodes {
-            for worker in &node.workers {
-                let snapshot = worker.app.store.writer.index().snapshot().unwrap();
-                assert!(snapshot.entries.len() <= node.config.limits.metadata_entries.get());
-                self.coverage.persisted += snapshot.entries.len();
-            }
-        }
-        self.cache_obligations();
-        self.coverage.origin_gets = self.catalog.borrow().gets;
-        self.coverage.origin_faults = self.catalog.borrow().faults.clone();
-        for (operation, injected) in &self.coverage.injected {
-            assert_eq!(
-                self.coverage.observed.get(operation),
-                Some(injected),
-                "injected OS fault was not consumed"
-            );
-        }
-        while !self.nodes.is_empty() {
-            self.remove(0);
-        }
-        self.coverage.collect(&self.sim);
-        self.coverage.collect_native(&self.fabric);
-        assert_eq!(
-            self.sim.live_handles(),
-            0,
-            "all descriptors must be fenced and released"
-        );
-        assert_eq!(
-            self.fabric.live_resources(),
-            0,
-            "native resources must be fenced and released"
-        );
-        self.coverage.trace.record(format!(
-            "final-invariants:{}:{}:{}:{}:{}:{}",
-            self.sim.live_handles(),
-            self.fabric.live_resources(),
-            self.coverage.success,
-            self.coverage.failures,
-            self.coverage.bytes,
-            self.coverage.persisted
-        ));
-        self.coverage.trace.checkpoint();
-        eprintln!("dst seed={} coverage={:?}", self.seed, self.coverage);
-    }
 }
 
 struct Client {
@@ -2292,83 +2060,6 @@ struct Client {
     done: bool,
     disconnected: bool,
     expected_status: Option<u16>,
-}
-impl Client {
-    fn poll(&mut self) -> bool {
-        if self.sent == 0
-            && !self.head
-            && self.expected_status.is_none()
-            && self.request.starts_with(b"GET ")
-        {
-            let request = String::from_utf8(self.request.clone()).unwrap();
-            self.request = request.replacen("GET /v1/", "POST /v2/", 1)
-                .replacen("Host: racer\r\n", "Host: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 64\r\nRacer-Byte-Credits: 1073741824\r\nRacer-Ordered: 1\r\n", 1).into_bytes();
-        }
-        let fd = handle(self.fd.as_ref().unwrap());
-        if self.released < self.releases.len() {
-            match fd.send(&self.releases[self.released..]) {
-                Ok(n) => self.released += n,
-                Err(e) if would_block(&e) => (),
-                Err(_) => {
-                    self.disconnected = true;
-                    return true;
-                }
-            }
-        }
-        if self.sent < self.request.len() {
-            match fd.send(&self.request[self.sent..]) {
-                Ok(n) => self.sent += n,
-                Err(e) if would_block(&e) => return false,
-                Err(_) => {
-                    self.disconnected = true;
-                    return true;
-                }
-            }
-        }
-        let mut bytes = [0; 65536];
-        match fd.recv(&mut bytes) {
-            Ok(0) => {
-                self.disconnected = true;
-                return true;
-            }
-            Ok(n) => self.response.extend_from_slice(&bytes[..n]),
-            Err(e) if would_block(&e) => return false,
-            Err(_) => {
-                self.disconnected = true;
-                return true;
-            }
-        }
-        assert!(
-            self.response.len() <= self.size.max(2 * PAGE_BYTES as usize) + 32768,
-            "unbounded client response"
-        );
-        if self.response.windows(4).any(|w| w == b"\r\n\r\n") {
-            let (_, h, end) = headers(&self.response);
-            let length: usize = h["content-length"].parse().unwrap();
-            if !self.head && h.contains_key("racer-range-start") {
-                let mut cursor = self.frame_cursor.unwrap_or(end);
-                while cursor + 21 <= self.response.len() {
-                    let count = u32::from_be_bytes(
-                        self.response[cursor + 17..cursor + 21].try_into().unwrap(),
-                    ) as usize;
-                    if cursor + 21 + count > self.response.len() {
-                        break;
-                    }
-                    if self.response[cursor] == 1 {
-                        self.releases
-                            .extend_from_slice(&self.response[cursor + 1..cursor + 9]);
-                        self.releases
-                            .extend_from_slice(&(count as u32).to_be_bytes());
-                    }
-                    cursor += 21 + count;
-                }
-                self.frame_cursor = Some(cursor);
-            }
-            self.response.len() >= end + if self.head { 0 } else { length }
-        } else {
-            false
-        }
-    }
 }
 
 fn setting(name: &str, default: usize, max: usize) -> usize {
@@ -2401,14 +2092,20 @@ fn phase5_default_grace_staggered_nodes_and_periodic_checkpoint_traffic() {
     // Replace only the store's admission policy, retaining each real node's
     // registry and all production peer/read dependencies.
     for node in &mut harness.nodes {
-        let published = node.app.node.as_ref().unwrap().publications.clone();
-        node.app.snapshots = Rc::new(SnapshotStore::new(
+        let published = node.workers[0]
+            .app
+            .node
+            .as_ref()
+            .unwrap()
+            .publications
+            .clone();
+        node.workers[0].app.snapshots = Rc::new(SnapshotStore::new(
             node.config.cluster.clone(),
             published,
             2,
         ));
     }
-    let old = harness.nodes[0]
+    let old = harness.nodes[0].workers[0]
         .app
         .snapshots
         .current()
@@ -2426,9 +2123,10 @@ fn phase5_default_grace_staggered_nodes_and_periodic_checkpoint_traffic() {
         );
         p.membership_version = MembershipVersion(harness.generation);
         p.members = members.clone();
-        node.app.snapshots.publish(p).unwrap();
+        node.workers[0].app.snapshots.publish(p).unwrap();
         assert!(
-            node.app
+            node.workers[0]
+                .app
                 .node
                 .as_ref()
                 .unwrap()
@@ -2444,7 +2142,14 @@ fn phase5_default_grace_staggered_nodes_and_periodic_checkpoint_traffic() {
         harness.tick();
     }
     for node in &harness.nodes {
-        assert!(node.app.telemetry.metrics.gauge(Gauge::CheckpointSequence) > 0);
+        assert!(
+            node.workers[0]
+                .app
+                .telemetry
+                .metrics
+                .gauge(Gauge::CheckpointSequence)
+                > 0
+        );
     }
     // A node cannot resolve a future membership it has not received. Complete
     // propagation before requiring arbitrary new-to-old requests to succeed.
@@ -2673,393 +2378,6 @@ fn dst_coverage_policy_and_aggregation() {
             .keys()
             .all(|name| !name.starts_with("native"))
     );
-}
-
-#[test]
-fn completed_peer_dispatches_do_not_exhaust_worker_cancellation() {
-    use crate::model::{MetadataSelector, OriginContext};
-    use crate::peer::protocol::{FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse};
-    use crate::topology::paths::RouteBudget;
-    use futures::{Stream, stream::FuturesUnordered};
-
-    let sim = Simulation::new();
-    let _os = sim.enter();
-    let clock = SimulationClock::new(73);
-    let environment = clock.environment(0);
-    let _time = environment.enter();
-    let _strict = crate::runtime::environment::require_simulated();
-    let mut harness = Harness::new(73, sim, clock, false);
-    harness.add(None);
-    harness.add(None);
-    let target = harness
-        .nodes
-        .iter()
-        .position(|n| n.workers.len() == 2)
-        .unwrap();
-    let source = 1 - target;
-    let app = &harness.nodes[target].workers[0].app;
-    let mut object = ObjectId {
-        cache: harness.definition(0).id,
-        key: CacheKey([0; 32]),
-    };
-    while app.directory.metadata_owner(&object).unwrap() != WorkerId(1) {
-        object.key.0[0] += 1;
-    }
-    let server = app.peers.clone();
-    // Exactly the long-lived scope used by WorkerApplication's ingress loop.
-    let worker_scope = app.task_scope.clone().unwrap();
-    let membership = app.snapshots.current().unwrap().membership.clone();
-    let destination = harness.nodes[target].config.node.clone();
-    let sender = &harness.nodes[source].workers[0].app;
-    let signatures = Rc::new(Signatures::new(
-        sender.keys.clone(),
-        Rc::new(Certificates::new(
-            harness.nodes[source].config.cluster.clone(),
-            sender.keys.clone(),
-        )),
-    ));
-    let forwarding = Forwarding::new(signatures);
-    let credentials = CredentialCrypto::new(sender.keys.clone(), sender.runtime.admission.clone());
-    let previous = harness.nodes[source].config.node.clone();
-    for round in 0u64..1100 {
-        let scope = RequestScope::new(
-            RequestId([1; 16]),
-            crate::runtime::environment::now() + Duration::from_secs(5),
-        )
-        .unwrap();
-        let mut attempt = [0; 16];
-        attempt[..8].copy_from_slice(&round.to_le_bytes());
-        let attempt = AttemptId(attempt);
-        let context = OriginContext {
-            object: object.clone(),
-            metadata: None,
-            authorization: None,
-        };
-        let request = PeerRequest {
-            operation: PeerOperation::Metadata {
-                object: object.clone(),
-                selector: MetadataSelector::Fresh,
-                mode: FetchMode::CopyOnly,
-            },
-            origin: credentials.seal(&context, attempt, &scope).unwrap(),
-            route: RouteBudget {
-                membership: membership.version,
-                request: scope.request,
-                attempt,
-                destination: destination.clone(),
-                visited: vec![previous.clone()],
-                remaining_links: 4,
-                remaining_attempts: 0,
-                deadline: scope.deadline,
-            },
-        };
-        let (request, binding) = forwarding.sign_request_to(request, &destination).unwrap();
-        let mut effective = worker_scope.clone();
-        effective.request = scope.request;
-        effective.deadline = scope.deadline;
-        // FuturesUnordered gives each completed ingress its own task waker, just
-        // like the production ingress collection. No synthetic registrations.
-        let server = server.clone();
-        let mut pending = FuturesUnordered::new();
-        pending.push(Box::pin(async move {
-            server.dispatch(request, &effective).await
-        }));
-        let mut response = None;
-        for _ in 0..100 {
-            {
-                let app = &harness.nodes[target].workers[0].app;
-                let _local = app
-                    .directory
-                    .simulation_scope(Some((app.worker, app.coordinator.clone())));
-                let _drivers = app.drivers.enter();
-                if let Poll::Ready(Some(result)) = std::pin::Pin::new(&mut pending)
-                    .poll_next(&mut Context::from_waker(futures::task::noop_waker_ref()))
-                {
-                    response = Some(result.unwrap());
-                    break;
-                }
-            }
-            harness.tick();
-        }
-        let verified = forwarding
-            .verify_response(response.expect("bounded peer dispatch"), &binding)
-            .unwrap();
-        assert!(
-            matches!(verified.response(), PeerResponse::Miss),
-            "round {round}: expected Miss; overloaded={}",
-            matches!(verified.response(), PeerResponse::Overloaded)
-        );
-        for worker in &harness.nodes[target].workers {
-            assert_eq!(worker.runtime.admission.used(ResourceClass::Waiter), 0);
-            assert_eq!(worker.runtime.admission.used(ResourceClass::Flight), 0);
-            assert_eq!(worker.app.drivers.pending(), 0);
-        }
-    }
-    assert!(worker_scope.check().is_ok());
-}
-
-#[test]
-fn healthy_relayed_page_reads() {
-    healthy_relayed_page_reads_with_mode(false);
-}
-
-#[test]
-fn listeners_survive_repeated_reactor_queue_pressure() {
-    let sim = Simulation::new();
-    let _os = sim.enter();
-    let clock = SimulationClock::new(73);
-    let environment = clock.environment(0);
-    let _time = environment.enter();
-    let _strict = crate::runtime::environment::require_simulated();
-    let mut harness = Harness::new(73, sim.clone(), clock.clone(), false);
-    harness.add(None);
-    // The DST harness bypasses control enrollment and already attaches diagnostic
-    // resources; install the same service task as start_diagnostics.
-    let app = &mut harness.nodes[0].app;
-    let diagnostic_scope = scope(Duration::from_secs(30)).unwrap();
-    app.diagnostic_scope = Some(diagnostic_scope.clone());
-    let telemetry = app.telemetry.clone();
-    let listen = app.diagnostics_address;
-    app.diagnostic_task = Some(Box::pin(async move {
-        telemetry.serve(listen, &diagnostic_scope).await
-    }));
-    harness.tick();
-    let reactor = harness.nodes[0].runtime.reactor.clone();
-    let limit = harness.nodes[0].config.limits.queue_entries.get();
-    let address = SocketAddress::Inet(harness.nodes[0].config.diagnostics_listen);
-    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-    for round in 0..4 {
-        // Complete the existing diagnostic accept, then fill the ordinary
-        // partition before the service consumes that CQE and submits its receive.
-        let probe = sim.connect(address.clone()).unwrap();
-        let peer = sim
-            .connect(SocketAddress::Inet(harness.nodes[0].config.peer_listen))
-            .unwrap();
-        reactor.poll_budgeted(128).unwrap();
-        reactor.poll_budgeted(128).unwrap();
-        let pressure_scope = scope(Duration::from_secs(30)).unwrap();
-        let (reader, _writer) = sim.socket_pair();
-        let reader = Rc::new(reader);
-        let mut pressure = Vec::new();
-        loop {
-            let mut wait = reactor.readiness(reader.clone(), libc::POLLIN as u32, &pressure_scope);
-            match wait.as_mut().poll(&mut cx) {
-                Poll::Pending => pressure.push(wait),
-                Poll::Ready(Err(Error::Overloaded)) => break,
-                _ => panic!("unexpected pressure result"),
-            }
-        }
-        assert!(!pressure.is_empty());
-        let ordinary_in_flight = reactor.in_flight();
-        assert!(ordinary_in_flight < limit);
-        for _ in 0..32 {
-            harness.nodes[0].app.poll_budgeted(&mut cx, 64).unwrap();
-            assert!(reactor.in_flight() >= ordinary_in_flight);
-            assert!(reactor.in_flight() <= limit);
-            assert!(harness.nodes[0].app.diagnostic_task.is_some());
-            assert!(harness.nodes[0].app.peer_task.is_some());
-        }
-        drop(probe);
-        drop(peer);
-        pressure_scope.cancel().unwrap();
-        drop(pressure);
-        for _ in 0..32 {
-            harness.tick();
-        }
-        for path in ["/readyz", "/metrics"] {
-            let socket = sim.connect(address.clone()).unwrap();
-            let request = format!("GET {path} HTTP/1.1\r\nHost: local\r\n\r\n");
-            assert_eq!(
-                handle(&socket).send(request.as_bytes()).unwrap(),
-                request.len()
-            );
-            let mut response = Vec::new();
-            let mut closed = false;
-            for _ in 0..1000 {
-                harness.tick();
-                let mut bytes = [0; 4096];
-                match handle(&socket).recv(&mut bytes) {
-                    Ok(0) => {
-                        closed = true;
-                        break;
-                    }
-                    Ok(count) => response.extend_from_slice(&bytes[..count]),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => (),
-                    Err(error) => panic!("{error}"),
-                }
-            }
-            assert!(closed, "round {round} {path} stalled");
-            assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"), "{response:?}");
-        }
-        assert!(reactor.in_flight() < limit);
-    }
-    let worker = &mut harness.nodes[0].workers[0];
-    worker.app.stop_admission().unwrap();
-    worker
-        .app
-        .diagnostic_scope
-        .as_ref()
-        .unwrap()
-        .cancel()
-        .unwrap();
-    for _ in 0..32 {
-        worker.runtime.reactor.poll_budgeted(128).unwrap();
-        worker.app.poll_budgeted(&mut cx, 64).unwrap();
-    }
-    assert!(worker.app.diagnostic_task.is_none());
-    assert!(worker.app.peer_task.is_none());
-    assert_eq!(reactor.in_flight(), 0);
-}
-
-#[test]
-fn healthy_relayed_page_reads_opaque_opt_in() {
-    healthy_relayed_page_reads_with_mode(true);
-}
-
-fn healthy_relayed_page_reads_with_mode(opaque: bool) {
-    let sim = Simulation::new();
-    let _os = sim.enter();
-    let clock = SimulationClock::new(71);
-    let environment = clock.environment(0);
-    let _time = environment.enter();
-    let _strict = crate::runtime::environment::require_simulated();
-    let mut harness = Harness::new(71, sim, clock, false);
-    harness.opaque_relay = opaque;
-    // Match the deployed 64 MiB per-worker payload budgets. A five-page layer
-    // exceeds resident capacity and forces receive admission to reclaim idle data.
-    harness.payload_regression = true;
-    harness.update(1);
-    for _ in 0..40 {
-        harness.add(None);
-    }
-    for node in &harness.nodes {
-        for worker in &node.workers {
-            assert_eq!(worker.app.peers.opaque_relay(), opaque);
-        }
-    }
-    for node in 0..40 {
-        let mut client = harness.request_on(1, true, false, node);
-        client.first = 0;
-        client.end = client.size;
-        client.request = format!(
-            "GET /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nIf-Match: {}\r\nRange: bytes=0-{}\r\nRacer-Metadata: dst opaque metadata\r\nAuthorization: Bearer dst-fixture\r\nConnection: close\r\n\r\n",
-            key(1), client.tag, client.size - 1,
-        ).into_bytes();
-        harness.exchange(client, false);
-    }
-    assert_eq!(harness.coverage.success, 40);
-    assert_eq!(harness.coverage.failures, 0);
-    assert_eq!(harness.coverage.bytes, 40 * (4 * PAGE_BYTES as usize + 257));
-    assert!(harness.coverage.relay_turns > 0);
-}
-
-#[test]
-fn concurrent_relayed_layers_diagnose_receive_pressure_and_recover() {
-    concurrent_relayed_layers_with_mode(false);
-}
-
-#[test]
-fn concurrent_relayed_layers_opaque_opt_in_pressure_and_recovery() {
-    concurrent_relayed_layers_with_mode(true);
-}
-
-fn concurrent_relayed_layers_with_mode(opaque: bool) {
-    let sim = Simulation::new();
-    let _os = sim.enter();
-    let clock = SimulationClock::new(73);
-    let environment = clock.environment(0);
-    let _time = environment.enter();
-    let _strict = crate::runtime::environment::require_simulated();
-    let mut harness = Harness::new(73, sim, clock, false);
-    harness.concurrent_layers = true;
-    harness.opaque_relay = opaque;
-    for object in 1..=4 {
-        harness.update(object);
-    }
-    for _ in 0..40 {
-        harness.add(None);
-    }
-    // Exercise success, then controlled receive pressure after success headers,
-    // then recovery on the same graphs, identities, disk, and connections.
-    for pressure in [false, true, false] {
-        let mut clients: Vec<_> = (1..=4).map(|object| {
-            let mut client = harness.request_on(object, true, false, 0);
-            client.first = 0;
-            client.end = client.size;
-            client.request = format!("GET /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nIf-Match: {}\r\nRange: bytes=0-{}\r\nRacer-Metadata: dst opaque metadata\r\nAuthorization: Bearer dst-fixture\r\nConnection: close\r\n\r\n", key(object), client.tag, client.size - 1).into_bytes();
-            client
-        }).collect();
-        let mut charges = Vec::new();
-        let mut injected = false;
-        let before = harness.coverage.failures;
-        for _ in 0..MAX_TURNS {
-            harness.tick();
-            for client in &mut clients {
-                if !client.done && client.poll() {
-                    harness.check(client, pressure);
-                    client.fd.take();
-                    client.done = true;
-                }
-            }
-            if pressure
-                && !injected
-                && clients
-                    .iter()
-                    .any(|client| client.response.len() > 32768 && !client.done)
-            {
-                for node in &harness.nodes {
-                    for worker in &node.workers {
-                        worker.app.memory.evict_idle(usize::MAX).unwrap();
-                        worker.runtime.admission.reclaim_buffers();
-                        let admission = &worker.runtime.admission;
-                        let free = admission.limit(ResourceClass::Ciphertext)
-                            - admission.used(ResourceClass::Ciphertext);
-                        if free != 0 {
-                            charges.push(
-                                admission
-                                    .reserve(None, ResourceClass::Ciphertext, free)
-                                    .unwrap(),
-                            );
-                        }
-                    }
-                }
-                injected = true;
-            }
-            if clients.iter().all(|client| client.done) {
-                break;
-            }
-        }
-        assert!(
-            clients.iter().all(|client| client.done),
-            "concurrent layer reads stalled"
-        );
-        if pressure {
-            assert!(injected);
-            assert!(harness.coverage.failures > before);
-            let mut diagnostics = String::new();
-            for node in &harness.nodes {
-                node.app.telemetry.failures.write(&mut diagnostics).unwrap();
-            }
-            assert!(
-                diagnostics.contains("stage=Admission error=Overloaded"),
-                "{diagnostics}"
-            );
-            assert!(diagnostics.contains("stage=NextSlice"), "{diagnostics}");
-            assert!(diagnostics.contains("class: Ciphertext"), "{diagnostics}");
-            assert!(
-                diagnostics.contains("stage=CandidateResponse")
-                    || diagnostics.contains("stage=PeerReceiveAdmission"),
-                "{diagnostics}"
-            );
-        } else {
-            assert_eq!(harness.coverage.failures, before);
-        }
-        drop(charges);
-        harness.settle();
-    }
-    assert!(harness.coverage.secondary_worker_turns > 0);
-    assert!(harness.coverage.relay_turns > 0);
-    assert_eq!(harness.coverage.success, 8);
 }
 
 fn replay(seed: u64, steps: usize, native: bool) -> Coverage {

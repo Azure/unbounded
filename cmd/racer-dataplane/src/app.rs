@@ -85,7 +85,7 @@ use std::{
 };
 
 pub(crate) mod caches;
-mod health;
+mod lifecycle;
 mod native;
 #[cfg(test)]
 mod peer_tests;
@@ -116,7 +116,7 @@ pub struct NodeState {
     checkpoint: Mutex<CheckpointCut>,
     periodic_checkpoint: Mutex<CheckpointCut>,
     recovery: Mutex<recovery::RecoveryCut>,
-    observations: health::Observations,
+    observations: lifecycle::Observations,
     native: native::NativePairs,
     cache_cut: Mutex<caches::CacheCut>,
 }
@@ -168,7 +168,7 @@ impl NodeState {
             checkpoint: Mutex::new(CheckpointCut::default()),
             periodic_checkpoint: Mutex::new(CheckpointCut::default()),
             recovery: Mutex::new(recovery::RecoveryCut::default()),
-            observations: health::Observations::default(),
+            observations: lifecycle::Observations::default(),
             native: native::NativePairs::default(),
             cache_cut: Mutex::new(caches::CacheCut::default()),
         })
@@ -989,167 +989,6 @@ impl WorkerApplication {
             control_scope: None,
             next_health: crate::runtime::environment::now(),
         })
-    }
-
-    pub fn start<'a>(&'a mut self, startup: &'a RequestScope) -> Operation<'a, ()> {
-        let environment = self.environment.clone();
-        let drivers = self.drivers.clone();
-        Box::pin(environment.scope(drivers.scope(async move {
-            startup.check()?;
-            if self.started || self.stopping {
-                return Err(Error::InvalidConfiguration);
-            }
-            // The authenticated node identity was installed before this graph existed.
-            self.keys.signing_identity()?;
-            let alignment = self.store.writer.open().await?;
-            let slabs = self.store.writer.slabs();
-            let geometry = CheckpointGeometry::new(
-                slabs.slab_bytes(),
-                slabs.segment_bytes(),
-                slabs.slab_bytes() / slabs.segment_bytes(),
-                alignment,
-            )?;
-            self.store.recovery.configure_geometry(geometry)?;
-            self.store.checkpoint.configure_geometry(geometry)?;
-            let (payload, tail) = geometry.payload_capacity(
-                self.store.eviction.reserve(),
-                self.store.writer.index().page_capacity(),
-            )?;
-            self.telemetry
-                .metrics
-                .add_gauge(Gauge::EffectivePayloadBytes, payload);
-            self.telemetry
-                .metrics
-                .add_gauge(Gauge::SegmentTailBytes, tail);
-            self.telemetry.metrics.add_gauge(
-                Gauge::DiskPageEntries,
-                self.store.writer.index().page_capacity() as u64,
-            );
-            self.endpoint = Some(
-                self.directory
-                    .install(self.worker, self.coordinator.clone())?,
-            );
-            let node = self
-                .node
-                .as_ref()
-                .ok_or(Error::InvalidConfiguration)?
-                .clone();
-            node.prepared.fetch_add(1, Ordering::Release);
-            self.attach_cache_adapter();
-            if let Some(control) = self.control.clone() {
-                let identity = loop {
-                    match control.start(startup).await {
-                        Ok(identity) => break identity,
-                        Err(
-                            Error::Io
-                            | Error::Unavailable
-                            | Error::Overloaded
-                            | Error::DeadlineExceeded,
-                        ) => {
-                            startup.check()?;
-                            let io = ReactorControlIo::new(self.runtime.reactor.clone());
-                            crate::control::transport::ControlIo::sleep(
-                                &io,
-                                control
-                                    .next_attempt()
-                                    .unwrap_or_else(crate::runtime::environment::now),
-                                startup,
-                            )
-                            .await?;
-                        }
-                        Err(error) => return Err(error),
-                    }
-                };
-                if identity.node() != self.keys.node() {
-                    return Err(Error::NodeIdentityChanged);
-                }
-                control.activate_identity()?;
-                // Accept a complete compatible first snapshot before any listener.
-                while self.snapshots.current().is_err() {
-                    startup.check()?;
-                    let mut progress = control.progress(startup);
-                    let result = std::future::poll_fn(|cx| {
-                        self.poll_keyring(cx)?;
-                        self.poll_cache_preparation(cx)?;
-                        let result = progress.as_mut().poll(cx).map(|r| r.map(|_| ()));
-                        if matches!(result, Poll::Ready(Err(_))) {
-                            return result;
-                        }
-                        // Progress can install the prepared first snapshot while
-                        // awaiting the next long poll. Startup depends on that
-                        // local commit, not on another controller publication.
-                        startup.check()?;
-                        if self.snapshots.current().is_ok() {
-                            Poll::Ready(Ok(()))
-                        } else {
-                            result
-                        }
-                    })
-                    .await;
-                    match result {
-                        Ok(_) => (),
-                        Err(
-                            Error::Io
-                            | Error::Unavailable
-                            | Error::Overloaded
-                            | Error::DeadlineExceeded,
-                        ) => {
-                            let io = ReactorControlIo::new(self.runtime.reactor.clone());
-                            crate::control::transport::ControlIo::sleep(
-                                &io,
-                                crate::runtime::environment::now() + Duration::from_millis(100),
-                                startup,
-                            )
-                            .await?;
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-            }
-            std::future::poll_fn(|cx| {
-                startup.check()?;
-                self.poll_cache_preparation(cx)?;
-                if STOP_REQUESTED.load(Ordering::Relaxed) {
-                    return Poll::Ready(Err(Error::Cancelled));
-                }
-                if node.prepared.load(Ordering::Acquire) == node.count
-                    && self.snapshots.current().is_ok()
-                {
-                    Poll::Ready(Ok(()))
-                } else {
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
-            })
-            .await?;
-            // Recovery must consult the accepted cache UID set, not only secrets.
-            self.recover_node(geometry, startup).await?;
-            self.refresh_snapshot(startup)?;
-            self.activate_native(startup).await?;
-            std::future::poll_fn(|cx| Poll::Ready(self.start_diagnostics(cx))).await?;
-            self.task_scope = Some(scope(Duration::from_secs(365 * 24 * 3600))?);
-            if self.control.is_some() {
-                let listener_scope = scope(Duration::from_secs(365 * 24 * 3600))?;
-                let peers = self.peers.clone();
-                let peer_scope = listener_scope.clone();
-                let address = self.peer_address;
-                self.peer_task = Some(Box::pin(
-                    async move { peers.listen(address, &peer_scope).await },
-                ));
-                self.listener_scope = Some(listener_scope);
-                // The first poll actually binds the socket. A failed bind is a
-                // startup error, never a successful readiness transition.
-                if let Some(result) =
-                    std::future::poll_fn(|cx| Poll::Ready(poll_task(&mut self.peer_task, cx))).await
-                {
-                    result?;
-                    return Err(Error::Unavailable);
-                }
-            }
-            self.started = true;
-            self.observe_health()?;
-            Ok(())
-        })))
     }
 
     fn refresh_snapshot(&mut self, current_scope: &RequestScope) -> Result<()> {

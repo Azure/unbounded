@@ -11,11 +11,11 @@ this item: that function changes images and other configuration.
 The source default is 2 (`cmd/racer-dataplane/src/config.rs:231`). The cap is
 retained per worker, not divided among workers (assertions in
 `cmd/racer-dataplane/src/app_native.rs:503-510`), and constructs the worker's HTTP
-pool (`cmd/racer-dataplane/src/app.rs:647-659`). Peer transfer reaches immediate
+pool (`cmd/racer-dataplane/src/app.rs:655-668`). Peer transfer reaches immediate
 checkout (`cmd/racer-dataplane/src/peer/transfer.rs:287-293`); an active endpoint at
 its cap returns `Overloaded` without a wait (`cmd/racer-dataplane/src/http/pool.rs:494-499`).
 The test at `http/pool.rs:762-773` specifically asserts immediate peer overload.
-RDMA sessions also use this cap (`app.rs:726-734`).
+RDMA sessions also use this cap (`app.rs:738-746`).
 
 The fresh preparation snapshot found both named DaemonSets inheriting 16 from
 `racer-dataplane-config`, with no explicit env value. The change adds explicit 4
