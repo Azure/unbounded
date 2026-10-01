@@ -129,7 +129,6 @@ fn coordinator(
         })
         .unwrap();
     let mut deps = f.fill.dependencies.clone();
-    deps.peers = peers.clone();
     deps.candidates = Rc::new(CandidatePolicy::new(
         signer.node().clone(),
         Rc::new(Placement::new(64)),
@@ -140,7 +139,6 @@ fn coordinator(
     let metadata = Rc::new(MetadataService::new(
         fill.dependencies.candidates.clone(),
         f.origin.clone(),
-        peers,
         fill.dependencies.credentials.clone(),
         32,
         MetadataDependencies {
@@ -159,7 +157,7 @@ fn coordinator(
         )),
         Duration::from_secs(30),
     ));
-    let streams = Rc::new(RangeStreams::new(fill.clone(), owners.clone(), delivery, 2));
+    let streams = Rc::new(RangeStreams::new(owners.clone(), delivery, 2));
     let local = Rc::new(Coordinator::new(
         snapshots,
         metadata,

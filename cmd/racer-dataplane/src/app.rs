@@ -534,7 +534,6 @@ pub struct WorkerApplication {
     peers: Rc<PeerServer>,
     coordinator: Rc<Coordinator>,
     metadata: Rc<MetadataService>,
-    dispatcher: Rc<Dispatcher>,
     /// Same table as Fill; the worker drives abandoned work without user futures.
     flights: Rc<Flights>,
     rdma: Option<Rc<RdmaTransfer>>,
@@ -840,7 +839,6 @@ impl WorkerApplication {
                 buffers,
                 disk,
                 writer,
-                peers: requester.clone(),
                 origin: origin.clone(),
                 candidates: candidates.clone(),
                 flights: flights.clone(),
@@ -854,7 +852,6 @@ impl WorkerApplication {
         let metadata = Rc::new(MetadataService::new(
             candidates,
             origin,
-            requester.clone(),
             credentials.clone(),
             limits.metadata_entries.get(),
             MetadataDependencies {
@@ -865,7 +862,6 @@ impl WorkerApplication {
         ));
         let streams = Rc::new(
             RangeStreams::new(
-                fill.clone(),
                 node.workers.clone(),
                 delivery.clone(),
                 config.limits.range_window_pages.get(),
@@ -891,11 +887,7 @@ impl WorkerApplication {
             )
             .with_network(network.clone()),
         );
-        let dispatcher = Rc::new(Dispatcher::new(
-            worker,
-            node.workers.clone(),
-            coordinator.clone(),
-        ));
+        let dispatcher = Rc::new(Dispatcher::new(node.workers.clone()));
         let peers = PeerServer::new(
             io.clone(),
             forwarding,
@@ -925,7 +917,7 @@ impl WorkerApplication {
         let responses =
             Rc::new(Responses::new(io.clone(), delivery).with_observer(admission.observer()));
         let clients = ClientListeners::new(
-            dispatcher.clone(),
+            coordinator.clone(),
             RequestParser::new(config.limits.header_bytes.get()),
             responses,
             io,
@@ -960,7 +952,6 @@ impl WorkerApplication {
             peers,
             coordinator,
             metadata,
-            dispatcher,
             flights,
             rdma,
             devices,
@@ -2001,11 +1992,6 @@ pub(crate) mod tests {
             assert!(
                 second.control.is_none(),
                 "only one worker enrolls and publishes"
-            );
-            assert!(
-                Rc::strong_count(&worker.dispatcher) == 3
-                    && Rc::strong_count(&worker.coordinator) == 2,
-                "client and peer share one dispatcher and local coordinator"
             );
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             assert_eq!(worker.poll_budgeted(&mut cx, 0), Err(Error::Unavailable));

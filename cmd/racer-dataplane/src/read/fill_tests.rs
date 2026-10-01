@@ -1,4 +1,5 @@
 use super::*;
+use crate::peer::PeerClient;
 #[path = "hot_read_tests.rs"]
 mod hot_reads;
 #[path = "fill_peer_tests.rs"]
@@ -290,7 +291,6 @@ fn fixture_with_availability(
         buffers,
         disk,
         writer,
-        peers,
         origin: origin.clone(),
         candidates,
         flights,
@@ -365,7 +365,6 @@ fn abandoned_acquisition_preserves_peer_scope(metadata: bool) {
                     receive: RefCell::new(Some(receive)),
                     calls: Cell::new(0),
                 }),
-                f.fill.dependencies.peers.clone(),
                 f.fill.dependencies.credentials.clone(),
                 4,
                 MetadataDependencies {
@@ -971,7 +970,6 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
         let metadata = Rc::new(MetadataService::new(
             fill.dependencies.candidates.clone(),
             f.origin.clone(),
-            fill.dependencies.peers.clone(),
             fill.dependencies.credentials.clone(),
             16,
             MetadataDependencies {
@@ -989,7 +987,7 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
             Rc::new(PipePool::new(admission, reactor)),
             Duration::from_secs(10),
         ));
-        let streams = Rc::new(RangeStreams::new(fill.clone(), owners.clone(), delivery, 1));
+        let streams = Rc::new(RangeStreams::new(owners.clone(), delivery, 1));
         let coordinator = Rc::new(Coordinator::new(
             snapshots,
             metadata,
@@ -1195,7 +1193,6 @@ fn bootstrap_rejection_re_elects_and_version_changes_never_mix_pages() {
     let service = MetadataService::new(
         f.fill.dependencies.candidates.clone(),
         origin.clone(),
-        f.fill.dependencies.peers.clone(),
         f.fill.dependencies.credentials.clone(),
         8,
         MetadataDependencies {
@@ -1352,7 +1349,6 @@ fn bootstrap_after_catalog_eviction_checks_cached_content_type_and_preserves_fre
             let service = MetadataService::new(
                 f.fill.dependencies.candidates.clone(),
                 origin.clone(),
-                f.fill.dependencies.peers.clone(),
                 f.fill.dependencies.credentials.clone(),
                 4,
                 MetadataDependencies {
@@ -1457,7 +1453,6 @@ fn blocked_metadata_leader_and_follower_notify_without_spinning() {
                 receive: RefCell::new(Some(receive)),
                 calls: Cell::new(0),
             }),
-            f.fill.dependencies.peers.clone(),
             f.fill.dependencies.credentials.clone(),
             4,
             MetadataDependencies {
@@ -1563,7 +1558,6 @@ fn metadata_deadline_wakes_parked_follower_without_polling_gated_leader() {
         let service = MetadataService::new(
             f.fill.dependencies.candidates.clone(),
             origin.clone(),
-            f.fill.dependencies.peers.clone(),
             f.fill.dependencies.credentials.clone(),
             1,
             MetadataDependencies {
@@ -2242,7 +2236,6 @@ fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
     let service = MetadataService::new(
         deps.candidates.clone(),
         deps.origin.clone(),
-        deps.peers.clone(),
         deps.credentials.clone(),
         64,
         MetadataDependencies {

@@ -16,10 +16,7 @@ use crate::{
         PageNumber, StrongEtag,
     },
     origin::Origin,
-    peer::{
-        PeerClient,
-        wire::{FetchMode, Operation as PeerOperation, PeerResponse},
-    },
+    peer::wire::{FetchMode, Operation as PeerOperation, PeerResponse},
     runtime::deadline::RequestScope,
     security::credentials::CredentialCrypto,
     store::index::Index,
@@ -382,7 +379,6 @@ impl MetadataService {
     pub fn new(
         candidates: Rc<CandidatePolicy>,
         origin: Rc<dyn Origin>,
-        _peers: Rc<dyn PeerClient>,
         credentials: Rc<CredentialCrypto>,
         capacity: usize,
         storage: MetadataDependencies,

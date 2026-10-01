@@ -1025,7 +1025,7 @@ fn raw_uds_acquisition_failure(seed_first: bool) -> Vec<u8> {
             Rc::new(PipePool::new(rig.admission.clone(), rig.reactor.clone())),
             Duration::from_secs(5),
         ));
-        let streams = RangeStreams::from_directory(directory, delivery, 1);
+        let streams = RangeStreams::new(directory, delivery, 1);
         let seed = seed_first.then(|| authenticated_first_page(&rig, metadata.clone(), &scope));
         let mut stream = streams
             .open_with_budget(

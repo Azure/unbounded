@@ -20,10 +20,7 @@ use crate::{
     },
     model::{ObjectMetadata, OriginContext, PAGE_BYTES, PageId, ResourceClass, VersionMetadata},
     origin::Origin,
-    peer::{
-        PeerClient,
-        wire::{FetchMode, Operation as PeerOperation, PeerResponse},
-    },
+    peer::wire::{FetchMode, Operation as PeerOperation, PeerResponse},
     runtime::{
         admission::{Admission, Reservation},
         deadline::RequestScope,
@@ -42,7 +39,6 @@ pub struct FillDependencies {
     pub buffers: Rc<BufferPool>,
     pub disk: Rc<StoreReader>,
     pub writer: Rc<StoreWriter>,
-    pub peers: Rc<dyn PeerClient>,
     pub origin: Rc<dyn Origin>,
     pub candidates: Rc<CandidatePolicy>,
     pub flights: Rc<Flights>,
@@ -1330,6 +1326,7 @@ mod integration_tests;
 mod tests {
     use super::*;
     use crate::model::{CacheId, CacheKey, ObjectId, ObjectVersion, StrongEtag};
+    use crate::peer::PeerClient;
     #[test]
     fn retained_metadata_never_substitutes_a_version_or_conflicting_length() {
         let version = ObjectVersion {
@@ -1537,7 +1534,6 @@ mod tests {
             buffers,
             disk,
             writer,
-            peers,
             origin: origin.clone(),
             candidates,
             flights: Rc::new(Flights::new(admission.clone())),

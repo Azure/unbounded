@@ -193,7 +193,7 @@ impl Service {
                             .parse(&CacheId(CACHE.into()), received.value)?;
                         let kind = request.kind.clone();
                         requests.set(requests.get() + 1);
-                        match rig.dispatcher.read(request, &scope).await {
+                        match rig.coordinator.read(request, &scope).await {
                             Ok(response) => {
                                 rig.responses.validate(&kind, &response)?;
                                 let sent = rig

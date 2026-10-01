@@ -28,7 +28,7 @@ use racer_dataplane::{
     read::{
         Coordinator, ReadService,
         candidates::CandidatePolicy,
-        dispatch::{Dispatcher, WorkerDirectory, WorkerEndpoint},
+        dispatch::{WorkerDirectory, WorkerEndpoint},
         fill::{Fill, FillDependencies},
         flight::Flights,
         metadata::{MetadataDependencies, MetadataService},
@@ -372,7 +372,7 @@ struct Rig {
     flights: Rc<Flights>,
     writer: Rc<StoreWriter>,
     memory: Rc<MemoryCache>,
-    dispatcher: Rc<Dispatcher>,
+    coordinator: Rc<Coordinator>,
     io: Rc<HttpIo>,
     responses: Rc<Responses>,
     pipes: Rc<PipePool>,
@@ -565,7 +565,6 @@ impl Rig {
             buffers,
             disk,
             writer: writer.clone(),
-            peers: peers.clone(),
             origin: origin.clone(),
             candidates: candidates.clone(),
             flights: flights.clone(),
@@ -577,7 +576,6 @@ impl Rig {
         let metadata = Rc::new(MetadataService::new(
             candidates,
             origin,
-            peers,
             credentials.clone(),
             entries,
             MetadataDependencies {
@@ -594,12 +592,7 @@ impl Rig {
             // two-second client stall while the fixture executor is occupied.
             TIMEOUT,
         ));
-        let streams = Rc::new(RangeStreams::new(
-            fill.clone(),
-            directory.clone(),
-            delivery.clone(),
-            2,
-        ));
+        let streams = Rc::new(RangeStreams::new(directory.clone(), delivery.clone(), 2));
         let coordinator = Rc::new(Coordinator::new(
             snapshots,
             metadata,
@@ -615,7 +608,6 @@ impl Rig {
             coordinator.clone(),
             snapshot.membership.clone(),
         );
-        let dispatcher = Rc::new(Dispatcher::new(worker, directory, coordinator));
         let client_io = Rc::new(HttpIo::for_clients(reactor.clone(), admission.clone()));
         let responses = Rc::new(Responses::new(client_io.clone(), delivery));
         Self {
@@ -629,7 +621,7 @@ impl Rig {
             flights,
             writer,
             memory,
-            dispatcher,
+            coordinator,
             io: client_io,
             responses,
             pipes,
@@ -682,7 +674,7 @@ impl Rig {
         let received = self.io.receive_head(lease, scope).await?;
         let request = RequestParser::new(32768).parse(&CacheId(CACHE.into()), received.value)?;
         let kind = request.kind.clone();
-        match self.dispatcher.read(request, scope).await {
+        match self.coordinator.read(request, scope).await {
             Ok(response) => {
                 self.responses.validate(&kind, &response)?;
                 if kind.is_head() {

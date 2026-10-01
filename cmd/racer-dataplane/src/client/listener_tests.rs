@@ -371,7 +371,7 @@ impl Fixture {
     fn connect(&self) -> UnixStream {
         // /proc keeps sun_path short even in deeply nested CI worktrees.
         let directory = File::open(self.socket().parent().unwrap()).unwrap();
-        let stream = UnixStream::connect(anchored(&directory).join("socket")).unwrap();
+        let stream = UnixStream::connect(file_path(&directory).join("socket")).unwrap();
         stream.set_nonblocking(true).unwrap();
         stream
     }
@@ -591,7 +591,7 @@ fn endpoint_ownership_rejects_unsafe_locks_and_foreign_sockets() {
             }
             _ => {
                 let dir = File::open(&directory).unwrap();
-                foreign = Some(UnixListener::bind(anchored(&dir).join("socket")).unwrap());
+                foreign = Some(UnixListener::bind(file_path(&dir).join("socket")).unwrap());
                 if kind == "foreign-stale" {
                     foreign.take();
                 }
@@ -613,8 +613,8 @@ fn lock_replacement_and_live_witness_without_lock_are_refused() {
     let fixture = Fixture::new();
     fixture.reconcile(&[definition()]).unwrap();
     let directory = File::open(fixture.socket().parent().unwrap()).unwrap();
-    let lock = anchored(&directory).join(".racer-client.lock");
-    fs::rename(&lock, anchored(&directory).join("old-lock")).unwrap();
+    let lock = file_path(&directory).join(".racer-client.lock");
+    fs::rename(&lock, file_path(&directory).join("old-lock")).unwrap();
     assert!(EndpointOwner::acquire(&directory).is_err());
     let mut changed = definition();
     changed.id = CacheId("00000000-0000-4000-8000-000000000003".into());
@@ -637,7 +637,8 @@ fn recovery_preserves_stale_foreign_inode_and_recovers_unpublished_witness() {
     fs::create_dir_all(&directory).unwrap();
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
     let directory = File::open(directory).unwrap();
-    let witness = anchored(&directory).join(".racer-owned-.racer-00000000000000000000000000000000");
+    let witness =
+        file_path(&directory).join(".racer-owned-.racer-00000000000000000000000000000000");
     let stale = UnixListener::bind(&witness).unwrap();
     // Parallel crash-owner tests spawn children. A concurrent fork can hold
     // this CLOEXEC descriptor until exec, so dropping our alias alone does
@@ -648,7 +649,7 @@ fn recovery_preserves_stale_foreign_inode_and_recovers_unpublished_witness() {
         0
     );
     drop(stale);
-    let socket = anchored(&directory).join("socket");
+    let socket = file_path(&directory).join("socket");
     drop(UnixListener::bind(&socket).unwrap());
     let inode = fs::metadata(&socket).unwrap().ino();
     assert_eq!(fixture.reconcile(&[definition()]), Err(Error::Io));
@@ -1093,7 +1094,7 @@ fn actual_uds_nonempty_range_and_late_failure_truncates() {
         // causes a real acquisition failure only after the first slice escaped.
         fixture.listeners.reads = Rc::new(Bodies {
             admission,
-            streams: RangeStreams::from_directory(directory, delivery, 1).with_observer(observer),
+            streams: RangeStreams::new(directory, delivery, 1).with_observer(observer),
             late_failure,
             unseeded: false,
         });
@@ -1259,7 +1260,7 @@ fn body_fixture_with_large_page(
     ));
     fixture.listeners.reads = Rc::new(Bodies {
         admission,
-        streams: RangeStreams::from_directory(directory, delivery, 1),
+        streams: RangeStreams::new(directory, delivery, 1),
         late_failure: large_page,
         unseeded,
     });

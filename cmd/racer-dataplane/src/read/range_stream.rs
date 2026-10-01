@@ -1,11 +1,7 @@
 //! Shared compact subscription demand with independently leased page slices.
 //! A stream pins its version and length once. A late error terminates that stream;
 //! it cannot replace headers or reopen against a newer version.
-use super::{
-    dispatch::WorkerDirectory,
-    fill::{Fill, PageResult},
-    flight::AcquisitionBudget,
-};
+use super::{dispatch::WorkerDirectory, fill::PageResult, flight::AcquisitionBudget};
 use crate::telemetry::failures::{Detail, Failure, Observer, Stage};
 use crate::{
     error::{Error, Operation, Result},
@@ -76,9 +72,6 @@ enum WindowPage {
 
 pub struct RangeStreams {
     observer: Observer,
-    // Retains the same worker-local Fill graph as the coordinator. Actual page
-    // acquisition always goes through the stable directory owner.
-    _fill: Option<Rc<Fill>>,
     directory: Arc<WorkerDirectory>,
     delivery: Rc<Delivery>,
     window_pages: usize,
@@ -111,30 +104,12 @@ pub struct RangeStream {
 }
 impl RangeStreams {
     pub fn new(
-        fill: Rc<Fill>,
         directory: Arc<WorkerDirectory>,
         delivery: Rc<Delivery>,
         window_pages: usize,
     ) -> Self {
         Self {
             observer: Observer::default(),
-            _fill: Some(fill),
-            directory,
-            delivery,
-            window_pages,
-        }
-    }
-    /// Construct delivery against an installed directory without retaining an
-    /// additional Fill handle. Seeded pages undergo the same full validation;
-    /// every unseeded page still goes through its stable directory owner.
-    pub fn from_directory(
-        directory: Arc<WorkerDirectory>,
-        delivery: Rc<Delivery>,
-        window_pages: usize,
-    ) -> Self {
-        Self {
-            observer: Observer::default(),
-            _fill: None,
             directory,
             delivery,
             window_pages,
@@ -775,7 +750,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let streams = RangeStreams::from_directory(
+        let streams = RangeStreams::new(
             directory.clone(),
             Rc::new(Delivery::new(pipes.clone(), Duration::from_secs(30))),
             1,
@@ -900,7 +875,7 @@ mod tests {
                 crate::test_support::cluster::config(false).limits,
             ));
             let reactor = Rc::new(Reactor::new(admission.clone()));
-            let streams = RangeStreams::from_directory(
+            let streams = RangeStreams::new(
                 Arc::new(
                     WorkerDirectory::new(
                         Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),

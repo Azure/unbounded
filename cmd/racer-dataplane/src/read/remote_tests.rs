@@ -49,7 +49,6 @@ fn node(n: usize) -> NodeId {
 }
 struct Identity {
     keys: Rc<Keyring>,
-    certificates: Rc<Certificates>,
     signatures: Rc<Signatures>,
 }
 fn identities(nodes: &[NodeId]) -> Vec<Identity> {
@@ -103,11 +102,7 @@ fn identities(nodes: &[NodeId]) -> Vec<Identity> {
             keys.install_signing_identity(Arc::new(identity)).unwrap();
             let certificates = Rc::new(Certificates::new(cluster, keys.clone()));
             let signatures = Rc::new(Signatures::new(keys.clone(), certificates.clone()));
-            Identity {
-                keys,
-                certificates,
-                signatures,
-            }
+            Identity { keys, signatures }
         })
         .collect()
 }
@@ -998,7 +993,6 @@ fn metadata_coordinator_with_newer_publication(
         buffers,
         disk,
         writer,
-        peers: peers.clone(),
         origin: origin.clone(),
         candidates: candidates.clone(),
         flights: Rc::new(super::flight::Flights::new(admission.clone())),
@@ -1010,7 +1004,6 @@ fn metadata_coordinator_with_newer_publication(
     let metadata = Rc::new(super::metadata::MetadataService::new(
         candidates,
         origin,
-        peers,
         credentials.clone(),
         16,
         super::metadata::MetadataDependencies {
@@ -1024,7 +1017,6 @@ fn metadata_coordinator_with_newer_publication(
         Duration::from_secs(10),
     ));
     let streams = Rc::new(super::range_stream::RangeStreams::new(
-        fill.clone(),
         owners.clone(),
         delivery,
         2,

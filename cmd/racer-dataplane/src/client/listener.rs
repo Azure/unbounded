@@ -75,18 +75,13 @@ impl AsRawFd for Directory {
         }
     }
 }
-trait Anchor {
-    fn anchor(&self) -> PathBuf;
+fn file_path(file: &File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
 }
-impl Anchor for File {
-    fn anchor(&self) -> PathBuf {
-        PathBuf::from(format!("/proc/self/fd/{}", self.as_raw_fd()))
-    }
-}
-impl Anchor for Directory {
+impl Directory {
     fn anchor(&self) -> PathBuf {
         match self {
-            Self::Real(file) => file.anchor(),
+            Self::Real(file) => file_path(file),
             #[cfg(test)]
             Self::Sim { path, .. } => path.clone(),
         }
@@ -108,7 +103,10 @@ struct BoundListener {
 impl Drop for BoundListener {
     fn drop(&mut self) {
         self.retired.set(true);
-        let path = anchored(&self.directory).join(self.basename.borrow().as_str());
+        let path = self
+            .directory
+            .anchor()
+            .join(self.basename.borrow().as_str());
         #[cfg(test)]
         if let Directory::Sim { sim, .. } = &self.directory {
             if sim.metadata(&path).is_ok_and(|(inode, mode)| {
@@ -130,7 +128,7 @@ impl Drop for BoundListener {
             }
         }
         if let Some(witness) = &self.witness {
-            let path = anchored(&self.directory).join(witness);
+            let path = self.directory.anchor().join(witness);
             if fs::symlink_metadata(&path).is_ok_and(|m| {
                 m.file_type().is_socket() && m.dev() == self.device && m.ino() == self.inode
             }) {
@@ -1086,10 +1084,6 @@ impl Drop for PreparedListeners {
     }
 }
 
-fn anchored(directory: &impl Anchor) -> PathBuf {
-    directory.anchor()
-}
-
 fn open_directory(path: &Path) -> Result<File> {
     // Open every component with O_NOFOLLOW, including /run/racer's ancestors.
     let mut directory = OpenOptions::new()
@@ -1172,10 +1166,10 @@ fn bind(
         }
         None => Rc::new(EndpointOwner::acquire(&directory)?),
     };
-    let path = anchored(&directory).join(basename);
+    let path = file_path(&directory).join(basename);
     // Bind the witness first, so every crash after bind leaves recoverable proof.
     let witness = format!(".racer-owned-{basename}");
-    let witness_path = anchored(&directory).join(&witness);
+    let witness_path = file_path(&directory).join(&witness);
     let listener = UnixListener::bind(&witness_path).map_err(|_| Error::Io)?;
     let metadata = fs::symlink_metadata(&witness_path).map_err(|_| Error::Io)?;
     let bound = BoundListener {
@@ -1220,7 +1214,7 @@ fn allow_socket_access(
     let socket = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(anchored(directory).join(basename))
+        .open(directory.anchor().join(basename))
         .map_err(|_| Error::Io)?;
     let metadata = socket.metadata().map_err(|_| Error::Io)?;
     if metadata.dev() != device || metadata.ino() != inode || !metadata.file_type().is_socket() {
@@ -1232,7 +1226,8 @@ fn allow_socket_access(
     }
     // Pod volume mounts control access; every UID/GID with the mount can connect.
     // Apply explicitly so the process umask cannot restrict client access.
-    fs::set_permissions(anchored(&socket), fs::Permissions::from_mode(0o666)).map_err(|_| Error::Io)
+    fs::set_permissions(file_path(&socket), fs::Permissions::from_mode(0o666))
+        .map_err(|_| Error::Io)
 }
 
 fn owns(listener: &BoundListener, basename: &str) -> bool {
@@ -1244,7 +1239,7 @@ fn owns(listener: &BoundListener, basename: &str) -> bool {
                 inode == listener.inode && mode as u32 & libc::S_IFMT == libc::S_IFSOCK
             });
     }
-    fs::symlink_metadata(anchored(&listener.directory).join(basename)).is_ok_and(|metadata| {
+    fs::symlink_metadata(listener.directory.anchor().join(basename)).is_ok_and(|metadata| {
         metadata.file_type().is_socket()
             && metadata.dev() == listener.device
             && metadata.ino() == listener.inode
@@ -1258,7 +1253,7 @@ fn absent(directory: &Directory, basename: &str) -> bool {
             .metadata(&path.join(basename))
             .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
     }
-    fs::symlink_metadata(anchored(directory).join(basename))
+    fs::symlink_metadata(directory.anchor().join(basename))
         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
 }
 
@@ -1352,7 +1347,7 @@ impl EndpointOwner {
             .truncate(false)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-            .open(anchored(directory).join(LOCK))
+            .open(file_path(directory).join(LOCK))
             .map_err(|_| Error::Io)?;
         let metadata = lock.metadata().map_err(|_| Error::Io)?;
         if !metadata.is_file()
@@ -1381,7 +1376,7 @@ impl EndpointOwner {
         let second = directory.metadata().map_err(|_| Error::Io)?;
         let lock = self.lock.metadata().map_err(|_| Error::Io)?;
         let current =
-            fs::symlink_metadata(anchored(directory).join(LOCK)).map_err(|_| Error::Io)?;
+            fs::symlink_metadata(file_path(directory).join(LOCK)).map_err(|_| Error::Io)?;
         if first.dev() != second.dev()
             || first.ino() != second.ino()
             || !current.is_file()
@@ -1395,7 +1390,7 @@ impl EndpointOwner {
     }
 
     fn recover(&self) -> Result<()> {
-        let directory = anchored(&self.directory);
+        let directory = file_path(&self.directory);
         let mut witnesses = Vec::new();
         let mut temporary_paths = Vec::new();
         for entry in fs::read_dir(&directory).map_err(|_| Error::Io)? {

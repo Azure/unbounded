@@ -862,15 +862,6 @@ impl Flights {
             Ok(())
         })
     }
-    pub(crate) fn has_plaintext_reader(&self, leader: &FlightLeader) -> Result<bool> {
-        self.update(|table, wakes| {
-            Ok(self
-                .leader_entry(table, leader, wakes)?
-                .waiters
-                .values()
-                .any(|w| w.plaintext && w.error.is_none()))
-        })
-    }
 
     pub(crate) fn publish_acquired(
         &self,
@@ -1965,60 +1956,5 @@ mod tests {
             first.begin_attempt(deadline, deadline),
             Err(Error::DeadlineExceeded)
         );
-    }
-
-    // Compile the ownership/data path rather than asserting Unimplemented errors.
-    async fn acquisition_api(
-        flights: Rc<Flights>,
-        page: PageId,
-        membership: MembershipLease,
-        context: &OriginContext,
-        scope: &RequestScope,
-        budget: &mut AcquisitionBudget,
-        result: PageResult,
-    ) -> Result<PageResult> {
-        match flights.join(page.clone(), membership, context, scope, budget)? {
-            JoinedFlight::Ciphertext(_) => Err(Error::CorruptRecord),
-            JoinedFlight::Complete(result) => Ok(result),
-            JoinedFlight::Waiter(mut caller) => match caller.wait().await? {
-                AcquisitionEvent::Ciphertext(_) => Err(Error::CorruptRecord),
-                AcquisitionEvent::Complete(result) => Ok(result),
-                AcquisitionEvent::Failed(error) => Err(error),
-                AcquisitionEvent::Lead(leader) => {
-                    let acquisition = caller.acquisition(&leader)?;
-                    let _: &OriginContext = acquisition.origin;
-                    let _: &MembershipLease = acquisition.membership;
-                    acquisition
-                        .budget
-                        .begin_attempt(Instant::now(), acquisition.scope.deadline.0)?;
-                    result.validate_for(&page)?;
-                    flights.publish(leader, result.clone())?;
-                    caller.detach()?;
-                    Ok(result)
-                }
-            },
-        }
-    }
-
-    async fn failure_and_copy_api(
-        flights: Rc<Flights>,
-        leader: FlightLeader,
-        abandoned: FlightLeader,
-        page: PageId,
-        scope: &RequestScope,
-    ) -> Result<Option<PageResult>> {
-        flights.fail(leader, AcquisitionFailure::OriginRejected)?;
-        let ticket = flights.abandon(abandoned)?;
-        flights.finish_draining(ticket).await?;
-        match flights.join_copy(&page, scope)? {
-            JoinedCopy::Ciphertext(_) => Err(Error::CorruptRecord),
-            JoinedCopy::Miss => Ok(None),
-            JoinedCopy::Complete(result) => Ok(Some(result)),
-            JoinedCopy::Waiter(mut waiter) => {
-                let result = waiter.wait().await?;
-                waiter.detach()?;
-                Ok(Some(result.verified()))
-            }
-        }
     }
 }

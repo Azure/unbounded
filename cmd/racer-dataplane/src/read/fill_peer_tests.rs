@@ -151,7 +151,6 @@ fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Ve
         local_deadlines: RefCell::new(Vec::new()),
     });
     let mut dependencies = f.fill.dependencies.clone();
-    dependencies.peers = peers.clone();
     dependencies.candidates = Rc::new(CandidatePolicy::new(local, placement, peers.clone()));
     f.fill = Fill::new(dependencies);
     (peers, ordered)

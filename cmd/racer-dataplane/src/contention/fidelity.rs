@@ -546,7 +546,6 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
         buffers: buffers.clone(),
         disk,
         writer: writer.clone(),
-        peers: peers.clone(),
         origin: Rc::new(NoTransport),
         candidates: Rc::new(CandidatePolicy::new(
             node,

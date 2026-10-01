@@ -1,9 +1,8 @@
 //! Bounded node-local handoffs. Only owned commands and immutable results cross
 //! threads; the coordinator, futures, delivery leases, and streams stay local.
-use super::{Coordinator, ReadResponse, ReadService, fill::PageResult, flight::AcquisitionBudget};
+use super::{Coordinator, fill::PageResult, flight::AcquisitionBudget};
 use crate::runtime::collections::HashMap;
 use crate::{
-    client::request::ClientRequest,
     error::{Error, Operation, Result},
     model::{
         AttemptId, MetadataSelector, ObjectId, ObjectMetadata, ObjectVersion, OriginContext,
@@ -990,29 +989,11 @@ async fn execute(
 }
 
 pub struct Dispatcher {
-    worker: WorkerId,
     directory: Arc<WorkerDirectory>,
-    local: Rc<Coordinator>,
 }
 impl Dispatcher {
-    pub fn new(worker: WorkerId, directory: Arc<WorkerDirectory>, local: Rc<Coordinator>) -> Self {
-        Self {
-            worker,
-            directory,
-            local,
-        }
-    }
-    pub fn worker(&self) -> WorkerId {
-        self.worker
-    }
-}
-impl ReadService for Dispatcher {
-    fn read<'a>(
-        &'a self,
-        request: ClientRequest,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, ReadResponse> {
-        self.local.read(request, scope)
+    pub fn new(directory: Arc<WorkerDirectory>) -> Self {
+        Self { directory }
     }
 }
 impl LocalPageService for Dispatcher {

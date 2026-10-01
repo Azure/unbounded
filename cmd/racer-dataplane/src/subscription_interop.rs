@@ -241,7 +241,6 @@ fn go_sdk_subscription_server() {
         buffers,
         disk,
         writer: writer.clone(),
-        peers: peers.clone(),
         origin: origin.clone(),
         candidates: candidates.clone(),
         flights: Rc::new(Flights::new(admission.clone())),
@@ -253,7 +252,6 @@ fn go_sdk_subscription_server() {
     let metadata = Rc::new(MetadataService::new(
         candidates,
         origin,
-        peers,
         credentials.clone(),
         16,
         MetadataDependencies {
@@ -267,7 +265,6 @@ fn go_sdk_subscription_server() {
         Duration::from_secs(10),
     ));
     let streams = Rc::new(RangeStreams::new(
-        fill.clone(),
         directory.clone(),
         delivery.clone(),
         2,
