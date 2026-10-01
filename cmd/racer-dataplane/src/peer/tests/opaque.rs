@@ -154,7 +154,6 @@ fn exchange(
         Rc::new(Never),
         relay,
     )
-    .with_network(network)
     .with_wire(Rc::new(codec(&admissions[1])))
     .with_signatures(signers[1].clone())
     .with_transfers(transfers)

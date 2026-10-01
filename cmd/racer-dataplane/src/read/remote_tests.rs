@@ -495,7 +495,6 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         }),
         relay,
     )
-    .with_network(destination_network)
     .with_wire(codec)
     .with_signatures(b.signatures.clone());
     let requester = Rc::new(Requester::new(

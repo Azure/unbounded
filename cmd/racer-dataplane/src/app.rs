@@ -895,13 +895,11 @@ impl WorkerApplication {
         )
         .with_subscriptions(node.subscriptions.clone())
         .with_request_timeout(config.request_timeout)
-        .with_network(network.clone())
         .with_opaque_relay(config.opaque_relay)
         .with_wire(wire)
         .with_signatures(signatures)
         .with_transfers(transfers)
-        .with_pipes(pipes.clone())
-        .with_reactor(reactor.clone());
+        .with_pipes(pipes.clone());
         #[cfg(not(test))]
         let distributed = true;
         #[cfg(test)]

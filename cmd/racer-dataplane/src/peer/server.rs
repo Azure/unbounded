@@ -44,10 +44,8 @@ pub struct PeerServer {
     admission: Rc<Admission>,
     local: Rc<dyn LocalPageService>,
     relay: Rc<Relay>,
-    network: Option<Rc<super::PeerNetwork>>,
     wire: Option<Rc<super::wire::SecurityCodec>>,
     signatures: Option<Rc<crate::security::signing::Signatures>>,
-    reactor: Option<Rc<crate::runtime::reactor::Reactor>>,
     transfers: Option<Rc<super::transfer::Transfers>>,
     request_timeout: Duration,
 }
@@ -83,7 +81,7 @@ impl PeerServer {
         Box::pin(async move {
             use futures::{StreamExt, stream::FuturesUnordered};
             scope.check()?;
-            let reactor = self.reactor.as_ref().ok_or(Error::InvalidConfiguration)?;
+            let reactor = self.io.reactor();
             let fd = Rc::new(crate::runtime::reactor::Descriptor::tcp_listener(address)?);
             let mut active = FuturesUnordered::new();
             let maximum = self
@@ -184,10 +182,8 @@ impl PeerServer {
             admission,
             local,
             relay,
-            network: None,
             wire: None,
             signatures: None,
-            reactor: None,
             transfers: None,
             request_timeout: Duration::from_secs(30),
         }
@@ -212,14 +208,6 @@ impl PeerServer {
     }
     pub(crate) fn with_pipes(mut self, pipes: Rc<crate::memory::pipe::PipePool>) -> Self {
         self.pipes = pipes;
-        self
-    }
-    pub fn with_reactor(mut self, reactor: Rc<crate::runtime::reactor::Reactor>) -> Self {
-        self.reactor = Some(reactor);
-        self
-    }
-    pub fn with_network(mut self, network: Rc<super::PeerNetwork>) -> Self {
-        self.network = Some(network);
         self
     }
     pub fn with_wire(mut self, wire: Rc<super::wire::SecurityCodec>) -> Self {
@@ -312,18 +300,16 @@ impl PeerServer {
             };
             let request = self.forwarding.verify_request(request)?;
             let membership = self
+                .relay
                 .network
-                .as_ref()
-                .ok_or(Error::InvalidConfiguration)?
                 .membership(request.request().route.membership);
             let response = match &membership {
                 Ok(membership)
                     if admitted.is_none()
                         && self.opaque_relay()
-                        && request.request().route.destination
-                            != self.network.as_ref().unwrap().local =>
+                        && request.request().route.destination != self.relay.network.local =>
                 {
-                    let network = self.network.as_ref().unwrap();
+                    let network = &self.relay.network;
                     let previous = request
                         .forwarders()
                         .last()
@@ -488,9 +474,8 @@ impl PeerServer {
             scope.check()?;
             let request = self.forwarding.verify_request(request)?;
             let membership = self
+                .relay
                 .network
-                .as_ref()
-                .ok_or(Error::InvalidConfiguration)?
                 .membership(request.request().route.membership);
             let membership = match membership {
                 Ok(membership) => membership,
@@ -513,7 +498,7 @@ impl PeerServer {
     ) -> Operation<'a, SignedResponse> {
         Box::pin(async move {
             let scope = super::request_scope(request.request(), scope)?;
-            let network = self.network.as_ref().ok_or(Error::InvalidConfiguration)?;
+            let network = &self.relay.network;
             let previous = request
                 .forwarders()
                 .last()
@@ -595,11 +580,7 @@ impl PeerServer {
             };
             membership.member(request.origin().node())?;
             let placement = crate::topology::placement::Placement::new(64);
-            let local = &self
-                .network
-                .as_ref()
-                .ok_or(Error::InvalidConfiguration)?
-                .local;
+            let local = &self.relay.network.local;
             let selection = self.subscriptions.schedule_eligible(
                 subscription.clone(),
                 membership.version,

@@ -411,8 +411,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
         admission.clone(),
         Rc::new(Service(calls.clone())),
         relay,
-    )
-    .with_network(network);
+    );
     let local = request(&admission, 1);
     let scope = local.origin.scope().clone();
     let (mut forged, _) = sender.sign_request(local).unwrap();
@@ -1063,7 +1062,6 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
         relay,
     )
     .with_request_timeout(Duration::from_secs(5))
-    .with_network(destination_network)
     .with_wire(codec)
     .with_signatures(signers[2].clone());
     let health = paths.link_health();
@@ -1663,7 +1661,6 @@ mod established_sessions {
             ));
             let server =
                 server::PeerServer::new(io.clone(), forwarding, admission.clone(), service, relay)
-                    .with_network(network)
                     .with_wire(Rc::new(codec(&admission)))
                     .with_signatures(signers[2].clone());
             Self {

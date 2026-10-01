@@ -644,8 +644,6 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
         gate.clone(),
         relay,
     )
-    .with_network(network)
-    .with_reactor(fixtures[2].reactor.clone())
     .with_wire(codec)
     .with_signatures(signers[2].clone());
     let serving_scope = RequestScope::new(

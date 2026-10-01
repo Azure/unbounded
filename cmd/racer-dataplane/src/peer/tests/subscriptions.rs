@@ -188,8 +188,7 @@ fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failure
             admission.clone(),
             service.clone(),
             relay,
-        )
-        .with_network(network);
+        );
         let codec = codec(&admission);
         let first = subscribe(&admission, A, 1, 8, FetchMode::Acquire);
         let first_scope = first.origin.scope().clone();
@@ -433,7 +432,6 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
         network(C),
     ));
     let server = server::PeerServer::new(io.clone(), destination, admission.clone(), local, relay)
-        .with_network(network(C))
         .with_wire(codec.clone())
         .with_signatures(signers[2].clone());
     let transfers = Rc::new(
