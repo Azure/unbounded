@@ -1,4 +1,5 @@
 use super::*;
+mod materialized_pairing;
 use crate::{
     http::{
         Codec,
@@ -93,6 +94,10 @@ struct RelayFixture {
 
 impl RelayFixture {
     fn new(materialized: bool) -> Self {
+        Self::with_pool_limit(materialized, 1)
+    }
+
+    fn with_pool_limit(materialized: bool, limit: usize) -> Self {
         let signers = signers();
         let admissions: Vec<_> = (0..3)
             .map(|_| {
@@ -151,7 +156,11 @@ impl RelayFixture {
             .unwrap(),
         );
         let auth = Rc::new(Forwarding::new(signers[1].clone()));
-        let pool = Rc::new(HttpPool::new(reactors[1].clone(), admissions[1].clone(), 1));
+        let pool = Rc::new(HttpPool::new(
+            reactors[1].clone(),
+            admissions[1].clone(),
+            limit,
+        ));
         let transfers = Rc::new(transport::Transfers::new(
             pool.clone(),
             ios[1].clone(),
