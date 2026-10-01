@@ -247,6 +247,22 @@ func (s *Server) serve(ctx context.Context, listener net.Listener, config *tls.C
 func (s *Server) initializeAdmission() {
 	s.once.Do(func() {
 		s.config = s.Config.effective()
+		// Freeze the entire serving chain before exposing a handler or listener,
+		// not lazily when its first authentication or issuance request arrives.
+		// Each dependency retains its normalized construction inputs, including
+		// pre-start overrides made by direct programmatic callers.
+		if s.Bootstrap != nil {
+			s.Bootstrap.runtimeConfig()
+
+			if s.Bootstrap.Issuer != nil {
+				s.Bootstrap.Issuer.runtimeConfig()
+			}
+		}
+
+		if s.Replication != nil {
+			s.Replication.runtimeConfig()
+		}
+
 		s.polls = newIdentityAdmission[wire.NodeID](s.config.Limits.MaxPolls)
 		s.keyringPolls = newIdentityAdmission[wire.NodeID](s.config.Limits.MaxPolls)
 		s.replicationPolls = newIdentityAdmission[string](s.config.Limits.MaxConcurrentBootstrap)

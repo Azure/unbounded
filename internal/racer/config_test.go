@@ -5,6 +5,8 @@ package racer
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +16,83 @@ import (
 
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
+
+func TestServingChainFreezesBeforeFirstRequest(t *testing.T) {
+	for _, boundary := range []string{"handler", "tls"} {
+		t.Run(boundary, func(t *testing.T) {
+			f := newServingFixture(t)
+			s := f.a.Server
+			// The fixture issued its own test certificate. Replace dependencies
+			// with unused direct constructions so no first request can mask a
+			// missing serving-boundary freeze.
+			b := s.Bootstrap
+			i := b.Issuer
+			s.Bootstrap = &Bootstrap{
+				Client: b.Client, APIReader: b.APIReader, Config: b.Config,
+				Issuer: &Issuer{APIReader: i.APIReader, Config: i.Config, Trust: i.Trust, CatalogGate: i.CatalogGate},
+			}
+			r := s.Replication
+			s.Replication = &Replication{Client: r.Client, APIReader: r.APIReader, Config: r.Config, Publications: r.Publications, Trust: r.Trust, CatalogGate: r.CatalogGate}
+			// Matching pre-start overrides are accepted and normalized once.
+			for _, input := range []*Config{&s.Config, &s.Bootstrap.Config, &s.Bootstrap.Issuer.Config, &s.Replication.Config} {
+				input.CertificateLifetime = 2 * time.Minute
+				input.SnapshotMaxAge = 0
+			}
+
+			want := s.Config.effective()
+
+			var handler http.Handler
+			if boundary == "handler" {
+				handler = s.Handler()
+			} else {
+				s.tlsConfigWithCertificate(f.ctx, func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return &f.serverCertificate, nil })
+			}
+			// Mutate sequentially, before any request, without calling dependency
+			// getters first: those calls would accidentally hide lazy freezing.
+			s.Bootstrap.Config.DataplaneServiceAccount = "wrong-account"
+			s.Bootstrap.Issuer.Config.Cluster = ""
+			s.Bootstrap.Issuer.Config.CertificateLifetime = time.Second
+
+			s.Replication.Config.ControllerServiceAccount = "wrong-controller"
+			if handler == nil {
+				handler = s.Handler()
+			}
+
+			for name, got := range map[string]Config{"server": s.config, "bootstrap": s.Bootstrap.runtimeConfig(), "issuer": s.Bootstrap.Issuer.runtimeConfig(), "replication": s.Replication.runtimeConfig()} {
+				if got != want {
+					t.Fatalf("%s did not freeze the same effective base before exposure", name)
+				}
+			}
+
+			encoded, err := wire.EncodeBootstrapRequest(f.request)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			request := httptest.NewRequest(http.MethodPost, wire.BootstrapPath, bytes.NewReader(encoded))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Authorization", "Bearer "+f.token)
+			request.TLS = &tls.ConnectionState{HandshakeComplete: true}
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, request)
+
+			if w.Code != http.StatusOK {
+				t.Fatal("first request used post-exposure config", w.Code)
+			}
+
+			response := decodeIssuedResponse(t, w.Body.Bytes())
+
+			leaf, err := x509.ParseCertificate(response.CertificateChain[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if response.Cluster != want.Cluster || leaf.NotAfter.Sub(leaf.NotBefore) != want.CertificateLifetime {
+				t.Fatal("first issuance ignored frozen identity/lifetime")
+			}
+		})
+	}
+}
 
 func TestFrozenConfigUsedByRuntimeOperations(t *testing.T) {
 	f := newServingFixture(t)
@@ -64,6 +143,8 @@ func TestFrozenConfigUsedByRuntimeOperations(t *testing.T) {
 
 func TestComponentConfigFreezesDefaultsAtFirstUse(t *testing.T) {
 	a := Assemble(Config{}, nil, nil)
+	// Test Server's own capture separately from its transitive dependency freeze.
+	s := &Server{}
 	// Assemble remains a pure scaffold, even with an invalid zero config.
 	for name, component := range map[string]struct {
 		input *Config
@@ -74,7 +155,7 @@ func TestComponentConfigFreezesDefaultsAtFirstUse(t *testing.T) {
 		"replication": {&a.Replication.Config, a.Replication.runtimeConfig},
 		"bootstrap":   {&a.Server.Bootstrap.Config, a.Server.Bootstrap.runtimeConfig},
 		"issuer":      {&a.Server.Bootstrap.Issuer.Config, a.Server.Bootstrap.Issuer.runtimeConfig},
-		"server":      {&a.Server.Config, func() Config { a.Server.initializeAdmission(); return a.Server.config }},
+		"server":      {&s.Config, func() Config { s.initializeAdmission(); return s.config }},
 	} {
 		t.Run(name, func(t *testing.T) {
 			*component.input = testConfig(t)
