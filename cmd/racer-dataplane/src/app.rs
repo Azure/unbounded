@@ -679,7 +679,6 @@ impl WorkerApplication {
         )?;
         let disk = store.reader.clone();
         let writer = store.writer.clone();
-        let index = writer.index().clone();
 
         let (sessions, rdma, devices) = if config.enable_rdma {
             let devices = Rc::new(Devices::new());
@@ -772,8 +771,14 @@ impl WorkerApplication {
         )?);
         let flights =
             Rc::new(Flights::new(admission.clone()).with_availability(availability.clone()));
-        let fill = Rc::new(
-            Fill::new(FillDependencies {
+        let (coordinator, metadata) = Self::assemble_reads(
+            config,
+            &node,
+            snapshots.clone(),
+            availability,
+            delivery.clone(),
+            &metrics,
+            FillDependencies {
                 memory: memory.clone(),
                 buffers,
                 disk,
@@ -785,37 +790,7 @@ impl WorkerApplication {
                 credentials: credentials.clone(),
                 admission: admission.clone(),
                 metadata_owner: node.workers.clone(),
-            })
-            .with_metrics(metrics.clone()),
-        );
-        let metadata = Rc::new(MetadataService::new(
-            candidates,
-            origin,
-            credentials.clone(),
-            limits.metadata_entries.get(),
-            MetadataDependencies {
-                index,
-                fill: fill.clone(),
-                owners: node.workers.clone(),
             },
-        ));
-        let streams = Rc::new(
-            RangeStreams::new(
-                node.workers.clone(),
-                delivery.clone(),
-                config.limits.range_window_pages.get(),
-            )
-            .with_observer(admission.observer()),
-        );
-        let coordinator = Rc::new(
-            Coordinator::new(
-                snapshots.clone(),
-                metadata.clone(),
-                fill,
-                streams,
-                credentials,
-            )
-            .with_availability(availability),
         );
         let relay = Rc::new(Relay::new(
             paths,
@@ -850,23 +825,15 @@ impl WorkerApplication {
             },
         );
         let peers = Rc::new(peers);
-        let io = Rc::new(HttpIo::for_clients(reactor, admission.clone()));
-        let responses =
-            Rc::new(Responses::new(io.clone(), delivery).with_observer(admission.observer()));
-        let clients = ClientListeners::new(
+        let clients = Self::assemble_clients(
+            config,
+            &node,
+            &runtime,
             coordinator.clone(),
-            RequestParser::new(config.limits.header_bytes.get()),
-            responses,
-            io,
-            admission,
-        )
-        .with_request_timeout(config.request_timeout)
-        .with_metrics(metrics.clone());
-        let clients = Rc::new(if distributed {
-            clients.with_ingress(node.ingress.clone())
-        } else {
-            clients
-        });
+            delivery,
+            &metrics,
+            distributed,
+        );
 
         let mut telemetry = Telemetry::default();
         telemetry.failures = node.failures.clone();
@@ -931,6 +898,79 @@ impl WorkerApplication {
             cache_preparing_generation: 0,
             control_scope: None,
             next_health: crate::runtime::environment::now(),
+        })
+    }
+
+    fn assemble_reads(
+        config: &Config,
+        node: &NodeState,
+        snapshots: Rc<SnapshotStore>,
+        availability: Rc<crate::control::availability::Availability>,
+        delivery: Rc<Delivery>,
+        metrics: &crate::telemetry::metrics::Metrics,
+        dependencies: FillDependencies,
+    ) -> (Rc<Coordinator>, Rc<MetadataService>) {
+        let candidates = dependencies.candidates.clone();
+        let origin = dependencies.origin.clone();
+        let credentials = dependencies.credentials.clone();
+        let index = dependencies.writer.index().clone();
+        let admission = dependencies.admission.clone();
+        let fill = Rc::new(Fill::new(dependencies).with_metrics(metrics.clone()));
+        let metadata = Rc::new(MetadataService::new(
+            candidates,
+            origin,
+            credentials.clone(),
+            admission.limits().metadata_entries.get(),
+            MetadataDependencies {
+                index,
+                fill: fill.clone(),
+                owners: node.workers.clone(),
+            },
+        ));
+        let streams = Rc::new(
+            RangeStreams::new(
+                node.workers.clone(),
+                delivery,
+                config.limits.range_window_pages.get(),
+            )
+            .with_observer(admission.observer()),
+        );
+        let coordinator = Rc::new(
+            Coordinator::new(snapshots, metadata.clone(), fill, streams, credentials)
+                .with_availability(availability),
+        );
+        (coordinator, metadata)
+    }
+
+    fn assemble_clients(
+        config: &Config,
+        node: &NodeState,
+        runtime: &WorkerRuntime,
+        coordinator: Rc<Coordinator>,
+        delivery: Rc<Delivery>,
+        metrics: &crate::telemetry::metrics::Metrics,
+        distributed: bool,
+    ) -> Rc<ClientListeners> {
+        let admission = runtime.admission.clone();
+        let io = Rc::new(HttpIo::for_clients(
+            runtime.reactor.clone(),
+            admission.clone(),
+        ));
+        let responses =
+            Rc::new(Responses::new(io.clone(), delivery).with_observer(admission.observer()));
+        let clients = ClientListeners::new(
+            coordinator,
+            RequestParser::new(config.limits.header_bytes.get()),
+            responses,
+            io,
+            admission,
+        )
+        .with_request_timeout(config.request_timeout)
+        .with_metrics(metrics.clone());
+        Rc::new(if distributed {
+            clients.with_ingress(node.ingress.clone())
+        } else {
+            clients
         })
     }
 
