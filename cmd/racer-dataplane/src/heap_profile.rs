@@ -223,7 +223,7 @@ mod enabled {
                 host = true;
             }
         }
-        if request.version == Some(1) && !host {
+        if request.version != Some(1) || !host {
             return Err(400);
         }
         if request.method != Some("GET") {
@@ -360,6 +360,8 @@ mod enabled {
                 ("GET /debug/pprof/heap?x=y HTTP/1.1\r\nHost: x\r\n\r\n", 404),
                 ("not a request\r\n\r\n", 400),
                 ("GET /debug/pprof/heap HTTP/1.1\r\n\r\n", 400),
+                ("GET /debug/pprof/heap HTTP/1.0\r\n\r\n", 400),
+                ("GET /debug/pprof/heap HTTP/1.0\r\nHost: x\r\n\r\n", 400),
                 (
                     "GET /debug/pprof/heap HTTP/1.0\r\nContent-Length: 1\r\n\r\nx",
                     400,
@@ -413,9 +415,11 @@ mod enabled {
                 (Err(DumpError::Failed), 500),
             ] {
                 let mut result = Some(result);
-                let response = exchange(b"GET /debug/pprof/heap HTTP/1.0\r\n\r\n", 4, move || {
-                    result.take().unwrap()
-                });
+                let response = exchange(
+                    b"GET /debug/pprof/heap HTTP/1.1\r\nHost: x\r\n\r\n",
+                    4,
+                    move || result.take().unwrap(),
+                );
                 assert!(response.starts_with(format!("HTTP/1.1 {status} ").as_bytes()));
                 assert!(response.ends_with(b"\r\n\r\n"));
             }
@@ -458,7 +462,7 @@ mod enabled {
             let mut client = TcpStream::connect(address).unwrap();
             client.set_write_timeout(Some(IO_TIMEOUT)).unwrap();
             client
-                .write_all(b"GET /debug/pprof/heap HTTP/1.0\r\n\r\n")
+                .write_all(b"GET /debug/pprof/heap HTTP/1.1\r\nHost: x\r\n\r\n")
                 .unwrap();
             entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             // Leave the JoinHandle in Server to exercise Drop's Some branch.
@@ -506,7 +510,7 @@ mod enabled {
                 .unwrap();
             client.set_write_timeout(Some(IO_TIMEOUT)).unwrap();
             client
-                .write_all(b"GET /debug/pprof/heap HTTP/1.0\r\n\r\n")
+                .write_all(b"GET /debug/pprof/heap HTTP/1.1\r\nHost: x\r\n\r\n")
                 .unwrap();
             let mut response = String::new();
             client.read_to_string(&mut response).unwrap();
@@ -594,7 +598,7 @@ mod enabled {
             check_profiler().unwrap();
             let retained = retained_heap_profile_test_allocation();
             let response = exchange(
-                b"GET /debug/pprof/allocs HTTP/1.0\r\n\r\n",
+                b"GET /debug/pprof/allocs HTTP/1.1\r\nHost: x\r\n\r\n",
                 MAX_RESPONSE,
                 dump,
             );
