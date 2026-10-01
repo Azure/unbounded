@@ -8,7 +8,7 @@ use crate::runtime::collections::HashMap;
 use crate::{
     error::{Error, Operation, Result},
     memory::page::CiphertextCopy,
-    model::{CacheId, KeyId, ObjectVersion, PageId, ResourceClass, VersionMetadata},
+    model::{CacheId, ObjectVersion, PageId, ResourceClass, VersionMetadata},
     runtime::{
         admission::{Admission, Reservation},
         deadline::RequestScope,
@@ -488,19 +488,6 @@ impl StoreWriter {
             self.slabs.reclaim_buffer();
             Ok(())
         })
-    }
-    /// Evict disposable references without canceling submitted I/O. Completion
-    /// owners retain their buffers and segment leases regardless of visibility.
-    pub fn retire_key(&self, cache: &CacheId, key: KeyId) -> Result<usize> {
-        let mut pending = self.pending.borrow_mut();
-        let before = pending.len();
-        pending.retain(|_, d| {
-            let e = d.page.ciphertext.envelope();
-            &e.page.version.object.cache != cache || e.key_id != key
-        });
-        self.queue.borrow_mut().retain(|p| pending.contains_key(p));
-        self.note_discard(before - pending.len());
-        Ok(self.index.retire_key(cache, key))
     }
     pub fn remove_cache(&self, cache: &CacheId) -> Result<()> {
         let mut pending = self.pending.borrow_mut();

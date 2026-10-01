@@ -135,7 +135,7 @@ fn index_eviction_during_read_cannot_resurrect_copy_or_recycle_active_generation
 }
 
 #[test]
-fn retirement_during_pressure_write_prevents_late_publication() {
+fn cache_removal_during_pressure_write_prevents_late_publication() {
     let f = fixture(1);
     let first = persist(&f, 1);
     let copy = f.copy(2, 113);
@@ -152,10 +152,7 @@ fn retirement_during_pressure_write_prevents_late_publication() {
     assert!(f.store.writer.index().lookup(&first).unwrap().is_none());
     f.store
         .writer
-        .retire_key(
-            &CacheId(crate::security::identity::tests::CACHE.into()),
-            KeyId([1; 16]),
-        )
+        .remove_cache(&CacheId(crate::security::identity::tests::CACHE.into()))
         .unwrap();
     drive(&f.reactor, write).unwrap();
     assert!(f.store.writer.index().lookup(&second).unwrap().is_none());

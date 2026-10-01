@@ -421,19 +421,6 @@ impl Index {
     pub fn segment_empty(&self, segment: SegmentId) -> bool {
         !self.state.borrow().reverse.contains_key(&segment)
     }
-    pub fn retire_key(&self, cache: &crate::model::CacheId, key: KeyId) -> usize {
-        let mut s = self.state.borrow_mut();
-        let pages: Vec<_> = s
-            .pages
-            .iter()
-            .filter(|(p, e)| &p.version.object.cache == cache && e.key_id == key)
-            .map(|(p, _)| p.clone())
-            .collect();
-        for page in &pages {
-            Self::remove_page(&mut s, page);
-        }
-        pages.len()
-    }
     pub fn remove_cache(&self, cache: &crate::model::CacheId) {
         let mut s = self.state.borrow_mut();
         let pages: Vec<_> = s

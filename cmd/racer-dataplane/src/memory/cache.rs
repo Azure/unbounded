@@ -6,7 +6,7 @@ use super::{
 use crate::runtime::collections::{HashMap, HashSet};
 use crate::{
     error::{Error, Result},
-    model::{CacheId, KeyId, ObjectVersion, PageId, ResourceClass, VersionMetadata},
+    model::{CacheId, ObjectVersion, PageId, ResourceClass, VersionMetadata},
 };
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
 #[derive(Default)]
@@ -292,28 +292,6 @@ impl MemoryCache {
             entries.remove(&id);
         }
         released
-    }
-    /// Evict lookup references. Existing owners keep
-    /// their charges until their completion fences release them.
-    pub fn retire_key(&self, cache: &CacheId, key: KeyId) -> Result<usize> {
-        self.ciphertext_entries.borrow_mut().retain(|id, entry| {
-            &id.version.object.cache != cache || entry.copy.ciphertext.envelope().key_id != key
-        });
-        let mut entries = self.entries.borrow_mut();
-        let before = entries.len();
-        let removed: Vec<_> = entries
-            .pages
-            .iter()
-            .filter(|(_, (_, entry))| {
-                &entry.metadata.version.object.cache == cache
-                    && entry.ciphertext.envelope().key_id == key
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in removed {
-            entries.remove(&id);
-        }
-        Ok(before - entries.len())
     }
     pub fn remove_cache(&self, cache: &CacheId) -> Result<()> {
         self.ciphertext_entries
@@ -607,10 +585,7 @@ mod tests {
         let other_id = other.plaintext.page().clone();
         cache.publish(page.clone()).unwrap();
         cache.publish(other).unwrap();
-        assert_eq!(
-            cache.retire_key(&id.version.object.cache, KeyId([1; 16])),
-            Ok(1)
-        );
+        cache.remove_cache(&id.version.object.cache).unwrap();
         assert!(cache.get(&id).unwrap().is_none());
         assert!(cache.get(&other_id).unwrap().is_some());
         assert_eq!(page.plaintext.bytes(), &[1; 3]);
@@ -632,9 +607,6 @@ mod tests {
             crate::test_support::availability(),
         );
         let id = CacheId("cache".into());
-        assert_eq!(cache.retire_key(&id, KeyId([1; 16])), Ok(0));
-        assert_eq!(cache.retire_key(&id, KeyId([1; 16])), Ok(0));
-        assert_eq!(cache.retire_key(&id, KeyId([2; 16])), Ok(0));
         assert_eq!(cache.remove_cache(&id), Ok(()));
         assert_eq!(cache.remove_cache(&id), Ok(()));
         assert_eq!(cache.remove_cache(&CacheId("other".into())), Ok(()));
@@ -673,7 +645,6 @@ mod tests {
             keys.install(next.clone()).unwrap();
             for key in previous {
                 if key.purpose == CacheKeyPurpose::Page {
-                    assert_eq!(memory.retire_key(&key.cache, key.id), Ok(0));
                     assert!(!memory.availability.page(&key.cache, key.id));
                 }
             }

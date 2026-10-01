@@ -423,7 +423,7 @@ fn record_round_trip_preserves_ciphertext_zeroes_padding_and_rejects_torn_header
     }
 }
 #[test]
-fn dirty_queue_is_bounded_and_retirement_discards_without_io() {
+fn dirty_queue_is_bounded_and_cache_removal_discards_without_io() {
     let f = Fixture::new();
     futures::executor::block_on(f.store.open()).unwrap();
     let first = f.copy(1, 3);
@@ -440,10 +440,7 @@ fn dirty_queue_is_bounded_and_retirement_discards_without_io() {
     assert!(f.store.writer.copy_only(&id).unwrap().is_some());
     f.store
         .writer
-        .retire_key(
-            &CacheId(crate::security::identity::tests::CACHE.into()),
-            KeyId([1; 16]),
-        )
+        .remove_cache(&CacheId(crate::security::identity::tests::CACHE.into()))
         .unwrap();
     assert_eq!(f.store.writer.pending_count(), 0);
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
@@ -922,7 +919,7 @@ fn abandoned_write_retains_kernel_lease_and_cannot_publish() {
 }
 
 #[test]
-fn retirement_during_write_fences_late_publication() {
+fn cache_removal_during_write_fences_late_publication() {
     let f = Fixture::new();
     futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
@@ -936,10 +933,7 @@ fn retirement_during_write_fences_late_publication() {
     assert!(operation.as_mut().poll(&mut cx).is_pending());
     f.store
         .writer
-        .retire_key(
-            &CacheId(crate::security::identity::tests::CACHE.into()),
-            KeyId([1; 16]),
-        )
+        .remove_cache(&CacheId(crate::security::identity::tests::CACHE.into()))
         .unwrap();
     // Reinsert the same immutable page while the original submitted write still
     // owns its segment/buffer. The old completion cannot publish or remove it.
@@ -1003,7 +997,7 @@ fn sustained_rotation_reclaims_history_and_fences_held_pages_and_write_completio
     )
     .unwrap();
     // More than the former writer limit, and twice as many keyring retirements.
-    // Both populated and empty caches follow the real keyring/memory/writer path.
+    // Lookups and writer progress consult current availability without eager eviction.
     for generation in 2..=65539 {
         let lease = keys.active(&cache, KeyPurpose::Page).unwrap();
         let old = lease.reference().clone();
@@ -1028,9 +1022,14 @@ fn sustained_rotation_reclaims_history_and_fences_held_pages_and_write_completio
         };
         keys.install(rotation_bundle(generation, roots.clone()))
             .unwrap();
-        assert_eq!(memory.retire_key(&cache, old.id), Ok(1));
-        f.store.writer.retire_key(&cache, old.id).unwrap();
         assert!(memory.get(page.plaintext.page()).unwrap().is_none());
+        assert!(
+            f.store
+                .writer
+                .copy_only(page.plaintext.page())
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(memory.publish(page.clone()), Err(Error::MissingKey));
         assert!(matches!(f.enqueue(page.copy()), Err(Error::MissingKey)));
         assert!(keys.lease(Some(&cache), old.id, KeyPurpose::Page).is_err());
@@ -1049,7 +1048,15 @@ fn sustained_rotation_reclaims_history_and_fences_held_pages_and_write_completio
                     .unwrap()
                     .is_none()
             );
+        } else {
+            // Unsubmitted stale copies are discarded without issuing a write.
+            assert_eq!(
+                drive(&f.reactor, f.store.writer.progress(1, &request)),
+                Ok(0)
+            );
         }
+        assert_eq!(f.store.writer.pending_count(), 0);
+        assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
         drop(lease);
     }
     assert_eq!(memory.publish(late.clone()), Err(Error::MissingKey));
@@ -1102,13 +1109,6 @@ fn truncated_payload_is_a_miss_and_write_failure_releases_dirty_accounting() {
         0
     );
     assert_eq!(f.store.writer.pending_count(), 0);
-    f.store
-        .writer
-        .retire_key(
-            &CacheId(crate::security::identity::tests::CACHE.into()),
-            KeyId([1; 16]),
-        )
-        .unwrap();
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
 }
 
