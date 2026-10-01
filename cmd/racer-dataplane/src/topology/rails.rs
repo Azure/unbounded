@@ -23,9 +23,9 @@ pub enum TransportPlan {
     Rdma { rail: RailId },
 }
 /// Conservative whole-route summary; transport admission must use `select_hop`.
-/// Select from authenticated advertised mappings. Before creating an RDMA
-/// session, validate each hop's actual hardware with `select_with_local` or
-/// `local_compatible`; discovery may only veto this plan, never replace it.
+/// Select from authenticated advertised mappings. Production session admission
+/// also requires device activation and readiness against the local publication;
+/// hardware discovery may only veto this plan, never replace it.
 pub fn select(route: &Route, page: &PageId) -> Result<TransportPlan> {
     validate_route(route)?;
     let members = route

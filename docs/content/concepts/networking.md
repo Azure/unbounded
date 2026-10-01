@@ -58,6 +58,35 @@ edge deployment. Each site is defined by:
 When a node joins the cluster, the controller matches its internal IP against
 all Site `nodeCidrs` and labels it with `unbounded-cloud.io/site=<name>`.
 
+#### Racer RDMA boundaries
+
+Racer uses Site membership as an RDMA fabric boundary. Each communicating pair
+must belong to the same nonempty Site before Racer attempts an RDMA upgrade.
+Nodes in different Sites, or nodes without a Site, use HTTP. A multi-hop route
+can mix transports: for `A → B → C`, if A and B belong to one Site and C belongs
+to another, A-B can use RDMA while B-C uses HTTP.
+
+Racer reads `unbounded-cloud.io/site` from each Node, falling back to the
+deprecated `net.unbounded-cloud.io/site` when the canonical value is empty.
+There is no separate Racer fabric-ID annotation. Both labels must be removed
+or emptied to clear membership when the deprecated label is still present.
+The networking controller manages these labels from Site configuration.
+
+Site membership is necessary but not sufficient for RDMA: existing RDMA
+enablement, aligned rail mappings, matching per-rail fabric labels, and local
+device compatibility checks still apply. Site does not change cache placement
+or the page-to-rail hash.
+
+Site label changes and removals advance Racer's published membership version,
+even when invalid rail annotations cause the last accepted rail configuration
+to be retained. In-flight operations can retain an older membership snapshot;
+a label change is not an immediate revocation mechanism.
+
+Upgrade all Racer dataplanes before relying on this boundary. Older dataplanes
+do not enforce Site restrictions, so mixed-version deployments must not be
+treated as enforcing them. Upgraded dataplanes use HTTP for publications that
+do not contain Site membership.
+
 ### Gateway Pools
 
 A **GatewayPool** defines a set of nodes that act as routers between sites.
