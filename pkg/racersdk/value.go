@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-const copyBufferSize = 32 * 1024
+const copyBufferSize = 256 * 1024
 
 // Value is an immutable full-object or selected-range stream. One goroutine may
 // consume it using Read or WriteTo (including io.Copy); Metadata and Close may be called
@@ -143,7 +143,7 @@ func (v *Value) Close() error {
 	return nil
 }
 
-// WriteTo streams into w using 32 KiB scratch without invoking w.ReadFrom.
+// WriteTo streams into w using 256 KiB scratch without invoking w.ReadFrom.
 // The returned count includes only bytes accepted by w. The caller must still
 // Close, including on writer failure. Copy buffers are bounded independently to
 // MaxConnections for bulk and SmallObjectConnections for small objects per client,

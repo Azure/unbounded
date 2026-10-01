@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -48,6 +49,7 @@ type copyDestination struct {
 	bytes.Buffer
 	readFrom bool
 	maxWrite int
+	sizes    []int
 }
 
 func (w *copyDestination) ReadFrom(io.Reader) (int64, error) {
@@ -57,6 +59,7 @@ func (w *copyDestination) ReadFrom(io.Reader) (int64, error) {
 
 func (w *copyDestination) Write(p []byte) (int, error) {
 	w.maxWrite = max(w.maxWrite, len(p))
+	w.sizes = append(w.sizes, len(p))
 	return w.Buffer.Write(p)
 }
 
@@ -97,6 +100,32 @@ func TestWriteToUsesBoundedBufferWithoutReaderFrom(t *testing.T) {
 
 	if len(v.client.copySlots) != 0 || len(v.client.copyBuffers) != 1 {
 		t.Fatal("copy buffer not returned")
+	}
+}
+
+func TestWriteToDeliveryBatches(t *testing.T) {
+	// Use a literal target, independent of the implementation's scratch size.
+	const batch = 256 * 1024
+
+	for _, tt := range []struct {
+		name  string
+		size  int
+		sizes []int
+	}{
+		{"short", batch - 1, []int{batch - 1}},
+		{"exact", batch, []int{batch}},
+		{"tail", 2*batch + 17, []int{batch, batch, 17}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			data := bytes.Repeat([]byte("xyz"), (tt.size+2)/3)[:tt.size]
+			v := copyTestValue(t, io.NopCloser(bytes.NewReader(data)), int64(len(data)))
+			w := &copyDestination{}
+
+			n, err := io.Copy(w, v)
+			if err != nil || n != int64(len(data)) || !bytes.Equal(w.Bytes(), data) || w.readFrom || !slices.Equal(w.sizes, tt.sizes) {
+				t.Fatalf("copy bytes=%d err=%v ReaderFrom=%v batches=%v want=%v", n, err, w.readFrom, w.sizes, tt.sizes)
+			}
+		})
 	}
 }
 
