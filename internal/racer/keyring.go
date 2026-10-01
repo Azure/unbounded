@@ -278,7 +278,24 @@ func (c *credentialState) prepareIssuer(cfg Config, now time.Time) (bool, error)
 // encodeRotation validates the complete candidate, including its publication
 // generation, before either Secret can be written.
 func (c *credentialState) encodeRotation(issuerChanged bool) (bool, error) {
-	encoded, err := wire.EncodeBundle(c.bundle)
+	candidate := c.bundle
+	if candidate.Generation < math.MaxUint64 {
+		candidate.Generation++
+	}
+
+	encoded, err := wire.EncodeBundle(candidate)
+	if err != nil {
+		return false, err
+	}
+
+	previous, err := wire.DecodeBundle(bytes.NewReader(c.shared.Data["bundle.json"]))
+	if err != nil {
+		return false, err
+	}
+
+	previous.Generation = candidate.Generation
+
+	previousEncoded, err := wire.EncodeBundle(previous)
 	if err != nil {
 		return false, err
 	}
@@ -288,7 +305,7 @@ func (c *credentialState) encodeRotation(issuerChanged bool) (bool, error) {
 		return false, err
 	}
 
-	if bytes.Equal(encoded, c.shared.Data["bundle.json"]) && bytes.Equal(stateBytes, c.shared.Data["rotation.json"]) {
+	if bytes.Equal(encoded, previousEncoded) && bytes.Equal(stateBytes, c.shared.Data["rotation.json"]) {
 		return false, nil
 	}
 
@@ -641,7 +658,12 @@ func planRotation(policy RotationPolicy, b wire.KeyringBundle, s RotationState, 
 		s.ActivateAt = now.Add(policy.PrepareFor)
 	}
 
-	if _, err := wire.EncodeBundle(b); err != nil {
+	candidate := b
+	if creationGeneration > candidate.Generation {
+		candidate.Generation = creationGeneration
+	}
+
+	if _, err := wire.EncodeBundle(candidate); err != nil {
 		return b, s, err
 	}
 
@@ -696,7 +718,11 @@ func catalogCapacity(cfg Config, b wire.KeyringBundle) (int, error) {
 	}
 
 	for _, purpose := range []wire.KeyPurpose{wire.PageKey, wire.OriginCredentialsKey} {
-		key, err := wire.NewCacheKey(wire.CacheKeyRef{Cache: wire.CacheID(cfg.Cluster), Purpose: purpose, ID: make([]byte, 16)}, wire.ActiveKey, [32]byte{})
+		id := make([]byte, 16)
+		copy(id, "RKG1")
+		binary.BigEndian.PutUint64(id[4:12], 1)
+
+		key, err := wire.NewCacheKey(wire.CacheKeyRef{Cache: wire.CacheID(cfg.Cluster), Purpose: purpose, ID: id}, wire.ActiveKey, [32]byte{})
 		if err != nil {
 			return 0, err
 		}

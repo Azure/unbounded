@@ -308,7 +308,12 @@ func TestCatalogAdmissionLegacyOvercommitDoesNotEvict(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	shared.Data["bundle.json"], _ = wire.EncodeBundle(b)
+	b.Generation++
+
+	shared.Data["bundle.json"], err = wire.EncodeBundle(b)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	shared.Data["rotation.json"], _ = json.Marshal(state)
 	if err := r.Update(t.Context(), shared); err != nil {

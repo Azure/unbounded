@@ -321,6 +321,8 @@ func TestKeyringCatalogAndBounds(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	b.Generation++
+
 	state.PreparedIssuer = state.ActiveIssuer
 	if _, _, err := PlanRotation(r.Config.Rotation, b, state, catalog, state.NextRotation); !errors.Is(err, wire.TooLarge) {
 		t.Fatalf("overlap bound not enforced: %v", err)
