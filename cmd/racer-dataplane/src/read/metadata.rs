@@ -420,7 +420,7 @@ impl MetadataService {
     ) -> Operation<'a, ObjectMetadata> {
         Box::pin(async move {
             Ok(self
-                .resolve_inner(selector, membership, context, scope, budget, false, false)
+                .resolve_inner(selector, membership, context, scope, budget, false)
                 .await?
                 .metadata)
         })
@@ -445,7 +445,6 @@ impl MetadataService {
         context: &'a OriginContext,
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
-        force_refresh: bool,
         bootstrap: bool,
     ) -> Operation<'a, RefreshOutput> {
         Box::pin(async move {
@@ -453,13 +452,11 @@ impl MetadataService {
             bounded_scope.deadline.0 = scope.deadline.0.min(budget.deadline());
             let scope = &bounded_scope;
             scope.check()?;
-            if !force_refresh {
-                if let Some(metadata) = self.copy_only(selector.clone(), context, scope).await? {
-                    return Ok(RefreshOutput {
-                        metadata,
-                        page: None,
-                    });
-                }
+            if let Some(metadata) = self.copy_only(selector.clone(), context, scope).await? {
+                return Ok(RefreshOutput {
+                    metadata,
+                    page: None,
+                });
             }
             let mut key = RefreshKey::new(&context.object, &selector);
             // HEAD cannot join a body-fetching bootstrap leader or elect one.
@@ -793,7 +790,6 @@ impl MetadataService {
                 context,
                 scope,
                 budget,
-                false,
                 true,
             )
             .await?;

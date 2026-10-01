@@ -57,10 +57,6 @@ pub struct Fill {
     metrics: Metrics,
     local_copies: Rc<RefCell<BTreeMap<PageId, LocalCopy>>>,
 }
-enum Prefetch {
-    Origin(crate::origin::page::OriginPage),
-    Ciphertext(UnverifiedPage),
-}
 impl Fill {
     #[cfg(test)]
     pub(crate) fn hedge_owner(&self) -> Option<&std::sync::Arc<super::hedge::Hedges>> {
@@ -385,39 +381,7 @@ impl Fill {
                     context,
                     scope,
                     budget,
-                    Some(Prefetch::Origin(origin)),
-                    true,
-                    None,
-                )
-                .await?
-            {
-                AcquiredPage::Plaintext(page) => Ok(page),
-                AcquiredPage::Ciphertext(_) => Err(Error::CorruptRecord),
-            }
-        })
-    }
-
-    pub(crate) fn accept_ciphertext<'a>(
-        &'a self,
-        copy: crate::memory::page::CiphertextCopy,
-        membership: MembershipLease,
-        context: &'a OriginContext,
-        scope: &'a RequestScope,
-        budget: &'a mut AcquisitionBudget,
-    ) -> Operation<'a, PageResult> {
-        Box::pin(async move {
-            let page = copy.ciphertext.envelope().page.clone();
-            match self
-                .acquire_with_prefetch(
-                    page,
-                    membership,
-                    context,
-                    scope,
-                    budget,
-                    Some(Prefetch::Ciphertext(UnverifiedPage {
-                        copy,
-                        disk_token: None,
-                    })),
+                    Some(origin),
                     true,
                     None,
                 )
@@ -436,7 +400,7 @@ impl Fill {
         context: &'a OriginContext,
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
-        mut prefetch: Option<Prefetch>,
+        mut prefetch: Option<crate::origin::page::OriginPage>,
         plaintext: bool,
         guard: Option<std::sync::Arc<super::subscription::FixedAcquisition>>,
     ) -> Operation<'a, AcquiredPage> {
@@ -504,7 +468,7 @@ impl Fill {
         page: &PageId,
         leader: FlightLeader,
         waiter: &mut AcquisitionWaiter<'_>,
-        prefetch: &mut Option<Prefetch>,
+        prefetch: &mut Option<crate::origin::page::OriginPage>,
         plaintext: bool,
         completion_guard: Option<Arc<super::subscription::FixedAcquisition>>,
     ) -> Result<()> {
@@ -542,10 +506,6 @@ impl Fill {
         driver_permit.submit(Box::pin(async move {
             let _completion_guard = completion_guard;
             let mut work = Box::pin(async {
-                let (ready, prefetched) = match prefetched {
-                    Some(Prefetch::Ciphertext(copy)) => (ready.or(Some(copy)), None),
-                    other => (ready, other),
-                };
                 if let Some(copy) = ready {
                     if !plaintext {
                         return Ok(AcquiredPage::Ciphertext(copy));
@@ -569,7 +529,7 @@ impl Fill {
                         Err(error) => return Err(error),
                     }
                 }
-                if let Some(Prefetch::Origin(origin)) = prefetched {
+                if let Some(origin) = prefetched {
                     fill.admit_bootstrap(origin, &owned_page, owned_membership, &owned_scope)
                         .await
                         .map(AcquiredPage::from)

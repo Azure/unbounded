@@ -650,7 +650,7 @@ fn verified_selected_handoff_retains_foreign_worker_charges_without_copying() {
 }
 
 #[test]
-fn prefetched_corrupt_ciphertext_falls_back_without_exposing_plaintext() {
+fn cached_corrupt_ciphertext_falls_back_without_exposing_plaintext() {
     let queue = Rc::new(crate::read::drivers::DriverQueue::default());
     let _owner = queue.enter();
     let mut f = fixture();
@@ -696,12 +696,20 @@ fn prefetched_corrupt_ciphertext_falls_back_without_exposing_plaintext() {
         .remove_cache(&f.context.object.cache)
         .unwrap();
     drop(result);
+    f.fill
+        .dependencies
+        .memory
+        .publish_ciphertext(UnverifiedPage {
+            copy,
+            disk_token: None,
+        })
+        .unwrap();
     let metrics = Metrics::default();
     f.fill.metrics = metrics.clone();
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
     let result = drive(
-        f.fill.accept_ciphertext(
-            copy,
+        f.fill.acquire(
+            f.page.clone(),
             f.membership.clone(),
             &f.context,
             &f.scope,
@@ -715,7 +723,7 @@ fn prefetched_corrupt_ciphertext_falls_back_without_exposing_plaintext() {
     assert_eq!(
         metrics.count(Event::PageDecrypt),
         2,
-        "bad prefetch then retained original"
+        "bad cached copy then retained original"
     );
     assert_eq!(f.origin.calls.get(), 1);
 }
