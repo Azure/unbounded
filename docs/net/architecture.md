@@ -525,7 +525,7 @@ sequenceDiagram
 
 **Key Design Decisions:**
 - The controller Service has **no selector** -- the leader manages its own EndpointSlice, ensuring only the leader receives pushes
-- On leader election, the controller cleans up stale `v1/Endpoints` resources left by previous controller versions to prevent kube-proxy routing to dead pods
+- The leader publishes only EndpointSlices, with a Pod target reference, and periodically repairs deleted or edited slices. It does not publish or migrate v1 Endpoints.
 - HTTP POST is sent asynchronously with an atomic in-flight guard to prevent ticker drift
 - Status collection uses a snapshot-and-release pattern to minimize lock hold time
 - Summary inspection preserves observed peer health, route counts/mismatches,
@@ -824,8 +824,7 @@ has a `TUNNEL_F_HEALTHY` flag updated by the health check system; unhealthy
 nexthops are skipped by the BPF program. Healthcheck probes (UDP 9997) are
 always forwarded regardless of health state to enable recovery detection.
 
-> **Note:** Policy-based routing (PBR) using connmark/fwmark/ip-rule is
-> deprecated. Cross-site transit forwarding now uses per-interface iptables
-> FORWARD ACCEPT rules (`iptables -I FORWARD 1 -i <iface> -j ACCEPT`) on
-> tunnel and WireGuard gateway interfaces. The `enablePolicyRouting` option
-> defaults to `false` and is retained only for backward compatibility.
+> **Note:** Gateway connmark PBR and its `enablePolicyRouting` option are removed.
+> Current forwarding uses per-source FORWARD jumps into `UNBOUNDED-FORWARD`,
+> whose per-destination rules accept only tunnel-to-tunnel traffic. The managed
+> route table remains supported independently of the retired PBR mode.

@@ -170,7 +170,7 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 
 	// Initialize MSS clamping for all forwarded traffic using the lowest
 	// calculated MTU for the unbounded fabric.
-	mssClampMgr, err := unboundednetnetlink.NewMSSClampManager(cfg.WireGuardInterfacePrefix)
+	mssClampMgr, err := unboundednetnetlink.NewMSSClampManager()
 	if err != nil {
 		klog.Warningf("Failed to create MSS clamp manager (MSS clamping will be disabled): %v", err)
 	} else {
@@ -197,22 +197,6 @@ func watchSiteAndConfigureWireGuard(ctx context.Context, clientset kubernetes.In
 		klog.Warningf("Failed to create notrack manager (conntrack bypass will be disabled): %v", err)
 	} else {
 		state.notrackManager = notrackMgr
-	}
-
-	// Initialize gateway policy manager to allow cleanup of stale policy rules
-	// even when policy routing is currently disabled.
-	policyManager, err := unboundednetnetlink.NewGatewayPolicyManager(cfg.WireGuardPort)
-	if err != nil {
-		klog.Warningf("Failed to create gateway policy manager: %v", err)
-	} else {
-		state.gatewayPolicyManager = policyManager
-		if !cfg.EnablePolicyRouting {
-			if err := state.gatewayPolicyManager.Cleanup(); err != nil {
-				klog.Warningf("Failed to cleanup stale gateway policy rules while disabled: %v", err)
-			} else {
-				klog.Info("Cleaned up stale gateway policy rules while policy routing is disabled")
-			}
-		}
 	}
 
 	defer cleanupNodeNetworkingOnShutdown(cfg, state)
@@ -492,7 +476,6 @@ func cleanupNodeNetworkingOnShutdown(cfg *config, state *wireGuardState) {
 	mainLinkManager := state.linkManager
 	mainWGManager := state.wireguardManager
 	routeManager := state.routeManager
-	gatewayPolicyManager := state.gatewayPolicyManager
 	masqueradeManager := state.masqueradeManager
 	mssClampManager := state.mssClampManager
 	forwardManager := state.forwardManager
@@ -534,15 +517,6 @@ func cleanupNodeNetworkingOnShutdown(cfg *config, state *wireGuardState) {
 
 			if err := unboundednetnetlink.RemoveIPRule(cfg.RouteTableID, 32765, 0, 0); err != nil {
 				klog.Errorf("Failed to remove ip rule for table %d on shutdown: %v", cfg.RouteTableID, err)
-			}
-		}
-
-		// Gateway policy routing rules
-		if gatewayPolicyManager != nil {
-			if err := gatewayPolicyManager.Cleanup(); err != nil {
-				klog.Errorf("Failed to cleanup gateway policy routing rules on shutdown: %v", err)
-			} else {
-				klog.Info("Cleaned up gateway policy routing rules on shutdown")
 			}
 		}
 

@@ -11,6 +11,21 @@ import (
 	"time"
 )
 
+func TestRuntimeConfigRejectsRemovedSettings(t *testing.T) {
+	for _, field := range []string{"enablePolicyRouting", "shutdownRemoveWireGuardConfiguration", "shutdownRemoveIPRoutes", "shutdownRemoveMasqueradeRules"} {
+		t.Run(field, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "runtime.yaml")
+			if err := os.WriteFile(path, []byte("node:\n  "+field+": true\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := LoadRuntimeConfig(path); err == nil || !strings.Contains(err.Error(), field) {
+				t.Fatalf("removed setting accepted: %v", err)
+			}
+		})
+	}
+}
+
 // TestLoadRuntimeConfig tests LoadRuntimeConfig.
 func TestLoadRuntimeConfig(t *testing.T) {
 	dir := t.TempDir()

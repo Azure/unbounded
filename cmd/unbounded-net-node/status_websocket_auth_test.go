@@ -60,7 +60,7 @@ func (body establishedWriteFailureBody) Write(data []byte) (int, error) {
 }
 
 func TestWebSocketEstablishedFailureFallsBack(t *testing.T) {
-	for _, mode := range []string{statusWSAPIServerModeFallback, statusWSAPIServerModePreferred, statusWSAPIServerModeNever} {
+	for _, mode := range []string{statusWSAPIServerModeFallback, statusWSAPIServerModeNever} {
 		for _, failure := range []string{"read", "full sync"} {
 			t.Run(mode+"/"+failure, func(t *testing.T) {
 				ctx, cancel := context.WithCancel(t.Context())
@@ -466,7 +466,7 @@ func (body initialWriteFailureBody) Write([]byte) (int, error) {
 }
 
 func TestWebSocketInitialWriteFailureFallsBack(t *testing.T) {
-	for _, mode := range []string{statusWSAPIServerModeFallback, statusWSAPIServerModePreferred, statusWSAPIServerModeNever} {
+	for _, mode := range []string{statusWSAPIServerModeFallback, statusWSAPIServerModeNever} {
 		t.Run(mode, func(t *testing.T) {
 			var (
 				fallbackCalls, failedWrites atomic.Int32

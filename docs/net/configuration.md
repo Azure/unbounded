@@ -122,7 +122,6 @@ node:
   bridgeName: cbr0
   wireGuardDir: /host/etc/wireguard
   wireGuardPort: 51820
-  enablePolicyRouting: false    # Deprecated -- PBR replaced by per-interface FORWARD ACCEPT rules
   mtu: 0
   healthPort: 9998
   informerResyncPeriod: 3600s
@@ -133,9 +132,7 @@ node:
   statusWebsocketApiserverStartupDelay: 60s
   statusWebsocketKeepaliveInterval: 10s
   statusWsKeepaliveFailureCount: 2
-  shutdownRemoveWireGuardConfiguration: false
-  cleanupNetlinkOnShutdown: false
-  shutdownRemoveMasqueradeRules: false
+  removeConfigurationOnShutdown: false
   criticalDeltaEvery: 1s
   statsDeltaEvery: 15s
   statusPushEnabled: true
@@ -274,7 +271,7 @@ graph TD
 | `--node-name` | string | - | `NODE_NAME` | Name of this node (required). |
 | `--health-port` | int | `9998` | - | Port for health check server (0 to disable). |
 | `--informer-resync-period` | duration | `3600s` | - | Informer resync period. |
-| `--route-table-id` | int | `252` | - | Custom routing table ID for policy routing. **Deprecated** -- PBR is replaced by per-interface FORWARD ACCEPT rules; see `--enable-policy-routing`. |
+| `--route-table-id` | int | `252` | - | Current managed route table ID, independent of the removed gateway connmark PBR mode. |
 | `--kube-proxy-health-interval` | duration | `30s` | - | Interval between kube-proxy health checks. 0s disables. |
 | `--preferred-private-encap` | string | `GENEVE` | - | Preferred encapsulation for internal (private IP) links. |
 | `--preferred-public-encap` | string | `WireGuard` | - | Preferred encapsulation for external (public IP) links. |
@@ -513,7 +510,6 @@ HTTP push also supports delta mode (`node.statusPushDelta`). If the controller c
 
 - `never`: use direct controller websocket and push endpoints only.
 - `fallback`: use direct controller endpoints first and API server aggregated endpoints as fallback.
-- `preferred`: compatibility alias for `fallback`; direct controller endpoints are preferred, with API server aggregation used only as fallback.
 
 `node.statusWebsocketApiserverURL` and `node.statusPushURL` support `$(KUBERNETES_SERVICE_HOST)` expansion at runtime.
 `node.statusWebsocketApiserverStartupDelay` delays API server fallback attempts during a direct transport outage to allow direct routing to settle first. WebSocket outages are tracked independently of HTTP push, so WebSocket fallback still works when HTTP push is disabled or healthy. A successful handshake alone does not clear an outage or advertise a usable transport: the initial full status write must also succeed. Initial-write failures retain outage timing and retry backoff so an unusable direct endpoint cannot suppress fallback. Failure of an established direct WebSocket starts a new outage and applies retry backoff; normal node shutdown does not. Fallback eligibility is checked when the outage delay expires, without waiting for the next direct retry. A recovered HTTP push prompts a direct WebSocket probe rather than closing a working fallback without confirming WebSocket recovery. A direct WebSocket 401, including during recovery probing, invalidates its HMAC credential for a fresh exchange.
@@ -526,17 +522,14 @@ HTTP push also supports delta mode (`node.statusPushDelta`). If the controller c
 | `--status-push-apiserver-interval` | duration | `30s` | Minimum interval for API server aggregated push attempts (load-control knob). |
 | `--status-ws-enabled` | bool | `true` | Enable websocket status push transport. |
 | `--status-ws-url` | string | - | Explicit websocket URL to controller. If set, this overrides automatic endpoint selection. |
-| `--status-ws-apiserver-mode` | string | `fallback` | Websocket/push endpoint selection: `never` disables API server endpoints; `fallback` prefers direct controller endpoints with API server fallback; `preferred` is a compatibility alias for `fallback`. |
+| `--status-ws-apiserver-mode` | string | `fallback` | Websocket/push endpoint selection: `never` disables API server endpoints; `fallback` prefers direct controller endpoints with API server fallback. |
 | `--status-ws-apiserver-url` | string | `wss://$(KUBERNETES_SERVICE_HOST)/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews` | Aggregated API websocket URL (also used to derive aggregated push URL). |
 | `--status-ws-apiserver-startup-delay` | duration | `60s` | Delay from the start of a direct transport outage before API server websocket/push fallback is allowed (`0s` disables delay). |
 | `--status-ws-keepalive-interval` | duration | `10s` | Interval between node websocket keepalive pings (`0s` disables pings). |
 | `--status-ws-keepalive-failure-count` | int | `2` | Sequential websocket keepalive ping failures before the node reconnects. |
 | `--status-critical-interval` | duration | `1s` | Maximum critical-delta publish frequency; changed fields are batched and sent at most once per interval. |
 | `--status-stats-interval` | duration | `15s` | Statistics refresh interval; includes a freshness timestamp even when measurements are unchanged. |
-| `--shutdown-remove-wireguard-configuration` | bool | `false` | Remove WireGuard interfaces on node-agent shutdown. |
-| `--shutdown-cleanup-netlink` | bool | `false` | Remove managed netlink routes and policy routing rules on node-agent shutdown. |
-| `--enable-policy-routing` | bool | `false` | **Deprecated.** Enable connmark/fwmark/ip-rule policy-based routing on gateway WireGuard interfaces. Replaced by per-interface iptables FORWARD ACCEPT rules that are added when tunnel/WG gateway interfaces are created and removed on deletion. Set to `true` only for backward compatibility with pre-1.0.2 deployments. |
-| `--shutdown-remove-masquerade-rules` | bool | `false` | Remove managed masquerade iptables rules on node-agent shutdown. |
+| `--remove-configuration-on-shutdown` | bool | `false` | Remove managed network configuration on node-agent shutdown. Replaces the removed per-subsystem cleanup flags. |
 | `--healthcheck-port` | int | `9997` | UDP port for health check probe listener (0 to disable). |
 | `--base-metric` | int | `1` | Base metric for programmed routes. |
 

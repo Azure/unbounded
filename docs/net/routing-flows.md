@@ -222,13 +222,11 @@ Rules are removed when the interface is deleted. This approach is simpler
 than PBR and avoids the complexity of per-interface routing tables and fwmark
 management.
 
-#### Policy-Based Routing (Deprecated)
+#### Historical Policy-Based Routing (Removed)
 
-> **Deprecated:** Policy-based routing is disabled by default since v1.0.2.
-> The `enablePolicyRouting` option defaults to `false`. Per-interface FORWARD
-> ACCEPT rules (above) replace PBR for cross-site transit forwarding. The PBR
-> code is retained for backward compatibility. Set `enablePolicyRouting: true`
-> explicitly if you need the old behavior.
+> **Removed:** The following describes the historical implementation, not a
+> supported configuration. `enablePolicyRouting` is rejected. Current forwarding
+> uses `UNBOUNDED-FORWARD` tunnel-to-tunnel rules and the managed route table.
 
 The legacy PBR approach uses a combination of connmark, fwmark, and policy routing:
 

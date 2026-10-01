@@ -4,6 +4,7 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"time"
@@ -62,21 +63,17 @@ type ControllerLeaderElectionYAML struct {
 
 // NodeRuntimeConfig contains node-agent runtime settings.
 type NodeRuntimeConfig struct {
-	InformerResyncPeriod string `yaml:"informerResyncPeriod"`
-	NodeName             string `yaml:"nodeName"`
-	STUNEnabled          *bool  `yaml:"stunEnabled"`
-	STUNHost             string `yaml:"stunHost"`
-	STUNPort             *int   `yaml:"stunPort"`
-	STUNRecheckInterval  string `yaml:"stunRecheckInterval"`
-	CNIConfDir           string `yaml:"cniConfDir"`
-	CNIConfFile          string `yaml:"cniConfFile"`
-	BridgeName           string `yaml:"bridgeName"`
-	WireGuardDir         string `yaml:"wireGuardDir"`
-	WireGuardPort        *int   `yaml:"wireGuardPort"`
-	// Deprecated: EnablePolicyRouting enables connmark/fwmark/ip-rule policy
-	// routing on gateway interfaces. Replaced by the UNBOUNDED-FORWARD chain.
-	// Defaults to false; retained for backward compatibility.
-	EnablePolicyRouting                  *bool  `yaml:"enablePolicyRouting"`
+	InformerResyncPeriod                 string `yaml:"informerResyncPeriod"`
+	NodeName                             string `yaml:"nodeName"`
+	STUNEnabled                          *bool  `yaml:"stunEnabled"`
+	STUNHost                             string `yaml:"stunHost"`
+	STUNPort                             *int   `yaml:"stunPort"`
+	STUNRecheckInterval                  string `yaml:"stunRecheckInterval"`
+	CNIConfDir                           string `yaml:"cniConfDir"`
+	CNIConfFile                          string `yaml:"cniConfFile"`
+	BridgeName                           string `yaml:"bridgeName"`
+	WireGuardDir                         string `yaml:"wireGuardDir"`
+	WireGuardPort                        *int   `yaml:"wireGuardPort"`
 	MTU                                  *int   `yaml:"mtu"`
 	HealthPort                           *int   `yaml:"healthPort"`
 	StatusPushEnabled                    *bool  `yaml:"statusPushEnabled"`
@@ -93,9 +90,6 @@ type NodeRuntimeConfig struct {
 	StatusWSKeepaliveInterval            string `yaml:"statusWebsocketKeepaliveInterval"`
 	StatusWSKeepaliveFailCount           *int   `yaml:"statusWsKeepaliveFailureCount"`
 	RemoveConfigurationOnShutdown        *bool  `yaml:"removeConfigurationOnShutdown"`
-	ShutdownRemoveWireGuardConfiguration *bool  `yaml:"shutdownRemoveWireGuardConfiguration"` // Deprecated: use RemoveConfigurationOnShutdown
-	ShutdownRemoveIPRoutes               *bool  `yaml:"shutdownRemoveIPRoutes"`               // Deprecated: use RemoveConfigurationOnShutdown
-	ShutdownRemoveMasqueradeRules        *bool  `yaml:"shutdownRemoveMasqueradeRules"`        // Deprecated: use RemoveConfigurationOnShutdown
 	CriticalDeltaEvery                   string `yaml:"criticalDeltaEvery"`
 	StatsDeltaEvery                      string `yaml:"statsDeltaEvery"`
 	FullSyncEvery                        string `yaml:"fullSyncEvery"`
@@ -123,7 +117,10 @@ func LoadRuntimeConfig(path string) (*RuntimeConfig, error) {
 	}
 
 	cfg := &RuntimeConfig{}
-	if err := yaml.Unmarshal(content, cfg); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(content))
+	decoder.KnownFields(true)
+
+	if err := decoder.Decode(cfg); err != nil {
 		return nil, fmt.Errorf("parse runtime config %q: %w", path, err)
 	}
 

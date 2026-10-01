@@ -1202,23 +1202,7 @@ func handleStatusPushRequestWithSource(health *healthState, bodyBytes []byte, so
 	}
 
 	if envelope.Mode == "" {
-		var nodeStatus NodeStatusResponse
-		if err := json.Unmarshal(bodyBytes, &nodeStatus); err != nil {
-			return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("invalid request body: %v", err)
-		}
-
-		if nodeStatus.NodeInfo.Name == "" {
-			return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("nodeInfo.name is required")
-		}
-
-		ack.Revision, err = health.statusCache.StoreFullChecked(nodeStatus.NodeInfo.Name, nodeStatus, source)
-		if err != nil {
-			return NodeStatusPushAck{}, http.StatusServiceUnavailable, fmt.Errorf("failed to store full status: %w", err)
-		}
-
-		klog.V(5).Infof("Received full status push from node %s", nodeStatus.NodeInfo.Name)
-
-		return ack, http.StatusOK, nil
+		return NodeStatusPushAck{}, http.StatusBadRequest, fmt.Errorf("status mode is required; bare full-status payloads are unsupported")
 	}
 
 	nodeName := envelope.NodeName

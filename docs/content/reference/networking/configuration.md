@@ -48,6 +48,18 @@ does not reserve historical namespace names or configure a migration reaper.
 
 ## Runtime Configuration
 
+Unknown YAML fields are rejected. The old gateway `enablePolicyRouting` mode
+and per-subsystem shutdown flags are removed. Use
+`node.removeConfigurationOnShutdown` (or `--remove-configuration-on-shutdown`)
+for deliberate shutdown cleanup. Current route-table selection and
+tunnel-to-tunnel `UNBOUNDED-FORWARD` rules are retained.
+
+Status uploads require an explicit envelope (JSON mode/type or protobuf).
+Bare top-level full-status JSON and empty publication acknowledgments are no
+longer accepted. Full publication mode and its revision-based deltas remain
+supported. Configured status URLs are used as supplied, without rewriting old
+API group names.
+
 Both the controller and node agent load runtime settings from a shared YAML
 file mounted from the `unbounded-net-config` ConfigMap.
 
@@ -325,7 +337,7 @@ the full protocol selection algorithm.
 | `--status-push-enabled` | `true` | Push status to controller. |
 | `--status-push-interval` | `10s` | Push interval. |
 | `--status-ws-enabled` | `true` | Enable WebSocket transport. |
-| `--status-ws-apiserver-mode` | `fallback` | Direct controller endpoints first; `fallback` permits API server relay, `never` disables it, and `preferred` is a compatibility alias for `fallback`. |
+| `--status-ws-apiserver-mode` | `fallback` | Direct controller endpoints first; `fallback` permits API server relay and `never` disables it. Other values are rejected. |
 | `--status-critical-interval` | `1s` | Max critical-delta publish frequency. |
 | `--status-stats-interval` | `15s` | Max statistics-delta publish frequency. |
 

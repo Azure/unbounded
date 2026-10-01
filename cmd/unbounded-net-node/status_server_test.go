@@ -224,7 +224,7 @@ func TestResolveStatusWebSocketURLs(t *testing.T) {
 	t.Run("explicit websocket URL wins", func(t *testing.T) {
 		cfg := &config{
 			StatusWSURL:           "wss://custom/ws",
-			StatusWSAPIServerMode: statusWSAPIServerModePreferred,
+			StatusWSAPIServerMode: statusWSAPIServerModeFallback,
 		}
 
 		urls := resolveStatusWebSocketURLs(cfg, true)
@@ -280,7 +280,7 @@ func TestResolveStatusWebSocketURLs(t *testing.T) {
 		}
 	})
 
-	t.Run("preferred mode prioritizes direct websocket URL", func(t *testing.T) {
+	t.Run("fallback mode prioritizes direct websocket URL", func(t *testing.T) {
 		_ = os.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_HOST", "controller.svc")
 		_ = os.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_PORT", "8080")
 		_ = os.Setenv("KUBERNETES_SERVICE_HOST", "api.public.example")
@@ -292,7 +292,7 @@ func TestResolveStatusWebSocketURLs(t *testing.T) {
 		})
 
 		cfg := &config{
-			StatusWSAPIServerMode: statusWSAPIServerModePreferred,
+			StatusWSAPIServerMode: statusWSAPIServerModeFallback,
 			StatusWSAPIServerURL:  "wss://$(KUBERNETES_SERVICE_HOST)/apis/custom.group/v1/status/nodews",
 		}
 
@@ -310,11 +310,11 @@ func TestResolveStatusWebSocketURLs(t *testing.T) {
 		}
 	})
 
-	t.Run("legacy aggregated group URL is rewritten", func(t *testing.T) {
+	t.Run("custom URL is not rewritten", func(t *testing.T) {
 		t.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_HOST", "")
 
 		cfg := &config{
-			StatusWSAPIServerMode: statusWSAPIServerModePreferred,
+			StatusWSAPIServerMode: statusWSAPIServerModeFallback,
 			StatusWSAPIServerURL:  "wss://kubernetes.default.svc/apis/net.unbounded-cloud.io/v1alpha1/status/nodews",
 		}
 
@@ -323,8 +323,8 @@ func TestResolveStatusWebSocketURLs(t *testing.T) {
 			t.Fatalf("expected at least one websocket URL")
 		}
 
-		if urls[0] != "wss://kubernetes.default.svc/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews" {
-			t.Fatalf("expected rewritten aggregated websocket URL, got %q", urls[0])
+		if urls[0] != cfg.StatusWSAPIServerURL {
+			t.Fatalf("custom websocket URL changed: %q", urls[0])
 		}
 	})
 
@@ -357,7 +357,7 @@ func TestResolveStatusWebSocketURLs(t *testing.T) {
 		t.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_HOST", "controller.svc")
 		t.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_PORT", "9999")
 
-		for _, mode := range []string{statusWSAPIServerModeFallback, statusWSAPIServerModePreferred, statusWSAPIServerModeNever} {
+		for _, mode := range []string{statusWSAPIServerModeFallback, statusWSAPIServerModeNever} {
 			cfg := &config{StatusWSAPIServerMode: mode}
 
 			for _, allowFallback := range []bool{false, true} {
@@ -378,7 +378,7 @@ func TestResolveStatusWebSocketURLs(t *testing.T) {
 	t.Run("no direct path uses only permitted fallback", func(t *testing.T) {
 		t.Setenv("UNBOUNDED_NET_CONTROLLER_SERVICE_HOST", "")
 
-		for _, mode := range []string{statusWSAPIServerModeFallback, statusWSAPIServerModePreferred, statusWSAPIServerModeNever} {
+		for _, mode := range []string{statusWSAPIServerModeFallback, statusWSAPIServerModeNever} {
 			cfg := &config{
 				StatusWSAPIServerMode: mode,
 				StatusWSAPIServerURL:  "wss://api.example/apis/status.net.unbounded-cloud.io/v1alpha1/status/nodews",
@@ -453,11 +453,11 @@ func TestResolveStatusPushAPIServerURL(t *testing.T) {
 		}
 	})
 
-	t.Run("rewrites legacy aggregated group in push URL", func(t *testing.T) {
+	t.Run("preserves custom group in push URL", func(t *testing.T) {
 		cfg := &config{StatusWSAPIServerURL: "wss://kubernetes.default.svc/apis/net.unbounded-cloud.io/v1alpha1/status/nodews"}
 		got := resolveStatusPushAPIServerURL(cfg)
 
-		want := "https://kubernetes.default.svc/apis/status.net.unbounded-cloud.io/v1alpha1/status/push"
+		want := "https://kubernetes.default.svc/apis/net.unbounded-cloud.io/v1alpha1/status/push"
 		if got != want {
 			t.Fatalf("unexpected push URL: got %q want %q", got, want)
 		}
