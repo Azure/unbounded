@@ -478,13 +478,11 @@ impl ObjectMetadata {
 }
 
 impl VersionMetadata {
-    /// Absence in legacy data is unknown, not a conflicting MIME claim.
+    /// MIME metadata is immutable, including its absence.
     pub fn compatible(&self, other: &Self) -> bool {
         self.version == other.version
             && self.length == other.length
-            && (self.content_type.is_none()
-                || other.content_type.is_none()
-                || self.content_type == other.content_type)
+            && self.content_type == other.content_type
     }
     /// A recovered or retained immutable descriptor can answer a pin, but carries
     /// no reusable freshness claim. Never infer total length from a page's bytes.

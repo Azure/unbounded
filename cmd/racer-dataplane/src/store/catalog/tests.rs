@@ -5,14 +5,23 @@ use crate::{
 };
 
 #[test]
-fn content_type_survives_catalog_and_legacy_refresh_and_rejects_conflicts() {
+fn content_type_is_immutable_including_absence() {
     let index = Index::new(WorkerId(0), 8, crate::test_support::availability());
     let legacy = descriptor("v1", 3);
     index.publish_version(legacy.clone()).unwrap();
     let mut typed = legacy.clone();
     typed.content_type = Some(crate::model::ContentType::parse(b"text/plain").unwrap());
-    index.publish_version(typed.clone()).unwrap();
+    assert_eq!(
+        index.publish_version(typed.clone()),
+        Err(Error::CorruptRecord)
+    );
     index.publish_version(legacy).unwrap();
+    let index = Index::new(WorkerId(0), 8, crate::test_support::availability());
+    index.publish_version(typed.clone()).unwrap();
+    assert_eq!(
+        index.publish_version(descriptor("v1", 3)),
+        Err(Error::CorruptRecord)
+    );
     assert_eq!(index.version(&typed.version).unwrap(), Some(typed.clone()));
     assert_eq!(typed.for_pin().content_type, typed.content_type);
     let mut conflict = typed.clone();

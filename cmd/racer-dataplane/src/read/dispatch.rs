@@ -664,15 +664,11 @@ impl WorkerDirectory {
                         .value?
                 };
                 match value {
-                    Value::Retained(Some(mut value)) => {
+                    Value::Retained(Some(value)) => {
                         if value.version != *version
                             || found.as_ref().is_some_and(|old| !old.compatible(&value))
                         {
                             return Err(Error::CorruptRecord);
-                        }
-                        if value.content_type.is_none() {
-                            value.content_type =
-                                found.as_ref().and_then(|old| old.content_type.clone());
                         }
                         found = Some(value);
                     }
@@ -1172,7 +1168,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_metadata_merges_legacy_workers_in_both_orders_and_rejects_conflicts() {
+    fn retained_metadata_requires_exact_mime_in_both_orders() {
         let version = version();
         let legacy = VersionMetadata {
             version: version.clone(),
@@ -1188,8 +1184,10 @@ mod tests {
         let mut wrong_version = legacy.clone();
         wrong_version.version.etag = StrongEtag::test_value("other");
         for (values, expected) in [
-            ([legacy.clone(), typed.clone()], Ok(Some(typed.clone()))),
-            ([typed.clone(), legacy.clone()], Ok(Some(typed.clone()))),
+            ([legacy.clone(), legacy.clone()], Ok(Some(legacy.clone()))),
+            ([typed.clone(), typed.clone()], Ok(Some(typed.clone()))),
+            ([legacy.clone(), typed.clone()], Err(Error::CorruptRecord)),
+            ([typed.clone(), legacy.clone()], Err(Error::CorruptRecord)),
             ([typed.clone(), conflict.clone()], Err(Error::CorruptRecord)),
             ([conflict, typed.clone()], Err(Error::CorruptRecord)),
             ([legacy.clone(), wrong_length], Err(Error::CorruptRecord)),

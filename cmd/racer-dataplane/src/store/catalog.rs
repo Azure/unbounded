@@ -85,9 +85,6 @@ impl IndexSnapshot {
                 if !old.compatible(metadata) {
                     return Err(Error::CorruptRecord);
                 }
-                if old.content_type.is_some() {
-                    continue;
-                }
             }
             lengths.insert(&metadata.version, metadata);
         }
@@ -197,9 +194,6 @@ impl Index {
             .entry(page.version.clone())
             .or_insert((entry.metadata.clone(), 0));
         version.1 += 1;
-        if version.0.content_type.is_none() {
-            version.0.content_type = entry.metadata.content_type.clone();
-        }
         state
             .reverse
             .entry(entry.location.segment)
@@ -219,37 +213,22 @@ impl Index {
             return Ok(None);
         }
         let s = self.state.borrow();
-        let mut descriptor = s.metadata.get(version).cloned().or_else(|| {
+        let descriptor = s.metadata.get(version).cloned().or_else(|| {
             s.versions
                 .get(version)
                 .map(|(metadata, _)| metadata.clone())
         });
-        if let Some(m) = descriptor.as_mut() {
-            if m.content_type.is_none() {
-                m.content_type = s
-                    .versions
-                    .get(version)
-                    .and_then(|(v, _)| v.content_type.clone());
-            }
-        }
         Ok(descriptor)
     }
     /// Page-zero owner only. Supports metadata-only objects without a dirty page,
     /// slab allocation, encryption record, or ciphertext reservation.
-    pub fn publish_version(&self, mut metadata: VersionMetadata) -> Result<()> {
+    pub fn publish_version(&self, metadata: VersionMetadata) -> Result<()> {
         if !self.available(&metadata.version.object.cache) {
             return Ok(());
         }
         Self::validate_descriptor(&metadata)?;
         let mut s = self.state.borrow_mut();
         Self::check_length(&s, &metadata)?;
-        if metadata.content_type.is_none() {
-            metadata.content_type = s
-                .metadata
-                .get(&metadata.version)
-                .or_else(|| s.versions.get(&metadata.version).map(|(m, _)| m))
-                .and_then(|m| m.content_type.clone());
-        }
         if self.metadata_capacity == 0 {
             return Err(Error::Overloaded);
         }
