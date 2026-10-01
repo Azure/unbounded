@@ -955,6 +955,28 @@ mod tests {
                 .verify_response(copy_response(&response), &forged)
                 .is_err()
         );
+        let mut forged_mac = binding.clone();
+        let mut proof = clone_head(&forged_mac.original);
+        proof
+            .head
+            .headers
+            .iter_mut()
+            .find(|h| h.name == "racer-request-mac")
+            .unwrap()
+            .value[0] ^= 1;
+        forged_mac.original = Arc::new(proof);
+        assert!(
+            sender
+                .verify_response(copy_response(&response), &forged_mac)
+                .is_err()
+        );
+        let wall = crate::runtime::environment::wall_now();
+        clock.set_wall_time(wall - Duration::from_secs(67));
+        assert!(matches!(
+            signatures[2].verify_retained_request(admitted.binding()),
+            Err(Error::Replay)
+        ));
+        clock.set_wall_time(wall);
         let mut wrong_path = binding.clone();
         wrong_path.path = vec![node(1)];
         assert!(
