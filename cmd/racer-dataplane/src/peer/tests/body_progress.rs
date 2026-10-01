@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     http::{
-        codec::Codec,
+        Codec,
         io::HttpIo,
         pool::{ConnectionLease, Endpoint, HttpPool},
     },

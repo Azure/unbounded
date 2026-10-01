@@ -5,7 +5,7 @@ use crate::{
     control::wire::{BundleGeneration, KeyringBundle, SCHEMA_VERSION},
     error::{Error, Operation},
     http::{
-        codec::Codec,
+        Codec,
         io::HttpIo,
         pool::{ConnectionLease, HttpPool},
     },
@@ -697,7 +697,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
             )),
         );
         assert!(matches!(responses.error_head(expected).unwrap().start,
-                crate::http::codec::StartLine::Response { status }
+                crate::http::StartLine::Response { status }
                 if status == if matches!(case, Absence::Fresh | Absence::Subscription) { 404 } else { 412 }));
     } else if forbidden {
         assert!(matches!(result, Err(Error::OriginForbidden)));

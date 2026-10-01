@@ -5,7 +5,7 @@
 use crate::security::forwarding::ForwardedHead;
 use crate::{
     error::{Error, Result},
-    http::codec::{Codec, Header, MessageHead, StartLine},
+    http::{Codec, Header, MessageHead, StartLine},
     security::signing::SignedHead,
 };
 use crate::{

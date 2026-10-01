@@ -3,7 +3,7 @@ use super::{Responses, header};
 use crate::{
     error::{Error, Operation, Result},
     http::{
-        codec::{MessageHead, StartLine},
+        MessageHead, StartLine,
         io::{HttpIo, OwnedBuffer},
         pool::ConnectionLease,
     },

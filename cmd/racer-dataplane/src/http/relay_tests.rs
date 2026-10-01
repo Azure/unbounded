@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    http::codec::{Codec, Header, MessageHead, StartLine},
+    http::{Codec, Header, MessageHead, StartLine},
     memory::pipe::PipePool,
     model::{RequestId, ResourceClass},
     runtime::{admission::Admission, reactor::Reactor},

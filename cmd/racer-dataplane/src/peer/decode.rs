@@ -2,7 +2,7 @@
 use super::wire::*;
 use crate::{
     error::{Error, Result},
-    http::codec::MessageHead,
+    http::MessageHead,
     memory::pool::BufferPool,
     model::{
         EncryptedAuthorization, ExpiresAt, KeyId, MetadataSelector, Nonce, ObjectMetadata,

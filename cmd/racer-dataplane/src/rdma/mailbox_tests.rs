@@ -3,7 +3,7 @@ use super::tests::{claim, mark_connected, provision_test};
 use super::*;
 use crate::{
     error::Operation,
-    http::codec::{Header, MessageHead, StartLine},
+    http::{Header, MessageHead, StartLine},
     memory::pool::BufferPool,
     model::{
         CacheId, CacheKey, KeyId, Nonce, ObjectId, ObjectVersion, PageEnvelope, PageId, PageNumber,

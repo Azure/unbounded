@@ -2,7 +2,7 @@
 use super::tests::{claim, mark_connected, provision_test};
 use super::*;
 use crate::{
-    http::codec::{Header, MessageHead, StartLine},
+    http::{Header, MessageHead, StartLine},
     model::{
         CacheId, CacheKey, KeyId, Nonce, ObjectId, ObjectVersion, PageEnvelope, PageId, PageNumber,
         RequestId, ResourceClass, StrongEtag, TransferId,

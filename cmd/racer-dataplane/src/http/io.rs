@@ -4,10 +4,7 @@
 //! socket while the kernel uses it. Before submission, move the connection and
 //! owned buffers into reactor-owned state; return them only after the final fence.
 //! Head operations must stage encoded/received bytes in owned IoBuffer storage.
-use super::{
-    codec::{MessageHead, StartLine},
-    pool::ConnectionLease,
-};
+use super::{MessageHead, StartLine, pool::ConnectionLease};
 use crate::{
     error::{Error, Operation, Result},
     model::ResourceClass,
@@ -103,7 +100,7 @@ impl<B: IoBuffer> IoBuffer for BufferRange<B> {
 }
 pub struct HttpIo {
     reactor: Rc<Reactor>,
-    codec: super::codec::Codec,
+    codec: super::Codec,
     send_body_limit: u64,
     admission: Option<Rc<Admission>>,
     idle_buffer: Rc<RefCell<Option<OwnedBuffer>>>,
@@ -160,7 +157,7 @@ impl HttpIo {
     pub(crate) fn reactor(&self) -> &Rc<Reactor> {
         &self.reactor
     }
-    pub fn new(reactor: Rc<Reactor>, codec: super::codec::Codec) -> Self {
+    pub fn new(reactor: Rc<Reactor>, codec: super::Codec) -> Self {
         Self {
             reactor,
             send_body_limit: codec.body_limit(),
@@ -173,7 +170,7 @@ impl HttpIo {
     /// compatibility, but head staging requires explicitly supplied admission.
     pub fn with_admission(
         reactor: Rc<Reactor>,
-        codec: super::codec::Codec,
+        codec: super::Codec,
         admission: Rc<Admission>,
     ) -> Self {
         Self {
@@ -190,12 +187,12 @@ impl HttpIo {
     pub fn for_clients(reactor: Rc<Reactor>, admission: Rc<Admission>) -> Self {
         let mut io = Self::with_admission(
             reactor,
-            super::codec::Codec::new(
+            super::Codec::new(
                 admission
                     .limits()
                     .header_bytes
                     .get()
-                    .min(super::codec::MAX_HEAD_BYTES),
+                    .min(super::MAX_HEAD_BYTES),
                 crate::model::PAGE_BYTES + 16,
             ),
             admission,
@@ -835,7 +832,7 @@ mod tests {
     use super::*;
     use crate::{
         http::{
-            codec::{Codec, Header},
+            Codec, Header,
             pool::{Endpoint, HttpPool},
         },
         model::RequestId,
@@ -1042,10 +1039,10 @@ mod tests {
             admission.clone(),
         );
         let client = HttpIo::for_clients(reactor.clone(), admission.clone());
-        let origin = peer.capped(super::super::codec::MAX_HEAD_BYTES);
+        let origin = peer.capped(super::super::MAX_HEAD_BYTES);
         for (io, limit) in [
             (&client, admission.limits().header_bytes.get()),
-            (&origin, super::super::codec::MAX_HEAD_BYTES),
+            (&origin, super::super::MAX_HEAD_BYTES),
             (&peer, crate::peer::wire::MAX_ENVELOPE_HEAD),
         ] {
             for extra in [0, 1] {
@@ -1490,7 +1487,7 @@ mod tests {
             let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
             let raw = if oversized {
                 let mut raw = b"GET / HTTP/1.1\r\nAuthorization: ".to_vec();
-                raw.resize(super::super::codec::MAX_HEAD_BYTES, b'x');
+                raw.resize(super::super::MAX_HEAD_BYTES, b'x');
                 raw
             } else {
                 b"GET / HTTP/1.1\r\nAuthorization:secret\r\nContent-Length: 4\r\n\r\nbody".to_vec()

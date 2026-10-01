@@ -871,7 +871,7 @@ mod tests {
     #[test]
     fn materialized_transit_fin_and_parent_cancel_fence_head_and_body() {
         use crate::{
-            http::{codec::Codec, io::HttpIo, pool::ConnectionLease},
+            http::{Codec, io::HttpIo, pool::ConnectionLease},
             runtime::reactor::Reactor,
         };
         use std::net::{Shutdown, TcpListener, TcpStream};
@@ -985,7 +985,7 @@ mod tests {
     #[test]
     fn materialized_transit_success_fences_watch_before_keepalive() {
         use crate::{
-            http::{codec::Codec, io::HttpIo, pool::ConnectionLease},
+            http::{Codec, io::HttpIo, pool::ConnectionLease},
             runtime::reactor::Reactor,
         };
         let admission = Rc::new(Admission::new(
@@ -1295,7 +1295,7 @@ mod tests {
     #[test]
     fn backpressured_handshake_responses_keep_fixed_deadline_and_fenced_admission() {
         use crate::{
-            http::{codec::Codec, io::HttpIo, pool::ConnectionLease},
+            http::{Codec, io::HttpIo, pool::ConnectionLease},
             memory::pool::BufferPool,
             peer::{PeerTransport, wire::SecurityCodec},
             runtime::{environment::SimulationClock, reactor::Reactor},
@@ -1345,7 +1345,7 @@ mod tests {
             work: &mut Operation<'_, ConnectionLease>,
             peer: &mut UnixStream,
             codec: &Codec,
-        ) -> crate::http::codec::MessageHead {
+        ) -> crate::http::MessageHead {
             let mut bytes = Vec::new();
             drive(
                 reactor,

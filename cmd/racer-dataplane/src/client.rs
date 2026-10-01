@@ -8,7 +8,7 @@ pub mod response;
 use crate::runtime::collections::HashSet;
 use crate::{
     error::{Error, Result},
-    http::codec::{MessageHead, StartLine},
+    http::{MessageHead, StartLine},
     model::{
         Authorization, ByteRange, CacheId, CacheKey, ObjectId, OpaqueMetadata, OriginContext,
         PAGE_BYTES, StrongEtag,
@@ -303,7 +303,7 @@ fn trim_ows(mut value: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::codec::{Codec, Header};
+    use crate::http::{Codec, Header};
 
     fn head(method: &str, fields: &[(&str, &[u8])]) -> MessageHead {
         MessageHead {

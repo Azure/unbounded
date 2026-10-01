@@ -393,7 +393,7 @@ mod tests {
     fn real_signed_setup_rejects_tampering_and_replay() {
         use crate::{
             control::wire::{BundleGeneration, KeyringBundle, SCHEMA_VERSION},
-            http::codec::{Header, MessageHead, StartLine},
+            http::{Header, MessageHead, StartLine},
             model::ClusterId,
             security::{
                 certificates::Certificates,

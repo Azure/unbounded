@@ -40,11 +40,7 @@ fn native_failure(error: Error, scope: &RequestScope) -> bool {
 mod tests {
     use super::*;
     use crate::{
-        http::{
-            codec::{Codec, MessageHead, StartLine},
-            io::HttpIo,
-            pool::HttpPool,
-        },
+        http::{Codec, MessageHead, StartLine, io::HttpIo, pool::HttpPool},
         memory::pool::BufferPool,
         model::{ExpiresAt, KeyId, Nonce, ObjectMetadata, PageEnvelope, ResourceClass, *},
         rdma::{device::Devices, session::Sessions, transfer::RdmaTransfer},

@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     control::snapshot::PublishedState,
-    http::codec::Codec,
+    http::Codec,
     model::{
         Authorization, CacheId, CacheKey, ClusterId, Limits, ObjectId, OpaqueMetadata, RequestId,
         StrongEtag,

@@ -1117,7 +1117,7 @@ mod tests {
     fn responses_stream_more_than_three_pages_only_with_client_sized_http_framing() {
         use crate::{
             client::response::Responses,
-            http::{codec::Codec, io::HttpIo, pool::ConnectionLease},
+            http::{Codec, io::HttpIo, pool::ConnectionLease},
             memory::{
                 pipe::PipePool,
                 pool::{CiphertextBytes, CiphertextPage, VerifiedBytes, VerifiedPage},

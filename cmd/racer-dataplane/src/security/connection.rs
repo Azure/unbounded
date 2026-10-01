@@ -5,11 +5,7 @@ use super::{
 };
 use crate::{
     error::{Error, Result},
-    http::{
-        codec::{MessageHead, StartLine},
-        io::HttpIo,
-        pool::ConnectionLease,
-    },
+    http::{MessageHead, StartLine, io::HttpIo, pool::ConnectionLease},
     model::NodeId,
     runtime::deadline::RequestScope,
 };
@@ -318,7 +314,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::{
         http::{
-            codec::Codec,
+            Codec,
             pool::{Endpoint, HttpPool},
         },
         model::{RequestId, ResourceClass},
@@ -336,7 +332,7 @@ pub(crate) mod tests {
                 method: "POST".into(),
                 target: crate::peer::wire::REQUEST_TARGET.into(),
             },
-            headers: vec![crate::http::codec::Header {
+            headers: vec![crate::http::Header {
                 name: "content-length".into(),
                 value: b"0".to_vec(),
             }],

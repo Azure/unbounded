@@ -672,7 +672,7 @@ impl WorkerApplication {
         );
         let io = Rc::new(HttpIo::with_admission(
             reactor.clone(),
-            crate::http::codec::Codec::new(
+            crate::http::Codec::new(
                 crate::peer::wire::MAX_ENVELOPE_HEAD,
                 crate::model::PAGE_BYTES + 16,
             ),
@@ -824,7 +824,7 @@ impl WorkerApplication {
                         .limits
                         .header_bytes
                         .get()
-                        .min(crate::http::codec::MAX_HEAD_BYTES),
+                        .min(crate::http::MAX_HEAD_BYTES),
                 ),
             ),
             admission.clone(),

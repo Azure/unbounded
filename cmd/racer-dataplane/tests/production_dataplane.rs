@@ -17,7 +17,7 @@ use racer_dataplane::{
     },
     error::{Error, Operation, Result},
     http::{
-        codec::Codec,
+        Codec,
         io::HttpIo,
         pool::{ConnectionLease, HttpPool},
     },

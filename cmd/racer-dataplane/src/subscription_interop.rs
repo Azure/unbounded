@@ -279,7 +279,7 @@ fn go_sdk_subscription_server() {
     let mut endpoint = directory.install(WorkerId(0), coordinator.clone()).unwrap();
     let io = Rc::new(http::io::HttpIo::with_admission(
         reactor.clone(),
-        http::codec::Codec::new(32768, i64::MAX as u64),
+        http::Codec::new(32768, i64::MAX as u64),
         admission.clone(),
     ));
     let responses = Rc::new(Responses::new(io.clone(), delivery));

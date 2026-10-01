@@ -1,7 +1,7 @@
 //! Closed payload-control schema using the security-owned RFC 9421 signer.
 use crate::{
     error::{Error, Result},
-    http::codec::{Header, MessageHead, StartLine},
+    http::{Header, MessageHead, StartLine},
     model::{NodeId, TransferId},
     runtime::deadline::RequestScope,
     security::{

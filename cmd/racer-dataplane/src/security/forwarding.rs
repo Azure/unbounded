@@ -47,7 +47,7 @@ use super::{
 };
 use crate::{
     error::{Error, Result},
-    http::codec::{MessageHead, StartLine},
+    http::{MessageHead, StartLine},
     model::NodeId,
     peer::wire::{PeerRequest, PeerResponse, SignedRequest, SignedResponse},
     topology::paths::RouteBudget,
@@ -928,9 +928,9 @@ mod tests {
             "racer-cache",
             "racer-key",
         ] {
-            let mut bad = crate::http::codec::Codec::new(65536, 32)
+            let mut bad = crate::http::Codec::new(65536, 32)
                 .decode_head(
-                    &crate::http::codec::Codec::new(65536, 32)
+                    &crate::http::Codec::new(65536, 32)
                         .encode_head(&response)
                         .unwrap(),
                 )

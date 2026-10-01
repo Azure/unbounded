@@ -84,7 +84,7 @@ fn signed_opaque_relay_roundtrip_and_exact_attempt_binding() {
 
 #[test]
 fn not_found_is_authenticated_through_relay_and_restricted_to_fresh_acquire() {
-    use crate::{http::codec::StartLine, security::protocol as p};
+    use crate::{http::StartLine, security::protocol as p};
     let signers = signers();
     let auth: Vec<_> = signers.iter().map(|s| Forwarding::new(s.clone())).collect();
     let admission = Rc::new(Admission::new(
@@ -319,7 +319,7 @@ fn search_view_consumes_ingress_without_changing_signed_route() {
 #[test]
 fn server_authenticates_before_copy_only_service_and_signs_failures() {
     use crate::{
-        http::{codec::Codec, io::HttpIo},
+        http::{Codec, io::HttpIo},
         runtime::reactor::Reactor,
         topology::{
             health::LinkHealth,
@@ -436,11 +436,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
 #[test]
 fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
     use crate::{
-        http::{
-            codec::{Codec, MessageHead, StartLine},
-            io::HttpIo,
-            pool::HttpPool,
-        },
+        http::{Codec, MessageHead, StartLine, io::HttpIo, pool::HttpPool},
         runtime::reactor::Reactor,
         security::{protocol as p, signing::signed_digest},
         topology::membership::{Member, Membership},
@@ -783,7 +779,7 @@ fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction(
 fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
     use super::PeerClient;
     use crate::{
-        http::{codec::Codec, io::HttpIo, pool::HttpPool},
+        http::{Codec, io::HttpIo, pool::HttpPool},
         runtime::reactor::Reactor,
         topology::{
             health::LinkHealth,
@@ -926,7 +922,7 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
     use super::PeerClient;
     use crate::{
         http::{
-            codec::Codec,
+            Codec,
             io::HttpIo,
             pool::{ConnectionLease, HttpPool},
         },
@@ -1120,7 +1116,7 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
 #[test]
 fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
     use crate::{
-        http::{codec::Codec, io::HttpIo, pool::ConnectionLease},
+        http::{Codec, io::HttpIo, pool::ConnectionLease},
         runtime::reactor::Reactor,
         topology::{health::LinkHealth, paths::Paths},
     };
@@ -1321,7 +1317,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
 fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     use crate::{
         http::{
-            codec::Codec,
+            Codec,
             io::HttpIo,
             pool::{Endpoint, HttpPool},
         },
@@ -1569,7 +1565,7 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
 mod established_sessions {
     use super::*;
     use crate::{
-        http::{codec::Codec, io::HttpIo, pool::ConnectionLease},
+        http::{Codec, io::HttpIo, pool::ConnectionLease},
         runtime::{reactor::IoBuffer, reactor::Reactor},
         security::{connection, protocol as p},
         topology::{
@@ -1703,7 +1699,7 @@ mod established_sessions {
                 ConnectionLease::from_accepted(b.into(), &self.admission).unwrap(),
             )
         }
-        fn frame(&self, large: bool) -> crate::http::codec::MessageHead {
+        fn frame(&self, large: bool) -> crate::http::MessageHead {
             let mut request = request(&self.admission, 1);
             if large {
                 request.origin.metadata =

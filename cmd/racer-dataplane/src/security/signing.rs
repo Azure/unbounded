@@ -9,7 +9,7 @@ use super::{
 };
 use crate::{
     error::{Error, Result},
-    http::codec::{Codec, MessageHead, StartLine},
+    http::{Codec, MessageHead, StartLine},
     model::NodeId,
 };
 use sha2::{Digest, Sha256};

@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     http::{
-        codec::Codec,
+        Codec,
         io::{BufferRange, HttpIo},
         pool::{ConnectionLease, HttpPool},
     },
@@ -459,7 +459,7 @@ fn opaque_relay_benchmark() {
 #[test]
 fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution() {
     use crate::security::{forwarding::ForwardedHead, protocol};
-    fn copy(head: &crate::http::codec::MessageHead) -> crate::http::codec::MessageHead {
+    fn copy(head: &crate::http::MessageHead) -> crate::http::MessageHead {
         let codec = Codec::new(wire::MAX_SIGNED_HEAD, crate::model::PAGE_BYTES + 16);
         let mut head = codec
             .decode_head(&codec.encode_head(head).unwrap())

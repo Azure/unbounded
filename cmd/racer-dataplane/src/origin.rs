@@ -11,7 +11,7 @@ use crate::{
     },
     error::{Error, Operation, Result},
     http::{
-        codec::{Header, MessageHead, StartLine},
+        Header, MessageHead, StartLine,
         io::HttpIo,
         pool::{ConnectionLease, Endpoint, HttpPool},
     },
@@ -547,7 +547,7 @@ pub mod metadata {
     use super::{page::OriginPage, protocol};
     use crate::{
         error::{Error, Result},
-        http::codec::MessageHead,
+        http::MessageHead,
         model::{ObjectId, ObjectMetadata, PAGE_BYTES},
     };
     pub struct MetadataReply {
@@ -591,7 +591,7 @@ pub mod metadata {
     mod tests {
         use super::*;
         use crate::{
-            http::codec::{Header, StartLine},
+            http::{Header, StartLine},
             model::{CacheId, CacheKey},
         };
         use std::time::{Duration, UNIX_EPOCH};
@@ -721,7 +721,7 @@ pub mod metadata {
 
         #[test]
         fn raw_expiry_whitespace_is_rejected_before_metadata_publication() {
-            use crate::http::codec::Codec;
+            use crate::http::Codec;
             for expiry in ["0", " 0", "0 ", "\t0", "0\t", "0 \t"] {
                 let raw = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"v\"\r\nRacer-Expires-At: {expiry}\r\n\r\n"
@@ -746,7 +746,7 @@ pub mod page {
     use super::protocol;
     use crate::{
         error::{Error, Result},
-        http::codec::MessageHead,
+        http::MessageHead,
         memory::pool::PlaintextBuffer,
         model::{ObjectMetadata, PAGE_BYTES, PageId},
     };
@@ -800,7 +800,7 @@ pub mod page {
     mod tests {
         use super::*;
         use crate::{
-            http::codec::{Header, StartLine},
+            http::{Header, StartLine},
             model::{CacheId, CacheKey, ObjectId, ObjectVersion, PageNumber, StrongEtag},
         };
 
@@ -870,7 +870,7 @@ pub mod page {
 mod protocol {
     use crate::{
         error::{Error, Result},
-        http::codec::{MessageHead, StartLine},
+        http::{MessageHead, StartLine},
         model::{ExpiresAt, ObjectId, ObjectMetadata, ObjectVersion, StrongEtag},
     };
 
@@ -1072,7 +1072,7 @@ mod protocol {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::http::codec::Header;
+        use crate::http::Header;
 
         #[test]
         fn optional_content_type_is_validated_without_transport_substitution() {
@@ -1145,7 +1145,7 @@ mod protocol {
         #[test]
         fn numeric_headers_reject_padding_before_any_normalization() {
             use crate::{
-                http::codec::Codec,
+                http::Codec,
                 model::{CacheId, CacheKey},
             };
             let object = ObjectId {

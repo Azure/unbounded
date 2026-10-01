@@ -1725,7 +1725,7 @@ impl Harness {
 
     fn peer_security(&mut self) {
         use crate::{
-            http::codec::{Codec, MessageHead, StartLine},
+            http::{Codec, MessageHead, StartLine},
             peer::wire::WireCodec,
             security::protocol as p,
         };

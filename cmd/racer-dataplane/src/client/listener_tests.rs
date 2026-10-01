@@ -204,7 +204,7 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
 }
 use crate::{
     client::ClientRequest,
-    http::codec::Codec,
+    http::Codec,
     memory::{delivery::Delivery, pipe::PipePool},
     model::{ExpiresAt, Limits, ObjectMetadata, ObjectVersion, StrongEtag},
     read::ReadResponse,

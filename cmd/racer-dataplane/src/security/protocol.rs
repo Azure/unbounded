@@ -3,7 +3,7 @@
 //! Encoders never include page bytes. Transports must preserve every signed head.
 use crate::{
     error::{Error, Result},
-    http::codec::{Header, MessageHead, StartLine},
+    http::{Header, MessageHead, StartLine},
     model::{NodeId, ObjectId, ObjectMetadata, ObjectVersion, PAGE_BYTES},
     peer::wire::{FetchMode, Operation, PeerRequest, PeerResponse},
     runtime::deadline::Deadline,
