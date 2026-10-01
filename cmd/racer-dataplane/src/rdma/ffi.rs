@@ -1,4 +1,4 @@
-//! The only Rust unsafe boundary. Used exclusively by the paired native service.
+//! Native RDMA unsafe boundary. Used exclusively by the paired native service.
 //! Provider layouts stay in native/rdma.c. Failed teardown retains DMA ownership.
 use crate::error::{Error, Result};
 use std::{

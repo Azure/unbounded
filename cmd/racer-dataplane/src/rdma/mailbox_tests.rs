@@ -228,7 +228,7 @@ fn sender_case(terminal: Option<Error>) {
     let grant = done(&mut prepare);
     drop(prepare);
     native.poll_budgeted(2).unwrap();
-    backend::lifetime_tests::complete(1, 0, 5);
+    ffi::lifetime_tests::complete(1, 0, 5);
     native.poll_budgeted(2).unwrap();
     done(&mut grant.wait_bound(&scope));
     let signed = verified(
@@ -256,11 +256,11 @@ fn sender_case(terminal: Option<Error>) {
     drop(guard);
     assert!(poll(&mut sending).is_pending());
     native.poll_budgeted(2).unwrap();
-    backend::lifetime_tests::complete(1, 0, 1);
+    ffi::lifetime_tests::complete(1, 0, 1);
     native.poll_budgeted(2).unwrap();
     assert!(poll(&mut sending).is_pending());
     if let Some(error) = terminal {
-        backend::lifetime_tests::fail_stop(true);
+        ffi::lifetime_tests::fail_stop(true);
         native.poll_budgeted(2).unwrap();
         assert!(!sender.stopped());
         assert!(poll(&mut sending).is_pending());
@@ -278,7 +278,7 @@ fn sender_case(terminal: Option<Error>) {
         assert_eq!(charged.get(), 1);
         assert_eq!(io.shared.slots[1].state.load(Ordering::Acquire), OWNED);
         assert!(!io.shared.slots[1].fenced.load(Ordering::Acquire));
-        backend::lifetime_tests::fail_stop(false);
+        ffi::lifetime_tests::fail_stop(false);
         native.resources[1].as_mut().unwrap().next_retry = None;
         native.poll_budgeted(2).unwrap();
         assert_eq!(io.shared.slots[1].state.load(Ordering::Acquire), READY);
@@ -317,7 +317,7 @@ fn sender_case(terminal: Option<Error>) {
     let grant = done(&mut bind);
     drop(bind);
     native.poll_budgeted(2).unwrap();
-    backend::lifetime_tests::complete(1, 0, 5);
+    ffi::lifetime_tests::complete(1, 0, 5);
     native.poll_budgeted(2).unwrap();
     done(&mut grant.wait_bound(&scope));
     let guard = io.shared.slots[0].mailbox.lock().unwrap();
@@ -350,7 +350,7 @@ fn command_poll_distinguishes_contended_completion_from_full_queue() {
         Poll::Ready(Err(Error::Overloaded))
     ));
     native.poll_budgeted(1).unwrap();
-    backend::lifetime_tests::complete(1, 0, 1);
+    ffi::lifetime_tests::complete(1, 0, 1);
     native.poll_budgeted(1).unwrap();
     let guard = io.shared.slots[0].mailbox.lock().unwrap();
     assert!(qp.poll_write(region.clone(), 4096, 7).is_pending());

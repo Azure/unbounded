@@ -4,8 +4,8 @@
 //! Attach the bounded lifecycle endpoints, activate `Devices` against publication,
 //! and run `WithNative` on the existing crypto role. Serving I/O turns only consume
 //! mailboxes and drive `Sessions::progress`.
-mod backend;
 pub mod device;
+mod ffi;
 pub mod lifecycle;
 pub mod permission;
 pub mod registered;

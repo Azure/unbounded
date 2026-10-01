@@ -118,7 +118,7 @@ fn receive_case(readback: bool, terminal: Option<Error>, failed_fence: bool) {
         futures::executor::block_on(transfer.prepare_receive(&session, &envelope, id, &scope))
             .unwrap();
     native.poll_budgeted(1).unwrap();
-    backend::lifetime_tests::complete(1, 0, 5);
+    ffi::lifetime_tests::complete(1, 0, 5);
     native.poll_budgeted(1).unwrap();
     grant.descriptor().unwrap();
     let signed = signers[0]
@@ -162,12 +162,12 @@ fn receive_case(readback: bool, terminal: Option<Error>, failed_fence: bool) {
     if readback {
         assert!(finish.as_mut().poll(&mut cx).is_pending());
         native.poll_budgeted(1).unwrap();
-        backend::lifetime_tests::complete(2, 0, 6);
+        ffi::lifetime_tests::complete(2, 0, 6);
         native.poll_budgeted(1).unwrap();
         assert!(finish.as_mut().poll(&mut cx).is_pending());
         assert!(!qp.stopped());
         if failed_fence {
-            backend::lifetime_tests::fail_stop(true);
+            ffi::lifetime_tests::fail_stop(true);
         }
         native.poll_budgeted(1).unwrap();
         assert_eq!(qp.stopped(), !failed_fence);
@@ -199,7 +199,7 @@ fn receive_case(readback: bool, terminal: Option<Error>, failed_fence: bool) {
         if !readback {
             assert!(finish.as_mut().poll(&mut cx).is_pending());
             native.poll_budgeted(1).unwrap();
-            backend::lifetime_tests::complete(2, 0, 6);
+            ffi::lifetime_tests::complete(2, 0, 6);
             native.poll_budgeted(1).unwrap();
             assert!(finish.as_mut().poll(&mut cx).is_pending());
             native.poll_budgeted(1).unwrap();
@@ -241,7 +241,7 @@ fn receive_case(readback: bool, terminal: Option<Error>, failed_fence: bool) {
         native.poll_budgeted(1).unwrap();
         assert_eq!(charged.get(), 1);
         assert_eq!(io.shared.slots[0].state.load(Ordering::Acquire), OWNED);
-        backend::lifetime_tests::fail_stop(false);
+        ffi::lifetime_tests::fail_stop(false);
         native.resources[0].as_mut().unwrap().next_retry = None;
         native.poll_budgeted(1).unwrap();
         assert_eq!(io.shared.slots[0].state.load(Ordering::Acquire), READY);

@@ -1,6 +1,6 @@
 //! Match discovered ports to trusted local fabric associations and publication.
 //! Fabric strings are opaque labels: a GID or enumeration order is never a label.
-use super::{backend, lifecycle::IoPort, verbs::DeviceHandle};
+use super::{ffi, lifecycle::IoPort, verbs::DeviceHandle};
 use crate::{
     error::{Error, Operation, Result},
     model::ResourceClass,
@@ -35,7 +35,7 @@ pub struct DiscoveredPort {
     pub gid: [u8; 16],
     pub numa_node: Option<usize>,
 }
-pub(crate) fn discovered_port(device: &backend::DeviceHandle) -> Result<DiscoveredPort> {
+pub(crate) fn discovered_port(device: &ffi::DeviceHandle) -> Result<DiscoveredPort> {
     Ok(DiscoveredPort {
         device: device.name.clone(),
         port: device.endpoint.port,

@@ -1,5 +1,5 @@
 //! I/O-local proxies. All native calls run on the paired NativeService.
-pub use super::backend::Endpoint;
+pub use super::ffi::Endpoint;
 use super::lifecycle::{Command, IoPort, OWNED, READY, Shared, Slot};
 use crate::error::{Error, Result};
 use std::{

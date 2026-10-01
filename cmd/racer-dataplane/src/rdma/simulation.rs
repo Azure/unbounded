@@ -1,7 +1,7 @@
 //! Connected, thread-local test fabric implementing the production native ABI.
 //! Enter a node's discovery scope before constructing NativeService/WithNative.
 //! Handles retain the fabric after the scope exits. No host RNIC or sysfs is used.
-//! Memory and DMA stay behind backend's unsafe boundary; wire addresses are virtual.
+//! Memory and DMA stay behind the FFI unsafe boundary; wire addresses are virtual.
 use super::*;
 use std::collections::VecDeque;
 

@@ -1,8 +1,8 @@
 //! Bounded native service for the EXISTING paired crypto thread. No thread is
 //! spawned here. I/O only tries mailboxes; native calls and destruction run here.
 use super::{
-    backend,
     device::{FabricPort, match_publication},
+    ffi,
     verbs::Endpoint,
 };
 use crate::{
@@ -22,7 +22,7 @@ use std::{
 
 /// Test-only native fabric; enter its scope before constructing the crypto service.
 #[cfg(test)]
-pub use super::backend::simulation;
+pub use super::ffi::simulation;
 
 pub(crate) const IDLE: u8 = 0;
 pub(crate) const READY: u8 = 1;
@@ -250,16 +250,16 @@ impl Drop for IoPort {
 }
 
 struct Resource {
-    device: Rc<backend::DeviceHandle>,
-    region: Rc<backend::Region>,
-    qp: Option<Rc<backend::QueuePairHandle>>,
-    window: Option<Rc<backend::Window>>,
-    pending: Option<backend::Ticket>,
+    device: Rc<ffi::DeviceHandle>,
+    region: Rc<ffi::Region>,
+    qp: Option<Rc<ffi::QueuePairHandle>>,
+    window: Option<Rc<ffi::Window>>,
+    pending: Option<ffi::Ticket>,
     stopping: bool,
     next_retry: Option<std::time::Instant>,
 }
 struct Activation {
-    devices: Vec<Rc<backend::DeviceHandle>>,
+    devices: Vec<Rc<ffi::DeviceHandle>>,
     selected: Vec<(RailMapping, usize)>,
     quotas: std::vec::IntoIter<Reservation>,
     bytes: usize,
@@ -301,7 +301,7 @@ impl NativeService {
         if config.publication.is_empty() {
             return Ok(Some(Vec::new()));
         }
-        let discovered = backend::Verbs.discover()?;
+        let discovered = ffi::Verbs.discover()?;
         let descriptions = discovered
             .iter()
             .map(super::device::discovered_port)
@@ -351,7 +351,7 @@ impl NativeService {
             .try_reserve_exact(activation.bytes)
             .map_err(|_| Error::Overloaded)?;
         mailbox.bytes.resize(activation.bytes, 0);
-        let region = backend::Region::new(device.clone(), activation.bytes, Box::new(quota))?;
+        let region = ffi::Region::new(device.clone(), activation.bytes, Box::new(quota))?;
         self.resources[i] = Some(Resource {
             device: device.clone(),
             region,
@@ -362,7 +362,7 @@ impl NativeService {
             next_retry: None,
         });
         let resource = self.resources[i].as_mut().unwrap();
-        resource.qp = Some(backend::QueuePairHandle::new(device)?);
+        resource.qp = Some(ffi::QueuePairHandle::new(device)?);
         let qp = resource.qp.as_ref().unwrap();
         qp.probe_window()?;
         mailbox.rail = rail.rail;
@@ -525,7 +525,7 @@ impl NativeService {
             }
             // Replenish the QP outside request turns. MR stays registered for the
             // entire bounded pool lifetime. Never reuse a QP/remote capability.
-            match backend::QueuePairHandle::new(resource.device.clone()) {
+            match ffi::QueuePairHandle::new(resource.device.clone()) {
                 Ok(qp) => {
                     mailbox.endpoint = Some(qp.endpoint);
                     resource.qp = Some(qp);
@@ -622,7 +622,7 @@ impl NativeService {
 impl Drop for NativeService {
     fn drop(&mut self) {
         self.close();
-        // Drop backend QPs before their region owners. On failure the backend
+        // Drop native QPs before their region owners. On failure the FFI boundary
         // keeps its own DMA references and quota, even after this service dies.
         for resource in self.resources.iter_mut().flatten() {
             resource.qp.take();
@@ -712,7 +712,7 @@ mod tests {
         service: &mut NativeService,
         index: usize,
     ) -> Rc<std::cell::Cell<usize>> {
-        let (qp, region, charged) = backend::lifetime_tests::fresh_fixture();
+        let (qp, region, charged) = ffi::lifetime_tests::fresh_fixture();
         let device = qp.device().clone();
         let slot = &service.port.shared.slots[index];
         let mut mailbox = slot.mailbox.lock().unwrap();
@@ -849,11 +849,11 @@ mod tests {
         mark_connected(&qp, &mut native);
         let region = Region::acquire(&qp, 16).unwrap();
         io.close();
-        backend::lifetime_tests::fail_stop(true);
+        ffi::lifetime_tests::fail_stop(true);
         native.poll_budgeted(1).unwrap();
         assert_eq!(io.reopen(), Err(Error::Overloaded));
         assert_eq!(charged.get(), 1);
-        backend::lifetime_tests::fail_stop(false);
+        ffi::lifetime_tests::fail_stop(false);
         native.resources[0].as_mut().unwrap().next_retry = None;
         native.poll_budgeted(1).unwrap();
         assert!(qp.stopped());
@@ -892,7 +892,7 @@ mod tests {
         let receive = Region::acquire(&failed, 16).unwrap();
         let (_grant, binding) = failed.bind(receive.clone()).unwrap();
         native.poll_budgeted(2).unwrap();
-        backend::lifetime_tests::complete(1, 0, 5);
+        ffi::lifetime_tests::complete(1, 0, 5);
         native.poll_budgeted(2).unwrap();
         assert_eq!(binding.result(), Some(Ok(())));
         let source = Region::acquire(&healthy, 16).unwrap();
@@ -903,7 +903,7 @@ mod tests {
         let sessions = Sessions::new(Rc::new(Devices::new()), 2);
         sessions.track_test(failed.clone());
         sessions.track_test(healthy.clone());
-        backend::lifetime_tests::fail_stop(true);
+        ffi::lifetime_tests::fail_stop(true);
         assert!(
             sessions.progress().is_ok(),
             "attempt timeout must not fail app's worker poll"
@@ -911,14 +911,14 @@ mod tests {
         assert_eq!(failed.progress(), Err(Error::DeadlineExceeded));
         assert!(!failed.stopped());
         assert!(healthy.ready());
-        backend::lifetime_tests::complete(1, 0, 1);
+        ffi::lifetime_tests::complete(1, 0, 1);
         native.poll_budgeted(2).unwrap();
         assert!(sessions.progress().is_ok());
         assert_eq!(written.result(), Some(Ok(())));
         assert_eq!(failed_charge.get(), 1);
         assert_eq!(healthy_charge.get(), 1);
         assert_eq!(receive.copy_to(), Err(Error::Unavailable));
-        backend::lifetime_tests::fail_stop(false);
+        ffi::lifetime_tests::fail_stop(false);
         native.resources[0].as_mut().unwrap().next_retry = None;
         native.poll_budgeted(2).unwrap();
         assert!(failed.stopped());
@@ -1007,7 +1007,7 @@ mod tests {
         region.copy_from(&[1; 16]).unwrap();
         let ticket = failed.write(region.clone(), 4096, 7).unwrap();
         native.poll_budgeted(2).unwrap();
-        backend::lifetime_tests::complete(1, 10, u32::MAX);
+        ffi::lifetime_tests::complete(1, 10, u32::MAX);
         native.poll_budgeted(2).unwrap();
         let sessions = Sessions::new(Rc::new(Devices::new()), 2);
         sessions.track_test(failed.clone());
@@ -1084,7 +1084,7 @@ mod tests {
             runtime::{admission::Admission, deadline::RequestScope},
         };
         assert!(
-            backend::Verbs
+            ffi::Verbs
                 .discover()
                 .expect("real adapter must load")
                 .is_empty()
@@ -1171,7 +1171,7 @@ mod tests {
         };
         let name = std::env::var("RACER_RDMA_TEST_DEVICE")
             .expect("select native test provider explicitly");
-        let ports = backend::Verbs.discover().expect("real native adapter");
+        let ports = ffi::Verbs.discover().expect("real native adapter");
         let selected = ports
             .iter()
             .find(|d| d.name == name)
