@@ -663,7 +663,6 @@ racer-sdk-conformance: ## Run the ignored real Go SDK / Rust conformance test (r
 		sdk::sdk_client_to_rust_http_and_request_parser_over_uds -- \
 		--exact --ignored --test-threads=1 --nocapture
 
-# All-feature builds include heap profiling and require libunwind-dev.
 # These explicit allowlists must not pick up throughput campaigns or new ignored tests.
 .PHONY: racer-process-restart racer-sdk-age-build racer-sdk-age
 racer-process-restart: ## Run exactly the three privileged executable restart tests

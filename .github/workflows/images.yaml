@@ -18,11 +18,6 @@ on:
         description: "Platforms to build, e.g. linux/amd64 or linux/amd64,linux/arm64"
         required: false
         type: string
-      heap_profiling:
-        description: "Enable heap profiling (racer-dataplane only)"
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -46,7 +41,6 @@ jobs:
       file: ${{ steps.resolve.outputs.file }}
       platforms: ${{ steps.resolve.outputs.platforms }}
       should_build: ${{ steps.resolve.outputs.should_build }}
-      heap_profiling: ${{ steps.resolve.outputs.heap_profiling }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -54,7 +48,6 @@ jobs:
         id: resolve
         env:
           INPUT_PLATFORMS: ${{ inputs.platforms || '' }}
-          INPUT_HEAP_PROFILING: ${{ inputs.heap_profiling || false }}
         run: |
           if [[ "${{ github.event_name }}" == "push" ]]; then
             # Tag is like "images/agent-ubuntu2404/v1.0.0"
@@ -68,11 +61,6 @@ jobs:
           fi
 
           file="images/${name}/Containerfile"
-
-          if [[ "$INPUT_HEAP_PROFILING" == "true" && "$name" != "racer-dataplane" ]]; then
-            echo "::error::heap_profiling is only supported for racer-dataplane"
-            exit 1
-          fi
 
           if [[ ( "$name" == playpen || "$name" == playpen-* ) && "${{ github.event_name }}" != "workflow_dispatch" ]]; then
             echo "::notice::Skipping ${name}; playpen images are manual-only. Dispatch this workflow with image=${name}."
@@ -96,7 +84,6 @@ jobs:
           echo "file=${file}" >> "$GITHUB_OUTPUT"
           echo "platforms=${platforms}" >> "$GITHUB_OUTPUT"
           echo "should_build=true" >> "$GITHUB_OUTPUT"
-          echo "heap_profiling=${INPUT_HEAP_PROFILING}" >> "$GITHUB_OUTPUT"
 
           echo "Image: ${name}:${tag}"
           echo "Containerfile: ${file}"
@@ -153,4 +140,3 @@ jobs:
           build-args: |
             VERSION=${{ needs.resolve.outputs.tag }}
             CONTAINER_REGISTRY=${{ env.CONTAINER_REGISTRY }}
-            RACER_HEAP_PROFILING=${{ needs.resolve.outputs.heap_profiling }}

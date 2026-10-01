@@ -147,7 +147,7 @@ jobs:
       - name: Install native build dependencies and enable io_uring
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential pkg-config libibverbs-dev libunwind-dev
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libibverbs-dev
           sudo sysctl -w kernel.io_uring_disabled=0
 
       - name: Set up Go for SDK conformance
@@ -220,7 +220,7 @@ jobs:
 
   racer-sdk-age:
     name: Racer SDK Connection Age
-    # Reuse the completed all-feature build rather than cold-building jemalloc
+    # Reuse the completed all-feature build rather than cold-building dependencies
     # inside this job's short fixture-preparation deadline.
     needs: [racer-rust]
     runs-on: ubuntu-24.04
@@ -238,7 +238,7 @@ jobs:
       - name: Install native dependencies and enable io_uring
         run: |
           timeout --signal=TERM --kill-after=10s 300s sudo apt-get update
-          timeout --signal=TERM --kill-after=10s 300s sudo apt-get install -y --no-install-recommends build-essential pkg-config libunwind-dev
+          timeout --signal=TERM --kill-after=10s 300s sudo apt-get install -y --no-install-recommends build-essential pkg-config
           timeout --signal=TERM --kill-after=10s 300s sudo sysctl -w kernel.io_uring_disabled=0
 
       - name: Set up pinned Rust

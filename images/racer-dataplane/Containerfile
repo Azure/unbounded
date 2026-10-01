@@ -6,7 +6,6 @@ ARG RUNTIME_IMAGE=docker.io/library/debian:bookworm-slim
 # Build on the target platform: both Rust and the verbs adapter use its ABI.
 FROM ${RUST_IMAGE} AS builder
 ARG RACER_NATIVE_RDMA=false
-ARG RACER_HEAP_PROFILING=false
 WORKDIR /src
 
 RUN case "$RACER_NATIVE_RDMA" in \
@@ -14,12 +13,6 @@ RUN case "$RACER_NATIVE_RDMA" in \
             libibverbs-dev pkg-config && rm -rf /var/lib/apt/lists/* ;; \
         false) ;; \
         *) echo "RACER_NATIVE_RDMA must be true or false" >&2; exit 1 ;; \
-    esac
-RUN case "$RACER_HEAP_PROFILING" in \
-        true) apt-get update && apt-get install -y --no-install-recommends \
-            libunwind-dev && rm -rf /var/lib/apt/lists/* ;; \
-        false) ;; \
-        *) echo "RACER_HEAP_PROFILING must be true or false" >&2; exit 1 ;; \
     esac
 
 # Copy only build inputs, never host target trees or deployment credentials.
@@ -30,22 +23,17 @@ COPY images/racer-dataplane/build-native.sh ./build-native.sh
 COPY images/racer-dataplane/check-debug-info.sh ./check-debug-info.sh
 RUN set -eu; \
     mkdir -p /out/usr/local/bin /out/usr/local/lib; \
-    set --; \
-    if [ "$RACER_HEAP_PROFILING" = true ]; then \
-        set -- --features heap-profiling; \
-    fi; \
     if [ "$RACER_NATIVE_RDMA" = true ]; then \
-        cargo build --locked --release --bin racer-dataplane --no-default-features --features rdma "$@"; \
+        cargo build --locked --release --bin racer-dataplane --no-default-features --features rdma; \
         sh ./build-native.sh native/rdma.c /out/usr/local/lib/libracer_rdma.so.1; \
     else \
-        cargo build --locked --release --bin racer-dataplane --no-default-features "$@"; \
+        cargo build --locked --release --bin racer-dataplane --no-default-features; \
     fi; \
     sh ./check-debug-info.sh target/release/racer-dataplane; \
     install -m 0755 target/release/racer-dataplane /out/usr/local/bin/racer-dataplane
 
 FROM ${RUNTIME_IMAGE}
 ARG RACER_NATIVE_RDMA=false
-ARG RACER_HEAP_PROFILING=false
 ARG VERSION=dev
 ARG GIT_COMMIT=unknown
 LABEL org.opencontainers.image.title="racer-dataplane" \
@@ -57,11 +45,6 @@ RUN set -eu; \
         true) set -- libibverbs1 ibverbs-providers ;; \
         false) set -- ;; \
         *) echo "RACER_NATIVE_RDMA must be true or false" >&2; exit 1 ;; \
-    esac; \
-    case "$RACER_HEAP_PROFILING" in \
-        true) set -- "$@" libunwind8 ;; \
-        false) ;; \
-        *) echo "RACER_HEAP_PROFILING must be true or false" >&2; exit 1 ;; \
     esac; \
     apt-get update; \
     apt-get install -y --no-install-recommends libgcc-s1 "$@"; \
