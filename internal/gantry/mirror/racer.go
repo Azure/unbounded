@@ -23,6 +23,12 @@ type RacerClient interface {
 	Stat(context.Context, racersdk.Request) (racersdk.Metadata, error)
 }
 
+// RepositoryAuthenticationChallenger recovers an origin challenge for the exact
+// requested resource without fetching content or forwarding caller credentials.
+type RepositoryAuthenticationChallenger interface {
+	RepositoryAuthenticationChallenge(context.Context, ifaces.OriginRef) (string, bool, error)
+}
+
 // WithRacer selects the exclusive Racer content path. The origin passed to New
 // remains available only for authentication challenges, never content fallback.
 func WithRacer(client RacerClient) Option {
@@ -35,7 +41,9 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, upstream, re
 		return
 	}
 
-	request, err := gantryracer.Request(ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}, registryauth.Authorization(r.Context()))
+	ref := ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}
+
+	request, err := gantryracer.Request(ref, registryauth.Authorization(r.Context()))
 	if err != nil {
 		http.Error(w, "invalid Racer request", http.StatusBadRequest)
 		return
@@ -52,7 +60,7 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, upstream, re
 	if r.Method == http.MethodHead || ranged {
 		metadata, err = s.racer.Stat(r.Context(), request)
 		if err != nil {
-			s.racerError(w, r, upstream, err)
+			s.racerError(w, r, ref, err)
 			return
 		}
 
@@ -84,7 +92,7 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, upstream, re
 
 	value, err := s.racer.GetStreaming(r.Context(), request, options...)
 	if err != nil {
-		s.racerError(w, r, upstream, err)
+		s.racerError(w, r, ref, err)
 		return
 	}
 
@@ -148,13 +156,23 @@ func writeRacerHeaders(w http.ResponseWriter, d digest.Digest, metadata racersdk
 	w.Header().Set("Gantry-Mirrored", "1")
 }
 
-func (s *Server) racerError(w http.ResponseWriter, r *http.Request, upstream string, err error) {
+func (s *Server) racerError(w http.ResponseWriter, r *http.Request, ref ifaces.OriginRef, err error) {
 	var sdkErr *racersdk.Error
 	if s.auth != nil && errors.As(err, &sdkErr) && sdkErr.Kind() == racersdk.ErrorUnauthorized {
-		// A same-node origin callback may have remembered a validated repository
-		// challenge even when the registry's /v2/ endpoint is public.
+		// The rejecting origin callback may run on another node. Its challenge
+		// cache is unavailable, and a public /v2/ root says nothing about this repo.
 		challengeCtx, cancel := context.WithTimeout(r.Context(), authenticationChallengeTimeout)
-		challenge, required, challengeErr := s.auth.AuthenticationChallenge(challengeCtx, upstream)
+
+		var (
+			challenge    string
+			required     bool
+			challengeErr error
+		)
+		if auth, ok := s.auth.(RepositoryAuthenticationChallenger); ok {
+			challenge, required, challengeErr = auth.RepositoryAuthenticationChallenge(challengeCtx, ref)
+		} else {
+			challenge, required, challengeErr = s.auth.AuthenticationChallenge(challengeCtx, ref.Registry)
+		}
 
 		cancel()
 
