@@ -2,7 +2,7 @@
 use super::candidates::{CandidatePolicy, CandidateResolution};
 use super::flight::AcquisitionBudget;
 use crate::{
-    control::wire::{BundleGeneration, KeyringBundle, SCHEMA_VERSION},
+    control::wire::SCHEMA_VERSION,
     error::{Error, Operation},
     http::{
         Codec,
@@ -19,12 +19,8 @@ use crate::{
     },
     runtime::{admission::Admission, deadline::RequestScope, reactor::Reactor},
     security::{
-        certificates::Certificates,
-        credentials::CredentialCrypto,
-        forwarding::Forwarding,
-        identity::PendingIdentity,
-        keyring::{KeyEpochs, Keyring},
-        signing::Signatures,
+        credentials::CredentialCrypto, forwarding::Forwarding, keyring::Keyring,
+        test_support::Identity,
     },
     topology::{
         health::LinkHealth,
@@ -47,64 +43,10 @@ const CACHE: &str = "33333333-3333-4333-8333-333333333333";
 fn node(n: usize) -> NodeId {
     NodeId(format!("22222222-2222-4222-8222-{n:012}"))
 }
-struct Identity {
-    keys: Rc<Keyring>,
-    signatures: Rc<Signatures>,
-}
 fn identities(nodes: &[NodeId]) -> Vec<Identity> {
-    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
-    let issuer_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
-    let issuer = params.self_signed(&issuer_key).unwrap();
-    let roots = vec![issuer.der().to_vec()];
-    nodes
-        .iter()
-        .map(|node| {
-            let pending = PendingIdentity::generate().unwrap();
-            let encoded = pending.export_pkcs8_for_persistence().unwrap();
-            let key = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
-                &rustls::pki_types::PrivatePkcs8KeyDer::from(encoded.as_slice()),
-                &rcgen::PKCS_ED25519,
-            )
-            .unwrap();
-            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-            params.subject_alt_names = vec![rcgen::SanType::URI(
-                format!("spiffe://{CLUSTER}/node/{}", node.0)
-                    .try_into()
-                    .unwrap(),
-            )];
-            params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
-            params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-            let cert = params.signed_by(&key, &issuer, &issuer_key).unwrap();
-            let cluster = ClusterId(CLUSTER.into());
-            let identity = pending
-                .accept(
-                    cluster.clone(),
-                    node.clone(),
-                    vec![cert.der().to_vec()],
-                    &roots,
-                )
-                .unwrap();
-            let keys = Rc::new(Keyring::new(
-                cluster.clone(),
-                node.clone(),
-                Arc::new(KeyEpochs::default()),
-            ));
-            keys.install(KeyringBundle {
-                schema_version: SCHEMA_VERSION,
-                cluster: cluster.clone(),
-                generation: BundleGeneration(1),
-                peer_trust_roots: roots.clone(),
-                cache_keys: crate::security::signing::tests::mac_test_key(CACHE),
-            })
-            .unwrap();
-            keys.install_signing_identity(Arc::new(identity)).unwrap();
-            let certificates = Rc::new(Certificates::new(cluster, keys.clone()));
-            let signatures = Rc::new(Signatures::new(keys.clone(), certificates.clone()));
-            Identity { keys, signatures }
-        })
-        .collect()
+    crate::security::test_support::identities(ClusterId(CLUSTER.into()), nodes, || {
+        crate::security::signing::tests::mac_test_key(CACHE)
+    })
 }
 struct NeverRelay;
 impl PeerTransport for NeverRelay {

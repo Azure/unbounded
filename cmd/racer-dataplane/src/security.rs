@@ -9,6 +9,8 @@ pub mod identity;
 pub mod keyring;
 pub mod protocol;
 pub mod signing;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
