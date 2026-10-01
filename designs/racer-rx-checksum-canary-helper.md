@@ -7,6 +7,42 @@ ownership. No cluster execution was performed during implementation.
 
 ## Scope and interpretation
 
+### Reviewed profiles
+
+The default remains `historical-ddv5-eg-to-adsv5-w`, preserving the original
+pair below. Explicit `--profile ddv5-6o-to-adsv5-7n-20261001` selects the
+October 1 recurring pair: remote `aks-ddv5-17198779-vmss00006o`, UID
+`024467ab-e873-46d1-9d92-d15119f3ea28`, to receiver
+`aks-adsv5-13731677-vmss00007n`, UID `4c4c2810-8c4d-49aa-8c2c-389f9e1728a4`,
+actual dataplane pod IP `10.224.5.52`, access pod `unbounded-net-node-km9tz`,
+and VF `enP1216s1`. Both ends were observed using mlx5, not MANA. The receiver
+recorded 17 distinct acquisition/attempt identities from that remote between
+14:26:05 and 14:41:00 UTC, including two new events during a 71-second read-only
+observation. This identifies the last reverse signer, not the corruption origin.
+
+Profiles are a closed allowlist, not arbitrary node/interface configuration.
+Preflight checks receiver node name, UID, InternalIP, pod node placement,
+readiness, actual dataplane IP, and the named host-network access pod/container.
+Changed-stage launch rechecks these API identities. Remote entry checks hostname,
+eth0 IP, hv_netvsc/mlx5 drivers, and the selected VF's eth0 lower-device association.
+Authorization must match the selected receiver UID and `rx:on->off->on` action.
+All existing timing, recurrence, feature comparison, and restoration gates remain.
+
+Parent-only invocation for this profile (not executed during implementation):
+
+```sh
+timeout --signal=TERM --kill-after=10s 300s \
+  python3 -u -B hack/scripts/racer-rx-checksum-canary.py \
+  --profile ddv5-6o-to-adsv5-7n-20261001 --concurrency 10 \
+  --authorize '4c4c2810-8c4d-49aa-8c2c-389f9e1728a4:rx:on->off->on' \
+  --checkpoint tmp/rx-canary-6o-7n-run.jsonl
+```
+
+Parent must confirm the applied concurrency and exclusive settings ownership.
+At the observed .01667 rejects/s, a 90-second off stage expects only 1.5 rejects;
+silence is inconclusive. Require fresh pair exposure and software-checksum use,
+not merely node-wide progress. No live execution accompanies this change.
+
 Fixed receiver: `aks-adsv5-13731677-vmss00000w`, `10.224.4.69`, node UID
 `7de2d936-08ba-4676-9218-30eff4c83380`. Sender identity is
 `8816d91d-e896-49bf-ba8a-da97ede93818`. Access is through existing privileged

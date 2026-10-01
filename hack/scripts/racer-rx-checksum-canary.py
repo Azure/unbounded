@@ -28,8 +28,43 @@ IP = "10.224.4.69"
 POD = "unbounded-net-node-z6z2d"
 VF = "enP60223s1"
 AUTH = UID + ":rx:on->off->on"
+PROFILE = "historical-ddv5-eg-to-adsv5-w"
+# Reviewed identities only. No arbitrary node, interface, or action flags.
+PROFILES = {
+    PROFILE: (NODE, UID, SENDER, IP, POD, VF),
+    "ddv5-6o-to-adsv5-7n-20261001": (
+        "aks-adsv5-13731677-vmss00007n",
+        "4c4c2810-8c4d-49aa-8c2c-389f9e1728a4",
+        "024467ab-e873-46d1-9d92-d15119f3ea28",
+        "10.224.5.52", "unbounded-net-node-km9tz", "enP1216s1"),
+}
 CHECKPOINT = None
 SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGALRM)
+
+
+def select_profile(name):
+    global PROFILE, NODE, UID, SENDER, IP, POD, VF, AUTH
+    if name not in PROFILES:
+        raise RuntimeError("unknown reviewed profile")
+    NODE, UID, SENDER, IP, POD, VF = PROFILES[name]
+    PROFILE = name
+    AUTH = UID + ":rx:on->off->on"
+
+
+def host_identity():
+    """Read-only guard before any baseline or changed-stage settings work."""
+    if command(["hostname"]).strip().lower() != NODE:
+        raise RuntimeError("receiver hostname mismatch")
+    addresses = json.loads(command(["ip", "-j", "-4", "address", "show", "dev", "eth0"]))
+    if IP not in [a.get("local") for link in addresses for a in link.get("addr_info", [])]:
+        raise RuntimeError("receiver host IP mismatch")
+    for dev, expected in (("eth0", "hv_netvsc"), (VF, "mlx5_core")):
+        info = command(["ethtool", "-i", dev])
+        if f"driver: {expected}" not in info.splitlines():
+            raise RuntimeError("receiver interface driver mismatch")
+    # The reviewed VF must be the actual eth0 lower device, not another NIC.
+    if not Path(f"/sys/class/net/eth0/lower_{VF}").is_dir():
+        raise RuntimeError("receiver VF association mismatch")
 
 
 @contextlib.contextmanager
@@ -311,26 +346,39 @@ def safe_stderr(line):
 
 def preflight(concurrency):
     node = json.loads(command(kube("get", "node", NODE, "-o", "json"), 5))
-    if node["metadata"]["uid"] != UID or IP not in [a["address"] for a in node["status"]["addresses"]]:
+    if (node["metadata"]["name"] != NODE or node["metadata"]["uid"] != UID
+            or node["metadata"].get("deletionTimestamp")
+            or IP not in [a["address"] for a in node["status"]["addresses"] if a["type"] == "InternalIP"]):
         raise RuntimeError("receiver identity mismatch")
     pods = json.loads(command(kube("-n", NS, "get", "pods", "--field-selector", "spec.nodeName=" + NODE,
                                    "-o", "json"), 5))["items"]
     access = [p for p in pods if p["metadata"]["name"] == POD and p["status"]["phase"] == "Running"
               and not p["metadata"].get("deletionTimestamp")]
     loads = [p for p in pods if p["metadata"].get("labels", {}).get("app.kubernetes.io/name") == "racer-loadgen"
-             and p["status"]["phase"] == "Running" and not p["metadata"].get("deletionTimestamp")]
-    if len(access) != 1 or len(loads) != 1:
-        raise RuntimeError("access/load pod identity mismatch")
-    for pod in (access[0], loads[0]):
+              and p["status"]["phase"] == "Running" and not p["metadata"].get("deletionTimestamp")]
+    planes = [p for p in pods if p["metadata"].get("labels", {}).get("app.kubernetes.io/name") == "racer-dataplane"
+              and p["status"]["phase"] == "Running" and not p["metadata"].get("deletionTimestamp")]
+    if len(access) != 1 or len(loads) != 1 or len(planes) != 1:
+        raise RuntimeError("access/load/dataplane pod identity mismatch")
+    for pod in (access[0], loads[0], planes[0]):
+        if pod["spec"]["nodeName"] != NODE:
+            raise RuntimeError("pod node mismatch")
         if not any(c["type"] == "Ready" and c["status"] == "True"
-                   for c in pod["status"].get("conditions", [])):
-            raise RuntimeError("access/load pod not ready")
+                    for c in pod["status"].get("conditions", [])):
+            raise RuntimeError("access/load/dataplane pod not ready")
+    if (access[0]["status"]["podIP"] != IP or planes[0]["status"]["podIP"] != IP
+            or not access[0]["spec"].get("hostNetwork")
+            or not any(c["name"] == "node" for c in access[0]["spec"]["containers"])):
+        raise RuntimeError("access/dataplane endpoint mismatch")
     ip = str(ipaddress.ip_address(loads[0]["status"]["podIP"]))
-    return dict(load_ip=ip, concurrency=concurrency)
+    return dict(load_ip=ip, concurrency=concurrency, profile=PROFILE)
 
 
 def remote(config, mode, seconds):
-    config = dict(config, mode=mode)
+    config = dict(config, mode=mode, profile=PROFILE)
+    if mode == "changed":
+        if config.get("authorize") != AUTH:
+            raise RuntimeError("selected receiver mutation not authorized")
     argv = host_exec("timeout", "--signal=TERM", "--kill-after=10s", f"{seconds}s", "sh", "-c",
                      remote_shell(mode == "changed"), "rx-canary", Path(__file__).read_text(),
                      "--remote", json.dumps(config))
@@ -417,6 +465,9 @@ def run(args):
         return
     if not summary.get("state"):
         raise RuntimeError("missing baseline safety state")
+    # Fail before entering any restoration path if the selected identity changed.
+    if preflight(args.concurrency) != config:
+        raise RuntimeError("preflight identity changed after baseline")
     config.update(original=original, state=summary["state"],
                   not_after=time.time() + 20, authorize=AUTH)
     launched = time.monotonic()
@@ -451,8 +502,12 @@ def main():
         signal.signal(sig, stop)
     if len(sys.argv) == 3 and sys.argv[1] == "--remote":
         config = json.loads(sys.argv[2])
-        host = Host(config)
         try:
+            select_profile(config["profile"])
+            if config["mode"] == "changed" and config.get("authorize") != AUTH:
+                raise RuntimeError("remote mutation not authorized")
+            host_identity()
+            host = Host(config)
             if config["mode"] == "baseline":
                 original = host.features()
                 if any(original[d]["rx-checksumming"] != ("on", False) for d in original):
@@ -482,17 +537,19 @@ def main():
             raise SystemExit(1) from None
         return
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--profile", choices=tuple(PROFILES), default=PROFILE)
     parser.add_argument("--authorize", required=True)
     parser.add_argument("--concurrency", required=True, type=int)
     parser.add_argument("--checkpoint", required=True)
     args = parser.parse_args()
+    select_profile(args.profile)
     if args.authorize != AUTH or not 1 <= args.concurrency <= 64:
         parser.error("requires fixed receiver authorization and concurrency 1..64")
     root = Path(__file__).resolve().parents[2]
     CHECKPOINT = (root / args.checkpoint).resolve()
     if not CHECKPOINT.is_relative_to(root / "tmp") or not CHECKPOINT.parent.is_dir():
         parser.error("checkpoint must be in existing worktree tmp directory")
-    emit("start", next="read-only baseline", error=None)
+    emit("start", profile=PROFILE, receiver_uid=UID, next="read-only baseline", error=None)
     # Reserve recovery time before the required external 300s TERM timeout.
     signal.alarm(210)
     try:

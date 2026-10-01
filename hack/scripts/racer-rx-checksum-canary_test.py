@@ -47,6 +47,110 @@ def row():
 
 
 class Tests(unittest.TestCase):
+    def setUp(self):
+        self.profile = rx.PROFILE
+        self.addCleanup(rx.select_profile, self.profile)
+
+    def test_reviewed_profile_selection_and_authorization(self):
+        historical = rx.AUTH
+        rx.select_profile("ddv5-6o-to-adsv5-7n-20261001")
+        self.assertEqual(rx.NODE, "aks-adsv5-13731677-vmss00007n")
+        self.assertEqual(rx.SENDER, "024467ab-e873-46d1-9d92-d15119f3ea28")
+        self.assertEqual(rx.AUTH, "4c4c2810-8c4d-49aa-8c2c-389f9e1728a4:rx:on->off->on")
+        self.assertEqual((rx.IP, rx.POD, rx.VF),
+                         ("10.224.5.52", "unbounded-net-node-km9tz", "enP1216s1"))
+        with self.assertRaisesRegex(RuntimeError, "unknown reviewed"):
+            rx.select_profile("arbitrary-node")
+        for auth in (historical, rx.UID, rx.UID + ":rx:off", None):
+            with patch.object(rx, "preflight") as preflight, patch.object(rx, "stream") as stream:
+                with self.assertRaisesRegex(RuntimeError, "not authorized"):
+                    rx.remote(dict(authorize=auth), "changed", 115)
+                preflight.assert_not_called()
+                stream.assert_not_called()
+
+    def test_profile_propagates_to_remote_and_restore(self):
+        rx.select_profile("ddv5-6o-to-adsv5-7n-20261001")
+        config = dict(authorize=rx.AUTH, concurrency=10, load_ip="10.0.0.1")
+        with patch.object(rx, "stream") as stream:
+            rx.remote(config, "changed", 115)
+        argv, seconds = stream.call_args.args
+        self.assertEqual(seconds, 120)
+        self.assertIn(rx.POD, argv)
+        self.assertIn(rx.NODE, argv[argv.index("-c", argv.index("sh")) + 1])
+        self.assertEqual(json.loads(argv[-1])["profile"], rx.PROFILE)
+        self.test_independent_restore_verifies_both_interfaces()
+
+    def test_identity_change_after_baseline_never_enters_restore(self):
+        rows = [dict(event="original", original=original()),
+                dict(event="summary", fresh_pair_rejects=1, ring_gap=False, verified_bytes=99,
+                     nic_delta={"rx_bytes": 99}, state={"previous": row()})]
+        with patch.object(rx, "preflight", side_effect=[{}, {"load_ip": "changed"}]), \
+                patch.object(rx, "remote", return_value=rows) as remote, \
+                patch.object(rx, "independent_restore") as restore:
+            with self.assertRaisesRegex(RuntimeError, "identity changed"):
+                rx.run(type("Args", (), {"concurrency": 10})())
+        self.assertEqual(remote.call_count, 1)
+        restore.assert_not_called()
+
+    def test_remote_rejects_wrong_authorization_before_host_access(self):
+        source = Path(rx.__file__).read_text().split('if __name__ == "__main__":')[0]
+        source += '\nhost_identity = lambda: print("UNREACHABLE")\nmain()\n'
+        config = dict(mode="changed", profile="ddv5-6o-to-adsv5-7n-20261001", authorize=rx.AUTH)
+        with self.assertRaises(subprocess.CalledProcessError) as caught:
+            rx.command(["python3", "-B", "-c", source, "--remote", json.dumps(config)], 3)
+        self.assertNotIn("UNREACHABLE", caught.exception.stdout)
+        self.assertEqual(json.loads(caught.exception.stdout)["diagnostic"], "remote mutation not authorized")
+
+    def test_preflight_strict_profile_identity(self):
+        rx.select_profile("ddv5-6o-to-adsv5-7n-20261001")
+        node = dict(metadata=dict(name=rx.NODE, uid=rx.UID),
+                    status=dict(addresses=[dict(type="InternalIP", address=rx.IP)]))
+        def pod(name, app):
+            return dict(metadata=dict(name=name, labels={"app.kubernetes.io/name": app}),
+                        spec=dict(nodeName=rx.NODE, hostNetwork=True, containers=[dict(name="node")]),
+                        status=dict(phase="Running", podIP=rx.IP,
+                                    conditions=[dict(type="Ready", status="True")]))
+        pods = [pod(rx.POD, "unbounded-net-node"), pod("load", "racer-loadgen"),
+                pod("plane", "racer-dataplane")]
+        def check(n, p):
+            with patch.object(rx, "command", side_effect=[json.dumps(n), json.dumps(dict(items=p))]):
+                return rx.preflight(10)
+        self.assertEqual(check(node, pods), dict(load_ip=rx.IP, concurrency=10, profile=rx.PROFILE))
+        for field in ("name", "uid"):
+            bad = copy.deepcopy(node)
+            bad["metadata"][field] = "wrong"
+            with self.assertRaisesRegex(RuntimeError, "identity"):
+                check(bad, pods)
+        bad = copy.deepcopy(node)
+        bad["status"]["addresses"][0]["type"] = "ExternalIP"
+        with self.assertRaisesRegex(RuntimeError, "identity"):
+            check(bad, pods)
+        for index, group, key, value in (
+                (0, "metadata", "name", "wrong-access"), (0, "spec", "nodeName", "wrong-node"),
+                (0, "spec", "hostNetwork", False), (0, "spec", "containers", []),
+                (0, "status", "podIP", "10.0.0.2"), (2, "status", "podIP", "10.0.0.2"),
+                (2, "status", "conditions", []), (1, "metadata", "deletionTimestamp", "now")):
+            bad = copy.deepcopy(pods)
+            bad[index][group][key] = value
+            with self.subTest(index=index, key=key), self.assertRaises(RuntimeError):
+                check(node, bad)
+
+    def test_host_ip_driver_and_vf_guards(self):
+        rx.select_profile("ddv5-6o-to-adsv5-7n-20261001")
+        values = [rx.NODE.upper(), json.dumps([dict(addr_info=[dict(local=rx.IP)])]),
+                  "driver: hv_netvsc\n", "driver: mlx5_core\n"]
+        with patch.object(rx, "command", side_effect=values), patch.object(Path, "is_dir", return_value=True) as is_dir:
+            rx.host_identity()
+        is_dir.assert_called_once()
+        for index, value in ((0, "wrong-node"), (1, "[]"), (2, "driver: wrong"), (3, "driver: mana")):
+            bad = list(values)
+            bad[index] = value
+            with patch.object(rx, "command", side_effect=bad), self.assertRaises(RuntimeError):
+                rx.host_identity()
+        with patch.object(rx, "command", side_effect=values), patch.object(Path, "is_dir", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "VF association"):
+                rx.host_identity()
+
     def test_success_and_restore(self):
         h = Host()
         stages = []
@@ -175,6 +279,7 @@ class FakeHost:
     def features(self):
         return {d: {"rx-checksumming": ("on", False)} for d in ("eth0", VF)}
 Host = FakeHost
+host_identity = lambda: None
 def stage(*args, **kwargs):
     assert args[1:3] == ("baseline", 45)
     emit("baseline_entry_verified")
@@ -182,7 +287,8 @@ main()
 '''
         prelude = 'hostname() { printf "%s\\n" aks-adsv5-13731677-vmss00000W; }\n'
         output = rx.command(["sh", "-c", prelude + rx.remote_shell(False), "test", source,
-                             "--remote", json.dumps(dict(mode="baseline", concurrency=8, load_ip="127.0.0.1"))], 3)
+                             "--remote", json.dumps(dict(mode="baseline", concurrency=8, load_ip="127.0.0.1",
+                                                         profile=rx.PROFILE))], 3)
         records = [json.loads(line) for line in output.splitlines()]
         self.assertEqual([r["event"] for r in records], ["original", "baseline_entry_verified"])
 
@@ -227,10 +333,12 @@ class FakeHost:
     def features(self):
         raise subprocess.CalledProcessError(17, ["SECRET_ARG"], stderr="Authorization: SECRET")
 Host = FakeHost
+host_identity = lambda: None
 main()
 '''
         with self.assertRaises(subprocess.CalledProcessError) as caught:
-            rx.command(["python3", "-B", "-c", source, "--remote", '{"mode":"baseline"}'], 3)
+            rx.command(["python3", "-B", "-c", source, "--remote",
+                        json.dumps(dict(mode="baseline", profile=rx.PROFILE))], 3)
         record = json.loads(caught.exception.stdout)
         self.assertEqual(record["event"], "remote_error")
         self.assertEqual(record["exit"], 17)
@@ -291,6 +399,7 @@ timeout() { shift 3; "$@"; }
         self.assertEqual(h.writes, ["off", "on"])
 
     def test_stage_fresh_pair_deduplicates_and_carries_state(self):
+        rx.select_profile("ddv5-6o-to-adsv5-7n-20261001")
         h = Host()
         now = [0]
         def snapshot():
