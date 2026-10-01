@@ -56,6 +56,7 @@ type Application struct {
 // c supplies indexed discovery (configured by SetupWithManager in production);
 // reader must bypass the cache for authorization and durable-state validation.
 func Assemble(cfg Config, c client.Client, reader client.Reader) *Application {
+	cfg = cfg.effective()
 	publications := NewPublications()
 	publications.maxAge = cfg.snapshotMaxAge()
 	lifecycle := newLifecycle(publications)
@@ -66,7 +67,7 @@ func Assemble(cfg Config, c client.Client, reader client.Reader) *Application {
 	// and publication commit. Informer ordering alone cannot provide this gate.
 	catalogGate := newCatalogGate()
 	issuer.CatalogGate = catalogGate
-	replication := &Replication{Config: cfg, Client: c, APIReader: reader, Publications: publications, Trust: trust, Lifecycle: lifecycle, CatalogGate: catalogGate}
+	replication := &Replication{Config: cfg, Client: c, APIReader: reader, Publications: publications, Trust: trust, CatalogGate: catalogGate}
 
 	return &Application{
 		Topology: &TopologyReconciler{
@@ -82,7 +83,6 @@ func Assemble(cfg Config, c client.Client, reader client.Reader) *Application {
 			Client:      c,
 			APIReader:   reader,
 			Config:      cfg,
-			Lifecycle:   lifecycle,
 			CatalogGate: catalogGate,
 			Trust:       trust,
 		},
@@ -343,6 +343,15 @@ func (c Config) certificateLifetime() time.Duration {
 	return c.CertificateLifetime
 }
 
+// effective resolves optional lifetimes once at composition without I/O or
+// validation side effects. Programmatic boundary methods still validate inputs.
+func (c Config) effective() Config {
+	c.CertificateLifetime = c.certificateLifetime()
+	c.SnapshotMaxAge = c.snapshotMaxAge()
+
+	return c
+}
+
 func (c Config) Validate() error {
 	if c.SnapshotMaxAge < 0 || c.SnapshotMaxAge > 0 && c.SnapshotMaxAge < time.Second {
 		return fmt.Errorf("snapshot maximum age: %w", wire.InvalidRequest)
@@ -402,10 +411,8 @@ func (c Config) validateReplication() error {
 // Lifecycle owns process serving, independently of the leader-owned publishers.
 type Lifecycle struct {
 	mu               sync.Mutex
-	started          bool
 	process          context.Context
 	synced           bool
-	issuer           bool
 	serving          bool
 	publications     *Publications
 	waitForCacheSync func(context.Context) bool
@@ -445,18 +452,18 @@ func (l *Lifecycle) ProcessContext(parent context.Context) (context.Context, con
 
 func (l *Lifecycle) Start(ctx context.Context) error {
 	l.mu.Lock()
-	if l.started {
+	if l.process != nil {
 		l.mu.Unlock()
 		return wire.Conflict
 	}
 
-	l.started, l.process = true, ctx
+	l.process = ctx
 	l.publications.bindProcess(ctx)
 	l.mu.Unlock()
 
 	defer func() {
 		l.mu.Lock()
-		l.synced, l.issuer, l.serving = false, false, false
+		l.synced, l.serving = false, false
 		l.mu.Unlock()
 	}()
 
@@ -476,13 +483,6 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	return nil
 }
 
-// SetIssuerReady must be reset on loss of usable signing material/trust.
-func (l *Lifecycle) SetIssuerReady(ready bool) {
-	l.mu.Lock()
-	l.issuer = ready
-	l.mu.Unlock()
-}
-
 // SetServingReady is set only after the authenticated listener is accepting.
 func (l *Lifecycle) SetServingReady(ready bool) {
 	l.mu.Lock()
@@ -494,7 +494,7 @@ func (l *Lifecycle) Ready(_ *http.Request) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if l.process == nil || l.process.Err() != nil || !l.synced || !l.issuer || !l.serving {
+	if l.process == nil || l.process.Err() != nil || !l.synced || !l.serving {
 		return wire.Unavailable
 	}
 

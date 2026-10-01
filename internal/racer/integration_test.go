@@ -329,7 +329,7 @@ func integrationRotation(t *testing.T, c client.Client) {
 
 			return boom
 		}}
-		if _, err := r.Reconcile(t.Context(), ctrl.Request{}); !failed || !errors.Is(err, boom) || r.Lifecycle.issuer {
+		if _, err := r.Reconcile(t.Context(), ctrl.Request{}); !failed || !errors.Is(err, boom) || trustReady(r.Trust) {
 			t.Fatalf("%s interruption: %v", step.name, err)
 		}
 

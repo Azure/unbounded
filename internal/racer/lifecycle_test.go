@@ -84,17 +84,22 @@ func TestLifecycleProcessContext(t *testing.T) {
 func TestLifecycleHTTPReadinessTransitions(t *testing.T) {
 	for _, tc := range []struct {
 		name string
-		set  func(*Lifecycle, bool)
+		set  func(*Server, bool)
 	}{
-		{name: "issuer", set: (*Lifecycle).SetIssuerReady},
-		{name: "serving", set: (*Lifecycle).SetServingReady},
+		{name: "issuer", set: func(s *Server, ready bool) {
+			if ready {
+				runKeys(t, &KeyringReconciler{Client: s.Bootstrap.Client, APIReader: s.Bootstrap.APIReader, Config: s.Config, Trust: s.Trust})
+			} else {
+				s.Trust.invalidate()
+			}
+		}},
+		{name: "serving", set: func(s *Server, ready bool) { s.Lifecycle.SetServingReady(ready) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newServingFixture(t)
-			l := f.a.Lifecycle
 			handler := f.a.Server.Handler()
 
-			tc.set(l, false)
+			tc.set(f.a.Server, false)
 
 			for _, step := range []struct {
 				name  string
@@ -108,7 +113,7 @@ func TestLifecycleHTTPReadinessTransitions(t *testing.T) {
 				{name: "restore readiness", ready: true},
 			} {
 				t.Run(step.name, func(t *testing.T) {
-					tc.set(l, step.ready)
+					tc.set(f.a.Server, step.ready)
 
 					r := httptest.NewRequest(http.MethodGet, wire.SnapshotPath, nil)
 					r.TLS = f.requestState(t)
@@ -137,7 +142,6 @@ func TestLifecycleFollowerWithValidatedPublicationIsReady(t *testing.T) {
 
 	l := newLifecycle(r.Publications)
 	l.process, l.synced = t.Context(), true
-	l.SetIssuerReady(true)
 	l.SetServingReady(true)
 
 	if err := l.Ready(nil); err != nil {
@@ -170,7 +174,6 @@ func TestLifecycleGatesAndCancellation(t *testing.T) {
 
 		go func() { started <- l.Start(ctx) }()
 
-		l.SetIssuerReady(true)
 		l.SetServingReady(true)
 		reconcileTopology(t, r, ctx)
 
@@ -185,13 +188,13 @@ func TestLifecycleGatesAndCancellation(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		l.SetIssuerReady(false)
+		r.Publications.Suspend()
 
 		if l.Ready(nil) == nil {
-			t.Fatal("ready without usable issuer")
+			t.Fatal("ready without publication authority")
 		}
 
-		l.SetIssuerReady(true)
+		reconcileTopology(t, r, ctx)
 		l.SetServingReady(false)
 
 		if l.Ready(nil) == nil {
@@ -204,7 +207,6 @@ func TestLifecycleGatesAndCancellation(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		l.SetIssuerReady(true)
 		l.SetServingReady(true)
 
 		if l.Ready(nil) == nil {
@@ -237,7 +239,6 @@ func TestLifecycleRequiresPublicationAndHonorsRequestCancellation(t *testing.T) 
 
 		go func() { done <- l.Start(ctx) }()
 
-		l.SetIssuerReady(true)
 		l.SetServingReady(true)
 		synctest.Wait()
 
@@ -272,7 +273,6 @@ func TestLifecycleRequiresPublicationAndHonorsRequestCancellation(t *testing.T) 
 		beforeStartup := newLifecycle(r.Publications)
 		beforeStartup.waitForCacheSync = func(ctx context.Context) bool { return ctx.Err() == nil }
 		require.NoError(t, beforeStartup.Start(ctx))
-		beforeStartup.SetIssuerReady(true)
 		beforeStartup.SetServingReady(true)
 		require.ErrorIs(t, beforeStartup.Ready(nil), wire.Unavailable, "canceled startup became ready")
 	})
@@ -314,7 +314,6 @@ func TestLifecycleHTTPStartupAdmission(t *testing.T) {
 				f := newServingFixture(t)
 				l := newLifecycle(f.a.Server.Publications)
 				f.a.Server.Lifecycle = l
-				l.SetIssuerReady(true)
 				l.SetServingReady(true)
 
 				syncCache := make(chan struct{})

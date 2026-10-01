@@ -364,7 +364,7 @@ func TestKeyringExpiredPreparationRecovery(t *testing.T) {
 				t.Fatalf("expired issuer accepted: %v", err)
 			}
 
-			if _, err := r.Reconcile(context.Background(), ctrl.Request{}); !errors.Is(err, wire.Unavailable) || r.Lifecycle.issuer {
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{}); !errors.Is(err, wire.Unavailable) || trustReady(r.Trust) {
 				t.Fatalf("expired active readiness: %v", err)
 			}
 

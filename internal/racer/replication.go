@@ -39,7 +39,6 @@ type Replication struct {
 	APIReader    client.Reader
 	Publications *Publications
 	Trust        *Trust
-	Lifecycle    *Lifecycle
 	CatalogGate  *CatalogGate
 	mu           sync.Mutex
 	leader       context.Context
@@ -149,9 +148,6 @@ func (r *Replication) observe(ctx context.Context) {
 		r.Trust.invalidate()
 		r.Publications.Suspend()
 	}
-
-	_, trustErr := r.Trust.pool()
-	r.Lifecycle.SetIssuerReady(trustErr == nil)
 }
 
 // installReplica is the alternate proof to publisher CAS: bounded canonical

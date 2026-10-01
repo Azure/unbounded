@@ -72,8 +72,8 @@ func (r *TopologyReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctr
 }
 
 func (r *TopologyReconciler) reconcile(ctx context.Context) error {
-	var update topologyUpdate
-	if err := r.publish(ctx, &update); err != nil {
+	update, err := r.publish(ctx)
+	if err != nil {
 		return err
 	}
 
@@ -87,37 +87,37 @@ type topologyUpdate struct {
 
 // publish protects authoritative reads, CAS, and local installation. Annotation
 // writes are recovery hints, not authority, and must not block trust observation.
-func (r *TopologyReconciler) publish(ctx context.Context, update *topologyUpdate) error {
+func (r *TopologyReconciler) publish(ctx context.Context) (topologyUpdate, error) {
 	if r.CatalogGate != nil {
 		if err := r.CatalogGate.Acquire(ctx); err != nil {
-			return err
+			return topologyUpdate{}, err
 		}
 		defer r.CatalogGate.Release()
 	}
 
 	if err := ctx.Err(); err != nil {
-		return err
+		return topologyUpdate{}, err
 	}
 
 	cm, previous, err := readVersion(ctx, r.APIReader, r.Config)
 	if err != nil {
 		r.suspendInvalidAuthority(err)
-		return err
+		return topologyUpdate{}, err
 	}
 
 	var nodes corev1.NodeList
 	if err := r.List(ctx, &nodes); err != nil {
-		return err
+		return topologyUpdate{}, err
 	}
 
 	var caches racerv1.ClusterCacheList
 	if err := r.APIReader.List(ctx, &caches); err != nil {
-		return err
+		return topologyUpdate{}, err
 	}
 
 	catalog, err := BuildCatalog(caches.Items)
 	if err != nil {
-		return err
+		return topologyUpdate{}, err
 	}
 
 	// The committed keyring is the admission authority. A cache event can arrive
@@ -127,7 +127,7 @@ func (r *TopologyReconciler) publish(ctx context.Context, update *topologyUpdate
 		credentials, err := readCredentials(ctx, r.APIReader, r.Config, claim)
 		if err != nil {
 			r.suspendInvalidAuthority(err)
-			return err
+			return topologyUpdate{}, err
 		}
 
 		keyed := keyedCaches(credentials.bundle)
@@ -146,7 +146,7 @@ func (r *TopologyReconciler) publish(ctx context.Context, update *topologyUpdate
 
 	ownership, err := readManagedWorkloadIdentities(ctx, r.APIReader, r.Config)
 	if err != nil {
-		return err
+		return topologyUpdate{}, err
 	}
 	// Indexed namespace-scoped queries avoid scanning unrelated Pods for each
 	// Node. Ownership is still verified against the current DaemonSet UID.
@@ -154,12 +154,12 @@ func (r *TopologyReconciler) publish(ctx context.Context, update *topologyUpdate
 
 	for _, node := range nodes.Items {
 		if err := ctx.Err(); err != nil {
-			return err
+			return topologyUpdate{}, err
 		}
 
 		var list corev1.PodList
 		if err := r.List(ctx, &list, client.InNamespace(r.Config.Namespace), client.MatchingFields{podNodeIndex: node.Name}); err != nil {
-			return err
+			return topologyUpdate{}, err
 		}
 
 		podsByNode[node.Name] = list.Items
@@ -167,7 +167,7 @@ func (r *TopologyReconciler) publish(ctx context.Context, update *topologyUpdate
 
 	candidate, diagnostics, err := reconcileMembers(nodes.Items, podsByNode, ownership, r.Accepted, r.Config.PeerPort)
 	if err != nil {
-		return err
+		return topologyUpdate{}, err
 	}
 
 	for _, d := range diagnostics {
@@ -176,26 +176,25 @@ func (r *TopologyReconciler) publish(ctx context.Context, update *topologyUpdate
 
 	prepared, err := r.Publications.Prepare(previous, cm.ResourceVersion, candidate, catalog)
 	if err != nil {
-		return err
+		return topologyUpdate{}, err
 	}
 
 	committed, err := r.CommitVersion(ctx, prepared)
 	if err != nil {
-		return err
+		return topologyUpdate{}, err
 	}
 
 	if err := ctx.Err(); err != nil {
-		return err
+		return topologyUpdate{}, err
 	}
 
 	if err := r.Publications.Install(committed); err != nil {
-		return err
+		return topologyUpdate{}, err
 	}
 
 	r.Accepted = candidate
-	*update = topologyUpdate{nodes: nodes, members: candidate}
 
-	return nil
+	return topologyUpdate{nodes: nodes, members: candidate}, nil
 }
 
 func (r *TopologyReconciler) annotate(ctx context.Context, update topologyUpdate) error {
@@ -290,14 +289,12 @@ func managedWorkloadNames(cfg Config) []string {
 // Refresh it for each authorization or topology pass; labels are not ownership.
 type DataplaneWorkloadIdentities struct {
 	namespace string
-	names     [2]string
-	uids      [2]types.UID
+	workloads [2]workloadIdentity
 }
 
-// ReadDataplaneWorkloadIdentities requires at most two exact-name reads. Missing
-// or deleting workloads authorize no Pods; any other read error fails closed.
-func ReadDataplaneWorkloadIdentities(ctx context.Context, reader client.Reader, namespace string) (DataplaneWorkloadIdentities, error) {
-	return readManagedWorkloadIdentities(ctx, reader, Config{Namespace: namespace, DaemonSetName: DataplaneDaemonSetName})
+type workloadIdentity struct {
+	name string
+	uid  types.UID
 }
 
 // Custom standalone installations retain their single configured workload.
@@ -305,7 +302,7 @@ func ReadDataplaneWorkloadIdentities(ctx context.Context, reader client.Reader, 
 func readManagedWorkloadIdentities(ctx context.Context, reader client.Reader, cfg Config) (DataplaneWorkloadIdentities, error) {
 	ids := DataplaneWorkloadIdentities{namespace: cfg.Namespace}
 	for i, name := range managedWorkloadNames(cfg) {
-		ids.names[i] = name
+		ids.workloads[i].name = name
 
 		var ds appsv1.DaemonSet
 		if err := reader.Get(ctx, client.ObjectKey{Namespace: cfg.Namespace, Name: name}, &ds); err != nil {
@@ -317,7 +314,7 @@ func readManagedWorkloadIdentities(ctx context.Context, reader client.Reader, cf
 		}
 
 		if ds.DeletionTimestamp == nil {
-			ids.uids[i] = ds.UID
+			ids.workloads[i].uid = ds.UID
 		}
 	}
 
@@ -340,8 +337,8 @@ func (ids DataplaneWorkloadIdentities) Owns(pod *corev1.Pod) bool {
 		return false
 	}
 
-	for i, name := range ids.names {
-		if owner.Name == name && owner.UID == ids.uids[i] {
+	for _, workload := range ids.workloads {
+		if owner.Name == workload.name && owner.UID == workload.uid {
 			return true
 		}
 	}

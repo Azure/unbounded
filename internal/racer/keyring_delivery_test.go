@@ -85,7 +85,7 @@ func TestKeyringReplayProtectionSurvivesInvalidation(t *testing.T) {
 						t.Fatalf("replay restored delivery: %v", err)
 					}
 
-					if _, err := r.Trust.pool(); !errors.Is(err, wire.Unavailable) || r.Lifecycle.issuer {
+					if _, err := r.Trust.pool(); !errors.Is(err, wire.Unavailable) {
 						t.Fatalf("replay restored trust: %v", err)
 					}
 
@@ -112,7 +112,7 @@ func TestKeyringReplayProtectionSurvivesInvalidation(t *testing.T) {
 					t.Fatalf("restored wrong content: %v", err)
 				}
 
-				if _, err := r.Trust.pool(); err != nil || !r.Lifecycle.issuer {
+				if _, err := r.Trust.pool(); err != nil {
 					t.Fatalf("restoration did not restore trust: %v", err)
 				}
 

@@ -261,10 +261,10 @@ func TestTrustRequiresFreshPostReconcileCredentials(t *testing.T) {
 
 				current, err := r.Trust.pool()
 				if failure == "outage" {
-					if err != nil || current != accepted || !r.Lifecycle.issuer {
+					if err != nil || current != accepted || !trustReady(r.Trust) {
 						t.Fatalf("read outage replaced accepted trust with candidate roots: %v", err)
 					}
-				} else if err == nil || r.Lifecycle.issuer {
+				} else if err == nil || trustReady(r.Trust) {
 					t.Fatal("observed invalid authority retained or installed trust")
 				}
 
@@ -335,7 +335,7 @@ func TestKeyringCancellationOverridesPostReconcileReadFailure(t *testing.T) {
 				t.Fatalf("post-reconcile cancellation: reads=%d result=%v err=%v", reads, result, err)
 			}
 
-			if _, err := r.Trust.pool(); err == nil || r.Lifecycle.issuer {
+			if _, err := r.Trust.pool(); err == nil {
 				t.Fatal("cancellation after admission retained trust or issuer readiness")
 			}
 
@@ -382,7 +382,7 @@ func TestReconcilerAlreadyExistsHandling(t *testing.T) {
 					t.Fatalf("keyring AlreadyExists not requeued: %v %v", result, err)
 				}
 
-				if _, err := r.Trust.pool(); err == nil || r.Lifecycle.issuer {
+				if _, err := r.Trust.pool(); err == nil {
 					t.Fatal("keyring write failure retained trust or issuer readiness")
 				}
 			} else {

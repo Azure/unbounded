@@ -37,7 +37,6 @@ type KeyringReconciler struct {
 	APIReader   client.Reader
 	Config      Config
 	Trust       *Trust
-	Lifecycle   *Lifecycle
 	Now         func() time.Time
 	CatalogGate *CatalogGate
 }
@@ -75,11 +74,6 @@ func (r *KeyringReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl
 
 	if shouldInvalidateTrust(err) {
 		r.Trust.invalidate()
-	}
-
-	if r.Lifecycle != nil {
-		_, trustErr := r.Trust.pool()
-		r.Lifecycle.SetIssuerReady(trustErr == nil)
 	}
 
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {

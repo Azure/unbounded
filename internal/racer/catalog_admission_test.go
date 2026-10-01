@@ -119,7 +119,7 @@ func TestCatalogAdmissionRotationCycles(t *testing.T) {
 				_, after, state, _ := keyState(t, r)
 
 				maxRoots = max(maxRoots, len(after.PeerTrustRoots))
-				if len(keyedCaches(after)) != capacity || !r.Lifecycle.issuer || after.Generation <= before.Generation {
+				if len(keyedCaches(after)) != capacity || !trustReady(r.Trust) || after.Generation <= before.Generation {
 					t.Fatal("rotation at capacity lost admission, readiness, or progress")
 				}
 
@@ -165,7 +165,7 @@ func TestCatalogAdmissionGrowthRemovalAndRestart(t *testing.T) {
 	logger := funcr.New(func(_, msg string) { logs.WriteString(msg) }, funcr.Options{})
 
 	ctx := ctrl.LoggerInto(t.Context(), logger)
-	if _, err := r.Reconcile(ctx, ctrl.Request{}); err != nil || !r.Lifecycle.issuer {
+	if _, err := r.Reconcile(ctx, ctrl.Request{}); err != nil || !trustReady(r.Trust) {
 		t.Fatalf("growth disabled healthy service: %v", err)
 	}
 
@@ -320,7 +320,7 @@ func TestCatalogAdmissionLegacyOvercommitDoesNotEvict(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := r.Reconcile(t.Context(), ctrl.Request{}); !errors.Is(err, wire.TooLarge) || r.Lifecycle.issuer {
+	if _, err := r.Reconcile(t.Context(), ctrl.Request{}); !errors.Is(err, wire.TooLarge) || trustReady(r.Trust) {
 		t.Fatalf("legacy overcommit silently accepted: %v", err)
 	}
 
@@ -425,7 +425,7 @@ func integrationCatalogCapacity(t *testing.T, c client.Client) {
 	runKeys(t, a.Keyring)
 	assertPublishedKeys(t, a.Topology, capacity)
 
-	if !a.Lifecycle.issuer {
+	if !trustReady(a.Server.Trust) {
 		t.Fatal("API-backed capacity rejection withdrew readiness")
 	}
 }

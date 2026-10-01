@@ -68,7 +68,7 @@ func TestKeyringRotationCrashRecovery(t *testing.T) {
 				}})
 
 				_, err := r.Reconcile(context.Background(), ctrl.Request{})
-				if failed && (!errors.Is(err, boom) || r.Lifecycle.issuer) {
+				if failed && (!errors.Is(err, boom) || trustReady(r.Trust)) {
 					t.Fatalf("write failure accepted: %v", err)
 				}
 				// Every intermediate durable pair must still be structurally readable.
@@ -271,7 +271,7 @@ func TestKeyringInitializationNeverResurrects(t *testing.T) {
 				t.Fatal("recreated established state")
 				return nil
 			}})
-			if _, err := r.Reconcile(context.Background(), ctrl.Request{}); err == nil || r.Lifecycle.issuer {
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{}); err == nil || trustReady(r.Trust) {
 				t.Fatal("lost state accepted")
 			}
 
@@ -337,7 +337,7 @@ func TestKeyringConflictCancellationAndAuthoritativeReads(t *testing.T) {
 			}
 
 			// Cancellation before admission observes no authority failure.
-			if r.Lifecycle.issuer != (cancelAt == "before") {
+			if trustReady(r.Trust) != (cancelAt == "before") {
 				t.Fatal("readiness did not reflect whether admission observed a failure")
 			}
 

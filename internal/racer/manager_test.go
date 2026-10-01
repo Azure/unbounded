@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 
@@ -35,8 +36,18 @@ func TestAssemble(t *testing.T) {
 		t.Fatal("controllers and issuance must share the catalog gate")
 	}
 
-	if a.Keyring.Lifecycle != a.Lifecycle || a.Server.Lifecycle != a.Lifecycle {
-		t.Fatal("issuer and serving must share the leader readiness gate")
+	if a.Server.Lifecycle != a.Lifecycle {
+		t.Fatal("serving must share the process readiness gate")
+	}
+
+	for _, cfg := range []Config{a.Server.Config, a.Topology.Config, a.Keyring.Config, a.Replication.Config, issuer.Config, a.Server.Bootstrap.Config} {
+		if cfg.CertificateLifetime != wire.CertificateLifetime || cfg.SnapshotMaxAge != 30*time.Second {
+			t.Fatal("composition did not resolve default lifetimes")
+		}
+	}
+
+	if a.Server.Publications.maxAge != a.Server.Config.SnapshotMaxAge || a.Server.Trust.maxAge != a.Server.Config.SnapshotMaxAge {
+		t.Fatal("freshness owners differ from effective configuration")
 	}
 
 	if a.Topology.Accepted == nil || a.Server.NeedLeaderElection() || a.Replication.NeedLeaderElection() {

@@ -112,7 +112,7 @@ func TestMixedControllerAuthorization(t *testing.T) {
 	require.NoError(t, authorizePod(t.Context(), c, cfg, &pod, string(sa.UID)))
 	require.ErrorIs(t, authorizePod(t.Context(), c, cfg, &pod, "old-sa"), wire.Forbidden)
 	require.ErrorIs(t, authorizePod(t.Context(), mixedFailReader{c}, cfg, &pod, string(sa.UID)), wire.Unavailable)
-	ids, err := ReadDataplaneWorkloadIdentities(t.Context(), mixedFailReader{c}, cfg.Namespace)
+	ids, err := readManagedWorkloadIdentities(t.Context(), mixedFailReader{c}, cfg)
 	require.Error(t, err)
 	require.False(t, ids.Owns(&pod))
 

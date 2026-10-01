@@ -35,7 +35,7 @@ func memberOwnership(t *testing.T, uid types.UID) DataplaneWorkloadIdentities {
 	t.Helper()
 	r := initializedTopology(t, &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: DataplaneDaemonSetName, Namespace: "racer", UID: uid}})
 
-	ids, err := ReadDataplaneWorkloadIdentities(t.Context(), r.APIReader, "racer")
+	ids, err := readManagedWorkloadIdentities(t.Context(), r.APIReader, Config{Namespace: "racer", DaemonSetName: DataplaneDaemonSetName})
 	if err != nil {
 		t.Fatal(err)
 	}

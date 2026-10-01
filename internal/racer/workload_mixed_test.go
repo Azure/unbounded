@@ -101,7 +101,7 @@ func TestMixedNetworkIdentities(t *testing.T) {
 	host := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: "racer", Name: DataplaneDaemonSetName, UID: "host-current"}}
 	podnet := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: "racer", Name: PodNetworkDaemonSetName, UID: "pod-current"}}
 	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(host, podnet).Build()
-	ids, err := ReadDataplaneWorkloadIdentities(t.Context(), reader, "racer")
+	ids, err := readManagedWorkloadIdentities(t.Context(), reader, Config{Namespace: "racer", DaemonSetName: DataplaneDaemonSetName})
 	require.NoError(t, err)
 
 	for _, ds := range []*appsv1.DaemonSet{host, podnet} {
@@ -127,8 +127,8 @@ func TestMixedNetworkIdentities(t *testing.T) {
 
 	require.False(t, ids.Owns(nil))
 	require.NoError(t, reader.Delete(t.Context(), podnet))
-	ids, err = ReadDataplaneWorkloadIdentities(t.Context(), reader, "racer")
+	ids, err = readManagedWorkloadIdentities(t.Context(), reader, Config{Namespace: "racer", DaemonSetName: DataplaneDaemonSetName})
 	require.NoError(t, err)
-	require.Empty(t, ids.uids[1])
-	require.Equal(t, host.UID, ids.uids[0])
+	require.Empty(t, ids.workloads[1].uid)
+	require.Equal(t, host.UID, ids.workloads[0].uid)
 }

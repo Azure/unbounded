@@ -71,7 +71,7 @@ func TestKeyringRotationLifecycle(t *testing.T) {
 	result := runKeys(t, r)
 
 	shared, initial, state, _ := keyState(t, r)
-	if initial.Generation != 1 || len(initial.CacheKeys) != 2 || len(initial.PeerTrustRoots) != 1 || result.RequeueAfter != r.Config.Rotation.Interval-r.Config.Rotation.PrepareFor || !r.Lifecycle.issuer {
+	if initial.Generation != 1 || len(initial.CacheKeys) != 2 || len(initial.PeerTrustRoots) != 1 || result.RequeueAfter != r.Config.Rotation.Interval-r.Config.Rotation.PrepareFor || !trustReady(r.Trust) {
 		t.Fatal("initial credentials or readiness")
 	}
 
@@ -582,7 +582,7 @@ func TestKeyringCorruptionAndGenerationExhaustion(t *testing.T) {
 
 			before := shared.DeepCopy()
 
-			if _, err := r.Reconcile(context.Background(), ctrl.Request{}); err == nil || r.Lifecycle.issuer {
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{}); err == nil || trustReady(r.Trust) {
 				t.Fatal("corrupt state accepted")
 			}
 
@@ -727,7 +727,7 @@ func TestKeyringOversizedOverlapDoesNotWrite(t *testing.T) {
 	shared, admitted, state, _ := keyState(t, r)
 
 	capacity, err := catalogCapacity(r.Config, admitted)
-	if err != nil || len(admitted.CacheKeys) != 2*capacity || capacity >= 801 || !r.Lifecycle.issuer {
+	if err != nil || len(admitted.CacheKeys) != 2*capacity || capacity >= 801 || !trustReady(r.Trust) {
 		t.Fatalf("rotation capacity not enforced: %d, %v", capacity, err)
 	}
 
@@ -760,7 +760,7 @@ func TestKeyringOversizedOverlapDoesNotWrite(t *testing.T) {
 	runKeys(t, r)
 
 	_, staged, _, _ := keyState(t, r)
-	if len(staged.CacheKeys) != 4*capacity || !r.Lifecycle.issuer {
+	if len(staged.CacheKeys) != 4*capacity || !trustReady(r.Trust) {
 		t.Fatal("admitted catalog could not rotate")
 	}
 }
