@@ -1392,6 +1392,7 @@ mod tests {
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(cut.as_mut().poll(&mut cx).is_pending());
         assert!(!first.ready());
+        assert!(!first.stopped());
         assert!(second.ready());
         native.poll_budgeted(2).unwrap();
         assert!(matches!(
@@ -1400,6 +1401,7 @@ mod tests {
         ));
         assert!(first.stopped());
         assert!(second.ready());
+        assert!(!io.shared.closed.load(Ordering::Acquire));
         assert!(sessions.progress().is_ok());
     }
     #[test]
@@ -1455,34 +1457,6 @@ mod tests {
         assert!(one.progress().is_ok());
         assert!(two.progress().is_ok());
         assert!(two.ready());
-    }
-    #[test]
-    fn accepted_cut_fences_snapshot_without_closing_future_sessions() {
-        let (io, port) = pair(2).unwrap();
-        let io = Rc::new(io);
-        let mut native = NativeService::new(port);
-        provision_test(&mut native, 0);
-        provision_test(&mut native, 1);
-        let first = claim(&io);
-        mark_connected(&first, &mut native);
-        let sessions = Sessions::new(Rc::new(Devices::new()), 2);
-        sessions.track_test(first.clone());
-        let mut cut = sessions.fence_cut();
-        let later = claim(&io);
-        mark_connected(&later, &mut native);
-        sessions.track_test(later.clone());
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        assert!(cut.as_mut().poll(&mut cx).is_pending());
-        assert!(later.ready());
-        assert!(!first.stopped());
-        native.poll_budgeted(2).unwrap();
-        assert!(matches!(
-            cut.as_mut().poll(&mut cx),
-            std::task::Poll::Ready(Ok(()))
-        ));
-        assert!(later.ready());
-        assert!(!io.shared.closed.load(Ordering::Acquire));
-        assert!(sessions.progress().is_ok());
     }
     #[cfg(feature = "rdma")]
     #[test]

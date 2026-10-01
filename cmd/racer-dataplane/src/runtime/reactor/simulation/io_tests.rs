@@ -86,39 +86,6 @@ fn real_reactor_stream_backpressure_eof_and_completion_fences() {
 }
 
 #[test]
-fn abandonment_retains_descriptor_buffer_and_lease_until_both_cqes() {
-    let sim = Simulation::new();
-    let _environment = sim.enter();
-    let r = reactor();
-    r.init().unwrap();
-    let scope = scope();
-    let baseline = r.admission.used(ResourceClass::RequestContext);
-    let (a, b) = sim.socket_pair();
-    let a = Rc::new(a);
-    let weak = Rc::downgrade(&a);
-    let lease = r
-        .admission
-        .reserve(None, ResourceClass::Connection, 1)
-        .unwrap();
-    let mut recv = r.recv(a, r.file_buffer(17).unwrap(), lease, &scope);
-    assert!(poll(&mut recv).is_pending());
-    drop(recv);
-    r.poll_budgeted(1).unwrap();
-    assert!(weak.upgrade().is_some());
-    assert_eq!(r.in_flight(), 1);
-    r.poll_budgeted(1).unwrap();
-    assert!(weak.upgrade().is_some());
-    assert_eq!(r.admission.used(ResourceClass::Connection), 1);
-    r.poll_budgeted(1).unwrap();
-    assert!(weak.upgrade().is_none());
-    assert_eq!(r.in_flight(), 0);
-    assert_eq!(r.admission.used(ResourceClass::Connection), 0);
-    assert_eq!(r.admission.used(ResourceClass::RequestContext), baseline);
-    drop(b);
-    assert_eq!(sim.live_handles(), 0);
-}
-
-#[test]
 fn scoped_selection_and_listener_pending_close_are_isolated() {
     let sim = Simulation::new();
     let other = Simulation::new();
@@ -414,7 +381,16 @@ fn abandoned_resources_wait_for_both_fences_in_either_order() {
         let fd = Rc::new(fd);
         let weak = Rc::downgrade(&fd);
         let drops = Rc::new(Cell::new(0));
-        let mut recv = r.recv(fd, r.file_buffer(8).unwrap(), Probe(drops.clone()), &scope);
+        let lease = r
+            .admission
+            .reserve(None, ResourceClass::Connection, 1)
+            .unwrap();
+        let mut recv = r.recv(
+            fd,
+            r.file_buffer(8).unwrap(),
+            (Probe(drops.clone()), lease),
+            &scope,
+        );
         assert!(poll(&mut recv).is_pending());
         let id = *r.state.borrow().entries.keys().next().unwrap();
         // An unsolicited cancellation CQE must not mutate the live entry.
@@ -439,11 +415,13 @@ fn abandoned_resources_wait_for_both_fences_in_either_order() {
         assert_eq!(drops.get(), 0);
         assert!(weak.upgrade().is_some());
         assert_eq!(r.in_flight(), 1);
+        assert_eq!(r.admission.used(ResourceClass::Connection), 1);
         assert!(r.admission.used(ResourceClass::RequestContext) > baseline);
         assert_eq!(r.poll_budgeted(1), Ok(1));
         assert_eq!(drops.get(), 1);
         assert!(weak.upgrade().is_none());
         assert_eq!(r.in_flight(), 0);
+        assert_eq!(r.admission.used(ResourceClass::Connection), 0);
         assert_eq!(r.admission.used(ResourceClass::RequestContext), baseline);
         assert!(matches!(
             r.state.borrow_mut().complete(id.0, 8),

@@ -1,14 +1,11 @@
 //! Deterministic mailbox schedules through the authenticated receive completion path.
+use super::mailbox_tests::{envelope, header, scope, verified};
 use super::tests::{claim, mark_connected, provision_test};
 use super::*;
 use crate::{
-    http::{Header, MessageHead, StartLine},
-    model::{
-        CacheId, CacheKey, KeyId, Nonce, ObjectId, ObjectVersion, PageEnvelope, PageId, PageNumber,
-        RequestId, ResourceClass, StrongEtag, TransferId,
-    },
+    model::{ResourceClass, TransferId},
     rdma::{COMPLETION_HEADER, Devices, RdmaTransfer, SessionLease, Sessions, completion_bytes},
-    runtime::{admission::Admission, deadline::RequestScope, environment},
+    runtime::{admission::Admission, environment},
     security::connection::signature_tests::network,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -81,27 +78,8 @@ fn receive_case(readback: bool, terminal: Option<Error>, failed_fence: bool) {
         crate::test_support::cluster::config(true).limits,
     ));
     let transfer = RdmaTransfer::new(sessions);
-    let envelope = PageEnvelope {
-        page: PageId {
-            version: ObjectVersion {
-                object: ObjectId {
-                    cache: CacheId("receive-test".into()),
-                    key: CacheKey([1; 32]),
-                },
-                etag: StrongEtag::test_value("v1"),
-            },
-            number: PageNumber(0),
-        },
-        key_id: KeyId([1; 16]),
-        nonce: Nonce([2; 24]),
-        plaintext_length: 16,
-        ciphertext_length: 32,
-    };
-    let mut scope = RequestScope::new(
-        RequestId([3; 16]),
-        environment::now() + Duration::from_secs(10),
-    )
-    .unwrap();
+    let envelope = envelope();
+    let mut scope = scope();
     let id = TransferId([4; 16]);
     native.resources[0]
         .as_ref()
@@ -116,27 +94,15 @@ fn receive_case(readback: bool, terminal: Option<Error>, failed_fence: bool) {
     ffi::lifetime_tests::complete(1, 0, 5);
     native.poll_budgeted(1).unwrap();
     grant.descriptor().unwrap();
-    let signed = signers[0]
-        .sign(MessageHead {
-            start: StartLine::Request {
-                method: "POST".into(),
-                target: "/racer/peer/v1/rdma".into(),
-            },
-            headers: vec![
-                Header {
-                    name: "racer-receiver".into(),
-                    value: signers[1].node().0.as_bytes().to_vec(),
-                },
-                Header {
-                    name: COMPLETION_HEADER.into(),
-                    value: STANDARD
-                        .encode(completion_bytes(session.binding(), id))
-                        .into_bytes(),
-                },
-            ],
-        })
-        .unwrap();
-    let completion = signers[1].verify_proof(signed).unwrap();
+    let completion = verified(
+        &signers,
+        vec![header(
+            COMPLETION_HEADER,
+            STANDARD
+                .encode(completion_bytes(session.binding(), id))
+                .into_bytes(),
+        )],
+    );
     // Expire only the finish scope; the grant remains valid so admission/binding
     // cannot be mistaken for the receive-completion deadline check.
     if terminal == Some(Error::DeadlineExceeded) {

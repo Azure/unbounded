@@ -194,10 +194,9 @@ impl<'a> WorkerGroup<'a> {
             borrowed: PhantomData,
         }
     }
-    /// Independent startup requires an owned recipe: borrowed factories are only
-    /// supported by `run`/`run_with_scope`, whose scoped threads cannot escape.
-    /// The caller remains a userspace thread, so I/O plus unique crypto threads
-    /// must fit in max_threads - 1. A fully occupied plan must use `run`.
+    /// Driver-controlled adapter over the same scoped execution used by `run`.
+    /// The coordinator becomes the first I/O worker, not an extra helper thread.
+    /// The external driver still requires one slot in the whole-process budget.
     pub fn start(
         &mut self,
         factory: Arc<dyn WorkerFactory + Send>,
@@ -210,56 +209,30 @@ impl<'a> WorkerGroup<'a> {
         &mut self,
         factory: Arc<dyn WorkerFactory + Send>,
         scope: &RequestScope,
-        mut allocate: impl FnMut(WorkerId, u64, NonZeroUsize) -> Result<(IoCryptoPort, CryptoPort)>,
+        allocate: impl FnMut(WorkerId, u64, NonZeroUsize) -> Result<(IoCryptoPort, CryptoPort)>
+        + Send
+        + 'static,
     ) -> Result<()> {
         self.prepare(false)?;
-        let limits = factory.limits();
-        let mut launched = vec![false; self.plan.pairs.len()];
-        for indices in self.plan.crypto_groups() {
-            let (ios, engines) = self.allocate_group(&indices, limits.queue_entries, &mut allocate);
-            if engines.is_empty() {
-                break;
-            }
-            let control = self.control.clone();
-            let recipe = factory.clone();
-            let startup = scope.clone();
-            let cpu = self.plan.pairs[indices[0]].crypto.cpu;
-            match thread::Builder::new()
-                .name(format!("racer-crypto-{cpu}"))
-                .spawn(move || crypto_thread(&*recipe, cpu, engines, startup, control))
-            {
-                Ok(handle) => self.threads.push(handle),
-                Err(_) => {
-                    self.control.fail(Error::Io);
-                    break;
+        let plan = AffinityPlan {
+            pairs: self.plan.pairs.clone(),
+            max_threads: self.plan.max_threads,
+        };
+        let control = self.control.clone();
+        let startup = scope.clone();
+        let generation = self.generation;
+        let handle = thread::Builder::new()
+            .name(format!("racer-io-{}", plan.pairs[0].worker.0))
+            .spawn(move || {
+                let mut group = WorkerGroup::new(plan);
+                group.control = control.clone();
+                group.generation = generation;
+                if let Err(error) = group.run_prepared(&*factory, &startup, false, allocate) {
+                    control.fail(error);
                 }
-            }
-            for (index, pair, io) in ios {
-                let control = self.control.clone();
-                let recipe = factory.clone();
-                let startup = scope.clone();
-                let limits = limits.clone();
-                match thread::Builder::new()
-                    .name(format!("racer-io-{}", pair.worker.0))
-                    .spawn(move || io_thread(&*recipe, pair, io, limits, startup, control, index))
-                {
-                    Ok(handle) => {
-                        self.threads.push(handle);
-                        launched[index] = true;
-                    }
-                    Err(_) => {
-                        self.control.close_io(index);
-                        self.control.fence_io(index);
-                        self.control.fail(Error::Io);
-                        break;
-                    }
-                }
-            }
-            if self.control.result().is_err() {
-                break;
-            }
-        }
-        self.close_unlaunched(&launched);
+            })
+            .map_err(|_| Error::Io)?;
+        self.threads.push(handle);
         let result = self
             .control
             .wait_for(scope, |state| state.ready == state.total);
@@ -412,9 +385,19 @@ impl<'a> WorkerGroup<'a> {
         factory: &'a dyn WorkerFactory,
         scope: &RequestScope,
         check_scope: bool,
-        mut allocate: impl FnMut(WorkerId, u64, NonZeroUsize) -> Result<(IoCryptoPort, CryptoPort)>,
+        allocate: impl FnMut(WorkerId, u64, NonZeroUsize) -> Result<(IoCryptoPort, CryptoPort)>,
     ) -> Result<()> {
         self.prepare(true)?;
+        self.run_prepared(factory, scope, check_scope, allocate)
+    }
+
+    fn run_prepared(
+        &mut self,
+        factory: &dyn WorkerFactory,
+        scope: &RequestScope,
+        check_scope: bool,
+        mut allocate: impl FnMut(WorkerId, u64, NonZeroUsize) -> Result<(IoCryptoPort, CryptoPort)>,
+    ) -> Result<()> {
         let original_affinity = current_cpus()?;
         let limits = factory.limits();
         self.control.lock().check_scope = check_scope;
@@ -1102,6 +1085,7 @@ mod tests {
         assert_eq!(map.metadata_owner(&object).unwrap(), WorkerId(1));
     }
 
+    #[derive(Clone)]
     struct TestFactory {
         events: Arc<Mutex<Vec<&'static str>>>,
         crypto_polls: Arc<std::sync::atomic::AtomicUsize>,
@@ -1118,18 +1102,6 @@ mod tests {
     struct TestCrypto {
         factory: TestFactory,
         _port: CryptoPort,
-    }
-    impl Clone for TestFactory {
-        fn clone(&self) -> Self {
-            Self {
-                events: self.events.clone(),
-                crypto_polls: self.crypto_polls.clone(),
-                fail_io: self.fail_io,
-                fail_crypto: self.fail_crypto,
-                stop_on_poll: self.stop_on_poll,
-                cpu: self.cpu,
-            }
-        }
     }
     impl TestFactory {
         fn event(&self, event: &'static str) {

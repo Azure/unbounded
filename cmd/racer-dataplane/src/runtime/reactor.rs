@@ -51,7 +51,6 @@ enum Submission {
 }
 // Control-owned filesystem extension; shares this reactor's completion fences.
 pub mod filesystem;
-mod syscall_arg;
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
@@ -68,7 +67,23 @@ use std::{
     task::{Context, Poll, Waker},
     time::Duration,
 };
-use syscall_arg::SyscallArg;
+// A private one-element Vec keeps syscall backing stable across owner moves.
+// Do not replace with Box: its move retagging invalidates derived pointers.
+struct SyscallArg<T>(Vec<T>);
+impl<T> SyscallArg<T> {
+    fn new(value: T) -> Self {
+        Self(vec![value])
+    }
+    fn as_ptr(&self) -> *const T {
+        self.0.as_ptr()
+    }
+    fn as_mut_ptr(&mut self) -> *mut T {
+        self.0.as_mut_ptr()
+    }
+    fn into_inner(mut self) -> T {
+        self.0.pop().expect("one syscall argument")
+    }
+}
 
 pub struct Reactor {
     environment: super::environment::Environment,

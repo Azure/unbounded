@@ -11,53 +11,10 @@ pub struct Buffer {
 }
 #[cfg(test)]
 mod partial_tests {
+    use super::super::tests::{drive, kernel_reactor, poll, scope};
     use super::*;
-    use std::{
-        task::{Context, Poll},
-        time::Instant,
-    };
     fn reactor() -> Option<Reactor> {
-        match IoUring::new(2) {
-            Ok(r) => drop(r),
-            Err(e)
-                if matches!(
-                    e.raw_os_error(),
-                    Some(libc::EPERM | libc::EACCES | libc::ENOSYS)
-                ) =>
-            {
-                eprintln!("filesystem io_uring unavailable: {e}");
-                return None;
-            }
-            Err(e) => panic!("{e}"),
-        }
-        let r = Reactor::new(Rc::new(Admission::new(
-            crate::test_support::cluster::config(false).limits,
-        )));
-        r.init().unwrap();
-        Some(r)
-    }
-    fn scope() -> RequestScope {
-        RequestScope::new(
-            crate::model::RequestId([93; 16]),
-            Instant::now() + Duration::from_secs(10),
-        )
-        .unwrap()
-    }
-    fn poll<T>(future: &mut Operation<'_, T>) -> Poll<Result<T>> {
-        future
-            .as_mut()
-            .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
-    }
-    fn drive<T>(r: &Reactor, mut future: Operation<'_, T>) -> Result<T> {
-        let end = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Poll::Ready(result) = poll(&mut future) {
-                return result;
-            }
-            assert!(Instant::now() < end);
-            r.poll_budgeted(8)?;
-            r.wait(Duration::from_millis(1))?;
-        }
+        kernel_reactor(16)
     }
     #[test]
     fn partial_completion_preserves_remaining_bytes_and_quota() {
@@ -420,45 +377,10 @@ impl Reactor {
 
 #[cfg(test)]
 mod buffer_tests {
+    use super::super::tests::{drive, kernel_reactor, poll};
     use super::*;
-    use std::{
-        os::unix::ffi::OsStrExt,
-        task::{Context, Poll},
-    };
-    fn poll<T>(f: &mut Operation<'_, T>) -> Poll<Result<T>> {
-        f.as_mut()
-            .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
-    }
-    fn drive<T>(r: &Reactor, mut f: Operation<'_, T>) -> Result<T> {
-        let end = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Poll::Ready(result) = poll(&mut f) {
-                return result;
-            }
-            assert!(std::time::Instant::now() < end);
-            r.poll_budgeted(4)?;
-            r.wait(Duration::from_millis(1))?;
-        }
-    }
     fn reactor() -> Option<Reactor> {
-        match IoUring::new(2) {
-            Ok(r) => drop(r),
-            Err(e)
-                if matches!(
-                    e.raw_os_error(),
-                    Some(libc::EPERM | libc::EACCES | libc::ENOSYS)
-                ) =>
-            {
-                eprintln!("filesystem kernel unavailable: {e}");
-                return None;
-            }
-            Err(e) => panic!("unexpected ring error: {e}"),
-        }
-        let r = Reactor::new(Rc::new(Admission::new(
-            crate::test_support::cluster::config(false).limits,
-        )));
-        r.init().unwrap();
-        Some(r)
+        kernel_reactor(16)
     }
     #[test]
     fn real_partial_read_and_abandoned_open_fence_own_resources() {

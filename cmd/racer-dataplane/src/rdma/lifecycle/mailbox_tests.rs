@@ -22,14 +22,14 @@ use std::{
     time::Duration,
 };
 
-fn scope() -> RequestScope {
+pub(super) fn scope() -> RequestScope {
     RequestScope::new(
         RequestId([1; 16]),
         environment::now() + Duration::from_secs(10),
     )
     .unwrap()
 }
-fn poll<T>(operation: &mut Operation<'_, T>) -> Poll<Result<T>> {
+pub(super) fn poll<T>(operation: &mut Operation<'_, T>) -> Poll<Result<T>> {
     operation
         .as_mut()
         .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
@@ -41,7 +41,7 @@ fn done<T>(operation: &mut Operation<'_, T>) -> T {
         Poll::Pending => panic!("unexpected pending operation"),
     }
 }
-fn verified(signers: &[Rc<Signatures>], headers: Vec<Header>) -> VerifiedHead {
+pub(super) fn verified(signers: &[Rc<Signatures>], headers: Vec<Header>) -> VerifiedHead {
     let mut headers = headers;
     headers.push(Header {
         name: "racer-receiver".into(),
@@ -61,7 +61,7 @@ fn verified(signers: &[Rc<Signatures>], headers: Vec<Header>) -> VerifiedHead {
         )
         .unwrap()
 }
-fn header(name: &str, value: Vec<u8>) -> Header {
+pub(super) fn header(name: &str, value: Vec<u8>) -> Header {
     Header {
         name: name.into(),
         value,
@@ -161,7 +161,7 @@ fn signed_setup_waits_for_slot_and_connect_mailboxes_without_consuming_admission
     assert!(session.ready());
 }
 
-fn envelope() -> PageEnvelope {
+pub(super) fn envelope() -> PageEnvelope {
     PageEnvelope {
         page: PageId {
             version: ObjectVersion {

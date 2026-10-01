@@ -1,5 +1,31 @@
 use super::*;
 
+struct Fixture {
+    admission: std::rc::Rc<crate::runtime::admission::Admission>,
+    client: CryptoClient,
+    engine: CryptoPort,
+    scope: RequestScope,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let admission = std::rc::Rc::new(crate::runtime::admission::Admission::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let (io, engine) = pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
+        Self {
+            admission,
+            client: CryptoClient::new(io),
+            engine,
+            scope: RequestScope::new(
+                crate::model::RequestId([0; 16]),
+                crate::runtime::environment::now() + std::time::Duration::from_secs(5),
+            )
+            .unwrap(),
+        }
+    }
+}
+
 pub(super) fn input(admission: &std::rc::Rc<crate::runtime::admission::Admission>) -> CryptoInput {
     use crate::{
         memory::pool::BufferPool,
@@ -33,20 +59,13 @@ pub(super) fn input(admission: &std::rc::Rc<crate::runtime::admission::Admission
 
 #[test]
 fn engine_loss_reclaims_queued_owners_and_unblocks_drain() {
-    use crate::{
-        model::{RequestId, ResourceClass},
-        runtime::admission::Admission,
-    };
-    let admission = std::rc::Rc::new(Admission::new(
-        crate::test_support::cluster::config(false).limits,
-    ));
-    let (io, engine) = pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
-    let client = CryptoClient::new(io);
-    let scope = RequestScope::new(
-        RequestId([0; 16]),
-        std::time::Instant::now() + std::time::Duration::from_secs(5),
-    )
-    .unwrap();
+    use crate::model::ResourceClass;
+    let Fixture {
+        admission,
+        client,
+        engine,
+        scope,
+    } = Fixture::new();
     let mut future = client.execute(input(&admission), key(), &scope);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(future.as_mut().poll(&mut cx).is_pending());
@@ -60,20 +79,13 @@ fn engine_loss_reclaims_queued_owners_and_unblocks_drain() {
 
 #[test]
 fn accepted_cancellation_cannot_return_before_completion_consumption() {
-    use crate::{
-        model::{RequestId, ResourceClass},
-        runtime::admission::Admission,
-    };
-    let admission = std::rc::Rc::new(Admission::new(
-        crate::test_support::cluster::config(false).limits,
-    ));
-    let (io, mut engine) = pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
-    let client = CryptoClient::new(io);
-    let scope = RequestScope::new(
-        RequestId([0; 16]),
-        std::time::Instant::now() + std::time::Duration::from_secs(5),
-    )
-    .unwrap();
+    use crate::model::ResourceClass;
+    let Fixture {
+        admission,
+        client,
+        mut engine,
+        scope,
+    } = Fixture::new();
     let mut future = client.execute(input(&admission), key(), &scope);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(future.as_mut().poll(&mut cx).is_pending());
@@ -104,84 +116,20 @@ fn accepted_cancellation_cannot_return_before_completion_consumption() {
 }
 
 #[test]
-fn accepted_cancellation_waits_for_consumed_completion_not_notification() {
-    use crate::{
-        model::{RequestId, ResourceClass},
-        runtime::admission::Admission,
-    };
-    let admission = std::rc::Rc::new(Admission::new(
-        crate::test_support::cluster::config(false).limits,
-    ));
-    let (io, mut engine) = pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
-    let client = CryptoClient::new(io);
-    let scope = RequestScope::new(
-        RequestId([0; 16]),
-        std::time::Instant::now() + std::time::Duration::from_secs(5),
-    )
-    .unwrap();
-    let mut future = client.execute(input(&admission), key(), &scope);
-    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-    assert!(future.as_mut().poll(&mut cx).is_pending());
-    scope.cancel().unwrap();
-    for _ in 0..4 {
-        client.poll_budgeted(1).unwrap();
-        assert!(future.as_mut().poll(&mut cx).is_pending());
-    }
-    assert_eq!(client.outstanding(), 1);
-    assert_eq!(admission.used(ResourceClass::Plaintext), 1);
-    let job = match engine.poll_job(&mut cx) {
-        Poll::Ready(Ok(Some(job))) => job,
-        _ => panic!("job"),
-    };
-    let CryptoJob {
-        permit,
-        input,
-        key,
-        scope: _,
-    } = job;
-    assert!(
-        engine
-            .complete(CryptoCompletion {
-                permit,
-                outcome: CryptoOutcome::Failed {
-                    input,
-                    error: Error::Cancelled
-                },
-                _key: key,
-            })
-            .is_ok()
-    );
-    assert!(
-        future.as_mut().poll(&mut cx).is_pending(),
-        "publication alone is not consumption"
-    );
-    client.poll_budgeted(1).unwrap();
-    assert!(matches!(
-        future.as_mut().poll(&mut cx),
-        Poll::Ready(Err(Error::Cancelled))
-    ));
-    assert_eq!(client.outstanding(), 0);
-    assert_eq!(admission.used(ResourceClass::Plaintext), 0);
-}
-
-#[test]
 fn accepted_deadline_expiry_waits_for_engine_completion() {
-    use crate::{model::RequestId, runtime::admission::Admission};
-    let admission = std::rc::Rc::new(Admission::new(
-        crate::test_support::cluster::config(false).limits,
-    ));
-    let (io, mut engine) = pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
-    let client = CryptoClient::new(io);
+    let clock = crate::runtime::environment::SimulationClock::new(91);
+    let _environment = clock.environment(0).enter();
+    let Fixture {
+        admission,
+        client,
+        mut engine,
+        scope,
+    } = Fixture::new();
     let key = key();
-    let scope = RequestScope::new(
-        RequestId([0; 16]),
-        std::time::Instant::now() + std::time::Duration::from_millis(20),
-    )
-    .unwrap();
     let mut future = client.execute(input(&admission), key, &scope);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(future.as_mut().poll(&mut cx).is_pending());
-    std::thread::sleep(std::time::Duration::from_millis(25));
+    clock.advance(std::time::Duration::from_secs(5));
     assert!(future.as_mut().poll(&mut cx).is_pending());
     let job = match engine.poll_job(&mut cx) {
         Poll::Ready(Ok(Some(job))) => job,

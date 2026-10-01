@@ -394,7 +394,11 @@ fn two_io_share_one_actual_crypto_thread_and_drain_outstanding_jobs() {
     let mut group = WorkerGroup::new(plan);
     let scope = scope();
     group.start(Arc::new(factory), &scope).unwrap();
-    assert_eq!(group.threads.len(), 3);
+    assert_eq!(
+        group.threads.len(),
+        1,
+        "one coordinator owns the scoped workers"
+    );
     assert_eq!(group.control.lock().total, 3);
     assert_eq!(group.control.lock().ready, 3);
     assert_eq!(observed.submitted.load(Ordering::SeqCst), 8);
@@ -598,19 +602,21 @@ fn later_crypto_group_allocation_failure_rolls_back_live_first_group() {
         let observed = factory.observed.clone();
         let mut group = WorkerGroup::new(plan);
         let scope = scope();
-        let allocate = |worker, generation, capacity| {
+        let allocator_observed = observed.clone();
+        let allocator_scope = scope.clone();
+        let allocate = move |worker, generation, capacity| {
             if worker == WorkerId(0) {
                 return crypto::try_pair(worker, generation, capacity);
             }
-            let event = if borrowed { "crypto-start" } else { "io-start" };
-            while !observed
+            let event = "crypto-start";
+            while !allocator_observed
                 .events
                 .lock()
                 .unwrap()
                 .iter()
                 .any(|(_, name, _)| *name == event)
             {
-                scope.check()?;
+                allocator_scope.check()?;
                 thread::sleep(IDLE_WAIT);
             }
             Err(Error::Overloaded)
@@ -629,11 +635,7 @@ fn later_crypto_group_allocation_failure_rolls_back_live_first_group() {
                 .iter()
                 .any(|(_, event, _)| *event == "crypto-shutdown")
         );
-        if !borrowed {
-            assert!(events.iter().any(|(_, event, _)| *event == "io-stop"));
-            assert!(events.iter().any(|(_, event, _)| *event == "io-drain"));
-            assert!(events.iter().any(|(_, event, _)| *event == "io-shutdown"));
-        }
+        // Both entry points allocate all groups before starting the caller's I/O.
     }
 }
 
@@ -650,7 +652,7 @@ fn distinct_crypto_cpus_create_distinct_execution_threads() {
     let mut group = WorkerGroup::new(plan);
     let scope = scope();
     group.start(Arc::new(factory), &scope).unwrap();
-    assert_eq!(group.threads.len(), 4);
+    assert_eq!(group.threads.len(), 1);
     assert_eq!(group.control.lock().ready, 4);
     group.drain(&scope).unwrap();
     group.shutdown(&scope).unwrap();

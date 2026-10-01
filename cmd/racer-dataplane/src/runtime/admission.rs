@@ -457,12 +457,7 @@ impl Admission {
         class: ResourceClass,
         amount: usize,
     ) -> Result<Reservation> {
-        let result = self.reserve_inner(cache, class, amount, false);
-        if matches!(result, Err(Error::Overloaded)) {
-            self.reclaim_buffers_for(cache, class);
-            return self.reserve_inner(cache, class, amount, false);
-        }
-        result
+        self.reserve_reclaiming(cache, class, amount, false)
     }
     /// Only for already-admitted work during drain. Does not bypass byte/count
     /// bounds; callers must not use this entry point to accept new requests.
@@ -472,10 +467,19 @@ impl Admission {
         class: ResourceClass,
         amount: usize,
     ) -> Result<Reservation> {
-        let result = self.reserve_inner(cache, class, amount, true);
+        self.reserve_reclaiming(cache, class, amount, true)
+    }
+    fn reserve_reclaiming(
+        &self,
+        cache: Option<&CacheId>,
+        class: ResourceClass,
+        amount: usize,
+        completion: bool,
+    ) -> Result<Reservation> {
+        let result = self.reserve_inner(cache, class, amount, completion);
         if matches!(result, Err(Error::Overloaded)) {
             self.reclaim_buffers_for(cache, class);
-            return self.reserve_inner(cache, class, amount, true);
+            return self.reserve_inner(cache, class, amount, completion);
         }
         result
     }

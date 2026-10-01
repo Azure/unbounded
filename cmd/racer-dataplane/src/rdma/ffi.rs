@@ -67,8 +67,29 @@ struct Completion {
 
 // This ABI consists only of fixed-width scalars, opaque pointers and repr(C)
 // records. Every symbol is version-checked before any native handle is created.
-struct Api {
-    library: Option<NonNull<c_void>>,
+macro_rules! native_api {
+    ($($field:ident: $signature:ty),* $(,)?) => {
+        struct Api {
+            library: Option<NonNull<c_void>>,
+            $($field: $signature,)*
+        }
+        impl Api {
+            #[cfg(all(feature = "rdma", target_os = "linux"))]
+            unsafe fn symbols(library: NonNull<c_void>) -> Result<Self> {
+                Ok(Self {
+                    library: Some(library),
+                    $($field: {
+                        let pointer = unsafe { libc::dlsym(library.as_ptr(),
+                            concat!("racer_rdma_", stringify!($field), "\0").as_ptr().cast()) };
+                        if pointer.is_null() { return Err(Error::Unavailable); }
+                        unsafe { std::mem::transmute::<*mut c_void, $signature>(pointer) }
+                    },)*
+                })
+            }
+        }
+    };
+}
+native_api! {
     discover: unsafe extern "C" fn(*mut Port, u32) -> c_int,
     open: unsafe extern "C" fn(*const c_char) -> *mut c_void,
     close: unsafe extern "C" fn(*mut c_void) -> c_int,
@@ -126,80 +147,7 @@ impl Api {
             if version() != 2 {
                 return Err(Error::Unavailable);
             }
-            let api = Self {
-                library: Some(library),
-                discover: sym!(
-                    "racer_rdma_discover",
-                    unsafe extern "C" fn(*mut Port, u32) -> c_int
-                ),
-                open: sym!(
-                    "racer_rdma_open",
-                    unsafe extern "C" fn(*const c_char) -> *mut c_void
-                ),
-                close: sym!(
-                    "racer_rdma_close",
-                    unsafe extern "C" fn(*mut c_void) -> c_int
-                ),
-                qp: sym!(
-                    "racer_rdma_qp",
-                    unsafe extern "C" fn(*mut c_void, u8, u32, *mut u32) -> *mut c_void
-                ),
-                connect: sym!(
-                    "racer_rdma_connect",
-                    unsafe extern "C" fn(*mut c_void, *const Endpoint, *const Endpoint) -> c_int
-                ),
-                stop: sym!(
-                    "racer_rdma_stop",
-                    unsafe extern "C" fn(*mut c_void) -> c_int
-                ),
-                qp_free: sym!(
-                    "racer_rdma_qp_free",
-                    unsafe extern "C" fn(*mut c_void) -> c_int
-                ),
-                register: sym!(
-                    "racer_rdma_register",
-                    unsafe extern "C" fn(*mut c_void, u32) -> *mut c_void
-                ),
-                deregister: sym!(
-                    "racer_rdma_deregister",
-                    unsafe extern "C" fn(*mut c_void) -> c_int
-                ),
-                bytes: sym!(
-                    "racer_rdma_bytes",
-                    unsafe extern "C" fn(*mut c_void) -> *mut u8
-                ),
-                window: sym!(
-                    "racer_rdma_window",
-                    unsafe extern "C" fn(*mut c_void, *mut u32) -> *mut c_void
-                ),
-                window_free: sym!(
-                    "racer_rdma_window_free",
-                    unsafe extern "C" fn(*mut c_void) -> c_int
-                ),
-                bind: sym!(
-                    "racer_rdma_bind",
-                    unsafe extern "C" fn(
-                        *mut c_void,
-                        *mut c_void,
-                        *mut c_void,
-                        u32,
-                        u64,
-                        u32,
-                    ) -> c_int
-                ),
-                invalidate: sym!(
-                    "racer_rdma_invalidate",
-                    unsafe extern "C" fn(*mut c_void, u32, u64) -> c_int
-                ),
-                write: sym!(
-                    "racer_rdma_write",
-                    unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u32, u64, u32) -> c_int
-                ),
-                poll: sym!(
-                    "racer_rdma_poll",
-                    unsafe extern "C" fn(*mut c_void, *mut Completion, u32) -> c_int
-                ),
-            };
+            let api = Self::symbols(library)?;
             std::mem::forget(guard);
             Ok(Rc::new(api))
         }
