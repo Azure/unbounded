@@ -15,7 +15,7 @@ is retained per worker, not divided among workers (assertions in
 `default_worker_sizing_funds_native_slots_within_node_budgets`), and constructs
 the worker's HTTP pool and RDMA sessions (`cmd/racer-dataplane/src/app.rs`,
 `WorkerApplication::assemble`). Peer transfer reaches immediate checkout
-(`cmd/racer-dataplane/src/peer/transport.rs:1208`, `Transfers::exchange_inner`);
+(`cmd/racer-dataplane/src/peer/transport.rs:1245`, `Transfers::exchange_timed`);
 an active endpoint at its cap returns `Overloaded` without a wait
 (`cmd/racer-dataplane/src/http/connection.rs:1432`, `HttpPool::prepare_connection`).
 The test `origin_wait_is_bounded_fifo_without_blocking_peers_or_other_caches` at
