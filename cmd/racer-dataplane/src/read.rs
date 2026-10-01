@@ -4,6 +4,7 @@ pub mod dispatch;
 pub mod drivers;
 pub mod fill;
 pub mod flight;
+pub mod hedge;
 pub mod metadata;
 pub mod range_stream;
 #[cfg(test)]

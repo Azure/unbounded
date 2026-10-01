@@ -5,7 +5,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-pub const EVENT_COUNT: usize = 57;
+pub const EVENT_COUNT: usize = 61;
 pub const GAUGE_COUNT: usize = 13;
 #[derive(Clone, Copy)]
 pub(crate) enum LookupTier {
@@ -55,6 +55,10 @@ impl Default for Metrics {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
 pub enum Event {
+    PageHedgeStarted,
+    PageHedgeWon,
+    PageHedgeSuppressed,
+    PageHedgeDuplicateBytes,
     PeerAdmissionAccepted,
     PeerAdmissionRejected,
     PeerCircuitRejected,
@@ -114,6 +118,10 @@ pub enum Event {
     DiskIndexLookupError,
 }
 pub const EVENTS: [Event; EVENT_COUNT] = [
+    Event::PageHedgeStarted,
+    Event::PageHedgeWon,
+    Event::PageHedgeSuppressed,
+    Event::PageHedgeDuplicateBytes,
     Event::PeerAdmissionAccepted,
     Event::PeerAdmissionRejected,
     Event::PeerCircuitRejected,
@@ -175,6 +183,10 @@ pub const EVENTS: [Event; EVENT_COUNT] = [
 impl Event {
     pub fn name(self) -> &'static str {
         match self {
+            Self::PageHedgeStarted => "racer_page_hedges_started_total",
+            Self::PageHedgeWon => "racer_page_hedges_won_total",
+            Self::PageHedgeSuppressed => "racer_page_hedges_suppressed_total",
+            Self::PageHedgeDuplicateBytes => "racer_page_hedge_duplicate_reserved_bytes_total",
             Self::PeerAdmissionAccepted => "racer_peer_admission_accepted_total",
             Self::PeerAdmissionRejected => "racer_peer_admission_rejected_total",
             Self::PeerCircuitRejected => "racer_peer_circuit_rejected_total",

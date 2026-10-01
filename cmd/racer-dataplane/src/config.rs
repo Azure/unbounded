@@ -27,6 +27,7 @@ const MAX_ENTRIES: usize = 1_048_576;
 const MAX_FABRIC_FILE_BYTES: usize = 65_536;
 
 pub struct Config {
+    pub page_hedge: crate::read::hedge::Config,
     pub peer_admission: crate::peer::adaptive::Config,
     pub shares: std::num::NonZeroU32,
     pub disk_page_entries: NonZeroUsize,
@@ -197,6 +198,14 @@ impl Config {
             value.parse().map_err(|_| Error::InvalidConfiguration)
         };
         let max_threads = to_usize(number("RACER_MAX_THREADS", DEFAULT_MAX_THREADS as u64)?)?;
+        let page_hedge = crate::read::hedge::Config {
+            delay: Duration::from_millis(number("RACER_PAGE_HEDGE_DELAY_MS", 100)?),
+            slots: to_usize(number("RACER_PAGE_HEDGE_SLOTS", 0)?)?,
+            bytes: to_usize(number(
+                "RACER_PAGE_HEDGE_BYTES",
+                crate::read::hedge::DUPLICATE_BYTES as u64,
+            )?)?,
+        };
         let peer_admission = crate::peer::adaptive::Config {
             total: to_usize(number("RACER_PEER_INFLIGHT_MAX", 256)?)?,
             per_peer: to_usize(number("RACER_PEER_PER_NEIGHBOR_MAX", 32)?)?,
@@ -248,6 +257,7 @@ impl Config {
         let disk_page_entries = limit("RACER_DISK_PAGE_ENTRIES", 65536)?;
         let checkpoint_bytes = limit("RACER_CHECKPOINT_BYTES", 64 * MIB)?;
         let config = Self {
+            page_hedge,
             peer_admission,
             shares,
             disk_page_entries,
@@ -283,6 +293,7 @@ impl Config {
     /// Check arithmetic and progress reserves; filesystem alignment is additionally
     /// discovered and checked by store::slab at open, not guessed from this config.
     pub fn validate(&self) -> Result<()> {
+        self.page_hedge.validate()?;
         self.peer_admission.validate()?;
         if self.disk_page_entries.get() > MAX_ENTRIES
             || self.checkpoint_bytes.get() > 512 * MIB as usize
@@ -1195,6 +1206,21 @@ mod tests {
             vec![("RACER_PEER_PER_NEIGHBOR_MAX", "257")],
         ] {
             assert!(parse(&overrides).is_err());
+        }
+    }
+    #[test]
+    fn page_hedges_are_off_by_default_and_require_bounded_capacity() {
+        assert_eq!(parse(&[]).unwrap().page_hedge.slots, 0);
+        assert!(parse(&[("RACER_PAGE_HEDGE_SLOTS", "1")]).is_ok());
+        for pairs in [
+            vec![("RACER_PAGE_HEDGE_SLOTS", "33")],
+            vec![("RACER_PAGE_HEDGE_DELAY_MS", "0")],
+            vec![
+                ("RACER_PAGE_HEDGE_SLOTS", "1"),
+                ("RACER_PAGE_HEDGE_BYTES", "1"),
+            ],
+        ] {
+            assert!(parse(&pairs).is_err());
         }
     }
 

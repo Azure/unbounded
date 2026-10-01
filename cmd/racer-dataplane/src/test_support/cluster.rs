@@ -132,6 +132,7 @@ pub fn config(enable_rdma: bool) -> Config {
     let count = NonZeroUsize::new(16).unwrap();
     let bytes = NonZeroUsize::new(128 * 1024 * 1024).unwrap();
     Config {
+        page_hedge: Default::default(),
         peer_admission: Default::default(),
         routing_algorithm: crate::topology::RoutingAlgorithm::default(),
         shares: std::num::NonZeroU32::new(4).unwrap(),
