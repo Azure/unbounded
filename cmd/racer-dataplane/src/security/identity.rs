@@ -733,4 +733,73 @@ mod certificate_tests;
 #[cfg(test)]
 pub(crate) mod keyring_tests;
 #[cfg(test)]
-pub(crate) mod tests;
+pub(crate) mod tests {
+    use super::*;
+    pub(crate) const CLUSTER: &str = "11111111-1111-4111-8111-111111111111";
+    pub(crate) const NODE: &str = "22222222-2222-4222-8222-222222222222";
+    pub(crate) const CACHE: &str = "33333333-3333-4333-8333-333333333333";
+    pub(crate) fn issued() -> (PendingIdentity, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        issued_with(|_| {})
+    }
+    pub(crate) fn issued_with(
+        customize: impl FnOnce(&mut rcgen::CertificateParams),
+    ) -> (PendingIdentity, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let (ca, ca_key) = crate::security::test_support::ca();
+        let (pending, chain) = crate::security::test_support::issue(
+            &ca,
+            &ca_key,
+            &ClusterId(CLUSTER.into()),
+            &NodeId(NODE.into()),
+            customize,
+        );
+        (pending, chain, vec![ca.der().to_vec()])
+    }
+    #[test]
+    fn identity_recovery_csr_tls_and_key_pairing() {
+        let (pending, chain, roots) = issued();
+        assert!(!pending.csr_der().unwrap().is_empty());
+        let bytes = pending.export_pkcs8_for_persistence().unwrap();
+        let identity = pending
+            .accept(
+                ClusterId(CLUSTER.into()),
+                NodeId(NODE.into()),
+                chain.clone(),
+                &roots,
+            )
+            .unwrap();
+        assert!(identity.tls_certified_key().is_ok());
+        let recovered = SigningIdentity::from_pkcs8(
+            identity.cluster.clone(),
+            identity.node.clone(),
+            &bytes,
+            chain.clone(),
+            &roots,
+        )
+        .unwrap();
+        assert_eq!(
+            identity.sign(b"exact message").unwrap(),
+            recovered.sign(b"exact message").unwrap()
+        );
+        assert!(
+            PendingIdentity::generate()
+                .unwrap()
+                .accept(
+                    identity.cluster.clone(),
+                    identity.node.clone(),
+                    chain.clone(),
+                    &roots
+                )
+                .is_err()
+        );
+        assert!(
+            SigningIdentity::from_pkcs8(
+                identity.cluster.clone(),
+                NodeId("other".into()),
+                &bytes,
+                chain,
+                &roots
+            )
+            .is_err()
+        );
+    }
+}

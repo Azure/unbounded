@@ -1,6 +1,126 @@
 //! Bounded diagnostics and HTTP endpoints, polled by an existing worker.
 pub mod failures;
-pub mod health;
+pub mod health {
+    use crate::error::{Error, Result};
+    use std::{
+        sync::{Arc, Mutex},
+        time::Instant,
+    };
+    #[derive(Clone, Default)]
+    pub struct Health(Arc<Mutex<Status>>);
+    #[derive(Default)]
+    struct Status {
+        lifecycle: State,
+        resources: Resources,
+    }
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub enum State {
+        #[default]
+        Starting,
+        Ready,
+        Degraded,
+        Draining,
+        Stopped,
+    }
+    /// Complete worker observation; no identities or credentials enter health state.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Resources {
+        pub workers_usable: bool,
+        pub storage_usable: bool,
+        pub listeners_usable: bool,
+        pub membership_usable: bool,
+        pub admission_usable: bool,
+        pub credentials_valid_until: Option<Instant>,
+        pub observed_until: Option<Instant>,
+    }
+    impl Resources {
+        pub fn usable_at(&self, now: Instant) -> bool {
+            self.workers_usable
+                && self.storage_usable
+                && self.listeners_usable
+                && self.membership_usable
+                && self.admission_usable
+                && self
+                    .credentials_valid_until
+                    .is_some_and(|expiry| now < expiry)
+                && self.observed_until.is_some_and(|expiry| now < expiry)
+        }
+    }
+    impl Health {
+        pub fn state(&self) -> Result<State> {
+            self.state_at(crate::runtime::environment::now())
+        }
+        pub fn state_at(&self, now: Instant) -> Result<State> {
+            let status = self.0.lock().map_err(|_| Error::Unavailable)?;
+            Ok(match status.lifecycle {
+                State::Ready if !status.resources.usable_at(now) => State::Degraded,
+                state => state,
+            })
+        }
+        pub fn observe(&self, resources: Resources) -> Result<()> {
+            self.0.lock().map_err(|_| Error::Unavailable)?.resources = resources;
+            Ok(())
+        }
+        pub fn ready(&self) -> bool {
+            self.state().is_ok_and(|state| state == State::Ready)
+        }
+        /// Starting, degraded, and draining remain live; a response establishes progress.
+        pub fn live(&self) -> bool {
+            self.state().is_ok_and(|state| state != State::Stopped)
+        }
+        pub fn transition(&self, state: State) -> Result<()> {
+            let mut status = self.0.lock().map_err(|_| Error::Unavailable)?;
+            if status.lifecycle == State::Stopped && state != State::Stopped
+                || status.lifecycle == State::Draining
+                    && !matches!(state, State::Draining | State::Stopped)
+                || state == State::Ready
+                    && !status
+                        .resources
+                        .usable_at(crate::runtime::environment::now())
+            {
+                return Err(Error::Unavailable);
+            }
+            status.lifecycle = state;
+            Ok(())
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::time::Duration;
+        #[test]
+        fn observation_and_credential_expiry_are_inclusive() {
+            let now = crate::runtime::environment::now();
+            for (observed, boundary) in [(5, 5), (20, 10)] {
+                let health = Health::default();
+                health
+                    .observe(Resources {
+                        workers_usable: true,
+                        storage_usable: true,
+                        listeners_usable: true,
+                        membership_usable: true,
+                        admission_usable: true,
+                        credentials_valid_until: Some(now + Duration::from_secs(10)),
+                        observed_until: Some(now + Duration::from_secs(observed)),
+                    })
+                    .unwrap();
+                health.transition(State::Ready).unwrap();
+                assert_eq!(
+                    health
+                        .state_at(now + Duration::from_secs(boundary) - Duration::from_nanos(1))
+                        .unwrap(),
+                    State::Ready
+                );
+                assert_eq!(
+                    health
+                        .state_at(now + Duration::from_secs(boundary))
+                        .unwrap(),
+                    State::Degraded
+                );
+            }
+        }
+    }
+}
 pub mod metrics;
 pub mod send_crc;
 

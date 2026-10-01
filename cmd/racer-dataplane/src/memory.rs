@@ -131,7 +131,52 @@ pub mod page {
     }
 
     #[cfg(test)]
-    mod tests;
+    mod tests {
+        use super::*;
+        use crate::error::Error;
+        #[test]
+        fn shared_results_reject_truncated_or_padded_ciphertext() {
+            let admission = crate::memory::pool::tests::admission(8);
+            for length in [0, 18, 19, 20] {
+                let mut page = crate::memory::pool::tests::bundle(&admission, "v1");
+                std::sync::Arc::get_mut(&mut page.ciphertext.inner)
+                    .unwrap()
+                    .bytes
+                    .resize(length, 0);
+                let expected = if length == 19 {
+                    Ok(())
+                } else {
+                    Err(Error::CorruptRecord)
+                };
+                assert_eq!(page.validate_metadata(), expected);
+                assert_eq!(page.copy().validate_metadata(), expected);
+            }
+        }
+        #[test]
+        fn shared_result_rejects_mixed_metadata_plaintext_and_ciphertext() {
+            let admission = crate::memory::pool::tests::admission(8);
+            let bundle = crate::memory::pool::tests::bundle(&admission, "v1");
+            let metadata = &bundle.metadata;
+            let page = bundle.plaintext.page();
+            let envelope = bundle.ciphertext.envelope();
+            assert_eq!(validate_association(metadata, page, 3, envelope), Ok(()));
+            for case in 0..4 {
+                let mut metadata = metadata.clone();
+                let mut page = page.clone();
+                let mut length = 3;
+                match case {
+                    0 => length = 2,
+                    1 => page.version.etag = crate::model::StrongEtag::test_value("v2"),
+                    2 => metadata.version.object.key.0[0] ^= 1,
+                    _ => metadata.length = 4,
+                }
+                assert_eq!(
+                    validate_association(&metadata, &page, length, envelope),
+                    Err(Error::CorruptRecord)
+                );
+            }
+        }
+    }
 }
 pub mod pipe;
 pub mod pool;

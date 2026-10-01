@@ -8,6 +8,7 @@ use super::{
         SegmentState, Segments,
     },
     disk::{DirectAlignment, DirectExtent, SlabId, SlabLocation},
+    format::Decoder,
 };
 use crate::error::{Error, Operation, Result};
 use crate::{
@@ -1158,7 +1159,6 @@ impl Encoder {
         Ok(())
     }
 }
-struct Decoder<'a>(&'a [u8]);
 impl<'a> Decoder<'a> {
     fn descriptor_bytes(&mut self) -> Result<usize> {
         let cache = self.string()?.len();
@@ -1167,23 +1167,6 @@ impl<'a> Decoder<'a> {
         self.take(8)?;
         let mime = self.string()?.len();
         Ok(cache + etag + mime)
-    }
-    fn take(&mut self, length: usize) -> Result<&'a [u8]> {
-        if length > self.0.len() {
-            return Err(Error::CorruptRecord);
-        }
-        let (value, rest) = self.0.split_at(length);
-        self.0 = rest;
-        Ok(value)
-    }
-    fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
-        self.take(N)?.try_into().map_err(|_| Error::CorruptRecord)
-    }
-    fn u32(&mut self) -> Result<u32> {
-        Ok(u32::from_le_bytes(self.array()?))
-    }
-    fn u64(&mut self) -> Result<u64> {
-        Ok(u64::from_le_bytes(self.array()?))
     }
     fn count(&mut self, max: usize, minimum_bytes: usize) -> Result<usize> {
         let count = self.u32()? as usize;

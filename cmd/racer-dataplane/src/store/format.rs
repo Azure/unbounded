@@ -167,7 +167,7 @@ pub fn parse_bytes(bytes: &[u8], extent: DirectExtent) -> Result<DecodedRecord> 
     if bytes.len() != extent.length() {
         return Err(Error::CorruptRecord);
     }
-    let mut r = Decoder { bytes, at: 0 };
+    let mut r = Decoder(bytes);
     if r.take(8)? != MAGIC {
         return Err(Error::CorruptRecord);
     }
@@ -183,7 +183,7 @@ pub fn parse_bytes(bytes: &[u8], extent: DirectExtent) -> Result<DecodedRecord> 
     if digest[..] != bytes[header_len - 32..header_len] {
         return Err(Error::CorruptRecord);
     }
-    r.bytes = &bytes[..header_len - 32];
+    r.0 = &bytes[16..header_len - 32];
     let generation = Generation(r.u64()?);
     let length = r.u64()?;
     let number = PageNumber(r.u64()?);
@@ -213,7 +213,7 @@ pub fn parse_bytes(bytes: &[u8], extent: DirectExtent) -> Result<DecodedRecord> 
                 .map_err(|_| Error::CorruptRecord)?,
         )
     };
-    if r.at != r.bytes.len() || generation.0 == 0 {
+    if !r.0.is_empty() || generation.0 == 0 {
         return Err(Error::CorruptRecord);
     }
     let version = ObjectVersion {
@@ -264,24 +264,20 @@ pub fn decode(buffer: &AlignedBuffer, expected: &RecordHeader) -> Result<PageEnv
     }
     Ok(actual.envelope)
 }
-struct Decoder<'a> {
-    bytes: &'a [u8],
-    at: usize,
-}
+pub(super) struct Decoder<'a>(pub(super) &'a [u8]);
 impl<'a> Decoder<'a> {
-    fn take(&mut self, len: usize) -> Result<&'a [u8]> {
-        let end = self.at.checked_add(len).ok_or(Error::CorruptRecord)?;
-        let value = self.bytes.get(self.at..end).ok_or(Error::CorruptRecord)?;
-        self.at = end;
+    pub(super) fn take(&mut self, len: usize) -> Result<&'a [u8]> {
+        let (value, rest) = self.0.split_at_checked(len).ok_or(Error::CorruptRecord)?;
+        self.0 = rest;
         Ok(value)
     }
-    fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
+    pub(super) fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
         self.take(N)?.try_into().map_err(|_| Error::CorruptRecord)
     }
-    fn u32(&mut self) -> Result<u32> {
+    pub(super) fn u32(&mut self) -> Result<u32> {
         Ok(u32::from_le_bytes(self.array()?))
     }
-    fn u64(&mut self) -> Result<u64> {
+    pub(super) fn u64(&mut self) -> Result<u64> {
         Ok(u64::from_le_bytes(self.array()?))
     }
 }

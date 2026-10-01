@@ -1171,76 +1171,59 @@ mod tests {
         }
     }
 
-    #[test]
-    fn peer_tcp_nodelay_requires_exact_boolean_and_defaults_off() {
-        assert!(
-            !Config::from_lookup_with_fabric_ports(lookup)
-                .unwrap()
-                .0
-                .peer_tcp_nodelay
-        );
+    fn exact_boolean(name: &str, field: fn(&Config) -> bool) {
+        assert!(!field(
+            &Config::from_lookup_with_fabric_ports(lookup).unwrap().0
+        ));
         for (value, expected) in [("true", true), ("false", false)] {
-            let (config, _) = Config::from_lookup_with_fabric_ports(|name| {
-                if name == "RACER_PEER_TCP_NODELAY" {
+            let (config, _) = Config::from_lookup_with_fabric_ports(|key| {
+                if key == name {
                     Ok(Some(value.into()))
                 } else {
-                    lookup(name)
+                    lookup(key)
                 }
             })
             .unwrap();
-            assert_eq!(config.peer_tcp_nodelay, expected);
+            assert_eq!(field(&config), expected);
+            assert_eq!(field(&parse(&[(name, value)]).unwrap()), expected);
         }
         for value in [
             "", "1", "0", "TRUE", "False", "auto", " true", "true ", "true\n",
         ] {
             assert!(matches!(
-                parse(&[("RACER_PEER_TCP_NODELAY", value)]),
+                parse(&[(name, value)]),
                 Err(Error::InvalidConfiguration)
             ));
         }
+        assert!(
+            Config::from_lookup_with_fabric_ports(|key| {
+                if key == name {
+                    Err(Error::InvalidConfiguration)
+                } else {
+                    lookup(key)
+                }
+            })
+            .is_err()
+        );
+        assert!(
+            Config::from_lookup(|key| {
+                if key == name {
+                    Err(Error::InvalidConfiguration)
+                } else {
+                    lookup(key)
+                }
+            })
+            .is_err()
+        );
+    }
+    #[test]
+    fn peer_tcp_nodelay_requires_exact_boolean_and_defaults_off() {
+        exact_boolean("RACER_PEER_TCP_NODELAY", |c| c.peer_tcp_nodelay);
     }
 
     #[test]
     fn opaque_relay_requires_an_exact_explicit_boolean() {
-        for (value, expected) in [("true", true), ("false", false)] {
-            // Use the executable's parser, including native auto selection.
-            let (config, _) = Config::from_lookup_with_fabric_ports(|name| {
-                if name == "RACER_OPAQUE_RELAY" {
-                    Ok(Some(value.into()))
-                } else {
-                    lookup(name)
-                }
-            })
-            .unwrap();
-            assert_eq!(config.opaque_relay, expected);
-        }
-        assert!(
-            !Config::from_lookup_with_fabric_ports(lookup)
-                .unwrap()
-                .0
-                .opaque_relay
-        );
-        for value in [
-            "", "1", "0", "TRUE", "False", "auto", " true", "true ", "true\n",
-        ] {
-            assert!(
-                matches!(
-                    parse(&[("RACER_OPAQUE_RELAY", value)]),
-                    Err(Error::InvalidConfiguration)
-                ),
-                "{value:?}"
-            );
-        }
-        assert!(matches!(
-            Config::from_lookup_with_fabric_ports(|name| {
-                if name == "RACER_OPAQUE_RELAY" {
-                    Err(Error::InvalidConfiguration)
-                } else {
-                    lookup(name)
-                }
-            }),
-            Err(Error::InvalidConfiguration)
-        ));
+        exact_boolean("RACER_OPAQUE_RELAY", |c| c.opaque_relay);
     }
 
     #[test]
@@ -1253,31 +1236,7 @@ mod tests {
 
     #[test]
     fn smt_requires_an_exact_explicit_boolean() {
-        for (value, expected) in [("true", true), ("false", false)] {
-            assert_eq!(
-                parse(&[("RACER_ALLOW_SMT", value)]).unwrap().allow_smt,
-                expected
-            );
-        }
-        for value in [
-            "", "1", "0", "TRUE", "False", "auto", " true", "true ", "true\n",
-        ] {
-            assert!(parse(&[("RACER_ALLOW_SMT", value)]).is_err(), "{value:?}");
-        }
-        assert!(
-            Config::from_lookup(|name| {
-                if name == "RACER_ALLOW_SMT" {
-                    Err(Error::InvalidConfiguration)
-                } else {
-                    Ok(match name {
-                        "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
-                        "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
-                        _ => None,
-                    })
-                }
-            })
-            .is_err()
-        );
+        exact_boolean("RACER_ALLOW_SMT", |c| c.allow_smt);
     }
 
     #[test]
