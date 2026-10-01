@@ -367,9 +367,19 @@ fn run(mode: &str) {
     independent_client
         .set_read_timeout(Some(Duration::from_secs(1)))
         .unwrap();
-    let mut other = other;
-    other.attach_connection(socket.into()).unwrap();
-    futures::executor::block_on(delivery.finish(other, &other_scope)).unwrap();
+    let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+    let mut finish = delivery.finish_to(other, connection, &other_scope);
+    let mut finished = false;
+    for _ in 0..1024 {
+        if let Poll::Ready(result) = finish.as_mut().poll(&mut cx) {
+            result.unwrap();
+            finished = true;
+            break;
+        }
+        pump(&mut endpoint);
+    }
+    assert!(finished, "independent reader completes");
+    drop(finish);
     let mut byte = [255];
     independent_client.read_exact(&mut byte).unwrap();
     assert_eq!(byte, [0], "other reader retains its own page and cursor");
