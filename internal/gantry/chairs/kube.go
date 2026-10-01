@@ -32,6 +32,9 @@ func NewClientset(kubeconfig string) (kubernetes.Interface, error) {
 		return nil, fmt.Errorf("chairs: load Kubernetes config: %w", err)
 	}
 
+	// Kubernetes is an external API, not an owned Gantry peer endpoint. Keep
+	// client-go's TLS/auth/proxy policy, including kubeconfig transport settings.
+	// The owned chair HTTPS transport separately enforces TLS 1.3.
 	client, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		return nil, fmt.Errorf("chairs: build Kubernetes client: %w", err)

@@ -69,39 +69,23 @@ type ContentWriter interface {
 }
 
 // ---------------------------------------------------------------------------
-// Members: cluster-membership view, sourced from a Kubernetes informer.
-// Implemented by internal/members .
+// Stable identifiers used by chair selection and peer discovery.
 // ---------------------------------------------------------------------------
 
 // PeerID is the serialized libp2p identity, never a Kubernetes node name.
 type PeerID string
 
-// Node is one entry in the cluster-membership view.
+// Node is a rendezvous-hash candidate. Chair selection uses fixed chair names;
+// no Kubernetes membership informer is involved.
 type Node struct {
 	ID PeerID
 
-	// Addr is the network address to reach this node's transfer
-	// endpoint (HTTP/2 on the configured transfer port). When the
-	// transfer port is known (production deploy), Addr is "ip:port";
-	// for back-compat with older snapshots it may be a bare IP and
-	// callers must append the port.
+	// Addr is an optional transfer address for candidate filtering.
 	Addr string
 
 	// Zone is the optional topology label `topology.kubernetes.io/zone`.
 	// Empty when not topology-aware (the design doc).
 	Zone string
-
-	// PeerID is the libp2p peer.ID (CID-encoded string form) the node
-	// publishes via its pod annotation. Empty until the peer announces.
-	// coord.Client uses this to dial via libp2p without requiring that
-	// NodeID itself be a peer.ID string.
-	PeerID string
-
-	// P2PAddrs lists the node's libp2p listen multiaddrs published via
-	// pod annotation. Empty until the peer announces. main.go reads
-	// this on startup to seed disco.Connect for DHT bootstrap (the design doc)
-	// without needing operator-supplied bootstrap_peers.
-	P2PAddrs []string
 }
 
 // PeerEndpoint is a libp2p identity plus the addresses needed for
@@ -369,8 +353,7 @@ type PleasePullOutcome struct {
 }
 
 // ChairAssignment identifies the Lease generation that authorized an origin
-// seed pull. It is optional on the wire so membership-based agents can
-// interoperate with chair-aware agents during a rolling deployment.
+// seed pull. Required for HTTPS chair requests.
 type ChairAssignment struct {
 	ChairID         uint32
 	Generation      int64

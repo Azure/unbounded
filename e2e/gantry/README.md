@@ -121,7 +121,7 @@ The scenarios below are still gaps. Each should land as a focused commit.
 
 - **Canary / mixed rollout / rollback.** Running a subset of nodes on
   the new image while the rest run the previous release is
-  unsupported and there is no rollback path. `storage_mode=containerd`
+  unsupported and there is no rollback path. The default containerd backend
   is the only accepted storage mode (plan §Phase 8 removed the
   alternative `gantry-cache` hostPath backend); a mixed-version
   rollout that mixes incompatible coord / advertise / cdsub semantics

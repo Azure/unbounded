@@ -187,8 +187,6 @@ func (s *Server) MarkReady() { s.ready.Store(true) }
 type metricsHooks struct {
 	onCacheHit                func()
 	onCacheMiss               func()
-	onOriginSuccess           func(kind string, bytes int64)
-	onOriginDownstreamFailure func(kind, class string)
 	onOriginStreamStarted     func(kind string)
 	onOriginStreamCompleted   func(kind string)
 	onOriginStreamFailed      func(kind string)
@@ -199,7 +197,6 @@ type metricsHooks struct {
 	onPeerFetchLatency        func(outcome string, d time.Duration)
 	onPeerDialResult          func(success bool)
 	onDhtLookup               func(outcome string, dur time.Duration)
-	onProvideError            func(op string)
 	onDhtStaleOnly            func()
 	onStaleProviderFiltered   func(n int)
 }
@@ -256,71 +253,6 @@ func WithMetrics(cacheHit, cacheMiss func()) Option {
 func WithByteMetrics(mirrorBytesServed func(kind, source string, bytes int64)) Option {
 	return func(s *Server) {
 		s.metrics.onMirrorBytesServed = mirrorBytesServed
-	}
-}
-
-// WithOriginSuccessMetric registers a callback fired by the mirror's
-// direct-origin path AFTER it has streamed the response body to
-// completion AND committed the bytes to cache (or, when cache is
-// unavailable, AFTER the direct-stream digest verifier confirms the
-// served bytes match the requested digest). The kind label uses the
-// design-doc Prometheus vocabulary (see ifaces.OriginRefKind.MetricLabel).
-//
-// This hook is the mirror-side half of the origin-success contract:
-// origin.Client.Pull no longer reports success itself because it has
-// no way to know whether the caller actually drained and verified the
-// stream. HEAD requests (which by design never read the body),
-// io.Copy interruptions, and cache-commit failures all leave the
-// response body Closed without a real success - so reporting success
-// on Close inside origin.Client inflated p2p_origin_pull_success_total
-// against operations that never produced a usable byte. The puller
-// pump's runOriginPull owns the equivalent hook on the
-// please_pull-coordinated path; together they're the two places that
-// know what "the origin pull actually succeeded" means.
-func WithOriginSuccessMetric(originSuccess func(kind string, bytes int64)) Option {
-	return func(s *Server) {
-		s.metrics.onOriginSuccess = originSuccess
-	}
-}
-
-// WithDownstreamFailureMetric registers a callback fired by the
-// mirror's direct-origin path when the body has been received from
-// origin but a DOWNSTREAM step (io.Copy stall, cw.Commit digest
-// mismatch / cache I/O error, directVerifier mismatch) fails before
-// the cluster has produced a usable artifact.
-//
-// Why this is separate from the origin failure-hook
-// (origin.WithMetrics' failure closure in cmd/gantry/main.go):
-// - origin.WithMetrics' failure closure is the origin-side
-// terminal counter - it bumps BOTH p2p_origin_pull_failure_total
-// (operator dashboards) AND p2p_origin_failure_total (the
-// "is origin sick?" alert). Origin-side failures are the
-// ones where the origin pull never started, never returned
-// 2xx, or returned a non-2xx body. Counting downstream
-// failures (where origin DID return 2xx but the body
-// stalled / corrupted en route to the cache) against the
-// same closure would falsely accuse origin of being sick.
-// - This hook bumps ONLY p2p_origin_pull_failure_total
-// (per-(kind,class) detail) with class="transient", leaving
-// p2p_origin_failure_total reserved for true origin-side
-// failures. Operators see the failure detail without the
-// alert false-positive.
-//
-// Together with onOriginSuccess and the origin-side failure
-// closure, this restores the per-pull arithmetic identity
-// for the GET path:
-//
-//	p2p_origin_pull_total{kind} == p2p_origin_pull_success_total{kind}
-//	 + p2p_origin_pull_failure_total{kind,class=any}
-//	 + (in-flight at scrape time)
-//
-// This constraint ensures the missing terminal counter
-// for downstream failures as the second of the two reasons that
-// identity drifted positive in production traces. (The first
-// was HEAD, fixed by adding origin.Head.)
-func WithDownstreamFailureMetric(downstreamFailure func(kind, class string)) Option {
-	return func(s *Server) {
-		s.metrics.onOriginDownstreamFailure = downstreamFailure
 	}
 }
 
@@ -448,16 +380,6 @@ func WithDhtLookupMetric(onLookup func(outcome string, dur time.Duration)) Optio
 	}
 }
 
-// WithProvideErrorMetric registers a hook that fires when the mirror's
-// post-peer-fetch dht.Provide call fails. The hook receives a stable
-// label string identifying the call site so a CounterVec keyed by `op`
-// can distinguish mirror-internal Provide failures from other sites.
-func WithProvideErrorMetric(onProvideErr func(op string)) Option {
-	return func(s *Server) {
-		s.metrics.onProvideError = onProvideErr
-	}
-}
-
 // WithDhtStaleOnlyMetric registers a hook that fires when a DHT
 // lookup returned candidate providers but the local stale/suspicious/
 // unavailable/self filters removed every one before any peer fetch
@@ -519,7 +441,7 @@ func WithPeerRediscover(budget, backoff time.Duration) Option {
 
 // WithSelfPeerID configures the local libp2p peer identity used to filter stale
 // self provider records from DHT lookup results after a local cache miss. DHT
-// providers use libp2p peer IDs as NodeID values.
+// providers use libp2p peer identities, never Kubernetes node aliases.
 func WithSelfPeerID(id ifaces.PeerID) Option {
 	return func(s *Server) { s.selfPeerID = id }
 }
@@ -1162,8 +1084,7 @@ func (s *Server) serveHeadMiss(ctx context.Context, w http.ResponseWriter, d dig
 	writeBlobHeaders(w, d, hsize, kind)
 }
 
-// serveFromOrigin runs the origin-pull + cache-write path (or, when
-// WithLiveStreamThrough is set, the proxy-and-correlate path). Called
+// serveFromOrigin streams directly to the caller without a competing writer. Called
 // after the local-store miss + peer/cold-start cascade have decided
 // that this node is the designated origin puller for d.
 //

@@ -618,9 +618,6 @@ func runAgent(args []string) error {
 			p2.dhtLookup.WithLabelValues(outcome).Inc()
 			p2.dhtLookupDur.WithLabelValues(outcome).Observe(dur.Seconds())
 		}),
-		mirror.WithProvideErrorMetric(func(op string) {
-			p2.dhtProvideErr.WithLabelValues(op).Inc()
-		}),
 		mirror.WithDhtStaleOnlyMetric(func() {
 			p9.dhtStaleOnly.Inc()
 		}),

@@ -454,6 +454,8 @@ const (
 )
 
 func newRegistryHTTPClient() *http.Client {
+	// Registries and token realms are external services. Preserve Go's secure
+	// TLS defaults rather than requiring the owned chair transport's TLS 1.3.
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: originDialTimeout, KeepAlive: 30 * time.Second}).DialContext,

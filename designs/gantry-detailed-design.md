@@ -782,3 +782,22 @@ from an on-path observer.
 - **Designated puller**  -  for a given **digest**, the node that HRW ranks highest among reachable cluster members. Responsible for pulling that digest from origin in cold-start scenarios. An image's manifest, config, and layer digests generally have *different* designated pullers, since HRW is computed independently per digest.
 - **Warm path**  -  per-digest pull served from peer-cached content via DHT discovery.
 - **Cold path**  -  per-digest pull where no peer has the content; requires origin contact via the designated puller.
+# First-release implementation update
+
+The first-release implementation supersedes historical membership and content-RPC
+descriptions below. Libp2p coordination carries only OfferChair rotation messages.
+Content requests use the HTTPS chair endpoint with a required lease assignment and
+explicit Kind; missing or unknown kinds are rejected before pumping. Peer identity
+is the serialized libp2p identity, with no Kubernetes node-name resolver or rank
+response. Protobuf reserves retired envelope field numbers.
+
+Live mirror GETs always stream to containerd; only the caller's containerd commits
+those bytes. Background chair pulls retain their ingest, lease, and advertisement
+path. cdsub requires a presence notifier and never directly publishes DHT records.
+Lease cleanup uses containerd CreatedAt, conservatively retaining invalid timestamps.
+
+Owned chair HTTPS requires TLS 1.3 and peer pinning. Transfer remains h2c under the
+existing isolation contract. External registry/token and Kubernetes API clients
+retain secure defaults and configured trust. See the public Gantry guide for the
+current configuration contract; historical compatibility switches below are not
+supported settings.

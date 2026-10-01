@@ -180,6 +180,21 @@ The Racer origin adapter requires bounded range reads. Resumed mirror responses
 must match the selected size, digest, and exact MIME type, including whether the
 MIME type is absent. A metadata mismatch fails before serving the response body.
 
+Live mirror responses always stream directly to containerd. Gantry does not open
+a competing containerd writer for these requests or advertise their bytes before
+containerd commits them. Background chair pulls still ingest and lease content.
+
+Content coordination uses the HTTPS chair endpoint, with a required assignment
+and explicit content kind. Libp2p coordination carries only chair-rotation offers;
+there is no pull-intent or content-pull RPC on that transport. Peer identities
+are libp2p identities, not Kubernetes node-name aliases.
+
+Owned chair HTTPS clients and servers require TLS 1.3 and authenticate the expected
+peer identity. The node-local mirror and peer content-transfer endpoints retain
+their existing HTTP/h2c network-isolation requirements. External registries,
+Bearer token realms, and the Kubernetes API retain their secure client defaults
+and configured trust policy; they are not blindly restricted to TLS 1.3.
+
 ### 5. Verify Distribution
 
 First verify one agent directly. Select a pod and forward its health and
