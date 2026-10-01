@@ -808,14 +808,11 @@ impl WorkerApplication {
                 owners: node.workers.clone(),
             },
         ));
-        let streams = Rc::new(
-            RangeStreams::new(
-                node.workers.clone(),
-                delivery,
-                config.limits.range_window_pages.get(),
-            )
-            .with_observer(admission.observer()),
-        );
+        let streams = Rc::new(RangeStreams::new(
+            node.workers.clone(),
+            delivery,
+            config.limits.range_window_pages.get(),
+        ));
         let coordinator = Rc::new(Coordinator::new(
             snapshots,
             metadata.clone(),

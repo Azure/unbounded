@@ -3,7 +3,6 @@
 //! it cannot replace headers or reopen against a newer version.
 use super::{dispatch::WorkerDirectory, flight::AcquisitionBudget};
 use crate::memory::page::PageResult;
-use crate::telemetry::failures::{Detail, Failure, Observer, Stage};
 use crate::{
     error::{Error, Operation, Result},
     memory::delivery::{Delivery, ReaderLease},
@@ -78,7 +77,6 @@ enum WindowPage {
 }
 
 pub struct RangeStreams {
-    observer: Observer,
     directory: Arc<WorkerDirectory>,
     delivery: Rc<Delivery>,
     window_pages: usize,
@@ -96,7 +94,6 @@ pub struct RangeStream {
     selection: Option<Operation<'static, (Result<PageResult>, AcquisitionBudget)>>,
     retained: std::collections::BTreeMap<PageNumber, crate::memory::pool::VerifiedPage>,
     subscription: Option<super::subscription::DemandLease>,
-    observer: Observer,
     metadata: ObjectMetadata,
     range: ResolvedRange,
     context: OriginContext,
@@ -117,7 +114,6 @@ impl RangeStreams {
         window_pages: usize,
     ) -> Self {
         Self {
-            observer: Observer::default(),
             directory,
             delivery,
             window_pages,
@@ -125,10 +121,6 @@ impl RangeStreams {
     }
     pub fn directory(&self) -> &Arc<WorkerDirectory> {
         &self.directory
-    }
-    pub(crate) fn with_observer(mut self, observer: Observer) -> Self {
-        self.observer = observer;
-        self
     }
     /// Open a client range with a bounded allowance for each distinct page and
     /// the original request deadline.
@@ -143,18 +135,6 @@ impl RangeStreams {
         let budget = RangeBudget::ClientPages {
             deadline: scope.deadline.0,
         };
-        self.open_budget(metadata, range, context, membership, scope, budget)
-    }
-    #[allow(clippy::too_many_arguments)]
-    fn open_budget(
-        &self,
-        metadata: ObjectMetadata,
-        range: ResolvedRange,
-        context: OriginContext,
-        membership: MembershipLease,
-        scope: RequestScope,
-        budget: RangeBudget,
-    ) -> Result<RangeStream> {
         scope.check()?;
         if self.window_pages == 0 {
             return Err(Error::InvalidConfiguration);
@@ -173,7 +153,6 @@ impl RangeStreams {
             selection: None,
             retained: std::collections::BTreeMap::new(),
             subscription: None,
-            observer: self.observer.clone(),
             metadata,
             range,
             context,
@@ -365,9 +344,6 @@ impl RangeStream {
             number,
         })
     }
-    fn advance(&mut self, page: PageNumber) {
-        self.next_page = (page != self.range.last_page()).then(|| PageNumber(page.0 + 1));
-    }
     /// Admit each distinct page once into a bounded sliding window. Client page
     /// progress gets its own fixed child allowance after headers; explicit
     /// aggregate budgets partition credits. Pending futures live in the stream,
@@ -388,115 +364,12 @@ impl RangeStream {
                 }
                 return result;
             }
-            if self.subscription.is_some() {
-                return self.next_subscription_slice().await;
-            }
-            if self.ready.is_empty() && self.next_page.is_none() {
-                self.terminated = true;
-                return Ok(None);
-            }
-            let operation_scope = self.operation_scope();
-            if let Err(error) = operation_scope.check() {
-                self.observer
-                    .record(Failure::new(Stage::RangeScope, error).request(&operation_scope));
+            if self.subscription.is_none() {
                 self.terminate();
-                return Err(error);
+                return Err(Error::InvalidRequest);
             }
-            // Schedule delivery before starting more page work. Waiting requests
-            // cannot pin newly acquired pages merely to discover pipe exhaustion.
-            let pipe = match self.admit_pipe(&operation_scope).await {
-                Ok(pipe) => pipe,
-                Err(error) => {
-                    self.observer
-                        .record(Failure::new(Stage::RangePipe, error).request(&operation_scope));
-                    self.terminate();
-                    return Err(error);
-                }
-            };
-            if let Err(error) = self.admit_window(&operation_scope) {
-                self.terminate();
-                return Err(error);
-            }
-            poll_fn(|cx| poll_window(&mut self.ready, &mut self.budget, cx)).await;
-            if let Err(error) = operation_scope.check() {
-                self.terminate();
-                return Err(error);
-            }
-            let Some((number, WindowPage::Ready(result))) = self.ready.pop_front() else {
-                self.terminated = true;
-                return Ok(None);
-            };
-            if let Err(error) = &result {
-                self.observer.record(
-                    Failure::new(Stage::PageAcquire, *error)
-                        .request(&operation_scope)
-                        .detail(Detail::Page(number.0)),
-                );
-            }
-            let lease = result.and_then(|result| {
-                let attach = (|| {
-                    self.validate(&result, number)?;
-                    let slice = self
-                        .range
-                        .slice_at(result.plaintext.page().number)?
-                        .ok_or(Error::CorruptRecord)?;
-                    self.delivery.attach_reserved(result.plaintext, slice, pipe)
-                })();
-                self.observer
-                    .result(Stage::PageAttach, &operation_scope, attach)
-            });
-            match lease {
-                Ok(lease) => Ok(Some(lease)),
-                Err(error) => {
-                    self.terminate();
-                    Err(error)
-                }
-            }
+            self.next_subscription_slice().await
         })
-    }
-    /// Non-subscription ranges acquire an ordered sliding window. Subscription
-    /// scheduling uses poll_ordered/poll_selection and never enters this path.
-    fn admit_window(&mut self, scope: &RequestScope) -> Result<()> {
-        while self.ready.len() < self.window_pages {
-            let Some(number) = self.next_page else { break };
-            let Some(child) = self.observer.result(
-                Stage::RangeBudget,
-                scope,
-                self.budget.next_page(!self.ready.is_empty()),
-            )?
-            else {
-                break;
-            };
-            let page = PageId {
-                version: self.metadata.version.clone(),
-                number,
-            };
-            let mut page_scope = scope.clone();
-            page_scope.deadline.0 = child.deadline();
-            let entry = match self.directory.start_page(
-                page,
-                self.membership.clone(),
-                &self.context,
-                &page_scope,
-                child,
-            ) {
-                Ok(future) => {
-                    self.advance(number);
-                    WindowPage::Waiting(future)
-                }
-                Err(error) => {
-                    self.observer.record(
-                        Failure::new(Stage::PageDispatch, error)
-                            .request(&page_scope)
-                            .detail(Detail::Page(number.0)),
-                    );
-                    self.next_page = None;
-                    WindowPage::Ready(Err(error))
-                }
-            };
-            self.ready.push_back((number, entry));
-        }
-        Ok(())
     }
     pub fn cancel(&mut self) -> Operation<'_, ()> {
         Box::pin(async move {
@@ -1138,6 +1011,9 @@ pub(super) mod tests {
                     scope.clone(),
                 )
                 .unwrap();
+            stream
+                .configure_subscription(2, 2 * PAGE_BYTES, true)
+                .unwrap();
             let attempts = Rc::new(Cell::new(0));
             let gate = Rc::new(Cell::new(false));
             // Script both admitted acquisitions, avoiding full-page allocation.
@@ -1167,7 +1043,7 @@ pub(super) mod tests {
                         Ok((result, budget))
                     })),
                 ));
-                stream.advance(PageNumber(number));
+                stream.next_page = Some(PageNumber(number + 1));
             }
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             if !expire {
@@ -1435,11 +1311,9 @@ pub(super) mod tests {
                     scope.clone(),
                 )
                 .unwrap();
-            if subscription {
-                stream
-                    .configure_subscription(4, 4 * PAGE_BYTES, false)
-                    .unwrap();
-            }
+            stream
+                .configure_subscription(4, 4 * PAGE_BYTES, !subscription)
+                .unwrap();
             let response = ReadResponse {
                 metadata,
                 range: Some(range),

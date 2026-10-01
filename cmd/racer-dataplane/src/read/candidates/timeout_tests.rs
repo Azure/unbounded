@@ -156,6 +156,12 @@ struct Fixture {
 }
 
 impl Fixture {
+    fn bounded(mut self, request: u8, seconds: u64, links: u8) -> Self {
+        let deadline = crate::runtime::environment::now() + Duration::from_secs(seconds);
+        self.scope = RequestScope::new(RequestId([request; 16]), deadline).unwrap();
+        self.budget = AcquisitionBudget::new(deadline, 16, links);
+        self
+    }
     fn new(rank: Option<usize>, stalled: usize, late_success: bool) -> Self {
         let (_, placement, context, _, credentials) = super::tests::fixture();
         let signers = network(5);
@@ -238,10 +244,8 @@ fn continuously_slow_candidate_reserves_fenced_fallback_and_conserves_credits() 
         std::time::SystemTime::now(),
     );
     let _env = clock.environment(0).enter();
-    let mut f = Fixture::new(None, 1, true);
-    let original = crate::runtime::environment::now() + Duration::from_secs(30);
-    f.scope = RequestScope::new(RequestId([94; 16]), original).unwrap();
-    f.budget = AcquisitionBudget::new(original, 16, 24);
+    let mut f = Fixture::new(None, 1, true).bounded(94, 30, 24);
+    let original = f.scope.deadline.0;
     f.peers.fenced.set(false);
     let operation = f.operation();
     let mut resolve = Box::pin(f.policy.resolve_with_budget(
@@ -303,10 +307,8 @@ fn slow_body_without_alternative_or_failure_route_credit_keeps_original_ceiling(
             std::time::SystemTime::now(),
         );
         let _env = clock.environment(0).enter();
-        let mut f = Fixture::new(None, 1, false);
-        let original = crate::runtime::environment::now() + Duration::from_secs(30);
-        f.scope = RequestScope::new(RequestId([95; 16]), original).unwrap();
-        f.budget = AcquisitionBudget::new(original, 16, links);
+        let mut f = Fixture::new(None, 1, false).bounded(95, 30, links);
+        let original = f.scope.deadline.0;
         f.peers.fenced.set(false);
         let operation = f.operation();
         let mut request = Box::pin(f.policy.request(
@@ -363,11 +365,8 @@ fn known_healthy_body_outlives_share_with_or_without_affordable_fallback() {
             std::time::SystemTime::now(),
         );
         let _env = clock.environment(0).enter();
-        let mut f = Fixture::new(None, 1, false);
-        let start = crate::runtime::environment::now();
-        let original = start + Duration::from_secs(30);
-        f.scope = RequestScope::new(RequestId([100; 16]), original).unwrap();
-        f.budget = AcquisitionBudget::new(original, 16, links);
+        let mut f = Fixture::new(None, 1, false).bounded(100, 30, links);
+        let original = f.scope.deadline.0;
         let operation = f.operation();
         let mut request = Box::pin(f.policy.request(
             &f.candidates.membership,
@@ -408,10 +407,8 @@ fn configured_total_cap_never_renews_or_accepts_late_success() {
         std::time::SystemTime::now(),
     );
     let _env = clock.environment(0).enter();
-    let mut f = Fixture::new(None, 1, true);
-    let original = crate::runtime::environment::now() + Duration::from_secs(60);
-    f.scope = RequestScope::new(RequestId([96; 16]), original).unwrap();
-    f.budget = AcquisitionBudget::new(original, 16, 24);
+    let mut f = Fixture::new(None, 1, true).bounded(96, 60, 24);
+    let original = f.scope.deadline.0;
     f.policy = f.policy.with_attempt_timeout(Duration::from_secs(6));
     f.peers.fenced.set(false);
     let operation = f.operation();
@@ -460,10 +457,8 @@ fn retries_get_independent_local_caps_but_never_extend_overall_authority() {
         std::time::SystemTime::now(),
     );
     let _env = clock.environment(0).enter();
-    let mut f = Fixture::new(None, 3, false);
-    let original = crate::runtime::environment::now() + Duration::from_secs(15);
-    f.scope = RequestScope::new(RequestId([101; 16]), original).unwrap();
-    f.budget = AcquisitionBudget::new(original, 16, 24);
+    let mut f = Fixture::new(None, 3, false).bounded(101, 15, 24);
+    let original = f.scope.deadline.0;
     f.policy = f.policy.with_attempt_timeout(Duration::from_secs(6));
     let operation = f.operation();
     let mut resolve = Box::pin(f.policy.resolve_with_budget(

@@ -532,52 +532,6 @@ impl WorkerDirectory {
             }
         })
     }
-    /// Independently admitted envelope and partitioned credits for a sliding
-    /// window. The returned future owns no borrow of the raw request context.
-    pub(crate) fn start_page(
-        &self,
-        page: PageId,
-        membership: MembershipLease,
-        context: &OriginContext,
-        scope: &RequestScope,
-        budget: AcquisitionBudget,
-    ) -> Result<Operation<'static, (Result<PageResult>, AcquisitionBudget)>> {
-        if page.version.object != context.object {
-            return Err(Error::InvalidRequest);
-        }
-        let owner = self.page_owner(&page)?;
-        if self.is_local(owner) {
-            let local = self.local()?;
-            let context = local.credentials.local_context(context, scope)?;
-            let scope = scope.clone();
-            return Ok(Box::pin(async move {
-                let mut budget = budget;
-                let result = local
-                    .fill
-                    .acquire(page.clone(), membership, &context, &scope, &mut budget)
-                    .await
-                    .and_then(|value| {
-                        value.validate_for(&page)?;
-                        Ok(value)
-                    });
-                Ok((result, budget))
-            }));
-        }
-        let work = Work::Acquire(page.clone(), membership, self.seal(context, scope)?);
-        let receipt = self.submit(owner, work, scope, Some(budget))?;
-        Ok(Box::pin(async move {
-            let completion = receipt.await?;
-            let budget = completion.budget.ok_or(Error::StaleFlight)?;
-            let value = completion.value.and_then(|value| match value {
-                Value::Page(value) => {
-                    value.validate_for(&page)?;
-                    Ok(value)
-                }
-                _ => Err(Error::StaleFlight),
-            });
-            Ok((value, budget))
-        }))
-    }
     /// Always enqueue, including local ingress. The command and elected Fill
     /// driver, rather than the detachable receipt, own mixed-mode exclusion.
     pub(crate) fn start_ordered_page(
