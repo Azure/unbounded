@@ -5,6 +5,39 @@ use std::{fs, rc::Rc};
 
 const SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
 
+// Standalone store fixtures use the production candidate scanner and cache-scoped
+// filter, but do not create an application worker directory. No legacy loader is
+// compiled into the dataplane.
+impl Recovery {
+    pub(crate) fn load(
+        &self,
+        alignment: DirectAlignment,
+    ) -> Operation<'_, Option<CheckpointImage>> {
+        self.load_filtered(alignment, |_, _| true)
+    }
+    fn load_filtered(
+        &self,
+        alignment: DirectAlignment,
+        available: impl Fn(&CacheId, KeyId) -> bool,
+    ) -> Operation<'_, Option<CheckpointImage>> {
+        let result = candidates(&self.directory, MAX_CHECKPOINT_BYTES).map(|mut cuts| {
+            cuts.find_map(|(_, mut image)| {
+                Recovery::filter_available(&mut image, |_| true, &available);
+                let valid = image.shards.iter().all(|s| {
+                    s.geometry.matches_alignment(alignment)
+                        && self.geometry.get().is_none_or(|g| s.geometry == g)
+                }) && image
+                    .shards
+                    .iter()
+                    .find(|s| s.worker == self.index.worker())
+                    .is_some_and(|s| self.index.validate_snapshot(&s.index).is_ok());
+                valid.then_some(image)
+            })
+        });
+        Box::pin(async move { result })
+    }
+}
+
 #[test]
 fn canceled_async_publication_preserves_existing_slots_without_submission() {
     use crate::runtime::{admission::Admission, deadline::RequestScope, reactor::Reactor};
@@ -471,7 +504,7 @@ fn newer_incompatible_geometry_or_catalog_falls_back_and_keys_filter_on_load() {
     let (index, segments) = state(1);
     let recovery = Recovery::new(directory.0.clone(), index, segments);
     recovery.configure_geometry(geometry()).unwrap();
-    let recovered = block_on(recovery.load_with_keys(geometry().alignment().unwrap(), Some(&[])))
+    let recovered = block_on(recovery.load_filtered(geometry().alignment().unwrap(), |_, _| false))
         .unwrap()
         .unwrap();
     assert_eq!(recovered.sequence, 1);
@@ -645,9 +678,10 @@ fn recovery_validates_before_mutation_seals_segments_and_filters_missing_keys() 
         segments.snapshot().unwrap()[0].used_bytes,
         before[0].used_bytes
     );
-    let recovered = shard();
-    let page = recovered.index.entries[0].0.clone();
-    block_on(recovery.install_shard_with_keys(Some(recovered), Some(&[]))).unwrap();
+    let mut recovered = image(1);
+    let page = recovered.shards[0].index.entries[0].0.clone();
+    Recovery::filter_available(&mut recovered, |_| true, |_, _| false);
+    block_on(recovery.install_shard(recovered.shards.pop())).unwrap();
     assert!(index.lookup(&page).unwrap().is_none());
     assert!(
         index

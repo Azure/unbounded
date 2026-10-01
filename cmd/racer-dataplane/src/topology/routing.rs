@@ -1,7 +1,7 @@
 //! Versioned graph neighbors and deterministic bounded shortest-path routing.
 //! Search caches eligible alternatives, then selects a next hop per request.
 use super::{
-    MAX_DEGREE, RoutingAlgorithm, hash,
+    MAX_DEGREE, RADIX, hash,
     health::LinkHealth,
     membership::{Membership, MembershipLease},
 };
@@ -23,22 +23,15 @@ use std::{
 /// Versioned union of incoming/outgoing (radix*i+j)%N edges, excluding self and duplicates.
 pub struct Graph {
     membership: MembershipLease,
-    algorithm: RoutingAlgorithm,
 }
 impl Graph {
     pub fn new(membership: MembershipLease) -> Self {
-        Self::with_algorithm(membership, RoutingAlgorithm::default())
-    }
-    pub fn with_algorithm(membership: MembershipLease, algorithm: RoutingAlgorithm) -> Self {
-        Self {
-            membership,
-            algorithm,
-        }
+        Self { membership }
     }
     pub fn neighbors(&self, node: &NodeId) -> Result<Vec<NodeId>> {
         let position = self.membership.position(node)?;
         Ok(
-            neighbor_positions_for(self.membership.members().len(), position, self.algorithm)
+            neighbor_positions_for(self.membership.members().len(), position)
                 .into_iter()
                 .map(|index| self.membership.members()[index].node.clone())
                 .collect(),
@@ -48,10 +41,10 @@ impl Graph {
 
 /// The incoming intervals are disjoint lifts of `node` modulo N. Their quotient
 /// by the radix gives every predecessor without scanning any other member.
-fn neighbor_positions_for(count: usize, node: usize, algorithm: RoutingAlgorithm) -> Vec<usize> {
+fn neighbor_positions_for(count: usize, node: usize) -> Vec<usize> {
     debug_assert!(node < count);
-    let radix = algorithm.radix();
-    let mut neighbors = Vec::with_capacity(algorithm.max_degree());
+    let radix = RADIX;
+    let mut neighbors = Vec::with_capacity(MAX_DEGREE);
     for digit in 0..radix {
         neighbors.push((radix * node + digit) % count);
         neighbors.push((node + digit * count) / radix);
@@ -159,7 +152,6 @@ struct PathCache {
 
 pub struct Paths {
     pub(crate) peer_admission: Option<Arc<crate::peer::adaptive::AdaptivePeers>>,
-    algorithm: RoutingAlgorithm,
     health: Rc<LinkHealth>,
     capacity: usize,
     cache: RefCell<PathCache>,
@@ -184,15 +176,7 @@ impl Paths {
         self.health.clone()
     }
     pub fn new(health: Rc<LinkHealth>, capacity: usize) -> Self {
-        Self::with_algorithm(health, capacity, RoutingAlgorithm::default())
-    }
-    pub fn with_algorithm(
-        health: Rc<LinkHealth>,
-        capacity: usize,
-        algorithm: RoutingAlgorithm,
-    ) -> Self {
         Self {
-            algorithm,
             peer_admission: None,
             health,
             capacity,
@@ -200,25 +184,18 @@ impl Paths {
             active_searches: Cell::new(0),
         }
     }
+    #[cfg(test)]
     pub fn shortest(
         &self,
         membership: MembershipLease,
         from: &NodeId,
         budget: &RouteBudget,
     ) -> Result<Route> {
-        let key = self.key(&membership, from, budget)?;
-        if let Some(route) = self.cached(&membership, &key, budget) {
-            return route;
-        }
-        let _admission = self.admit_search()?;
-        let mut search = RouteSearch::new(membership.members().len(), &key, self.algorithm);
-        while !search.step(SEARCH_QUANTUM, budget.deadline)? {}
-        let nodes = search.finish()?;
-        self.store(&membership, key, &nodes);
-        select_route(membership, &nodes, budget, self.algorithm)
+        let scope = RequestScope::new(budget.request, budget.deadline.0)?;
+        futures::executor::block_on(self.shortest_async(membership, from, budget, &scope))
     }
 
-    /// Same result as `shortest`, yielding after at most 32 vertex expansions.
+    /// Yield after at most 32 vertex expansions.
     /// Each expansion examines at most 64 edges. Dropping the future cancels it.
     pub fn shortest_async<'a>(
         &'a self,
@@ -234,7 +211,7 @@ impl Paths {
                 return route;
             }
             let _admission = self.admit_search()?;
-            let mut search = RouteSearch::new(membership.members().len(), &key, self.algorithm);
+            let mut search = EqualCostSearch::new(membership.members().len(), &key);
             let deadline = Deadline(budget.deadline.0.min(scope.deadline.0));
             std::future::poll_fn(|cx| {
                 match scope
@@ -257,7 +234,7 @@ impl Paths {
                 return Err(Error::Unavailable);
             }
             self.store(&membership, key, &nodes);
-            select_route(membership, &nodes, budget, self.algorithm)
+            select_route(membership, &nodes, budget)
         })
     }
 
@@ -293,13 +270,12 @@ impl Paths {
             .collect::<Result<Vec<_>>>()?;
         visited.sort_unstable();
         let mut failed = Vec::new();
-        let neighbors: Vec<_> =
-            neighbor_positions_for(membership.members().len(), source, self.algorithm)
-                .into_iter()
-                .map(|position| membership.members()[position].node.clone())
-                .collect();
+        let neighbors: Vec<_> = neighbor_positions_for(membership.members().len(), source)
+            .into_iter()
+            .map(|position| membership.members()[position].node.clone())
+            .collect();
         self.health.retain_neighbors(&neighbors);
-        for neighbor in neighbor_positions_for(membership.members().len(), source, self.algorithm) {
+        for neighbor in neighbor_positions_for(membership.members().len(), source) {
             if !self
                 .health
                 .available(&membership.members()[neighbor].node)?
@@ -330,12 +306,7 @@ impl Paths {
         let cache = self.cache.borrow();
         let (weak, nodes) = cache.entries.get(key)?;
         weak.upgrade()?;
-        Some(select_route(
-            membership.clone(),
-            nodes,
-            budget,
-            self.algorithm,
-        ))
+        Some(select_route(membership.clone(), nodes, budget))
     }
 
     fn store(&self, membership: &MembershipLease, key: PathKey, nodes: &[Vec<usize>]) {
@@ -366,7 +337,6 @@ fn select_route(
     membership: MembershipLease,
     alternatives: &[Vec<usize>],
     budget: &RouteBudget,
-    _algorithm: RoutingAlgorithm,
 ) -> Result<Route> {
     let index = if alternatives.len() == 1 {
         0
@@ -426,8 +396,6 @@ fn weighted_draw(sample: u64, total: u64, weights: &[u64]) -> Option<usize> {
     unreachable!("ticket is below the sum of positive weights")
 }
 
-type RouteSearch = EqualCostSearch;
-
 fn route(membership: MembershipLease, positions: &[usize]) -> Route {
     let nodes = positions
         .iter()
@@ -473,7 +441,6 @@ impl EqualCostWave {
 /// Reconstruct one canonical witness per bit. Relays reselect at their own hop.
 struct EqualCostSearch {
     count: usize,
-    algorithm: RoutingAlgorithm,
     key: PathKey,
     neighbors: Vec<usize>,
     waves: [EqualCostWave; 2],
@@ -494,12 +461,11 @@ impl EqualCostSearch {
         self.waves.iter().map(|wave| wave.visits.len()).sum()
     }
 
-    fn new(count: usize, key: &PathKey, algorithm: RoutingAlgorithm) -> Self {
-        let neighbors = neighbor_positions_for(count, key.from, algorithm);
+    fn new(count: usize, key: &PathKey) -> Self {
+        let neighbors = neighbor_positions_for(count, key.from);
         assert!(neighbors.len() <= MAX_DEGREE);
         Self {
             count,
-            algorithm,
             key: key.clone(),
             meetings: vec![None; neighbors.len()],
             neighbors,
@@ -533,7 +499,7 @@ impl EqualCostSearch {
             }
             let depth = self.waves[self.side].visits[&node].depth + 1;
             let first = self.waves[self.side].visits[&node].first;
-            for next in neighbor_positions_for(self.count, node, self.algorithm) {
+            for next in neighbor_positions_for(self.count, node) {
                 #[cfg(test)]
                 {
                     self.edges += 1;
@@ -603,7 +569,7 @@ impl EqualCostSearch {
                 current = if depth == 1 {
                     self.key.from
                 } else {
-                    neighbor_positions_for(self.count, current, self.algorithm)
+                    neighbor_positions_for(self.count, current)
                         .into_iter()
                         .find(|candidate| {
                             self.waves[0].visits.get(candidate).is_some_and(|v| {
@@ -638,8 +604,7 @@ mod graph_tests {
     use crate::topology::fixtures::membership;
     #[test]
     fn exhaustive_inverse_matches_definition() {
-        let algorithm = RoutingAlgorithm::V5;
-        let radix = algorithm.radix();
+        let radix = RADIX;
         for n in 1..=160 {
             for i in 0..n {
                 let expected: Vec<_> = (0..n)
@@ -649,27 +614,18 @@ mod graph_tests {
                                 .any(|j| (radix * i + j) % n == k || (radix * k + j) % n == i)
                     })
                     .collect();
-                assert_eq!(
-                    neighbor_positions_for(n, i, algorithm),
-                    expected,
-                    "N={n}, i={i}"
-                );
+                assert_eq!(neighbor_positions_for(n, i), expected, "N={n}, i={i}");
             }
         }
     }
     #[test]
     fn hundred_thousand_nodes_bounded_symmetric_and_four_link_reachable() {
-        let algorithm = RoutingAlgorithm::V5;
         let n = 100_000;
         for i in 0..n {
-            let neighbors = neighbor_positions_for(n, i, algorithm);
-            assert!(neighbors.len() <= algorithm.max_degree());
+            let neighbors = neighbor_positions_for(n, i);
+            assert!(neighbors.len() <= MAX_DEGREE);
             for &other in &neighbors {
-                assert!(
-                    neighbor_positions_for(n, other, algorithm)
-                        .binary_search(&i)
-                        .is_ok()
-                );
+                assert!(neighbor_positions_for(n, other).binary_search(&i).is_ok());
             }
         }
         for source in [0, 1, 17, 49_999, 99_999] {
@@ -680,7 +636,7 @@ mod graph_tests {
                 if distance[i] == 4 {
                     continue;
                 }
-                for j in neighbor_positions_for(n, i, algorithm) {
+                for j in neighbor_positions_for(n, i) {
                     if distance[j] == u8::MAX {
                         distance[j] = distance[i] + 1;
                         queue.push_back(j);

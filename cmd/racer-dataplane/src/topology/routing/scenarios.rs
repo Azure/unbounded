@@ -79,7 +79,7 @@ fn all_equal_next_hops_match_independent_oracle() {
                     let distance = distances(&edges, &key);
                     for links in [1, 2, 4] {
                         key.links = links;
-                        let mut search = EqualCostSearch::new(n, &key, RoutingAlgorithm::V5);
+                        let mut search = EqualCostSearch::new(n, &key);
                         while !search.step(1, request.deadline).unwrap() {}
                         let result = search.finish();
                         if distance[source] > links as usize {
@@ -165,7 +165,7 @@ fn last_first_hop_bit_survives_search_and_reconstruction() {
     let n = 100_000;
     let members = membership(n);
     let source = 19;
-    let neighbors = neighbor_positions_for(n, source, RoutingAlgorithm::V5);
+    let neighbors = neighbor_positions_for(n, source);
     assert_eq!(neighbors.len(), 64);
     let last = neighbors[63];
     let paths = Paths::new(Rc::new(LinkHealth), 0);
@@ -174,13 +174,13 @@ fn last_first_hop_bit_survives_search_and_reconstruction() {
         .key(&members, &members.members()[source].node, &request)
         .unwrap();
     key.failed = neighbors[..63].to_vec();
-    let next = neighbor_positions_for(n, last, RoutingAlgorithm::V5)
+    let next = neighbor_positions_for(n, last)
         .into_iter()
         .find(|v| *v != source && !neighbors.contains(v))
         .unwrap();
     for to in [last, next] {
         key.to = to;
-        let mut search = EqualCostSearch::new(n, &key, RoutingAlgorithm::V5);
+        let mut search = EqualCostSearch::new(n, &key);
         while !search.step(1, request.deadline).unwrap() {}
         let alternatives = search.finish().unwrap();
         assert_eq!(alternatives.len(), 1);
@@ -188,7 +188,7 @@ fn last_first_hop_bit_survives_search_and_reconstruction() {
         assert_eq!(alternatives[0].last(), Some(&to));
     }
     key.failed = neighbors;
-    let mut search = EqualCostSearch::new(n, &key, RoutingAlgorithm::V5);
+    let mut search = EqualCostSearch::new(n, &key);
     while !search.step(1, request.deadline).unwrap() {}
     assert_eq!(search.finish(), Err(Error::Unavailable));
 }
@@ -296,7 +296,7 @@ fn search_work_is_bounded_per_turn() {
     let key = paths
         .key(&members, &members.members()[0].node, &request)
         .unwrap();
-    let mut search = EqualCostSearch::new(100_000, &key, RoutingAlgorithm::V5);
+    let mut search = EqualCostSearch::new(100_000, &key);
     loop {
         let before = search.expansions;
         let done = search.step(7, request.deadline).unwrap();

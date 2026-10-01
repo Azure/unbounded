@@ -17,6 +17,13 @@ use std::sync::{Arc, Mutex};
 pub const CAPACITY: usize = 128;
 pub const AEAD_CAPACITY: usize = 64;
 
+fn hex(out: &mut impl std::fmt::Write, bytes: &[u8]) -> std::fmt::Result {
+    for byte in bytes {
+        write!(out, "{byte:02x}")?;
+    }
+    Ok(())
+}
+
 /// Authenticated acquisition identity, not a TCP tuple or proof of body integrity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PeerProvenance {
@@ -43,12 +50,6 @@ pub(crate) struct AeadFailure {
 }
 impl AeadFailure {
     pub(crate) fn write_fields(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
-        fn hex(out: &mut impl std::fmt::Write, bytes: &[u8]) -> std::fmt::Result {
-            for byte in bytes {
-                write!(out, "{byte:02x}")?;
-            }
-            Ok(())
-        }
         write!(out, " ms={} request=", self.unix_millis)?;
         hex(out, &self.request.0)?;
         if let Some(peer) = self.peer {
@@ -62,6 +63,9 @@ impl AeadFailure {
                 std::str::from_utf8(&peer.supplier).unwrap_or("unknown")
             )?;
         }
+        self.write_fingerprint(out)
+    }
+    fn write_fingerprint(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
         write!(out, " page=")?;
         hex(out, &self.page)?;
         write!(out, " number={} key=", self.number)?;
@@ -274,12 +278,6 @@ impl Failures {
             "total={total} retained={len} overwritten={} capacity={AEAD_CAPACITY}",
             total.saturating_sub(len as u64)
         )?;
-        fn hex(out: &mut impl std::fmt::Write, bytes: &[u8]) -> std::fmt::Result {
-            for byte in bytes {
-                write!(out, "{byte:02x}")?;
-            }
-            Ok(())
-        }
         for offset in 0..len {
             let index = (next + AEAD_CAPACITY - len + offset) % AEAD_CAPACITY;
             if let Some((sequence, id, f)) = entries[index] {
@@ -306,18 +304,8 @@ impl Failures {
                         " acquisition=none attempt=none supplier=none remote=none"
                     )?;
                 }
-                write!(out, " page=")?;
-                hex(out, &f.page)?;
-                write!(out, " number={} key=", f.number)?;
-                hex(out, &f.key)?;
-                write!(out, " nonce=")?;
-                hex(out, &f.nonce)?;
-                write!(out, " lengths={}/{} aad=", f.plaintext, f.ciphertext)?;
-                hex(out, &f.aad)?;
-                match f.crc {
-                    Some(crc) => writeln!(out, " crc={crc:016x}")?,
-                    None => writeln!(out, " crc=none")?,
-                }
+                f.write_fingerprint(out)?;
+                writeln!(out)?;
             }
         }
         Ok(())
@@ -350,17 +338,13 @@ impl Failures {
                     )?;
                 }
                 if let Some(request) = failure.request {
-                    for byte in request.0 {
-                        write!(out, "{byte:02x}")?;
-                    }
+                    hex(out, &request.0)?;
                 } else {
                     write!(out, "none")?;
                 }
                 write!(out, " attempt=")?;
                 if let Some(attempt) = failure.attempt {
-                    for byte in attempt.0 {
-                        write!(out, "{byte:02x}")?;
-                    }
+                    hex(out, &attempt.0)?;
                 } else {
                     write!(out, "none")?;
                 }

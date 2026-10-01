@@ -75,26 +75,10 @@ mod hash {
 /// Latest supported contract; topology changes require coordinated rollout.
 pub const ALGORITHM_VERSION: u32 = 5;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum RoutingAlgorithm {
-    #[default]
-    V5,
-}
-
-impl RoutingAlgorithm {
-    pub const fn radix(self) -> usize {
-        match self {
-            Self::V5 => 32,
-        }
-    }
-
-    pub const fn max_degree(self) -> usize {
-        2 * self.radix()
-    }
-}
+pub const RADIX: usize = 32;
 
 /// Shared capacity bound for every supported topology, including first-hop masks.
-pub const MAX_DEGREE: usize = RoutingAlgorithm::V5.max_degree();
+pub const MAX_DEGREE: usize = 2 * RADIX;
 const _: () = assert!(MAX_DEGREE <= u64::BITS as usize);
 
 #[cfg(test)]

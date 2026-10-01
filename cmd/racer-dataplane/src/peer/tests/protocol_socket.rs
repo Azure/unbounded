@@ -634,31 +634,8 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
 }
 
 #[test]
-fn v3_equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
-    equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction(
-        crate::topology::RoutingAlgorithm::V5,
-    );
-}
-
-#[test]
-fn v4_equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
-    equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction(
-        crate::topology::RoutingAlgorithm::V5,
-    );
-}
-
-#[test]
 fn v5_equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
-    equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction(
-        crate::topology::RoutingAlgorithm::V5,
-    );
-}
-
-fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction(
-    algorithm: crate::topology::RoutingAlgorithm,
-) {
     use crate::topology::{
-        RoutingAlgorithm,
         health::{LinkHealth, LinkOutcome},
         membership::{Member, Membership},
         routing::Paths,
@@ -677,14 +654,7 @@ fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction(
                 .enumerate()
                 .map(|(i, node)| Member {
                     node: NodeId(node),
-                    shares: std::num::NonZeroU32::new(
-                        if matches!(algorithm, RoutingAlgorithm::V5) && i % 3 == 0 {
-                            1
-                        } else {
-                            4
-                        },
-                    )
-                    .unwrap(),
+                    shares: std::num::NonZeroU32::new(if i % 3 == 0 { 1 } else { 4 }).unwrap(),
                     peer_endpoint: "127.0.0.1:7443".into(),
                     rails: vec![],
                     alignment_enabled: false,
@@ -694,9 +664,9 @@ fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction(
         )
         .unwrap(),
     );
-    let paths = Paths::with_algorithm(Rc::new(LinkHealth), 1, algorithm);
+    let paths = Paths::new(Rc::new(LinkHealth), 1);
     let health = Rc::new(LinkHealth);
-    let cold = Paths::with_algorithm(health.clone(), 0, algorithm);
+    let cold = Paths::new(health.clone(), 0);
     let mut selected = std::collections::BTreeSet::new();
     for attempt in 1..=32 {
         let original = request(&admission, attempt);
@@ -818,11 +788,7 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
         .unwrap(),
     );
     let health = Rc::new(LinkHealth::new(36));
-    let paths = Rc::new(Paths::with_algorithm(
-        health.clone(),
-        4,
-        crate::topology::RoutingAlgorithm::V5,
-    ));
+    let paths = Rc::new(Paths::new(health.clone(), 4));
     let requester = Requester::new(
         paths.clone(),
         Rc::new(Forwarding::new(signers[0].clone())),
@@ -1586,26 +1552,16 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
     let neighbors = Graph::new(membership.clone()).neighbors(&local).unwrap();
     assert!(neighbors.len() < membership.members().len() - 1);
     assert_eq!(neighbors.len(), 62);
-    for algorithm in [crate::topology::RoutingAlgorithm::V5] {
-        let explicit = PeerNetwork::with_algorithm(
-            local.clone(),
-            Arc::new(crate::control::state::PublishedState::default()),
-            algorithm,
-        )
-        .unwrap();
-        let radix = if algorithm == crate::topology::RoutingAlgorithm::V5 {
-            32
-        } else {
-            18
-        };
+    {
+        let radix = crate::topology::RADIX;
         for (index, member) in membership.members().iter().enumerate() {
             let expected = index != 0
                 && (0..radix)
                     .any(|digit| digit % 1500 == index || (radix * index + digit) % 1500 == 0);
             assert_eq!(
-                explicit.endpoint(&membership, &member.node).is_ok(),
+                network.endpoint(&membership, &member.node).is_ok(),
                 expected,
-                "{algorithm:?} {index}"
+                "{index}"
             );
         }
     }

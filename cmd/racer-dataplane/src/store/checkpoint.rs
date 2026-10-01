@@ -351,6 +351,7 @@ fn publish_bytes(directory: &Path, slot: usize, bytes: &[u8]) -> Result<()> {
 /// Recovery seals open segments and clears freshness. Checkpoints have no fsync
 /// guarantee; record validation and AEAD convert stale payload references to misses.
 pub struct Recovery {
+    #[cfg(test)]
     directory: PathBuf,
     index: Rc<Index>,
     segments: Rc<Segments>,
@@ -376,9 +377,10 @@ impl Recovery {
                 .retain(|m| metadata_available(&m.version.object.cache));
         }
     }
-    pub fn new(directory: PathBuf, index: Rc<Index>, segments: Rc<Segments>) -> Self {
+    pub fn new(_directory: PathBuf, index: Rc<Index>, segments: Rc<Segments>) -> Self {
         Self {
-            directory,
+            #[cfg(test)]
+            directory: _directory,
             index,
             segments,
             geometry: Cell::new(None),
@@ -392,51 +394,12 @@ impl Recovery {
         Ok(())
     }
 
-    pub fn load(&self, alignment: DirectAlignment) -> Operation<'_, Option<CheckpointImage>> {
-        self.load_with_keys(alignment, None)
-    }
-
-    /// Missing keys discard their dependent page mappings. Standalone immutable
-    /// descriptors, including metadata-only objects, are retained.
-    pub fn load_with_keys<'a>(
-        &'a self,
-        alignment: DirectAlignment,
-        available: Option<&'a [KeyId]>,
-    ) -> Operation<'a, Option<CheckpointImage>> {
-        Box::pin(async move {
-            let geometry = self.geometry.get();
-            let mut candidates = candidates(&self.directory, MAX_CHECKPOINT_BYTES)?;
-            Ok(candidates.find_map(|(_, mut image)| {
-                for shard in &mut image.shards {
-                    filter_keys(shard, available);
-                }
-                let valid = image.shards.iter().all(|shard| {
-                    shard.geometry.matches_alignment(alignment)
-                        && geometry.is_none_or(|expected| shard.geometry == expected)
-                }) && image
-                    .shards
-                    .iter()
-                    .find(|shard| shard.worker == self.index.worker())
-                    .is_some_and(|shard| self.index.validate_snapshot(&shard.index).is_ok());
-                valid.then_some(image)
-            }))
-        })
-    }
-
     /// Before admission, install one validated cut into this worker. None resets
     /// its index and allocation table; no slab is scanned or zeroed.
     pub fn install_shard(&self, image: Option<ShardImage>) -> Operation<'_, ()> {
-        self.install_shard_with_keys(image, None)
-    }
-
-    pub fn install_shard_with_keys<'a>(
-        &'a self,
-        image: Option<ShardImage>,
-        available: Option<&'a [KeyId]>,
-    ) -> Operation<'a, ()> {
         Box::pin(async move {
             let geometry = self.geometry.get().ok_or(Error::InvalidConfiguration)?;
-            let mut image = match image {
+            let image = match image {
                 Some(image) => image,
                 None => {
                     let empty = Segments::new(self.index.worker(), geometry.segment_bytes);
@@ -461,7 +424,6 @@ impl Recovery {
             }
             image.validate()?;
             self.segments.validate_restore(&image.segments)?;
-            filter_keys(&mut image, available);
             self.index.validate_snapshot(&image.index)?;
             // Index::restore checks its own standalone metadata capacity before
             // mutation. There is no await between validation and these installs.
@@ -470,16 +432,6 @@ impl Recovery {
             self.segments.restore(image.segments)?;
             Ok(())
         })
-    }
-}
-
-fn filter_keys(shard: &mut ShardImage, available: Option<&[KeyId]>) {
-    if let Some(available) = available {
-        let keys: crate::runtime::collections::HashSet<_> = available.iter().copied().collect();
-        shard
-            .index
-            .entries
-            .retain(|(_, entry)| keys.contains(&entry.key_id));
     }
 }
 

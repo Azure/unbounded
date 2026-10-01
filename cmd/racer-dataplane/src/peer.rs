@@ -128,7 +128,6 @@ use std::{rc::Rc, sync::Arc};
 pub struct PeerNetwork {
     pub local: NodeId,
     published: Arc<crate::control::state::PublishedState>,
-    algorithm: crate::topology::RoutingAlgorithm,
 }
 
 impl PeerNetwork {
@@ -136,26 +135,10 @@ impl PeerNetwork {
         local: NodeId,
         published: Arc<crate::control::state::PublishedState>,
     ) -> Result<Self> {
-        Self::with_algorithm(
-            local,
-            published,
-            crate::topology::RoutingAlgorithm::default(),
-        )
-    }
-
-    pub fn with_algorithm(
-        local: NodeId,
-        published: Arc<crate::control::state::PublishedState>,
-        algorithm: crate::topology::RoutingAlgorithm,
-    ) -> Result<Self> {
         if local.0.is_empty() {
             return Err(Error::InvalidConfiguration);
         }
-        Ok(Self {
-            local,
-            published,
-            algorithm,
-        })
+        Ok(Self { local, published })
     }
 
     pub fn membership(&self, version: MembershipVersion) -> Result<MembershipLease> {
@@ -167,7 +150,7 @@ impl PeerNetwork {
         membership: &MembershipLease,
         node: &NodeId,
     ) -> Result<crate::http::connection::Endpoint> {
-        if !crate::topology::routing::Graph::with_algorithm(membership.clone(), self.algorithm)
+        if !crate::topology::routing::Graph::new(membership.clone())
             .neighbors(&self.local)?
             .contains(node)
         {

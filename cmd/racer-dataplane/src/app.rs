@@ -929,20 +929,15 @@ impl WorkerApplication {
         };
 
         let paths = Rc::new(
-            Paths::with_algorithm(
-                Rc::new(LinkHealth),
-                limits.cached_paths.get(),
-                crate::topology::RoutingAlgorithm::V5,
-            )
-            .with_peer_admission(node.peer_admission.clone()),
+            Paths::new(Rc::new(LinkHealth), limits.cached_paths.get())
+                .with_peer_admission(node.peer_admission.clone()),
         );
         let placement = Rc::new(Placement::with_memory_budget(
             limits.cached_rankings.get() * crate::topology::placement::RANKING_BYTES,
         ));
-        let network = Rc::new(crate::peer::PeerNetwork::with_algorithm(
+        let network = Rc::new(crate::peer::PeerNetwork::new(
             config.node.clone(),
             node.publications.clone(),
-            crate::topology::RoutingAlgorithm::V5,
         )?);
         let wire = Rc::new(crate::peer::protocol::SecurityCodec::new(
             admission.clone(),
