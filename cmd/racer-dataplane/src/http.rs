@@ -20,7 +20,6 @@
 //! Raw heads deliberately do not implement Debug (they can contain credentials).
 pub mod connection;
 pub mod io;
-mod relay;
 
 use crate::error::{Error, Result};
 use zeroize::Zeroize;

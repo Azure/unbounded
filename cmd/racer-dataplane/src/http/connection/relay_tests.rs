@@ -1,3 +1,4 @@
+//! Opaque transit, fallback, cancellation, and ownership-fence scenarios.
 use super::*;
 use crate::{
     http::{Codec, Header, MessageHead, StartLine},
