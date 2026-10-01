@@ -1,6 +1,5 @@
 //! Correlated logical requests with monotonic budgets, attempts, and cancellation.
 pub mod adaptive;
-mod native;
 pub mod protocol;
 pub mod server;
 pub mod subscriptions;

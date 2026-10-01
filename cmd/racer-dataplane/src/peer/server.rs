@@ -268,7 +268,7 @@ impl PeerServer {
                     .ok_or(Error::InvalidRequest)?
                     .max(1),
             )?;
-            let native_control = super::native::detach(&mut received.value)?;
+            let native_control = super::transport::detach(&mut received.value)?;
             let (authentication, length) = WireCodec::decode(received.value, false)?;
             if length != 0 {
                 return Err(Error::InvalidRequest);

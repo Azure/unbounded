@@ -140,7 +140,7 @@ fn offer_fallback(sender_failure: bool) {
             vec![],
         )
         .unwrap();
-    binding.response = native::envelope_digest(&authentication).unwrap();
+    binding.response = envelope_digest(&authentication).unwrap();
     // A well-formed signed remote endpoint cannot manufacture a local provider.
     let mut setup = b"racer-rdma-setup-v1\0".to_vec();
     setup.extend_from_slice(&7u16.to_be_bytes());
@@ -163,7 +163,7 @@ fn offer_fallback(sender_failure: bool) {
         .unwrap();
     let previous = signed_digest(&offer).unwrap();
     let mut offered = WireCodec::encode(&authentication, true, 0).unwrap();
-    native::attach(&mut offered, &offer).unwrap();
+    attach(&mut offered, &offer).unwrap();
     let response = SignedResponse {
         authentication,
         response,
@@ -189,7 +189,7 @@ fn offer_fallback(sender_failure: bool) {
         };
         let sent = receiver.io.send_head(a, initial, &scope).await?;
         let mut received = receiver.io.receive_head(sent.connection, &scope).await?;
-        let offer = native::detach(&mut received.value)?.unwrap();
+        let offer = detach(&mut received.value)?.unwrap();
         let (auth, _) = WireCodec::decode(received.value, true)?;
         let mut original = binding.clone();
         original.response = [0; 32];
@@ -322,7 +322,7 @@ fn offer_fallback(sender_failure: bool) {
         reactor.wait(Duration::from_millis(1)).unwrap();
     };
     assert_eq!(
-        native::envelope_digest(&result.authentication).unwrap(),
+        envelope_digest(&result.authentication).unwrap(),
         binding.response
     );
     match result.response {
@@ -536,7 +536,7 @@ fn native_provider_signed_setup_grant_write_completion_roundtrip() {
         };
         let sent = receiver.io.send_head(a, initial, &scope).await?;
         let mut offered = receiver.io.receive_head(sent.connection, &scope).await?;
-        let control = native::detach(&mut offered.value)?.ok_or(Error::Unavailable)?;
+        let control = detach(&mut offered.value)?.ok_or(Error::Unavailable)?;
         let (auth, length) = WireCodec::decode(offered.value, true)?;
         assert_eq!(length, 0, "provider test requires native offer");
         receiver

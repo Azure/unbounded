@@ -1,8 +1,5 @@
 //! Transport-neutral ciphertext lifecycle, selecting HTTP or authenticated RDMA.
-use super::{
-    native::{self, Binding, Phase, extension},
-    protocol::{PeerResponse, SecurityCodec, SignedRequest, SignedResponse, WireCodec},
-};
+use super::protocol::{PeerResponse, SecurityCodec, SignedRequest, SignedResponse, WireCodec};
 use crate::telemetry::failures::{BodyProgress, Detail, Failure, Stage, timestamp};
 use crate::{
     error::{Error, Operation, Result},
@@ -11,7 +8,7 @@ use crate::{
         pool::{ConnectionLease, HttpPool},
     },
     memory::pool::CiphertextPage,
-    model::{NodeId, ResourceClass},
+    model::{NodeId, ResourceClass, TransferId},
     rdma::RdmaTransfer,
     rdma::{
         permission::{AuthenticatedDescriptor, COMPLETION_HEADER, DESCRIPTOR_HEADER},
@@ -24,14 +21,276 @@ use crate::{
     },
     security::{
         forwarding::ForwardedHead,
-        signing::{SignedHead, VerifiedHead, signed_digest},
+        signing::{Signatures, SignedHead, VerifiedHead, signed_digest},
     },
-    topology::rails::TransportPlan,
+    topology::rails::{RailId, TransportPlan},
 };
-use std::{rc::Rc, time::Duration};
+use crate::{
+    http::{Header, MessageHead, StartLine},
+    security::protocol as p,
+};
+use std::{rc::Rc, sync::Arc, time::Duration};
 
 #[cfg(test)]
+mod native_control_tests;
+#[cfg(test)]
 mod native_exchange_tests;
+
+const HEADER: &str = "racer-payload-control";
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Binding {
+    pub request: [u8; 32],
+    pub response: [u8; 32],
+    pub transfer: TransferId,
+    pub membership: u64,
+    pub deadline: u64,
+    pub rail: RailId,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Phase {
+    Accept,
+    Offer,
+    Setup,
+    Ready,
+    Grant,
+    Complete,
+    Failed,
+    Fallback,
+    Done,
+    Finish,
+}
+impl Phase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Accept => "accept",
+            Self::Offer => "offer",
+            Self::Setup => "setup",
+            Self::Ready => "ready",
+            Self::Grant => "grant",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+            Self::Fallback => "fallback",
+            Self::Done => "done",
+            Self::Finish => "finish",
+        }
+    }
+    fn response(self) -> bool {
+        matches!(
+            self,
+            Self::Offer | Self::Ready | Self::Complete | Self::Failed | Self::Finish
+        )
+    }
+    fn fields(self) -> &'static [&'static str] {
+        match self {
+            Self::Offer => &["racer-rdma-setup"],
+            Self::Setup | Self::Ready => &["racer-rdma-setup", "racer-rdma-setup-binding"],
+            Self::Grant => &["racer-rdma-descriptor"],
+            Self::Complete => &["racer-rdma-completion"],
+            _ => &[],
+        }
+    }
+}
+impl Binding {
+    pub fn request(
+        auth: &ForwardedHead,
+        membership: u64,
+        scope: &RequestScope,
+        rail: RailId,
+    ) -> Result<Self> {
+        let mut transfer = [0; 16];
+        crate::runtime::environment::fill_random(&mut transfer).map_err(|_| Error::Unavailable)?;
+        Ok(Self {
+            request: envelope_digest(auth)?,
+            response: [0; 32],
+            transfer: TransferId(transfer),
+            membership,
+            deadline: p::encode_deadline(scope.deadline)?,
+            rail,
+        })
+    }
+    fn head(
+        &self,
+        phase: Phase,
+        previous: &[u8; 32],
+        length: usize,
+        extensions: Vec<Header>,
+    ) -> Result<MessageHead> {
+        if self.membership == 0
+            || self.transfer.0 == [0; 16]
+            || extensions.len() != phase.fields().len()
+            || extensions
+                .iter()
+                .zip(phase.fields())
+                .any(|(h, n)| h.name != *n)
+        {
+            return Err(Error::InvalidRequest);
+        }
+        for h in &extensions {
+            if h.value.len() > 256 {
+                return Err(Error::InvalidRequest);
+            }
+            p::decode_binary(&h.value)?;
+        }
+        if length > crate::model::PAGE_BYTES as usize + 16
+            || (length != 0 && phase != Phase::Finish)
+        {
+            return Err(Error::InvalidRequest);
+        }
+        let mut h = MessageHead {
+            start: if phase.response() {
+                StartLine::Response { status: 200 }
+            } else {
+                StartLine::Request {
+                    method: "POST".into(),
+                    target: "/racer/peer/v1/payload".into(),
+                }
+            },
+            headers: vec![],
+        };
+        p::push(&mut h, "content-length", length);
+        p::push(&mut h, "racer-kind", format!("payload-v1-{}", phase.name()));
+        for (n, b) in [
+            ("racer-payload-request", self.request.as_slice()),
+            ("racer-payload-response", self.response.as_slice()),
+            ("racer-payload-transfer", self.transfer.0.as_slice()),
+            ("racer-payload-previous", previous.as_slice()),
+        ] {
+            p::push_binary(&mut h, n, b);
+        }
+        p::push(&mut h, "racer-payload-membership", self.membership);
+        p::push(&mut h, "racer-payload-deadline", self.deadline);
+        p::push(&mut h, "racer-payload-rail", self.rail.0);
+        h.headers.extend(extensions);
+        Ok(h)
+    }
+    pub fn sign(
+        &self,
+        signatures: &Signatures,
+        to: &NodeId,
+        phase: Phase,
+        previous: &[u8; 32],
+        length: usize,
+        extensions: Vec<Header>,
+    ) -> Result<SignedHead> {
+        let mut h = self.head(phase, previous, length, extensions)?;
+        p::push(&mut h, "racer-receiver", &to.0);
+        signatures.sign(h)
+    }
+    pub fn verify(
+        &self,
+        signatures: &Signatures,
+        from: &NodeId,
+        signed: SignedHead,
+        allowed: &[Phase],
+        previous: &[u8; 32],
+        length: usize,
+        scope: &RequestScope,
+    ) -> Result<(VerifiedHead, Phase)> {
+        scope.check()?;
+        if p::decode_deadline(self.deadline)?.0 <= crate::runtime::environment::now() {
+            return Err(Error::DeadlineExceeded);
+        }
+        let kind = p::field(&signed.head, "racer-kind")?;
+        let phase = *allowed
+            .iter()
+            .find(|phase| kind == format!("payload-v1-{}", phase.name()))
+            .ok_or(Error::Unauthorized)?;
+        let extensions = phase
+            .fields()
+            .iter()
+            .map(|name| {
+                Ok(Header {
+                    name: (*name).into(),
+                    value: signed
+                        .head
+                        .unique(name)?
+                        .ok_or(Error::Unauthorized)?
+                        .to_vec(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        p::agrees(
+            &signed.head,
+            &self.head(phase, previous, length, extensions)?,
+            false,
+        )?;
+        if crate::security::signing::node_field(&signed.head, "racer-signer")? != *from {
+            return Err(Error::Unauthorized);
+        }
+        Ok((signatures.verify_proof(signed)?, phase))
+    }
+    pub fn parse_accept(signed: &SignedHead) -> Result<Self> {
+        fn a<const N: usize>(h: &MessageHead, n: &str) -> Result<[u8; N]> {
+            p::decode_binary(p::field(h, n)?.as_bytes())?
+                .try_into()
+                .map_err(|_| Error::InvalidRequest)
+        }
+        let h = &signed.head;
+        Ok(Self {
+            request: a(h, "racer-payload-request")?,
+            response: a(h, "racer-payload-response")?,
+            transfer: TransferId(a(h, "racer-payload-transfer")?),
+            membership: p::number(h, "racer-payload-membership")?,
+            deadline: p::number(h, "racer-payload-deadline")?,
+            rail: RailId(
+                p::number(h, "racer-payload-rail")?
+                    .try_into()
+                    .map_err(|_| Error::InvalidRequest)?,
+            ),
+        })
+    }
+}
+/// Bind all original/hop signatures using security's canonical digest, never bodies.
+fn envelope_digest(auth: &ForwardedHead) -> Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"racer-peer-v1/payload-envelope\0");
+    hash.update((auth.hops.len() as u64).to_be_bytes());
+    hash.update(signed_digest(&auth.original)?);
+    for h in &auth.hops {
+        hash.update(signed_digest(h)?);
+    }
+    Ok(hash.finalize().into())
+}
+fn attach(head: &mut MessageHead, signed: &SignedHead) -> Result<()> {
+    head.headers.push(Header {
+        name: HEADER.into(),
+        value: super::protocol::encode_signed(signed)?,
+    });
+    Ok(())
+}
+pub(super) fn detach(head: &mut MessageHead) -> Result<Option<SignedHead>> {
+    let value = head.unique(HEADER)?.map(|v| v.to_vec());
+    head.headers
+        .retain(|h| !h.name.eq_ignore_ascii_case(HEADER));
+    value
+        .map(|v| super::protocol::decode_signed(&v))
+        .transpose()
+}
+fn frame(signed: SignedHead) -> Result<MessageHead> {
+    let response = matches!(signed.head.start, StartLine::Response { .. });
+    WireCodec::encode(
+        &ForwardedHead {
+            original: Arc::new(signed),
+            hops: vec![],
+        },
+        response,
+        0,
+    )
+}
+fn unframe(head: MessageHead, response: bool) -> Result<SignedHead> {
+    let (auth, len) = WireCodec::decode(head, response)?;
+    if len != 0 || !auth.hops.is_empty() {
+        return Err(Error::InvalidRequest);
+    }
+    Arc::try_unwrap(auth.original).map_err(|_| Error::InvalidRequest)
+}
+fn extension(name: &str, value: Vec<u8>) -> Header {
+    Header {
+        name: name.into(),
+        value,
+    }
+}
 
 fn recoverable(error: Error) -> bool {
     matches!(error, Error::Unavailable | Error::Io | Error::Overloaded)
@@ -110,7 +369,7 @@ impl Transfers {
             Err(e) if recoverable(e) => return Ok((connection, false)),
             Err(e) => return Err(e),
         };
-        binding.response = native::envelope_digest(&response.authentication)?;
+        binding.response = envelope_digest(&response.authentication)?;
         let local_setup = prepared.setup().header_value();
         let offer = binding.sign(
             signatures,
@@ -122,7 +381,7 @@ impl Transfers {
         )?;
         let mut previous = signed_digest(&offer)?;
         let mut head = WireCodec::encode(&response.authentication, true, 0)?;
-        native::attach(&mut head, &offer)?;
+        attach(&mut head, &offer)?;
         connection = self.io.send_head(connection, head, scope).await?.connection;
         connection.next_round()?;
         let (conn, setup) = self.read_control(connection, false, scope).await?;
@@ -297,7 +556,7 @@ impl Transfers {
             vec![],
         )?;
         let mut head = WireCodec::encode(&response.authentication, true, ciphertext.bytes().len())?;
-        native::attach(&mut head, &finish)?;
+        attach(&mut head, &finish)?;
         let connection = self.io.send_head(connection, head, scope).await?.connection;
         let written = self
             .io
@@ -347,7 +606,7 @@ impl Transfers {
             return Ok(None);
         };
         let binding = Binding::parse_accept(&control)?;
-        if binding.request != native::envelope_digest(&request.authentication)?
+        if binding.request != envelope_digest(&request.authentication)?
             || binding.response != [0; 32]
             || binding.membership != request.request.route.membership.0
             || binding.deadline
@@ -383,7 +642,7 @@ impl Transfers {
     ) -> Result<ConnectionLease> {
         Ok(self
             .io
-            .send_head(connection, native::frame(signed)?, scope)
+            .send_head(connection, frame(signed)?, scope)
             .await?
             .connection)
     }
@@ -394,10 +653,7 @@ impl Transfers {
         scope: &RequestScope,
     ) -> Result<(ConnectionLease, SignedHead)> {
         let received = self.io.receive_head(connection, scope).await?;
-        Ok((
-            received.connection,
-            native::unframe(received.value, response)?,
-        ))
+        Ok((received.connection, unframe(received.value, response)?))
     }
     async fn read_ciphertext(
         &self,
@@ -437,7 +693,7 @@ impl Transfers {
         let (signatures, sessions) = self.native.as_ref().ok_or(Error::InvalidConfiguration)?;
         let rdma = self.rdma.as_ref().ok_or(Error::Unavailable)?;
         let (admission, _) = &self.wire;
-        binding.response = native::envelope_digest(&authentication)?;
+        binding.response = envelope_digest(&authentication)?;
         let (offer, _) = binding.verify(
             signatures,
             &peer,
@@ -660,9 +916,9 @@ impl Transfers {
         let previous = signed_digest(&fallback)?;
         let connection = self.write_control(connection, fallback, scope).await?;
         let mut received = self.io.receive_head(connection, scope).await?;
-        let control = native::detach(&mut received.value)?.ok_or(Error::Unauthorized)?;
+        let control = detach(&mut received.value)?.ok_or(Error::Unauthorized)?;
         let (returned, length) = WireCodec::decode(received.value, true)?;
-        if native::envelope_digest(&returned)? != binding.response {
+        if envelope_digest(&returned)? != binding.response {
             return Err(Error::Unauthorized);
         }
         binding.verify(
@@ -1056,7 +1312,7 @@ impl Transfers {
             let native = self.accept_native(&request, plan, scope)?;
             scope.candidate_progress()?;
             if let Some((_, accept, _)) = &native {
-                super::native::attach(&mut head, accept)?;
+                attach(&mut head, accept)?;
             }
             let sent = observer.result(
                 Stage::PeerHead,
@@ -1068,7 +1324,7 @@ impl Transfers {
                 scope,
                 self.io.receive_head(sent.connection, scope).await,
             )?;
-            let control = super::native::detach(&mut received.value)?;
+            let control = detach(&mut received.value)?;
             let relay_context = if relay.is_some() {
                 let size = received.value.headers.iter().try_fold(0usize, |n, h| {
                     n.checked_add(h.value.len() + h.name.len())
