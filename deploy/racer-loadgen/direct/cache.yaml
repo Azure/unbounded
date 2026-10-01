@@ -1,0 +1,5 @@
+apiVersion: racer.unbounded-cloud.io/v1alpha1
+kind: ClusterCache
+metadata:
+  name: racer-loadgen
+# ClusterCache is cluster-scoped and has no spec; storage is configured on Racer.
