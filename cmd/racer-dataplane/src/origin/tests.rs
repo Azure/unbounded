@@ -213,26 +213,13 @@ fn socket_root_is_lexical_and_preserves_canonical_publications() {
 
 #[test]
 fn real_uds_root_remapping_keeps_public_authority_and_http_validation() {
+    use crate::test_support::NoPeers;
     use crate::{
-        peer::{
-            PeerClient,
-            protocol::{FetchMode, Operation as PeerOperation, PeerRequest, VerifiedResponse},
-        },
+        peer::protocol::{FetchMode, Operation as PeerOperation},
         read::candidates::{CandidatePolicy, CandidateResolution},
         topology::placement::Placement,
     };
     use std::os::fd::AsRawFd;
-    struct NoPeers;
-    impl PeerClient for NoPeers {
-        fn request<'a>(
-            &'a self,
-            _: PeerRequest,
-            _: crate::topology::membership::MembershipLease,
-            _: &'a RequestScope,
-        ) -> Operation<'a, VerifiedResponse> {
-            panic!("rank-zero origin candidate must not probe peers")
-        }
-    }
     struct Directory(PathBuf);
     impl Drop for Directory {
         fn drop(&mut self) {
@@ -896,29 +883,16 @@ fn real_uds_errors_preserve_credential_and_version_contracts() {
 
 #[test]
 fn public_operations_reject_wrong_authority_before_io() {
+    use crate::test_support::NoPeers;
     use crate::{
         model::{MembershipVersion, NodeId},
-        peer::{
-            PeerClient,
-            protocol::{FetchMode, Operation as PeerOperation, PeerRequest, VerifiedResponse},
-        },
+        peer::protocol::{FetchMode, Operation as PeerOperation},
         read::candidates::{CandidatePolicy, CandidateResolution},
         topology::{
             membership::{Member, Membership},
             placement::Placement,
         },
     };
-    struct NoPeers;
-    impl PeerClient for NoPeers {
-        fn request<'a>(
-            &'a self,
-            _: PeerRequest,
-            _: crate::topology::membership::MembershipLease,
-            _: &'a RequestScope,
-        ) -> Operation<'a, VerifiedResponse> {
-            panic!("rank zero must not probe peers")
-        }
-    }
     let node = NodeId("node".into());
     let membership = Arc::new(
         Membership::validate(

@@ -32,17 +32,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-struct NoPeer;
-impl PeerClient for NoPeer {
-    fn request<'a>(
-        &'a self,
-        _: crate::peer::protocol::PeerRequest,
-        _: crate::topology::membership::MembershipLease,
-        _: &'a RequestScope,
-    ) -> Operation<'a, crate::peer::protocol::VerifiedResponse> {
-        Box::pin(async { panic!("single-node fill must never contact a peer") })
-    }
-}
+use crate::test_support::NoPeers as NoPeer;
 struct TestOrigin {
     buffers: Rc<BufferPool>,
     calls: Cell<usize>,
@@ -346,6 +336,66 @@ fn drive<T>(
         }
     }
     panic!("bounded test executor did not complete");
+}
+
+fn adapter_client(
+    f: &Fixture,
+    adapter: &crate::test_support::origin::AdapterOrigin,
+) -> Rc<crate::origin::OriginClient> {
+    use crate::control::{
+        snapshot::{PublishedState, SnapshotStore},
+        wire::{Publication, PublicationSequence, SCHEMA_VERSION},
+    };
+    let snapshots = Rc::new(SnapshotStore::new(
+        f.keys.cluster().clone(),
+        Arc::new(PublishedState::default()),
+        2,
+    ));
+    let (client_socket, origin_socket) =
+        crate::control::caches::canonical_socket_paths("fixture").unwrap();
+    snapshots
+        .publish(Publication {
+            schema_version: SCHEMA_VERSION,
+            cluster: f.keys.cluster().clone(),
+            sequence: PublicationSequence(1),
+            membership_version: f.membership.version,
+            members: f.membership.members().to_vec(),
+            caches: vec![crate::control::caches::CacheDefinition {
+                id: f.context.object.cache.clone(),
+                name: "fixture".into(),
+                client_socket,
+                origin_socket,
+            }],
+        })
+        .unwrap();
+    adapter.client(
+        snapshots,
+        f.fill.dependencies.admission.clone(),
+        f.reactor.clone(),
+        f.fill.dependencies.buffers.clone(),
+    )
+}
+
+fn drive_io<T>(
+    future: impl Future<Output = T>,
+    reactor: &Reactor,
+    engine: &mut PageCryptoEngine,
+    crypto: &CryptoClient,
+) -> T {
+    let mut future = std::pin::pin!(future);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        super::super::drivers::poll(&mut cx, 64);
+        engine.poll_budgeted(64).unwrap();
+        crypto.poll_budgeted(64).unwrap();
+        if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "read fixture made no progress");
+        reactor.poll_budgeted(128).unwrap();
+        reactor.wait(Duration::from_millis(1)).unwrap();
+    }
 }
 
 #[test]

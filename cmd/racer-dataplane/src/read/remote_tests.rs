@@ -138,18 +138,7 @@ fn remote_origin_absence_preserves_fresh_404_pinned_412_and_later_cached_version
 fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
     let queue = Rc::new(crate::read::drivers::DriverQueue::default());
     let _owner = queue.enter();
-    use crate::peer::PeerClient;
-    struct NoPeers;
-    impl PeerClient for NoPeers {
-        fn request<'a>(
-            &'a self,
-            _: protocol::PeerRequest,
-            _: crate::topology::membership::MembershipLease,
-            _: &'a RequestScope,
-        ) -> Operation<'a, protocol::VerifiedResponse> {
-            Box::pin(async { panic!("single candidate must not probe peers") })
-        }
-    }
+    use crate::test_support::NoPeers;
     let ids = identities(&[node(0), node(1)]);
     let membership = Arc::new(
         Membership::validate(

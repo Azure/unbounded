@@ -8,95 +8,17 @@ pub(super) struct GatedMetadataOrigin {
     pub(super) calls: Cell<usize>,
 }
 
-struct BootstrapOrigin {
-    buffers: Rc<BufferPool>,
-    metadata: ObjectMetadata,
-    calls: Cell<usize>,
-    reject: Cell<bool>,
-    version: Cell<u8>,
-}
-impl Origin for BootstrapOrigin {
-    fn page_reserved<'a>(
-        &'a self,
-        _: &'a OriginAuthority,
-        _: &'a OriginContext,
-        _: &'a PageId,
-        _: Reservation,
-        _: &'a RequestScope,
-    ) -> Operation<'a, OriginPage> {
-        Box::pin(async { panic!("bootstrap must not refetch page") })
-    }
-    fn metadata<'a>(
-        &'a self,
-        _: &'a OriginAuthority,
-        _: &'a OriginContext,
-        _: crate::model::MetadataSelector,
-        _: &'a RequestScope,
-    ) -> Operation<'a, MetadataReply> {
-        Box::pin(async { panic!("bootstrap must not HEAD") })
-    }
-    fn page<'a>(
-        &'a self,
-        _: &'a OriginAuthority,
-        _: &'a OriginContext,
-        _: &'a PageId,
-        _: &'a RequestScope,
-    ) -> Operation<'a, OriginPage> {
-        Box::pin(async { panic!("bootstrap must not refetch page") })
-    }
-    fn bootstrap_reserved<'a>(
-        &'a self,
-        _: &'a OriginAuthority,
-        _: &'a OriginContext,
-        reservation: Reservation,
-        _: &'a RequestScope,
-    ) -> Operation<'a, MetadataReply> {
-        Box::pin(async move {
-            self.calls.set(self.calls.get() + 1);
-            let mut yielded = false;
-            std::future::poll_fn(|cx| {
-                if yielded {
-                    Poll::Ready(())
-                } else {
-                    yielded = true;
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
-            })
-            .await;
-            if self.reject.replace(false) {
-                return Err(Error::OriginForbidden);
-            }
-            let version = self.version.get();
-            let mut metadata = self.metadata.clone();
-            metadata.version.etag = StrongEtag::test_value(&format!("v{version}"));
-            metadata.expires_at = ExpiresAt(std::time::UNIX_EPOCH);
-            let mut plaintext = self.buffers.plaintext(reservation, 3)?;
-            plaintext.bytes_mut()?.fill(version);
-            Ok(MetadataReply {
-                metadata: metadata.clone(),
-                page_zero: Some(OriginPage {
-                    metadata,
-                    plaintext,
-                }),
-            })
-        })
-    }
-}
-
 #[test]
 fn bootstrap_rejection_re_elects_and_version_changes_never_mix_pages() {
     let queue = Rc::new(drivers::DriverQueue::default());
     let _owner = queue.enter();
     use crate::read::metadata::{MetadataDependencies, MetadataService};
     let mut f = fixture();
-    let origin = Rc::new(BootstrapOrigin {
-        buffers: f.fill.dependencies.buffers.clone(),
-        metadata: f.origin.metadata.clone(),
-        calls: Cell::new(0),
-        reject: Cell::new(true),
-        version: Cell::new(1),
-    });
+    use crate::test_support::origin::{AdapterOrigin, RequestKind};
+    let adapter = AdapterOrigin::new("fixture", f.origin.metadata.clone());
+    adapter.set_body(vec![1; 3]);
+    adapter.reject_next(RequestKind::InitialGet, 403);
+    let origin = adapter_client(&f, &adapter);
     let service = MetadataService::new(
         f.fill.dependencies.candidates.clone(),
         origin.clone(),
@@ -114,7 +36,7 @@ fn bootstrap_rejection_re_elects_and_version_changes_never_mix_pages() {
         metadata: None,
         authorization: None,
     };
-    let (a, b) = drive(
+    let (a, b) = drive_io(
         async {
             let mut first_budget = AcquisitionBudget::new(f.scope.deadline.0, 32, 96);
             let mut second_budget = AcquisitionBudget::new(f.scope.deadline.0, 32, 96);
@@ -133,6 +55,7 @@ fn bootstrap_rejection_re_elects_and_version_changes_never_mix_pages() {
                 )
             )
         },
+        &f.reactor,
         &mut f.engine,
         &f.crypto,
     );
@@ -153,16 +76,20 @@ fn bootstrap_rejection_re_elects_and_version_changes_never_mix_pages() {
         .unwrap()
         .unwrap();
     assert_eq!(first_bytes.plaintext.bytes(), &[1; 3]);
-    assert_eq!(origin.calls.get(), 2);
-    origin.version.set(2);
+    assert_eq!(adapter.count(RequestKind::InitialGet), 2);
+    let mut metadata = f.origin.metadata.clone();
+    metadata.version.etag = StrongEtag::test_value("v2");
+    adapter.set_version(metadata);
+    adapter.set_body(vec![2; 3]);
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 32, 96);
-    let result = drive(
+    let result = drive_io(
         service.bootstrap_peer(
             f.membership.clone(),
             &second_context,
             &second_scope,
             &mut budget,
         ),
+        &f.reactor,
         &mut f.engine,
         &f.crypto,
     )
@@ -186,7 +113,21 @@ fn bootstrap_rejection_re_elects_and_version_changes_never_mix_pages() {
     assert_eq!(second_metadata.version.etag, StrongEtag::test_value("v2"));
     assert_eq!(first_bytes.plaintext.bytes(), &[1; 3]);
     assert_eq!(first_metadata.version.etag, StrongEtag::test_value("v1"));
-    assert_eq!(origin.calls.get(), 3, "rejection was not negative-cached");
+    assert_eq!(
+        adapter.count(RequestKind::InitialGet),
+        3,
+        "rejection was not negative-cached"
+    );
+    assert_eq!(
+        adapter.count(RequestKind::Head),
+        0,
+        "bootstrap must not HEAD"
+    );
+    assert_eq!(
+        adapter.count(RequestKind::PinnedGet),
+        0,
+        "bootstrap must not refetch page"
+    );
 }
 impl Origin for GatedMetadataOrigin {
     fn bootstrap_reserved<'a>(
