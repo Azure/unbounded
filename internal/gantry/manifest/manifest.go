@@ -42,47 +42,6 @@ type descriptor struct {
 	URLs      []string `json:"urls"`
 }
 
-// ChildDigests parses body as an OCI / Docker schema-2 image manifest
-// and returns the digests of every content blob the manifest
-// references - its config blob plus every layer descriptor. The
-// returned slice preserves source order: config first, then layers
-// top-to-bottom (which is also the order containerd will request
-// them).
-//
-// When body is an image index (manifest list) the function returns
-// (nil, nil): no prefetch can happen until containerd requests the
-// architecture-specific manifest.
-//
-// Foreign-layer descriptors (those with a non-empty `urls` array) are
-// skipped: they point at non-OCI hosts (Microsoft base layers) and
-// MUST NOT be fetched through Gantry.
-//
-// The function does not error on individual malformed digest strings
-// inside the manifest; those entries are silently skipped. A parse
-// failure on the manifest envelope itself is returned as an error.
-//
-// Prefer TypedChildren over ChildDigests for new callers that need
-// the per-digest kind (image-config blob vs layer blob) - e.g. so
-// the per-kind metric label survives end-to-end through the prefetch
-// fan-out into please_pull and StartLocalPull batches.
-func ChildDigests(body []byte) ([]digest.Digest, error) {
-	typed, err := TypedChildren(body)
-	if err != nil {
-		return nil, err
-	}
-
-	if typed == nil {
-		return nil, nil
-	}
-
-	out := make([]digest.Digest, 0, len(typed))
-	for _, c := range typed {
-		out = append(out, c.Digest)
-	}
-
-	return out, nil
-}
-
 // TypedChild pairs a child digest with the OCI URL-family kind the
 // puller MUST target. Kind is one of ifaces.KindConfig (the manifest's
 // image-config blob, served from /v2/<repo>/blobs/<digest> per the
@@ -103,11 +62,10 @@ type TypedChild struct {
 	Kind   ifaces.OriginRefKind
 }
 
-// TypedChildren is the kind-preserving cousin of ChildDigests. Source
-// order is the same: config first, then layers top-to-bottom.
-// Foreign-layer descriptors (non-empty `urls`) and image indexes
-// (.manifests with no .layers) are handled exactly as in
-// ChildDigests; only the return type changes. The config digest is
+// TypedChildren returns config first, then layers top-to-bottom.
+// Foreign-layer descriptors (non-empty `urls`) are skipped; image indexes
+// (.manifests with no .layers) return no children. Invalid child digests are
+// skipped, but malformed JSON returns an error. The config digest is
 // tagged KindConfig; every layer is tagged KindBlob (KindLayer is
 // intentionally NOT introduced - the OCI URL family is /blobs/ for
 // both and downstream pullers do not need to distinguish, only the
@@ -117,7 +75,7 @@ func TypedChildren(body []byte) ([]TypedChild, error) {
 	if err := json.Unmarshal(body, &m); err != nil {
 		return nil, fmt.Errorf("manifest: parse: %w", err)
 	}
-	// Image index detection (see ChildDigests): index has .manifests,
+	// Image index detection: index has .manifests,
 	// image manifest has .layers. If both happen to be populated,
 	// prefer image-manifest interpretation (defensive against weird
 	// hand-crafted bodies).
