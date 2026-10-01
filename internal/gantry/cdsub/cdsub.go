@@ -18,9 +18,8 @@
 // advertiser. The advertiser owns the DHT announced set, verifies
 // local serveability, and performs best-effort Withdraw.
 //
-// - When no notifier is supplied, cdsub preserves the older direct
-// dht.Provide path for tests and legacy experiments. Delete events
-// remain a no-op in that compatibility mode.
+// - A notifier is required. cdsub never bypasses the advertiser to publish
+// content whose local serveability has not been verified.
 //
 // - Exponential-backoff reconnect with the cap (max 30 s). On
 // every successful reconnect the loop calls ImageSource.List(ctx)
@@ -37,7 +36,6 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
-	"github.com/Azure/unbounded/internal/gantry/ifaces"
 )
 
 // ImageEventKind discriminates the three event types cdsub cares about.
@@ -79,11 +77,9 @@ type ImageSource interface {
 // Subscriber walks the announce loop: List -> Subscribe -> reconnect on error.
 type Subscriber struct {
 	src    ImageSource
-	dht    ifaces.DHT
 	notify func(ctx context.Context, d digest.Digest, present bool)
 	logger *slog.Logger
 
-	provideTimeout time.Duration
 	backoffInitial time.Duration
 	backoffMax     time.Duration
 
@@ -94,10 +90,9 @@ type Subscriber struct {
 }
 
 type metricsHooks struct {
-	onAnnounce      func()
-	onAnnounceError func()
-	onReconcile     func(count int)
-	onReconnect     func()
+	onAnnounce  func()
+	onReconcile func(count int)
+	onReconnect func()
 }
 
 // Option configures a Subscriber.
@@ -108,15 +103,6 @@ func WithLogger(l *slog.Logger) Option {
 	return func(s *Subscriber) {
 		if l != nil {
 			s.logger = l.With(slog.String("subsystem", "cdsub"))
-		}
-	}
-}
-
-// WithProvideTimeout caps per-Provide RPC budget.
-func WithProvideTimeout(d time.Duration) Option {
-	return func(s *Subscriber) {
-		if d > 0 {
-			s.provideTimeout = d
 		}
 	}
 }
@@ -135,18 +121,17 @@ func WithBackoff(initial, maxBackoff time.Duration) Option {
 }
 
 // WithMetrics registers metric callbacks. Any callback may be nil.
-func WithMetrics(onAnnounce, onAnnounceError func(), onReconcile func(int), onReconnect func()) Option {
+func WithMetrics(onAnnounce func(), onReconcile func(int), onReconnect func()) Option {
 	return func(s *Subscriber) {
 		s.metrics.onAnnounce = onAnnounce
-		s.metrics.onAnnounceError = onAnnounceError
 		s.metrics.onReconcile = onReconcile
 		s.metrics.onReconnect = onReconnect
 	}
 }
 
 // WithNotifier routes digest presence changes to a central owner such as
-// internal/advertise.Advertiser. When set, cdsub does not call DHT.Provide
-// directly. present=true corresponds to create/update/list observations;
+// internal/advertise.Advertiser. Required before Run.
+// present=true corresponds to create/update/list observations;
 // present=false corresponds to delete observations.
 func WithNotifier(fn func(ctx context.Context, d digest.Digest, present bool)) Option {
 	return func(s *Subscriber) {
@@ -155,13 +140,10 @@ func WithNotifier(fn func(ctx context.Context, d digest.Digest, present bool)) O
 }
 
 // New builds a Subscriber. Run drives the loop until ctx is canceled.
-// dht may be nil when WithNotifier is supplied.
-func New(src ImageSource, dht ifaces.DHT, opts ...Option) *Subscriber {
+func New(src ImageSource, opts ...Option) *Subscriber {
 	s := &Subscriber{
 		src:            src,
-		dht:            dht,
 		logger:         slog.Default().With(slog.String("subsystem", "cdsub")),
-		provideTimeout: 30 * time.Second,
 		backoffInitial: time.Second,
 		backoffMax:     30 * time.Second,
 		closed:         make(chan struct{}),
@@ -180,6 +162,10 @@ func New(src ImageSource, dht ifaces.DHT, opts ...Option) *Subscriber {
 // 3. On Subscribe error, channel close, or any non-context error,
 // sleep with jittered exponential backoff and retry.
 func (s *Subscriber) Run(ctx context.Context) error {
+	if s.notify == nil {
+		return errors.New("cdsub: notifier required")
+	}
+
 	backoff := s.backoffInitial
 
 	for {
@@ -255,8 +241,8 @@ func (s *Subscriber) runOnce(ctx context.Context) error {
 }
 
 // reconcile is called once per successful (re)connect. It announces every
-// digest the local containerd currently has via the configured notifier
-// or compatibility DHT provider path, then bumps the reconcile metric.
+// digest the local containerd currently has via the required notifier,
+// then bumps the reconcile metric.
 func (s *Subscriber) reconcile(ctx context.Context, events []ImageEvent) {
 	count := 0
 
@@ -289,54 +275,7 @@ func (s *Subscriber) handle(ctx context.Context, ev ImageEvent) {
 }
 
 func (s *Subscriber) announce(ctx context.Context, d digest.Digest, present bool) bool {
-	if s.notify != nil {
-		s.notify(ctx, d, present)
-
-		if s.metrics.onAnnounce != nil {
-			s.metrics.onAnnounce()
-		}
-
-		return true
-	}
-
-	if present {
-		return s.provide(ctx, d)
-	}
-
-	s.logger.Debug("cdsub: image deleted; no notifier wired, relying on DHT TTL expiry",
-		slog.String("digest", d.String()),
-	)
-
-	return false
-}
-
-// provide is the single-digest announce path. Returns true on success.
-func (s *Subscriber) provide(ctx context.Context, d digest.Digest) bool {
-	if s.dht == nil {
-		if s.metrics.onAnnounceError != nil {
-			s.metrics.onAnnounceError()
-		}
-
-		s.logger.Debug("cdsub: no DHT provider wired", slog.String("digest", d.String()))
-
-		return false
-	}
-
-	pctx, cancel := context.WithTimeout(ctx, s.provideTimeout)
-	defer cancel()
-
-	if err := s.dht.Provide(pctx, d); err != nil {
-		if s.metrics.onAnnounceError != nil {
-			s.metrics.onAnnounceError()
-		}
-
-		s.logger.Debug("cdsub: provide failed",
-			slog.String("digest", d.String()),
-			slog.Any("err", err),
-		)
-
-		return false
-	}
+	s.notify(ctx, d, present)
 
 	if s.metrics.onAnnounce != nil {
 		s.metrics.onAnnounce()

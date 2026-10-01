@@ -675,13 +675,12 @@ func runAgent(args []string) error {
 	// directly in containerd mode; every event is routed through the
 	// advertiser so one component owns the announced set and delete
 	// events can trigger best-effort Withdraw.
-	cdSub := cdsub.New(cdsubSrc, nil,
+	cdSub := cdsub.New(cdsubSrc,
 		cdsub.WithLogger(logger),
 		cdsub.WithNotifier(func(ctx context.Context, d digest.Digest, present bool) {
 			adv.Notify(ctx, d, present)
 		}),
 		cdsub.WithMetrics(
-			nil,
 			nil,
 			func(int) { p2.dhtReconcile.Inc() },
 			func() { p2.cdsubReconnect.Inc() },

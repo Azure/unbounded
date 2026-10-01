@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/Azure/unbounded/internal/gantry/digest"
-	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
 )
 
 // fakeSource is a controllable ImageSource for tests.
@@ -69,19 +68,19 @@ func TestRun_ReconcilesAndAnnouncesEvents(t *testing.T) {
 		},
 	}
 
-	dht := fakes.NewDHT()
-
 	var (
 		announceCount  int32
 		reconcileCount int32
 	)
 
-	sub := New(src, dht,
+	sub := New(src, WithNotifier(func(_ context.Context, d digest.Digest, present bool) {
+		if !present || (d != d1 && d != d2 && d != d3) {
+			t.Errorf("unexpected notification: %v present=%v", d, present)
+		}
+	}),
 		WithBackoff(50*time.Millisecond, 100*time.Millisecond),
-		WithProvideTimeout(time.Second),
 		WithMetrics(
 			func() { atomic.AddInt32(&announceCount, 1) },
-			nil,
 			func(n int) { atomic.StoreInt32(&reconcileCount, int32(n)) },
 			nil,
 		),
@@ -140,13 +139,11 @@ func TestRun_BackoffOnSubscribeError(t *testing.T) {
 		return successCh, nil
 	}
 
-	dht := fakes.NewDHT()
-
 	var reconnects int32
 
-	sub := New(src, dht,
+	sub := New(src, WithNotifier(func(context.Context, digest.Digest, bool) {}),
 		WithBackoff(10*time.Millisecond, 100*time.Millisecond),
-		WithMetrics(nil, nil, nil, func() { atomic.AddInt32(&reconnects, 1) }),
+		WithMetrics(nil, nil, func() { atomic.AddInt32(&reconnects, 1) }),
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -182,7 +179,7 @@ func TestRun_BackoffOnSubscribeError(t *testing.T) {
 	}
 }
 
-func TestRun_DeleteEventIsNoOp(t *testing.T) {
+func TestRun_DeleteEventNotifiesAbsence(t *testing.T) {
 	d := mkDigest("doomed")
 
 	ch := make(chan ImageEvent, 1)
@@ -194,13 +191,16 @@ func TestRun_DeleteEventIsNoOp(t *testing.T) {
 			return ch, nil
 		},
 	}
-	dht := fakes.NewDHT()
 
 	var announceCount int32
 
-	sub := New(src, dht,
+	sub := New(src, WithNotifier(func(_ context.Context, got digest.Digest, present bool) {
+		if got != d || present {
+			t.Errorf("delete: %v present=%v", got, present)
+		}
+	}),
 		WithBackoff(50*time.Millisecond, 100*time.Millisecond),
-		WithMetrics(func() { atomic.AddInt32(&announceCount, 1) }, nil, nil, nil),
+		WithMetrics(func() { atomic.AddInt32(&announceCount, 1) }, nil, nil),
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
@@ -208,8 +208,8 @@ func TestRun_DeleteEventIsNoOp(t *testing.T) {
 
 	_ = sub.Run(ctx) //nolint:errcheck // best-effort
 
-	if got := atomic.LoadInt32(&announceCount); got != 0 {
-		t.Errorf("announce count = %d, want 0 (delete is no-op)", got)
+	if got := atomic.LoadInt32(&announceCount); got != 1 {
+		t.Errorf("announce count = %d, want 1 (delete notifies absence)", got)
 	}
 }
 
@@ -239,7 +239,7 @@ func TestRun_NotifierReceivesCreateAndDeleteEvents(t *testing.T) {
 		events []event
 	)
 
-	sub := New(src, nil,
+	sub := New(src,
 		WithBackoff(50*time.Millisecond, 100*time.Millisecond),
 		WithNotifier(func(_ context.Context, d digest.Digest, present bool) {
 			mu.Lock()
@@ -289,8 +289,7 @@ func TestRun_ChannelCloseTriggersReconnect(t *testing.T) {
 		return c, nil
 	}
 
-	dht := fakes.NewDHT()
-	sub := New(src, dht,
+	sub := New(src, WithNotifier(func(context.Context, digest.Digest, bool) {}),
 		WithBackoff(10*time.Millisecond, 50*time.Millisecond),
 	)
 
@@ -312,8 +311,7 @@ func TestRun_ListErrorIsBackedOff(t *testing.T) {
 			return nil, errors.New("not reached")
 		},
 	}
-	dht := fakes.NewDHT()
-	sub := New(src, dht, WithBackoff(20*time.Millisecond, 100*time.Millisecond))
+	sub := New(src, WithNotifier(func(context.Context, digest.Digest, bool) {}), WithBackoff(20*time.Millisecond, 100*time.Millisecond))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
@@ -343,5 +341,11 @@ func TestJitter(t *testing.T) {
 
 	if got := jitter(0); got != 0 {
 		t.Errorf("jitter(0) = %v, want 0", got)
+	}
+}
+
+func TestRunRequiresNotifierBeforeSourceAccess(t *testing.T) {
+	if err := New(nil).Run(t.Context()); err == nil || !strings.Contains(err.Error(), "notifier required") {
+		t.Fatalf("Run without notifier = %v", err)
 	}
 }
