@@ -6,7 +6,7 @@ package config
 import (
 	"bytes"
 	"flag"
-	"math"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -24,22 +24,6 @@ func TestDefaultsValidateAfterMinimalUpstream(t *testing.T) {
 
 	if c.AdvertiseReconcileInterval != time.Minute {
 		t.Fatalf("AdvertiseReconcileInterval = %v, want 1m", c.AdvertiseReconcileInterval)
-	}
-
-	if c.PrefetchPullerFraction != 0 {
-		t.Fatalf("PrefetchPullerFraction = %v, want disabled", c.PrefetchPullerFraction)
-	}
-
-	if c.PrefetchCoordinatorReplicas != 3 {
-		t.Fatalf("PrefetchCoordinatorReplicas = %d, want 3", c.PrefetchCoordinatorReplicas)
-	}
-
-	if c.PrefetchMaxConcurrentGroups != 64 {
-		t.Fatalf("PrefetchMaxConcurrentGroups = %d, want 64", c.PrefetchMaxConcurrentGroups)
-	}
-
-	if c.PrefetchDispatchJitter != time.Second {
-		t.Fatalf("PrefetchDispatchJitter = %v, want 1s", c.PrefetchDispatchJitter)
 	}
 
 	if c.TransferMaxConcurrentServes != 10 {
@@ -227,6 +211,7 @@ func TestValidateChairSeedCountBounds(t *testing.T) {
 func TestPrefetchPullerFractionConfig(t *testing.T) {
 	t.Run("environment", func(t *testing.T) {
 		c := NewDefault()
+		before := *c
 
 		err := c.LoadEnv(func(key string) string {
 			if key == "GANTRY_PREFETCH_PULLER_FRACTION" {
@@ -239,8 +224,8 @@ func TestPrefetchPullerFractionConfig(t *testing.T) {
 			t.Fatalf("LoadEnv: %v", err)
 		}
 
-		if c.PrefetchPullerFraction != 0.02 {
-			t.Fatalf("PrefetchPullerFraction = %v, want 0.02", c.PrefetchPullerFraction)
+		if !reflect.DeepEqual(*c, before) {
+			t.Fatal("removed prefetch environment variable changed config")
 		}
 	})
 
@@ -249,23 +234,17 @@ func TestPrefetchPullerFractionConfig(t *testing.T) {
 		flags := flag.NewFlagSet("test", flag.ContinueOnError)
 		c.BindFlags(flags)
 
-		if err := flags.Parse([]string{"--prefetch-puller-fraction=0.02"}); err != nil {
-			t.Fatalf("Parse: %v", err)
-		}
-
-		if c.PrefetchPullerFraction != 0.02 {
-			t.Fatalf("PrefetchPullerFraction = %v, want 0.02", c.PrefetchPullerFraction)
+		if err := flags.Parse([]string{"--prefetch-puller-fraction=0.02"}); err == nil {
+			t.Fatal("removed prefetch flag accepted")
 		}
 	})
 }
 
 func TestValidate_PrefetchPullerFractionBounds(t *testing.T) {
-	for _, fraction := range []float64{-0.01, 1.01, math.NaN()} {
+	for _, fraction := range []string{"-0.01", "0.02", "1.01", ".nan"} {
 		c := NewDefault()
-		c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
-		c.PrefetchPullerFraction = fraction
 
-		err := c.Validate()
+		err := c.LoadYAML(strings.NewReader("prefetch_puller_fraction: " + fraction))
 		if err == nil || !strings.Contains(err.Error(), "prefetch_puller_fraction") {
 			t.Fatalf("fraction %v: want prefetch_puller_fraction error, got %v", fraction, err)
 		}
@@ -275,6 +254,7 @@ func TestValidate_PrefetchPullerFractionBounds(t *testing.T) {
 func TestPrefetchDispatchConfig(t *testing.T) {
 	t.Run("environment", func(t *testing.T) {
 		c := NewDefault()
+		before := *c
 
 		err := c.LoadEnv(func(key string) string {
 			switch key {
@@ -292,8 +272,8 @@ func TestPrefetchDispatchConfig(t *testing.T) {
 			t.Fatalf("LoadEnv: %v", err)
 		}
 
-		if c.PrefetchCoordinatorReplicas != 5 || c.PrefetchMaxConcurrentGroups != 32 || c.PrefetchDispatchJitter != 750*time.Millisecond {
-			t.Fatalf("prefetch dispatch config = %d, %d, %v", c.PrefetchCoordinatorReplicas, c.PrefetchMaxConcurrentGroups, c.PrefetchDispatchJitter)
+		if !reflect.DeepEqual(*c, before) {
+			t.Fatal("removed prefetch environment variables changed config")
 		}
 	})
 
@@ -302,32 +282,32 @@ func TestPrefetchDispatchConfig(t *testing.T) {
 		flags := flag.NewFlagSet("test", flag.ContinueOnError)
 		c.BindFlags(flags)
 
-		if err := flags.Parse([]string{"--prefetch-coordinator-replicas=5", "--prefetch-max-concurrent-groups=32", "--prefetch-dispatch-jitter=750ms"}); err != nil {
-			t.Fatalf("Parse: %v", err)
-		}
-
-		if c.PrefetchCoordinatorReplicas != 5 || c.PrefetchMaxConcurrentGroups != 32 || c.PrefetchDispatchJitter != 750*time.Millisecond {
-			t.Fatalf("prefetch dispatch config = %d, %d, %v", c.PrefetchCoordinatorReplicas, c.PrefetchMaxConcurrentGroups, c.PrefetchDispatchJitter)
+		for _, name := range []string{"prefetch-coordinator-replicas", "prefetch-max-concurrent-groups", "prefetch-dispatch-jitter", "prefetch-puller-replicas", "hrw-k", "hrw-topology-scope", "zone-label-key", "topk-expansion-factor-degraded"} {
+			if flags.Lookup(name) != nil {
+				t.Errorf("removed flag %s registered", name)
+			}
 		}
 	})
 }
 
 func TestValidate_PrefetchDispatchBounds(t *testing.T) {
 	for _, test := range []struct {
-		name   string
-		mutate func(*Config)
-		want   string
+		name string
+		yaml string
+		want string
 	}{
-		{name: "zero coordinators", mutate: func(c *Config) { c.PrefetchCoordinatorReplicas = 0 }, want: "prefetch_coordinator_replicas"},
-		{name: "zero groups", mutate: func(c *Config) { c.PrefetchMaxConcurrentGroups = 0 }, want: "prefetch_max_concurrent_groups"},
-		{name: "negative jitter", mutate: func(c *Config) { c.PrefetchDispatchJitter = -time.Second }, want: "prefetch_dispatch_jitter"},
+		{name: "zero coordinators", yaml: "prefetch_coordinator_replicas: 0", want: "prefetch_coordinator_replicas"},
+		{name: "zero groups", yaml: "prefetch_max_concurrent_groups: 0", want: "prefetch_max_concurrent_groups"},
+		{name: "negative jitter", yaml: "prefetch_dispatch_jitter: -1s", want: "prefetch_dispatch_jitter"},
+		{name: "puller replicas", yaml: "prefetch_puller_replicas: 8", want: "prefetch_puller_replicas"},
+		{name: "HRW K", yaml: "hrw_k: 3", want: "hrw_k"},
+		{name: "zone", yaml: "zone_label_key: zone", want: "zone_label_key"},
+		{name: "topk", yaml: "topk_expansion_factor_degraded: 2", want: "topk_expansion_factor_degraded"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			c := NewDefault()
-			c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
-			test.mutate(c)
 
-			err := c.Validate()
+			err := c.LoadYAML(strings.NewReader(test.yaml))
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("want %s error, got %v", test.want, err)
 			}
@@ -452,10 +432,8 @@ func TestValidate_DuplicateUpstreamName(t *testing.T) {
 
 func TestValidate_HRWScope(t *testing.T) {
 	c := NewDefault()
-	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
-	c.HRWTopologyScope = "rack"
 
-	err := c.Validate()
+	err := c.LoadYAML(strings.NewReader("hrw_topology_scope: rack"))
 	if err == nil || !strings.Contains(err.Error(), "hrw_topology_scope") {
 		t.Fatalf("want hrw_topology_scope error, got %v", err)
 	}
@@ -732,7 +710,6 @@ upstream_registries:
   - name: registry.example.com
     endpoint: https://registry.example.com
     credentials_path: /etc/gantry/creds.txt
-hrw_k: 5
 coord_peer_authz_enforce: true
 coord_max_digests_per_request: 12
 coord_max_concurrent_pulls: 4
@@ -747,10 +724,6 @@ log_level: debug
 
 	if len(c.UpstreamRegistries) != 1 || c.UpstreamRegistries[0].Name != "registry.example.com" {
 		t.Errorf("upstream overlay failed: %+v", c.UpstreamRegistries)
-	}
-
-	if c.HRWK != 5 {
-		t.Errorf("HRWK = %d, want 5", c.HRWK)
 	}
 
 	if !c.CoordPeerAuthzEnforce {
@@ -800,10 +773,6 @@ func TestLoadEnv(t *testing.T) {
 	getenv := func(k string) string { return env[k] }
 	if err := c.LoadEnv(getenv); err != nil {
 		t.Fatalf("LoadEnv: %v", err)
-	}
-
-	if c.HRWK != 9 {
-		t.Errorf("HRWK = %d", c.HRWK)
 	}
 
 	if c.CoordMaxDigestsPerRequest != 11 {

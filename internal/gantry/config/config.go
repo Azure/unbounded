@@ -267,50 +267,7 @@ type Config struct {
 	// one of these once more than one is configured.
 	UpstreamRegistries []UpstreamRegistry `yaml:"upstream_registries"`
 
-	// ---------- HRW / coordination ----------
-
-	// HRWK is the top-K size for HRW probe (the step 3 default 3; the design doc
-	// open question).
-	HRWK int `yaml:"hrw_k"`
-
-	// PrefetchPullerReplicas is how many distinct HRW-ranked pullers each
-	// prefetched layer digest is dispatched to. 1 designates a single origin
-	// puller per layer (tightest dedup), but the whole swarm then fans out
-	// from ONE initial seed, which bottlenecks a cold thundering-herd (peer
-	// transfers pile onto the lone seed and stall). N>1 asks the top-N pullers
-	// to origin-pull the layer in parallel, giving N initial seeds so peer
-	// transfers fan out N-fold, at the cost of up to N origin copies of each
-	// layer. The default is 8.
-	PrefetchPullerReplicas int `yaml:"prefetch_puller_replicas"`
-
-	// PrefetchPullerFraction dynamically sizes the initial puller set from the
-	// eligible HRW candidate count. Values are fractions in (0, 1], so 0.02
-	// selects ceil(nodes * 0.02) pullers. Zero disables dynamic sizing and uses
-	// PrefetchPullerReplicas for backward compatibility. Selection is uncapped
-	// except by the number of eligible nodes.
-	PrefetchPullerFraction float64 `yaml:"prefetch_puller_fraction"`
-
-	// PrefetchCoordinatorReplicas limits remote speculative prefetch dispatch
-	// to a deterministic HRW-ranked subset of manifest consumers. Local
-	// self-selected pulls still run on every consumer. The default is 3.
-	PrefetchCoordinatorReplicas int `yaml:"prefetch_coordinator_replicas"`
-
-	// PrefetchMaxConcurrentGroups caps simultaneous outbound prefetch groups
-	// per manifest. Group dispatch is best effort and target-side deduplicated.
-	PrefetchMaxConcurrentGroups int `yaml:"prefetch_max_concurrent_groups"`
-
-	// PrefetchDispatchJitter spreads manifest prefetch across requesters. Each
-	// node derives a stable delay in [0, jitter) from itself and the manifest.
-	PrefetchDispatchJitter time.Duration `yaml:"prefetch_dispatch_jitter"`
-
-	// HRWTopologyScope selects "cluster" (HRW over all nodes) or "zone"
-	// (HRW within the requester's zone) - the design doc / the design doc open question.
-	HRWTopologyScope string `yaml:"hrw_topology_scope"`
-
-	// ZoneLabelKey is the Kubernetes node label that identifies the zone
-	// when HRWTopologyScope == "zone". Default
-	// `topology.kubernetes.io/zone` (the design doc).
-	ZoneLabelKey string `yaml:"zone_label_key"`
+	// ---------- Coordination ----------
 
 	// CoordPeerAuthzEnforce is retained so existing ConfigMaps parse, but
 	// coord peer authorization was removed with the membership view it
@@ -407,10 +364,6 @@ type Config struct {
 	// BootstrapRoutingTablePct is the routing-table-size threshold that
 	// supersedes BootstrapWindow once met (the design doc default 25%).
 	BootstrapRoutingTablePct int `yaml:"bootstrap_routing_table_pct"`
-
-	// TopKExpansionFactorDegraded is the multiplier applied to HRWK when
-	// expanding top-K under Degraded health (the step 5 / the design doc default 2).
-	TopKExpansionFactorDegraded int `yaml:"topk_expansion_factor_degraded"`
 
 	// ---------- Origin-failure circuit breaker (the design doc) ----------
 
@@ -520,15 +473,6 @@ func NewDefault() *Config {
 
 		UpstreamRegistries: nil,
 
-		HRWK:                        3,
-		PrefetchPullerReplicas:      8,
-		PrefetchPullerFraction:      0,
-		PrefetchCoordinatorReplicas: 3,
-		PrefetchMaxConcurrentGroups: 64,
-		PrefetchDispatchJitter:      time.Second,
-		HRWTopologyScope:            "cluster",
-		ZoneLabelKey:                "topology.kubernetes.io/zone",
-
 		CoordPeerAuthzEnforce:       false,
 		CoordRequireChairAssignment: false,
 		CoordMaxDigestsPerRequest:   256,
@@ -540,12 +484,11 @@ func NewDefault() *Config {
 		TransferMaxConcurrentServes: 10,              // serve cap preserves bandwidth per large-layer stream
 		AdvertiseReconcileInterval:  time.Minute,
 
-		NF5JitterBase:               3 * time.Second,
-		NF5JitterCap:                0, // no cap by default (original behavior)
-		NF5PerNodeRateLimit:         2,
-		BootstrapWindow:             30 * time.Second,
-		BootstrapRoutingTablePct:    25,
-		TopKExpansionFactorDegraded: 2,
+		NF5JitterBase:            3 * time.Second,
+		NF5JitterCap:             0, // no cap by default (original behavior)
+		NF5PerNodeRateLimit:      2,
+		BootstrapWindow:          30 * time.Second,
+		BootstrapRoutingTablePct: 25,
 
 		OriginFailureCooldownInitial:    10 * time.Second,
 		OriginFailureCooldownMax:        10 * time.Minute,
@@ -586,17 +529,6 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setInt := func(key string, dst *int) {
 		if v, ok := lookup(env, key); ok {
 			n, err := strconv.Atoi(v)
-			if err != nil {
-				errs = append(errs, fmt.Errorf("env GANTRY_%s: %w", key, err))
-				return
-			}
-
-			*dst = n
-		}
-	}
-	setFloat := func(key string, dst *float64) {
-		if v, ok := lookup(env, key); ok {
-			n, err := strconv.ParseFloat(v, 64)
 			if err != nil {
 				errs = append(errs, fmt.Errorf("env GANTRY_%s: %w", key, err))
 				return
@@ -682,14 +614,6 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setDur("CONTAINERD_LEASE_TTL", &c.ContainerdLeaseTTL)
 	setDur("CONTAINERD_LEASE_CLEANUP_INTERVAL", &c.ContainerdLeaseCleanupInterval)
 
-	setInt("HRW_K", &c.HRWK)
-	setInt("PREFETCH_PULLER_REPLICAS", &c.PrefetchPullerReplicas)
-	setFloat("PREFETCH_PULLER_FRACTION", &c.PrefetchPullerFraction)
-	setInt("PREFETCH_COORDINATOR_REPLICAS", &c.PrefetchCoordinatorReplicas)
-	setInt("PREFETCH_MAX_CONCURRENT_GROUPS", &c.PrefetchMaxConcurrentGroups)
-	setDur("PREFETCH_DISPATCH_JITTER", &c.PrefetchDispatchJitter)
-	setStr("HRW_TOPOLOGY_SCOPE", &c.HRWTopologyScope)
-	setStr("ZONE_LABEL_KEY", &c.ZoneLabelKey)
 	setBool("COORD_PEER_AUTHZ_ENFORCE", &c.CoordPeerAuthzEnforce)
 	setBool("COORD_REQUIRE_CHAIR_ASSIGNMENT", &c.CoordRequireChairAssignment)
 	setInt("COORD_MAX_DIGESTS_PER_REQUEST", &c.CoordMaxDigestsPerRequest)
@@ -706,7 +630,6 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setInt("NF5_PER_NODE_RATE_LIMIT", &c.NF5PerNodeRateLimit)
 	setDur("BOOTSTRAP_WINDOW", &c.BootstrapWindow)
 	setInt("BOOTSTRAP_ROUTING_TABLE_PCT", &c.BootstrapRoutingTablePct)
-	setInt("TOPK_EXPANSION_FACTOR_DEGRADED", &c.TopKExpansionFactorDegraded)
 
 	setDur("ORIGIN_FAILURE_COOLDOWN_INITIAL", &c.OriginFailureCooldownInitial)
 	setDur("ORIGIN_FAILURE_COOLDOWN_MAX", &c.OriginFailureCooldownMax)
@@ -775,14 +698,6 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.DurationVar(&c.ContainerdLeaseTTL, "containerd-lease-ttl", c.ContainerdLeaseTTL, "TTL for containerd content leases attached by Gantry on ingest (storage_mode=containerd only)")
 	fs.DurationVar(&c.ContainerdLeaseCleanupInterval, "containerd-lease-cleanup-interval", c.ContainerdLeaseCleanupInterval, "period of the expired-lease sweep loop (storage_mode=containerd only)")
 
-	fs.IntVar(&c.HRWK, "hrw-k", c.HRWK, "legacy no-op membership HRW size")
-	fs.IntVar(&c.PrefetchPullerReplicas, "prefetch-puller-replicas", c.PrefetchPullerReplicas, "legacy no-op prefetch replica count")
-	fs.Float64Var(&c.PrefetchPullerFraction, "prefetch-puller-fraction", c.PrefetchPullerFraction, "legacy no-op prefetch fraction")
-	fs.IntVar(&c.PrefetchCoordinatorReplicas, "prefetch-coordinator-replicas", c.PrefetchCoordinatorReplicas, "legacy no-op prefetch coordinator count")
-	fs.IntVar(&c.PrefetchMaxConcurrentGroups, "prefetch-max-concurrent-groups", c.PrefetchMaxConcurrentGroups, "legacy no-op prefetch concurrency")
-	fs.DurationVar(&c.PrefetchDispatchJitter, "prefetch-dispatch-jitter", c.PrefetchDispatchJitter, "legacy no-op prefetch dispatch jitter")
-	fs.StringVar(&c.HRWTopologyScope, "hrw-topology-scope", c.HRWTopologyScope, "legacy no-op membership HRW scope")
-	fs.StringVar(&c.ZoneLabelKey, "zone-label-key", c.ZoneLabelKey, "legacy no-op zone label key")
 	fs.BoolVar(&c.CoordPeerAuthzEnforce, "coord-peer-authz-enforce", c.CoordPeerAuthzEnforce, "unsupported in Lease-chair mode; validation requires false")
 	fs.BoolVar(&c.CoordRequireChairAssignment, "coord-require-chair-assignment", c.CoordRequireChairAssignment, "reject legacy please_pull requests without Lease-chair metadata after rollout")
 	fs.IntVar(&c.CoordMaxDigestsPerRequest, "coord-max-digests-per-request", c.CoordMaxDigestsPerRequest, "maximum digests accepted in one please_pull batch")
@@ -799,7 +714,6 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.IntVar(&c.NF5PerNodeRateLimit, "nf5-per-node-rate-limit", c.NF5PerNodeRateLimit, "per-node direct-origin fallback rate (per minute)")
 	fs.DurationVar(&c.BootstrapWindow, "bootstrap-window", c.BootstrapWindow, "time after startup during which DHT-empty is not trusted as cold-start")
 	fs.IntVar(&c.BootstrapRoutingTablePct, "bootstrap-routing-table-pct", c.BootstrapRoutingTablePct, "routing-table-size percent that ends the bootstrap window")
-	fs.IntVar(&c.TopKExpansionFactorDegraded, "topk-expansion-factor-degraded", c.TopKExpansionFactorDegraded, "multiplier applied to HRW K when expanding under Degraded health")
 
 	fs.DurationVar(&c.OriginFailureCooldownInitial, "origin-failure-cooldown-initial", c.OriginFailureCooldownInitial, "initial cooldown for the origin-failure circuit breaker")
 	fs.DurationVar(&c.OriginFailureCooldownMax, "origin-failure-cooldown-max", c.OriginFailureCooldownMax, "max cooldown for the origin-failure circuit breaker")
@@ -1005,10 +919,6 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if c.HRWK < 1 {
-		errs = append(errs, fmt.Errorf("hrw_k: must be >= 1, got %d", c.HRWK))
-	}
-
 	if c.ChairLeaseDuration <= 0 {
 		errs = append(errs, fmt.Errorf("chair_lease_duration: must be > 0, got %v", c.ChairLeaseDuration))
 	}
@@ -1083,34 +993,8 @@ func (c *Config) Validate() error {
 		errs = append(errs, errors.New("coord_peer_authz_enforce cannot be enabled with Lease-chair discovery: the design has no pod-membership identity oracle"))
 	}
 
-	if c.PrefetchPullerReplicas < 1 {
-		errs = append(errs, fmt.Errorf("prefetch_puller_replicas: must be >= 1, got %d", c.PrefetchPullerReplicas))
-	}
-
-	if c.PrefetchPullerFraction != c.PrefetchPullerFraction || c.PrefetchPullerFraction < 0 || c.PrefetchPullerFraction > 1 {
-		errs = append(errs, fmt.Errorf("prefetch_puller_fraction: must be between 0 and 1, got %g", c.PrefetchPullerFraction))
-	}
-
-	if c.PrefetchCoordinatorReplicas < 1 {
-		errs = append(errs, fmt.Errorf("prefetch_coordinator_replicas: must be >= 1, got %d", c.PrefetchCoordinatorReplicas))
-	}
-
-	switch c.HRWTopologyScope {
-	case "cluster", "zone":
-	default:
-		errs = append(errs, fmt.Errorf("hrw_topology_scope %q: must be \"cluster\" or \"zone\"", c.HRWTopologyScope))
-	}
-
 	if c.CoordMaxDigestsPerRequest < 1 {
 		errs = append(errs, fmt.Errorf("coord_max_digests_per_request: must be >= 1, got %d", c.CoordMaxDigestsPerRequest))
-	}
-
-	if c.PrefetchMaxConcurrentGroups < 1 {
-		errs = append(errs, fmt.Errorf("prefetch_max_concurrent_groups: must be >= 1, got %d", c.PrefetchMaxConcurrentGroups))
-	}
-
-	if c.PrefetchDispatchJitter < 0 {
-		errs = append(errs, fmt.Errorf("prefetch_dispatch_jitter: must be >= 0, got %v", c.PrefetchDispatchJitter))
 	}
 
 	if c.CoordMaxConcurrentPulls < 1 {
@@ -1163,10 +1047,6 @@ func (c *Config) Validate() error {
 
 	if c.BootstrapRoutingTablePct < 1 || c.BootstrapRoutingTablePct > 100 {
 		errs = append(errs, fmt.Errorf("bootstrap_routing_table_pct: must be in [1,100], got %d", c.BootstrapRoutingTablePct))
-	}
-
-	if c.TopKExpansionFactorDegraded < 1 {
-		errs = append(errs, fmt.Errorf("topk_expansion_factor_degraded: must be >= 1, got %d", c.TopKExpansionFactorDegraded))
 	}
 
 	if c.OriginFailureCooldownInitial <= 0 {
