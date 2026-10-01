@@ -24,7 +24,7 @@ use self::{
 use crate::{
     error::{Error, Operation, Result},
     runtime::deadline::RequestScope,
-    security::keyring::Keyring,
+    security::identity::Keyring,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -913,7 +913,7 @@ mod tests {
     use crate::{
         control::{snapshot::PublishedState, testing},
         model::{ClusterId, NodeId},
-        security::keyring::KeyEpochs,
+        security::identity::KeyEpochs,
     };
     use std::sync::Arc;
     fn client(d: &testing::Directory) -> ControlClient {
@@ -1212,7 +1212,7 @@ mod tests {
                 .borrow()
                 .active(
                     &bundle.cache_keys[0].key.cache,
-                    crate::security::keyring::KeyPurpose::Page
+                    crate::security::identity::KeyPurpose::Page
                 )
                 .is_ok()
         );

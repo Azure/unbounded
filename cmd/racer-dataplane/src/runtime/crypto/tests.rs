@@ -384,17 +384,17 @@ pub(super) fn key() -> KeyLease {
     keyring()
         .active(
             &crate::model::CacheId("00000000-0000-4000-8000-000000000003".into()),
-            crate::security::keyring::KeyPurpose::Page,
+            crate::security::identity::KeyPurpose::Page,
         )
         .unwrap()
 }
 
-pub(super) fn keyring() -> crate::security::keyring::Keyring {
+pub(super) fn keyring() -> crate::security::identity::Keyring {
     use crate::{
         control::wire::*,
         model::KeyId,
         model::{CacheId, ClusterId, NodeId},
-        security::keyring::{KeyEpochs, Keyring},
+        security::identity::{KeyEpochs, Keyring},
     };
     let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
     let mut params = rcgen::CertificateParams::default();

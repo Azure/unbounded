@@ -1,12 +1,10 @@
 //! Verified identities, signature chains, and separate page/credential AEAD domains.
 pub mod aead;
-pub mod certificates;
 pub mod connection;
 pub mod crc64;
 pub mod credentials;
 pub mod forwarding;
 pub mod identity;
-pub mod keyring;
 pub mod protocol;
 pub mod signing;
 #[cfg(test)]
@@ -33,12 +31,12 @@ pub(crate) fn hmac(key: &[u8; 32], bytes: &[u8]) -> [u8; 32] {
 }
 
 /// Request-only derivation from a credential epoch, never an AEAD or page key.
-pub(crate) fn request_key(key: &keyring::KeyLease) -> crate::error::Result<Zeroizing<[u8; 32]>> {
+pub(crate) fn request_key(key: &identity::KeyLease) -> crate::error::Result<Zeroizing<[u8; 32]>> {
     let mut domain = b"racer/request-mac/key/v1\0".to_vec();
     aead::field(&mut domain, key.cache().0.as_bytes())?;
     domain.extend_from_slice(&key.id().0);
     Ok(Zeroizing::new(hmac(
-        key.material(keyring::KeyPurpose::OriginCredentials)?,
+        key.material(identity::KeyPurpose::OriginCredentials)?,
         &domain,
     )))
 }
@@ -65,16 +63,16 @@ mod tests {
                 0x2e, 0x32, 0xcf, 0xf7
             ]
         );
-        let keys = keyring::tests::keys();
+        let keys = identity::keyring_tests::keys();
         let cache = crate::model::CacheId(identity::tests::CACHE.into());
-        assert!(request_key(&keys.active(&cache, keyring::KeyPurpose::Page).unwrap()).is_err());
+        assert!(request_key(&keys.active(&cache, identity::KeyPurpose::Page).unwrap()).is_err());
         let credential = keys
-            .active(&cache, keyring::KeyPurpose::OriginCredentials)
+            .active(&cache, identity::KeyPurpose::OriginCredentials)
             .unwrap();
         assert_ne!(
             &*request_key(&credential).unwrap(),
             credential
-                .material(keyring::KeyPurpose::OriginCredentials)
+                .material(identity::KeyPurpose::OriginCredentials)
                 .unwrap()
         );
     }

@@ -1707,7 +1707,7 @@ fn authenticated_first_page(
         },
         security::{
             aead::{PageCrypto, PageCryptoEngine},
-            keyring::{KeyEpochs, Keyring},
+            identity::{KeyEpochs, Keyring},
         },
     };
     use std::sync::Arc;

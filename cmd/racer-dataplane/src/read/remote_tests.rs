@@ -19,7 +19,7 @@ use crate::{
     },
     runtime::{admission::Admission, deadline::RequestScope, reactor::Reactor},
     security::{
-        credentials::CredentialCrypto, forwarding::Forwarding, keyring::Keyring,
+        credentials::CredentialCrypto, forwarding::Forwarding, identity::Keyring,
         test_support::Identity,
     },
     topology::{

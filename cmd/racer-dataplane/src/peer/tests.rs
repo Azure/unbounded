@@ -17,7 +17,9 @@ use crate::{
         deadline::{Deadline, RequestScope},
     },
     security::{
-        certificates::Certificates, forwarding::Forwarding, keyring::Keyring, signing::Signatures,
+        forwarding::Forwarding,
+        identity::{Certificates, Keyring},
+        signing::Signatures,
     },
     topology::paths::RouteBudget,
 };

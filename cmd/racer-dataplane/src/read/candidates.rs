@@ -1271,7 +1271,7 @@ mod tests {
             model::ClusterId,
             model::{MembershipVersion, RequestId},
             runtime::admission::Admission,
-            security::keyring::{KeyEpochs, Keyring},
+            security::identity::{KeyEpochs, Keyring},
             topology::membership::{Member, Membership},
         };
         let membership = std::sync::Arc::new(
@@ -1561,7 +1561,7 @@ mod tests {
         )
     }
     fn policy(node: NodeId, peers: Rc<RecordedPeer>) -> CandidatePolicy {
-        use crate::security::keyring::{KeyEpochs, Keyring};
+        use crate::security::identity::{KeyEpochs, Keyring};
         let config = crate::test_support::cluster::config(false);
         let admission = Rc::new(crate::runtime::admission::Admission::new(config.limits));
         let keys = Rc::new(Keyring::new(

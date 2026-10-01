@@ -3,8 +3,7 @@
 //! Cover identities, range, lengths, TTL, membership, freshness, metadata, and
 //! encrypted Authorization. Never hash/sign page bodies. Reject duplicate fields.
 use super::{
-    certificates::{Certificates, VerifiedPeer},
-    keyring::Keyring,
+    identity::{Certificates, Keyring, VerifiedPeer},
     protocol::{self, field, number, push, push_binary},
 };
 use crate::{
@@ -77,7 +76,7 @@ impl Signatures {
             let cache = crate::model::CacheId(field(&head, "racer-cache")?);
             let key = self
                 .keys
-                .active(&cache, super::keyring::KeyPurpose::OriginCredentials)?;
+                .active(&cache, super::identity::KeyPurpose::OriginCredentials)?;
             push_binary(&mut head, "racer-mac-key", &key.id().0);
             let tag = super::hmac(&*super::request_key(&key)?, &mac_base(&head)?);
             push_binary(&mut head, "racer-request-mac", &tag);
@@ -124,7 +123,7 @@ impl Signatures {
             let key = self.keys.lease(
                 Some(&cache),
                 crate::model::KeyId(id),
-                super::keyring::KeyPurpose::OriginCredentials,
+                super::identity::KeyPurpose::OriginCredentials,
             )?;
             let expected = super::hmac(&*super::request_key(&key)?, &mac_base(head)?);
             if !super::equal(

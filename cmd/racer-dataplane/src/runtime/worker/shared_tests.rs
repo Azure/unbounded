@@ -5,7 +5,7 @@ use crate::{
     runtime::crypto::{CryptoInput, CryptoOutput},
     security::{
         aead::PageCryptoEngine,
-        keyring::{KeyPurpose, Keyring},
+        identity::{KeyPurpose, Keyring},
     },
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -105,7 +105,7 @@ impl WorkerFactory for Factory {
             worker,
             runtime,
             observed: self.observed.clone(),
-            keys: crate::security::keyring::tests::keys(),
+            keys: crate::security::identity::keyring_tests::keys(),
             failure: self.failure,
             jobs: self.jobs,
             roundtrip: self.roundtrip,

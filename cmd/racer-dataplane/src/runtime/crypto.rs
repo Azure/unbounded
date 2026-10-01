@@ -34,7 +34,7 @@ use crate::{
     error::{Error, Operation, Result},
     memory::pool::{CiphertextPage, PlaintextBuffer, VerifiedPage},
     model::{PageId, WorkerId},
-    security::keyring::KeyLease,
+    security::identity::KeyLease,
 };
 use std::{
     cell::{Cell, RefCell},

@@ -40,7 +40,7 @@ fn scope() -> RequestScope {
 fn credentials(admission: Rc<Admission>) -> Rc<crate::security::credentials::CredentialCrypto> {
     use crate::security::{
         credentials::CredentialCrypto,
-        keyring::{KeyEpochs, Keyring},
+        identity::{KeyEpochs, Keyring},
     };
     Rc::new(CredentialCrypto::new(
         Rc::new(Keyring::new(

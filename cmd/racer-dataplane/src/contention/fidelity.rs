@@ -541,7 +541,7 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
         buffers.clone(),
     ));
     let writer = Rc::new(StoreWriter::new(index, segments, slabs));
-    let keys = Rc::new(crate::security::keyring::tests::keys());
+    let keys = Rc::new(crate::security::identity::keyring_tests::keys());
     let (port, engine_port) = crypto::pair(worker, 0, NonZeroUsize::new(4).unwrap());
     let client = Rc::new(CryptoClient::new(port));
     let mut engine = PageCryptoEngine::new(CryptoRuntime { port: engine_port });
@@ -674,7 +674,7 @@ fn canceled_crypto_matches_metadata_owner_trace_through_completion_reap() {
     let (port, engine_port) = crypto::pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
     let client = Rc::new(CryptoClient::new(port));
     let crypto = PageCrypto::new(
-        Rc::new(crate::security::keyring::tests::keys()),
+        Rc::new(crate::security::identity::keyring_tests::keys()),
         client.clone(),
     );
     let mut engine = PageCryptoEngine::new(CryptoRuntime { port: engine_port });

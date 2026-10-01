@@ -36,7 +36,7 @@
 //! ```
 use super::{
     aead::{field, fresh_nonce},
-    keyring::{KeyPurpose, Keyring},
+    identity::{KeyPurpose, Keyring},
 };
 use crate::{
     error::{Error, Result},
@@ -87,7 +87,7 @@ fn aad(
     Ok(out)
 }
 fn bounds(object: &ObjectId, metadata: Option<&[u8]>, credential_length: usize) -> Result<usize> {
-    if !super::certificates::canonical_uuid(&object.cache.0)
+    if !super::identity::canonical_uuid(&object.cache.0)
         || metadata.is_some_and(|m| m.len() > crate::model::MAX_FIELD_BYTES)
         || credential_length > crate::model::MAX_FIELD_BYTES + 16
     {
@@ -297,7 +297,7 @@ impl CredentialCrypto {
 mod tests {
     #[test]
     fn local_context_is_independently_charged_and_keeps_exact_sensitive_fields() {
-        let keys = std::rc::Rc::new(crate::security::keyring::tests::keys());
+        let keys = std::rc::Rc::new(crate::security::identity::keyring_tests::keys());
         let admission = std::rc::Rc::new(crate::runtime::admission::Admission::new(
             crate::test_support::cluster::config(false).limits,
         ));
@@ -364,7 +364,7 @@ mod tests {
             crate::test_support::cluster::config(false).limits,
         ));
         let crypto = CredentialCrypto::new(
-            Rc::new(super::super::keyring::tests::keys()),
+            Rc::new(super::super::identity::keyring_tests::keys()),
             admission.clone(),
         );
         let original = origin();
@@ -398,7 +398,7 @@ mod tests {
         let mut limits = crate::test_support::cluster::config(false).limits;
         limits.request_context_bytes = std::num::NonZeroUsize::new(1).unwrap();
         let crypto = CredentialCrypto::new(
-            Rc::new(super::super::keyring::tests::keys()),
+            Rc::new(super::super::identity::keyring_tests::keys()),
             Rc::new(Admission::new(limits)),
         );
         assert!(matches!(
@@ -412,7 +412,7 @@ mod tests {
             crate::test_support::cluster::config(false).limits,
         ));
         let crypto = CredentialCrypto::new(
-            Rc::new(super::super::keyring::tests::keys()),
+            Rc::new(super::super::identity::keyring_tests::keys()),
             admission.clone(),
         );
         let mut original = origin();
@@ -441,7 +441,7 @@ mod tests {
     #[test]
     fn rejects_substitution_and_distinguishes_absent_from_empty() {
         let crypto = CredentialCrypto::new(
-            Rc::new(super::super::keyring::tests::keys()),
+            Rc::new(super::super::identity::keyring_tests::keys()),
             Rc::new(Admission::new(
                 crate::test_support::cluster::config(false).limits,
             )),

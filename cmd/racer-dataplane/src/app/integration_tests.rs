@@ -1147,8 +1147,10 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
     let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
     {
         let mut bundle = fixture.bundle.lock().unwrap();
-        *bundle =
-            crate::security::keyring::tests::rotation_bundle(1, bundle.peer_trust_roots.clone());
+        *bundle = crate::security::identity::keyring_tests::rotation_bundle(
+            1,
+            bundle.peer_trust_roots.clone(),
+        );
         bundle.cluster = config.cluster.clone();
     }
     config.node = bootstrap(
@@ -1185,8 +1187,10 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
     let key_scope = scope(Duration::from_secs(15)).unwrap();
     {
         let mut bundle = fixture.bundle.lock().unwrap();
-        *bundle =
-            crate::security::keyring::tests::rotation_bundle(2, bundle.peer_trust_roots.clone());
+        *bundle = crate::security::identity::keyring_tests::rotation_bundle(
+            2,
+            bundle.peer_trust_roots.clone(),
+        );
         bundle.cluster = config.cluster.clone();
     }
     let mut rotation = control.keyring_progress(&key_scope);
@@ -1246,8 +1250,10 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
     std::fs::write(&config.service_account_token, b"fixture.token.fresh").unwrap();
     {
         let mut bundle = fixture.bundle.lock().unwrap();
-        *bundle =
-            crate::security::keyring::tests::rotation_bundle(3, bundle.peer_trust_roots.clone());
+        *bundle = crate::security::identity::keyring_tests::rotation_bundle(
+            3,
+            bundle.peer_trust_roots.clone(),
+        );
         bundle.cluster = config.cluster.clone();
     }
     drive(

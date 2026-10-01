@@ -1473,7 +1473,7 @@ impl Transfers {
                           last: Option<std::time::Instant>,
                           reads| {
                 let mut remote = [b'?'; 36];
-                if crate::security::certificates::canonical_uuid(&peer.0) {
+                if crate::security::identity::canonical_uuid(&peer.0) {
                     remote.copy_from_slice(peer.0.as_bytes());
                 }
                 observer.record(

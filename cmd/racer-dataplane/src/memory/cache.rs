@@ -621,10 +621,10 @@ mod tests {
     fn empty_stable_catalog_rotates_without_consuming_page_metadata_capacity() {
         use crate::{
             control::{availability::for_caches, wire::CacheKeyPurpose},
-            security::keyring::tests::rotation_bundle,
+            security::identity::keyring_tests::rotation_bundle,
         };
         let admission = admission(1024);
-        let keys = Rc::new(crate::security::keyring::tests::keys());
+        let keys = Rc::new(crate::security::identity::keyring_tests::keys());
         let roots = (*keys.peer_trust_roots().unwrap()).clone();
         let caches: Vec<_> = (0..356)
             .map(|cache| CacheId(format!("{cache:08x}-0000-4000-8000-000000000000")))

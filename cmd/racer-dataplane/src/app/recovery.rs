@@ -417,7 +417,7 @@ mod tests {
     #[test]
     fn newest_complete_cut_wins_and_partial_duplicate_or_foreign_workers_fall_back() {
         let node = NodeState::default();
-        let keys = crate::security::keyring::tests::keys();
+        let keys = crate::security::identity::keyring_tests::keys();
         let geometry = [(WorkerId(0), geometry()), (WorkerId(1), geometry())]
             .into_iter()
             .collect();
@@ -489,7 +489,7 @@ mod tests {
             segment::Segments,
         };
         let node = NodeState::new(vec![WorkerId(0)], 16).unwrap();
-        let keys = crate::security::keyring::tests::keys();
+        let keys = crate::security::identity::keyring_tests::keys();
         let caches = caches();
         let cache = caches[0].id.clone();
         let g = geometry();
@@ -617,7 +617,7 @@ mod tests {
             CacheId, CacheKey, ObjectId, ObjectVersion, StrongEtag, VersionMetadata,
         };
         let node = NodeState::default();
-        let keys = crate::security::keyring::tests::keys();
+        let keys = crate::security::identity::keyring_tests::keys();
         let geometry = [(WorkerId(0), geometry()), (WorkerId(1), geometry())]
             .into_iter()
             .collect();

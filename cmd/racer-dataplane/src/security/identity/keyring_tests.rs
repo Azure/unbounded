@@ -1,4 +1,4 @@
-use super::super::identity::tests::{CACHE, CLUSTER, NODE};
+use super::tests::{CACHE, CLUSTER, NODE};
 use super::*;
 pub(crate) fn keys() -> Keyring {
     let (_, _, roots) = super::super::identity::tests::issued();

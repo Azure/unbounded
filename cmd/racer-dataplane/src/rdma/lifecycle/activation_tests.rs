@@ -5,7 +5,7 @@ use crate::{
     model::{ResourceClass, *},
     rdma::Devices,
     runtime::{admission::Admission, crypto, worker::CryptoRuntime},
-    security::{aead::PageCryptoEngine, keyring::KeyPurpose},
+    security::{aead::PageCryptoEngine, identity::KeyPurpose},
 };
 use simulation::{Fault, Operation as NativeOp};
 use std::task::{Context, Poll};
@@ -78,7 +78,7 @@ fn configured_activation_spends_budget_and_yields_to_sibling_page_jobs() {
 
     // Real page jobs on a sibling engine, polled on this same thread between
     // native turns just as the shared executor does. No synthetic progress counter.
-    let keys = crate::security::keyring::tests::keys();
+    let keys = crate::security::identity::keyring_tests::keys();
     let page = PageId {
         version: ObjectVersion {
             object: ObjectId {

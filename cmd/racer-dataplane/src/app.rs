@@ -51,10 +51,10 @@ use crate::{
     },
     security::{
         aead::{PageCrypto, PageCryptoEngine},
-        certificates::Certificates,
         credentials::CredentialCrypto,
         forwarding::Forwarding,
-        keyring::{KeyEpochs, KeyPurpose, Keyring},
+        identity::Certificates,
+        identity::{KeyEpochs, KeyPurpose, Keyring},
         signing::Signatures,
     },
     store::{

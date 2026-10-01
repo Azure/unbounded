@@ -241,7 +241,7 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
         Rc::new(BufferPool::new(admission.clone())),
     );
     let crypto = CredentialCrypto::new(
-        Rc::new(crate::security::keyring::tests::keys()),
+        Rc::new(crate::security::identity::keyring_tests::keys()),
         admission.clone(),
     );
     let scope = scope(Duration::from_secs(30)).unwrap();

@@ -251,7 +251,7 @@ fn lifecycle(size: usize, rotating: bool, paired: bool, operation: &str) {
         .unwrap();
         let job = permit.job(
             input,
-            keys.active(cache, crate::security::keyring::KeyPurpose::Page)
+            keys.active(cache, crate::security::identity::KeyPurpose::Page)
                 .unwrap(),
             scope.clone(),
         );
@@ -397,7 +397,7 @@ fn accounting_sample(size: usize, decrypt: bool, enabled: bool, iterations: usiz
             let output = client
                 .execute(
                     input,
-                    keys.active(cache, crate::security::keyring::KeyPurpose::Page)
+                    keys.active(cache, crate::security::identity::KeyPurpose::Page)
                         .unwrap(),
                     &scope,
                 )
@@ -536,7 +536,7 @@ fn measurements_account_once_at_reap_even_for_cancel_and_abandon() {
             .unwrap();
             let cache = crate::model::CacheId("00000000-0000-4000-8000-000000000003".into());
             let lease = || {
-                keys.active(&cache, crate::security::keyring::KeyPurpose::Page)
+                keys.active(&cache, crate::security::identity::KeyPurpose::Page)
                     .unwrap()
             };
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -654,7 +654,7 @@ fn shared_worker_queue_measurements(decrypt: bool) {
     let keys = keyring();
     let cache = crate::model::CacheId("00000000-0000-4000-8000-000000000003".into());
     let lease = || {
-        keys.active(&cache, crate::security::keyring::KeyPurpose::Page)
+        keys.active(&cache, crate::security::identity::KeyPurpose::Page)
             .unwrap()
     };
     let events = measurement_events(decrypt);

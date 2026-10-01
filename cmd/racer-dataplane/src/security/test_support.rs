@@ -1,8 +1,8 @@
 //! Shared CA, node identity, keyring, and signer fixture for signed scenarios.
 use super::{
-    certificates::Certificates,
+    identity::Certificates,
     identity::PendingIdentity,
-    keyring::{KeyEpochs, Keyring},
+    identity::{KeyEpochs, Keyring},
     signing::Signatures,
 };
 use crate::{

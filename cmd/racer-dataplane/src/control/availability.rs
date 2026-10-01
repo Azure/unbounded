@@ -4,7 +4,7 @@
 use crate::{
     control::snapshot::PublishedState,
     model::{CacheId, KeyId},
-    security::keyring::{KeyPurpose, Keyring},
+    security::identity::{KeyPurpose, Keyring},
 };
 use std::{rc::Rc, sync::Arc};
 

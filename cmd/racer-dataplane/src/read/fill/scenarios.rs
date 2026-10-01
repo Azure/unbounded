@@ -127,7 +127,7 @@ impl Origin for TestOrigin {
 struct Fixture {
     fill: Fill,
     reactor: Rc<Reactor>,
-    keys: Rc<crate::security::keyring::Keyring>,
+    keys: Rc<crate::security::identity::Keyring>,
     origin: Rc<TestOrigin>,
     crypto: Rc<CryptoClient>,
     engine: PageCryptoEngine,
@@ -159,7 +159,7 @@ fn fixture_with_availability(
     }
     let worker = WorkerId(0);
     let admission = Rc::new(Admission::new(config.limits.clone()));
-    let keys = Rc::new(crate::security::keyring::tests::keys());
+    let keys = Rc::new(crate::security::identity::keyring_tests::keys());
     let availability = crate::control::availability::for_caches(
         keys.clone(),
         vec![CacheId(crate::security::identity::tests::CACHE.into())],
@@ -883,7 +883,7 @@ fn ciphertext_ready_promotes_once_for_concurrent_plaintext_readers() {
 fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
     let queue = Rc::new(crate::read::drivers::DriverQueue::default());
     let _owner = queue.enter();
-    use crate::security::keyring::{KeyPurpose, tests::rotation_bundle};
+    use crate::security::identity::{KeyPurpose, keyring_tests::rotation_bundle};
     let mut f = fixture_with_availability(3, None, true);
     let flights = f.fill.dependencies.flights.clone();
     let mut held_budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);

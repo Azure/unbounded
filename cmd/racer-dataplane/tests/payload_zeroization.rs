@@ -183,7 +183,7 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
         },
         security::{
             aead::{PageCryptoEngine, page_aad},
-            keyring::{KeyEpochs, KeyPurpose, Keyring},
+            identity::{KeyEpochs, KeyPurpose, Keyring},
         },
     };
     use std::{

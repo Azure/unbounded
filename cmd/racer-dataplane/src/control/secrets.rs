@@ -2,7 +2,7 @@
 use super::wire::{self, BundleGeneration, KeyringBundle};
 use crate::{
     error::{Error, Result},
-    security::keyring::Keyring,
+    security::identity::Keyring,
 };
 use sha2::{Digest, Sha256};
 use std::{cell::RefCell, rc::Rc};
@@ -59,7 +59,7 @@ mod tests {
     use std::os::unix::fs::symlink;
     #[test]
     fn bundle_installation_is_idempotent_and_rejects_rollback() {
-        use crate::security::keyring::{KeyEpochs, KeyPurpose};
+        use crate::security::identity::{KeyEpochs, KeyPurpose};
         use std::sync::Arc;
 
         let publication =

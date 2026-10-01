@@ -887,9 +887,9 @@ fn sustained_rotation_reclaims_history_and_fences_held_pages_and_write_completio
     use crate::{
         control::availability::for_caches,
         memory::{cache::MemoryCache, pool::tests::bundle_for},
-        security::keyring::{
+        security::identity::{
             KeyPurpose,
-            tests::{keys, rotation_bundle},
+            keyring_tests::{keys, rotation_bundle},
         },
     };
     use std::sync::Arc;

@@ -40,7 +40,7 @@
 //! }
 //! ```
 use super::{
-    certificates::VerifiedPeer,
+    identity::VerifiedPeer,
     protocol::{self, field, number, push, push_binary},
     signing::{Signatures, SignedHead},
     signing::{node_field, receiver, signed_digest},

@@ -18,7 +18,7 @@ use crate::{
         admission::Admission,
         deadline::{Deadline, RequestScope},
     },
-    security::{certificates::VerifiedPeer, signing::VerifiedHead},
+    security::{identity::VerifiedPeer, signing::VerifiedHead},
     topology::rails::{RailId, RailMapping},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -403,9 +403,9 @@ mod session_tests {
             http::{Header, MessageHead, StartLine},
             model::ClusterId,
             security::{
-                certificates::Certificates,
+                identity::Certificates,
                 identity::tests::{CLUSTER, NODE, issued},
-                keyring::{KeyEpochs, Keyring},
+                identity::{KeyEpochs, Keyring},
                 signing::{Signatures, SignedHead},
             },
         };
