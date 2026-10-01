@@ -1,6 +1,9 @@
 # Racer tail-latency controls: code-only evaluation
 
 Evaluated at `3255648690259da3ac95ec2c5c8586c7a802d576`, 2026-10-01.
+Section 3 was corrected after the six-blocker safety review on 2026-10-01;
+its updated behavior and regression references supersede that initial evaluation.
+Other line references below describe the initial evaluated revision.
 Implementation and test assertions were read before related prose. No cluster
 inspection, rollout, load change, or performance measurement was performed.
 This document changes no defaults. Below, `D/` means
@@ -72,40 +75,56 @@ Thus the cap is not a promise that all resource teardown finishes at that instan
 
 Only a singleflight leader's plaintext fixed-page acquisition at a noncandidate
 can try a pair. The first two ranked candidates must be distinct, healthy direct
-neighbors, with at least four attempt and eight link credits available. Direct
+neighbors, with at least seven attempt and sixteen link credits available. Direct
 neighbor eligibility is checked against the topology, not inferred from distinct
-final destinations (`D/read/candidates.rs:60-109`, `D/peer.rs:61-75`).
+final destinations (`D/read/candidates.rs:66-95`, `D/peer.rs:61-75`).
 
 The primary uses `Acquire`; at most one delayed secondary uses `CopyOnly`, so
 the duplicate does not request another origin acquisition. Both are pinned to
 their own direct first hop and forced to HTTP. Metadata, bootstrap, subscription
 selection, ciphertext relay, and native transfers do not race through this hook.
 There is no whole-GET duplication; an eligible fixed-page fallback within a read
-can still reach the hook (`D/read/candidates.rs:110-174`,
+can still reach the hook (`D/read/candidates.rs:138-219`,
 `D/peer/requester.rs:144-168,276-293`, `D/read/fill.rs:999-1048`).
 
 Slots and duplicate-byte capacity are shared by all workers of one node owner
 (`D/app.rs:610-617`). Each slot charges a full 33554448-byte pair, including during
-the delay. Before scheduling, worker/cache plaintext and ciphertext escrow must
-also fit; actual receive/decrypt allocations still pay their normal quotas.
-Launch rechecks adaptive and local headroom. Adaptive reduction, peer circuit
-pressure, missing route independence, insufficient original credits, exhausted
-slots, or memory pressure suppress speculation
-(`D/read/hedge.rs:89-108`, `D/read/candidates.rs:87-174`,
-`D/peer/adaptive.rs:77-87`). Escrow is intentionally conservative extra accounting,
-not a measurement of allocated memory or transmitted bytes.
+the delay. Before spending any credits, worker/cache admission preflights the
+whole working set: the already reserved serial plaintext page, duplicate
+plaintext/ciphertext escrow, and both contenders' plaintext/ciphertext buffers.
+This conservative strategy requires 64 MiB plaintext capacity in an otherwise
+empty worker; 32 or 48 MiB suppresses the pair and leaves the funded serial path
+usable. Trial contender reservations are released after preflight; actual
+receive/decrypt allocations remain independently quota-controlled, and launch
+rechecks local headroom. Competing allocations can still suppress/fail work,
+never bypass quota (`D/read/candidates.rs:96-127,170-197`). Adaptive reduction,
+peer circuit pressure, missing independence, insufficient credits, exhausted
+slots, or memory pressure suppress speculation. Escrow is extra accounting,
+not measured allocated memory or transmitted bytes.
 
 The original credits are partitioned, with only unused child credits reunited.
-Either response must pass binding/page validation and plaintext decryption before
-it can win. The winner cancels the loser but waits for accepted exchange/crypto work
-to fence before return/publication. This is **not early publication** and slow
-loser teardown can erase any latency benefit. On recoverable pair failure, serial
-resolution can revisit candidates using only remaining original credits; this
-acquisition does not launch another pair (`D/read/candidates.rs:176-200`,
-`D/read/hedge.rs:159-264`, `D/read/fill.rs:1003-1044,1149-1196`). Tests assert real
-AEAD validation, two-reader singleflight, exact credit/deadline conservation,
-suppression, and retention after caller detach until the loser fence
-(`D/read/fill_peer_tests.rs:152-237,243-314`, `D/read/hedge.rs:334-432`).
+The two pinned direct exchanges debit one link each, rather than four, and have
+nonrenewable local caps of at most one-third of the remaining original time
+(also bounded by the configured attempt cap). Signed overall authority never
+changes (`D/read/candidates.rs:128-153,805-837`). After a failed pair, continuation
+skips the consumed primary, keeps the secondary's CopyOnly miss eligible for a
+later Acquire, caps serial routes at four links, and reserves attempts for later
+candidates. It does not restart candidate zero in the same membership or launch
+another pair. An authenticated stale response from either contender enters the
+ordinary single newer-membership refresh using remaining credits; another stale
+response is terminal (`D/read/candidates.rs:498-633`).
+
+Each validation receives that contender's independent child scope, including
+crypto admission and completion waits. The winner cancels the loser, but accepted
+crypto still must complete and have its result consumed before the race returns.
+Retained version metadata compatibility is checked before and after AEAD, before
+winner election, not just at publication (`D/read/fill.rs:1016-1038`). This is
+**not early publication**: slow loser teardown can erase any latency benefit.
+New regressions cover stalled-primary/fast-miss fallback through the third
+candidate, primary and secondary stale refresh, full 16 MiB pages at exact
+32/48/64 MiB quotas, AEAD-valid conflicting length/content type, and accepted
+crypto cancellation/fencing (`D/read/fill_peer_tests.rs:386-751`). Existing
+singleflight and immutable-deadline assertions remain in place.
 
 **No fleet-global distributed hedge budget is implemented.** The owner is local
 `Arc`/`Mutex` state, not a distributed coordinator (`D/read/hedge.rs:58-108`,
@@ -213,3 +232,17 @@ These are contract/unit/local-socket tests, not a load benchmark, full suite, or
 native-hardware validation. Go tests were not run. The already reported
 `make fmt` Go-toolchain mismatch was not retried unchanged; no Go or Rust source
 was edited. Defaults and existing guard behavior remain unchanged.
+
+### Post-review correction validation
+
+The historical validation above preceded the six-blocker code fixes. The correction
+phase changed only the Racer read code/tests and this section's behavioral claims;
+defaults and deployment/guard code remain unchanged. Externally bounded Rust
+commands used the same manifest and `--locked`: `--lib hedge` **20 passed**,
+`--lib read::` **168 passed** before the final additional version-outcome regression,
+`--lib peer::` **71 passed, 2 ignored**, and `--lib runtime::crypto::`
+**19 passed, 3 ignored**. The strengthened stalled-primary fallback test passed
+again after the final credit-reserve assertion. `cargo check --all-targets
+--features rdma`, Rust formatting, and diff checks passed. No cluster or load
+commands ran. `make fmt` was not repeated under the user's explicit instruction
+because its installed Go-toolchain mismatch is unchanged.
