@@ -14,23 +14,25 @@ const copyBufferSize = 256 * 1024
 
 // Value is an immutable full-object or selected-range stream. One goroutine may
 // consume it using Read or WriteTo (including io.Copy); Metadata and Close may be called
-// concurrently. A Value must not be copied. Construct it with Client.Get.
+// concurrently. A Value must not be copied. Construct it with Client.Get, or
+// Client.GetStreaming for exclusive WriteToHTTP consumption.
 type Value struct {
-	stream   *PageStream
-	ordered  *orderedRead
-	mu       sync.Mutex
-	client   *Client
-	pool     *connectionPool
-	ctx      context.Context
-	cancel   context.CancelFunc
-	stop     func() bool
-	body     io.Closer
-	terminal error
-	finished chan struct{}
-	slot     bool
-	metadata Metadata
-	offset   int64
-	end      int64
+	stream    *PageStream
+	streaming bool
+	ordered   *orderedRead
+	mu        sync.Mutex
+	client    *Client
+	pool      *connectionPool
+	ctx       context.Context
+	cancel    context.CancelFunc
+	stop      func() bool
+	body      io.Closer
+	terminal  error
+	finished  chan struct{}
+	slot      bool
+	metadata  Metadata
+	offset    int64
+	end       int64
 }
 
 // Metadata returns the immutable total-size/tag/expiry snapshot, never a
@@ -101,7 +103,12 @@ func (v *Value) finish(err error) {
 
 // Read consumes ordered page leases. An incomplete page is never exposed.
 // A terminal error never restarts the version or opens another subscription.
+// GetStreaming Values reject Read, including zero-length reads.
 func (v *Value) Read(p []byte) (int, error) {
+	if v.streaming {
+		return 0, failure(ErrorInvalidArgument, "streaming value requires WriteToHTTP", nil)
+	}
+
 	if err := v.err(); err != nil {
 		// Cancellation publishes the error before joining the receiver. A
 		// consumer observing it must also wait for admission/storage cleanup.
@@ -150,6 +157,7 @@ func (v *Value) Close() error {
 // including canceled copies still blocked in caller-owned Write.
 // If those blocked writers exhaust scratch admission, WriteTo returns
 // ErrorUnavailable. Cancellation cannot interrupt an arbitrary destination Write.
+// GetStreaming Values reject WriteTo without consuming the subscription.
 func (v *Value) WriteTo(w io.Writer) (int64, error) {
 	if _, err := v.Read(nil); err != nil {
 		if err == io.EOF {

@@ -60,6 +60,7 @@ func (w *copyDestination) ReadFrom(io.Reader) (int64, error) {
 func (w *copyDestination) Write(p []byte) (int, error) {
 	w.maxWrite = max(w.maxWrite, len(p))
 	w.sizes = append(w.sizes, len(p))
+
 	return w.Buffer.Write(p)
 }
 

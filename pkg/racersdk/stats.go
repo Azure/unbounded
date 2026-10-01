@@ -44,8 +44,11 @@ type Stats struct {
 	ConnectionRotations uint64
 	// Retries counts single fresh-connection retries after stale pooled failures.
 	Retries uint64
-	// BytesRead counts body bytes consumed by Values, excluding headers and Stat.
-	// It includes bytes read before a later body or destination-writer failure.
+	// BytesRead counts body bytes observed as consumed by Values, excluding headers
+	// and Stat. It includes buffered bytes read before a later body or writer
+	// failure. Streaming splice transfers use the standard library's delivered-byte
+	// accounting: on destination failure, source bytes left in a kernel pipe are
+	// not observable through a public API and may be missing from this count.
 	BytesRead uint64
 }
 

@@ -239,6 +239,20 @@ func (c *Client) admit(ctx context.Context, pool *connectionPool) (*Value, error
 // bootstrap, or continuation requests. ctx governs admission and the entire
 // Value lifetime. Use OpenPages for unordered page delivery.
 func (c *Client) Get(ctx context.Context, request Request, options ...ReadOptions) (*Value, error) {
+	return c.get(ctx, request, false, options...)
+}
+
+// GetStreaming opens an ordered subscription without starting a buffered page
+// receiver. Only WriteToHTTP may consume the returned Value; Read and WriteTo
+// return ErrorInvalidArgument without consuming it. Unlike Get, this mode may
+// expose an incomplete page prefix on failure, but withholds the selected range's
+// final byte until Complete is validated. The caller must Close on every path.
+// Options and metadata validation are identical to Get.
+func (c *Client) GetStreaming(ctx context.Context, request Request, options ...ReadOptions) (*Value, error) {
+	return c.get(ctx, request, true, options...)
+}
+
+func (c *Client) get(ctx context.Context, request Request, streaming bool, options ...ReadOptions) (*Value, error) {
 	if len(options) > 1 {
 		return nil, failure(ErrorInvalidArgument, "get", nil)
 	}
@@ -257,7 +271,11 @@ func (c *Client) Get(ctx context.Context, request Request, options ...ReadOption
 
 	s.owner.stream = s
 	s.owner.offset, s.owner.end = int64(s.first), int64(s.end)
-	s.owner.startOrdered(s)
+
+	s.owner.streaming = streaming
+	if !streaming {
+		s.owner.startOrdered(s)
+	}
 
 	return s.owner, nil
 }
