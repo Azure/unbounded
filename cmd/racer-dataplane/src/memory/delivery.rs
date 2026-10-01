@@ -25,8 +25,10 @@ use crate::{
 #[cfg(test)]
 use std::os::fd::AsRawFd;
 #[cfg(test)]
+use std::task::Poll;
+#[cfg(test)]
 use std::time::Instant;
-use std::{io, rc::Rc, task::Poll, time::Duration};
+use std::{io, rc::Rc, time::Duration};
 
 // Limit both syscall size and work in one executor turn, even for a writable peer.
 const SEND_CHUNK_BYTES: usize = 64 * 1024;
@@ -182,6 +184,7 @@ impl Delivery {
 
     /// Client body writes are bounded by lack of socket progress, not total
     /// object duration. Peer writes retain their absolute operation deadline.
+    #[cfg(test)]
     pub(crate) fn finish_progressing<'a>(
         &'a self,
         reader: ReaderLease,

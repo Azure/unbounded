@@ -829,6 +829,20 @@ mod tests {
         security::connection::signature_tests::{clone_head, network, node},
     };
     use std::time::{Duration, Instant};
+    fn wire_ciphertext(
+        envelope: PageEnvelope,
+        length: usize,
+    ) -> crate::memory::pool::CiphertextPage {
+        crate::memory::pool::CiphertextPage {
+            provenance: None,
+            inner: Arc::new(crate::memory::pool::CiphertextBytes {
+                checksum: std::sync::OnceLock::new(),
+                envelope,
+                bytes: vec![0; length],
+                reservation: request(5).origin.reservation,
+            }),
+        }
+    }
     fn request(id: u8) -> PeerRequest {
         let n = std::num::NonZeroUsize::new(1024 * 1024).unwrap();
         let admission = Admission::new(Limits {
@@ -1468,10 +1482,6 @@ mod tests {
     }
     #[test]
     fn page_descriptor_fields_and_successful_response_are_bound_exactly() {
-        use crate::{
-            memory::pool::{CiphertextBytes, CiphertextPage},
-            model::{ExpiresAt, ObjectMetadata, PageEnvelope},
-        };
         let signatures = network(3);
         let a = Forwarding::new(signatures[0].clone());
         let b = Forwarding::new(signatures[2].clone());
@@ -1495,21 +1505,16 @@ mod tests {
             length: 7,
             expires_at: ExpiresAt::test_time(std::time::SystemTime::now()),
         };
-        let ciphertext = CiphertextPage {
-            provenance: None,
-            inner: Arc::new(CiphertextBytes {
-                checksum: std::sync::OnceLock::new(),
-                envelope: PageEnvelope {
-                    page,
-                    key_id: KeyId([6; 16]),
-                    nonce: Nonce([7; 24]),
-                    plaintext_length: 7,
-                    ciphertext_length: 23,
-                },
-                bytes: vec![0; 23],
-                reservation: self::request(5).origin.reservation,
-            }),
-        };
+        let ciphertext = wire_ciphertext(
+            PageEnvelope {
+                page,
+                key_id: KeyId([6; 16]),
+                nonce: Nonce([7; 24]),
+                plaintext_length: 7,
+                ciphertext_length: 23,
+            },
+            23,
+        );
         let response = b
             .sign_response(
                 admitted.binding(),
@@ -1534,15 +1539,7 @@ mod tests {
                             .unwrap()
                 }
             }
-            let body = CiphertextPage {
-                provenance: None,
-                inner: Arc::new(CiphertextBytes {
-                    checksum: std::sync::OnceLock::new(),
-                    envelope,
-                    bytes: vec![0; 23],
-                    reservation: self::request(5).origin.reservation,
-                }),
-            };
+            let body = wire_ciphertext(envelope, 23);
             let tampered = SignedResponse {
                 authentication: ForwardedHead {
                     original: response.authentication.original.clone(),
@@ -1612,10 +1609,6 @@ mod tests {
     }
     #[test]
     fn validly_signed_page_must_match_the_requested_version_and_page() {
-        use crate::{
-            memory::pool::{CiphertextBytes, CiphertextPage},
-            model::{ExpiresAt, ObjectMetadata, PAGE_BYTES, PageEnvelope},
-        };
         let signatures = network(3);
         let sender = Forwarding::new(signatures[0].clone());
         let mut local = request(1);
@@ -1644,21 +1637,16 @@ mod tests {
                 length: page.number.0 * PAGE_BYTES + 3,
                 expires_at: ExpiresAt::test_time(std::time::SystemTime::now()),
             };
-            let ciphertext = CiphertextPage {
-                provenance: None,
-                inner: Arc::new(CiphertextBytes {
-                    checksum: std::sync::OnceLock::new(),
-                    envelope: PageEnvelope {
-                        page,
-                        key_id: KeyId([3; 16]),
-                        nonce: Nonce([4; 24]),
-                        plaintext_length: 3,
-                        ciphertext_length: 19,
-                    },
-                    bytes: vec![0; 19],
-                    reservation: request(1).origin.reservation,
-                }),
-            };
+            let ciphertext = wire_ciphertext(
+                PageEnvelope {
+                    page,
+                    key_id: KeyId([3; 16]),
+                    nonce: Nonce([4; 24]),
+                    plaintext_length: 3,
+                    ciphertext_length: 19,
+                },
+                19,
+            );
             let response = PeerResponse::Page {
                 metadata,
                 ciphertext,
@@ -1915,10 +1903,6 @@ mod tests {
     }
     #[test]
     fn page_descriptor_range_nonce_and_exact_request_binding() {
-        use crate::{
-            memory::pool::{CiphertextBytes, CiphertextPage},
-            model::{ExpiresAt, ObjectMetadata, PageEnvelope},
-        };
         let signatures = network(3);
         let requester = Forwarding::new(signatures[0].clone());
         let server = Forwarding::new(signatures[2].clone());
@@ -1949,19 +1933,9 @@ mod tests {
             plaintext_length: 3,
             ciphertext_length: 19,
         };
-        let pool_request = request(2);
-        let reservation = pool_request.origin.reservation;
         // A charged wire ciphertext is unverified page data; signing does not
         // authenticate its body. Only the signed descriptor is consumed here.
-        let ciphertext = CiphertextPage {
-            provenance: None,
-            inner: Arc::new(CiphertextBytes {
-                checksum: std::sync::OnceLock::new(),
-                envelope: envelope.clone(),
-                bytes: vec![0; 19],
-                reservation,
-            }),
-        };
+        let ciphertext = wire_ciphertext(envelope.clone(), 19);
         let response = server
             .sign_response(
                 admitted.binding(),
@@ -1990,16 +1964,7 @@ mod tests {
                 3 => m.length += 1,
                 _ => e.page.number.0 += 1,
             }
-            let reservation = request(3).origin.reservation;
-            let bad = CiphertextPage {
-                provenance: None,
-                inner: Arc::new(CiphertextBytes {
-                    checksum: std::sync::OnceLock::new(),
-                    envelope: e,
-                    bytes: vec![0; 19],
-                    reservation,
-                }),
-            };
+            let bad = wire_ciphertext(e, 19);
             let response = SignedResponse {
                 authentication: ForwardedHead {
                     original: auth.original.clone(),
