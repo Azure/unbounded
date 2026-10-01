@@ -24,8 +24,7 @@
 // The `containerd.io/gc.expire` label is what containerd's
 // lease manager recognizes for TTL expiration - leases.
 // WithExpiration sets it under the hood. The returned guard is
-// released on failed ingest; AttachLease is retained as a compatibility
-// wrapper for tests and older call sites.
+// released on failed ingest.
 //
 // 2. CleanupExpiredLeases(ctx): lists every gantry-managed lease,
 // deletes those past their expiry, and returns the count of
@@ -67,10 +66,6 @@ const (
 	// with the resource binding but useful for log/metric extraction
 	// without an extra ListResources call.
 	LabelDigest = "gantry.io/digest"
-	// LabelCreated records the RFC3339 creation timestamp. Used by
-	// CleanupExpiredLeases when the containerd gc.expire label is
-	// missing (e.g. legacy leases from earlier agent versions).
-	LabelCreated = "gantry.io/created"
 )
 
 // DefaultLeaseTTL is the lease lifetime used when WithLeaseTTL is
@@ -95,7 +90,7 @@ type LeaseManager interface {
 }
 
 // WithLeaseManager wires the containerd lease manager into the Store
-// so AttachLease and CleanupExpiredLeases can run. Without this option
+// so CreateLease and CleanupExpiredLeases can run. Without this option
 // both methods return ErrNoLeaseManager - tests or dev-only wiring
 // may omit it; production containerd-only wiring always sets it.
 func WithLeaseManager(m LeaseManager) Option {
@@ -112,7 +107,7 @@ func WithLeaseTTL(d time.Duration) Option {
 	}
 }
 
-// ErrNoLeaseManager is returned by AttachLease and CleanupExpiredLeases
+// ErrNoLeaseManager is returned by CreateLease and CleanupExpiredLeases
 // when the Store was not constructed with WithLeaseManager.
 var ErrNoLeaseManager = fmt.Errorf("containerdstore: lease manager not configured")
 
@@ -155,7 +150,6 @@ func (s *Store) CreateLease(ctx context.Context, d gdigest.Digest, source, repos
 		LabelSource:     source,
 		LabelRepository: repository,
 		LabelDigest:     d.String(),
-		LabelCreated:    time.Now().UTC().Format(time.RFC3339),
 	}
 
 	lease, err := s.leases.Create(ctx,
@@ -181,27 +175,13 @@ func (s *Store) CreateLease(ctx context.Context, d gdigest.Digest, source, repos
 	return &LeaseGuard{store: s, lease: lease}, nil
 }
 
-// AttachLease creates a containerd lease that keeps d alive for the
-// configured TTL. The returned LeaseGuard is intentionally discarded
-// because the caller does not need to release this lease early - it
-// will expire via TTL. Idempotent at the digest level: a digest may be
-// referenced by multiple leases without breaking anything, but
-// gantry uses one lease per Commit to keep cleanup arithmetic simple.
-func (s *Store) AttachLease(ctx context.Context, d gdigest.Digest, source, repository string) error {
-	_, err := s.CreateLease(ctx, d, source, repository)
-	return err
-}
-
 // CleanupExpiredLeases removes every Gantry-managed lease whose
 // creation timestamp + configured TTL is in the past, returning the
 // number of leases deleted. Used by a periodic background task in
 // cmd/gantry to keep the lease catalog from growing unbounded.
 //
-// We rely on our own LabelCreated rather than parsing containerd's
-// containerd.io/gc.expire because the latter is internal-format and
-// not exposed in the leases.Lease.Labels map after creation in some
-// containerd versions. Lease.CreatedAt + Store.leaseTTL is the
-// authoritative computation.
+// The supported containerd metadata store persists CreatedAt on creation and
+// restores it on listing. Lease.CreatedAt + Store.leaseTTL determines expiry.
 func (s *Store) CleanupExpiredLeases(ctx context.Context) (int, error) {
 	if s.leases == nil {
 		return 0, ErrNoLeaseManager
@@ -239,19 +219,10 @@ func (s *Store) CleanupExpiredLeases(ctx context.Context) (int, error) {
 }
 
 // isExpired returns true when the lease was created more than
-// s.leaseTTL ago. Falls back to LabelCreated when CreatedAt is the
-// zero value (some older containerd lease backends don't populate it).
+// s.leaseTTL ago. Missing or invalid timestamps are conservatively retained.
 func (s *Store) isExpired(l leases.Lease, now time.Time) bool {
 	created := l.CreatedAt
-	if created.IsZero() {
-		if ts, ok := l.Labels[LabelCreated]; ok {
-			if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
-				created = parsed
-			}
-		}
-	}
-
-	if created.IsZero() {
+	if created.IsZero() || created.Year() < 1 || created.Year() > 9999 || created.After(now) {
 		// No timestamp available - treat as fresh to avoid deleting
 		// leases we can't safely reason about. The lease's own
 		// containerd.io/gc.expire label will eventually expire it.

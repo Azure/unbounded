@@ -110,14 +110,16 @@ func mustDigestFor(t *testing.T, hex string) gdigest.Digest {
 	return d
 }
 
-func TestAttachLease_CreatesLeaseWithLabelsAndResource(t *testing.T) {
+func TestCreateLease_CreatesLeaseWithLabelsAndResource(t *testing.T) {
 	fl := newFakeLeases()
 	fs := &fakeStore{}
 	s := New(fs, WithLeaseManager(fl), WithLeaseTTL(30*time.Minute))
 
 	d := mustDigestFor(t, "1111111111111111111111111111111111111111111111111111111111111111")
-	if err := s.AttachLease(context.Background(), d, "registry.example.com", "library/nginx"); err != nil {
-		t.Fatalf("AttachLease: %v", err)
+
+	guard, err := s.CreateLease(context.Background(), d, "registry.example.com", "library/nginx")
+	if err != nil || guard == nil {
+		t.Fatalf("CreateLease: guard=%v err=%v", guard, err)
 	}
 
 	if len(fl.created) != 1 {
@@ -141,8 +143,8 @@ func TestAttachLease_CreatesLeaseWithLabelsAndResource(t *testing.T) {
 		t.Errorf("LabelDigest = %q", got.Labels[LabelDigest])
 	}
 
-	if got.Labels[LabelCreated] == "" {
-		t.Error("LabelCreated empty")
+	if _, ok := got.Labels["gantry.io/created"]; ok {
+		t.Error("obsolete creation label retained")
 	}
 
 	if _, ok := got.Labels["containerd.io/gc.expire"]; !ok {
@@ -157,16 +159,20 @@ func TestAttachLease_CreatesLeaseWithLabelsAndResource(t *testing.T) {
 	if res[0].Type != "content" || res[0].ID != d.String() {
 		t.Errorf("resource = %+v", res[0])
 	}
+
+	if err := guard.Release(t.Context()); err != nil || len(fl.deleted) != 1 || fl.deleted[0] != got.ID {
+		t.Fatalf("release: deleted=%v err=%v", fl.deleted, err)
+	}
 }
 
-func TestAttachLease_RollsBackOnAddResourceFailure(t *testing.T) {
+func TestCreateLease_RollsBackOnAddResourceFailure(t *testing.T) {
 	fl := newFakeLeases()
 	fl.failAdd = errors.New("backend down")
 	fs := &fakeStore{}
 	s := New(fs, WithLeaseManager(fl))
 
 	d := mustDigestFor(t, "2222222222222222222222222222222222222222222222222222222222222222")
-	if err := s.AttachLease(context.Background(), d, "r", "p"); err == nil {
+	if _, err := s.CreateLease(context.Background(), d, "r", "p"); err == nil {
 		t.Fatal("expected error")
 	}
 	// Created the lease, then deleted it on failure.
@@ -179,12 +185,12 @@ func TestAttachLease_RollsBackOnAddResourceFailure(t *testing.T) {
 	}
 }
 
-func TestAttachLease_NoLeaseManagerReturnsSentinel(t *testing.T) {
+func TestCreateLease_NoLeaseManagerReturnsSentinel(t *testing.T) {
 	fs := &fakeStore{}
 	s := New(fs) // no WithLeaseManager
 
 	d := mustDigestFor(t, "3333333333333333333333333333333333333333333333333333333333333333")
-	if err := s.AttachLease(context.Background(), d, "r", "p"); !errors.Is(err, ErrNoLeaseManager) {
+	if _, err := s.CreateLease(context.Background(), d, "r", "p"); !errors.Is(err, ErrNoLeaseManager) {
 		t.Errorf("err = %v, want ErrNoLeaseManager", err)
 	}
 }
@@ -242,13 +248,13 @@ func TestCleanupExpiredLeases_NotFoundOnDeleteIsTolerated(t *testing.T) {
 	}
 }
 
-func TestCleanupExpiredLeases_FallsBackToLabelCreatedWhenCreatedAtZero(t *testing.T) {
+func TestCleanupExpiredLeases_RetainsMissingTimestampDespiteOldLabel(t *testing.T) {
 	fl := newFakeLeases()
 	old := time.Now().Add(-3 * time.Hour).UTC().Format(time.RFC3339)
 	fl.listResult = []leases.Lease{
 		{ID: "gantry-labelonly", Labels: map[string]string{
-			LabelManaged: "true",
-			LabelCreated: old,
+			LabelManaged:        "true",
+			"gantry.io/created": old,
 		}},
 	}
 	fs := &fakeStore{}
@@ -259,8 +265,29 @@ func TestCleanupExpiredLeases_FallsBackToLabelCreatedWhenCreatedAtZero(t *testin
 		t.Fatalf("err = %v", err)
 	}
 
-	if deleted != 1 {
-		t.Errorf("deleted = %d, want 1", deleted)
+	if deleted != 0 {
+		t.Errorf("deleted = %d, want 0", deleted)
+	}
+}
+
+func TestLeaseCreatedAtIsAuthoritative(t *testing.T) {
+	now := time.Now()
+	s := New(&fakeStore{}, WithLeaseTTL(time.Minute))
+
+	lease := leases.Lease{CreatedAt: now.Add(-time.Hour), Labels: map[string]string{"gantry.io/created": now.Format(time.RFC3339)}}
+	if !s.isExpired(lease, now) {
+		t.Fatal("obsolete label overrode the containerd creation timestamp")
+	}
+}
+
+func TestLeaseInvalidTimestampsAreRetained(t *testing.T) {
+	now := time.Now()
+
+	s := New(&fakeStore{}, WithLeaseTTL(time.Minute))
+	for _, created := range []time.Time{{}, now.Add(time.Hour), time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)} {
+		if s.isExpired(leases.Lease{CreatedAt: created}, now) {
+			t.Errorf("invalid timestamp %v expired", created)
+		}
 	}
 }
 
