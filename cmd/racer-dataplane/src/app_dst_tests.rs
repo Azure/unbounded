@@ -780,7 +780,7 @@ impl Harness {
         let (mut app, runtime, engine) = integration_tests::local_worker(&config, &node, 0);
         let crypto = node.native.crypto(WorkerId(0), engine).unwrap();
         if self.native {
-            app.fabric_ports = vec![crate::rdma::device::FabricPort {
+            app.fabric_ports = vec![crate::rdma::FabricPort {
                 fabric: "dst-fabric".into(),
                 device,
                 port: 1,

@@ -7,7 +7,7 @@ use crate::runtime::collections::HashSet;
 use crate::{
     error::{Error, Result},
     model::{ClusterId, Limits, NodeId, PAGE_BYTES},
-    rdma::device::FabricPort,
+    rdma::FabricPort,
     store::format::MAX_HEADER_BYTES,
 };
 use std::{
@@ -1074,7 +1074,7 @@ mod tests {
     #[test]
     fn configured_ports_do_not_override_membership_or_discovered_hardware() {
         use crate::{
-            rdma::device::{DiscoveredPort, match_publication},
+            rdma::{DiscoveredPort, match_publication},
             topology::rails::{RailId, RailMapping},
         };
         let ports = parse_fabric_ports(Some(r#"[{"fabric":"trusted","device":"mlx5_0","port":1,"gid":"01010101010101010101010101010101"}]"#)).unwrap();

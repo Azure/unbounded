@@ -10,9 +10,8 @@ use crate::{
         RequestId, ResourceClass, StrongEtag, TransferId,
     },
     rdma::{
-        device::Devices,
+        Devices, RegisteredLease,
         permission::{AuthenticatedDescriptor, DESCRIPTOR_HEADER, Grant},
-        registered::RegisteredLease,
         session::{SETUP_BINDING_HEADER, SETUP_HEADER, SessionLease, Sessions},
         transfer::RdmaTransfer,
         verbs::{QueuePairHandle, Region},

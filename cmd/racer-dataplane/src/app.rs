@@ -29,7 +29,7 @@ use crate::{
     model::{Limits, NodeId, RequestId, WorkerId},
     origin::{Origin, OriginClient},
     peer::{Relay, Requester, server::PeerServer, transfer::Transfers},
-    rdma::{device::Devices, session::Sessions, transfer::RdmaTransfer},
+    rdma::{Devices, session::Sessions, transfer::RdmaTransfer},
     read::{
         Coordinator,
         candidates::CandidatePolicy,
@@ -100,7 +100,7 @@ pub struct Application {
     config: Arc<Config>,
     node: Arc<NodeState>,
     limits: Limits,
-    fabric_ports: Vec<crate::rdma::device::FabricPort>,
+    fabric_ports: Vec<crate::rdma::FabricPort>,
 }
 
 /// Shared immutable-publication and partitioned-admission roots. No Rc worker
@@ -538,7 +538,7 @@ pub struct WorkerApplication {
     flights: Rc<Flights>,
     rdma: Option<Rc<RdmaTransfer>>,
     devices: Option<Rc<Devices>>,
-    fabric_ports: Vec<crate::rdma::device::FabricPort>,
+    fabric_ports: Vec<crate::rdma::FabricPort>,
     actual_rails: Vec<crate::topology::rails::RailMapping>,
     native_numa: Option<Option<usize>>,
     native_task: Option<Operation<'static, Vec<crate::topology::rails::RailMapping>>>,

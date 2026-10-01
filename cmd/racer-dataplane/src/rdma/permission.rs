@@ -1,7 +1,7 @@
 //! Type-2B windows expose exactly one transfer buffer. Bind CQE precedes export;
 //! invalidation plus terminal QP destruction precedes any CPU access or reuse.
 use super::{
-    registered::{MAX_CIPHERTEXT, RegisteredLease},
+    MAX_CIPHERTEXT, RegisteredLease,
     session::{SessionLease, signed_value},
     verbs::{QueuePairHandle, Ticket, Window},
 };

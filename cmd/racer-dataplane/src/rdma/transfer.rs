@@ -1,8 +1,8 @@
 //! Ciphertext-only movement. Control exchange supplies signed per-transfer grants;
 //! failed attempts are fenced before the peer owner starts a new HTTP attempt.
 use super::{
+    RegisteredLease,
     permission::{AuthenticatedDescriptor, Grant, completion_bytes},
-    registered::RegisteredLease,
     session::{SessionLease, Sessions},
     verbs::QueuePairHandle,
 };

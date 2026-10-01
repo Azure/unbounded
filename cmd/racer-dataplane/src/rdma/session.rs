@@ -1,7 +1,7 @@
 //! Bounded authenticated RC sessions. Each transfer uses a dedicated session;
 //! terminal QP destruction fences remote writes before registered memory reuse.
 use super::{
-    device::Devices,
+    Devices,
     verbs::{Endpoint, QueuePairHandle},
 };
 use crate::{

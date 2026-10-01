@@ -8,7 +8,7 @@ use crate::{
         RequestId, ResourceClass, StrongEtag, TransferId,
     },
     rdma::{
-        device::Devices,
+        Devices,
         permission::{COMPLETION_HEADER, completion_bytes},
         session::{SessionLease, Sessions},
         transfer::RdmaTransfer,

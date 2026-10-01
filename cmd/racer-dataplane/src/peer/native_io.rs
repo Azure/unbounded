@@ -43,7 +43,7 @@ mod tests {
         http::{Codec, MessageHead, StartLine, io::HttpIo, pool::HttpPool},
         memory::pool::BufferPool,
         model::{ExpiresAt, KeyId, Nonce, ObjectMetadata, PageEnvelope, ResourceClass, *},
-        rdma::{device::Devices, session::Sessions, transfer::RdmaTransfer},
+        rdma::{Devices, session::Sessions, transfer::RdmaTransfer},
         runtime::{admission::Admission, reactor::Reactor},
         security::{protocol as p, signing::Signatures},
     };
@@ -379,7 +379,7 @@ mod tests {
     #[ignore = "requires real ABI v2 adapter and RACER_RDMA_TEST_DEVICE/PORT/GID for an active type-2B port"]
     fn native_provider_signed_setup_grant_write_completion_roundtrip() {
         use crate::rdma::{
-            device::FabricPort,
+            FabricPort,
             lifecycle::{NativeService, pair},
         };
         use crate::topology::{

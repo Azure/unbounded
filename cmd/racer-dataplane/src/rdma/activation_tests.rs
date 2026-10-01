@@ -3,7 +3,7 @@ use super::*;
 use crate::{
     memory::pool::BufferPool,
     model::{ResourceClass, *},
-    rdma::device::Devices,
+    rdma::Devices,
     runtime::{admission::Admission, crypto, worker::CryptoRuntime},
     security::{aead::PageCryptoEngine, keyring::KeyPurpose},
 };

@@ -1199,7 +1199,7 @@ mod tests {
         use crate::{
             model::{RequestId, ResourceClass},
             rdma::{
-                device::{Devices, FabricPort},
+                Devices, FabricPort,
                 lifecycle::{NativeService, pair},
                 verbs,
             },

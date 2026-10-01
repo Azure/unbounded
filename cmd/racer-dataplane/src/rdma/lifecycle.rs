@@ -1,10 +1,6 @@
 //! Bounded native service for the EXISTING paired crypto thread. No thread is
 //! spawned here. I/O only tries mailboxes; native calls and destruction run here.
-use super::{
-    device::{FabricPort, match_publication},
-    ffi,
-    verbs::Endpoint,
-};
+use super::{FabricPort, ffi, match_publication, verbs::Endpoint};
 use crate::{
     error::{Error, Result},
     runtime::{admission::Reservation, deadline::RequestScope, worker::CryptoService},
@@ -304,7 +300,7 @@ impl NativeService {
         let discovered = ffi::Verbs.discover()?;
         let descriptions = discovered
             .iter()
-            .map(super::device::discovered_port)
+            .map(super::discovered_port)
             .collect::<Result<Vec<_>>>()?;
         let selected = match_publication(&config.publication, &config.associations, &descriptions)?;
         if selected.is_empty() {
@@ -702,7 +698,7 @@ mod activation_tests;
 mod tests {
     use super::*;
     use crate::rdma::{
-        device::Devices,
+        Devices,
         session::Sessions,
         verbs::{DeviceHandle, QueuePairHandle, Region},
     };

@@ -1,7 +1,7 @@
 //! Native lifecycle endpoints remain per I/O shard, even with shared crypto threads.
 use super::*;
 use crate::rdma::{
-    device::FabricPort,
+    FabricPort,
     lifecycle::{IoPort, NativePort, WithNative},
 };
 use crate::runtime::collections::HashMap;
@@ -14,8 +14,7 @@ pub(super) struct NativePairs {
 type NativePair = (Option<IoPort>, Option<NativePort>);
 
 pub(super) fn slot_count(limits: &Limits) -> Result<usize> {
-    let charge =
-        crate::rdma::registered::native_slot_charge(crate::rdma::registered::MAX_CIPHERTEXT)?;
+    let charge = crate::rdma::native_slot_charge(crate::rdma::MAX_CIPHERTEXT)?;
     Ok((limits.registered_bytes.get() / charge)
         .min(limits.queue_entries.get())
         .min(256))
@@ -160,7 +159,7 @@ impl WorkerApplication {
                     publication,
                     ports,
                     &admission,
-                    crate::rdma::registered::MAX_CIPHERTEXT,
+                    crate::rdma::MAX_CIPHERTEXT,
                     &turn,
                 )
                 .await
@@ -181,7 +180,7 @@ impl WorkerApplication {
                 publication,
                 self.fabric_ports.clone(),
                 &self.runtime.admission,
-                crate::rdma::registered::MAX_CIPHERTEXT,
+                crate::rdma::MAX_CIPHERTEXT,
                 startup,
             )
             .await
@@ -528,7 +527,7 @@ mod tests {
                 vec![],
                 vec![],
                 &admission,
-                crate::rdma::registered::MAX_CIPHERTEXT,
+                crate::rdma::MAX_CIPHERTEXT,
                 &startup,
             );
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -654,7 +653,7 @@ mod tests {
                 vec![],
                 vec![],
                 &admission,
-                crate::rdma::registered::MAX_CIPHERTEXT,
+                crate::rdma::MAX_CIPHERTEXT,
                 &startup,
             )),
             Err(Error::Overloaded)

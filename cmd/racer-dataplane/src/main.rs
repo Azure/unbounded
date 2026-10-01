@@ -1,6 +1,6 @@
 //! Process entry point. Configuration and application lifecycle own all resources.
 
-use racer_dataplane::{app::Application, config::Config, error::Result, rdma::device::FabricPort};
+use racer_dataplane::{app::Application, config::Config, error::Result, rdma::FabricPort};
 
 mod heap_profile;
 
