@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -147,90 +148,107 @@ func TestRunRejectsProfileBeforeStartup(t *testing.T) {
 }
 
 func TestZipfWorkerDrawsAfterSuccessAndFailure(t *testing.T) {
-	for _, fail := range []bool{false, true} {
-		t.Run(fmt.Sprintf("failure=%t", fail), func(t *testing.T) {
-			catalog, err := newCatalog(t.Context(), testImageOptions(), 3)
-			require.NoError(t, err)
+	for _, mode := range []string{"fixed", "concurrency-file", "node-caps"} {
+		t.Run(mode, func(t *testing.T) {
+			for _, fail := range []bool{false, true} {
+				t.Run(fmt.Sprintf("failure=%t", fail), func(t *testing.T) {
+					catalog, err := newCatalog(t.Context(), testImageOptions(), 3)
+					require.NoError(t, err)
 
-			handler := catalog.handler()
+					handler := catalog.handler()
 
-			var (
-				mu   sync.Mutex
-				refs []string
-			)
+					var (
+						mu   sync.Mutex
+						refs []string
+					)
 
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if _, ref, ok := strings.Cut(r.URL.Path, "/manifests/"); ok {
+					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						if _, ref, ok := strings.Cut(r.URL.Path, "/manifests/"); ok {
+							mu.Lock()
+
+							refs = append(refs, ref)
+							mu.Unlock()
+						}
+
+						if fail {
+							w.WriteHeader(http.StatusServiceUnavailable)
+							return
+						}
+
+						handler.ServeHTTP(w, r)
+					}))
+					t.Cleanup(server.Close)
+					opts := pullTestOptions(server.URL)
+					opts.Profile, opts.ZipfExponent = profileZipf, 1
+					opts.RetryDelay = time.Millisecond
+
+					if mode != "fixed" {
+						dir := t.TempDir()
+
+						opts.ConcurrencyFile = filepath.Join(dir, "concurrency")
+						if mode == "node-caps" {
+							opts.NodeCapsFile, opts.NodeName = filepath.Join(dir, "caps"), "node-a"
+							capProjection(t, dir, "start", "8", `{"version":1,"caps":{"node-a":1}}`)
+						} else {
+							replaceConcurrency(t, opts.ConcurrencyFile, "1")
+						}
+					}
+
+					p, metrics := pullTestNew(t, catalog.images[0], opts)
+					p.images = catalog.images
+
+					ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+					defer cancel()
+					// For exponent 1 and three entries the CDF is [6/11,9/11,1].
+					// Repeated hot draws prove replacement; following cold draws prove
+					// failure does not stick to the previous image or reshuffle ranks.
+					draws := []float64{0, 0.1, 0.99, 0.7, 0.2, 0.9}
+					wantIndices := []int{0, 0, 2, 1, 0, 2}
+					next := 0
+					p.randomFloat64 = func() float64 {
+						if next == len(draws) {
+							cancel()
+							return 0
+						}
+
+						draw := draws[next]
+						next++
+
+						return draw
+					}
+					p.run(ctx)
+					require.Equal(t, len(draws), next)
+
+					var (
+						wantRefs  []string
+						wantBytes int64
+					)
+
+					for _, index := range wantIndices {
+						img := catalog.images[index]
+						wantRefs = append(wantRefs, img.Manifest.Digest.String())
+
+						wantBytes += img.Manifest.Size + img.Config.Size
+						for _, layer := range img.Layers {
+							wantBytes += layer.Size
+						}
+					}
+
 					mu.Lock()
 
-					refs = append(refs, ref)
+					gotRefs := append([]string(nil), refs...)
 					mu.Unlock()
-				}
+					require.Equal(t, wantRefs, gotRefs)
 
-				if fail {
-					w.WriteHeader(http.StatusServiceUnavailable)
-					return
-				}
+					result := "success"
+					if fail {
+						result, wantBytes = "error", 0
+					}
 
-				handler.ServeHTTP(w, r)
-			}))
-			t.Cleanup(server.Close)
-			opts := pullTestOptions(server.URL)
-			opts.Profile, opts.ZipfExponent = profileZipf, 1
-			opts.RetryDelay = time.Millisecond
-			p, metrics := pullTestNew(t, catalog.images[0], opts)
-			p.images = catalog.images
-
-			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-			defer cancel()
-			// For exponent 1 and three entries the CDF is [6/11,9/11,1].
-			// Repeated hot draws prove replacement; following cold draws prove
-			// failure does not stick to the previous image or reshuffle ranks.
-			draws := []float64{0, 0.1, 0.99, 0.7, 0.2, 0.9}
-			wantIndices := []int{0, 0, 2, 1, 0, 2}
-			next := 0
-			p.randomFloat64 = func() float64 {
-				if next == len(draws) {
-					cancel()
-					return 0
-				}
-
-				draw := draws[next]
-				next++
-
-				return draw
+					require.Equal(t, float64(len(draws)), testutil.ToFloat64(metrics.pulls.WithLabelValues(result)))
+					require.Equal(t, float64(wantBytes), testutil.ToFloat64(metrics.verifiedBytes))
+				})
 			}
-			p.run(ctx)
-			require.Equal(t, len(draws), next)
-
-			var (
-				wantRefs  []string
-				wantBytes int64
-			)
-
-			for _, index := range wantIndices {
-				img := catalog.images[index]
-				wantRefs = append(wantRefs, img.Manifest.Digest.String())
-
-				wantBytes += img.Manifest.Size + img.Config.Size
-				for _, layer := range img.Layers {
-					wantBytes += layer.Size
-				}
-			}
-
-			mu.Lock()
-
-			gotRefs := append([]string(nil), refs...)
-			mu.Unlock()
-			require.Equal(t, wantRefs, gotRefs)
-
-			result := "success"
-			if fail {
-				result, wantBytes = "error", 0
-			}
-
-			require.Equal(t, float64(len(draws)), testutil.ToFloat64(metrics.pulls.WithLabelValues(result)))
-			require.Equal(t, float64(wantBytes), testutil.ToFloat64(metrics.verifiedBytes))
 		})
 	}
 }

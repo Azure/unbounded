@@ -136,6 +136,17 @@ type catalogTraversal struct {
 	randomFloat64 func() float64
 }
 
+// Each worker copies this initial state: the immutable CDF and concurrency-safe
+// RNG are shared, while shuffle order and progress remain local to the worker.
+func (p *puller) newTraversal() catalogTraversal {
+	traversal := catalogTraversal{randomFloat64: p.randomFloat64}
+	if p.opts.Profile == profileZipf {
+		traversal.zipfCDF = newZipfCDF(len(p.images), p.opts.ZipfExponent)
+	}
+
+	return traversal
+}
+
 func (t *catalogTraversal) nextImage(images []*syntheticImage) *syntheticImage {
 	if len(t.zipfCDF) != 0 {
 		return images[zipfIndex(t.zipfCDF, t.randomFloat64())]

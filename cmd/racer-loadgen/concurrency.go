@@ -89,14 +89,15 @@ func (w *liveWorkers) apply(ctx context.Context, p *puller, desired int) {
 	close(w.changed)
 
 	w.changed = make(chan struct{})
+	initialTraversal := p.newTraversal()
+
 	for w.started < desired {
 		id := w.started
 		w.started++
 		w.workers.Go(func() {
-			var (
-				traversal catalogTraversal
-				next      time.Time
-			)
+			traversal := initialTraversal
+
+			var next time.Time
 
 			for w.admit(ctx, id, next) {
 				delay := p.opts.Interval

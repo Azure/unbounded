@@ -141,15 +141,12 @@ func (p *puller) run(ctx context.Context) {
 
 	p.metrics.appliedConcurrency.Set(float64(p.opts.Concurrency))
 
-	var cdf []float64
-	if p.opts.Profile == profileZipf {
-		cdf = newZipfCDF(len(p.images), p.opts.ZipfExponent)
-	}
+	initialTraversal := p.newTraversal()
 
 	var workers sync.WaitGroup
 	for range p.opts.Concurrency {
 		workers.Go(func() {
-			traversal := catalogTraversal{zipfCDF: cdf, randomFloat64: p.randomFloat64}
+			traversal := initialTraversal
 
 			for ctx.Err() == nil {
 				delay := p.opts.Interval
