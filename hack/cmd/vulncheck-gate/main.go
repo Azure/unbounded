@@ -4,17 +4,17 @@
 // vulncheck-gate decides whether a govulncheck run should fail the build.
 //
 // It fails only on vulnerabilities that are both reachable from our code and
-// have a published fix, because those are the only ones anyone can act on: the
-// fix is a module bump. A reachable vulnerability with no fix available is
-// reported prominently and allowed through. Blocking on it would wedge every
-// branch in the repository for as long as upstream takes to publish a fix,
-// which can be indefinitely, while changing nothing about our exposure.
+// have a final-release fix, because those are the only ones anyone can act on
+// with a production module bump. A reachable vulnerability with no final fix
+// is reported prominently and allowed through. Prereleases and Go
+// pseudo-versions are reported as such rather than forcing unstable dependency
+// versions into the build.
 //
 // That trade is deliberate and it has a cost: a serious vulnerability with no
-// upstream fix will pass this gate every day without anyone being forced to
-// look at it. The report exists so that "nobody was forced to" does not become
-// "nobody knew". Acting on those means dropping or replacing the dependency,
-// which is a judgment call this tool cannot make.
+// final-release fix will pass this gate every day without anyone being forced
+// to look at it. The report exists so that "nobody was forced to" does not
+// become "nobody knew". Adopting an unstable fix, replacing the dependency, or
+// waiting for a final release is a judgment call this tool cannot make.
 //
 // Input is the JSON stream from `govulncheck -format json`. That format is the
 // documented programmatic interface; the human-readable output is not, and the
@@ -30,6 +30,8 @@ import (
 	"os"
 	"sort"
 	"strings"
+
+	"golang.org/x/mod/semver"
 )
 
 // govulncheckMessage is one object in the `govulncheck -format json` stream.
@@ -56,10 +58,9 @@ type osvRecord struct {
 type finding struct {
 	OSV string `json:"osv"`
 
-	// FixedVersion is absent, not empty, when no fix has been published. That
-	// distinction is the whole basis of the verdict, so it is read through a
-	// plain string: absent and empty both decode to "" and both mean "nothing
-	// to bump to".
+	// FixedVersion is absent, not empty, when no fix has been published. A
+	// nonempty value can still be a prerelease, which the gate reports but does
+	// not treat as a production-ready module bump.
 	FixedVersion string `json:"fixed_version"`
 
 	// Trace runs from the vulnerable symbol outward. A frame carries a
@@ -90,14 +91,24 @@ type vulnerability struct {
 	// reachable is true when any finding traced into our code.
 	reachable bool
 
-	// fixedVersion is set when any reachable finding has one. Taking it from
-	// any rather than all is deliberate: an OSV can span modules, and one of
-	// them being fixable is enough to make the finding actionable.
+	// fixedVersion is set when any reachable finding has one. A final release
+	// is preferred when an OSV spans findings with different fixes.
 	fixedVersion string
 }
 
 func (v vulnerability) blocking() bool {
-	return v.reachable && v.fixedVersion != ""
+	return v.reachable && blockingFix(v.fixedVersion)
+}
+
+// blockingFix reports whether version is suitable for a production module
+// bump. Unexpected nonempty versions fail closed so a format change cannot
+// silently disarm the gate.
+func blockingFix(version string) bool {
+	if version == "" {
+		return false
+	}
+
+	return !semver.IsValid(version) || semver.Prerelease(version) == ""
 }
 
 // errNoConfig guards the one failure mode that would silently disarm the gate.
@@ -214,7 +225,19 @@ func absorb(entry *vulnerability, f *finding) {
 
 	entry.reachable = true
 
+	if f.FixedVersion == "" {
+		return
+	}
+
 	if entry.fixedVersion == "" {
+		entry.fixedVersion = f.FixedVersion
+
+		return
+	}
+
+	// Do not let an earlier prerelease hide a final fix reported by another
+	// reachable finding for the same OSV.
+	if blockingFix(f.FixedVersion) && !blockingFix(entry.fixedVersion) {
 		entry.fixedVersion = f.FixedVersion
 	}
 }
@@ -235,41 +258,41 @@ func sorted(vulns map[string]*vulnerability) []vulnerability {
 // The whole report is rendered into a builder and written once, so there is a
 // single write to check rather than one per line.
 func report(w io.Writer, vulns []vulnerability, annotate bool) error {
-	var blocking, unfixed []vulnerability
+	var blocking, withoutFinalFix []vulnerability
 
 	for _, v := range vulns {
 		switch {
 		case v.blocking():
 			blocking = append(blocking, v)
 		case v.reachable:
-			unfixed = append(unfixed, v)
+			withoutFinalFix = append(withoutFinalFix, v)
 		}
 	}
 
 	var b strings.Builder
 
-	if len(unfixed) > 0 {
-		fmt.Fprintf(&b, "Reachable, no fix available (%d, not blocking):\n\n", len(unfixed))
+	if len(withoutFinalFix) > 0 {
+		fmt.Fprintf(&b, "Reachable without a final-release fix (%d, not blocking):\n\n", len(withoutFinalFix))
 
-		for _, v := range unfixed {
+		for _, v := range withoutFinalFix {
 			b.WriteString(describe(v))
 
 			if annotate {
 				// Annotations surface these on the workflow summary, which is
 				// the only reason anyone reads a passing job.
-				fmt.Fprintf(&b, "::warning title=%s::%s (%s): no fix available\n", v.id, v.summaryOrID(), v.module)
+				fmt.Fprintf(&b, "::warning title=%s::%s (%s): %s\n", v.id, v.summaryOrID(), v.module, v.nonblockingReason())
 			}
 		}
 	}
 
 	if len(blocking) > 0 {
-		fmt.Fprintf(&b, "Reachable with a fix available (%d, blocking):\n\n", len(blocking))
+		fmt.Fprintf(&b, "Reachable with a final-release fix (%d, blocking):\n\n", len(blocking))
 
 		for _, v := range blocking {
 			b.WriteString(describe(v))
 		}
 	} else {
-		b.WriteString("vulncheck: no reachable vulnerability has an available fix\n")
+		b.WriteString("vulncheck: no reachable vulnerability has a final-release fix\n")
 	}
 
 	if _, err := io.WriteString(w, b.String()); err != nil {
@@ -280,7 +303,7 @@ func report(w io.Writer, vulns []vulnerability, annotate bool) error {
 		return nil
 	}
 
-	return fmt.Errorf("%s reachable and fixable: upgrade the affected module(s)", plural(len(blocking)))
+	return fmt.Errorf("%s reachable with a final-release fix: upgrade the affected module(s)", plural(len(blocking)))
 }
 
 func describe(v vulnerability) string {
@@ -289,8 +312,10 @@ func describe(v vulnerability) string {
 	fmt.Fprintf(&b, "  %s  %s\n", v.id, v.summaryOrID())
 	fmt.Fprintf(&b, "    module:    %s@%s\n", v.module, v.version)
 
-	if v.fixedVersion != "" {
+	if blockingFix(v.fixedVersion) {
 		fmt.Fprintf(&b, "    fixed in:  %s\n", v.fixedVersion)
+	} else if v.fixedVersion != "" {
+		fmt.Fprintf(&b, "    prerelease fix: %s\n", v.fixedVersion)
 	}
 
 	fmt.Fprintf(&b, "    more info: https://pkg.go.dev/vuln/%s\n\n", v.id)
@@ -304,6 +329,14 @@ func (v vulnerability) summaryOrID() string {
 	}
 
 	return v.id
+}
+
+func (v vulnerability) nonblockingReason() string {
+	if v.fixedVersion != "" {
+		return "only a prerelease fix is available: " + v.fixedVersion
+	}
+
+	return "no fix is available"
 }
 
 func plural(n int) string {
