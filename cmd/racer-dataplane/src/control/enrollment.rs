@@ -59,6 +59,26 @@ struct PersistedIdentity {
     pending: PendingIdentity,
     response: String,
 }
+impl PersistedIdentity {
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        serde_json::from_value(wire::strict_json(bytes, wire::MAX_ENROLLMENT_BYTES * 3)?)
+            .map_err(|_| Error::CorruptRecord)
+    }
+
+    fn response(&self) -> Result<EnrollmentResponse> {
+        wire::decode_enrollment_response(
+            &STANDARD
+                .decode(&self.response)
+                .map_err(|_| Error::CorruptRecord)?,
+        )
+    }
+
+    fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {
+        Ok(Zeroizing::new(
+            serde_json::to_vec(self).map_err(|_| Error::Io)?,
+        ))
+    }
+}
 struct TransactionGuard<'a>(&'a Cell<bool>);
 impl Drop for TransactionGuard<'_> {
     fn drop(&mut self) {
@@ -198,16 +218,7 @@ impl Enrollment {
             .await
             {
                 Ok(b) => {
-                    let old: PersistedIdentity = serde_json::from_value(wire::strict_json(
-                        &b,
-                        wire::MAX_ENROLLMENT_BYTES * 3,
-                    )?)
-                    .map_err(|_| Error::CorruptRecord)?;
-                    let old = wire::decode_enrollment_response(
-                        &STANDARD
-                            .decode(&old.response)
-                            .map_err(|_| Error::CorruptRecord)?,
-                    )?;
+                    let old = PersistedIdentity::decode(&b)?.response()?;
                     if old.cluster != response.cluster {
                         return Err(Error::Unauthorized);
                     }
@@ -224,14 +235,7 @@ impl Enrollment {
                 &scope,
             )
             .await?;
-            let pending = decode_pending(&bytes)?;
-            self.request(&pending)?;
-            let identity = self.validate(&pending, &response)?;
-            let persisted = PersistedIdentity {
-                pending,
-                response: STANDARD.encode(wire::encode_enrollment_response(&response)?),
-            };
-            let bytes = Zeroizing::new(serde_json::to_vec(&persisted).map_err(|_| Error::Io)?);
+            let (identity, bytes) = self.accept_pending(&bytes, &response)?;
             af::atomic_write(&r, &dir, "identity.json", &bytes, &scope).await?;
             af::remove(&r, &dir, "pending.json", &scope).await?;
             Ok(identity)
@@ -264,14 +268,8 @@ impl Enrollment {
                 Err(Error::MissingKey) => return Ok(None),
                 Err(e) => return Err(e),
             };
-            let p: PersistedIdentity =
-                serde_json::from_value(wire::strict_json(&bytes, wire::MAX_ENROLLMENT_BYTES * 3)?)
-                    .map_err(|_| Error::CorruptRecord)?;
-            let response = wire::decode_enrollment_response(
-                &STANDARD
-                    .decode(&p.response)
-                    .map_err(|_| Error::CorruptRecord)?,
-            )?;
+            let p = PersistedIdentity::decode(&bytes)?;
+            let response = p.response()?;
             match self.validate(&p.pending, &response) {
                 Ok(identity) => {
                     r.file_sync(dir.clone(), &scope).await?;
@@ -303,6 +301,8 @@ impl Enrollment {
         *self.roots.borrow_mut() = roots;
         Ok(())
     }
+    /// Non-reactor compatibility for enrollment tools and interoperability fixtures.
+    /// Runtime callers attach a reactor and use the fenced async methods instead.
     /// Reread the projected token on every attempt; never retain it in a DTO.
     pub fn read_token(&self) -> Result<Zeroizing<String>> {
         if self.reactor.borrow().is_some() {
@@ -414,16 +414,7 @@ impl Enrollment {
         match files::read_at(&dir, "identity.json", wire::MAX_ENROLLMENT_BYTES * 3, true) {
             Ok(bytes) => {
                 let bytes = Zeroizing::new(bytes);
-                let old: PersistedIdentity = serde_json::from_value(wire::strict_json(
-                    &bytes,
-                    wire::MAX_ENROLLMENT_BYTES * 3,
-                )?)
-                .map_err(|_| Error::CorruptRecord)?;
-                let old = wire::decode_enrollment_response(
-                    &STANDARD
-                        .decode(&old.response)
-                        .map_err(|_| Error::CorruptRecord)?,
-                )?;
+                let old = PersistedIdentity::decode(&bytes)?.response()?;
                 if old.cluster != response.cluster {
                     return Err(Error::Unauthorized);
                 }
@@ -431,19 +422,13 @@ impl Enrollment {
             Err(Error::MissingKey) => (),
             Err(e) => return Err(e),
         }
-        let pending = decode_pending(&Zeroizing::new(files::read_at(
+        let bytes = Zeroizing::new(files::read_at(
             &dir,
             "pending.json",
             wire::MAX_ENROLLMENT_BYTES,
             true,
-        )?))?;
-        self.request(&pending)?;
-        let identity = self.validate(&pending, &response)?;
-        let persisted = PersistedIdentity {
-            pending,
-            response: STANDARD.encode(wire::encode_enrollment_response(&response)?),
-        };
-        let b = Zeroizing::new(serde_json::to_vec(&persisted).map_err(|_| Error::Io)?);
+        )?);
+        let (identity, b) = self.accept_pending(&bytes, &response)?;
         files::atomic_write(&dir, "identity.json", &b)?;
         files::remove(&dir, "pending.json")?;
         Ok(identity)
@@ -462,14 +447,8 @@ impl Enrollment {
             Err(Error::MissingKey) => return Ok(None),
             Err(e) => return Err(e),
         };
-        let p: PersistedIdentity =
-            serde_json::from_value(wire::strict_json(&b, wire::MAX_ENROLLMENT_BYTES * 3)?)
-                .map_err(|_| Error::CorruptRecord)?;
-        let response = wire::decode_enrollment_response(
-            &STANDARD
-                .decode(&p.response)
-                .map_err(|_| Error::CorruptRecord)?,
-        )?;
+        let p = PersistedIdentity::decode(&b)?;
+        let response = p.response()?;
         match self.validate(&p.pending, &response) {
             Ok(identity) => {
                 // Complete a crash between identity rename and pending removal.
@@ -486,6 +465,23 @@ impl Enrollment {
             Err(e) => Err(e),
         }
     }
+    /// Shared identity parsing and validation; only persistence differs between
+    /// reactor transactions and the non-reactor compatibility entry points.
+    fn accept_pending(
+        &self,
+        bytes: &[u8],
+        response: &EnrollmentResponse,
+    ) -> Result<(LocalSigningIdentity, Zeroizing<Vec<u8>>)> {
+        let pending = decode_pending(bytes)?;
+        self.request(&pending)?;
+        let identity = self.validate(&pending, response)?;
+        let persisted = PersistedIdentity {
+            pending,
+            response: STANDARD.encode(wire::encode_enrollment_response(response)?),
+        };
+        Ok((identity, persisted.encode()?))
+    }
+
     fn validate(
         &self,
         p: &PendingIdentity,
