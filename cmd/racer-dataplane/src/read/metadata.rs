@@ -645,83 +645,13 @@ impl MetadataService {
                 PeerResponse::StaleMembership => return Err(Error::IncompatibleMembership.into()),
             },
             CandidateResolution::Origin(authority) => {
-                authority.validate(&context.object, PageNumber(0))?;
-                budget.begin_attempt(crate::runtime::environment::now(), scope.deadline.0)?;
-                let acquisition = if bootstrap && matches!(selector, MetadataSelector::Fresh) {
-                    let reservation = self.storage.fill.reserve_bootstrap(&context.object.cache)?;
-                    self.origin
-                        .bootstrap_reserved(&authority, context, reservation, scope)
-                        .await
-                } else {
-                    self.origin
-                        .metadata(&authority, context, selector.clone(), scope)
-                        .await
-                };
-                let mut reply = match acquisition {
-                    Ok(reply) => reply,
-                    Err(Error::VersionUnavailable)
-                        if matches!(selector, MetadataSelector::Pinned(_)) =>
-                    {
-                        // A conditional origin miss says nothing about immutable
-                        // copies on later candidates. Probe those copy-only first.
-                        let candidates = self
-                            .candidates
-                            .candidates_scoped(
-                                membership.clone(),
-                                &context.object,
-                                PageNumber(0),
-                                scope,
-                            )
-                            .await?;
-                        let operation = PeerOperation::Metadata {
-                            object: context.object.clone(),
-                            selector: selector.clone(),
-                            mode: FetchMode::CopyOnly,
-                        };
-                        let response = self
-                            .candidates
-                            .remaining_copy(&candidates, context, &operation, scope, budget)
-                            .await?
-                            .ok_or_else(|| self.candidates.origin_miss_error(&authority))?;
-                        match response.response() {
-                            PeerResponse::Metadata(metadata) => {
-                                crate::origin::metadata::MetadataReply {
-                                    metadata: metadata.clone(),
-                                    page_zero: None,
-                                }
-                            }
-                            _ => return Err(Error::CorruptRecord.into()),
-                        }
-                    }
-                    Err(error) => return Err(error.into()),
-                };
-                if let Some(page) = &reply.page_zero {
-                    validate_bootstrap_metadata(&reply.metadata, &page.metadata)?;
-                    if reply.metadata.content_type.is_none() {
-                        reply.metadata.content_type = page.metadata.content_type.clone();
-                    }
-                    if reply.metadata.length == 0 {
-                        return Err(Error::CorruptRecord.into());
-                    }
-                }
-                validate_metadata(&context.object, &selector, &reply.metadata)?;
-                if let Some(page) = reply.page_zero {
-                    let result = self
-                        .storage
-                        .fill
-                        .publish_bootstrap_with_context(page, membership, context, scope, budget)
-                        .await?;
-                    validate_bootstrap_metadata(&reply.metadata, &result.metadata)?;
-                    if reply.metadata.content_type.is_none() {
-                        reply.metadata.content_type = result.metadata.content_type.clone();
-                    }
-                    result.validate_for(&PageId {
-                        version: reply.metadata.version.clone(),
-                        number: PageNumber(0),
-                    })?;
-                    bootstrap_page = Some(result.into());
-                }
-                reply.metadata
+                let output = self
+                    .refresh_origin(
+                        &authority, &selector, membership, context, scope, budget, bootstrap,
+                    )
+                    .await?;
+                bootstrap_page = output.page;
+                output.metadata
             }
         };
         scope.check()?;
@@ -736,6 +666,112 @@ impl MetadataService {
             metadata,
             page: bootstrap_page,
         })
+    }
+
+    /// Acquire and authenticate page zero before publishing any fresh observation.
+    async fn refresh_origin(
+        &self,
+        authority: &super::candidates::OriginAuthority,
+        selector: &MetadataSelector,
+        membership: MembershipLease,
+        context: &OriginContext,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+        bootstrap: bool,
+    ) -> std::result::Result<RefreshOutput, RefreshFailure> {
+        authority.validate(&context.object, PageNumber(0))?;
+        budget.begin_attempt(crate::runtime::environment::now(), scope.deadline.0)?;
+        let acquisition = if bootstrap && matches!(selector, MetadataSelector::Fresh) {
+            let reservation = self.storage.fill.reserve_bootstrap(&context.object.cache)?;
+            self.origin
+                .bootstrap_reserved(authority, context, reservation, scope)
+                .await
+        } else {
+            self.origin
+                .metadata(authority, context, selector.clone(), scope)
+                .await
+        };
+        let mut reply = match acquisition {
+            Ok(reply) => reply,
+            Err(Error::VersionUnavailable) if matches!(selector, MetadataSelector::Pinned(_)) => {
+                self.copy_after_origin_miss(
+                    authority,
+                    selector,
+                    membership.clone(),
+                    context,
+                    scope,
+                    budget,
+                )
+                .await?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(page) = &reply.page_zero {
+            validate_bootstrap_metadata(&reply.metadata, &page.metadata)?;
+            if reply.metadata.content_type.is_none() {
+                reply.metadata.content_type = page.metadata.content_type.clone();
+            }
+            if reply.metadata.length == 0 {
+                return Err(Error::CorruptRecord.into());
+            }
+        }
+        validate_metadata(&context.object, selector, &reply.metadata)?;
+        let page = if let Some(page) = reply.page_zero {
+            let result = self
+                .storage
+                .fill
+                .publish_bootstrap_with_context(page, membership, context, scope, budget)
+                .await?;
+            validate_bootstrap_metadata(&reply.metadata, &result.metadata)?;
+            if reply.metadata.content_type.is_none() {
+                reply.metadata.content_type = result.metadata.content_type.clone();
+            }
+            result.validate_for(&PageId {
+                version: reply.metadata.version.clone(),
+                number: PageNumber(0),
+            })?;
+            Some(result.into())
+        } else {
+            None
+        };
+        Ok(RefreshOutput {
+            metadata: reply.metadata,
+            page,
+        })
+    }
+
+    /// A conditional origin miss says nothing about immutable copies on later
+    /// candidates. Probe them copy-only before reporting the pin unavailable.
+    async fn copy_after_origin_miss(
+        &self,
+        authority: &super::candidates::OriginAuthority,
+        selector: &MetadataSelector,
+        membership: MembershipLease,
+        context: &OriginContext,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+    ) -> Result<crate::origin::metadata::MetadataReply> {
+        let candidates = self
+            .candidates
+            .candidates_scoped(membership, &context.object, PageNumber(0), scope)
+            .await?;
+        let operation = PeerOperation::Metadata {
+            object: context.object.clone(),
+            selector: selector.clone(),
+            mode: FetchMode::CopyOnly,
+        };
+        let response = self
+            .candidates
+            .remaining_copy(&candidates, context, &operation, scope, budget)
+            .await?
+            .ok_or_else(|| self.candidates.origin_miss_error(authority))?;
+        match response.response() {
+            PeerResponse::Metadata(metadata) => Ok(crate::origin::metadata::MetadataReply {
+                metadata: metadata.clone(),
+                page_zero: None,
+            }),
+            _ => Err(Error::CorruptRecord),
+        }
     }
     pub(crate) async fn bootstrap_copy(
         &self,
