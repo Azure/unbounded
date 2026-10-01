@@ -577,6 +577,8 @@ fn native_provider_signed_setup_grant_write_completion_roundtrip() {
             )
             .await?;
         assert!(sent);
+        assert_eq!(conn.tx_remaining, Some(0));
+        assert_eq!(conn.rx_remaining, Some(0));
         conn.finish_exchange()?;
         Ok::<(), Error>(())
     };

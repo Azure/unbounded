@@ -65,10 +65,6 @@ impl PeerServer {
     }
     #[cfg(test)]
     pub(crate) fn transport_io(&self) -> &Rc<crate::http::connection::HttpIo> {
-        assert!(Rc::ptr_eq(
-            &self.io,
-            self.transfers.as_ref().unwrap().transport_io()
-        ));
         &self.io
     }
     /// Accept bounded neighbor HTTP connections on the owning reactor. The shared

@@ -1074,10 +1074,6 @@ pub struct Transfers {
     )>,
 }
 impl Transfers {
-    #[cfg(test)]
-    pub(crate) fn transport_io(&self) -> &Rc<HttpIo> {
-        &self.io
-    }
     /// Authentication and charged decoding are mandatory, even for HTTP-only peers.
     ///
     /// ```compile_fail

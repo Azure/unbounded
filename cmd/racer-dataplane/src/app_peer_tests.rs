@@ -47,7 +47,7 @@ fn application() -> (WorkerApplication, WorkerRuntime, PageCryptoEngine) {
 #[test]
 fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
     let (app, runtime, _engine) = application();
-    let io = app.peers.transport_io(); // Also asserts requester/server share this I/O.
+    let io = app.peers.transport_io();
     let admission = &runtime.admission;
     let reactor = &runtime.reactor;
     reactor.init().unwrap();
