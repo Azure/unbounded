@@ -147,7 +147,7 @@ jobs:
       - name: Install native build dependencies and enable io_uring
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential pkg-config libibverbs-dev
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libibverbs-dev libunwind-dev
           sudo sysctl -w kernel.io_uring_disabled=0
 
       - name: Set up Go for SDK conformance
@@ -202,21 +202,99 @@ jobs:
             make racer-sdk-conformance
 
       - name: Test privileged executable restarts with bounded memory
-        # Select only this ignored suite. Cargo builds as the checkout owner;
+        # Select exactly three restart tests, never all ignored process tests.
+        # Cargo builds as the checkout owner;
         # its runner elevates the tests for child-only private mount namespaces.
         run: |
           mkdir -p tmp
-          sudo systemd-run --wait --pipe --collect \
+          timeout --signal=TERM --kill-after=10s 300s sudo systemd-run --wait --pipe --collect \
             --property="User=$(id -un)" --property="WorkingDirectory=$PWD" \
             --property=MemoryMax=12G --property=MemorySwapMax=0 \
             --property=RuntimeMaxSec=5min --property=TimeoutStopSec=30s \
             --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv="TMPDIR=$PWD/tmp" \
             --setenv="CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$PWD/bin/racer-cargo}" \
+            --setenv=CARGO_BUILD_JOBS=2 \
             --setenv='CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=sudo -n' \
             bash "$PWD/hack/scripts/memory-safe-run.sh" -- \
+            make racer-process-restart
+
+  racer-sdk-age:
+    name: Racer SDK Connection Age
+    # Reuse the completed all-feature build rather than cold-building jemalloc
+    # inside this job's short fixture-preparation deadline.
+    needs: [racer-rust]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Install native dependencies and enable io_uring
+        run: |
+          timeout --signal=TERM --kill-after=10s 300s sudo apt-get update
+          timeout --signal=TERM --kill-after=10s 300s sudo apt-get install -y --no-install-recommends build-essential pkg-config libunwind-dev
+          timeout --signal=TERM --kill-after=10s 300s sudo sysctl -w kernel.io_uring_disabled=0
+
+      - name: Set up pinned Rust
+        run: |
+          timeout --signal=TERM --kill-after=10s 300s rustup toolchain install 1.96.0 --profile minimal
+          timeout --signal=TERM --kill-after=10s 300s rustup override set 1.96.0
+
+      - name: Cache Rust artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            bin/racer-cargo
+          key: racer-rust-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/Cargo.toml') }}-${{ github.sha }}
+          restore-keys: |
+            racer-rust-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/Cargo.toml') }}-
+
+      - name: Prebuild Go SDK fixture
+        run: timeout --signal=TERM --kill-after=10s 300s make racer-sdk-age-build
+
+      - name: Prebuild Rust fixture with bounded memory
+        run: |
+          mkdir -p tmp
+          timeout --signal=TERM --kill-after=10s 300s sudo systemd-run --wait --pipe --collect \
+            --property="User=$(id -un)" --property="WorkingDirectory=$PWD" \
+            --property=MemoryMax=12G --property=MemorySwapMax=0 \
+            --property=RuntimeMaxSec=290s --property=TimeoutStopSec=10s \
+            --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv="TMPDIR=$PWD/tmp" \
+            --setenv=CARGO_BUILD_JOBS=2 \
+            bash "$PWD/hack/scripts/memory-safe-run.sh" -- \
             cargo test --locked --manifest-path cmd/racer-dataplane/Cargo.toml \
-            --all-features --test process_restart -j 2 -- \
-            --ignored --test-threads=1 --nocapture
+            --target-dir "$PWD/bin/racer-cargo" --all-features --test process_restart --no-run
+
+      - name: Test SDK connection age only
+        # Forward explicitly through both systemd and sudo's environment boundary.
+        # Throughput matrices remain opt-in, not an implicit part of this job.
+        run: |
+          timeout --signal=TERM --kill-after=10s 300s sudo systemd-run --wait --pipe --collect \
+            --property="User=$(id -un)" --property="WorkingDirectory=$PWD" \
+            --property=MemoryMax=12G --property=MemorySwapMax=0 \
+            --property=RuntimeMaxSec=290s --property=TimeoutStopSec=10s \
+            --setenv="PATH=$PATH" --setenv="HOME=$HOME" --setenv="TMPDIR=$PWD/tmp" \
+            --setenv=CARGO_BUILD_JOBS=2 \
+            --setenv="RACER_SDK_AGE_BINARY=$PWD/bin/racer-sdk-age.test" \
+            --setenv='CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=sudo -n --preserve-env=RACER_SDK_AGE_BINARY' \
+            bash "$PWD/hack/scripts/memory-safe-run.sh" -- make racer-sdk-age
+
+      - name: Upload SDK age diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: racer-sdk-age
+          path: cmd/racer-dataplane/target/sdk-age-*
+          retention-days: 7
+          if-no-files-found: ignore
 
   # Every PR and merge group exercises the shipped images through the operator.
   racer-e2e:
@@ -241,16 +319,16 @@ jobs:
           sudo sysctl -w kernel.io_uring_disabled=0
           sudo sysctl -w fs.inotify.max_user_instances=8192 fs.inotify.max_user_watches=524288
           mkdir -p bin
-          GOBIN="$PWD/bin" go install sigs.k8s.io/kind@v0.28.0
+          GOBIN="$PWD/bin" go install sigs.k8s.io/kind@v0.30.0
           curl --fail --silent --show-error --location --retry 3 \
-            https://dl.k8s.io/release/v1.33.1/bin/linux/amd64/kubectl -o bin/kubectl
+            https://dl.k8s.io/release/v1.34.0/bin/linux/amd64/kubectl -o bin/kubectl
           curl --fail --silent --show-error --location --retry 3 \
-            https://dl.k8s.io/release/v1.33.1/bin/linux/amd64/kubectl.sha256 -o bin/kubectl.sha256
+            https://dl.k8s.io/release/v1.34.0/bin/linux/amd64/kubectl.sha256 -o bin/kubectl.sha256
           printf '%s  bin/kubectl\n' "$(<bin/kubectl.sha256)" | sha256sum --check
           chmod +x bin/kubectl
           bin/kind version
           bin/kubectl version --client
-          docker pull kindest/node:v1.33.1
+          docker pull kindest/node:v1.34.0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
@@ -533,8 +611,14 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
+      - name: Provision locked Cargo sources for NOTICE
+        run: |
+          timeout --signal=TERM --kill-after=10s 300s rustup toolchain install 1.96.0 --profile minimal
+          timeout --signal=TERM --kill-after=10s 300s rustup override set 1.96.0
+          timeout --signal=TERM --kill-after=10s 300s cargo fetch --locked --manifest-path cmd/racer-dataplane/Cargo.toml
+
       - name: Verify NOTICE
-        run: make notice-check
+        run: timeout --signal=TERM --kill-after=10s 300s make notice-check
 
   # ---------- Build Container Images ----------
   build-images:

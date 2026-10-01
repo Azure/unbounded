@@ -8,10 +8,51 @@ Releases come from two places. `main` cuts minors and majors (`vX.Y.0`); a
 `release-X.Y` branch cuts patches (`vX.Y.Z`) against a series that has already
 shipped. See [The tag and branch model](#the-tag-and-branch-model).
 
+## First-release baseline
+
+This release is a fresh-install baseline. **Upgrades or migrations from any
+earlier Unbounded tag are unsupported**, including old Site APIs and split
+component namespaces. Prepare a fresh integration environment before the first
+soak; do not use `force_init` to migrate an existing installation. The workflow
+filename `release-upgrade.yaml` is retained for automation, but its existing-Site
+path only reconciles installations created on this baseline. Historical tag
+examples below describe release mechanics, not supported upgrade sources.
+
+- Minimum Kubernetes baseline: **1.34**. Keep CI's kind node and kubectl pins,
+  the platform e2e defaults, and Playpen control-plane defaults aligned. The
+  separately pinned envtest job also exercises a current Kubernetes API server.
+- Racer authenticated network connections require **TLS 1.3**; there is no
+  TLS 1.2 compatibility mode. Use the matching current controller, dataplane,
+  and SDK wire schemas.
+- Gantry without Racer remains supported. This baseline does not remove its
+  standalone distribution path or require enabling Racer for every installation.
+- Signed artifacts, BOM verification, rollout checks, Orca integration, smoke
+  discovery, and publication gates remain in place. Fresh installation is not
+  permission to skip the soak or silently publish an unverified release.
+
+### Local release checks
+
+Run `make license-check` and `make notice-check` before cutting. NOTICE is
+generated, never edited by hand: install frontend dependencies with `npm ci` in
+`frontend/`, fetch Rust sources with
+`cargo fetch --locked --manifest-path cmd/racer-dataplane/Cargo.toml`, then run
+`make notice`. The collector covers direct Go, npm, and Cargo dependencies,
+including optional production profiling crates; only Cargo dev-only dependencies
+are excluded. CI provisions Rust 1.96.0 and the locked source cache explicitly.
+
+All-feature Racer builds require `libunwind-dev` as well as the C toolchain and
+pkg-config; the native RDMA adapter additionally needs `libibverbs-dev`.
+`make racer-process-restart` selects exactly three privileged restart tests,
+not every ignored process test. The separate `racer-sdk-age` CI job prebuilds
+`pkg/racersdk` with `make racer-sdk-age-build`, then runs only
+`real_sdk_connection_age_sustained`. Its absolute `RACER_SDK_AGE_BINARY` path
+is forwarded through both systemd and sudo. These tests need mount namespaces,
+io_uring, and O_DIRECT; throughput matrices remain explicit opt-in campaigns.
+
 ## How a release happens
 
 Three workflows, in order. In the normal flow only the first is started by a
-human; `release-upgrade` is also dispatchable by hand for backfills, rollbacks
+human; `release-upgrade` is also dispatchable by hand for baseline re-deploys
 and the [break-glass paths](#break-glass).
 
 | Phase | Workflow | Trigger | Result |
@@ -672,7 +713,7 @@ for each rather than treating them alike:
 | Override | What it bypasses | Command | Confirmation |
 |---|---|---|---|
 | [Tolerate more unreachable nodes](#tolerate-more-unreachable-nodes) | how many NotReady nodes are excusable | `relctl soak <tag> --max-notready-nodes N` | `y/N`, with a warning |
-| [Re-initialize the cluster](#re-initialize-the-soak-cluster) | `site init` instead of `upgrade-apply` | `relctl soak <tag> --force-init` | typed phrase |
+| [Initialize a fresh cluster](#re-initialize-the-soak-cluster) | explicitly run `site init` | `relctl soak <tag> --force-init` | typed phrase |
 | [Publish without a soak](#publish-without-a-soak) | deploy, Orca and smoke entirely | `relctl publish <tag> --reason ...` | typed phrase, no `--yes` |
 
 A typed phrase cannot be satisfied by `--yes`, so the last two are not reachable
@@ -710,7 +751,7 @@ the number deliberately; it is a claim someone can review.
 
 ### Re-initialize the soak cluster
 
-`site init` instead of `upgrade-apply`, for a first-ever bootstrap:
+Explicitly run `site init` for a fresh baseline bootstrap:
 
 ```sh
 relctl soak v0.4.0 --force-init
@@ -726,11 +767,11 @@ gh workflow run release-upgrade.yaml --repo Azure/unbounded \
 
 </details>
 
-This is not a recovery tool. On a cluster that is already initialized, `site
-init` creates a fresh Site rather than migrating the existing one, which is why
-the workflow otherwise selects init mode only when it detects the pre-redesign
-layout, and why `relctl` asks for a typed phrase here and an ordinary prompt for
-a plain retry.
+This is not a recovery or migration tool. The workflow selects init mode when
+the current Site CRD or named Site is absent; otherwise it installs the operator
+and reconciles the existing baseline Site. No old Site API or split-namespace
+migration is attempted. `relctl` asks for a typed phrase here and an ordinary
+prompt for a plain retry.
 
 If the soak failed and the cluster is intact, re-run it without this.
 

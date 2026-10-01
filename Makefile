@@ -126,7 +126,6 @@ UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT ?=
 # image: overriding CONTAINER_REGISTRY (as the release workflow does per fork)
 # points components at the same registry/org as the operator.
 UNBOUNDED_OPERATOR_IMAGE_REGISTRY ?= $(CONTAINER_REGISTRY)
-UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES ?= true
 export UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT
 UNBOUNDED_OPERATOR_MANIFEST_TEMPLATES_DIR := deploy/unbounded-operator
 UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR  := deploy/unbounded-operator/rendered
@@ -281,7 +280,7 @@ help: ## Show this help
 	@echo "  racer-sdk-conformance             Run the opt-in Go SDK / Rust wire integration test"
 	@echo "  e2e-playpen                      Run the kind-based playpen e2e suite"
 	@echo "  license-check                    Verify project-owned license declarations"
-	@echo "  notice                           Regenerate NOTICE from Go and npm dependencies"
+	@echo "  notice                           Regenerate NOTICE from Go, npm, and Cargo dependencies"
 	@echo "  notice-check                     Verify NOTICE is in sync with dependencies"
 	@echo "  toolchain-shell                  Drop into the toolchain container with the repo mounted at /project (set TOOLCHAIN_FLAVOR=fedora|ubuntu to pick a flavor)"
 	@echo "  toolchain-build                  Rebuild the toolchain container image (honors TOOLCHAIN_FLAVOR)"
@@ -387,6 +386,8 @@ help: ## Show this help
 	@echo "  racer-dataplane-dst-10m            Build once, then run a 600-second DST campaign with fresh seeds"
 	@echo "  racer-dataplane-contention        Run metadata contention tests under 16 GiB/no-swap cgroup limits"
 	@echo "  racer-dataplane-native-build      Build the optional real-libibverbs adapter into bin/"
+	@echo "  racer-process-restart             Run only the three privileged restart tests"
+	@echo "  racer-sdk-age-build | racer-sdk-age  Prebuild/run the dedicated SDK connection-age test"
 	@echo "  racer-dataplane-native-install    Install adapter (DESTDIR, RACER_PREFIX, RACER_LIBDIR)"
 	@echo "  image-racer-dataplane-local       Build local image (RACER_NATIVE_RDMA=false|true)"
 	@echo ""
@@ -662,6 +663,33 @@ racer-sdk-conformance: ## Run the ignored real Go SDK / Rust conformance test (r
 		sdk::sdk_client_to_rust_http_and_request_parser_over_uds -- \
 		--exact --ignored --test-threads=1 --nocapture
 
+# All-feature builds include heap profiling and require libunwind-dev.
+# These explicit allowlists must not pick up throughput campaigns or new ignored tests.
+.PHONY: racer-process-restart racer-sdk-age-build racer-sdk-age
+racer-process-restart: ## Run exactly the three privileged executable restart tests
+	@set -eu; for test in \
+		graceful_process_restart_recovers_encrypted_multipage_pin_without_origin \
+		interrupted_process_restart_refetches_safely_after_partial_origin_body \
+		periodic_checkpoint_sigkill_recovers_older_pages_and_bounds_recent_loss; do \
+		timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) test --locked \
+			--manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" \
+			--all-features --test process_restart -- "$$test" \
+			--exact --ignored --test-threads=1 --nocapture; \
+	done
+
+RACER_SDK_AGE_BINARY ?= $(CURDIR)/bin/racer-sdk-age.test
+racer-sdk-age-build: ## Prebuild the SDK fixture without privilege escalation
+	@mkdir -p bin
+	timeout --signal=TERM --kill-after=10s 300s $(GOTEST) -c -timeout=5m -o "$(RACER_SDK_AGE_BINARY)" ./pkg/racersdk
+
+racer-sdk-age: ## Run only SDK connection-age integration with a prebuilt Go fixture
+	@test -x "$(RACER_SDK_AGE_BINARY)" || { echo "Run make racer-sdk-age-build first" >&2; exit 1; }
+	@mkdir -p cmd/racer-dataplane/target
+	RACER_SDK_AGE_BINARY="$(RACER_SDK_AGE_BINARY)" timeout --signal=TERM --kill-after=10s 300s $(RACER_CARGO) test --locked \
+		--manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" \
+		--all-features --test process_restart -- real_sdk_connection_age_sustained \
+		--exact --ignored --test-threads=1 --nocapture
+
 $(SETUP_ENVTEST):
 	@mkdir -p bin tmp/envtest-tools
 	TMPDIR="$(CURDIR)/tmp/envtest-tools" GOBIN="$(CURDIR)/bin" $(GOCMD) install sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION)
@@ -750,7 +778,7 @@ license-check: ## Verify project-owned source license declarations
 		exit 1; \
 	fi
 
-notice: ## Regenerate NOTICE from Go and npm dependencies
+notice: ## Regenerate NOTICE from Go, npm, and Cargo dependencies (run locked cargo fetch first)
 	@if [ ! -d "$(NET_FRONTEND_DIR)/node_modules" ]; then \
 		echo "ERROR: $(NET_FRONTEND_DIR)/node_modules not found." >&2; \
 		echo "Run: (cd $(NET_FRONTEND_DIR) && npm ci)" >&2; \
@@ -758,7 +786,7 @@ notice: ## Regenerate NOTICE from Go and npm dependencies
 	fi
 	$(GOCMD) run ./hack/cmd/notice generate --output NOTICE
 
-notice-check: ## Verify NOTICE is in sync with Go and npm dependencies
+notice-check: ## Verify NOTICE is in sync with Go, npm, and Cargo dependencies
 	@if [ ! -d "$(NET_FRONTEND_DIR)/node_modules" ]; then \
 		echo "ERROR: $(NET_FRONTEND_DIR)/node_modules not found." >&2; \
 		echo "Run: (cd $(NET_FRONTEND_DIR) && npm ci)" >&2; \
@@ -1125,7 +1153,7 @@ PLAYPEN_ARM64_RUNNERS ?= 2
 PLAYPEN_RUNNER_WIREGUARD_HOST_PORT_START ?= 51820
 PLAYPEN_RUNNER_WIREGUARD_HOST_PORT_END ?= 51899
 PLAYPEN_CONTROL_PLANE_COUNT ?= 1
-PLAYPEN_CONTROL_PLANE_VERSIONS ?= v1.33.0
+PLAYPEN_CONTROL_PLANE_VERSIONS ?= v1.34.0
 PLAYPEN_CONTROL_PLANE_IMAGE ?= rancher/k3s:{version}-k3s1
 PLAYPEN_CONTROL_PLANE_API_SERVER_HOST_PORT_START ?= 16443
 PLAYPEN_CONTROL_PLANE_API_SERVER_HOST_PORT_END ?= 16499
@@ -1165,8 +1193,7 @@ unbounded-operator-manifests: ## Render unbounded-operator manifests into deploy
 		--set Namespace=$(UNBOUNDED_OPERATOR_NAMESPACE) \
 		--set OperatorImage=$(UNBOUNDED_OPERATOR_IMAGE) \
 		--set ImageRegistry=$(UNBOUNDED_OPERATOR_IMAGE_REGISTRY) \
-		--set "APIServerEndpoint=$${UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT}" \
-		--set ReapLegacyResources=$(UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES)
+		--set "APIServerEndpoint=$${UNBOUNDED_OPERATOR_API_SERVER_ENDPOINT}"
 	@echo "Rendered unbounded-operator manifests into $(UNBOUNDED_OPERATOR_MANIFEST_RENDERED_DIR) (image: $(UNBOUNDED_OPERATOR_IMAGE))"
 
 machine-ops-manifests: ## Render machine-ops-controller manifests into deploy/machine-ops/rendered
