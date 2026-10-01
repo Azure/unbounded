@@ -346,12 +346,10 @@ fn binary_round_trip_retains_locations_keys_metadata_and_is_send() {
 }
 
 #[test]
-fn legacy_and_extended_metadata_checkpoints_round_trip_without_data_loss() {
-    let mut legacy = image(9);
-    legacy.version = 1;
-    let encoded = checkpoint_format::encode(&legacy).unwrap();
+fn current_metadata_checkpoints_round_trip_without_data_loss() {
+    let encoded = checkpoint_format::encode(&image(9)).unwrap();
     let mut recovered = checkpoint_format::decode(&encoded).unwrap();
-    assert_eq!(recovered.version, 1);
+    assert_eq!(recovered.version, CHECKPOINT_VERSION);
     assert!(
         recovered.shards[0]
             .index
@@ -368,11 +366,6 @@ fn legacy_and_extended_metadata_checkpoints_round_trip_without_data_loss() {
     for (_, entry) in recovered.shards[0].index.entries.iter_mut() {
         entry.metadata.content_type = Some(value.clone());
     }
-    assert!(
-        checkpoint_format::encode(&recovered).is_err(),
-        "v1 cannot silently lose metadata"
-    );
-    recovered.version = CHECKPOINT_VERSION;
     let extended = checkpoint_format::encode(&recovered).unwrap();
     let decoded = checkpoint_format::decode(&extended).unwrap();
     assert_eq!(
@@ -390,10 +383,10 @@ fn legacy_and_extended_metadata_checkpoints_round_trip_without_data_loss() {
 }
 
 #[test]
-fn empty_cut_has_stable_version_one_binary_vector() {
+fn empty_cut_has_stable_current_binary_vector() {
     let (index, segments) = state(8);
     let image = CheckpointImage {
-        version: 1,
+        version: CHECKPOINT_VERSION,
         sequence: 1,
         shards: vec![ShardImage {
             worker: WorkerId(0),
@@ -410,8 +403,36 @@ fn empty_cut_has_stable_version_one_binary_vector() {
         .collect();
     assert_eq!(
         digest,
-        "357123d5dbff2ad5724ac0ecfe16c26edd27dbed03833f1e7bc99698abc32442"
+        "088cec30ebf4ca46e9ae669e335ebad64dde2d3a98fe39a4d1be15b4cc7a5b75"
     );
+}
+
+#[test]
+fn older_checkpoint_versions_are_rejected_and_recover_as_cold_cache() {
+    let directory = Directory::new();
+    for version in [0u32, 1, 3] {
+        let mut cut = image(9);
+        cut.version = version;
+        assert!(checkpoint_format::encode(&cut).is_err());
+        let mut bytes = checkpoint_format::encode(&image(9)).unwrap();
+        bytes[8..12].copy_from_slice(&version.to_le_bytes());
+        let end = bytes.len() - 32;
+        let digest = Sha256::digest(&bytes[..end]);
+        bytes[end..].copy_from_slice(&digest);
+        assert!(checkpoint_format::decode(&bytes).is_err());
+        assert!(sequence_hint(&bytes).is_err());
+        fs::write(directory.0.join("checkpoint.0"), bytes).unwrap();
+        let (index, segments) = state(8);
+        let recovery = Recovery::new(directory.0.clone(), index.clone(), segments);
+        recovery.configure_geometry(geometry()).unwrap();
+        assert!(
+            block_on(recovery.load(geometry().alignment().unwrap()))
+                .unwrap()
+                .is_none()
+        );
+        block_on(recovery.install_shard(None)).unwrap();
+        assert!(index.snapshot().unwrap().entries.is_empty());
+    }
 }
 
 #[test]

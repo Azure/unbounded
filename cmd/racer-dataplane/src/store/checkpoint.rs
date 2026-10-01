@@ -627,7 +627,7 @@ pub(crate) fn read_candidates(directory: &Path) -> Result<Vec<(usize, Checkpoint
 }
 
 // Bounded, versioned binary checkpoints. SHA-256 covers the header and body.
-// Version 1 uses little-endian integers: magic[8], version:u32, flags:u32,
+// Version 2 uses little-endian integers: magic[8], version:u32, flags:u32,
 // sequence:u64, total_bytes:u64, shard_count:u32, then shards and digest[32].
 // Each shard is worker:u16, six geometry u64s, counted segments, counted page
 // entries, and counted standalone descriptors. Counts and string lengths are
@@ -637,7 +637,7 @@ pub(crate) fn read_candidates(directory: &Path) -> Result<Vec<(usize, Checkpoint
 // offset:u64, disk_length:u64. Encoder ordering is canonical by worker, segment,
 // and full version/page identity. No freshness or payload bytes are serialized.
 // Version 2 appends a counted ASCII MIME string to every descriptor. Zero length
-// means unknown. Version 1 remains readable and cannot encode typed descriptors.
+// means absent. Older versions are discarded as disposable cache hints.
 pub const CHECKPOINT_VERSION: u32 = 2;
 pub const MAX_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
 const MAGIC: &[u8; 8] = b"RACERCP\0";
@@ -861,7 +861,7 @@ pub async fn encode_incremental(image: &CheckpointImage) -> Result<Vec<u8>> {
             if i % 128 == 0 {
                 cooperative_turn().await;
             }
-            out.descriptor(&entry.metadata, image.version)?;
+            out.descriptor(&entry.metadata)?;
             out.u64(page.number.0)?;
             out.bytes(&entry.key_id.0)?;
             out.u64(entry.location.segment.0)?;
@@ -877,7 +877,7 @@ pub async fn encode_incremental(image: &CheckpointImage) -> Result<Vec<u8>> {
             if i % 128 == 0 {
                 cooperative_turn().await;
             }
-            out.descriptor(metadata, image.version)?;
+            out.descriptor(metadata)?;
         }
     }
     let length = out
@@ -914,7 +914,7 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
         return Err(Error::CorruptRecord);
     }
     let version = input.u32()?;
-    if !matches!(version, 1 | 2) || input.u32()? != 0 {
+    if version != CHECKPOINT_VERSION || input.u32()? != 0 {
         return Err(Error::CorruptRecord);
     }
     let sequence = input.u64()?;
@@ -953,7 +953,7 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
         let count = input.count(MAX_ITEMS, 112)?;
         let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
-            let metadata = input.descriptor(version)?;
+            let metadata = input.descriptor()?;
             let page = PageId {
                 version: metadata.version.clone(),
                 number: PageNumber(input.u64()?),
@@ -981,7 +981,7 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
         let count = input.count(MAX_ITEMS, 48)?;
         let mut metadata = Vec::with_capacity(count);
         for _ in 0..count {
-            metadata.push(input.descriptor(version)?);
+            metadata.push(input.descriptor()?);
         }
         shards.push(ShardImage {
             worker,
@@ -1022,7 +1022,6 @@ fn recovery_memory(bytes: &[u8], budget: usize) -> Result<usize> {
         Ok(())
     };
     charge(1, std::mem::size_of::<CheckpointImage>())?;
-    let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
     let mut input = Decoder(&bytes[HEADER_BYTES..bytes.len() - DIGEST_BYTES]);
     let shards = input.count(MAX_SHARDS, 62)?;
     charge(shards, std::mem::size_of::<ShardImage>() + 512)?;
@@ -1040,13 +1039,13 @@ fn recovery_memory(bytes: &[u8], budget: usize) -> Result<usize> {
         let pages = input.count(MAX_ITEMS, 112)?;
         charge(pages, std::mem::size_of::<(PageId, IndexedPage)>() + 512)?;
         for _ in 0..pages {
-            charge(input.descriptor_bytes(version)?, 4)?;
+            charge(input.descriptor_bytes()?, 4)?;
             input.take(64)?;
         }
         let metadata = input.count(MAX_ITEMS, 48)?;
         charge(metadata, std::mem::size_of::<VersionMetadata>() + 512)?;
         for _ in 0..metadata {
-            charge(input.descriptor_bytes(version)?, 4)?;
+            charge(input.descriptor_bytes()?, 4)?;
         }
     }
     if !input.0.is_empty() {
@@ -1060,7 +1059,7 @@ fn recovery_memory(bytes: &[u8], budget: usize) -> Result<usize> {
 pub(crate) fn sequence_hint(bytes: &[u8]) -> Result<u64> {
     if bytes.len() < HEADER_BYTES
         || &bytes[..8] != MAGIC
-        || !matches!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 1 | 2)
+        || u32::from_le_bytes(bytes[8..12].try_into().unwrap()) != CHECKPOINT_VERSION
     {
         return Err(Error::CorruptRecord);
     }
@@ -1087,7 +1086,9 @@ fn version_key(version: &ObjectVersion) -> (&str, &[u8; 32], &[u8]) {
     )
 }
 fn validate_image(image: &CheckpointImage) -> Result<()> {
-    if !matches!(image.version, 1 | 2) || image.shards.is_empty() || image.shards.len() > MAX_SHARDS
+    if image.version != CHECKPOINT_VERSION
+        || image.shards.is_empty()
+        || image.shards.len() > MAX_SHARDS
     {
         return Err(Error::CorruptRecord);
     }
@@ -1113,9 +1114,6 @@ fn validate_image(image: &CheckpointImage) -> Result<()> {
             if let Some(old) = lengths.get(&metadata.version) {
                 if !old.compatible(metadata) {
                     return Err(Error::CorruptRecord);
-                }
-                if old.content_type.is_some() {
-                    continue;
                 }
             }
             lengths.insert(&metadata.version, metadata);
@@ -1146,36 +1144,28 @@ impl Encoder {
         self.count(value.len())?;
         self.bytes(value)
     }
-    fn descriptor(&mut self, metadata: &VersionMetadata, version: u32) -> Result<()> {
+    fn descriptor(&mut self, metadata: &VersionMetadata) -> Result<()> {
         self.string(metadata.version.object.cache.0.as_bytes())?;
         self.bytes(&metadata.version.object.key.0)?;
         self.string(metadata.version.etag.as_bytes())?;
         self.u64(metadata.length)?;
-        if version >= 2 {
-            self.string(
-                metadata
-                    .content_type
-                    .as_ref()
-                    .map_or(&[][..], |v| v.as_bytes()),
-            )?;
-        } else if metadata.content_type.is_some() {
-            return Err(Error::CorruptRecord);
-        }
+        self.string(
+            metadata
+                .content_type
+                .as_ref()
+                .map_or(&[][..], |v| v.as_bytes()),
+        )?;
         Ok(())
     }
 }
 struct Decoder<'a>(&'a [u8]);
 impl<'a> Decoder<'a> {
-    fn descriptor_bytes(&mut self, version: u32) -> Result<usize> {
+    fn descriptor_bytes(&mut self) -> Result<usize> {
         let cache = self.string()?.len();
         self.take(32)?;
         let etag = self.string()?.len();
         self.take(8)?;
-        let mime = if version >= 2 {
-            self.string()?.len()
-        } else {
-            0
-        };
+        let mime = self.string()?.len();
         Ok(cache + etag + mime)
     }
     fn take(&mut self, length: usize) -> Result<&'a [u8]> {
@@ -1206,22 +1196,18 @@ impl<'a> Decoder<'a> {
         let length = self.count(MAX_STRING_BYTES, 1)?;
         self.take(length)
     }
-    fn descriptor(&mut self, version: u32) -> Result<VersionMetadata> {
+    fn descriptor(&mut self) -> Result<VersionMetadata> {
         let cache = std::str::from_utf8(self.string()?)
             .map_err(|_| Error::CorruptRecord)?
             .to_owned();
         let key = CacheKey(self.array()?);
         let etag = StrongEtag::parse(self.string()?).map_err(|_| Error::CorruptRecord)?;
         let length = self.u64()?;
-        let content_type = if version >= 2 {
-            let value = self.string()?;
-            if value.is_empty() {
-                None
-            } else {
-                Some(crate::model::ContentType::parse(value).map_err(|_| Error::CorruptRecord)?)
-            }
-        } else {
+        let value = self.string()?;
+        let content_type = if value.is_empty() {
             None
+        } else {
+            Some(crate::model::ContentType::parse(value).map_err(|_| Error::CorruptRecord)?)
         };
         Ok(VersionMetadata {
             content_type,
