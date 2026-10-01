@@ -1,9 +1,9 @@
-//! Descriptor-relative, bounded control file access and durable atomic replacement.
+//! Test-only bounded control file access.
 use crate::error::{Error, Result};
 use std::{
     ffi::CString,
     fs::File,
-    io::{Read, Write},
+    io::Read,
     os::{
         fd::{AsRawFd, FromRawFd},
         unix::fs::MetadataExt,
@@ -112,43 +112,6 @@ pub(crate) fn read_file(file: File, limit: usize, private: bool) -> Result<Vec<u
     }
     Ok(bytes)
 }
-pub(crate) fn atomic_write(dir: &File, target: &str, bytes: &[u8]) -> Result<()> {
-    let mut random = [0; 16];
-    crate::runtime::environment::fill_random(&mut random).map_err(|_| Error::Io)?;
-    let temporary = format!(".stage-{:032x}", u128::from_be_bytes(random));
-    let mut file = open_at(
-        dir,
-        temporary.as_ref(),
-        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-    )?;
-    let result = (|| {
-        file.write_all(bytes).map_err(|_| Error::Io)?;
-        file.sync_all().map_err(|_| Error::Io)?;
-        let from = name(temporary.as_ref())?;
-        let to = name(target.as_ref())?;
-        // SAFETY: both names are directory-relative and descriptors stay owned.
-        if unsafe { libc::renameat(dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr()) }
-            != 0
-        {
-            return Err(Error::Io);
-        }
-        dir.sync_all().map_err(|_| Error::Io)
-    })();
-    if result.is_err() {
-        let _ = remove(dir, &temporary);
-    }
-    result
-}
-pub(crate) fn remove(dir: &File, component: &str) -> Result<()> {
-    let c = name(component.as_ref())?;
-    if unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) } != 0
-        && std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(Error::Io);
-    }
-    dir.sync_all().map_err(|_| Error::Io)
-}
-
 /// Open Kubernetes' ..data target once, never through the per-file symlink.
 #[cfg(test)]
 pub(crate) fn projected_file(

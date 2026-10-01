@@ -3,6 +3,7 @@
 pub(crate) mod async_files;
 mod dns;
 pub mod enrollment;
+#[cfg(test)]
 mod files;
 pub mod secrets;
 pub mod state;
