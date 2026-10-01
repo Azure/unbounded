@@ -316,7 +316,7 @@ fn drop_leader_retains_resources_until_actual_completion_without_ticket() {
     flights.poll_budgeted(1).unwrap();
     assert!(!released.get());
     assert_eq!(
-        flights.table.borrow().entries[&fence().page].state,
+        flights.table.borrow().entries[&fence().page].phase.state(),
         FlightState::Draining
     );
     assert!(poll(b.wait()).is_pending());

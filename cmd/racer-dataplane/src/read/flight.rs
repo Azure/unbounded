@@ -76,16 +76,13 @@ struct Table {
 }
 struct Entry {
     fence: Fence,
-    state: FlightState,
+    phase: Phase,
     leader: Option<u64>,
     waiters: BTreeMap<u64, WaiterRecord>,
     deadlines: BTreeMap<(Instant, u64), ()>,
     waiter_cursor: u64,
     operations: HashMap<u64, Option<Retained>>,
-    outcome: Option<Outcome>,
-    result: Option<PageResult>,
     ciphertext: Option<UnverifiedPage>,
-    error: Option<Error>,
     drain_waker: Option<Waker>,
     _reservation: Reservation,
 }
@@ -107,6 +104,24 @@ enum Outcome {
     Published(AcquiredPage),
     Failed(Error),
     Retry,
+}
+enum Phase {
+    Acquiring,
+    RetryPending,
+    Draining(Outcome),
+    Complete(PageResult),
+    Failed(Error),
+}
+impl Phase {
+    fn state(&self) -> FlightState {
+        match self {
+            Self::Acquiring => FlightState::Acquiring,
+            Self::RetryPending => FlightState::RetryPending,
+            Self::Draining(_) => FlightState::Draining,
+            Self::Complete(_) => FlightState::Complete,
+            Self::Failed(_) => FlightState::Failed,
+        }
+    }
 }
 
 /// Transfer this token to the actual completion owner before submitting work.
@@ -131,7 +146,7 @@ impl FlightOperation {
         table.stopping
             || table.entries.get(&self.fence.page).is_none_or(|entry| {
                 self.fence.validate(&entry.fence).is_err()
-                    || entry.state != FlightState::Acquiring
+                    || !matches!(entry.phase, Phase::Acquiring)
                     || entry
                         .leader
                         .and_then(|id| entry.waiters.get(&id))
@@ -452,7 +467,7 @@ impl AcquisitionWaiter<'_> {
                 if let Some(error) = waiter.error {
                     return Poll::Ready(Ok(AcquisitionEvent::Failed(error)));
                 }
-                if let Some(result) = &entry.result {
+                if let Phase::Complete(result) = &entry.phase {
                     return Poll::Ready(Ok(AcquisitionEvent::Complete(result.clone())));
                 }
                 if !waiter.plaintext {
@@ -460,10 +475,10 @@ impl AcquisitionWaiter<'_> {
                         return Poll::Ready(Ok(AcquisitionEvent::Ciphertext(copy.clone())));
                     }
                 }
-                if let Some(error) = entry.error {
+                if let Phase::Failed(error) = entry.phase {
                     return Poll::Ready(Ok(AcquisitionEvent::Failed(error)));
                 }
-                if entry.state == FlightState::RetryPending && !waiter.issued {
+                if matches!(entry.phase, Phase::RetryPending) && !waiter.issued {
                     if crate::runtime::environment::now() >= self.budget.deadline
                         || (self.budget.attempts == 0 && entry.ciphertext.is_none())
                     {
@@ -477,12 +492,12 @@ impl AcquisitionWaiter<'_> {
                         return Poll::Ready(Ok(AcquisitionEvent::Failed(error)));
                     }
                     if entry.fence.generation >= flights.limits.generations_per_flight {
-                        entry.outcome = Some(Outcome::Failed(Error::Unavailable));
+                        entry.phase = Phase::Draining(Outcome::Failed(Error::Unavailable));
                         settle(entry, wakes);
                         return Poll::Ready(Ok(AcquisitionEvent::Failed(Error::Unavailable)));
                     }
                     entry.fence.generation += 1;
-                    entry.state = FlightState::Acquiring;
+                    entry.phase = Phase::Acquiring;
                     entry.leader = Some(self.registration.id);
                     waiter.issued = true;
                     self.registration.fence.generation = entry.fence.generation;
@@ -544,10 +559,13 @@ impl CopyWaiter<'_> {
                 };
                 refresh(entry, wakes);
                 let waiter = entry.waiters.get_mut(&self.registration.id).unwrap();
-                if let Some(error) = waiter.error.or(entry.error) {
+                if let Some(error) = waiter.error {
                     return Poll::Ready(Err(error));
                 }
-                if let Some(result) = &entry.result {
+                if let Phase::Failed(error) = entry.phase {
+                    return Poll::Ready(Err(error));
+                }
+                if let Phase::Complete(result) = &entry.phase {
                     return Poll::Ready(Ok(result.clone().into()));
                 }
                 if let Some(copy) = &entry.ciphertext {
@@ -615,13 +633,15 @@ impl Flights {
             return Err(Error::Unavailable);
         }
         let result = entry.and_then(|entry| {
+            if let Phase::Complete(result) = &entry.phase {
+                return Some(result.copy());
+            }
             entry
-                .result
+                .ciphertext
                 .as_ref()
-                .map(PageResult::copy)
-                .or_else(|| entry.ciphertext.as_ref().map(|p| p.copy.clone()))
-                .or_else(|| match &entry.outcome {
-                    Some(Outcome::Published(result)) => Some(result.copy()),
+                .map(|p| p.copy.clone())
+                .or_else(|| match &entry.phase {
+                    Phase::Draining(Outcome::Published(result)) => Some(result.copy()),
                     _ => None,
                 })
         });
@@ -678,7 +698,7 @@ impl Flights {
             self.admit_join(&page, table.entries.get(&page))?;
             if let Some(entry) = table.entries.get_mut(&page) {
                 refresh(entry, wakes);
-                if let Some(result) = &entry.result {
+                if let Phase::Complete(result) = &entry.phase {
                     return Ok(JoinedFlight::Complete(result.clone()));
                 }
                 if !plaintext {
@@ -686,7 +706,7 @@ impl Flights {
                         return Ok(JoinedFlight::Ciphertext(copy.clone()));
                     }
                 }
-                if let Some(error) = entry.error {
+                if let Phase::Failed(error) = entry.phase {
                     return Err(error);
                 }
                 if entry.waiters.len() >= self.limits.waiters_per_flight {
@@ -730,16 +750,13 @@ impl Flights {
                             incarnation,
                             generation: 0,
                         },
-                        state: FlightState::RetryPending,
+                        phase: Phase::RetryPending,
                         leader: None,
                         waiters: BTreeMap::new(),
                         deadlines: BTreeMap::new(),
                         waiter_cursor: 0,
                         operations: HashMap::default(),
-                        outcome: None,
-                        result: None,
                         ciphertext: None,
-                        error: None,
                         drain_waker: None,
                         _reservation: flight,
                     },
@@ -798,13 +815,13 @@ impl Flights {
                 return Ok(JoinedCopy::Miss);
             }
             refresh(entry, wakes);
-            if let Some(result) = &entry.result {
+            if let Phase::Complete(result) = &entry.phase {
                 return Ok(JoinedCopy::Complete(result.clone()));
             }
             if let Some(copy) = &entry.ciphertext {
                 return Ok(JoinedCopy::Ciphertext(copy.clone()));
             }
-            if matches!(entry.state, FlightState::Failed | FlightState::Draining) {
+            if matches!(entry.phase, Phase::Failed(_) | Phase::Draining(_)) {
                 return Ok(JoinedCopy::Miss);
             }
             if entry.waiters.len() >= self.limits.waiters_per_flight {
@@ -871,11 +888,10 @@ impl Flights {
         self.update(|table, wakes| {
             let entry = self.leader_entry(table, &leader, wakes)?;
             page.validate_for(&entry.fence.page)?;
-            entry.outcome = Some(Outcome::Published(page));
-            entry.state = FlightState::Draining;
+            entry.phase = Phase::Draining(Outcome::Published(page));
             leader.active = false;
             settle(entry, wakes);
-            Ok(entry.state)
+            Ok(entry.phase.state())
         })
     }
 
@@ -892,7 +908,7 @@ impl Flights {
     ) -> Result<FlightState> {
         self.update(|table, wakes| {
             let entry = self.leader_entry(table, &leader, wakes)?;
-            entry.outcome = Some(match failure {
+            entry.phase = Phase::Draining(match failure {
                 AcquisitionFailure::OriginRejected => {
                     entry.waiters.get_mut(&leader.caller).unwrap().error =
                         Some(Error::OriginRejected);
@@ -905,11 +921,10 @@ impl Flights {
                 }
                 AcquisitionFailure::Terminal(error) => Outcome::Failed(error),
             });
-            entry.state = FlightState::Draining;
             leader.active = false;
             notify(entry, wakes);
             settle(entry, wakes);
-            Ok(entry.state)
+            Ok(entry.phase.state())
         })
     }
 
@@ -947,8 +962,8 @@ impl Flights {
                     return Poll::Ready(Err(error));
                 }
                 refresh(entry, wakes);
-                if entry.state != FlightState::Draining {
-                    return Poll::Ready(Ok(entry.state));
+                if !matches!(entry.phase, Phase::Draining(_)) {
+                    return Poll::Ready(Ok(entry.phase.state()));
                 }
                 store_waker(&mut entry.drain_waker, cx);
                 Poll::Pending
@@ -1051,8 +1066,7 @@ impl Flights {
                 for waiter in entry.waiters.values_mut() {
                     waiter.error = Some(Error::Cancelled);
                 }
-                entry.outcome = Some(Outcome::Failed(Error::Cancelled));
-                entry.state = FlightState::Draining;
+                entry.phase = Phase::Draining(Outcome::Failed(Error::Cancelled));
                 notify(entry, wakes);
                 entry.waiters.clear();
                 entry.deadlines.clear();
@@ -1194,50 +1208,38 @@ fn eligible(waiter: &WaiterRecord) -> bool {
     waiter.acquisition && !waiter.issued && waiter.error.is_none()
 }
 fn settle(entry: &mut Entry, wakes: &mut Vec<Waker>) {
-    if !entry.operations.is_empty() {
+    if !entry.operations.is_empty() || !matches!(entry.phase, Phase::Draining(_)) {
         return;
     }
-    if let Some(outcome) = entry.outcome.take() {
-        entry.leader = None;
-        match outcome {
-            Outcome::Published(result) => match result {
-                AcquiredPage::Plaintext(page) => {
-                    entry.result = Some(page);
-                    entry.ciphertext = None;
-                    entry.state = FlightState::Complete;
-                }
-                AcquiredPage::Ciphertext(page) => {
-                    entry.ciphertext = Some(page);
-                    entry.state = FlightState::RetryPending;
-                    for waiter in entry.waiters.values_mut() {
-                        if waiter.plaintext {
-                            waiter.issued = false;
-                        }
-                    }
-                }
-            },
-            Outcome::Failed(error) => {
-                entry.error = Some(error);
-                entry.state = FlightState::Failed;
-            }
-            Outcome::Retry => {
-                if entry.waiters.values().any(eligible) {
-                    entry.state = FlightState::RetryPending;
-                } else {
-                    entry.error = Some(Error::Unavailable);
-                    entry.state = FlightState::Failed;
-                }
-            }
+    let Phase::Draining(outcome) = std::mem::replace(&mut entry.phase, Phase::RetryPending) else {
+        unreachable!();
+    };
+    entry.leader = None;
+    entry.phase = match outcome {
+        Outcome::Published(AcquiredPage::Plaintext(page)) => {
+            entry.ciphertext = None;
+            Phase::Complete(page)
         }
-        notify(entry, wakes);
-    }
+        Outcome::Published(AcquiredPage::Ciphertext(page)) => {
+            entry.ciphertext = Some(page);
+            for waiter in entry.waiters.values_mut() {
+                if waiter.plaintext {
+                    waiter.issued = false;
+                }
+            }
+            Phase::RetryPending
+        }
+        Outcome::Failed(error) => Phase::Failed(error),
+        Outcome::Retry if entry.waiters.values().any(eligible) => Phase::RetryPending,
+        Outcome::Retry => Phase::Failed(Error::Unavailable),
+    };
+    notify(entry, wakes);
 }
 fn revoke(entry: &mut Entry, error: Error, wakes: &mut Vec<Waker>) {
     if let Some(waiter) = entry.leader.and_then(|id| entry.waiters.get_mut(&id)) {
         waiter.error = Some(error);
     }
-    entry.state = FlightState::Draining;
-    entry.outcome = Some(Outcome::Retry);
+    entry.phase = Phase::Draining(Outcome::Retry);
     notify(entry, wakes);
     settle(entry, wakes);
 }
@@ -1257,7 +1259,7 @@ fn refresh(entry: &mut Entry, wakes: &mut Vec<Waker>) {
         entry.deadlines.remove(&(deadline, id));
         refresh_waiter(entry, id, wakes);
     }
-    if entry.state == FlightState::Acquiring
+    if matches!(entry.phase, Phase::Acquiring)
         && entry
             .leader
             .and_then(|id| entry.waiters.get(&id))
@@ -1271,11 +1273,11 @@ fn refresh(entry: &mut Entry, wakes: &mut Vec<Waker>) {
         revoke(entry, error, wakes);
     }
     settle(entry, wakes);
-    if entry.state == FlightState::RetryPending
+    if matches!(entry.phase, Phase::RetryPending)
         && entry.ciphertext.is_none()
         && !entry.waiters.values().any(eligible)
     {
-        entry.outcome = Some(Outcome::Failed(Error::Unavailable));
+        entry.phase = Phase::Draining(Outcome::Failed(Error::Unavailable));
         settle(entry, wakes);
     }
 }
@@ -1301,7 +1303,7 @@ fn refresh_waiter(entry: &mut Entry, id: u64, wakes: &mut Vec<Waker>) {
 fn validate_leader(entry: &Entry, leader: &FlightLeader) -> Result<()> {
     leader.fence.validate(&entry.fence)?;
     if !leader.active
-        || entry.state != FlightState::Acquiring
+        || !matches!(entry.phase, Phase::Acquiring)
         || entry.leader != Some(leader.caller)
     {
         return Err(Error::StaleFlight);
@@ -1354,7 +1356,7 @@ impl Registration {
                 }
                 Ok(FlightState::Removed)
             } else {
-                Ok(entry.state)
+                Ok(entry.phase.state())
             }
         });
         self.attached = false;
