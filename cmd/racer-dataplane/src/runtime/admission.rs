@@ -459,7 +459,7 @@ impl Admission {
     ) -> Result<Reservation> {
         let result = self.reserve_inner(cache, class, amount, false);
         if matches!(result, Err(Error::Overloaded)) {
-            self.reclaim_buffers();
+            self.reclaim_buffers_for(cache, class);
             return self.reserve_inner(cache, class, amount, false);
         }
         result
@@ -474,7 +474,7 @@ impl Admission {
     ) -> Result<Reservation> {
         let result = self.reserve_inner(cache, class, amount, true);
         if matches!(result, Err(Error::Overloaded)) {
-            self.reclaim_buffers();
+            self.reclaim_buffers_for(cache, class);
             return self.reserve_inner(cache, class, amount, true);
         }
         result
@@ -492,6 +492,20 @@ impl Admission {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+    }
+    fn reclaim_buffers_for(&self, cache: Option<&CacheId>, class: ResourceClass) {
+        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        // Cache-scoped admission can also exhaust cache records or fair shares;
+        // retain its existing aggregate reclamation. Without a cache, only this
+        // resource's counter can reject admission, so unrelated payload charges
+        // cannot help. Preserve the existing whole-pool release when relevant.
+        if cache.is_some()
+            || buffers
+                .iter()
+                .any(|(_, reservation)| index(reservation.class) == index(class))
+        {
+            buffers.clear();
+        }
     }
     fn reserve_inner(
         &self,
@@ -811,6 +825,84 @@ mod tests {
         assert_eq!(admission.used(ResourceClass::Ciphertext), 3 * capacity);
         drop(reservation);
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+    }
+    #[test]
+    fn unrelated_quota_failure_preserves_recycled_payload() {
+        for completing in [false, true] {
+            for class in [ResourceClass::Plaintext, ResourceClass::Ciphertext] {
+                let admission = Admission::new(crate::test_support::cluster::config(false).limits);
+                let length = PAGE_BYTES as usize
+                    + usize::from(matches!(class, ResourceClass::Ciphertext)) * 16;
+                let mut old = admission.reserve(None, class, length).unwrap();
+                let mut bytes = old.buffer(length).unwrap();
+                bytes.fill(0xa7);
+                let pointer = bytes.as_ptr();
+                old.recycle(bytes);
+                drop(old);
+                let limit = admission.limit(ResourceClass::RequestContext);
+                let held = admission
+                    .reserve(None, ResourceClass::RequestContext, limit)
+                    .unwrap();
+                let result = if completing {
+                    admission.reserve_completion(None, ResourceClass::RequestContext, 1)
+                } else {
+                    admission.reserve(None, ResourceClass::RequestContext, 1)
+                };
+                assert!(matches!(result, Err(Error::Overloaded)));
+                assert_eq!(admission.used(ResourceClass::RequestContext), limit);
+                assert_eq!(admission.retained_buffer_bytes(), length);
+                assert_eq!(admission.used(class), length);
+                drop(held);
+                let next = admission.reserve(None, class, length).unwrap();
+                let bytes = next.buffer(length).unwrap();
+                assert_eq!(bytes.as_ptr(), pointer);
+                assert!(bytes.iter().all(|byte| *byte == 0));
+                assert_eq!(admission.retained_buffer_bytes(), 0);
+                assert_eq!(admission.used(class), length);
+                drop((bytes, next));
+                assert_eq!(admission.used(class), 0);
+            }
+        }
+    }
+    #[test]
+    fn relevant_quota_failure_still_reclaims_recycled_payload() {
+        for completing in [false, true] {
+            for cache_records in [false, true] {
+                let length = 1 << 20;
+                let mut limits = crate::test_support::cluster::config(false).limits;
+                limits.ciphertext_bytes = std::num::NonZeroUsize::new(length).unwrap();
+                limits.metadata_entries = std::num::NonZeroUsize::new(1).unwrap();
+                let admission = Admission::new(limits);
+                let first = CacheId("first".into());
+                let second = CacheId("second".into());
+                let mut old = admission
+                    .reserve(Some(&first), ResourceClass::Ciphertext, length)
+                    .unwrap();
+                let bytes = old.buffer(length).unwrap();
+                old.recycle(bytes);
+                drop(old);
+                assert_eq!(admission.retained_buffer_bytes(), length);
+                let (cache, class, amount) = if cache_records {
+                    (Some(&second), ResourceClass::RequestContext, 1)
+                } else {
+                    (None, ResourceClass::Ciphertext, length)
+                };
+                let reservation = if completing {
+                    admission.reserve_completion(cache, class, amount)
+                } else {
+                    admission.reserve(cache, class, amount)
+                }
+                .unwrap();
+                assert_eq!(admission.retained_buffer_bytes(), 0);
+                assert_eq!(admission.used(class), amount);
+                if cache_records {
+                    assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+                    assert!(!admission.caches.borrow().contains_key(&first));
+                }
+                drop(reservation);
+                assert_eq!(admission.used(class), 0);
+            }
+        }
     }
     #[test]
     #[ignore = "opt-in same-workload payload recycle benchmark"]
