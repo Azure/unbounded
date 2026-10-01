@@ -574,7 +574,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         drop(membership);
         let read = async {
             if let Some((coordinator, _endpoint)) = &ingress {
-                use crate::client::request::{ClientRequest, ReadKind};
+                use crate::client::{ClientRequest, ReadKind};
                 let result = coordinator
                     .read_with_budget(
                         ClientRequest {

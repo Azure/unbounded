@@ -75,7 +75,15 @@ fn client() -> (OriginClient, Rc<Admission>, Rc<Reactor>) {
     ));
     let buffers = Rc::new(BufferPool::new(admission.clone()));
     (
-        OriginClient::new(snapshots, pool, io).with_buffers(admission.clone(), buffers),
+        OriginClient::new(
+            snapshots,
+            pool,
+            io,
+            admission.clone(),
+            buffers,
+            "/run/racer",
+        )
+        .unwrap(),
         admission,
         reactor,
     )
@@ -101,6 +109,17 @@ fn published_client() -> (
     (client, admission, reactor, snapshot)
 }
 
+fn remap(client: OriginClient, root: impl Into<PathBuf>) -> Result<OriginClient> {
+    OriginClient::new(
+        client.snapshots,
+        client.pool,
+        client.io,
+        client.admission,
+        client.buffers,
+        root,
+    )
+}
+
 #[test]
 fn socket_root_is_lexical_and_preserves_canonical_publications() {
     let (client, _, _, snapshot) = published_client();
@@ -114,7 +133,7 @@ fn socket_root_is_lexical_and_preserves_canonical_publications() {
         }
     );
     let root = PathBuf::from("/nonexistent-racer-fixture-root");
-    let client = client.with_socket_root(root.clone()).unwrap();
+    let client = remap(client, root.clone()).unwrap();
     assert_eq!(
         client.endpoint(&context).unwrap(),
         Endpoint::Origin {
@@ -134,15 +153,12 @@ fn socket_root_is_lexical_and_preserves_canonical_publications() {
     ] {
         let (client, _, _) = self::client();
         assert!(
-            matches!(
-                client.with_socket_root(root),
-                Err(Error::InvalidConfiguration)
-            ),
+            matches!(remap(client, root), Err(Error::InvalidConfiguration)),
             "{root:?}"
         );
     }
     let (client, _, _) = self::client();
-    assert!(client.with_socket_root("/").is_ok());
+    assert!(remap(client, "/").is_ok());
     let mut cache = snapshot.caches[0].clone();
     for path in ["/elsewhere/socket", "/run/racer/cache-a/origin//socket"] {
         cache.origin_socket = path.into();
@@ -161,7 +177,7 @@ fn socket_root_is_lexical_and_preserves_canonical_publications() {
     let suffix = "/cache-a/origin/socket";
     let root = PathBuf::from(format!("/{}", "x".repeat(107 - suffix.len() - 1)));
     let (client, _, _, snapshot) = published_client();
-    let client = client.with_socket_root(root.clone()).unwrap();
+    let client = remap(client, root.clone()).unwrap();
     assert_eq!(
         resolve_socket(&client.socket_root, &snapshot.caches[0])
             .unwrap()
@@ -176,7 +192,7 @@ fn socket_root_is_lexical_and_preserves_canonical_publications() {
     );
     let (client, _, _) = self::client();
     assert!(matches!(
-        client.with_socket_root(format!("/{}", "x".repeat(107))),
+        remap(client, format!("/{}", "x".repeat(107))),
         Err(Error::InvalidConfiguration)
     ));
 }
@@ -224,7 +240,7 @@ fn real_uds_root_remapping_keeps_public_authority_and_http_validation() {
     let listener = UnixListener::bind(root.join("cache-a/origin/socket")).unwrap();
     listener.set_nonblocking(true).unwrap();
     let (client, admission, reactor, snapshot) = published_client();
-    let client = client.with_socket_root(root).unwrap();
+    let client = remap(client, root).unwrap();
     let mut context = context();
     context.object.cache = snapshot.caches[0].id.clone();
     let candidates = Placement::new(2)
@@ -336,7 +352,7 @@ fn same_name_new_uid_dials_replacement_without_reusing_old_keepalive() {
         2,
     ));
     let snapshot = client.snapshots.publish(publication.clone()).unwrap();
-    let client = client.with_socket_root(root).unwrap();
+    let client = remap(client, root).unwrap();
     let mut old_context = context();
     old_context.object.cache = snapshot.caches[0].id.clone();
     let old_endpoint = client.endpoint(&old_context).unwrap();

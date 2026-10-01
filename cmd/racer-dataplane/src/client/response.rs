@@ -1,5 +1,5 @@
 //! Central status mapping and streaming body delivery, including late truncation.
-use super::request::ReadKind;
+use super::ReadKind;
 use crate::telemetry::failures::{Detail, Failure, Observer, Stage};
 use crate::{
     error::{Error, Operation, Result},

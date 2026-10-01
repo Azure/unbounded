@@ -9,7 +9,7 @@ mod index_pressure;
 
 use base64::Engine;
 use racer_dataplane::{
-    client::{request::RequestParser, response::Responses},
+    client::{RequestParser, response::Responses},
     control::{
         caches::{CacheDefinition, canonical_socket_paths},
         snapshot::{PublishedState, SnapshotStore},
@@ -537,10 +537,15 @@ impl Rig {
             peers.clone(),
         ));
         let origin = Rc::new(
-            OriginClient::new(snapshots.clone(), http, io.clone())
-                .with_buffers(admission.clone(), buffers.clone())
-                .with_socket_root(scratch.socket_root())
-                .unwrap(),
+            OriginClient::new(
+                snapshots.clone(),
+                http,
+                io.clone(),
+                admission.clone(),
+                buffers.clone(),
+                scratch.socket_root(),
+            )
+            .unwrap(),
         );
         assert_eq!(
             snapshot.caches[0].origin_socket,

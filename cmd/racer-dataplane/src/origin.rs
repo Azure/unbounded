@@ -81,33 +81,25 @@ pub struct OriginClient {
     snapshots: Rc<SnapshotStore>,
     pool: Rc<HttpPool>,
     io: Rc<HttpIo>,
-    buffers: Option<(Rc<Admission>, Rc<BufferPool>)>,
+    admission: Rc<Admission>,
+    buffers: Rc<BufferPool>,
     socket_root: PathBuf,
 }
 impl OriginClient {
-    pub fn new(snapshots: Rc<SnapshotStore>, pool: Rc<HttpPool>, io: Rc<HttpIo>) -> Self {
-        Self {
-            health: crate::topology::health::LinkHealth::new(64),
-            snapshots,
-            pool,
-            io,
-            buffers: None,
-            socket_root: PathBuf::from("/run/racer"),
-        }
-    }
-
-    /// Install the worker's shared bounded plaintext allocation owners.
-    pub fn with_buffers(mut self, admission: Rc<Admission>, buffers: Rc<BufferPool>) -> Self {
-        self.buffers = Some((admission, buffers));
-        self
-    }
-
-    /// Remap canonical published endpoints to `<root>/<cache name>/origin/socket`.
+    /// Assemble the adapter with its shared plaintext owners and socket root.
+    /// Canonical published endpoints map to `<root>/<cache name>/origin/socket`.
     /// The deployment root must be an absolute, lexically canonical directory path
     /// without NUL, empty, `.` or `..` components. This performs no filesystem I/O;
     /// the caller provisions and owns the directories (including any symlink policy).
     /// The complete resolved endpoint is checked against Linux's 107-byte UDS cap.
-    pub fn with_socket_root(mut self, root: impl Into<PathBuf>) -> Result<Self> {
+    pub fn new(
+        snapshots: Rc<SnapshotStore>,
+        pool: Rc<HttpPool>,
+        io: Rc<HttpIo>,
+        admission: Rc<Admission>,
+        buffers: Rc<BufferPool>,
+        root: impl Into<PathBuf>,
+    ) -> Result<Self> {
         let root = root.into();
         let bytes = root.as_os_str().as_encoded_bytes();
         if !root.is_absolute()
@@ -120,8 +112,15 @@ impl OriginClient {
         {
             return Err(Error::InvalidConfiguration);
         }
-        self.socket_root = root;
-        Ok(self)
+        Ok(Self {
+            health: crate::topology::health::LinkHealth::new(64),
+            snapshots,
+            pool,
+            io,
+            admission,
+            buffers,
+            socket_root: root,
+        })
     }
 
     async fn bootstrap_at(
@@ -131,8 +130,7 @@ impl OriginClient {
         scope: &RequestScope,
     ) -> Result<MetadataReply> {
         scope.check()?;
-        let (admission, _) = self.buffers.as_ref().ok_or(Error::InvalidConfiguration)?;
-        let reservation = admission.reserve(
+        let reservation = self.admission.reserve(
             Some(&context.object.cache),
             ResourceClass::Plaintext,
             PAGE_BYTES as usize,
@@ -149,7 +147,7 @@ impl OriginClient {
         scope: &RequestScope,
     ) -> Result<MetadataReply> {
         scope.check()?;
-        let (admission, buffers) = self.buffers.as_ref().ok_or(Error::InvalidConfiguration)?;
+        let (admission, buffers) = (&self.admission, &self.buffers);
         reservation.validate(ResourceClass::Plaintext, PAGE_BYTES as usize)?;
         if !admission.owns(&reservation) || reservation.cache() != Some(&context.object.cache) {
             return Err(Error::InvalidConfiguration);
@@ -274,8 +272,7 @@ impl OriginClient {
         page: &PageId,
         scope: &RequestScope,
     ) -> Result<OriginPage> {
-        let (admission, _) = self.buffers.as_ref().ok_or(Error::InvalidConfiguration)?;
-        let reservation = admission.reserve(
+        let reservation = self.admission.reserve(
             Some(&context.object.cache),
             ResourceClass::Plaintext,
             PAGE_BYTES as usize,
@@ -310,7 +307,7 @@ impl OriginClient {
             .push(header("Range", format!("bytes={first}-{last}").as_bytes()));
         head.headers
             .push(header("If-Match", page.version.etag.as_bytes()));
-        let (admission, buffers) = self.buffers.as_ref().ok_or(Error::InvalidConfiguration)?;
+        let (admission, buffers) = (&self.admission, &self.buffers);
         reservation.validate(ResourceClass::Plaintext, PAGE_BYTES as usize)?;
         if !admission.owns(&reservation) || reservation.cache() != Some(&context.object.cache) {
             return Err(Error::InvalidConfiguration);

@@ -1,7 +1,7 @@
 //! Production coordinator/range/selection/Fill graph across authenticated nodes.
 use super::*;
 use crate::{
-    client::request::{ClientRequest, ReadKind},
+    client::{ClientRequest, ReadKind},
     control::{
         snapshot::{PublishedState, SnapshotStore},
         wire::*,

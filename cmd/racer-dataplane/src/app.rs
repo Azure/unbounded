@@ -13,7 +13,7 @@
 
 use crate::telemetry::metrics::Gauge;
 use crate::{
-    client::{listener::ClientListeners, request::RequestParser, response::Responses},
+    client::{RequestParser, listener::ClientListeners, response::Responses},
     config::Config,
     control::{
         ControlClient, ControlEndpoint,
@@ -815,22 +815,22 @@ impl WorkerApplication {
                 .with_observer(admission.observer()),
         );
         candidates.set_publications(node.publications.clone());
-        let origin: Rc<dyn Origin> = Rc::new(
-            OriginClient::new(
-                snapshots.clone(),
-                http.clone(),
-                Rc::new(
-                    io.capped(
-                        config
-                            .limits
-                            .header_bytes
-                            .get()
-                            .min(crate::http::codec::MAX_HEAD_BYTES),
-                    ),
+        let origin: Rc<dyn Origin> = Rc::new(OriginClient::new(
+            snapshots.clone(),
+            http.clone(),
+            Rc::new(
+                io.capped(
+                    config
+                        .limits
+                        .header_bytes
+                        .get()
+                        .min(crate::http::codec::MAX_HEAD_BYTES),
                 ),
-            )
-            .with_buffers(admission.clone(), buffers.clone()),
-        );
+            ),
+            admission.clone(),
+            buffers.clone(),
+            "/run/racer",
+        )?);
         let flights =
             Rc::new(Flights::new(admission.clone()).with_availability(availability.clone()));
         let fill = Rc::new(

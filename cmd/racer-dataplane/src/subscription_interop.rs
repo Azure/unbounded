@@ -126,7 +126,7 @@ impl peer::PeerClient for NoPeer {
 #[test]
 #[ignore = "run RACER_SUBSCRIPTION_INTEROP=1 go test ./pkg/racersdk -run '^TestRustSubscriptionInterop$' -timeout=5m under external timeout"]
 fn go_sdk_subscription_server() {
-    use client::{listener::ClientListeners, request::RequestParser, response::Responses};
+    use client::{listener::ClientListeners, RequestParser, response::Responses};
     use control::{
         caches::CacheDefinition,
         snapshot::{PublishedState, SnapshotStore},

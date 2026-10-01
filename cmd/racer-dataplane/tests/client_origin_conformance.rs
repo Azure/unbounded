@@ -2,10 +2,7 @@
 //! These exercise production HTTP/parser/writer components over real Unix sockets;
 //! they do not substitute for an Application/Coordinator end-to-end deployment.
 use racer_dataplane::{
-    client::{
-        request::{ClientRequest, ReadKind, RequestParser},
-        response::Responses,
-    },
+    client::{ClientRequest, ReadKind, RequestParser, response::Responses},
     error::{Error, Result},
     http::{
         codec::{Codec, Header, MessageHead, StartLine},

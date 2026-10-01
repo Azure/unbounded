@@ -929,7 +929,7 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
     // Its range body must nevertheless miss the retired completed page flight.
     {
         use crate::{
-            client::request::{ClientRequest, ReadKind},
+            client::{ClientRequest, ReadKind},
             control::{
                 caches::CacheDefinition,
                 snapshot::{PublishedState, SnapshotStore},

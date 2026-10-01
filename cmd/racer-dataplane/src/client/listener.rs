@@ -1,7 +1,7 @@
 //! Owned per-cache Unix sockets with permissions, bounded connections, and draining.
 //! Bind /run/racer/<cache name>/client/socket; mount its client directory separately
 //! from the origin directory so pods receive only their authorized endpoint.
-use super::{request::RequestParser, response::Responses};
+use super::{RequestParser, response::Responses};
 use crate::{
     control::caches::CacheDefinition,
     error::{Error, Operation, Result},
@@ -701,7 +701,7 @@ async fn serve_connection(
         let _context = admission.reserve(
             Some(cache),
             crate::model::ResourceClass::RequestContext,
-            super::request::MAX_HEAD_BYTES,
+            super::MAX_HEAD_BYTES,
         )?;
         let idle_scope = new_scope(timeout, cancellation.clone())?;
         deadline.set(idle_scope.deadline.0);
@@ -796,7 +796,7 @@ async fn serve_connection(
             return Ok(());
         }
         drop(read);
-        let mut send = if matches!(kind, super::request::ReadKind::Subscription { .. }) {
+        let mut send = if matches!(kind, super::ReadKind::Subscription { .. }) {
             responses.send_subscription(connection, response, scope, &mut observation, timeout)
         } else {
             responses.send_observed(connection, response, scope, &mut observation)

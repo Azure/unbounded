@@ -19,7 +19,7 @@ use self::{
     range_stream::{RangeStream, RangeStreams},
 };
 use crate::{
-    client::request::{ClientRequest, ReadKind},
+    client::{ClientRequest, ReadKind},
     control::snapshot::SnapshotStore,
     error::{Error, Operation, Result},
     model::{

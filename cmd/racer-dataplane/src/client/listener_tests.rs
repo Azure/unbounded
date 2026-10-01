@@ -201,7 +201,7 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
     assert_eq!(sim.live_handles(), 0);
 }
 use crate::{
-    client::request::ClientRequest,
+    client::ClientRequest,
     http::codec::Codec,
     memory::{delivery::Delivery, pipe::PipePool},
     model::{ExpiresAt, Limits, ObjectMetadata, ObjectVersion, StrongEtag},
@@ -945,7 +945,7 @@ impl ReadService for Bodies {
                 expires_at: ExpiresAt(UNIX_EPOCH + Duration::from_millis(1234)),
             };
             let requested = match &request.kind {
-                super::super::request::ReadKind::Subscription { range, .. } => {
+                super::super::ReadKind::Subscription { range, .. } => {
                     range.unwrap_or(ByteRange::From(0))
                 }
                 _ => ByteRange::Closed {
@@ -1007,7 +1007,7 @@ impl ReadService for Bodies {
                 crate::read::flight::AcquisitionBudget::new(scope.deadline.0, 4, 4),
                 if self.unseeded { None } else { Some(seed) },
             )?;
-            if let super::super::request::ReadKind::Subscription {
+            if let super::super::ReadKind::Subscription {
                 page_credits,
                 byte_credits,
                 ordered,
@@ -1687,7 +1687,7 @@ fn actual_uds_rejected_raw_heads_receive_sdk_errors() {
 
 #[test]
 fn actual_uds_configured_head_cap_counts_only_wire_bytes() {
-    for limit in [512, super::super::request::MAX_HEAD_BYTES] {
+    for limit in [512, super::super::MAX_HEAD_BYTES] {
         let mut fixture = Fixture::new();
         fixture.listeners.parser = RequestParser::new(limit);
         fixture.reconcile(&[definition()]).unwrap();
