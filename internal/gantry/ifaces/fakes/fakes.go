@@ -442,85 +442,12 @@ func (d *DHT) FindProviders(_ context.Context, dg digest.Digest) ([]ifaces.Provi
 	return out, nil
 }
 
-// ---------------------------------------------------------------------------
-// Coordinator
-// ---------------------------------------------------------------------------
-
-// Coordinator is an in-memory ifaces.Coordinator. Per-peer responses are
-// programmed via Program.
-type Coordinator struct {
-	mu sync.Mutex
-
-	intent     map[key]ifaces.PullIntent
-	pleasePull map[key][]ifaces.PleasePullOutcome
-}
-
-type key struct {
-	peer   ifaces.NodeID
-	digest string
-}
-
-func NewCoordinator() *Coordinator {
-	return &Coordinator{
-		intent:     map[key]ifaces.PullIntent{},
-		pleasePull: map[key][]ifaces.PleasePullOutcome{},
-	}
-}
-
-// ProgramIntent sets the canned PullIntent response for (peer, d).
-func (c *Coordinator) ProgramIntent(peer ifaces.NodeID, d digest.Digest, intent ifaces.PullIntent) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.intent[key{peer, d.String()}] = intent
-}
-
-// ProgramPleasePull sets the canned per-digest outcome for (peer, d). Tests
-// programming a batched please_pull MUST seed each digest.
-func (c *Coordinator) ProgramPleasePull(peer ifaces.NodeID, d digest.Digest, outcome ifaces.PleasePullOutcome) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.pleasePull[key{peer, d.String()}] = append(c.pleasePull[key{peer, d.String()}], outcome)
-}
-
-func (c *Coordinator) PullIntentQuery(_ context.Context, peer ifaces.NodeID, d digest.Digest) (ifaces.PullIntent, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	intent, ok := c.intent[key{peer, d.String()}]
-	if !ok {
-		return ifaces.PullIntent{}, fmt.Errorf("fakes: no intent programmed for (%s, %s)", peer, d)
-	}
-
-	return intent, nil
-}
-
-func (c *Coordinator) PleasePull(_ context.Context, peer ifaces.NodeID, _, _ string, _ ifaces.OriginRefKind, digests []digest.Digest) ([]ifaces.PleasePullOutcome, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	out := make([]ifaces.PleasePullOutcome, 0, len(digests))
-	for _, d := range digests {
-		queue := c.pleasePull[key{peer, d.String()}]
-		if len(queue) == 0 {
-			return nil, fmt.Errorf("fakes: no please_pull outcome programmed for (%s, %s)", peer, d)
-		}
-
-		out = append(out, queue[0])
-		c.pleasePull[key{peer, d.String()}] = queue[1:]
-	}
-
-	return out, nil
-}
-
 // Compile-time assertions that the fakes implement the interfaces.
 var (
 	_ ifaces.LocalContentStore = (*Cache)(nil)
 	_ ifaces.OriginPuller      = (*OriginPuller)(nil)
 	_ ifaces.PeerDialer        = (*PeerDialer)(nil)
 	_ ifaces.DHT               = (*DHT)(nil)
-	_ ifaces.Coordinator       = (*Coordinator)(nil)
 )
 
 // helper to keep go vet happy on unused time import in case of future trims

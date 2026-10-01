@@ -25,9 +25,6 @@ func TestInvalidKindRejectedBeforePump(t *testing.T) {
 
 	for _, kind := range []coordv1.PleasePullRequest_Kind{coordv1.PleasePullRequest_KIND_UNSPECIFIED, 99, -1} {
 		req := &coordv1.PleasePullRequest{Kind: kind, UpstreamRegistry: "registry.example", Repository: "repo"}
-		if _, err := s.servePleasePull(t.Context(), "", req); err == nil {
-			t.Fatalf("wire kind %d accepted", kind)
-		}
 
 		data, err := proto.Marshal(req)
 		if err != nil {

@@ -360,17 +360,6 @@ type DHT interface {
 // Implemented by internal/coord .
 // ---------------------------------------------------------------------------
 
-// PullIntent is the requester-side view of a PullIntentResponse.
-type PullIntent struct {
-	HasCached      bool
-	InFlight       bool
-	StartedAt      time.Time
-	RecipientRank  int32
-	RecentlyFailed bool
-	CooldownUntil  time.Time
-	FailureClass   FailureClass
-}
-
 // PleasePullOutcome is the requester-side view of a single
 // PleasePullResponse.Result.
 type PleasePullOutcome struct {
@@ -402,13 +391,6 @@ const (
 	PleasePullStaleChair
 )
 
-// Coordinator issues coordination RPCs to peers. Implementations are
-// expected to open one libp2p stream per call.
-type Coordinator interface {
-	PullIntentQuery(ctx context.Context, peer NodeID, d digest.Digest) (PullIntent, error)
-	PleasePull(ctx context.Context, peer NodeID, registry, repository string, kind OriginRefKind, digests []digest.Digest) ([]PleasePullOutcome, error)
-}
-
 // ChairCoordinator issues a chair-authorized please_pull request.
 type ChairCoordinator interface {
 	PleasePullChair(ctx context.Context, endpoint PeerEndpoint, registry, repository string, kind OriginRefKind, digests []digest.Digest, assignment ChairAssignment) ([]PleasePullOutcome, error)
@@ -423,18 +405,6 @@ type ChairRotationCoordinator interface {
 // ChairSuccessor accepts or declines a planned chair assignment.
 type ChairSuccessor interface {
 	AcceptChair(ctx context.Context, proposer NodeID, assignment ChairAssignment) (PeerEndpoint, bool)
-}
-
-// LocalIntentProvider computes the PullIntent for self synchronously,
-// without going through a libp2p coord stream. The cold-start
-// orchestrator uses it to include self as a first-class participant
-// in the rule cascade so that when self is HRW rank 0, self
-// pulls instead of delegating to rank 1 (which violates the
-// "one origin pull per digest" thundering-herd invariant - every
-// requester must converge on the same designated puller, and that
-// puller MAY be self).
-type LocalIntentProvider interface {
-	LocalPullIntent(ctx context.Context, d digest.Digest) PullIntent
 }
 
 // LocalPullStarter starts an origin pull on the local node without

@@ -317,10 +317,7 @@ func runAgent(args []string) error {
 		}),
 	)
 
-	coordClient := coord.NewClient(disco.LibP2P(),
-		coord.WithClientLogger(logger),
-		coord.WithClientMaxDigestsPerPleasePull(c.CoordMaxDigestsPerRequest),
-	)
+	coordClient := coord.NewClient(disco.LibP2P())
 
 	var chairManager *chairs.Manager
 
@@ -396,16 +393,12 @@ func runAgent(args []string) error {
 	coordOpts := []coord.Option{
 		coord.WithLogger(logger),
 		coord.WithMetrics(coord.MetricsHooks{
-			OnPullIntentServed:             func() { p3.coordPullIntentServed.Inc() },
-			OnPullIntentStorageUnavailable: func() { p3.coordPullIntentStorageUnavailable.Inc() },
-			OnPleasePullServed:             func() { p3.coordPleasePullServed.Inc() },
-			OnPleasePullStarted:            func() { p3.coordPleasePullStarted.Inc() },
-			OnPleasePullDeclined:           func(reason string) { p3.coordPleasePullDeclined.WithLabelValues(reason).Inc() },
-			OnStreamError:                  func() { p3.coordStreamError.Inc() },
+			OnPleasePullServed:   func() { p3.coordPleasePullServed.Inc() },
+			OnPleasePullStarted:  func() { p3.coordPleasePullStarted.Inc() },
+			OnPleasePullDeclined: func(reason string) { p3.coordPleasePullDeclined.WithLabelValues(reason).Inc() },
+			OnStreamError:        func() { p3.coordStreamError.Inc() },
 		}),
-		coord.WithNegativeCache(negCacheAdapter{c: negCache}),
 		coord.WithPullerPump(pullerPump),
-		coord.WithRequireChairAssignment(true),
 		coord.WithMaxDigestsPerPleasePull(c.CoordMaxDigestsPerRequest),
 	}
 	if chairManager != nil {
@@ -415,7 +408,7 @@ func runAgent(args []string) error {
 		)
 	}
 
-	coordServer := coord.NewServer(cstore, inflightMap, coordOpts...)
+	coordServer := coord.NewServer(coordOpts...)
 	coordServer.Bind(disco.LibP2P())
 
 	chairPort, err := listenPort(c.ChairListen)
@@ -2274,23 +2267,6 @@ func isCredentialSpecificOriginFailure(class ifaces.FailureClass) bool {
 	default:
 		return false
 	}
-}
-
-// negCacheAdapter bridges *negcache.Cache to coord.NegativeCache.
-// Required because internal/negcache must not import internal/coord
-// (would cycle on the metric hooks the coord server uses).
-type negCacheAdapter struct{ c *negcache.Cache }
-
-func (a negCacheAdapter) Lookup(d digest.Digest) (coord.NegativeEntry, bool) {
-	e, ok := a.c.Lookup(d)
-	if !ok {
-		return coord.NegativeEntry{}, false
-	}
-
-	return coord.NegativeEntry{
-		CooldownUntil: e.CooldownUntil,
-		Class:         e.Class,
-	}, true
 }
 
 // mirrorNegCacheRecorder bridges *negcache.Cache to

@@ -4,7 +4,10 @@
 package coord_test
 
 import (
+	"bytes"
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -12,163 +15,42 @@ import (
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
+	"github.com/libp2p/go-msgio"
+	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/Azure/unbounded/internal/gantry/coord"
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
-	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
-	"github.com/Azure/unbounded/internal/gantry/inflight"
+	coordv1 "github.com/Azure/unbounded/internal/gantry/proto/coord/v1"
 	"github.com/Azure/unbounded/internal/gantry/registryauth"
 )
 
-// helper: build two libp2p hosts that know each other's addresses.
 func makeHostPair(t *testing.T) (a, b host.Host) {
 	t.Helper()
 
-	mkHost := func() host.Host {
+	mk := func() host.Host {
 		h, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
 		if err != nil {
-			t.Fatalf("libp2p.New: %v", err)
+			t.Fatal(err)
 		}
+
+		t.Cleanup(func() { _ = h.Close() })
 
 		return h
 	}
-	a = mkHost()
-	b = mkHost()
+	a, b = mk(), mk()
 	a.Peerstore().AddAddrs(b.ID(), b.Addrs(), peerstore.PermanentAddrTTL)
 	b.Peerstore().AddAddrs(a.ID(), a.Addrs(), peerstore.PermanentAddrTTL)
-	t.Cleanup(func() {
-		_ = a.Close() //nolint:errcheck // best-effort close
-		_ = b.Close() //nolint:errcheck // best-effort close
-	})
 
 	return a, b
 }
 
-func TestPullIntent_NotCachedNotInFlight(t *testing.T) {
-	hClient, hServer := makeHostPair(t)
+type fixedChairValidator struct{ want ifaces.ChairAssignment }
 
-	c := fakes.NewCache()
-
-	infl := inflight.New(inflight.DefaultStalls(), nil)
-
-	srv := coord.NewServer(c, infl)
-	srv.Bind(hServer)
-
-	cli := coord.NewClient(hClient)
-
-	d := digest.MustParse("sha256:" + rep('a', 64))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	intent, err := cli.PullIntentQuery(ctx, ifaces.NodeID(hServer.ID().String()), d)
-	if err != nil {
-		t.Fatalf("PullIntentQuery: %v", err)
-	}
-
-	if intent.HasCached {
-		t.Error("unexpected HasCached=true")
-	}
-
-	if intent.InFlight {
-		t.Error("unexpected InFlight=true")
-	}
-
-	// RecipientRank is always -1: ranking required a cluster-wide membership
-	// view, which the chair design does not maintain.
-	if intent.RecipientRank != -1 {
-		t.Errorf("RecipientRank = %d, want -1", intent.RecipientRank)
-	}
-}
-
-func TestPullIntent_InFlight(t *testing.T) {
-	hClient, hServer := makeHostPair(t)
-
-	c := fakes.NewCache()
-	infl := inflight.New(inflight.DefaultStalls(), nil)
-	d := digest.MustParse("sha256:" + rep('b', 64))
-
-	h, _, _ := infl.Start(d, ifaces.KindBlob, 0)
-	defer h.Done()
-
-	srv := coord.NewServer(c, infl)
-	srv.Bind(hServer)
-
-	cli := coord.NewClient(hClient)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	intent, err := cli.PullIntentQuery(ctx, ifaces.NodeID(hServer.ID().String()), d)
-	if err != nil {
-		t.Fatalf("PullIntentQuery: %v", err)
-	}
-
-	if !intent.InFlight {
-		t.Error("InFlight=false, want true")
-	}
-
-	if intent.StartedAt.IsZero() {
-		t.Error("StartedAt zero, want set")
-	}
-}
-
-func TestPleasePull_Started(t *testing.T) {
-	hClient, hServer := makeHostPair(t)
-
-	c := fakes.NewCache()
-	infl := inflight.New(inflight.DefaultStalls(), nil)
-
-	var pumpCalls int32
-
-	pump := coord.PullerPump(func(ctx context.Context, registry, repository string, d digest.Digest, kind ifaces.OriginRefKind) coord.PumpResult {
-		atomic.AddInt32(&pumpCalls, 1)
-		// Claim in-flight as the real puller would; that gates re-pulls.
-		h, e, already := infl.Start(d, kind, 0)
-		_ = h // leak intentionally for test brevity //nolint:errcheck // best-effort
-
-		if already {
-			return coord.PumpResult{Status: coord.PumpAlreadyPulling, StartedAt: e.StartedAt}
-		}
-
-		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: e.StartedAt}
-	})
-	srv := coord.NewServer(c, infl, coord.WithPullerPump(pump))
-	srv.Bind(hServer)
-
-	cli := coord.NewClient(hClient)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	d1 := digest.MustParse("sha256:" + rep('1', 64))
-	d2 := digest.MustParse("sha256:" + rep('2', 64))
-
-	outs, err := cli.PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", ifaces.KindBlob, []digest.Digest{d1, d2})
-	if err != nil {
-		t.Fatalf("PleasePull: %v", err)
-	}
-
-	if len(outs) != 2 {
-		t.Fatalf("len(outs) = %d, want 2", len(outs))
-	}
-
-	for _, o := range outs {
-		if o.Outcome != ifaces.PleasePullStarted {
-			t.Errorf("outcome for %s = %v, want PleasePullStarted", o.Digest, o.Outcome)
-		}
-	}
-
-	if atomic.LoadInt32(&pumpCalls) != 2 {
-		t.Errorf("pumpCalls = %d, want 2", pumpCalls)
-	}
-}
-
-type fixedChairValidator struct {
-	want ifaces.ChairAssignment
+func (v fixedChairValidator) ValidateChair(_ context.Context, a ifaces.ChairAssignment) bool {
+	return a == v.want
 }
 
 type acceptingChairSuccessor struct {
@@ -176,758 +58,288 @@ type acceptingChairSuccessor struct {
 	endpoint ifaces.PeerEndpoint
 }
 
-func (s acceptingChairSuccessor) AcceptChair(_ context.Context, _ ifaces.NodeID, assignment ifaces.ChairAssignment) (ifaces.PeerEndpoint, bool) {
-	return s.endpoint, assignment == s.want
+func (s acceptingChairSuccessor) AcceptChair(_ context.Context, _ ifaces.NodeID, a ifaces.ChairAssignment) (ifaces.PeerEndpoint, bool) {
+	return s.endpoint, a == s.want
 }
 
-func (v fixedChairValidator) ValidateChair(_ context.Context, assignment ifaces.ChairAssignment) bool {
-	return assignment == v.want
+var testAssignment = ifaces.ChairAssignment{ChairID: 7, Generation: 4, AssignmentEpoch: 12}
+
+func chairFixture(t *testing.T, pump coord.PullerPump, opts ...coord.Option) (*coord.Server, *coord.ChairHTTPClient, ifaces.PeerEndpoint) {
+	t.Helper()
+
+	opts = append(opts, coord.WithPullerPump(pump), coord.WithChairValidator(fixedChairValidator{want: testAssignment}))
+	srv := coord.NewServer(opts...)
+	port, id := startChairServer(t, srv)
+	cli := coord.NewChairHTTPClient(coord.ChairHTTPOptions{Port: port, Timeout: 5 * time.Second})
+
+	return srv, cli, ifaces.PeerEndpoint{PeerID: ifaces.NodeID(id.String()), TransferAddr: "127.0.0.1:5001"}
+}
+
+// The old intent tests now verify the removed wire fields cannot start work.
+func rejectedEnvelope(t *testing.T, field protowire.Number) {
+	t.Helper()
+	a, b := makeHostPair(t)
+
+	var calls atomic.Int32
+
+	srv := coord.NewServer(coord.WithPullerPump(func(context.Context, string, string, digest.Digest, ifaces.OriginRefKind) coord.PumpResult {
+		calls.Add(1)
+		return coord.PumpResult{Status: coord.PumpStarted}
+	}))
+	srv.Bind(b)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+
+	s, err := a.NewStream(ctx, b.ID(), coord.ProtocolID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	_ = s.SetDeadline(time.Now().Add(2 * time.Second))
+
+	data := protowire.AppendBytes(protowire.AppendTag(nil, field, protowire.BytesType), nil)
+	if err := msgio.NewVarintWriter(s).WriteMsg(data); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := msgio.NewVarintReaderSize(s, coord.MaxMessageBytes).ReadMsg(); err == nil {
+		t.Fatal("removed envelope accepted")
+	}
+
+	if calls.Load() != 0 {
+		t.Fatal("removed RPC started pump")
+	}
+}
+func TestPullIntent_NotCachedNotInFlight(t *testing.T)                       { rejectedEnvelope(t, 1) }
+func TestPullIntent_InFlight(t *testing.T)                                   { rejectedEnvelope(t, 2) }
+func TestPullIntent_NegativeCacheSurfaced(t *testing.T)                      { rejectedEnvelope(t, 3) }
+func TestPleasePull_RequireChairAssignmentRejectsLegacyRequest(t *testing.T) { rejectedEnvelope(t, 4) }
+
+func outcomeRoundTrip(t *testing.T, result coord.PumpResult, want ifaces.PleasePullStatus) {
+	t.Helper()
+
+	var calls atomic.Int32
+
+	_, cli, endpoint := chairFixture(t, func(context.Context, string, string, digest.Digest, ifaces.OriginRefKind) coord.PumpResult {
+		calls.Add(1)
+		return result
+	})
+	d := digest.MustParse("sha256:" + strings.Repeat("a", 64))
+
+	out, err := cli.PleasePullChair(t.Context(), endpoint, "reg", "repo", ifaces.KindBlob, []digest.Digest{d}, testAssignment)
+	if err != nil || len(out) != 1 {
+		t.Fatalf("out=%+v err=%v", out, err)
+	}
+
+	if out[0].Outcome != want || out[0].Digest != d || calls.Load() != 1 {
+		t.Fatalf("out=%+v calls=%d", out, calls.Load())
+	}
+
+	if !result.StartedAt.IsZero() && !out[0].StartedAt.Equal(result.StartedAt) {
+		t.Fatal("started timestamp lost")
+	}
+
+	if !result.CooldownUntil.IsZero() && (!out[0].CooldownUntil.Equal(result.CooldownUntil) || out[0].FailureClass != result.FailureClass) {
+		t.Fatal("failure metadata lost")
+	}
+}
+
+func TestPleasePull_Started(t *testing.T) {
+	outcomeRoundTrip(t, coord.PumpResult{Status: coord.PumpStarted, StartedAt: time.Now()}, ifaces.PleasePullStarted)
+}
+
+func TestPleasePull_AlreadyPulling(t *testing.T) {
+	outcomeRoundTrip(t, coord.PumpResult{Status: coord.PumpAlreadyPulling, StartedAt: time.Now()}, ifaces.PleasePullAlreadyPulling)
+}
+
+func TestPleasePull_RecentlyFailedShortCircuit(t *testing.T) {
+	outcomeRoundTrip(t, coord.PumpResult{Status: coord.PumpRecentlyFailed, CooldownUntil: time.Now().Add(time.Minute), FailureClass: ifaces.FailureAuth}, ifaces.PleasePullRecentlyFailed)
 }
 
 func TestPleasePullChair_StaleAssignmentDoesNotStartPump(t *testing.T) {
-	hClient, hServer := makeHostPair(t)
-	c := fakes.NewCache()
-	infl := inflight.New(inflight.DefaultStalls(), nil)
-
-	var pumpCalls int32
-
-	pump := coord.PullerPump(func(context.Context, string, string, digest.Digest, ifaces.OriginRefKind) coord.PumpResult {
-		atomic.AddInt32(&pumpCalls, 1)
-		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: time.Now()}
+	_, cli, endpoint := chairFixture(t, func(context.Context, string, string, digest.Digest, ifaces.OriginRefKind) coord.PumpResult {
+		t.Error("stale chair started pump")
+		return coord.PumpResult{}
 	})
-	want := ifaces.ChairAssignment{ChairID: 7, Generation: 4, AssignmentEpoch: 12}
-	srv := coord.NewServer(c, infl,
-		coord.WithPullerPump(pump),
-		coord.WithChairValidator(fixedChairValidator{want: want}),
-	)
-	srv.Bind(hServer)
+	d := digest.MustParse("sha256:" + strings.Repeat("a", 64))
+	a := testAssignment
+	a.Generation--
 
-	cli := coord.NewClient(hClient)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	d := digest.MustParse("sha256:" + rep('7', 64))
-	stale := want
-	stale.Generation--
-
-	outs, err := cli.PleasePullChair(ctx, ifaces.PeerEndpoint{PeerID: ifaces.NodeID(hServer.ID().String())}, "reg", "repo", ifaces.KindBlob, []digest.Digest{d}, stale)
-	if err != nil {
-		t.Fatalf("PleasePullChair: %v", err)
+	out, err := cli.PleasePullChair(t.Context(), endpoint, "reg", "repo", ifaces.KindBlob, []digest.Digest{d}, a)
+	if err != nil || len(out) != 1 || out[0].Outcome != ifaces.PleasePullStaleChair {
+		t.Fatalf("out=%+v err=%v", out, err)
 	}
 
-	if len(outs) != 1 || outs[0].Outcome != ifaces.PleasePullStaleChair {
-		t.Fatalf("outcomes = %+v, want stale chair", outs)
-	}
-
-	if got := atomic.LoadInt32(&pumpCalls); got != 0 {
-		t.Fatalf("pump calls = %d, want 0", got)
-	}
-
-	legacy, err := cli.PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", ifaces.KindBlob, []digest.Digest{d})
-	if err != nil {
-		t.Fatalf("legacy PleasePull: %v", err)
-	}
-
-	if len(legacy) != 1 || legacy[0].Outcome != ifaces.PleasePullStarted {
-		t.Fatalf("legacy outcomes = %+v, want started", legacy)
-	}
-}
-
-func TestPleasePull_RequireChairAssignmentRejectsLegacyRequest(t *testing.T) {
-	hClient, hServer := makeHostPair(t)
-	c := fakes.NewCache()
-	infl := inflight.New(inflight.DefaultStalls(), nil)
-
-	var pumpCalls int32
-
-	pump := coord.PullerPump(func(context.Context, string, string, digest.Digest, ifaces.OriginRefKind) coord.PumpResult {
-		atomic.AddInt32(&pumpCalls, 1)
-		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: time.Now()}
-	})
-	want := ifaces.ChairAssignment{ChairID: 7, Generation: 4, AssignmentEpoch: 12}
-	srv := coord.NewServer(c, infl,
-		coord.WithPullerPump(pump),
-		coord.WithChairValidator(fixedChairValidator{want: want}),
-		coord.WithRequireChairAssignment(true),
-	)
-	srv.Bind(hServer)
-
-	cli := coord.NewClient(hClient)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	d := digest.MustParse("sha256:" + rep('8', 64))
-
-	legacy, err := cli.PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", ifaces.KindBlob, []digest.Digest{d})
-	if err != nil {
-		t.Fatalf("legacy PleasePull: %v", err)
-	}
-
-	if len(legacy) != 1 || legacy[0].Outcome != ifaces.PleasePullStaleChair {
-		t.Fatalf("legacy outcomes = %+v, want stale chair", legacy)
-	}
-
-	if got := atomic.LoadInt32(&pumpCalls); got != 0 {
-		t.Fatalf("pump calls after legacy request = %d, want 0", got)
-	}
-
-	chairOutcomes, err := cli.PleasePullChair(ctx, ifaces.PeerEndpoint{PeerID: ifaces.NodeID(hServer.ID().String())}, "reg", "repo", ifaces.KindBlob, []digest.Digest{d}, want)
-	if err != nil {
-		t.Fatalf("PleasePullChair: %v", err)
-	}
-
-	if len(chairOutcomes) != 1 || chairOutcomes[0].Outcome != ifaces.PleasePullStarted {
-		t.Fatalf("chair outcomes = %+v, want started", chairOutcomes)
+	if _, err := cli.PleasePullChair(t.Context(), endpoint, "reg", "repo", ifaces.KindBlob, []digest.Digest{d}, ifaces.ChairAssignment{}); err == nil {
+		t.Fatal("missing assignment accepted")
 	}
 }
 
 func TestOfferChairReturnsAcceptedSuccessorEndpoint(t *testing.T) {
-	hClient, hServer := makeHostPair(t)
-	want := ifaces.ChairAssignment{ChairID: 5, Generation: 8, AssignmentEpoch: 21}
-	wantEndpoint := ifaces.PeerEndpoint{
-		PeerID:       ifaces.NodeID(hServer.ID().String()),
-		P2PAddrs:     []string{"/ip4/10.0.0.5/tcp/4001/p2p/" + hServer.ID().String()},
-		TransferAddr: "10.0.0.5:5001",
-	}
-	srv := coord.NewServer(fakes.NewCache(), inflight.New(inflight.DefaultStalls(), nil),
-		coord.WithChairSuccessor(acceptingChairSuccessor{want: want, endpoint: wantEndpoint}),
-	)
-	srv.Bind(hServer)
+	a, b := makeHostPair(t)
+	want := ifaces.PeerEndpoint{PeerID: ifaces.NodeID(b.ID().String()), TransferAddr: "10.0.0.5:5001", P2PAddrs: []string{"/ip4/10.0.0.5/tcp/4001"}}
+	coord.NewServer(coord.WithChairSuccessor(acceptingChairSuccessor{want: testAssignment, endpoint: want})).Bind(b)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	endpoint, accepted, err := coord.NewClient(hClient).OfferChair(ctx, ifaces.NodeID(hServer.ID().String()), want)
-	if err != nil {
-		t.Fatalf("OfferChair: %v", err)
-	}
-
-	if !accepted || endpoint.PeerID != wantEndpoint.PeerID || endpoint.TransferAddr != wantEndpoint.TransferAddr || len(endpoint.P2PAddrs) != 1 {
-		t.Fatalf("accepted=%t endpoint=%+v, want %+v", accepted, endpoint, wantEndpoint)
+	got, accepted, err := coord.NewClient(a).OfferChair(t.Context(), ifaces.NodeID(b.ID().String()), testAssignment)
+	if err != nil || !accepted || got.PeerID != want.PeerID || got.TransferAddr != want.TransferAddr || len(got.P2PAddrs) != 1 {
+		t.Fatalf("got=%+v accepted=%v err=%v", got, accepted, err)
 	}
 }
 
 func TestPleasePull_DelegatesAuthorization(t *testing.T) {
-	for _, authorization := range []string{
-		"Bearer requester-token",
-		"Basic cmVxdWVzdGVyOnNlY3JldA==",
-	} {
-		t.Run(strings.Fields(authorization)[0], func(t *testing.T) {
-			hClient, hServer := makeHostPair(t)
-			c := fakes.NewCache()
-			infl := inflight.New(inflight.DefaultStalls(), nil)
-
-			seen := make(chan string, 1)
-			pump := coord.PullerPump(func(ctx context.Context, _, _ string, _ digest.Digest, _ ifaces.OriginRefKind) coord.PumpResult {
-				seen <- registryauth.Authorization(ctx)
-
-				return coord.PumpResult{Status: coord.PumpStarted, StartedAt: time.Now()}
-			})
-
-			srv := coord.NewServer(c, infl, coord.WithPullerPump(pump))
-			srv.Bind(hServer)
-
-			ctx := registryauth.WithAuthorization(context.Background(), authorization)
-
-			d := digest.MustParse("sha256:" + rep('a', 64))
-			if _, err := coord.NewClient(hClient).PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", ifaces.KindBlob, []digest.Digest{d}); err != nil {
-				t.Fatalf("PleasePull: %v", err)
-			}
-
-			if got := <-seen; got != authorization {
-				t.Fatalf("pump authorization = %q, want %q", got, authorization)
-			}
+	for _, auth := range []string{"Bearer requester-token", "Basic cmVxdWVzdGVyOnNlY3JldA=="} {
+		seen := make(chan string, 1)
+		_, cli, endpoint := chairFixture(t, func(ctx context.Context, _, _ string, _ digest.Digest, _ ifaces.OriginRefKind) coord.PumpResult {
+			seen <- registryauth.Authorization(ctx)
+			return coord.PumpResult{Status: coord.PumpStarted}
 		})
+
+		d := digest.MustParse("sha256:" + strings.Repeat("a", 64))
+		if _, err := cli.PleasePullChair(registryauth.WithAuthorization(t.Context(), auth), endpoint, "reg", "repo", ifaces.KindBlob, []digest.Digest{d}, testAssignment); err != nil {
+			t.Fatal(err)
+		}
+
+		if got := <-seen; got != auth {
+			t.Fatal("authorization lost")
+		}
 	}
 }
 
 func TestPleasePull_DeclinedFiresHook(t *testing.T) {
-	hClient, hServer := makeHostPair(t)
+	var declined, started atomic.Int32
 
-	c := fakes.NewCache()
-	infl := inflight.New(inflight.DefaultStalls(), nil)
-
-	// Pump always declines, simulating a node at its concurrent-pull
-	// ceiling or shutting down.
-	pump := coord.PullerPump(func(context.Context, string, string, digest.Digest, ifaces.OriginRefKind) coord.PumpResult {
+	_, cli, endpoint := chairFixture(t, func(context.Context, string, string, digest.Digest, ifaces.OriginRefKind) coord.PumpResult {
 		return coord.PumpResult{Status: coord.PumpDeclined}
-	})
+	}, coord.WithMetrics(coord.MetricsHooks{OnPleasePullDeclined: func(string) { declined.Add(1) }, OnPleasePullStarted: func() { started.Add(1) }}))
+	d := digest.MustParse("sha256:" + strings.Repeat("a", 64))
 
-	var declined, started int32
-
-	srv := coord.NewServer(c, infl,
-		coord.WithPullerPump(pump),
-		coord.WithMetrics(coord.MetricsHooks{
-			OnPleasePullDeclined: func(string) { atomic.AddInt32(&declined, 1) },
-			OnPleasePullStarted:  func() { atomic.AddInt32(&started, 1) },
-		}),
-	)
-	srv.Bind(hServer)
-
-	cli := coord.NewClient(hClient)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	d1 := digest.MustParse("sha256:" + rep('1', 64))
-	d2 := digest.MustParse("sha256:" + rep('2', 64))
-
-	outs, err := cli.PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", ifaces.KindBlob, []digest.Digest{d1, d2})
-	if err != nil {
-		t.Fatalf("PleasePull: %v", err)
-	}
-
-	for _, o := range outs {
-		if o.Outcome != ifaces.PleasePullUnspecified {
-			t.Errorf("outcome for %s = %v, want PleasePullUnspecified", o.Digest, o.Outcome)
-		}
-	}
-
-	if got := atomic.LoadInt32(&declined); got != 2 {
-		t.Errorf("OnPleasePullDeclined fired %d times, want 2", got)
-	}
-
-	if got := atomic.LoadInt32(&started); got != 0 {
-		t.Errorf("OnPleasePullStarted fired %d times, want 0", got)
+	out, err := cli.PleasePullChair(t.Context(), endpoint, "reg", "repo", ifaces.KindBlob, []digest.Digest{d, d}, testAssignment)
+	if err != nil || len(out) != 2 || declined.Load() != 2 || started.Load() != 0 {
+		t.Fatalf("out=%+v err=%v declined=%d started=%d", out, err, declined.Load(), started.Load())
 	}
 }
 
 func TestPleasePull_RejectsOversizedBatch(t *testing.T) {
-	hClient, hServer := makeHostPair(t)
+	// HTTP request-size bounds are tested directly; normal clients chunk batches.
+	local := &localPullStub{}
 
-	c := fakes.NewCache()
-	infl := inflight.New(inflight.DefaultStalls(), nil)
-
-	var pumpCalls int32
-
-	pump := coord.PullerPump(func(context.Context, string, string, digest.Digest, ifaces.OriginRefKind) coord.PumpResult {
-		atomic.AddInt32(&pumpCalls, 1)
-		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: time.Now()}
-	})
-	srv := coord.NewServer(c, infl,
-		coord.WithPullerPump(pump),
-		coord.WithMaxDigestsPerPleasePull(1),
-	)
-	srv.Bind(hServer)
-
-	cli := coord.NewClient(hClient, coord.WithClientMaxDigestsPerPleasePull(10))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	d1 := digest.MustParse("sha256:" + rep('1', 64))
-	d2 := digest.MustParse("sha256:" + rep('2', 64))
-
-	if _, err := cli.PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", ifaces.KindBlob, []digest.Digest{d1, d2}); err == nil {
-		t.Fatal("expected oversized please_pull to fail")
+	request := &coordv1.PleasePullRequest{Kind: coordv1.PleasePullRequest_KIND_BLOB, ChairAssignment: &coordv1.ChairAssignment{Generation: 1, AssignmentEpoch: 1}, UpstreamRegistry: "reg", Repository: "repo"}
+	for range coord.DefaultMaxDigestsPerPleasePull + 1 {
+		request.Digests = append(request.Digests, "sha256:"+strings.Repeat("a", 64))
 	}
 
-	if got := atomic.LoadInt32(&pumpCalls); got != 0 {
-		t.Fatalf("pumpCalls = %d, want 0", got)
+	data, err := proto.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := httptest.NewRecorder()
+	coord.NewChairHTTPHandler(local, nil).ServeHTTP(w, httptest.NewRequest(http.MethodPost, coord.ChairHTTPPath, bytes.NewReader(data)))
+
+	if w.Code != http.StatusBadRequest || local.gotRegistry != "" {
+		t.Fatal("oversized request reached starter")
 	}
 }
 
 func TestPleasePull_ClientChunksBatches(t *testing.T) {
-	hClient, hServer := makeHostPair(t)
+	var calls atomic.Int32
 
-	c := fakes.NewCache()
-	infl := inflight.New(inflight.DefaultStalls(), nil)
-
-	var pumpCalls int32
-
-	pump := coord.PullerPump(func(context.Context, string, string, digest.Digest, ifaces.OriginRefKind) coord.PumpResult {
-		atomic.AddInt32(&pumpCalls, 1)
-		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: time.Now()}
+	_, cli, endpoint := chairFixture(t, func(context.Context, string, string, digest.Digest, ifaces.OriginRefKind) coord.PumpResult {
+		calls.Add(1)
+		return coord.PumpResult{Status: coord.PumpStarted}
 	})
-	srv := coord.NewServer(c, infl,
-		coord.WithPullerPump(pump),
-		coord.WithMaxDigestsPerPleasePull(1),
-	)
-	srv.Bind(hServer)
+	d := digest.MustParse("sha256:" + strings.Repeat("a", 64))
 
-	cli := coord.NewClient(hClient, coord.WithClientMaxDigestsPerPleasePull(1))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	d1 := digest.MustParse("sha256:" + rep('1', 64))
-	d2 := digest.MustParse("sha256:" + rep('2', 64))
-
-	outs, err := cli.PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", ifaces.KindBlob, []digest.Digest{d1, d2})
-	if err != nil {
-		t.Fatalf("PleasePull: %v", err)
+	ds := make([]digest.Digest, coord.DefaultMaxDigestsPerPleasePull+1)
+	for i := range ds {
+		ds[i] = d
 	}
 
-	if len(outs) != 2 {
-		t.Fatalf("len(outs) = %d, want 2", len(outs))
-	}
-
-	if got := atomic.LoadInt32(&pumpCalls); got != 2 {
-		t.Fatalf("pumpCalls = %d, want 2", got)
+	out, err := cli.PleasePullChair(t.Context(), endpoint, "reg", "repo", ifaces.KindBlob, ds, testAssignment)
+	if err != nil || len(out) != len(ds) || int(calls.Load()) != len(ds) {
+		t.Fatalf("count=%d calls=%d err=%v", len(out), calls.Load(), err)
 	}
 }
 
 func TestStartLocalPull_RespectsCanceledContext(t *testing.T) {
-	c := fakes.NewCache()
-	infl := inflight.New(inflight.DefaultStalls(), nil)
-
-	var pumpCalls int32
-
-	pump := coord.PullerPump(func(context.Context, string, string, digest.Digest, ifaces.OriginRefKind) coord.PumpResult {
-		atomic.AddInt32(&pumpCalls, 1)
-		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: time.Now()}
-	})
-	srv := coord.NewServer(c, infl, coord.WithPullerPump(pump))
-
-	ctx, cancel := context.WithCancel(context.Background())
+	s := coord.NewServer(coord.WithPullerPump(func(context.Context, string, string, digest.Digest, ifaces.OriginRefKind) coord.PumpResult {
+		t.Fatal("canceled request pumped")
+		return coord.PumpResult{}
+	}))
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	d := digest.MustParse("sha256:" + rep('3', 64))
-
-	outs, err := srv.StartLocalPull(ctx, "reg", "repo", ifaces.KindBlob, []digest.Digest{d})
-	if err == nil {
-		t.Fatal("expected canceled context error")
-	}
-
-	if len(outs) != 0 {
-		t.Fatalf("len(outs) = %d, want 0", len(outs))
-	}
-
-	if got := atomic.LoadInt32(&pumpCalls); got != 0 {
-		t.Fatalf("pumpCalls = %d, want 0", got)
+	if _, err := s.StartLocalPull(ctx, "reg", "repo", ifaces.KindBlob, nil); err == nil {
+		t.Fatal("canceled request accepted")
 	}
 }
 
-func TestPleasePull_AlreadyPulling(t *testing.T) {
-	hClient, hServer := makeHostPair(t)
+func kindRoundTrip(t *testing.T, kind ifaces.OriginRefKind) {
+	t.Helper()
 
-	c := fakes.NewCache()
-	infl := inflight.New(inflight.DefaultStalls(), nil)
-
-	d := digest.MustParse("sha256:" + rep('c', 64))
-
-	pre, _, _ := infl.Start(d, ifaces.KindBlob, 0)
-	defer pre.Done()
-
-	pump := coord.PullerPump(func(_ context.Context, _, _ string, d digest.Digest, kind ifaces.OriginRefKind) coord.PumpResult {
-		h, e, already := infl.Start(d, kind, 0)
-		_ = h //nolint:errcheck // best-effort
-
-		if already {
-			return coord.PumpResult{Status: coord.PumpAlreadyPulling, StartedAt: e.StartedAt}
-		}
-
-		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: e.StartedAt}
+	seen := make(chan ifaces.OriginRefKind, 1)
+	_, cli, endpoint := chairFixture(t, func(_ context.Context, _, _ string, _ digest.Digest, k ifaces.OriginRefKind) coord.PumpResult {
+		seen <- k
+		return coord.PumpResult{Status: coord.PumpStarted}
 	})
-	srv := coord.NewServer(c, infl, coord.WithPullerPump(pump))
-	srv.Bind(hServer)
 
-	cli := coord.NewClient(hClient)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	outs, err := cli.PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", ifaces.KindBlob, []digest.Digest{d})
-	if err != nil {
-		t.Fatalf("PleasePull: %v", err)
+	d := digest.MustParse("sha256:" + strings.Repeat("a", 64))
+	if _, err := cli.PleasePullChair(t.Context(), endpoint, "reg", "repo", kind, []digest.Digest{d}, testAssignment); err != nil {
+		t.Fatal(err)
 	}
 
-	if len(outs) != 1 || outs[0].Outcome != ifaces.PleasePullAlreadyPulling {
-		t.Fatalf("outs = %+v; want ALREADY_PULLING", outs)
+	if got := <-seen; got != kind {
+		t.Fatal("kind changed")
+	}
+}
+func TestPleasePull_KindRoundtrip(t *testing.T)       { kindRoundTrip(t, ifaces.KindManifest) }
+func TestPleasePull_KindConfigRoundtrip(t *testing.T) { kindRoundTrip(t, ifaces.KindConfig) }
+func TestClient_UnknownNodeReturnsError(t *testing.T) { invalidOfferTarget(t, "not-a-peer-id") }
+func TestClient_ResolvePeerIDCache(t *testing.T)      { invalidOfferTarget(t, "alias") }
+func TestClient_PeerIDResolverCallback(t *testing.T)  { invalidOfferTarget(t, "k8s-node-name") }
+func invalidOfferTarget(t *testing.T, id string) {
+	t.Helper()
+
+	a, _ := makeHostPair(t)
+	if _, _, err := coord.NewClient(a).OfferChair(t.Context(), ifaces.NodeID(id), testAssignment); err == nil {
+		t.Fatal("membership alias accepted")
 	}
 }
 
-// stubNegCache implements coord.NegativeCache for testing the design doc wiring.
-type stubNegCache struct {
-	entries map[digest.Digest]coord.NegativeEntry
-}
-
-func (s stubNegCache) Lookup(d digest.Digest) (coord.NegativeEntry, bool) {
-	e, ok := s.entries[d]
-	return e, ok
-}
-
-func TestPullIntent_NegativeCacheSurfaced(t *testing.T) {
-	hClient, hServer := makeHostPair(t)
-
-	c := fakes.NewCache()
-	infl := inflight.New(inflight.DefaultStalls(), nil)
-
-	d := digest.MustParse("sha256:" + rep('f', 64))
-	cooldownUntil := time.Now().Add(30 * time.Second).UTC().Truncate(time.Microsecond)
-	neg := stubNegCache{entries: map[digest.Digest]coord.NegativeEntry{
-		d: {CooldownUntil: cooldownUntil, Class: ifaces.FailureRateLimited},
-	}}
-
-	srv := coord.NewServer(c, infl, coord.WithNegativeCache(neg))
-	srv.Bind(hServer)
-
-	cli := coord.NewClient(hClient)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	intent, err := cli.PullIntentQuery(ctx, ifaces.NodeID(hServer.ID().String()), d)
-	if err != nil {
-		t.Fatalf("PullIntentQuery: %v", err)
-	}
-
-	if !intent.RecentlyFailed {
-		t.Fatalf("RecentlyFailed = false, want true")
-	}
-
-	if intent.FailureClass != ifaces.FailureRateLimited {
-		t.Fatalf("FailureClass = %v, want FailureRateLimited", intent.FailureClass)
-	}
-
-	if !intent.CooldownUntil.Equal(cooldownUntil) {
-		t.Fatalf("CooldownUntil = %v, want %v", intent.CooldownUntil, cooldownUntil)
-	}
-}
-
-func TestPleasePull_RecentlyFailedShortCircuit(t *testing.T) {
-	hClient, hServer := makeHostPair(t)
-
-	c := fakes.NewCache()
-	infl := inflight.New(inflight.DefaultStalls(), nil)
-
-	d := digest.MustParse("sha256:" + rep('7', 64))
-	cooldownUntil := time.Now().Add(time.Minute).UTC().Truncate(time.Microsecond)
-
-	// Pump returns *NegativeEntry to short-circuit (real puller would
-	// consult its negcache before starting an origin pull).
-	var pumpCalls int32
-
-	pump := coord.PullerPump(func(_ context.Context, _, _ string, _ digest.Digest, _ ifaces.OriginRefKind) coord.PumpResult {
-		atomic.AddInt32(&pumpCalls, 1)
-
-		return coord.PumpResult{
-			Status:        coord.PumpRecentlyFailed,
-			CooldownUntil: cooldownUntil,
-			FailureClass:  ifaces.FailureAuth,
-		}
-	})
-	srv := coord.NewServer(c, infl, coord.WithPullerPump(pump))
-	srv.Bind(hServer)
-
-	cli := coord.NewClient(hClient)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	outs, err := cli.PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", ifaces.KindBlob, []digest.Digest{d})
-	if err != nil {
-		t.Fatalf("PleasePull: %v", err)
-	}
-
-	if len(outs) != 1 {
-		t.Fatalf("len(outs) = %d, want 1", len(outs))
-	}
-
-	o := outs[0]
-	if o.Outcome != ifaces.PleasePullRecentlyFailed {
-		t.Fatalf("Outcome = %v, want PleasePullRecentlyFailed", o.Outcome)
-	}
-
-	if o.FailureClass != ifaces.FailureAuth {
-		t.Fatalf("FailureClass = %v, want FailureAuth", o.FailureClass)
-	}
-
-	if !o.CooldownUntil.Equal(cooldownUntil) {
-		t.Fatalf("CooldownUntil = %v, want %v", o.CooldownUntil, cooldownUntil)
-	}
-
-	if got := atomic.LoadInt32(&pumpCalls); got != 1 {
-		t.Fatalf("pumpCalls = %d, want 1", got)
-	}
-}
-
-// TestPleasePull_KindRoundtrip asserts that the PleasePullRequest.kind
-// field is encoded on the client and surfaced verbatim to the
-// puller-pump on the server. Regression test for the earlier wire
-// gap where the server hardcoded ifaces.KindBlob, causing manifest
-// cold-start requests to be sent to /v2/<repo>/blobs/<digest>
-// instead of /v2/<repo>/manifests/<digest>.
-func TestPleasePull_KindRoundtrip(t *testing.T) {
-	hClient, hServer := makeHostPair(t)
-
-	c := fakes.NewCache()
-	infl := inflight.New(inflight.DefaultStalls(), nil)
-
-	var (
-		observedKind   ifaces.OriginRefKind
-		observedDigest digest.Digest
-	)
-
-	pump := coord.PullerPump(func(_ context.Context, _, _ string, d digest.Digest, kind ifaces.OriginRefKind) coord.PumpResult {
-		observedKind = kind
-		observedDigest = d
-		h, e, already := infl.Start(d, kind, 0)
-		_ = h //nolint:errcheck // best-effort
-
-		if already {
-			return coord.PumpResult{Status: coord.PumpAlreadyPulling, StartedAt: e.StartedAt}
-		}
-
-		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: e.StartedAt}
-	})
-	srv := coord.NewServer(c, infl, coord.WithPullerPump(pump))
-	srv.Bind(hServer)
-
-	cli := coord.NewClient(hClient)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	d := digest.MustParse("sha256:" + rep('b', 64))
-	if _, err := cli.PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", ifaces.KindManifest, []digest.Digest{d}); err != nil {
-		t.Fatalf("PleasePull: %v", err)
-	}
-
-	if observedDigest != d {
-		t.Fatalf("observedDigest = %s; want %s", observedDigest, d)
-	}
-
-	if observedKind != ifaces.KindManifest {
-		t.Fatalf("observedKind = %v; want KindManifest", observedKind)
-	}
-}
-
-// TestPleasePull_KindConfigRoundtrip extends the kind-roundtrip
-// coverage to the new ifaces.KindConfig variant. The proto enum
-// gained KIND_CONFIG so per-kind metrics ("manifest | config | layer")
-// stay honest across the please_pull wire - without this round-trip
-// a coordinator-driven origin pull of an image-config blob would
-// downgrade to "blob" on the puller and the
-// p2p_origin_pull_total{kind="config"} bucket would be permanently
-// zero in production.
-func TestPleasePull_KindConfigRoundtrip(t *testing.T) {
-	hClient, hServer := makeHostPair(t)
-
-	c := fakes.NewCache()
-	infl := inflight.New(inflight.DefaultStalls(), nil)
-
-	var observedKind ifaces.OriginRefKind
-
-	pump := coord.PullerPump(func(_ context.Context, _, _ string, d digest.Digest, kind ifaces.OriginRefKind) coord.PumpResult {
-		observedKind = kind
-		h, e, already := infl.Start(d, kind, 0)
-		_ = h //nolint:errcheck // best-effort
-
-		if already {
-			return coord.PumpResult{Status: coord.PumpAlreadyPulling, StartedAt: e.StartedAt}
-		}
-
-		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: e.StartedAt}
-	})
-	srv := coord.NewServer(c, infl, coord.WithPullerPump(pump))
-	srv.Bind(hServer)
-
-	cli := coord.NewClient(hClient)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	d := digest.MustParse("sha256:" + rep('c', 64))
-	if _, err := cli.PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "repo", ifaces.KindConfig, []digest.Digest{d}); err != nil {
-		t.Fatalf("PleasePull: %v", err)
-	}
-
-	if observedKind != ifaces.KindConfig {
-		t.Fatalf("observedKind = %v; want KindConfig (wire downgrade detected)", observedKind)
-	}
-}
-
-func TestClient_UnknownNodeReturnsError(t *testing.T) {
-	hClient, _ := makeHostPair(t)
-	cli := coord.NewClient(hClient)
-
-	// peer.Decode of a non-peerID string fails.
-	d := digest.MustParse("sha256:" + rep('d', 64))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-
-	_, err := cli.PullIntentQuery(ctx, ifaces.NodeID("not-a-peer-id"), d)
-	if err == nil {
-		t.Fatal("expected error for unresolvable NodeID")
-	}
-}
-
-// Ensure peer.ID resolution caching works.
-func TestClient_ResolvePeerIDCache(t *testing.T) {
-	hClient, hServer := makeHostPair(t)
-	c := fakes.NewCache()
-	infl := inflight.New(inflight.DefaultStalls(), nil)
-	srv := coord.NewServer(c, infl)
-	srv.Bind(hServer)
-
-	cli := coord.NewClient(hClient)
-	cli.ResolvePeerID("alias", hServer.ID())
-
-	d := digest.MustParse("sha256:" + rep('e', 64))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if _, err := cli.PullIntentQuery(ctx, "alias", d); err != nil {
-		t.Fatalf("aliased call: %v", err)
-	}
-}
-
-// TestClient_PeerIDResolverCallback verifies that
-// WithPeerIDResolver is consulted before ResolvePeerID's static cache
-// and before peer.Decode fallback - so a NodeID that is neither in the
-// cache nor a valid peer.ID string is still routable when the resolver
-// returns a hit.
-func TestClient_PeerIDResolverCallback(t *testing.T) {
-	hClient, hServer := makeHostPair(t)
-	c := fakes.NewCache()
-	infl := inflight.New(inflight.DefaultStalls(), nil)
-	srv := coord.NewServer(c, infl)
-	srv.Bind(hServer)
-
-	var calls int32
-
-	cli := coord.NewClient(hClient,
-		coord.WithPeerIDResolver(func(id ifaces.NodeID) (peer.ID, bool) {
-			atomic.AddInt32(&calls, 1)
-
-			if id == "k8s-node-name" {
-				return hServer.ID(), true
-			}
-
-			return "", false
-		}),
-	)
-
-	d := digest.MustParse("sha256:" + rep('f', 64))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if _, err := cli.PullIntentQuery(ctx, "k8s-node-name", d); err != nil {
-		t.Fatalf("resolver-routed call: %v", err)
-	}
-
-	if atomic.LoadInt32(&calls) == 0 {
-		t.Fatal("resolver fn was not consulted")
-	}
-}
-
-// silence "imported and not used" for peer in some build matrices.
-var _ peer.ID
-
-// TestServer_IdleStreamHitsDeadline asserts the server-side handshake
-// timeout: a peer that opens a coord stream and never writes the
-// length-delimited envelope must not pin a goroutine indefinitely. We
-// configure a short StreamHandshakeTimeout, open a raw stream, write
-// nothing, and verify the server-side close lands well inside the
-// test's own deadline.
 func TestServer_IdleStreamHitsDeadline(t *testing.T) {
-	hClient, hServer := makeHostPair(t)
+	a, b := makeHostPair(t)
+	coord.NewServer(coord.WithStreamHandshakeTimeout(100 * time.Millisecond)).Bind(b)
 
-	c := fakes.NewCache()
-	infl := inflight.New(inflight.DefaultStalls(), nil)
-
-	srv := coord.NewServer(c, infl,
-		coord.WithStreamHandshakeTimeout(150*time.Millisecond),
-	)
-	srv.Bind(hServer)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	str, err := hClient.NewStream(ctx, hServer.ID(), coord.ProtocolID)
+	s, err := a.NewStream(t.Context(), b.ID(), coord.ProtocolID)
 	if err != nil {
-		t.Fatalf("NewStream: %v", err)
+		t.Fatal(err)
 	}
+	defer s.Close()
 
-	defer func() { _ = str.Close() }() //nolint:errcheck // best-effort close
+	_ = s.SetReadDeadline(time.Now().Add(2 * time.Second))
 
-	// Write nothing. The server must hit its read deadline and close
-	// the stream; the client-side Read should observe EOF / reset.
-	buf := make([]byte, 4)
-	readDone := make(chan error, 1)
-
-	go func() {
-		_, rerr := str.Read(buf)
-		readDone <- rerr
-	}()
-
-	select {
-	case <-readDone:
-		// Good \u2014 server closed the stream within the handshake window.
-	case <-time.After(2 * time.Second):
-		t.Fatal("server did not close idle stream within deadline; slowloris guard regressed")
+	start := time.Now()
+	if _, err := s.Read(make([]byte, 1)); err == nil || time.Since(start) > time.Second {
+		t.Fatal("idle stream not promptly closed")
 	}
 }
 
-func rep(c byte, n int) string {
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = c
-	}
-
-	return string(b)
-}
-
-// TestPleasePull_RejectsInvalidRepository asserts the server rejects a
-// please_pull whose repository is outside the OCI name grammar before it
-// reaches the puller pump, so an unvalidated repository never flows into
-// origin URL construction.
 func TestPleasePull_RejectsInvalidRepository(t *testing.T) {
-	hClient, hServer := makeHostPair(t)
-
-	c := fakes.NewCache()
-	infl := inflight.New(inflight.DefaultStalls(), nil)
-
-	var pumpCalls int32
-
-	pump := coord.PullerPump(func(_ context.Context, _, _ string, _ digest.Digest, _ ifaces.OriginRefKind) coord.PumpResult {
-		atomic.AddInt32(&pumpCalls, 1)
-		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: time.Now()}
+	_, cli, endpoint := chairFixture(t, func(context.Context, string, string, digest.Digest, ifaces.OriginRefKind) coord.PumpResult {
+		t.Error("invalid repo pumped")
+		return coord.PumpResult{}
 	})
-	srv := coord.NewServer(c, infl, coord.WithPullerPump(pump))
-	srv.Bind(hServer)
 
-	cli := coord.NewClient(hClient)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	d := digest.MustParse("sha256:" + rep('a', 64))
-	if _, err := cli.PleasePull(ctx, ifaces.NodeID(hServer.ID().String()), "reg", "../../etc/passwd", ifaces.KindBlob, []digest.Digest{d}); err == nil {
-		t.Fatal("PleasePull: want rejection for invalid repository, got nil error")
-	}
-
-	if got := atomic.LoadInt32(&pumpCalls); got != 0 {
-		t.Fatalf("pumpCalls = %d, want 0 (invalid repository must not reach pump)", got)
+	d := digest.MustParse("sha256:" + strings.Repeat("a", 64))
+	if _, err := cli.PleasePullChair(t.Context(), endpoint, "reg", "../../etc/passwd", ifaces.KindBlob, []digest.Digest{d}, testAssignment); err == nil {
+		t.Fatal("invalid repository accepted")
 	}
 }
 
-// TestStartLocalPull_RejectsInvalidRepository asserts the in-process
-// self-pull path applies the same repository validation.
 func TestStartLocalPull_RejectsInvalidRepository(t *testing.T) {
-	c := fakes.NewCache()
-	infl := inflight.New(inflight.DefaultStalls(), nil)
-
-	var pumpCalls int32
-
-	pump := coord.PullerPump(func(_ context.Context, _, _ string, _ digest.Digest, _ ifaces.OriginRefKind) coord.PumpResult {
-		atomic.AddInt32(&pumpCalls, 1)
-		return coord.PumpResult{Status: coord.PumpStarted, StartedAt: time.Now()}
-	})
-	srv := coord.NewServer(c, infl, coord.WithPullerPump(pump))
-
-	d := digest.MustParse("sha256:" + rep('a', 64))
-	if _, err := srv.StartLocalPull(context.Background(), "reg", "Bad Repo?", ifaces.KindBlob, []digest.Digest{d}); err == nil {
-		t.Fatal("StartLocalPull: want rejection for invalid repository, got nil error")
-	}
-
-	if got := atomic.LoadInt32(&pumpCalls); got != 0 {
-		t.Fatalf("pumpCalls = %d, want 0 (invalid repository must not reach pump)", got)
+	if _, err := coord.NewServer().StartLocalPull(t.Context(), "reg", "Bad Repo?", ifaces.KindBlob, nil); err == nil {
+		t.Fatal("invalid repository accepted")
 	}
 }
