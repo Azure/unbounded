@@ -41,7 +41,10 @@ type syntheticImage struct {
 	blobs      map[digest.Digest]imageBlob
 }
 
-type imageBlob struct {
+// imageBlob is retained for compatibility with the OCI fixture helpers.
+type imageBlob = blobSource
+
+type blobSource struct {
 	descriptor ocispec.Descriptor
 	data       io.ReaderAt
 }

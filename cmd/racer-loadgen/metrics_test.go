@@ -190,7 +190,7 @@ func TestMetricsInstrumentRegistryHeadRangeAndErrors(t *testing.T) {
 	}
 
 	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
-# HELP racer_loadgen_origin_requests_total Synthetic origin HTTP requests.
+# HELP racer_loadgen_origin_requests_total Synthetic HTTP requests or SDK origin callbacks; SDK callback failures use code=error.
 # TYPE racer_loadgen_origin_requests_total counter
 racer_loadgen_origin_requests_total{code="200",method="GET"} 1
 racer_loadgen_origin_requests_total{code="206",method="GET"} 1
@@ -221,7 +221,7 @@ func TestMetricsInstrumentBoundedMethodLabels(t *testing.T) {
 	}
 
 	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(fmt.Sprintf(`
-# HELP racer_loadgen_origin_requests_total Synthetic origin HTTP requests.
+# HELP racer_loadgen_origin_requests_total Synthetic HTTP requests or SDK origin callbacks; SDK callback failures use code=error.
 # TYPE racer_loadgen_origin_requests_total counter
 racer_loadgen_origin_requests_total{code="204",method="GET"} 1
 racer_loadgen_origin_requests_total{code="204",method="HEAD"} 1

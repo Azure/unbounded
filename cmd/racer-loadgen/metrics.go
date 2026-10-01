@@ -32,18 +32,18 @@ func newMetrics(reg *prometheus.Registry) *loadMetrics {
 
 	buckets := []float64{0.001, 0.01, 0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300}
 	m := &loadMetrics{
-		pulls:              prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: ns, Name: "pulls_total", Help: "Completed full image pull attempts."}, []string{"result"}),
-		pullFailures:       prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: ns, Name: "pull_failures_total", Help: "Failed image pulls by bounded reason, including cancellation; one reason per pull."}, []string{"reason"}),
-		pullDuration:       prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: ns, Name: "pull_duration_seconds", Help: "Full image pull latency including failures.", Buckets: buckets}, []string{"result"}),
-		inFlight:           prometheus.NewGauge(prometheus.GaugeOpts{Namespace: ns, Name: "in_flight", Help: "Image pulls currently in progress."}),
-		appliedConcurrency: prometheus.NewGauge(prometheus.GaugeOpts{Namespace: ns, Name: "applied_concurrency", Help: "Applied image pull worker limit; in-flight pulls may exceed it while draining after a decrease."}),
+		pulls:              prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: ns, Name: "pulls_total", Help: "Completed blob-batch attempts: one OCI image or one generic blob per operation."}, []string{"result"}),
+		pullFailures:       prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: ns, Name: "pull_failures_total", Help: "Failed blob-batch operations by bounded reason, including cancellation; one reason per operation."}, []string{"reason"}),
+		pullDuration:       prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: ns, Name: "pull_duration_seconds", Help: "Complete blob-batch latency including failures.", Buckets: buckets}, []string{"result"}),
+		inFlight:           prometheus.NewGauge(prometheus.GaugeOpts{Namespace: ns, Name: "in_flight", Help: "Blob-batch operations currently in progress."}),
+		appliedConcurrency: prometheus.NewGauge(prometheus.GaugeOpts{Namespace: ns, Name: "applied_concurrency", Help: "Applied blob-batch worker limit; in-flight operations may exceed it while draining after a decrease."}),
 		receivedBytes:      prometheus.NewCounter(prometheus.CounterOpts{Namespace: ns, Name: "received_bytes_total", Help: "Response body bytes received, including failed pulls."}),
-		verifiedBytes:      prometheus.NewCounter(prometheus.CounterOpts{Namespace: ns, Name: "verified_bytes_total", Help: "Response body bytes in successful fully SHA-256-verified image pulls, including manifest and config."}),
-		requests:           prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: ns, Name: "requests_total", Help: "Completed pull HTTP requests."}, []string{"kind", "result"}),
-		requestDuration:    prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: ns, Name: "request_duration_seconds", Help: "Pull HTTP request latency through body consumption.", Buckets: buckets}, []string{"kind", "result"}),
-		originRequests:     prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: ns, Name: "origin_requests_total", Help: "Synthetic origin HTTP requests."}, []string{"method", "code"}),
-		originBytes:        prometheus.NewCounter(prometheus.CounterOpts{Namespace: ns, Name: "origin_bytes_total", Help: "Response body bytes written by the synthetic origin."}),
-		originDuration:     prometheus.NewHistogram(prometheus.HistogramOpts{Namespace: ns, Name: "origin_request_duration_seconds", Help: "Synthetic origin HTTP request latency.", Buckets: buckets}),
+		verifiedBytes:      prometheus.NewCounter(prometheus.CounterOpts{Namespace: ns, Name: "verified_bytes_total", Help: "Bytes in successful fully SHA-256-verified blob batches, including manifest and config for OCI workloads."}),
+		requests:           prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: ns, Name: "requests_total", Help: "Completed blob acquisitions via HTTP or SDK Get (not SDK page requests)."}, []string{"kind", "result"}),
+		requestDuration:    prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: ns, Name: "request_duration_seconds", Help: "Blob acquisition latency through body consumption.", Buckets: buckets}, []string{"kind", "result"}),
+		originRequests:     prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: ns, Name: "origin_requests_total", Help: "Synthetic HTTP requests or SDK origin callbacks; SDK callback failures use code=error."}, []string{"method", "code"}),
+		originBytes:        prometheus.NewCounter(prometheus.CounterOpts{Namespace: ns, Name: "origin_bytes_total", Help: "Bytes written to HTTP or read by SDK from the synthetic origin; not cache or network delivery accounting."}),
+		originDuration:     prometheus.NewHistogram(prometheus.HistogramOpts{Namespace: ns, Name: "origin_request_duration_seconds", Help: "Synthetic HTTP request or SDK callback/body lifetime.", Buckets: buckets}),
 	}
 	reg.MustRegister(m.pulls, m.pullFailures, m.pullDuration, m.inFlight, m.appliedConcurrency, m.receivedBytes, m.verifiedBytes, m.requests, m.requestDuration,
 		m.originRequests, m.originBytes, m.originDuration, collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))

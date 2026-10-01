@@ -62,11 +62,15 @@ func zipfIndex(cdf []float64, draw float64) int {
 	return sort.Search(len(cdf), func(index int) bool { return cdf[index] > draw })
 }
 
-type imageCatalog struct {
+// imageCatalog is the legacy name used by OCI fixture helpers.
+type imageCatalog = blobCatalog
+
+type blobCatalog struct {
+	batches    []blobBatch
 	images     []*syntheticImage
 	repository string
 	manifests  map[string]*syntheticImage
-	blobs      map[digest.Digest]imageBlob
+	blobs      map[digest.Digest]blobSource
 }
 
 // newCatalog hashes one image at a time with one bounded scratch buffer. Only
@@ -106,6 +110,7 @@ func catalogFromImages(images []*syntheticImage) *imageCatalog {
 
 	c.manifests["latest"] = images[0]
 	for index, img := range images {
+		c.batches = append(c.batches, imageBatch(img))
 		c.manifests[fmt.Sprintf("image-%06d", index)] = img
 
 		c.manifests[img.Manifest.Digest.String()] = img
@@ -141,26 +146,30 @@ type catalogTraversal struct {
 func (p *puller) newTraversal() catalogTraversal {
 	traversal := catalogTraversal{randomFloat64: p.randomFloat64}
 	if p.opts.Profile == profileZipf {
-		traversal.zipfCDF = newZipfCDF(len(p.images), p.opts.ZipfExponent)
+		traversal.zipfCDF = newZipfCDF(p.batchCount(), p.opts.ZipfExponent)
 	}
 
 	return traversal
 }
 
 func (t *catalogTraversal) nextImage(images []*syntheticImage) *syntheticImage {
+	return images[t.nextIndex(len(images))]
+}
+
+func (t *catalogTraversal) nextIndex(count int) int {
 	if len(t.zipfCDF) != 0 {
-		return images[zipfIndex(t.zipfCDF, t.randomFloat64())]
+		return zipfIndex(t.zipfCDF, t.randomFloat64())
 	}
 
 	if len(t.order) == 0 {
-		t.order = rand.Perm(len(images))
+		t.order = rand.Perm(count)
 	} else if t.next == len(t.order) {
 		rand.Shuffle(len(t.order), func(i, j int) { t.order[i], t.order[j] = t.order[j], t.order[i] })
 		t.next = 0
 	}
 
-	img := images[t.order[t.next]]
+	index := t.order[t.next]
 	t.next++
 
-	return img
+	return index
 }

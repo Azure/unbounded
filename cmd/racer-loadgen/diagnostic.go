@@ -49,16 +49,16 @@ func (e *pageEvidence) LogValue() slog.Value {
 		slog.Int64("omitted_mismatching_pages", max(0, e.mismatching-int64(len(pages)))), slog.Any("records", pages))
 }
 
-func (p *puller) configureDiagnostics(catalog *imageCatalog) error {
+func (p *puller) configureDiagnostics(catalog *blobCatalog) error {
 	if !p.opts.DiagnoseIntegrity {
 		return nil
 	}
 
-	if catalog == nil || len(catalog.images) == 0 {
+	if catalog == nil || len(catalog.blobs) == 0 {
 		return errors.New("diagnostic catalog is empty")
 	}
 
-	p.expected = make(map[digest.Digest]imageBlob, len(catalog.blobs)+len(catalog.images))
+	p.expected = make(map[digest.Digest]blobSource, len(catalog.blobs)+len(catalog.images))
 	for key, blob := range catalog.blobs {
 		if blob.data == nil || blob.descriptor.Digest != key || blob.descriptor.Size < 0 {
 			return errors.New("invalid diagnostic blob")
@@ -72,13 +72,13 @@ func (p *puller) configureDiagnostics(catalog *imageCatalog) error {
 			return errors.New("invalid diagnostic manifest")
 		}
 
-		p.expected[img.Manifest.Digest] = imageBlob{descriptor: img.Manifest, data: bytes.NewReader(img.manifest)}
+		p.expected[img.Manifest.Digest] = blobSource{descriptor: img.Manifest, data: bytes.NewReader(img.manifest)}
 	}
 
 	return nil
 }
 
-func (p *puller) readBodyDiagnostic(body io.Reader, expected imageBlob) (int64, string, *pageEvidence, error) {
+func (p *puller) readBodyDiagnostic(body io.Reader, expected blobSource) (int64, string, *pageEvidence, error) {
 	buffer, ok := p.buffers.Get().(*[]byte)
 	if !ok {
 		return 0, "", nil, errors.New("invalid pull buffer")
@@ -159,7 +159,7 @@ func (p *puller) readBodyDiagnostic(body io.Reader, expected imageBlob) (int64, 
 			total += int64(n)
 		}
 
-		if errors.Is(err, io.EOF) {
+		if err == io.EOF {
 			break
 		}
 

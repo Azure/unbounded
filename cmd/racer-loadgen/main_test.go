@@ -29,12 +29,13 @@ func TestParseOptionsDefaults(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, output.String())
 	require.Equal(t, options{
-		listen: ":8080", metricsListen: ":9090", startDelay: 10 * time.Second, catalogImages: 1,
+		listen: ":8080", metricsListen: ":9090", startDelay: 10 * time.Second, catalogImages: 1, blobBytes: 64 << 20,
 		image: imageOptions{
 			Repository: "benchmark/image", Layers: 8, LayerBytes: 64 << 20,
 			Jitter: 0.2, Seed: "benchmark-v1",
 		},
 		pull: pullOptions{
+			Backend: "gantry",
 			Profile: profileShuffle, ZipfExponent: defaultZipfExponent,
 			Target: "http://127.0.0.1:5000", Namespace: "loadgen.invalid",
 			Concurrency: 64, LayerConcurrency: 4, Timeout: 2 * time.Minute,
@@ -55,9 +56,10 @@ func TestParseOptionsOverrides(t *testing.T) {
 	}, io.Discard)
 	require.NoError(t, err)
 	require.Equal(t, options{
-		listen: "127.0.0.1:8001", metricsListen: "127.0.0.1:9001", duration: time.Minute, catalogImages: 512, startupTimeout: 4 * time.Minute,
+		listen: "127.0.0.1:8001", metricsListen: "127.0.0.1:9001", duration: time.Minute, catalogImages: 512, startupTimeout: 4 * time.Minute, blobBytes: 64 << 20,
 		image: imageOptions{Repository: "custom/image", Layers: 2, LayerBytes: 4096, Seed: "custom"},
 		pull: pullOptions{
+			Backend: "gantry",
 			Profile: profileZipf, ZipfExponent: 0.8,
 			Target: "https://mirror.example/base", Namespace: "registry.example:5000",
 			Concurrency: 0, LayerConcurrency: 3, Timeout: 9 * time.Second,

@@ -21,9 +21,13 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
 type pullOptions struct {
+	Backend           string
+	Cache             string
 	Profile           string
 	ZipfExponent      float64
 	Target            string
@@ -32,7 +36,8 @@ type pullOptions struct {
 	ConcurrencyFile   string
 	NodeCapsFile      string
 	NodeName          string
-	LayerConcurrency  int
+	LayerConcurrency  int // Compatibility input; normalized into BlobConcurrency.
+	BlobConcurrency   int
 	Timeout           time.Duration
 	RetryDelay        time.Duration
 	Interval          time.Duration
@@ -41,21 +46,36 @@ type pullOptions struct {
 }
 
 type puller struct {
-	img         *syntheticImage
-	images      []*syntheticImage
-	opts        pullOptions
-	target      *url.URL
-	metrics     *loadMetrics
-	client      *http.Client
-	transport   *http.Transport
-	buffers     sync.Pool
-	failureLogs failureLogs
-	expected    map[digest.Digest]imageBlob
+	batches      []blobBatch
+	acquire      func(context.Context, string, ocispec.Descriptor) (blobResponse, error)
+	closeBackend func() error
+	img          *syntheticImage
+	images       []*syntheticImage
+	opts         pullOptions
+	target       *url.URL
+	metrics      *loadMetrics
+	client       *http.Client
+	transport    *http.Transport
+	buffers      sync.Pool
+	failureLogs  failureLogs
+	expected     map[digest.Digest]blobSource
 	// Shared by workers; production uses the concurrency-safe package RNG.
 	randomFloat64 func() float64
 }
 
 func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*puller, error) {
+	if opts.Backend == "" {
+		opts.Backend = "gantry"
+	}
+
+	if opts.Backend != "gantry" && opts.Backend != "uds" {
+		return nil, errors.New("backend must be gantry or uds")
+	}
+
+	if opts.BlobConcurrency == 0 {
+		opts.BlobConcurrency = opts.LayerConcurrency
+	}
+
 	if opts.DiagnoseIntegrity && !opts.Verify {
 		return nil, errors.New("diagnose-integrity requires verify")
 	}
@@ -72,8 +92,8 @@ func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*pu
 		return nil, err
 	}
 
-	if opts.Concurrency < 0 || opts.LayerConcurrency < 1 || opts.Timeout <= 0 || opts.RetryDelay <= 0 || opts.Interval < 0 {
-		return nil, errors.New("concurrency and interval must be nonnegative; layer concurrency, timeout, and retry delay must be positive")
+	if opts.Concurrency < 0 || opts.BlobConcurrency < 1 || opts.Timeout <= 0 || opts.RetryDelay <= 0 || opts.Interval < 0 {
+		return nil, errors.New("concurrency and interval must be nonnegative; blob concurrency, timeout, and retry delay must be positive")
 	}
 
 	capacity := opts.Concurrency
@@ -89,8 +109,13 @@ func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*pu
 		capacity = maxLiveConcurrency
 	}
 
-	if capacity > int(^uint(0)>>1)/opts.LayerConcurrency {
-		return nil, errors.New("combined image and layer concurrency is too large")
+	if capacity > int(^uint(0)>>1)/opts.BlobConcurrency {
+		return nil, errors.New("combined batch and blob concurrency is too large")
+	}
+
+	if opts.Backend == "uds" {
+		// HTTP configuration is irrelevant in direct mode, including target validation.
+		opts.Target = "http://unused.invalid"
 	}
 
 	target, err := url.Parse(opts.Target)
@@ -110,7 +135,7 @@ func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*pu
 
 	transport := base.Clone()
 	transport.DisableCompression = true
-	transport.MaxIdleConnsPerHost = max(2, capacity*opts.LayerConcurrency)
+	transport.MaxIdleConnsPerHost = max(2, capacity*opts.BlobConcurrency)
 	transport.MaxIdleConns = transport.MaxIdleConnsPerHost
 	p := &puller{
 		randomFloat64: rand.Float64,
@@ -126,7 +151,25 @@ func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*pu
 		}},
 	}
 
+	p.acquire = p.acquireHTTP
+	if opts.Backend == "uds" {
+		if err := p.configureUDS(capacity); err != nil {
+			transport.CloseIdleConnections()
+			return nil, err
+		}
+	}
+
 	return p, nil
+}
+
+func (p *puller) close() {
+	p.transport.CloseIdleConnections()
+
+	if p.closeBackend != nil {
+		if err := p.closeBackend(); err != nil {
+			slog.Warn("close blob backend", "error", err)
+		}
+	}
 }
 
 // run owns the worker lifetime, including workers sleeping between pulls.
@@ -150,7 +193,7 @@ func (p *puller) run(ctx context.Context) {
 
 			for ctx.Err() == nil {
 				delay := p.opts.Interval
-				if err := p.pullImage(ctx, traversal.nextImage(p.images)); err != nil {
+				if err := p.pullBatch(ctx, p.nextBatch(&traversal)); err != nil {
 					delay = p.opts.RetryDelay
 				}
 
@@ -186,7 +229,11 @@ func (p *puller) pull(ctx context.Context) error {
 	return p.pullImage(ctx, p.img)
 }
 
-func (p *puller) pullImage(ctx context.Context, img *syntheticImage) (err error) {
+func (p *puller) pullImage(ctx context.Context, img *syntheticImage) error {
+	return p.pullBatch(ctx, imageBatch(img))
+}
+
+func (p *puller) pullBatch(ctx context.Context, batch blobBatch) (err error) {
 	ctx, cancel := context.WithTimeout(ctx, p.opts.Timeout)
 	defer cancel()
 
@@ -201,10 +248,14 @@ func (p *puller) pullImage(ctx context.Context, img *syntheticImage) (err error)
 
 		result := pullResult(err)
 		if err == nil && p.opts.Verify {
-			// Credit only a complete verified image, including manifest and config.
-			bytes := float64(img.Manifest.Size) + float64(img.Config.Size)
-			for _, layer := range img.Layers {
-				bytes += float64(layer.Size)
+			// Credit only a complete verified operation, including any OCI prefix.
+			var bytes float64
+			for _, blob := range batch.prefix {
+				bytes += float64(blob.descriptor.Size)
+			}
+
+			for _, blob := range batch.blobs {
+				bytes += float64(blob.descriptor.Size)
 			}
 
 			p.metrics.verifiedBytes.Add(bytes)
@@ -216,25 +267,24 @@ func (p *puller) pullImage(ctx context.Context, img *syntheticImage) (err error)
 		p.reportPullFailure(err, time.Now(), slog.Default())
 	}()
 
-	if err := p.fetch(ctx, "manifest", img.Manifest); err != nil {
-		return err
+	for _, blob := range batch.prefix {
+		if err := p.fetch(ctx, blob.kind, blob.descriptor); err != nil {
+			return err
+		}
 	}
 
-	if err := p.fetch(ctx, "config", img.Config); err != nil {
-		return err
-	}
-
-	group, layerCtx := errgroup.WithContext(ctx)
-	count := min(p.opts.LayerConcurrency, len(img.Layers))
-	// A fixed worker pool avoids allocating a goroutine or queued job per layer.
+	group, blobCtx := errgroup.WithContext(ctx)
+	count := min(p.opts.BlobConcurrency, len(batch.blobs))
+	// A fixed worker pool avoids allocating a goroutine or queued job per blob.
 	for worker := range count {
 		group.Go(func() error {
-			for index := worker; index < len(img.Layers); index += count {
-				if err := layerCtx.Err(); err != nil {
+			for index := worker; index < len(batch.blobs); index += count {
+				if err := blobCtx.Err(); err != nil {
 					return err
 				}
 
-				if err := p.fetch(layerCtx, "layer", img.Layers[index]); err != nil {
+				blob := batch.blobs[index]
+				if err := p.fetch(blobCtx, blob.kind, blob.descriptor); err != nil {
 					return err
 				}
 			}
@@ -278,37 +328,20 @@ func (p *puller) fetch(ctx context.Context, kind string, desc ocispec.Descriptor
 		p.metrics.requestDuration.WithLabelValues(kind, result).Observe(time.Since(start).Seconds())
 	}()
 
-	endpoint := *p.target
-
-	resource := "blobs"
-	if kind == "manifest" {
-		resource = "manifests"
-	}
-
-	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + "/v2/" + p.img.repository + "/" + resource + "/" + desc.Digest.String()
-
-	endpoint.RawPath = ""
-	if p.opts.Namespace != "" {
-		endpoint.RawQuery = url.Values{"ns": {p.opts.Namespace}}.Encode()
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	response, err := p.acquire(ctx, kind, desc)
 	if err != nil {
-		reason = failureOther
-		return fmt.Errorf("create %s request: %w", kind, err)
-	}
+		var sdkErr *racersdk.Error
+		if errors.As(err, &sdkErr) && sdkErr.StatusCode() != 0 {
+			reason, status = failureStatus, sdkErr.StatusCode()
+		}
 
-	req.Header.Set("Accept", desc.MediaType)
-
-	response, err := p.client.Do(req)
-	if err != nil {
 		return fmt.Errorf("request %s: %w", kind, err)
 	}
 
-	status = response.StatusCode
+	status = response.status
 
 	defer func() {
-		if closeErr := response.Body.Close(); err == nil && closeErr != nil {
+		if closeErr := response.body.Close(); err == nil && closeErr != nil {
 			err = fmt.Errorf("close %s body: %w", kind, closeErr)
 		}
 	}()
@@ -319,28 +352,33 @@ func (p *puller) fetch(ctx context.Context, kind string, desc ocispec.Descriptor
 		pages  *pageEvidence
 	)
 
-	if p.opts.DiagnoseIntegrity && status == http.StatusOK {
+	if p.opts.DiagnoseIntegrity && response.success {
 		expected, ok := p.expected[desc.Digest]
 		if !ok || expected.descriptor.Size != desc.Size {
 			reason = failureOther
 			return errors.New("diagnostic expected object missing or inconsistent")
 		}
 
-		n, actual, pages, err = p.readBodyDiagnostic(response.Body, expected)
+		n, actual, pages, err = p.readBodyDiagnostic(response.body, expected)
 		if errors.Is(err, errDiagnosticOracle) {
 			reason = failureOther
 		}
 	} else {
-		n, actual, err = p.readBody(response.Body)
+		n, actual, err = p.readBody(response.body)
 	}
 
 	if err != nil {
 		return fmt.Errorf("read %s %s: %w", kind, desc.Digest, err)
 	}
 
-	if response.StatusCode != http.StatusOK {
+	if !response.success {
 		reason = failureStatus
-		return fmt.Errorf("request %s %s: HTTP status %d", kind, desc.Digest, response.StatusCode)
+		return fmt.Errorf("request %s %s: status %d", kind, desc.Digest, status)
+	}
+
+	if response.totalSize != nil && *response.totalSize != desc.Size {
+		reason = failureSize
+		return fmt.Errorf("%s %s: metadata size %d, expected %d", kind, desc.Digest, *response.totalSize, desc.Size)
 	}
 
 	if n != desc.Size {
@@ -394,7 +432,7 @@ func (p *puller) readBody(body io.Reader) (int64, string, error) {
 			}
 		}
 
-		if errors.Is(err, io.EOF) {
+		if err == io.EOF {
 			break
 		}
 

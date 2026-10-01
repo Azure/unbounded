@@ -150,7 +150,7 @@ func (p *puller) reportPullFailure(err error, now time.Time, logger *slog.Logger
 	var failure *pullFailure
 	if errors.As(err, &failure) {
 		switch failure.kind {
-		case "manifest", "config", "layer":
+		case "manifest", "config", "layer", "blob":
 			kind = failure.kind
 		}
 
@@ -176,5 +176,5 @@ func (p *puller) reportPullFailure(err error, now time.Time, logger *slog.Logger
 		}
 	}
 
-	logger.Warn("image pull failed", attrs...)
+	logger.Warn("blob batch failed", attrs...)
 }

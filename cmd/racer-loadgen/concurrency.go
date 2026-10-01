@@ -101,7 +101,7 @@ func (w *liveWorkers) apply(ctx context.Context, p *puller, desired int) {
 
 			for w.admit(ctx, id, next) {
 				delay := p.opts.Interval
-				if err := p.pullImage(ctx, traversal.nextImage(p.images)); err != nil {
+				if err := p.pullBatch(ctx, p.nextBatch(&traversal)); err != nil {
 					delay = p.opts.RetryDelay
 				}
 

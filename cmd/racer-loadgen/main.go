@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // SPDX-License-Identifier: Apache-2.0
 
-// racer-loadgen serves deterministic synthetic OCI images and repeatedly pulls
-// them through a registry mirror without a local content cache.
+// racer-loadgen serves deterministic synthetic blobs and repeatedly reads them
+// through Gantry or the Racer SDK, without a local content cache.
 package main
 
 import (
@@ -23,6 +23,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/Azure/unbounded/pkg/racersdk"
 )
 
 type options struct {
@@ -33,6 +35,8 @@ type options struct {
 	startDelay     time.Duration
 	duration       time.Duration
 	catalogImages  int
+	catalogBlobs   int
+	blobBytes      int64
 	startupTimeout time.Duration
 }
 
@@ -41,6 +45,8 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 
 	f := flag.NewFlagSet("racer-loadgen", flag.ContinueOnError)
 	f.SetOutput(output)
+	f.StringVar(&opts.pull.Backend, "backend", "gantry", "Acquisition and origin transport: gantry (OCI HTTP) or uds (direct Racer SDK)")
+	f.StringVar(&opts.pull.Cache, "cache", "", "Racer cache name; required for uds, using /run/racer/<cache>/{client,origin}/socket")
 	f.StringVar(&opts.listen, "listen", ":8080", "Synthetic registry listen address")
 	f.StringVar(&opts.metricsListen, "metrics-listen", ":9090", "Metrics and health listen address")
 	f.StringVar(&opts.image.Repository, "repository", "benchmark/image", "Synthetic image repository (tag: latest)")
@@ -49,17 +55,20 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	f.Float64Var(&opts.image.Jitter, "jitter", 0.2, "Deterministic per-layer size jitter fraction in [0,1)")
 	f.StringVar(&opts.image.Seed, "seed", "benchmark-v1", "Content seed; keep identical on all nodes")
 	f.IntVar(&opts.catalogImages, "catalog-images", 1, "Number of deterministic images, 1-512; keep identical on all origins")
+	f.IntVar(&opts.catalogBlobs, "catalog-blobs", 0, "Select generic workload: 1-512 independent raw blobs, one blob per operation; excludes image sizing flags")
+	f.Int64Var(&opts.blobBytes, "blob-bytes", 64<<20, "Exact bytes per generic blob (no jitter or tar framing); requires catalog-blobs")
 	f.StringVar(&opts.pull.Profile, "profile", profileShuffle, "Catalog selection profile: shuffle or zipf")
 	f.Float64Var(&opts.pull.ZipfExponent, "zipf-exponent", defaultZipfExponent, "Finite positive Zipf exponent; larger values increase skew (zipf profile only)")
-	f.DurationVar(&opts.startupTimeout, "startup-timeout", 0, "Deadline for serial catalog generation and hashing; zero disables the deadline")
+	f.DurationVar(&opts.startupTimeout, "startup-timeout", 0, "Deadline for catalog generation, hashing, and origin startup; zero disables the overall deadline (UDS readiness is always bounded)")
 	f.StringVar(&opts.pull.Target, "target", "http://127.0.0.1:5000", "Gantry mirror URL (or origin URL for baseline)")
 	f.StringVar(&opts.pull.Namespace, "namespace", "loadgen.invalid", "Gantry upstream registry name sent as ns query parameter")
-	f.IntVar(&opts.pull.Concurrency, "concurrency", 64, "Concurrent image pulls; zero serves only the origin")
+	f.IntVar(&opts.pull.Concurrency, "concurrency", 64, "Concurrent blob-batch operations (one image or one generic blob); zero serves only the origin")
 	f.StringVar(&opts.pull.ConcurrencyFile, "concurrency-file", "", "Optional regular file containing concurrency 0-256; polled every second without restarting the origin")
 	f.StringVar(&opts.pull.NodeCapsFile, "node-concurrency-caps-file", "", "Optional versioned node-cap JSON key in the same projected ConfigMap as concurrency-file")
 	f.StringVar(&opts.pull.NodeName, "node-name", "", "Exact Kubernetes node name for optional node concurrency caps")
-	f.IntVar(&opts.pull.LayerConcurrency, "layer-concurrency", 4, "Concurrent layer requests per image pull")
-	f.DurationVar(&opts.pull.Timeout, "pull-timeout", 2*time.Minute, "Deadline for one complete image pull")
+	f.IntVar(&opts.pull.LayerConcurrency, "blob-concurrency", 4, "Concurrent blob requests per batch (generic single-blob operations use one)")
+	f.IntVar(&opts.pull.LayerConcurrency, "layer-concurrency", 4, "Compatibility alias for blob-concurrency")
+	f.DurationVar(&opts.pull.Timeout, "pull-timeout", 2*time.Minute, "Deadline for one complete blob-batch operation")
 	f.DurationVar(&opts.pull.RetryDelay, "retry-delay", time.Second, "Per-worker delay after failed pulls")
 	f.DurationVar(&opts.pull.Interval, "interval", 0, "Per-worker delay after successful pulls")
 	f.BoolVar(&opts.pull.Verify, "verify", true, "Verify SHA-256 for every downloaded object")
@@ -73,6 +82,38 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 
 	if f.NArg() != 0 {
 		return opts, errors.New("unexpected positional arguments")
+	}
+
+	seen := make(map[string]bool)
+
+	f.Visit(func(flag *flag.Flag) { seen[flag.Name] = true })
+
+	if opts.pull.Backend != "gantry" && opts.pull.Backend != "uds" {
+		return opts, errors.New("backend must be gantry or uds")
+	}
+
+	if opts.pull.Backend == "uds" {
+		if _, err := racersdk.ParseCacheName(opts.pull.Cache); err != nil {
+			return opts, fmt.Errorf("uds requires a valid cache: %w", err)
+		}
+	}
+
+	if seen["blob-concurrency"] && seen["layer-concurrency"] {
+		return opts, errors.New("specify only one of blob-concurrency and layer-concurrency")
+	}
+
+	if seen["catalog-blobs"] {
+		if opts.catalogBlobs < 1 || opts.catalogBlobs > maxCatalogImages || opts.blobBytes < 1 {
+			return opts, errors.New("catalog-blobs must be in [1, 512] and blob-bytes must be positive")
+		}
+
+		for _, name := range []string{"catalog-images", "layers", "layer-bytes", "jitter"} {
+			if seen[name] {
+				return opts, fmt.Errorf("catalog-blobs cannot be combined with %s", name)
+			}
+		}
+	} else if seen["blob-bytes"] {
+		return opts, errors.New("blob-bytes requires catalog-blobs")
 	}
 
 	if opts.startDelay < 0 || opts.duration < 0 {
@@ -114,6 +155,12 @@ func main() {
 }
 
 func run(parent context.Context, opts options) error {
+	return runWithOriginStarter(parent, opts, startUDSOrigin)
+}
+
+type originStarter func(context.Context, context.Context, racersdk.OriginConfig, racersdk.Origin, racersdk.Key, func(error)) (func(), error)
+
+func runWithOriginStarter(parent context.Context, opts options, startOrigin originStarter) error {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
@@ -124,17 +171,17 @@ func run(parent context.Context, opts options) error {
 	if err != nil {
 		return err
 	}
-	defer p.transport.CloseIdleConnections()
+	defer p.close()
 
 	slog.Info("catalog selection configured", "profile", p.opts.Profile, "zipf_exponent", p.opts.ZipfExponent)
 
-	var ready atomic.Pointer[imageCatalog]
+	var ready atomic.Pointer[blobCatalog]
 
 	ops := http.NewServeMux()
 	ops.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 	ops.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	ops.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
-		if ready.Load() == nil {
+		if ready.Load() == nil || ctx.Err() != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
@@ -150,14 +197,17 @@ func run(parent context.Context, opts options) error {
 
 		catalog.handler().ServeHTTP(w, r)
 	}))
+
 	servers := []*http.Server{
-		{Addr: opts.listen, Handler: origin, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: time.Minute},
 		{Addr: opts.metricsListen, Handler: ops, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: time.Minute},
+	}
+	if p.opts.Backend == "gantry" {
+		servers = append(servers, &http.Server{Addr: opts.listen, Handler: origin, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: time.Minute})
 	}
 
 	var serving sync.WaitGroup
 
-	serveErrors := make(chan error, len(servers))
+	serveErrors := make(chan error, len(servers)+1)
 
 	defer func() {
 		ready.Store(nil)
@@ -195,7 +245,7 @@ func run(parent context.Context, opts options) error {
 		})
 	}
 
-	slog.Info("generating synthetic catalog", "images", opts.catalogImages, "layers", opts.image.Layers, "layer_bytes", opts.image.LayerBytes, "seed", opts.image.Seed)
+	slog.Info("generating synthetic catalog", "catalog_images", opts.catalogImages, "catalog_blobs", opts.catalogBlobs, "blob_bytes", opts.blobBytes, "seed", opts.image.Seed)
 
 	startupCtx := ctx
 
@@ -204,19 +254,78 @@ func run(parent context.Context, opts options) error {
 		startupCtx, stopStartup = context.WithTimeout(ctx, opts.startupTimeout)
 	}
 
-	catalog, err := newCatalog(startupCtx, opts.image, opts.catalogImages)
+	defer stopStartup()
 
-	stopStartup()
+	var catalog *blobCatalog
+	if opts.catalogBlobs > 0 {
+		catalog, err = newBlobCatalog(startupCtx, opts.image.Repository, opts.image.Seed, opts.catalogBlobs, opts.blobBytes)
+	} else {
+		catalog, err = newCatalog(startupCtx, opts.image, opts.catalogImages)
+	}
 
 	if err == nil {
-		p.img = catalog.images[0]
+		p.img = &syntheticImage{repository: catalog.repository}
+		if len(catalog.images) != 0 {
+			p.img = catalog.images[0]
+		}
+
 		if err := p.configureDiagnostics(catalog); err != nil {
 			return err
 		}
 
 		p.images = catalog.images
+
+		p.batches = catalog.batches
+		if p.opts.Backend == "uds" {
+			var (
+				adapter racersdk.Origin
+				probe   racersdk.Key
+			)
+
+			adapter, probe, err = syntheticOrigin(catalog, metrics)
+			if err == nil {
+				var cache racersdk.CacheName
+
+				cache, err = racersdk.ParseCacheName(p.opts.Cache)
+				if err == nil {
+					capacity := p.opts.Concurrency
+					if p.opts.ConcurrencyFile != "" {
+						capacity = maxLiveConcurrency
+					}
+
+					limit := max(1, capacity*p.opts.BlobConcurrency)
+
+					var stopOrigin func()
+
+					stopOrigin, err = startOrigin(ctx, startupCtx, racersdk.OriginConfig{
+						Cache: cache, RecoverStaleSocket: true, MaxConnections: max(128, limit),
+						MaxConcurrentRequests: max(64, limit), MaxConcurrentHeadRequests: max(4, capacity), RequestTimeout: p.opts.Timeout,
+					}, adapter, probe, func(originErr error) { serveErrors <- originErr; cancel() })
+					if err == nil {
+						defer stopOrigin()
+						defer ready.Store(nil)
+					}
+				}
+			}
+
+			if err != nil {
+				select {
+				case originErr := <-serveErrors:
+					return originErr
+				default:
+				}
+
+				if parent.Err() != nil {
+					return nil
+				}
+
+				return err
+			}
+		}
+
+		stopStartup()
 		ready.Store(catalog)
-		slog.Info("origin ready", "images", len(catalog.images), "digest", p.img.Manifest.Digest, "repository", opts.image.Repository, "target", opts.pull.Target, "concurrency", opts.pull.Concurrency)
+		slog.Info("origin ready", "backend", p.opts.Backend, "batches", len(p.batches), "repository", opts.image.Repository, "target", opts.pull.Target, "cache", p.opts.Cache, "concurrency", opts.pull.Concurrency)
 
 		if waitPullDelay(ctx, opts.startDelay) {
 			loadCtx := ctx
