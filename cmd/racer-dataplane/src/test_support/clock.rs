@@ -40,10 +40,6 @@ impl Clock {
         })))
     }
 
-    pub fn elapsed(&self) -> Duration {
-        self.0.borrow().elapsed
-    }
-
     pub fn now(&self) -> Instant {
         let state = self.0.borrow();
         state.origin + state.elapsed

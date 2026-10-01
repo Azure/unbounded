@@ -147,7 +147,7 @@ fn accepted_cancellation_waits_for_consumed_completion_not_notification() {
                     input,
                     error: Error::Cancelled
                 },
-                key,
+                _key: key,
             })
             .is_ok()
     );
@@ -240,7 +240,7 @@ fn abandoned_task_cannot_replace_worker_completion_wake() {
                     input,
                     error: Error::Cancelled
                 },
-                key,
+                _key: key,
             })
             .is_ok()
     );
@@ -289,7 +289,7 @@ fn drain_scope_cancellation_wakes_even_with_unconsumed_result() {
                     input,
                     error: Error::Cancelled
                 },
-                key,
+                _key: key,
             })
             .is_ok()
     );
@@ -502,7 +502,7 @@ fn abandoned_future_retains_buffers_key_and_permit_until_reaped() {
                     input,
                     error: Error::Cancelled
                 },
-                key,
+                _key: key,
             })
             .is_ok()
     );

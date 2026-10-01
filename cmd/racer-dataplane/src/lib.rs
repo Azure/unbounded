@@ -4,8 +4,6 @@
 //! lifecycle methods activate reactor-owned I/O, authenticated control and peer
 //! transports, encrypted storage, and bounded read coordination.
 
-// Component APIs also expose lifecycle and diagnostic hooks to embedders.
-#![allow(dead_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod app;

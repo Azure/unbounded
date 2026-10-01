@@ -184,7 +184,7 @@ impl PageCryptoEngine {
         CryptoCompletion {
             permit,
             outcome,
-            key,
+            _key: key,
         }
     }
 
@@ -785,7 +785,7 @@ mod tests {
             };
             assert_eq!(completion.id(), id);
             assert!(io.poll_reserve(&mut cx, next).is_pending());
-            assert_eq!(completion.key.id(), descriptor.key_id);
+            assert_eq!(completion._key.id(), descriptor.key_id);
             match &completion.outcome {
                 CryptoOutcome::Completed(CryptoOutput::Decrypted(clear, original)) => {
                     assert!(!canceled && !corrupt);

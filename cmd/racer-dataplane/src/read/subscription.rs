@@ -340,6 +340,7 @@ impl DemandLease {
     /// Select from the entire compact demand, not a consumer sliding window.
     /// At most 64 holes and 64 outstanding assignments per subscriber are retained.
     /// Every other assignment advances its oldest head, even under hot-page load.
+    #[cfg(test)]
     pub(crate) fn select(&mut self) -> Option<PageNumber> {
         let mut state = self.scheduler.state.lock().unwrap();
         if let Some(number) = state.demands.get_mut(&self.id)?.queued.pop_front() {
@@ -424,6 +425,7 @@ impl DemandLease {
         *state.pending.entry(page).or_default() += assigned;
         state.demands.get_mut(&self.id)?.queued.pop_front()
     }
+    #[cfg(test)]
     pub(crate) fn completed(&mut self, number: PageNumber) {
         let mut state = self.scheduler.state.lock().unwrap();
         let Some(demand) = state.demands.get_mut(&self.id) else {
@@ -471,6 +473,7 @@ impl DemandLease {
         let demand = &state.demands[&self.id];
         demand.next == demand.end && demand.queued.is_empty()
     }
+    #[cfg(test)]
     pub(crate) fn ready_to_select(&self) -> bool {
         let state = self.scheduler.state.lock().unwrap();
         let demand = &state.demands[&self.id];

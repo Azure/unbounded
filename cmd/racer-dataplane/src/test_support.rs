@@ -96,13 +96,6 @@ pub mod cluster {
     }
 }
 
-/// Single-poll helpers deliberately do not spin an executor or sleep on host time.
-pub fn poll_once<T>(
-    future: std::pin::Pin<&mut impl std::future::Future<Output = T>>,
-) -> std::task::Poll<T> {
-    future.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
-}
-
 #[derive(Default)]
 pub struct WakeCounter(std::sync::atomic::AtomicUsize);
 

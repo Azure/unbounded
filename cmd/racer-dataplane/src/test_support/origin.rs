@@ -51,7 +51,6 @@ struct State {
     rejections: BTreeMap<RequestKind, VecDeque<u16>>,
     rejected_pages: BTreeMap<u64, u16>,
     blocked: BTreeSet<RequestKind>,
-    blocked_pages: BTreeSet<u64>,
     delays: BTreeMap<RequestKind, Duration>,
 }
 
@@ -95,7 +94,6 @@ impl AdapterOrigin {
             rejections: BTreeMap::new(),
             rejected_pages: BTreeMap::new(),
             blocked: BTreeSet::new(),
-            blocked_pages: BTreeSet::new(),
             delays: BTreeMap::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
@@ -193,12 +191,6 @@ impl AdapterOrigin {
     pub fn release(&self, kind: RequestKind) {
         self.state.lock().unwrap().blocked.remove(&kind);
     }
-    pub fn block_page(&self, page: u64) {
-        self.state.lock().unwrap().blocked_pages.insert(page);
-    }
-    pub fn release_page(&self, page: u64) {
-        self.state.lock().unwrap().blocked_pages.remove(&page);
-    }
     pub fn delay(&self, kind: RequestKind, delay: Duration) {
         self.state.lock().unwrap().delays.insert(kind, delay);
     }
@@ -289,7 +281,6 @@ fn serve(mut stream: UnixStream, state: &Mutex<State>, stop: &AtomicBool) {
         }
         let state = state.lock().unwrap();
         let blocked = state.blocked.contains(&kind)
-            || state.blocked_pages.contains(&call.page)
             || started.elapsed() < state.delays.get(&kind).copied().unwrap_or_default();
         drop(state);
         if !blocked {

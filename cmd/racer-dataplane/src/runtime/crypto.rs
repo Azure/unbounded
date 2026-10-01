@@ -258,7 +258,7 @@ pub enum CryptoOutcome {
 pub struct CryptoCompletion {
     pub(crate) permit: CryptoPermit,
     pub(crate) outcome: CryptoOutcome,
-    pub(crate) key: KeyLease,
+    pub(crate) _key: KeyLease,
 }
 
 impl CryptoCompletion {
