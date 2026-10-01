@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -166,7 +167,8 @@ func prepareOriginDirectory(cache racersdk.CacheName) error {
 	return nil
 }
 
-// startUDSOrigin returns only after this invocation's callback has served a HEAD.
+// startUDSOrigin returns only after this invocation's callback has served a HEAD
+// and the matching HTTP response has passed status and metadata validation.
 // Merely finding a socket (possibly a competing owner) is not readiness. stop
 // cancels and joins ServeOrigin so its owned-socket cleanup finishes before exit.
 func startUDSOrigin(ctx, startup context.Context, config racersdk.OriginConfig, origin racersdk.Origin, probe racersdk.Key, failed func(error)) (func(), error) {
@@ -174,19 +176,27 @@ func startUDSOrigin(ctx, startup context.Context, config racersdk.OriginConfig, 
 		return nil, err
 	}
 
+	return startUDSOriginOnPath(ctx, startup, "/run/racer/"+config.Cache.String()+"/origin/socket", origin, probe, failed,
+		func(ctx context.Context, origin racersdk.Origin) error {
+			return racersdk.ServeOrigin(ctx, config, origin)
+		})
+}
+
+// The path/serve seam keeps production on SDK-owned canonical sockets while
+// allowing lifecycle and HTTP readiness tests on temporary Unix listeners.
+func startUDSOriginOnPath(ctx, startup context.Context, path string, origin racersdk.Origin, probe racersdk.Key, failed func(error), serve func(context.Context, racersdk.Origin) error) (func(), error) {
 	lifetime, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
-	ready := make(chan struct{})
 
-	var once sync.Once
+	var witness atomic.Pointer[racersdk.Metadata]
 
 	go func() {
 		defer close(done)
 
-		err := racersdk.ServeOrigin(lifetime, config, func(ctx context.Context, request racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
+		err := serve(lifetime, func(ctx context.Context, request racersdk.OriginRequest) (racersdk.Metadata, io.ReadCloser, error) {
 			metadata, body, err := origin(ctx, request)
-			if err == nil && request.Operation() == racersdk.OperationHead {
-				once.Do(func() { close(ready) })
+			if err == nil && body == nil && metadata.Validate() == nil && request.Operation() == racersdk.OperationHead && request.Key() == probe {
+				witness.Store(&metadata)
 			}
 
 			return metadata, body, err
@@ -205,12 +215,15 @@ func startUDSOrigin(ctx, startup context.Context, config racersdk.OriginConfig, 
 	probeCtx, stopProbe := context.WithTimeout(startup, 10*time.Second)
 	defer stopProbe()
 
+	stopLifetimeProbe := context.AfterFunc(lifetime, stopProbe)
+	defer stopLifetimeProbe()
+
 	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, "unix", "/run/racer/"+config.Cache.String()+"/origin/socket")
+		return (&net.Dialer{}).DialContext(ctx, "unix", path)
 	}}
 	defer transport.CloseIdleConnections()
 
-	client := &http.Client{Transport: transport}
+	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 
 	for {
 		req, err := http.NewRequestWithContext(probeCtx, http.MethodHead, "http://racer/v1/objects/"+probe.String(), nil)
@@ -221,19 +234,29 @@ func startUDSOrigin(ctx, startup context.Context, config racersdk.OriginConfig, 
 
 		response, err := client.Do(req)
 		if err == nil {
-			if err := response.Body.Close(); err != nil {
+			validationErr := validateOriginProbe(response, probe, witness.Load())
+
+			closeErr := response.Body.Close()
+			if validationErr != nil || closeErr != nil {
 				stop()
-				return nil, err
+				return nil, errors.Join(validationErr, closeErr)
 			}
+		}
+
+		if probeCtx.Err() != nil || lifetime.Err() != nil {
+			stop()
+			return nil, fmt.Errorf("origin readiness: %w", errors.Join(probeCtx.Err(), lifetime.Err()))
 		}
 
 		select {
 		case <-done:
 			stop()
 			return nil, errors.New("origin stopped during startup")
-		case <-ready:
-			return stop, nil
 		default:
+		}
+
+		if err == nil {
+			return stop, nil
 		}
 
 		if !waitPullDelay(probeCtx, 10*time.Millisecond) {
@@ -241,4 +264,25 @@ func startUDSOrigin(ctx, startup context.Context, config racersdk.OriginConfig, 
 			return nil, fmt.Errorf("origin readiness: %w", probeCtx.Err())
 		}
 	}
+}
+
+func validateOriginProbe(response *http.Response, probe racersdk.Key, witness *racersdk.Metadata) error {
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("origin readiness: HEAD status %d", response.StatusCode)
+	}
+
+	if witness == nil || witness.Validate() != nil {
+		return errors.New("origin readiness: missing valid owned callback witness")
+	}
+
+	if response.ContentLength != int64(witness.Size) || response.Header.Get("ETag") != `"sha256:`+probe.String()+`"` || response.Header.Get("ETag") != witness.ETag.String() || response.Header.Get("Racer-Content-Type") != witness.ContentType {
+		return errors.New("origin readiness: HEAD metadata mismatch")
+	}
+
+	expires, err := strconv.ParseInt(response.Header.Get("Racer-Expires-At"), 10, 64)
+	if err != nil || expires < 0 || expires != witness.ExpiresAt.UnixMilli() {
+		return errors.New("origin readiness: invalid expiry metadata")
+	}
+
+	return nil
 }
