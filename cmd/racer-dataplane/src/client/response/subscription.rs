@@ -269,9 +269,54 @@ impl Responses {
                             .finish_progressing(reader, connection, &progress_scope)
                             .await
                     });
+                    let mut ready: Option<Operation<'_, u32>> = None;
                     let result = std::future::poll_fn(|cx| {
+                        // Observe write completion before accepting releases. The
+                        // current page is not releasable until its full delivery.
+                        if let Poll::Ready(result) = write.as_mut().poll(cx) {
+                            return Poll::Ready(result);
+                        }
+                        if let Err(error) = releases.poll(cx, &socket, stream, &mut outstanding) {
+                            return Poll::Ready(Err(error));
+                        }
+                        // No release can replenish credit until a previous page
+                        // has completed. Avoid consuming a reactor slot solely
+                        // to watch input when there is nothing releasable.
+                        if ready.is_none() && !outstanding.is_empty() {
+                            let reactor = self.io.reactor().clone();
+                            let socket = socket.clone();
+                            let reservation = reservation.clone();
+                            let mut receive_scope = scope.clone();
+                            receive_scope.deadline.0 = crate::runtime::environment::now() + timeout;
+                            ready = Some(Box::pin(async move {
+                                reactor
+                                    .readiness_with_lease(
+                                        socket,
+                                        libc::POLLIN as u32,
+                                        reservation,
+                                        &receive_scope,
+                                    )
+                                    .await
+                            }));
+                        }
+                        if let Some(wait) = ready.as_mut()
+                            && let Poll::Ready(result) = wait.as_mut().poll(cx)
+                        {
+                            ready = None;
+                            // Payload delivery owns its progress-based stall
+                            // deadline. An idle release direction must not turn
+                            // that into an absolute page-duration limit.
+                            if let Err(error) = result {
+                                // Read readiness is auxiliary: a full reactor
+                                // must leave the already admitted write alive.
+                                if !matches!(error, Error::DeadlineExceeded | Error::Overloaded) {
+                                    return Poll::Ready(Err(error));
+                                }
+                            }
+                            cx.waker().wake_by_ref();
+                        }
                         stream.poll_prefetch(cx);
-                        write.as_mut().poll(cx)
+                        Poll::Pending
                     })
                     .await?;
                     connection = result;

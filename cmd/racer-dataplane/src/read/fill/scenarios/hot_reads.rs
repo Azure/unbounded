@@ -1,4 +1,6 @@
 //! Production coordinator/range/selection/Fill graph across authenticated nodes.
+#[path = "duplex_release_tests.rs"]
+mod duplex_release;
 use super::*;
 use crate::{
     client::{ClientRequest, ReadKind},
