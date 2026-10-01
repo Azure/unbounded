@@ -38,7 +38,7 @@ pub struct Slabs {
     slab_bytes: u64,
     segment_bytes: u64,
     opened: RefCell<Option<OpenSlab>>,
-    admission: RefCell<Option<Rc<Admission>>>,
+    admission: Rc<Admission>,
     writes: Rc<Cell<usize>>,
     idle_buffer: Rc<RefCell<Option<AlignedBuffer>>>,
 }
@@ -47,6 +47,7 @@ impl Slabs {
         worker: WorkerId,
         directory: PathBuf,
         reactor: Rc<Reactor>,
+        admission: Rc<Admission>,
         slab_bytes: u64,
         segment_bytes: u64,
     ) -> Self {
@@ -57,19 +58,20 @@ impl Slabs {
             slab_bytes,
             segment_bytes,
             opened: RefCell::new(None),
-            admission: RefCell::new(None),
+            admission,
             writes: Rc::new(Cell::new(0)),
             idle_buffer: Rc::new(RefCell::new(None)),
         }
     }
-    pub fn set_admission(&self, admission: Rc<Admission>) {
-        *self.admission.borrow_mut() = Some(admission);
+    pub(super) fn validate_admission(&self, admission: &Rc<Admission>) -> Result<()> {
+        if Rc::ptr_eq(&self.admission, admission) {
+            Ok(())
+        } else {
+            Err(Error::InvalidConfiguration)
+        }
     }
     pub fn owns_reservation(&self, reservation: &Reservation) -> bool {
-        self.admission
-            .borrow()
-            .as_ref()
-            .is_some_and(|admission| admission.owns(reservation))
+        self.admission.owns(reservation)
     }
     pub fn reserve(
         &self,
@@ -77,40 +79,26 @@ impl Slabs {
         class: ResourceClass,
         amount: usize,
     ) -> Result<Reservation> {
-        let result = self
-            .admission
-            .borrow()
-            .as_ref()
-            .ok_or(Error::Unavailable)?
-            .reserve(cache, class, amount);
+        let result = self.admission.reserve(cache, class, amount);
         if matches!(result, Err(Error::Overloaded)) {
             self.idle_buffer.borrow_mut().take();
-            return self
-                .admission
-                .borrow()
-                .as_ref()
-                .ok_or(Error::Unavailable)?
-                .reserve(cache, class, amount);
+            return self.admission.reserve(cache, class, amount);
         }
         result
     }
     /// Existing accepted fills may complete after request admission closes.
     /// Completion admission still enforces the configured byte quota.
     pub(crate) fn reserve_staging(&self, length: usize, cache: &CacheId) -> Result<Reservation> {
-        let result = self
-            .admission
-            .borrow()
-            .as_ref()
-            .ok_or(Error::Unavailable)?
-            .reserve_completion(Some(cache), ResourceClass::Ciphertext, length);
+        let result =
+            self.admission
+                .reserve_completion(Some(cache), ResourceClass::Ciphertext, length);
         if matches!(result, Err(Error::Overloaded)) {
             self.idle_buffer.borrow_mut().take();
-            return self
-                .admission
-                .borrow()
-                .as_ref()
-                .ok_or(Error::Unavailable)?
-                .reserve_completion(Some(cache), ResourceClass::Ciphertext, length);
+            return self.admission.reserve_completion(
+                Some(cache),
+                ResourceClass::Ciphertext,
+                length,
+            );
         }
         result
     }
@@ -393,11 +381,11 @@ mod tests {
             WorkerId(0),
             directory.0.clone(),
             Rc::new(Reactor::new(admission.clone())),
+            admission.clone(),
             64 * 1024 * 1024,
             32 * 1024 * 1024,
         );
         assert!(!directory.0.join("worker-0-slab-0.dat").exists());
-        slabs.set_admission(admission.clone());
         let alignment = slabs.open_now().unwrap();
         let opened = slabs.opened.borrow();
         let fd = opened.as_ref().unwrap().file.as_raw_fd();
@@ -437,7 +425,8 @@ mod tests {
         let conflicting = Slabs::new(
             WorkerId(0),
             directory.0.clone(),
-            Rc::new(Reactor::new(admission)),
+            Rc::new(Reactor::new(admission.clone())),
+            admission,
             64 * 1024 * 1024,
             32 * 1024 * 1024,
         );

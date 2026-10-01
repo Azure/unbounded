@@ -930,6 +930,7 @@ fn metadata_coordinator_with_newer_publication(
         WorkerId(0),
         "unused/absence-slabs".into(),
         reactor.clone(),
+        admission.clone(),
         1024 * 1024 * 1024,
         64 * 1024 * 1024,
     ));

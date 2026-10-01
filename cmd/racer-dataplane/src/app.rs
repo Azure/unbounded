@@ -988,6 +988,7 @@ impl WorkerApplication {
             worker,
             config.slab_directory.clone(),
             runtime.reactor.clone(),
+            runtime.admission.clone(),
             config.slab_bytes,
             config.segment_bytes,
         ));

@@ -92,8 +92,8 @@ impl StoreWriter {
         if queue_entries == 0 || self.busy.get() || !self.pending.borrow().is_empty() {
             return Err(Error::InvalidConfiguration);
         }
+        self.slabs.validate_admission(&admission)?;
         self.index.set_page_capacity(page_entries)?;
-        self.slabs.set_admission(admission);
         *self.clock.borrow_mut() = Some(clock);
         self.capacity.set(queue_entries);
         Ok(())

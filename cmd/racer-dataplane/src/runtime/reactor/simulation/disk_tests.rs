@@ -41,6 +41,7 @@ fn real_slab_open_is_sparse_exclusive_and_checks_direct_geometry() {
         WorkerId(0),
         "/slabs".into(),
         r.clone(),
+        r.admission.clone(),
         64 * 1024 * 1024,
         32 * 1024 * 1024,
     );
@@ -49,6 +50,7 @@ fn real_slab_open_is_sparse_exclusive_and_checks_direct_geometry() {
         WorkerId(0),
         "/slabs".into(),
         r.clone(),
+        r.admission.clone(),
         64 * 1024 * 1024,
         32 * 1024 * 1024,
     );

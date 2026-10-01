@@ -201,10 +201,10 @@ fn fixture_with_availability(
         worker,
         directory.clone(),
         reactor.clone(),
+        admission.clone(),
         1024 * 1024 * 1024,
         64 * 1024 * 1024,
     ));
-    slabs.set_admission(admission.clone());
     slabs
         .open_now()
         .expect("read fixture filesystem supports direct slab alignment");

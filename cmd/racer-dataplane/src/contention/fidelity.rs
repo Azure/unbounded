@@ -529,10 +529,10 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target/contention-fidelity-unopened"),
         Rc::new(Reactor::new(real.clone())),
+        real.clone(),
         128 * 1024 * 1024,
         64 * 1024 * 1024,
     ));
-    slabs.set_admission(real.clone());
     let disk = Rc::new(StoreReader::new(
         Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1)),
         index.clone(),

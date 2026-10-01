@@ -463,6 +463,7 @@ impl Rig {
             worker,
             scratch.path.join("slabs"),
             reactor.clone(),
+            admission.clone(),
             slab_bytes,
             64 * 1024 * 1024,
         ));

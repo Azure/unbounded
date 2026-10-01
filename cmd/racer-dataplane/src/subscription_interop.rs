@@ -216,10 +216,10 @@ pub fn go_sdk_subscription_server() {
         WorkerId(0),
         root.join("slabs"),
         reactor.clone(),
+        admission.clone(),
         256 * 1024 * 1024,
         64 * 1024 * 1024,
     ));
-    slabs.set_admission(admission.clone());
     slabs.open_now().unwrap();
     let writer = Rc::new(StoreWriter::new(
         index.clone(),

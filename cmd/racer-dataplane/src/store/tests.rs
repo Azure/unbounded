@@ -71,6 +71,7 @@ impl Fixture {
             WorkerId(0),
             directory.0.clone(),
             reactor.clone(),
+            admission.clone(),
             64 * 1024 * 1024,
             32 * 1024 * 1024,
         ));
@@ -100,6 +101,11 @@ impl Fixture {
             eviction,
         };
         store.configure(admission.clone(), 2, 16).unwrap();
+        let foreign = Rc::new(Admission::new(admission.limits().clone()));
+        assert_eq!(
+            store.configure(foreign, 2, 16),
+            Err(Error::InvalidConfiguration)
+        );
         Self {
             metrics,
             store,
