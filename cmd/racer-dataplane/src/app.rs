@@ -884,6 +884,10 @@ impl WorkerApplication {
             network.clone(),
         ));
         let dispatcher = Rc::new(Dispatcher::new(node.workers.clone()));
+        #[cfg(not(test))]
+        let distributed = true;
+        #[cfg(test)]
+        let distributed = crate::runtime::reactor::simulation::Simulation::current().is_none();
         let peers = PeerServer::new(
             io.clone(),
             forwarding,
@@ -892,21 +896,20 @@ impl WorkerApplication {
             relay,
             wire,
             signatures,
-        )
-        .with_subscriptions(node.subscriptions.clone())
-        .with_request_timeout(config.request_timeout)
-        .with_opaque_relay(config.opaque_relay)
-        .with_transfers(transfers)
-        .with_pipes(pipes.clone());
-        #[cfg(not(test))]
-        let distributed = true;
-        #[cfg(test)]
-        let distributed = crate::runtime::reactor::simulation::Simulation::current().is_none();
-        let peers = Rc::new(if distributed {
-            peers.with_ingress(node.ingress.clone())
-        } else {
-            peers
-        });
+            node.subscriptions.clone(),
+            pipes.clone(),
+            transfers,
+            crate::peer::server::Settings {
+                accept: if distributed {
+                    crate::peer::server::AcceptMode::Distributed(node.ingress.clone())
+                } else {
+                    crate::peer::server::AcceptMode::Local
+                },
+                request_timeout: config.request_timeout,
+                opaque_relay: config.opaque_relay,
+            },
+        );
+        let peers = Rc::new(peers);
         let io = Rc::new(HttpIo::for_clients(reactor, admission.clone()));
         let responses =
             Rc::new(Responses::new(io.clone(), delivery).with_observer(admission.observer()));

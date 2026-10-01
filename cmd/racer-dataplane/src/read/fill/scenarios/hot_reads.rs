@@ -638,7 +638,7 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
         admission.clone(),
         Rc::new(BufferPool::new(admission.clone())),
     ));
-    let server = PeerServer::new(
+    let server = PeerServer::for_test(
         Rc::new(HttpIo::with_admission(
             fixtures[2].reactor.clone(),
             Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD, PAGE_BYTES + 16),

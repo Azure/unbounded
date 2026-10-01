@@ -405,7 +405,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
         admission.clone(),
     ));
     let calls = Rc::new(Cell::new(0));
-    let server = server::PeerServer::new(
+    let server = server::PeerServer::for_test(
         io,
         destination,
         admission.clone(),
@@ -1051,7 +1051,7 @@ fn signed_tcp_case(case: &str) {
         admission.clone(),
         destination_network.clone(),
     ));
-    let server = server::PeerServer::new(
+    let server = server::PeerServer::for_test(
         io,
         destination_auth,
         admission.clone(),
@@ -1231,7 +1231,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
                 PeerNetwork::new(signers[2].node().clone(), Arc::new(Default::default())).unwrap(),
             ),
         ));
-        let mut server = server::PeerServer::new(
+        let mut server = server::PeerServer::for_test(
             io.clone(),
             forwarding,
             admission.clone(),
@@ -1483,7 +1483,18 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
             let (signed, _) = Forwarding::new(signers[0].clone())
                 .sign_request(local)
                 .unwrap();
-            let result = transfers.exchange(endpoint.clone(), signed, &scope).await;
+            // A proposed native route without native capability must complete the
+            // real signed exchange over HTTP, not merely pass a selector test.
+            let result = transfers
+                .exchange_planned(
+                    endpoint.clone(),
+                    signed,
+                    crate::topology::rails::TransportPlan::Rdma {
+                        rail: crate::topology::rails::RailId(0),
+                    },
+                    &scope,
+                )
+                .await;
             if attempt == 2 {
                 assert!(result.is_err());
             } else {
@@ -1509,19 +1520,6 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
             reactor.wait(Duration::from_millis(1)).unwrap();
         }
     }
-    assert!(matches!(
-        transfers.select(
-            crate::topology::rails::TransportPlan::Rdma {
-                rail: crate::topology::rails::RailId(0)
-            },
-            transport::Capabilities {
-                rdma: true,
-                scoped_grants: true
-            },
-            None
-        ),
-        crate::topology::rails::TransportPlan::Http
-    ));
 }
 #[test]
 fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
@@ -1710,7 +1708,7 @@ mod established_sessions {
                 admission.clone(),
                 network.clone(),
             ));
-            let server = server::PeerServer::new(
+            let server = server::PeerServer::for_test(
                 io.clone(),
                 forwarding,
                 admission.clone(),

@@ -178,7 +178,7 @@ fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failure
             calls: Cell::new(0),
             reject,
         });
-        let server = server::PeerServer::new(
+        let server = server::PeerServer::for_test(
             Rc::new(HttpIo::with_admission(
                 Rc::new(Reactor::new(admission.clone())),
                 Codec::new(protocol::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
@@ -433,7 +433,7 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
         admission.clone(),
         network(C),
     ));
-    let server = server::PeerServer::new(
+    let server = server::PeerServer::for_test(
         io.clone(),
         destination,
         admission.clone(),

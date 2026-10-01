@@ -7,7 +7,6 @@ use crate::{
         connection::HttpIo,
         connection::{ConnectionLease, HttpPool},
     },
-    memory::pool::CiphertextPage,
     model::{NodeId, ResourceClass, TransferId},
     rdma::RdmaTransfer,
     rdma::{
@@ -1054,12 +1053,6 @@ pub enum RelayResponse {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Capabilities {
-    pub rdma: bool,
-    pub scoped_grants: bool,
-}
-
 pub struct Transfers {
     reclaim: Option<Rc<ReclaimCiphertext>>,
     signatures: Rc<crate::security::signing::Signatures>,
@@ -1122,85 +1115,6 @@ impl Transfers {
     ) -> Self {
         self.reclaim = Some(Rc::new(reclaim));
         self
-    }
-    /// Route selection alone never authorizes RDMA. A matching, live authenticated
-    /// single-use session and transfer-scoped grant are both required.
-    pub fn select(
-        &self,
-        proposed: TransportPlan,
-        capabilities: Capabilities,
-        session: Option<&crate::rdma::SessionLease>,
-    ) -> TransportPlan {
-        match proposed {
-            TransportPlan::Rdma { rail }
-                if capabilities.rdma
-                    && capabilities.scoped_grants
-                    && self.rdma.as_ref().is_some_and(|rdma| rdma.ready(rail))
-                    && session.is_some_and(|s| s.rail() == rail && s.ready()) =>
-            {
-                TransportPlan::Rdma { rail }
-            }
-            _ => TransportPlan::Http,
-        }
-    }
-
-    pub fn send_scoped<'a>(
-        &'a self,
-        destination: &'a crate::model::NodeId,
-        session: &'a crate::rdma::SessionLease,
-        page: CiphertextPage,
-        descriptor: crate::rdma::AuthenticatedDescriptor,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, crate::rdma::SendCompletion> {
-        Box::pin(async move {
-            scope.check()?;
-            if session.peer() != destination {
-                return Err(Error::Unauthorized);
-            }
-            self.rdma
-                .as_ref()
-                .ok_or(Error::Unavailable)?
-                .send_to(session, page, descriptor, scope)
-                .await
-        })
-    }
-
-    pub fn prepare_receive<'a>(
-        &'a self,
-        source: &'a crate::model::NodeId,
-        session: &'a crate::rdma::SessionLease,
-        envelope: &'a crate::model::PageEnvelope,
-        transfer: crate::model::TransferId,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, crate::rdma::Grant> {
-        Box::pin(async move {
-            if session.peer() != source {
-                return Err(Error::Unauthorized);
-            }
-            self.rdma
-                .as_ref()
-                .ok_or(Error::Unavailable)?
-                .prepare_receive(session, envelope, transfer, scope)
-                .await
-        })
-    }
-
-    pub fn finish_receive<'a>(
-        &'a self,
-        session: &'a crate::rdma::SessionLease,
-        grant: crate::rdma::Grant,
-        completion: &'a crate::security::signing::VerifiedHead,
-        envelope: crate::model::PageEnvelope,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, CiphertextPage> {
-        Box::pin(async move {
-            let (admission, _) = &self.wire;
-            self.rdma
-                .as_ref()
-                .ok_or(Error::Unavailable)?
-                .finish_receive(session, grant, completion, envelope, admission, scope)
-                .await
-        })
     }
     /// The signed envelope and HTTP ciphertext share one exclusive pooled socket.
     /// A failed/abandoned exchange is never marked reusable.
@@ -1483,34 +1397,6 @@ impl Transfers {
             }
             connection.finish_exchange()?;
             Ok(RelayResponse::Complete(response))
-        })
-    }
-    pub fn send<'a>(
-        &'a self,
-        _destination: &'a crate::model::NodeId,
-        _transfer: crate::model::TransferId,
-        _plan: TransportPlan,
-        _page: CiphertextPage,
-        _scope: &'a RequestScope,
-    ) -> Operation<'a, ()> {
-        Box::pin(async move {
-            _scope.check()?;
-            // HTTP pages are carried by exchange/respond with their signed head.
-            // An unbound standalone transfer cannot safely report success.
-            Err(Error::InvalidRequest)
-        })
-    }
-    pub fn receive<'a>(
-        &'a self,
-        _source: &'a crate::model::NodeId,
-        _transfer: crate::model::TransferId,
-        _plan: TransportPlan,
-        _envelope: crate::model::PageEnvelope,
-        _scope: &'a RequestScope,
-    ) -> Operation<'a, CiphertextPage> {
-        Box::pin(async move {
-            _scope.check()?;
-            Err(Error::InvalidRequest)
         })
     }
 }

@@ -34,11 +34,24 @@ pub trait LocalPageService {
         scope: &'a RequestScope,
     ) -> Operation<'a, PeerResponse>;
 }
+/// Listener ownership is explicit: production distributes accepted descriptors,
+/// while local and simulated listeners serve them on their own reactor.
+pub(crate) enum AcceptMode {
+    Distributed(std::sync::Arc<crate::runtime::ingress::Ingress>),
+    Local,
+}
+
+pub(crate) struct Settings {
+    pub accept: AcceptMode,
+    pub request_timeout: Duration,
+    pub opaque_relay: bool,
+}
+
 pub struct PeerServer {
     subscriptions: std::sync::Arc<super::subscriptions::Subscriptions>,
     opaque_relay: bool,
     pipes: Rc<crate::memory::pipe::PipePool>,
-    ingress: Option<std::sync::Arc<crate::runtime::ingress::Ingress>>,
+    accept: AcceptMode,
     io: Rc<crate::http::connection::HttpIo>,
     forwarding: Rc<Forwarding>,
     admission: Rc<Admission>,
@@ -46,22 +59,61 @@ pub struct PeerServer {
     relay: Rc<Relay>,
     wire: Rc<super::protocol::SecurityCodec>,
     signatures: Rc<crate::security::signing::Signatures>,
-    transfers: Option<Rc<super::transport::Transfers>>,
+    transfers: Rc<super::transport::Transfers>,
     request_timeout: Duration,
 }
 impl PeerServer {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        io: Rc<crate::http::connection::HttpIo>,
+        forwarding: Rc<Forwarding>,
+        admission: Rc<Admission>,
+        local: Rc<dyn LocalPageService>,
+        relay: Rc<Relay>,
+        wire: Rc<super::protocol::SecurityCodec>,
+        signatures: Rc<crate::security::signing::Signatures>,
+    ) -> Self {
+        let pipes = Rc::new(crate::memory::pipe::PipePool::new(
+            admission.clone(),
+            io.reactor().clone(),
+        ));
+        let transfers = Rc::new(super::transport::Transfers::new(
+            Rc::new(crate::http::connection::HttpPool::new(
+                io.reactor().clone(),
+                admission.clone(),
+                1,
+            )),
+            io.clone(),
+            None,
+            admission.clone(),
+            wire.clone(),
+            signatures.clone(),
+        ));
+        Self::new(
+            io,
+            forwarding,
+            admission,
+            local,
+            relay,
+            wire,
+            signatures,
+            std::sync::Arc::new(
+                super::subscriptions::Subscriptions::new(Default::default()).unwrap(),
+            ),
+            pipes,
+            transfers,
+            Settings {
+                accept: AcceptMode::Local,
+                request_timeout: Duration::from_secs(30),
+                opaque_relay: false,
+            },
+        )
+    }
     #[cfg(test)]
     pub(crate) fn subscription_owner(
         &self,
     ) -> &std::sync::Arc<super::subscriptions::Subscriptions> {
         &self.subscriptions
-    }
-    pub(crate) fn with_ingress(
-        mut self,
-        ingress: std::sync::Arc<crate::runtime::ingress::Ingress>,
-    ) -> Self {
-        self.ingress = Some(ingress);
-        self
     }
     #[cfg(test)]
     pub(crate) fn transport_io(&self) -> &Rc<crate::http::connection::HttpIo> {
@@ -85,7 +137,7 @@ impl PeerServer {
                 .limit(crate::model::ResourceClass::IngressConnection);
             loop {
                 scope.check()?;
-                if let Some(ingress) = &self.ingress {
+                if let AcceptMode::Distributed(ingress) = &self.accept {
                     crate::runtime::retry_listener(scope, || {
                         reactor.readiness_with_lease(fd.clone(), libc::POLLIN as u32, (), scope)
                     })
@@ -155,7 +207,7 @@ impl PeerServer {
             }
         })
     }
-    pub fn new(
+    pub(crate) fn new(
         io: Rc<crate::http::connection::HttpIo>,
         forwarding: Rc<Forwarding>,
         admission: Rc<Admission>,
@@ -163,18 +215,16 @@ impl PeerServer {
         relay: Rc<Relay>,
         wire: Rc<super::protocol::SecurityCodec>,
         signatures: Rc<crate::security::signing::Signatures>,
+        subscriptions: std::sync::Arc<super::subscriptions::Subscriptions>,
+        pipes: Rc<crate::memory::pipe::PipePool>,
+        transfers: Rc<super::transport::Transfers>,
+        settings: Settings,
     ) -> Self {
         Self {
-            subscriptions: std::sync::Arc::new(
-                super::subscriptions::Subscriptions::new(Default::default())
-                    .expect("valid subscription limits"),
-            ),
-            opaque_relay: false,
-            pipes: Rc::new(crate::memory::pipe::PipePool::new(
-                admission.clone(),
-                io.reactor().clone(),
-            )),
-            ingress: None,
+            subscriptions,
+            opaque_relay: settings.opaque_relay,
+            pipes,
+            accept: settings.accept,
             io,
             forwarding,
             admission,
@@ -182,30 +232,20 @@ impl PeerServer {
             relay,
             wire,
             signatures,
-            transfers: None,
-            request_timeout: Duration::from_secs(30),
+            transfers,
+            request_timeout: settings.request_timeout,
         }
     }
     /// Bound incoming heads and the complete connection handshake, including writes.
     /// Authenticated page dispatch and transfer retain their signed request deadline.
+    #[cfg(test)]
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
         self
     }
+    #[cfg(test)]
     pub fn with_transfers(mut self, transfers: Rc<super::transport::Transfers>) -> Self {
-        self.transfers = Some(transfers);
-        self
-    }
-    /// Assembly shares one bounded scheduler across every worker on this node.
-    pub fn with_subscriptions(
-        mut self,
-        subscriptions: std::sync::Arc<super::subscriptions::Subscriptions>,
-    ) -> Self {
-        self.subscriptions = subscriptions;
-        self
-    }
-    pub(crate) fn with_pipes(mut self, pipes: Rc<crate::memory::pipe::PipePool>) -> Self {
-        self.pipes = pipes;
+        self.transfers = transfers;
         self
     }
 
@@ -278,10 +318,10 @@ impl PeerServer {
                 .deadline
                 .0
                 .min(request.request.route.deadline.0);
-            let admitted = match (native_control, &self.transfers) {
-                (Some(control), Some(transfers)) => {
-                    transfers.admit_native(&request, control, &request_scope)?
-                }
+            let admitted = match native_control {
+                Some(control) => self
+                    .transfers
+                    .admit_native(&request, control, &request_scope)?,
                 _ => None,
             };
             let request = self.forwarding.verify_request(request)?;
@@ -399,10 +439,9 @@ impl PeerServer {
                 Err(error) => return Err(*error),
             };
             let mut connection = received.connection;
-            if let (Some(admitted), Some(transfers), Ok(membership)) =
-                (admitted, &self.transfers, &membership)
-            {
-                let (returned, sent) = transfers
+            if let (Some(admitted), Ok(membership)) = (admitted, &membership) {
+                let (returned, sent) = self
+                    .transfers
                     .send_native(connection, &response, admitted, &membership, &request_scope)
                     .await?;
                 connection = returned;
@@ -656,6 +695,7 @@ impl PeerServer {
         })
     }
     /// Enable experimental opaque HTTP transit without changing endpoint/native paths.
+    #[cfg(test)]
     pub fn with_opaque_relay(mut self, enabled: bool) -> Self {
         self.opaque_relay = enabled;
         self
@@ -1380,7 +1420,7 @@ mod tests {
                         .unwrap(),
                     ),
                 ));
-                let server = PeerServer::new(
+                let server = PeerServer::for_test(
                     io,
                     forwarding,
                     admission.clone(),

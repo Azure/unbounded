@@ -478,7 +478,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
                 origin_calls.clone(),
             )
         });
-    let server = PeerServer::new(
+    let server = PeerServer::for_test(
         io,
         auth,
         admission.clone(),

@@ -150,7 +150,7 @@ fn exchange(
         admissions[1].clone(),
         network.clone(),
     ));
-    let server = server::PeerServer::new(
+    let server = server::PeerServer::for_test(
         ios[1].clone(),
         auth,
         admissions[1].clone(),

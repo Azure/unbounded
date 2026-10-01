@@ -210,7 +210,7 @@ fn destination_exchange(order: CompletionOrder) {
         admission.clone(),
         network.clone(),
     ));
-    let server = server::PeerServer::new(
+    let server = server::PeerServer::for_test(
         io.clone(),
         forwarding,
         admission.clone(),
