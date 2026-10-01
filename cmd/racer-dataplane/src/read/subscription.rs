@@ -295,11 +295,23 @@ impl DemandLease {
         // Completion still fans out to all eligible overlapping readers.
         {
             let demand = &state.demands[&self.id];
-            if !demand.turn || demand.selected.len() >= 63 {
+            if !demand.turn
+                || demand.selected.len() >= 63
+                || !demand.credits.can_reserve(PAGE_BYTES as u32)
+            {
                 intervals.push(PageInterval {
                     start: demand.next,
                     end: demand.next + 1,
                 });
+                // With less than a full page of byte credit, only boundary
+                // slices can fit. Do not advertise ineligible interior pages.
+                let tail = demand.end - 1;
+                if demand.turn && tail != demand.next && demand.eligible(tail) {
+                    intervals.push(PageInterval {
+                        start: tail,
+                        end: tail + 1,
+                    });
+                }
             } else {
                 let mut start = demand.next;
                 for hole in &demand.selected {
@@ -949,6 +961,34 @@ mod tests {
             assert!(!selection.demand.contains(low_page));
             drop((selection, low));
         }
+    }
+
+    #[test]
+    fn production_selection_advertises_only_credit_eligible_slices() {
+        let scheduler = Scheduler::new(1);
+        let range = ByteRange::From(PAGE_BYTES - 1)
+            .resolve(3 * PAGE_BYTES + 2)
+            .unwrap();
+        let mut reader = scheduler
+            .register(version(), range, 2, PAGE_BYTES, false)
+            .unwrap();
+        {
+            let mut state = scheduler.state.lock().unwrap();
+            let demand = state.demands.get_mut(&reader.id).unwrap();
+            demand.turn = true;
+            demand
+                .credits
+                .reserve(PageNumber(99), PAGE_BYTES as u32 - 2)
+                .unwrap();
+        }
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        let std::task::Poll::Ready(Ok(Next::Select(selection))) = reader.poll_next(&mut cx) else {
+            panic!()
+        };
+        assert!(selection.demand.contains(0));
+        assert!(selection.demand.contains(3));
+        assert!(!selection.demand.contains(1));
+        assert!(!selection.demand.contains(2));
     }
 
     #[test]
