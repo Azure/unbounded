@@ -1,4 +1,4 @@
-//! Faults exist only under cfg(test). Exercise the production ownership machinery.
+//! FFI fault injection exercises production ownership, ABI, and quarantine safety.
 use super::*;
 #[cfg(feature = "rdma")]
 use std::time::Duration;

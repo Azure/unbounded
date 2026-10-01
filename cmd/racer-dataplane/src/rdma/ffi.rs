@@ -16,6 +16,7 @@ use std::{
 pub struct Verbs;
 
 #[cfg(test)]
+// Simulation implements this private ABI and must share the unsafe owner boundary.
 #[path = "simulation.rs"]
 pub mod simulation;
 
@@ -748,5 +749,4 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "verbs_tests.rs"]
 pub(crate) mod lifetime_tests;

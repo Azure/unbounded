@@ -1104,15 +1104,12 @@ impl<S: CryptoService> CryptoService for WithNative<S> {
 }
 
 #[cfg(test)]
-#[path = "receive_tests.rs"]
 mod receive_tests;
 
 #[cfg(test)]
-#[path = "mailbox_tests.rs"]
 mod mailbox_tests;
 
 #[cfg(test)]
-#[path = "activation_tests.rs"]
 mod activation_tests;
 
 #[cfg(test)]
