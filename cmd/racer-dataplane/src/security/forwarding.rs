@@ -79,6 +79,17 @@ pub struct RequestBinding {
     path: Vec<NodeId>,
     deadline: u64,
 }
+impl RequestBinding {
+    pub(super) fn retained_proof(&self) -> Result<&SignedHead> {
+        check_request_deadline(self)?;
+        if field(&self.original.head, "racer-kind")? != "request"
+            || self.deadline > number(&self.original.head, "racer-route-deadline")?
+        {
+            return Err(Error::Unauthorized);
+        }
+        Ok(&self.original)
+    }
+}
 
 /// Admitted ingress with its original signature and entire forwarding chain.
 /// Only this module's verifier can construct it. Shared access prevents callers
@@ -320,7 +331,7 @@ impl Forwarding {
     ) -> Result<SignedResponse> {
         check_request_deadline(request)?;
         // A retained subscription must not outlive retired request keys/trust.
-        self.signatures.verify_historical(&request.original)?;
+        self.signatures.verify_retained_request(request)?;
         if request.path.last() != Some(self.signatures.node()) || request.path.len() < 2 {
             return Err(Error::Unauthorized);
         }
@@ -428,7 +439,7 @@ impl Forwarding {
         request: &RequestBinding,
     ) -> Result<(VerifiedPeer, Vec<VerifiedPeer>)> {
         check_request_deadline(request)?;
-        self.signatures.verify_historical(&request.original)?;
+        self.signatures.verify_retained_request(request)?;
         check_grant_deadline(&auth.original.head, request)?;
         if auth.hops.len() >= protocol::MAX_HOPS {
             return Err(Error::HopBudgetExhausted);
@@ -911,6 +922,60 @@ mod tests {
             response: PeerResponse::Miss,
         }
     }
+    #[test]
+    fn retained_request_survives_fresh_window_but_not_deadline_or_forgery() {
+        let clock = crate::runtime::environment::SimulationClock::new_at(
+            931,
+            Instant::now(),
+            std::time::SystemTime::now(),
+        );
+        let environment = clock.environment(0);
+        let _guard = environment.enter();
+        let signatures = network(3);
+        let sender = Forwarding::new(signatures[0].clone());
+        let receiver = Forwarding::new(signatures[2].clone());
+        let mut logical = request(44);
+        logical.route.deadline.0 = crate::runtime::environment::now() + Duration::from_secs(120);
+        let (signed, binding) = sender.sign_request(logical).unwrap();
+        let admitted = receiver.verify_request(signed).unwrap();
+        clock.advance(Duration::from_secs(61));
+        assert!(matches!(
+            signatures[2].verify_historical(&binding.original),
+            Err(Error::Replay)
+        ));
+        let response = receiver
+            .sign_response(admitted.binding(), PeerResponse::Miss)
+            .unwrap();
+        let mut forged = binding.clone();
+        let mut proof = clone_head(&forged.original);
+        proof.signature[0] ^= 1;
+        forged.original = Arc::new(proof);
+        assert!(
+            sender
+                .verify_response(copy_response(&response), &forged)
+                .is_err()
+        );
+        let mut wrong_path = binding.clone();
+        wrong_path.path = vec![node(1)];
+        assert!(
+            sender
+                .verify_response(copy_response(&response), &wrong_path)
+                .is_err()
+        );
+        sender
+            .verify_response(copy_response(&response), &binding)
+            .unwrap();
+        clock.advance(Duration::from_secs(59));
+        assert!(matches!(
+            receiver.sign_response(admitted.binding(), PeerResponse::Miss),
+            Err(Error::DeadlineExceeded)
+        ));
+        assert!(matches!(
+            sender.verify_response(response, &binding),
+            Err(Error::DeadlineExceeded)
+        ));
+    }
+
     #[test]
     fn bootstrap_binds_intent_empty_page_zero_length_and_destination() {
         use crate::memory::pool::tests::bundle_for;

@@ -112,6 +112,17 @@ impl Signatures {
     /// admission at this node. The owning connection admits the fresh outer head;
     /// forwarding then validates the complete retained chain and logical fields.
     pub(crate) fn verify_historical(&self, signed: &SignedHead) -> Result<VerifiedPeer> {
+        self.verify_signed_age(signed, true)
+    }
+    /// Only an opaque, already bound request may use its original deadline
+    /// instead of the fresh-message replay window. Revalidate current keys/trust.
+    pub(crate) fn verify_retained_request(
+        &self,
+        binding: &super::forwarding::RequestBinding,
+    ) -> Result<VerifiedPeer> {
+        self.verify_signed_age(binding.retained_proof()?, false)
+    }
+    fn verify_signed_age(&self, signed: &SignedHead, fresh: bool) -> Result<VerifiedPeer> {
         let head = &signed.head;
         if field(head, "racer-profile")? != p::PROFILE
             || field(head, "racer-cluster")? != self.keys.cluster().0
@@ -155,9 +166,10 @@ impl Signatures {
             > now
                 .checked_add(Duration::from_secs(5))
                 .ok_or(Error::Unauthorized)?
-            || now
-                .duration_since(timestamp)
-                .is_ok_and(|age| age >= Duration::from_secs(60))
+            || fresh
+                && now
+                    .duration_since(timestamp)
+                    .is_ok_and(|age| age >= Duration::from_secs(60))
         {
             return Err(Error::Replay);
         }
