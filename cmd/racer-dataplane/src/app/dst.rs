@@ -654,7 +654,7 @@ impl Harness {
             Vec::new()
         };
         let (mut app, runtime, engine) =
-            integration_tests::local_worker_with_fabric(&config, &node, 0, fabric_ports);
+            test_support::local_worker_with_fabric(&config, &node, 0, fabric_ports);
         let crypto = node.native.crypto(WorkerId(0), engine).unwrap();
         app.keys.install(self.bundle(&config, 1)).unwrap();
         app.keys
@@ -668,7 +668,7 @@ impl Harness {
         let control = app.control.take();
         self.generation += 1;
         let mut publication =
-            integration_tests::publication(&config, self.generation, vec![self.definition(id)]);
+            test_support::publication(&config, self.generation, vec![self.definition(id)]);
         publication.membership_version = MembershipVersion(self.generation);
         publication.members = self.members();
         publication.members.push(member(&config));
@@ -685,7 +685,7 @@ impl Harness {
                 .environment(1 + id as u64 + (self.generation << 32) + ((worker as u64) << 48));
             let _role = role.enter();
             let (mut app, runtime, engine) =
-                integration_tests::local_worker(&config, &node, worker as u16);
+                test_support::local_worker(&config, &node, worker as u16);
             app.fabric_ports = workers[0].app.fabric_ports.clone();
             let crypto = node.native.crypto(WorkerId(worker as u16), engine).unwrap();
             workers.push(LocalWorker {
@@ -793,8 +793,7 @@ impl Harness {
         let members = self.members();
         let definitions: Vec<_> = self.nodes.iter().map(|n| self.definition(n.id)).collect();
         for (node, definition) in self.nodes.iter_mut().zip(definitions) {
-            let mut p =
-                integration_tests::publication(&node.config, self.generation, vec![definition]);
+            let mut p = test_support::publication(&node.config, self.generation, vec![definition]);
             p.membership_version = MembershipVersion(self.generation);
             p.members = members.clone();
             node.workers[0].app.snapshots.publish(p).unwrap();
@@ -1287,7 +1286,7 @@ fn phase5_default_grace_staggered_nodes_and_periodic_checkpoint_traffic() {
     harness.generation += 1;
     for i in 1..4 {
         let node = &harness.nodes[i];
-        let mut p = integration_tests::publication(
+        let mut p = test_support::publication(
             &node.config,
             harness.generation,
             vec![harness.definition(node.id)],

@@ -1,137 +1,15 @@
 //! Real TLS enrollment/publication fixture driving the production application graph.
+use super::test_support::*;
 use super::*;
 use crate::control::wire;
 use std::{
     io::{Read, Write},
-    path::PathBuf,
     thread,
 };
 
-pub(super) fn local_worker(
-    config: &Config,
-    node: &Arc<NodeState>,
-    id: u16,
-) -> (WorkerApplication, WorkerRuntime, PageCryptoEngine) {
-    local_worker_with_fabric(config, node, id, Vec::new())
-}
-
-pub(super) fn local_worker_with_fabric(
-    config: &Config,
-    node: &Arc<NodeState>,
-    id: u16,
-    fabric_ports: Vec<crate::rdma::FabricPort>,
-) -> (WorkerApplication, WorkerRuntime, PageCryptoEngine) {
-    let worker = WorkerId(id);
-    let admission = Rc::new(Admission::new(config.limits.clone()));
-    let (io, engine) = crate::runtime::crypto::pair(worker, 0, config.limits.queue_entries);
-    let runtime = WorkerRuntime {
-        reactor: Rc::new(Reactor::new(admission.clone())),
-        admission,
-        crypto: Rc::new(crate::runtime::crypto::CryptoClient::new(io)),
-    };
-    let local = WorkerRuntime {
-        reactor: runtime.reactor.clone(),
-        admission: runtime.admission.clone(),
-        crypto: runtime.crypto.clone(),
-    };
-    let app =
-        WorkerApplication::assemble(config, node.clone(), worker, local, fabric_ports).unwrap();
-    (
-        app,
-        runtime,
-        PageCryptoEngine::new(CryptoRuntime { port: engine }),
-    )
-}
-
-pub(super) fn definition() -> crate::control::caches::CacheDefinition {
-    let (client_socket, origin_socket) =
-        crate::control::caches::canonical_socket_paths("app-lifecycle").unwrap();
-    crate::control::caches::CacheDefinition {
-        id: crate::model::CacheId("33333333-3333-4333-8333-333333333333".into()),
-        name: "app-lifecycle".into(),
-        client_socket,
-        origin_socket,
-    }
-}
-
-pub(super) fn publication(
-    config: &Config,
-    sequence: u64,
-    caches: Vec<crate::control::caches::CacheDefinition>,
-) -> wire::Publication {
-    wire::Publication {
-        schema_version: 1,
-        cluster: config.cluster.clone(),
-        sequence: wire::PublicationSequence(sequence),
-        membership_version: crate::model::MembershipVersion(1),
-        members: vec![crate::topology::membership::Member {
-            node: config.node.clone(),
-            shares: std::num::NonZeroU32::new(1).unwrap(),
-            peer_endpoint: "127.0.0.1:7443".into(),
-            rails: vec![],
-            alignment_enabled: false,
-        }],
-        caches,
-    }
-}
-
-pub(super) fn page(app: &WorkerApplication) -> crate::memory::page::PageResult {
-    use crate::memory::pool::{VerifiedBytes, VerifiedPage};
-    use crate::model::{ResourceClass, VersionMetadata, *};
-    let version = ObjectVersion {
-        object: ObjectId {
-            cache: definition().id,
-            key: CacheKey([0; 32]),
-        },
-        etag: StrongEtag::test_value("one"),
-    };
-    let id = PageId {
-        version: version.clone(),
-        number: PageNumber(0),
-    };
-    let cache = &version.object.cache;
-    let plaintext = VerifiedPage {
-        inner: Arc::new(VerifiedBytes {
-            page: id.clone(),
-            bytes: vec![1; 3],
-            reservation: app
-                .runtime
-                .admission
-                .reserve(Some(cache), ResourceClass::Plaintext, 3)
-                .unwrap(),
-        }),
-    };
-    let ciphertext = BufferPool::new(app.runtime.admission.clone())
-        .ciphertext(
-            app.runtime
-                .admission
-                .reserve(Some(cache), ResourceClass::Ciphertext, 19)
-                .unwrap(),
-            PageEnvelope {
-                page: id,
-                key_id: KeyId([7; 16]),
-                nonce: Nonce([2; 24]),
-                plaintext_length: 3,
-                ciphertext_length: 19,
-            },
-            vec![2; 19],
-        )
-        .unwrap();
-    crate::memory::page::PageResult {
-        plaintext,
-        ciphertext,
-        metadata: VersionMetadata {
-            version,
-            length: 3,
-            content_type: None,
-        }
-        .for_pin(),
-    }
-}
-
 #[test]
 fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill() {
-    let mut fixture = Fixture::new();
+    let mut fixture = ControlFixture::new();
     let mut config = fixture.config.take().unwrap();
     let node = Arc::new(NodeState::new(vec![WorkerId(0), WorkerId(1)], 64).unwrap());
     config.node = bootstrap(
@@ -284,7 +162,7 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
 
 #[test]
 fn two_workers_start_from_real_control_and_checkpoint_one_complete_cut() {
-    let mut fixture = Fixture::new();
+    let mut fixture = ControlFixture::new();
     let mut config = fixture.config.take().unwrap();
     let node = Arc::new(NodeState::new(vec![WorkerId(0), WorkerId(1)], 64).unwrap());
     config.node = bootstrap(
@@ -338,32 +216,9 @@ fn two_workers_start_from_real_control_and_checkpoint_one_complete_cut() {
     assert_eq!(fixture.enrollments.load(Ordering::Acquire), 2);
 }
 
-struct Fixture {
-    bundle: Arc<Mutex<wire::KeyringBundle>>,
-    keyring_override: Arc<Mutex<Option<(usize, Vec<u8>)>>>,
-    keyring_tokens: Arc<Mutex<Vec<String>>>,
-    reject_keyring_mtls: Arc<AtomicBool>,
-    handshake_alerts: Arc<Mutex<VecDeque<u8>>>,
-    directory: PathBuf,
-    stop: Arc<AtomicBool>,
-    server: Option<thread::JoinHandle<()>>,
-    config: Option<Config>,
-    enrollments: Arc<AtomicUsize>,
-    polls: Arc<AtomicUsize>,
-    binding: Arc<Mutex<NodeId>>,
-    bootstrap_status: Arc<AtomicUsize>,
-    poll_status: Arc<AtomicUsize>,
-    certificate_age: Arc<AtomicUsize>,
-    publication: Arc<Mutex<Option<wire::Publication>>>,
-    bootstrap_requests: Arc<Mutex<Vec<wire::EnrollmentRequest>>>,
-    poll_certificates: Arc<Mutex<Vec<Vec<u8>>>>,
-    hold_long_poll: Arc<AtomicBool>,
-    long_polls: Arc<AtomicUsize>,
-}
-
 #[test]
 fn startup_finishes_local_snapshot_installation_while_next_long_poll_is_held() {
-    let mut fixture = Fixture::new();
+    let mut fixture = ControlFixture::new();
     let mut config = fixture.config.take().unwrap();
     fixture.hold_long_poll.store(true, Ordering::Release);
     let node = Arc::new(NodeState::new(vec![WorkerId(0), WorkerId(1)], 64).unwrap());
@@ -461,7 +316,7 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
         assert!(!runtime.admission.is_stopped());
     }
 
-    let mut fixture = Fixture::new();
+    let mut fixture = ControlFixture::new();
     let mut config = fixture.config.take().unwrap();
     let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
     config.node = bootstrap(
@@ -674,7 +529,7 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
 #[test]
 fn removal_publication_finishes_locally_after_controller_disappears() {
     use crate::model::{KeyId, VersionMetadata, *};
-    let mut fixture = Fixture::new();
+    let mut fixture = ControlFixture::new();
     let mut config = fixture.config.take().unwrap();
     let diagnostic_address = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     config.diagnostics_listen = diagnostic_address.local_addr().unwrap();
@@ -844,7 +699,7 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
 
 #[test]
 fn startup_retries_tls_internal_error_before_enrollment_and_worker_snapshot() {
-    let mut fixture = Fixture::new();
+    let mut fixture = ControlFixture::new();
     let mut config = fixture.config.take().unwrap();
     let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
     fixture.handshake_alerts.lock().unwrap().push_back(80);
@@ -876,7 +731,7 @@ fn startup_retries_tls_internal_error_before_enrollment_and_worker_snapshot() {
 
 #[test]
 fn startup_tls_authentication_alert_remains_terminal() {
-    let mut fixture = Fixture::new();
+    let mut fixture = ControlFixture::new();
     let config = fixture.config.take().unwrap();
     let node = NodeState::new(vec![WorkerId(0)], 64).unwrap();
     fixture.handshake_alerts.lock().unwrap().push_back(42);
@@ -897,7 +752,7 @@ fn startup_tls_authentication_alert_remains_terminal() {
 
 #[test]
 fn startup_tls_internal_error_respects_deadline() {
-    let mut fixture = Fixture::new();
+    let mut fixture = ControlFixture::new();
     let config = fixture.config.take().unwrap();
     let node = NodeState::new(vec![WorkerId(0)], 64).unwrap();
     fixture.handshake_alerts.lock().unwrap().extend([80; 16]);
@@ -918,7 +773,7 @@ fn startup_tls_internal_error_respects_deadline() {
 
 #[test]
 fn startup_reauthenticates_retained_identity_and_fails_closed() {
-    let mut fixture = Fixture::new();
+    let mut fixture = ControlFixture::new();
     let config = fixture.config.take().unwrap();
     let start = || {
         let node = NodeState::new(vec![WorkerId(0)], 64).unwrap();
@@ -953,7 +808,7 @@ fn startup_reauthenticates_retained_identity_and_fails_closed() {
 fn node_replacement_drains_all_workers_and_restart_converges() {
     use crate::runtime::affinity::{EffectiveTopology, WorkerPair};
     for renewal_due in [false, true] {
-        let mut fixture = Fixture::new();
+        let mut fixture = ControlFixture::new();
         let mut config = fixture.config.take().unwrap();
         let node = Arc::new(NodeState::new(vec![WorkerId(0), WorkerId(1)], 64).unwrap());
         config.node = bootstrap(
@@ -1076,7 +931,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
         runtime::affinity::{EffectiveTopology, WorkerPair},
         store::checkpoint_format,
     };
-    let mut fixture = Fixture::new();
+    let mut fixture = ControlFixture::new();
     let mut config = fixture.config.take().unwrap();
     let node = Arc::new(NodeState::new(vec![WorkerId(0), WorkerId(1)], 64).unwrap());
     config.node = bootstrap(
@@ -1168,371 +1023,6 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
     assert_eq!(workers, vec![0, 1]);
     assert!(!node.observations.health.ready());
 }
-impl Fixture {
-    fn new() -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join(format!(
-                "app-fixture-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        ca_params.key_usages = vec![
-            rcgen::KeyUsagePurpose::KeyCertSign,
-            rcgen::KeyUsagePurpose::CrlSign,
-        ];
-        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
-        let ca = ca_params.self_signed(&ca_key).unwrap();
-        let server_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
-        let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
-        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
-        let cert = params.signed_by(&server_key, &ca, &ca_key).unwrap();
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(ca.der().clone()).unwrap();
-        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
-            Arc::new(roots),
-            Arc::new(rustls::crypto::ring::default_provider()),
-        )
-        .allow_unauthenticated()
-        .build()
-        .unwrap();
-        let tls = Arc::new(
-            rustls::ServerConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(
-                vec![cert.der().clone()],
-                rustls::pki_types::PrivatePkcs8KeyDer::from(server_key.serialize_der()).into(),
-            )
-            .unwrap(),
-        );
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let mut config = crate::test_support::cluster::config(false);
-        config.control_endpoint = format!("https://{}", listener.local_addr().unwrap());
-        config.trust_bundle = directory.join("trust.pem");
-        config.service_account_token = directory.join("token");
-        config.identity_directory = directory.join("identity");
-        config.slab_directory = directory.join("slabs");
-        config.slab_bytes = 256 * 1024 * 1024;
-        config.limits.range_window_pages = NonZeroUsize::new(2).unwrap();
-        config.limits.connections_per_neighbor = NonZeroUsize::new(2).unwrap();
-        config.limits.queue_entries = NonZeroUsize::new(64).unwrap();
-        config.shutdown_timeout = Duration::from_secs(2);
-        std::fs::write(&config.trust_bundle, ca.pem()).unwrap();
-        std::fs::write(&config.service_account_token, b"fixture.token").unwrap();
-        let bundle = wire::KeyringBundle {
-            schema_version: 1,
-            cluster: config.cluster.clone(),
-            generation: wire::BundleGeneration(1),
-            peer_trust_roots: vec![ca.der().to_vec()],
-            cache_keys: vec![],
-        };
-        let bundle = Arc::new(Mutex::new(bundle));
-        let served_bundle = bundle.clone();
-        let keyring_override = Arc::new(Mutex::new(None::<(usize, Vec<u8>)>));
-        let keyring_tokens = Arc::new(Mutex::new(Vec::new()));
-        let reject_keyring_mtls = Arc::new(AtomicBool::new(false));
-        let (key_override, key_tokens, reject_mtls) = (
-            keyring_override.clone(),
-            keyring_tokens.clone(),
-            reject_keyring_mtls.clone(),
-        );
-        let node = config.node.clone();
-        let binding = Arc::new(Mutex::new(node.clone()));
-        let current_binding = binding.clone();
-        let bootstrap_status = Arc::new(AtomicUsize::new(200));
-        let enrollment_status = bootstrap_status.clone();
-        let poll_status = Arc::new(AtomicUsize::new(200));
-        let snapshot_status = poll_status.clone();
-        let certificate_age = Arc::new(AtomicUsize::new(1));
-        let age = certificate_age.clone();
-        let publication = wire::Publication {
-            schema_version: 1,
-            cluster: config.cluster.clone(),
-            sequence: wire::PublicationSequence(1),
-            membership_version: crate::model::MembershipVersion(1),
-            members: vec![crate::topology::membership::Member {
-                node: node.clone(),
-                shares: std::num::NonZeroU32::new(1).unwrap(),
-                peer_endpoint: "127.0.0.1:7443".into(),
-                rails: vec![],
-                alignment_enabled: false,
-            }],
-            caches: vec![],
-        };
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopping = stop.clone();
-        let enrollments = Arc::new(AtomicUsize::new(0));
-        let issued = enrollments.clone();
-        let polls = Arc::new(AtomicUsize::new(0));
-        let polled = polls.clone();
-        let bootstrap_requests = Arc::new(Mutex::new(Vec::new()));
-        let requests = bootstrap_requests.clone();
-        let poll_certificates = Arc::new(Mutex::new(Vec::new()));
-        let certificates = poll_certificates.clone();
-        let published = Arc::new(Mutex::new(None::<wire::Publication>));
-        let external_publication = published.clone();
-        let handshake_alerts = Arc::new(Mutex::new(VecDeque::new()));
-        let alerts = handshake_alerts.clone();
-        let hold_long_poll = Arc::new(AtomicBool::new(false));
-        let held = hold_long_poll.clone();
-        let long_polls = Arc::new(AtomicUsize::new(0));
-        let waiting = long_polls.clone();
-        let ca = Arc::new(ca);
-        let ca_key = Arc::new(ca_key);
-        let server = thread::spawn(move || {
-            let mut handlers = Vec::new();
-            while !stopping.load(Ordering::Acquire) {
-                let (mut socket, _) = match listener.accept() {
-                    Ok(pair) => pair,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(1));
-                        continue;
-                    }
-                    Err(e) => panic!("fixture accept: {e}"),
-                };
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
-                socket
-                    .set_write_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
-                if let Some(alert) = alerts.lock().unwrap().pop_front() {
-                    // Read the complete ClientHello before sending Go's fatal
-                    // pre-handshake alert, avoiding a reset from unread TCP data.
-                    let mut header = [0; 5];
-                    socket.read_exact(&mut header).unwrap();
-                    let mut hello = vec![0; u16::from_be_bytes([header[3], header[4]]) as usize];
-                    socket.read_exact(&mut hello).unwrap();
-                    socket.write_all(&[21, 3, 3, 0, 2, 2, alert]).unwrap();
-                    continue;
-                }
-                let (
-                    tls,
-                    current_binding,
-                    external_publication,
-                    enrollment_status,
-                    snapshot_status,
-                ) = (
-                    tls.clone(),
-                    current_binding.clone(),
-                    external_publication.clone(),
-                    enrollment_status.clone(),
-                    snapshot_status.clone(),
-                );
-                let (requests, certificates, issued, polled, age) = (
-                    requests.clone(),
-                    certificates.clone(),
-                    issued.clone(),
-                    polled.clone(),
-                    age.clone(),
-                );
-                let (served_bundle, waiting, held, stopping) = (
-                    served_bundle.clone(),
-                    waiting.clone(),
-                    held.clone(),
-                    stopping.clone(),
-                );
-                let (ca, ca_key) = (ca.clone(), ca_key.clone());
-                let (key_override, key_tokens, reject_mtls) = (
-                    key_override.clone(),
-                    key_tokens.clone(),
-                    reject_mtls.clone(),
-                );
-                let mut publication = publication.clone();
-                handlers.push(thread::spawn(move || {
-                let mut stream = rustls::StreamOwned::new(
-                    rustls::ServerConnection::new(tls.clone()).unwrap(),
-                    socket,
-                );
-                let mut head = Vec::new();
-                loop {
-                    let mut byte = [0];
-                    if stream.read_exact(&mut byte).is_err() {
-                        break;
-                    }
-                    head.push(byte[0]);
-                    if head.ends_with(b"\r\n\r\n") {
-                        break;
-                    }
-                    assert!(head.len() <= 32768);
-                }
-                if !head.ends_with(b"\r\n\r\n") {
-                    return;
-                }
-                let head = String::from_utf8(head).unwrap();
-                let length: usize = head
-                    .lines()
-                    .find_map(|line| {
-                        line.split_once(':')
-                            .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-                            .map(|(_, v)| v.trim().parse().unwrap())
-                    })
-                    .unwrap_or(0);
-                let mut body = vec![0; length];
-                stream.read_exact(&mut body).unwrap();
-                let node = current_binding.lock().unwrap().clone();
-                if let Some(next) = external_publication.lock().unwrap().clone() {
-                    publication = next;
-                }
-                publication.members[0].node = node.clone();
-                let requested_status = if head.starts_with("GET /v1/keyring") {
-                    200
-                } else if head.starts_with("POST ") {
-                    assert!(head.contains("Authorization: Bearer fixture.token"));
-                    assert!(stream.conn.peer_certificates().is_none());
-                    requests
-                        .lock()
-                        .unwrap()
-                        .push(wire::decode_enrollment_request(&body).unwrap());
-                    enrollment_status.load(Ordering::Acquire)
-                } else {
-                    snapshot_status.load(Ordering::Acquire)
-                };
-                let (status, body) = if requested_status != 200 {
-                    let code = if requested_status == 503 {
-                        "unavailable"
-                    } else {
-                        "forbidden"
-                    };
-                    (
-                        requested_status,
-                        format!("{{\"code\":\"{code}\"}}").into_bytes(),
-                    )
-                } else if head.starts_with("GET /v1/keyring") {
-                    assert!(stream.conn.peer_certificates().is_some() || head.contains("Authorization: Bearer fixture.token"));
-                    if let Some(token) = head.lines().find_map(|line| line.strip_prefix("Authorization: Bearer ")) {
-                        key_tokens.lock().unwrap().push(token.to_owned());
-                    }
-                    let bundle = served_bundle.lock().unwrap();
-                    if reject_mtls.load(Ordering::Acquire) && stream.conn.peer_certificates().is_some() {
-                        (403, br#"{"code":"forbidden"}"#.to_vec())
-                    } else if let Some(response) = key_override.lock().unwrap().clone() {
-                        if response.0 == 0 { return; }
-                        response
-                    } else if head.lines().next().unwrap().contains(&format!("?after={} ", bundle.generation.0)) {
-                        (204, Vec::new())
-                    } else {
-                        (200, wire::encode_bundle(&bundle).unwrap())
-                    }
-                } else if head.starts_with("POST ") {
-                    assert!(head.contains("Authorization: Bearer fixture.token"));
-                    assert!(stream.conn.peer_certificates().is_none());
-                    let request = wire::decode_enrollment_request(&body).unwrap();
-                    let der = rustls::pki_types::CertificateSigningRequestDer::from(
-                        request.csr_der.clone(),
-                    );
-                    let mut csr = rcgen::CertificateSigningRequestParams::from_der(&der).unwrap();
-                    let not_before = std::time::SystemTime::now()
-                        - Duration::from_secs(age.load(Ordering::Acquire) as u64);
-                    csr.params.not_before = not_before.into();
-                    csr.params.not_after = (not_before + Duration::from_secs(86400)).into();
-                    csr.params.subject_alt_names = vec![rcgen::SanType::URI(
-                        format!("spiffe://{}/node/{}", request.cluster.0, node.0)
-                            .try_into()
-                            .unwrap(),
-                    )];
-                    csr.params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
-                    csr.params.extended_key_usages =
-                        vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-                    let cert = csr.signed_by(&ca, &ca_key).unwrap();
-                    issued.fetch_add(1, Ordering::Release);
-                    (
-                        200,
-                        wire::encode_enrollment_response(&wire::EnrollmentResponse {
-                            schema_version: 1,
-                            cluster: request.cluster,
-                            node: node.clone(),
-                            enrollment: request.enrollment,
-                            certificate_chain: vec![cert.der().to_vec()],
-                        })
-                        .unwrap(),
-                    )
-                } else {
-                    assert!(stream.conn.peer_certificates().is_some());
-                    certificates
-                        .lock()
-                        .unwrap()
-                        .push(stream.conn.peer_certificates().unwrap()[0].to_vec());
-                    polled.fetch_add(1, Ordering::Release);
-                    if head
-                        .lines()
-                        .next()
-                        .unwrap()
-                        .contains(&format!("?after={} ", publication.sequence.0))
-                    {
-                        waiting.fetch_add(1, Ordering::Release);
-                        while held.load(Ordering::Acquire) && !stopping.load(Ordering::Acquire) {
-                            thread::sleep(Duration::from_millis(1));
-                        }
-                        (204, Vec::new())
-                    } else {
-                        (200, wire::encode_publication(&publication).unwrap())
-                    }
-                };
-                let response = format!(
-                    "HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = stream
-                    .write_all(response.as_bytes())
-                    .and_then(|()| stream.write_all(&body))
-                    .and_then(|()| stream.flush());
-                }));
-                let mut i = 0;
-                while i < handlers.len() {
-                    if handlers[i].is_finished() {
-                        handlers.swap_remove(i).join().unwrap();
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-            for handler in handlers {
-                handler.join().unwrap();
-            }
-        });
-        Self {
-            bundle,
-            keyring_override,
-            keyring_tokens,
-            reject_keyring_mtls,
-            handshake_alerts,
-            directory,
-            stop,
-            server: Some(server),
-            config: Some(config),
-            enrollments,
-            polls,
-            binding,
-            bootstrap_status,
-            poll_status,
-            certificate_age,
-            bootstrap_requests,
-            poll_certificates,
-            publication: published,
-            hold_long_poll,
-            long_polls,
-        }
-    }
-}
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(server) = self.server.take() {
-            server.join().unwrap();
-        }
-        std::fs::remove_dir_all(&self.directory).unwrap();
-    }
-}
 fn drive<T>(
     runtime: &WorkerRuntime,
     engine: &mut dyn CryptoService,
@@ -1559,7 +1049,7 @@ fn drive<T>(
 }
 #[test]
 fn blocked_publication_is_superseded_while_projection_rotates() {
-    let mut fixture = Fixture::new();
+    let mut fixture = ControlFixture::new();
     let mut config = fixture.config.take().unwrap();
     let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
     config.node = bootstrap(
@@ -1652,7 +1142,7 @@ fn blocked_publication_is_superseded_while_projection_rotates() {
 
 #[test]
 fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
-    let mut fixture = Fixture::new();
+    let mut fixture = ControlFixture::new();
     let mut config = fixture.config.take().unwrap();
     let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
     {
@@ -1811,7 +1301,7 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
 
 #[test]
 fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
-    let mut fixture = Fixture::new();
+    let mut fixture = ControlFixture::new();
     let mut config = fixture.config.take().unwrap();
     let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
     let startup = scope(Duration::from_secs(15)).unwrap();

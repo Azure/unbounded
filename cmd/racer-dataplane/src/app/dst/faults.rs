@@ -598,7 +598,7 @@ impl Harness {
                     Ok(transition) => {
                         let node = &self.nodes[index];
                         let mut publication =
-                            integration_tests::publication(&node.config, self.generation, vec![]);
+                            test_support::publication(&node.config, self.generation, vec![]);
                         publication.membership_version = MembershipVersion(self.generation);
                         publication.members = members.clone();
                         node.workers[0]

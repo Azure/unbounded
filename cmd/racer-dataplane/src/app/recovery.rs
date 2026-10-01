@@ -381,7 +381,7 @@ mod tests {
         .unwrap()
     }
     fn caches() -> Vec<crate::control::caches::CacheDefinition> {
-        let mut cache = super::super::integration_tests::definition();
+        let mut cache = super::super::test_support::definition();
         cache.id = crate::model::CacheId(crate::security::identity::tests::CACHE.into());
         vec![cache]
     }

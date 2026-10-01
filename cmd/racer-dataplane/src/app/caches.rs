@@ -186,44 +186,23 @@ mod tests {
     fn publication_waits_for_every_worker_and_failed_acceptance_rolls_back_preparation() {
         let config = crate::test_support::cluster::config(false);
         let node = Arc::new(NodeState::default());
-        let admission = Rc::new(Admission::new(config.limits.clone()));
-        let (io, _engine) =
-            crate::runtime::crypto::pair(WorkerId(0), 0, config.limits.queue_entries);
-        let runtime = WorkerRuntime {
-            reactor: Rc::new(Reactor::new(admission.clone())),
-            admission,
-            crypto: Rc::new(crate::runtime::crypto::CryptoClient::new(io)),
-        };
-        let worker =
-            WorkerApplication::assemble(&config, node.clone(), WorkerId(0), runtime, Vec::new())
-                .unwrap();
+        let (mut worker, _, _) = super::super::test_support::local_worker(&config, &node, 0);
+        let (mut second, _, _) = super::super::test_support::local_worker(&config, &node, 1);
         let adapter = CachePublication {
             node: node.clone(),
             listeners: worker.prepared_listeners.clone(),
             capacity: config.limits.metadata_entries.get(),
         };
         assert!(matches!(adapter.stage(&[]), Err(Error::Unavailable)));
-        let startup = scope(Duration::from_secs(2)).unwrap();
-        *worker.prepared_listeners.borrow_mut() =
-            Some(futures::executor::block_on(worker.clients.prepare(&[], &startup)).unwrap());
-        node.cache_cut.lock().unwrap().prepared.insert(WorkerId(0));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        worker.poll_cache_preparation(&mut cx).unwrap();
         assert!(matches!(adapter.stage(&[]), Err(Error::Unavailable)));
         assert!(worker.prepared_listeners.borrow().is_some());
-        node.cache_cut.lock().unwrap().prepared.insert(WorkerId(1));
+        second.poll_cache_preparation(&mut cx).unwrap();
         let staged = adapter.stage(&[]).unwrap();
         drop(staged);
-        assert!(!node.cache_cut.lock().unwrap().committed);
-        assert!(
-            !node
-                .cache_cut
-                .lock()
-                .unwrap()
-                .prepared
-                .contains(&WorkerId(0))
-        );
-        *worker.prepared_listeners.borrow_mut() =
-            Some(futures::executor::block_on(worker.clients.prepare(&[], &startup)).unwrap());
-        node.cache_cut.lock().unwrap().prepared.insert(WorkerId(0));
+        assert!(matches!(adapter.stage(&[]), Err(Error::Unavailable)));
+        worker.poll_cache_preparation(&mut cx).unwrap();
         adapter.stage(&[]).unwrap().commit();
         assert!(node.cache_cut.lock().unwrap().committed);
         // A topology-only update reuses committed cache resources.
@@ -235,10 +214,10 @@ mod tests {
     fn capacity_failure_keeps_last_good_generation_and_uid_reuse_needs_no_tombstones() {
         let config = crate::test_support::cluster::config(false);
         let node = Arc::new(NodeState::default());
-        let definition = super::super::integration_tests::definition();
+        let definition = super::super::test_support::definition();
         let store = SnapshotStore::new(config.cluster.clone(), node.publications.clone(), 16);
         store
-            .publish(super::super::integration_tests::publication(
+            .publish(super::super::test_support::publication(
                 &config,
                 1,
                 vec![definition.clone()],

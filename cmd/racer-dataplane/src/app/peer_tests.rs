@@ -1,5 +1,5 @@
 //! Exercise assembled peer I/O, including socket session signatures and full paths.
-use super::integration_tests::local_worker;
+use super::test_support::local_worker;
 use super::*;
 
 #[test]
@@ -205,7 +205,7 @@ fn application() -> (WorkerApplication, WorkerRuntime, PageCryptoEngine) {
     config.limits.request_context_bytes =
         NonZeroUsize::new(protocol::MIN_REQUEST_CONTEXT_BYTES + 4 * 32 * 1024).unwrap();
     partition_limits(&config.limits, 1, false).unwrap();
-    integration_tests::local_worker(&config, &Arc::new(NodeState::default()), 0)
+    local_worker(&config, &Arc::new(NodeState::default()), 0)
 }
 
 #[test]

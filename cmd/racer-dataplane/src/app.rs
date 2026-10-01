@@ -1512,6 +1512,8 @@ mod dst;
 
 #[cfg(test)]
 mod integration_tests;
+#[cfg(test)]
+mod test_support;
 
 #[cfg(test)]
 mod lifetime_tests;
