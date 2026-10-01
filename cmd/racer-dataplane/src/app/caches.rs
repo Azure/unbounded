@@ -3,7 +3,7 @@ use super::*;
 use crate::runtime::collections::HashSet;
 use crate::{
     client::listener::PreparedListeners,
-    control::caches::{CacheDefinition, CacheLifecycle, CacheTransition},
+    control::caches::{CacheDefinition, CacheTransition},
 };
 use std::cell::RefCell;
 
@@ -14,7 +14,7 @@ pub(super) struct CacheCut {
     prepared: HashSet<WorkerId>,
     pub(super) committed: bool,
 }
-pub(super) struct Adapter {
+pub(crate) struct CachePublication {
     pub(super) node: Arc<NodeState>,
     pub(super) listeners: Rc<RefCell<Option<PreparedListeners>>>,
     pub(super) capacity: usize,
@@ -54,8 +54,11 @@ impl Drop for Transition {
         }
     }
 }
-impl CacheLifecycle for Adapter {
-    fn stage(&self, definitions: &[CacheDefinition]) -> Result<Box<dyn CacheTransition>> {
+impl CachePublication {
+    pub(crate) fn stage(
+        &self,
+        definitions: &[CacheDefinition],
+    ) -> Result<Box<dyn CacheTransition>> {
         crate::control::caches::validate_definitions(definitions)?;
         let mut cut = self.node.cache_cut.lock().map_err(|_| Error::Unavailable)?;
         if cut.generation == 0 || cut.definitions != definitions {
@@ -99,7 +102,7 @@ impl CacheLifecycle for Adapter {
 impl WorkerApplication {
     pub(super) fn attach_cache_adapter(&self) {
         if let (Some(control), Some(node)) = (&self.control, &self.node) {
-            control.attach_cache_lifecycle(Rc::new(Adapter {
+            control.attach_cache_publication(Rc::new(CachePublication {
                 node: node.clone(),
                 listeners: self.prepared_listeners.clone(),
                 capacity: self.runtime.admission.limits().metadata_entries.get(),
@@ -194,7 +197,7 @@ mod tests {
             crypto: Rc::new(crate::runtime::crypto::CryptoClient::new(io)),
         };
         let worker = WorkerApplication::assemble(&config, &node, WorkerId(0), runtime).unwrap();
-        let adapter = Adapter {
+        let adapter = CachePublication {
             node: node.clone(),
             listeners: worker.prepared_listeners.clone(),
             capacity: config.limits.metadata_entries.get(),
@@ -241,7 +244,7 @@ mod tests {
                 vec![definition.clone()],
             ))
             .unwrap();
-        let mut adapter = Adapter {
+        let mut adapter = CachePublication {
             node: node.clone(),
             listeners: Rc::new(RefCell::new(None)),
             capacity: 0,

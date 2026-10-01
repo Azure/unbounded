@@ -60,7 +60,7 @@ pub struct ControlClient {
     next: Cell<Option<Instant>>,
     active_scope: RefCell<Option<RequestScope>>,
     events: RefCell<Vec<CacheEvent>>,
-    lifecycle: RefCell<Option<Rc<dyn caches::CacheLifecycle>>>,
+    lifecycle: RefCell<Option<Rc<crate::app::caches::CachePublication>>>,
     projection_error: Cell<Option<Error>>,
     renewal_error: Cell<Option<Error>>,
     renew_next: Cell<Option<Instant>>,
@@ -318,7 +318,10 @@ impl ControlClient {
         self.key_transport.attach_io(io.clone());
         self.transport.attach_io(io);
     }
-    pub fn attach_cache_lifecycle(&self, lifecycle: Rc<dyn caches::CacheLifecycle>) {
+    pub(crate) fn attach_cache_publication(
+        &self,
+        lifecycle: Rc<crate::app::caches::CachePublication>,
+    ) {
         *self.lifecycle.borrow_mut() = Some(lifecycle);
     }
     pub fn projection_error(&self) -> Option<Error> {

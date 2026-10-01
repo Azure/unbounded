@@ -1002,7 +1002,7 @@ impl PreparedListeners {
         &self.definitions
     }
 
-    /// Infallible activation for CacheLifecycle::stage's prepared-resource handoff.
+    /// Infallible activation for the prepared cache publication handoff.
     /// The application serializes prepare/commit with cache stop/drain operations.
     /// Worker polling performs deferred pathname cleanup after this returns.
     pub fn commit(mut self) {

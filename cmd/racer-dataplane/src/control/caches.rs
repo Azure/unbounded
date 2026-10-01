@@ -33,9 +33,6 @@ pub enum CacheEvent {
 pub trait CacheTransition {
     fn commit(self: Box<Self>);
 }
-pub trait CacheLifecycle {
-    fn stage(&self, definitions: &[CacheDefinition]) -> Result<Box<dyn CacheTransition>>;
-}
 #[derive(Default)]
 pub struct CacheRegistry {
     current: RefCell<BTreeMap<CacheId, CacheDefinition>>,

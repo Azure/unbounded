@@ -295,7 +295,6 @@ pub(super) fn page(app: &WorkerApplication) -> crate::memory::page::PageResult {
 
 #[test]
 fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill() {
-    use crate::control::caches::CacheLifecycle;
     let mut fixture = Fixture::new();
     let mut config = fixture.config.take().unwrap();
     let node = Arc::new(NodeState::new(vec![WorkerId(0), WorkerId(1)], 64).unwrap());
@@ -342,7 +341,7 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
     let late1 = page(&second);
     first.memory.publish(late0.clone()).unwrap();
     second.memory.publish(late1.clone()).unwrap();
-    let adapter = caches::Adapter {
+    let adapter = caches::CachePublication {
         node: node.clone(),
         listeners: first.prepared_listeners.clone(),
         capacity: config.limits.metadata_entries.get(),
@@ -1724,16 +1723,6 @@ fn drive<T>(
 }
 #[test]
 fn blocked_publication_is_superseded_while_projection_rotates() {
-    use crate::control::caches::{CacheLifecycle, CacheTransition};
-    struct Blocked;
-    impl CacheLifecycle for Blocked {
-        fn stage(
-            &self,
-            _: &[crate::control::caches::CacheDefinition],
-        ) -> Result<Box<dyn CacheTransition>> {
-            Err(Error::Unavailable)
-        }
-    }
     let mut fixture = Fixture::new();
     let mut config = fixture.config.take().unwrap();
     let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
@@ -1752,7 +1741,8 @@ fn blocked_publication_is_superseded_while_projection_rotates() {
     )
     .unwrap();
     let control = worker.control.clone().unwrap();
-    control.attach_cache_lifecycle(Rc::new(Blocked));
+    // Drive control without polling worker preparation. The real rendezvous must
+    // keep publications pending until the worker prepares their resources.
     // This test drives key delivery explicitly below rather than the worker task.
     worker.keyring_task.take();
     *fixture.publication.lock().unwrap() = Some(publication(&config, 2, vec![definition()]));
@@ -1795,8 +1785,7 @@ fn blocked_publication_is_superseded_while_projection_rotates() {
         worker.snapshots.cursor().unwrap(),
         Some(wire::PublicationSequence(1))
     );
-    // Restore real resource staging. Only the newer publication may commit.
-    worker.attach_cache_adapter();
+    // Resume worker preparation. Only the newer publication may commit.
     let until = Instant::now() + Duration::from_secs(5);
     while worker.snapshots.cursor().unwrap() != Some(wire::PublicationSequence(3)) {
         assert!(Instant::now() < until);

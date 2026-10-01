@@ -1438,13 +1438,12 @@ impl Harness {
     }
 
     fn cache_recreate(&mut self) {
-        use crate::control::caches::CacheLifecycle;
         self.generation += 1;
         let members = self.members();
         let mut staged = Vec::new();
         for node in &mut self.nodes {
             node.app.control = node.control.clone();
-            staged.push(caches::Adapter {
+            staged.push(caches::CachePublication {
                 node: node.app.node.as_ref().unwrap().clone(),
                 listeners: node.app.prepared_listeners.clone(),
                 capacity: node.config.limits.metadata_entries.get(),

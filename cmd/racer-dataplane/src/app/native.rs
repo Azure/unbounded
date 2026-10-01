@@ -9,9 +9,19 @@ use crate::runtime::collections::HashMap;
 #[derive(Default)]
 pub(super) struct NativePairs {
     ports: Mutex<HashMap<WorkerId, NativePair>>,
-    numa: Mutex<HashMap<WorkerId, Option<usize>>>,
+    numa: Mutex<HashMap<WorkerId, NativePlacement>>,
 }
-type NativePair = (Option<IoPort>, Option<NativePort>);
+struct NativePair {
+    io: Option<IoPort>,
+    crypto: Option<NativePort>,
+}
+
+/// Absence of a placement allows simulated endpoints. A planned crypto role
+/// must have known NUMA locality before it can advertise aligned native rails.
+#[derive(Clone, Copy)]
+pub(super) struct NativePlacement {
+    pub(super) numa_node: Option<usize>,
+}
 
 pub(super) fn slot_count(limits: &Limits) -> Result<usize> {
     let charge = crate::rdma::native_slot_charge(crate::rdma::MAX_CIPHERTEXT)?;
@@ -24,11 +34,16 @@ impl NativePairs {
     pub(super) fn place(&self, plan: &AffinityPlan) -> Result<()> {
         let mut numa = self.numa.lock().map_err(|_| Error::Unavailable)?;
         for pair in &plan.pairs {
-            numa.insert(pair.worker, pair.crypto.numa_node);
+            numa.insert(
+                pair.worker,
+                NativePlacement {
+                    numa_node: pair.crypto.numa_node,
+                },
+            );
         }
         Ok(())
     }
-    pub(super) fn numa(&self, worker: WorkerId) -> Result<Option<Option<usize>>> {
+    pub(super) fn numa(&self, worker: WorkerId) -> Result<Option<NativePlacement>> {
         Ok(self
             .numa
             .lock()
@@ -49,7 +64,13 @@ impl NativePairs {
         let mut ports = self.ports.lock().map_err(|_| Error::Unavailable)?;
         for worker in workers {
             let (io, native) = crate::rdma::lifecycle::pair(slots)?;
-            ports.insert(worker, (Some(io), Some(native)));
+            ports.insert(
+                worker,
+                NativePair {
+                    io: Some(io),
+                    crypto: Some(native),
+                },
+            );
         }
         Ok(())
     }
@@ -59,7 +80,7 @@ impl NativePairs {
             .lock()
             .map_err(|_| Error::Unavailable)?
             .get_mut(&worker)
-            .and_then(|pair| pair.0.take()))
+            .and_then(|pair| pair.io.take()))
     }
     pub(super) fn crypto(
         &self,
@@ -71,7 +92,7 @@ impl NativePairs {
             .lock()
             .map_err(|_| Error::Unavailable)?
             .get_mut(&worker)
-            .and_then(|pair| pair.1.take());
+            .and_then(|pair| pair.crypto.take());
         Ok(match native {
             Some(native) => Box::new(WithNative::new(engine, native)),
             None => Box::new(engine),
@@ -100,10 +121,10 @@ impl WorkerApplication {
             return Ok(Vec::new());
         }
         let mut rails = member.rails.clone();
-        if let Some(numa) = self.native_numa {
+        if let Some(placement) = self.native_numa {
             // Native allocations are first-touched by this pinned crypto role.
             // Unknown topology cannot establish the aligned-locality contract.
-            let Some(numa) = numa else {
+            let Some(numa) = placement.numa_node else {
                 return Ok(Vec::new());
             };
             rails.retain(|rail| rail.numa_node == Some(numa));
@@ -225,7 +246,7 @@ mod tests {
     #[test]
     fn operator_profile_reaches_runtime_admission_and_progress_floors() {
         // Parse the actual deployed ConfigMap defaults, not a second test profile.
-        let manifest = include_str!("../../../deploy/racer/dataplane-config.yaml.tmpl");
+        let manifest = include_str!("../../../../deploy/racer/dataplane-config.yaml.tmpl");
         let values: std::collections::HashMap<_, _> = manifest
             .lines()
             .filter_map(|line| line.trim().split_once(": \""))
@@ -462,7 +483,10 @@ mod tests {
             .unwrap();
         for pair in &plan.pairs {
             assert_eq!(
-                native.numa(pair.worker).unwrap(),
+                native
+                    .numa(pair.worker)
+                    .unwrap()
+                    .map(|placement| placement.numa_node),
                 Some(pair.crypto.numa_node)
             );
             assert!(native.io(pair.worker).unwrap().is_some());
@@ -745,7 +769,7 @@ mod tests {
         app.fabric_ports[0].device = "test-device".into();
         app.fabric_ports[0].gid = None;
         let (mut worker, engine) = worker(&app, true, true);
-        worker.native_numa = Some(None);
+        worker.native_numa = Some(NativePlacement { numa_node: None });
         assert!(worker.native_publication().unwrap().is_empty());
         worker.native_numa = None;
         assert_eq!(worker.native_publication().unwrap().len(), 1);

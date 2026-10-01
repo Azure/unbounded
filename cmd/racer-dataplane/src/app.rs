@@ -84,16 +84,11 @@ use std::{
     time::Duration,
 };
 
-#[path = "app_caches.rs"]
-mod caches;
-#[path = "app_health.rs"]
+pub(crate) mod caches;
 mod health;
-#[path = "app_native.rs"]
 mod native;
 #[cfg(test)]
-#[path = "app_peer_tests.rs"]
 mod peer_tests;
-#[path = "app_recovery.rs"]
 mod recovery;
 
 pub struct Application {
@@ -540,11 +535,10 @@ pub struct WorkerApplication {
     devices: Option<Rc<Devices>>,
     fabric_ports: Vec<crate::rdma::FabricPort>,
     actual_rails: Vec<crate::topology::rails::RailMapping>,
-    native_numa: Option<Option<usize>>,
+    native_numa: Option<native::NativePlacement>,
     native_task: Option<Operation<'static, Vec<crate::topology::rails::RailMapping>>>,
     native_retry: std::time::Instant,
     telemetry: Rc<Telemetry>,
-    network: Rc<crate::peer::PeerNetwork>,
     directory: Arc<WorkerDirectory>,
     node: Option<Arc<NodeState>>,
     endpoint: Option<WorkerEndpoint>,
@@ -961,7 +955,6 @@ impl WorkerApplication {
             native_task: None,
             native_retry: crate::runtime::environment::now(),
             telemetry: Rc::new(telemetry),
-            network,
             directory: node.workers.clone(),
             node: None,
             endpoint: None,
@@ -1619,15 +1612,12 @@ impl WorkerService for WorkerApplication {
 }
 
 #[cfg(test)]
-#[path = "app_dst_tests.rs"]
 mod dst;
 
 #[cfg(test)]
-#[path = "app_integration_tests.rs"]
 mod integration_tests;
 
 #[cfg(test)]
-#[path = "app_lifetime_tests.rs"]
 mod lifetime_tests;
 
 #[cfg(test)]
@@ -1996,7 +1986,7 @@ pub(crate) mod tests {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             assert_eq!(worker.poll_budgeted(&mut cx, 0), Err(Error::Unavailable));
             assert_eq!(worker.poll_budgeted(&mut cx, 1), Err(Error::Unavailable));
-            // Admission bounds generations once for both actual worker networks.
+            // Admission bounds retained generations once across the node.
             let mut publication = crate::control::wire::decode_publication(include_bytes!(
                 "control/testdata/publication.json"
             ))
@@ -2007,12 +1997,6 @@ pub(crate) mod tests {
                 publication.sequence.0 = version as u64;
                 publication.membership_version.0 = version as u64;
                 let snapshot = worker.snapshots.publish(publication.clone()).unwrap();
-                for network in [&worker.network, &second.network] {
-                    assert!(Arc::ptr_eq(
-                        &snapshot.membership,
-                        &network.membership(snapshot.membership.version).unwrap()
-                    ));
-                }
                 requests.push(snapshot.membership.clone());
             }
             publication.sequence.0 += 1;
