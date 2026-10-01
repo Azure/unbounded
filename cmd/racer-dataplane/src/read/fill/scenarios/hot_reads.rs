@@ -323,6 +323,131 @@ fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
 }
 
 #[test]
+fn ordered_acquisition_window_is_not_an_unreleased_credit_ceiling() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
+    // Full-page batch, then a one-byte boundary with byte credit just below
+    // and exactly at the threshold for two additional full pages.
+    for (start, bytes, batch) in [
+        (0, 4 * PAGE_BYTES, 4),
+        (PAGE_BYTES - 1, 2 * PAGE_BYTES, 2),
+        (PAGE_BYTES - 1, 2 * PAGE_BYTES + 1, 3),
+    ] {
+        let signers = network(1);
+        let mut f = fixture_with(5 * PAGE_BYTES + 7, None);
+        f.reactor.init().unwrap();
+        let membership = Arc::new(
+            Membership::validate(
+                MembershipVersion(1),
+                vec![Member {
+                    node: signers[0].node().clone(),
+                    shares: NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: "127.0.0.1:8000".into(),
+                    rails: vec![],
+                    alignment_enabled: false,
+                }],
+            )
+            .unwrap(),
+        );
+        let (local, mut endpoint, _publication) =
+            coordinator(&f, &signers[0], &membership, Rc::new(NoPeer));
+        let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
+        let mut stream = futures::executor::block_on(local.read(
+            ClientRequest {
+                kind: ReadKind::Subscription {
+                    pin: Some(f.page.version.etag.clone()),
+                    range: Some(ByteRange::From(start)),
+                    page_credits: 4,
+                    byte_credits: bytes,
+                    ordered: true,
+                },
+                origin: OriginContext {
+                    object: f.context.object.clone(),
+                    metadata: None,
+                    authorization: None,
+                },
+            },
+            &scope,
+        ))
+        .unwrap()
+        .body
+        .unwrap();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut pump = |endpoint: &mut crate::read::dispatch::WorkerEndpoint| {
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            endpoint.poll(&mut cx, 64).unwrap();
+            crate::read::drivers::poll(&mut cx, 64);
+            f.engine.poll_budgeted(64).unwrap();
+            f.crypto.poll_budgeted(64).unwrap();
+            f.reactor.poll_budgeted(128).unwrap();
+        };
+        // Complete acquisitions without delivery: even four credits must not
+        // create more than the coordinator's two acquisition/ready slots.
+        for _ in 0..1024 {
+            stream.poll_prefetch(&mut cx);
+            pump(&mut endpoint);
+        }
+        assert_eq!(&*f.origin.started_pages.borrow(), &[0, 1]);
+        assert_eq!(stream.buffered_pages(), 2);
+        let mut slices = Vec::new();
+        for number in 0..batch {
+            let mut reader = None;
+            for _ in 0..2048 {
+                if let Poll::Ready(result) = stream.next_slice().as_mut().poll(&mut cx) {
+                    reader = result.unwrap();
+                    break;
+                }
+                assert!(stream.buffered_pages() <= 2);
+                pump(&mut endpoint);
+            }
+            let reader = reader.expect("client credits must permit the entire unreleased batch");
+            assert_eq!(reader.slice().page, PageNumber(number));
+            slices.push(reader.slice());
+            drop(reader); // Delivery completion does not release subscription credit.
+        }
+        for _ in 0..32 {
+            assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());
+            pump(&mut endpoint);
+        }
+        assert_eq!(f.origin.started_pages.borrow().len(), batch as usize);
+        // Partial first-page delivery still pins the entire admitted plaintext.
+        assert!(
+            f.fill
+                .dependencies
+                .admission
+                .used(crate::model::ResourceClass::Plaintext)
+                >= batch as usize * PAGE_BYTES as usize
+        );
+        let first = slices[0];
+        assert_eq!(
+            stream.release_page(first.page, first.length + 1),
+            Err(Error::InvalidRequest)
+        );
+        assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());
+        for slice in slices {
+            stream.release_page(slice.page, slice.length).unwrap();
+        }
+        let mut next = None;
+        for _ in 0..2048 {
+            if let Poll::Ready(result) = stream.next_slice().as_mut().poll(&mut cx) {
+                next = result.unwrap();
+                break;
+            }
+            assert!(stream.buffered_pages() <= 2);
+            pump(&mut endpoint);
+        }
+        assert_eq!(next.unwrap().slice().page, PageNumber(batch));
+        futures::executor::block_on(stream.cancel()).unwrap();
+        drop(stream);
+        for _ in 0..128 {
+            pump(&mut endpoint);
+        }
+        drop(pump);
+        endpoint.uninstall().unwrap();
+    }
+}
+
+#[test]
 fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fence() {
     let queue = Rc::new(crate::read::drivers::DriverQueue::default());
     let _owner = queue.enter();

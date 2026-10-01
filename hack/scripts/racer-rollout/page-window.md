@@ -40,11 +40,28 @@ configuration. Dependencies are the existing Python 3/PyYAML/kubectl tools.
 
 Gantry passes `RacerPageWindow` into the SDK (`cmd/gantry/agent_racer.go:243-253`),
 which uses it for page and byte credits (`pkg/racersdk/subscription.go:92-104`).
-Ordered Racer acquisition uses **min(configured range window, client credits)**
-(`cmd/racer-dataplane/src/read/range_stream.rs:259-266`). Raising only one from
-1 to 2 cannot increase that effective acquisition window. This is a staged
+Ordered Racer acquisition uses **min(configured range window, available client
+page credits)**, also constrained by exact slice byte credits
+(`cmd/racer-dataplane/src/read/range_stream.rs`, `configure_subscription` and
+`poll_ordered`). The server window bounds acquiring/ready pages, not delivered
+but unreleased leases. A server window of 2 with four client credits can deliver
+four pages before a batch release. Raising only one setting from 1 to 2 cannot
+increase the maximum concurrent acquisition window. This is a staged
 two-setting experiment, not a single-variable claim. Gantry-only is a control
 stage, but its SDK buffer allowance still changes.
+
+Racer's retained plaintext is separate from acquisition-window occupancy, not
+unaccounted memory. Credit is reserved before dispatch and remains consumed
+through delivery until exact release. Ready plus retained assignments therefore
+stay within the client page-credit limit (at most 64); delivered leases retain
+`VerifiedPage` references and their original full-allocation admission charges
+(`src/read/subscription.rs`, `Credits`; `src/memory/pool.rs`, `VerifiedBytes`,
+relative to `cmd/racer-dataplane`). Byte credits count the requested slice, while
+a boundary slice can pin a whole page: do not equate client byte credits with
+server plaintext memory. For a contiguous range, full backing can exceed the
+charged slice bytes by less than two pages, and is also bounded by page credits
+times page size and the existing worker/cache plaintext admission limits. No
+memory budget is raised and allocation pressure can still reject acquisition.
 
 SDK ordered buffering is capped at two pages (`pkg/racersdk/ordered.go:27-30`);
 the single-credit test checks resident storage and reuse

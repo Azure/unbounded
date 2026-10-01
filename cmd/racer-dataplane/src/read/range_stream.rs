@@ -242,7 +242,8 @@ impl RangeStream {
     /// Drive admitted acquisitions while the current slice encounters client
     /// backpressure. Completed pages leave their acquisition scopes promptly;
     /// new subscription work requires credit and ordered work also requires room
-    /// in the configured window, including delivered but unreleased pages.
+    /// in the acquisition window. Delivered leases consume client credit, not
+    /// acquisition slots; their full plaintext allocations remain admitted.
     pub(crate) fn poll_prefetch(&mut self, cx: &mut Context<'_>) {
         if self.terminated || self.prefetch_error.is_some() {
             return;
@@ -265,7 +266,10 @@ impl RangeStream {
         if self.subscription.as_ref().unwrap().exhausted() {
             self.next_page = None;
         }
-        while self.ready.len() + self.retained.len() < self.window_pages {
+        // Credit is reserved before dispatch and covers ready plus retained
+        // pages. Retained VerifiedPage clones keep their original full allocation
+        // charges, even when byte credit accounts only a partial boundary slice.
+        while self.ready.len() < self.window_pages {
             if self
                 .ready
                 .iter()
@@ -709,6 +713,101 @@ mod tests {
                 }),
             },
         }
+    }
+
+    #[test]
+    fn retained_boundary_slices_keep_full_plaintext_charged_until_exact_release() {
+        use crate::{
+            memory::pipe::PipePool,
+            model::{MembershipVersion, RequestId, ResourceClass, WorkerId},
+            runtime::{admission::Admission, reactor::Reactor, worker::WorkerMap},
+            topology::membership::Membership,
+        };
+        let admission = Rc::new(Admission::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let reactor = Rc::new(Reactor::new(admission.clone()));
+        let directory = Arc::new(
+            WorkerDirectory::new(
+                Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
+                vec![WorkerId(0)],
+                2,
+            )
+            .unwrap(),
+        );
+        let streams = RangeStreams::new(
+            directory,
+            Rc::new(Delivery::new(
+                Rc::new(PipePool::new(admission.clone(), reactor)),
+                Duration::from_secs(30),
+            )),
+            2,
+        );
+        let mut metadata = metadata();
+        metadata.length = 2 * PAGE_BYTES;
+        let range = ByteRange::Closed {
+            first: PAGE_BYTES - 1,
+            last: PAGE_BYTES,
+        }
+        .resolve(metadata.length)
+        .unwrap();
+        let scope = RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        let mut stream = streams
+            .open(
+                metadata.clone(),
+                range,
+                OriginContext {
+                    object: metadata.version.object.clone(),
+                    metadata: None,
+                    authorization: None,
+                },
+                Arc::new(Membership::validate(MembershipVersion(1), vec![]).unwrap()),
+                scope,
+            )
+            .unwrap();
+        for number in 0..2 {
+            stream.ready.push_back((
+                PageNumber(number),
+                WindowPage::Ready(Ok(page_result(&admission, &metadata, number))),
+            ));
+        }
+        stream.configure_subscription(4, PAGE_BYTES, true).unwrap();
+        for number in 0..2 {
+            let reader = futures::executor::block_on(stream.next_slice())
+                .unwrap()
+                .unwrap();
+            assert_eq!(reader.slice().page, PageNumber(number));
+            assert_eq!(reader.slice().length, 1);
+            drop(reader);
+        }
+        assert_eq!(stream.retained.len(), 2);
+        // Idle recycled buffers are still charged; reclaim only those to isolate
+        // the unreleased leases, which must remain charged despite reclamation.
+        admission.reclaim_buffers();
+        assert_eq!(
+            admission.used(ResourceClass::Plaintext),
+            2 * PAGE_BYTES as usize
+        );
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+        assert_eq!(
+            stream.release_page(PageNumber(0), 2),
+            Err(Error::InvalidRequest)
+        );
+        assert_eq!(
+            admission.used(ResourceClass::Plaintext),
+            2 * PAGE_BYTES as usize
+        );
+        stream.release_page(PageNumber(0), 1).unwrap();
+        admission.reclaim_buffers();
+        assert_eq!(
+            admission.used(ResourceClass::Plaintext),
+            PAGE_BYTES as usize
+        );
+        futures::executor::block_on(stream.cancel()).unwrap();
+        admission.reclaim_buffers();
+        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+        assert!(stream.retained.is_empty());
     }
 
     #[test]
