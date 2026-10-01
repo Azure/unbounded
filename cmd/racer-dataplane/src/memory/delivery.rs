@@ -820,7 +820,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_expired_and_disconnected_readers_release_resources() {
+    fn canceled_expired_and_disconnected_readers_release_resources() {
         let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
         for failure in [Error::Cancelled, Error::DeadlineExceeded, Error::Io] {
             let mut scope = scope();
@@ -910,7 +910,7 @@ mod tests {
     }
 
     #[test]
-    fn stalled_reader_times_out_without_cancelling_another_reader() {
+    fn stalled_reader_times_out_without_canceling_another_reader() {
         let (admission, reactor, delivery) = setup(2, Duration::from_millis(25));
         let page = page(&admission, vec![0x5a; 512 * 1024]);
         let weak = Arc::downgrade(&page.inner);

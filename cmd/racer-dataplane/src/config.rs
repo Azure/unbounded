@@ -291,7 +291,7 @@ impl Config {
     }
 
     /// Check arithmetic and progress reserves; filesystem alignment is additionally
-    /// discovered and checked by store::slab at open, not guessed from this config.
+    /// discovered and checked when opening the slabs, not guessed from this config.
     pub fn validate(&self) -> Result<()> {
         self.page_hedge.validate()?;
         self.peer_admission.validate()?;

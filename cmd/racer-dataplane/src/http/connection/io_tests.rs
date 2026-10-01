@@ -696,7 +696,7 @@ fn dropped_checkout_and_destroyed_pool_release_quota_only_after_connect_fence() 
     }
 }
 #[test]
-fn cancelled_receive_retains_resources_until_completion_and_reports_cancelled() {
+fn canceled_receive_retains_resources_until_completion_and_reports_canceled() {
     let (admission, reactor, io, scope) = setup();
     reactor.init().unwrap();
     let baseline = admission.used(ResourceClass::RequestContext);

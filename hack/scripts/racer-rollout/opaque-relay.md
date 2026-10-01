@@ -8,12 +8,18 @@ bytes unchanged. Missing relay entries become explicit `"true"`; existing litera
 or edits affecting unrelated alias consumers fail closed. This is not a generic
 environment editor.
 
-Production reachability: `cmd/racer-dataplane/src/config.rs:168-172` parses the
-setting, `src/app.rs:898` installs it, and `src/peer/server.rs:319-385` selects
-ciphertext streaming only for intermediate HTTP hops without an admitted native
-transfer. The bounded pipe path is `src/http/relay.rs:36-136`; correctness tests at
-`src/peer/opaque_tests.rs:378-425,440-452` check payload equality, decryption,
-bounded transit admission, keepalive, fallback and truncation. This retains the
+Production reachability (paths relative to `cmd/racer-dataplane`):
+`Config::from_lookup` in `src/config.rs` parses the setting,
+`WorkerApplication::assemble` in `src/app.rs` installs it, and
+`PeerServer::serve_connection` in `src/peer/server.rs` selects ciphertext streaming
+only for intermediate HTTP hops without an admitted native transfer.
+The bounded pipe path is `HttpIo::relay_body` in `src/http/connection.rs`.
+In `src/peer/tests/opaque.rs`,
+`signed_full_page_bootstrap_and_page_stream_without_transit_allocation` checks
+payload equality, decryption, bounded transit admission, keepalive and fallback;
+`signed_materialized_full_page_bootstrap_and_page_keepalive` covers the disabled
+streaming path, and `signed_success_truncation_closes_relay_and_pooled_destination`
+covers truncation. This retains the
 user design's encrypted transit and integrity requirements (`~/design.md:15-19,39`)
 and does not alter its bounded routing (`:29-33`). No throughput gain is promised.
 It does not fix the separate current Gantry subscription-copy versus design-splice

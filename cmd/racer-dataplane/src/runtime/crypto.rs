@@ -613,9 +613,9 @@ impl CryptoClient {
                 };
                 waiter.waker = cx.waker().clone();
                 if let Some(completion) = waiter.result.take() {
-                    let cancelled = waiter.abandoned;
+                    let canceled = waiter.abandoned;
                     waiters.remove(&id);
-                    if cancelled {
+                    if canceled {
                         return Poll::Ready(Err(Error::Cancelled));
                     }
                     if let Err(error) = scope.check() {

@@ -9,7 +9,8 @@ Every kubectl invocation pins context `joolshev-scale-test` and namespace
 ## Compatibility, motivation, and risk
 
 Production source reviewed at **3645eaefd67342f9dd193f68b0a9cc52e220139f**
-(the following Rust line references are at that commit, not newer HEAD):
+(line references describe that commit; symbol references below were refreshed
+after the readability refactor, relative to `cmd/racer-dataplane/src`):
 
 - `cmd/racer-dataplane/src/config.rs:173-178` accepts explicit 3 and 5, defaulting
   to 5. Default support does not override the currently explicit 3.
@@ -17,12 +18,15 @@ Production source reviewed at **3645eaefd67342f9dd193f68b0a9cc52e220139f**
   `Paths` and `PeerNetwork`. `peer.rs:60-69` validates neighbors using the selected
   graph. One dataplane setting controls both; there is no second routing knob.
 - `cmd/racer-dataplane/src/topology.rs:12-39` defines V5 radix32 versus V3 radix18,
-  with a 64-neighbor capacity/first-hop mask. `topology/graph.rs:34-53` constructs
-  the versioned edges. V3 and V5 are different graphs, not interchangeable peers.
-- `topology/paths.rs:44-45` keeps normal/failure link budgets at 4/8.
-  `topology/paths.rs:770-835` tests 1500 balanced source/destination pairs against
+  with a 64-neighbor capacity/first-hop mask. `Graph::neighbors` and
+  `neighbor_positions_for` in `topology/routing.rs` construct the versioned edges.
+  V3 and V5 are different graphs, not interchangeable peers.
+- `NORMAL_LINKS` and `FAILURE_LINKS` in `topology/routing.rs` keep budgets at 4/8.
+  `v5_default_reduces_hops_on_balanced_deterministic_pairs` in
+  `topology/routing/scenarios.rs` tests 1500 balanced source/destination pairs against
   independent shortest paths, sync/async agreement and hop-by-hop forwarding,
-  asserting over 10% fewer total links. `topology/paths.rs:1745-1835` checks V5 at
+  asserting over 10% fewer total links. In the same file,
+  `default_hundred_thousand_member_routes_at_every_distance_are_bounded` checks V5 at
   100,000 members with both budgets: <=64 candidates, bounded search quanta,
   expansions/edges/visited entries, cache capacity and released search admissions.
   These assertions were read, not rerun or represented as new Rust test results.

@@ -141,7 +141,12 @@ winner election, not just at publication (`D/read/fill.rs:1016-1038`). This is
 New regressions cover stalled-primary/fast-miss fallback through the third
 candidate, primary and secondary stale refresh, full 16 MiB pages at exact
 32/48/64 MiB quotas, AEAD-valid conflicting length/content type, and accepted
-crypto cancellation/fencing (`D/read/fill_peer_tests.rs:386-751`). Existing
+crypto cancellation/fencing (in `D/read/fill/scenarios/peer_copies.rs`:
+`hedge_stalled_primary_copy_miss_keeps_time_and_credits_for_later_acquire`,
+`hedge_stale_membership_refreshes_once_without_fresh_credits`,
+`hedge_full_page_exact_plaintext_quotas_suppress_before_spending_serial_credits`,
+`hedge_authenticated_metadata_conflict_cannot_win_over_retained_descriptor`, and
+`hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence`). Existing
 singleflight and immutable-deadline assertions remain in place.
 
 Malformed contender-local HTTP/wire parsing (`InvalidRequest`, `HeaderTooLarge`)

@@ -50,7 +50,7 @@ fn non_listener_worker_installs_nonempty_cache_set_without_binding_paths() {
 }
 
 #[test]
-fn snapshot_refresh_retries_cancelled_publication_and_applies_skipped_removal() {
+fn snapshot_refresh_retries_canceled_publication_and_applies_skipped_removal() {
     use crate::control::wire;
 
     let config = crate::test_support::cluster::config(false);
@@ -106,7 +106,7 @@ fn snapshot_refresh_retries_cancelled_publication_and_applies_skipped_removal() 
     assert_eq!(index.snapshot_metadata(), vec![metadata.clone()]);
 
     // The worker need not observe the intervening empty cache set to retire the
-    // old UID. A cancelled refresh must not mark the replacement as installed.
+    // old UID. A canceled refresh must not mark the replacement as installed.
     worker
         .snapshots
         .publish(test_support::publication(&config, 2, vec![]))
@@ -126,9 +126,9 @@ fn snapshot_refresh_retries_cancelled_publication_and_applies_skipped_removal() 
     assert_eq!(retained_plaintext.strong_count(), 1);
     assert_eq!(retained_ciphertext.strong_count(), 1);
     assert_eq!(index.snapshot_metadata(), vec![metadata]);
-    let cancelled = scope(Duration::from_secs(1)).unwrap();
-    cancelled.cancel().unwrap();
-    assert_eq!(worker.refresh_snapshot(&cancelled), Err(Error::Cancelled));
+    let canceled = scope(Duration::from_secs(1)).unwrap();
+    canceled.cancel().unwrap();
+    assert_eq!(worker.refresh_snapshot(&canceled), Err(Error::Cancelled));
     assert_eq!(worker.caches, vec![original]);
     assert_eq!(
         worker.snapshot_sequence,
@@ -145,8 +145,8 @@ fn snapshot_refresh_retries_cancelled_publication_and_applies_skipped_removal() 
         worker.snapshot_sequence,
         Some(crate::control::wire::PublicationSequence(3))
     );
-    // An unchanged publication is a no-op, even when the supplied scope is cancelled.
-    worker.refresh_snapshot(&cancelled).unwrap();
+    // An unchanged publication is a no-op, even when the supplied scope is canceled.
+    worker.refresh_snapshot(&canceled).unwrap();
     assert!(worker.memory.get(&page_id).unwrap().is_none());
     assert!(index.snapshot_metadata().is_empty());
     assert!(worker.peer_task.is_none());

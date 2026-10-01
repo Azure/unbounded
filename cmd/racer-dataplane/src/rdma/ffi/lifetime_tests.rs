@@ -193,7 +193,7 @@ pub(crate) fn fresh_fixture() -> (Rc<NativeQueuePair>, Rc<NativeRegion>, QuotaOb
 }
 
 #[test]
-fn cancelled_waiter_retains_source_and_quota_until_terminal_fence() {
+fn canceled_waiter_retains_source_and_quota_until_terminal_fence() {
     let (qp, region, charged) = fixture();
     let ticket = qp.write(region.clone(), 4096, 7).unwrap();
     drop(ticket);
