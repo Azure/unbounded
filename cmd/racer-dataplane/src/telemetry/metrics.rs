@@ -1,11 +1,23 @@
 //! Fixed metric names; only installed runtime worker IDs are exposed as labels.
+//!
+//! Integrity diagnostics are two independent axes, not a reason/source matrix:
+//! - `racer_crypto_decrypt_{crc,aead}_rejected_total` counts the exact failed
+//!   check once at completion reap, including abandoned jobs. Structural errors,
+//!   missing keys, and cancellation are not classified as CRC or AEAD failures.
+//! - `racer_fill_decrypt_{disk,retained,peer}_corrupt_total` counts CorruptRecord
+//!   results observed by the fill decrypt helper (including its structural checks).
+//!   Retained includes memory, flights, and pending writes, even for copies first
+//!   read from disk or peers. Earlier read/response parsing failures are excluded.
+//! These counters count attempts, not unique records or corrupt client deliveries,
+//! and identify rejection/check location, not where corruption originated. Source
+//! totals need not equal crypto totals, especially with abandoned fill waiters.
 use crate::{error::Result, model::WorkerId, runtime::admission::AdmissionUsage};
 use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicU64, Ordering},
 };
 
-pub const EVENT_COUNT: usize = 70;
+pub const EVENT_COUNT: usize = 75;
 pub const GAUGE_COUNT: usize = 13;
 #[derive(Clone, Copy)]
 pub(crate) enum LookupTier {
@@ -127,6 +139,11 @@ pub enum Event {
     PeerPageBodyCount,
     PeerPageBodyNs,
     PeerPageCensored,
+    CryptoDecryptCrcRejected,
+    CryptoDecryptAeadRejected,
+    FillDecryptDiskCorrupt,
+    FillDecryptRetainedCorrupt,
+    FillDecryptPeerCorrupt,
 }
 pub const EVENTS: [Event; EVENT_COUNT] = [
     Event::PageHedgeStarted,
@@ -199,6 +216,11 @@ pub const EVENTS: [Event; EVENT_COUNT] = [
     Event::PeerPageBodyCount,
     Event::PeerPageBodyNs,
     Event::PeerPageCensored,
+    Event::CryptoDecryptCrcRejected,
+    Event::CryptoDecryptAeadRejected,
+    Event::FillDecryptDiskCorrupt,
+    Event::FillDecryptRetainedCorrupt,
+    Event::FillDecryptPeerCorrupt,
 ];
 impl Event {
     pub fn name(self) -> &'static str {
@@ -273,6 +295,11 @@ impl Event {
             Self::PeerPageBodyCount => "racer_peer_page_body_nanoseconds_count",
             Self::PeerPageBodyNs => "racer_peer_page_body_nanoseconds_sum",
             Self::PeerPageCensored => "racer_peer_page_censored_total",
+            Self::CryptoDecryptCrcRejected => "racer_crypto_decrypt_crc_rejected_total",
+            Self::CryptoDecryptAeadRejected => "racer_crypto_decrypt_aead_rejected_total",
+            Self::FillDecryptDiskCorrupt => "racer_fill_decrypt_disk_corrupt_total",
+            Self::FillDecryptRetainedCorrupt => "racer_fill_decrypt_retained_corrupt_total",
+            Self::FillDecryptPeerCorrupt => "racer_fill_decrypt_peer_corrupt_total",
         }
     }
 }
@@ -536,6 +563,43 @@ impl Metrics {
 mod tests {
     use super::*;
     use crate::{model::ResourceClass, runtime::admission::Admission};
+
+    #[test]
+    fn integrity_diagnostics_have_fixed_names_and_saturating_sharded_counts() {
+        let workers = Metrics::for_workers(2).unwrap();
+        let events = [
+            Event::CryptoDecryptCrcRejected,
+            Event::CryptoDecryptAeadRejected,
+            Event::FillDecryptDiskCorrupt,
+            Event::FillDecryptRetainedCorrupt,
+            Event::FillDecryptPeerCorrupt,
+        ];
+        for event in events {
+            workers[0].record(event, u64::MAX).unwrap();
+            workers[0].record(event, 1).unwrap();
+            workers[1].record(event, 1).unwrap();
+            assert_eq!(workers[1].count(event), u64::MAX);
+        }
+        let mut output = String::new();
+        workers[1].write_prometheus(&mut output).unwrap();
+        for event in events {
+            assert!(output.contains(&format!(
+                "# TYPE {} counter\n{} {}\n",
+                event.name(),
+                event.name(),
+                u64::MAX
+            )));
+        }
+        assert!(!output.contains('{'), "no identity or content labels");
+        assert_eq!(
+            EVENTS
+                .iter()
+                .map(|e| e.name())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            EVENT_COUNT
+        );
+    }
 
     #[test]
     fn worker_quota_gauges_follow_authoritative_reservations() {

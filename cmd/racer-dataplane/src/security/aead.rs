@@ -8,6 +8,7 @@ use crate::{
         admission::Reservation,
         crypto::{
             CryptoClient, CryptoCompletion, CryptoInput, CryptoJob, CryptoOutcome, CryptoOutput,
+            CryptoPermit, IntegrityRejection,
         },
         deadline::RequestScope,
         reactor::IoBuffer,
@@ -174,7 +175,7 @@ impl PageCryptoEngine {
             key,
             scope,
         } = job;
-        let outcome = match Self::prepare(&input, &key, &scope) {
+        let outcome = match Self::prepare(&input, &key, &scope, &mut permit) {
             Err(error) => CryptoOutcome::Failed { input, error },
             Ok((envelope, bytes)) => Self::complete(input, envelope, bytes),
         };
@@ -193,6 +194,7 @@ impl PageCryptoEngine {
         input: &CryptoInput,
         key: &super::identity::KeyLease,
         scope: &RequestScope,
+        permit: &mut CryptoPermit,
     ) -> Result<(PageEnvelope, Zeroizing<Vec<u8>>)> {
         scope.check()?;
         let cipher = XChaCha20Poly1305::new(key.material(KeyPurpose::Page)?.into());
@@ -248,7 +250,9 @@ impl PageCryptoEngine {
                 plaintext,
             } => {
                 let envelope = ciphertext.envelope();
-                ciphertext.verify_checksum()?;
+                ciphertext.verify_checksum().inspect_err(|_| {
+                    permit.rejected(IntegrityRejection::Crc);
+                })?;
                 if key.cache() != &envelope.page.version.object.cache || key.id() != envelope.key_id
                 {
                     return Err(Error::MissingKey);
@@ -275,7 +279,10 @@ impl PageCryptoEngine {
                             .map_err(|_| Error::CorruptRecord)?,
                         &tag,
                     )
-                    .map_err(|_| Error::CorruptRecord)?;
+                    .map_err(|_| {
+                        permit.rejected(IntegrityRejection::Aead);
+                        Error::CorruptRecord
+                    })?;
                 (envelope.clone(), bytes)
             }
         };

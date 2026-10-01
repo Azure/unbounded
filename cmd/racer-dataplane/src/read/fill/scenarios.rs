@@ -763,6 +763,9 @@ fn cached_corrupt_ciphertext_falls_back_without_exposing_plaintext() {
         2,
         "bad cached copy then retained original"
     );
+    assert_eq!(metrics.count(Event::FillDecryptRetainedCorrupt), 1);
+    assert_eq!(metrics.count(Event::FillDecryptDiskCorrupt), 0);
+    assert_eq!(metrics.count(Event::FillDecryptPeerCorrupt), 0);
     assert_eq!(f.origin.calls.get(), 1);
 }
 

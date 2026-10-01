@@ -524,7 +524,18 @@ fn measurements_account_once_at_reap_even_for_cancel_and_abandon() {
     ));
     let keys = keyring();
     for decrypt in [false, true] {
-        for mode in ["success", "failure", "cancel", "abandon"] {
+        for mode in [
+            "success",
+            "failure",
+            "cancel",
+            "abandon",
+            "aead",
+            "malformed",
+            "abandon_crc",
+        ] {
+            if !decrypt && matches!(mode, "aead" | "malformed" | "abandon_crc") {
+                continue;
+            }
             let (io, mut engine) = pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
             let client = CryptoClient::new(io);
             let metrics = Metrics::default();
@@ -564,8 +575,19 @@ fn measurements_account_once_at_reap_even_for_cancel_and_abandon() {
                     panic!("encrypted")
                 };
                 drop(plain);
-                if mode == "failure" {
-                    Arc::get_mut(&mut ciphertext.inner).unwrap().bytes[0] ^= 1;
+                if matches!(mode, "failure" | "aead" | "abandon_crc") {
+                    let inner = Arc::get_mut(&mut ciphertext.inner).unwrap();
+                    inner.bytes[0] ^= 1;
+                    if mode == "aead" {
+                        // Peer bytes without a persisted CRC must still fail AEAD.
+                        inner.checksum = std::sync::OnceLock::new();
+                    }
+                }
+                if mode == "malformed" {
+                    Arc::get_mut(&mut ciphertext.inner)
+                        .unwrap()
+                        .envelope
+                        .ciphertext_length += 1;
                 }
                 data = CryptoInput::Decrypt {
                     ciphertext,
@@ -601,11 +623,26 @@ fn measurements_account_once_at_reap_even_for_cancel_and_abandon() {
             assert!(engine.complete(completion).is_ok());
             let events = measurement_events(decrypt);
             assert_eq!(metrics.count(events[0]), 0);
-            if mode == "abandon" {
+            assert_eq!(metrics.count(CryptoDecryptCrcRejected), 0);
+            assert_eq!(metrics.count(CryptoDecryptAeadRejected), 0);
+            if matches!(mode, "abandon" | "abandon_crc") {
                 drop(future);
             } else {
                 client.poll_budgeted(1).unwrap();
-                assert!(future.as_mut().poll(&mut cx).is_ready());
+                match future.as_mut().poll(&mut cx) {
+                    Poll::Ready(Ok(_)) => assert_eq!(mode, "success"),
+                    Poll::Ready(Err(error)) => assert_eq!(
+                        error,
+                        if mode == "cancel" {
+                            Error::Cancelled
+                        } else if !decrypt {
+                            Error::MissingKey
+                        } else {
+                            Error::CorruptRecord
+                        }
+                    ),
+                    Poll::Pending => panic!("completion not returned"),
+                }
             }
             client.poll_budgeted(1).unwrap();
             client.poll_budgeted(1).unwrap();
@@ -623,6 +660,16 @@ fn measurements_account_once_at_reap_even_for_cancel_and_abandon() {
                 assert_eq!(metrics.count(event), expected, "{mode} {event:?}");
             }
             assert_eq!(client.outstanding(), 0);
+            assert_eq!(
+                metrics.count(CryptoDecryptCrcRejected),
+                u64::from(decrypt && matches!(mode, "failure" | "abandon_crc")),
+                "{mode}"
+            );
+            assert_eq!(
+                metrics.count(CryptoDecryptAeadRejected),
+                u64::from(mode == "aead"),
+                "{mode}"
+            );
         }
     }
 }

@@ -128,6 +128,14 @@ struct Measurement {
     submitted: Option<std::time::Instant>,
     queue_ns: Option<u64>,
     execution_ns: Option<u64>,
+    rejection: Option<IntegrityRejection>,
+}
+
+/// Exact failed integrity check, not a diagnosis of where bytes became invalid.
+#[derive(Clone, Copy)]
+pub(crate) enum IntegrityRejection {
+    Crc,
+    Aead,
 }
 
 fn elapsed_ns(start: std::time::Instant) -> u64 {
@@ -151,6 +159,10 @@ impl CryptoPermit {
 
     pub(crate) fn executed(&mut self, start: std::time::Instant) {
         self.measurement.execution_ns = Some(elapsed_ns(start));
+    }
+
+    pub(crate) fn rejected(&mut self, rejection: IntegrityRejection) {
+        self.measurement.rejection = Some(rejection);
     }
 }
 
@@ -200,6 +212,15 @@ impl CryptoCompletion {
         ];
         for (event, amount) in events.into_iter().zip(amounts) {
             let _ = metrics.record(event, amount);
+        }
+        if let Some(rejection) = m.rejection {
+            let _ = metrics.record(
+                match rejection {
+                    IntegrityRejection::Crc => CryptoDecryptCrcRejected,
+                    IntegrityRejection::Aead => CryptoDecryptAeadRejected,
+                },
+                1,
+            );
         }
     }
 }

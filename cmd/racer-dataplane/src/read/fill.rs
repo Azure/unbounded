@@ -57,6 +57,32 @@ pub struct Fill {
     metrics: Metrics,
     local_copies: Rc<RefCell<BTreeMap<PageId, LocalCopy>>>,
 }
+
+/// Immediate acquisition tier, not the original producer or corruption location.
+/// Retained includes flights, memory cache, and pending writer copies, even when
+/// the retained copy still has a disk invalidation token.
+#[derive(Clone, Copy)]
+enum DecryptSource {
+    Disk,
+    Retained,
+    Peer,
+}
+impl DecryptSource {
+    fn observe<T>(self, metrics: &Metrics, result: Result<T>) -> Result<T> {
+        result.inspect_err(|error| {
+            if *error == Error::CorruptRecord {
+                let _ = metrics.record(
+                    match self {
+                        Self::Disk => Event::FillDecryptDiskCorrupt,
+                        Self::Retained => Event::FillDecryptRetainedCorrupt,
+                        Self::Peer => Event::FillDecryptPeerCorrupt,
+                    },
+                    1,
+                );
+            }
+        })
+    }
+}
 impl Fill {
     #[cfg(test)]
     pub(crate) fn hedge_owner(&self) -> Option<&std::sync::Arc<super::hedge::Hedges>> {
@@ -174,7 +200,9 @@ impl Fill {
             copy.ciphertext = copy.ciphertext.rehome(reservation)?;
         }
         let reservation = self.reserve_bootstrap(&page.version.object.cache)?;
-        let result = self.decrypt(&page, copy, reservation, scope).await?;
+        let result = self
+            .decrypt(&page, copy, reservation, scope, DecryptSource::Peer)
+            .await?;
         self.publish(result.clone(), None, scope).await?;
         // Selected subscription pages bypass acquire_inner's source accounting.
         // Count only authenticated, published reception on the stable owner.
@@ -509,7 +537,13 @@ impl Fill {
                     }
                     let reservation = fill.reserve_bootstrap(&owned_page.version.object.cache)?;
                     match fill
-                        .decrypt(&owned_page, copy.copy.clone(), reservation, &owned_scope)
+                        .decrypt(
+                            &owned_page,
+                            copy.copy.clone(),
+                            reservation,
+                            &owned_scope,
+                            DecryptSource::Retained,
+                        )
                         .await
                     {
                         Ok(result) => {
@@ -853,7 +887,12 @@ impl Fill {
                 Some(value) => value,
                 None => self.reserve_bootstrap(&page.version.object.cache)?,
             };
-            match self.decrypt(page, copy, reservation, scope).await {
+            let source = if token.is_some() {
+                DecryptSource::Disk
+            } else {
+                DecryptSource::Retained
+            };
+            match self.decrypt(page, copy, reservation, scope, source).await {
                 Ok(result) => {
                     self.publish(result.clone(), None, scope).await?;
                     self.metrics.record(
@@ -1124,7 +1163,7 @@ impl Fill {
             Some(reserved) => reserved,
             None => self.reserve_bootstrap(&page.version.object.cache)?,
         };
-        self.decrypt(page, copy, reservation, scope)
+        self.decrypt(page, copy, reservation, scope, DecryptSource::Peer)
             .await
             .inspect_err(|error| {
                 if *error == Error::CorruptRecord {
@@ -1139,22 +1178,30 @@ impl Fill {
         copy: crate::memory::page::CiphertextCopy,
         reservation: Reservation,
         scope: &RequestScope,
+        source: DecryptSource,
     ) -> Result<PageResult> {
-        validate_copy(&copy, page)?;
-        // Keep the original immutable ciphertext lease across crypto submission.
-        self.metrics.record(Event::PageDecrypt, 1)?;
-        let plaintext = self
-            .dependencies
-            .crypto
-            .decrypt(copy.ciphertext.clone(), reservation, scope)
-            .await?;
-        let result = PageResult {
-            metadata: copy.metadata,
-            plaintext,
-            ciphertext: copy.ciphertext,
-        };
-        result.validate_for(page)?;
-        Ok(result)
+        // These source counters include structural CorruptRecord rejections in
+        // this helper. They are independent of the exact CRC/AEAD engine counters,
+        // which are reaped even if a waiting fill has been abandoned.
+        let result = async {
+            validate_copy(&copy, page)?;
+            // Keep the original immutable ciphertext lease across crypto submission.
+            self.metrics.record(Event::PageDecrypt, 1)?;
+            let plaintext = self
+                .dependencies
+                .crypto
+                .decrypt(copy.ciphertext.clone(), reservation, scope)
+                .await?;
+            let result = PageResult {
+                metadata: copy.metadata,
+                plaintext,
+                ciphertext: copy.ciphertext,
+            };
+            result.validate_for(page)?;
+            Ok(result)
+        }
+        .await;
+        source.observe(&self.metrics, result)
     }
 
     async fn publish(
@@ -1269,6 +1316,31 @@ mod scenarios;
 mod tests {
     use super::*;
     use crate::model::{CacheId, CacheKey, ObjectId, ObjectVersion, StrongEtag};
+    #[test]
+    fn decrypt_source_counters_preserve_results_and_ignore_non_corruption() {
+        let metrics = Metrics::default();
+        for (source, event) in [
+            (DecryptSource::Disk, Event::FillDecryptDiskCorrupt),
+            (DecryptSource::Retained, Event::FillDecryptRetainedCorrupt),
+            (DecryptSource::Peer, Event::FillDecryptPeerCorrupt),
+        ] {
+            assert_eq!(source.observe(&metrics, Ok(42)), Ok(42));
+            for error in [
+                Error::Cancelled,
+                Error::MissingKey,
+                Error::Overloaded,
+                Error::Io,
+            ] {
+                assert_eq!(source.observe::<()>(&metrics, Err(error)), Err(error));
+            }
+            assert_eq!(metrics.count(event), 0);
+            assert_eq!(
+                source.observe::<()>(&metrics, Err(Error::CorruptRecord)),
+                Err(Error::CorruptRecord)
+            );
+            assert_eq!(metrics.count(event), 1);
+        }
+    }
     #[test]
     fn retained_metadata_never_substitutes_a_version_or_conflicting_length() {
         let version = ObjectVersion {

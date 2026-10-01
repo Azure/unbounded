@@ -1120,12 +1120,14 @@ fn hedge_child_cancellation_removes_crypto_admission_wait_without_canceling_acce
         copy.clone(),
         f.fill.reserve_bootstrap(&f.context.object.cache).unwrap(),
         &f.scope,
+        DecryptSource::Peer,
     ));
     let mut waiting = Box::pin(f.fill.decrypt(
         &f.page,
         copy,
         f.fill.reserve_bootstrap(&f.context.object.cache).unwrap(),
         &child,
+        DecryptSource::Peer,
     ));
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(accepted.as_mut().poll(&mut cx).is_pending());
@@ -1182,6 +1184,40 @@ fn unusable_copy(f: &Fixture, good: &CiphertextCopy, missing_key: bool) -> Ciphe
     };
     validate_copy(&copy, &f.page).unwrap(); // Structural checks cannot detect flipped ciphertext.
     copy
+}
+
+#[test]
+fn corrupt_disk_decrypt_is_counted_without_publishing_plaintext() {
+    let mut f = fixture();
+    let good = encrypted_copy(&mut f);
+    let bad = unusable_copy(&f, &good, false);
+    let dirty = f
+        .fill
+        .dependencies
+        .admission
+        .reserve(
+            Some(&f.context.object.cache),
+            ResourceClass::DirtyCiphertext,
+            bad.ciphertext.bytes().len(),
+        )
+        .unwrap();
+    f.fill.dependencies.writer.enqueue(bad, dirty).unwrap();
+    f.reactor.init().unwrap();
+    futures::executor::block_on(f.fill.dependencies.writer.open()).unwrap();
+    drive_disk(&f, f.fill.dependencies.writer.progress(1, &f.scope)).unwrap();
+    let result = drive_io(
+        f.fill.acquire_local_copy(&f.page, &f.scope, true),
+        &f.reactor,
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    assert!(result.is_none());
+    assert_eq!(f.fill.metrics.count(Event::FillDecryptDiskCorrupt), 1);
+    assert_eq!(f.fill.metrics.count(Event::FillDecryptRetainedCorrupt), 0);
+    assert_eq!(f.fill.metrics.count(Event::FillDecryptPeerCorrupt), 0);
+    assert_unpublished(&f);
+    assert_eq!(f.origin.calls.get(), 0);
 }
 
 fn acquire(f: &mut Fixture, budget: &mut AcquisitionBudget) -> Result<PageResult> {
@@ -1262,6 +1298,18 @@ fn unusable_peer_copy_advances_to_alternate_or_authorized_origin() {
                 u64::from(use_origin)
             );
             assert_eq!(f.fill.metrics.count(Event::PeerHit), u64::from(!use_origin));
+            assert_eq!(
+                f.fill.metrics.count(Event::FillDecryptPeerCorrupt),
+                if missing_key {
+                    0
+                } else if use_origin {
+                    2
+                } else {
+                    1
+                }
+            );
+            assert_eq!(f.fill.metrics.count(Event::FillDecryptDiskCorrupt), 0);
+            assert_eq!(f.fill.metrics.count(Event::FillDecryptRetainedCorrupt), 0);
             assert_eq!(
                 f.fill.metrics.count(Event::CorruptMiss),
                 if missing_key {
