@@ -3,7 +3,8 @@
 Evaluated at `3255648690259da3ac95ec2c5c8586c7a802d576`, 2026-10-01.
 Section 3 was corrected after the six-blocker safety review on 2026-10-01;
 its updated behavior and regression references supersede that initial evaluation.
-Other line references below describe the initial evaluated revision.
+Other line references below describe the initial evaluated revision, except
+references with symbol names, refreshed after the readability refactor.
 Implementation and test assertions were read before related prose. No cluster
 inspection, rollout, load change, or performance measurement was performed.
 This document changes no defaults. Below, `D/` means
@@ -37,14 +38,16 @@ bounded to 256 entries with guarded retirement (`D/peer/adaptive.rs:41-43,112-26
 Blame is deliberately narrow: selected observed connect errors and live-scope EOF provide
 link evidence; generic I/O errors, local deadlines/cancellation and downstream
 overload are not peer-failure evidence. Signed downstream overload is also not
-adaptive recovery (`D/http/pool.rs:329-365`, `D/peer/transfer.rs:61-77`,
-`D/peer/requester.rs:315-343`). Permits follow accepted transport ownership;
+adaptive recovery (`D/http/connection.rs:1263`, `HttpPool::checkout_peer`;
+`D/peer/transport.rs:1050`, `observe_read`; `D/peer.rs:493`,
+`Requester::exchange_inner_mode`). Permits follow accepted transport ownership;
 native teardown failure retains/quarantines its permit rather than pretending
 timeout means DMA completion (`D/rdma/lifecycle.rs:55-67,480-505`).
 
 Assertions cover shared caps and retained permits, local-pressure reduction,
-exclusive recovery, and production worker pointer identity
-(`D/peer/adaptive.rs:341-462`, `D/app_integration_tests.rs:65-93`).
+exclusive recovery, and production workers' shared permits and metrics
+(`D/peer/adaptive.rs`, tests; `D/app/peer_tests.rs`,
+`worker_requesters_share_configured_admission_and_production_metrics`).
 
 ## 2. Attempt cap and body ETA are distinct from signed authority
 
@@ -68,7 +71,11 @@ An expired exchange is canceled and polled through its completion fence before
 fallback; a late success cannot override expiry (`D/read/candidates.rs:733-795`).
 Tests assert healthy progress beyond the idle share, slow-body rejection even
 without another route, unchanged signed deadlines, conserved credits, and
-fenced late-success rejection (`D/read/candidate_timeout_tests.rs:277-432,436-489`).
+fenced late-success rejection (`D/read/candidates/timeout_tests.rs:280`,
+`slow_body_without_alternative_or_failure_route_credit_keeps_original_ceiling`;
+`:340`, `known_healthy_body_outlives_share_with_or_without_affordable_fallback`;
+`:386`, `configured_total_cap_never_renews_or_accepts_late_success`;
+`:438`, `retries_get_independent_local_caps_but_never_extend_overall_authority`).
 Thus the cap is not a promise that all resource teardown finishes at that instant.
 
 ## 3. Opt-in hedging is deliberately narrower than general request racing
@@ -85,7 +92,8 @@ their own direct first hop and forced to HTTP. Metadata, bootstrap, subscription
 selection, ciphertext relay, and native transfers do not race through this hook.
 There is no whole-GET duplication; an eligible fixed-page fallback within a read
 can still reach the hook (`D/read/candidates.rs:138-219`,
-`D/peer/requester.rs:144-168,276-293`, `D/read/fill.rs:999-1048`).
+`D/peer.rs:398`, `Requester::request_direct`, and `:493`,
+`Requester::exchange_inner_mode`; `D/read/fill.rs:888`, `Fill::acquire_once`).
 
 Slots and duplicate-byte capacity are shared by all workers of one node owner
 (`D/app.rs:610-617`). Each slot charges a full 33554448-byte pair, including during

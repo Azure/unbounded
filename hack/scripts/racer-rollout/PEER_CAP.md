@@ -8,14 +8,19 @@ this item: that function changes images and other configuration.
 
 ## Rationale and risk
 
-The source default is 2 (`cmd/racer-dataplane/src/config.rs:231`). The cap is
-retained per worker, not divided among workers (assertions in
-`cmd/racer-dataplane/src/app_native.rs:503-510`), and constructs the worker's HTTP
-pool (`cmd/racer-dataplane/src/app.rs:655-668`). Peer transfer reaches immediate
-checkout (`cmd/racer-dataplane/src/peer/transfer.rs:287-293`); an active endpoint at
-its cap returns `Overloaded` without a wait (`cmd/racer-dataplane/src/http/pool.rs:494-499`).
-The test at `http/pool.rs:762-773` specifically asserts immediate peer overload.
-RDMA sessions also use this cap (`app.rs:738-746`).
+The source default is 2 (`cmd/racer-dataplane/src/config.rs`,
+`Config::from_lookup_with_fabric_ports`, `RACER_CONNECTIONS_PER_NEIGHBOR`). The cap
+is retained per worker, not divided among workers (assertions in
+`cmd/racer-dataplane/src/app/native.rs:498`,
+`default_worker_sizing_funds_native_slots_within_node_budgets`), and constructs
+the worker's HTTP pool and RDMA sessions (`cmd/racer-dataplane/src/app.rs`,
+`WorkerApplication::assemble`). Peer transfer reaches immediate checkout
+(`cmd/racer-dataplane/src/peer/transport.rs:1208`, `Transfers::exchange_inner`);
+an active endpoint at its cap returns `Overloaded` without a wait
+(`cmd/racer-dataplane/src/http/connection.rs:1432`, `HttpPool::prepare_connection`).
+The test `origin_wait_is_bounded_fifo_without_blocking_peers_or_other_caches` at
+`cmd/racer-dataplane/src/http/connection/pool_tests.rs:163` specifically asserts
+immediate peer overload.
 
 The fresh preparation snapshot found both named DaemonSets inheriting 16 from
 `racer-dataplane-config`, with no explicit env value. The change adds explicit 4
