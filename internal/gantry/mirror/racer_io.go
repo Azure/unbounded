@@ -7,6 +7,8 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
+	"sync"
 	"time"
 )
 
@@ -56,6 +58,12 @@ func RacerHTTPHandler(next http.Handler, timeout time.Duration, observe func(Rac
 		if err := writer.FlushError(); err != nil {
 			panic(http.ErrAbortHandler)
 		}
+		// No upstream work remains. Keep final protocol bytes (HTTP/1 chunk
+		// terminator or HTTP/2 END_STREAM) bounded when net/http finishes the
+		// handler. net/http owns deadline cleanup at that lifecycle boundary.
+		if err := writer.deadline(); err != nil {
+			panic(http.ErrAbortHandler)
+		}
 
 		completed = true
 	})
@@ -67,14 +75,71 @@ type racerResponseWriter struct {
 	status  int
 	bytes   int64
 	failed  bool
+	// Only deadline state is shared with the SDK cancellation callback. Status,
+	// bytes, and failed remain owned by the handler goroutine.
+	deadlineMu       sync.Mutex
+	externalDeadline time.Time
+	interrupted      bool
 }
 
 func (w *racerResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
+// SetWriteDeadline coordinates SDK deadlines with rolling handler deadlines.
+// An immediate interruption is sticky until explicitly cleared. Serializing the
+// underlying calls as well as the state prevents a refresh from racing past it.
+func (w *racerResponseWriter) SetWriteDeadline(deadline time.Time) error {
+	w.deadlineMu.Lock()
+	defer w.deadlineMu.Unlock()
+
+	if !w.interrupted || deadline.IsZero() {
+		w.externalDeadline = deadline
+		w.interrupted = !deadline.IsZero() && !deadline.After(time.Now())
+	}
+
+	return http.NewResponseController(w.ResponseWriter).SetWriteDeadline(w.externalDeadline)
+}
+
 func (w *racerResponseWriter) deadline() error {
-	err := http.NewResponseController(w.ResponseWriter).SetWriteDeadline(time.Now().Add(w.timeout))
+	w.deadlineMu.Lock()
+	defer w.deadlineMu.Unlock()
+
+	now := time.Now()
+	if w.interrupted || !w.externalDeadline.IsZero() && !w.externalDeadline.After(now) {
+		w.failed = true
+		return os.ErrDeadlineExceeded
+	}
+
+	deadline := now.Add(w.timeout)
+	if !w.externalDeadline.IsZero() && w.externalDeadline.Before(deadline) {
+		deadline = w.externalDeadline
+	}
+
+	err := http.NewResponseController(w.ResponseWriter).SetWriteDeadline(deadline)
 	if errors.Is(err, http.ErrNotSupported) {
 		return nil // Recorders and non-network writers have no socket to deadline.
+	}
+
+	if err != nil {
+		w.failed = true
+	}
+
+	return err
+}
+
+// End a downstream operation without clearing an SDK cancellation interrupt.
+// Keep the external bound as state for nested Write calls, but disarm its timer
+// during upstream-only waits, including ReadFrom's userspace copy fallback.
+func (w *racerResponseWriter) clearDeadline() error {
+	w.deadlineMu.Lock()
+	defer w.deadlineMu.Unlock()
+
+	if w.interrupted {
+		return nil
+	}
+
+	err := http.NewResponseController(w.ResponseWriter).SetWriteDeadline(time.Time{})
+	if errors.Is(err, http.ErrNotSupported) {
+		return nil
 	}
 
 	if err != nil {
@@ -98,6 +163,10 @@ func (w *racerResponseWriter) WriteHeader(status int) {
 	}
 
 	w.ResponseWriter.WriteHeader(status)
+
+	if err := w.clearDeadline(); err != nil {
+		panic(http.ErrAbortHandler)
+	}
 }
 
 func (w *racerResponseWriter) Write(p []byte) (int, error) {
@@ -113,7 +182,12 @@ func (w *racerResponseWriter) Write(p []byte) (int, error) {
 		}
 
 		chunk := p[:min(len(p), racerWriteChunk)]
+
 		n, err := w.ResponseWriter.Write(chunk)
+		if clearErr := w.clearDeadline(); err == nil {
+			err = clearErr
+		}
+
 		total += n
 
 		w.bytes += int64(n)
@@ -140,6 +214,10 @@ func (w *racerResponseWriter) ReadFrom(r io.Reader) (int64, error) {
 
 	fast, supported := w.ResponseWriter.(io.ReaderFrom)
 	if !bounded || !supported {
+		if err := w.clearDeadline(); err != nil {
+			return 0, err
+		}
+
 		return io.Copy(struct{ io.Writer }{w}, r)
 	}
 
@@ -157,7 +235,12 @@ func (w *racerResponseWriter) ReadFrom(r io.Reader) (int64, error) {
 		remaining := source.N
 		source.N = min(remaining, int64(racerSocketChunk))
 		chunk := source.N
+
 		n, err := fast.ReadFrom(source)
+		if clearErr := w.clearDeadline(); err == nil {
+			err = clearErr
+		}
+
 		consumed := chunk - source.N
 		source.N += remaining - chunk
 		total += n
@@ -192,8 +275,14 @@ func (w *racerResponseWriter) FlushError() error {
 	}
 
 	err := http.NewResponseController(w.ResponseWriter).Flush()
+	clearErr := w.clearDeadline()
+
 	if errors.Is(err, http.ErrNotSupported) {
-		return nil
+		err = nil
+	}
+
+	if err == nil {
+		err = clearErr
 	}
 
 	if err != nil {

@@ -395,14 +395,14 @@ type racerMetadataClient struct {
 	returned *racersdk.Metadata
 }
 
-func (c racerMetadataClient) Get(ctx context.Context, req racersdk.Request, options ...racersdk.ReadOptions) (*racersdk.Value, error) {
+func (c racerMetadataClient) GetStreaming(ctx context.Context, req racersdk.Request, options ...racersdk.ReadOptions) (*racersdk.Value, error) {
 	if c.returned != nil && len(options) == 1 {
 		selected := options[0]
 		selected.Metadata = c.returned
 		options = []racersdk.ReadOptions{selected}
 	}
 
-	return c.Client.Get(ctx, req, options...)
+	return c.Client.GetStreaming(ctx, req, options...)
 }
 
 type racerTranscriptClient struct {
@@ -417,12 +417,12 @@ func (c *racerTranscriptClient) Stat(ctx context.Context, req racersdk.Request) 
 	return c.Client.Stat(ctx, req)
 }
 
-func (c *racerTranscriptClient) Get(ctx context.Context, req racersdk.Request, options ...racersdk.ReadOptions) (*racersdk.Value, error) {
+func (c *racerTranscriptClient) GetStreaming(ctx context.Context, req racersdk.Request, options ...racersdk.ReadOptions) (*racersdk.Value, error) {
 	c.gets.Add(1)
 
 	c.options <- options
 
-	return c.Client.Get(ctx, req, options...)
+	return c.Client.GetStreaming(ctx, req, options...)
 }
 
 func TestRacerSDKRequestTranscript(t *testing.T) {
@@ -456,7 +456,7 @@ func TestRacerSDKRequestTranscript(t *testing.T) {
 			}
 
 			if client.stats.Load() != wantStats || client.gets.Load() != wantGets {
-				t.Fatalf("SDK transcript: Stat=%d Get=%d; want %d/%d", client.stats.Load(), client.gets.Load(), wantStats, wantGets)
+				t.Fatalf("SDK transcript: Stat=%d GetStreaming=%d; want %d/%d", client.stats.Load(), client.gets.Load(), wantStats, wantGets)
 			}
 
 			if wantGets == 0 {

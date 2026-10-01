@@ -19,7 +19,7 @@ import (
 
 // RacerClient is satisfied by the SDK client, including its protocol fake.
 type RacerClient interface {
-	Get(context.Context, racersdk.Request, ...racersdk.ReadOptions) (*racersdk.Value, error)
+	GetStreaming(context.Context, racersdk.Request, ...racersdk.ReadOptions) (*racersdk.Value, error)
 	Stat(context.Context, racersdk.Request) (racersdk.Metadata, error)
 }
 
@@ -82,7 +82,7 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, upstream, re
 		options = []racersdk.ReadOptions{{SmallObject: true}}
 	}
 
-	value, err := s.racer.Get(r.Context(), request, options...)
+	value, err := s.racer.GetStreaming(r.Context(), request, options...)
 	if err != nil {
 		s.racerError(w, r, upstream, err)
 		return
@@ -122,14 +122,17 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, upstream, re
 	if ranged {
 		remaining -= offset
 	}
-	// Page leases become readable only after a complete verified slice arrives.
-	// Publish the already validated response headers without waiting for a page.
-	if err := http.NewResponseController(w).Flush(); err != nil {
-		panic(http.ErrAbortHandler)
+	// Publish nonempty response headers without waiting for payload. Empty
+	// responses cannot withhold a final byte, so validate Complete before flushing.
+	if remaining > 0 {
+		if err := http.NewResponseController(w).Flush(); err != nil {
+			panic(http.ErrAbortHandler)
+		}
 	}
-	// Read through SDK EOF, including its final framing check. A LimitedReader
-	// would hide a truncated terminator after the advertised payload. OCI digest
-	// verification belongs to the consumer, including resumed object assembly.
+	// The SDK gates the final byte on Complete, including for resumed ranges.
+	// Earlier incomplete page prefixes may already be visible on failure: abort
+	// rather than append an error body or let net/http complete the response.
+	// OCI digest verification belongs to the consumer's assembled object.
 	if n, err := value.WriteToHTTP(w); err != nil || n != remaining {
 		panic(http.ErrAbortHandler)
 	}

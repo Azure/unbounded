@@ -1,5 +1,35 @@
 # Reviewed page-window 1 to 2 experiment
 
+## Implementation update: HTTP streaming
+
+The memory calculations and copy-path observations below describe the buffered
+SDK `Get` path used by the original experiment. Gantry now selects
+`Client.GetStreaming` and consumes it through `Value.WriteToHTTP`. This path
+does not allocate whole-page receive buffers: it validates ordered frame headers,
+drains buffered read-ahead, and forwards exact payload batches of at most 256KiB.
+On eligible Linux plaintext HTTP/1 connections it preserves the raw Unix socket
+under one `io.LimitedReader`, allowing the Go HTTP/TCP implementation to splice
+through a kernel pipe. TLS, HTTP/2, and unsupported writers/platforms copy instead.
+No HTTP connection is hijacked, and range responses and keepalive remain supported.
+
+Streaming can expose an incomplete page prefix on failure. It withholds the final
+selected byte until the subscription's `Complete` frame validates, then Gantry
+aborts the response on any error or short delivery. Empty responses defer flushing
+until validation because there is no final byte to hold. Existing `Get`, `Read`,
+and `OpenPages` keep their buffered validation behavior. Copy scratch admission
+remains bounded even when an arbitrary writer cannot be interrupted; streaming
+still consumes connection admission and Racer's negotiated page/byte credits.
+
+This changes the SDK memory model, not the server acquisition window, configured
+admission limits, or rollout approval. Do not apply the historical per-stream page
+buffer estimates to streaming clients, or interpret reduced SDK allocations as a
+fleet memory safety proof. Kernel socket/pipe storage and Racer buffers still count.
+Keep all measurement and recovery gates below. A local protocol-fixture benchmark
+is available as `BenchmarkHTTPStream`; it is not a production goodput result.
+
+The older copy-versus-splice observation below is retained as experiment history,
+not a description of Gantry's current delivery path.
+
 `page_window.py` changes only the existing Gantry `config.yaml` scalar and,
 in a separately reviewed stage, the two Racer DaemonSet environment overrides
 in `unbounded-component-overrides/data/racer-v2.yaml`. It does not edit the

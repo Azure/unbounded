@@ -23,7 +23,7 @@ import (
 
 type startupRacerClient struct{ closed atomic.Bool }
 
-func (*startupRacerClient) Get(context.Context, racersdk.Request, ...racersdk.ReadOptions) (*racersdk.Value, error) {
+func (*startupRacerClient) GetStreaming(context.Context, racersdk.Request, ...racersdk.ReadOptions) (*racersdk.Value, error) {
 	return nil, errors.New("unexpected content request")
 }
 
