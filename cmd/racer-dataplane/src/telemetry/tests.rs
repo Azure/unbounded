@@ -111,6 +111,42 @@ fn good_resources() -> health::Resources {
 }
 
 #[test]
+fn membership_endpoint_is_bounded_and_not_a_readiness_alias() {
+    let telemetry = Telemetry::default();
+    assert_eq!(
+        parse(b"GET /debug/membership HTTP/1.1\r\nHost: local\r\n\r\n"),
+        Route::Membership
+    );
+    let mut bytes = [0; MAX_RESPONSE_BYTES];
+    let length = respond(&telemetry, Route::Membership, true, &mut bytes).unwrap();
+    assert_response(
+        &bytes[..length],
+        "200 OK",
+        Some("unavailable fully_applied=0\n"),
+    );
+    assert!(
+        telemetry
+            .membership
+            .set(Rc::new(|| Ok(MembershipDiagnostic {
+                accepted_sequence: u64::MAX,
+                accepted_membership: 7,
+                accepted_hash: [0xab; 32],
+                expected_workers: 2,
+                matching_workers: 2,
+                ..Default::default()
+            })))
+            .is_ok()
+    );
+    let length = respond(&telemetry, Route::Membership, true, &mut bytes).unwrap();
+    let text = std::str::from_utf8(&bytes[..length]).unwrap();
+    assert!(text.contains("accepted_sequence=18446744073709551615 accepted_membership=7"));
+    assert!(text.contains(&format!("accepted_membership_hash={}", "ab".repeat(32))));
+    assert!(text.ends_with("matching_workers=2 fully_applied=1\n"));
+    assert!(!telemetry.health.ready());
+    assert!(length < 1024);
+}
+
+#[test]
 fn resource_and_lifecycle_changes_are_observable_at_both_health_endpoints() {
     let (_, reactor, io) = setup();
     let telemetry = Telemetry::default();

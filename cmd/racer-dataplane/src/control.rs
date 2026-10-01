@@ -855,6 +855,21 @@ impl ControlClient {
                 .unwrap_or_else(crate::runtime::environment::now),
         })
     }
+    /// Diagnostic only. Pending receipt is not acceptance or worker application.
+    pub(crate) fn membership_diagnostic(&self) -> Result<crate::telemetry::MembershipDiagnostic> {
+        let (sequence, membership, hash) = self.snapshots.accepted_identity()?;
+        let pending = self.pending.borrow();
+        Ok(crate::telemetry::MembershipDiagnostic {
+            accepted_sequence: sequence,
+            accepted_membership: membership,
+            accepted_hash: hash,
+            pending_sequence: pending.as_ref().map_or(0, |p| p.snapshot.sequence.0),
+            pending_membership: pending
+                .as_ref()
+                .map_or(0, |p| p.snapshot.membership.version.0),
+            ..Default::default()
+        })
+    }
     fn response(&self, response: HttpResponse, unchanged: bool) -> Result<Vec<u8>> {
         Self::response_with_retry(response, unchanged, &self.retry_after)
     }
@@ -976,6 +991,15 @@ mod tests {
                 10
             };
             let prepared = client.pending.borrow().clone();
+            let diagnostic = client.membership_diagnostic().unwrap();
+            assert_eq!(diagnostic.accepted_sequence, 10);
+            assert_eq!(diagnostic.pending_sequence, if pending { 11 } else { 0 });
+            let (_, canonical_members) = wire::canonical_content(&publication).unwrap();
+            use sha2::Digest;
+            assert_eq!(
+                diagnostic.accepted_hash.as_slice(),
+                sha2::Sha256::digest(canonical_members).as_slice()
+            );
             let path = format!("{}?after={cursor}", wire::SNAPSHOT_PATH);
             publication.sequence = wire::PublicationSequence(12);
             let mut rollback = publication.clone();
@@ -1036,6 +1060,9 @@ mod tests {
                 Some(wire::PublicationSequence(12))
             );
             assert!(client.pending.borrow().is_none());
+            let diagnostic = client.membership_diagnostic().unwrap();
+            assert_eq!(diagnostic.accepted_sequence, 12);
+            assert_eq!(diagnostic.pending_sequence, 0);
             assert_eq!(
                 block_on(client.poll_publication(&scope)),
                 Err(Error::Replay)

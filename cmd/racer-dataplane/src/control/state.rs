@@ -112,6 +112,21 @@ pub struct SnapshotStore {
     retained_limit: usize,
 }
 impl SnapshotStore {
+    /// Read-only coherent accepted identity; never describes a prepared update.
+    pub(crate) fn accepted_identity(&self) -> Result<(u64, u64, [u8; 32])> {
+        let state = self
+            .published
+            .state
+            .lock()
+            .map_err(|_| Error::Unavailable)?;
+        let current = state.current.as_ref().ok_or(Error::Unavailable)?;
+        Ok((
+            current.sequence.0,
+            current.membership.version.0,
+            state.membership_hash,
+        ))
+    }
+
     pub fn new(cluster: ClusterId, published: Arc<PublishedState>, retained_limit: usize) -> Self {
         Self {
             cluster,

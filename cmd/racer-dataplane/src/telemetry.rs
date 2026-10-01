@@ -32,12 +32,52 @@ use zeroize::Zeroize;
 
 #[derive(Default)]
 pub struct Telemetry {
+    pub(crate) membership: OnceCell<Rc<dyn Fn() -> Result<MembershipDiagnostic>>>,
     pub send_crc: send_crc::Samples,
     pub failures: failures::Failures,
     pub metrics: metrics::Metrics,
     pub health: health::Health,
     pub tracing: tracing::Tracing,
     io: OnceCell<Rc<DiagnosticIo>>,
+}
+
+/// Fixed-size diagnostic, with exact decimal counters and no metric labels.
+#[derive(Default)]
+pub(crate) struct MembershipDiagnostic {
+    pub accepted_sequence: u64,
+    pub accepted_membership: u64,
+    pub accepted_hash: [u8; 32],
+    pub pending_sequence: u64,
+    pub pending_membership: u64,
+    pub expected_workers: usize,
+    pub matching_workers: usize,
+}
+impl MembershipDiagnostic {
+    pub(crate) fn fully_applied(&self) -> bool {
+        self.accepted_sequence != 0
+            && self.pending_sequence == 0
+            && self.expected_workers != 0
+            && self.matching_workers == self.expected_workers
+    }
+    fn write(&self, out: &mut impl Write) -> std::fmt::Result {
+        write!(
+            out,
+            "accepted_sequence={} accepted_membership={} accepted_membership_hash=",
+            self.accepted_sequence, self.accepted_membership
+        )?;
+        for byte in self.accepted_hash {
+            write!(out, "{byte:02x}")?;
+        }
+        writeln!(
+            out,
+            " pending_sequence={} pending_membership={} expected_workers={} matching_workers={} fully_applied={}",
+            self.pending_sequence,
+            self.pending_membership,
+            self.expected_workers,
+            self.matching_workers,
+            u8::from(self.fully_applied())
+        )
+    }
 }
 
 impl Telemetry {
@@ -316,6 +356,7 @@ fn exchange<'a>(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Route {
+    Membership,
     Health,
     Ready,
     Metrics,
@@ -361,6 +402,7 @@ fn parse(bytes: &[u8]) -> Route {
         return Route::Method;
     }
     match request.path {
+        Some("/debug/membership") => Route::Membership,
         Some("/healthz") => Route::Health,
         Some("/readyz") => Route::Ready,
         Some("/metrics") => Route::Metrics,
@@ -408,6 +450,7 @@ fn respond(
             Event::DiagnosticReady,
         ),
         Route::Metrics => ("200 OK", "", Event::DiagnosticMetrics),
+        Route::Membership => ("200 OK", "", Event::DiagnosticMetrics),
         Route::Failures => ("200 OK", "", Event::DiagnosticFailures),
         Route::Aead => ("200 OK", "", Event::DiagnosticFailures),
         Route::SendCrc => ("200 OK", "", Event::DiagnosticFailures),
@@ -448,6 +491,13 @@ fn respond(
             u8::from(telemetry.health.live())
         )
         .map_err(|_| Error::Internal)?;
+    } else if route == Route::Membership {
+        match telemetry.membership.get().and_then(|read| read().ok()) {
+            Some(state) => state.write(&mut output).map_err(|_| Error::Internal)?,
+            None => output
+                .write_str("unavailable fully_applied=0\n")
+                .map_err(|_| Error::Internal)?,
+        }
     } else if route == Route::SendCrc {
         telemetry
             .send_crc

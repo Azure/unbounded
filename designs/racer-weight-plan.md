@@ -97,17 +97,23 @@ impaired resource/error behavior from observations during any authorized trial.
    The version ConfigMap alone is not the member map. Check controller replicas
    serve the same final publication after replication. Prepare/commit/install are
    distinct (`internal/racer/topology.go:148-175`).
-6. Controller-map attestation is practical but not proof of application on every
-   dataplane. Existing diagnostic routes expose no applied membership hash/version
-   (`cmd/racer-dataplane/src/telemetry.rs:363-370`); Ready is not that assertion.
-   The poll cursor can refer to a pending snapshot (`control.rs:186-201`), so a
-   request cursor alone is not an application ACK either. Existing retained old
-   membership grace is 30 seconds (`control/state.rs:300-306`), NOT a fleet
-   convergence deadline. Do not invent a Prometheus metric or claim all-node
-   convergence. If parent policy requires exact application attestation, obtain
-   an approved existing per-process inspection path before the trial; this item
-   deliberately does not introduce a controller/dataplane refactor. Otherwise
-   explicitly record the weaker evidence and let the parent own the resume gate.
+6. On dataplanes supporting `GET /debug/membership`, collect a direct response
+   from every expected process, binding each response to its Node UID, Pod UID,
+   container identity and restart count. Older images return 404 and cannot attest.
+   Require `fully_applied=1`, `pending_sequence=0`, and matching accepted sequence,
+   membership version and canonical membership hash from step 5. The hash is the
+   controller's full canonical membership hash, NOT the planner's UID/shares hash.
+   `matching_workers` counts actual worker-installed publication sequences equal
+   to the accepted sequence, observed within two seconds; it must equal the
+   nonzero `expected_workers`. Missing, stale, stopped or lagging workers fail
+   closed. Pending counters describe downloaded/prepared state, never acceptance.
+   The diagnostic reads existing state without advancing control or doing I/O.
+   This is a bounded observation, not a lease or proof that the controller has
+   not advanced: hold the final controller map stable, bracket fleet collection
+   with controller checks, and invalidate evidence after a restart or map change.
+   Ready and poll cursors alone remain insufficient. The old-membership 30-second
+   grace is NOT a fleet convergence deadline. No keys or credentials are exposed;
+   no membership identities are added as Prometheus labels.
 7. Parent alone resumes a guarded warm-up, retains all verification, and measures
    a full steady window only after placement/cache effects stabilize. Compare
    verified goodput, errors, all-node progress, TX/RX, impaired-node behavior and

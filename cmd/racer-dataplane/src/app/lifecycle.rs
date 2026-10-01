@@ -9,19 +9,30 @@ use std::time::UNIX_EPOCH;
 #[derive(Default)]
 pub(super) struct Observations {
     pub health: Health,
-    workers: Mutex<HashMap<WorkerId, Resources>>,
+    workers:
+        Mutex<HashMap<WorkerId, (Resources, Option<crate::control::wire::PublicationSequence>)>>,
 }
 impl Observations {
+    #[cfg(test)]
     fn record(&self, worker: WorkerId, resources: Resources, count: usize) -> Result<()> {
+        self.record_snapshot(worker, resources, count, None)
+    }
+    fn record_snapshot(
+        &self,
+        worker: WorkerId,
+        resources: Resources,
+        count: usize,
+        sequence: Option<crate::control::wire::PublicationSequence>,
+    ) -> Result<()> {
         let mut workers = self.workers.lock().map_err(|_| Error::Unavailable)?;
-        workers.insert(worker, resources);
+        workers.insert(worker, (resources, sequence));
         let now = crate::runtime::environment::now();
         let complete = workers.len() == count;
         let all = |test: fn(&Resources) -> bool| {
             complete
                 && workers
                     .values()
-                    .all(|r| test(r) && r.observed_until.is_some_and(|until| now < until))
+                    .all(|(r, _)| test(r) && r.observed_until.is_some_and(|until| now < until))
         };
         let resources = Resources {
             workers_usable: all(|r| r.workers_usable),
@@ -31,10 +42,14 @@ impl Observations {
             admission_usable: all(|r| r.admission_usable),
             credentials_valid_until: workers
                 .values()
-                .map(|r| r.credentials_valid_until)
+                .map(|(r, _)| r.credentials_valid_until)
                 .min()
                 .flatten(),
-            observed_until: workers.values().map(|r| r.observed_until).min().flatten(),
+            observed_until: workers
+                .values()
+                .map(|(r, _)| r.observed_until)
+                .min()
+                .flatten(),
         };
         self.health.observe(resources)?;
         if matches!(
@@ -49,6 +64,24 @@ impl Observations {
         }
         Ok(())
     }
+    fn membership_workers(
+        &self,
+        diagnostic: &mut crate::telemetry::MembershipDiagnostic,
+        count: usize,
+    ) -> Result<()> {
+        let workers = self.workers.lock().map_err(|_| Error::Unavailable)?;
+        let now = crate::runtime::environment::now();
+        diagnostic.expected_workers = count;
+        diagnostic.matching_workers = workers
+            .values()
+            .filter(|(r, sequence)| {
+                sequence.is_some_and(|s| s.0 == diagnostic.accepted_sequence)
+                    && r.workers_usable
+                    && r.observed_until.is_some_and(|until| now < until)
+            })
+            .count();
+        Ok(())
+    }
 }
 
 impl WorkerApplication {
@@ -56,6 +89,17 @@ impl WorkerApplication {
         if self.control.is_none() {
             return Ok(());
         }
+        let control = self.control.as_ref().unwrap().clone();
+        let node = self.node.clone();
+        self.telemetry
+            .membership
+            .set(Rc::new(move || {
+                let mut diagnostic = control.membership_diagnostic()?;
+                node.observations
+                    .membership_workers(&mut diagnostic, node.count)?;
+                Ok(diagnostic)
+            }))
+            .map_err(|_| Error::InvalidConfiguration)?;
         self.telemetry
             .attach_io(self.runtime.reactor.clone(), self.runtime.admission.clone())?;
         let diagnostic_scope = scope(Duration::from_secs(365 * 24 * 3600))?;
@@ -95,7 +139,7 @@ impl WorkerApplication {
             now.checked_add(remaining)
         });
         let snapshot = self.snapshots.current().ok();
-        node.observations.record(
+        node.observations.record_snapshot(
             self.worker,
             Resources {
                 workers_usable: self.started && !self.stopping,
@@ -111,6 +155,7 @@ impl WorkerApplication {
                 observed_until: Some(now + Duration::from_secs(2)),
             },
             node.count,
+            self.snapshot_sequence,
         )
     }
     pub fn start<'a>(&'a mut self, startup: &'a RequestScope) -> Operation<'a, ()> {
@@ -293,6 +338,54 @@ impl WorkerApplication {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn membership_attestation_requires_fresh_matching_workers() {
+        use crate::control::wire::PublicationSequence;
+        let observations = Observations::default();
+        let now = crate::runtime::environment::now();
+        let resources = Resources {
+            workers_usable: true,
+            observed_until: Some(now + Duration::from_secs(2)),
+            ..Default::default()
+        };
+        let mut diagnostic = crate::telemetry::MembershipDiagnostic {
+            accepted_sequence: 9,
+            accepted_membership: 7,
+            accepted_hash: [42; 32],
+            ..Default::default()
+        };
+        observations
+            .record_snapshot(WorkerId(0), resources, 2, Some(PublicationSequence(9)))
+            .unwrap();
+        observations
+            .record_snapshot(WorkerId(1), resources, 2, Some(PublicationSequence(8)))
+            .unwrap();
+        observations.membership_workers(&mut diagnostic, 2).unwrap();
+        assert_eq!(diagnostic.matching_workers, 1);
+        assert!(!diagnostic.fully_applied());
+        observations
+            .record_snapshot(WorkerId(1), resources, 2, Some(PublicationSequence(9)))
+            .unwrap();
+        observations.membership_workers(&mut diagnostic, 2).unwrap();
+        assert!(diagnostic.fully_applied());
+        diagnostic.pending_sequence = 10;
+        diagnostic.pending_membership = 8;
+        assert!(!diagnostic.fully_applied());
+        diagnostic.pending_sequence = 0;
+        observations
+            .record_snapshot(
+                WorkerId(1),
+                Resources {
+                    observed_until: Some(now),
+                    ..resources
+                },
+                2,
+                Some(PublicationSequence(9)),
+            )
+            .unwrap();
+        observations.membership_workers(&mut diagnostic, 2).unwrap();
+        assert!(!diagnostic.fully_applied());
+    }
     #[test]
     fn readiness_requires_every_worker_and_expires_without_progress() {
         let observations = Observations::default();
