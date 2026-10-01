@@ -1,6 +1,209 @@
 use super::*;
 
 #[test]
+fn sparse_page_copies_preserve_boundaries_holes_and_snapshots() {
+    for offset in [0, 1, 4095, 4096, 4097] {
+        for length in [0, 1, 4095, 4096, 4097, 8193] {
+            let sim = Simulation::new();
+            let Descriptor::Sim(file) = sim
+                .open(None, Path::new("/file"), libc::O_CREAT | libc::O_RDWR)
+                .unwrap()
+            else {
+                unreachable!()
+            };
+            // Leave a full sparse page before an unaligned multi-page write.
+            let offset = 8192 + offset;
+            let original: Vec<_> = (0..length).map(|i| (i % 251) as u8).collect();
+            assert_eq!(file.file_write(offset, &original).unwrap(), length);
+            let mut expected = vec![0; offset as usize];
+            expected.extend_from_slice(&original);
+            let (node, _) = file.node().unwrap();
+            let snapshot = node.borrow().pages.clone();
+            let replacement = vec![0xa5; length + 1];
+            sim.inject("write", Fault::Short(length / 2));
+            assert_eq!(file.file_write(offset, &replacement).unwrap(), length / 2);
+            expected[offset as usize..offset as usize + length / 2].fill(0xa5);
+            for (index, byte) in original.iter().enumerate() {
+                let pos = offset as usize + index;
+                assert_eq!(snapshot[&(pos as u64 / 4096)][pos % 4096], *byte);
+            }
+            let mut output = vec![0xcc; expected.len() + 8];
+            assert_eq!(file.file_read(0, &mut output).unwrap(), expected.len());
+            assert_eq!(&output[..expected.len()], expected);
+            assert_eq!(&output[expected.len()..], &[0xcc; 8]);
+            let mut partial = vec![0xcc; length + 8];
+            sim.inject("read", Fault::Short(length / 2));
+            assert_eq!(file.file_read(offset, &mut partial).unwrap(), length / 2);
+            assert_eq!(
+                &partial[..length / 2],
+                &expected[offset as usize..offset as usize + length / 2]
+            );
+            assert!(partial[length / 2..].iter().all(|b| *b == 0xcc));
+            sim.inject("write", Fault::Errno(libc::EIO));
+            assert_eq!(
+                file.file_write(offset, b"bad").unwrap_err().raw_os_error(),
+                Some(libc::EIO)
+            );
+            assert_eq!(sim.read_file(Path::new("/file")).unwrap(), expected);
+        }
+    }
+}
+
+#[test]
+fn sparse_files_partial_io_faults_rename_unlink_and_open_inode_ownership() {
+    let (sim, _environment, r, scope) = setup();
+    sim.create_dir_all(Path::new("/data")).unwrap();
+    let dir = drive(
+        &r,
+        r.file_open(
+            None,
+            CString::new("/data").unwrap(),
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            0,
+            &scope,
+        ),
+    )
+    .unwrap();
+    let file = drive(
+        &r,
+        r.file_open(
+            Some(dir.clone()),
+            CString::new("a").unwrap(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_EXCL,
+            0,
+            &scope,
+        ),
+    )
+    .unwrap();
+    sim.inject("write", Fault::Short(2));
+    let write = drive(
+        &r,
+        r.write_at(
+            file.clone(),
+            1 << 30,
+            r.file_bytes(b"abcdef").unwrap(),
+            (),
+            &scope,
+        ),
+    )
+    .unwrap();
+    assert_eq!(write.bytes, 2);
+    drop(write);
+    let stat = drive(&r, r.file_stat(file.clone(), &scope)).unwrap();
+    assert_eq!(stat.stx_size, (1 << 30) + 2);
+    sim.inject("fsync", Fault::Errno(libc::EIO));
+    assert_eq!(drive(&r, r.file_sync(file.clone(), &scope)), Err(Error::Io));
+    drive(&r, r.file_sync(file.clone(), &scope)).unwrap();
+    drive(
+        &r,
+        r.file_rename(
+            dir.clone(),
+            CString::new("a").unwrap(),
+            CString::new("b").unwrap(),
+            &scope,
+        ),
+    )
+    .unwrap();
+    drive(
+        &r,
+        r.file_unlink(dir.clone(), CString::new("b").unwrap(), &scope),
+    )
+    .unwrap();
+    let read = drive(
+        &r,
+        r.read_at(
+            file.clone(),
+            (1 << 30) - 2,
+            r.file_buffer(8).unwrap(),
+            (),
+            &scope,
+        ),
+    )
+    .unwrap();
+    assert_eq!(read.bytes, 4);
+    assert_eq!(read.buffer.prefix(4).unwrap(), b"\0\0ab");
+    assert!(matches!(
+        drive(
+            &r,
+            r.file_open(
+                Some(dir.clone()),
+                CString::new("b").unwrap(),
+                libc::O_RDONLY,
+                0,
+                &scope
+            )
+        ),
+        Err(Error::MissingKey)
+    ));
+    drop((read, file, dir));
+    assert_eq!(sim.live_handles(), 0);
+    assert!(
+        sim.trace()
+            .iter()
+            .any(|e| e.operation == "complete:fsync" && e.result == -(libc::EIO as i64))
+    );
+}
+
+#[test]
+fn projected_directory_rotation_and_private_atomic_writes_use_real_filesystem_calls() {
+    let (sim, _environment, r, scope) = setup();
+    sim.write_file(Path::new("/projected/epoch-a/bundle"), b"first")
+        .unwrap();
+    sim.symlink(Path::new("epoch-a"), Path::new("/projected/..data"))
+        .unwrap();
+    let bytes = drive(
+        &r,
+        Box::pin(crate::control::async_files::projected_file(
+            &r,
+            Path::new("/projected"),
+            "bundle",
+            64,
+            &scope,
+        )),
+    )
+    .unwrap();
+    assert_eq!(&**bytes, b"first");
+    let private = drive(
+        &r,
+        Box::pin(crate::control::async_files::directory(
+            &r,
+            Path::new("/private"),
+            true,
+            true,
+            &scope,
+        )),
+    )
+    .unwrap();
+    sim.inject("write", Fault::Short(2));
+    drive(
+        &r,
+        Box::pin(crate::control::async_files::atomic_write(
+            &r, &private, "identity", b"secret", &scope,
+        )),
+    )
+    .unwrap();
+    assert_eq!(
+        sim.read_file(Path::new("/private/identity")).unwrap(),
+        b"secret"
+    );
+    sim.symlink(Path::new("/private"), Path::new("/projected/escape"))
+        .unwrap();
+    assert!(
+        drive(
+            &r,
+            r.file_open(
+                None,
+                CString::new("/projected/escape").unwrap(),
+                libc::O_RDONLY,
+                4,
+                &scope
+            )
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn partition_stalls_established_streams_and_connects_then_heals_without_loss() {
     let (sim, _environment, r, scope) = setup();
     let a = SocketAddress::Inet("127.0.0.1:101".parse().unwrap());

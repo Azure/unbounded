@@ -3,6 +3,26 @@ use super::{tests::*, *};
 use crate::{error::Error, model::ResourceClass};
 use std::{cell::Cell, time::Duration};
 
+#[test]
+fn datagrams_preserve_packet_boundaries_and_source_addresses() {
+    let sim = Simulation::new();
+    let server_address = "127.0.0.1:53".parse().unwrap();
+    let server = sim.bind_datagram(server_address).unwrap();
+    let client = sim.bind_datagram("127.0.0.1:0".parse().unwrap()).unwrap();
+    let (Descriptor::Sim(server), Descriptor::Sim(client)) = (server, client) else {
+        unreachable!()
+    };
+    client.connect_datagram(server_address).unwrap();
+    client.send_datagram(b"query").unwrap();
+    let mut bytes = [0; 32];
+    let (count, source) = server.recv_from(&mut bytes).unwrap();
+    assert_eq!(&bytes[..count], b"query");
+    server.send_to(b"reply", source).unwrap();
+    let (count, source) = client.recv_from(&mut bytes).unwrap();
+    assert_eq!(source, server_address);
+    assert_eq!(&bytes[..count], b"reply");
+}
+
 struct Probe(Rc<Cell<usize>>);
 impl Drop for Probe {
     fn drop(&mut self) {
