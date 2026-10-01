@@ -100,6 +100,12 @@ func serveChairHTTP(w http.ResponseWriter, r *http.Request, local ifaces.LocalCh
 		return
 	}
 
+	kind, err := pleasePullKindFromProto(req.GetKind())
+	if err != nil {
+		http.Error(w, "missing or unknown kind", http.StatusBadRequest)
+		return
+	}
+
 	digests := make([]digest.Digest, 0, len(req.GetDigests()))
 
 	for _, raw := range req.GetDigests() {
@@ -121,7 +127,7 @@ func serveChairHTTP(w http.ResponseWriter, r *http.Request, local ifaces.LocalCh
 
 	outcomes, err := local.StartLocalChairPull(ctx,
 		req.GetUpstreamRegistry(), req.GetRepository(),
-		pleasePullKindFromProto(req.GetKind()), digests, assignment)
+		kind, digests, assignment)
 	if err != nil {
 		logger.Debug("chaircall: local pull failed", slog.Any("err", err))
 		http.Error(w, "pull failed", http.StatusServiceUnavailable)

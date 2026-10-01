@@ -574,6 +574,10 @@ func (s *Server) StartLocalChairPull(ctx context.Context, registry, repository s
 }
 
 func (s *Server) startLocalPull(ctx context.Context, registry, repository string, kind ifaces.OriginRefKind, digests []digest.Digest, assignment *ifaces.ChairAssignment) ([]ifaces.PleasePullOutcome, error) {
+	if kind != ifaces.KindBlob && kind != ifaces.KindManifest && kind != ifaces.KindConfig {
+		return nil, errors.New("start_local_pull: invalid kind")
+	}
+
 	if registry == "" || repository == "" {
 		return nil, errors.New("start_local_pull: missing registry/repository")
 	}
@@ -657,6 +661,11 @@ func (s *Server) startLocalPull(ctx context.Context, registry, repository string
 }
 
 func (s *Server) servePleasePull(ctx context.Context, _ peer.ID, req *coordv1.PleasePullRequest) (*coordv1.PleasePullResponse, error) {
+	kind, err := pleasePullKindFromProto(req.GetKind())
+	if err != nil {
+		return nil, err
+	}
+
 	// the design doc invariant: one repo per batch. Empty / malformed -> reject.
 	if req.GetUpstreamRegistry() == "" || req.GetRepository() == "" {
 		return nil, errors.New("please_pull: missing registry/repository")
@@ -719,7 +728,7 @@ func (s *Server) servePleasePull(ctx context.Context, _ peer.ID, req *coordv1.Pl
 			continue
 		}
 
-		res := s.pullerPump(pumpCtx, req.GetUpstreamRegistry(), req.GetRepository(), d, pleasePullKindFromProto(req.GetKind()))
+		res := s.pullerPump(pumpCtx, req.GetUpstreamRegistry(), req.GetRepository(), d, kind)
 		switch res.Status {
 		case PumpRecentlyFailed:
 			r.Outcome = coordv1.PleasePullResponse_Result_OUTCOME_RECENTLY_FAILED
@@ -1186,16 +1195,13 @@ func chairAssignmentFromProto(assignment *coordv1.ChairAssignment) ifaces.ChairA
 }
 
 // pleasePullKindToProto maps the in-process OriginRefKind enum to the
-// wire-form Kind enum. Unknown / zero is sent as KIND_UNSPECIFIED so a
-// pre-Kind responder still defaults to blob semantics.
+// wire-form Kind enum. Unknown values are sent as KIND_UNSPECIFIED, which
+// the recipient rejects before starting a pull.
 //
 // KIND_CONFIG is bytes-equivalent to KIND_BLOB at the OCI Distribution
 // Spec level (both pull /v2/<repo>/blobs/<digest>) but is preserved on
 // the wire so per-kind metrics ("manifest | config | layer") agree
-// end-to-end across the please_pull boundary. A pre-KIND_CONFIG peer
-// receiving KIND_CONFIG will treat it as KIND_BLOB (the default branch
-// in pleasePullKindFromProto below) - correct bytes, only the metric
-// label downgrades on that peer.
+// end-to-end across the please_pull boundary.
 func pleasePullKindToProto(k ifaces.OriginRefKind) coordv1.PleasePullRequest_Kind {
 	switch k {
 	case ifaces.KindManifest:
@@ -1210,16 +1216,17 @@ func pleasePullKindToProto(k ifaces.OriginRefKind) coordv1.PleasePullRequest_Kin
 }
 
 // pleasePullKindFromProto maps the wire-form Kind enum back to the
-// in-process OriginRefKind. KIND_UNSPECIFIED is treated as KindBlob for
-// back-compat with peers that have not been recompiled.
-func pleasePullKindFromProto(k coordv1.PleasePullRequest_Kind) ifaces.OriginRefKind {
+// in-process OriginRefKind. Missing and unknown kinds are invalid requests.
+func pleasePullKindFromProto(k coordv1.PleasePullRequest_Kind) (ifaces.OriginRefKind, error) {
 	switch k {
 	case coordv1.PleasePullRequest_KIND_MANIFEST:
-		return ifaces.KindManifest
+		return ifaces.KindManifest, nil
 	case coordv1.PleasePullRequest_KIND_CONFIG:
-		return ifaces.KindConfig
+		return ifaces.KindConfig, nil
+	case coordv1.PleasePullRequest_KIND_BLOB:
+		return ifaces.KindBlob, nil
 	default:
-		return ifaces.KindBlob
+		return 0, errors.New("please_pull: missing or unknown kind")
 	}
 }
 
