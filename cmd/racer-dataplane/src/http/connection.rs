@@ -1030,8 +1030,66 @@ fn create_socket(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::{Codec, Header, MessageHead, StartLine};
     use crate::{model::RequestId, test_support::WakeCounter};
-    use std::{os::unix::net::UnixStream, sync::Arc, task::Context};
+    use std::{sync::Arc, task::Context};
+
+    enum Listener {
+        Tcp(std::net::TcpListener),
+        Unix(std::os::unix::net::UnixListener, PathBuf),
+    }
+    impl Listener {
+        fn peer() -> (Self, Endpoint) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
+            listener.set_nonblocking(true).unwrap();
+            (Self::Tcp(listener), endpoint)
+        }
+        fn origin() -> (Self, Endpoint) {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let path = PathBuf::from(format!(
+                "pool-test-{}-{}.sock",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            (Self::Unix(listener, path.clone()), Endpoint::Unix(path))
+        }
+        fn accept(&self) -> Option<Descriptor> {
+            let result = match self {
+                Self::Tcp(listener) => listener.accept().map(|(socket, _)| socket.into()),
+                Self::Unix(listener, path) => {
+                    assert!(path.exists());
+                    listener.accept().map(|(socket, _)| socket.into())
+                }
+            };
+            match result {
+                Ok(socket) => Some(socket),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
+                Err(error) => panic!("accept: {error}"),
+            }
+        }
+    }
+    impl Drop for Listener {
+        fn drop(&mut self) {
+            if let Self::Unix(_, path) = self {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+    }
+    fn drive<T>(reactor: &Reactor, future: impl std::future::Future<Output = T>) -> T {
+        let mut future = std::pin::pin!(future);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
+                return result;
+            }
+            assert!(Instant::now() < deadline, "bounded pool exchange");
+            reactor.poll_budgeted(128).unwrap();
+        }
+    }
 
     fn scope() -> RequestScope {
         RequestScope::new(RequestId([7; 16]), Instant::now() + Duration::from_secs(5)).unwrap()
@@ -1042,32 +1100,75 @@ mod tests {
         limits.queue_entries = std::num::NonZeroUsize::new(2).unwrap();
         let admission = Rc::new(Admission::new(limits));
         let reactor = Rc::new(Reactor::new(admission.clone()));
+        reactor.init().unwrap();
         let pool = HttpPool::new(reactor.clone(), admission.clone(), 1).with_origin_limit(2);
         (admission, reactor, pool)
     }
 
-    // A live, reusable exchange without submitting I/O, to isolate scheduling.
-    fn held(pool: &HttpPool, endpoint: &Endpoint) -> (ConnectionLease, UnixStream) {
-        let mut state = pool.state.borrow_mut();
-        let entry = state.entries.entry(endpoint.clone()).or_default();
-        entry.active += 1;
-        let generation = entry.generation;
-        let (socket, peer) = UnixStream::pair().unwrap();
-        let mut connection = ConnectionLease::new(
-            Rc::new(socket.into()),
-            pool.admission
-                .reserve_connection(ResourceClass::OutboundConnection)
-                .unwrap(),
-            Some(ReturnToPool {
-                state: Rc::downgrade(&pool.state),
-                endpoint: endpoint.clone(),
-                generation,
-            }),
+    // Hold a real checked-out connection only after a complete head/body exchange.
+    fn held(
+        pool: &HttpPool,
+        endpoint: &Endpoint,
+        listener: &Listener,
+    ) -> (ConnectionLease, ConnectionLease) {
+        let scope = scope();
+        let io = HttpIo::with_admission(
+            pool.reactor.clone(),
+            Codec::new(4096, 16),
+            pool.admission.clone(),
         );
-        connection.rx_remaining = Some(0);
-        connection.tx_remaining = Some(0);
-        connection.finish_exchange().unwrap();
-        (connection, peer)
+        let client = async {
+            let connection = pool.checkout_metadata(endpoint, &scope).await?;
+            let request = MessageHead {
+                start: StartLine::Request {
+                    method: "GET".into(),
+                    target: "/pool".into(),
+                },
+                headers: vec![Header {
+                    name: "content-length".into(),
+                    value: b"0".to_vec(),
+                }],
+            };
+            let sent = io.send_head(connection, request, &scope).await?;
+            let received = io.receive_head(sent.connection, &scope).await?;
+            assert!(matches!(
+                received.value.start,
+                StartLine::Response { status: 200 }
+            ));
+            let read = io
+                .read_body(received.connection, io.buffer(1)?, &scope)
+                .await?;
+            assert_eq!(read.bytes, 1);
+            assert_eq!(read.buffer.bytes()?, b"x");
+            let mut connection = read.lease;
+            connection.finish_exchange()?;
+            Ok::<_, Error>(connection)
+        };
+        let server = async {
+            let socket =
+                std::future::poll_fn(|_| listener.accept().map_or(Poll::Pending, Poll::Ready))
+                    .await;
+            let connection = ConnectionLease::from_accepted(socket, &pool.admission)?;
+            let received = io.receive_head(connection, &scope).await?;
+            assert!(
+                matches!(received.value.start, StartLine::Request { ref target, .. } if target == "/pool")
+            );
+            let response = MessageHead {
+                start: StartLine::Response { status: 200 },
+                headers: vec![Header {
+                    name: "content-length".into(),
+                    value: b"1".to_vec(),
+                }],
+            };
+            let sent = io.send_head(received.connection, response, &scope).await?;
+            let mut buffer = io.buffer(1)?;
+            buffer.bytes_mut()?.copy_from_slice(b"x");
+            let sent = io.write_body(sent.connection, buffer, &scope).await?;
+            let mut connection = sent.lease;
+            connection.finish_exchange()?;
+            Ok::<_, Error>(connection)
+        };
+        drive(&pool.reactor, async { futures::try_join!(client, server) }).unwrap()
     }
 
     #[test]
@@ -1075,9 +1176,9 @@ mod tests {
         let (admission, _, mut pool) = setup();
         pool.idle_timeout = Duration::ZERO;
         let mut peers = Vec::new();
-        for port in 1..=3 {
-            let endpoint = Endpoint::Peer(format!("127.0.0.1:{port}"));
-            let (lease, peer) = held(&pool, &endpoint);
+        for _ in 1..=3 {
+            let (listener, endpoint) = Listener::peer();
+            let (lease, peer) = held(&pool, &endpoint, &listener);
             peers.push(peer);
             drop(lease);
         }
@@ -1085,15 +1186,16 @@ mod tests {
             pool.state.borrow_mut().next_expiry = crate::runtime::environment::now();
             pool.poll_waiters(1);
             assert_eq!(pool.state.borrow().entries.len(), remaining);
-            assert_eq!(admission.used(ResourceClass::Connection), remaining);
+            assert_eq!(admission.used(ResourceClass::OutboundConnection), remaining);
         }
     }
     #[test]
     fn origin_wait_is_bounded_fifo_without_blocking_peers_or_other_caches() {
         let (admission, reactor, pool) = setup();
-        let endpoint = Endpoint::Unix("/unused/origin".into());
-        let (first, _a) = held(&pool, &endpoint);
-        let (second, _b) = held(&pool, &endpoint);
+        let (listener, endpoint) = Listener::origin();
+        let (first, a) = held(&pool, &endpoint, &listener);
+        let (second, b) = held(&pool, &endpoint, &listener);
+        let baseline = admission.used(ResourceClass::RequestContext);
         let scope = scope();
         let count = Arc::new(WakeCounter::default());
         let waker = Waker::from(count.clone());
@@ -1118,11 +1220,8 @@ mod tests {
 
         // A full origin queue does not gate a peer or an unrelated cache. Peer
         // saturation remains immediate so routing can try another candidate.
-        for other in [
-            Endpoint::Peer("127.0.0.1:9".into()),
-            Endpoint::Unix("/unused/other".into()),
-        ] {
-            let (lease, _peer) = held(&pool, &other);
+        for (listener, other) in [Listener::peer(), Listener::origin()] {
+            let (lease, _peer) = held(&pool, &other, &listener);
             if matches!(other, Endpoint::Peer(_)) {
                 assert!(matches!(
                     pool.checkout(&other, &scope).as_mut().poll(&mut cx),
@@ -1155,8 +1254,8 @@ mod tests {
             panic!("second waiter must progress")
         };
         assert!(pool.state.borrow().waiting.is_empty());
-        assert_eq!(admission.used(ResourceClass::RequestContext), 0);
-        drop((lease, next));
+        assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+        drop((lease, next, a, b));
         pool.close();
         assert_eq!(admission.used(ResourceClass::Connection), 0);
     }
@@ -1165,8 +1264,9 @@ mod tests {
     fn waiting_cancel_deadline_close_stop_and_drop_release_only_waiter_quota() {
         for case in ["cancel", "deadline", "close", "stop", "drop"] {
             let (admission, reactor, pool) = setup();
-            let endpoint = Endpoint::Peer("127.0.0.1:9".into());
-            let (held, _peer) = held(&pool, &endpoint);
+            let (listener, endpoint) = Listener::peer();
+            let (held, peer) = held(&pool, &endpoint, &listener);
+            let baseline = admission.used(ResourceClass::RequestContext);
             let mut scope = scope();
             if case == "deadline" {
                 scope.deadline.0 = Instant::now() + Duration::from_millis(20);
@@ -1205,10 +1305,10 @@ mod tests {
             }
             drop(wait);
             assert!(pool.state.borrow().waiting.is_empty());
-            assert_eq!(admission.used(ResourceClass::RequestContext), 0);
-            assert_eq!(admission.used(ResourceClass::Connection), 1);
+            assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+            assert_eq!(admission.used(ResourceClass::OutboundConnection), 1);
             assert_eq!(reactor.in_flight(), 0);
-            drop(held);
+            drop((held, peer));
             pool.close();
             assert_eq!(admission.used(ResourceClass::Connection), 0);
         }
@@ -1218,8 +1318,8 @@ mod tests {
     fn worker_tick_wakes_bounded_round_robin_waiters_even_in_nested_executor() {
         use futures::{Stream, stream::FuturesUnordered};
         let (_, _, pool) = setup();
-        let endpoint = Endpoint::Peer("127.0.0.1:9".into());
-        let (_held, _peer) = held(&pool, &endpoint);
+        let (listener, endpoint) = Listener::peer();
+        let (_held, _peer) = held(&pool, &endpoint, &listener);
         let mut scope = scope();
         scope.deadline.0 = Instant::now() + Duration::from_millis(20);
         let mut futures = FuturesUnordered::new();
@@ -1304,18 +1404,19 @@ mod tests {
 
     #[test]
     fn waiting_endpoint_table_and_context_pressure_remain_bounded() {
-        let (admission, _, mut pool) = setup();
+        let (admission, reactor, mut pool) = setup();
         pool.max_endpoints = 1;
-        let first = Endpoint::Peer("127.0.0.1:9".into());
-        let second = Endpoint::Peer("127.0.0.1:10".into());
-        let (held, _peer) = held(&pool, &first);
+        let (listener, first) = Listener::peer();
+        let (second_listener, second) = Listener::peer();
+        let (held, peer) = held(&pool, &first, &listener);
+        let baseline = admission.used(ResourceClass::RequestContext);
         let scope = scope();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let context = admission
             .reserve(
                 None,
                 ResourceClass::RequestContext,
-                admission.limit(ResourceClass::RequestContext),
+                admission.limit(ResourceClass::RequestContext) - baseline,
             )
             .unwrap();
         assert!(matches!(
@@ -1329,13 +1430,14 @@ mod tests {
         assert!(wait.as_mut().poll(&mut cx).is_pending());
         assert_eq!(pool.state.borrow().entries.len(), 1);
         drop(held);
-        // An idle-only endpoint is evicted, rather than consuming the entire
-        // table until its idle timeout. No actual connection is needed here.
-        let (connection, _) = pool.prepare_connection(&second).unwrap();
+        // An idle-only endpoint is evicted by a real checkout rather than waiting
+        // for idle timeout to free the endpoint table.
+        let connection = drive(&reactor, wait.as_mut()).unwrap();
+        assert!(second_listener.accept().is_some());
         assert_eq!(pool.state.borrow().entries.len(), 1);
         assert!(!pool.state.borrow().entries.contains_key(&first));
-        drop((connection, wait));
-        assert_eq!(admission.used(ResourceClass::RequestContext), 0);
+        drop((connection, wait, peer));
+        assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
         assert_eq!(admission.used(ResourceClass::Connection), 0);
     }
 
@@ -1343,26 +1445,26 @@ mod tests {
     fn origin_uid_churn_preserves_endpoint_and_connection_bounds() {
         let (admission, _, mut pool) = setup();
         pool.max_endpoints = 1;
+        let (listener, endpoint) = Listener::origin();
+        let Endpoint::Unix(path) = endpoint else {
+            unreachable!()
+        };
         let origin = |uid: usize| Endpoint::Origin {
             cache: crate::model::CacheId(format!("cache-{uid}")),
-            path: "/unused/origin".into(),
+            path: path.clone(),
         };
-        let (first, _peer) = held(&pool, &origin(0));
+        let (first, peer) = held(&pool, &origin(0), &listener);
         assert!(matches!(
             pool.prepare_connection(&origin(1)),
             Err(Error::Overloaded)
         ));
         assert_eq!(pool.state.borrow().entries.len(), 1);
-        drop(first);
+        drop((first, peer));
         for uid in 1..32 {
-            let (mut connection, address) = pool.prepare_connection(&origin(uid)).unwrap();
-            assert!(address.is_some(), "new UID must dial rather than reuse");
+            let (connection, peer) = held(&pool, &origin(uid), &listener);
             assert_eq!(pool.state.borrow().entries.len(), 1);
-            assert_eq!(admission.used(ResourceClass::Connection), 1);
-            connection.rx_remaining = Some(0);
-            connection.tx_remaining = Some(0);
-            connection.finish_exchange().unwrap();
-            drop(connection);
+            assert_eq!(admission.used(ResourceClass::OutboundConnection), 1);
+            drop((connection, peer));
         }
         pool.close();
         assert_eq!(admission.used(ResourceClass::Connection), 0);
@@ -1371,12 +1473,16 @@ mod tests {
     #[test]
     fn origin_cap_is_independent_of_peer_cap_and_idle_quota_is_reclaimed() {
         let (admission, _, pool) = setup();
+        let (listener, endpoint) = Listener::origin();
+        let Endpoint::Unix(path) = endpoint else {
+            unreachable!()
+        };
         let origin = Endpoint::Origin {
             cache: crate::model::CacheId("cache".into()),
-            path: "/unused/origin".into(),
+            path,
         };
-        let (first, _a) = held(&pool, &origin);
-        let (second, _b) = held(&pool, &origin);
+        let (first, a) = held(&pool, &origin, &listener);
+        let (second, b) = held(&pool, &origin, &listener);
         drop(second);
         let (second, address) = pool.prepare_connection(&origin).unwrap();
         assert!(
@@ -1387,7 +1493,7 @@ mod tests {
             pool.prepare_connection(&origin),
             Err(Error::Overloaded)
         ));
-        drop((first, second));
+        drop((first, second, a, b));
         let quota = admission
             .reserve(
                 None,
@@ -1405,12 +1511,17 @@ mod tests {
     #[test]
     fn metadata_bypasses_queued_pages_within_existing_origin_cap() {
         let (admission, _, pool) = setup();
+        let (listener, endpoint) = Listener::origin();
+        let Endpoint::Unix(path) = endpoint else {
+            unreachable!()
+        };
         let endpoint = Endpoint::Origin {
             cache: crate::model::CacheId("cache".into()),
-            path: "/unused/origin".into(),
+            path,
         };
-        let (first, _a) = held(&pool, &endpoint);
-        let (idle, _b) = held(&pool, &endpoint);
+        let (first, a) = held(&pool, &endpoint, &listener);
+        let (idle, b) = held(&pool, &endpoint, &listener);
+        let baseline = admission.used(ResourceClass::RequestContext);
         drop(idle);
         let scope = scope();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -1422,49 +1533,23 @@ mod tests {
         };
         assert_eq!(pool.state.borrow().entries[&endpoint].active, 2);
         assert!(page.as_mut().poll(&mut cx).is_pending());
-        drop((metadata, first, page));
+        drop((metadata, first, page, a, b));
         pool.close();
         assert_eq!(admission.used(ResourceClass::Connection), 0);
-        assert_eq!(admission.used(ResourceClass::RequestContext), 0);
+        assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
     }
 
     #[test]
     fn invalidated_active_generation_cannot_reenter_idle_and_expiry_releases_quota() {
-        let admission = Rc::new(Admission::new(
-            crate::test_support::cluster::config(false).limits,
-        ));
-        let reactor = Rc::new(Reactor::new(admission.clone()));
-        let pool = HttpPool::with_limits(reactor, admission.clone(), 1, 1, Duration::ZERO);
-        let endpoint = Endpoint::Peer("127.0.0.1:1".into());
+        let (admission, _, mut pool) = setup();
+        pool.idle_timeout = Duration::ZERO;
+        let (listener, endpoint) = Listener::peer();
         for invalidate in [true, false] {
-            pool.state.borrow_mut().entries.insert(
-                endpoint.clone(),
-                Entry {
-                    active: 1,
-                    generation: 1,
-                    idle: vec![],
-                },
-            );
-            pool.state.borrow_mut().next_generation = 1;
-            let (socket, _peer) = UnixStream::pair().unwrap();
-            let mut connection = ConnectionLease::new(
-                Rc::new(socket.into()),
-                admission
-                    .reserve_connection(ResourceClass::OutboundConnection)
-                    .unwrap(),
-                Some(ReturnToPool {
-                    state: Rc::downgrade(&pool.state),
-                    endpoint: endpoint.clone(),
-                    generation: 1,
-                }),
-            );
-            connection.rx_remaining = Some(0);
-            connection.tx_remaining = Some(0);
-            connection.finish_exchange().unwrap();
+            let (connection, peer) = held(&pool, &endpoint, &listener);
             if invalidate {
                 pool.invalidate(&endpoint);
             }
-            drop(connection);
+            drop((connection, peer));
             assert_eq!(
                 admission.used(ResourceClass::Connection),
                 usize::from(!invalidate)
@@ -1486,27 +1571,8 @@ mod tests {
         reactor.init().unwrap();
         let baseline = admission.used(ResourceClass::RequestContext);
         let pool = HttpPool::new(reactor.clone(), admission.clone(), 1);
-        let endpoint = Endpoint::Peer("127.0.0.1:1".into());
-        pool.state.borrow_mut().entries.insert(
-            endpoint.clone(),
-            Entry {
-                active: 1,
-                generation: 1,
-                idle: vec![],
-            },
-        );
-        let (socket, _peer) = UnixStream::pair().unwrap();
-        let connection = ConnectionLease::new(
-            Rc::new(socket.into()),
-            admission
-                .reserve_connection(ResourceClass::OutboundConnection)
-                .unwrap(),
-            Some(ReturnToPool {
-                state: Rc::downgrade(&pool.state),
-                endpoint,
-                generation: 1,
-            }),
-        );
+        let (listener, endpoint) = Listener::peer();
+        let (connection, peer) = held(&pool, &endpoint, &listener);
         let scope =
             RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(5)).unwrap();
         let staging = OwnedBuffer::new(&admission, 4096).unwrap();
@@ -1515,7 +1581,7 @@ mod tests {
         assert!(matches!(receive.as_mut().poll(&mut cx), Poll::Pending));
         drop(receive);
         drop(pool);
-        assert_eq!(admission.used(ResourceClass::Connection), 1);
+        assert_eq!(admission.used(ResourceClass::OutboundConnection), 1);
         assert!(admission.used(ResourceClass::RequestContext) >= baseline + 4096);
         let deadline = Instant::now() + Duration::from_secs(5);
         while reactor.in_flight() != 0 {
@@ -1523,6 +1589,7 @@ mod tests {
             reactor.poll_budgeted(32).unwrap();
             reactor.wait(Duration::from_millis(1)).unwrap();
         }
+        drop(peer);
         assert_eq!(admission.used(ResourceClass::Connection), 0);
         assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
     }
