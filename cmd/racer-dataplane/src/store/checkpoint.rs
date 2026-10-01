@@ -10,7 +10,7 @@ use super::{
     disk::{DirectAlignment, DirectExtent, SlabId, SlabLocation},
     format::Decoder,
 };
-use crate::error::{Error, Operation, Result};
+use crate::error::{Error, Operation, Result, cooperative_turn};
 use crate::{
     model::{
         CacheId, CacheKey, KeyId, ObjectId, ObjectVersion, PageId, PageNumber, StrongEtag,
@@ -277,20 +277,6 @@ impl Checkpointer {
                 .await
         }))
     }
-}
-
-pub(crate) async fn cooperative_turn() {
-    let mut yielded = false;
-    std::future::poll_fn(|cx| {
-        if yielded {
-            std::task::Poll::Ready(())
-        } else {
-            yielded = true;
-            cx.waker().wake_by_ref();
-            std::task::Poll::Pending
-        }
-    })
-    .await
 }
 
 impl Drop for Checkpointer {

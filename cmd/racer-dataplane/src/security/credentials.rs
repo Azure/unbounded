@@ -218,14 +218,6 @@ impl CredentialCrypto {
             scope: scope.clone(),
         })
     }
-    pub fn open(
-        &self,
-        context: PeerOriginContext,
-        request: RequestId,
-        attempt: AttemptId,
-    ) -> Result<ChargedOriginContext> {
-        self.open_charged(context, request, attempt)
-    }
     pub fn open_charged(
         &self,
         context: PeerOriginContext,
@@ -377,7 +369,7 @@ mod tests {
             second.authorization.as_ref().unwrap().nonce
         );
         drop(second);
-        let clear = crypto.open(first, scope.request, attempt).unwrap();
+        let clear = crypto.open_charged(first, scope.request, attempt).unwrap();
         assert_eq!(
             clear.authorization.as_ref().unwrap().expose_for_origin(),
             b"Bearer exact  \xfe"
@@ -422,7 +414,7 @@ mod tests {
         let sealed = crypto.seal(&original, attempt, &scope).unwrap();
         assert!(sealed.authorization.is_none());
         assert!(admission.used(ResourceClass::RequestContext) > 0);
-        let clear = crypto.open(sealed, scope.request, attempt).unwrap();
+        let clear = crypto.open_charged(sealed, scope.request, attempt).unwrap();
         assert!(clear.authorization.is_none());
         assert_eq!(
             clear.metadata.as_ref().unwrap().as_header(),
@@ -433,7 +425,7 @@ mod tests {
         let sealed = crypto.seal(&original, attempt, &scope).unwrap();
         scope.cancel().unwrap();
         assert!(matches!(
-            crypto.open(sealed, scope.request, attempt),
+            crypto.open_charged(sealed, scope.request, attempt),
             Err(Error::Cancelled)
         ));
         assert_eq!(admission.used(ResourceClass::RequestContext), 0);

@@ -7,6 +7,20 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Worker-local future: deliberately not `Send`, and never drives a hidden executor.
 pub type Operation<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + 'a>>;
 
+/// Yield one cooperative turn without retaining an executor or I/O owner.
+pub(crate) async fn cooperative_turn() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if std::mem::replace(&mut yielded, true) {
+            std::task::Poll::Ready(())
+        } else {
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     InvalidConfiguration,

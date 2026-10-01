@@ -37,6 +37,18 @@ fn context() -> OriginContext {
 fn scope() -> RequestScope {
     RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(5)).unwrap()
 }
+pub(super) fn response_head(status: u16, fields: &[(&str, &[u8])]) -> MessageHead {
+    MessageHead {
+        start: StartLine::Response { status },
+        headers: fields
+            .iter()
+            .map(|(name, value)| Header {
+                name: (*name).into(),
+                value: value.to_vec(),
+            })
+            .collect(),
+    }
+}
 
 // Endpoint-level socket scenarios allocate here; production callers supply their
 // existing reservation through the Origin trait's reserved operations.

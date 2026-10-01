@@ -110,6 +110,18 @@ fn good_resources() -> health::Resources {
     }
 }
 
+fn diagnostic_text(telemetry: &Telemetry, path: &str) -> String {
+    let mut bytes = vec![0; MAX_RESPONSE_BYTES];
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: local\r\nAuthorization: synthetic-secret\r\n\r\n");
+    let length = respond(telemetry, parse(request.as_bytes()), true, &mut bytes).unwrap();
+    assert_response(&bytes[..length], "200 OK", None);
+    assert!(length < MAX_RESPONSE_BYTES);
+    let text = std::str::from_utf8(&bytes[..length]).unwrap().to_owned();
+    assert!(!text.contains("synthetic"));
+    text
+}
+
 #[test]
 fn membership_endpoint_is_bounded_and_not_a_readiness_alias() {
     let telemetry = Telemetry::default();
@@ -438,10 +450,7 @@ fn failure_endpoint_exports_full_ring_with_maximum_numeric_fields() {
             }),
         );
     }
-    let mut bytes = vec![0; MAX_RESPONSE_BYTES];
-    let length = respond(&telemetry, parse(b"GET /debug/failures HTTP/1.1\r\nHost: local\r\nAuthorization: synthetic-secret\r\n\r\n"), true, &mut bytes).unwrap();
-    assert_response(&bytes[..length], "200 OK", None);
-    let text = std::str::from_utf8(&bytes[..length]).unwrap();
+    let text = diagnostic_text(&telemetry, "/debug/failures");
     assert_eq!(text.matches("stage=PeerReceiveAdmission").count(), CAPACITY);
     assert!(text.contains("sequence=2 worker=65535"));
     assert!(!text.contains("synthetic"));
@@ -466,19 +475,7 @@ fn aead_endpoint_exports_full_ring_with_maximum_fields() {
             test_aead_failure(),
         );
     }
-    let mut bytes = vec![0; MAX_RESPONSE_BYTES];
-    let length = respond(
-        &telemetry,
-        parse(
-            b"GET /debug/aead HTTP/1.1\r\nHost: local\r\nAuthorization: synthetic-secret\r\n\r\n",
-        ),
-        true,
-        &mut bytes,
-    )
-    .unwrap();
-    assert_response(&bytes[..length], "200 OK", None);
-    let text = std::str::from_utf8(&bytes[..length]).unwrap();
-    assert!(length < MAX_RESPONSE_BYTES);
+    let text = diagnostic_text(&telemetry, "/debug/aead");
     assert_eq!(text.matches(" supplier=").count(), AEAD_CAPACITY);
     assert!(text.contains("total=65 retained=64 overwritten=1 capacity=64"));
     assert!(!text.contains("synthetic"));
@@ -487,29 +484,12 @@ fn aead_endpoint_exports_full_ring_with_maximum_fields() {
 #[test]
 fn send_crc_endpoint_is_empty_when_disabled_and_does_not_echo_headers() {
     let telemetry = Telemetry::default();
-    let mut bytes = vec![0; MAX_RESPONSE_BYTES];
-    let length = respond(&telemetry, parse(b"GET /debug/send-crc HTTP/1.1\r\nHost: local\r\nAuthorization: synthetic-secret\r\n\r\n"), true, &mut bytes).unwrap();
-    assert_response(&bytes[..length], "200 OK", None);
-    let text = std::str::from_utf8(&bytes[..length]).unwrap();
+    let text = diagnostic_text(&telemetry, "/debug/send-crc");
     assert!(text.contains("sampled=0"));
     assert!(!text.contains("synthetic"));
     telemetry.send_crc.fill_test_ring();
-    let length = respond(
-        &telemetry,
-        parse(b"GET /debug/send-crc HTTP/1.1\r\nHost: local\r\n\r\n"),
-        true,
-        &mut bytes,
-    )
-    .unwrap();
-    assert_response(&bytes[..length], "200 OK", None);
-    assert!(length < MAX_RESPONSE_BYTES);
-    assert_eq!(
-        std::str::from_utf8(&bytes[..length])
-            .unwrap()
-            .matches("status=computed")
-            .count(),
-        64
-    );
+    let text = diagnostic_text(&telemetry, "/debug/send-crc");
+    assert_eq!(text.matches("status=computed").count(), 64);
 }
 
 #[test]

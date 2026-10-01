@@ -510,23 +510,14 @@ pub mod metadata {
         }
 
         fn head(length: &[u8], expiry: &[u8], etag: &[u8]) -> MessageHead {
-            MessageHead {
-                start: StartLine::Response { status: 200 },
-                headers: vec![
-                    Header {
-                        name: "Content-Length".into(),
-                        value: length.to_vec(),
-                    },
-                    Header {
-                        name: "Racer-Expires-At".into(),
-                        value: expiry.to_vec(),
-                    },
-                    Header {
-                        name: "ETag".into(),
-                        value: etag.to_vec(),
-                    },
+            crate::origin::tests::response_head(
+                200,
+                &[
+                    ("Content-Length", length),
+                    ("Racer-Expires-At", expiry),
+                    ("ETag", etag),
                 ],
-            }
+            )
         }
 
         #[test]
@@ -706,7 +697,7 @@ pub mod page {
     mod tests {
         use super::*;
         use crate::{
-            http::{Header, StartLine},
+            http::StartLine,
             model::{CacheId, CacheKey, ObjectId, ObjectVersion, PageNumber, StrongEtag},
         };
 
@@ -723,22 +714,16 @@ pub mod page {
             }
         }
         fn head() -> MessageHead {
-            MessageHead {
-                start: StartLine::Response { status: 206 },
-                headers: [
-                    ("Content-Length", "3"),
-                    ("Content-Type", "application/octet-stream"),
-                    ("Content-Range", "bytes 16777216-16777218/16777219"),
-                    ("ETag", "\"v\""),
-                    ("Racer-Expires-At", "0"),
-                ]
-                .into_iter()
-                .map(|(name, value)| Header {
-                    name: name.into(),
-                    value: value.as_bytes().to_vec(),
-                })
-                .collect(),
-            }
+            crate::origin::tests::response_head(
+                206,
+                &[
+                    ("Content-Length", b"3"),
+                    ("Content-Type", b"application/octet-stream"),
+                    ("Content-Range", b"bytes 16777216-16777218/16777219"),
+                    ("ETag", b"\"v\""),
+                    ("Racer-Expires-At", b"0"),
+                ],
+            )
         }
 
         #[test]
@@ -986,21 +971,15 @@ mod protocol {
                 cache: crate::model::CacheId("cache".into()),
                 key: crate::model::CacheKey([0; 32]),
             };
-            let base = MessageHead {
-                start: StartLine::Response { status: 200 },
-                headers: [
-                    ("ETag", "\"v1\""),
-                    ("Content-Length", "3"),
-                    ("Racer-Expires-At", "0"),
-                    ("Content-Type", "application/octet-stream"),
-                ]
-                .into_iter()
-                .map(|(name, value)| Header {
-                    name: name.into(),
-                    value: value.as_bytes().to_vec(),
-                })
-                .collect(),
-            };
+            let base = crate::origin::tests::response_head(
+                200,
+                &[
+                    ("ETag", b"\"v1\""),
+                    ("Content-Length", b"3"),
+                    ("Racer-Expires-At", b"0"),
+                    ("Content-Type", b"application/octet-stream"),
+                ],
+            );
             assert!(metadata(&base, &object, 3).unwrap().content_type.is_none());
             for value in [
                 b"application/vnd.oci.image.manifest.v1+json".as_slice(),
@@ -1109,13 +1088,8 @@ mod protocol {
                 "Racer-Metadata",
                 "Authorization",
             ] {
-                let mut head = MessageHead {
-                    start: StartLine::Response { status: 200 },
-                    headers: vec![Header {
-                        name: "Content-Length".into(),
-                        value: b"0".to_vec(),
-                    }],
-                };
+                let mut head =
+                    crate::origin::tests::response_head(200, &[("Content-Length", b"0")]);
                 if name != "Content-Length" {
                     head.headers.push(Header {
                         name: name.into(),
@@ -1146,13 +1120,8 @@ mod protocol {
                 (503, Error::Unavailable),
                 (302, Error::BadGateway),
             ] {
-                let mut head = MessageHead {
-                    start: StartLine::Response { status },
-                    headers: vec![Header {
-                        name: "Content-Length".into(),
-                        value: b"0".to_vec(),
-                    }],
-                };
+                let mut head =
+                    crate::origin::tests::response_head(status, &[("Content-Length", b"0")]);
                 if status == 416 {
                     head.headers.push(Header {
                         name: "Content-Range".into(),

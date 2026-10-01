@@ -26,7 +26,7 @@ use crate::{
 use std::os::fd::AsRawFd;
 #[cfg(test)]
 use std::time::Instant;
-use std::{future::poll_fn, io, rc::Rc, task::Poll, time::Duration};
+use std::{io, rc::Rc, task::Poll, time::Duration};
 
 // Limit both syscall size and work in one executor turn, even for a writable peer.
 const SEND_CHUNK_BYTES: usize = 64 * 1024;
@@ -367,19 +367,7 @@ fn validate_socket(connection: &Descriptor) -> Result<()> {
     connection.validate_socket()
 }
 
-async fn yield_once() {
-    let mut yielded = false;
-    poll_fn(|cx| {
-        if yielded {
-            Poll::Ready(())
-        } else {
-            yielded = true;
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
-    })
-    .await;
-}
+use crate::error::cooperative_turn as yield_once;
 
 #[cfg(test)]
 mod tests {
@@ -447,6 +435,36 @@ mod tests {
         let mut connection = ConnectionLease::from_accepted(socket, admission).unwrap();
         connection.tx_remaining = Some(length);
         connection
+    }
+
+    fn blocked_reader(
+        admission: &Admission,
+        delivery: &Delivery,
+    ) -> (
+        ReaderLease,
+        ConnectionLease,
+        UnixStream,
+        std::sync::Weak<VerifiedBytes>,
+    ) {
+        let page = page(admission, vec![0x5a; 512 * 1024]);
+        let weak = Arc::downgrade(&page.inner);
+        let reader = delivery.attach(page, slice(0, 512 * 1024)).unwrap();
+        let (socket, peer) = UnixStream::pair().unwrap();
+        small_send_buffer(&socket);
+        (
+            reader,
+            connection(socket.into(), admission, 512 * 1024),
+            peer,
+            weak,
+        )
+    }
+    fn assert_pending<T>(operation: &mut Operation<'_, T>) {
+        assert!(
+            operation
+                .as_mut()
+                .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+                .is_pending()
+        );
     }
 
     fn drive<T>(reactor: &Reactor, mut future: Operation<'_, T>) -> Result<T> {
@@ -981,19 +999,10 @@ mod tests {
     fn abandonment_and_cancellation_of_pending_send_release_copied_page() {
         for cancel in [false, true] {
             let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
-            let page = page(&admission, vec![0x5a; 512 * 1024]);
-            let weak = Arc::downgrade(&page.inner);
-            let reader = delivery.attach(page, slice(0, 512 * 1024)).unwrap();
-            let (socket, _peer) = UnixStream::pair().unwrap();
-            small_send_buffer(&socket);
+            let (reader, connection, _peer, weak) = blocked_reader(&admission, &delivery);
             let scope = scope();
-            let mut operation = delivery.finish_to(
-                reader,
-                connection(socket.into(), &admission, 512 * 1024),
-                &scope,
-            );
-            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-            assert!(operation.as_mut().poll(&mut cx).is_pending());
+            let mut operation = delivery.finish_to(reader, connection, &scope);
+            assert_pending(&mut operation);
             assert!(weak.upgrade().is_some());
             assert!(matches!(delivery.pipes.acquire(), Err(Error::Overloaded)));
             if cancel {
@@ -1082,17 +1091,10 @@ mod tests {
     #[test]
     fn http_connection_and_reader_admission_survive_readiness_wait() {
         let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
-        let page = page(&admission, vec![0x5a; 512 * 1024]);
-        let weak = Arc::downgrade(&page.inner);
-        let reader = delivery.attach(page, slice(0, 512 * 1024)).unwrap();
-        let (socket, _peer) = UnixStream::pair().unwrap();
-        small_send_buffer(&socket);
-        let mut connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
-        connection.tx_remaining = Some(512 * 1024);
+        let (reader, connection, _peer, weak) = blocked_reader(&admission, &delivery);
         let scope = scope();
         let mut operation = delivery.finish_to(reader, connection, &scope);
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        assert!(operation.as_mut().poll(&mut cx).is_pending());
+        assert_pending(&mut operation);
         assert!(reactor.in_flight() > 0);
         assert!(weak.upgrade().is_some());
         assert_eq!(admission.used(ResourceClass::Pipe), 1);
@@ -1113,26 +1115,12 @@ mod tests {
     #[test]
     fn original_deadline_caps_a_longer_stall_timeout() {
         let (admission, reactor, delivery) = setup(1, Duration::from_secs(30));
-        let reader = delivery
-            .attach(
-                page(&admission, vec![0x5a; 512 * 1024]),
-                slice(0, 512 * 1024),
-            )
-            .unwrap();
-        let (socket, _peer) = UnixStream::pair().unwrap();
-        small_send_buffer(&socket);
+        let (reader, connection, _peer, _) = blocked_reader(&admission, &delivery);
         let mut scope = scope();
         scope.deadline = Deadline(Instant::now() + Duration::from_millis(25));
         let original = scope.deadline.0;
         assert!(matches!(
-            drive(
-                &reactor,
-                delivery.finish_to(
-                    reader,
-                    connection(socket.into(), &admission, 512 * 1024),
-                    &scope
-                )
-            ),
+            drive(&reactor, delivery.finish_to(reader, connection, &scope)),
             Err(Error::DeadlineExceeded)
         ));
         assert_eq!(scope.deadline.0, original);
@@ -1142,13 +1130,7 @@ mod tests {
     fn abandoned_http_send_does_not_cycle_through_reactor_owner() {
         let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
         let weak_reactor = Rc::downgrade(&reactor);
-        let page = page(&admission, vec![0x5a; 512 * 1024]);
-        let weak_page = Arc::downgrade(&page.inner);
-        let reader = delivery.attach(page, slice(0, 512 * 1024)).unwrap();
-        let (socket, _peer) = UnixStream::pair().unwrap();
-        small_send_buffer(&socket);
-        let mut connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
-        connection.tx_remaining = Some(512 * 1024);
+        let (reader, connection, _peer, weak_page) = blocked_reader(&admission, &delivery);
         let scope = scope();
         let mut operation = delivery.finish_to(reader, connection, &scope);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -1168,13 +1150,7 @@ mod tests {
     #[test]
     fn abandoned_http_send_retains_all_leases_until_completion_fence() {
         let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
-        let page = page(&admission, vec![0x5a; 512 * 1024]);
-        let weak = Arc::downgrade(&page.inner);
-        let reader = delivery.attach(page, slice(0, 512 * 1024)).unwrap();
-        let (socket, _peer) = UnixStream::pair().unwrap();
-        small_send_buffer(&socket);
-        let mut connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
-        connection.tx_remaining = Some(512 * 1024);
+        let (reader, connection, _peer, weak) = blocked_reader(&admission, &delivery);
         let scope = scope();
         let mut operation = delivery.finish_to(reader, connection, &scope);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -1199,13 +1175,7 @@ mod tests {
     fn reactor_drain_fences_pending_http_delivery_and_releases_all_leases() {
         for abandon in [false, true] {
             let (admission, reactor, delivery) = setup(1, Duration::from_secs(30));
-            let page = page(&admission, vec![0x5a; 512 * 1024]);
-            let weak = Arc::downgrade(&page.inner);
-            let reader = delivery.attach(page, slice(0, 512 * 1024)).unwrap();
-            let (socket, _peer) = UnixStream::pair().unwrap();
-            small_send_buffer(&socket);
-            let mut connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
-            connection.tx_remaining = Some(512 * 1024);
+            let (reader, connection, _peer, weak) = blocked_reader(&admission, &delivery);
             let scope = scope();
             let mut operation = delivery.finish_to(reader, connection, &scope);
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -1324,13 +1294,7 @@ mod tests {
     fn pending_http_send_cancellation_disconnect_and_stall_release_all_leases() {
         let (admission, reactor, delivery) = setup(1, Duration::from_millis(25));
         for failure in [Error::Cancelled, Error::Io, Error::DeadlineExceeded] {
-            let page = page(&admission, vec![0x5a; 512 * 1024]);
-            let weak = Arc::downgrade(&page.inner);
-            let reader = delivery.attach(page, slice(0, 512 * 1024)).unwrap();
-            let (socket, peer) = UnixStream::pair().unwrap();
-            small_send_buffer(&socket);
-            let mut connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
-            connection.tx_remaining = Some(512 * 1024);
+            let (reader, connection, peer, weak) = blocked_reader(&admission, &delivery);
             let scope = scope();
             let original = scope.deadline.0;
             let mut operation = delivery.finish_progressing(reader, connection, &scope);
