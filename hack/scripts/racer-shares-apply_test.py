@@ -192,10 +192,40 @@ class GateTests(unittest.TestCase):
                 s.coverage(payload, {"a"}, 0)
         s.coverage(vector(["a"]), {"a"}, 0)
         q = s.drain_query(*s.GAUGES[-1])
-        for token in ("max_over_time", "[3m]", "count_over_time", "offset 150s", "timestamp", "time()-45"):
+        for token in ("max_over_time", "[255s]", "count_over_time", ">= 4", "[75s] offset 180s", "timestamp", "time()-75"):
             self.assertIn(token, q)
         self.assertNotIn("or 0", q)
         self.assertEqual(len(s.GAUGES), 8)
+
+    def test_sixty_second_scrape_phase_and_full_three_minute_history(self):
+        # Independent scalar oracle for the range/count/freshness/early clauses.
+        # Ages are seconds before evaluation; Prometheus ranges are (left,right].
+        def accepts(samples):
+            history = [(age, value) for age, value in samples if 0 <= age < 255]
+            return (len(history) >= 4 and max(v for _, v in history) == 0
+                    and min(age for age, _ in history) <= 75
+                    and any(180 <= age < 255 for age, _ in history))
+
+        for phase in range(60):
+            samples = [(phase + 60 * i, 0) for i in range(5)]
+            with self.subTest(phase=phase):
+                self.assertTrue(accepts(samples))
+                # A sample preceding the 180s boundary is included in the zero
+                # check, preventing an unobserved leading gap from passing.
+                bad = [(age, 1 if 180 <= age < 255 else value) for age, value in samples]
+                self.assertFalse(accepts(bad))
+        self.assertTrue(accepts([(14, 0), (74, 0), (134, 0), (194, 0), (254, 0)]))
+        self.assertTrue(accepts([(0, 0), (60, 0), (120, 0), (180, 0)]))
+        self.assertTrue(accepts([(75, 0), (130, 0), (190, 0), (250, 0)]))
+        self.assertFalse(accepts([(76, 0), (130, 0), (190, 0), (250, 0)]))
+        self.assertFalse(accepts([(0, 0), (60, 0), (120, 0), (255, 0)]))
+        self.assertFalse(accepts([(0, 0), (60, 0), (120, 0)]))
+        self.assertFalse(accepts([]))
+        # Both zero gauges and up health gates use the expanded history.
+        health = s.drain_query("up", "racer-dataplane", False)
+        self.assertIn("min_over_time", health)
+        self.assertIn("[255s]", health)
+        self.assertIn("== 1", health)
 
     def test_gate_all_gauges_and_up(self):
         f = Fake()

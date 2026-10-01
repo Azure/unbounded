@@ -127,13 +127,17 @@ def control_identity(cm, rows):
 
 def drain_query(metric, app, zero=True):
     selector = f'{metric}{{job="kubernetes-pods",namespace="unbounded-system",app_kubernetes_io_name="{app}",node!=""}}'
-    # Every observed series must have six samples, early-window coverage, and
-    # a fresh current sample. No `or 0`: absence is a failed coverage gate.
-    value = (f"max by(node)(max_over_time({selector}[3m])) == 0" if zero else
-             f"min by(node)(min_over_time({selector}[3m])) == 1")
-    return (f"({value}) and on(node) (min by(node)(count_over_time({selector}[3m])) >= 6) "
-            f"and on(node) (min by(node)(timestamp({selector})) >= time()-45) "
-            f"and on(node) (count by(node)(count_over_time({selector}[30s] offset 150s)) "
+    # 60s scrapes, with 15s scheduling margin: early sample age is [180,255)s
+    # (range selectors exclude their left boundary). All samples back through
+    # that bucket must be zero, not just samples after the three-minute boundary.
+    # Four samples and current age <=75s accommodate normal scrape phase/jitter.
+    # No `or 0`: absence is a failed coverage gate. This is sampled evidence,
+    # never proof of unobserved values between scrapes.
+    value = (f"max by(node)(max_over_time({selector}[255s])) == 0" if zero else
+             f"min by(node)(min_over_time({selector}[255s])) == 1")
+    return (f"({value}) and on(node) (min by(node)(count_over_time({selector}[255s])) >= 4) "
+            f"and on(node) (min by(node)(timestamp({selector})) >= time()-75) "
+            f"and on(node) (count by(node)(count_over_time({selector}[75s] offset 180s)) "
             f"== on(node) count by(node)({selector}))")
 
 

@@ -16,9 +16,16 @@ is skipped on apply; exact absent/1 is skipped on rollback. Any third state,
 UID drift, exclusion, deletion, or enrolled shares other than 4 stops the phase.
 
 Before writing, the helper requires global ConfigMap concurrency 0, the exact
-eleven C1 caps, eight zero max-over-3m gauges, healthy loadgen/dataplane scrapes,
-all 1500 node labels, at least six samples per series, early-window samples and
-fresh current samples. This is sampled telemetry evidence, not a continuous
+eleven C1 caps, eight zero max-over-255s gauges, healthy loadgen/dataplane scrapes,
+all 1500 node labels, at least four samples per series, early-window samples and
+current sample age <=75s. For the observed 60s scrape cadence, the early bucket
+is `[75s] offset 180s`: it requires a sample aged at least 180s and less than 255s.
+The entire 255s window must be zero (up must remain 1), including that early
+sample, so this does not shorten the three-minute drain gate or leave an
+unchecked leading bucket. Regular 60s scrapes pass at every scrape phase; the
+extra 15s allows modest scheduling jitter. A recently paused fleet may correctly
+fail longer than three minutes while an older nonzero sample remains in 255s.
+This is sampled telemetry evidence, not a continuous
 proof between scrapes. Missing or warning-bearing queries fail closed. Parent
 must finish the existing drain process first; this helper does not wait for it.
 All phase nodes are preflighted before any write; each write uses a fresh GET.
