@@ -28,6 +28,12 @@ func TestDeltaAddRemoveUpdateAndRejectedBase(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if os.Getenv("RACER_UPDATE_SITE_VECTORS") == "1" {
+		if err := os.WriteFile("testdata/delta.json", append(bytes.Clone(encoded), '\n'), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	golden, err := os.ReadFile("testdata/delta.json")
 	if err != nil {
 		t.Fatal(err)

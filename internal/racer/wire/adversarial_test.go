@@ -256,8 +256,8 @@ func TestUnknownFieldsAndExactNames(t *testing.T) {
 	b := fixture(t, "publication.json")
 
 	b = bytes.Replace(b, []byte(`"schema_version":1`), []byte(`"schema_version":1,"SCHEMA_VERSION":42`), 1)
-	if _, err := DecodePublication(bytes.NewReader(b)); err != nil {
-		t.Fatal("unknown case variant was not ignored", err)
+	if _, err := DecodePublication(bytes.NewReader(b)); err == nil {
+		t.Fatal("unknown case variant accepted")
 	}
 
 	b = bytes.Replace(b, []byte(`"schema_version":1,`), nil, 1)
@@ -280,7 +280,7 @@ func TestBundleValidationAndKeyIsolation(t *testing.T) {
 	}
 
 	ref.ID[0] = 123
-	if key.Key.ID[0] != 0 {
+	if key.Key.ID[0] != 'R' {
 		t.Fatal("material ingress retained mutable id")
 	}
 

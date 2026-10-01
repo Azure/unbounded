@@ -23,7 +23,7 @@ func TestMemberSiteWireValidation(t *testing.T) {
 			require.NoError(t, err)
 
 			if site == "" {
-				require.NotContains(t, string(encoded), `"site"`)
+				require.Contains(t, string(encoded), `"site":""`)
 			} else {
 				require.Contains(t, string(encoded), `"alignment_enabled":true,"site":"`+site+`"`)
 			}
@@ -59,12 +59,12 @@ func TestMemberSiteJSONShape(t *testing.T) {
 		require.ErrorIs(t, err, InvalidRequest, "%s", value)
 	}
 
-	raw := strings.Replace(string(fixture(t, "publication.json")), `"alignment_enabled":true`, `"alignment_enabled":true,"site":""`, 1)
+	raw := string(fixture(t, "publication.json"))
 	v, err := DecodePublication(strings.NewReader(raw))
 	require.NoError(t, err)
 	encoded, err := EncodePublication(v)
 	require.NoError(t, err)
-	require.NotContains(t, string(encoded), `"site"`)
+	require.Contains(t, string(encoded), `"site":""`)
 }
 
 func TestMemberSiteDeltaValidation(t *testing.T) {

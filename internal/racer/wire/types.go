@@ -9,7 +9,9 @@ import (
 	"bytes"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"net/netip"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -59,7 +61,7 @@ type Member struct {
 	Rails            []Rail `json:"rails"`
 	AlignmentEnabled bool   `json:"alignment_enabled"`
 	// Site is the RDMA boundary. Empty means HTTP-only, not a shared default site.
-	Site string `json:"site,omitempty"`
+	Site string `json:"site"`
 }
 
 type CacheDefinition struct {
@@ -81,7 +83,7 @@ type Publication struct {
 // BootstrapRequest contains no bearer token. The transport reads the projected
 // token for each issuance attempt and supplies it in Authorization.
 type BootstrapRequest struct {
-	Shares        uint32       `json:"shares,omitempty"`
+	Shares        uint32       `json:"shares"`
 	SchemaVersion uint32       `json:"schema_version"`
 	Cluster       ClusterID    `json:"cluster"`
 	Enrollment    EnrollmentID `json:"enrollment"`
@@ -128,7 +130,7 @@ func (CacheKey) GoString() string { return "<redacted cache key>" }
 
 // NewCacheKey is the only material ingress besides bounded bundle decoding.
 func NewCacheKey(ref CacheKeyRef, state KeyState, material [32]byte) (CacheKey, error) {
-	if !ValidUUID(string(ref.Cache)) || len(ref.ID) != 16 || (ref.Purpose != PageKey && ref.Purpose != OriginCredentialsKey) || (state != PreparedKey && state != ActiveKey && state != RetiringKey) {
+	if !ValidUUID(string(ref.Cache)) || len(ref.ID) != 16 || string(ref.ID[:4]) != "RKG1" || binary.BigEndian.Uint64(ref.ID[4:12]) == 0 || (ref.Purpose != PageKey && ref.Purpose != OriginCredentialsKey) || (state != PreparedKey && state != ActiveKey && state != RetiringKey) {
 		return CacheKey{}, InvalidRequest
 	}
 
@@ -230,7 +232,7 @@ func ValidateBootstrapRequest(v BootstrapRequest) error {
 		return err
 	}
 
-	if !ValidUUID(string(v.Enrollment)) {
+	if !ValidUUID(string(v.Enrollment)) || v.Shares == 0 {
 		return InvalidRequest
 	}
 
@@ -244,8 +246,8 @@ func ValidateBootstrapRequest(v BootstrapRequest) error {
 
 	// The validated version is 1 and UUIDs are unescaped ASCII. Only padded
 	// base64 contributes variable framing size; no encoder newline is on the wire.
-	const framing = len(`{"schema_version":1,"cluster":"","enrollment":"","csr_der":""}`)
-	if framing+len(v.Cluster)+len(v.Enrollment)+base64.StdEncoding.EncodedLen(len(v.CSRDER)) > MaxBootstrapBytes {
+	const framing = len(`{"shares":,"schema_version":1,"cluster":"","enrollment":"","csr_der":""}`)
+	if framing+len(strconv.FormatUint(uint64(v.Shares), 10))+len(v.Cluster)+len(v.Enrollment)+base64.StdEncoding.EncodedLen(len(v.CSRDER)) > MaxBootstrapBytes {
 		return TooLarge
 	}
 
@@ -443,6 +445,10 @@ func validateBundle(v KeyringBundle) error {
 	for _, k := range v.CacheKeys {
 		if _, err := NewCacheKey(k.Key, k.State, k.material); err != nil {
 			return err
+		}
+
+		if binary.BigEndian.Uint64(k.Key.ID[4:12]) > uint64(v.Generation) {
+			return InvalidRequest
 		}
 
 		s := scope{k.Key.Cache, k.Key.Purpose}

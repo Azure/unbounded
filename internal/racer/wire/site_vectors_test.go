@@ -5,6 +5,7 @@ package wire
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"os"
 	"testing"
@@ -31,6 +32,7 @@ func TestGenerateSharedSiteVectors(t *testing.T) {
 		t.Skip("set RACER_UPDATE_SITE_VECTORS=1 to regenerate shared Site vectors")
 	}
 
+	regenerateSharedVectors(t)
 	p, err := DecodePublication(bytes.NewReader(fixture(t, "publication.json")))
 	require.NoError(t, err)
 
@@ -110,7 +112,7 @@ func TestSharedSiteVectors(t *testing.T) {
 			require.Equal(t, []byte(v.Publication), encoded)
 
 			if step.site == "" {
-				require.NotContains(t, string(encoded), `"site"`)
+				require.Contains(t, string(encoded), `"site":""`)
 			} else {
 				require.Contains(t, string(encoded), `"alignment_enabled":true,"site":"`+step.site+`"`)
 			}
@@ -168,4 +170,62 @@ func TestSharedSiteVectors(t *testing.T) {
 	require.Equal(t, vectors[0].Membership, vectors[3].Membership)
 	require.Equal(t, vectors[0].ContentHash, vectors[3].ContentHash)
 	require.Equal(t, vectors[0].MembershipHash, vectors[3].MembershipHash)
+}
+
+// regenerateSharedVectors migrates public fixture inputs through the current
+// encoders. No private certificate key or production key material is persisted.
+func regenerateSharedVectors(t *testing.T) {
+	t.Helper()
+
+	write := func(name string, b []byte) {
+		t.Helper()
+		require.NoError(t, os.WriteFile("testdata/"+name, append(b, '\n'), 0o644))
+
+		if name == "publication.json" || name == "bootstrap-request.json" || name == "bootstrap-response.json" || name == "bundle.json" {
+			require.NoError(t, os.WriteFile("../../../cmd/racer-dataplane/src/control/testdata/"+name, append(b, '\n'), 0o644))
+		}
+	}
+
+	var p Publication
+	require.NoError(t, json.Unmarshal(fixture(t, "publication.json"), &p))
+	b, err := json.Marshal(p)
+	require.NoError(t, err)
+	write("publication.json", b)
+
+	candidate, err := NewCanonicalCandidate(p)
+	require.NoError(t, err)
+	c, m, err := candidate.canonicalContent()
+	require.NoError(t, err)
+	write("content.json", c)
+	write("membership.json", m)
+
+	ph, mh, err := candidate.ContentHashes()
+	require.NoError(t, err)
+	b, err = json.Marshal(map[string]string{"content": ph, "membership": mh})
+	require.NoError(t, err)
+	write("hashes.json", b)
+
+	var request BootstrapRequest
+	require.NoError(t, json.Unmarshal(fixture(t, "bootstrap-request.json"), &request))
+	request.Shares = DefaultShares
+	b, err = EncodeBootstrapRequest(request)
+	require.NoError(t, err)
+	write("bootstrap-request.json", b)
+	write("bootstrap-response.json", fixture(t, "bootstrap-response.json"))
+
+	var bundle bundleJSON
+	require.NoError(t, json.Unmarshal(fixture(t, "bundle.json"), &bundle))
+
+	for i := range bundle.CacheKeys {
+		id := make([]byte, 16)
+		copy(id, "RKG1")
+		binary.BigEndian.PutUint64(id[4:12], uint64(i%2+1))
+		bundle.CacheKeys[i].ID = id
+	}
+
+	b, err = json.Marshal(bundle)
+	require.NoError(t, err)
+	_, err = DecodeBundle(bytes.NewReader(b))
+	require.NoError(t, err)
+	write("bundle.json", b)
 }

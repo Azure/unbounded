@@ -107,7 +107,7 @@ func TestPublicDEREncoding(t *testing.T) {
 	cluster := ClusterID("11111111-1111-4111-8111-111111111111")
 	enrollment := EnrollmentID("55555555-5555-4555-8555-555555555555")
 
-	request, err := EncodeBootstrapRequest(BootstrapRequest{SchemaVersion: 1, Cluster: cluster, Enrollment: enrollment, CSRDER: csr})
+	request, err := EncodeBootstrapRequest(BootstrapRequest{Shares: DefaultShares, SchemaVersion: 1, Cluster: cluster, Enrollment: enrollment, CSRDER: csr})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -34,7 +34,8 @@ func TestKeyringDeliveryEncodingBoundsAndGeneration(t *testing.T) {
 	for n := uint64(1); n <= 4000; n++ {
 		ref := bundle.CacheKeys[0].Key
 		ref.ID = make([]byte, 16)
-		binary.BigEndian.PutUint64(ref.ID, n)
+		copy(ref.ID, "RKG1")
+		binary.BigEndian.PutUint64(ref.ID[4:12], n+10)
 
 		key, err := NewCacheKey(ref, RetiringKey, [32]byte{})
 		if err != nil {
@@ -52,6 +53,50 @@ func TestKeyringDeliveryEncodingBoundsAndGeneration(t *testing.T) {
 func TestBundleEncodingCannotBypassCodec(t *testing.T) {
 	if _, err := json.Marshal(KeyringBundle{}); !errors.Is(err, UnsupportedVersion) {
 		t.Fatalf("standard encoder bypassed bundle validation: %v", err)
+	}
+}
+
+func TestKeyIDsRequireCurrentNamespaceAndValidGeneration(t *testing.T) {
+	bundle, err := DecodeBundle(bytes.NewReader(fixture(t, "bundle.json")))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bundle.Generation = 2
+	for _, generation := range []uint64{0, 1, 2, 3} {
+		ref := bundle.CacheKeys[0].Key
+		ref.ID = bytes.Clone(ref.ID)
+		binary.BigEndian.PutUint64(ref.ID[4:12], generation)
+
+		key, err := NewCacheKey(ref, ActiveKey, [32]byte{})
+		if generation == 0 {
+			if err == nil {
+				t.Fatal("zero generation accepted")
+			}
+
+			continue
+		}
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		candidate := bundle
+		candidate.CacheKeys = []CacheKey{key}
+
+		_, err = EncodeBundle(candidate)
+		if (err == nil) != (generation <= 2) {
+			t.Fatal(generation, err)
+		}
+	}
+
+	for _, id := range [][]byte{make([]byte, 16), []byte("RKG0abcdefgh1234"), []byte("RKG1")} {
+		ref := bundle.CacheKeys[0].Key
+
+		ref.ID = id
+		if _, err := NewCacheKey(ref, ActiveKey, [32]byte{}); err == nil {
+			t.Fatal("legacy ID accepted")
+		}
 	}
 }
 

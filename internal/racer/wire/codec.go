@@ -207,8 +207,7 @@ func decode(r io.Reader, limit int, v any) error {
 	if err = checkShape(tree, reflect.TypeOf(v).Elem(), false); err != nil {
 		return err
 	}
-	// Re-encode the exact-name projection. encoding/json otherwise matches unknown
-	// fields case-insensitively, potentially overwriting a validated known field.
+	// Re-encode only after exact-name validation, including every nested field.
 	b, err = json.Marshal(tree)
 	if err != nil {
 		return InvalidRequest
@@ -221,7 +220,7 @@ func decode(r io.Reader, limit int, v any) error {
 	return nil
 }
 
-// readValue checks duplicates even in ignored fields and caps nesting. JSON's
+// readValue checks duplicates in all fields and caps nesting. JSON's
 // default map decoder silently overwrites duplicates and is not suitable here.
 func readValue(d *json.Decoder, depth int) (any, error) {
 	t, err := d.Token()
@@ -387,7 +386,7 @@ func checkShape(v any, t reflect.Type, quoted bool) error {
 
 		for key := range m {
 			if !known[key] {
-				delete(m, key)
+				return InvalidRequest
 			}
 		}
 	case reflect.Slice:

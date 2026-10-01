@@ -220,19 +220,13 @@ fn certificates(v: &[String]) -> Result<Vec<Vec<u8>>> {
         .collect()
 }
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Request {
-    #[serde(default = "default_shares", skip_serializing_if = "is_default_shares")]
     shares: u32,
     schema_version: u32,
     cluster: String,
     enrollment: String,
     csr_der: String,
-}
-fn default_shares() -> u32 {
-    4
-}
-fn is_default_shares(shares: &u32) -> bool {
-    *shares == 4
 }
 pub fn decode_enrollment_request(b: &[u8]) -> Result<EnrollmentRequest> {
     let r: Request = decode(b, MAX_ENROLLMENT_BYTES)?;
@@ -271,6 +265,7 @@ pub fn encode_enrollment_request(r: &EnrollmentRequest) -> Result<Vec<u8>> {
     Ok(b)
 }
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Response {
     schema_version: u32,
     cluster: String,
@@ -311,6 +306,7 @@ pub fn encode_enrollment_response(r: &EnrollmentResponse) -> Result<Vec<u8>> {
     Ok(b)
 }
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Rail {
     rail: u16,
     fabric: String,
@@ -327,16 +323,17 @@ fn nonnull_optional<'de, D: serde::Deserializer<'de>>(
     u32::deserialize(d).map(Some)
 }
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MemberDto {
     node: String,
     shares: u32,
     peer_endpoint: String,
     rails: Vec<Rail>,
     alignment_enabled: bool,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
     site: String,
 }
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Cache {
     id: String,
     name: String,
@@ -344,6 +341,7 @@ struct Cache {
     origin_socket: String,
 }
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PublicationDto {
     schema_version: u32,
     cluster: String,
@@ -546,6 +544,7 @@ pub fn canonical_content(p: &Publication) -> Result<(Vec<u8>, Vec<u8>)> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DeltaDto {
     delta_version: u32,
     cluster: String,
@@ -676,6 +675,7 @@ mod delta_tests {
     }
 }
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Bundle {
     schema_version: u32,
     cluster: String,
@@ -684,6 +684,7 @@ struct Bundle {
     cache_keys: Vec<Key>,
 }
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Key {
     cache: String,
     id: String,
@@ -725,6 +726,10 @@ pub fn decode_bundle(b: &[u8]) -> Result<KeyringBundle> {
         let id: [u8; 16] = bytes(&k.id)?
             .try_into()
             .map_err(|_| Error::InvalidRequest)?;
+        let created = u64::from_be_bytes(id[4..12].try_into().unwrap());
+        if &id[..4] != b"RKG1" || created == 0 || created > generation.0 {
+            return Err(Error::InvalidRequest);
+        }
         let material = key_material(&k.material)?;
         if !seen.insert((k.cache.clone(), k.purpose.clone(), id)) {
             return Err(Error::InvalidRequest);
@@ -808,6 +813,7 @@ pub fn encode_bundle(b: &KeyringBundle) -> Result<Vec<u8>> {
 }
 pub fn decode_error(b: &[u8]) -> Result<ErrorResponse> {
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Failure {
         code: String,
     }
@@ -890,7 +896,7 @@ mod tests {
     }
     #[test]
     fn go_delta_vector_applies_exactly_and_rejects_tampering() {
-        let base = decode_publication(br#"{"schema_version":1,"cluster":"11111111-1111-4111-8111-111111111111","sequence":"1","membership_version":"1","members":[{"node":"22222222-2222-4222-8222-222222222222","shares":4,"peer_endpoint":"127.0.0.1:7443","rails":[],"alignment_enabled":true},{"node":"33333333-3333-4333-8333-333333333333","shares":4,"peer_endpoint":"127.0.0.2:7443","rails":[],"alignment_enabled":true}],"caches":[]}"#).unwrap();
+        let base = decode_publication(br#"{"schema_version":1,"cluster":"11111111-1111-4111-8111-111111111111","sequence":"1","membership_version":"1","members":[{"node":"22222222-2222-4222-8222-222222222222","shares":4,"peer_endpoint":"127.0.0.1:7443","rails":[],"alignment_enabled":true,"site":""},{"node":"33333333-3333-4333-8333-333333333333","shares":4,"peer_endpoint":"127.0.0.2:7443","rails":[],"alignment_enabled":true,"site":""}],"caches":[]}"#).unwrap();
         let delta = include_str!("../../../../../internal/racer/wire/testdata/delta.json");
         let next = apply_delta(&base, delta.as_bytes()).unwrap();
         assert_eq!(next.sequence.0, 2);
@@ -899,7 +905,7 @@ mod tests {
         assert_eq!(next.members[1].shares.get(), 7);
         assert_eq!(
             format!("{:x}", Sha256::digest(canonical_content(&next).unwrap().0)),
-            "ed94a8a96377ae007c43d8c7895327483d906896ddbb9c1bf0e43e9f4d766d04"
+            "8274c3baff472a8cd5a75b6925a54b0d1446722be397948d9e0a1c5228a3b166"
         );
         assert!(apply_delta(&next, delta.as_bytes()).is_err());
         assert!(
@@ -916,11 +922,11 @@ mod tests {
         let (c, m) = canonical_content(&p).unwrap();
         assert_eq!(
             format!("{:x}", Sha256::digest(c)),
-            "9364dc7078f4f7957643e38c5850f981644eac1d864c6d4d8163ccc974ea8486"
+            "b8f2903edf26d15baaa665e733643e517060b8b309dff562d48162235de0d540"
         );
         assert_eq!(
             format!("{:x}", Sha256::digest(m)),
-            "70bcaf18d9a87f3cc72eef79e3163c02c285c186d7811229e5bc2ccd94336617"
+            "2348021c7385fc57f9726242344943c5cd5dd766574ceb31f8e10029126e9af0"
         );
         let encoded = encode_publication(&p).unwrap();
         assert_eq!(
@@ -949,7 +955,10 @@ mod tests {
                 "\"schema_version\":1",
                 "\"schema_version\":1,\"schema_versi\\u006fn\":1",
             ),
-            ("\"future\":{", "\"future\":{\"x\":1,\"x\":2,"),
+            (
+                "\"schema_version\":1",
+                "\"schema_version\":1,\"future\":{\"x\":1,\"x\":2}",
+            ),
             ("\"schema_version\":1", "\"schema_version\":2"),
             ("\"rail\":0", "\"rail\":-0"),
             ("\"shares\":4,", "\"shares\":4.0,"),
@@ -978,7 +987,7 @@ mod tests {
                     )
                     .as_bytes()
             )
-            .is_ok()
+            .is_err()
         );
         let mut exact = REQUEST.as_bytes().to_vec();
         exact.resize(MAX_ENROLLMENT_BYTES, b' ');
@@ -1002,8 +1011,8 @@ mod tests {
         for (old, new) in [
             ("\"state\":\"prepared\"", "\"state\":\"active\""),
             ("\"state\":\"active\"", "\"state\":\"retiring\""),
-            ("AAAAAAAAAAAAAAAAAAAAAA==", "AAAAAAAAAAAAAAAAAAAAAB=="),
-            ("AAAAAAAAAAAAAAAAAAAAAA==", "AAAAAAAAAAAAAAAAAAAAAA"),
+            ("UktHMQAAAAAAAAABAAAAAA==", "UktHMQAAAAAAAAABAAAAAB=="),
+            ("UktHMQAAAAAAAAABAAAAAA==", "UktHMQAAAAAAAAABAAAAAA"),
             ("\"purpose\":\"page\"", "\"purpose\":\"future\""),
         ] {
             assert!(decode_bundle(BUNDLE.replacen(old, new, 1).as_bytes()).is_err());

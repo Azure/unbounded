@@ -99,11 +99,7 @@ fn shared_site_vectors() {
             let mut d: Value = serde_json::from_slice(delta).unwrap();
             assert_eq!(d["upsert_members"].as_array().unwrap().len(), 1);
             assert!(d["remove_members"].as_array().unwrap().is_empty());
-            if site.is_empty() {
-                assert!(d["upsert_members"][0].get("site").is_none());
-            } else {
-                assert_eq!(d["upsert_members"][0]["site"], site);
-            }
+            assert_eq!(d["upsert_members"][0]["site"], site);
             d["upsert_members"][0]["site"] = "tampered-site".into();
             assert_eq!(
                 apply_delta(base, &serde_json::to_vec(&d).unwrap()).err(),
@@ -131,7 +127,7 @@ fn site_wire_defaults_validation_and_hashes() {
     assert!(p.members.iter().all(|m| m.site.is_empty()));
     let legacy = encode_publication(&p).unwrap();
     assert!(
-        !String::from_utf8(legacy.clone())
+        String::from_utf8(legacy.clone())
             .unwrap()
             .contains("\"site\"")
     );
