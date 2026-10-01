@@ -590,7 +590,7 @@ fn selected_owner_reclaims_foreign_receive_charges_across_full_pages() {
 }
 
 #[test]
-fn verified_selected_handoff_retains_foreign_worker_charges_without_copying() {
+fn ordinary_publication_rejects_foreign_worker_charges() {
     let queue = Rc::new(crate::read::drivers::DriverQueue::default());
     let _owner = queue.enter();
     let mut source = fixture();
@@ -612,27 +612,15 @@ fn verified_selected_handoff_retains_foreign_worker_charges_without_copying() {
         target.fill.dependencies.memory.publish(page.clone()),
         Err(Error::InvalidConfiguration)
     ));
-    target
-        .fill
-        .dependencies
-        .memory
-        .publish_handoff(page.clone())
-        .unwrap();
-    let retained = target
-        .fill
-        .dependencies
-        .memory
-        .get(&source.page)
-        .unwrap()
-        .unwrap();
-    assert!(Arc::ptr_eq(
-        &page.plaintext.inner,
-        &retained.plaintext.inner
-    ));
-    assert!(Arc::ptr_eq(
-        &page.ciphertext.inner,
-        &retained.ciphertext.inner
-    ));
+    assert!(
+        target
+            .fill
+            .dependencies
+            .memory
+            .get(&source.page)
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(
         target
             .fill

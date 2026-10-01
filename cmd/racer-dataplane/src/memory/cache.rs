@@ -170,31 +170,6 @@ impl MemoryCache {
         self.pool.validate_page(&page)?;
         self.publish_validated(page)
     }
-    /// Legacy foreign-charge fixture. Production must rehome selected ciphertext
-    /// and decrypt on the stable owner before ordinary validated publication.
-    #[cfg(test)]
-    pub(crate) fn publish_handoff(&self, page: PageResult) -> Result<()> {
-        page.validate_metadata()?;
-        let cache = &page.metadata.version.object.cache;
-        for (reservation, class, bytes) in [
-            (
-                &page.plaintext.inner.reservation,
-                crate::model::ResourceClass::Plaintext,
-                page.plaintext.bytes().len(),
-            ),
-            (
-                &page.ciphertext.inner.reservation,
-                crate::model::ResourceClass::Ciphertext,
-                page.ciphertext.bytes().len(),
-            ),
-        ] {
-            reservation.validate(class, bytes)?;
-            if reservation.cache() != Some(cache) {
-                return Err(Error::InvalidRequest);
-            }
-        }
-        self.publish_validated(page)
-    }
     fn publish_validated(&self, page: PageResult) -> Result<()> {
         let id = page.plaintext.page();
         self.ciphertext_entries.borrow_mut().remove(id);
