@@ -21,7 +21,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	netv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	"github.com/Azure/unbounded/cmd/agent/internal/installstate"
 	"github.com/Azure/unbounded/internal/provision"
 	"github.com/Azure/unbounded/pkg/agent/config"
@@ -378,10 +377,8 @@ func buildMachineCR(cfg *provision.AgentConfig) v1alpha3.Machine {
 }
 
 func machineSiteLabels(labels map[string]string) map[string]string {
-	for _, key := range []string{v1alpha3.MachineSiteLabelKey, netv1alpha1.SiteLabelKey} {
-		if value := strings.TrimSpace(labels[key]); value != "" {
-			return map[string]string{v1alpha3.MachineSiteLabelKey: value}
-		}
+	if value := strings.TrimSpace(labels[v1alpha3.MachineSiteLabelKey]); value != "" {
+		return map[string]string{v1alpha3.MachineSiteLabelKey: value}
 	}
 
 	return nil
