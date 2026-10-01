@@ -1,5 +1,14 @@
 # Gantry + Unbounded Integration
 
+> **Historical proposal, superseded.** Gantry is now an optional operator-managed
+> component, and standalone deployment remains supported. The first release does
+> not promise the proposed `kubectl unbounded gantry` day-2 command group or
+> Pod-annotation peer discovery. Manifests are rendered from templates; they are
+> not the directly applicable source YAML described below. See the
+> [current Gantry guide](../docs/content/guides/gantry.md) for deployment, Lease
+> chair discovery, requester-delegated authentication, and both supported backends.
+> The phasing below records proposal history, not a first-release acceptance list.
+
 ## Background
 
 Gantry is a P2P OCI image distribution agent that runs as a Kubernetes DaemonSet. Today it

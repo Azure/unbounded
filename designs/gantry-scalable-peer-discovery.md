@@ -1,6 +1,15 @@
 # Scalable Peer Discovery for Gantry
 
-**Status:** Draft for discussion
+**Status:** Historical alternative; superseded by rotating Lease chairs
+
+The DHT-closest-peer cold-puller selection proposed here was not adopted as the
+first-release contract. Current Gantry uses fixed Lease chair slots, HRW over
+stable chair IDs, and HTTPS content requests with required assignments. The DHT
+discovers completed content; it does not select cold pullers from its closest
+peers. Full Kubernetes Pod/Node membership watches are not required. See the
+[rotating-chair design](gantry-cold-pull-rotating-chair.md) and
+[current Gantry guide](../docs/content/guides/gantry.md). The remaining text is
+retained for design rationale only.
 
 ## Summary
 

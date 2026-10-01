@@ -1,11 +1,19 @@
-# Integration: single `unbounded-system` namespace + operator-driven migration
+# Historical integration: single `unbounded-system` namespace
 
-Status: in progress
-Integration branch: `feature/unbounded-system`
+Status: superseded by the first-release baseline
+Historical integration branch: `feature/unbounded-system`
 
-This document is the source of truth for the namespace-consolidation effort. It
-lives on the integration branch and its checklist is kept current as each chunk
-is opened and merged.
+This document preserves the namespace-consolidation design and review history,
+not a current installation or migration contract. The first release uses the
+shared `unbounded-cloud.io/v1alpha3` Site and defaults to `unbounded-system`.
+It does not translate old Sites, copy old namespace state, dual-write Site
+labels, run a legacy reaper, or support upgrades from pre-release tags. The
+reaper flags, scripts, workflows, and release gates discussed below are retired.
+Use the [current networking configuration reference](../docs/content/reference/networking/configuration.md)
+for the Kubernetes 1.34+ baseline, canonical labels, and namespace configuration.
+
+Everything below records the historical proposal and its completion state at
+the time; it is not a remaining first-release checklist.
 
 ## Problem
 

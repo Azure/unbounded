@@ -1,7 +1,17 @@
 # Gantry  -  Architecture
 
-**Status:** Draft for team review
+**Status:** Historical architecture proposal; superseded by the first-release implementation
 **Scope:** High-level design for Gantry cluster-internal container image distribution at 10k+ node scale.
+
+Read the [current Gantry guide](../docs/content/guides/gantry.md) before using
+this document. The body preserves earlier design alternatives, not supported
+configuration or wire contracts. In particular, full-membership HRW puller
+selection, libp2p pull-intent/content RPCs, shared registry credential files,
+compatibility switches, and competing live-mirror cache writes are retired.
+Current cold seeding uses rotating Lease chairs and HRW over stable chair IDs;
+HTTPS content requests require an assignment and explicit kind. Libp2p retains
+chair-rotation offers. Containerd remains the default backend; Racer is optional.
+These distinctions supersede conflicting examples and guarantees below.
 
 ---
 
