@@ -65,7 +65,7 @@ impl PeerNetwork {
         &self,
         membership: &MembershipLease,
         node: &NodeId,
-    ) -> Result<crate::http::pool::Endpoint> {
+    ) -> Result<crate::http::connection::Endpoint> {
         if !crate::topology::Graph::with_algorithm(membership.clone(), self.algorithm)
             .neighbors(&self.local)?
             .contains(node)
@@ -73,7 +73,7 @@ impl PeerNetwork {
             return Err(Error::InvalidRequest);
         }
         let member = membership.member(node)?;
-        Ok(crate::http::pool::Endpoint::Peer(
+        Ok(crate::http::connection::Endpoint::Peer(
             member.peer_endpoint.clone(),
         ))
     }

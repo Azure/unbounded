@@ -15,7 +15,7 @@ use super::{
 use crate::runtime::reactor::Descriptor;
 use crate::{
     error::{Error, Operation, Result},
-    http::{io::OwnedBuffer, pool::ConnectionLease},
+    http::{connection::ConnectionLease, io::OwnedBuffer},
     model::PageSlice,
     runtime::{
         deadline::RequestScope,

@@ -5,7 +5,7 @@ use super::{RequestParser, response::Responses};
 use crate::{
     control::caches::CacheDefinition,
     error::{Error, Operation, Result},
-    http::{io::HttpIo, pool::ConnectionLease},
+    http::{connection::ConnectionLease, io::HttpIo},
     model::{CacheId, RequestId},
     read::ReadService,
     runtime::{

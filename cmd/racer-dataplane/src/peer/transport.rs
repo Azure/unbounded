@@ -4,8 +4,8 @@ use crate::telemetry::failures::{BodyProgress, Detail, Failure, Stage, timestamp
 use crate::{
     error::{Error, Operation, Result},
     http::{
+        connection::{ConnectionLease, HttpPool},
         io::HttpIo,
-        pool::{ConnectionLease, HttpPool},
     },
     memory::pool::CiphertextPage,
     model::{NodeId, ResourceClass, TransferId},
@@ -1044,7 +1044,7 @@ pub enum RelayResponse {
     Complete(SignedResponse),
     Http {
         authentication: crate::security::forwarding::ForwardedHead,
-        connection: Box<crate::http::pool::ConnectionLease>,
+        connection: Box<crate::http::connection::ConnectionLease>,
         length: usize,
     },
 }
@@ -1081,7 +1081,7 @@ impl Transfers {
     /// Authentication and charged decoding are mandatory, even for HTTP-only peers.
     ///
     /// ```compile_fail
-    /// use racer_dataplane::{http::{io::HttpIo, pool::HttpPool}, peer::transport::Transfers};
+    /// use racer_dataplane::{http::{io::HttpIo, connection::HttpPool}, peer::transport::Transfers};
     /// use std::rc::Rc;
     /// fn unsigned(pool: Rc<HttpPool>, io: Rc<HttpIo>) {
     ///     let _ = Transfers::new(pool, io, None);
@@ -1205,7 +1205,7 @@ impl Transfers {
     /// A failed/abandoned exchange is never marked reusable.
     pub fn exchange<'a>(
         &'a self,
-        endpoint: crate::http::pool::Endpoint,
+        endpoint: crate::http::connection::Endpoint,
         request: SignedRequest,
         scope: &'a RequestScope,
     ) -> Operation<'a, SignedResponse> {
@@ -1213,7 +1213,7 @@ impl Transfers {
     }
     pub fn exchange_planned<'a>(
         &'a self,
-        endpoint: crate::http::pool::Endpoint,
+        endpoint: crate::http::connection::Endpoint,
         request: SignedRequest,
         plan: TransportPlan,
         scope: &'a RequestScope,
@@ -1238,7 +1238,7 @@ impl Transfers {
     }
     pub(crate) fn exchange_inner<'a>(
         &'a self,
-        endpoint: crate::http::pool::Endpoint,
+        endpoint: crate::http::connection::Endpoint,
         request: SignedRequest,
         plan: TransportPlan,
         relay: Option<Rc<Reservation>>,

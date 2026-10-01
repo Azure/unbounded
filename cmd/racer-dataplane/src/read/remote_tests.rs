@@ -6,8 +6,8 @@ use crate::{
     error::{Error, Operation},
     http::{
         Codec,
+        connection::{ConnectionLease, HttpPool},
         io::HttpIo,
-        pool::{ConnectionLease, HttpPool},
     },
     memory::pool::BufferPool,
     model::{ExpiresAt, MetadataSelector, ObjectMetadata, OriginContext, *},

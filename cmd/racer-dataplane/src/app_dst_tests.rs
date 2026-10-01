@@ -1279,7 +1279,7 @@ impl Harness {
         let listener_scope = self.nodes[index].app.listener_scope.take().unwrap();
         listener_scope.cancel().unwrap();
         self.nodes[index].app.peer_task.take();
-        let endpoint = crate::http::pool::Endpoint::Peer(address.to_string());
+        let endpoint = crate::http::connection::Endpoint::Peer(address.to_string());
         for node in &self.nodes {
             node.app.http.invalidate(&endpoint);
         }

@@ -410,7 +410,7 @@ impl PipeLease {
     /// nonblocking stream socket. The public arbitrary-FD API still validates it.
     pub(crate) fn try_splice_connection(
         &mut self,
-        socket: &crate::http::pool::ConnectionLease,
+        socket: &crate::http::connection::ConnectionLease,
     ) -> io::Result<usize> {
         #[cfg(test)]
         if matches!(&*socket.fd, Descriptor::Sim(_)) {

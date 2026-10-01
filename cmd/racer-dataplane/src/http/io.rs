@@ -4,7 +4,7 @@
 //! socket while the kernel uses it. Before submission, move the connection and
 //! owned buffers into reactor-owned state; return them only after the final fence.
 //! Head operations must stage encoded/received bytes in owned IoBuffer storage.
-use super::{MessageHead, StartLine, pool::ConnectionLease};
+use super::{MessageHead, StartLine, connection::ConnectionLease};
 use crate::{
     error::{Error, Operation, Result},
     model::ResourceClass,
@@ -122,7 +122,7 @@ impl<B: SendBuffer> SendBuffer for SendRange<B> {
 /// Head and body operations transfer ownership in both directions:
 /// ```no_run
 /// use racer_dataplane::{error::Result,
-///     http::{io::HttpIo, pool::ConnectionLease}, memory::pool::PlaintextBuffer,
+///     http::{io::HttpIo, connection::ConnectionLease}, memory::pool::PlaintextBuffer,
 ///     runtime::{deadline::RequestScope, reactor::Completion}};
 /// async fn exchange(io: &HttpIo, connection: ConnectionLease,
 ///     buffer: PlaintextBuffer, scope: &RequestScope)
@@ -491,7 +491,7 @@ impl HttpIo {
     /// Stream bounded chunks; endpoint controls expected body length and validation.
     /// Borrowed destinations cannot survive abandonment of a submitted operation:
     /// ```compile_fail
-    /// use racer_dataplane::{http::{io::HttpIo, pool::ConnectionLease},
+    /// use racer_dataplane::{http::{io::HttpIo, connection::ConnectionLease},
     ///     runtime::deadline::RequestScope};
     /// fn borrowed(io: &HttpIo, connection: ConnectionLease, scope: &RequestScope) {
     ///     let mut bytes = [0; 16];
@@ -512,7 +512,7 @@ impl HttpIo {
     }
     /// Transfer an admitted mutable or immutable owner, never a borrowed slice.
     /// ```compile_fail
-    /// use racer_dataplane::{http::{io::HttpIo, pool::ConnectionLease},
+    /// use racer_dataplane::{http::{io::HttpIo, connection::ConnectionLease},
     ///     runtime::deadline::RequestScope};
     /// fn borrowed(io: &HttpIo, connection: ConnectionLease, scope: &RequestScope) {
     ///     let bytes = [0; 16];
@@ -833,7 +833,7 @@ mod tests {
     use crate::{
         http::{
             Codec, Header,
-            pool::{Endpoint, HttpPool},
+            connection::{Endpoint, HttpPool},
         },
         model::RequestId,
     };

@@ -12,8 +12,8 @@ use crate::{
     error::{Error, Operation, Result},
     http::{
         Header, MessageHead, StartLine,
+        connection::{ConnectionLease, Endpoint, HttpPool},
         io::HttpIo,
-        pool::{ConnectionLease, Endpoint, HttpPool},
     },
     memory::pool::{BufferPool, PlaintextBuffer},
     model::{MetadataSelector, OriginContext, PAGE_BYTES, PageId, PageNumber, ResourceClass},

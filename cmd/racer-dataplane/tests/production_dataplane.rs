@@ -18,8 +18,8 @@ use racer_dataplane::{
     error::{Error, Operation, Result},
     http::{
         Codec,
+        connection::{ConnectionLease, HttpPool},
         io::HttpIo,
-        pool::{ConnectionLease, HttpPool},
     },
     memory::{cache::MemoryCache, delivery::Delivery, pipe::PipePool, pool::BufferPool},
     model::{Limits, PAGE_BYTES, ResourceClass, *},

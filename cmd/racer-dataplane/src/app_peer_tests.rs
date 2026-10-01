@@ -1,7 +1,7 @@
 //! Exercise assembled peer I/O, including socket session signatures and full paths.
 use super::*;
 use crate::{
-    http::{Codec, Header, MessageHead, StartLine, pool::ConnectionLease},
+    http::{Codec, Header, MessageHead, StartLine, connection::ConnectionLease},
     model::{ExpiresAt, MetadataSelector, ObjectMetadata, ResourceClass, *},
     peer::protocol::{
         self, FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse, WireCodec,

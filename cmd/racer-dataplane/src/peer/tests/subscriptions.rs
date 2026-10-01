@@ -340,7 +340,7 @@ fn subscription_selection_is_canonical_signed_and_bound_to_exact_grant() {
 #[test]
 fn subscription_runs_through_real_tcp_requester_session_and_provider() {
     use crate::{
-        http::pool::{ConnectionLease, HttpPool},
+        http::connection::{ConnectionLease, HttpPool},
         peer::PeerClient,
     };
     struct Local(Rc<Admission>);

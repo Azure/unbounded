@@ -1,8 +1,8 @@
 //! Fixed-length opaque transit on the owning reactor. Every readiness operation
 //! retains both connections, pipe, fallback storage and relay admission.
 use super::{
+    connection::ConnectionLease,
     io::{HttpIo, OwnedBuffer},
-    pool::ConnectionLease,
 };
 use crate::{
     error::{Error, Result},

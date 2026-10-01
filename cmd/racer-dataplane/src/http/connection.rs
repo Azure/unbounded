@@ -1,4 +1,4 @@
-//! Bounded nonblocking TCP/Unix pools. Unfinished exchanges never return to idle.
+//! Exclusive HTTP connections and bounded TCP/Unix reuse. Unfinished exchanges close.
 use super::io::OwnedBuffer;
 use crate::runtime::reactor::Descriptor;
 use crate::{

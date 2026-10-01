@@ -764,7 +764,7 @@ fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction(
 fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
     use super::PeerClient;
     use crate::{
-        http::{Codec, io::HttpIo, pool::HttpPool},
+        http::{Codec, connection::HttpPool, io::HttpIo},
         runtime::reactor::Reactor,
         topology::{
             health::LinkHealth,
@@ -911,8 +911,8 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
     use crate::{
         http::{
             Codec,
+            connection::{ConnectionLease, HttpPool},
             io::HttpIo,
-            pool::{ConnectionLease, HttpPool},
         },
         runtime::reactor::Reactor,
         topology::{
@@ -1094,7 +1094,7 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
 #[test]
 fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
     use crate::{
-        http::{Codec, io::HttpIo, pool::ConnectionLease},
+        http::{Codec, connection::ConnectionLease, io::HttpIo},
         runtime::reactor::Reactor,
         topology::{health::LinkHealth, paths::Paths},
     };
@@ -1296,8 +1296,8 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     use crate::{
         http::{
             Codec,
+            connection::{Endpoint, HttpPool},
             io::HttpIo,
-            pool::{Endpoint, HttpPool},
         },
         model::{ExpiresAt, ObjectMetadata, PageEnvelope},
         runtime::reactor::Reactor,
@@ -1381,7 +1381,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     let scope =
         RequestScope::new(RequestId([7; 16]), Instant::now() + Duration::from_secs(30)).unwrap();
     let server = async {
-        use crate::{http::pool::ConnectionLease, runtime::reactor::IoBuffer};
+        use crate::{http::connection::ConnectionLease, runtime::reactor::IoBuffer};
         let fd = reactor
             .accept(
                 Rc::new(crate::runtime::reactor::Descriptor::from(listener)),
@@ -1527,7 +1527,7 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
         if neighbors.contains(&member.node) {
             assert_eq!(
                 endpoint.unwrap(),
-                crate::http::pool::Endpoint::Peer(member.peer_endpoint.clone())
+                crate::http::connection::Endpoint::Peer(member.peer_endpoint.clone())
             );
         } else {
             assert!(matches!(endpoint, Err(Error::InvalidRequest)));
@@ -1548,7 +1548,7 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
 mod established_sessions {
     use super::*;
     use crate::{
-        http::{Codec, io::HttpIo, pool::ConnectionLease},
+        http::{Codec, connection::ConnectionLease, io::HttpIo},
         runtime::{reactor::IoBuffer, reactor::Reactor},
         security::{connection, protocol as p},
         topology::{

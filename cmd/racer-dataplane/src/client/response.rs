@@ -3,7 +3,7 @@ use super::ReadKind;
 use crate::telemetry::failures::{Detail, Failure, Observer, Stage};
 use crate::{
     error::{Error, Operation, Result},
-    http::{Header, MessageHead, StartLine, io::HttpIo, pool::ConnectionLease},
+    http::{Header, MessageHead, StartLine, connection::ConnectionLease, io::HttpIo},
     memory::delivery::Delivery,
     model::{ObjectMetadata, ResolvedRange},
     read::ReadResponse,

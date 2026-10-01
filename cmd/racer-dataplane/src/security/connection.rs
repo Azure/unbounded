@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     error::{Error, Result},
-    http::{MessageHead, StartLine, io::HttpIo, pool::ConnectionLease},
+    http::{MessageHead, StartLine, connection::ConnectionLease, io::HttpIo},
     model::NodeId,
     runtime::deadline::RequestScope,
 };
@@ -315,7 +315,7 @@ pub(crate) mod tests {
     use crate::{
         http::{
             Codec,
-            pool::{Endpoint, HttpPool},
+            connection::{Endpoint, HttpPool},
         },
         model::{RequestId, ResourceClass},
         runtime::{admission::Admission, reactor::Reactor},

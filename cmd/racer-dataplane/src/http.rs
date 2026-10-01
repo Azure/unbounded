@@ -18,8 +18,8 @@
 //! which require exactly one separator and reject edge whitespace. Encoding
 //! always emits that separator SP.
 //! Raw heads deliberately do not implement Debug (they can contain credentials).
+pub mod connection;
 pub mod io;
-pub mod pool;
 mod relay;
 
 use crate::error::{Error, Result};

@@ -317,7 +317,7 @@ fn sdk_range(
 // One credit forces exact releases before the next page, including clipped pages.
 async fn send_subscription(
     rig: &Rig,
-    connection: racer_dataplane::http::pool::ConnectionLease,
+    connection: racer_dataplane::http::connection::ConnectionLease,
     releases: &mut UnixStream,
     size: u64,
     first: u64,

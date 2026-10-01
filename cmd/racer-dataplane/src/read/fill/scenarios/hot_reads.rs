@@ -480,7 +480,7 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
                 Duration::from_secs(30),
             );
             let (socket, _stalled_client) = std::os::unix::net::UnixStream::pair().unwrap();
-            let mut connection = crate::http::pool::ConnectionLease::from_accepted(
+            let mut connection = crate::http::connection::ConnectionLease::from_accepted(
                 socket.into(),
                 &f.fill.dependencies.admission,
             )
@@ -582,7 +582,7 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
                 admission.clone(),
             ));
             let transfers = Rc::new(crate::peer::transport::Transfers::new(
-                Rc::new(crate::http::pool::HttpPool::new(
+                Rc::new(crate::http::connection::HttpPool::new(
                     reactor,
                     admission.clone(),
                     4,

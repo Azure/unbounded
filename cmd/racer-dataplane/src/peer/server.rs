@@ -139,7 +139,7 @@ impl PeerServer {
                     scope,
                 )
                 .await?;
-                let connection = match crate::http::pool::ConnectionLease::from_accepted(
+                let connection = match crate::http::connection::ConnectionLease::from_accepted(
                     accepted,
                     &self.admission,
                 ) {
@@ -217,9 +217,9 @@ impl PeerServer {
     /// only when the HTTP layer confirms both bodies were fully consumed.
     pub fn serve_connection<'a>(
         &'a self,
-        connection: crate::http::pool::ConnectionLease,
+        connection: crate::http::connection::ConnectionLease,
         scope: &'a RequestScope,
-    ) -> Operation<'a, crate::http::pool::ConnectionLease> {
+    ) -> Operation<'a, crate::http::connection::ConnectionLease> {
         Box::pin(async move {
             use super::protocol::WireCodec;
             scope.check()?;
@@ -696,7 +696,7 @@ where
 /// Cancel an abandoned HTTP exchange without dropping work before its completion fences.
 async fn materialized_exchange<T>(
     io: &crate::http::io::HttpIo,
-    connection: &crate::http::pool::ConnectionLease,
+    connection: &crate::http::connection::ConnectionLease,
     parent: &RequestScope,
     exchange: &RequestScope,
     work: impl std::future::Future<Output = crate::error::Result<T>>,
@@ -842,7 +842,7 @@ mod tests {
     #[test]
     fn materialized_transit_fin_and_parent_cancel_fence_head_and_body() {
         use crate::{
-            http::{Codec, io::HttpIo, pool::ConnectionLease},
+            http::{Codec, connection::ConnectionLease, io::HttpIo},
             runtime::reactor::Reactor,
         };
         use std::net::{Shutdown, TcpListener, TcpStream};
@@ -956,7 +956,7 @@ mod tests {
     #[test]
     fn materialized_transit_success_fences_watch_before_keepalive() {
         use crate::{
-            http::{Codec, io::HttpIo, pool::ConnectionLease},
+            http::{Codec, connection::ConnectionLease, io::HttpIo},
             runtime::reactor::Reactor,
         };
         let admission = Rc::new(Admission::new(
@@ -1266,7 +1266,7 @@ mod tests {
     #[test]
     fn backpressured_handshake_responses_keep_fixed_deadline_and_fenced_admission() {
         use crate::{
-            http::{Codec, io::HttpIo, pool::ConnectionLease},
+            http::{Codec, connection::ConnectionLease, io::HttpIo},
             memory::pool::BufferPool,
             peer::{PeerTransport, protocol::SecurityCodec},
             runtime::{environment::SimulationClock, reactor::Reactor},

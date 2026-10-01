@@ -4,8 +4,8 @@ use crate::{
     error::{Error, Operation, Result},
     http::{
         MessageHead, StartLine,
+        connection::ConnectionLease,
         io::{HttpIo, OwnedBuffer},
-        pool::ConnectionLease,
     },
     model::{ObjectMetadata, PAGE_BYTES, PageNumber, ResolvedRange},
     read::{ReadResponse, range_stream::RangeStream},

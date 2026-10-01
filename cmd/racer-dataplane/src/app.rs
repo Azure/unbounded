@@ -24,7 +24,7 @@ use crate::{
         transport::ReactorControlIo,
     },
     error::{Error, Operation, Result},
-    http::{io::HttpIo, pool::HttpPool},
+    http::{connection::HttpPool, io::HttpIo},
     memory::{cache::MemoryCache, delivery::Delivery, pipe::PipePool, pool::BufferPool},
     model::{Limits, NodeId, RequestId, WorkerId},
     origin::{Origin, OriginClient},
@@ -1233,7 +1233,7 @@ impl WorkerApplication {
                 .into_iter()
                 .flatten()
             {
-                let connection = crate::http::pool::ConnectionLease::from_reserved(
+                let connection = crate::http::connection::ConnectionLease::from_reserved(
                     accepted.fd.into(),
                     accepted.reservation,
                 )?;
