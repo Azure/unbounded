@@ -300,7 +300,8 @@ impl Placement {
         })
     }
 
-    pub fn cached_rankings(&self) -> usize {
+    #[cfg(test)]
+    fn cached_rankings(&self) -> usize {
         self.cache.borrow().entries.len()
     }
     /// Warm only already-demanded predecessor slots. Each turn hashes at most

@@ -1840,31 +1840,44 @@ mod tests {
     }
 
     #[test]
-    fn endpoints_share_one_bounded_pair_descriptor() {
+    fn endpoints_enforce_pair_capacity_generation_and_close() {
         let (io, engine) = pair(WorkerId(7), 12, NonZeroUsize::new(3).unwrap());
-        assert!(Arc::ptr_eq(&io.handoff, &engine.handoff));
-        assert_eq!(io.handoff.worker, WorkerId(7));
-        assert_eq!(engine.handoff.capacity.get(), 3);
-        assert_eq!(engine.handoff.generation, 12);
-        let (other, _) = pair(WorkerId(7), 13, NonZeroUsize::new(3).unwrap());
-        assert!(!Arc::ptr_eq(&io.handoff, &other.handoff));
-    }
-
-    // Type-check the ownership path without manufacturing a key, permit, or page.
-    // On rejection the caller can retry the very same resource-bearing job.
-    #[allow(dead_code)]
-    fn round_trip_api(
-        io: IoCryptoPort,
-        mut engine: CryptoPort,
-        job: CryptoJob,
-        completion: CryptoCompletion,
-    ) {
-        if let Err(failure) = io.try_submit(job) {
-            let _: CryptoId = failure.command.id();
-            let _retry = io.try_submit(failure.command);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        for (worker, generation) in [(WorkerId(8), 12), (WorkerId(7), 13)] {
+            assert!(matches!(
+                io.poll_reserve(
+                    &mut cx,
+                    CryptoId {
+                        worker,
+                        generation,
+                        sequence: 0
+                    }
+                ),
+                Poll::Ready(Err(Error::StaleFlight))
+            ));
         }
-        if let Err(failure) = engine.complete(completion) {
-            let _retry = engine.complete(failure.command);
+        let id = |sequence| CryptoId {
+            worker: WorkerId(7),
+            generation: 12,
+            sequence,
+        };
+        let mut permits = Vec::new();
+        for sequence in 0..3 {
+            let Poll::Ready(Ok(permit)) = io.poll_reserve(&mut cx, id(sequence)) else {
+                panic!("available permit")
+            };
+            permits.push(permit);
         }
+        assert!(io.poll_reserve(&mut cx, id(3)).is_pending());
+        drop(permits.pop());
+        assert!(matches!(
+            io.poll_reserve(&mut cx, id(3)),
+            Poll::Ready(Ok(_))
+        ));
+        drop(engine);
+        assert!(matches!(
+            io.poll_reserve(&mut cx, id(4)),
+            Poll::Ready(Err(Error::Unavailable))
+        ));
     }
 }

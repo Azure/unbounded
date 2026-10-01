@@ -316,7 +316,8 @@ impl Paths {
             .insert(key, (Arc::downgrade(membership), nodes.to_vec()));
     }
 
-    pub fn cached_paths(&self) -> usize {
+    #[cfg(test)]
+    fn cached_paths(&self) -> usize {
         self.cache.borrow().entries.len()
     }
 }
