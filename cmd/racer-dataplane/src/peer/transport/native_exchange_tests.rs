@@ -48,13 +48,56 @@ fn transfers(
     )
     .with_native(sessions)
 }
+
+fn test_membership(
+    signers: &[Rc<Signatures>],
+    nodes: &[usize],
+    sites: &[&str],
+) -> crate::topology::membership::MembershipLease {
+    use crate::topology::{
+        membership::{Member, Membership},
+        rails::{RailId, RailMapping},
+    };
+    Arc::new(
+        Membership::validate(
+            MembershipVersion(1),
+            nodes
+                .iter()
+                .zip(sites)
+                .map(|(&i, site)| Member {
+                    node: signers[i].node().clone(),
+                    shares: std::num::NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: format!("127.0.0.1:{}", 9000 + i),
+                    rails: vec![RailMapping {
+                        rail: RailId(7),
+                        fabric: "test-provider".into(),
+                        numa_node: None,
+                    }],
+                    alignment_enabled: true,
+                    site: (*site).into(),
+                })
+                .collect(),
+        )
+        .unwrap(),
+    )
+}
 #[test]
 fn real_socket_signed_offer_falls_back_when_local_provider_is_unavailable() {
-    offer_fallback(false);
+    offer_fallback(false, None, false);
 }
 #[test]
 fn real_socket_sender_failure_requires_signed_fallback_before_ciphertext() {
-    offer_fallback(true);
+    offer_fallback(true, None, false);
+}
+#[test]
+fn signed_offer_rejects_cross_site_and_missing_site_before_session_preparation() {
+    for sites in [["site1", "site2"], ["", "site1"], ["site1", ""], ["", ""]] {
+        offer_fallback(false, Some(sites), false);
+    }
+}
+#[test]
+fn signed_offer_cannot_substitute_the_actual_local_identity_in_response_path() {
+    offer_fallback(false, None, true);
 }
 #[test]
 fn native_subdeadline_preserves_parent_deadline_and_cancellation() {
@@ -68,8 +111,14 @@ fn native_subdeadline_preserves_parent_deadline_and_cancellation() {
     assert_eq!(native.check(), Err(Error::Cancelled));
     assert!(!native_failure(Error::DeadlineExceeded, &scope));
 }
-fn offer_fallback(sender_failure: bool) {
+fn offer_fallback(sender_failure: bool, rejected_sites: Option<[&str; 2]>, wrong_path: bool) {
+    let rejected = rejected_sites.is_some() || wrong_path;
     let signers = super::super::tests::signers();
+    let membership = test_membership(
+        &signers,
+        &[0, 2],
+        &rejected_sites.unwrap_or(["site1", "site1"]),
+    );
     let admission = Rc::new(Admission::new(
         crate::test_support::cluster::config(false).limits,
     ));
@@ -117,7 +166,10 @@ fn offer_fallback(sender_failure: bool) {
     let mut head = p::response_head(
         &response,
         &[4; 32],
-        &[signers[0].node().clone(), signers[2].node().clone()],
+        &[
+            signers[usize::from(wrong_path)].node().clone(),
+            signers[2].node().clone(),
+        ],
     )
     .unwrap();
     p::push(&mut head, "racer-receiver", &signers[0].node().0);
@@ -252,6 +304,7 @@ fn offer_fallback(sender_failure: bool) {
                 accept,
                 signers[2].node().clone(),
                 offer,
+                &membership,
                 &scope,
             )
             .await
@@ -266,6 +319,10 @@ fn offer_fallback(sender_failure: bool) {
             .await?;
         let mut connection = sent.connection;
         connection.finish_exchange()?;
+        if rejected {
+            // Keep the connection alive until the receiver returns its rejection.
+            return std::future::pending::<Result<()>>().await;
+        }
         if sender_failure {
             let (connection, setup) = sender.read_control(connection, false, &scope).await?;
             let (setup, _) = binding.verify(
@@ -317,13 +374,19 @@ fn offer_fallback(sender_failure: bool) {
     };
     let mut future = std::pin::pin!(async { futures::try_join!(receive, send) });
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-    let (result, ()) = loop {
+    let result = loop {
         if let Poll::Ready(result) = std::future::Future::poll(future.as_mut(), &mut cx) {
-            break result.unwrap();
+            break result;
         }
         reactor.poll_budgeted(128).unwrap();
         reactor.wait(Duration::from_millis(1)).unwrap();
     };
+    if rejected {
+        assert!(matches!(result, Err(Error::Unauthorized)));
+        assert_eq!(receiver.native.as_ref().unwrap().prepare_attempts.get(), 0);
+        return;
+    }
+    let (result, ()) = result.unwrap();
     assert_eq!(
         envelope_digest(&result.authentication).unwrap(),
         binding.response
@@ -339,6 +402,28 @@ fn offer_fallback(sender_failure: bool) {
 #[test]
 #[ignore = "requires real ABI v2 adapter and RACER_RDMA_TEST_DEVICE/PORT/GID for an active type-2B port"]
 fn native_provider_signed_setup_grant_write_completion_roundtrip() {
+    native_roundtrip(false, false, None, false);
+}
+
+#[test]
+fn simulated_native_mixed_site_hop_both_directions() {
+    for reverse in [false, true] {
+        for relayed in [false, true] {
+            native_roundtrip(true, reverse, None, relayed);
+        }
+    }
+}
+
+#[test]
+fn simulated_native_sender_rejects_cross_site_before_session_preparation() {
+    for site in ["site2", ""] {
+        native_roundtrip(true, false, Some(site), false);
+        native_roundtrip(true, true, Some(site), true);
+    }
+}
+
+fn native_roundtrip(simulated: bool, reverse: bool, rejected_site: Option<&str>, relayed: bool) {
+    let reject_sender = rejected_site.is_some();
     use crate::rdma::{
         FabricPort,
         lifecycle::{NativeService, pair},
@@ -347,18 +432,40 @@ fn native_provider_signed_setup_grant_write_completion_roundtrip() {
         membership::{Member, Membership},
         rails::{RailId, RailMapping},
     };
-    let device = std::env::var("RACER_RDMA_TEST_DEVICE").expect("select real device");
-    let port = std::env::var("RACER_RDMA_TEST_PORT")
-        .expect("select port")
-        .parse()
-        .unwrap();
-    let text = std::env::var("RACER_RDMA_TEST_GID").expect("32 lowercase hex GID digits");
+    let device = if simulated {
+        "sim-rnic".into()
+    } else {
+        std::env::var("RACER_RDMA_TEST_DEVICE").expect("select real device")
+    };
+    let port = if simulated {
+        1
+    } else {
+        std::env::var("RACER_RDMA_TEST_PORT")
+            .expect("select port")
+            .parse()
+            .unwrap()
+    };
+    let text = if simulated {
+        "11".repeat(16)
+    } else {
+        std::env::var("RACER_RDMA_TEST_GID").expect("32 lowercase hex GID digits")
+    };
     assert_eq!(text.len(), 32);
     let mut gid = [0; 16];
     for (i, b) in gid.iter_mut().enumerate() {
         *b = u8::from_str_radix(&text[2 * i..2 * i + 2], 16).unwrap();
     }
-    let signers = super::super::tests::signers();
+    let fabric = crate::rdma::lifecycle::simulation::Simulation::new()
+        .with_devices(vec![crate::rdma::lifecycle::simulation::Device::new(
+            device.clone(),
+            gid,
+        )])
+        .unwrap();
+    let _fabric = simulated.then(|| fabric.enter());
+    let mut signers = super::super::tests::signers();
+    if reverse {
+        signers.swap(0, 2);
+    }
     let admission = Rc::new(Admission::new(
         crate::test_support::cluster::config(true).limits,
     ));
@@ -469,18 +576,51 @@ fn native_provider_signed_setup_grant_write_completion_roundtrip() {
         },
         ciphertext: page,
     };
-    let mut head = p::response_head(
-        &response,
-        &[4; 32],
-        &[signers[0].node().clone(), signers[2].node().clone()],
-    )
-    .unwrap();
-    p::push(&mut head, "racer-receiver", &signers[0].node().0);
+    let path = if relayed {
+        vec![
+            signers[0].node().clone(),
+            signers[2].node().clone(),
+            signers[1].node().clone(),
+        ]
+    } else {
+        vec![
+            signers[1].node().clone(),
+            signers[0].node().clone(),
+            signers[2].node().clone(),
+        ]
+    };
+    let mut head = p::response_head(&response, &[4; 32], &path).unwrap();
+    p::push(&mut head, "racer-receiver", &path[1].0);
+    let original = Arc::new(signers[if relayed { 1 } else { 2 }].sign(head).unwrap());
+    let mut hops = vec![];
+    if relayed {
+        let mut hop = MessageHead {
+            start: StartLine::Request {
+                method: "POST".into(),
+                target: "/racer/peer/v1/hop".into(),
+            },
+            headers: vec![],
+        };
+        p::push(&mut hop, "racer-kind", "response-hop");
+        p::push(&mut hop, "content-length", 0);
+        p::push_binary(
+            &mut hop,
+            "racer-original",
+            &signed_digest(&original).unwrap(),
+        );
+        p::push_binary(
+            &mut hop,
+            "racer-previous",
+            &signed_digest(&original).unwrap(),
+        );
+        p::push_binary(&mut hop, "racer-request-binding", &[4; 32]);
+        p::push(&mut hop, "racer-response-path", p::nodes(&path).unwrap());
+        p::push(&mut hop, "racer-reverse-index", 0);
+        p::push(&mut hop, "racer-receiver", &signers[0].node().0);
+        hops.push(signers[2].sign(hop).unwrap());
+    }
     let response = SignedResponse {
-        authentication: ForwardedHead {
-            original: Arc::new(signers[2].sign(head).unwrap()),
-            hops: vec![],
-        },
+        authentication: ForwardedHead { original, hops },
         response,
     };
     let binding = Binding {
@@ -505,7 +645,7 @@ fn native_provider_signed_setup_grant_write_completion_roundtrip() {
     let membership = Arc::new(
         Membership::validate(
             MembershipVersion(1),
-            [0, 2]
+            [0, 1, 2]
                 .into_iter()
                 .map(|i| Member {
                     node: signers[i].node().clone(),
@@ -513,7 +653,14 @@ fn native_provider_signed_setup_grant_write_completion_roundtrip() {
                     peer_endpoint: format!("127.0.0.1:{}", 9000 + i),
                     rails: mappings.clone(),
                     alignment_enabled: true,
-                    site: "site1".into(),
+                    site: if i == 1 {
+                        "site2"
+                    } else if i == 2 {
+                        rejected_site.unwrap_or("site1")
+                    } else {
+                        "site1"
+                    }
+                    .into(),
                 })
                 .collect(),
         )
@@ -540,8 +687,19 @@ fn native_provider_signed_setup_grant_write_completion_roundtrip() {
         };
         let sent = receiver.io.send_head(a, initial, &scope).await?;
         let mut offered = receiver.io.receive_head(sent.connection, &scope).await?;
-        let control = detach(&mut offered.value)?.ok_or(Error::Unavailable)?;
+        let control = detach(&mut offered.value)?;
         let (auth, length) = WireCodec::decode(offered.value, true)?;
+        if reject_sender {
+            assert!(control.is_none());
+            let (_, body) = receiver
+                .read_ciphertext(offered.connection, length, &scope)
+                .await?;
+            return receiver
+                .wire
+                .1
+                .response(auth, body.bytes()?.to_vec(), &scope);
+        }
+        let control = control.ok_or(Error::Unavailable)?;
         assert_eq!(length, 0, "provider test requires native offer");
         receiver
             .receive_native(
@@ -551,6 +709,7 @@ fn native_provider_signed_setup_grant_write_completion_roundtrip() {
                 accept,
                 signers[2].node().clone(),
                 control,
+                &membership,
                 &scope,
             )
             .await
@@ -577,7 +736,22 @@ fn native_provider_signed_setup_grant_write_completion_roundtrip() {
                 &scope,
             )
             .await?;
-        assert!(sent);
+        if reject_sender {
+            assert!(!sent);
+            assert_eq!(sender.native.as_ref().unwrap().prepare_attempts.get(), 0);
+            let head = WireCodec::encode(&response.authentication, true, 144)?;
+            conn = sender.io.send_head(conn, head, &scope).await?.connection;
+            let PeerResponse::Page { ciphertext, .. } = &response.response else {
+                unreachable!()
+            };
+            conn = sender
+                .io
+                .write_body(conn, ciphertext.clone(), &scope)
+                .await?
+                .lease;
+        } else {
+            assert!(sent);
+        }
         assert_eq!(conn.tx_remaining, Some(0));
         assert_eq!(conn.rx_remaining, Some(0));
         conn.finish_exchange()?;
@@ -599,9 +773,12 @@ fn native_provider_signed_setup_grant_write_completion_roundtrip() {
     }
     assert_eq!(
         sender.native_completed.get(),
-        1,
+        usize::from(!reject_sender),
         "HTTP fallback cannot pass a native success test"
     );
     assert_eq!(sender.native_fallbacks.get(), 0);
-    assert_eq!(receiver.native_completions.get(), 1);
+    assert_eq!(
+        receiver.native_completions.get(),
+        usize::from(!reject_sender)
+    );
 }

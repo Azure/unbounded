@@ -317,6 +317,64 @@ async fn fence(session: &crate::rdma::SessionLease, scope: &RequestScope) -> Res
 }
 
 impl Transfers {
+    /// Bind the upgrade to the actual authenticated reverse hop, not a planned
+    /// route or a peer's claimed Site. Run before either end prepares a native QP.
+    fn response_plan(
+        &self,
+        connection: &ConnectionLease,
+        authentication: &ForwardedHead,
+        membership: &crate::topology::membership::MembershipLease,
+        page: &crate::model::PageId,
+        peer: &NodeId,
+        sending: bool,
+    ) -> Result<TransportPlan> {
+        if connection.session.as_ref().map(|s| s.peer()) != Some(peer) {
+            return Err(Error::Unauthorized);
+        }
+        let path = crate::security::protocol::decode_nodes(
+            crate::security::protocol::field(&authentication.original.head, "racer-response-path")?
+                .as_bytes(),
+        )?;
+        let receiver_index = path
+            .len()
+            .checked_sub(authentication.hops.len() + 2)
+            .ok_or(Error::Unauthorized)?;
+        let local = self.signatures.node();
+        let (sender, receiver) = if sending {
+            (local, peer)
+        } else {
+            (peer, local)
+        };
+        if &path[receiver_index] != receiver || &path[receiver_index + 1] != sender {
+            return Err(Error::Unauthorized);
+        }
+        for (i, signed) in std::iter::once(authentication.original.as_ref())
+            .chain(authentication.hops.iter())
+            .enumerate()
+        {
+            let index = path
+                .len()
+                .checked_sub(i + 1)
+                .filter(|i| *i > 0)
+                .ok_or(Error::Unauthorized)?;
+            let verified = self.signatures.verify_historical(signed)?;
+            if verified.node() != &path[index]
+                || crate::security::signing::receiver(&signed.head)? != path[index - 1]
+            {
+                return Err(Error::Unauthorized);
+            }
+        }
+        crate::topology::rails::select_hop(
+            &crate::topology::paths::Route {
+                membership: membership.clone(),
+                nodes: path,
+            },
+            page,
+            local,
+            peer,
+        )
+    }
+
     pub(super) async fn send_native(
         &self,
         mut connection: ConnectionLease,
@@ -347,19 +405,14 @@ impl Transfers {
         let scope = &bounded_scope;
         scope.check()?;
         let peer = accept.peer.node();
-        let path = crate::security::protocol::decode_nodes(
-            crate::security::protocol::field(
-                &response.authentication.original.head,
-                "racer-response-path",
-            )?
-            .as_bytes(),
-        )?;
-        let route = crate::topology::paths::Route {
-            membership: membership.clone(),
-            nodes: path,
-        };
-        if crate::topology::rails::select(&route, &ciphertext.envelope().page)?
-            != (TransportPlan::Rdma { rail: binding.rail })
+        if self.response_plan(
+            &connection,
+            &response.authentication,
+            membership,
+            &ciphertext.envelope().page,
+            peer,
+            true,
+        )? != (TransportPlan::Rdma { rail: binding.rail })
             || !rdma.ready(binding.rail)
         {
             return Ok((connection, false));
@@ -715,6 +768,7 @@ impl Transfers {
         accept: SignedHead,
         peer: NodeId,
         offer: SignedHead,
+        membership: &crate::topology::membership::MembershipLease,
         scope: &RequestScope,
     ) -> Result<SignedResponse> {
         let sessions = self.native.as_ref().ok_or(Error::InvalidConfiguration)?;
@@ -730,6 +784,20 @@ impl Transfers {
             scope,
         )?;
         let (metadata, envelope) = super::protocol::page_descriptor(&authentication.original.head)?;
+        if binding.membership != membership.version.0 {
+            return Err(Error::IncompatibleMembership);
+        }
+        if self.response_plan(
+            &connection,
+            &authentication,
+            membership,
+            &envelope.page,
+            offer.peer.node(),
+            false,
+        )? != (TransportPlan::Rdma { rail: binding.rail })
+        {
+            return Err(Error::Unauthorized);
+        }
         let remote = SetupParameters::from_verified(&offer, binding.rail)?;
         let mut previous = signed_digest(&offer.signed)?;
         connection.next_round()?;
@@ -1195,6 +1263,7 @@ impl Transfers {
                     plan,
                     None,
                     None,
+                    None,
                     Rc::new(std::cell::Cell::new(false)),
                     scope,
                 )
@@ -1210,6 +1279,7 @@ impl Transfers {
         endpoint: crate::http::connection::Endpoint,
         request: SignedRequest,
         plan: TransportPlan,
+        membership: Option<crate::topology::membership::MembershipLease>,
         relay: Option<Rc<Reservation>>,
         peer_admission: Option<std::sync::Arc<super::adaptive::Permit>>,
         failure: Rc<std::cell::Cell<bool>>,
@@ -1278,7 +1348,12 @@ impl Transfers {
                     .await,
                 )?
             };
-            let native = self.accept_native(&request, plan, scope)?;
+            // Legacy callers without an authenticated membership lease are HTTP-only.
+            let native = if membership.is_some() {
+                self.accept_native(&request, plan, scope)?
+            } else {
+                None
+            };
             scope.candidate_progress()?;
             if let Some((_, accept, _)) = &native {
                 attach(&mut head, accept)?;
@@ -1321,6 +1396,7 @@ impl Transfers {
                         accept,
                         peer,
                         control,
+                        membership.as_ref().ok_or(Error::IncompatibleMembership)?,
                         scope,
                     )
                     .await

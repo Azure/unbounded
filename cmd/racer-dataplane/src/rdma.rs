@@ -39,6 +39,8 @@ pub struct Sessions {
     per_neighbor: usize,
     live: RefCell<Vec<(NodeId, Rc<QueuePairHandle>)>>,
     draining: Cell<bool>,
+    #[cfg(test)]
+    pub(crate) prepare_attempts: Cell<usize>,
 }
 pub struct SessionLease {
     pub(crate) qp: Rc<QueuePairHandle>,
@@ -154,13 +156,15 @@ impl Sessions {
             per_neighbor,
             live: RefCell::new(Vec::new()),
             draining: Cell::new(false),
+            #[cfg(test)]
+            prepare_attempts: Cell::new(0),
         }
     }
     pub fn ready(&self, rail: RailId) -> bool {
         !self.draining.get() && self.per_neighbor > 0 && self.devices.ready(rail)
     }
     /// Both sides prepare before exchanging signed setup headers. The routing
-    /// owner must first validate the complete path's authenticated rail mapping.
+    /// owner must first validate the actual hop's authenticated Site and rail mapping.
     pub fn prepare<'a>(
         &'a self,
         peer: &'a VerifiedPeer,
@@ -176,6 +180,8 @@ impl Sessions {
         permit: Option<std::sync::Arc<crate::peer::adaptive::Permit>>,
         scope: &'a crate::runtime::deadline::RequestScope,
     ) -> Operation<'a, PreparedSession> {
+        #[cfg(test)]
+        self.prepare_attempts.set(self.prepare_attempts.get() + 1);
         Box::pin(wait(scope, move |cx| {
             self.register_driver(cx.waker());
             self.poll_prepare(peer, rail, permit.clone())

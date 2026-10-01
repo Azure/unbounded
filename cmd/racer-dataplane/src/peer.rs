@@ -541,7 +541,7 @@ impl Requester {
                 if route.nodes.get(1) != Some(&next) {
                     return Err(Error::Unavailable);
                 }
-                rails::select(&route, &page)?
+                rails::select_hop(&route, &page, &network.local, &next)?
             } else {
                 crate::topology::rails::TransportPlan::Http
             };
@@ -560,6 +560,7 @@ impl Requester {
                     endpoint,
                     request,
                     plan,
+                    Some(membership.clone()),
                     relay,
                     permit.clone(),
                     socket_failure.clone(),

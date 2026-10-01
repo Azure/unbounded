@@ -1,4 +1,4 @@
-//! Select RDMA only with compatible authenticated mappings over the entire path.
+//! Select RDMA only for same-Site hops with compatible authenticated mappings.
 //! Published Node-annotation mappings must match local hardware; discovery never
 //! reports or overrides membership. Missing/incompatible mappings fall back to HTTP.
 use super::{
@@ -22,10 +22,46 @@ pub enum TransportPlan {
     Http,
     Rdma { rail: RailId },
 }
+/// Conservative whole-route summary; transport admission must use `select_hop`.
 /// Select from authenticated advertised mappings. Before creating an RDMA
 /// session, validate each hop's actual hardware with `select_with_local` or
 /// `local_compatible`; discovery may only veto this plan, never replace it.
 pub fn select(route: &Route, page: &PageId) -> Result<TransportPlan> {
+    validate_route(route)?;
+    let members = route
+        .nodes
+        .iter()
+        .map(|node| route.membership.member(node))
+        .collect::<Result<Vec<_>>>()?;
+    select_members(&route.membership, &members, page)
+}
+
+/// Select the actual immediate hop, independently of other hops' Sites or rails.
+/// Both identities must be adjacent in the authenticated route. Hardware discovery
+/// still only vetoes the selected published rail before native session admission.
+pub fn select_hop(
+    route: &Route,
+    page: &PageId,
+    local: &crate::model::NodeId,
+    peer: &crate::model::NodeId,
+) -> Result<TransportPlan> {
+    validate_route(route)?;
+    if !route.nodes.windows(2).any(|pair| {
+        (&pair[0] == local && &pair[1] == peer) || (&pair[1] == local && &pair[0] == peer)
+    }) {
+        return Err(Error::IncompatibleMembership);
+    }
+    select_members(
+        &route.membership,
+        &[
+            route.membership.member(local)?,
+            route.membership.member(peer)?,
+        ],
+        page,
+    )
+}
+
+fn validate_route(route: &Route) -> Result<()> {
     if route.nodes.is_empty()
         || route.nodes.len() > usize::from(FAILURE_LINKS) + 1
         || route
@@ -36,18 +72,28 @@ pub fn select(route: &Route, page: &PageId) -> Result<TransportPlan> {
     {
         return Err(Error::InvalidRequest);
     }
-    let members = route
-        .nodes
-        .iter()
-        .map(|node| route.membership.member(node))
-        .collect::<Result<Vec<_>>>()?;
-    if members
-        .iter()
-        .any(|member| !member.alignment_enabled || member.rails.is_empty())
-    {
+    for node in &route.nodes {
+        route.membership.member(node)?;
+    }
+    Ok(())
+}
+
+fn select_members(
+    membership: &super::membership::Membership,
+    members: &[&super::membership::Member],
+    page: &PageId,
+) -> Result<TransportPlan> {
+    if members.iter().any(|member| {
+        member.site.is_empty()
+            || member.site != members[0].site
+            || !member.alignment_enabled
+            || member.rails.is_empty()
+    }) {
         return Ok(TransportPlan::Http);
     }
-    let domain = route.membership.rail_domain();
+    // Keep the publication-wide domain and v2 hash stable. Site is an admission
+    // boundary, not a new rail numbering or page placement scheme.
+    let domain = membership.rail_domain();
     if domain.is_empty() {
         return Ok(TransportPlan::Http);
     }
@@ -152,6 +198,58 @@ mod tests {
     }
 
     #[test]
+    fn mixed_site_hops_preserve_global_rail_mapping_and_hardware_vetoes() {
+        let mixed = route(|m| m[2].site = "site2".into());
+        let a = &mixed.nodes[0];
+        let b = &mixed.nodes[1];
+        let c = &mixed.nodes[2];
+        assert_eq!(select(&mixed, &page(0)).unwrap(), TransportPlan::Http);
+        assert_eq!(
+            select_hop(&mixed, &page(0), a, b).unwrap(),
+            TransportPlan::Rdma { rail: RailId(2) }
+        );
+        assert_eq!(
+            select_hop(&mixed, &page(0), b, a).unwrap(),
+            TransportPlan::Rdma { rail: RailId(2) }
+        );
+        assert_eq!(
+            select_hop(&mixed, &page(0), b, c).unwrap(),
+            TransportPlan::Http
+        );
+        assert_eq!(
+            select_hop(&mixed, &page(0), c, b).unwrap(),
+            TransportPlan::Http
+        );
+        assert!(select_hop(&mixed, &page(0), a, c).is_err());
+        assert!(select_hop(&mixed, &page(0), a, a).is_err());
+        assert!(select_hop(&mixed, &page(0), a, &NodeId("unknown".into())).is_err());
+        for local in [0, 1] {
+            let missing = route(|m| m[local].site.clear());
+            assert_eq!(
+                select_hop(&missing, &page(0), a, b).unwrap(),
+                TransportPlan::Http
+            );
+        }
+        for changed in [
+            route(|m| m[1].alignment_enabled = false),
+            route(|m| m[1].rails.clear()),
+            route(|m| {
+                m[1].rails
+                    .iter_mut()
+                    .for_each(|r| r.fabric = "wrong".into())
+            }),
+        ] {
+            assert_eq!(
+                select_hop(&changed, &page(0), a, b).unwrap(),
+                TransportPlan::Http
+            );
+        }
+        let plan = select_hop(&mixed, &page(0), a, b).unwrap();
+        assert!(local_compatible(&mixed, &plan, a, &mappings()).unwrap());
+        assert!(!local_compatible(&mixed, &plan, a, &[]).unwrap());
+    }
+
+    #[test]
     fn golden_page_to_rail_vectors() {
         let route = route(|_| {});
         for (number, rail) in [(0, 2), (1, 7), (u64::MAX, 2)] {
@@ -165,6 +263,7 @@ mod tests {
         let mut members: Vec<_> = (0..3)
             .map(|i| {
                 let mut member = member(i, 4);
+                member.site = "site1".into();
                 member.rails = mappings();
                 member
             })
