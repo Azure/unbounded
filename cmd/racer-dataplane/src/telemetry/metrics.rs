@@ -17,7 +17,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-pub const EVENT_COUNT: usize = 75;
+pub const EVENT_COUNT: usize = 78;
 pub const GAUGE_COUNT: usize = 13;
 #[derive(Clone, Copy)]
 pub(crate) enum LookupTier {
@@ -144,6 +144,9 @@ pub enum Event {
     FillDecryptDiskCorrupt,
     FillDecryptRetainedCorrupt,
     FillDecryptPeerCorrupt,
+    OpaqueRelayBodyCompleted,
+    OpaqueRelayBodyBytes,
+    OpaqueRelayBodyFailed,
 }
 pub const EVENTS: [Event; EVENT_COUNT] = [
     Event::PageHedgeStarted,
@@ -221,6 +224,9 @@ pub const EVENTS: [Event; EVENT_COUNT] = [
     Event::FillDecryptDiskCorrupt,
     Event::FillDecryptRetainedCorrupt,
     Event::FillDecryptPeerCorrupt,
+    Event::OpaqueRelayBodyCompleted,
+    Event::OpaqueRelayBodyBytes,
+    Event::OpaqueRelayBodyFailed,
 ];
 impl Event {
     pub fn name(self) -> &'static str {
@@ -300,6 +306,9 @@ impl Event {
             Self::FillDecryptDiskCorrupt => "racer_fill_decrypt_disk_corrupt_total",
             Self::FillDecryptRetainedCorrupt => "racer_fill_decrypt_retained_corrupt_total",
             Self::FillDecryptPeerCorrupt => "racer_fill_decrypt_peer_corrupt_total",
+            Self::OpaqueRelayBodyCompleted => "racer_opaque_relay_body_completed_total",
+            Self::OpaqueRelayBodyBytes => "racer_opaque_relay_body_completed_bytes_total",
+            Self::OpaqueRelayBodyFailed => "racer_opaque_relay_body_failed_total",
         }
     }
 }
@@ -359,6 +368,34 @@ pub struct GaugeLease {
     metrics: Metrics,
     gauge: Gauge,
 }
+/// One nonempty intermediate HTTP relay_body call, after sending its response head.
+/// Success credits the entire ciphertext body only after both HTTP finish checks.
+/// Error or abandonment credits one failure and no bytes, even after partial writes.
+/// Head failures, empty bodies, materialized/native paths, and pre-body retries are
+/// excluded. Splice-to-copy fallback is still one attempt. These are per-hop transfer
+/// counts, not unique pages, endpoint AEAD acceptance, or confirmed client delivery.
+pub(crate) struct OpaqueRelayBody<'a> {
+    metrics: &'a Metrics,
+    bytes: usize,
+    completed: bool,
+}
+impl OpaqueRelayBody<'_> {
+    pub(crate) fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+impl Drop for OpaqueRelayBody<'_> {
+    fn drop(&mut self) {
+        if self.completed {
+            let _ = self
+                .metrics
+                .record(Event::OpaqueRelayBodyBytes, self.bytes as u64);
+            let _ = self.metrics.record(Event::OpaqueRelayBodyCompleted, 1);
+        } else {
+            let _ = self.metrics.record(Event::OpaqueRelayBodyFailed, 1);
+        }
+    }
+}
 /// One complete client head through final delivery, including cancellation/drop.
 pub(crate) struct RequestMetrics {
     active: GaugeLease,
@@ -391,6 +428,13 @@ impl Drop for GaugeLease {
     }
 }
 impl Metrics {
+    pub(crate) fn opaque_relay_body(&self, bytes: usize) -> Option<OpaqueRelayBody<'_>> {
+        (bytes != 0).then(|| OpaqueRelayBody {
+            metrics: self,
+            bytes,
+            completed: false,
+        })
+    }
     /// Install once during worker assembly, not on the admission hot path.
     pub(crate) fn observe_admission(&self, worker: WorkerId, usage: AdmissionUsage) -> Result<()> {
         self.registry.shards[self.shard]
@@ -563,6 +607,22 @@ impl Metrics {
 mod tests {
     use super::*;
     use crate::{model::ResourceClass, runtime::admission::Admission};
+
+    #[test]
+    fn opaque_body_attempts_exclude_empty_and_count_abandonment_once() {
+        let metrics = Metrics::default();
+        assert!(metrics.opaque_relay_body(0).is_none());
+        assert_eq!(metrics.count(Event::OpaqueRelayBodyFailed), 0);
+        let mut completed = metrics.opaque_relay_body(17).unwrap();
+        assert_eq!(metrics.count(Event::OpaqueRelayBodyBytes), 0);
+        completed.complete();
+        completed.complete();
+        drop(completed);
+        drop(metrics.opaque_relay_body(19));
+        assert_eq!(metrics.count(Event::OpaqueRelayBodyCompleted), 1);
+        assert_eq!(metrics.count(Event::OpaqueRelayBodyBytes), 17);
+        assert_eq!(metrics.count(Event::OpaqueRelayBodyFailed), 1);
+    }
 
     #[test]
     fn integrity_diagnostics_have_fixed_names_and_saturating_sharded_counts() {

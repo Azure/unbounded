@@ -721,6 +721,18 @@ fn metrics_http_response_exports_worker_quotas_with_bounded_output() {
     let text = std::str::from_utf8(&bytes[..length]).unwrap();
     assert!(length < MAX_RESPONSE_BYTES);
     for name in [
+        "racer_opaque_relay_body_completed_total",
+        "racer_opaque_relay_body_completed_bytes_total",
+        "racer_opaque_relay_body_failed_total",
+    ] {
+        assert!(text.contains(&format!("# TYPE {name} counter\n{name} {}\n", u64::MAX)));
+        assert_eq!(
+            text.lines().filter(|line| line.starts_with(name)).count(),
+            1
+        );
+        assert!(!text.contains(&format!("{name}{{")));
+    }
+    for name in [
         "relay_used",
         "relay_limit",
         "ciphertext_used_bytes",

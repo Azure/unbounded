@@ -696,7 +696,8 @@ impl WorkerApplication {
                 request_timeout: config.request_timeout,
                 opaque_relay: config.opaque_relay,
             },
-        );
+        )
+        .with_metrics(metrics.clone());
         let peers = Rc::new(peers.with_send_crc(
             config.send_crc_pair.clone(),
             node.send_crc.clone(),

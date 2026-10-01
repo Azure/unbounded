@@ -13,7 +13,9 @@ use std::{cell::RefCell, net::Shutdown};
 
 #[test]
 fn upstream_fin_before_response_head_recovers_quota_by_signed_deadline() {
-    let f = RelayFixture::new(false);
+    let mut f = RelayFixture::new(false);
+    let metrics = Metrics::default();
+    f.server = f.server.with_metrics(metrics.clone());
     f.reactors[1].init().unwrap();
     let context_baseline = f.admissions[1].used(ResourceClass::RequestContext);
     assert!(f.server.opaque_relay());
@@ -108,6 +110,17 @@ fn upstream_fin_before_response_head_recovers_quota_by_signed_deadline() {
     )
     .unwrap();
     assert!(admitted.get() && finished.get());
+    for event in [
+        Event::OpaqueRelayBodyCompleted,
+        Event::OpaqueRelayBodyBytes,
+        Event::OpaqueRelayBodyFailed,
+    ] {
+        assert_eq!(
+            metrics.count(event),
+            0,
+            "no body attempt before response head"
+        );
+    }
     f.pool.close();
     for reactor in &f.reactors {
         drive(&f.reactors, reactor.drain(), || {}).unwrap();
@@ -134,6 +147,8 @@ fn upstream_fin_before_response_head_recovers_quota_by_signed_deadline() {
 #[test]
 fn wrong_equal_length_body_through_opaque_relay_fails_aead_then_recovers() {
     let mut f = RelayFixture::new(false);
+    let relay_metrics = Metrics::default();
+    f.server = f.server.with_metrics(relay_metrics.clone());
     assert!(f.server.opaque_relay());
     let identities = crate::security::test_support::identities(
         ClusterId(CLUSTER.into()),
@@ -347,6 +362,12 @@ fn wrong_equal_length_body_through_opaque_relay_fails_aead_then_recovers() {
         drive(&f.reactors, reactor.drain(), &poll_crypto).unwrap();
     }
     assert!(clients.iter().all(|client| client.outstanding() == 0));
+    assert_eq!(relay_metrics.count(Event::OpaqueRelayBodyCompleted), 2);
+    assert_eq!(
+        relay_metrics.count(Event::OpaqueRelayBodyBytes),
+        2 * (length + 16) as u64
+    );
+    assert_eq!(relay_metrics.count(Event::OpaqueRelayBodyFailed), 0);
     f.admissions[0].reclaim_buffers();
     assert_eq!(f.admissions[1].used(ResourceClass::Connection), 0);
     assert_eq!(f.admissions[1].used(ResourceClass::Relay), 0);

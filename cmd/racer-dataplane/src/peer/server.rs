@@ -48,6 +48,7 @@ pub(crate) struct Settings {
 }
 
 pub struct PeerServer {
+    metrics: crate::telemetry::metrics::Metrics,
     send_crc: Option<(
         crate::telemetry::send_crc::Pair,
         crate::telemetry::send_crc::Samples,
@@ -69,6 +70,10 @@ pub struct PeerServer {
     request_timeout: Duration,
 }
 impl PeerServer {
+    pub(crate) fn with_metrics(mut self, metrics: crate::telemetry::metrics::Metrics) -> Self {
+        self.metrics = metrics;
+        self
+    }
     pub(crate) fn with_send_crc(
         mut self,
         pair: Option<crate::telemetry::send_crc::Pair>,
@@ -282,6 +287,7 @@ impl PeerServer {
     ) -> Self {
         Self {
             subscriptions,
+            metrics: crate::telemetry::metrics::Metrics::default(),
             send_crc: None,
             placement: crate::topology::placement::Placement::new(64),
             opaque_relay: settings.opaque_relay,
@@ -434,10 +440,17 @@ impl PeerServer {
                             let pipe = connection.relay_pipe.take();
                             // Once the success head is sent, any body failure closes
                             // both dirty connections. Never append an error envelope.
-                            return self
+                            let mut observation = self.metrics.opaque_relay_body(length);
+                            let result = self
                                 .io
                                 .relay_body(downstream, connection, pipe, &request_scope)
                                 .await;
+                            if result.is_ok() {
+                                if let Some(observation) = &mut observation {
+                                    observation.complete();
+                                }
+                            }
+                            return result;
                         }
                         Ok(super::transport::RelayResponse::Complete(response)) => response,
                         Err(Error::Overloaded) => self

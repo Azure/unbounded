@@ -427,6 +427,9 @@ impl RelayFixture {
             metadata,
             page,
         } = self;
+        use crate::telemetry::metrics::{Event, Metrics};
+        let metrics = Metrics::default();
+        let server = server.with_metrics(metrics.clone());
         let accepted = Cell::new(0);
         let destination = async {
             let fd = reactors[2].accept(Rc::new(listener.into()), &scope).await?;
@@ -526,10 +529,26 @@ impl RelayFixture {
                 let result = server.serve_connection(conn, &scope).await;
                 if truncated && i + 1 == rounds {
                     assert!(matches!(result, Err(Error::Io)));
+                    assert_eq!(metrics.count(Event::OpaqueRelayBodyFailed), 1);
+                    assert_eq!(metrics.count(Event::OpaqueRelayBodyCompleted), i as u64);
+                    assert_eq!(
+                        metrics.count(Event::OpaqueRelayBodyBytes),
+                        (i * body.len()) as u64
+                    );
                     return Ok::<_, Error>(());
                 }
                 conn = result?;
                 assert!(conn.is_reusable());
+                let completed = if materialized { 0 } else { i + 1 };
+                assert_eq!(
+                    metrics.count(Event::OpaqueRelayBodyCompleted),
+                    completed as u64
+                );
+                assert_eq!(
+                    metrics.count(Event::OpaqueRelayBodyBytes),
+                    (completed * body.len()) as u64
+                );
+                assert_eq!(metrics.count(Event::OpaqueRelayBodyFailed), 0);
             }
             Ok::<_, Error>(())
         };
@@ -665,6 +684,12 @@ fn signed_materialized_full_page_bootstrap_and_page_keepalive() {
 #[test]
 fn signed_success_truncation_closes_relay_and_pooled_destination() {
     exchange(false, false, 2, false, true);
+}
+#[test]
+fn opaque_truncation_without_prior_success_credits_no_complete_bytes() {
+    for fallback in [false, true] {
+        exchange(false, fallback, 1, false, true);
+    }
 }
 #[test]
 #[ignore = "local bounded before/after benchmark; run explicitly"]
