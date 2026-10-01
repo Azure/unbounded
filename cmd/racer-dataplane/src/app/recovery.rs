@@ -369,7 +369,7 @@ fn select(
 mod tests {
     use super::*;
     use crate::store::{
-        checkpoint_format::CHECKPOINT_VERSION, direct::DirectAlignment, index::IndexSnapshot,
+        catalog::IndexSnapshot, checkpoint_format::CHECKPOINT_VERSION, direct::DirectAlignment,
     };
     fn geometry() -> CheckpointGeometry {
         CheckpointGeometry::new(
@@ -484,9 +484,8 @@ mod tests {
     {
         use crate::model::{VersionMetadata, *};
         use crate::store::{
+            catalog::{IndexedPage, RecordLocation, Segments},
             checkpoint_format,
-            index::{IndexedPage, RecordLocation},
-            segment::Segments,
         };
         let node = NodeState::new(vec![WorkerId(0)], 16).unwrap();
         let keys = crate::security::identity::keyring_tests::keys();

@@ -1,19 +1,19 @@
-//! Identity mappings and reverse segment membership, published after complete writes.
+//! Identity mappings, segment lifecycle, and lease-fenced second-chance eviction.
 use super::{
-    segment::{Generation, SegmentId},
-    slab::SlabLocation,
+    direct::DirectAlignment,
+    slab::{SlabId, SlabLocation},
 };
 use crate::model::KeyId;
 use crate::runtime::collections::{HashMap, HashSet};
 use crate::{
-    error::{Error, Result},
+    error::{Error, Operation, Result},
     model::{
         CurrentVersion, ObjectId, ObjectMetadata, ObjectVersion, PageId, VersionMetadata, WorkerId,
     },
 };
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     rc::Rc,
 };
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -500,174 +500,435 @@ impl Index {
         }
     }
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn content_type_survives_catalog_and_legacy_refresh_and_rejects_conflicts() {
-        let index = Index::new(WorkerId(0), 8);
-        let legacy = descriptor("v1", 3);
-        index.publish_version(legacy.clone()).unwrap();
-        let mut typed = legacy.clone();
-        typed.content_type = Some(crate::model::ContentType::parse(b"text/plain").unwrap());
-        index.publish_version(typed.clone()).unwrap();
-        index.publish_version(legacy).unwrap();
-        assert_eq!(index.version(&typed.version).unwrap(), Some(typed.clone()));
-        assert_eq!(typed.for_pin().content_type, typed.content_type);
-        let mut conflict = typed.clone();
-        conflict.content_type = Some(crate::model::ContentType::parse(b"text/html").unwrap());
-        assert_eq!(index.publish_version(conflict), Err(Error::CorruptRecord));
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SegmentId(pub u64);
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct Generation(pub u64);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SegmentState {
+    Free,
+    Open,
+    Sealed,
+    Evicting,
+}
+#[derive(Clone, Debug)]
+pub struct SegmentSnapshot {
+    pub id: SegmentId,
+    pub generation: Generation,
+    pub state: SegmentState,
+    pub used_bytes: u64,
+}
+pub struct SegmentLease {
+    worker: WorkerId,
+    pub(crate) id: SegmentId,
+    pub(crate) generation: Generation,
+    count: Rc<Cell<usize>>,
+}
+impl SegmentLease {
+    pub fn worker(&self) -> WorkerId {
+        self.worker
     }
-    use crate::{
-        error::Error,
-        model::{CacheId, CacheKey, StrongEtag},
-    };
-
-    fn descriptor(etag: &str, length: u64) -> VersionMetadata {
-        VersionMetadata {
-            content_type: None,
-            version: ObjectVersion {
-                object: ObjectId {
-                    cache: CacheId("cache".into()),
-                    key: CacheKey([0; 32]),
-                },
-                etag: StrongEtag::test_value(etag),
-            },
-            length,
-        }
+    pub fn id(&self) -> SegmentId {
+        self.id
     }
-
-    #[test]
-    fn metadata_only_checkpoint_preserves_empty_and_old_versions_without_freshness() {
-        let old = descriptor("old", 17);
-        let empty = descriptor("new", 0);
-        let snapshot = IndexSnapshot {
-            entries: vec![],
-            metadata: vec![old.clone(), empty.clone()],
-        };
-        assert_eq!(snapshot.validate_metadata(), Ok(()));
-        assert_eq!(snapshot.metadata[0].for_pin().length, 17);
-        assert_eq!(snapshot.metadata[1].for_pin().length, 0);
-        assert_eq!(
-            snapshot.metadata[0].for_pin().expires_at.0,
-            std::time::UNIX_EPOCH
-        );
-    }
-
-    #[test]
-    fn checkpoint_rejects_two_lengths_for_one_version() {
-        let first = descriptor("v1", 17);
-        let conflicting = VersionMetadata {
-            length: 18,
-            ..first.clone()
-        };
-        let snapshot = IndexSnapshot {
-            entries: vec![],
-            metadata: vec![first, conflicting],
-        };
-        assert_eq!(snapshot.validate_metadata(), Err(Error::CorruptRecord));
-    }
-
-    fn indexed(metadata: VersionMetadata, segment: u64) -> (PageId, IndexedPage) {
-        let page = PageId {
-            version: metadata.version.clone(),
-            number: crate::model::PageNumber(0),
-        };
-        (
-            page,
-            IndexedPage {
-                metadata,
-                key_id: KeyId([1; 16]),
-                location: RecordLocation {
-                    segment: SegmentId(segment),
-                    generation: Generation(1),
-                    location: SlabLocation {
-                        slab: super::super::slab::SlabId(0),
-                        extent: super::super::direct::DirectExtent::checked(segment * 1024, 512)
-                            .unwrap(),
-                    },
-                },
-            },
-        )
-    }
-    #[test]
-    fn catalog_eviction_preserves_pages_and_conditional_removal_preserves_replacement() {
-        let index = Index::new(WorkerId(0), 1);
-        index.set_page_capacity(1).unwrap();
-        let (page, old) = indexed(descriptor("old", 17), 0);
-        index.publish_version(old.metadata.clone()).unwrap();
-        index.publish(page.clone(), old.clone()).unwrap();
-        index.publish_version(descriptor("new", 0)).unwrap();
-        assert_eq!(index.version(&page.version).unwrap().unwrap().length, 17);
-        let (_, replacement) = indexed(old.metadata.clone(), 1);
-        index.publish(page.clone(), replacement.clone()).unwrap();
-        assert!(index.segment_entries(SegmentId(0)).is_empty());
-        index.remove_if_matches(&page, &old.location).unwrap();
-        assert_eq!(
-            index.lookup(&page).unwrap().unwrap().location,
-            replacement.location
-        );
-        let (other, entry) = indexed(descriptor("other", 1), 2);
-        assert_eq!(index.publish(other, entry), Err(Error::Overloaded));
-        index
-            .remove_if_matches(&page, &replacement.location)
-            .unwrap();
-        assert!(index.version(&page.version).unwrap().is_none());
-    }
-    #[test]
-    fn capacity_preflight_allows_replacement_and_reopens_only_after_removal() {
-        let index = Index::new(WorkerId(0), 1);
-        index.set_page_capacity(1).unwrap();
-        let (page, entry) = indexed(descriptor("first", 17), 0);
-        let (other, other_entry) = indexed(descriptor("other", 17), 1);
-        assert_eq!(index.preflight_capacity(&page), Ok(()));
-        assert_eq!(index.preflight_capacity(&other), Ok(()));
-        assert!(index.snapshot().unwrap().entries.is_empty());
-        index.publish(page.clone(), entry.clone()).unwrap();
-        assert_eq!(index.preflight_capacity(&page), Ok(()));
-        assert_eq!(index.preflight_capacity(&other), Err(Error::Overloaded));
-        // Preflight did not reserve a slot or bypass final publish validation.
-        assert_eq!(
-            index.publish(other.clone(), other_entry.clone()),
-            Err(Error::Overloaded)
-        );
-        let (_, replacement) = indexed(entry.metadata, 2);
-        index.publish(page.clone(), replacement.clone()).unwrap();
-        assert_eq!(
-            index.lookup(&page).unwrap().unwrap().location,
-            replacement.location
-        );
-        assert_eq!(index.preflight_capacity(&other), Err(Error::Overloaded));
-        index
-            .remove_if_matches(&page, &replacement.location)
-            .unwrap();
-        assert_eq!(index.preflight_capacity(&other), Ok(()));
-        index.publish(other, other_entry).unwrap();
-    }
-    #[test]
-    fn restore_is_atomic_and_drops_freshness() {
-        let index = Index::new(WorkerId(0), 2);
-        let m = descriptor("v1", 17);
-        let mut current = m.for_pin();
-        current.expires_at.0 = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
-        index.publish_current(current).unwrap();
-        assert!(index.current(&m.version.object).unwrap().is_some());
-        let bad = IndexSnapshot {
-            entries: vec![],
-            metadata: vec![
-                m.clone(),
-                VersionMetadata {
-                    content_type: None,
-                    length: 99,
-                    ..m.clone()
-                },
-            ],
-        };
-        assert_eq!(index.restore(bad), Err(Error::CorruptRecord));
-        assert!(index.current(&m.version.object).unwrap().is_some());
-        let snapshot = index.snapshot().unwrap();
-        index.restore(snapshot).unwrap();
-        assert!(index.current(&m.version.object).unwrap().is_none());
-        assert_eq!(index.version(&m.version).unwrap(), Some(m));
+    pub fn generation(&self) -> Generation {
+        self.generation
     }
 }
+impl Drop for SegmentLease {
+    fn drop(&mut self) {
+        self.count.set(self.count.get() - 1);
+    }
+}
+pub struct AppendLease {
+    pub segment: SegmentLease,
+    pub location: SlabLocation,
+}
+struct Slot {
+    image: SegmentSnapshot,
+    leases: Rc<Cell<usize>>,
+}
+pub struct Segments {
+    worker: WorkerId,
+    segment_bytes: u64,
+    slab_bytes: Cell<u64>,
+    alignment: Cell<Option<DirectAlignment>>,
+    slots: RefCell<Vec<Slot>>,
+    frozen: Cell<bool>,
+    open: Cell<Option<usize>>,
+    free: RefCell<BTreeSet<usize>>,
+}
+impl Segments {
+    pub fn new(worker: WorkerId, segment_bytes: u64) -> Self {
+        Self {
+            worker,
+            segment_bytes,
+            slab_bytes: Cell::new(0),
+            alignment: Cell::new(None),
+            slots: RefCell::new(Vec::new()),
+            frozen: Cell::new(false),
+            open: Cell::new(None),
+            free: RefCell::new(BTreeSet::new()),
+        }
+    }
+    pub fn worker(&self) -> WorkerId {
+        self.worker
+    }
+    pub fn segment_bytes(&self) -> u64 {
+        self.segment_bytes
+    }
+    pub fn slab_bytes(&self) -> u64 {
+        self.slab_bytes.get()
+    }
+    pub fn configure(
+        &self,
+        slab_bytes: u64,
+        segment_count: usize,
+        alignment: DirectAlignment,
+    ) -> Result<()> {
+        if !self.slots.borrow().is_empty()
+            || self.segment_bytes == 0
+            || slab_bytes == 0
+            || !slab_bytes.is_multiple_of(self.segment_bytes)
+            || !self.segment_bytes.is_multiple_of(alignment.offset())
+            || !self.segment_bytes.is_multiple_of(alignment.length() as u64)
+            || segment_count == 0
+            || segment_count > 1_000_000
+            || segment_count as u64 > slab_bytes / self.segment_bytes
+        {
+            return Err(Error::InvalidConfiguration);
+        }
+        self.slab_bytes.set(slab_bytes);
+        self.alignment.set(Some(alignment));
+        *self.slots.borrow_mut() = (0..segment_count)
+            .map(|id| Slot {
+                image: SegmentSnapshot {
+                    id: SegmentId(id as u64),
+                    generation: Generation(1),
+                    state: SegmentState::Free,
+                    used_bytes: 0,
+                },
+                leases: Rc::new(Cell::new(0)),
+            })
+            .collect();
+        *self.free.borrow_mut() = (0..segment_count).collect();
+        Ok(())
+    }
+    pub fn append(&self, disk_bytes: usize) -> Result<AppendLease> {
+        if self.frozen.get() {
+            return Err(Error::Overloaded);
+        }
+        let alignment = self.alignment.get().ok_or(Error::Unavailable)?;
+        if disk_bytes == 0
+            || disk_bytes as u64 > self.segment_bytes
+            || alignment.extent(0, disk_bytes)?.length() != disk_bytes
+        {
+            return Err(Error::InvalidConfiguration);
+        }
+        let mut slots = self.slots.borrow_mut();
+        if let Some(position) = self.open.get() {
+            let slot = &mut slots[position];
+            if self.segment_bytes - slot.image.used_bytes < disk_bytes as u64 {
+                slot.image.state = SegmentState::Sealed;
+                self.open.set(None);
+            }
+        }
+        let position = match self.open.get() {
+            Some(position) => position,
+            None => self
+                .free
+                .borrow_mut()
+                .pop_first()
+                .ok_or(Error::Overloaded)?,
+        };
+        self.open.set(Some(position));
+        let slot = &mut slots[position];
+        slot.image.state = SegmentState::Open;
+        let offset = slot
+            .image
+            .id
+            .0
+            .checked_mul(self.segment_bytes)
+            .and_then(|v| v.checked_add(slot.image.used_bytes))
+            .ok_or(Error::InvalidConfiguration)?;
+        slot.image.used_bytes += disk_bytes as u64;
+        if slot.image.used_bytes == self.segment_bytes {
+            slot.image.state = SegmentState::Sealed;
+            self.open.set(None);
+        }
+        let lease = self.take_lease(slot)?;
+        Ok(AppendLease {
+            segment: lease,
+            location: SlabLocation {
+                slab: SlabId(0),
+                extent: alignment.extent(offset, disk_bytes)?,
+            },
+        })
+    }
+    fn take_lease(&self, slot: &Slot) -> Result<SegmentLease> {
+        slot.leases
+            .set(slot.leases.get().checked_add(1).ok_or(Error::Overloaded)?);
+        Ok(SegmentLease {
+            worker: self.worker,
+            id: slot.image.id,
+            generation: slot.image.generation,
+            count: slot.leases.clone(),
+        })
+    }
+    pub fn lease(&self, id: SegmentId, generation: Generation) -> Result<SegmentLease> {
+        let slots = self.slots.borrow();
+        let slot = slots.get(id.0 as usize).ok_or(Error::CorruptRecord)?;
+        if slot.image.generation != generation
+            || !matches!(slot.image.state, SegmentState::Open | SegmentState::Sealed)
+        {
+            return Err(Error::CorruptRecord);
+        }
+        self.take_lease(slot)
+    }
+    pub fn begin_evict(&self, id: SegmentId) -> Result<()> {
+        if self.frozen.get() {
+            return Err(Error::Overloaded);
+        }
+        let mut slots = self.slots.borrow_mut();
+        let slot = slots.get_mut(id.0 as usize).ok_or(Error::CorruptRecord)?;
+        if !matches!(
+            slot.image.state,
+            SegmentState::Sealed | SegmentState::Evicting
+        ) {
+            return Err(Error::Overloaded);
+        }
+        slot.image.state = SegmentState::Evicting;
+        Ok(())
+    }
+    pub fn recycle(&self, id: SegmentId) -> Result<()> {
+        if self.frozen.get() {
+            return Err(Error::Overloaded);
+        }
+        let mut slots = self.slots.borrow_mut();
+        let slot = slots.get_mut(id.0 as usize).ok_or(Error::CorruptRecord)?;
+        if slot.image.state != SegmentState::Evicting || slot.leases.get() != 0 {
+            return Err(Error::Overloaded);
+        }
+        slot.image.generation = Generation(
+            slot.image
+                .generation
+                .0
+                .checked_add(1)
+                .ok_or(Error::Unavailable)?,
+        );
+        slot.image.state = SegmentState::Free;
+        slot.image.used_bytes = 0;
+        self.free.borrow_mut().insert(id.0 as usize);
+        Ok(())
+    }
+    pub fn snapshot(&self) -> Result<Vec<SegmentSnapshot>> {
+        Ok(self
+            .slots
+            .borrow()
+            .iter()
+            .map(|s| s.image.clone())
+            .collect())
+    }
+    pub fn freeze(&self) -> Result<()> {
+        if self.frozen.replace(true) {
+            return Err(Error::Overloaded);
+        }
+        Ok(())
+    }
+    pub fn thaw(&self) {
+        self.frozen.set(false);
+    }
+    pub fn validate_restore(&self, images: &[SegmentSnapshot]) -> Result<()> {
+        let slots = self.slots.borrow();
+        if images.len() != slots.len() || slots.iter().any(|s| s.leases.get() != 0) {
+            return Err(Error::CorruptRecord);
+        }
+        let alignment = self.alignment.get().ok_or(Error::Unavailable)?;
+        for (i, s) in images.iter().enumerate() {
+            if s.id.0 != i as u64
+                || s.generation.0 == 0
+                || s.used_bytes > self.segment_bytes
+                || !s.used_bytes.is_multiple_of(alignment.offset())
+                || !s.used_bytes.is_multiple_of(alignment.length() as u64)
+                || (s.state == SegmentState::Free && s.used_bytes != 0)
+            {
+                return Err(Error::CorruptRecord);
+            }
+        }
+        Ok(())
+    }
+    pub fn restore(&self, images: Vec<SegmentSnapshot>) -> Result<()> {
+        self.validate_restore(&images)?;
+        let mut slots = self.slots.borrow_mut();
+        self.open.set(None);
+        self.free.borrow_mut().clear();
+        for (slot, mut image) in slots.iter_mut().zip(images) {
+            if image.state == SegmentState::Open {
+                image.state = SegmentState::Sealed;
+            }
+            if image.state == SegmentState::Free {
+                self.free.borrow_mut().insert(image.id.0 as usize);
+            }
+            slot.image = image;
+        }
+        Ok(())
+    }
+    pub fn validate_location(&self, location: &RecordLocation) -> Result<()> {
+        let slots = self.slots.borrow();
+        let s = slots
+            .get(location.segment.0 as usize)
+            .ok_or(Error::CorruptRecord)?;
+        let start = location
+            .segment
+            .0
+            .checked_mul(self.segment_bytes)
+            .ok_or(Error::CorruptRecord)?;
+        let end = location
+            .location
+            .extent
+            .offset()
+            .checked_add(location.location.extent.length() as u64)
+            .ok_or(Error::CorruptRecord)?;
+        if location.location.slab != SlabId(0)
+            || s.image.generation != location.generation
+            || !matches!(s.image.state, SegmentState::Open | SegmentState::Sealed)
+            || location.location.extent.offset() < start
+            || end > start + s.image.used_bytes
+        {
+            return Err(Error::CorruptRecord);
+        }
+        let a = self.alignment.get().ok_or(Error::Unavailable)?;
+        if a.extent(
+            location.location.extent.offset(),
+            location.location.extent.length(),
+        )? != location.location.extent
+        {
+            return Err(Error::CorruptRecord);
+        }
+        Ok(())
+    }
+    pub fn free_count(&self) -> usize {
+        self.free.borrow().len()
+    }
+    pub fn count(&self) -> usize {
+        self.slots.borrow().len()
+    }
+    pub fn state(&self, id: SegmentId) -> Result<SegmentState> {
+        self.slots
+            .borrow()
+            .get(id.0 as usize)
+            .map(|s| s.image.state)
+            .ok_or(Error::CorruptRecord)
+    }
+}
+
+/// Per-worker bounded second-chance clock, with no payload compaction.
+pub struct SegmentClock {
+    index: Rc<Index>,
+    segments: Rc<Segments>,
+    free_reserve: usize,
+    hand: Cell<usize>,
+    recent: RefCell<HashSet<SegmentId>>,
+}
+impl SegmentClock {
+    pub fn reserve(&self) -> usize {
+        self.free_reserve
+    }
+    pub fn new(index: Rc<Index>, segments: Rc<Segments>, free_reserve: usize) -> Self {
+        Self {
+            index,
+            segments,
+            free_reserve,
+            hand: Cell::new(0),
+            recent: RefCell::new(HashSet::default()),
+        }
+    }
+    pub fn mark_read(&self, segment: SegmentId) -> Result<()> {
+        if !matches!(
+            self.segments.state(segment)?,
+            SegmentState::Open | SegmentState::Sealed
+        ) {
+            return Err(Error::CorruptRecord);
+        }
+        self.recent.borrow_mut().insert(segment);
+        Ok(())
+    }
+    /// Make index room independently of slab space, with at most two rotations.
+    /// Use the same segment-level second chance as payload reclamation, but only
+    /// forget mappings: even an open segment can lose its index entries safely.
+    /// Its bytes and generation stay intact until normal lease-fenced recycling.
+    pub fn reclaim_index_for(&self, page: &PageId) -> Result<()> {
+        if self.index.preflight_capacity(page).is_ok() {
+            return Ok(());
+        }
+        let count = self.segments.count();
+        for _ in 0..count.saturating_mul(2).min(64) {
+            let hand = self.hand.get() % count;
+            self.hand.set((hand + 1) % count);
+            let id = SegmentId(hand as u64);
+            if self.recent.borrow_mut().remove(&id) {
+                continue;
+            }
+            for (victim, location) in self.index.segment_entries_bounded(id, 1) {
+                self.index.remove_if_matches(&victim, &location)?;
+            }
+            if self.index.preflight_capacity(page).is_ok() {
+                return Ok(());
+            }
+        }
+        Err(Error::Overloaded)
+    }
+    /// At most two rotations. Busy segments remain Evicting until a later poll.
+    pub fn reclaim_now(&self) -> Result<()> {
+        let count = self.segments.count();
+        if count == 0 {
+            return Err(Error::Unavailable);
+        }
+        let target = self.free_reserve.max(1).min(count);
+        let mut free = self.segments.free_count();
+        let mut entries_left = 256;
+        for _ in 0..count.saturating_mul(2).min(64) {
+            if free >= target {
+                return Ok(());
+            }
+            let hand = self.hand.get() % count;
+            self.hand.set((hand + 1) % count);
+            let id = SegmentId(hand as u64);
+            if !matches!(
+                self.segments.state(id)?,
+                SegmentState::Sealed | SegmentState::Evicting
+            ) {
+                continue;
+            }
+            if self.recent.borrow_mut().remove(&id) {
+                continue;
+            }
+            self.segments.begin_evict(id)?;
+            for (page, location) in self.index.segment_entries_bounded(id, entries_left) {
+                self.index.remove_if_matches(&page, &location)?;
+                entries_left -= 1;
+            }
+            if !self.index.segment_empty(id) {
+                return Err(Error::Overloaded);
+            }
+            match self.segments.recycle(id) {
+                Ok(()) => free += 1,
+                Err(Error::Overloaded) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if free >= target {
+            Ok(())
+        } else {
+            Err(Error::Overloaded)
+        }
+    }
+    pub fn reclaim(&self) -> Operation<'_, ()> {
+        Box::pin(async move { self.reclaim_now() })
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests;
+#[cfg(test)]
+mod tests;

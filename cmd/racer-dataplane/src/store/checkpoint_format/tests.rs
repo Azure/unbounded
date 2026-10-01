@@ -1,5 +1,5 @@
 use super::*;
-use crate::store::{checkpoint::Checkpointer, index::Index, recovery::Recovery};
+use crate::store::{catalog::Index, checkpoint::Checkpointer, recovery::Recovery};
 use futures::executor::block_on;
 use std::{
     fs,

@@ -1,8 +1,8 @@
 //! Versioned little-endian encrypted records. Header SHA-256 is framing integrity;
 //! payload integrity remains AEAD at the fill boundary. Padding is never returned.
 use super::{
+    catalog::Generation,
     direct::{AlignedBuffer, DirectAlignment, DirectExtent},
-    segment::Generation,
 };
 use crate::{
     error::{Error, Result},

@@ -12,9 +12,11 @@
 //! Version 2 appends a counted ASCII MIME string to every descriptor. Zero length
 //! means unknown. Version 1 remains readable and cannot encode typed descriptors.
 use super::{
+    catalog::{
+        Generation, IndexSnapshot, IndexedPage, RecordLocation, SegmentId, SegmentSnapshot,
+        SegmentState, Segments,
+    },
     direct::{DirectAlignment, DirectExtent},
-    index::{IndexSnapshot, IndexedPage, RecordLocation},
-    segment::{Generation, SegmentId, SegmentSnapshot, SegmentState, Segments},
     slab::{SlabId, SlabLocation},
 };
 use crate::runtime::collections::{HashMap, HashSet};

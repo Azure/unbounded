@@ -19,7 +19,7 @@ use crate::{
     peer::protocol::{FetchMode, Operation as PeerOperation, PeerResponse},
     runtime::deadline::RequestScope,
     security::credentials::CredentialCrypto,
-    store::index::Index,
+    store::catalog::Index,
     topology::membership::MembershipLease,
 };
 use std::{

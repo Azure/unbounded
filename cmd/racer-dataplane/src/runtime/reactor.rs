@@ -769,7 +769,7 @@ impl Reactor {
     /// use racer_dataplane::runtime::reactor::Descriptor;
     /// use racer_dataplane::{error::Result,
     ///     runtime::{deadline::RequestScope, reactor::{Completion, Reactor}},
-    ///     store::{direct::AlignedBuffer, segment::SegmentLease}};
+    ///     store::{direct::AlignedBuffer, catalog::SegmentLease}};
     /// async fn copy(reactor: &Reactor, fd: Rc<Descriptor>, buffer: AlignedBuffer,
     ///     lease: SegmentLease, scope: &RequestScope)
     ///     -> Result<Completion<AlignedBuffer, SegmentLease>> {
@@ -783,7 +783,7 @@ impl Reactor {
     /// use racer_dataplane::runtime::reactor::Descriptor;
     /// use racer_dataplane::{memory::pool::PlaintextBuffer,
     ///     runtime::{deadline::RequestScope, reactor::Reactor},
-    ///     store::segment::SegmentLease};
+    ///     store::catalog::SegmentLease};
     /// fn borrowed(reactor: &Reactor, fd: Rc<Descriptor>, buffer: PlaintextBuffer,
     ///     lease: &SegmentLease, scope: &RequestScope) {
     ///     let _future = reactor.read_at(fd, 0, buffer, lease, scope);

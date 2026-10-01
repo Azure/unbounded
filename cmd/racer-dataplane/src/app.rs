@@ -59,12 +59,10 @@ use crate::{
     },
     store::{
         Store, StoreReader,
+        catalog::{Index, SegmentClock, Segments},
         checkpoint::Checkpointer,
         checkpoint_format::{CheckpointGeometry, ShardImage},
-        eviction::SegmentClock,
-        index::Index,
         recovery::Recovery,
-        segment::Segments,
         slab::Slabs,
         writer::StoreWriter,
     },

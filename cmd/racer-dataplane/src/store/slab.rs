@@ -1,7 +1,7 @@
 //! Worker-owned sparse slab, opened once with O_DIRECT and never scanned at startup.
 use super::{
+    catalog::SegmentLease,
     direct::{AlignedBuffer, DirectAlignment, DirectExtent},
-    segment::SegmentLease,
 };
 use crate::runtime::reactor::Descriptor;
 use crate::{

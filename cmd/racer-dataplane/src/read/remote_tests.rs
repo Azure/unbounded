@@ -883,7 +883,9 @@ fn metadata_coordinator_with_newer_publication(
         },
         security::aead::PageCrypto,
         store::{
-            StoreReader, eviction::SegmentClock, index::Index, segment::Segments, slab::Slabs,
+            StoreReader,
+            catalog::{Index, SegmentClock, Segments},
+            slab::Slabs,
             writer::StoreWriter,
         },
     };

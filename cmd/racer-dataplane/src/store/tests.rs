@@ -46,7 +46,7 @@ struct Fixture {
     admission: Rc<Admission>,
     reactor: Rc<Reactor>,
     pool: Rc<BufferPool>,
-    segments: Rc<segment::Segments>,
+    segments: Rc<catalog::Segments>,
     _directory: Directory,
 }
 impl Fixture {
@@ -60,9 +60,9 @@ impl Fixture {
         ));
         let reactor = Rc::new(Reactor::new(admission.clone()));
         let pool = Rc::new(BufferPool::new(admission.clone()));
-        let index = Rc::new(index::Index::new(WorkerId(0), 16));
-        let segments = Rc::new(segment::Segments::new(WorkerId(0), 32 * 1024 * 1024));
-        let eviction = Rc::new(eviction::SegmentClock::new(
+        let index = Rc::new(catalog::Index::new(WorkerId(0), 16));
+        let segments = Rc::new(catalog::Segments::new(WorkerId(0), 32 * 1024 * 1024));
+        let eviction = Rc::new(catalog::SegmentClock::new(
             index.clone(),
             segments.clone(),
             1,
@@ -315,7 +315,7 @@ fn record_round_trip_preserves_ciphertext_zeroes_padding_and_rejects_torn_header
             .unwrap();
         let buffer = a.allocate(disk.length(), reserve).unwrap();
         assert_eq!(buffer.bytes().unwrap().as_ptr() as usize % a.memory(), 0);
-        let mut encoded = format::encode(&page, segment::Generation(7), a, buffer).unwrap();
+        let mut encoded = format::encode(&page, catalog::Generation(7), a, buffer).unwrap();
         let parsed = format::parse(&encoded.buffer, disk).unwrap();
         assert_eq!(
             &encoded.buffer.bytes().unwrap()[parsed.ciphertext.clone()],
@@ -331,7 +331,7 @@ fn record_round_trip_preserves_ciphertext_zeroes_padding_and_rejects_torn_header
             format::decode(&encoded.buffer, &encoded.header).unwrap(),
             *page.ciphertext.envelope()
         );
-        encoded.header.generation = segment::Generation(8);
+        encoded.header.generation = catalog::Generation(8);
         assert!(format::decode(&encoded.buffer, &encoded.header).is_err());
         encoded.buffer.bytes_mut().unwrap()[24] ^= 1;
         assert!(format::parse(&encoded.buffer, disk).is_err());
@@ -372,9 +372,9 @@ fn dirty_queue_is_bounded_and_retirement_discards_without_io() {
 fn segment_images(
     f: &Fixture,
 ) -> Vec<(
-    segment::SegmentId,
-    segment::Generation,
-    segment::SegmentState,
+    catalog::SegmentId,
+    catalog::Generation,
+    catalog::SegmentState,
     u64,
 )> {
     f.segments
@@ -412,7 +412,7 @@ fn index_capacity_rejection_preserves_segments_and_releases_all_charges_without_
         .segments
         .append(alignment.extent(0, 512).unwrap().length())
         .unwrap();
-    let location = index::RecordLocation {
+    let location = catalog::RecordLocation {
         segment: append.segment.id(),
         generation: append.segment.generation(),
         location: append.location,
@@ -420,7 +420,7 @@ fn index_capacity_rejection_preserves_segments_and_releases_all_charges_without_
     index
         .publish(
             retained_id.clone(),
-            index::IndexedPage {
+            catalog::IndexedPage {
                 location: location.clone(),
                 metadata: retained.metadata.immutable(),
                 key_id: retained.ciphertext.envelope().key_id,
@@ -1112,7 +1112,7 @@ fn shutdown_deadline_discards_second_copy_and_fences_submitted_first_copy() {
     assert!(f.admission.used(ResourceClass::DirtyCiphertext) > 0);
     let submitted = &f.segments;
     let mut snapshot = submitted.snapshot().unwrap();
-    snapshot[0].state = segment::SegmentState::Sealed;
+    snapshot[0].state = catalog::SegmentState::Sealed;
     // Active segment leases prohibit restore/reuse even though queued work is gone.
     assert!(submitted.restore(snapshot).is_err());
     drive(&f.reactor, write).unwrap();
@@ -1263,9 +1263,9 @@ fn unreclaimable_segment_pressure_discards_copies_without_fatal_progress_error()
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
     f.store.writer.reclaim_idle_buffer();
     assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
-    assert!(segments.recycle(segment::SegmentId(0)).is_err());
+    assert!(segments.recycle(catalog::SegmentId(0)).is_err());
     drop((first, second));
-    segments.recycle(segment::SegmentId(0)).unwrap();
+    segments.recycle(catalog::SegmentId(0)).unwrap();
 }
 
 #[test]

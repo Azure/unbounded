@@ -3,13 +3,12 @@
 //! Recovery seals open segments and clears freshness. Checkpoints have no fsync
 //! guarantee; record validation and AEAD convert stale payload references to misses.
 use super::{
+    catalog::{Index, IndexSnapshot, Segments},
     checkpoint::CHECKPOINT_NAMES,
     checkpoint_format::{
         self, CheckpointGeometry, CheckpointImage, MAX_CHECKPOINT_BYTES, ShardImage,
     },
     direct::DirectAlignment,
-    index::{Index, IndexSnapshot},
-    segment::Segments,
 };
 use crate::{
     error::{Error, Operation, Result},

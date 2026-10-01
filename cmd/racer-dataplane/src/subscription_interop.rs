@@ -185,7 +185,9 @@ impl SubscriptionFixture {
             credentials::CredentialCrypto,
         };
         use store::{
-            StoreReader, eviction::SegmentClock, index::Index, segment::Segments, slab::Slabs,
+            StoreReader,
+            catalog::{Index, SegmentClock, Segments},
+            slab::Slabs,
             writer::StoreWriter,
         };
 

@@ -1,9 +1,7 @@
 //! Bounded dirty copies persist asynchronously, with publication after full I/O.
 use super::{
-    eviction::SegmentClock,
+    catalog::{Index, IndexedPage, RecordLocation, SegmentClock, Segments},
     format,
-    index::{Index, IndexedPage, RecordLocation},
-    segment::Segments,
     slab::Slabs,
 };
 use crate::runtime::collections::HashMap;
@@ -118,7 +116,7 @@ impl StoreWriter {
     pub fn index(&self) -> &Rc<Index> {
         &self.index
     }
-    pub fn lease(&self, location: &RecordLocation) -> Result<super::segment::SegmentLease> {
+    pub fn lease(&self, location: &RecordLocation) -> Result<super::catalog::SegmentLease> {
         self.segments.validate_location(location)?;
         self.segments.lease(location.segment, location.generation)
     }

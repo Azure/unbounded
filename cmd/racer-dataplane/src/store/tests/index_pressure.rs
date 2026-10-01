@@ -29,7 +29,7 @@ fn small_records_turn_over_open_segment_and_checkpoint_recovers_only_live_mappin
     let first = persist(&f, 1);
     let second = persist(&f, 2);
     let before = segment_images(&f);
-    assert_eq!(before[0].2, segment::SegmentState::Open);
+    assert_eq!(before[0].2, catalog::SegmentState::Open);
     assert_eq!(f.segments.free_count(), 1);
     let third = persist(&f, 3);
     let fourth = persist(&f, 4);
@@ -38,7 +38,7 @@ fn small_records_turn_over_open_segment_and_checkpoint_recovers_only_live_mappin
     assert_eq!(index.snapshot().unwrap().entries.len(), 2);
     let after = segment_images(&f);
     assert_eq!(after[0].1, before[0].1);
-    assert_eq!(after[0].2, segment::SegmentState::Open);
+    assert_eq!(after[0].2, catalog::SegmentState::Open);
     assert!(after[0].3 > before[0].3);
     assert!(after[0].3 < 32 * 1024 * 1024);
     assert_eq!(after[1], before[1]);
@@ -117,11 +117,11 @@ fn index_eviction_during_read_cannot_resurrect_copy_or_recycle_active_generation
     // Seal the old open segment, then exercise the normal slab-pressure fence.
     let segments = &f.segments;
     drop(segments.append(32 * 1024 * 1024).unwrap());
-    let clock = eviction::SegmentClock::new(index.clone(), segments.clone(), 2);
+    let clock = catalog::SegmentClock::new(index.clone(), segments.clone(), 2);
     assert_eq!(clock.reclaim_now(), Err(Error::Overloaded));
     assert_eq!(
         segments.state(old.segment).unwrap(),
-        segment::SegmentState::Evicting
+        catalog::SegmentState::Evicting
     );
     assert_eq!(segments.recycle(old.segment), Err(Error::Overloaded));
     drop(held);
@@ -166,9 +166,9 @@ fn retirement_during_pressure_write_prevents_late_publication() {
 #[test]
 fn index_clock_gives_recent_segments_a_second_chance_and_handles_no_victim() {
     let f = Fixture::new();
-    let index = Rc::new(index::Index::new(WorkerId(0), 2));
+    let index = Rc::new(catalog::Index::new(WorkerId(0), 2));
     index.set_page_capacity(2).unwrap();
-    let segments = Rc::new(segment::Segments::new(WorkerId(0), 512));
+    let segments = Rc::new(catalog::Segments::new(WorkerId(0), 512));
     segments
         .configure(
             1536,
@@ -176,7 +176,7 @@ fn index_clock_gives_recent_segments_a_second_chance_and_handles_no_victim() {
             direct::DirectAlignment::validate(512, 512, 512).unwrap(),
         )
         .unwrap();
-    let clock = eviction::SegmentClock::new(index.clone(), segments.clone(), 1);
+    let clock = catalog::SegmentClock::new(index.clone(), segments.clone(), 1);
     let mut ids = Vec::new();
     for number in [1, 2] {
         let copy = f.copy(number, 113);
@@ -185,8 +185,8 @@ fn index_clock_gives_recent_segments_a_second_chance_and_handles_no_victim() {
         index
             .publish(
                 id.clone(),
-                index::IndexedPage {
-                    location: index::RecordLocation {
+                catalog::IndexedPage {
+                    location: catalog::RecordLocation {
                         segment: append.segment.id(),
                         generation: append.segment.generation(),
                         location: append.location,
@@ -199,26 +199,26 @@ fn index_clock_gives_recent_segments_a_second_chance_and_handles_no_victim() {
         ids.push(id);
     }
     let incoming = f.copy(3, 113).ciphertext.envelope().page.clone();
-    clock.mark_read(segment::SegmentId(0)).unwrap();
+    clock.mark_read(catalog::SegmentId(0)).unwrap();
     clock.reclaim_index_for(&incoming).unwrap();
     assert!(index.lookup(&ids[0]).unwrap().is_some());
     assert!(index.lookup(&ids[1]).unwrap().is_none());
     assert_eq!(segments.free_count(), 1);
     // Even if every retained segment is recent, the second rotation makes room.
     index.set_page_capacity(1).unwrap();
-    clock.mark_read(segment::SegmentId(0)).unwrap();
+    clock.mark_read(catalog::SegmentId(0)).unwrap();
     clock.reclaim_index_for(&incoming).unwrap();
     assert!(index.lookup(&ids[0]).unwrap().is_none());
 
     // An unavailable segment table cannot spin or manufacture a free index slot.
-    let empty = Rc::new(segment::Segments::new(WorkerId(0), 512));
+    let empty = Rc::new(catalog::Segments::new(WorkerId(0), 512));
     let copy = f.copy(1, 113);
     let append = segments.append(512).unwrap();
     index
         .publish(
             ids[0].clone(),
-            index::IndexedPage {
-                location: index::RecordLocation {
+            catalog::IndexedPage {
+                location: catalog::RecordLocation {
                     segment: append.segment.id(),
                     generation: append.segment.generation(),
                     location: append.location,
@@ -229,7 +229,7 @@ fn index_clock_gives_recent_segments_a_second_chance_and_handles_no_victim() {
         )
         .unwrap();
     assert_eq!(
-        eviction::SegmentClock::new(index, empty, 1).reclaim_index_for(&incoming),
+        catalog::SegmentClock::new(index, empty, 1).reclaim_index_for(&incoming),
         Err(Error::Overloaded)
     );
 }

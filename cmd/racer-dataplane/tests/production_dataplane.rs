@@ -49,7 +49,9 @@ use racer_dataplane::{
         signing::Signatures,
     },
     store::{
-        StoreReader, eviction::SegmentClock, index::Index, segment::Segments, slab::Slabs,
+        StoreReader,
+        catalog::{Index, SegmentClock, Segments},
+        slab::Slabs,
         writer::StoreWriter,
     },
     topology::{

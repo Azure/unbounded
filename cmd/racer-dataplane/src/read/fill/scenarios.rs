@@ -17,7 +17,10 @@ use crate::{
         worker::{CryptoRuntime, CryptoService, WorkerMap},
     },
     security::aead::PageCryptoEngine,
-    store::{eviction::SegmentClock, index::Index, segment::Segments, slab::Slabs},
+    store::{
+        catalog::{Index, SegmentClock, Segments},
+        slab::Slabs,
+    },
     topology::{
         membership::{Member, Membership},
         placement::Placement,

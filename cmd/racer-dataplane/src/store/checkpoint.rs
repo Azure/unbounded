@@ -3,12 +3,11 @@
 //! The coordinator keeps every owner frozen through publication, then explicitly
 //! finishes each snapshot even on failure. Write/rename provides no fsync durability.
 use super::{
+    catalog::{Index, Segments},
     checkpoint_format::{
         self, CHECKPOINT_VERSION, CheckpointGeometry, CheckpointImage, ShardImage,
     },
-    index::Index,
     recovery::read_candidates,
-    segment::Segments,
 };
 use crate::error::{Error, Operation, Result};
 use std::{
@@ -126,7 +125,7 @@ impl Checkpointer {
                 Ok(ShardImage {
                     worker: owner.index.worker(),
                     geometry,
-                    index: super::index::IndexSnapshot { entries, metadata },
+                    index: super::catalog::IndexSnapshot { entries, metadata },
                     segments,
                 })
             }

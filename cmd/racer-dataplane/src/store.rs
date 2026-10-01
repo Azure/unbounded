@@ -1,18 +1,15 @@
 //! Worker-local encrypted slab storage. No HTTP, plaintext, or origin credentials.
+pub mod catalog;
 pub mod checkpoint;
 pub mod checkpoint_format;
 pub mod direct;
-pub mod eviction;
 pub mod format;
-pub mod index;
 pub mod recovery;
-pub mod segment;
 pub mod slab;
 pub mod writer;
 
 use self::{
-    index::{Index, RecordLocation},
-    segment::Segments,
+    catalog::{Index, RecordLocation, Segments},
     slab::Slabs,
 };
 use crate::{
@@ -28,7 +25,7 @@ pub struct Store {
     pub writer: Rc<writer::StoreWriter>,
     pub checkpoint: Rc<checkpoint::Checkpointer>,
     pub recovery: recovery::Recovery,
-    pub eviction: Rc<eviction::SegmentClock>,
+    pub eviction: Rc<catalog::SegmentClock>,
 }
 
 impl Store {
@@ -69,7 +66,7 @@ impl Store {
 /// AEAD validation remains owned by fill.
 pub struct StoreReader {
     metrics: crate::telemetry::metrics::Metrics,
-    clock: Rc<eviction::SegmentClock>,
+    clock: Rc<catalog::SegmentClock>,
     index: Rc<Index>,
     segments: Rc<Segments>,
     slabs: Rc<Slabs>,
@@ -89,7 +86,7 @@ impl StoreReader {
         self.index.version(version)
     }
     pub fn new(
-        clock: Rc<eviction::SegmentClock>,
+        clock: Rc<catalog::SegmentClock>,
         index: Rc<Index>,
         segments: Rc<Segments>,
         slabs: Rc<Slabs>,
