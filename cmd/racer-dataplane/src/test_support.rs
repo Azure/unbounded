@@ -64,7 +64,6 @@ pub mod cluster {
             send_crc_pair: None,
             page_hedge: Default::default(),
             peer_admission: Default::default(),
-            routing_algorithm: crate::topology::RoutingAlgorithm::default(),
             shares: NonZeroU32::new(4).unwrap(),
             disk_page_entries: NonZeroUsize::new(65536).unwrap(),
             checkpoint_bytes: NonZeroUsize::new(64 * 1024 * 1024).unwrap(),

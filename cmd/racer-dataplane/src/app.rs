@@ -573,7 +573,7 @@ impl WorkerApplication {
             Paths::with_algorithm(
                 Rc::new(LinkHealth),
                 limits.cached_paths.get(),
-                config.routing_algorithm,
+                crate::topology::RoutingAlgorithm::V5,
             )
             .with_peer_admission(node.peer_admission.clone()),
         );
@@ -583,7 +583,7 @@ impl WorkerApplication {
         let network = Rc::new(crate::peer::PeerNetwork::with_algorithm(
             config.node.clone(),
             node.publications.clone(),
-            config.routing_algorithm,
+            crate::topology::RoutingAlgorithm::V5,
         )?);
         let wire = Rc::new(crate::peer::protocol::SecurityCodec::new(
             admission.clone(),

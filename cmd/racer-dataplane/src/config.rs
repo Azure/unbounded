@@ -43,7 +43,6 @@ pub struct Config {
     pub max_threads: usize,
     /// Opt into logical-CPU sizing instead of one eligible CPU per physical core.
     pub allow_smt: bool,
-    pub routing_algorithm: crate::topology::RoutingAlgorithm,
     pub enable_rdma: bool,
     /// Opt into experimental opaque HTTP transit; materialized relay is the default.
     pub opaque_relay: bool,
@@ -147,6 +146,10 @@ impl Config {
                 return Err(Error::InvalidConfiguration);
             }
         }
+        // Removed selectors must fail explicitly, never silently change topology.
+        if lookup("RACER_ROUTING_ALGORITHM")?.is_some() {
+            return Err(Error::InvalidConfiguration);
+        }
         let mut text = |name: &str, default: Option<&str>| -> Result<String> {
             let value = lookup(name)?
                 .or_else(|| default.map(str::to_owned))
@@ -176,13 +179,6 @@ impl Config {
         let peer_tcp_nodelay = match text("RACER_PEER_TCP_NODELAY", Some("false"))?.as_str() {
             "true" => true,
             "false" => false,
-            _ => return Err(Error::InvalidConfiguration),
-        };
-        let routing_algorithm = match text("RACER_ROUTING_ALGORITHM", Some("5"))?.as_str() {
-            "2" => crate::topology::RoutingAlgorithm::V2,
-            "3" => crate::topology::RoutingAlgorithm::V3,
-            "4" => crate::topology::RoutingAlgorithm::V4,
-            "5" => crate::topology::RoutingAlgorithm::V5,
             _ => return Err(Error::InvalidConfiguration),
         };
         let peer_listen =
@@ -278,7 +274,6 @@ impl Config {
             node: NodeId(UNRESOLVED_NODE_ID.into()),
             max_threads,
             allow_smt,
-            routing_algorithm,
             enable_rdma,
             opaque_relay,
             peer_tcp_nodelay,
@@ -1207,10 +1202,6 @@ mod tests {
         let config = parse(&[]).unwrap();
         assert_eq!(config.max_threads, usize::MAX);
         assert!(!config.allow_smt);
-        assert_eq!(
-            config.routing_algorithm,
-            crate::topology::RoutingAlgorithm::V5
-        );
         assert_eq!(config.node.0, UNRESOLVED_NODE_ID);
         assert!(!config.enable_rdma);
         assert_eq!(config.slab_bytes / config.segment_bytes, 16);
@@ -1332,22 +1323,9 @@ mod tests {
     }
 
     #[test]
-    fn routing_algorithm_requires_a_supported_explicit_version() {
-        use crate::topology::RoutingAlgorithm;
-        for (value, expected) in [
-            ("2", RoutingAlgorithm::V2),
-            ("3", RoutingAlgorithm::V3),
-            ("4", RoutingAlgorithm::V4),
-            ("5", RoutingAlgorithm::V5),
-        ] {
-            assert_eq!(
-                parse(&[("RACER_ROUTING_ALGORITHM", value)])
-                    .unwrap()
-                    .routing_algorithm,
-                expected
-            );
-        }
-        for value in ["", "1", "6", "03", " 3", "3 ", "auto"] {
+    fn routing_algorithm_selector_is_rejected() {
+        assert!(parse(&[]).is_ok());
+        for value in ["", "1", "2", "3", "4", "5", "6", "03", " 3", "3 ", "auto"] {
             assert!(parse(&[("RACER_ROUTING_ALGORITHM", value)]).is_err());
         }
     }

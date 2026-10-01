@@ -3,12 +3,7 @@ use crate::topology::fixtures::membership;
 
 #[test]
 fn exhaustive_inverse_matches_definition() {
-    for algorithm in [
-        RoutingAlgorithm::V2,
-        RoutingAlgorithm::V3,
-        RoutingAlgorithm::V4,
-        RoutingAlgorithm::V5,
-    ] {
+    for algorithm in [RoutingAlgorithm::V5] {
         let radix = algorithm.radix();
         for n in 1..=160 {
             for i in 0..n {
@@ -31,7 +26,7 @@ fn exhaustive_inverse_matches_definition() {
 
 #[test]
 fn hundred_thousand_nodes_bounded_symmetric_and_four_link_reachable() {
-    for algorithm in [RoutingAlgorithm::V2, RoutingAlgorithm::V5] {
+    for algorithm in [RoutingAlgorithm::V5] {
         let n = 100_000;
         for i in 0..n {
             let neighbors = neighbor_positions_for(n, i, algorithm);

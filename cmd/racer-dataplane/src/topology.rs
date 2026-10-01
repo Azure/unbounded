@@ -13,9 +13,6 @@ pub const ALGORITHM_VERSION: u32 = 5;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RoutingAlgorithm {
-    V2,
-    V3,
-    V4,
     #[default]
     V5,
 }
@@ -23,7 +20,6 @@ pub enum RoutingAlgorithm {
 impl RoutingAlgorithm {
     pub const fn radix(self) -> usize {
         match self {
-            Self::V2 | Self::V3 | Self::V4 => 18,
             Self::V5 => 32,
         }
     }

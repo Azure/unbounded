@@ -46,11 +46,6 @@ impl Graph {
     }
 }
 
-/// Explicit legacy graph for the V2 search and its interoperability fixtures.
-fn neighbor_positions(count: usize, node: usize) -> Vec<usize> {
-    neighbor_positions_for(count, node, RoutingAlgorithm::V2)
-}
-
 /// The incoming intervals are disjoint lifts of `node` modulo N. Their quotient
 /// by the radix gives every predecessor without scanning any other member.
 fn neighbor_positions_for(count: usize, node: usize, algorithm: RoutingAlgorithm) -> Vec<usize> {
@@ -371,23 +366,12 @@ fn select_route(
     membership: MembershipLease,
     alternatives: &[Vec<usize>],
     budget: &RouteBudget,
-    algorithm: RoutingAlgorithm,
+    _algorithm: RoutingAlgorithm,
 ) -> Result<Route> {
     let index = if alternatives.len() == 1 {
         0
-    } else if matches!(algorithm, RoutingAlgorithm::V4 | RoutingAlgorithm::V5) {
-        weighted_index(&membership, alternatives, budget)?
     } else {
-        let mut digest = hash::domain(b"racer/next-hop/v3\0");
-        digest.update(budget.request.0);
-        digest.update(budget.attempt.0);
-        hash::bytes(
-            &mut digest,
-            membership.members()[alternatives[0][0]].node.0.as_bytes(),
-        );
-        hash::bytes(&mut digest, budget.destination.0.as_bytes());
-        let sample = u64::from_be_bytes(hash::finish(digest)[..8].try_into().unwrap());
-        (sample % alternatives.len() as u64) as usize
+        weighted_index(&membership, alternatives, budget)?
     };
     Ok(route(membership, &alternatives[index]))
 }
@@ -442,32 +426,7 @@ fn weighted_draw(sample: u64, total: u64, weights: &[u64]) -> Option<usize> {
     unreachable!("ticket is below the sum of positive weights")
 }
 
-enum RouteSearch {
-    Legacy(Search),
-    EqualCost(EqualCostSearch),
-}
-impl RouteSearch {
-    fn new(count: usize, key: &PathKey, algorithm: RoutingAlgorithm) -> Self {
-        match algorithm {
-            RoutingAlgorithm::V2 => Self::Legacy(Search::new(count, key)),
-            RoutingAlgorithm::V3 | RoutingAlgorithm::V4 | RoutingAlgorithm::V5 => {
-                Self::EqualCost(EqualCostSearch::new(count, key, algorithm))
-            }
-        }
-    }
-    fn step(&mut self, quantum: usize, deadline: Deadline) -> Result<bool> {
-        match self {
-            Self::Legacy(search) => search.step(quantum, deadline),
-            Self::EqualCost(search) => search.step(quantum, deadline),
-        }
-    }
-    fn finish(self) -> Result<Vec<Vec<usize>>> {
-        match self {
-            Self::Legacy(search) => search.finish().map(|route| vec![route]),
-            Self::EqualCost(search) => search.finish(),
-        }
-    }
-}
+type RouteSearch = EqualCostSearch;
 
 fn route(membership: MembershipLease, positions: &[usize]) -> Route {
     let nodes = positions
@@ -475,130 +434,6 @@ fn route(membership: MembershipLease, positions: &[usize]) -> Route {
         .map(|&index| membership.members()[index].node.clone())
         .collect();
     Route { membership, nodes }
-}
-
-struct Wave {
-    parents: BTreeMap<usize, usize>,
-    queue: VecDeque<usize>,
-}
-
-impl Wave {
-    fn new(source: usize) -> Self {
-        Self {
-            parents: BTreeMap::from([(source, source)]),
-            queue: VecDeque::from([source]),
-        }
-    }
-}
-
-/// Alternate complete BFS layers, source first. Before each layer the two
-/// visited balls are disjoint, so the first intersection has shortest distance
-/// (the sum of the prior radii plus one). Sorted neighbors and FIFO discovery
-/// choose a deterministic tie without enumerating equivalent paths.
-/// Each side visits a node once, to radius ceil(L/2) / floor(L/2), respectively.
-/// Scratch storage is O(visited), at most O(N), with no membership-wide scan or
-/// initialization. Each expanded vertex examines at most 36 edges.
-struct Search {
-    count: usize,
-    key: PathKey,
-    waves: [Wave; 2],
-    side: usize,
-    layer_remaining: usize,
-    layers: u8,
-    meeting: Option<usize>,
-    #[cfg(test)]
-    expansions: usize,
-    #[cfg(test)]
-    edges: usize,
-}
-
-impl Search {
-    fn new(count: usize, key: &PathKey) -> Self {
-        Self {
-            count,
-            key: key.clone(),
-            waves: [Wave::new(key.from), Wave::new(key.to)],
-            side: 0,
-            layer_remaining: 1,
-            layers: 0,
-            meeting: (key.from == key.to).then_some(key.from),
-            #[cfg(test)]
-            expansions: 0,
-            #[cfg(test)]
-            edges: 0,
-        }
-    }
-
-    fn step(&mut self, quantum: usize, deadline: Deadline) -> Result<bool> {
-        if crate::runtime::environment::now() >= deadline.0 {
-            return Err(Error::DeadlineExceeded);
-        }
-        if self.meeting.is_some() || self.layers == self.key.links {
-            return Ok(true);
-        }
-        for _ in 0..quantum {
-            if crate::runtime::environment::now() >= deadline.0 {
-                return Err(Error::DeadlineExceeded);
-            }
-            let Some(node) = self.waves[self.side].queue.pop_front() else {
-                return Ok(true);
-            };
-            #[cfg(test)]
-            {
-                self.expansions += 1;
-            }
-            for neighbor in neighbor_positions(self.count, node) {
-                #[cfg(test)]
-                {
-                    self.edges += 1;
-                }
-                if self.key.visited.binary_search(&neighbor).is_ok()
-                    || (node == self.key.from && self.key.failed.binary_search(&neighbor).is_ok())
-                    || (neighbor == self.key.from && self.key.failed.binary_search(&node).is_ok())
-                {
-                    continue;
-                }
-                let wave = &mut self.waves[self.side];
-                if let std::collections::btree_map::Entry::Vacant(entry) =
-                    wave.parents.entry(neighbor)
-                {
-                    entry.insert(node);
-                    wave.queue.push_back(neighbor);
-                    if self.waves[1 - self.side].parents.contains_key(&neighbor) {
-                        self.meeting = Some(neighbor);
-                        return Ok(true);
-                    }
-                }
-            }
-            self.layer_remaining -= 1;
-            if self.layer_remaining == 0 {
-                self.layers += 1;
-                if self.layers == self.key.links || self.waves[self.side].queue.is_empty() {
-                    return Ok(true);
-                }
-                self.side = 1 - self.side;
-                self.layer_remaining = self.waves[self.side].queue.len();
-            }
-        }
-        Ok(false)
-    }
-
-    fn finish(self) -> Result<Vec<usize>> {
-        let meeting = self.meeting.ok_or(Error::Unavailable)?;
-        let mut path = vec![meeting];
-        let mut current = meeting;
-        while current != self.key.from {
-            current = self.waves[0].parents[&current];
-            path.push(current);
-        }
-        path.reverse();
-        current = meeting;
-        while current != self.key.to {
-            current = self.waves[1].parents[&current];
-            path.push(current);
-        }
-        Ok(path)
-    }
 }
 
 struct Visit {
