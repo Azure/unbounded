@@ -88,10 +88,8 @@ func TestDefaultConfigMap_StartsCleanWithoutSecret(t *testing.T) {
 	// no required credentials_path, so the pod starts cleanly on
 	// any cluster regardless of whether deploy/gantry/examples/registry-secret.example.yaml
 	// has been applied.
-	for i, ur := range cfg.UpstreamRegistries {
-		if ur.CredentialsPath != "" {
-			t.Errorf("deploy/gantry/configmap.yaml UpstreamRegistries[%d] (%q) has credentials_path=%q on an active entry; the shipped default must be credentials-free so the agent starts without deploy/gantry/examples/registry-secret.example.yaml being applied. Comment the credentials_path line out (operators uncomment when they bring real credentials).", i, ur.Name, ur.CredentialsPath)
-		}
+	if strings.Contains(cfgYAML, "credentials_path") {
+		t.Error("removed credentials-file configuration rendered")
 	}
 
 	// And the load-bearing assertion: origin.New must succeed on

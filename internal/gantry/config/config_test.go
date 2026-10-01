@@ -709,7 +709,6 @@ func TestLoadYAML_Roundtrip(t *testing.T) {
 upstream_registries:
   - name: registry.example.com
     endpoint: https://registry.example.com
-    credentials_path: /etc/gantry/creds.txt
 coord_max_digests_per_request: 12
 coord_max_concurrent_pulls: 4
 peer_fetch_timeout: 45m

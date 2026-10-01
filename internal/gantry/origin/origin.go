@@ -10,9 +10,8 @@
 // - Endpoints: GET /v2/, GET /v2/<repo>/blobs/<digest>,
 // GET /v2/<repo>/manifests/<digest>.
 // - Auth: request-scoped delegated Basic/Bearer authorization takes precedence
-// and is used without caching or identity fallback. Without configured shared
-// credentials, the client discovers the upstream /v2/ challenge for containerd.
-// An optional "username:password" file retains the legacy shared-identity flow.
+// and is used without caching or identity fallback. The client discovers the
+// upstream /v2/ challenge for containerd and supports anonymous Bearer exchange.
 // - Failure classification: maps HTTP status and network errors to
 // ifaces.FailureClass for the design doc propagation. Tag-resolution requests are
 // not handled here (the mirror returns 503 on tag manifests so
@@ -35,7 +34,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -144,8 +142,7 @@ func (t meteredTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, err
 }
 
-// New builds a Client from the operator config. Returns an error if any
-// upstream credentials file cannot be read.
+// New builds a Client from the operator config, validating upstream endpoints.
 func New(cfg *config.Config, opts ...Option) (*Client, error) {
 	if cfg == nil || len(cfg.UpstreamRegistries) == 0 {
 		return nil, errors.New("origin: at least one upstream registry required")
@@ -402,12 +399,10 @@ var (
 // ---------------------------------------------------------------------------
 
 type registry struct {
-	name     string
-	base     *url.URL // root of the OCI Distribution v2 API
-	username string
-	password string
-	hc       *http.Client
-	logger   *slog.Logger
+	name   string
+	base   *url.URL // root of the OCI Distribution v2 API
+	hc     *http.Client
+	logger *slog.Logger
 
 	// keeps a single most-recent token per registry. OCI registries
 	// usually issue tokens whose scope covers an entire repo's pulls, so one
@@ -492,33 +487,11 @@ func newRegistry(ur config.UpstreamRegistry, logger *slog.Logger) (*registry, er
 		hc:     newRegistryHTTPClient(),
 		logger: logger.With(slog.String("registry", ur.Name)),
 	}
-	if ur.CredentialsPath != "" {
-		b, err := os.ReadFile(ur.CredentialsPath) //#nosec G304 -- operator-supplied path
-		if err != nil {
-			return nil, fmt.Errorf("read credentials %q: %w", ur.CredentialsPath, err)
-		}
-
-		line := strings.TrimSpace(string(b))
-
-		idx := strings.IndexByte(line, ':')
-		if idx <= 0 || idx == len(line)-1 {
-			return nil, fmt.Errorf("credentials %q: want \"username:password\"", ur.CredentialsPath)
-		}
-
-		r.username = line[:idx]
-		r.password = line[idx+1:]
-	}
 
 	return r, nil
 }
 
 func (r *registry) authenticationChallenge(ctx context.Context) (string, bool, error) {
-	// An explicitly configured credential opts into the legacy shared-identity
-	// mode. In that mode Gantry authenticates to origin itself and containerd
-	// does not need to negotiate a requester credential with the mirror.
-	if r.username != "" {
-		return "", false, nil
-	}
 	// Challenge discovery and delegated credentials are HTTPS-only. Reporting
 	// no challenge preserves anonymous HTTP registries; private HTTP registries
 	// cannot use requester-delegated authentication.
@@ -858,8 +831,8 @@ func (r *registry) urlFor(ref ifaces.OriginRef) string {
 // do issues a request, preferring request-scoped delegated Basic/Bearer auth. A
 // delegated credential is used exactly as supplied and is never cached; if it
 // is rejected, the 401 is returned rather than silently changing identity to
-// this node's configured credentials. Without delegated auth, the legacy
-// credentials-file bearer-token flow remains available.
+// another identity. Without delegated auth, anonymous Bearer exchange remains
+// available for public registries that require a token.
 func (r *registry) do(ctx context.Context, method, urlStr string, offset int64) (*http.Response, error) {
 	rangeValue := ""
 	if offset > 0 {
@@ -945,10 +918,6 @@ func (r *registry) doRange(ctx context.Context, method, urlStr, rangeValue strin
 		retry, err := build("")
 		if err != nil {
 			return nil, err
-		}
-
-		if r.canSendBasicAuth() && r.username != "" {
-			retry.SetBasicAuth(r.username, r.password)
 		}
 
 		return r.hc.Do(retry)
@@ -1099,10 +1068,6 @@ func (r *registry) fetchBearerToken(ctx context.Context, challenge string) (stri
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, realmURL.String(), nil)
 	if err != nil {
 		return "", 0, err
-	}
-
-	if r.canSendBasicAuth() && r.username != "" {
-		req.SetBasicAuth(r.username, r.password)
 	}
 
 	resp, err := r.hc.Do(req)

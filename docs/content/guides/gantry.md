@@ -157,20 +157,9 @@ registry, the flow is:
 Requester-delegated private-registry authentication requires an HTTPS origin.
 Private plaintext HTTP registries are not supported by this mode.
 
-#### Shared-Identity Authentication
-
-Shared identity is a compatibility mode for environments where kubelet or CRI
-cannot provide a usable request credential. It gives every Gantry agent the
-same registry identity.
-
-To enable it, create `Secret/gantry-registry-credentials` in the release
-namespace and set the matching registry's `credentialsPath` chart value.
-The file contains a `username:password` pair keyed by the registry `name`.
-
-Gantry reads configured credential files eagerly during startup. A missing
-file causes the pod to fail, so do not add `credentials_path` unless the Secret
-is present. Prefer requester-delegated authentication when possible because it
-avoids distributing a shared registry credential to every node.
+Gantry does not mount shared registry identities or read credential files.
+Public registries that require an anonymous Bearer token remain supported.
+Private pulls use the requester's delegated credentials without identity fallback.
 
 ### 5. Verify Distribution
 

@@ -79,7 +79,6 @@ func TestRepositoryAuthenticationChallenge(t *testing.T) {
 
 			jar.SetCookies(r.base, []*http.Cookie{{Name: "session", Value: "secret"}})
 			r.hc.Jar = jar
-			r.username, r.password = "shared", "secret"
 			r.setToken("cached-token", time.Hour)
 			r.rememberAuthenticationChallenge(`Basic realm="wrong-repository"`)
 

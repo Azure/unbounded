@@ -46,9 +46,6 @@ data:
       {{- range .Values.gantry.upstreamRegistries }}
       - name: {{ .name | quote }}
         endpoint: {{ .endpoint | quote }}
-        {{- with .credentialsPath }}
-        credentials_path: {{ . | quote }}
-        {{- end }}
         {{- with .namespaceAlias }}
         ns_alias: {{ . | quote }}
         {{- end }}

@@ -33,8 +33,6 @@ nodeConfig:
   hostPath: /etc/containerd/certs.d
   reconcileIntervalSeconds: 5
 
-registryCredentials:
-  secretName: gantry-registry-credentials
 
 resources:
   agent:
@@ -65,5 +63,4 @@ gantry:
   upstreamRegistries:
     - name: registry.example.com
       endpoint: https://registry.example.com
-      credentialsPath: ""
       namespaceAlias: ""

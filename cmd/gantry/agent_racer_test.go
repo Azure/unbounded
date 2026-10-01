@@ -37,7 +37,7 @@ func TestRacerStartupSelection(t *testing.T) {
 	// Both modes read the same config. The Racer path reaches origin construction
 	// despite missing legacy requirements; legacy mode rejects those requirements.
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(path, []byte("containerd_socket: ''\ntransfer_listen: ''\nchair_listen: ''\nupstream_registries:\n- name: registry.example.com\n  endpoint: https://registry.example.com\n  credentials_path: "+filepath.Join(t.TempDir(), "missing")+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("containerd_socket: ''\ntransfer_listen: ''\nchair_listen: ''\nupstream_registries:\n- name: registry.example.com\n  endpoint: https://registry.example.com/%zz\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 

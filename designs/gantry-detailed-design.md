@@ -582,7 +582,7 @@ the DHT consistent with it.
 
 - **Transport encryption:** libp2p Noise (built-in).
 - **Content verification:** OCI digest verification on every byte received from peers. Non-negotiable.
-- **Origin auth:** request-scoped Basic/Bearer authorization from the incoming containerd mirror request is forwarded through peer and `please_pull` paths and takes precedence for origin. It is never cached or persisted, is sent only to HTTPS origins, and a rejection never falls back to the puller node's identity. Secret-mounted `credentials_path` is explicit legacy shared-identity mode. See §7.8.
+- **Origin auth:** request-scoped Basic/Bearer authorization from the incoming containerd mirror request is forwarded through peer and `please_pull` paths. It is never cached or persisted, is sent only to HTTPS origins, and a rejection never falls back to another identity. Anonymous Bearer exchange supports public registries. See §7.8.
 - **NetworkPolicy:** the transfer port (HTTP/2) and libp2p listen ports are restricted to inter-node traffic only.
 - **Signature verification:** out of scope. Existing tooling (Cosign, admission controllers) handles this and is unaffected by the P2P layer.
 
@@ -698,10 +698,8 @@ eventually exhausts; A may attempt its gated direct-origin fallback or return a
 5xx so containerd falls through/retries. A direct origin 401 includes the
 current challenge and re-enters containerd's normal credential refresh flow.
 
-Setting secret-mounted `credentials_path` explicitly opts a registry into the
-legacy shared-identity mode: Gantry skips requester challenge negotiation and
-authenticates to origin itself. Leaving it empty selects requester-mediated
-authentication.
+Gantry has no shared-identity file mode. Private registries use requester-mediated
+authentication; public registries may use anonymous Bearer exchange.
 
 The standard containerd Docker authorizer caches handlers by HTTP destination
 host, so an origin token is not proactively reused for the loopback mirror.

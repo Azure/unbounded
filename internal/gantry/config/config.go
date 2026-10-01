@@ -355,15 +355,6 @@ type UpstreamRegistry struct {
 	// "https://registry.example.com".
 	Endpoint string `yaml:"endpoint"`
 
-	// CredentialsPath is an optional fallback file containing registry
-	// credentials. Format: "username:password" (or "_json_key:<json>" for
-	// the well-known GCR pattern). A request-scoped Basic/Bearer credential
-	// delegated by containerd takes precedence and is never cached. Setting
-	// this file opts the registry into legacy shared-identity mode for requests
-	// without delegated auth; leaving it empty enables containerd challenge
-	// negotiation for private HTTPS registries.
-	CredentialsPath string `yaml:"credentials_path"`
-
 	// NSAlias lets containerd's ?ns= use a different name than Name.
 	// Empty means ?ns= must equal Name.
 	NSAlias string `yaml:"ns_alias"`
