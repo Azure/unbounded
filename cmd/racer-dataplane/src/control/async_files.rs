@@ -324,6 +324,7 @@ mod tests {
         let old = vec![7; 1001];
         let new = vec![9; 1003];
         for cut in 0..10 {
+            let scope = testing::scope();
             testing::drive(&r, Box::pin(atomic_write(&r, &dir, "state", &old, &scope))).unwrap();
             let mut request = testing::scope();
             request.request = crate::model::RequestId([cut; 16]);
@@ -380,6 +381,7 @@ mod tests {
         // Stop between each submission/completion boundary. The worker is not
         // allowed to publish replacement bytes before the final durability fence.
         for stop in 0..12u8 {
+            let scope = testing::scope();
             testing::drive(&r, Box::pin(atomic_write(&r, &dir, "state", &old, &scope))).unwrap();
             let mut turn = testing::scope();
             turn.request = crate::model::RequestId([stop; 16]);
@@ -498,6 +500,7 @@ mod tests {
         let old = vec![b'a'; 32769];
         let new = vec![b'b'; 32771];
         for boundary in 0..12 {
+            let scope = testing::scope();
             testing::drive(&r, Box::pin(atomic_write(&r, &dir, "state", &old, &scope))).unwrap();
             let mut turn = testing::scope();
             turn.request = crate::model::RequestId([boundary; 16]);
