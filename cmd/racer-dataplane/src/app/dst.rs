@@ -1221,7 +1221,23 @@ impl Harness {
                 }
             }
             if body.len() != length {
-                assert!(faulted && client.disconnected, "healthy response truncated");
+                if !faulted || !client.disconnected {
+                    let mut diagnostics = String::new();
+                    for node in &self.nodes {
+                        for worker in &node.workers {
+                            worker
+                                .app
+                                .telemetry
+                                .failures
+                                .write(&mut diagnostics)
+                                .unwrap();
+                        }
+                    }
+                    panic!(
+                        "healthy response truncated: body={} expected={length} offset={offset}: {diagnostics}",
+                        body.len()
+                    );
+                }
                 self.coverage.failures += 1;
                 return;
             }

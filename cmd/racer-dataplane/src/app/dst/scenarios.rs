@@ -410,7 +410,9 @@ fn healthy_relayed_page_reads_with_mode(opaque: bool) {
         let mut client = harness.request_on(1, true, false, node);
         client.first = 0;
         client.end = client.size;
-        client.request = format!("GET /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nIf-Match: {}\r\nRange: bytes=0-{}\r\nRacer-Metadata: dst opaque metadata\r\nAuthorization: Bearer dst-fixture\r\nConnection: close\r\n\r\n", key(1), client.tag, client.size - 1).into_bytes();
+        // Match client credit to this small payload budget. Delivered leases no
+        // longer occupy the independent server acquisition window.
+        client.request = format!("POST /v2/objects/{} HTTP/1.1\r\nHost: racer\r\nContent-Length: 0\r\nRacer-Page-Credits: 2\r\nRacer-Byte-Credits: {}\r\nRacer-Ordered: 1\r\nIf-Match: {}\r\nRange: bytes=0-{}\r\nRacer-Metadata: dst opaque metadata\r\nAuthorization: Bearer dst-fixture\r\nConnection: close\r\n\r\n", key(1), 2 * PAGE_BYTES, client.tag, client.size - 1).into_bytes();
         harness.exchange(client, false);
     }
     assert_eq!(harness.coverage.success, 40);
