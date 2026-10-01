@@ -2,6 +2,7 @@
 pub mod failures;
 pub mod health;
 pub mod metrics;
+pub mod send_crc;
 pub mod tracing;
 
 use crate::runtime::reactor::Descriptor;
@@ -31,6 +32,7 @@ use zeroize::Zeroize;
 
 #[derive(Default)]
 pub struct Telemetry {
+    pub send_crc: send_crc::Samples,
     pub failures: failures::Failures,
     pub metrics: metrics::Metrics,
     pub health: health::Health,
@@ -319,6 +321,7 @@ enum Route {
     Metrics,
     Failures,
     Aead,
+    SendCrc,
     NotFound,
     Method,
     BadRequest,
@@ -363,6 +366,7 @@ fn parse(bytes: &[u8]) -> Route {
         Some("/metrics") => Route::Metrics,
         Some("/debug/failures") => Route::Failures,
         Some("/debug/aead") => Route::Aead,
+        Some("/debug/send-crc") => Route::SendCrc,
         _ => Route::NotFound,
     }
 }
@@ -406,6 +410,7 @@ fn respond(
         Route::Metrics => ("200 OK", "", Event::DiagnosticMetrics),
         Route::Failures => ("200 OK", "", Event::DiagnosticFailures),
         Route::Aead => ("200 OK", "", Event::DiagnosticFailures),
+        Route::SendCrc => ("200 OK", "", Event::DiagnosticFailures),
         Route::Method => (
             "405 Method Not Allowed",
             "method not allowed\n",
@@ -443,6 +448,11 @@ fn respond(
             u8::from(telemetry.health.live())
         )
         .map_err(|_| Error::Internal)?;
+    } else if route == Route::SendCrc {
+        telemetry
+            .send_crc
+            .write(&mut output)
+            .map_err(|_| Error::Internal)?;
     } else if route == Route::Aead {
         telemetry
             .failures

@@ -48,6 +48,11 @@ pub(crate) struct Settings {
 }
 
 pub struct PeerServer {
+    send_crc: Option<(
+        crate::telemetry::send_crc::Pair,
+        crate::telemetry::send_crc::Samples,
+        Rc<crate::security::aead::PageCrypto>,
+    )>,
     subscriptions: std::sync::Arc<super::subscriptions::Subscriptions>,
     placement: crate::topology::placement::Placement,
     opaque_relay: bool,
@@ -64,6 +69,62 @@ pub struct PeerServer {
     request_timeout: Duration,
 }
 impl PeerServer {
+    pub(crate) fn with_send_crc(
+        mut self,
+        pair: Option<crate::telemetry::send_crc::Pair>,
+        samples: crate::telemetry::send_crc::Samples,
+        crypto: Rc<crate::security::aead::PageCrypto>,
+    ) -> Self {
+        self.send_crc = pair.map(|pair| (pair, samples, crypto));
+        self
+    }
+    fn begin_send_sample(
+        &self,
+        connection: &crate::http::connection::ConnectionLease,
+        response: &SignedResponse,
+        scope: &RequestScope,
+    ) -> Option<crate::telemetry::send_crc::Ticket> {
+        let (pair, samples, crypto) = self.send_crc.as_ref()?;
+        let ciphertext = match &response.response {
+            PeerResponse::Page { ciphertext, .. }
+            | PeerResponse::Selected { ciphertext, .. }
+            | PeerResponse::Bootstrap {
+                page_zero: Some(ciphertext),
+                ..
+            } => ciphertext,
+            _ => return None,
+        };
+        ciphertext.provenance?;
+        let receiver = connection.session.as_ref()?.peer();
+        let (ticket, sample) = samples.begin(pair, self.signatures.node(), receiver)?;
+        let permit = match crate::read::drivers::reserve() {
+            Ok(p) => p,
+            Err(error) => {
+                sample.finish(Some(error));
+                return Some(ticket);
+            }
+        };
+        let deadline = scope
+            .deadline
+            .0
+            .min(crate::runtime::environment::now() + Duration::from_secs(2));
+        let diagnostic_scope = match RequestScope::new(scope.request, deadline) {
+            Ok(s) => s,
+            Err(error) => {
+                sample.finish(Some(error));
+                return Some(ticket);
+            }
+        };
+        let crypto = crypto.clone();
+        let ciphertext = ciphertext.clone();
+        permit.submit(Box::pin(async move {
+            crypto
+                .sample_send(ciphertext, &diagnostic_scope, sample)
+                .await;
+            Ok(())
+        }));
+        Some(ticket)
+    }
     #[cfg(test)]
     pub(crate) fn for_test(
         io: Rc<crate::http::connection::HttpIo>,
@@ -221,6 +282,7 @@ impl PeerServer {
     ) -> Self {
         Self {
             subscriptions,
+            send_crc: None,
             placement: crate::topology::placement::Placement::new(64),
             opaque_relay: settings.opaque_relay,
             pipes,
@@ -465,7 +527,22 @@ impl PeerServer {
         Ok(connection)
     }
 
-    async fn send_http_response(
+    pub(crate) async fn send_http_response(
+        &self,
+        connection: crate::http::connection::ConnectionLease,
+        response: &SignedResponse,
+        scope: &RequestScope,
+    ) -> crate::error::Result<crate::http::connection::ConnectionLease> {
+        let ticket = self.begin_send_sample(&connection, response, scope);
+        let result = self
+            .send_http_response_inner(connection, response, scope)
+            .await;
+        if let Some(ticket) = &ticket {
+            ticket.finish(result.is_ok());
+        }
+        result
+    }
+    async fn send_http_response_inner(
         &self,
         connection: crate::http::connection::ConnectionLease,
         response: &SignedResponse,

@@ -42,7 +42,40 @@ pub(crate) struct AeadFailure {
     pub crc: Option<u64>,
 }
 impl AeadFailure {
-    /// Called only on the crypto worker, after an exact AEAD rejection. Reuses
+    pub(crate) fn write_fields(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
+        fn hex(out: &mut impl std::fmt::Write, bytes: &[u8]) -> std::fmt::Result {
+            for byte in bytes {
+                write!(out, "{byte:02x}")?;
+            }
+            Ok(())
+        }
+        write!(out, " ms={} request=", self.unix_millis)?;
+        hex(out, &self.request.0)?;
+        if let Some(peer) = self.peer {
+            write!(out, " acquisition=")?;
+            hex(out, &peer.request.0)?;
+            write!(out, " attempt=")?;
+            hex(out, &peer.attempt.0)?;
+            write!(
+                out,
+                " supplier={}",
+                std::str::from_utf8(&peer.supplier).unwrap_or("unknown")
+            )?;
+        }
+        write!(out, " page=")?;
+        hex(out, &self.page)?;
+        write!(out, " number={} key=", self.number)?;
+        hex(out, &self.key)?;
+        write!(out, " nonce=")?;
+        hex(out, &self.nonce)?;
+        write!(out, " lengths={}/{} aad=", self.plaintext, self.ciphertext)?;
+        hex(out, &self.aad)?;
+        match self.crc {
+            Some(crc) => write!(out, " crc={crc:016x}"),
+            None => write!(out, " crc=none"),
+        }
+    }
+    /// Called only on crypto for exact AEAD rejects or opt-in send samples. Reuses
     /// the CRC already initialized by verify_checksum; never scans payload bytes.
     pub(crate) fn capture(
         ciphertext: &crate::memory::pool::CiphertextPage,

@@ -696,6 +696,220 @@ fn measurements_account_once_at_reap_even_for_cancel_and_abandon() {
 }
 
 #[test]
+fn send_crc_computes_fresh_body_and_holds_owner_through_abandoned_reap() {
+    use crate::runtime::environment;
+    use crate::{
+        security::aead::PageCryptoEngine,
+        telemetry::send_crc::{Pair, Samples},
+    };
+    let admission = std::rc::Rc::new(crate::runtime::admission::Admission::new(
+        crate::test_support::cluster::config(false).limits,
+    ));
+    let keys = keyring();
+    let cache = crate::model::CacheId("00000000-0000-4000-8000-000000000003".into());
+    let lease = || {
+        keys.active(&cache, crate::security::identity::KeyPurpose::Page)
+            .unwrap()
+    };
+    let scope = RequestScope::new(
+        crate::model::RequestId([7; 16]),
+        environment::now() + Duration::from_secs(10),
+    )
+    .unwrap();
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let (setup, _engine) = pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
+    let Poll::Ready(Ok(permit)) = setup.poll_reserve(
+        &mut cx,
+        CryptoId {
+            worker: WorkerId(0),
+            generation: 0,
+            sequence: 1,
+        },
+    ) else {
+        panic!("permit")
+    };
+    let completion =
+        PageCryptoEngine::process(permit.job(input(&admission), lease(), scope.clone()));
+    let CryptoOutcome::Completed(CryptoOutput::Encrypted(plain, mut ciphertext)) =
+        completion.outcome
+    else {
+        panic!("encrypted")
+    };
+    drop(plain);
+    Arc::get_mut(&mut ciphertext.inner).unwrap().checksum = std::sync::OnceLock::new();
+    let expected = crate::security::crc64::checksum(ciphertext.bytes());
+    let retained = ciphertext.clone();
+    let samples = Samples::default();
+    let filter =
+        Pair::parse("8816d91d-e896-49bf-ba8a-da97ede93818,11111111-1111-4111-8111-111111111111")
+            .unwrap();
+    let (ticket, sample) = samples
+        .begin(&filter, &filter.sender, &filter.receiver)
+        .unwrap();
+    ticket.finish(true);
+    drop(ticket);
+    let (io, mut engine) = pair(WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
+    let client = CryptoClient::new(io);
+    let mut future = client.execute_sample(
+        CryptoInput::Checksum { ciphertext },
+        lease(),
+        &scope,
+        Some(sample),
+    );
+    assert!(future.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(retained.cached_checksum(), None);
+    drop(future);
+    let Poll::Ready(Ok(Some(job))) = engine.poll_job(&mut cx) else {
+        panic!("job")
+    };
+    let completion = PageCryptoEngine::process(job);
+    assert_eq!(retained.cached_checksum(), Some(expected));
+    assert!(engine.complete(completion).is_ok());
+    let mut text = String::new();
+    samples.write(&mut text).unwrap();
+    assert!(text.contains("busy=1"));
+    assert!(text.contains("status=pending"));
+    client.poll_budgeted(1).unwrap();
+    client.poll_budgeted(1).unwrap();
+    text.clear();
+    samples.write(&mut text).unwrap();
+    assert!(text.contains("busy=0"));
+    assert!(text.contains("send=completed status=computed"));
+    assert!(text.contains(&format!("crc={expected:016x}")));
+    assert_eq!(text.lines().count(), 2);
+    assert_eq!(client.outstanding(), 0);
+}
+
+#[test]
+fn send_crc_cached_cancel_missing_key_and_capacity_are_diagnostic_only() {
+    use crate::{
+        security::aead::{PageCrypto, PageCryptoEngine},
+        telemetry::send_crc::{Pair, Samples},
+    };
+    let admission = std::rc::Rc::new(crate::runtime::admission::Admission::new(
+        crate::test_support::cluster::config(false).limits,
+    ));
+    let keys = std::rc::Rc::new(keyring());
+    let filter =
+        Pair::parse("8816d91d-e896-49bf-ba8a-da97ede93818,11111111-1111-4111-8111-111111111111")
+            .unwrap();
+    for mode in ["cached", "cancel", "missing", "capacity"] {
+        let mut page = crate::memory::pool::tests::bundle_for(
+            &admission,
+            crate::model::VersionMetadata {
+                content_type: None,
+                version: crate::model::ObjectVersion {
+                    object: crate::model::ObjectId {
+                        cache: crate::model::CacheId("00000000-0000-4000-8000-000000000003".into()),
+                        key: crate::model::CacheKey([3; 32]),
+                    },
+                    etag: crate::model::StrongEtag::test_value("send-crc"),
+                },
+                length: 3,
+            },
+        )
+        .ciphertext;
+        let inner = Arc::get_mut(&mut page.inner).unwrap();
+        inner.envelope.page.version.object.cache =
+            crate::model::CacheId("00000000-0000-4000-8000-000000000003".into());
+        if mode == "cached" {
+            inner.checksum.set(42).unwrap();
+        }
+        if mode == "missing" {
+            // The fixture keyring installs [1;16], also the bundle's default.
+            inner.envelope.key_id = crate::model::KeyId([99; 16]);
+        }
+        let cache = page.envelope().page.version.object.cache.clone();
+        let lease = keys
+            .active(&cache, crate::security::identity::KeyPurpose::Page)
+            .unwrap();
+        let scope = RequestScope::new(
+            crate::model::RequestId([7; 16]),
+            crate::runtime::environment::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+        let (io, mut engine) = pair(WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
+        let client = std::rc::Rc::new(CryptoClient::new(io));
+        let samples = Samples::default();
+        let (ticket, sample) = samples
+            .begin(&filter, &filter.sender, &filter.receiver)
+            .unwrap();
+        ticket.finish(true);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        if mode == "missing" {
+            let crypto = PageCrypto::new(keys.clone(), client.clone());
+            let mut future = Box::pin(crypto.sample_send(page, &scope, sample));
+            assert!(
+                future.as_mut().poll(&mut cx).is_ready(),
+                "missing-key work must not enqueue"
+            );
+        } else {
+            let held = if mode == "capacity" {
+                let Poll::Ready(Ok(permit)) = client.port.poll_reserve(
+                    &mut cx,
+                    CryptoId {
+                        worker: WorkerId(0),
+                        generation: 1,
+                        sequence: 0,
+                    },
+                ) else {
+                    panic!("permit")
+                };
+                Some(permit)
+            } else {
+                None
+            };
+            let mut future = client.execute_sample(
+                CryptoInput::Checksum { ciphertext: page },
+                lease,
+                &scope,
+                Some(sample),
+            );
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            if mode == "capacity" {
+                scope.cancel().unwrap();
+                assert!(matches!(
+                    future.as_mut().poll(&mut cx),
+                    Poll::Ready(Err(Error::Cancelled))
+                ));
+                drop(future);
+                drop(held);
+            } else {
+                if mode == "cancel" {
+                    scope.cancel().unwrap();
+                }
+                let Poll::Ready(Ok(Some(job))) = engine.poll_job(&mut cx) else {
+                    panic!("job")
+                };
+                let completion = PageCryptoEngine::process(job);
+                assert!(engine.complete(completion).is_ok());
+                client.poll_budgeted(1).unwrap();
+                assert!(future.as_mut().poll(&mut cx).is_ready());
+                drop(future);
+            }
+        }
+        let mut text = String::new();
+        samples.write(&mut text).unwrap();
+        assert!(text.contains("busy=0"), "{mode}: {text}");
+        assert!(text.contains("send=completed"));
+        assert!(
+            text.contains(if mode == "cached" {
+                "status=cached"
+            } else {
+                "status=unavailable"
+            }),
+            "{mode}: {text}"
+        );
+        if mode == "cached" {
+            assert!(text.contains("crc=000000000000002a"));
+        }
+        if mode == "missing" {
+            assert!(text.contains("MissingKey"));
+        }
+    }
+}
+
+#[test]
 fn shared_worker_encrypt_queue_measurements() {
     shared_worker_queue_measurements(false);
 }

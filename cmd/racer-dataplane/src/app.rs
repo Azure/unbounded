@@ -100,6 +100,7 @@ pub struct Application {
 /// Shared immutable-publication and partitioned-admission roots. No Rc worker
 /// graph crosses a thread. Worker zero alone drives enrollment/control reloads.
 pub struct NodeState {
+    send_crc: crate::telemetry::send_crc::Samples,
     hedges: std::sync::OnceLock<Arc<crate::read::hedge::Hedges>>,
     peer_admission: Arc<crate::peer::adaptive::AdaptivePeers>,
     subscriptions: Arc<crate::peer::subscriptions::Subscriptions>,
@@ -151,6 +152,7 @@ impl NodeState {
             crate::peer::adaptive::AdaptivePeers::new(peer_config, metrics[0].clone())?;
         Ok(Self {
             peer_admission,
+            send_crc: Default::default(),
             hedges: std::sync::OnceLock::new(),
             ingress: Arc::new(crate::runtime::ingress::Ingress::new(&workers)),
             subscriptions: Arc::new(crate::peer::subscriptions::Subscriptions::new(
@@ -657,7 +659,7 @@ impl WorkerApplication {
                 origin: origin.clone(),
                 candidates: candidates.clone(),
                 flights: flights.clone(),
-                crypto,
+                crypto: crypto.clone(),
                 credentials: credentials.clone(),
                 admission: admission.clone(),
                 metadata_owner: node.workers.clone(),
@@ -695,7 +697,11 @@ impl WorkerApplication {
                 opaque_relay: config.opaque_relay,
             },
         );
-        let peers = Rc::new(peers);
+        let peers = Rc::new(peers.with_send_crc(
+            config.send_crc_pair.clone(),
+            node.send_crc.clone(),
+            crypto,
+        ));
         let clients = Self::assemble_clients(
             config,
             &node,
@@ -707,6 +713,7 @@ impl WorkerApplication {
         );
 
         let mut telemetry = Telemetry::default();
+        telemetry.send_crc = node.send_crc.clone();
         telemetry.failures = node.failures.clone();
         telemetry.metrics = metrics;
         telemetry.health = node.observations.health.clone();

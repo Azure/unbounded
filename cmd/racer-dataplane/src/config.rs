@@ -27,6 +27,7 @@ const MAX_ENTRIES: usize = 1_048_576;
 const MAX_FABRIC_FILE_BYTES: usize = 65_536;
 
 pub struct Config {
+    pub send_crc_pair: Option<crate::telemetry::send_crc::Pair>,
     pub page_hedge: crate::read::hedge::Config,
     pub peer_admission: crate::peer::adaptive::Config,
     pub shares: std::num::NonZeroU32,
@@ -256,7 +257,11 @@ impl Config {
         let origin_connections_per_cache = limit("RACER_ORIGIN_CONNECTIONS_PER_CACHE", 8)?;
         let disk_page_entries = limit("RACER_DISK_PAGE_ENTRIES", 65536)?;
         let checkpoint_bytes = limit("RACER_CHECKPOINT_BYTES", 64 * MIB)?;
+        let send_crc_pair = lookup("RACER_SEND_CRC_PAIR")?
+            .map(|value| crate::telemetry::send_crc::Pair::parse(&value))
+            .transpose()?;
         let config = Self {
+            send_crc_pair,
             page_hedge,
             peer_admission,
             shares,
@@ -293,6 +298,9 @@ impl Config {
     /// Check arithmetic and progress reserves; filesystem alignment is additionally
     /// discovered and checked when opening the slabs, not guessed from this config.
     pub fn validate(&self) -> Result<()> {
+        if let Some(pair) = &self.send_crc_pair {
+            pair.validate()?;
+        }
         self.page_hedge.validate()?;
         self.peer_admission.validate()?;
         if self.disk_page_entries.get() > MAX_ENTRIES
@@ -1165,6 +1173,25 @@ mod tests {
                     _ => None,
                 }))
         })
+    }
+    #[test]
+    fn send_crc_pair_is_opt_in_and_validated() {
+        assert!(parse(&[]).unwrap().send_crc_pair.is_none());
+        let valid = "8816d91d-e896-49bf-ba8a-da97ede93818,11111111-1111-4111-8111-111111111111";
+        assert!(
+            parse(&[("RACER_SEND_CRC_PAIR", valid)])
+                .unwrap()
+                .send_crc_pair
+                .is_some()
+        );
+        for invalid in [
+            "",
+            "a,b",
+            "a,b,c",
+            "8816d91d-e896-49bf-ba8a-da97ede93818,8816d91d-e896-49bf-ba8a-da97ede93818",
+        ] {
+            assert!(parse(&[("RACER_SEND_CRC_PAIR", invalid)]).is_err());
+        }
     }
 
     #[test]

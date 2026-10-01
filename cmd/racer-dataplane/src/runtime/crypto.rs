@@ -116,6 +116,7 @@ struct Handoff {
 /// fn duplicate(permit: CryptoPermit) { let _second = permit.clone(); }
 /// ```
 pub struct CryptoPermit {
+    pub(crate) send_sample: Option<crate::telemetry::send_crc::Work>,
     handoff: Arc<Handoff>,
     id: CryptoId,
     measurement: Measurement,
@@ -241,10 +242,11 @@ impl Drop for CryptoPermit {
 }
 
 pub struct CryptoJob {
-    pub(crate) permit: CryptoPermit,
     pub(crate) input: CryptoInput,
     pub(crate) key: KeyLease,
     pub(crate) scope: RequestScope,
+    // Engine loss drops payload owners before releasing diagnostic admission.
+    pub(crate) permit: CryptoPermit,
 }
 
 impl CryptoPermit {
@@ -287,8 +289,8 @@ pub enum CryptoOutcome {
 /// Only the engine may create a completion after it has stopped accessing input.
 /// The key and permit survive success AND failure until I/O consumes the result.
 pub struct CryptoCompletion {
-    pub(crate) permit: CryptoPermit,
     pub(crate) outcome: CryptoOutcome,
+    pub(crate) permit: CryptoPermit,
     pub(crate) _key: KeyLease,
 }
 
@@ -387,6 +389,7 @@ impl IoCryptoPort {
         }
         self.last_sequence.set(Some(id.sequence));
         Poll::Ready(Ok(CryptoPermit {
+            send_sample: None,
             aead_failure: None,
             handoff: self.handoff.clone(),
             id,
@@ -581,6 +584,15 @@ impl CryptoClient {
         key: KeyLease,
         scope: &'a RequestScope,
     ) -> Operation<'a, CryptoOutput> {
+        self.execute_sample(input, key, scope, None)
+    }
+    pub(crate) fn execute_sample<'a>(
+        &'a self,
+        input: CryptoInput,
+        key: KeyLease,
+        scope: &'a RequestScope,
+        sample: Option<crate::telemetry::send_crc::Work>,
+    ) -> Operation<'a, CryptoOutput> {
         Box::pin(async move {
             scope.check()?;
             let cancellation = scope.cancellation.subscribe()?;
@@ -599,7 +611,7 @@ impl CryptoClient {
                 sequence,
             };
             let capacity_waiter = CapacityWaiter { client: self, id };
-            let permit = futures::future::poll_fn(|cx| {
+            let mut permit = futures::future::poll_fn(|cx| {
                 cancellation.register(cx.waker());
                 scope.check()?;
                 let mut pending = self.pending.borrow_mut();
@@ -622,6 +634,10 @@ impl CryptoClient {
             })
             .await?;
             drop(capacity_waiter);
+            if let Some(sample) = &sample {
+                sample.identify(id);
+            }
+            permit.send_sample = sample;
             let mut job = Some(permit.job(input, key, scope.clone()));
             futures::future::poll_fn(|cx| {
                 self.waiters.borrow_mut().insert(
@@ -689,6 +705,13 @@ impl CryptoClient {
                 }
             }
             let id = completion.id();
+            if let Some(sample) = &completion.permit.send_sample {
+                sample.finish(match &completion.outcome {
+                    CryptoOutcome::Failed { error, .. } => Some(*error),
+                    _ => None,
+                });
+                // Permit retains the owner through reap and completion consumption.
+            }
             if let Some(failure) = completion.permit.aead_failure {
                 self.observer.borrow().record_aead(id, failure);
             }

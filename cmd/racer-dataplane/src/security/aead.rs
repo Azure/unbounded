@@ -68,6 +68,34 @@ pub struct PageCrypto {
     client: Rc<CryptoClient>,
 }
 impl PageCrypto {
+    pub(crate) async fn sample_send(
+        &self,
+        ciphertext: CiphertextPage,
+        scope: &RequestScope,
+        sample: crate::telemetry::send_crc::Work,
+    ) {
+        let envelope = ciphertext.envelope();
+        let key = match self.keys.lease(
+            Some(&envelope.page.version.object.cache),
+            envelope.key_id,
+            KeyPurpose::Page,
+        ) {
+            Ok(key) => key,
+            Err(error) => {
+                sample.finish(Some(error));
+                return;
+            }
+        };
+        let _ = self
+            .client
+            .execute_sample(
+                CryptoInput::Checksum { ciphertext },
+                key,
+                scope,
+                Some(sample),
+            )
+            .await;
+    }
     /// Verify persisted ciphertext integrity on the bounded crypto worker queue.
     /// This does not authenticate a peer copy or produce publishable plaintext.
     pub fn verify_checksum<'a>(
@@ -203,7 +231,19 @@ impl PageCryptoEngine {
             key,
             scope,
         } = job;
-        let outcome = match Self::prepare(&input, &key, &scope, &mut permit) {
+        let prepared = Self::prepare(&input, &key, &scope, &mut permit);
+        if let Some(sample) = &mut permit.send_sample {
+            if let CryptoInput::Checksum { ciphertext } = &input {
+                if let Ok(aad) = page_aad(ciphertext.envelope()) {
+                    sample.facts = Some(crate::telemetry::failures::AeadFailure::capture(
+                        ciphertext,
+                        &aad,
+                        scope.request,
+                    ));
+                }
+            }
+        }
+        let outcome = match prepared {
             Err(error) => CryptoOutcome::Failed { input, error },
             Ok((envelope, bytes)) => Self::complete(input, envelope, bytes),
         };
@@ -226,6 +266,12 @@ impl PageCryptoEngine {
     ) -> Result<(PageEnvelope, Zeroizing<Vec<u8>>)> {
         scope.check()?;
         if let CryptoInput::Checksum { ciphertext } = input {
+            if let Some(sample) = &mut permit.send_sample {
+                sample.cached = ciphertext.cached_checksum().is_some();
+                if sample.cached {
+                    return Ok((ciphertext.envelope().clone(), Zeroizing::new(Vec::new())));
+                }
+            }
             ciphertext.verify_checksum()?;
             scope.check()?;
             return Ok((ciphertext.envelope().clone(), Zeroizing::new(Vec::new())));

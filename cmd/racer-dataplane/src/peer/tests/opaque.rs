@@ -92,6 +92,149 @@ struct RelayFixture {
     page: crate::memory::pool::CiphertextPage,
 }
 
+#[test]
+fn send_crc_http_success_failure_drop_do_not_wait_for_crypto() {
+    use crate::{
+        runtime::crypto::{CryptoClient, pair},
+        security::aead::PageCrypto,
+        telemetry::send_crc::{Pair, Samples},
+    };
+    for mode in ["success", "failure", "drop"] {
+        let f = RelayFixture::new(true);
+        let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+        let _guard = queue.enter();
+        let (_, ids) = identities();
+        let (io, _engine) = pair(
+            crate::model::WorkerId(0),
+            1,
+            std::num::NonZeroUsize::new(1).unwrap(),
+        );
+        let crypto = Rc::new(PageCrypto::new(
+            ids[1].0.clone(),
+            Rc::new(CryptoClient::new(io)),
+        ));
+        let samples = Samples::default();
+        let server = f.server.with_send_crc(
+            Some(Pair {
+                sender: NodeId(B.into()),
+                receiver: NodeId(A.into()),
+            }),
+            samples.clone(),
+            crypto,
+        );
+        let client_conn =
+            ConnectionLease::from_accepted(f.requester_socket.into(), &f.admissions[0]).unwrap();
+        let server_conn =
+            ConnectionLease::from_accepted(f.relay_socket.into(), &f.admissions[1]).unwrap();
+        let (client_conn, mut server_conn) = drive(
+            &f.reactors,
+            async {
+                futures::try_join!(
+                    connection::connect(
+                        &f.ios[0],
+                        client_conn,
+                        f.signers[0].clone(),
+                        f.signers[1].node(),
+                        &f.scope
+                    ),
+                    connection::accept(&f.ios[1], server_conn, f.signers[1].clone(), &f.scope)
+                )
+            },
+            || {},
+        )
+        .unwrap();
+        // This test invokes the response sender directly after the handshake,
+        // bypassing receive_head's completed bodyless-request framing.
+        server_conn.rx_remaining = Some(0);
+        let a = Forwarding::new(f.signers[0].clone());
+        let b = Forwarding::new(f.signers[1].clone());
+        let mut local = request(&f.admissions[0], 9);
+        local.route.destination = NodeId(B.into());
+        local.operation = protocol::Operation::Bootstrap {
+            object: f.metadata.version.object.clone(),
+            mode: protocol::FetchMode::CopyOnly,
+        };
+        let (signed, _) = a.sign_request_to(local, f.signers[1].node()).unwrap();
+        let admitted = b.verify_request(signed).unwrap();
+        let mut page = f.page.clone();
+        page.provenance = Some(crate::telemetry::failures::PeerProvenance {
+            request: f.scope.request,
+            attempt: crate::model::AttemptId([9; 16]),
+            supplier: C.as_bytes().try_into().unwrap(),
+            remote: C.as_bytes().try_into().unwrap(),
+        });
+        let response = b
+            .sign_response(
+                admitted.binding(),
+                PeerResponse::Bootstrap {
+                    metadata: f.metadata.clone(),
+                    page_zero: Some(page),
+                },
+            )
+            .unwrap();
+        if mode == "failure" {
+            f.scope.cancel().unwrap();
+            assert!(
+                drive(
+                    &f.reactors,
+                    server.send_http_response(server_conn, &response, &f.scope),
+                    || {}
+                )
+                .is_err()
+            );
+            drop(client_conn);
+        } else if mode == "drop" {
+            let mut send = Box::pin(server.send_http_response(server_conn, &response, &f.scope));
+            assert!(
+                send.as_mut()
+                    .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+                    .is_pending()
+            );
+            drop(send);
+            drop(client_conn);
+        } else {
+            let receive = async {
+                let received = f.ios[0].receive_head(client_conn, &f.scope).await?;
+                let mut conn = received.connection;
+                let mut count = 0;
+                while count < f.body.len() {
+                    let done = f.ios[0]
+                        .read_body(conn, f.ios[0].buffer(65536)?, &f.scope)
+                        .await?;
+                    count += done.bytes;
+                    conn = done.lease;
+                }
+                Ok::<_, Error>(conn)
+            };
+            drive(
+                &f.reactors,
+                async {
+                    futures::try_join!(
+                        server.send_http_response(server_conn, &response, &f.scope),
+                        receive
+                    )
+                },
+                || {},
+            )
+            .unwrap();
+        }
+        // Deliberately never drive crypto or the diagnostic queue during send.
+        let mut text = String::new();
+        samples.write(&mut text).unwrap();
+        assert!(
+            text.contains(match mode {
+                "success" => "send=completed",
+                "failure" => "send=failed",
+                _ => "send=abandoned",
+            }),
+            "{text}"
+        );
+        assert!(text.contains("status=pending"));
+        drop(queue);
+        drop(_guard);
+    }
+}
+
 impl RelayFixture {
     fn new(materialized: bool) -> Self {
         Self::with_pool_limit(materialized, 1)
