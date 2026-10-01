@@ -391,7 +391,6 @@ func TestMirror_GET_LiveStreamEarlyHeadersUsePeerMetadata(t *testing.T) {
 	stack := newHeadTestStack(t,
 		map[digest.Digest][]byte{d: body},
 		map[digest.Digest][]ifaces.Provider{d: {{NodeID: "peer-a", Addr: peerAddr}}},
-		mirror.WithLiveStreamThrough(),
 		mirror.WithPeerRediscover(time.Second, 10*time.Millisecond),
 	)
 

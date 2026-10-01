@@ -170,7 +170,6 @@ func TestMirror_ColdStart_SelfPullRechecksLocalCacheBeforeSelfFilter(t *testing.
 		UpstreamRegistries: []config.UpstreamRegistry{{Name: "reg.example.com", Endpoint: "http://unused"}},
 	}
 	m := mirror.New(cfg, local, originPuller,
-		mirror.WithLiveStreamThrough(),
 		mirror.WithDiscovery(dht, peerDialer),
 		mirror.WithColdStart(cs),
 		mirror.WithSelfNodeID(selfNode),
@@ -398,6 +397,10 @@ func TestMirror_PeerProvidersExhausted_ConsultsColdStart(t *testing.T) {
 
 	defer func() { _ = resp.Body.Close() }() //nolint:errcheck // best-effort body close
 
+	if got, err := io.ReadAll(resp.Body); err != nil || string(got) != string(body) {
+		t.Fatalf("body=%q err=%v", got, err)
+	}
+
 	if resp.StatusCode != 200 {
 		got, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status = %d, body = %q; want 200 (cold-start should have surfaced fresh peer)", resp.StatusCode, got)
@@ -445,7 +448,6 @@ func TestMirror_StaleOnlyFilteredProviders_ConsultsColdStartWithoutRefetch(t *te
 	)
 
 	m := mirror.New(cfg, local, originPuller,
-		mirror.WithLiveStreamThrough(),
 		mirror.WithDiscovery(dht, peerDialer),
 		mirror.WithColdStart(cs),
 		mirror.WithDhtStaleOnlyMetric(func() { atomic.AddInt32(&staleOnlyCount, 1) }),
@@ -626,6 +628,10 @@ func TestMirror_DHTLookupError_ConsultsColdStart(t *testing.T) {
 	if resp.StatusCode != 200 {
 		got, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status = %d, body = %q; want 200 (cold-start should have surfaced peer despite DHT error)", resp.StatusCode, got)
+	}
+
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatal(err)
 	}
 
 	if atomic.LoadInt32(originHits) != 0 {

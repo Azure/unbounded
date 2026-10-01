@@ -227,20 +227,9 @@ func TestMirror_PeerFallback_ServesFromPeerNotOrigin(t *testing.T) {
 	if atomic.LoadInt32(peerFetches) != 1 {
 		t.Errorf("peer fetches = %d, want 1", *peerFetches)
 	}
-	// the step 7: after a successful peer fetch the digest MUST be
-	// re-advertised to the DHT so the provider set grows. Provide is
-	// fire-and-forget in a goroutine; poll up to 2s.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if dht.ProvideCount(d) >= 1 {
-			break
-		}
-
-		time.Sleep(20 * time.Millisecond)
-	}
-
-	if got := dht.ProvideCount(d); got < 1 {
-		t.Errorf("dht.Provide call count = %d, want >= 1 (post-peer-fetch re-advertise)", got)
+	// Only the advertiser may publish after observing containerd's commit.
+	if got := dht.ProvideCount(d); got != 0 {
+		t.Errorf("live mirror advertised uncommitted content: count=%d", got)
 	}
 }
 
@@ -259,7 +248,6 @@ func TestMirror_PeerFallback_LiveStreamResumesFromAnotherPeer(t *testing.T) {
 	var hits, stalls int32
 
 	m := mirror.New(cfg, &writerSpyCache{}, originSrc,
-		mirror.WithLiveStreamThrough(),
 		mirror.WithDiscovery(dht, dialer),
 		mirror.WithPeerBudgets(time.Second, time.Second, 2),
 		mirror.WithPeerMetrics(func(outcome string) {
@@ -472,6 +460,13 @@ func TestMirror_PeerFallback_FiltersSelfProviderAfterLocalMiss(t *testing.T) {
 	}
 
 	if atomic.LoadInt32(&peerHits) != 1 {
+		// Headers arrive before the streaming body completes.
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if atomic.LoadInt32(&peerHits) != 1 {
 		t.Errorf("peer hits = %d, want 1", peerHits)
 	}
 
@@ -595,7 +590,6 @@ func TestMirror_PeerFallback_LiveStreamDigestMismatchQuarantines(t *testing.T) {
 	var digestMismatches int32
 
 	m := mirror.New(cfg, fakes.NewCache(), oc,
-		mirror.WithLiveStreamThrough(),
 		mirror.WithDiscovery(dht, transfer.NewClient()),
 		mirror.WithPeerBudgets(time.Second, 2*time.Second, 1),
 		mirror.WithPeerMetrics(func(outcome string) {

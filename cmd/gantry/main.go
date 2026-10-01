@@ -563,7 +563,6 @@ func runAgent(args []string) error {
 	// responses with the content later becoming openable in containerd.
 	mirrorSrv := mirror.New(c, cstore, mirrorOriginClient,
 		mirror.WithLogger(logger),
-		mirror.WithLiveStreamThrough(),
 		mirror.WithMetrics(
 			func() { inst.cacheHit.Inc() },
 			func() { inst.cacheMiss.Inc() },

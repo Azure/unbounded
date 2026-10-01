@@ -136,19 +136,6 @@ type Server struct {
 	// rationale.
 	negCache NegativeCacheRecorder
 
-	// liveStreamThrough switches live GET cache-miss handling from
-	// Gantry-owned ingest to direct stream-through. When true, peer and
-	// origin responses are proxied straight to the requesting
-	// containerd/kubelet client and hash-checked as they pass through,
-	// but Gantry does NOT write the bytes into s.cache itself. If the
-	// final digest check fails, some bytes have already reached
-	// containerd; containerd remains the final verifier and should reject
-	// the commit. That avoids same-digest
-	// writer races now that the active store in production is the
-	// containerd content store itself. Background please_pull / direct-origin-fallback
-	// ingest continues to land via runOriginPull in cmd/gantry/main.go.
-	liveStreamThrough bool
-
 	// draining is set to true via Drain when the agent is shutting
 	// down. Once true, every /v2/ request returns 503 immediately so
 	// containerd's hosts.toml falls through to origin (// graceful-shutdown contract). The check is layered ON TOP of
@@ -335,18 +322,6 @@ func WithOriginSuccessMetric(originSuccess func(kind string, bytes int64)) Optio
 func WithDownstreamFailureMetric(downstreamFailure func(kind, class string)) Option {
 	return func(s *Server) {
 		s.metrics.onOriginDownstreamFailure = downstreamFailure
-	}
-}
-
-// WithLiveStreamThrough enables the "Mode A: live mirror requests
-// - stream-through" contract for cache misses handled on behalf of the
-// local containerd mirror client. When enabled, the mirror no longer
-// writes live peer/origin responses into the active store; it proxies
-// them directly to the caller and relies on the caller's containerd to
-// perform the final commit.
-func WithLiveStreamThrough() Option {
-	return func(s *Server) {
-		s.liveStreamThrough = true
 	}
 }
 
@@ -963,9 +938,7 @@ func (s *Server) serveOriginRange(ctx context.Context, w http.ResponseWriter, d 
 	pullStartedAt := time.Now()
 	ref := ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Offset: offset, Kind: kind}
 
-	if s.liveStreamThrough {
-		s.fireOriginStreamStarted(kind)
-	}
+	s.fireOriginStreamStarted(kind)
 
 	rc, totalSize, err := s.origin.Pull(ctx, ref)
 	if err != nil {
@@ -979,9 +952,7 @@ func (s *Server) serveOriginRange(ctx context.Context, w http.ResponseWriter, d 
 			slog.Any("err", err),
 		)
 
-		if s.liveStreamThrough {
-			s.fireOriginStreamFailed(kind)
-		}
+		s.fireOriginStreamFailed(kind)
 
 		writeOriginError(w, err, logger)
 
@@ -992,9 +963,7 @@ func (s *Server) serveOriginRange(ctx context.Context, w http.ResponseWriter, d 
 
 	remaining := totalSize - offset
 	if remaining <= 0 {
-		if s.liveStreamThrough {
-			s.fireOriginStreamFailed(kind)
-		}
+		s.fireOriginStreamFailed(kind)
 
 		http.Error(w, "invalid origin range size", http.StatusBadGateway)
 
@@ -1021,16 +990,12 @@ func (s *Server) serveOriginRange(ctx context.Context, w http.ResponseWriter, d 
 			slog.Any("err", copyErr),
 		)
 
-		if s.liveStreamThrough {
-			s.fireOriginStreamFailed(kind)
-		}
+		s.fireOriginStreamFailed(kind)
 
 		return
 	}
 
-	if s.liveStreamThrough {
-		s.fireOriginStreamCompleted(kind)
-	}
+	s.fireOriginStreamCompleted(kind)
 
 	s.fireMirrorResponseCompleted(d, kind, "origin")
 	s.fireLiveStreamCompleted(d)
@@ -1235,9 +1200,7 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 	pullStartedAt := time.Now()
 	pRef := ifaces.OriginRef{Registry: upstream, Repository: repo, Digest: d, Kind: kind}
 
-	if s.liveStreamThrough {
-		s.fireOriginStreamStarted(kind)
-	}
+	s.fireOriginStreamStarted(kind)
 
 	pr, psize, perr := s.origin.Pull(ctx, pRef)
 	if perr != nil {
@@ -1264,9 +1227,7 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 			s.recordNegCacheFailure(d, perr)
 		}
 
-		if s.liveStreamThrough {
-			s.fireOriginStreamFailed(kind)
-		}
+		s.fireOriginStreamFailed(kind)
 
 		writeOriginError(w, perr, logger)
 
@@ -1275,7 +1236,7 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 
 	defer func() { _ = pr.Close() }() //nolint:errcheck // best-effort close
 
-	if s.liveStreamThrough {
+	{
 		written, streamErr := streamDigestToClient(w, pr, d, psize, kind)
 		s.fireMirrorBytesServed(kind, "origin", written)
 
@@ -1300,159 +1261,6 @@ func (s *Server) serveFromOrigin(ctx context.Context, w http.ResponseWriter, d d
 		s.recordNegCacheSuccess(d)
 
 		return
-	}
-
-	cw, cwerr := s.store.Writer(ctx, d)
-
-	var dest io.Writer
-
-	var directVerifier *digestpipe.Writer // non-nil only when caching is unavailable
-
-	if cwerr == nil {
-		defer func() { _ = cw.Abort(ctx) }() //nolint:errcheck // no-op after Commit
-
-		dest = io.MultiWriter(w, cw)
-	} else {
-		logger.Warn("mirror: cache writer unavailable; serving without caching", slog.Any("err", cwerr))
-		// digest-verification says the cache layer is what enforces digest verification
-		// on origin pulls - and cache.Writer wraps the stream in a
-		// digestpipe internally before Commit. When that path is
-		// unavailable we still need to verify, otherwise an origin
-		// returning corrupted bytes (truncation, content-injection
-		// proxy, etc.) leaks straight to the client with no detection.
-		// We can't unsend the bytes, but logging a digest mismatch
-		// here is the only signal operators get that the origin lied.
-		directVerifier = digestpipe.New(w)
-		dest = directVerifier
-	}
-
-	// Peek the origin body so writeBlobHeaders can label content with
-	// the right Content-Type for two cases:
-	// - kind == KindBlob: a manifest that arrived via origin's
-	// /blobs/->/manifests/ fallback would otherwise be labeled
-	// octet-stream, and containerd CRI rejects the unpacked
-	// content as "Target.MediaType must be set".
-	// - kind == KindManifest: a manifest LIST/index body must be
-	// labeled with the matching list/index media type, otherwise
-	// containerd fails the unpack with "expected manifest but
-	// found index" when it later resolves children.
-	// The peek consumes nothing (bufio buffers the bytes).
-	prBuf := bufio.NewReader(pr)
-
-	var sniff []byte
-
-	if kind == ifaces.KindBlob || kind == ifaces.KindManifest {
-		if peek, _ := prBuf.Peek(512); len(peek) > 0 { //nolint:errcheck // peek best-effort for logging
-			sniff = peek
-		}
-	}
-
-	writeBlobHeadersWithPrefix(w, d, psize, kind, sniff)
-
-	written, err := io.Copy(dest, prBuf)
-	s.fireMirrorBytesServed(kind, "origin", written)
-
-	if err != nil {
-		// Bytes already sent; we can't undo. Cache will be aborted by defer.
-		// This is a terminal downstream failure: origin returned 2xx
-		// and we drained part of the body, but the stream stalled
-		// before EOF. Count it against p2p_origin_pull_failure_total
-		// (class=transient) so the per-pull arithmetic
-		// (started == success + failure + in_flight) holds. We do
-		// NOT also bump p2p_origin_failure_total - origin gave us
-		// 2xx, the failure is downstream.
-		logger.Debug("mirror: copy stalled", slog.Int64("written", written), slog.Any("err", err))
-		s.fireOriginDownstreamFailure(kind, ifaces.FailureTransient)
-		// the design doc cooldown: io.Copy stalls are the canonical mid-stream
-		// truncation a prior review flagged for direct-origin-fallback direct
-		// fallback. Classify as transient (matches the puller-pump
-		// path) so the cooldown ladder grows on repeated truncations
-		// of the same digest.
-		s.recordNegCacheFailure(d, err)
-
-		return
-	}
-
-	if directVerifier != nil {
-		if verr := directVerifier.Verify(d); verr != nil {
-			logger.Error("mirror: origin direct-stream digest mismatch - corrupted bytes were already served to client",
-				slog.String("digest", d.String()),
-				slog.Int64("written", written),
-				slog.Any("err", verr),
-			)
-			// Corrupted bytes: do NOT count as origin success.
-			// The client already got them, but the cluster did
-			// not produce a usable cached/verifiable copy. This
-			// is a downstream-detected failure (origin returned
-			// 2xx; we caught the mismatch via the in-process
-			// digestpipe verifier) so it goes to the downstream
-			// counter, not to origin's failure family.
-			s.fireOriginDownstreamFailure(kind, ifaces.FailureTransient)
-			// the design doc cooldown: a direct-stream digest mismatch is the
-			// strongest "this origin is lying" signal we have on the
-			// no-cache path. Treat the failure as transient (same
-			// class the puller-pump path uses for cw.Commit
-			// mismatches) so repeated mismatches grow the cooldown.
-			s.recordNegCacheFailure(d, verr)
-
-			return
-		}
-		// Direct-stream verifier passed: bytes were delivered to
-		// the client AND digest-matched the requested ref. The
-		// cluster did not gain a cache entry (cache was
-		// unavailable), but the origin pull itself succeeded
-		// end-to-end. Count it.
-		s.fireOriginSuccess(kind, written)
-		// the design doc "Self-healing": a successful end-to-end pull clears
-		// any prior cooldown entry. Symmetric with the puller-pump
-		// path's neg.RecordSuccess(d) after cw.Commit.
-		s.recordNegCacheSuccess(d)
-
-		return
-	}
-
-	if cwerr == nil {
-		if err := cw.Commit(ctx); err != nil {
-			// The client already got the bytes; cache just doesn't keep them.
-			// cw.Commit is where the cache's internal digestpipe runs;
-			// a non-nil error here means EITHER cache I/O failed OR
-			// the stream's digest didn't match d. Either way it's a
-			// terminal downstream failure of THIS pull (no usable
-			// cached copy produced) and must move the arithmetic
-			// off in-flight. Origin returned 2xx, so we route this
-			// to the downstream counter, NOT to the origin failure
-			// family.
-			logger.Warn("mirror: cache commit failed", slog.Any("err", err))
-			s.fireOriginDownstreamFailure(kind, ifaces.FailureTransient)
-			// the design doc cooldown: cw.Commit is where the cache's digestpipe
-			// fires; this branch means EITHER cache I/O failed OR
-			// origin's bytes didn't hash to d. Both are transient by
-			// the puller-pump path's classification - record so the
-			// next direct-origin attempt for the same digest waits
-			// out the cooldown.
-			s.recordNegCacheFailure(d, err)
-
-			return
-		}
-		// Re-advertise into the DHT now that we hold a byte-identical
-		// copy in our cache. Without this, an direct-origin-fallback-eligible direct
-		// origin pull leaves the cluster's only known provider record
-		// pointing at the origin instead of at this node - defeating
-		// the deduplication promise of the step 7 specifically for
-		// the cold-start-exhausted path that just escalated to origin.
-		s.reAdvertiseDigest(d, "mirror_origin_announce", logger)
-		s.firePrefetch(ctx, kind, upstream, repo, d)
-		// Bytes streamed AND committed: this is the canonical
-		// mirror-direct origin-pull success. Fire AFTER commit
-		// (not after Copy) so a commit failure correctly leaves
-		// the operation classified as not-yet-successful even
-		// though the client already got the bytes.
-		s.fireOriginSuccess(kind, written)
-		// the design doc "Self-healing": clear any prior cooldown entry so
-		// the next failure restarts the ladder from Initial.
-		// Symmetric with the puller-pump path's neg.RecordSuccess(d)
-		// after its cw.Commit.
-		s.recordNegCacheSuccess(d)
 	}
 }
 
@@ -1696,10 +1504,7 @@ func (s peerAttemptSummary) retryableAfterPartial() bool {
 // reaching those terminal legs. Busy additionally honors Retry-After and
 // retries peers until progress or client cancellation.
 func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *http.Request, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, logger *slog.Logger) peerFallbackResult {
-	var stream *livePeerStream
-	if s.liveStreamThrough {
-		stream = &livePeerStream{}
-	}
+	stream := &livePeerStream{}
 
 	backoff := s.peerRediscoverBackoff
 	if backoff <= 0 {
@@ -1735,7 +1540,7 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 		// Re-discovery is disabled for ordinary misses and failures. Capacity
 		// pressure is handled above because returning 5xx for a live-but-busy
 		// swarm would cause fail-open containerd to bypass Gantry.
-		if stream != nil && stream.started && firstResult != peerFallbackServed {
+		if stream.started && firstResult != peerFallbackServed {
 			return peerFallbackPartial
 		}
 
@@ -1765,7 +1570,7 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 		// cache since the last round. Once headers are flushed the bytes still
 		// have to come from somewhere, and this node cannot fetch from itself,
 		// so resume from the local copy rather than closing short.
-		if stream != nil && stream.started {
+		if stream.started {
 			if handled, result := s.serveStartedLocalHit(ctx, w, d, kind, upstream, repo, stream, logger); handled {
 				return result
 			}
@@ -1775,7 +1580,7 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 
 		select {
 		case <-ctx.Done():
-			if stream != nil && stream.started {
+			if stream.started {
 				return peerFallbackPartial
 			}
 
@@ -1798,7 +1603,7 @@ func (s *Server) tryPeerFallback(ctx context.Context, w http.ResponseWriter, r *
 		}
 	}
 
-	if stream != nil && stream.started {
+	if stream.started {
 		return peerFallbackPartial
 	}
 
@@ -2272,7 +2077,7 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 
 	s.bumpPeerDial(true)
 
-	if s.liveStreamThrough {
+	{
 		if err := stream.begin(w, d, psize, kind, contentType); err != nil {
 			s.bumpPeerFetch("protocol_error")
 			s.bumpPeerFetchLatency("protocol_error", fetchStart)
@@ -2353,104 +2158,6 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 
 		return peerAttemptResult{outcome: peerFetchOutcomeHit, served: true}
 	}
-
-	cw, cwerr := s.store.Writer(pCtx, d)
-	if cwerr != nil {
-		s.bumpPeerFetch("local_error")
-		s.bumpPeerFetchLatency("local_error", fetchStart)
-		logger.Warn("mirror: cache writer unavailable for peer fetch", slog.Any("err", cwerr))
-
-		return peerAttemptResult{outcome: peerFetchOutcomeLocalError}
-	}
-
-	defer func() { _ = cw.Abort(pCtx) }() //nolint:errcheck // best-effort abort
-
-	_, err = io.Copy(cw, rc)
-	if err != nil {
-		s.bumpPeerFetch("stall")
-		s.bumpPeerFetchLatency("stall", fetchStart)
-		logger.Debug("mirror: peer copy stalled",
-			slog.String("peer", p.Addr),
-			slog.Any("err", err),
-		)
-
-		return peerAttemptResult{outcome: peerFetchOutcomeStall}
-	}
-
-	if err := cw.Commit(pCtx); err != nil {
-		if isDigestMismatchErr(err) {
-			s.markProviderSuspicious(d, p)
-			s.bumpPeerFetch("digest_mismatch")
-			s.bumpPeerFetchLatency("digest_mismatch", fetchStart)
-			logger.Warn("mirror: peer digest mismatch",
-				slog.String("peer", p.Addr),
-				slog.Any("err", err),
-			)
-
-			return peerAttemptResult{outcome: peerFetchOutcomeDigestMismatch}
-		}
-
-		s.bumpPeerFetch("local_error")
-		s.bumpPeerFetchLatency("local_error", fetchStart)
-		logger.Warn("mirror: peer commit failed",
-			slog.String("peer", p.Addr),
-			slog.Any("err", err),
-		)
-
-		return peerAttemptResult{outcome: peerFetchOutcomeLocalError}
-	}
-
-	// Re-advertise this digest into the DHT now that we've cached a
-	// byte-identical copy. Without this, peer-fetched blobs were
-	// discoverable only via the source peer's announcements, so the
-	// provider set never grew - defeating the deduplication promise
-	// of the design (detailed-design the step 7). Fire-and-forget
-	// with a 30s budget; bg ctx so client cancellation can't abort
-	// the announcement.
-	s.reAdvertiseDigest(d, "peer_fetch_readvertise", logger)
-
-	// Re-open from cache and stream verified bytes to the client.
-	rcLocal, size, err := s.store.Open(ctx, d)
-	if err != nil {
-		s.bumpPeerFetch("local_error")
-		s.bumpPeerFetchLatency("local_error", fetchStart)
-		logger.Warn("mirror: post-commit cache open failed", slog.Any("err", err))
-
-		return peerAttemptResult{outcome: peerFetchOutcomeLocalError}
-	}
-
-	defer func() { _ = rcLocal.Close() }() //nolint:errcheck // best-effort close
-
-	s.bumpPeerFetch("hit")
-	s.bumpPeerFetchLatency("hit", fetchStart)
-	// Sniff the cached body's prefix so writeBlobHeaders can label
-	// content with the right Content-Type for blobs that hold manifest
-	// bytes AND for manifests that hold a manifest list/index body
-	// (see writeBlobHeadersWithPrefix for the rationale).
-	rcLocalBuf := bufio.NewReader(rcLocal)
-
-	var sniff []byte
-
-	if kind == ifaces.KindBlob || kind == ifaces.KindManifest {
-		if peek, _ := rcLocalBuf.Peek(512); len(peek) > 0 { //nolint:errcheck // peek best-effort for logging
-			sniff = peek
-		}
-	}
-
-	writeBlobHeadersWithPrefix(w, d, size, kind, sniff)
-
-	if r.Method == http.MethodHead {
-		return peerAttemptResult{outcome: peerFetchOutcomeHit, served: true}
-	}
-
-	written, err := io.Copy(w, rcLocalBuf)
-	s.fireMirrorBytesServed(kind, "peer", written)
-
-	if err != nil {
-		logger.Debug("mirror: copy from cache (post-peer) failed", slog.Any("err", err))
-	}
-
-	return peerAttemptResult{outcome: peerFetchOutcomeHit, served: true}
 }
 
 func (s *Server) resolveViaColdStart(ctx context.Context, d digest.Digest, kind ifaces.OriginRefKind, upstream, repo string, afterDHTErr, staleOnly bool, summary peerAttemptSummary, logger *slog.Logger) ([]ifaces.Provider, peerFallbackResult) {
@@ -2770,39 +2477,6 @@ func (s *Server) firePrefetch(ctx context.Context, kind ifaces.OriginRefKind, re
 	go s.prefetcher.OnManifestServed(registryauth.Detach(ctx), registry, repository, d)
 }
 
-// reAdvertiseDigest does a fire-and-forget dht.Provide(d) in a
-// goroutine with a 30s budget. This helper is retained for the legacy
-// verify-before-serving mirror mode used by tests; production wiring
-// enables WithLiveStreamThrough, where live mirror requests never call
-// this path and advertisement is owned by the advertiser after
-// containerd commit observation. The op label distinguishes the call
-// site for the p2p_dht_provide_error_total{op} counter. The background
-// context shields the announce from client cancellation.
-func (s *Server) reAdvertiseDigest(d digest.Digest, op string, logger *slog.Logger) {
-	if s.dht == nil {
-		return
-	}
-
-	dHash := d
-
-	go func() {
-		provCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-
-		if perr := s.dht.Provide(provCtx, dHash); perr != nil {
-			if s.metrics.onProvideError != nil {
-				s.metrics.onProvideError(op)
-			}
-
-			logger.Debug("mirror: post-commit dht.Provide failed",
-				slog.String("op", op),
-				slog.String("digest", dHash.String()),
-				slog.Any("err", perr),
-			)
-		}
-	}()
-}
-
 // bumpCacheHit / bumpCacheMiss are no-ops if no metric hooks were
 // registered. There is intentionally no bumpOriginPull,
 // bumpOriginFailure, bumpOriginSuccess, or bumpOriginDownstreamFailure
@@ -2894,40 +2568,6 @@ func (s *Server) fireLiveStreamCompleted(d digest.Digest) {
 	}
 
 	s.metrics.onLiveStreamCompleted(d)
-}
-
-// fireOriginSuccess emits p2p_origin_pull_success_total via the hook
-// registered with WithOriginSuccessMetric. Call sites must invoke
-// this AFTER the response body has been streamed AND the cluster has
-// produced a useful artifact from it (cache commit OK, or
-// direct-stream digest verifier passed when cache is unavailable).
-// Calling it earlier - e.g. inside a deferred Close on the origin
-// reader - inflates the success counter against HEAD requests, io.Copy
-// interruptions, and cache-commit failures (the exact bug the
-// a prior review flagged as "false positives on the success metric").
-func (s *Server) fireOriginSuccess(kind ifaces.OriginRefKind, bytes int64) {
-	if s.metrics.onOriginSuccess == nil {
-		return
-	}
-
-	s.metrics.onOriginSuccess(kind.MetricLabel(), bytes)
-}
-
-// fireOriginDownstreamFailure emits the per-(kind,class)
-// p2p_origin_pull_failure_total via the hook registered with
-// WithDownstreamFailureMetric. Call sites must invoke this on
-// terminal failures of the downstream pipeline (io.Copy / cw.Commit
-// / directVerifier.Verify) AFTER origin returned 2xx. Origin-side
-// failures (origin.Pull returned an *ifaces.OriginError) are
-// counted separately by origin.WithMetrics' failure closure and
-// must NOT also fire this hook - see WithDownstreamFailureMetric's
-// doc for the cleanup of the two counters.
-func (s *Server) fireOriginDownstreamFailure(kind ifaces.OriginRefKind, class ifaces.FailureClass) {
-	if s.metrics.onOriginDownstreamFailure == nil {
-		return
-	}
-
-	s.metrics.onOriginDownstreamFailure(kind.MetricLabel(), string(class))
 }
 
 // classifyOriginFailureClass extracts the FailureClass from an

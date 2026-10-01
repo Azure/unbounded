@@ -173,7 +173,7 @@ func TestContainerdResumesInterruptedGantryBodyWithoutOriginReplay(t *testing.T)
 		t.Fatalf("origin.New: %v", err)
 	}
 
-	gantryServer := httptest.NewServer(mirror.New(cfg, fakes.NewCache(), originClient, mirror.WithLiveStreamThrough()).Handler())
+	gantryServer := httptest.NewServer(mirror.New(cfg, fakes.NewCache(), originClient).Handler())
 	defer gantryServer.Close()
 
 	fetchGeneratedLayer(t, []docker.RegistryHost{containerdRegistryHost(t, gantryServer)}, d, layerSize)
