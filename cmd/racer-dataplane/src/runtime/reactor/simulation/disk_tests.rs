@@ -33,7 +33,7 @@ fn delayed_completion_and_fault_trace_replay_exactly() {
 
 #[test]
 fn real_slab_open_is_sparse_exclusive_and_checks_direct_geometry() {
-    use crate::{model::WorkerId, store::slab::Slabs};
+    use crate::{model::WorkerId, store::disk::Slabs};
     let sim = Simulation::new();
     let _environment = sim.enter();
     let r = Rc::new(reactor());
@@ -801,7 +801,7 @@ fn direct_io_faults_check_address_offset_and_length_independently() {
     use crate::{
         model::ResourceClass,
         runtime::reactor::{IoBuffer, sealed},
-        store::direct::{AlignedBuffer, DirectAlignment},
+        store::disk::{AlignedBuffer, DirectAlignment},
     };
     // Only a borrowed-range view of real aligned storage; no I/O behavior here.
     struct View {

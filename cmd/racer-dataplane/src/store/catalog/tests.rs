@@ -80,8 +80,7 @@ fn indexed(metadata: VersionMetadata, segment: u64) -> (PageId, IndexedPage) {
                 generation: Generation(1),
                 location: SlabLocation {
                     slab: SlabId(0),
-                    extent: crate::store::direct::DirectExtent::checked(segment * 1024, 512)
-                        .unwrap(),
+                    extent: crate::store::disk::DirectExtent::checked(segment * 1024, 512).unwrap(),
                 },
             },
         },

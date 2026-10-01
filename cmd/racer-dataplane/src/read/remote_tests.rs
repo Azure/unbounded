@@ -885,7 +885,7 @@ fn metadata_coordinator_with_newer_publication(
         store::{
             StoreReader,
             catalog::{Index, SegmentClock, Segments},
-            slab::Slabs,
+            disk::Slabs,
             writer::StoreWriter,
         },
     };

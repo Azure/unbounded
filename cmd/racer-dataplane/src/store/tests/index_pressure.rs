@@ -173,7 +173,7 @@ fn index_clock_gives_recent_segments_a_second_chance_and_handles_no_victim() {
         .configure(
             1536,
             3,
-            direct::DirectAlignment::validate(512, 512, 512).unwrap(),
+            disk::DirectAlignment::validate(512, 512, 512).unwrap(),
         )
         .unwrap();
     let clock = catalog::SegmentClock::new(index.clone(), segments.clone(), 1);

@@ -2,7 +2,7 @@
 //! payload integrity remains AEAD at the fill boundary. Padding is never returned.
 use super::{
     catalog::Generation,
-    direct::{AlignedBuffer, DirectAlignment, DirectExtent},
+    disk::{AlignedBuffer, DirectAlignment, DirectExtent},
 };
 use crate::{
     error::{Error, Result},

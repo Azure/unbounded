@@ -2,15 +2,14 @@
 pub mod catalog;
 pub mod checkpoint;
 pub mod checkpoint_format;
-pub mod direct;
+pub mod disk;
 pub mod format;
 pub mod recovery;
-pub mod slab;
 pub mod writer;
 
 use self::{
     catalog::{Index, RecordLocation, Segments},
-    slab::Slabs,
+    disk::Slabs,
 };
 use crate::{
     error::{Error, Operation, Result},
@@ -45,7 +44,7 @@ impl Store {
     }
 
     /// Open slabs and configure the actual live shard and checkpoint geometry.
-    pub fn open(&self) -> Operation<'_, direct::DirectAlignment> {
+    pub fn open(&self) -> Operation<'_, disk::DirectAlignment> {
         Box::pin(async move {
             let alignment = self.writer.open().await?;
             let slabs = self.writer.slabs();

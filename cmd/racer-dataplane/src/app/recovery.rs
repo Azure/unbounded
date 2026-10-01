@@ -369,7 +369,7 @@ fn select(
 mod tests {
     use super::*;
     use crate::store::{
-        catalog::IndexSnapshot, checkpoint_format::CHECKPOINT_VERSION, direct::DirectAlignment,
+        catalog::IndexSnapshot, checkpoint_format::CHECKPOINT_VERSION, disk::DirectAlignment,
     };
     fn geometry() -> CheckpointGeometry {
         CheckpointGeometry::new(

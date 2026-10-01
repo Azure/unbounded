@@ -1,8 +1,5 @@
 //! Identity mappings, segment lifecycle, and lease-fenced second-chance eviction.
-use super::{
-    direct::DirectAlignment,
-    slab::{SlabId, SlabLocation},
-};
+use super::disk::{DirectAlignment, SlabId, SlabLocation};
 use crate::model::KeyId;
 use crate::runtime::collections::{HashMap, HashSet};
 use crate::{

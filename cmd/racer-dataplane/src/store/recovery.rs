@@ -8,7 +8,7 @@ use super::{
     checkpoint_format::{
         self, CheckpointGeometry, CheckpointImage, MAX_CHECKPOINT_BYTES, ShardImage,
     },
-    direct::DirectAlignment,
+    disk::DirectAlignment,
 };
 use crate::{
     error::{Error, Operation, Result},

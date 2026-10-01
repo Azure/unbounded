@@ -37,7 +37,7 @@ use crate::{
     store::{
         StoreReader,
         catalog::{Index, SegmentClock, Segments},
-        slab::Slabs,
+        disk::Slabs,
         writer::StoreWriter,
     },
     topology::{

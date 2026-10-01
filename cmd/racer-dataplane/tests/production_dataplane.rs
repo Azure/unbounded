@@ -51,7 +51,7 @@ use racer_dataplane::{
     store::{
         StoreReader,
         catalog::{Index, SegmentClock, Segments},
-        slab::Slabs,
+        disk::Slabs,
         writer::StoreWriter,
     },
     topology::{

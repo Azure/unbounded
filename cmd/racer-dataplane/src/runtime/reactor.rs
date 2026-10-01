@@ -362,7 +362,7 @@ pub(crate) mod sealed {
 /// Both supported buffer types have independently owned lifetimes:
 /// ```
 /// use racer_dataplane::{memory::pool::PlaintextBuffer,
-///     runtime::reactor::IoBuffer, store::direct::AlignedBuffer};
+///     runtime::reactor::IoBuffer, store::disk::AlignedBuffer};
 /// fn independent<T: 'static>() {}
 /// fn completion_safe<B: IoBuffer>() { independent::<B>(); }
 /// completion_safe::<PlaintextBuffer>();
@@ -769,7 +769,7 @@ impl Reactor {
     /// use racer_dataplane::runtime::reactor::Descriptor;
     /// use racer_dataplane::{error::Result,
     ///     runtime::{deadline::RequestScope, reactor::{Completion, Reactor}},
-    ///     store::{direct::AlignedBuffer, catalog::SegmentLease}};
+    ///     store::{disk::AlignedBuffer, catalog::SegmentLease}};
     /// async fn copy(reactor: &Reactor, fd: Rc<Descriptor>, buffer: AlignedBuffer,
     ///     lease: SegmentLease, scope: &RequestScope)
     ///     -> Result<Completion<AlignedBuffer, SegmentLease>> {

@@ -67,7 +67,7 @@ impl Fixture {
             segments.clone(),
             1,
         ));
-        let slabs = Rc::new(slab::Slabs::new(
+        let slabs = Rc::new(disk::Slabs::new(
             WorkerId(0),
             directory.0.clone(),
             reactor.clone(),
@@ -294,7 +294,7 @@ fn incremental_checkpoint_budget_thaws_and_async_publication_roundtrips() {
         1024 * 1024 * 1024,
         64 * 1024 * 1024,
         16,
-        direct::DirectAlignment::validate(4096, 4096, 4096).unwrap(),
+        disk::DirectAlignment::validate(4096, 4096, 4096).unwrap(),
     )
     .unwrap();
     let (payload, tail) = geometry.payload_capacity(2, 65536).unwrap();
@@ -305,7 +305,7 @@ fn incremental_checkpoint_budget_thaws_and_async_publication_roundtrips() {
 #[test]
 fn record_round_trip_preserves_ciphertext_zeroes_padding_and_rejects_torn_header() {
     let f = Fixture::new();
-    let a = direct::DirectAlignment::validate(512, 512, 512).unwrap();
+    let a = disk::DirectAlignment::validate(512, 512, 512).unwrap();
     for length in [3, crate::model::PAGE_BYTES as usize] {
         let page = f.copy(9, length);
         let disk = a.extent(0, format::logical_length(&page).unwrap()).unwrap();

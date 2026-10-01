@@ -19,7 +19,7 @@ use crate::{
     security::aead::PageCryptoEngine,
     store::{
         catalog::{Index, SegmentClock, Segments},
-        slab::Slabs,
+        disk::Slabs,
     },
     topology::{
         membership::{Member, Membership},

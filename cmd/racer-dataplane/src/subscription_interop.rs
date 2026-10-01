@@ -187,7 +187,7 @@ impl SubscriptionFixture {
         use store::{
             StoreReader,
             catalog::{Index, SegmentClock, Segments},
-            slab::Slabs,
+            disk::Slabs,
             writer::StoreWriter,
         };
 

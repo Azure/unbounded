@@ -1,8 +1,8 @@
 //! Bounded dirty copies persist asynchronously, with publication after full I/O.
 use super::{
     catalog::{Index, IndexedPage, RecordLocation, SegmentClock, Segments},
+    disk::Slabs,
     format,
-    slab::Slabs,
 };
 use crate::runtime::collections::HashMap;
 use crate::{
@@ -96,7 +96,7 @@ impl StoreWriter {
         self.capacity.set(queue_entries);
         Ok(())
     }
-    pub fn open(&self) -> Operation<'_, super::direct::DirectAlignment> {
+    pub fn open(&self) -> Operation<'_, super::disk::DirectAlignment> {
         Box::pin(async move {
             let alignment = self.slabs.open().await?;
             if self.segments.snapshot()?.is_empty() {

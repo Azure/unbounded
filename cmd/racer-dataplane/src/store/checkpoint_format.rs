@@ -16,8 +16,7 @@ use super::{
         Generation, IndexSnapshot, IndexedPage, RecordLocation, SegmentId, SegmentSnapshot,
         SegmentState, Segments,
     },
-    direct::{DirectAlignment, DirectExtent},
-    slab::{SlabId, SlabLocation},
+    disk::{DirectAlignment, DirectExtent, SlabId, SlabLocation},
 };
 use crate::runtime::collections::{HashMap, HashSet};
 use crate::{
