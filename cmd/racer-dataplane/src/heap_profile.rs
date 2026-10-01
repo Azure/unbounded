@@ -363,23 +363,23 @@ mod enabled {
                 ("GET /debug/pprof/heap HTTP/1.0\r\n\r\n", 400),
                 ("GET /debug/pprof/heap HTTP/1.0\r\nHost: x\r\n\r\n", 400),
                 (
-                    "GET /debug/pprof/heap HTTP/1.0\r\nContent-Length: 1\r\n\r\nx",
+                    "GET /debug/pprof/heap HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\n\r\nx",
                     400,
                 ),
                 (
-                    "GET /debug/pprof/heap HTTP/1.0\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+                    "GET /debug/pprof/heap HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
                     400,
                 ),
                 (
-                    "GET /debug/pprof/heap HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n",
+                    "GET /debug/pprof/heap HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n",
                     400,
                 ),
                 (
-                    "GET /debug/pprof/heap HTTP/1.0\r\nExpect: 100-continue\r\n\r\n",
+                    "GET /debug/pprof/heap HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\n\r\n",
                     400,
                 ),
                 (
-                    "GET /debug/pprof/heap HTTP/1.0\r\n\r\nuntrusted-secret",
+                    "GET /debug/pprof/heap HTTP/1.1\r\nHost: x\r\n\r\nuntrusted-secret",
                     400,
                 ),
                 ("GET /debug/pprof/heap HTTP/1.0\r\n", 400),
@@ -404,7 +404,7 @@ mod enabled {
 
         #[test]
         fn request_and_response_limits_and_dump_errors() {
-            let prefix = "GET /debug/pprof/heap HTTP/1.0\r\nX: ";
+            let prefix = "GET /debug/pprof/heap HTTP/1.1\r\nHost: x\r\nX: ";
             let request = format!("{prefix}{}", "x".repeat(MAX_REQUEST - prefix.len()));
             let response = exchange(request.as_bytes(), MAX_RESPONSE, || panic!("must not dump"));
             assert!(response.starts_with(b"HTTP/1.1 431 "));
