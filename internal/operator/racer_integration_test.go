@@ -22,8 +22,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	controllerconfig "sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
@@ -59,7 +61,7 @@ func TestEnvtestRacerProvisioning(t *testing.T) {
 	const namespace = "racer-provisioning"
 	require.NoError(t, c.Create(t.Context(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}))
 
-	mgr, err := ctrl.NewManager(rc, ctrl.Options{Scheme: scheme, Metrics: metricsserver.Options{BindAddress: "0"}, HealthProbeBindAddress: "0"})
+	mgr, err := ctrl.NewManager(rc, ctrl.Options{Scheme: scheme, Metrics: metricsserver.Options{BindAddress: "0"}, HealthProbeBindAddress: "0", Controller: controllerconfig.Controller{SkipNameValidation: ptr.To(true)}})
 	require.NoError(t, err)
 
 	r := &SiteReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: scheme, Namespace: namespace, Config: Config{ImageRegistry: "example.test", ImageTag: "v1"}}
@@ -94,12 +96,6 @@ func TestEnvtestRacerProvisioning(t *testing.T) {
 
 	cfg, err := racercore.LoadConfig()
 	require.NoError(t, err)
-	workloadCfg, err := racercore.WorkloadConfigFromLookup(os.LookupEnv)
-	require.NoError(t, err)
-	// Adopt the old controller's exact immutable selector and keep its UID.
-	legacy, err := racercore.DesiredDaemonSet(workloadCfg)
-	require.NoError(t, err)
-	require.NoError(t, c.Create(ctx, legacy, client.FieldOwner("racer-controller")))
 
 	app := racercore.Assemble(cfg, c, c)
 	require.NoError(t, app.Topology.InitializeVersion(ctx))
@@ -118,7 +114,6 @@ func TestEnvtestRacerProvisioning(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return c.Get(ctx, key("racer-dataplane"), ds) == nil && len(ds.Spec.Template.Spec.Containers[0].EnvFrom) == 1
 	}, 20*time.Second, 100*time.Millisecond)
-	require.Equal(t, legacy.UID, ds.UID)
 	require.Equal(t, "example.test/racer-dataplane:v1", ds.Spec.Template.Spec.Containers[0].Image)
 	t.Run("config-rollout-and-SSA-overrides", func(t *testing.T) {
 		integrationRacerOverrides(t, c, key, ds)

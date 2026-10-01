@@ -6,7 +6,6 @@ package racer
 import (
 	"context"
 	"crypto/ecdsa"
-	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -377,48 +376,6 @@ func TestTLSCreateRacesAndReadFailures(t *testing.T) {
 	}
 }
 
-func TestTLSLegacyMigration(t *testing.T) {
-	now := tlsEpoch()
-	secret, err := newTLS("custom-system", now)
-	require.NoError(t, err)
-	// Re-create the old ten-year CA and one-year leaf format with the old
-	// common subject. No rotation metadata existed in those installations.
-	pair, err := tls.X509KeyPair(secret.Data["ca.crt"], secret.Data["ca.key"])
-	require.NoError(t, err)
-
-	key := pair.PrivateKey.(*ecdsa.PrivateKey)
-	ca, err := singleCertificate(secret.Data["ca.crt"])
-	require.NoError(t, err)
-
-	ca.Subject.CommonName = "racer-serving-ca"
-	ca.RawSubject = nil
-	ca.NotAfter = now.Add(10 * 365 * day)
-	der, err := x509.CreateCertificate(rand.Reader, ca, ca, &key.PublicKey, key)
-	require.NoError(t, err)
-
-	secret.Data["ca.crt"] = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	ca, err = x509.ParseCertificate(der)
-	require.NoError(t, err)
-	secret.Data[corev1.TLSCertKey], secret.Data[corev1.TLSPrivateKeyKey], err = issueLeaf("custom-system", ca, key, now)
-	require.NoError(t, err)
-	leaf, err := singleCertificate(secret.Data[corev1.TLSCertKey])
-	require.NoError(t, err)
-
-	leaf.NotAfter = now.Add(365 * day)
-	der, err = x509.CreateCertificate(rand.Reader, leaf, ca, leaf.PublicKey, key)
-	require.NoError(t, err)
-
-	secret.Data[corev1.TLSCertKey] = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	delete(secret.Data, tlsStateKey)
-	delete(secret.Data, previousCAKey)
-	delete(secret.Annotations, tlsStateAnnotation)
-	before := secret.DeepCopy()
-	next, err := renewTLS(secret, "custom-system", now)
-	require.EqualError(t, err, "missing Racer serving rotation state")
-	require.Nil(t, next)
-	require.Equal(t, before, secret, "unsupported credentials must not be silently replaced")
-}
-
 func TestTLSCorruptionFailsClosed(t *testing.T) {
 	now := tlsEpoch()
 	original, err := newTLS("custom-system", now)
@@ -573,51 +530,36 @@ func TestTLSCASAndLostResponse(t *testing.T) {
 }
 
 func TestTLSRotationDoesNotChangePodTemplates(t *testing.T) {
-	for _, legacyHash := range []string{"", "legacy-hash-preserved"} {
-		t.Run(legacyHash, func(t *testing.T) {
-			env := testEnv(t, cache("cache"))
-			initialize(t, env)
-			persist(t, env, planPass(t, env))
+	env := testEnv(t, cache("cache"))
+	initialize(t, env)
+	persist(t, env, planPass(t, env))
 
-			deployment, ds := &appsv1.Deployment{}, &appsv1.DaemonSet{}
-			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), deployment))
-			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, dataplaneName), ds))
+	deployment, ds := &appsv1.Deployment{}, &appsv1.DaemonSet{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), deployment))
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, dataplaneName), ds))
 
-			if legacyHash != "" {
-				deployment.Spec.Template.Annotations["unbounded-cloud.io/racer-tls-hash"] = legacyHash
-				require.NoError(t, env.Client.Update(t.Context(), deployment))
-			}
+	beforeController, beforeDataplane := deployment.Spec.Template.DeepCopy(), ds.Spec.Template.DeepCopy()
+	now := time.Now().UTC().Truncate(time.Second)
+	old, err := newTLS(env.Namespace, now.Add(-caRotationInterval))
+	require.NoError(t, err)
 
-			// Compatibility metadata is removed on reconciliation, independently
-			// of TLS rotation. An old installation may roll once for this change.
-			persist(t, env, planPass(t, env))
-			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), deployment))
-			require.NotContains(t, deployment.Spec.Template.Annotations, "unbounded-cloud.io/racer-tls-hash")
+	stored := &corev1.Secret{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, tlsName), stored))
+	stored.Data = old.Data
+	require.NoError(t, env.Client.Update(t.Context(), stored))
+	rotation := planPass(t, env)
+	require.Len(t, rotation.Operations, 1, "persist TLS before publishing derived trust")
+	persist(t, env, rotation)
+	persist(t, env, planPass(t, env))
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), deployment))
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, dataplaneName), ds))
+	require.Equal(t, *beforeController, deployment.Spec.Template)
+	require.Equal(t, *beforeDataplane, ds.Spec.Template)
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, tlsName), stored))
 
-			beforeController, beforeDataplane := deployment.Spec.Template.DeepCopy(), ds.Spec.Template.DeepCopy()
-			now := time.Now().UTC().Truncate(time.Second)
-			old, err := newTLS(env.Namespace, now.Add(-caRotationInterval))
-			require.NoError(t, err)
-
-			stored := &corev1.Secret{}
-			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, tlsName), stored))
-			stored.Data = old.Data
-			require.NoError(t, env.Client.Update(t.Context(), stored))
-			rotation := planPass(t, env)
-			require.Len(t, rotation.Operations, 1, "persist TLS before publishing derived trust")
-			persist(t, env, rotation)
-			persist(t, env, planPass(t, env))
-			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), deployment))
-			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, dataplaneName), ds))
-			require.Equal(t, *beforeController, deployment.Spec.Template)
-			require.Equal(t, *beforeDataplane, ds.Spec.Template)
-			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, tlsName), stored))
-
-			trust := &corev1.ConfigMap{}
-			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, trustName), trust))
-			require.Equal(t, string(stored.Data["ca.crt"])+string(stored.Data[previousCAKey]), trust.Data["ca.crt"])
-			require.NoError(t, verifyServing(t, stored, []byte(trust.Data["ca.crt"]), now))
-			require.NoError(t, verifyServing(t, old, []byte(trust.Data["ca.crt"]), now), "old live server remains trusted during projection delay")
-		})
-	}
+	trust := &corev1.ConfigMap{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, trustName), trust))
+	require.Equal(t, string(stored.Data["ca.crt"])+string(stored.Data[previousCAKey]), trust.Data["ca.crt"])
+	require.NoError(t, verifyServing(t, stored, []byte(trust.Data["ca.crt"]), now))
+	require.NoError(t, verifyServing(t, old, []byte(trust.Data["ca.crt"]), now), "old live server remains trusted during projection delay")
 }

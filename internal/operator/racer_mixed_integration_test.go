@@ -23,8 +23,10 @@ import (
 	"k8s.io/apimachinery/pkg/selection"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	controllerconfig "sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
@@ -381,7 +383,9 @@ overrides:
 	t.Log("checkpoint: reverse migration steady")
 	// Setup and real informer startup must accept both workload watches. A
 	// podnet metadata drift event must repair that workload without manual calls.
-	mgr, err := ctrl.NewManager(rc, ctrl.Options{Scheme: scheme, Metrics: metricsserver.Options{BindAddress: "0"}, HealthProbeBindAddress: "0"})
+	// Another test starts the same controller in a separate API server. The
+	// process-global name registry must not reject these isolated managers.
+	mgr, err := ctrl.NewManager(rc, ctrl.Options{Scheme: scheme, Metrics: metricsserver.Options{BindAddress: "0"}, HealthProbeBindAddress: "0", Controller: controllerconfig.Controller{SkipNameValidation: ptr.To(true)}})
 	require.NoError(t, err)
 
 	r := newReconciler()

@@ -272,8 +272,8 @@ func renewTLS(secret *corev1.Secret, namespace string, now time.Time) (*corev1.S
 	}
 
 	updated := secret.DeepCopy()
-	// This derived field was absent in earlier version-1 Secrets. Repair it
-	// only after validating the authoritative credentials and rotation state.
+	// Repair derived trust only after validating the authoritative credentials
+	// and rotation state.
 	changed := !bytes.Equal(secret.Data[caBundleKey], servingRoots(secret))
 	// Older generations are a suffix. If an intermediate has expired, no
 	// earlier root can verify through it, so retire that entire suffix.
