@@ -402,12 +402,10 @@ impl PeerServer {
                     }
                 }
                 Ok(membership) => {
-                    if admitted.is_none()
-                        && request.request().route.destination
-                            != self.network.as_ref().unwrap().local
-                    {
+                    if admitted.is_none() {
                         // A listener scope is shared by unrelated connections. Only
-                        // this materialized HTTP transit exchange may be canceled.
+                        // this HTTP exchange may be canceled, including its local
+                        // destination waiter, never independent shared-flight work.
                         let exchange =
                             RequestScope::new(request_scope.request, request_scope.deadline.0)?;
                         materialized_exchange(
@@ -724,7 +722,7 @@ where
         }
     }
 }
-/// Cancel abandoned transit without dropping downstream work before its CQE fences.
+/// Cancel an abandoned HTTP exchange without dropping work before its completion fences.
 async fn materialized_exchange<T>(
     io: &crate::http::io::HttpIo,
     connection: &crate::http::pool::ConnectionLease,
