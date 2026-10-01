@@ -1238,11 +1238,7 @@ pub(super) mod tests {
         };
         let total = 4 * PAGE_BYTES + 17;
         let range = ByteRange::From(PAGE_BYTES).resolve(total).unwrap();
-        for (capped, progressing, subscription) in [
-            (true, false, true),
-            (false, true, true),
-            (false, false, true),
-        ] {
+        for (capped, progressing) in [(true, false), (false, true), (false, false)] {
             let clock = crate::runtime::environment::SimulationClock::new(55);
             let environment = clock.environment(0);
             let _clock = environment.enter();
@@ -1311,7 +1307,7 @@ pub(super) mod tests {
                 )
                 .unwrap();
             stream
-                .configure_subscription(4, 4 * PAGE_BYTES, !subscription)
+                .configure_subscription(4, 4 * PAGE_BYTES, false)
                 .unwrap();
             let response = ReadResponse {
                 metadata,
@@ -1343,37 +1339,31 @@ pub(super) mod tests {
                 reader_headers.store(true, std::sync::atomic::Ordering::Release);
                 let head = String::from_utf8(head).unwrap();
                 assert!(
-                    head.starts_with(if subscription {
-                        "HTTP/1.1 200"
-                    } else {
-                        "HTTP/1.1 206"
-                    }),
-                    "subscription={subscription} progressing={progressing}: {head}"
+                    head.starts_with("HTTP/1.1 200"),
+                    "progressing={progressing}: {head}"
                 );
                 assert!(head.contains(&format!(
                     "Content-Length: {}\r\n",
-                    3 * PAGE_BYTES + 17 + if subscription { 5 * 21 } else { 0 }
+                    3 * PAGE_BYTES + 17 + 5 * 21
                 )));
                 let mut scratch = [0; 65536];
                 for number in 1..=4 {
                     let mut left = if number == 4 { 17 } else { PAGE_BYTES as usize };
-                    if subscription {
-                        let mut frame = [0; 21];
-                        client.read_exact(&mut frame).unwrap();
-                        assert_eq!(frame[0], 1);
-                        assert_eq!(
-                            u64::from_be_bytes(frame[1..9].try_into().unwrap()),
-                            number as u64
-                        );
-                        assert_eq!(
-                            u64::from_be_bytes(frame[9..17].try_into().unwrap()),
-                            number as u64 * PAGE_BYTES
-                        );
-                        assert_eq!(
-                            u32::from_be_bytes(frame[17..].try_into().unwrap()),
-                            left as u32
-                        );
-                    }
+                    let mut frame = [0; 21];
+                    client.read_exact(&mut frame).unwrap();
+                    assert_eq!(frame[0], 1);
+                    assert_eq!(
+                        u64::from_be_bytes(frame[1..9].try_into().unwrap()),
+                        number as u64
+                    );
+                    assert_eq!(
+                        u64::from_be_bytes(frame[9..17].try_into().unwrap()),
+                        number as u64 * PAGE_BYTES
+                    );
+                    assert_eq!(
+                        u32::from_be_bytes(frame[17..].try_into().unwrap()),
+                        left as u32
+                    );
                     while left != 0 {
                         let count = left.min(scratch.len());
                         client.read_exact(&mut scratch[..count]).unwrap();
@@ -1381,42 +1371,33 @@ pub(super) mod tests {
                         left -= count;
                     }
                 }
-                if subscription {
-                    let mut frame = [0; 21];
-                    client.read_exact(&mut frame).unwrap();
-                    assert_eq!(frame[0], 2);
-                    assert_eq!(u64::from_be_bytes(frame[1..9].try_into().unwrap()), 4);
-                    assert_eq!(
-                        u64::from_be_bytes(frame[9..17].try_into().unwrap()),
-                        3 * PAGE_BYTES + 17
-                    );
-                    assert_eq!(&frame[17..], &[0; 4]);
-                    // No final release is required before the terminal frame.
-                    assert_eq!(client.read(&mut frame).unwrap(), 0);
-                }
+                let mut frame = [0; 21];
+                client.read_exact(&mut frame).unwrap();
+                assert_eq!(frame[0], 2);
+                assert_eq!(u64::from_be_bytes(frame[1..9].try_into().unwrap()), 4);
+                assert_eq!(
+                    u64::from_be_bytes(frame[9..17].try_into().unwrap()),
+                    3 * PAGE_BYTES + 17
+                );
+                assert_eq!(&frame[17..], &[0; 4]);
+                // No final release is required before the terminal frame.
+                assert_eq!(client.read(&mut frame).unwrap(), 0);
             });
             let work = async {
                 let connection = ConnectionLease::from_accepted(server.into(), &admission)?;
                 let head = io.receive_head(connection, &scope).await?;
-                if subscription {
-                    let metrics = crate::telemetry::metrics::Metrics::default();
-                    let mut observation = metrics.request()?;
-                    responses
-                        .send_subscription(
-                            head.connection,
-                            response,
-                            &scope,
-                            &mut observation,
-                            Duration::from_secs(30),
-                        )
-                        .await
-                        .map(drop)
-                } else {
-                    responses
-                        .send(head.connection, response, &scope)
-                        .await
-                        .map(drop)
-                }
+                let metrics = crate::telemetry::metrics::Metrics::default();
+                let mut observation = metrics.request()?;
+                responses
+                    .send_subscription(
+                        head.connection,
+                        response,
+                        &scope,
+                        &mut observation,
+                        Duration::from_secs(30),
+                    )
+                    .await
+                    .map(drop)
             };
             let mut work = std::pin::pin!(work);
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
