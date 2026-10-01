@@ -44,11 +44,6 @@ fn body_cases(cases: &[&str]) {
             crate::test_support::cluster::config(false).limits,
         ));
         admission.set_observer(telemetry.failures.observer(WorkerId(2)));
-        let mut before_metrics = String::new();
-        telemetry
-            .metrics
-            .write_prometheus(&mut before_metrics)
-            .unwrap();
         let reactor = Rc::new(Reactor::new(admission.clone()));
         let io = Rc::new(HttpIo::with_admission(
             reactor.clone(),
@@ -100,6 +95,7 @@ fn body_cases(cases: &[&str]) {
         }
         let auth = Forwarding::new(signers[0].clone());
         let (signed, binding) = auth.sign_request(local).unwrap();
+        let mut timing = super::super::timing::PageTiming::new(&telemetry.metrics);
         let server_scope = RequestScope::new(scope.request, original).unwrap();
         let sent = Cell::new(0usize);
         let server = async {
@@ -212,7 +208,14 @@ fn body_cases(cases: &[&str]) {
             Ok::<_, Error>(())
         };
         let mut server: crate::error::Operation<'_, ()> = Box::pin(server);
-        let mut client = transfers.exchange(Endpoint::Peer(address.to_string()), signed, &scope);
+        let mut client = transfers.exchange_timed(
+            Endpoint::Peer(address.to_string()),
+            signed,
+            crate::topology::rails::TransportPlan::Http,
+            None,
+            Some(&mut timing),
+            &scope,
+        );
         let result = loop {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             if let Poll::Ready(result) = client.as_mut().poll(&mut cx) {
@@ -227,8 +230,13 @@ fn body_cases(cases: &[&str]) {
             assert!(Instant::now() < fixture_end, "bounded body fixture");
             std::thread::sleep(Duration::from_micros(100));
         };
+        drop(client);
         if matches!(case, "success" | "progress" | "reserved_progress") {
-            let response = auth.verify_response(result.unwrap(), &binding).unwrap();
+            let transfer::RelayResponse::Complete(response) = result.unwrap() else {
+                panic!()
+            };
+            let response = auth.verify_response(response, &binding).unwrap();
+            timing.success(&response);
             assert!(
                 matches!(response.response(), PeerResponse::Page { ciphertext, .. } if ciphertext.bytes().len() == 8208)
             );
@@ -241,7 +249,7 @@ fn body_cases(cases: &[&str]) {
                 "{case}"
             );
         }
-        drop(client);
+        drop(timing);
         drop(server);
         let mut text = String::new();
         telemetry.failures.write(&mut text).unwrap();
@@ -327,11 +335,19 @@ fn body_cases(cases: &[&str]) {
         ] {
             assert_eq!(admission.used(class), 0, "{case} {class:?}");
         }
-        let mut after_metrics = String::new();
-        telemetry
-            .metrics
-            .write_prometheus(&mut after_metrics)
-            .unwrap();
-        assert_eq!(before_metrics, after_metrics);
+        let success = matches!(case, "success" | "progress" | "reserved_progress");
+        for (count, sum) in super::super::timing::STAGES {
+            assert_eq!(telemetry.metrics.count(count), u64::from(success), "{case}");
+            if !success {
+                assert_eq!(telemetry.metrics.count(sum), 0, "{case}");
+            }
+        }
+        assert_eq!(
+            telemetry
+                .metrics
+                .count(crate::telemetry::metrics::Event::PeerPageCensored),
+            u64::from(!success),
+            "{case}"
+        );
     }
 }

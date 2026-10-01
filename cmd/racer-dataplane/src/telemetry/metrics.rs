@@ -5,7 +5,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-pub const EVENT_COUNT: usize = 50;
+pub const EVENT_COUNT: usize = 59;
 pub const GAUGE_COUNT: usize = 11;
 #[derive(Clone, Copy)]
 pub(crate) enum LookupTier {
@@ -107,6 +107,15 @@ pub enum Event {
     DiskIndexLookupHit,
     DiskIndexLookupMiss,
     DiskIndexLookupError,
+    PeerPageCheckoutCount,
+    PeerPageCheckoutNs,
+    PeerPageAuthCount,
+    PeerPageAuthNs,
+    PeerPageHeadCount,
+    PeerPageHeadNs,
+    PeerPageBodyCount,
+    PeerPageBodyNs,
+    PeerPageCensored,
 }
 pub const EVENTS: [Event; EVENT_COUNT] = [
     Event::Request,
@@ -159,6 +168,15 @@ pub const EVENTS: [Event; EVENT_COUNT] = [
     Event::DiskIndexLookupHit,
     Event::DiskIndexLookupMiss,
     Event::DiskIndexLookupError,
+    Event::PeerPageCheckoutCount,
+    Event::PeerPageCheckoutNs,
+    Event::PeerPageAuthCount,
+    Event::PeerPageAuthNs,
+    Event::PeerPageHeadCount,
+    Event::PeerPageHeadNs,
+    Event::PeerPageBodyCount,
+    Event::PeerPageBodyNs,
+    Event::PeerPageCensored,
 ];
 impl Event {
     pub fn name(self) -> &'static str {
@@ -213,6 +231,15 @@ impl Event {
             Self::DiskIndexLookupHit => "racer_disk_index_lookup_hits_total",
             Self::DiskIndexLookupMiss => "racer_disk_index_lookup_misses_total",
             Self::DiskIndexLookupError => "racer_disk_index_lookup_errors_total",
+            Self::PeerPageCheckoutCount => "racer_peer_page_checkout_nanoseconds_count",
+            Self::PeerPageCheckoutNs => "racer_peer_page_checkout_nanoseconds_sum",
+            Self::PeerPageAuthCount => "racer_peer_page_auth_nanoseconds_count",
+            Self::PeerPageAuthNs => "racer_peer_page_auth_nanoseconds_sum",
+            Self::PeerPageHeadCount => "racer_peer_page_head_nanoseconds_count",
+            Self::PeerPageHeadNs => "racer_peer_page_head_nanoseconds_sum",
+            Self::PeerPageBodyCount => "racer_peer_page_body_nanoseconds_count",
+            Self::PeerPageBodyNs => "racer_peer_page_body_nanoseconds_sum",
+            Self::PeerPageCensored => "racer_peer_page_censored_total",
         }
     }
 }
@@ -669,7 +696,7 @@ mod tests {
             EVENT_COUNT + GAUGE_COUNT
         );
         assert!(!output.contains('{'));
-        assert!(output.len() < 8192);
+        assert!(output.len() < 64 * 1024);
     }
 
     #[test]

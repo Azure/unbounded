@@ -791,6 +791,7 @@ impl WorkerApplication {
         });
         let requester = Rc::new(
             Requester::new(paths.clone(), rails, forwarding.clone(), transfers.clone())
+                .with_metrics(metrics.clone())
                 .with_network(network.clone())
                 .with_observer(admission.observer()),
         );

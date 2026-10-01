@@ -71,6 +71,7 @@ pub trait PeerTransport {
     ) -> Operation<'a, SignedResponse>;
 }
 pub struct Requester {
+    metrics: crate::telemetry::metrics::Metrics,
     observer: Observer,
     health: Rc<crate::topology::health::LinkHealth>,
     paths: Rc<Paths>,
@@ -87,6 +88,7 @@ impl Requester {
         transfers: Rc<Transfers>,
     ) -> Self {
         Self {
+            metrics: crate::telemetry::metrics::Metrics::default(),
             observer: Observer::default(),
             health: paths.link_health(),
             paths,
@@ -102,6 +104,10 @@ impl Requester {
     }
     pub(crate) fn with_observer(mut self, observer: Observer) -> Self {
         self.observer = observer;
+        self
+    }
+    pub(crate) fn with_metrics(mut self, metrics: crate::telemetry::metrics::Metrics) -> Self {
+        self.metrics = metrics;
         self
     }
 }
@@ -128,13 +134,22 @@ impl PeerClient for Requester {
             )?;
             let next = route.nodes.get(1).ok_or(Error::Unavailable)?;
             let (signed, binding) = self.forwarding.sign_request_to(request, next)?;
-            let response = self.exchange(signed, membership, &scope).await?;
+            let mut timing = super::timing::PageTiming::new(&self.metrics);
+            let response = match self
+                .exchange_timed(signed, membership, None, Some(&mut timing), &scope)
+                .await?
+            {
+                super::transfer::RelayResponse::Complete(response) => response,
+                _ => return Err(Error::Internal),
+            };
             scope.check()?;
-            self.observer.result(
+            let response = self.observer.result(
                 Stage::PeerVerify,
                 &scope,
                 self.forwarding.verify_response(response, &binding),
-            )
+            )?;
+            timing.success(&response);
+            Ok(response)
         })
     }
 }
@@ -171,6 +186,16 @@ impl Requester {
         request: SignedRequest,
         membership: MembershipLease,
         relay: Option<Rc<crate::runtime::admission::Reservation>>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, super::transfer::RelayResponse> {
+        self.exchange_timed(request, membership, relay, None, scope)
+    }
+    fn exchange_timed<'a>(
+        &'a self,
+        request: SignedRequest,
+        membership: MembershipLease,
+        relay: Option<Rc<crate::runtime::admission::Reservation>>,
+        timing: Option<&'a mut super::timing::PageTiming<'_>>,
         scope: &'a RequestScope,
     ) -> Operation<'a, super::transfer::RelayResponse> {
         Box::pin(async move {
@@ -218,7 +243,7 @@ impl Requester {
             let _probe = self.health.acquire(&next)?;
             let response = self
                 .transfers
-                .exchange_inner(endpoint, request, plan, relay, &scope)
+                .exchange_timed(endpoint, request, plan, relay, timing, &scope)
                 .await;
             // A signed application response (including miss, 401 or 403) proves
             // the immediate transport works. It is verified by the logical owner.

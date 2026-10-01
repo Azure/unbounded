@@ -7,6 +7,8 @@ mod destination_disconnect;
 mod hot_subscriptions;
 #[path = "opaque_tests.rs"]
 mod opaque;
+#[path = "timing_tests.rs"]
+mod timing;
 use crate::{
     control::wire::{BundleGeneration, KeyringBundle, SCHEMA_VERSION},
     memory::pool::BufferPool,

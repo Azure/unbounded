@@ -8,6 +8,7 @@ pub mod server;
 pub mod subscriptions;
 #[cfg(test)]
 mod tests;
+mod timing;
 pub mod transfer;
 pub mod wire;
 

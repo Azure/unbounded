@@ -254,6 +254,17 @@ impl Transfers {
         relay: Option<Rc<Reservation>>,
         scope: &'a RequestScope,
     ) -> Operation<'a, RelayResponse> {
+        self.exchange_timed(endpoint, request, plan, relay, None, scope)
+    }
+    pub(super) fn exchange_timed<'a>(
+        &'a self,
+        endpoint: crate::http::pool::Endpoint,
+        request: SignedRequest,
+        plan: TransportPlan,
+        relay: Option<Rc<Reservation>>,
+        mut timing: Option<&'a mut super::timing::PageTiming<'_>>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, RelayResponse> {
         Box::pin(async move {
             scope.check()?;
             let (admission, codec) = self.wire.as_ref().ok_or(Error::InvalidConfiguration)?;
@@ -284,6 +295,9 @@ impl Transfers {
                     .head,
             )?;
             let observer = admission.observer();
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.enable(&request.request, plan, relay.is_some());
+            }
             let mut connection = observer.result(
                 Stage::PeerCheckout,
                 scope,
@@ -291,10 +305,16 @@ impl Transfers {
                     .checkout_relay(&endpoint, relay.clone(), scope)
                     .await,
             )?;
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.end(0);
+            }
             connection.relay_reservation = relay.clone();
             // Connection and handshake get separate bounded idle allowances.
             // No header byte can renew the request/head allowance.
             scope.candidate_progress()?;
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.begin();
+            }
             let connection = {
                 let _permit = connection
                     .session
@@ -310,10 +330,16 @@ impl Transfers {
                     .await,
                 )?
             };
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.end(1);
+            }
             let native = self.accept_native(&request, plan, scope)?;
             scope.candidate_progress()?;
             if let Some((_, accept, _)) = &native {
                 super::native::attach(&mut head, accept)?;
+            }
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.begin();
             }
             let sent = observer.result(
                 Stage::PeerHead,
@@ -325,6 +351,9 @@ impl Transfers {
                 scope,
                 self.io.receive_head(sent.connection, scope).await,
             )?;
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.end(2);
+            }
             let control = super::native::detach(&mut received.value)?;
             let relay_context = if relay.is_some() {
                 let size = received.value.headers.iter().try_fold(0usize, |n, h| {
@@ -367,6 +396,9 @@ impl Transfers {
                 });
             }
             let mut connection = received.connection;
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.begin();
+            }
             let (body, staging_reservation) = if length == 0 {
                 (Vec::new(), None)
             } else {
@@ -456,6 +488,9 @@ impl Transfers {
                 (bytes, Some(reservation))
             };
             scope.check()?;
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.end(3);
+            }
             let response = observer.result(
                 Stage::PeerDecode,
                 scope,
