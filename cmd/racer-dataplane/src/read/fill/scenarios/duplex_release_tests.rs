@@ -120,7 +120,9 @@ fn run(mode: &str) {
     let mut prefix = Vec::new();
     let mut head_end = None;
     for _ in 0..8192 {
-        assert!(send.as_mut().poll(&mut cx).is_pending());
+        if let Poll::Ready(result) = send.as_mut().poll(&mut cx) {
+            panic!("response completed before prefix: {:?}", result.err());
+        }
         pump(&mut endpoint);
         let mut byte = [0];
         match client.read(&mut byte) {
