@@ -1301,7 +1301,7 @@ fn actual_uds_waiting_deadline_and_cache_shutdown_release_all_leases() {
 }
 
 #[test]
-fn actual_uds_empty_bootstrap_and_cancelled_success() {
+fn actual_uds_empty_bootstrap_and_canceled_success() {
     struct Empty(bool);
     impl ReadService for Empty {
         fn read<'a>(
@@ -1331,23 +1331,23 @@ fn actual_uds_empty_bootstrap_and_cancelled_success() {
     }
     let mut fixture = Fixture::new();
     fixture.reconcile(&[definition()]).unwrap();
-    for cancelled in [false, true] {
-        fixture.listeners.reads = Rc::new(Empty(cancelled));
+    for canceled in [false, true] {
+        fixture.listeners.reads = Rc::new(Empty(canceled));
         let mut socket = fixture.connect();
         socket
             .write_all(&request("POST", "Connection: close\r\n"))
             .unwrap();
         let output = fixture.receive(&mut socket, true);
         let text = std::str::from_utf8(&output).unwrap().to_ascii_lowercase();
-        let status = if cancelled { 503 } else { 200 };
+        let status = if canceled { 503 } else { 200 };
         assert!(text.starts_with(&format!("http/1.1 {status}")), "{text}");
-        assert!(text.contains(if cancelled {
+        assert!(text.contains(if canceled {
             "content-length: 0\r\n"
         } else {
             "content-length: 21\r\n"
         }));
         assert!(!text.contains("content-range:"));
-        if cancelled {
+        if canceled {
             assert!(text.ends_with("\r\n\r\n"));
         } else {
             assert_eq!(
@@ -1357,12 +1357,12 @@ fn actual_uds_empty_bootstrap_and_cancelled_success() {
                 ]
             );
         }
-        if !cancelled {
+        if !canceled {
             assert!(text.contains("etag: \"\"\r\n"));
             assert!(text.contains("racer-expires-at: 0\r\n"));
             assert!(text.contains("content-type: application/octet-stream\r\n"));
         }
-        fixture.assert_metrics(if cancelled { 2 } else { 1 }, u64::from(cancelled), 0);
+        fixture.assert_metrics(if canceled { 2 } else { 1 }, u64::from(canceled), 0);
     }
 }
 

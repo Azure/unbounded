@@ -568,7 +568,7 @@ impl Drop for DemandLease {
                     },
                 );
             }
-            // A cancelled waiter must not strand the next ticket. Wake outside
+            // A canceled waiter must not strand the next ticket. Wake outside
             // the lock; accepted work still owns its separate completion guard.
             let wake = state
                 .demands
@@ -720,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_gate_waiter_wakes_successor_without_releasing_live_fences() {
+    fn canceled_gate_waiter_wakes_successor_without_releasing_live_fences() {
         use std::{
             sync::atomic::{AtomicUsize, Ordering},
             task::Poll,
@@ -740,19 +740,19 @@ mod tests {
         let mut ordered = scheduler
             .register(version(), range, 4, 4 * PAGE_BYTES, true)
             .unwrap();
-        let mut cancelled = scheduler
+        let mut canceled = scheduler
             .register(version(), range, 1, PAGE_BYTES, false)
             .unwrap();
         let Poll::Ready(Ok(Some((_, first)))) = ordered.poll_ordered(&mut cx) else {
             panic!()
         };
-        assert!(cancelled.poll_next(&mut cx).is_pending());
+        assert!(canceled.poll_next(&mut cx).is_pending());
         assert!(ordered.poll_ordered(&mut cx).is_pending());
         let before = wakes.0.load(Ordering::Relaxed);
-        drop(cancelled);
+        drop(canceled);
         assert!(wakes.0.load(Ordering::Relaxed) > before);
         let Poll::Ready(Ok(Some((_, second)))) = ordered.poll_ordered(&mut cx) else {
-            panic!("cancelled selection no longer blocks refill")
+            panic!("canceled selection no longer blocks refill")
         };
         let mut successor = scheduler
             .register(version(), range, 1, PAGE_BYTES, false)

@@ -993,22 +993,26 @@ async fn execute(
     }
 }
 
-pub struct Dispatcher {
-    directory: Arc<WorkerDirectory>,
-}
-impl Dispatcher {
-    pub fn new(directory: Arc<WorkerDirectory>) -> Self {
-        Self { directory }
-    }
-}
-impl LocalPageService for Dispatcher {
+impl LocalPageService for WorkerDirectory {
     fn serve_peer<'a>(
         &'a self,
         request: VerifiedRequest,
         membership: MembershipLease,
         scope: &'a RequestScope,
     ) -> Operation<'a, PeerResponse> {
-        self.directory.peer(request, membership, scope)
+        self.peer(request, membership, scope)
+    }
+}
+
+// PeerServer owns local services through Rc; retain the node-wide directory Arc.
+impl LocalPageService for Arc<WorkerDirectory> {
+    fn serve_peer<'a>(
+        &'a self,
+        request: VerifiedRequest,
+        membership: MembershipLease,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, PeerResponse> {
+        self.as_ref().serve_peer(request, membership, scope)
     }
 }
 

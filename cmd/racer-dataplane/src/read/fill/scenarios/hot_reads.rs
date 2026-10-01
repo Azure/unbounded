@@ -415,7 +415,7 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
             }
             assert!(
                 unordered.poll_next(&mut cx).is_pending(),
-                "cancelled waiter is not actual origin completion"
+                "canceled waiter is not actual origin completion"
             );
             f.origin.blocked_pages.borrow_mut().clear();
             for _ in 0..1024 {

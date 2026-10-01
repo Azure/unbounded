@@ -1007,7 +1007,7 @@ fn real_uds_bounds_raw_heads_even_with_a_larger_shared_codec() {
 }
 
 #[test]
-fn real_uds_cancelled_and_expired_reads_release_owned_resources() {
+fn real_uds_canceled_and_expired_reads_release_owned_resources() {
     for cancel in [false, true] {
         let (_path, listener, endpoint) = listen();
         let scope = RequestScope::new(

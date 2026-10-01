@@ -1481,7 +1481,7 @@ fn copy_only_miss_releases_shared_scope_subscriptions_across_cohorts() {
 }
 
 #[test]
-fn cancelled_before_lookup_has_no_outcome() {
+fn canceled_before_lookup_has_no_outcome() {
     let queue = Rc::new(crate::read::drivers::DriverQueue::default());
     let _owner = queue.enter();
     let f = fixture();

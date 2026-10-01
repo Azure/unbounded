@@ -33,7 +33,7 @@ use crate::{
     read::{
         Coordinator,
         candidates::CandidatePolicy,
-        dispatch::{Dispatcher, WorkerDirectory, WorkerEndpoint},
+        dispatch::{WorkerDirectory, WorkerEndpoint},
         fill::{Fill, FillDependencies},
         flight::Flights,
         metadata::{MetadataDependencies, MetadataService},
@@ -824,7 +824,7 @@ impl WorkerApplication {
             admission.clone(),
             network.clone(),
         ));
-        let dispatcher = Rc::new(Dispatcher::new(node.workers.clone()));
+        let dispatcher = Rc::new(node.workers.clone());
         #[cfg(not(test))]
         let distributed = true;
         #[cfg(test)]
