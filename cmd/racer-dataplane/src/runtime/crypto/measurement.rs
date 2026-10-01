@@ -538,14 +538,17 @@ fn measurements_account_once_at_reap_even_for_cancel_and_abandon() {
             "aead",
             "malformed",
             "abandon_crc",
+            "abandon_aead",
         ] {
-            if !decrypt && matches!(mode, "aead" | "malformed" | "abandon_crc") {
+            if !decrypt && matches!(mode, "aead" | "malformed" | "abandon_crc" | "abandon_aead") {
                 continue;
             }
             let (io, mut engine) = pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
             let client = CryptoClient::new(io);
             let metrics = Metrics::default();
             client.set_metrics(metrics.clone());
+            let failures = crate::telemetry::failures::Failures::default();
+            client.set_failure_observer(failures.observer(WorkerId(0)));
             let scope = RequestScope::new(
                 crate::model::RequestId([0; 16]),
                 environment::now() + Duration::from_secs(10),
@@ -581,10 +584,10 @@ fn measurements_account_once_at_reap_even_for_cancel_and_abandon() {
                     panic!("encrypted")
                 };
                 drop(plain);
-                if matches!(mode, "failure" | "aead" | "abandon_crc") {
+                if matches!(mode, "failure" | "aead" | "abandon_crc" | "abandon_aead") {
                     let inner = Arc::get_mut(&mut ciphertext.inner).unwrap();
                     inner.bytes[0] ^= 1;
-                    if mode == "aead" {
+                    if matches!(mode, "aead" | "abandon_aead") {
                         // Peer bytes without a persisted CRC must still fail AEAD.
                         inner.checksum = std::sync::OnceLock::new();
                     }
@@ -631,7 +634,7 @@ fn measurements_account_once_at_reap_even_for_cancel_and_abandon() {
             assert_eq!(metrics.count(events[0]), 0);
             assert_eq!(metrics.count(CryptoDecryptCrcRejected), 0);
             assert_eq!(metrics.count(CryptoDecryptAeadRejected), 0);
-            if matches!(mode, "abandon" | "abandon_crc") {
+            if matches!(mode, "abandon" | "abandon_crc" | "abandon_aead") {
                 drop(future);
             } else {
                 client.poll_budgeted(1).unwrap();
@@ -673,9 +676,21 @@ fn measurements_account_once_at_reap_even_for_cancel_and_abandon() {
             );
             assert_eq!(
                 metrics.count(CryptoDecryptAeadRejected),
-                u64::from(mode == "aead"),
+                u64::from(matches!(mode, "aead" | "abandon_aead")),
                 "{mode}"
             );
+            let mut records = String::new();
+            failures.write_aead(&mut records).unwrap();
+            let rejected = matches!(mode, "aead" | "abandon_aead");
+            assert_eq!(records.lines().count(), 1 + usize::from(rejected), "{mode}");
+            assert!(records.starts_with(if rejected {
+                "total=1 retained=1"
+            } else {
+                "total=0 retained=0"
+            }));
+            if rejected {
+                assert!(!records.contains("crc=none"));
+            }
         }
     }
 }

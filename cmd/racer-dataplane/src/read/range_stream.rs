@@ -697,6 +697,7 @@ mod tests {
                 }),
             },
             ciphertext: CiphertextPage {
+                provenance: None,
                 inner: Arc::new(CiphertextBytes {
                     checksum: Default::default(),
                     envelope: PageEnvelope {

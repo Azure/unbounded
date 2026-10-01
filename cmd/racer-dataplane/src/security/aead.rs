@@ -315,6 +315,12 @@ impl PageCryptoEngine {
                     )
                     .map_err(|_| {
                         permit.rejected(IntegrityRejection::Aead);
+                        permit.aead_failure =
+                            Some(crate::telemetry::failures::AeadFailure::capture(
+                                ciphertext,
+                                &aad,
+                                scope.request,
+                            ));
                         Error::CorruptRecord
                     })?;
                 (envelope.clone(), bytes)
@@ -351,6 +357,7 @@ impl PageCryptoEngine {
                     }),
                 };
                 let encrypted = CiphertextPage {
+                    provenance: None,
                     inner: Arc::new(CiphertextBytes {
                         checksum: std::sync::OnceLock::from(super::crc64::checksum(&bytes)),
                         envelope,
@@ -1174,6 +1181,7 @@ mod tests {
                 panic!("reserve");
             };
             let cipher = CiphertextPage {
+                provenance: None,
                 inner: Arc::new(CiphertextBytes {
                     checksum: std::sync::OnceLock::new(),
                     envelope: descriptor.clone(),

@@ -356,7 +356,7 @@ impl Forwarding {
     /// ```
     pub fn verify_response(
         &self,
-        response: SignedResponse,
+        mut response: SignedResponse,
         request: &RequestBinding,
     ) -> Result<VerifiedResponse> {
         let path = protocol::decode_nodes(
@@ -373,6 +373,46 @@ impl Forwarding {
         )?;
         let (origin, forwarders) =
             self.verify_response_head(&response.authentication, &expected, request)?;
+        // Diagnostic context belongs to this received lease, never its shared bytes.
+        // Extraction cannot change the verified response's delivery behavior.
+        let provenance = (|| {
+            let id = |name| -> Result<[u8; 16]> {
+                protocol::decode_binary(field(&request.original.head, name)?.as_bytes())?
+                    .try_into()
+                    .map_err(|_| Error::InvalidRequest)
+            };
+            Ok::<_, Error>(crate::telemetry::failures::PeerProvenance {
+                request: crate::model::RequestId(id("racer-request")?),
+                attempt: crate::model::AttemptId(id("racer-attempt")?),
+                supplier: origin
+                    .node()
+                    .0
+                    .as_bytes()
+                    .try_into()
+                    .map_err(|_| Error::InvalidRequest)?,
+                remote: forwarders
+                    .last()
+                    .unwrap_or(&origin)
+                    .node()
+                    .0
+                    .as_bytes()
+                    .try_into()
+                    .map_err(|_| Error::InvalidRequest)?,
+            })
+        })()
+        .ok();
+        match &mut response.response {
+            PeerResponse::Page { ciphertext, .. } | PeerResponse::Selected { ciphertext, .. } => {
+                ciphertext.provenance = provenance;
+            }
+            PeerResponse::Bootstrap {
+                page_zero: Some(ciphertext),
+                ..
+            } => {
+                ciphertext.provenance = provenance;
+            }
+            _ => {}
+        }
         Ok(VerifiedResponse {
             signed: response,
             binding: request.clone(),
@@ -1369,6 +1409,7 @@ mod tests {
             expires_at: ExpiresAt(std::time::SystemTime::now()),
         };
         let ciphertext = CiphertextPage {
+            provenance: None,
             inner: Arc::new(CiphertextBytes {
                 checksum: std::sync::OnceLock::new(),
                 envelope: PageEnvelope {
@@ -1403,6 +1444,7 @@ mod tests {
                 _ => m.expires_at.0 += Duration::from_millis(1),
             }
             let body = CiphertextPage {
+                provenance: None,
                 inner: Arc::new(CiphertextBytes {
                     checksum: std::sync::OnceLock::new(),
                     envelope,
@@ -1425,7 +1467,57 @@ mod tests {
                 "accepted page field {change}"
             );
         }
-        a.verify_response(response, &binding).unwrap();
+        let verified = a.verify_response(response, &binding).unwrap();
+        let PeerResponse::Page {
+            ciphertext: direct, ..
+        } = verified.response()
+        else {
+            panic!("page");
+        };
+        let provenance = direct.provenance.unwrap();
+        assert_eq!(&provenance.supplier, node(2).0.as_bytes());
+        assert_eq!(provenance.remote, provenance.supplier);
+        assert_eq!(provenance.request, admitted.request().origin.request);
+        assert_eq!(provenance.attempt, admitted.request().origin.attempt);
+        assert!(
+            ciphertext.provenance.is_none(),
+            "shared bytes must not share acquisition identity"
+        );
+
+        let relay = Forwarding::new(signatures[1].clone());
+        let mut local = self::request(4);
+        local.operation = Operation::Page {
+            page: ciphertext.envelope().page.clone(),
+            mode: FetchMode::Acquire,
+        };
+        let (signed, binding) = a.sign_request_to(local, &node(1)).unwrap();
+        let inbound = relay.verify_request(signed).unwrap();
+        let reverse = inbound.binding().clone();
+        let mut budget = inbound.request().route.clone();
+        budget.visited.push(node(1));
+        budget.remaining_links -= 1;
+        let forwarded = relay.append_request(inbound, &node(2), budget).unwrap();
+        let inbound = b.verify_request(forwarded).unwrap();
+        let reply = b
+            .sign_response(
+                inbound.binding(),
+                PeerResponse::Page {
+                    metadata,
+                    ciphertext,
+                },
+            )
+            .unwrap();
+        let reply = relay.verify_response(reply, &reverse).unwrap();
+        let reply = relay.append_response(reply, &node(0)).unwrap();
+        let reply = a.verify_response(reply, &binding).unwrap();
+        let PeerResponse::Page { ciphertext, .. } = reply.response() else {
+            panic!("page");
+        };
+        let provenance = ciphertext.provenance.unwrap();
+        assert_eq!(&provenance.supplier, node(2).0.as_bytes());
+        assert_eq!(&provenance.remote, node(1).0.as_bytes());
+        assert_eq!(provenance.request, inbound.request().origin.request);
+        assert_eq!(provenance.attempt, inbound.request().origin.attempt);
     }
     #[test]
     fn validly_signed_page_must_match_the_requested_version_and_page() {
@@ -1462,6 +1554,7 @@ mod tests {
                 expires_at: ExpiresAt(std::time::SystemTime::now()),
             };
             let ciphertext = CiphertextPage {
+                provenance: None,
                 inner: Arc::new(CiphertextBytes {
                     checksum: std::sync::OnceLock::new(),
                     envelope: PageEnvelope {
@@ -1770,6 +1863,7 @@ mod tests {
         // A charged wire ciphertext is unverified page data; signing does not
         // authenticate its body. Only the signed descriptor is consumed here.
         let ciphertext = CiphertextPage {
+            provenance: None,
             inner: Arc::new(CiphertextBytes {
                 checksum: std::sync::OnceLock::new(),
                 envelope: envelope.clone(),
@@ -1803,6 +1897,7 @@ mod tests {
             }
             let reservation = request(3).origin.reservation;
             let bad = CiphertextPage {
+                provenance: None,
                 inner: Arc::new(CiphertextBytes {
                     checksum: std::sync::OnceLock::new(),
                     envelope: e,

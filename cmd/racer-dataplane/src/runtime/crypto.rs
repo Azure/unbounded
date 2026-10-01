@@ -119,6 +119,7 @@ pub struct CryptoPermit {
     handoff: Arc<Handoff>,
     id: CryptoId,
     measurement: Measurement,
+    pub(crate) aead_failure: Option<crate::telemetry::failures::AeadFailure>,
 }
 
 #[derive(Default)]
@@ -386,6 +387,7 @@ impl IoCryptoPort {
         }
         self.last_sequence.set(Some(id.sequence));
         Poll::Ready(Ok(CryptoPermit {
+            aead_failure: None,
             handoff: self.handoff.clone(),
             id,
             measurement: Measurement {
@@ -497,6 +499,7 @@ impl Drop for CryptoPort {
 /// delivery; the engine/queue retains resources until I/O reaps the completion.
 /// I/O checks generation/sequence before delivery and never publishes stale work.
 pub struct CryptoClient {
+    observer: RefCell<crate::telemetry::failures::Observer>,
     port: IoCryptoPort,
     metrics: RefCell<Option<crate::telemetry::metrics::Metrics>>,
     waiters: RefCell<BTreeMap<CryptoId, Waiter>>,
@@ -547,6 +550,7 @@ impl Drop for Registration<'_> {
 impl CryptoClient {
     pub fn new(port: IoCryptoPort) -> Self {
         Self {
+            observer: RefCell::new(crate::telemetry::failures::Observer::default()),
             port,
             metrics: RefCell::new(None),
             waiters: RefCell::new(BTreeMap::new()),
@@ -561,6 +565,9 @@ impl CryptoClient {
     /// Install the I/O writer before admitting work; crypto never writes this shard.
     pub(crate) fn set_metrics(&self, metrics: crate::telemetry::metrics::Metrics) {
         *self.metrics.borrow_mut() = Some(metrics);
+    }
+    pub(crate) fn set_failure_observer(&self, observer: crate::telemetry::failures::Observer) {
+        *self.observer.borrow_mut() = observer;
     }
 
     /// Allocate a unique ID in this pair's generation, reserve both queue slots,
@@ -682,6 +689,9 @@ impl CryptoClient {
                 }
             }
             let id = completion.id();
+            if let Some(failure) = completion.permit.aead_failure {
+                self.observer.borrow().record_aead(id, failure);
+            }
             let wake = {
                 let mut waiters = self.waiters.borrow_mut();
                 if let Some(waiter) = waiters.get_mut(&id) {

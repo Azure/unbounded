@@ -248,6 +248,15 @@ fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failure
             .verify_response(decoded, &second_binding)
             .unwrap();
         assert!(matches!(verified.response(), PeerResponse::Selected { .. }));
+        let PeerResponse::Selected { ciphertext, .. } = verified.response() else {
+            unreachable!()
+        };
+        let provenance = ciphertext.provenance.unwrap();
+        assert_eq!(&provenance.supplier, signers[2].node().0.as_bytes());
+        assert_eq!(provenance.remote, provenance.supplier);
+        let retained = ciphertext.clone();
+        drop(verified);
+        assert_eq!(retained.provenance, Some(provenance));
     }
 }
 

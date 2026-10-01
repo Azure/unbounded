@@ -132,6 +132,7 @@ fn page_result(admission: &Admission, page: &PageId) -> crate::memory::page::Pag
             }),
         },
         ciphertext: CiphertextPage {
+            provenance: None,
             inner: Arc::new(CiphertextBytes {
                 checksum: std::sync::OnceLock::new(),
                 envelope: PageEnvelope {

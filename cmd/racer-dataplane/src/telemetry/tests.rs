@@ -412,6 +412,43 @@ fn failure_endpoint_exports_full_ring_with_maximum_numeric_fields() {
 }
 
 #[test]
+fn aead_endpoint_exports_full_ring_with_maximum_fields() {
+    use crate::{
+        model::WorkerId,
+        runtime::crypto::CryptoId,
+        telemetry::failures::{AEAD_CAPACITY, test_aead_failure},
+    };
+    let telemetry = Telemetry::default();
+    let observer = telemetry.failures.observer(WorkerId(u16::MAX));
+    for _ in 0..AEAD_CAPACITY + 1 {
+        observer.record_aead(
+            CryptoId {
+                worker: WorkerId(u16::MAX),
+                generation: u64::MAX,
+                sequence: u64::MAX,
+            },
+            test_aead_failure(),
+        );
+    }
+    let mut bytes = vec![0; MAX_RESPONSE_BYTES];
+    let length = respond(
+        &telemetry,
+        parse(
+            b"GET /debug/aead HTTP/1.1\r\nHost: local\r\nAuthorization: synthetic-secret\r\n\r\n",
+        ),
+        true,
+        &mut bytes,
+    )
+    .unwrap();
+    assert_response(&bytes[..length], "200 OK", None);
+    let text = std::str::from_utf8(&bytes[..length]).unwrap();
+    assert!(length < MAX_RESPONSE_BYTES);
+    assert_eq!(text.matches(" supplier=").count(), AEAD_CAPACITY);
+    assert!(text.contains("total=65 retained=64 overwritten=1 capacity=64"));
+    assert!(!text.contains("synthetic"));
+}
+
+#[test]
 fn raw_endpoints_fragmentation_readiness_redaction_and_data_admission_stop() {
     let (admission, reactor, io) = setup();
     let telemetry = Telemetry::default();

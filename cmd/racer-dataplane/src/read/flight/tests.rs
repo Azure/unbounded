@@ -176,6 +176,7 @@ fn result(flights: &Flights, page: PageId) -> PageResult {
             }),
         },
         ciphertext: CiphertextPage {
+            provenance: None,
             inner: Arc::new(CiphertextBytes {
                 checksum: std::sync::OnceLock::new(),
                 envelope: PageEnvelope {

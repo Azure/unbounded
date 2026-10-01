@@ -61,6 +61,7 @@ impl Drop for VerifiedBytes {
 #[derive(Clone)]
 pub struct CiphertextPage {
     pub(crate) inner: Arc<CiphertextBytes>,
+    pub(crate) provenance: Option<crate::telemetry::failures::PeerProvenance>,
 }
 pub(crate) struct CiphertextBytes {
     pub checksum: std::sync::OnceLock<u64>,
@@ -117,6 +118,7 @@ impl BufferPool {
         )?;
         reservation.shrink(bytes.capacity())?;
         Ok(CiphertextPage {
+            provenance: None,
             inner: Arc::new(CiphertextBytes {
                 checksum: std::sync::OnceLock::new(),
                 envelope,
@@ -199,6 +201,7 @@ impl CiphertextPage {
                 bytes,
                 reservation,
             }),
+            provenance: self.provenance,
         })
     }
     pub fn checksum(&self) -> u64 {
@@ -206,6 +209,10 @@ impl CiphertextPage {
             .inner
             .checksum
             .get_or_init(|| crate::security::crc64::checksum(self.bytes()))
+    }
+    /// Never initializes a checksum or scans bytes on the I/O thread.
+    pub(crate) fn cached_checksum(&self) -> Option<u64> {
+        self.inner.checksum.get().copied()
     }
     pub(crate) fn verify_checksum(&self) -> Result<()> {
         let actual = crate::security::crc64::checksum(self.bytes());
@@ -316,7 +323,14 @@ pub(crate) mod tests {
         for shared in [false, true] {
             let source = admission(8);
             let target = admission(8);
-            let page = bundle(&source, "rehome");
+            let mut page = bundle(&source, "rehome");
+            let provenance = crate::telemetry::failures::PeerProvenance {
+                request: crate::model::RequestId([3; 16]),
+                attempt: crate::model::AttemptId([4; 16]),
+                supplier: [b'a'; 36],
+                remote: [b'b'; 36],
+            };
+            page.ciphertext.provenance = Some(provenance);
             let checksum = page.ciphertext.checksum();
             let pointer = page.ciphertext.bytes().as_ptr();
             let retained = shared.then(|| page.ciphertext.clone());
@@ -330,6 +344,10 @@ pub(crate) mod tests {
             let moved = page.ciphertext.rehome(reservation).unwrap();
             assert_eq!(moved.bytes().as_ptr() == pointer, !shared);
             assert_eq!(moved.checksum(), checksum);
+            assert_eq!(moved.provenance, Some(provenance));
+            if let Some(retained) = &retained {
+                assert_eq!(retained.provenance, Some(provenance));
+            }
             assert!(target.owns(&moved.inner.reservation));
             assert_eq!(
                 source.used(ResourceClass::Ciphertext),
@@ -377,6 +395,63 @@ pub(crate) mod tests {
         assert!(page.validate_metadata().is_ok());
         assert_eq!(page.ciphertext.verify_checksum(), Err(Error::CorruptRecord));
         assert_eq!(*page.ciphertext.inner.checksum.get().unwrap(), checksum);
+    }
+    #[test]
+    fn aead_fingerprints_reuse_crc_and_separate_body_from_identity() {
+        use crate::{model::RequestId, telemetry::failures::AeadFailure};
+        let admission = admission(8);
+        let mut page = bundle(&admission, "sensitive-etag");
+        let request = RequestId([9; 16]);
+        let capture = |p: &CiphertextPage| {
+            // This fixture's cache is not a UUID, so encode a small stand-in AAD.
+            // Production passes the already validated canonical page_aad bytes.
+            let mut aad = p.envelope().nonce.0.to_vec();
+            aad.extend_from_slice(p.envelope().page.version.etag.as_bytes());
+            AeadFailure::capture(p, &aad, request)
+        };
+        assert_eq!(page.ciphertext.cached_checksum(), None);
+        assert_eq!(capture(&page.ciphertext).crc, None);
+        assert_eq!(
+            page.ciphertext.cached_checksum(),
+            None,
+            "capture must not hash payload"
+        );
+        page.ciphertext.verify_checksum().unwrap();
+        let first = capture(&page.ciphertext);
+        let repeat = capture(&page.ciphertext);
+        assert_eq!(first.page, repeat.page);
+        assert_eq!(first.aad, repeat.aad);
+        assert_eq!(first.crc, repeat.crc);
+        let inner = Arc::get_mut(&mut page.ciphertext.inner).unwrap();
+        inner.bytes[0] ^= 1;
+        inner.checksum = std::sync::OnceLock::new();
+        page.ciphertext.verify_checksum().unwrap();
+        let changed = capture(&page.ciphertext);
+        assert_ne!(first.crc, changed.crc);
+        assert_eq!(first.page, changed.page);
+        assert_eq!(first.aad, changed.aad);
+        Arc::get_mut(&mut page.ciphertext.inner)
+            .unwrap()
+            .envelope
+            .nonce
+            .0[0] ^= 1;
+        let changed_aad = capture(&page.ciphertext);
+        assert_eq!(changed.crc, changed_aad.crc);
+        assert_eq!(changed.page, changed_aad.page);
+        assert_ne!(changed.aad, changed_aad.aad);
+        let failures = crate::telemetry::failures::Failures::default();
+        failures.observer(crate::model::WorkerId(0)).record_aead(
+            crate::runtime::crypto::CryptoId {
+                worker: crate::model::WorkerId(0),
+                generation: 0,
+                sequence: 1,
+            },
+            first,
+        );
+        let mut text = String::new();
+        failures.write_aead(&mut text).unwrap();
+        assert!(!text.contains("sensitive-etag"));
+        assert!(!text.contains(&page.ciphertext.envelope().page.version.object.key.to_hex()));
     }
     #[test]
     fn plaintext_is_stable_zeroed_and_reservation_backed() {

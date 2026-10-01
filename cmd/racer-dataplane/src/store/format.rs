@@ -333,6 +333,7 @@ mod tests {
         };
         CiphertextCopy {
             ciphertext: CiphertextPage {
+                provenance: None,
                 inner: Arc::new(CiphertextBytes {
                     checksum: std::sync::OnceLock::new(),
                     envelope: PageEnvelope {

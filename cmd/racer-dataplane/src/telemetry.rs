@@ -318,6 +318,7 @@ enum Route {
     Ready,
     Metrics,
     Failures,
+    Aead,
     NotFound,
     Method,
     BadRequest,
@@ -361,6 +362,7 @@ fn parse(bytes: &[u8]) -> Route {
         Some("/readyz") => Route::Ready,
         Some("/metrics") => Route::Metrics,
         Some("/debug/failures") => Route::Failures,
+        Some("/debug/aead") => Route::Aead,
         _ => Route::NotFound,
     }
 }
@@ -403,6 +405,7 @@ fn respond(
         ),
         Route::Metrics => ("200 OK", "", Event::DiagnosticMetrics),
         Route::Failures => ("200 OK", "", Event::DiagnosticFailures),
+        Route::Aead => ("200 OK", "", Event::DiagnosticFailures),
         Route::Method => (
             "405 Method Not Allowed",
             "method not allowed\n",
@@ -440,6 +443,11 @@ fn respond(
             u8::from(telemetry.health.live())
         )
         .map_err(|_| Error::Internal)?;
+    } else if route == Route::Aead {
+        telemetry
+            .failures
+            .write_aead(&mut output)
+            .map_err(|_| Error::Internal)?;
     } else if route == Route::Failures {
         telemetry
             .failures
