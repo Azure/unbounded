@@ -11,7 +11,7 @@ use crate::{
     model::{NodeId, ResourceClass, TransferId},
     rdma::RdmaTransfer,
     rdma::{
-        permission::{AuthenticatedDescriptor, COMPLETION_HEADER, DESCRIPTOR_HEADER},
+        AuthenticatedDescriptor, COMPLETION_HEADER, DESCRIPTOR_HEADER,
         session::{SETUP_BINDING_HEADER, SETUP_HEADER, SetupParameters},
     },
     runtime::deadline::RequestScope,
@@ -1148,7 +1148,7 @@ impl Transfers {
         destination: &'a crate::model::NodeId,
         session: &'a crate::rdma::session::SessionLease,
         page: CiphertextPage,
-        descriptor: crate::rdma::permission::AuthenticatedDescriptor,
+        descriptor: crate::rdma::AuthenticatedDescriptor,
         scope: &'a RequestScope,
     ) -> Operation<'a, crate::rdma::SendCompletion> {
         Box::pin(async move {
@@ -1171,7 +1171,7 @@ impl Transfers {
         envelope: &'a crate::model::PageEnvelope,
         transfer: crate::model::TransferId,
         scope: &'a RequestScope,
-    ) -> Operation<'a, crate::rdma::permission::Grant> {
+    ) -> Operation<'a, crate::rdma::Grant> {
         Box::pin(async move {
             if session.peer() != source {
                 return Err(Error::Unauthorized);
@@ -1187,7 +1187,7 @@ impl Transfers {
     pub fn finish_receive<'a>(
         &'a self,
         session: &'a crate::rdma::session::SessionLease,
-        grant: crate::rdma::permission::Grant,
+        grant: crate::rdma::Grant,
         completion: &'a crate::security::signing::VerifiedHead,
         envelope: crate::model::PageEnvelope,
         scope: &'a RequestScope,

@@ -10,9 +10,8 @@ use crate::{
         RequestId, ResourceClass, StrongEtag, TransferId,
     },
     rdma::{
-        Devices, RdmaTransfer, RegisteredLease,
+        AuthenticatedDescriptor, DESCRIPTOR_HEADER, Devices, Grant, RdmaTransfer, RegisteredLease,
         lifecycle::{QueuePairHandle, Region},
-        permission::{AuthenticatedDescriptor, DESCRIPTOR_HEADER, Grant},
         session::{SETUP_BINDING_HEADER, SETUP_HEADER, SessionLease, Sessions},
     },
     runtime::{admission::Admission, environment},
