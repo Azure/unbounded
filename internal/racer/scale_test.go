@@ -283,10 +283,7 @@ func scaleFanout(t *testing.T, r *TopologyReconciler, ctx context.Context, count
 	defer cancel()
 
 	eventually(t, "100000 admitted waiters", func() bool {
-		server.admission.Lock()
-		defer server.admission.Unlock()
-
-		return len(server.polls) == count
+		return server.polls.count() == count
 	})
 
 	admit := time.Since(start)

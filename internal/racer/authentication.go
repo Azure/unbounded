@@ -371,24 +371,9 @@ func (b *Bootstrap) Authenticate(ctx context.Context, r *http.Request) (NodeIden
 		return NodeIdentity{}, wire.Unavailable
 	}
 
-	values := r.Header.Values("Authorization")
-	if len(values) != 1 {
-		return NodeIdentity{}, wire.Unauthenticated
-	}
-
-	scheme, token, ok := strings.Cut(values[0], " ")
-	if !ok || !strings.EqualFold(scheme, "Bearer") || token == "" || strings.ContainsAny(token, " \t\r\n,") || len(token) > b.Config.Limits.HeaderBytes {
-		return NodeIdentity{}, wire.Unauthenticated
-	}
-
-	review := &authv1.TokenReview{Spec: authv1.TokenReviewSpec{Token: token, Audiences: []string{wire.TokenAudience}}}
-	if err := b.Client.Create(ctx, review); err != nil {
-		return NodeIdentity{}, wire.Unavailable
-	}
-
-	status := review.Status
-	if !status.Authenticated || status.Error != "" || !slices.Contains(status.Audiences, wire.TokenAudience) {
-		return NodeIdentity{}, wire.Unauthenticated
+	status, token, err := reviewBearer(ctx, b.Client, r, wire.TokenAudience, b.Config.Limits.HeaderBytes)
+	if err != nil {
+		return NodeIdentity{}, err
 	}
 
 	if status.User.Username != "system:serviceaccount:"+b.Config.Namespace+":"+b.Config.DataplaneServiceAccount {
@@ -454,6 +439,32 @@ func singleExtra(user authv1.UserInfo, key string) string {
 	return values[0]
 }
 
+// reviewBearer shares only token parsing and API authentication. Callers retain
+// their distinct workload, service-account, binding, and expiration policies.
+func reviewBearer(ctx context.Context, c client.Client, r *http.Request, audience string, maxBytes int) (authv1.TokenReviewStatus, string, error) {
+	values := r.Header.Values("Authorization")
+	if len(values) != 1 {
+		return authv1.TokenReviewStatus{}, "", wire.Unauthenticated
+	}
+
+	scheme, token, ok := strings.Cut(values[0], " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") || token == "" || strings.ContainsAny(token, " \t\r\n,") || maxBytes > 0 && len(token) > maxBytes {
+		return authv1.TokenReviewStatus{}, "", wire.Unauthenticated
+	}
+
+	review := &authv1.TokenReview{Spec: authv1.TokenReviewSpec{Token: token, Audiences: []string{audience}}}
+	if c == nil || c.Create(ctx, review) != nil {
+		return authv1.TokenReviewStatus{}, "", wire.Unavailable
+	}
+
+	status := review.Status
+	if !status.Authenticated || status.Error != "" || !slices.Contains(status.Audiences, audience) {
+		return authv1.TokenReviewStatus{}, "", wire.Unauthenticated
+	}
+
+	return status, token, nil
+}
+
 func tokenExpiration(token string) (time.Time, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
@@ -514,12 +525,7 @@ func (b *Bootstrap) Enroll(ctx context.Context, r *http.Request, request wire.Bo
 			return nil, wire.Forbidden
 		}
 
-		shares := request.Shares
-		if shares == 0 {
-			shares = wire.DefaultShares
-		}
-
-		value := strconv.FormatUint(uint64(shares), 10)
+		value := strconv.FormatUint(uint64(request.Shares), 10)
 		if node.Annotations[enrolledSharesAnnotation] != value {
 			before := node.DeepCopy()
 			if node.Annotations == nil {

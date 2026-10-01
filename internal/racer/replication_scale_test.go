@@ -554,9 +554,7 @@ func replicationSmokePark(t *testing.T, ctx context.Context, replicas []*replica
 		total := 0
 
 		for _, r := range replicas {
-			r.a.Server.admission.Lock()
-			total += len(r.a.Server.polls)
-			r.a.Server.admission.Unlock()
+			total += r.a.Server.polls.count()
 		}
 
 		if total == count {
@@ -578,9 +576,7 @@ func replicationSmokeStats(t *testing.T, phase string, replicas []*replicationSm
 	var polls, live, accepted []int64
 
 	for _, r := range replicas {
-		r.a.Server.admission.Lock()
-		polls = append(polls, int64(len(r.a.Server.polls)))
-		r.a.Server.admission.Unlock()
+		polls = append(polls, int64(r.a.Server.polls.count()))
 		live = append(live, r.listener.live.Load())
 		accepted = append(accepted, r.listener.accepted.Load())
 	}

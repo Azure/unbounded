@@ -595,9 +595,7 @@ func awaitServerPolls(t *testing.T, s *Server, count int) {
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		s.admission.Lock()
-		n := len(s.polls)
-		s.admission.Unlock()
+		n := s.polls.count()
 
 		if n == count {
 			return

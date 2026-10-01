@@ -131,9 +131,7 @@ func TestRustKeyringInterop(t *testing.T) {
 				continue
 			}
 
-			f.a.Server.admission.Lock()
-			parked := len(f.a.Server.keyringPolls) == 1
-			f.a.Server.admission.Unlock()
+			parked := f.a.Server.keyringPolls.count() == 1
 
 			if parked {
 				_, _, rotation, _ := keyState(t, f.a.Keyring)

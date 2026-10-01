@@ -294,9 +294,8 @@ func TestKeyringPollWakeAndTermination(t *testing.T) {
 					go func() { defer close(done); handler.ServeHTTP(w, r) }()
 
 					synctest.Wait()
-					f.a.Server.admission.Lock()
-					polls := len(f.a.Server.keyringPolls)
-					f.a.Server.admission.Unlock()
+
+					polls := f.a.Server.keyringPolls.count()
 
 					if polls != 1 || len(f.a.Server.writes) != 0 || len(f.a.Server.bootstrapSlots) != 0 {
 						t.Fatal("poll not parked independently of auth/write admission")
@@ -370,7 +369,7 @@ func TestKeyringPollWakeAndTermination(t *testing.T) {
 						}
 					}
 
-					if len(f.a.Server.keyringPolls) != 0 {
+					if f.a.Server.keyringPolls.count() != 0 {
 						t.Fatal("admission leaked")
 					}
 				})
@@ -434,7 +433,7 @@ func TestKeyringAdmissionHeldThroughResponse(t *testing.T) {
 					<-done
 					requireKeyringResponse(t, w.ResponseRecorder, status)
 
-					if len(f.a.Server.keyringPolls) != 0 || len(f.a.Server.writes) != 0 {
+					if f.a.Server.keyringPolls.count() != 0 || len(f.a.Server.writes) != 0 {
 						t.Fatal("admission leaked")
 					}
 				})
@@ -477,7 +476,7 @@ func TestKeyringBearerAdmissionAndDeadline(t *testing.T) {
 		<-done
 		requireKeyringResponse(t, w, 503)
 
-		if len(s.bootstrapSlots) != 0 || len(s.keyringPolls) != 0 {
+		if len(s.bootstrapSlots) != 0 || s.keyringPolls.count() != 0 {
 			t.Fatal("API timeout leaked admission")
 		}
 	})

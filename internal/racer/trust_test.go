@@ -429,9 +429,7 @@ func TestLocalTrustInvalidationDuringPoll(t *testing.T) {
 	deadline := time.After(5 * time.Second)
 
 	for {
-		f.a.Server.admission.Lock()
-		n := len(f.a.Server.polls)
-		f.a.Server.admission.Unlock()
+		n := f.a.Server.polls.count()
 
 		if n == 1 {
 			break

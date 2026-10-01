@@ -13,13 +13,11 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	authv1 "k8s.io/api/authentication/v1"
 	coordv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -45,7 +43,6 @@ type Replication struct {
 	CatalogGate  *CatalogGate
 	mu           sync.Mutex
 	leader       context.Context
-	polls        map[string]bool
 }
 
 type publisherLifetime struct{ replication *Replication }
@@ -297,24 +294,9 @@ func (r *Replication) poll(ctx, process context.Context) error {
 }
 
 func (r *Replication) authenticate(ctx context.Context, request *http.Request) (string, time.Time, error) {
-	values := request.Header.Values("Authorization")
-	if len(values) != 1 {
-		return "", time.Time{}, wire.Unauthenticated
-	}
-
-	scheme, token, ok := strings.Cut(values[0], " ")
-	if !ok || !strings.EqualFold(scheme, "Bearer") || token == "" || strings.ContainsAny(token, " \t\r\n,") {
-		return "", time.Time{}, wire.Unauthenticated
-	}
-
-	review := &authv1.TokenReview{Spec: authv1.TokenReviewSpec{Token: token, Audiences: []string{ReplicationAudience}}}
-	if err := r.Client.Create(ctx, review); err != nil {
-		return "", time.Time{}, wire.Unavailable
-	}
-
-	status := review.Status
-	if !status.Authenticated || status.Error != "" || !slices.Contains(status.Audiences, ReplicationAudience) {
-		return "", time.Time{}, wire.Unauthenticated
+	status, token, err := reviewBearer(ctx, r.Client, request, ReplicationAudience, 0)
+	if err != nil {
+		return "", time.Time{}, err
 	}
 
 	if status.User.Username != "system:serviceaccount:"+r.Config.Namespace+":"+r.Config.ControllerServiceAccount {
@@ -378,23 +360,17 @@ func (s *Server) serveReplication(w http.ResponseWriter, request *http.Request) 
 		return
 	}
 
-	r.mu.Lock()
-	if r.polls == nil {
-		r.polls = make(map[string]bool)
-	}
-
-	if r.polls[uid] || len(r.polls) >= s.Config.Limits.MaxConcurrentBootstrap {
-		r.mu.Unlock()
+	if !s.replicationPolls.acquire(uid) {
 		writeFailure(w, wire.Overloaded)
 
 		return
 	}
 
-	r.polls[uid] = true
+	defer s.replicationPolls.release(uid)
+
+	r.mu.Lock()
 	leader := r.leader
 	r.mu.Unlock()
-
-	defer func() { r.mu.Lock(); delete(r.polls, uid); r.mu.Unlock() }()
 
 	ctx, cancel := context.WithDeadline(request.Context(), minTime(expires, time.Now().Add(r.interval())))
 	defer cancel()

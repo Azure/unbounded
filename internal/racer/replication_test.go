@@ -251,9 +251,7 @@ func TestReplicationRouteAuthorizationAndEarlyListener(t *testing.T) {
 					t.Fatal("write admission released before flush")
 				}
 
-				r.mu.Lock()
-				held := r.polls[string(pod.UID)]
-				r.mu.Unlock()
+				held := f.a.Server.replicationPolls.count() == 1
 
 				if !held {
 					t.Fatal("poll admission released before flush")
@@ -281,9 +279,7 @@ func TestReplicationRouteAuthorizationAndEarlyListener(t *testing.T) {
 					t.Fatal("write admission leaked after flush")
 				}
 
-				r.mu.Lock()
-				held = r.polls[string(pod.UID)]
-				r.mu.Unlock()
+				held = f.a.Server.replicationPolls.count() != 0
 
 				if held {
 					t.Fatal("poll admission leaked after flush")
@@ -298,9 +294,12 @@ func TestReplicationRouteAuthorizationAndEarlyListener(t *testing.T) {
 	}{{"controller", 200}, {"duplicate poll", 429}, {"dataplane", 403}, {"wrong audience", 401}} {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.name == "duplicate poll" {
-				r.polls = map[string]bool{string(pod.UID): true}
+				f.a.Server.initializeAdmission()
 
-				defer func() { r.polls = nil }()
+				if !f.a.Server.replicationPolls.acquire(string(pod.UID)) {
+					t.Fatal("could not reserve replication poll")
+				}
+				defer f.a.Server.replicationPolls.release(string(pod.UID))
 			}
 
 			if tc.name == "dataplane" {

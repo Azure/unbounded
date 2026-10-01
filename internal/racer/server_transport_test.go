@@ -384,9 +384,7 @@ func TestTLSSlowSnapshotWriteDeadline(t *testing.T) {
 	}
 	// Do not read response bytes. The write deadline must release both slots.
 	for {
-		f.a.Server.admission.Lock()
-		n := len(f.a.Server.polls)
-		f.a.Server.admission.Unlock()
+		n := f.a.Server.polls.count()
 
 		if n == 0 && len(f.a.Server.writes) == 0 {
 			break

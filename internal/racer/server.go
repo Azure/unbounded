@@ -31,9 +31,9 @@ type Server struct {
 	Lifecycle          *Lifecycle
 	Replication        *Replication
 	once               sync.Once
-	admission          sync.Mutex
-	polls              map[wire.NodeID]struct{}
-	keyringPolls       map[wire.NodeID]struct{}
+	polls              *identityAdmission[wire.NodeID]
+	keyringPolls       *identityAdmission[wire.NodeID]
+	replicationPolls   *identityAdmission[string]
 	authSlots          chan struct{}
 	bootstrapSlots     chan struct{}
 	writes             chan struct{}
@@ -238,8 +238,9 @@ func (s *Server) serve(ctx context.Context, listener net.Listener, config *tls.C
 
 func (s *Server) initializeAdmission() {
 	s.once.Do(func() {
-		s.polls = make(map[wire.NodeID]struct{})
-		s.keyringPolls = make(map[wire.NodeID]struct{})
+		s.polls = newIdentityAdmission[wire.NodeID](s.Config.Limits.MaxPolls)
+		s.keyringPolls = newIdentityAdmission[wire.NodeID](s.Config.Limits.MaxPolls)
+		s.replicationPolls = newIdentityAdmission[string](s.Config.Limits.MaxConcurrentBootstrap)
 		s.authSlots = make(chan struct{}, max(0, s.Config.Limits.MaxConcurrentBootstrap))
 		// API-backed bearer authentication must not starve local TLS authentication.
 		// Enrollment and keyring bearer checks share this bounded API work pool.
@@ -251,23 +252,11 @@ func (s *Server) initializeAdmission() {
 // admitPoll is the sole per-node/global poll guard. The handler must retain it
 // through response Write and Flush, including error responses and aborted writes.
 func (s *Server) admitPoll(node wire.NodeID) bool {
-	s.admission.Lock()
-	defer s.admission.Unlock()
-
-	if _, exists := s.polls[node]; exists || len(s.polls) >= s.Config.Limits.MaxPolls {
-		return false
-	}
-
-	s.polls[node] = struct{}{}
-
-	return true
+	return s.polls.acquire(node)
 }
 
 func (s *Server) releasePoll(node wire.NodeID) {
-	s.admission.Lock()
-	defer s.admission.Unlock()
-
-	delete(s.polls, node)
+	s.polls.release(node)
 }
 
 func take(slots chan struct{}) bool {
@@ -708,23 +697,11 @@ func writeFailure(w http.ResponseWriter, err error) {
 // Keyring polling has independent per-node and global admission, so a snapshot
 // poll cannot prevent the same node from receiving the keys needed to use it.
 func (s *Server) admitKeyringPoll(node wire.NodeID) bool {
-	s.admission.Lock()
-	defer s.admission.Unlock()
-
-	if _, exists := s.keyringPolls[node]; exists || len(s.keyringPolls) >= s.Config.Limits.MaxPolls {
-		return false
-	}
-
-	s.keyringPolls[node] = struct{}{}
-
-	return true
+	return s.keyringPolls.acquire(node)
 }
 
 func (s *Server) releaseKeyringPoll(node wire.NodeID) {
-	s.admission.Lock()
-	defer s.admission.Unlock()
-
-	delete(s.keyringPolls, node)
+	s.keyringPolls.release(node)
 }
 
 func keyringCursor(r *http.Request) (*wire.Generation, error) {
