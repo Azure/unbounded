@@ -17,9 +17,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/Azure/unbounded/internal/racer/wire"
@@ -538,35 +536,6 @@ func (p *Publications) Ready(_ *http.Request) error { _, err := p.Current(); ret
 
 const installationUIDAnnotation = "racer.unbounded-cloud.io/installation-uid"
 
-// Initialize consumes a new installation's permanent marker before the sole
-// counter Create attempt. It does not run controllers or acquire serving authority.
-func Initialize(ctx context.Context, cfg Config) error {
-	if err := cfg.Validate(); err != nil {
-		return err
-	}
-
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		return err
-	}
-
-	restConfig, err := ctrl.GetConfig()
-	if err != nil {
-		return err
-	}
-
-	c, err := client.New(restConfig, client.Options{Scheme: scheme})
-	if err != nil {
-		return err
-	}
-
-	return initializeVersion(ctx, c, c, cfg)
-}
-
 func readInstallation(ctx context.Context, reader client.Reader, cfg Config, fresh bool) (*corev1.ConfigMap, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -577,6 +546,10 @@ func readInstallation(ctx context.Context, reader client.Reader, cfg Config, fre
 		return nil, authorityReadFailure(err)
 	}
 
+	return cm, validateMarker(cm, cfg, fresh)
+}
+
+func validateMarker(cm *corev1.ConfigMap, cfg Config, fresh bool) error {
 	state := "consumed"
 	if fresh {
 		state = "fresh"
@@ -584,25 +557,33 @@ func readInstallation(ctx context.Context, reader client.Reader, cfg Config, fre
 
 	immutable := cm.Immutable != nil && *cm.Immutable
 	if cm.UID == "" || cm.ResourceVersion == "" || cm.DeletionTimestamp != nil || cm.Data["cluster"] != string(cfg.Cluster) || cm.Data["version_configmap"] != cfg.VersionConfigMapName || cm.Data["state"] != state || immutable == fresh {
-		return nil, fmt.Errorf("installation marker invalid or already consumed: %w", wire.Unavailable)
+		return fmt.Errorf("installation marker invalid: %w", wire.Unavailable)
 	}
 
-	return cm, nil
+	return nil
 }
 
-// InitializeVersion never retries marker CAS or counter creation, including
-// ambiguous transport failures.
-func (r *TopologyReconciler) InitializeVersion(ctx context.Context) error {
-	return initializeVersion(ctx, r.Client, r.APIReader, r.Config)
-}
-
-func initializeVersion(ctx context.Context, writer client.Writer, reader client.Reader, cfg Config) error {
+// ensureInstalled allows only the successful marker CAS caller one Create attempt.
+// Lost responses and crashes never authorize a retry, even on process restart.
+func ensureInstalled(ctx context.Context, writer client.Writer, reader client.Reader, cfg Config) error {
 	if !wire.ValidUUID(string(cfg.Cluster)) {
 		return wire.InvalidRequest
 	}
 
-	marker, err := readInstallation(ctx, reader, cfg, true)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	marker := &corev1.ConfigMap{}
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: cfg.Namespace, Name: cfg.InstallationConfigMapName}, marker); err != nil {
+		return err
+	}
+
+	if marker.Data["state"] == "consumed" {
+		return waitInstalled(ctx, reader, cfg)
+	}
+
+	if err := validateMarker(marker, cfg, true); err != nil {
 		return err
 	}
 
@@ -610,6 +591,11 @@ func initializeVersion(ctx context.Context, writer client.Writer, reader client.
 	if err := reader.Get(ctx, key, &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
 		if err != nil {
 			return err
+		}
+
+		// Another starter may have completed since our fresh-marker read.
+		if _, _, err := readVersion(ctx, reader, cfg); err == nil {
+			return nil
 		}
 
 		return fmt.Errorf("version state already exists: %w", wire.Conflict)
@@ -629,6 +615,10 @@ func initializeVersion(ctx context.Context, writer client.Writer, reader client.
 	}
 
 	if err := writer.Update(ctx, marker); err != nil {
+		if apierrors.IsConflict(err) {
+			return waitInstalled(ctx, reader, cfg)
+		}
+
 		return err
 	}
 
@@ -640,6 +630,48 @@ func initializeVersion(ctx context.Context, writer client.Writer, reader client.
 		ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name, Annotations: map[string]string{installationUIDAnnotation: string(marker.UID)}},
 		Data:       versionData(VersionRecord{Cluster: cfg.Cluster, Sequence: 1, MembershipVersion: 1, ContentHash: content, MembershipHash: membership}),
 	})
+}
+
+// A competing startup may be between marker consumption and Create. Wait only
+// for that bounded gap; neither this path nor a later restart may write anything.
+func waitInstalled(ctx context.Context, reader client.Reader, cfg Config) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		marker := &corev1.ConfigMap{}
+		if err := reader.Get(ctx, client.ObjectKey{Namespace: cfg.Namespace, Name: cfg.InstallationConfigMapName}, marker); err != nil {
+			return err
+		}
+
+		fresh := marker.Data["state"] == "fresh"
+		if err := validateMarker(marker, cfg, fresh); err != nil {
+			return err
+		}
+
+		if !fresh {
+			cm := &corev1.ConfigMap{}
+
+			err := reader.Get(ctx, client.ObjectKey{Namespace: cfg.Namespace, Name: cfg.VersionConfigMapName}, cm)
+			if err == nil {
+				_, err = parseVersion(cm, cfg.Cluster, marker.UID)
+				return err
+			}
+
+			if !apierrors.IsNotFound(err) {
+				return err
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("installation incomplete; refusing to recreate version state: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 func versionData(v VersionRecord) map[string]string {
@@ -689,7 +721,7 @@ func readVersion(ctx context.Context, reader client.Reader, cfg Config) (*corev1
 }
 
 // ValidateInstallation checks the durable marker and counter binding required by
-// normal startup without modifying state. Provisioners use it before deployment.
+// dataplane deployment without modifying state. Controller startup can precede it.
 func ValidateInstallation(ctx context.Context, reader client.Reader, namespace, cluster string) error {
 	_, _, err := readVersion(ctx, reader, Config{
 		Namespace: namespace, Cluster: wire.ClusterID(cluster),

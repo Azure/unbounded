@@ -13,7 +13,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
-	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -37,7 +36,7 @@ import (
 
 // Exercise startup CRD bootstrap, informer-driven activation without a Site,
 // the real executor/SSA, and the controller's initialization and workload paths.
-// Envtest has no kubelet: execute the observed Job's initialize action directly.
+// Envtest has no kubelet: execute the deployed controller's startup seam directly.
 func TestEnvtestRacerProvisioning(t *testing.T) {
 	assets := os.Getenv("KUBEBUILDER_ASSETS")
 	if assets == "" {
@@ -78,12 +77,13 @@ func TestEnvtestRacerProvisioning(t *testing.T) {
 	require.True(t, apierrors.IsNotFound(c.Get(ctx, key("racer-controller"), &appsv1.Deployment{})))
 	require.NoError(t, c.Create(ctx, &racerv1.ClusterCache{ObjectMeta: metav1.ObjectMeta{Name: "gantry"}}))
 
-	job := &batchv1.Job{}
+	deployment := &appsv1.Deployment{}
 
-	require.Eventually(t, func() bool { return c.Get(ctx, key("racer-initialize"), job) == nil }, 45*time.Second, 100*time.Millisecond)
-	require.Equal(t, []string{"initialize"}, job.Spec.Template.Spec.Containers[0].Args)
-	require.Equal(t, "example.test/racer-controller:v1", job.Spec.Template.Spec.Containers[0].Image)
-	require.True(t, apierrors.IsNotFound(c.Get(ctx, key("racer-controller"), &appsv1.Deployment{})))
+	require.Eventually(t, func() bool { return c.Get(ctx, key("racer-controller"), deployment) == nil }, 45*time.Second, 100*time.Millisecond)
+	require.Empty(t, deployment.Spec.Template.Spec.Containers[0].Args)
+	require.Equal(t, "example.test/racer-controller:v1", deployment.Spec.Template.Spec.Containers[0].Image)
+	require.True(t, apierrors.IsNotFound(c.Get(ctx, key("racer-version"), &corev1.ConfigMap{})))
+	require.True(t, apierrors.IsNotFound(c.Get(ctx, key("racer-dataplane"), &appsv1.DaemonSet{})))
 
 	cm := &corev1.ConfigMap{}
 	require.NoError(t, c.Get(ctx, key("racer-config"), cm))
@@ -98,9 +98,7 @@ func TestEnvtestRacerProvisioning(t *testing.T) {
 	require.NoError(t, err)
 
 	app := racercore.Assemble(cfg, c, c)
-	require.NoError(t, app.Topology.InitializeVersion(ctx))
-
-	deployment := &appsv1.Deployment{}
+	require.NoError(t, app.Recover(ctx, c))
 
 	require.Eventually(t, func() bool { return c.Get(ctx, key("racer-controller"), deployment) == nil }, 20*time.Second, 100*time.Millisecond)
 	require.Equal(t, appsv1.RollingUpdateDeploymentStrategyType, deployment.Spec.Strategy.Type)
@@ -135,7 +133,7 @@ func TestEnvtestRacerProvisioning(t *testing.T) {
 	_, err = r.Reconcile(ctx, ctrl.Request{})
 	require.Error(t, err)
 	require.True(t, apierrors.IsNotFound(c.Get(ctx, key("racer-version"), &corev1.ConfigMap{})))
-	require.Error(t, app.Topology.InitializeVersion(ctx))
+	require.Error(t, app.Recover(ctx, c))
 }
 
 func integrationRacerOverrides(t *testing.T, c client.Client, key func(string) client.ObjectKey, ds *appsv1.DaemonSet) {

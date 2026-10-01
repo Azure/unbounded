@@ -13,7 +13,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
-	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -113,9 +112,9 @@ func TestEnvtestRacerMixedMigration(t *testing.T) {
 		pass()
 	}
 
-	job := &batchv1.Job{}
-	require.NoError(t, c.Get(ctx, key("racer-initialize"), job))
-	require.Equal(t, []string{"initialize"}, job.Spec.Template.Spec.Containers[0].Args)
+	startupDeployment := &appsv1.Deployment{}
+	require.NoError(t, c.Get(ctx, key("racer-controller"), startupDeployment))
+	require.Empty(t, startupDeployment.Spec.Template.Spec.Containers[0].Args)
 
 	config := &corev1.ConfigMap{}
 	require.NoError(t, c.Get(ctx, key("racer-config"), config))
@@ -128,7 +127,7 @@ func TestEnvtestRacerMixedMigration(t *testing.T) {
 
 	cfg, err := racercore.LoadConfig()
 	require.NoError(t, err)
-	require.NoError(t, racercore.Assemble(cfg, c, c).Topology.InitializeVersion(ctx))
+	require.NoError(t, racercore.Assemble(cfg, c, c).Recover(ctx, c))
 	t.Log("checkpoint: initialized")
 
 	config.Data["RACER_HOST_NETWORK"] = "true"

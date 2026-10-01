@@ -160,13 +160,9 @@ func TestOperatorClusterRoleAllowsRacerProvisioning(t *testing.T) {
 		}
 	}
 
-	if !clusterRoleGrants(cr, "batch", "jobs", "create") {
-		t.Fatal("operator cannot create the initialization Job")
-	}
-
-	for _, verb := range []string{"update", "patch", "delete"} {
+	for _, verb := range []string{"create", "update", "patch", "delete"} {
 		if clusterRoleGrants(cr, "batch", "jobs", verb) {
-			t.Fatalf("initialization only requires create, not %s", verb)
+			t.Fatalf("controller startup requires no Job %s permission", verb)
 		}
 	}
 }

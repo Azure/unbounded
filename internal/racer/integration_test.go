@@ -145,7 +145,7 @@ func integrationInitialization(t *testing.T, c client.Client) {
 			return c.Update(ctx, obj, opts...)
 		}}, c).Topology
 
-		go func() { results <- r.InitializeVersion(ctx) }()
+		go func() { results <- ensureInstalled(ctx, r.Client, r.APIReader, r.Config) }()
 	}
 
 	for range 2 {
@@ -169,14 +169,14 @@ func integrationInitialization(t *testing.T, c client.Client) {
 		}
 	}
 
-	if winners != 1 {
-		t.Fatalf("marker CAS winners: %d", winners)
+	if winners != 2 {
+		t.Fatalf("successful concurrent startups: %d", winners)
 	}
 
 	a := integrationInstallation(t, c, "init-cas")
 
 	r := a.Topology
-	if err := r.InitializeVersion(ctx); err != nil {
+	if err := a.Recover(ctx, r.Client); err != nil {
 		t.Fatal(err)
 	}
 
@@ -197,8 +197,8 @@ func integrationInitialization(t *testing.T, c client.Client) {
 		}
 	}
 
-	if err := r.InitializeVersion(ctx); err == nil {
-		t.Fatal("consumed initialization accepted")
+	if err := a.Recover(ctx, r.Client); err != nil {
+		t.Fatalf("installed startup rejected: %v", err)
 	}
 
 	cm, previous, err := readVersion(ctx, r.APIReader, r.Config)
@@ -264,13 +264,13 @@ func integrationInitialization(t *testing.T, c client.Client) {
 
 			return boom
 		}}
-		if err := a.Topology.InitializeVersion(ctx); !errors.Is(err, boom) {
+		if err := a.Recover(ctx, a.Topology.Client); !errors.Is(err, boom) {
 			t.Fatal(err)
 		}
 
 		restarted := Assemble(a.Topology.Config, c, c)
-		if err := restarted.Topology.InitializeVersion(ctx); err == nil {
-			t.Fatal("ambiguous initialization retried Create")
+		if err := restarted.Recover(ctx, c); (err == nil) != afterCreate {
+			t.Fatalf("ambiguous initialization recovery: %v", err)
 		}
 
 		if _, _, err := readVersion(ctx, restarted.Topology.APIReader, restarted.Topology.Config); (err == nil) != afterCreate {
@@ -281,7 +281,7 @@ func integrationInitialization(t *testing.T, c client.Client) {
 
 func integrationRotation(t *testing.T, c client.Client) {
 	a := integrationInstallation(t, c, "rotation")
-	if err := a.Topology.InitializeVersion(t.Context()); err != nil {
+	if err := a.Recover(t.Context(), a.Topology.Client); err != nil {
 		t.Fatal(err)
 	}
 
@@ -434,7 +434,7 @@ func integrationTLS(t *testing.T, cfg *Config) *x509.CertPool {
 
 func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, c client.Client) {
 	a := integrationInstallation(t, c, "managers")
-	if err := a.Topology.InitializeVersion(t.Context()); err != nil {
+	if err := a.Recover(t.Context(), a.Topology.Client); err != nil {
 		t.Fatal(err)
 	}
 

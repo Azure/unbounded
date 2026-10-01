@@ -27,6 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	racerv1 "github.com/Azure/unbounded/api/racer/v1alpha1"
 	"github.com/Azure/unbounded/internal/operator/component"
@@ -120,13 +121,13 @@ func initialize(t *testing.T, env *component.Env) racercore.Config {
 
 	for range 4 {
 		plan := planPass(t, env)
-		require.NotContains(t, plan.Summary(), "Deployment/")
+		require.NotContains(t, plan.Summary(), "DaemonSet/")
 		persist(t, env, plan)
 	}
 
 	cfg := configuration(t, env)
-	r := &racercore.TopologyReconciler{Client: env.Client, APIReader: env.APIReader, Config: cfg}
-	require.NoError(t, r.InitializeVersion(t.Context()))
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), &appsv1.Deployment{}))
+	require.NoError(t, racercore.Assemble(cfg, env.Client, env.APIReader).Recover(t.Context(), env.Client))
 
 	return cfg
 }
@@ -206,11 +207,10 @@ func TestLifecycleWithoutSites(t *testing.T) {
 	_, err = leaf.Verify(x509.VerifyOptions{DNSName: controllerName + "." + env.Namespace + ".svc", Roots: roots})
 	require.NoError(t, err)
 
-	job := &batchv1.Job{}
-	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, jobName), job))
-	require.Zero(t, *job.Spec.BackoffLimit)
-	require.Equal(t, corev1.RestartPolicyNever, job.Spec.Template.Spec.RestartPolicy)
-	require.Equal(t, []string{"initialize"}, job.Spec.Template.Spec.Containers[0].Args)
+	jobs := &batchv1.JobList{}
+	require.NoError(t, env.Client.List(t.Context(), jobs))
+	require.Empty(t, jobs.Items)
+	require.Empty(t, controller.Args)
 
 	for _, op := range plan.Operations {
 		require.Empty(t, op.Object.GetOwnerReferences())
@@ -373,6 +373,8 @@ func TestInitializerDependsOnPrerequisites(t *testing.T) {
 	}
 
 	plan := planPass(t, env)
+	require.Contains(t, plan.Summary(), "Deployment/")
+
 	env.Client = interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
 		Apply: func(context.Context, client.WithWatch, runtime.ApplyConfiguration, ...client.ApplyOption) error {
 			return errors.New("RBAC forbidden")
@@ -382,12 +384,25 @@ func TestInitializerDependsOnPrerequisites(t *testing.T) {
 	require.NoError(t, err)
 
 	for _, op := range result.Results {
-		if op.Ref.Name == jobName {
+		if op.Ref.Name == controllerName && op.Ref.GVK.Kind == "Deployment" {
 			require.Equal(t, component.OpSkipped, op.Status)
 		}
 	}
 
-	require.True(t, apierrors.IsNotFound(env.Client.Get(t.Context(), objectKey(env, jobName), &batchv1.Job{})))
+	require.True(t, apierrors.IsNotFound(env.Client.Get(t.Context(), objectKey(env, controllerName), &appsv1.Deployment{})))
+}
+
+func TestStartupVersionWatch(t *testing.T) {
+	env := testEnv(t)
+	p := startupConfigPredicate(env)
+	version := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: versionName, Namespace: env.Namespace}, Data: map[string]string{"sequence": "1"}}
+	require.True(t, p.Create(event.CreateEvent{Object: version}))
+	require.True(t, p.Delete(event.DeleteEvent{Object: version}))
+	next := version.DeepCopy()
+	next.Data["sequence"] = "2"
+	require.False(t, p.Update(event.UpdateEvent{ObjectOld: version, ObjectNew: next}))
+	next.Namespace = "foreign"
+	require.False(t, p.Create(event.CreateEvent{Object: next}))
 }
 
 func TestServingTLSRenewal(t *testing.T) {
@@ -434,44 +449,43 @@ func TestInitializationFailureStates(t *testing.T) {
 				persist(t, env, planPass(t, env))
 			}
 
-			job := &batchv1.Job{}
-			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, jobName), job))
-
 			marker := &corev1.ConfigMap{}
 			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, markerName), marker))
 
 			switch scenario {
 			case "failed":
-				job.Status.Failed = 1
-				require.NoError(t, env.Client.Status().Update(t.Context(), job))
+				// Failure before CAS leaves the fresh marker usable.
+				cfg := configuration(t, env)
+				writer := interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{
+					Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error {
+						return errors.New("startup denied")
+					},
+				})
+				require.Error(t, racercore.Assemble(cfg, writer, env.APIReader).Recover(t.Context(), writer))
 			case "foreign":
-				job.Annotations = nil
-				require.NoError(t, env.Client.Update(t.Context(), job))
+				marker.Annotations = nil
+				require.NoError(t, env.Client.Update(t.Context(), marker))
 			case "completed-fresh":
-				job.Status.Succeeded = 1
-				require.NoError(t, env.Client.Status().Update(t.Context(), job))
+				// A fresh marker cannot coexist with completed version state.
+				require.NoError(t, env.Client.Create(t.Context(), &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: versionName, Namespace: env.Namespace}}))
 			case "consumed-active", "consumed-missing":
 				marker.Data["state"] = "consumed"
 				immutable := true
 				marker.Immutable = &immutable
 				require.NoError(t, env.Client.Update(t.Context(), marker))
-
-				if scenario == "consumed-active" {
-					job.Status.Active = 1
-					require.NoError(t, env.Client.Status().Update(t.Context(), job))
-				}
 			case "fresh-version":
 				require.NoError(t, env.Client.Create(t.Context(), &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: versionName, Namespace: env.Namespace}}))
 			}
 
 			plan, result, err := (Component{}).Plan(t.Context(), env, nil)
-			require.Zero(t, plan.Len())
-
-			if scenario == "consumed-active" {
+			if scenario == "failed" {
 				require.NoError(t, err)
 				require.Positive(t, result.RequeueAfter)
+				require.Contains(t, plan.Summary(), "Deployment/")
+				require.NotContains(t, plan.Summary(), "DaemonSet/")
 			} else {
 				require.Error(t, err)
+				require.Zero(t, plan.Len())
 			}
 		})
 	}

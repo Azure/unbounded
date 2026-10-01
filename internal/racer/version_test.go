@@ -8,6 +8,7 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -59,7 +60,7 @@ func initializedTopology(t *testing.T, objects ...client.Object) *TopologyReconc
 	t.Helper()
 
 	r := testTopology(t, objects...)
-	if err := r.InitializeVersion(context.Background()); err != nil {
+	if err := ensureInstalled(context.Background(), r.Client, r.APIReader, r.Config); err != nil {
 		t.Fatal(err)
 	}
 
@@ -135,7 +136,7 @@ func TestInitializeCrashOrdering(t *testing.T) {
 				},
 			})
 
-			err := r.InitializeVersion(ctx)
+			err := ensureInstalled(ctx, r.Client, r.APIReader, r.Config)
 			if (err == nil) != (stage == "success") {
 				t.Fatalf("initialize: %v", err)
 			}
@@ -149,13 +150,25 @@ func TestInitializeCrashOrdering(t *testing.T) {
 				t.Fatalf("writes: %v", writes)
 			}
 
-			r.Client = base
+			writes = nil
+
 			if stage == "before marker" {
-				if err := r.InitializeVersion(context.Background()); err != nil {
+				r.Client = base
+				if err := ensureInstalled(context.Background(), r.Client, r.APIReader, r.Config); err != nil {
 					t.Fatalf("fresh marker cannot initialize: %v", err)
 				}
-			} else if err := r.InitializeVersion(context.Background()); err == nil {
-				t.Fatal("consumed marker reused")
+			} else {
+				restart, stop := context.WithTimeout(t.Context(), 100*time.Millisecond)
+				defer stop()
+
+				err := ensureInstalled(restart, r.Client, r.APIReader, r.Config)
+				if (err == nil) != (stage == "success" || stage == "create response lost") {
+					t.Fatalf("restart: %v", err)
+				}
+
+				if len(writes) != 0 {
+					t.Fatalf("restart wrote state: %v", writes)
+				}
 			}
 
 			_, _, err = readVersion(context.Background(), r.APIReader, r.Config)
@@ -182,7 +195,11 @@ func TestInitializeConflictAndExistingState(t *testing.T) {
 			return nil
 		},
 	})
-	if err := r.InitializeVersion(context.Background()); !apierrors.IsConflict(err) || creates != 0 {
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+
+	if err := ensureInstalled(ctx, r.Client, r.APIReader, r.Config); !errors.Is(err, context.DeadlineExceeded) || creates != 0 {
 		t.Fatalf("marker conflict: %v, creates=%d", err, creates)
 	}
 
@@ -191,7 +208,7 @@ func TestInitializeConflictAndExistingState(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := r.InitializeVersion(context.Background()); !errors.Is(err, wire.Conflict) {
+	if err := ensureInstalled(context.Background(), r.Client, r.APIReader, r.Config); !errors.Is(err, wire.Conflict) {
 		t.Fatalf("existing counters accepted: %v", err)
 	}
 
@@ -205,7 +222,7 @@ func TestInitializeCanceledBeforeMarker(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if err := r.InitializeVersion(ctx); !errors.Is(err, context.Canceled) {
+	if err := ensureInstalled(ctx, r.Client, r.APIReader, r.Config); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled initialize: %v", err)
 	}
 

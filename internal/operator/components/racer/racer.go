@@ -10,7 +10,6 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
-	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -19,6 +18,7 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	machinav1 "github.com/Azure/unbounded/api/machina/v1alpha3"
@@ -37,7 +37,6 @@ const (
 	configName             = "racer-config"
 	dataplaneConfigName    = "racer-dataplane-config"
 	dataplaneName          = "racer-dataplane"
-	jobName                = "racer-initialize"
 	tlsName                = "racer-controller-tls"
 	trustName              = "racer-bootstrap-trust"
 	managerAnnotation      = "racer.unbounded-cloud.io/manager"
@@ -105,14 +104,8 @@ func planAt(ctx context.Context, env *component.Env, now time.Time) (*component.
 			return nil, component.Result{}, fmt.Errorf("fresh Racer marker requires absent version state (read: %v)", err)
 		}
 	} else if err := racercore.ValidateInstallation(ctx, env.LiveReader(), env.Namespace, marker.Data["cluster"]); err != nil {
-		// A running initializer may be between marker consumption and counter
-		// creation. Requeue, but never issue another initialization attempt.
-		job := &batchv1.Job{}
-		if getErr := env.LiveReader().Get(ctx, objectKey(env, jobName), job); getErr == nil &&
-			job.Annotations[installationAnnotation] == string(marker.UID) && job.Status.Active > 0 && job.DeletionTimestamp == nil {
-			return plan, pending(), nil
-		}
-
+		// Startup may be in its one-shot Create gap. Do not deploy dataplanes or
+		// repair durable state; a later reconcile can observe successful creation.
 		return nil, component.Result{}, fmt.Errorf("racer durable state: %w", err)
 	}
 
@@ -131,24 +124,6 @@ func planAt(ctx context.Context, env *component.Env, now time.Time) (*component.
 	}
 
 	if fresh {
-		job := &batchv1.Job{}
-
-		err := env.LiveReader().Get(ctx, objectKey(env, jobName), job)
-		if apierrors.IsNotFound(err) {
-			op := component.Operation{Kind: component.OpCreateIfAbsent, Object: component.ToUnstructured(initializationJob(env, marker.UID)), Component: name}
-			// Jobs are not an inferred workload tier. Declare all prerequisites
-			// explicitly so no failed RBAC/config write can launch initialization.
-			for _, dependency := range plan.Operations {
-				op.DependsOn = append(op.DependsOn, dependency.Ref())
-			}
-
-			plan.Add(op)
-		} else if err != nil {
-			return nil, component.Result{}, err
-		} else if job.Annotations[installationAnnotation] != string(marker.UID) || job.DeletionTimestamp != nil || job.Status.Failed > 0 || job.Status.Succeeded > 0 {
-			return nil, component.Result{}, fmt.Errorf("racer initializer failed or does not match the fresh installation; inspect job/%s", jobName)
-		}
-
 		return plan, pending(), nil
 	}
 
@@ -223,10 +198,6 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 
 			continue
 		case "Deployment":
-			if !ready {
-				continue
-			}
-
 			if err := component.SetNamedContainerImage(obj, "controller", env.Config.Image(controllerName)); err != nil {
 				return err
 			}
@@ -240,6 +211,14 @@ func runtimePlan(ctx context.Context, env *component.Env, plan *component.Plan, 
 		}
 
 		op := component.Operation{Kind: component.OpApply, Object: obj, Component: name, Overridable: obj.GetKind() == "Deployment"}
+		if obj.GetKind() == "Deployment" {
+			// Every security/config prerequisite must succeed before startup can
+			// consume the permanent marker, including during a fresh installation.
+			for _, dependency := range plan.Operations {
+				op.DependsOn = append(op.DependsOn, dependency.Ref())
+			}
+		}
+
 		if obj.GetKind() == "ValidatingAdmissionPolicy" || obj.GetKind() == "ValidatingAdmissionPolicyBinding" {
 			prerequisites = append(prerequisites, op.Ref())
 		} else if obj.GetKind() == "RoleBinding" || obj.GetKind() == "Deployment" {
@@ -302,7 +281,22 @@ func (Component) SetupWatches(b *builder.Builder, env *component.Env) {
 	b.Watches(&appsv1.Deployment{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedWorkloadPredicate(env.InNamespaceNamed(controllerName))))
 	b.Watches(&appsv1.DaemonSet{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(env.InNamespaceNamed(dataplaneName, racercore.PodNetworkDaemonSetName))))
 	b.Watches(&corev1.Pod{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool { return obj.GetNamespace() == env.Namespace && migrationPod(obj) })))
-	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(), builder.WithPredicates(env.ManagedConfigPredicate(env.InNamespaceNamed(claimName, markerName, configName, dataplaneConfigName, trustName))))
+	b.Watches(&corev1.ConfigMap{}, env.RequestSingleton(), builder.WithPredicates(startupConfigPredicate(env)))
 	b.Watches(&corev1.Secret{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(env.InNamespaceNamed(tlsName))))
-	b.Watches(&batchv1.Job{}, env.RequestSingleton(), builder.WithPredicates(predicate.NewPredicateFuncs(env.InNamespaceNamed(jobName))))
+}
+
+func startupConfigPredicate(env *component.Env) predicate.Predicate {
+	// Observe startup completion/loss without applying workloads on every normal
+	// topology counter update. Other configuration retains its payload predicate.
+	version := env.InNamespaceNamed(versionName)
+
+	return predicate.Or(
+		env.ManagedConfigPredicate(env.InNamespaceNamed(claimName, markerName, configName, dataplaneConfigName, trustName)),
+		predicate.Funcs{
+			CreateFunc:  func(e event.CreateEvent) bool { return version(e.Object) },
+			DeleteFunc:  func(e event.DeleteEvent) bool { return version(e.Object) },
+			UpdateFunc:  func(event.UpdateEvent) bool { return false },
+			GenericFunc: func(event.GenericEvent) bool { return false },
+		},
+	)
 }

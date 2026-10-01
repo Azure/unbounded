@@ -3,8 +3,8 @@
 
 // Package racer implements the Racer server using controller-runtime directly.
 // Constructors compose only; serving requires locally validated replicated state.
-// Run and Assemble in controller.go wire the process; Initialize in publications.go
-// is the explicit one-shot setup path. Topology and keyring own leader writes;
+// Run and Assemble in controller.go wire the process and guarded startup.
+// Topology and keyring own leader writes;
 // replication, trust, authentication, and server own replica-local serving.
 // workload.go provides the operator's pure builders; wire owns protocol encoding.
 package racer
@@ -179,8 +179,8 @@ func Run(ctx context.Context, cfg Config) error {
 	app := Assemble(cfg, mgr.GetClient(), mgr.GetAPIReader())
 	// Recovery validates permanent configuration and counters before starting any
 	// manager runnable. The leader revalidates authoritatively for every commit.
-	if _, _, err := readVersion(ctx, mgr.GetAPIReader(), cfg); err != nil {
-		return fmt.Errorf("recover Racer installation: %w", err)
+	if err := app.Recover(ctx, mgr.GetClient()); err != nil {
+		return err
 	}
 
 	if err := app.SetupWithManager(mgr); err != nil {
@@ -188,6 +188,26 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	return mgr.Start(ctx)
+}
+
+// Recover runs the production startup guard before any manager runnable starts.
+// The writer need not have a running cache; all reads use the authoritative reader
+// supplied to Assemble. Constructors and recovery never grant serving authority.
+func (a *Application) Recover(ctx context.Context, writer client.Writer) error {
+	cfg, reader := a.Topology.Config, a.Topology.APIReader
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+
+	if err := ensureInstalled(ctx, writer, reader, cfg); err != nil {
+		return fmt.Errorf("ensure Racer installation: %w", err)
+	}
+
+	if _, _, err := readVersion(ctx, reader, cfg); err != nil {
+		return fmt.Errorf("recover Racer installation: %w", err)
+	}
+
+	return nil
 }
 
 func managerOptions(cfg Config, scheme *runtime.Scheme) ctrl.Options {

@@ -9,7 +9,6 @@ import (
 
 	"github.com/google/uuid"
 	appsv1 "k8s.io/api/apps/v1"
-	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -127,7 +126,6 @@ func checkNewInstallation(ctx context.Context, env *component.Env) error {
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "racer-issuer"}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "racer-keyring"}},
 		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: controllerName}},
-		&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobName}},
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: controllerName}},
 		&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "racer-dataplane"}},
 		&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: racercore.PodNetworkDaemonSetName}},

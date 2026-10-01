@@ -396,7 +396,7 @@ func integrationCatalogCapacity(t *testing.T, c client.Client) {
 	a.Keyring.Config.Rotation = RotationPolicy{Interval: time.Hour, PrepareFor: time.Hour, RetainFor: 300 * time.Hour}
 
 	a.Topology.Config = a.Keyring.Config
-	if err := a.Topology.InitializeVersion(t.Context()); err != nil {
+	if err := a.Recover(t.Context(), a.Topology.Client); err != nil {
 		t.Fatal(err)
 	}
 
