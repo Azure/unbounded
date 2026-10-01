@@ -14,6 +14,7 @@ import (
 
 type loadMetrics struct {
 	pulls              *prometheus.CounterVec
+	pullFailures       *prometheus.CounterVec
 	pullDuration       *prometheus.HistogramVec
 	inFlight           prometheus.Gauge
 	appliedConcurrency prometheus.Gauge
@@ -32,6 +33,7 @@ func newMetrics(reg *prometheus.Registry) *loadMetrics {
 	buckets := []float64{0.001, 0.01, 0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300}
 	m := &loadMetrics{
 		pulls:              prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: ns, Name: "pulls_total", Help: "Completed full image pull attempts."}, []string{"result"}),
+		pullFailures:       prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: ns, Name: "pull_failures_total", Help: "Failed image pulls by bounded reason, including cancellation; one reason per pull."}, []string{"reason"}),
 		pullDuration:       prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: ns, Name: "pull_duration_seconds", Help: "Full image pull latency including failures.", Buckets: buckets}, []string{"result"}),
 		inFlight:           prometheus.NewGauge(prometheus.GaugeOpts{Namespace: ns, Name: "in_flight", Help: "Image pulls currently in progress."}),
 		appliedConcurrency: prometheus.NewGauge(prometheus.GaugeOpts{Namespace: ns, Name: "applied_concurrency", Help: "Applied image pull worker limit; in-flight pulls may exceed it while draining after a decrease."}),
@@ -43,7 +45,7 @@ func newMetrics(reg *prometheus.Registry) *loadMetrics {
 		originBytes:        prometheus.NewCounter(prometheus.CounterOpts{Namespace: ns, Name: "origin_bytes_total", Help: "Response body bytes written by the synthetic origin."}),
 		originDuration:     prometheus.NewHistogram(prometheus.HistogramOpts{Namespace: ns, Name: "origin_request_duration_seconds", Help: "Synthetic origin HTTP request latency.", Buckets: buckets}),
 	}
-	reg.MustRegister(m.pulls, m.pullDuration, m.inFlight, m.appliedConcurrency, m.receivedBytes, m.verifiedBytes, m.requests, m.requestDuration,
+	reg.MustRegister(m.pulls, m.pullFailures, m.pullDuration, m.inFlight, m.appliedConcurrency, m.receivedBytes, m.verifiedBytes, m.requests, m.requestDuration,
 		m.originRequests, m.originBytes, m.originDuration, collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 
 	return m

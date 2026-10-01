@@ -46,7 +46,8 @@ func pullTestOptions(target string) pullOptions {
 
 func pullTestMetrics() *loadMetrics {
 	return &loadMetrics{
-		pulls: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "test_pulls_total"}, []string{"result"}),
+		pulls:        prometheus.NewCounterVec(prometheus.CounterOpts{Name: "test_pulls_total"}, []string{"result"}),
+		pullFailures: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "test_pull_failures_total"}, []string{"reason"}),
 		pullDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name: "test_pull_duration_seconds",
 		}, []string{"result"}),
@@ -152,6 +153,7 @@ func TestPullCompleteImage(t *testing.T) {
 	require.Equal(t, float64(2), testutil.ToFloat64(metrics.pulls.WithLabelValues("success")))
 	require.Zero(t, testutil.ToFloat64(metrics.inFlight))
 	require.Equal(t, uint64(2), pullTestHistogramCount(t, metrics.pullDuration, "success"))
+	require.Zero(t, testutil.CollectAndCount(metrics.pullFailures))
 
 	for kind, count := range map[string]int{"manifest": 2, "config": 2, "layer": 2 * len(img.Layers)} {
 		require.Equal(t, float64(count), testutil.ToFloat64(metrics.requests.WithLabelValues(kind, "success")))
@@ -242,9 +244,18 @@ func TestPullResponseFailures(t *testing.T) {
 				require.Equal(t, uint64(1), pullTestHistogramCount(t, metrics.pullDuration, result))
 
 				if mode != "unverified" {
+					reasons := map[string]string{
+						"status": "http_status", "redirect": "http_status", "truncated": "incomplete",
+						"short": "incomplete", "long": "size_mismatch", "corrupt": "digest_mismatch",
+					}
+					require.Equal(t, reasons[mode], classifyFailure(err).String())
+					require.Equal(t, float64(1), testutil.ToFloat64(metrics.pullFailures.WithLabelValues(reasons[mode])))
+					require.Equal(t, 1, testutil.CollectAndCount(metrics.pullFailures))
 					require.Equal(t, float64(1), testutil.ToFloat64(metrics.requests.WithLabelValues(kind, "error")))
 					require.Equal(t, uint64(1), pullTestHistogramCount(t, metrics.requestDuration, kind, "error"))
 					require.Zero(t, testutil.ToFloat64(metrics.pulls.WithLabelValues("success")))
+				} else {
+					require.Zero(t, testutil.CollectAndCount(metrics.pullFailures))
 				}
 
 				require.Zero(t, testutil.ToFloat64(metrics.inFlight))
@@ -326,6 +337,13 @@ func TestPullTimeoutAndCancellation(t *testing.T) {
 				}
 
 				require.Equal(t, float64(1), testutil.ToFloat64(metrics.pulls.WithLabelValues(result)))
+
+				reason := "timeout"
+				if canceled {
+					reason = "canceled"
+				}
+
+				require.Equal(t, float64(1), testutil.ToFloat64(metrics.pullFailures.WithLabelValues(reason)))
 				require.Equal(t, float64(1), testutil.ToFloat64(metrics.requests.WithLabelValues(kind, result)))
 				require.Zero(t, testutil.ToFloat64(metrics.verifiedBytes))
 				require.Zero(t, testutil.ToFloat64(metrics.inFlight))
@@ -368,6 +386,8 @@ func TestPullLayerFailureCancelsSiblings(t *testing.T) {
 	}
 
 	require.Equal(t, float64(1), testutil.ToFloat64(metrics.pulls.WithLabelValues("error")))
+	require.Equal(t, float64(1), testutil.ToFloat64(metrics.pullFailures.WithLabelValues("http_status")))
+	require.Equal(t, 1, testutil.CollectAndCount(metrics.pullFailures), "sibling cancellation must not replace or duplicate the pull failure")
 	require.Equal(t, float64(1), testutil.ToFloat64(metrics.requests.WithLabelValues("layer", "error")))
 	require.Equal(t, float64(1), testutil.ToFloat64(metrics.requests.WithLabelValues("layer", "canceled")))
 }

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"log/slog"
 	"math/rand/v2"
 	"net/http"
 	"net/url"
@@ -36,14 +37,15 @@ type pullOptions struct {
 }
 
 type puller struct {
-	img       *syntheticImage
-	images    []*syntheticImage
-	opts      pullOptions
-	target    *url.URL
-	metrics   *loadMetrics
-	client    *http.Client
-	transport *http.Transport
-	buffers   sync.Pool
+	img         *syntheticImage
+	images      []*syntheticImage
+	opts        pullOptions
+	target      *url.URL
+	metrics     *loadMetrics
+	client      *http.Client
+	transport   *http.Transport
+	buffers     sync.Pool
+	failureLogs failureLogs
 	// Shared by workers; production uses the concurrency-safe package RNG.
 	randomFloat64 func() float64
 }
@@ -201,6 +203,7 @@ func (p *puller) pullImage(ctx context.Context, img *syntheticImage) (err error)
 		p.metrics.inFlight.Dec()
 		p.metrics.pulls.WithLabelValues(result).Inc()
 		p.metrics.pullDuration.WithLabelValues(result).Observe(time.Since(start).Seconds())
+		p.reportPullFailure(err, time.Now(), slog.Default())
 	}()
 
 	if err := p.fetch(ctx, "manifest", img.Manifest); err != nil {
@@ -247,10 +250,15 @@ func pullResult(err error) string {
 
 func (p *puller) fetch(ctx context.Context, kind string, desc ocispec.Descriptor) (err error) {
 	start := time.Now()
+	reason, status := failureTransport, 0
 
 	defer func() {
 		if ctx.Err() != nil {
 			err = ctx.Err()
+		}
+
+		if err != nil {
+			err = &pullFailure{err: err, reason: reason, kind: kind, status: status}
 		}
 
 		result := pullResult(err)
@@ -274,6 +282,7 @@ func (p *puller) fetch(ctx context.Context, kind string, desc ocispec.Descriptor
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
 	if err != nil {
+		reason = failureOther
 		return fmt.Errorf("create %s request: %w", kind, err)
 	}
 
@@ -283,6 +292,8 @@ func (p *puller) fetch(ctx context.Context, kind string, desc ocispec.Descriptor
 	if err != nil {
 		return fmt.Errorf("request %s: %w", kind, err)
 	}
+
+	status = response.StatusCode
 
 	defer func() {
 		if closeErr := response.Body.Close(); err == nil && closeErr != nil {
@@ -296,14 +307,21 @@ func (p *puller) fetch(ctx context.Context, kind string, desc ocispec.Descriptor
 	}
 
 	if response.StatusCode != http.StatusOK {
+		reason = failureStatus
 		return fmt.Errorf("request %s %s: HTTP status %d", kind, desc.Digest, response.StatusCode)
 	}
 
 	if n != desc.Size {
+		reason = failureSize
+		if n < desc.Size {
+			reason = failureIncomplete
+		}
+
 		return fmt.Errorf("%s %s: size %d, expected %d", kind, desc.Digest, n, desc.Size)
 	}
 
 	if p.opts.Verify && actual != desc.Digest.String() {
+		reason = failureDigest
 		return fmt.Errorf("%s %s: digest mismatch (received %s)", kind, desc.Digest, actual)
 	}
 
