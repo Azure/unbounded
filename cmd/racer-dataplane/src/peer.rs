@@ -5,6 +5,7 @@ pub mod server;
 pub mod subscriptions;
 #[cfg(test)]
 mod tests;
+mod timing;
 pub mod transport;
 
 use self::{
@@ -352,6 +353,7 @@ pub trait PeerTransport {
     ) -> Operation<'a, SignedResponse>;
 }
 pub struct Requester {
+    metrics: crate::telemetry::metrics::Metrics,
     observer: Observer,
     health: Rc<crate::topology::health::LinkHealth>,
     paths: Rc<Paths>,
@@ -371,6 +373,7 @@ impl Requester {
         network: Rc<PeerNetwork>,
     ) -> Self {
         Self {
+            metrics: crate::telemetry::metrics::Metrics::default(),
             observer: Observer::default(),
             health: paths.link_health(),
             paths,
@@ -381,6 +384,10 @@ impl Requester {
     }
     pub(crate) fn with_observer(mut self, observer: Observer) -> Self {
         self.observer = observer;
+        self
+    }
+    pub(crate) fn with_metrics(mut self, metrics: crate::telemetry::metrics::Metrics) -> Self {
+        self.metrics = metrics;
         self
     }
 }
@@ -414,14 +421,17 @@ impl PeerClient for Requester {
                 return Err(Error::Overloaded);
             }
             let (signed, binding) = self.forwarding.sign_request_to(request, &next)?;
+            let mut timing = timing::PageTiming::new(&self.metrics);
             let response = self
-                .exchange_inner_mode(signed, membership, None, &scope, true)
+                .exchange_inner_mode(signed, membership, None, &scope, true, Some(&mut timing))
                 .await?;
             let transport::RelayResponse::Complete(response) = response else {
                 return Err(Error::Internal);
             };
             scope.check()?;
-            self.forwarding.verify_response(response, &binding)
+            let response = self.forwarding.verify_response(response, &binding)?;
+            timing.success(&response);
+            Ok(response)
         })
     }
     /// Sign a fresh attempt, exchange the full envelope, then verify the response
@@ -446,13 +456,21 @@ impl PeerClient for Requester {
             )?;
             let next = route.nodes.get(1).ok_or(Error::Unavailable)?;
             let (signed, binding) = self.forwarding.sign_request_to(request, next)?;
-            let response = self.exchange(signed, membership, &scope).await?;
+            let mut timing = timing::PageTiming::new(&self.metrics);
+            let response = self
+                .exchange_inner_mode(signed, membership, None, &scope, false, Some(&mut timing))
+                .await?;
+            let transport::RelayResponse::Complete(response) = response else {
+                return Err(Error::Internal);
+            };
             scope.check()?;
-            self.observer.result(
+            let response = self.observer.result(
                 Stage::PeerVerify,
                 &scope,
                 self.forwarding.verify_response(response, &binding),
-            )
+            )?;
+            timing.success(&response);
+            Ok(response)
         })
     }
 }
@@ -491,7 +509,7 @@ impl Requester {
         relay: Option<Rc<crate::runtime::admission::Reservation>>,
         scope: &'a RequestScope,
     ) -> Operation<'a, transport::RelayResponse> {
-        self.exchange_inner_mode(request, membership, relay, scope, false)
+        self.exchange_inner_mode(request, membership, relay, scope, false, None)
     }
     fn exchange_inner_mode<'a>(
         &'a self,
@@ -500,6 +518,7 @@ impl Requester {
         relay: Option<Rc<crate::runtime::admission::Reservation>>,
         scope: &'a RequestScope,
         direct_http: bool,
+        timing: Option<&'a mut timing::PageTiming<'_>>,
     ) -> Operation<'a, transport::RelayResponse> {
         Box::pin(async move {
             let scope = request_scope(&request.request, scope)?;
@@ -559,7 +578,7 @@ impl Requester {
             let socket_failure = Rc::new(std::cell::Cell::new(false));
             let response = self
                 .transfers
-                .exchange_inner(
+                .exchange_timed(
                     endpoint,
                     request,
                     plan,
@@ -567,6 +586,7 @@ impl Requester {
                     relay,
                     permit.clone(),
                     socket_failure.clone(),
+                    timing,
                     &scope,
                 )
                 .await;

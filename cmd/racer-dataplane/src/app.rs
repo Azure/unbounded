@@ -608,6 +608,7 @@ impl WorkerApplication {
                 transfers.clone(),
                 network.clone(),
             )
+            .with_metrics(metrics.clone())
             .with_observer(admission.observer()),
         );
         let candidates = Rc::new(

@@ -6,6 +6,7 @@ mod opaque;
 mod protocol_socket;
 mod requester_safety;
 mod subscriptions;
+mod timing;
 use crate::{
     memory::pool::BufferPool,
     model::{

@@ -1287,6 +1287,30 @@ impl Transfers {
         failure: Rc<std::cell::Cell<bool>>,
         scope: &'a RequestScope,
     ) -> Operation<'a, RelayResponse> {
+        self.exchange_timed(
+            endpoint,
+            request,
+            plan,
+            membership,
+            relay,
+            peer_admission,
+            failure,
+            None,
+            scope,
+        )
+    }
+    pub(super) fn exchange_timed<'a>(
+        &'a self,
+        endpoint: crate::http::connection::Endpoint,
+        request: SignedRequest,
+        plan: TransportPlan,
+        membership: Option<crate::topology::membership::MembershipLease>,
+        relay: Option<Rc<Reservation>>,
+        peer_admission: Option<std::sync::Arc<super::adaptive::Permit>>,
+        failure: Rc<std::cell::Cell<bool>>,
+        mut timing: Option<&'a mut super::timing::PageTiming<'_>>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, RelayResponse> {
         Box::pin(async move {
             scope.check()?;
             let (admission, codec) = &self.wire;
@@ -1317,6 +1341,9 @@ impl Transfers {
                     .head,
             )?;
             let observer = admission.observer();
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.enable(&request.request, plan, relay.is_some());
+            }
             let mut connection = observer.result(
                 Stage::PeerCheckout,
                 scope,
@@ -1331,11 +1358,17 @@ impl Transfers {
                     .await,
             )?;
             connection.peer_admission = peer_admission.clone();
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.end(0);
+            }
             connection.relay_reservation = relay.clone();
             // Connection and handshake get separate bounded idle allowances.
             // No header byte can renew the request/head allowance.
             scope.candidate_progress()?;
             let connection = {
+                if let Some(timing) = timing.as_deref_mut() {
+                    timing.begin();
+                }
                 let _permit = connection
                     .session
                     .is_none()
@@ -1351,6 +1384,9 @@ impl Transfers {
                 )?
             };
             // Legacy callers without an authenticated membership lease are HTTP-only.
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.end(1);
+            }
             let native = if membership.is_some() {
                 self.accept_native(&request, plan, scope)?
             } else {
@@ -1359,6 +1395,9 @@ impl Transfers {
             scope.candidate_progress()?;
             if let Some((_, accept, _)) = &native {
                 attach(&mut head, accept)?;
+            }
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.begin();
             }
             let sent = observer.result(
                 Stage::PeerHead,
@@ -1370,6 +1409,9 @@ impl Transfers {
                 scope,
                 self.io.receive_head(sent.connection, scope).await,
             )?;
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.end(2);
+            }
             let control = detach(&mut received.value)?;
             let relay_context = if relay.is_some() {
                 let size = received.value.headers.iter().try_fold(0usize, |n, h| {
@@ -1412,6 +1454,9 @@ impl Transfers {
                     length,
                 });
             }
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.begin();
+            }
             let (mut connection, body, staging_reservation) = self
                 .receive_http_body(
                     received.connection,
@@ -1424,6 +1469,9 @@ impl Transfers {
                 )
                 .await?;
             scope.check()?;
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.end(3);
+            }
             let response = observer.result(
                 Stage::PeerDecode,
                 scope,

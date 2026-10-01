@@ -44,7 +44,6 @@ fn body_cases(cases: &[&str]) {
 struct BodyFixture {
     idle: bool,
     telemetry: Telemetry,
-    before_metrics: String,
     admission: Rc<Admission>,
     reactor: Rc<Reactor>,
     io: Rc<HttpIo>,
@@ -82,11 +81,6 @@ impl BodyFixture {
             crate::test_support::cluster::config(false).limits,
         ));
         admission.set_observer(telemetry.failures.observer(WorkerId(2)));
-        let mut before_metrics = String::new();
-        telemetry
-            .metrics
-            .write_prometheus(&mut before_metrics)
-            .unwrap();
         let reactor = Rc::new(Reactor::new(admission.clone()));
         let io = Rc::new(HttpIo::with_admission(
             reactor.clone(),
@@ -149,7 +143,6 @@ impl BodyFixture {
         Self {
             idle,
             telemetry,
-            before_metrics,
             admission,
             reactor,
             io,
@@ -173,7 +166,6 @@ impl BodyFixture {
         let Self {
             idle,
             telemetry,
-            before_metrics,
             admission,
             reactor,
             io,
@@ -191,6 +183,7 @@ impl BodyFixture {
             signed,
             binding,
         } = self;
+        let mut timing = super::super::timing::PageTiming::new(&telemetry.metrics);
         let address = listener.local_addr().unwrap();
         let fixture_end = start + Duration::from_secs(5);
         let sent = Cell::new(0usize);
@@ -306,7 +299,17 @@ impl BodyFixture {
             Ok::<_, Error>(())
         };
         let mut server: crate::error::Operation<'_, ()> = Box::pin(server);
-        let mut client = transfers.exchange(Endpoint::Peer(address.to_string()), signed, &scope);
+        let mut client = transfers.exchange_timed(
+            Endpoint::Peer(address.to_string()),
+            signed,
+            crate::topology::rails::TransportPlan::Http,
+            None,
+            None,
+            None,
+            Rc::new(std::cell::Cell::new(false)),
+            Some(&mut timing),
+            &scope,
+        );
         let result = loop {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             if let Poll::Ready(result) = client.as_mut().poll(&mut cx) {
@@ -321,11 +324,16 @@ impl BodyFixture {
             assert!(Instant::now() < fixture_end, "bounded body fixture");
             std::thread::sleep(Duration::from_micros(100));
         };
+        drop(client);
         if matches!(
             case,
             "success" | "progress" | "reserved_progress" | "capped_progress"
         ) {
-            let response = auth.verify_response(result.unwrap(), &binding).unwrap();
+            let transport::RelayResponse::Complete(response) = result.unwrap() else {
+                panic!()
+            };
+            let response = auth.verify_response(response, &binding).unwrap();
+            timing.success(&response);
             assert!(
                 matches!(response.response(), PeerResponse::Page { ciphertext, .. } if ciphertext.bytes().len() == 8208)
             );
@@ -338,7 +346,7 @@ impl BodyFixture {
                 "{case}"
             );
         }
-        drop(client);
+        drop(timing);
         drop(server);
         let mut text = String::new();
         telemetry.failures.write(&mut text).unwrap();
@@ -434,11 +442,22 @@ impl BodyFixture {
         ] {
             assert_eq!(admission.used(class), 0, "{case} {class:?}");
         }
-        let mut after_metrics = String::new();
-        telemetry
-            .metrics
-            .write_prometheus(&mut after_metrics)
-            .unwrap();
-        assert_eq!(before_metrics, after_metrics);
+        let success = matches!(
+            case,
+            "success" | "progress" | "reserved_progress" | "capped_progress"
+        );
+        for (count, sum) in super::super::timing::STAGES {
+            assert_eq!(telemetry.metrics.count(count), u64::from(success), "{case}");
+            if !success {
+                assert_eq!(telemetry.metrics.count(sum), 0, "{case}");
+            }
+        }
+        assert_eq!(
+            telemetry
+                .metrics
+                .count(crate::telemetry::metrics::Event::PeerPageCensored),
+            u64::from(!success),
+            "{case}"
+        );
     }
 }
