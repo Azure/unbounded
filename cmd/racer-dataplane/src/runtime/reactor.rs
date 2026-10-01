@@ -1005,7 +1005,7 @@ impl Reactor {
     /// Preserve connect errno locally for attribution, without changing boundary errors.
     pub(crate) fn connect_with_observation<'a, L: 'static>(
         &'a self,
-        fd: Rc<OwnedFd>,
+        fd: Rc<Descriptor>,
         address: SocketAddress,
         lease: L,
         errno: Option<Rc<std::cell::Cell<Option<i32>>>>,

@@ -1814,7 +1814,7 @@ pub(crate) mod tests {
 
     #[test]
     fn assembled_worker_exports_live_quota_gauges() {
-        use crate::model::limits::ResourceClass;
+        use crate::model::ResourceClass;
         let worker = wake_test_worker();
         let relay = worker
             .runtime

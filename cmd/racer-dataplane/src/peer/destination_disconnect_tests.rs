@@ -1,8 +1,11 @@
 //! Real destination HTTP ingress with an independently owned, pending page flight.
 use super::*;
 use crate::{
-    http::{codec::Codec, io::HttpIo, pool::ConnectionLease},
-    model::context::OriginContext,
+    http::{
+        Codec,
+        connection::{ConnectionLease, HttpIo},
+    },
+    model::OriginContext,
     read::flight::{
         AcquisitionBudget, AcquisitionEvent, AcquisitionFailure, Flights, JoinedCopy, JoinedFlight,
     },
@@ -28,7 +31,7 @@ struct PendingPage {
 impl server::LocalPageService for PendingPage {
     fn serve_peer<'a>(
         &'a self,
-        request: wire::VerifiedRequest,
+        request: protocol::VerifiedRequest,
         _: crate::topology::membership::MembershipLease,
         scope: &'a RequestScope,
     ) -> crate::error::Operation<'a, PeerResponse> {
@@ -46,13 +49,13 @@ impl server::LocalPageService for PendingPage {
         })
     }
 }
-impl requester::PeerTransport for PendingPage {
+impl PeerTransport for PendingPage {
     fn exchange<'a>(
         &'a self,
-        _: wire::SignedRequest,
+        _: protocol::SignedRequest,
         _: crate::topology::membership::MembershipLease,
         _: &'a RequestScope,
-    ) -> crate::error::Operation<'a, wire::SignedResponse> {
+    ) -> crate::error::Operation<'a, protocol::SignedResponse> {
         Box::pin(async { panic!("final destination must not relay") })
     }
 }
@@ -110,10 +113,7 @@ enum CompletionOrder {
 fn page_result(admission: &Admission, page: &PageId) -> crate::memory::page::PageResult {
     use crate::{
         memory::pool::{CiphertextBytes, CiphertextPage, VerifiedBytes, VerifiedPage},
-        model::{
-            envelope::PageEnvelope,
-            metadata::{ExpiresAt, ObjectMetadata},
-        },
+        model::{ExpiresAt, ObjectMetadata, PageEnvelope},
     };
     crate::memory::page::PageResult {
         metadata: ObjectMetadata {
@@ -158,10 +158,7 @@ fn destination_exchange(order: CompletionOrder) {
     reactor.init().unwrap();
     let io = Rc::new(HttpIo::with_admission(
         reactor.clone(),
-        Codec::new(
-            wire::MAX_ENVELOPE_HEAD,
-            crate::model::range::PAGE_BYTES + 16,
-        ),
+        Codec::new(protocol::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
         admission.clone(),
     ));
     let signers = signers();
@@ -206,25 +203,22 @@ fn destination_exchange(order: CompletionOrder) {
         page: page.clone(),
         entered: Cell::new(0),
     });
-    let relay = Rc::new(
-        relay::Relay::new(
-            Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
-            forwarding.clone(),
-            service.clone(),
-            admission.clone(),
-        )
-        .with_network(network.clone()),
-    );
+    let relay = Rc::new(Relay::new(
+        Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
+        forwarding.clone(),
+        service.clone(),
+        admission.clone(),
+        network.clone(),
+    ));
     let server = server::PeerServer::new(
         io.clone(),
         forwarding,
         admission.clone(),
         service.clone(),
         relay,
-    )
-    .with_network(network)
-    .with_wire(Rc::new(codec(&admission)))
-    .with_signatures(signers[2].clone());
+        Rc::new(codec(&admission)),
+        signers[2].clone(),
+    );
     let parent =
         RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(60)).unwrap();
     let independent = RequestScope::new(RequestId([8; 16]), parent.deadline.0).unwrap();

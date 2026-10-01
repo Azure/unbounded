@@ -331,8 +331,7 @@ mod tests {
                         }
                     })
                     .await;
-                    let codec =
-                        crate::http::codec::Codec::new(if kind == "large" { 8 } else { 4096 }, 0);
+                    let codec = crate::http::Codec::new(if kind == "large" { 8 } else { 4096 }, 0);
                     let bytes: &[u8] = if kind == "invalid" {
                         b"not-http\r\n\r\n"
                     } else {
@@ -341,7 +340,7 @@ mod tests {
                     let parsed = codec.decode_head(bytes);
                     let error = match parsed {
                         Err(e) => e,
-                        Ok(Some((head, _))) => crate::peer::wire::WireCodec::decode(head, true)
+                        Ok(Some((head, _))) => crate::peer::protocol::WireCodec::decode(head, true)
                             .err()
                             .expect("missing signed wire envelope"),
                         _ => panic!("complete malformed frame"),

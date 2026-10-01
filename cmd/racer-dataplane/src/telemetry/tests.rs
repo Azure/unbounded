@@ -616,7 +616,7 @@ fn fixed_parser_and_worst_case_response_bounds() {
 
 #[test]
 fn metrics_http_response_exports_worker_quotas_with_bounded_output() {
-    use crate::{model::identity::WorkerId, telemetry::metrics::Metrics};
+    use crate::{model::WorkerId, telemetry::metrics::Metrics};
     let workers = Metrics::for_workers(64).unwrap();
     let admissions: Vec<_> = workers
         .iter()
@@ -647,7 +647,7 @@ fn metrics_http_response_exports_worker_quotas_with_bounded_output() {
         .collect();
     let mut telemetry = Telemetry::default();
     telemetry.metrics = workers[0].clone();
-    for event in super::super::metrics::EVENTS {
+    for event in crate::telemetry::metrics::EVENTS {
         telemetry.metrics.record(event, u64::MAX).unwrap();
     }
     let mut bytes = [0; MAX_RESPONSE_BYTES];

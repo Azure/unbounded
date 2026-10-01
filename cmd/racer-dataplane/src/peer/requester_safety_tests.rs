@@ -2,15 +2,14 @@
 use super::*;
 use crate::{
     http::{
-        codec::Codec,
-        io::HttpIo,
-        pool::{ConnectionLease, HttpPool},
+        Codec,
+        connection::{ConnectionLease, HttpIo, HttpPool},
     },
     model::{MembershipVersion, ResourceClass},
     peer::{
         adaptive::{AdaptivePeers, Outcome},
-        transfer::RelayResponse,
-        wire::{PeerResponse, SecurityCodec, WireCodec},
+        protocol::{PeerResponse, SecurityCodec, WireCodec},
+        transport::RelayResponse,
     },
     runtime::{
         admission::Admission,
@@ -79,16 +78,23 @@ fn page_hedge_does_not_treat_multihop_destination_as_independent_first_hop() {
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let io = Rc::new(HttpIo::with_admission(
         reactor.clone(),
-        Codec::new(crate::peer::wire::MAX_ENVELOPE_HEAD, 0),
+        Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD, 0),
         admission.clone(),
     ));
-    let pool = Rc::new(HttpPool::new(reactor, admission, 2));
+    let pool = Rc::new(HttpPool::new(reactor, admission.clone(), 2));
     let adaptive = AdaptivePeers::new(Default::default(), Metrics::default()).unwrap();
     let signers = crate::peer::tests::signers();
     let requester = Requester::new(
         Rc::new(Paths::new(Rc::new(LinkHealth), 4).with_peer_admission(adaptive)),
         Rc::new(Forwarding::new(signers[0].clone())),
-        Rc::new(Transfers::new(pool, io, None)),
+        Rc::new(Transfers::new(
+            pool,
+            io,
+            None,
+            admission.clone(),
+            Rc::new(crate::peer::tests::codec(&admission)),
+            signers[0].clone(),
+        )),
         network,
     );
     assert!(!requester.direct_hedge_available(&members, &nonneighbor.node));
@@ -102,7 +108,7 @@ fn probe_exchange(opaque: bool, case: &str) {
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let io = Rc::new(HttpIo::with_admission(
         reactor.clone(),
-        Codec::new(crate::peer::wire::MAX_ENVELOPE_HEAD, 0),
+        Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD, 0),
         admission.clone(),
     ));
     let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2));
@@ -110,11 +116,14 @@ fn probe_exchange(opaque: bool, case: &str) {
         admission.clone(),
         Rc::new(crate::memory::pool::BufferPool::new(admission.clone())),
     ));
-    let transfers = Rc::new(
-        Transfers::new(pool, io.clone(), None)
-            .with_wire(admission.clone(), codec.clone())
-            .with_signatures(signers[0].clone()),
-    );
+    let transfers = Rc::new(Transfers::new(
+        pool,
+        io.clone(),
+        None,
+        admission.clone(),
+        codec.clone(),
+        signers[0].clone(),
+    ));
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let membership = Arc::new(
@@ -173,7 +182,7 @@ fn probe_exchange(opaque: bool, case: &str) {
     request.route.deadline = scope.deadline;
     request.origin.scope = scope.clone();
     if case == "direct" {
-        request.operation = crate::peer::wire::Operation::Page {
+        request.operation = crate::peer::protocol::Operation::Page {
             page: crate::model::PageId {
                 version: crate::model::ObjectVersion {
                     object: request.origin.object.clone(),
@@ -181,7 +190,7 @@ fn probe_exchange(opaque: bool, case: &str) {
                 },
                 number: crate::model::PageNumber(0),
             },
-            mode: crate::peer::wire::FetchMode::CopyOnly,
+            mode: crate::peer::protocol::FetchMode::CopyOnly,
         };
         assert!(requester.direct_hedge_available(&membership, &node));
     }

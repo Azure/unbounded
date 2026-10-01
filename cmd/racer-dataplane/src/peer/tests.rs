@@ -140,7 +140,7 @@ pub(super) fn request(admission: &Admission, attempt: u8) -> PeerRequest {
         route,
     }
 }
-fn codec(admission: &Rc<Admission>) -> SecurityCodec {
+pub(super) fn codec(admission: &Rc<Admission>) -> SecurityCodec {
     SecurityCodec::new(
         admission.clone(),
         Rc::new(BufferPool::new(admission.clone())),

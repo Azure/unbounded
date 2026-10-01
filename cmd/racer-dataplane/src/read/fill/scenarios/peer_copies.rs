@@ -558,9 +558,9 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
         memory::{delivery::Delivery, pipe::PipePool},
         peer::server::LocalPageService,
         read::{
+            Coordinator,
             metadata::{MetadataDependencies, MetadataService},
             range_stream::RangeStreams,
-            serve::Coordinator,
         },
     };
     struct Mesh {
@@ -702,7 +702,6 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
                 );
             }
             let mut deps = f.fill.dependencies.clone();
-            deps.peers = peers.clone();
             deps.candidates = Rc::new(policy);
             f.fill = Fill::new(deps);
             let fill = Rc::new(f.fill.clone());
@@ -730,7 +729,6 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
             let metadata = Rc::new(MetadataService::new(
                 fill.dependencies.candidates.clone(),
                 f.origin.clone(),
-                peers,
                 fill.dependencies.credentials.clone(),
                 16,
                 MetadataDependencies {
@@ -746,7 +744,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
                 )),
                 Duration::from_secs(10),
             ));
-            let streams = Rc::new(RangeStreams::new(fill.clone(), owners.clone(), delivery, 1));
+            let streams = Rc::new(RangeStreams::new(owners.clone(), delivery, 1));
             let coordinator = Rc::new(Coordinator::new(
                 snapshots,
                 metadata,
@@ -848,23 +846,28 @@ fn hedge_full_page_exact_plaintext_quotas_suppress_before_spending_serial_credit
         limits.plaintext_bytes = std::num::NonZeroUsize::new(PAGE_BYTES as usize * pages).unwrap();
         let mut f = fixture_with(PAGE_BYTES, Some(limits));
         let (peers, ordered) = install_peers(&mut f, None);
-        let reserved = f
+        let plaintext = f.fill.reserve_bootstrap(&f.context.object.cache).unwrap();
+        let ciphertext = f
             .fill
-            .reserve_progress(&f.context.object.cache, false)
+            .dependencies
+            .admission
+            .reserve(
+                Some(&f.context.object.cache),
+                ResourceClass::Ciphertext,
+                PAGE_BYTES as usize + 16,
+            )
             .unwrap();
         let plaintext = f
             .fill
             .dependencies
             .buffers
-            .plaintext(reserved.plaintext, PAGE_BYTES as usize)
+            .plaintext(plaintext, PAGE_BYTES as usize)
             .unwrap();
         let (plain, ciphertext) = drive(
-            f.fill.dependencies.crypto.encrypt(
-                f.page.clone(),
-                plaintext,
-                reserved.ciphertext,
-                &f.scope,
-            ),
+            f.fill
+                .dependencies
+                .crypto
+                .encrypt(f.page.clone(), plaintext, ciphertext, &f.scope),
             &mut f.engine,
             &f.crypto,
         )
@@ -924,23 +927,28 @@ fn hedge_authenticated_metadata_conflict_cannot_win_over_retained_descriptor() {
             })
             .unwrap();
         f.page.number = crate::model::PageNumber(0);
-        let reserved = f
+        let plaintext = f.fill.reserve_bootstrap(&f.context.object.cache).unwrap();
+        let ciphertext = f
             .fill
-            .reserve_progress(&f.context.object.cache, false)
+            .dependencies
+            .admission
+            .reserve(
+                Some(&f.context.object.cache),
+                ResourceClass::Ciphertext,
+                PAGE_BYTES as usize + 16,
+            )
             .unwrap();
         let plaintext = f
             .fill
             .dependencies
             .buffers
-            .plaintext(reserved.plaintext, PAGE_BYTES as usize)
+            .plaintext(plaintext, PAGE_BYTES as usize)
             .unwrap();
         let (plain, ciphertext) = drive(
-            f.fill.dependencies.crypto.encrypt(
-                f.page.clone(),
-                plaintext,
-                reserved.ciphertext,
-                &f.scope,
-            ),
+            f.fill
+                .dependencies
+                .crypto
+                .encrypt(f.page.clone(), plaintext, ciphertext, &f.scope),
             &mut f.engine,
             &f.crypto,
         )

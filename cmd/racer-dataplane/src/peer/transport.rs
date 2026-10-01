@@ -708,7 +708,12 @@ impl Transfers {
         let mut previous = signed_digest(&offer.signed)?;
         connection.next_round()?;
         let prepared = match sessions
-            .prepare_admitted(&offer.peer, binding.rail, connection.peer_admission.clone(), scope)
+            .prepare_admitted(
+                &offer.peer,
+                binding.rail,
+                connection.peer_admission.clone(),
+                scope,
+            )
             .await
         {
             Ok(prepared) => prepared,

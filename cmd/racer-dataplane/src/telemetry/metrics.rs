@@ -1,5 +1,5 @@
 //! Fixed metric names; only installed runtime worker IDs are exposed as labels.
-use crate::{error::Result, model::identity::WorkerId, runtime::admission::AdmissionUsage};
+use crate::{error::Result, model::WorkerId, runtime::admission::AdmissionUsage};
 use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicU64, Ordering},
@@ -508,7 +508,7 @@ impl Metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{model::limits::ResourceClass, runtime::admission::Admission};
+    use crate::{model::ResourceClass, runtime::admission::Admission};
 
     #[test]
     fn worker_quota_gauges_follow_authoritative_reservations() {

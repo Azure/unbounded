@@ -180,7 +180,12 @@ impl Sessions {
             self.poll_prepare(peer, rail, permit.clone())
         }))
     }
-    fn poll_prepare(&self, peer: &VerifiedPeer, rail: RailId, permit: Option<std::sync::Arc<crate::peer::adaptive::Permit>>) -> Poll<Result<PreparedSession>> {
+    fn poll_prepare(
+        &self,
+        peer: &VerifiedPeer,
+        rail: RailId,
+        permit: Option<std::sync::Arc<crate::peer::adaptive::Permit>>,
+    ) -> Poll<Result<PreparedSession>> {
         if !self.ready(rail) {
             return Poll::Ready(Err(Error::Unavailable));
         }
@@ -194,7 +199,10 @@ impl Sessions {
         {
             return Poll::Ready(Err(Error::Overloaded));
         }
-        let qp = std::task::ready!(QueuePairHandle::poll_new_admitted(self.devices.select(rail)?.handle, permit))?;
+        let qp = std::task::ready!(QueuePairHandle::poll_new_admitted(
+            self.devices.select(rail)?.handle,
+            permit
+        ))?;
         // Bound a peer that opens setup but never completes the exchange. A
         // transfer subsequently replaces this with its original request deadline.
         qp.expire_at(crate::runtime::environment::now() + std::time::Duration::from_secs(30));

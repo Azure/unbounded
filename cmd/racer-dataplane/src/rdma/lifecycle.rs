@@ -1176,7 +1176,7 @@ mod tests {
         ) else {
             panic!("prepared native slot");
         };
-        backend::lifetime_tests::fail_stop(true);
+        ffi::lifetime_tests::fail_stop(true);
         drop(qp);
         native.poll_budgeted(1).unwrap();
         assert_eq!(
@@ -1184,7 +1184,7 @@ mod tests {
             1
         );
         assert!(matches!(admission.acquire(&peer), Err(Error::Overloaded)));
-        backend::lifetime_tests::fail_stop(false);
+        ffi::lifetime_tests::fail_stop(false);
         native.resources[0].as_mut().unwrap().next_retry = None;
         native.poll_budgeted(1).unwrap();
         assert_eq!(
@@ -1225,7 +1225,7 @@ mod tests {
         let (window, ticket) = qp.bind(region).unwrap();
         native.poll_budgeted(1).unwrap();
         drop((window, ticket));
-        backend::lifetime_tests::fail_stop(true);
+        ffi::lifetime_tests::fail_stop(true);
         drop(qp);
         drop(native);
         drop(io);
@@ -1235,7 +1235,7 @@ mod tests {
             1
         );
         assert!(matches!(admission.acquire(&peer), Err(Error::Overloaded)));
-        backend::lifetime_tests::fail_stop(false);
+        ffi::lifetime_tests::fail_stop(false);
     }
     pub(super) fn mark_connected(qp: &QueuePairHandle, service: &mut NativeService) {
         qp.connect(qp.endpoint).unwrap();

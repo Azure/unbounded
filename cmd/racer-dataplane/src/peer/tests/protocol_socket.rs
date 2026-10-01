@@ -1041,7 +1041,8 @@ fn signed_tcp_case(case: &str) {
     );
     let destination_auth = Rc::new(Forwarding::new(signers[2].clone()));
     let metrics = crate::telemetry::metrics::Metrics::default();
-    let adaptive = crate::peer::adaptive::AdaptivePeers::new(Default::default(), metrics.clone()).unwrap();
+    let adaptive =
+        crate::peer::adaptive::AdaptivePeers::new(Default::default(), metrics.clone()).unwrap();
     let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4).with_peer_admission(adaptive));
     let relay = Rc::new(Relay::new(
         paths.clone(),
@@ -1131,9 +1132,18 @@ fn signed_tcp_case(case: &str) {
         reactor.wait(Duration::from_millis(1)).unwrap();
     };
     assert!(matches!(response.response(), PeerResponse::Miss));
-    assert_eq!(metrics.count(crate::telemetry::metrics::Event::PeerAdmissionAccepted), 1);
-    assert_eq!(metrics.count(crate::telemetry::metrics::Event::PeerVerified), 1);
-    assert_eq!(metrics.gauge(crate::telemetry::metrics::Gauge::PeerExchanges), 0);
+    assert_eq!(
+        metrics.count(crate::telemetry::metrics::Event::PeerAdmissionAccepted),
+        1
+    );
+    assert_eq!(
+        metrics.count(crate::telemetry::metrics::Event::PeerVerified),
+        1
+    );
+    assert_eq!(
+        metrics.gauge(crate::telemetry::metrics::Gauge::PeerExchanges),
+        0
+    );
     assert_eq!(
         health.tracked_links(),
         0,

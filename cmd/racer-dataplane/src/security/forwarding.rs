@@ -205,7 +205,7 @@ impl Forwarding {
         length: usize,
         request: &RequestBinding,
     ) -> Result<()> {
-        let expected = crate::peer::decode::opaque_response_head(&auth.original.head, length)?;
+        let expected = crate::peer::protocol::opaque_response_head(&auth.original.head, length)?;
         self.verify_response_head(auth, &expected, request)?;
         Ok(())
     }

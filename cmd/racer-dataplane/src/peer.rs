@@ -389,7 +389,11 @@ impl PeerClient for Requester {
     ) -> bool {
         self.network.endpoint(membership, destination).is_ok()
             && self.health.available(destination).unwrap_or(false)
-            && self.paths.peer_admission.as_ref().is_some_and(|a| a.hedge_available(destination))
+            && self
+                .paths
+                .peer_admission
+                .as_ref()
+                .is_some_and(|a| a.hedge_available(destination))
     }
     fn request_direct<'a>(
         &'a self,
@@ -398,7 +402,7 @@ impl PeerClient for Requester {
         scope: &'a RequestScope,
     ) -> Operation<'a, VerifiedResponse> {
         Box::pin(async move {
-            if !matches!(request.operation, wire::Operation::Page { .. }) {
+            if !matches!(request.operation, protocol::Operation::Page { .. }) {
                 return Err(Error::InvalidRequest);
             }
             let scope = request_scope(&request, scope)?;
@@ -407,8 +411,10 @@ impl PeerClient for Requester {
                 return Err(Error::Overloaded);
             }
             let (signed, binding) = self.forwarding.sign_request_to(request, &next)?;
-            let response = self.exchange_inner_mode(signed, membership, None, &scope, true).await?;
-            let transfer::RelayResponse::Complete(response) = response else {
+            let response = self
+                .exchange_inner_mode(signed, membership, None, &scope, true)
+                .await?;
+            let transport::RelayResponse::Complete(response) = response else {
                 return Err(Error::Internal);
             };
             scope.check()?;
@@ -540,19 +546,32 @@ impl Requester {
                 crate::topology::rails::TransportPlan::Http
             };
             let _probe = self.health.acquire(&next)?;
-            let permit = self.paths.peer_admission.as_ref().map(|a| a.acquire(&next)).transpose()?;
+            let permit = self
+                .paths
+                .peer_admission
+                .as_ref()
+                .map(|a| a.acquire(&next))
+                .transpose()?;
             let binding = self.forwarding.outbound_binding(&request)?;
             let socket_failure = Rc::new(std::cell::Cell::new(false));
             let response = self
                 .transfers
-                .exchange_inner(endpoint, request, plan, relay, permit.clone(), socket_failure.clone(), &scope)
+                .exchange_inner(
+                    endpoint,
+                    request,
+                    plan,
+                    relay,
+                    permit.clone(),
+                    socket_failure.clone(),
+                    &scope,
+                )
                 .await;
             // Receiving a signed envelope is not proof. Recover only after the
             // complete reverse chain and original request binding are verified.
             let response = response.and_then(|response| self.verify_exchange(response, &binding));
             use crate::topology::health::LinkOutcome;
             let outcome = match &response {
-                Ok(transfer::RelayResponse::Complete(_)) => Some(LinkOutcome::Success),
+                Ok(transport::RelayResponse::Complete(_)) => Some(LinkOutcome::Success),
                 Err(_) if permit.is_none() && socket_failure.get() => Some(LinkOutcome::Refused),
                 // Unavailable/deadline/protocol errors can arise locally or at a
                 // downstream node. Do not blame an immediate peer without evidence.
@@ -565,9 +584,12 @@ impl Requester {
                 permit.observe(match &response {
                     // A downstream overload is not attributable to the immediate
                     // peer. It also must not increase its admission or recover a probe.
-                    Ok(transfer::RelayResponse::Complete(response))
-                        if matches!(response.response, wire::PeerResponse::Overloaded) => adaptive::Outcome::Neutral,
-                    Ok(transfer::RelayResponse::Complete(_)) => adaptive::Outcome::Verified,
+                    Ok(transport::RelayResponse::Complete(response))
+                        if matches!(response.response, protocol::PeerResponse::Overloaded) =>
+                    {
+                        adaptive::Outcome::Neutral
+                    }
+                    Ok(transport::RelayResponse::Complete(_)) => adaptive::Outcome::Verified,
                     Err(Error::Overloaded) => adaptive::Outcome::LocalPressure,
                     _ => adaptive::Outcome::Neutral,
                 });
@@ -579,20 +601,32 @@ impl Requester {
 
     fn verify_exchange(
         &self,
-        response: transfer::RelayResponse,
+        response: transport::RelayResponse,
         binding: &crate::security::forwarding::RequestBinding,
-    ) -> Result<transfer::RelayResponse> {
+    ) -> Result<transport::RelayResponse> {
         match response {
-            transfer::RelayResponse::Complete(response) => self.forwarding.verify_response(response, binding)
-                .map(|verified| transfer::RelayResponse::Complete(verified.into_signed())),
-            transfer::RelayResponse::Http { authentication, mut connection, length } => {
-                self.forwarding.verify_opaque(&authentication, length, binding)?;
+            transport::RelayResponse::Complete(response) => self
+                .forwarding
+                .verify_response(response, binding)
+                .map(|verified| transport::RelayResponse::Complete(verified.into_signed())),
+            transport::RelayResponse::Http {
+                authentication,
+                mut connection,
+                length,
+            } => {
+                self.forwarding
+                    .verify_opaque(&authentication, length, binding)?;
                 // All Racer outcomes use HTTP 200. Inspect the authenticated
                 // outcome, exactly as the materialized path does, not HTTP status.
                 connection.peer_response_verified = crate::security::protocol::field(
-                    &authentication.original.head, "racer-outcome",
+                    &authentication.original.head,
+                    "racer-outcome",
                 )? != "overloaded";
-                Ok(transfer::RelayResponse::Http { authentication, connection, length })
+                Ok(transport::RelayResponse::Http {
+                    authentication,
+                    connection,
+                    length,
+                })
             }
         }
     }
@@ -607,16 +641,43 @@ mod requester_tests {
     use super::*;
     #[test]
     fn invalid_response_never_recovers_half_open_peer() {
-        use crate::{model::NodeId, peer::wire::PeerResponse, telemetry::metrics::{Event, Metrics}, topology::health::LinkHealth};
+        use crate::{
+            model::NodeId,
+            peer::protocol::PeerResponse,
+            telemetry::metrics::{Event, Metrics},
+            topology::health::LinkHealth,
+        };
         let clock = crate::runtime::environment::SimulationClock::new(782);
         let _env = clock.environment(0).enter();
         let signers = crate::peer::tests::signers();
-        let admission = Rc::new(crate::runtime::admission::Admission::new(crate::test_support::cluster::config(false).limits));
+        let admission = Rc::new(crate::runtime::admission::Admission::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
         let reactor = Rc::new(crate::runtime::reactor::Reactor::new(admission.clone()));
-        let io = Rc::new(crate::http::io::HttpIo::with_admission(reactor.clone(), crate::http::codec::Codec::new(crate::peer::wire::MAX_ENVELOPE_HEAD, 0), admission.clone()));
-        let pool = Rc::new(crate::http::pool::HttpPool::new(reactor, admission.clone(), 2));
+        let io = Rc::new(crate::http::connection::HttpIo::with_admission(
+            reactor.clone(),
+            crate::http::Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD, 0),
+            admission.clone(),
+        ));
+        let pool = Rc::new(crate::http::connection::HttpPool::new(
+            reactor,
+            admission.clone(),
+            2,
+        ));
         let forwarding = Rc::new(Forwarding::new(signers[0].clone()));
-        let requester = Requester::new(Rc::new(Paths::new(Rc::new(LinkHealth), 4)), forwarding.clone(), Rc::new(Transfers::new(pool, io, None)), Rc::new(PeerNetwork::new(signers[0].node().clone(), Default::default()).unwrap()));
+        let requester = Requester::new(
+            Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
+            forwarding.clone(),
+            Rc::new(Transfers::new(
+                pool,
+                io,
+                None,
+                admission.clone(),
+                Rc::new(tests::codec(&admission)),
+                signers[0].clone(),
+            )),
+            Rc::new(PeerNetwork::new(signers[0].node().clone(), Default::default()).unwrap()),
+        );
         let metrics = Metrics::default();
         let adaptive = adaptive::AdaptivePeers::new(Default::default(), metrics.clone()).unwrap();
         let node: NodeId = signers[2].node().clone();
@@ -629,9 +690,12 @@ mod requester_tests {
         let (signed, binding) = forwarding.sign_request(request).unwrap();
         let destination = Forwarding::new(signers[2].clone());
         let admitted = destination.verify_request(signed).unwrap();
-        let mut response = destination.sign_response(admitted.binding(), PeerResponse::Miss).unwrap();
+        let mut response = destination
+            .sign_response(admitted.binding(), PeerResponse::Miss)
+            .unwrap();
         response.response = PeerResponse::Overloaded;
-        let result = requester.verify_exchange(transfer::RelayResponse::Complete(response), &binding);
+        let result =
+            requester.verify_exchange(transport::RelayResponse::Complete(response), &binding);
         assert!(result.is_err());
         assert_eq!(metrics.count(Event::PeerVerified), 0);
         drop(probe);
