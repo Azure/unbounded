@@ -2,8 +2,8 @@
 //!
 //! Delivery copies immutable bytes into a bounded pipe, then splices to a socket.
 //! Unsupported sockets fall back to nonblocking send from the last accepted byte.
-//! Neither path lends userspace page pointers to the socket after return. Only
-//! raw-socket readiness is asynchronous. On HTTP backpressure, an accounted send
+//! Neither path lends userspace page pointers to the socket after return.
+//! On HTTP backpressure, an accounted send
 //! transfers the entire connection/reader lease to the reactor, retaining admission
 //! through abandonment and the final completion fence. After backpressure, the
 //! rest of that page uses direct sends instead of repeating pipe drain round trips.
@@ -85,7 +85,6 @@ pub struct ReaderLease {
     pipe: PipeLease,
     slice: PageSlice,
     sent: usize,
-    connection: Option<Rc<Descriptor>>,
 }
 
 impl ReaderLease {
@@ -99,17 +98,6 @@ impl ReaderLease {
 
     pub fn remaining(&self) -> usize {
         self.slice.length as usize - self.sent
-    }
-
-    /// Bind an exclusively owned socket for the legacy finish API. The socket is
-    /// closed on completion; use finish_to to recover an HTTP connection lease.
-    pub fn attach_connection(&mut self, connection: Descriptor) -> Result<()> {
-        if self.connection.is_some() {
-            return Err(Error::InvalidRequest);
-        }
-        validate_socket(&connection)?;
-        self.connection = Some(Rc::new(connection));
-        Ok(())
     }
 
     fn try_send(&mut self, connection: &Descriptor, copying: bool) -> io::Result<usize> {
@@ -164,30 +152,6 @@ impl Delivery {
             pipe,
             slice,
             sent: 0,
-            connection: None,
-        })
-    }
-
-    pub fn attach_connection(
-        &self,
-        page: VerifiedPage,
-        slice: PageSlice,
-        connection: Descriptor,
-    ) -> Result<ReaderLease> {
-        let mut reader = self.attach(page, slice)?;
-        reader.attach_connection(connection)?;
-        Ok(reader)
-    }
-
-    /// An unbound reader fails with InvalidRequest, even for an empty slice.
-    pub fn finish<'a>(
-        &'a self,
-        mut reader: ReaderLease,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, ()> {
-        Box::pin(async move {
-            let connection = reader.connection.take().ok_or(Error::InvalidRequest)?;
-            self.send_reader(reader, connection, scope).await
         })
     }
 
@@ -226,9 +190,6 @@ impl Delivery {
         Box::pin(async move {
             if !progressing {
                 scope.check()?;
-            }
-            if reader.connection.is_some() {
-                return Err(Error::InvalidRequest);
             }
             let remaining = connection.tx_remaining.ok_or(Error::InvalidRequest)?;
             let length = reader.remaining() as u64;
@@ -350,97 +311,6 @@ impl Delivery {
             Ok(connection)
         })
     }
-
-    /// Own an unframed client socket until the slice is sent, then return it.
-    /// Errors or abandonment drop that owner. HTTP callers must use finish_to.
-    ///
-    /// Readiness retains the descriptor, so abandoning a future cannot recycle a
-    /// descriptor still referenced by the reactor. Blocking input sockets use the
-    /// MSG_DONTWAIT copy fallback; nonblocking sockets use the copied splice path.
-    pub fn finish_to_socket<'a>(
-        &'a self,
-        reader: ReaderLease,
-        connection: Descriptor,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, Descriptor> {
-        Box::pin(async move {
-            scope.check()?;
-            if reader.connection.is_some() {
-                return Err(Error::InvalidRequest);
-            }
-            validate_socket(&connection)?;
-            let connection = Rc::new(connection);
-            self.send_reader(reader, connection.clone(), scope).await?;
-            // Successful readiness must release its descriptor reference at its
-            // completion fence. An unfenced reference cannot be returned as an
-            // exclusively owned socket.
-            Rc::try_unwrap(connection).map_err(|_| Error::Io)
-        })
-    }
-
-    async fn send_reader(
-        &self,
-        mut reader: ReaderLease,
-        connection: Rc<Descriptor>,
-        scope: &RequestScope,
-    ) -> Result<()> {
-        scope.check()?;
-        let mut stalled_at = crate::runtime::environment::now();
-        let mut budget = 0;
-        let mut calls = 0;
-        let mut copying = false;
-        while reader.remaining() != 0 {
-            scope.check()?;
-            let stall_deadline = stalled_at
-                .checked_add(self.stall_timeout)
-                .ok_or(Error::InvalidConfiguration)?;
-            if crate::runtime::environment::now() >= stall_deadline {
-                return Err(Error::DeadlineExceeded);
-            }
-            let result = reader.try_send(&connection, copying);
-            if let Ok(sent) = result {
-                if sent == 0 || sent > reader.remaining() {
-                    return Err(Error::Io);
-                }
-                reader.sent += sent;
-                budget += sent;
-                calls += 1;
-                stalled_at = crate::runtime::environment::now();
-                if (budget >= SEND_BUDGET_BYTES || calls >= SEND_BUDGET_CALLS)
-                    && reader.remaining() != 0
-                {
-                    yield_once().await;
-                    budget = 0;
-                    calls = 0;
-                }
-                continue;
-            }
-            let error = result.unwrap_err();
-            if !copying && splice_unsupported(&error) {
-                // Any queued suffix is now ignored and closed with the reader.
-                // The immutable page plus accepted cursor reconstructs it exactly
-                // without allocating unaccounted fallback staging memory.
-                copying = true;
-                continue;
-            }
-            match error.kind() {
-                io::ErrorKind::Interrupted => yield_once().await,
-                io::ErrorKind::WouldBlock => {
-                    let mut wait_scope = scope.clone();
-                    wait_scope.deadline.0 = wait_scope.deadline.0.min(stall_deadline);
-                    self.pipes
-                        .reactor()
-                        .readiness(connection.clone(), libc::POLLOUT as u32, &wait_scope)
-                        .await?;
-                    // Readiness may be spurious or report HUP. Retry send to get
-                    // the real result, but never spin within one executor turn.
-                    yield_once().await;
-                }
-                _ => return Err(Error::Io),
-            }
-        }
-        Ok(())
-    }
 }
 
 fn validate_slice(page: &VerifiedPage, slice: PageSlice) -> Result<()> {
@@ -538,6 +408,12 @@ mod tests {
             offset,
             length,
         }
+    }
+
+    fn connection(socket: Descriptor, admission: &Admission, length: u64) -> ConnectionLease {
+        let mut connection = ConnectionLease::from_accepted(socket, admission).unwrap();
+        connection.tx_remaining = Some(length);
+        connection
     }
 
     fn drive<T>(reactor: &Reactor, mut future: Operation<'_, T>) -> Result<T> {
@@ -816,11 +692,11 @@ mod tests {
         let scope = scope();
         let socket = drive(
             &reactor,
-            delivery.finish_to_socket(first, socket.into(), &scope),
+            delivery.finish_to(first, connection(socket.into(), &admission, 7), &scope),
         )
         .unwrap();
         assert!(weak.upgrade().is_some());
-        let socket = drive(&reactor, delivery.finish_to_socket(second, socket, &scope)).unwrap();
+        let socket = drive(&reactor, delivery.finish_to(second, socket, &scope)).unwrap();
         assert!(weak.upgrade().is_none());
         let mut bytes = [0; 7];
         peer.read_exact(&mut bytes).unwrap();
@@ -845,7 +721,7 @@ mod tests {
         socket.set_nonblocking(false).unwrap();
         let socket = drive(
             &reactor,
-            delivery.finish_to_socket(reader, socket.into(), &scope()),
+            delivery.finish_to(reader, connection(socket.into(), &admission, 5), &scope()),
         )
         .unwrap();
         drop(socket);
@@ -855,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn tcp_splice_delivers_selected_slice_and_closes_on_legacy_finish() {
+    fn tcp_splice_delivers_selected_slice_and_returns_connection() {
         use std::net::{TcpListener, TcpStream};
         let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -865,10 +741,9 @@ mod tests {
         peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
         let page = page(&admission, b"prefix-selected-suffix".to_vec());
         let weak = Arc::downgrade(&page.inner);
-        let reader = delivery
-            .attach_connection(page, slice(7, 8), socket.into())
-            .unwrap();
-        drive(&reactor, delivery.finish(reader, &scope())).unwrap();
+        let reader = delivery.attach(page, slice(7, 8)).unwrap();
+        let connection = connection(socket.into(), &admission, 8);
+        drop(drive(&reactor, delivery.finish_to(reader, connection, &scope())).unwrap());
         assert!(weak.upgrade().is_none());
         assert_eq!(
             admission.used(ResourceClass::Pipe),
@@ -882,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_ranges_and_unbound_finish_fail_without_sending() {
+    fn invalid_ranges_and_missing_framing_fail_without_sending() {
         let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
         let page = page(&admission, b"abc".to_vec());
         for invalid in [
@@ -902,26 +777,34 @@ mod tests {
         }
         let scope = scope();
         let reader = delivery.attach(page.clone(), slice(0, 3)).unwrap();
-        assert_eq!(
-            drive(&reactor, delivery.finish(reader, &scope)),
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let unframed = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+        assert!(matches!(
+            drive(&reactor, delivery.finish_to(reader, unframed, &scope)),
             Err(Error::InvalidRequest)
-        );
+        ));
         let reader = delivery.attach(page, slice(3, 0)).unwrap();
-        assert_eq!(
-            drive(&reactor, delivery.finish(reader, &scope)),
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let unframed = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+        assert!(matches!(
+            drive(&reactor, delivery.finish_to(reader, unframed, &scope)),
             Err(Error::InvalidRequest)
-        );
+        ));
     }
 
     #[test]
-    fn bound_legacy_finish_and_empty_slices_work() {
+    fn framed_delivery_and_empty_slices_work() {
         let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
         let page = page(&admission, b"abc".to_vec());
         let (socket, mut peer) = UnixStream::pair().unwrap();
-        let reader = delivery
-            .attach_connection(page.clone(), slice(1, 2), socket.into())
-            .unwrap();
-        drive(&reactor, delivery.finish(reader, &scope())).unwrap();
+        let reader = delivery.attach(page.clone(), slice(1, 2)).unwrap();
+        drop(
+            drive(
+                &reactor,
+                delivery.finish_to(reader, connection(socket.into(), &admission, 2), &scope()),
+            )
+            .unwrap(),
+        );
         let mut bytes = Vec::new();
         peer.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"bc");
@@ -930,7 +813,7 @@ mod tests {
         assert!(
             drive(
                 &reactor,
-                delivery.finish_to_socket(reader, socket.into(), &scope())
+                delivery.finish_to(reader, connection(socket.into(), &admission, 0), &scope())
             )
             .is_ok()
         );
@@ -952,7 +835,7 @@ mod tests {
                 _ => unreachable!(),
             }
             assert!(
-                matches!(drive(&reactor, delivery.finish_to_socket(reader, socket.into(), &scope)),
+                matches!(drive(&reactor, delivery.finish_to(reader, connection(socket.into(), &admission, 3), &scope)),
                 Err(error) if error == failure)
             );
             assert!(weak.upgrade().is_none());
@@ -961,7 +844,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_nonsockets_datagrams_and_duplicate_binding() {
+    fn rejects_nonsockets_and_datagrams() {
         let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
         let page = page(&admission, b"abc".to_vec());
         let reader = delivery.attach(page.clone(), slice(0, 3)).unwrap();
@@ -969,23 +852,19 @@ mod tests {
         assert!(matches!(
             drive(
                 &reactor,
-                delivery.finish_to_socket(reader, file.into(), &scope())
+                delivery.finish_to(reader, connection(file.into(), &admission, 3), &scope())
             ),
             Err(Error::InvalidRequest)
         ));
-        let mut reader = delivery.attach(page, slice(0, 3)).unwrap();
+        let reader = delivery.attach(page, slice(0, 3)).unwrap();
         let (datagram, _peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
-        assert_eq!(
-            reader.attach_connection(datagram.into()),
+        assert!(matches!(
+            drive(
+                &reactor,
+                delivery.finish_to(reader, connection(datagram.into(), &admission, 3), &scope())
+            ),
             Err(Error::InvalidRequest)
-        );
-        let (socket, _peer) = UnixStream::pair().unwrap();
-        reader.attach_connection(socket.into()).unwrap();
-        let (socket, _peer) = UnixStream::pair().unwrap();
-        assert_eq!(
-            reader.attach_connection(socket.into()),
-            Err(Error::InvalidRequest)
-        );
+        ));
     }
 
     #[test]
@@ -998,7 +877,11 @@ mod tests {
         small_send_buffer(&socket);
         peer.set_nonblocking(true).unwrap();
         let scope = scope();
-        let mut operation = delivery.finish_to_socket(reader, socket.into(), &scope);
+        let mut operation = delivery.finish_to(
+            reader,
+            connection(socket.into(), &admission, bytes.len() as u64),
+            &scope,
+        );
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(operation.as_mut().poll(&mut cx).is_pending());
         let mut received = Vec::new();
@@ -1039,7 +922,11 @@ mod tests {
         assert!(matches!(
             drive(
                 &reactor,
-                delivery.finish_to_socket(slow, socket.into(), &scope)
+                delivery.finish_to(
+                    slow,
+                    connection(socket.into(), &admission, 512 * 1024),
+                    &scope
+                )
             ),
             Err(Error::DeadlineExceeded)
         ));
@@ -1048,7 +935,7 @@ mod tests {
         let (socket, mut peer) = UnixStream::pair().unwrap();
         drive(
             &reactor,
-            delivery.finish_to_socket(fast, socket.into(), &scope),
+            delivery.finish_to(fast, connection(socket.into(), &admission, 3), &scope),
         )
         .unwrap();
         let mut bytes = [0; 3];
@@ -1059,15 +946,19 @@ mod tests {
 
     #[test]
     fn abandonment_and_cancellation_of_pending_send_release_copied_page() {
-        let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
         for cancel in [false, true] {
+            let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
             let page = page(&admission, vec![0x5a; 512 * 1024]);
             let weak = Arc::downgrade(&page.inner);
             let reader = delivery.attach(page, slice(0, 512 * 1024)).unwrap();
             let (socket, _peer) = UnixStream::pair().unwrap();
             small_send_buffer(&socket);
             let scope = scope();
-            let mut operation = delivery.finish_to_socket(reader, socket.into(), &scope);
+            let mut operation = delivery.finish_to(
+                reader,
+                connection(socket.into(), &admission, 512 * 1024),
+                &scope,
+            );
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             assert!(operation.as_mut().poll(&mut cx).is_pending());
             assert!(weak.upgrade().is_some());
@@ -1077,13 +968,12 @@ mod tests {
                 assert!(matches!(drive(&reactor, operation), Err(Error::Cancelled)));
             } else {
                 drop(operation);
+                assert!(weak.upgrade().is_some());
+                drive(&reactor, reactor.drain()).unwrap();
             }
             assert!(weak.upgrade().is_none());
             assert!(delivery.pipes.acquire().is_ok());
-            // Fence abandoned readiness registrations; they do not own page bytes.
-            for _ in 0..4 {
-                reactor.poll_budgeted(64).unwrap();
-            }
+            assert_eq!(reactor.in_flight(), 0);
         }
     }
 
@@ -1145,7 +1035,8 @@ mod tests {
         let reader = delivery.attach(page, slice(0, 3)).unwrap();
         let (socket, mut peer) = UnixStream::pair().unwrap();
         let scope = scope();
-        let operation = delivery.finish_to_socket(reader, socket.into(), &scope);
+        let operation =
+            delivery.finish_to(reader, connection(socket.into(), &admission, 3), &scope);
         assert!(weak.upgrade().is_some());
         assert!(matches!(delivery.pipes.acquire(), Err(Error::Overloaded)));
         drop(operation);
@@ -1203,7 +1094,11 @@ mod tests {
         assert!(matches!(
             drive(
                 &reactor,
-                delivery.finish_to_socket(reader, socket.into(), &scope)
+                delivery.finish_to(
+                    reader,
+                    connection(socket.into(), &admission, 512 * 1024),
+                    &scope
+                )
             ),
             Err(Error::DeadlineExceeded)
         ));
