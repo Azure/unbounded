@@ -9,7 +9,7 @@ use crate::{
     model::{ExpiresAt, KeyId, Nonce, ObjectMetadata, PageEnvelope, ResourceClass, *},
     rdma::{Devices, RdmaTransfer, Sessions},
     runtime::{admission::Admission, reactor::Reactor},
-    security::{protocol as p, signing::Signatures},
+    security::{connection::Signatures, protocol as p},
 };
 use std::{
     os::unix::net::UnixStream,

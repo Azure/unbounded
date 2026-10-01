@@ -1,9 +1,9 @@
 //! Shared CA, node identity, keyring, and signer fixture for signed scenarios.
 use super::{
+    connection::Signatures,
     identity::Certificates,
     identity::PendingIdentity,
     identity::{KeyEpochs, Keyring},
-    signing::Signatures,
 };
 use crate::{
     control::wire::{BundleGeneration, CacheEncryptionKey, KeyringBundle, SCHEMA_VERSION},

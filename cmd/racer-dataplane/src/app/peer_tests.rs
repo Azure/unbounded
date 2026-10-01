@@ -190,7 +190,7 @@ use crate::{
     },
     security::{
         connection,
-        signing::tests::{network, node},
+        connection::signature_tests::{network, node},
     },
     topology::paths::RouteBudget,
 };

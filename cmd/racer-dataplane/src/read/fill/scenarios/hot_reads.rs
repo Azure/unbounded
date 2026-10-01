@@ -22,11 +22,11 @@ use crate::{
         range_stream::RangeStreams,
     },
     security::{
-        forwarding::Forwarding,
-        signing::{
+        connection::{
             Signatures,
-            tests::{network, node},
+            signature_tests::{network, node},
         },
+        forwarding::Forwarding,
     },
     topology::{health::LinkHealth, paths::Paths},
 };

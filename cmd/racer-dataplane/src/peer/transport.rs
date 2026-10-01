@@ -19,8 +19,8 @@ use crate::{
         reactor::IoBuffer,
     },
     security::{
+        connection::{Signatures, SignedHead, VerifiedHead, signed_digest},
         forwarding::ForwardedHead,
-        signing::{Signatures, SignedHead, VerifiedHead, signed_digest},
     },
     topology::rails::{RailId, TransportPlan},
 };
@@ -213,7 +213,7 @@ impl Binding {
             &self.head(phase, previous, length, extensions)?,
             false,
         )?;
-        if crate::security::signing::node_field(&signed.head, "racer-signer")? != *from {
+        if crate::security::connection::node_field(&signed.head, "racer-signer")? != *from {
             return Err(Error::Unauthorized);
         }
         Ok((signatures.verify_proof(signed)?, phase))
@@ -658,7 +658,7 @@ impl Transfers {
         if !sessions.ready(rail) || !self.rdma.as_ref().is_some_and(|rdma| rdma.ready(rail)) {
             return Ok(None);
         }
-        let peer = crate::security::signing::receiver(
+        let peer = crate::security::connection::receiver(
             &request
                 .authentication
                 .hops
@@ -694,7 +694,7 @@ impl Transfers {
         {
             return Err(Error::Unauthorized);
         }
-        let peer = crate::security::signing::node_field(
+        let peer = crate::security::connection::node_field(
             &request
                 .authentication
                 .hops
@@ -1180,7 +1180,7 @@ pub enum RelayResponse {
 
 pub struct Transfers {
     reclaim: Option<Rc<ReclaimCiphertext>>,
-    signatures: Rc<crate::security::signing::Signatures>,
+    signatures: Rc<crate::security::connection::Signatures>,
     #[cfg(test)]
     pub(super) native_completions: std::cell::Cell<usize>,
     #[cfg(test)]
@@ -1209,7 +1209,7 @@ impl Transfers {
         rdma: Option<Rc<RdmaTransfer>>,
         admission: Rc<Admission>,
         codec: Rc<SecurityCodec>,
-        signatures: Rc<crate::security::signing::Signatures>,
+        signatures: Rc<crate::security::connection::Signatures>,
     ) -> Self {
         Self {
             reclaim: None,
@@ -1306,7 +1306,7 @@ impl Transfers {
             )?;
             let mut head = WireCodec::encode(&request.authentication, false, 0)?;
             let signatures = self.signatures.clone();
-            let peer = crate::security::signing::receiver(
+            let peer = crate::security::connection::receiver(
                 &request
                     .authentication
                     .hops

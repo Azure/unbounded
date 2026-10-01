@@ -15,7 +15,7 @@ use crate::{
         lifecycle::{QueuePairHandle, Region},
     },
     runtime::{admission::Admission, environment},
-    security::signing::{Signatures, VerifiedHead, tests::network},
+    security::connection::{Signatures, VerifiedHead, signature_tests::network},
 };
 use std::{
     task::{Context, Poll},

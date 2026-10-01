@@ -40,10 +40,9 @@
 //! }
 //! ```
 use super::{
+    connection::{Signatures, SignedHead, node_field, receiver, signed_digest},
     identity::VerifiedPeer,
     protocol::{self, field, number, push, push_binary},
-    signing::{Signatures, SignedHead},
-    signing::{node_field, receiver, signed_digest},
 };
 use crate::{
     error::{Error, Result},
@@ -776,7 +775,7 @@ mod tests {
         },
         peer::protocol::{FetchMode, Operation},
         runtime::{admission::Admission, deadline::RequestScope},
-        security::signing::tests::{clone_head, network, node},
+        security::connection::signature_tests::{clone_head, network, node},
     };
     use std::time::{Duration, Instant};
     fn request(id: u8) -> PeerRequest {

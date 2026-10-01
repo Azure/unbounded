@@ -199,7 +199,7 @@ impl Harness {
             // WireCodec wraps the signed original in a base64 field. Mutate the
             // signed signature before encoding so the outer HTTP remains legal.
             let original = &envelope.original;
-            let mut signed = crate::security::signing::tests::clone_head(original);
+            let mut signed = crate::security::connection::signature_tests::clone_head(original);
             let signature = signed
                 .head
                 .headers

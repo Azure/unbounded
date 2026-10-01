@@ -58,7 +58,7 @@ pub struct PeerServer {
     local: Rc<dyn LocalPageService>,
     relay: Rc<Relay>,
     wire: Rc<super::protocol::SecurityCodec>,
-    signatures: Rc<crate::security::signing::Signatures>,
+    signatures: Rc<crate::security::connection::Signatures>,
     transfers: Rc<super::transport::Transfers>,
     request_timeout: Duration,
 }
@@ -71,7 +71,7 @@ impl PeerServer {
         local: Rc<dyn LocalPageService>,
         relay: Rc<Relay>,
         wire: Rc<super::protocol::SecurityCodec>,
-        signatures: Rc<crate::security::signing::Signatures>,
+        signatures: Rc<crate::security::connection::Signatures>,
     ) -> Self {
         let pipes = Rc::new(crate::memory::pipe::PipePool::new(
             admission.clone(),
@@ -206,7 +206,7 @@ impl PeerServer {
         local: Rc<dyn LocalPageService>,
         relay: Rc<Relay>,
         wire: Rc<super::protocol::SecurityCodec>,
-        signatures: Rc<crate::security::signing::Signatures>,
+        signatures: Rc<crate::security::connection::Signatures>,
         subscriptions: std::sync::Arc<super::subscriptions::Subscriptions>,
         pipes: Rc<crate::memory::pipe::PipePool>,
         transfers: Rc<super::transport::Transfers>,
@@ -1406,7 +1406,7 @@ mod tests {
                     SimulationClock::new_at(83, Instant::now(), std::time::SystemTime::now());
                 let environment = clock.environment(0);
                 let _guard = environment.enter();
-                let signers = crate::security::signing::tests::network(2);
+                let signers = crate::security::connection::signature_tests::network(2);
                 let mut limits = crate::test_support::cluster::config(false).limits;
                 limits.client_connections = std::num::NonZeroUsize::new(1).unwrap();
                 let admission = Rc::new(Admission::new(limits));

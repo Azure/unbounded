@@ -508,7 +508,7 @@ impl Requester {
                 .hops
                 .last()
                 .unwrap_or(&request.authentication.original);
-            let next = crate::security::signing::receiver(&signed_head.head)?;
+            let next = crate::security::connection::receiver(&signed_head.head)?;
             // A signature selects the next receiver. Never reroute this envelope
             // independently after signing, even if link health changes.
             let endpoint = network.endpoint(&membership, &next)?;

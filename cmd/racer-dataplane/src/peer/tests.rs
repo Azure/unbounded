@@ -17,9 +17,9 @@ use crate::{
         deadline::{Deadline, RequestScope},
     },
     security::{
+        connection::Signatures,
         forwarding::Forwarding,
         identity::{Certificates, Keyring},
-        signing::Signatures,
     },
     topology::paths::RouteBudget,
 };
@@ -39,7 +39,7 @@ fn identities() -> (Vec<Rc<Signatures>>, Vec<Discovery>) {
     crate::security::test_support::identities(
         ClusterId(CLUSTER.into()),
         &[A, B, C].map(|name| NodeId(name.into())),
-        || crate::security::signing::tests::mac_test_key(CACHE),
+        || crate::security::connection::signature_tests::mac_test_key(CACHE),
     )
     .into_iter()
     .map(|identity| (identity.signatures, (identity.keys, identity.certificates)))

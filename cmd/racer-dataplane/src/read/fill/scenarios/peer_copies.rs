@@ -5,8 +5,8 @@ use crate::{
     model::NodeId,
     peer::protocol::{PeerRequest, VerifiedResponse},
     security::{
+        connection::signature_tests::{network, node},
         forwarding::Forwarding,
-        signing::tests::{network, node},
     },
 };
 use std::collections::VecDeque;

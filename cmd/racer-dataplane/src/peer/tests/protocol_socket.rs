@@ -152,7 +152,7 @@ fn not_found_is_authenticated_through_relay_and_restricted_to_fresh_acquire() {
             .collect();
         let mut head = p::response_head(
             &PeerResponse::NotFound,
-            &crate::security::signing::signed_digest(&admitted.signed().authentication.original)
+            &crate::security::connection::signed_digest(&admitted.signed().authentication.original)
                 .unwrap(),
             &path,
         )
@@ -217,7 +217,7 @@ fn not_found_is_authenticated_through_relay_and_restricted_to_fresh_acquire() {
             ("racer-outcome", "miss"),
             ("racer-outcome", "unknown"),
         ] {
-            let mut changed = crate::security::signing::tests::clone_head(&original);
+            let mut changed = crate::security::connection::signature_tests::clone_head(&original);
             if field == "status" {
                 changed.head.start = StartLine::Response { status: 200 };
             } else {
@@ -235,7 +235,7 @@ fn not_found_is_authenticated_through_relay_and_restricted_to_fresh_acquire() {
             };
             assert!(codec.response(envelope, vec![], &scope).is_err());
         }
-        let mut changed = crate::security::signing::tests::clone_head(&original);
+        let mut changed = crate::security::connection::signature_tests::clone_head(&original);
         // A structurally valid alternate outcome/status still needs a valid signature.
         changed.head.start = StartLine::Response { status: 200 };
         changed
@@ -439,7 +439,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
 fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
     use crate::{
         http::{MessageHead, StartLine},
-        security::{protocol as p, signing::signed_digest},
+        security::{connection::signed_digest, protocol as p},
         topology::membership::{Member, Membership},
     };
     let signers = signers();
@@ -717,7 +717,7 @@ fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction(
             .sign_request_to(original, next)
             .unwrap();
         let receiver =
-            crate::security::signing::receiver(&signed.authentication.original.head).unwrap();
+            crate::security::connection::receiver(&signed.authentication.original.head).unwrap();
         let (envelope, _) = WireCodec::decode(
             WireCodec::encode(&signed.authentication, false, 0).unwrap(),
             false,

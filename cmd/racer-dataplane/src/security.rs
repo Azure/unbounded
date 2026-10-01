@@ -6,7 +6,6 @@ pub mod credentials;
 pub mod forwarding;
 pub mod identity;
 pub mod protocol;
-pub mod signing;
 #[cfg(test)]
 pub(crate) mod test_support;
 

@@ -41,12 +41,12 @@ use racer_dataplane::{
     },
     security::{
         aead::{PageCrypto, PageCryptoEngine},
+        connection::Signatures,
         credentials::CredentialCrypto,
         forwarding::Forwarding,
         identity::Certificates,
         identity::PendingIdentity,
         identity::{KeyEpochs, Keyring},
-        signing::Signatures,
     },
     store::{
         StoreReader,

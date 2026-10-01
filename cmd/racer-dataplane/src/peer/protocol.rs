@@ -8,7 +8,7 @@ use crate::{
         OpaqueMetadata, PageEnvelope, PeerOriginContext, ResourceClass, *,
     },
     runtime::{admission::Admission, deadline::RequestScope},
-    security::{forwarding::ForwardedHead, protocol as p, signing::SignedHead},
+    security::{connection::SignedHead, forwarding::ForwardedHead, protocol as p},
     topology::paths::RouteBudget,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -323,7 +323,7 @@ mod envelope_tests {
     }
     #[test]
     fn maximum_signed_heads_and_hop_count_fit_outer_signature_profile() {
-        let signers = crate::security::signing::tests::network(2);
+        let signers = crate::security::connection::signature_tests::network(2);
         let mut head = MessageHead {
             start: StartLine::Response { status: 200 },
             headers: vec![
@@ -342,7 +342,7 @@ mod envelope_tests {
         let length = codec.encode_head(&small.head).unwrap().len();
         head = small.head;
         head.headers.retain(|h| {
-            !crate::security::signing::is_auth_field(&h.name) || h.name == "racer-receiver"
+            !crate::security::connection::is_auth_field(&h.name) || h.name == "racer-receiver"
         });
         head.headers
             .iter_mut()
@@ -407,7 +407,7 @@ fn array<const N: usize>(head: &MessageHead, name: &str) -> Result<[u8; N]> {
         .map_err(|_| Error::InvalidRequest)
 }
 fn node(head: &MessageHead, name: &str) -> Result<NodeId> {
-    crate::security::signing::node_field(head, name)
+    crate::security::connection::node_field(head, name)
 }
 fn object(head: &MessageHead) -> Result<ObjectId> {
     let cache = p::field(head, "racer-cache")?;

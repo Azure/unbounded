@@ -298,7 +298,7 @@ fn subscription_selection_is_canonical_signed_and_bound_to_exact_grant() {
         // Sign directly to test receiver validation independently of sign_response.
         let mut head = crate::security::protocol::response_head(
             &response,
-            &crate::security::signing::signed_digest(&admitted.signed().authentication.original)
+            &crate::security::connection::signed_digest(&admitted.signed().authentication.original)
                 .unwrap(),
             &[NodeId(A.into()), NodeId(C.into())],
         )
@@ -512,11 +512,11 @@ fn retained_subscription_cannot_complete_after_request_mac_key_retirement() {
         .unwrap();
     let admitted = destination.verify_request(request).unwrap();
     let keys = &discovery[2].0;
-    let mut retired = crate::security::signing::tests::mac_test_key(CACHE);
+    let mut retired = crate::security::connection::signature_tests::mac_test_key(CACHE);
     for key in &mut retired {
         key.state = CacheKeyState::Retiring;
     }
-    let mut replacement = crate::security::signing::tests::mac_test_key(CACHE);
+    let mut replacement = crate::security::connection::signature_tests::mac_test_key(CACHE);
     for key in &mut replacement {
         key.key.id.0[0] ^= 1;
         key.material[0] ^= 1;

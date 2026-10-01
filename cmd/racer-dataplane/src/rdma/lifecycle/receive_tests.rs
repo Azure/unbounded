@@ -9,7 +9,7 @@ use crate::{
     },
     rdma::{COMPLETION_HEADER, Devices, RdmaTransfer, SessionLease, Sessions, completion_bytes},
     runtime::{admission::Admission, deadline::RequestScope, environment},
-    security::signing::tests::network,
+    security::connection::signature_tests::network,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use std::{

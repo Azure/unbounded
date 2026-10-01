@@ -45,7 +45,7 @@ fn node(n: usize) -> NodeId {
 }
 fn identities(nodes: &[NodeId]) -> Vec<Identity> {
     crate::security::test_support::identities(ClusterId(CLUSTER.into()), nodes, || {
-        crate::security::signing::tests::mac_test_key(CACHE)
+        crate::security::connection::signature_tests::mac_test_key(CACHE)
     })
 }
 struct NeverRelay;

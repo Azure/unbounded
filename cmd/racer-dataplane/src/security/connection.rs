@@ -1,19 +1,328 @@
-//! Mutually authenticated, exclusively socket-owned ordered peer sessions.
+//! Authenticated peer messaging: HTTP signatures for retained forwarding proofs
+//! and mutually authenticated, exclusively socket-owned ordered sessions.
+//!
+//! A verified proof establishes identity and provenance, not replay admission.
+//! Only the carrying connection session admits a fresh immediate-hop message.
 use super::{
-    protocol as p,
-    signing::{Signatures, SignedHead, is_auth_field, node_field},
+    identity::{Certificates, Keyring, VerifiedPeer},
+    protocol::{self as p, field, number, push, push_binary},
 };
 use crate::{
     error::{Error, Result},
     http::{
-        MessageHead, StartLine,
+        Codec, MessageHead, StartLine,
         connection::{ConnectionLease, HttpIo},
     },
     model::NodeId,
     runtime::deadline::RequestScope,
 };
 use sha2::{Digest, Sha256};
-use std::{rc::Rc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    rc::Rc,
+    time::{Duration, UNIX_EPOCH},
+};
+
+pub struct Signatures {
+    keys: Rc<Keyring>,
+    certificates: Rc<Certificates>,
+}
+pub struct SignedHead {
+    pub head: MessageHead,
+    pub signature: Vec<u8>,
+}
+pub struct VerifiedHead {
+    pub(crate) signed: SignedHead,
+    pub(crate) peer: VerifiedPeer,
+}
+impl Signatures {
+    pub fn new(keys: Rc<Keyring>, certificates: Rc<Certificates>) -> Self {
+        Self { keys, certificates }
+    }
+    pub fn node(&self) -> &NodeId {
+        self.keys.node()
+    }
+    /// Sign retained provenance. Replay admission belongs exclusively to the
+    /// immediate-hop head signed by the owning connection session.
+    pub fn sign(&self, head: MessageHead) -> Result<SignedHead> {
+        if head.headers.iter().any(|h| {
+            is_auth_field(&h.name.to_ascii_lowercase())
+                && !h.name.eq_ignore_ascii_case("racer-receiver")
+        }) {
+            return Err(Error::InvalidRequest);
+        }
+        receiver(&head)?;
+        let signed = self.sign_fields(head)?;
+        Codec::new(p::MAX_HEAD, u64::MAX).encode_head(&signed.head)?;
+        Ok(signed)
+    }
+    pub(crate) fn sign_fields(&self, mut head: MessageHead) -> Result<SignedHead> {
+        let identity = self.keys.signing_identity()?;
+        if identity.node() != self.node() {
+            return Err(Error::Unauthorized);
+        }
+        push(&mut head, "racer-profile", p::PROFILE);
+        p::uuid(&self.keys.cluster().0)?;
+        p::uuid(&self.node().0)?;
+        push(&mut head, "racer-cluster", &self.keys.cluster().0);
+        push(&mut head, "racer-signer", &self.node().0);
+        push_binary(
+            &mut head,
+            "racer-certificates",
+            &encode_chain(identity.certificate_chain())?,
+        );
+        push(
+            &mut head,
+            "racer-timestamp",
+            p::millis(crate::runtime::environment::wall_now())?,
+        );
+        if head.unique("racer-kind")? == Some(b"request".as_slice()) {
+            let cache = crate::model::CacheId(field(&head, "racer-cache")?);
+            let key = self
+                .keys
+                .active(&cache, super::identity::KeyPurpose::OriginCredentials)?;
+            push_binary(&mut head, "racer-mac-key", &key.id().0);
+            let tag = super::hmac(&*super::request_key(&key)?, &mac_base(&head)?);
+            push_binary(&mut head, "racer-request-mac", &tag);
+        }
+        let input = signature_input(&head)?;
+        push(&mut head, "signature-input", format!("racer={input}"));
+        let signature = identity.sign(&signature_base(&head)?)?;
+        if signature.len() != 64 {
+            return Err(Error::Unauthorized);
+        }
+        push(
+            &mut head,
+            "signature",
+            format!("racer=:{}:", p::binary(&signature)),
+        );
+        Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD, u64::MAX).encode_head(&head)?;
+        Ok(SignedHead { head, signature })
+    }
+    /// Verify identity and retained provenance, without replay admission. Network
+    /// callers must first admit the carrying immediate-hop head on its socket.
+    pub fn verify_proof(&self, head: SignedHead) -> Result<VerifiedHead> {
+        let peer = self.verify_historical(&head)?;
+        if receiver(&head.head)? != *self.node() {
+            return Err(Error::Unauthorized);
+        }
+        Ok(VerifiedHead { signed: head, peer })
+    }
+    /// Cryptographically validate an original or historical hop, without replay
+    /// admission at this node. The owning connection admits the fresh outer head;
+    /// forwarding then validates the complete retained chain and logical fields.
+    pub(crate) fn verify_historical(&self, signed: &SignedHead) -> Result<VerifiedPeer> {
+        let head = &signed.head;
+        if field(head, "racer-profile")? != p::PROFILE
+            || field(head, "racer-cluster")? != self.keys.cluster().0
+        {
+            return Err(Error::Unauthorized);
+        }
+        p::uuid(&self.keys.cluster().0)?;
+        if head.unique("racer-kind")? == Some(b"request".as_slice()) {
+            let cache = crate::model::CacheId(field(head, "racer-cache")?);
+            let id = p::decode_binary(field(head, "racer-mac-key")?.as_bytes())?
+                .try_into()
+                .map_err(|_| Error::Unauthorized)?;
+            let key = self.keys.lease(
+                Some(&cache),
+                crate::model::KeyId(id),
+                super::identity::KeyPurpose::OriginCredentials,
+            )?;
+            let expected = super::hmac(&*super::request_key(&key)?, &mac_base(head)?);
+            if !super::equal(
+                &p::decode_binary(field(head, "racer-request-mac")?.as_bytes())?,
+                &expected,
+            ) {
+                return Err(Error::Unauthorized);
+            }
+        }
+        let base = signature_base(head)?;
+        if signed.signature.len() != 64
+            || field(head, "signature")? != format!("racer=:{}:", p::binary(&signed.signature))
+        {
+            return Err(Error::Unauthorized);
+        }
+        let signer = node_field(head, "racer-signer")?;
+        let chain = decode_chain(&p::decode_binary(
+            field(head, "racer-certificates")?.as_bytes(),
+        )?)?;
+        let timestamp = UNIX_EPOCH
+            .checked_add(Duration::from_millis(number(head, "racer-timestamp")?))
+            .ok_or(Error::Unauthorized)?;
+        let now = crate::runtime::environment::wall_now();
+        if timestamp
+            > now
+                .checked_add(Duration::from_secs(5))
+                .ok_or(Error::Unauthorized)?
+            || now
+                .duration_since(timestamp)
+                .is_ok_and(|age| age >= Duration::from_secs(60))
+        {
+            return Err(Error::Replay);
+        }
+        self.certificates
+            .verify_signed(&chain, &signer, &base, &signed.signature)
+    }
+}
+pub(crate) fn is_auth_field(name: &str) -> bool {
+    matches!(
+        name,
+        "signature-input"
+            | "signature"
+            | "racer-profile"
+            | "racer-cluster"
+            | "racer-signer"
+            | "racer-receiver"
+            | "racer-certificates"
+            | "racer-session"
+            | "racer-direction"
+            | "racer-sequence"
+            | "racer-timestamp"
+            | "racer-mac-key"
+            | "racer-request-mac"
+    )
+}
+fn mac_base(head: &MessageHead) -> Result<Vec<u8>> {
+    let mut out = b"racer/request-mac/message/v1\0".to_vec();
+    let start = match &head.start {
+        StartLine::Request { method, target } => format!("{method} {target}"),
+        _ => return Err(Error::Unauthorized),
+    };
+    super::aead::field(&mut out, start.as_bytes())?;
+    for name in components(head)? {
+        if name.starts_with('@') || name == "racer-request-mac" {
+            continue;
+        }
+        super::aead::field(&mut out, name.as_bytes())?;
+        super::aead::field(&mut out, head.unique(&name)?.ok_or(Error::Unauthorized)?)?;
+    }
+    Ok(out)
+}
+pub fn node_field(head: &MessageHead, name: &str) -> Result<NodeId> {
+    let node = field(head, name)?;
+    p::uuid(&node)?;
+    Ok(NodeId(node))
+}
+pub fn receiver(head: &MessageHead) -> Result<NodeId> {
+    node_field(head, "racer-receiver")
+}
+fn components(head: &MessageHead) -> Result<Vec<String>> {
+    Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD, u64::MAX).encode_head(head)?;
+    let mut names = BTreeSet::new();
+    for h in &head.headers {
+        let name = h.name.to_ascii_lowercase();
+        if !names.insert(name)
+            || h.value.first().is_some_and(|b| b.is_ascii_whitespace())
+            || h.value.last().is_some_and(|b| b.is_ascii_whitespace())
+            || !h.value.is_ascii()
+        {
+            return Err(Error::Unauthorized);
+        }
+    }
+    names.remove("signature");
+    names.remove("signature-input");
+    let mut components = match head.start {
+        StartLine::Request { .. } => vec!["@method".into(), "@request-target".into()],
+        StartLine::Response { .. } => vec!["@status".into()],
+    };
+    components.extend(names);
+    Ok(components)
+}
+fn signature_input(head: &MessageHead) -> Result<String> {
+    signature_input_for_components(head, &components(head)?)
+}
+fn signature_input_for_components(head: &MessageHead, components: &[String]) -> Result<String> {
+    let components = components
+        .iter()
+        .map(|s| format!("\"{s}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let timestamp = number(head, "racer-timestamp")? / 1000;
+    let keyid = field(head, "racer-signer")?;
+    p::uuid(&keyid)?;
+    Ok(format!(
+        "({components});created={timestamp};keyid=\"{keyid}\";alg=\"ed25519\";tag=\"{}\"",
+        p::PROFILE
+    ))
+}
+/// RFC 9421 section 2.5 signature base, using the strict Racer profile. The
+/// verifier accepts only this canonical structured-field serialization, avoiding
+/// duplicate labels, unsupported parameters and alternate parsing ambiguity.
+pub fn signature_base(head: &MessageHead) -> Result<Vec<u8>> {
+    let components = components(head)?;
+    let input = signature_input_for_components(head, &components)?;
+    if field(head, "signature-input")? != format!("racer={input}") {
+        return Err(Error::Unauthorized);
+    }
+    let mut lines = Vec::new();
+    for name in components {
+        let value = match (name.as_str(), &head.start) {
+            ("@method", StartLine::Request { method, .. }) => method.clone(),
+            ("@request-target", StartLine::Request { target, .. }) => target.clone(),
+            ("@status", StartLine::Response { status }) => status.to_string(),
+            // The complete outer head was bounded by components(). Its base64
+            // provenance fields can exceed the inner logical field's 64 KiB cap.
+            _ => String::from_utf8(head.unique(&name)?.ok_or(Error::Unauthorized)?.to_vec())
+                .map_err(|_| Error::Unauthorized)?,
+        };
+        lines.push(format!("\"{name}\": {value}"));
+    }
+    lines.push(format!("\"@signature-params\": {input}"));
+    Ok(lines.join("\n").into_bytes())
+}
+/// Domain-separated SHA-256 binding of the exact signature base and Ed25519
+/// signature. Includes the signature itself, so a request ID is never sufficient.
+pub fn signed_digest(head: &SignedHead) -> Result<[u8; 32]> {
+    let base = signature_base(&head.head)?;
+    let mut hash = Sha256::new();
+    hash.update(b"racer-peer-v2/signed-head\0");
+    hash.update((base.len() as u64).to_be_bytes());
+    hash.update(base);
+    hash.update((head.signature.len() as u64).to_be_bytes());
+    hash.update(&head.signature);
+    Ok(hash.finalize().into())
+}
+fn encode_chain(chain: &[Vec<u8>]) -> Result<Vec<u8>> {
+    if chain.is_empty() || chain.len() > 8 {
+        return Err(Error::Unauthorized);
+    }
+    let mut bytes = Vec::new();
+    for cert in chain {
+        if cert.is_empty() || cert.len() > 16384 {
+            return Err(Error::Unauthorized);
+        }
+        bytes.extend_from_slice(&(cert.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(cert);
+    }
+    if bytes.len() > 65536 {
+        return Err(Error::Unauthorized);
+    }
+    Ok(bytes)
+}
+fn decode_chain(mut bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
+    if bytes.len() > 65536 {
+        return Err(Error::Unauthorized);
+    }
+    let mut chain = Vec::new();
+    while !bytes.is_empty() {
+        if bytes.len() < 4 || chain.len() == 8 {
+            return Err(Error::Unauthorized);
+        }
+        let n =
+            u32::from_be_bytes(bytes[..4].try_into().map_err(|_| Error::Unauthorized)?) as usize;
+        bytes = &bytes[4..];
+        if n == 0 || n > 16384 || bytes.len() < n {
+            return Err(Error::Unauthorized);
+        }
+        chain.push(bytes[..n].to_vec());
+        bytes = &bytes[n..];
+    }
+    if chain.is_empty() {
+        return Err(Error::Unauthorized);
+    }
+    Ok(chain)
+}
 
 const TARGET: &str = "/racer/peer/v2/session";
 const DOMAIN: &[u8] = b"racer-peer-v2/connection\0";
@@ -91,7 +400,7 @@ impl Session {
         if let Some(proof) = last {
             let proof = crate::peer::protocol::decode_signed(proof)?;
             if node_field(&proof.head, "racer-signer")? != self.peer
-                || super::signing::receiver(&proof.head)? != *self.signatures.node()
+                || receiver(&proof.head)? != *self.signatures.node()
             {
                 return Err(Error::Unauthorized);
             }
@@ -313,6 +622,9 @@ pub async fn accept(
 }
 
 #[cfg(test)]
+pub(crate) mod signature_tests;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::{
@@ -350,7 +662,7 @@ pub(crate) mod tests {
             .0
     }
     pub(crate) fn pair() -> (Session, Session) {
-        let n = super::super::signing::tests::network(3);
+        let n = super::signature_tests::network(3);
         let id = random().unwrap();
         (
             Session::new(n[0].clone(), n[1].node().clone(), id, 0),
@@ -544,7 +856,7 @@ pub(crate) mod tests {
 
     #[test]
     fn loopback_mutual_authentication_pool_reuse_and_fresh_reconnect() {
-        let n = super::super::signing::tests::network(2);
+        let n = super::signature_tests::network(2);
         let admission = Rc::new(Admission::new(
             crate::test_support::cluster::config(false).limits,
         ));
@@ -612,7 +924,7 @@ pub(crate) mod tests {
     }
     #[test]
     pub(crate) fn signed_challenges_bind_both_identities_protocol_and_fresh_randomness() {
-        let n = super::super::signing::tests::network(3);
+        let n = super::signature_tests::network(3);
         let a = random().unwrap();
         let b = random().unwrap();
         assert_ne!(a, random().unwrap());
@@ -658,7 +970,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn handshake_codec_bounds() {
-        let n = super::super::signing::tests::network(2);
+        let n = super::signature_tests::network(2);
         let h = head(
             &n[1],
             n[0].node(),
@@ -689,7 +1001,7 @@ pub(crate) mod tests {
     #[test]
     fn socket_admission_rejects_replay_before_dispatch_and_closes_pool_slot() {
         use crate::runtime::reactor::IoBuffer;
-        let n = super::super::signing::tests::network(2);
+        let n = super::signature_tests::network(2);
         let admission = Rc::new(Admission::new(
             crate::test_support::cluster::config(false).limits,
         ));
@@ -730,7 +1042,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn handshake_cancel_expiry_and_abandonment_retain_only_fenced_admissions() {
-        let n = super::super::signing::tests::network(2);
+        let n = super::signature_tests::network(2);
         for end in ["cancel", "expiry", "drop"] {
             let admission = Rc::new(Admission::new(
                 crate::test_support::cluster::config(false).limits,

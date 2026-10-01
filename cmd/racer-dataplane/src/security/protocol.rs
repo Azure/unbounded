@@ -532,7 +532,7 @@ pub fn agrees(actual: &MessageHead, expected: &MessageHead, ignore_route: bool) 
         let mut map = std::collections::BTreeMap::new();
         for h in &head.headers {
             let name = h.name.to_ascii_lowercase();
-            if super::signing::is_auth_field(&name)
+            if super::connection::is_auth_field(&name)
                 || (ignore_route
                     && matches!(
                         name.as_str(),
@@ -575,8 +575,8 @@ mod tests {
         push(&mut head, "n", "01");
         assert!(number(&head, "n").is_err());
         let nodes = vec![
-            super::super::signing::tests::node(1),
-            super::super::signing::tests::node(2),
+            super::super::connection::signature_tests::node(1),
+            super::super::connection::signature_tests::node(2),
         ];
         assert_eq!(
             decode_nodes(super::nodes(&nodes).unwrap().as_bytes()).unwrap(),

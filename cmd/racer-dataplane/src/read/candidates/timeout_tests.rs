@@ -2,8 +2,8 @@ use super::*;
 use crate::{
     model::{ExpiresAt, MembershipVersion, ObjectMetadata, ObjectVersion, RequestId, StrongEtag},
     security::{
+        connection::{Signatures, signature_tests::network},
         forwarding::Forwarding,
-        signing::{Signatures, tests::network},
     },
     topology::membership::{Member, Membership},
 };

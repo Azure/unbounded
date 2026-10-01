@@ -473,7 +473,7 @@ fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution()
             .unwrap()
             .0;
         head.headers.retain(|h| {
-            !crate::security::signing::is_auth_field(&h.name) || h.name == "racer-receiver"
+            !crate::security::connection::is_auth_field(&h.name) || h.name == "racer-receiver"
         });
         head
     }
