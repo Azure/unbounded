@@ -1239,8 +1239,7 @@ pub(super) mod tests {
         let total = 4 * PAGE_BYTES + 17;
         let range = ByteRange::From(PAGE_BYTES).resolve(total).unwrap();
         for (capped, progressing, subscription) in [
-            (true, false, false),
-            (false, false, false),
+            (true, false, true),
             (false, true, true),
             (false, false, true),
         ] {

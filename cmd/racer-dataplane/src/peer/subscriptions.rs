@@ -219,24 +219,8 @@ impl Subscriptions {
         deadline: u64,
         now_ms: u64,
     ) -> Result<Selection> {
-        self.schedule_eligible(subscription, membership, receiver, deadline, now_ms, |_| {
-            true
-        })
-    }
-
-    /// Eligibility is evaluated only at compact sweep endpoints, never by expanding
-    /// an object's pages. The signed demand remains intact in the retained contract.
-    pub fn schedule_eligible(
-        self: &Arc<Self>,
-        subscription: Subscription,
-        membership: MembershipVersion,
-        receiver: NodeId,
-        deadline: u64,
-        now_ms: u64,
-        eligible: impl Fn(u64) -> bool,
-    ) -> Result<Selection> {
         let key = self.admit(subscription, membership, receiver, deadline, now_ms)?;
-        self.select(&key, now_ms, |page| Some(eligible(page)))?
+        self.select(&key, now_ms, |_| Some(true))?
             .map_err(|_| Error::Internal)
     }
 

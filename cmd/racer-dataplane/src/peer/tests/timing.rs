@@ -215,12 +215,8 @@ fn page_timing_invalid_signature_miss_and_drop_censor_without_partial_success() 
 #[test]
 fn page_timing_requester_reuses_authenticated_session_and_rejects_bad_signature() {
     use crate::{
-        http::{
-            Codec,
-            connection::{ConnectionLease, HttpIo, HttpPool},
-        },
+        http::connection::ConnectionLease,
         peer::PeerClient,
-        runtime::reactor::Reactor,
         topology::{
             health::LinkHealth,
             membership::{Member, Membership},
@@ -232,24 +228,15 @@ fn page_timing_requester_reuses_authenticated_session_and_rejects_bad_signature(
         task::{Context, Poll},
     };
     let signers = signers();
-    let admission = Rc::new(Admission::new(
-        crate::test_support::cluster::config(false).limits,
-    ));
-    let reactor = Rc::new(Reactor::new(admission.clone()));
-    let io = Rc::new(HttpIo::with_admission(
-        reactor.clone(),
-        Codec::new(protocol::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
-        admission.clone(),
-    ));
-    let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 1));
-    let transfers = Rc::new(transport::Transfers::new(
-        pool.clone(),
-        io.clone(),
-        None,
-        admission.clone(),
-        Rc::new(codec(&admission)),
-        signers[0].clone(),
-    ));
+    let fixture = SocketFixture::new(1);
+    let transfers = fixture.transfers(signers[0].clone());
+    let SocketFixture {
+        admission,
+        reactor,
+        io,
+        pool,
+        ..
+    } = fixture;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let members = Arc::new(

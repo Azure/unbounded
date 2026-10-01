@@ -1,6 +1,6 @@
 //! Central status mapping and streaming body delivery, including late truncation.
 use super::ReadKind;
-use crate::telemetry::failures::{Detail, Failure, Observer, Stage};
+use crate::telemetry::failures::Observer;
 use crate::{
     error::{Error, Operation, Result},
     http::{
@@ -103,9 +103,7 @@ impl Responses {
         success_head(&response.metadata, response.range)?;
         Ok(())
     }
-    /// Prepare the first slice before success headers. Pre-body failures send an
-    /// error head and return a poisoned connection; callers must check reuse.
-    /// Errors after success headers are terminal and close the incomplete body.
+    /// Send HEAD metadata. Object bodies use the duplex subscription sender.
     pub fn send<'a>(
         &'a self,
         connection: ConnectionLease,
@@ -128,79 +126,17 @@ impl Responses {
     fn send_inner<'a>(
         &'a self,
         mut connection: ConnectionLease,
-        mut response: ReadResponse,
+        response: ReadResponse,
         scope: &'a RequestScope,
         mut observation: Option<&'a mut crate::telemetry::metrics::RequestMetrics>,
     ) -> Operation<'a, ConnectionLease> {
         Box::pin(async move {
             scope.check()?;
-            let head = success_head(&response.metadata, response.range)?;
-            let expected = response.range.map_or(0, |range| range.len());
-            if response.body.is_some() != response.range.is_some() {
+            if response.body.is_some() || response.range.is_some() {
                 return Err(Error::BadGateway);
             }
-            // Acquire and validate the first page and its delivery pipe before
-            // promising a body. Admission failures can still be a complete 503.
-            let mut first = if let Some(stream) = response.body.as_mut() {
-                match stream.next_slice().await {
-                    Ok(Some(reader))
-                        if reader.remaining() != 0 && reader.remaining() as u64 <= expected =>
-                    {
-                        Some(reader)
-                    }
-                    result => {
-                        let error = result.err().unwrap_or(Error::BadGateway);
-                        self.observer.record(
-                            Failure::new(Stage::FirstSlice, error)
-                                .request(scope)
-                                .detail(Detail::Delivery { sent: 0, expected }),
-                        );
-                        if let Some(observation) = observation {
-                            observation.fail(error);
-                        }
-                        // Drop the stream only after the error head is sent: its
-                        // destructor cancels the shared request scope.
-                        return self.send_error(connection, error, scope).await;
-                    }
-                }
-            } else {
-                None
-            };
+            let head = success_head(&response.metadata, None)?;
             connection = self.io.send_head(connection, head, scope).await?.connection;
-            let mut sent = 0u64;
-            if let Some(stream) = response.body.as_mut() {
-                loop {
-                    let reader = match first.take() {
-                        Some(reader) => reader,
-                        None => match stream.next_slice().await.inspect_err(|&error| {
-                            self.observer.record(
-                                Failure::new(Stage::NextSlice, error)
-                                    .request(scope)
-                                    .detail(Detail::Delivery { sent, expected }),
-                            );
-                        })? {
-                            Some(reader) => reader,
-                            None => break,
-                        },
-                    };
-                    let length = reader.remaining() as u64;
-                    if length == 0 || length > expected - sent {
-                        return Err(Error::BadGateway);
-                    }
-                    let written = self.delivery.finish_to(reader, connection, scope).await;
-                    connection = written.inspect_err(|&error| {
-                        self.observer.record(
-                            Failure::new(Stage::ClientWrite, error)
-                                .request(scope)
-                                .detail(Detail::Delivery { sent, expected }),
-                        );
-                    })?;
-                    sent += length;
-                }
-            }
-            if sent != expected {
-                return Err(Error::BadGateway);
-            }
             connection.finish_exchange()?;
             if let Some(observation) = observation.as_mut() {
                 observation.success();
@@ -279,28 +215,13 @@ fn success_head(metadata: &ObjectMetadata, range: Option<ResolvedRange>) -> Resu
     if let Some(content_type) = &metadata.content_type {
         headers.push(header("Racer-Content-Type", content_type.as_bytes()));
     }
-    let status = if let Some(range) = range {
-        if range.end() > metadata.length {
-            return Err(Error::BadGateway);
-        }
-        headers.push(header("Content-Length", range.len().to_string()));
-        headers.push(header(
-            "Content-Range",
-            format!(
-                "bytes {}-{}/{}",
-                range.start(),
-                range.end() - 1,
-                metadata.length
-            ),
-        ));
-        206
-    } else {
-        headers.push(header("Content-Length", metadata.length.to_string()));
-        200
-    };
+    if range.is_some() {
+        return Err(Error::BadGateway);
+    }
+    headers.push(header("Content-Length", metadata.length.to_string()));
     headers.push(header("Content-Type", "application/octet-stream"));
     Ok(MessageHead {
-        start: StartLine::Response { status },
+        start: StartLine::Response { status: 200 },
         headers,
     })
 }
@@ -343,13 +264,11 @@ mod tests {
             assert!(head.unique("Content-Range").unwrap().is_none());
         }
         let range = ByteRange::Suffix(7).resolve(100).unwrap();
-        let head = success_head(&metadata(100), Some(range)).unwrap();
-        assert!(matches!(head.start, StartLine::Response { status: 206 }));
-        assert_eq!(
-            head.unique("Content-Range").unwrap().unwrap(),
-            b"bytes 93-99/100"
-        );
-        assert_eq!(head.unique("Content-Length").unwrap().unwrap(), b"7");
+        let head = subscription::success_head(&metadata(100), Some(range)).unwrap();
+        assert!(matches!(head.start, StartLine::Response { status: 200 }));
+        assert_eq!(head.unique("Racer-Range-Start").unwrap().unwrap(), b"93");
+        assert_eq!(head.unique("Racer-Range-End").unwrap().unwrap(), b"100");
+        assert_eq!(head.unique("Content-Length").unwrap().unwrap(), b"49");
         assert_eq!(
             head.unique("Content-Type").unwrap().unwrap(),
             b"application/octet-stream"
@@ -364,7 +283,11 @@ mod tests {
                 .unwrap(),
         );
         for range in [None, Some(ByteRange::From(0).resolve(3).unwrap())] {
-            let head = success_head(&metadata, range).unwrap();
+            let head = match range {
+                None => success_head(&metadata, None),
+                Some(_) => subscription::success_head(&metadata, range),
+            }
+            .unwrap();
             assert_eq!(
                 head.unique("Racer-Content-Type").unwrap(),
                 Some(metadata.content_type.as_ref().unwrap().as_bytes())

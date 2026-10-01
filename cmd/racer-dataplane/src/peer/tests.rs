@@ -99,3 +99,60 @@ pub(super) fn request(admission: &Admission, attempt: u8) -> PeerRequest {
 pub(super) fn codec(admission: &Rc<Admission>) -> SecurityCodec {
     SecurityCodec::new(admission.clone(), BufferPool::new(admission.clone()))
 }
+
+/// Common signed HTTP plumbing. Scenarios retain their own membership and service.
+pub(crate) struct SocketFixture {
+    pub admission: Rc<Admission>,
+    pub reactor: Rc<crate::runtime::reactor::Reactor>,
+    pub io: Rc<crate::http::connection::HttpIo>,
+    pub codec: Rc<SecurityCodec>,
+    pub pool: Rc<crate::http::connection::HttpPool>,
+}
+
+impl SocketFixture {
+    pub fn new(pool_limit: usize) -> Self {
+        let admission = Rc::new(Admission::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let reactor = Rc::new(crate::runtime::reactor::Reactor::new(admission.clone()));
+        let io = Rc::new(crate::http::connection::HttpIo::with_admission(
+            reactor.clone(),
+            crate::http::Codec::new(protocol::MAX_ENVELOPE_HEAD, PAGE_BYTES + 16),
+            admission.clone(),
+        ));
+        Self {
+            codec: Rc::new(codec(&admission)),
+            pool: Rc::new(crate::http::connection::HttpPool::new(
+                reactor.clone(),
+                admission.clone(),
+                pool_limit,
+            )),
+            admission,
+            reactor,
+            io,
+        }
+    }
+
+    pub fn transfers(&self, signer: Rc<Signatures>) -> Rc<transport::Transfers> {
+        Rc::new(transport::Transfers::new(
+            self.pool.clone(),
+            self.io.clone(),
+            None,
+            self.admission.clone(),
+            self.codec.clone(),
+            signer,
+        ))
+    }
+}
+
+struct NeverTransport;
+impl PeerTransport for NeverTransport {
+    fn exchange<'a>(
+        &'a self,
+        _: protocol::SignedRequest,
+        _: crate::topology::membership::MembershipLease,
+        _: &'a RequestScope,
+    ) -> crate::error::Operation<'a, protocol::SignedResponse> {
+        Box::pin(async { panic!("direct request must not relay") })
+    }
+}

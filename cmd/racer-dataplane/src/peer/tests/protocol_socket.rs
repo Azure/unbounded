@@ -928,12 +928,7 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
 fn signed_tcp_case(case: &str) {
     use super::PeerClient;
     use crate::{
-        http::{
-            Codec,
-            connection::HttpIo,
-            connection::{ConnectionLease, HttpPool},
-        },
-        runtime::reactor::Reactor,
+        http::connection::ConnectionLease,
         topology::{
             health::LinkHealth,
             membership::{Member, Membership},
@@ -944,17 +939,6 @@ fn signed_tcp_case(case: &str) {
         net::TcpListener,
         task::{Context, Poll},
     };
-    struct NeverTransport;
-    impl PeerTransport for NeverTransport {
-        fn exchange<'a>(
-            &'a self,
-            _: protocol::SignedRequest,
-            _: crate::topology::membership::MembershipLease,
-            _: &'a RequestScope,
-        ) -> crate::error::Operation<'a, protocol::SignedResponse> {
-            Box::pin(async { panic!("direct request must not relay") })
-        }
-    }
     struct Local;
     impl server::LocalPageService for Local {
         fn serve_peer<'a>(
@@ -983,25 +967,15 @@ fn signed_tcp_case(case: &str) {
         }
     }
     let (signers, _) = identities();
-    let admission = Rc::new(Admission::new(
-        crate::test_support::cluster::config(false).limits,
-    ));
-    let reactor = Rc::new(Reactor::new(admission.clone()));
-    let io = Rc::new(HttpIo::with_admission(
-        reactor.clone(),
-        Codec::new(protocol::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
-        admission.clone(),
-    ));
-    let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2));
-    let codec = Rc::new(codec(&admission));
-    let transfers = Rc::new(transport::Transfers::new(
-        pool,
-        io.clone(),
-        None,
-        admission.clone(),
-        codec.clone(),
-        signers[0].clone(),
-    ));
+    let fixture = SocketFixture::new(2);
+    let transfers = fixture.transfers(signers[0].clone());
+    let SocketFixture {
+        admission,
+        reactor,
+        io,
+        codec,
+        ..
+    } = fixture;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();

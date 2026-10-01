@@ -17,7 +17,7 @@ pub(super) async fn until(condition: impl Fn() -> bool) {
 
 // Include a body prefix with the signed head, then use non-power-of-two body
 // fragments. Both the head read-ahead and ordinary body receive paths participate.
-async fn prefix(
+pub(super) async fn prefix(
     io: &HttpIo,
     mut conn: ConnectionLease,
     response: protocol::SignedResponse,

@@ -8,15 +8,14 @@ pub mod response;
 use crate::runtime::collections::HashSet;
 use crate::{
     error::{Error, Result},
-    http::{MessageHead, StartLine},
+    http::{MessageHead, StartLine, is_token, trim_ows},
     model::{
         Authorization, ByteRange, CacheId, CacheKey, ObjectId, OpaqueMetadata, OriginContext,
         PAGE_BYTES, StrongEtag,
     },
 };
 
-pub const MAX_HEAD_BYTES: usize = 32 * 1024;
-pub const MAX_FIELD_BYTES: usize = 8192;
+pub use crate::{http::MAX_HEAD_BYTES, model::MAX_FIELD_BYTES};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReadKind {
@@ -52,20 +51,6 @@ pub struct ClientRequest {
     pub origin: OriginContext,
 }
 
-/// Endpoint-only distinctions without putting raw request data in shared errors.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RequestError {
-    Invalid(Error),
-    HeaderLimit,
-    MethodNotAllowed,
-}
-
-impl From<Error> for RequestError {
-    fn from(error: Error) -> Self {
-        Self::Invalid(error)
-    }
-}
-
 #[derive(Clone)]
 pub struct RequestParser {
     header_limit: usize,
@@ -80,24 +65,11 @@ impl RequestParser {
     pub(crate) fn header_limit(&self) -> usize {
         self.header_limit
     }
-    pub fn parse(&self, cache: &CacheId, head: MessageHead) -> Result<ClientRequest> {
-        self.parse_detailed(cache, head)
-            .map_err(|error| match error {
-                RequestError::Invalid(error) => error,
-                RequestError::HeaderLimit => Error::HeaderTooLarge,
-                RequestError::MethodNotAllowed => Error::MethodNotAllowed,
-            })
-    }
-
     /// Codec must validate the raw head and its byte limit before calling this.
     /// In particular, context fields must have exactly one separator space and
     /// must not have their value trimmed by the codec. Decoded fields cannot
     /// reconstruct wire length: unknown fields need not have a separator SP.
-    pub fn parse_detailed(
-        &self,
-        cache: &CacheId,
-        head: MessageHead,
-    ) -> std::result::Result<ClientRequest, RequestError> {
+    pub fn parse(&self, cache: &CacheId, head: MessageHead) -> Result<ClientRequest> {
         let StartLine::Request { method, target } = head.start else {
             return Err(Error::InvalidRequest.into());
         };
@@ -119,10 +91,10 @@ impl RequestParser {
                 .saturating_add(header.name.len())
                 .saturating_add(header.value.len());
             if decoded_bytes > self.header_limit {
-                return Err(RequestError::HeaderLimit);
+                return Err(Error::HeaderTooLarge);
             }
             if header.name.is_empty()
-                || !header.name.bytes().all(header_token)
+                || !header.name.bytes().all(is_token)
                 || header
                     .value
                     .iter()
@@ -178,7 +150,7 @@ impl RequestParser {
                 }
                 "if-match" => {
                     if value.len() > MAX_FIELD_BYTES {
-                        return Err(RequestError::HeaderLimit);
+                        return Err(Error::HeaderTooLarge);
                     }
                     pin = Some(StrongEtag::parse(value)?);
                 }
@@ -206,12 +178,17 @@ impl RequestParser {
             }
         }
         if decoded_bytes > self.header_limit {
-            return Err(RequestError::HeaderLimit);
+            return Err(Error::HeaderTooLarge);
         }
         if host != Some(true) {
             return Err(Error::InvalidRequest.into());
         }
-        let key = parse_key(&target, "/v2/objects/")?;
+        let key = CacheKey::parse_hex(
+            target
+                .strip_prefix("/v2/objects/")
+                .ok_or(Error::InvalidRequest)?
+                .as_bytes(),
+        )?;
         let kind = match method.as_str() {
             "HEAD" if range.is_none() => match pin {
                 Some(etag) => ReadKind::HeadPinned { etag },
@@ -226,7 +203,7 @@ impl RequestParser {
                 ordered,
             },
             "POST" => return Err(Error::InvalidRequest.into()),
-            _ => return Err(RequestError::MethodNotAllowed),
+            _ => return Err(Error::MethodNotAllowed),
         };
         Ok(ClientRequest {
             kind,
@@ -240,15 +217,6 @@ impl RequestParser {
             },
         })
     }
-}
-
-fn parse_key(target: &str, prefix: &str) -> Result<CacheKey> {
-    CacheKey::parse_hex(
-        target
-            .strip_prefix(prefix)
-            .ok_or(Error::InvalidRequest)?
-            .as_bytes(),
-    )
 }
 
 fn decimal(value: &[u8], minimum: u64, maximum: u64) -> Result<u64> {
@@ -267,9 +235,9 @@ fn decimal(value: &[u8], minimum: u64, maximum: u64) -> Result<u64> {
     Ok(number)
 }
 
-fn validate_opaque(value: &[u8]) -> std::result::Result<(), RequestError> {
+fn validate_opaque(value: &[u8]) -> Result<()> {
     if value.len() > MAX_FIELD_BYTES {
-        return Err(RequestError::HeaderLimit);
+        return Err(Error::HeaderTooLarge);
     }
     if value.is_empty()
         || value.first() == Some(&b' ')
@@ -279,20 +247,6 @@ fn validate_opaque(value: &[u8]) -> std::result::Result<(), RequestError> {
         return Err(Error::InvalidRequest.into());
     }
     Ok(())
-}
-
-fn header_token(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
-}
-
-fn trim_ows(mut value: &[u8]) -> &[u8] {
-    while matches!(value.first(), Some(b' ' | b'\t')) {
-        value = &value[1..];
-    }
-    while matches!(value.last(), Some(b' ' | b'\t')) {
-        value = &value[..value.len() - 1];
-    }
-    value
 }
 
 #[cfg(test)]
@@ -322,8 +276,8 @@ mod tests {
         }
     }
 
-    fn parse(head: MessageHead) -> std::result::Result<ClientRequest, RequestError> {
-        RequestParser::new(MAX_HEAD_BYTES).parse_detailed(&CacheId("uid".into()), head)
+    fn parse(head: MessageHead) -> Result<ClientRequest> {
+        RequestParser::new(MAX_HEAD_BYTES).parse(&CacheId("uid".into()), head)
     }
 
     #[test]
@@ -432,7 +386,7 @@ mod tests {
         }
         assert!(matches!(
             parse(head("GET", &[])),
-            Err(RequestError::MethodNotAllowed)
+            Err(Error::MethodNotAllowed)
         ));
         let mut request = head("HEAD", &[]);
         request.headers.clear();
@@ -570,11 +524,11 @@ mod tests {
             assert!(parse(head("HEAD", &[(name, &vec![b'a'; MAX_FIELD_BYTES])])).is_ok());
             assert!(matches!(
                 parse(head("HEAD", &[(name, &vec![b'a'; MAX_FIELD_BYTES + 1])])),
-                Err(RequestError::HeaderLimit)
+                Err(Error::HeaderTooLarge)
             ));
         }
         let request = head("HEAD", &[("X", &vec![b'x'; MAX_HEAD_BYTES])]);
-        assert!(matches!(parse(request), Err(RequestError::HeaderLimit)));
+        assert!(matches!(parse(request), Err(Error::HeaderTooLarge)));
     }
 
     #[test]

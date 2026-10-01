@@ -14,7 +14,7 @@ use crate::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 use std::{rc::Rc, sync::Arc};
 
-pub use crate::security::forwarding::{RequestBinding, VerifiedRequest, VerifiedResponse};
+pub use crate::security::forwarding::{VerifiedRequest, VerifiedResponse};
 
 pub enum FetchMode {
     CopyOnly,
@@ -711,7 +711,12 @@ pub(crate) fn opaque_response_head(head: &MessageHead, length: usize) -> Result<
     if length != 0 {
         return Err(Error::InvalidRequest);
     }
-    let response = match outcome.as_str() {
+    let response = bodyless_response(head, &outcome)?;
+    p::response_head(&response, &binding, &path)
+}
+
+fn bodyless_response(head: &MessageHead, outcome: &str) -> Result<PeerResponse> {
+    Ok(match outcome {
         "bootstrap" => PeerResponse::Bootstrap {
             metadata: metadata(head)?,
             page_zero: None,
@@ -726,8 +731,7 @@ pub(crate) fn opaque_response_head(head: &MessageHead, length: usize) -> Result<
         "origin-forbidden" => PeerResponse::OriginForbidden,
         "stale-membership" => PeerResponse::StaleMembership,
         _ => return Err(Error::InvalidRequest),
-    };
-    p::response_head(&response, &binding, &path)
+    })
 }
 fn route(head: &MessageHead) -> Result<RouteBudget> {
     let remaining_links = p::number(head, "racer-route-links")?
@@ -879,25 +883,8 @@ impl SecurityCodec {
             "page" | "selected" | "bootstrap"
                 if outcome != "bootstrap" || present(head, "racer-page-present")? =>
             {
-                let metadata = metadata(head)?;
-                let envelope = PageEnvelope {
-                    page: PageId {
-                        version: metadata.version.clone(),
-                        number: PageNumber(p::number(head, "racer-page")?),
-                    },
-                    key_id: KeyId(array(head, "racer-page-key")?),
-                    nonce: Nonce(array(head, "racer-page-nonce")?),
-                    plaintext_length: p::number(head, "racer-plaintext-length")?
-                        .try_into()
-                        .map_err(|_| Error::InvalidRequest)?,
-                    ciphertext_length: p::number(head, "racer-ciphertext-length")?
-                        .try_into()
-                        .map_err(|_| Error::InvalidRequest)?,
-                };
-                metadata.immutable().validate_page(&envelope)?;
-                if body.len() != envelope.ciphertext_length as usize
-                    || envelope.plaintext_length.checked_add(16) != Some(envelope.ciphertext_length)
-                {
+                let (metadata, envelope) = page_descriptor(head)?;
+                if body.len() != envelope.ciphertext_length as usize {
                     return Err(Error::InvalidRequest);
                 }
                 let reservation = match reservation {
@@ -942,22 +929,7 @@ impl SecurityCodec {
                 if !body.is_empty() {
                     return Err(Error::InvalidRequest);
                 }
-                match outcome {
-                    "bootstrap" => PeerResponse::Bootstrap {
-                        metadata: metadata(head)?,
-                        page_zero: None,
-                    },
-                    "metadata" => PeerResponse::Metadata(metadata(head)?),
-                    "miss" => PeerResponse::Miss,
-                    "not-found" => PeerResponse::NotFound,
-                    "version-unavailable" => PeerResponse::VersionUnavailable,
-                    "unavailable" => PeerResponse::Unavailable,
-                    "overloaded" => PeerResponse::Overloaded,
-                    "origin-rejected" => PeerResponse::OriginRejected,
-                    "origin-forbidden" => PeerResponse::OriginForbidden,
-                    "stale-membership" => PeerResponse::StaleMembership,
-                    _ => return Err(Error::InvalidRequest),
-                }
+                bodyless_response(head, outcome)?
             }
         };
         let binding = array(head, "racer-request-binding")?;

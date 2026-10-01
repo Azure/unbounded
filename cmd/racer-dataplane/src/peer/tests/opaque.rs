@@ -481,30 +481,8 @@ impl RelayFixture {
                     return Ok::<_, Error>(());
                 }
                 if fragmented {
-                    let head = conn.session.as_mut().unwrap().sign(head)?;
-                    let mut encoded =
-                        Codec::new(protocol::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16)
-                            .encode_head(&head)?;
-                    encoded.extend_from_slice(&body[..173]);
-                    for chunk in encoded.chunks(997) {
-                        let mut buffer = ios[2].buffer(chunk.len())?;
-                        buffer.bytes_mut()?.copy_from_slice(chunk);
-                        let mut offset = 0;
-                        while offset < chunk.len() {
-                            let done = reactors[2]
-                                .send(
-                                    conn.socket(),
-                                    BufferRange::new(buffer, offset..chunk.len())?,
-                                    conn,
-                                    &scope,
-                                )
-                                .await?;
-                            offset += done.bytes;
-                            buffer = done.buffer.into_inner();
-                            conn = done.lease;
-                        }
-                    }
-                    conn.tx_remaining = Some((body.len() - 173) as u64);
+                    conn = materialized_pairing::prefix(&ios[2], conn, response, &page, &scope)
+                        .await?;
                     for start in (173..body.len()).step_by(65521) {
                         conn = ios[2]
                             .write_body_range(
