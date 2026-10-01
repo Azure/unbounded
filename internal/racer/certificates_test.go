@@ -52,7 +52,7 @@ func issuanceRequest(t *testing.T, r *KeyringReconciler) (NodeIdentity, wire.Boo
 		t.Fatal(err)
 	}
 
-	return NodeIdentity{cluster: r.Config.Cluster, node: wire.NodeID(testNodeUID), expires: r.now().Add(time.Hour)}, wire.BootstrapRequest{SchemaVersion: wire.SchemaVersion, Cluster: r.Config.Cluster, Enrollment: wire.EnrollmentID(testOtherUID), CSRDER: csr}, pub
+	return NodeIdentity{cluster: r.Config.Cluster, node: wire.NodeID(testNodeUID), expires: r.now().Add(time.Hour)}, wire.BootstrapRequest{SchemaVersion: wire.SchemaVersion, Cluster: r.Config.Cluster, Enrollment: wire.EnrollmentID(testOtherUID), CSRDER: csr, Shares: wire.DefaultShares}, pub
 }
 
 func decodeIssuedResponse(t *testing.T, encoded []byte) wire.BootstrapResponse {

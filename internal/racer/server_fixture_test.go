@@ -76,7 +76,7 @@ func newServingFixture(t *testing.T) *servingFixture {
 		t.Fatal(err)
 	}
 
-	request := wire.BootstrapRequest{SchemaVersion: 1, Cluster: a.Server.Config.Cluster, Enrollment: wire.EnrollmentID(testOtherUID), CSRDER: csr}
+	request := wire.BootstrapRequest{SchemaVersion: 1, Cluster: a.Server.Config.Cluster, Enrollment: wire.EnrollmentID(testOtherUID), CSRDER: csr, Shares: wire.DefaultShares}
 	identity := NodeIdentity{cluster: request.Cluster, node: wire.NodeID(testNodeUID), expires: time.Now().Add(time.Hour)}
 
 	encoded, err := a.Server.Bootstrap.Issuer.Issue(ctx, identity, request)

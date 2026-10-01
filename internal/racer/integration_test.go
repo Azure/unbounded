@@ -934,7 +934,7 @@ func integrationEnrollment(t *testing.T, rc *rest.Config, c client.Client, a *Ap
 		t.Fatal(err)
 	}
 
-	body, err := wire.EncodeBootstrapRequest(wire.BootstrapRequest{SchemaVersion: 1, Cluster: cfg.Cluster, Enrollment: wire.EnrollmentID(testOtherUID), CSRDER: csr})
+	body, err := wire.EncodeBootstrapRequest(wire.BootstrapRequest{SchemaVersion: 1, Cluster: cfg.Cluster, Enrollment: wire.EnrollmentID(testOtherUID), CSRDER: csr, Shares: wire.DefaultShares})
 	if err != nil {
 		t.Fatal(err)
 	}

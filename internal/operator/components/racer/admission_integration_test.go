@@ -103,6 +103,7 @@ func TestEnvtestRuntimeSecretAdmission(t *testing.T) {
 					}
 
 					require.NoError(t, env.Client.Create(ctx, baseline))
+
 					defer func() { require.NoError(t, env.Client.Delete(ctx, baseline)) }()
 
 					updated := baseline.DeepCopy()

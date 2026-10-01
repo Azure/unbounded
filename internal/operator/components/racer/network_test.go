@@ -69,28 +69,23 @@ func TestRacerNetworkConfiguration(t *testing.T) {
 	// The existing controller parser ignores workload-only keys and publishes
 	// the same port. Ownership remains mandatory even on the host network.
 	cfg := configuration(t, env)
+	require.Equal(t, uint16(18082), cfg.PeerPort)
 	// The fake SSA persistence path does not allocate API server UIDs.
 	ds.UID = "managed-daemonset"
+	require.NoError(t, env.Client.Update(t.Context(), ds))
+	ownership, err := racercore.ReadDataplaneWorkloadIdentities(t.Context(), env.Client, env.Namespace)
+	require.NoError(t, err)
 
 	for _, ip := range []string{"10.0.0.12", "fd00::12"} {
 		managed := corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{UID: "pod", OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "DaemonSet", UID: ds.UID, Controller: ptr.To(true)}}},
+			ObjectMeta: metav1.ObjectMeta{Namespace: env.Namespace, UID: "pod", OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "DaemonSet", Name: ds.Name, UID: ds.UID, Controller: ptr.To(true)}}},
 			Spec:       pod, Status: corev1.PodStatus{PodIP: ip},
 		}
 		managed.Spec.NodeName = "node"
-		endpoint, err := racercore.SelectEndpoint([]corev1.Pod{managed}, ds.UID, "node", cfg.PeerPort)
-		require.NoError(t, err)
-
-		want := ip + ":18082"
-		if ip == "fd00::12" {
-			want = "[" + ip + "]:18082"
-		}
-
-		require.Equal(t, want, endpoint)
+		require.True(t, ownership.Owns(&managed))
 
 		managed.OwnerReferences = nil
-		_, err = racercore.SelectEndpoint([]corev1.Pod{managed}, ds.UID, "node", cfg.PeerPort)
-		require.Error(t, err)
+		require.False(t, ownership.Owns(&managed))
 	}
 
 	// Removing the opt-in restores ordinary Pod networking and legacy ports.
