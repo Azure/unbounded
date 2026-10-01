@@ -113,8 +113,8 @@ fn object() -> ObjectId {
     }
 }
 fn request(method: &str, fields: &[u8]) -> Vec<u8> {
-    // GET here is used only for unchanged origin framing checks.
-    let version = if method == "POST" { "v2" } else { "v1" };
+    // Client request fixtures use only the current v2 target.
+    let version = "v2";
     let mut raw = format!(
         "{method} /{version}/objects/{} HTTP/1.1\r\nHost: racer\r\n",
         "ab".repeat(32)
@@ -162,7 +162,7 @@ fn raw_uds_exact_targets_methods_and_bodyless_framing() {
         );
     }
     reject(request("POST", b""), Error::InvalidRequest);
-    reject(request("GET", b""), Error::InvalidRequest);
+    reject(request("GET", b""), Error::MethodNotAllowed);
     let canonical_v2 = canonical.replacen("v1", "v2", 1);
     reject(
         format!("GET {canonical_v2} HTTP/1.1\r\nHost: racer\r\n\r\n").into_bytes(),

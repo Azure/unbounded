@@ -63,30 +63,41 @@ func TestParseAnnotations(t *testing.T) {
 		name        string
 		annotations map[string]string
 		want        MemberAttributes
+		wantError   bool
 	}{
-		{"defaults", nil, MemberAttributes{Shares: 4, Rails: []wire.Rail{}, AlignmentEnabled: true}},
-		{"explicit empty rails", map[string]string{wire.RailsAnnotation: "[]"}, MemberAttributes{Shares: 4, Rails: []wire.Rail{}, AlignmentEnabled: true}},
+		{"defaults", nil, MemberAttributes{Shares: 4, Rails: []wire.Rail{}, AlignmentEnabled: true}, false},
+		{"explicit empty rails", map[string]string{wire.RailsAnnotation: "[]"}, MemberAttributes{Shares: 4, Rails: []wire.Rail{}, AlignmentEnabled: true}, false},
 		{"bounds and sorting", map[string]string{
 			wire.SharesAnnotation: "4294967295", wire.AlignmentAnnotation: "false",
 			wire.RailsAnnotation: `[{"rail":65535,"fabric":"β<&>","numa_node":4294967295},{"rail":0,"fabric":"a","numa_node":0}]`,
-		}, MemberAttributes{Shares: ^uint32(0), Rails: []wire.Rail{{Rail: 0, Fabric: "a", NUMANode: &zero}, {Rail: 65535, Fabric: "β<&>", NUMANode: &maxNUMA}}}},
+		}, MemberAttributes{Shares: ^uint32(0), Rails: []wire.Rail{{Rail: 0, Fabric: "a", NUMANode: &zero}, {Rail: 65535, Fabric: "β<&>", NUMANode: &maxNUMA}}}, false},
 		{
 			"identical duplicates",
 			map[string]string{wire.RailsAnnotation: `[{"rail":2,"fabric":"b","numa_node":0},{"rail":1,"fabric":"a"},{"rail":2,"fabric":"b","numa_node":0},{"rail":1,"fabric":"a"}]`},
 			MemberAttributes{Shares: 4, Rails: []wire.Rail{{Rail: 1, Fabric: "a"}, {Rail: 2, Fabric: "b", NUMANode: &zero}}, AlignmentEnabled: true},
+			false,
 		},
 		{
-			"unknown fields ignored",
+			"unknown fields rejected",
 			map[string]string{wire.RailsAnnotation: `[{"rail":0,"fabric":"a","Rail":1,"future":{"x":true}}]`},
-			MemberAttributes{Shares: 4, Rails: []wire.Rail{{Fabric: "a"}}, AlignmentEnabled: true},
+			MemberAttributes{},
+			true,
 		},
-		{"decimal shares", map[string]string{wire.SharesAnnotation: "0008"}, MemberAttributes{Shares: 8, Rails: []wire.Rail{}, AlignmentEnabled: true}},
+		{"decimal shares", map[string]string{wire.SharesAnnotation: "0008"}, MemberAttributes{Shares: 8, Rails: []wire.Rail{}, AlignmentEnabled: true}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			node := memberNode()
 			node.Annotations = tc.annotations
 
 			got, err := ParseAnnotations(&node)
+			if tc.wantError {
+				if err == nil {
+					t.Fatal("unknown wire fields accepted")
+				}
+
+				return
+			}
+
 			if err != nil || !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("got %#v, %v; want %#v", got, err, tc.want)
 			}

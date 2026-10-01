@@ -76,7 +76,7 @@ func TestEnvtestDataplaneApply(t *testing.T) {
 					}
 				}
 			case "missing-label":
-				delete(ds.Labels, "app.kubernetes.io/managed-by")
+				delete(ds.Labels, "app.kubernetes.io/name")
 			}
 
 			ds.Annotations = map[string]string{"admin": "preserve"}
@@ -89,7 +89,8 @@ func TestEnvtestDataplaneApply(t *testing.T) {
 			require.Equal(t, want.Template.Spec, ds.Spec.Template.Spec)
 			require.Equal(t, want.MinReadySeconds, ds.Spec.MinReadySeconds)
 			require.Equal(t, want.UpdateStrategy, ds.Spec.UpdateStrategy)
-			require.Equal(t, "racer-controller", ds.Labels["app.kubernetes.io/managed-by"])
+			require.Equal(t, "racer-dataplane", ds.Labels["app.kubernetes.io/name"])
+			require.Equal(t, dataplaneName, ds.Labels["app.kubernetes.io/instance"])
 			require.Equal(t, "preserve", ds.Annotations["admin"])
 			require.Equal(t, "preserve", ds.Spec.Template.Annotations["rollout"])
 			version := ds.ResourceVersion

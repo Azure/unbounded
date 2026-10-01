@@ -1331,8 +1331,10 @@ fn small_versions_keep_persisting_at_index_capacity_and_serve_from_disk_offline(
     );
 }
 fn request(method: &str, fields: &str) -> String {
+    // GET is retained only to verify rejection of the retired client protocol.
+    let version = if method == "GET" { "v1" } else { "v2" };
     format!(
-        "{method} /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\n{fields}\r\n",
+        "{method} /{version}/objects/{} HTTP/1.1\r\nHost: racer\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\n{fields}\r\n",
         "ab".repeat(32)
     )
 }
