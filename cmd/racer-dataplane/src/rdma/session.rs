@@ -202,15 +202,6 @@ impl Sessions {
             finished: Cell::new(false),
         }))
     }
-    /// Legacy one-message setup cannot bind a locally created QP to the signed
-    /// exchange. Use prepare/finish instead; never silently trust encoded bytes.
-    pub fn establish(
-        &self,
-        _peer: VerifiedPeer,
-        _setup: SetupParameters,
-    ) -> Operation<'_, SessionLease> {
-        Box::pin(async { Err(Error::Unauthorized) })
-    }
     pub fn progress(&self) -> Result<usize> {
         let mut count = 0;
         for (_, qp) in self.live.borrow().iter() {
