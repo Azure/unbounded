@@ -745,7 +745,7 @@ fn open_fixture_storage(
     entries: usize,
     reactor: &Rc<Reactor>,
     admission: &Rc<Admission>,
-    buffers: Rc<BufferPool>,
+    buffers: BufferPool,
 ) -> (Rc<Index>, Rc<StoreReader>, Rc<StoreWriter>) {
     let index = Rc::new(Index::new(worker, entries));
     let segments = Rc::new(Segments::new(worker, 64 * 1024 * 1024));
