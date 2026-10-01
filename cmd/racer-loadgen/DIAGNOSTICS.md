@@ -1,9 +1,10 @@
 # Opt-in integrity diagnostics
 
-`--diagnose-integrity` requires `--verify=true`. It compares each received HTTP
-200 object against the deterministic catalog while retaining normal size/status
+`--diagnose-integrity` requires `--verify=true`. It compares each successful HTTP
+or direct-UDS blob stream against the deterministic catalog while retaining normal size/status
 classification. Only exact-size digest failures emit page evidence. Offsets are
-relative to the complete object, including tar metadata. Pages are 16 MiB; at
+relative to the complete object, including tar metadata for OCI layers (raw blobs
+have no tar framing). Pages are 16 MiB; at
 most eight mismatching page hash pairs are retained. Comparison continues after
 the cap and reports the omitted count. No payload is retained or logged.
 
@@ -12,6 +13,10 @@ compare them, and calculate two page SHA-256 streams. Diagnostic throughput is n
 a saturated-path baseline. Evidence localizes bytes, not the component responsible.
 
 ## Finite standalone runner
+
+This test runner remains HTTP/OCI-specific. For direct UDS or raw-blob diagnostics,
+use the normal binary with `--diagnose-integrity` and a bounded `--duration`; see
+the [loadgen guide](README.md). Both backends share the integrity evidence path.
 
 Compile the same-package test binary (choose an existing output directory):
 
