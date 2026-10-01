@@ -972,41 +972,57 @@ func (r *registry) doRange(ctx context.Context, method, urlStr, rangeValue strin
 // never enter this path. Every waiter can abandon its wait via its own context.
 func (r *registry) refreshBearerToken(ctx context.Context, challenge string) (string, error) {
 	for {
-		r.tokMu.Lock()
-		if flight := r.tokenRefresh; flight != nil {
-			r.tokMu.Unlock()
-
-			select {
-			case <-ctx.Done():
-				return "", ctx.Err()
-			case <-flight.done:
-			}
-
-			if flight.challenge == challenge {
-				return flight.token, flight.err
-			}
-
-			continue
-		}
-
-		flight := &tokenRefresh{challenge: challenge, done: make(chan struct{})}
-		r.tokenRefresh = flight
-		r.tokMu.Unlock()
-
-		token, ttl, err := r.fetchBearerToken(ctx, challenge)
-		if err == nil {
-			r.setToken(token, ttl)
+		if err := ctx.Err(); err != nil {
+			return "", err
 		}
 
 		r.tokMu.Lock()
-		flight.token, flight.err = token, err
-		r.tokenRefresh = nil
 
-		close(flight.done)
+		flight := r.tokenRefresh
+		if flight == nil {
+			flight = &tokenRefresh{challenge: challenge, done: make(chan struct{})}
+			r.tokenRefresh = flight
+			// No caller owns the shared exchange. Bound the complete exchange,
+			// including reading the token body, independently of caller lifetime.
+			go r.runTokenRefresh(flight)
+		}
 		r.tokMu.Unlock()
 
-		return token, err
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-flight.done:
+		}
+
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+
+		if flight.challenge == challenge {
+			return flight.token, flight.err
+		}
 	}
+}
+
+func (r *registry) runTokenRefresh(flight *tokenRefresh) {
+	ctx, cancel := context.WithTimeout(context.Background(), originResponseHeaderTimeout)
+	defer cancel()
+
+	token, ttl, err := r.fetchBearerToken(ctx, flight.challenge)
+	r.tokMu.Lock()
+	defer r.tokMu.Unlock()
+	defer close(flight.done)
+
+	flight.token, flight.err = token, err
+	if r.tokenRefresh != flight {
+		return
+	}
+
+	if err == nil {
+		r.setTokenLocked(token, ttl)
+	}
+
+	r.tokenRefresh = nil
 }
 
 func parseOriginContentRange(value string) (start, end, size int64, ok bool) {
@@ -1177,6 +1193,11 @@ func (r *registry) cachedToken() string {
 func (r *registry) setToken(value string, ttl time.Duration) {
 	r.tokMu.Lock()
 	defer r.tokMu.Unlock()
+
+	r.setTokenLocked(value, ttl)
+}
+
+func (r *registry) setTokenLocked(value string, ttl time.Duration) {
 	// Honor the server-advertised TTL (Docker token endpoints emit
 	// expires_in as seconds; OAuth2 the design doc). Apply a 30s safety margin
 	// so requests in flight don't get caught by a token expiring
