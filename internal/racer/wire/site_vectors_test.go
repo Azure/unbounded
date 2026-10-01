@@ -182,7 +182,12 @@ func regenerateSharedVectors(t *testing.T) {
 		require.NoError(t, os.WriteFile("testdata/"+name, append(b, '\n'), 0o644))
 
 		if name == "publication.json" || name == "bootstrap-request.json" || name == "bootstrap-response.json" || name == "bundle.json" {
-			require.NoError(t, os.WriteFile("../../../cmd/racer-dataplane/src/control/testdata/"+name, append(b, '\n'), 0o644))
+			// Rust consumes this authoritative directory directly. Regeneration
+			// also removes copies produced by older versions of this generator.
+			err := os.Remove("../../../cmd/racer-dataplane/src/control/testdata/" + name)
+			if !os.IsNotExist(err) {
+				require.NoError(t, err)
+			}
 		}
 	}
 
