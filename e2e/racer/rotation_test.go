@@ -106,7 +106,7 @@ const rotationAuthorization = "Bearer racer-e2e-public-rotation-fixture"
 func (h *harness) rotationState() (wire.KeyringBundle, racer.RotationState, corev1.Secret) {
 	h.t.Helper()
 
-	secret := h.rotationSecret("racer-keyring")
+	secret := h.rotationSecret("racer-credentials")
 	bundle, err := wire.DecodeBundle(bytes.NewReader(secret.Data["bundle.json"]))
 	require.NoError(h.t, err)
 
@@ -341,7 +341,7 @@ func (h *harness) verifyLiveRotation(nodes [2]peerNode, fixture *peerOrigin, pre
 	require.NoError(h.t, err)
 	patch, err := json.Marshal(map[string]any{"metadata": map[string]string{"resourceVersion": secret.ResourceVersion}, "data": map[string][]byte{"rotation.json": stateBytes}})
 	require.NoError(h.t, err)
-	h.kubectl("patch", "secret/racer-keyring", "-n", namespace, "--type=merge", "-p", string(patch))
+	h.kubectl("patch", "secret/racer-credentials", "-n", namespace, "--type=merge", "-p", string(patch))
 
 	var (
 		prepared      wire.KeyringBundle
@@ -385,6 +385,8 @@ func (h *harness) verifyLiveRotation(nodes [2]peerNode, fixture *peerOrigin, pre
 	}, time.Until(preparedState.ActivateAt)+15*time.Second, time.Second, "Go controller did not activate its prepared issuer")
 	require.Equal(h.t, preparedState.PreparedIssuer, activeState.ActiveIssuer)
 	require.Len(h.t, active.PeerTrustRoots, 2)
+	require.Len(h.t, active.CacheKeys, len(initial.CacheKeys))
+	require.Len(h.t, activeState.Retiring, 1)
 
 	for _, key := range active.CacheKeys {
 		require.NotEqual(h.t, wire.PreparedKey, key.State)
@@ -395,13 +397,11 @@ func (h *harness) verifyLiveRotation(nodes [2]peerNode, fixture *peerOrigin, pre
 
 		for _, key := range active.CacheKeys {
 			if key.Key.Cache == old.Key.Cache && key.Key.Purpose == old.Key.Purpose && bytes.Equal(key.Key.ID, old.Key.ID) {
-				require.Equal(h.t, wire.RetiringKey, key.State)
-
 				found = true
 			}
 		}
 
-		require.True(h.t, found, "old opaque key reference lost before retention deadline")
+		require.False(h.t, found, "replaced symmetric key retained at activation")
 	}
 
 	h.awaitRotationGeneration(urls[0], active.Generation, "active-server")
@@ -471,7 +471,10 @@ func (h *harness) verifyLiveRotation(nodes [2]peerNode, fixture *peerOrigin, pre
 		}, 100*time.Second, time.Second, "node %s did not install controller-issued renewal", node.name)
 	}
 
-	var pruned wire.KeyringBundle
+	var (
+		pruned      wire.KeyringBundle
+		credentials corev1.Secret
+	)
 
 	lastRead := time.Time{}
 
@@ -482,7 +485,7 @@ func (h *harness) verifyLiveRotation(nodes [2]peerNode, fixture *peerOrigin, pre
 			lastRead = time.Now()
 		}
 
-		pruned, _, _ = h.rotationState()
+		pruned, _, credentials = h.rotationState()
 
 		return len(pruned.PeerTrustRoots) == 1
 	}, max(15*time.Second, time.Until(activeState.Retiring[initialState.ActiveIssuer])+15*time.Second), time.Second, "Go controller did not prune old root")
@@ -498,19 +501,13 @@ func (h *harness) verifyLiveRotation(nodes [2]peerNode, fixture *peerOrigin, pre
 		}
 	}
 
-	var issuer corev1.Secret
-
-	require.Eventually(h.t, func() bool {
-		issuer = h.rotationSecret("racer-issuer")
-
-		var material struct {
-			Keys map[string]json.RawMessage `json:"keys"`
-		}
-		require.NoError(h.t, json.Unmarshal(issuer.Data["issuer.json"], &material))
-		_, retained := material.Keys[initialState.ActiveIssuer]
-
-		return !retained && len(material.Keys) == 1
-	}, 10*time.Second, time.Second, "old issuer private material not pruned")
+	var material struct {
+		Keys map[string]json.RawMessage `json:"keys"`
+	}
+	require.NoError(h.t, json.Unmarshal(credentials.Data["issuer.json"], &material))
+	_, retained := material.Keys[initialState.ActiveIssuer]
+	require.False(h.t, retained, "root and private key must be pruned in the same version")
+	require.Len(h.t, material.Keys, 1)
 
 	for i := range nodes {
 		h.awaitRotationGeneration(urls[i], pruned.Generation, fmt.Sprintf("pruned-%d", i))
