@@ -910,6 +910,19 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
 
 #[test]
 fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
+    for case in [
+        "success",
+        "scope",
+        "attempt",
+        "membership",
+        "cancel",
+        "deadline",
+    ] {
+        signed_tcp_case(case);
+    }
+}
+
+fn signed_tcp_case(case: &str) {
     use super::PeerClient;
     use crate::{
         http::{
@@ -1054,8 +1067,42 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
         transfers,
         source_network,
     );
-    let local = request(&admission, 1);
+    let mut local = request(&admission, 1);
     let scope = local.origin.scope().clone();
+    let expected = match case {
+        "scope" => {
+            local.route.request = RequestId([9; 16]);
+            Some(Error::InvalidRequest)
+        }
+        "attempt" => {
+            local.route.attempt = AttemptId([9; 16]);
+            Some(Error::InvalidRequest)
+        }
+        "membership" => {
+            local.route.membership = MembershipVersion(2);
+            Some(Error::IncompatibleMembership)
+        }
+        "cancel" => {
+            scope.cancel().unwrap();
+            Some(Error::Cancelled)
+        }
+        "deadline" => {
+            local.route.deadline.0 = Instant::now();
+            Some(Error::DeadlineExceeded)
+        }
+        _ => None,
+    };
+    if let Some(expected) = expected {
+        let result = futures::executor::block_on(requester.request(local, membership, &scope));
+        assert!(matches!(result, Err(error) if error == expected), "{case}");
+        assert_eq!(admission.used(ResourceClass::Connection), 0, "{case}");
+        assert_eq!(reactor.in_flight(), 0, "{case}");
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "{case} must fail before socket checkout"
+        );
+        return;
+    }
     let listener_scope = RequestScope::new(
         RequestId([0; 16]),
         scope.deadline.0 + Duration::from_secs(60),
