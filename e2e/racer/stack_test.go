@@ -77,7 +77,7 @@ func TestOperatorImagePull(t *testing.T) {
 			h.command(context.Background(), "kind", "delete", "cluster", "--name", h.cluster)
 		}
 	})
-	h.run("kind", "create", "cluster", "--name", h.cluster, "--image", "kindest/node:v1.33.1", "--config", filepath.Join(artifacts, "kind.yaml"), "--kubeconfig", h.kubeconfig, "--wait", "120s")
+	h.run("kind", "create", "cluster", "--name", h.cluster, "--image", "kindest/node:v1.34.0", "--config", filepath.Join(artifacts, "kind.yaml"), "--kubeconfig", h.kubeconfig, "--wait", "120s")
 
 	for _, component := range images {
 		h.run("kind", "load", "docker-image", "--name", h.cluster, imageRegistry+"/"+component+":e2e")

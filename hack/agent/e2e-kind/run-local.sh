@@ -19,7 +19,7 @@
 #   sudo apt-get install -y qemu-system-x86 qemu-utils genisoimage iptables
 #   Docker: https://docs.docker.com/engine/install/
 #
-# Also requires: go, kind (v0.29.0+), kubectl
+# Also requires: go, kind (v0.30.0+), kubectl
 #
 # Usage:
 #   ./hack/agent/e2e-kind/run-local.sh

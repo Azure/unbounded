@@ -44,7 +44,7 @@ permissions:
 env:
   # Pinned to match the kind release validated locally. Bump alongside the
   # kindest/node image kind selects by default for this version.
-  KIND_VERSION: v0.29.0
+  KIND_VERSION: v0.30.0
 
 jobs:
   operator-e2e:
