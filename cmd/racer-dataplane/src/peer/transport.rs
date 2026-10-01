@@ -1242,6 +1242,7 @@ impl Transfers {
     }
     /// The signed envelope and HTTP ciphertext share one exclusive pooled socket.
     /// A failed/abandoned exchange is never marked reusable.
+    #[cfg(test)]
     pub(crate) fn exchange_inner<'a>(
         &'a self,
         endpoint: crate::http::connection::Endpoint,

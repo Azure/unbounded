@@ -224,7 +224,7 @@ fn page_timing_requester_reuses_authenticated_session_and_rejects_bad_signature(
         topology::{
             health::LinkHealth,
             membership::{Member, Membership},
-            paths::Paths,
+            routing::Paths,
         },
     };
     use std::{
