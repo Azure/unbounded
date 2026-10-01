@@ -48,22 +48,6 @@ fn assembly_applies_configured_client_request_timeout() {
 }
 
 #[test]
-fn worker_servers_share_one_node_wide_subscription_owner() {
-    let config = crate::test_support::cluster::config(false);
-    let node = Arc::new(NodeState::default());
-    let (first, _, _) = local_worker(&config, &node, 0);
-    let (second, _, _) = local_worker(&config, &node, 1);
-    assert!(Arc::ptr_eq(
-        first.peers.subscription_owner(),
-        second.peers.subscription_owner()
-    ));
-    assert!(Arc::ptr_eq(
-        first.peers.subscription_owner(),
-        &node.subscriptions
-    ));
-}
-
-#[test]
 fn worker_requesters_share_configured_admission_and_production_metrics() {
     use crate::telemetry::metrics::{Event, Gauge};
     let mut config = crate::test_support::cluster::config(false);

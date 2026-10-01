@@ -2,6 +2,146 @@
 use super::*;
 
 #[test]
+fn worker_subscriptions_contend_across_servers_and_recover_after_release() {
+    use crate::{
+        model::OriginContext,
+        peer::{
+            protocol::{FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse},
+            subscriptions::{Demand, PageInterval, Subscription},
+        },
+        topology::paths::RouteBudget,
+    };
+
+    let sim = Simulation::new();
+    let _os = sim.enter();
+    let clock = SimulationClock::new(73);
+    let _time = clock.environment(0).enter();
+    let _strict = crate::runtime::environment::require_simulated();
+    let mut harness = Harness::new(73, sim, clock, false);
+    harness.add(None);
+    harness.add(None);
+    let target = harness
+        .nodes
+        .iter()
+        .position(|n| n.workers.len() == 2)
+        .unwrap();
+    let source = 1 - target;
+    let receiver = &harness.nodes[target];
+    let servers = receiver
+        .workers
+        .iter()
+        .map(|w| w.app.peers.clone())
+        .collect::<Vec<_>>();
+    let membership = receiver.workers[0]
+        .app
+        .snapshots
+        .current()
+        .unwrap()
+        .membership
+        .clone();
+    let destination = receiver.config.node.clone();
+    let sender = &harness.nodes[source];
+    let keys = sender.workers[0].app.keys.clone();
+    let forwarding = Forwarding::new(Rc::new(Signatures::new(
+        keys.clone(),
+        Rc::new(Certificates::new(
+            sender.config.cluster.clone(),
+            keys.clone(),
+        )),
+    )));
+    let credentials = CredentialCrypto::new(keys, sender.workers[0].runtime.admission.clone());
+    let scope = scope(Duration::from_secs(5)).unwrap();
+    let object = ObjectId {
+        cache: harness.definition(0).id,
+        key: CacheKey([0; 32]),
+    };
+    let signed = |sequence: u8| {
+        let attempt = AttemptId([sequence + 1; 16]);
+        let request = PeerRequest {
+            operation: PeerOperation::Subscribe {
+                subscription: Subscription {
+                    id: [42; 16],
+                    sequence: sequence.into(),
+                    version: ObjectVersion {
+                        object: object.clone(),
+                        etag: StrongEtag::test_value("absent"),
+                    },
+                    demand: Demand::new(vec![PageInterval { start: 0, end: 1 }]).unwrap(),
+                    page_budget: 3 - u32::from(sequence),
+                    byte_budget: PAGE_BYTES + 16,
+                },
+                mode: FetchMode::CopyOnly,
+            },
+            origin: credentials
+                .seal(
+                    &OriginContext {
+                        object: object.clone(),
+                        metadata: None,
+                        authorization: None,
+                    },
+                    attempt,
+                    &scope,
+                )
+                .unwrap(),
+            route: RouteBudget {
+                membership: membership.version,
+                request: scope.request,
+                attempt,
+                destination: destination.clone(),
+                visited: vec![sender.config.node.clone()],
+                remaining_links: 4,
+                remaining_attempts: 0,
+                deadline: scope.deadline,
+            },
+        };
+        forwarding.sign_request_to(request, &destination).unwrap()
+    };
+    let (first, _) = signed(0);
+    let (contending, binding) = signed(1);
+    let (retry, retry_binding) = signed(2);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    // Do not tick the owner yet: the first server holds a live selection while
+    // its real WorkerDirectory dispatch waits in the selected worker's mailbox.
+    let mut held = servers[0].dispatch(first, &scope);
+    assert!(held.as_mut().poll(&mut cx).is_pending());
+    let mut rejected = servers[1].dispatch(contending, &scope);
+    let Poll::Ready(Ok(response)) = rejected.as_mut().poll(&mut cx) else {
+        panic!("second server must reject the same live subscription");
+    };
+    assert!(matches!(
+        forwarding
+            .verify_response(response, &binding)
+            .unwrap()
+            .response(),
+        PeerResponse::Overloaded
+    ));
+    drop(rejected);
+    drop(held);
+
+    let mut recovered = servers[1].dispatch(retry, &scope);
+    assert!(
+        recovered.as_mut().poll(&mut cx).is_pending(),
+        "released selection admits the other worker"
+    );
+    let response = (0..100)
+        .find_map(|_| {
+            harness.tick();
+            match recovered.as_mut().poll(&mut cx) {
+                Poll::Ready(result) => Some(result.unwrap()),
+                Poll::Pending => None,
+            }
+        })
+        .expect("accepted copy-only request completes through its owner");
+    assert!(matches!(
+        forwarding
+            .verify_response(response, &retry_binding)
+            .unwrap()
+            .response(),
+        PeerResponse::Miss
+    ));
+}
+
+#[test]
 fn completed_peer_dispatches_do_not_exhaust_worker_cancellation() {
     use crate::model::{MetadataSelector, OriginContext};
     use crate::peer::protocol::{FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse};
