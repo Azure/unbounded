@@ -3,7 +3,7 @@ use super::identity::{KeyPurpose, Keyring};
 use crate::{
     error::{Error, Operation, Result},
     memory::pool::{CiphertextBytes, CiphertextPage, PlaintextBuffer, VerifiedBytes, VerifiedPage},
-    model::{Nonce, PAGE_BYTES, PageEnvelope, PageId, ResourceClass},
+    model::{Nonce, PageEnvelope, PageId, ResourceClass},
     runtime::{
         admission::Reservation,
         crypto::{
@@ -40,15 +40,9 @@ pub(crate) fn field(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
 /// v1: domain, cache(length:u32 BE, bytes), exact object key, quoted ETag
 /// (length:u32 BE, bytes), page:u64 BE, key ID, nonce, lengths:u32 BE.
 pub fn page_aad(envelope: &PageEnvelope) -> Result<Vec<u8>> {
+    envelope.validate()?;
     if !super::identity::canonical_uuid(&envelope.page.version.object.cache.0)
         || envelope.page.version.etag.as_bytes().len() > crate::model::MAX_FIELD_BYTES
-        || envelope.plaintext_length == 0
-        || u64::from(envelope.plaintext_length) > PAGE_BYTES
-        || envelope.ciphertext_length
-            != envelope
-                .plaintext_length
-                .checked_add(16)
-                .ok_or(Error::CorruptRecord)?
     {
         return Err(Error::CorruptRecord);
     }

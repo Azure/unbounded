@@ -843,6 +843,10 @@ mod tests {
             let key = CacheKey(std::array::from_fn(|i| (start + i) as u8));
             assert_eq!(CacheKey::parse_hex(key.to_hex().as_bytes()), Ok(key));
         }
+        for byte in 0..=u8::MAX {
+            let key = CacheKey([byte; 32]);
+            assert_eq!(CacheKey::parse_hex(key.to_hex().as_bytes()), Ok(key));
+        }
     }
 
     #[test]
@@ -853,7 +857,13 @@ mod tests {
                 Err(Error::InvalidRequest)
             );
         }
-        for invalid in [b'A', b'F', b'g', b'/', b' ', b'\t', b'\n', 0, 0xff] {
+        for invalid in [
+            b'A', b'F', b'G', b'g', b'/', b':', b'%', b' ', b'\t', b'\n', 0, 0x80, 0xff,
+        ] {
+            assert_eq!(
+                CacheKey::parse_hex(&[invalid; 64]),
+                Err(Error::InvalidRequest)
+            );
             for position in [0, 1, 62, 63] {
                 let mut value = [b'0'; 64];
                 value[position] = invalid;
@@ -862,53 +872,6 @@ mod tests {
         }
         assert_eq!(
             CacheKey::parse_hex(format!("0x{}", "0".repeat(62)).as_bytes()),
-            Err(Error::InvalidRequest)
-        );
-    }
-
-    #[test]
-    fn cache_key_canonical_hex_vectors_round_trip() {
-        for (bytes, hex) in [
-            ([0; 32], "0".repeat(64)),
-            ([0xff; 32], "f".repeat(64)),
-            (
-                std::array::from_fn(|index| index as u8),
-                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f".into(),
-            ),
-        ] {
-            assert_eq!(CacheKey::parse_hex(hex.as_bytes()), Ok(CacheKey(bytes)));
-            assert_eq!(CacheKey(bytes).to_hex(), hex);
-        }
-        // Exercise every byte value, including both hexadecimal nibble positions.
-        for byte in 0..=u8::MAX {
-            let key = CacheKey([byte; 32]);
-            assert_eq!(CacheKey::parse_hex(key.to_hex().as_bytes()), Ok(key));
-        }
-    }
-
-    #[test]
-    fn cache_key_rejects_noncanonical_hex_byte_vectors() {
-        for value in [
-            Vec::new(),
-            vec![b'0'; 63],
-            vec![b'0'; 65],
-            vec![b'A'; 64],
-            vec![b'g'; 64],
-            vec![b' '; 64],
-            vec![0xff; 64],
-        ] {
-            assert_eq!(CacheKey::parse_hex(&value), Err(Error::InvalidRequest));
-        }
-        for invalid in [b'A', b'G', b'/', b':', b'\n', b'\0', b'%', 0x80] {
-            for index in [0, 1, 62, 63] {
-                let mut value = [b'0'; 64];
-                value[index] = invalid;
-                assert_eq!(CacheKey::parse_hex(&value), Err(Error::InvalidRequest));
-            }
-        }
-        let prefixed = format!("0x{}", "0".repeat(62));
-        assert_eq!(
-            CacheKey::parse_hex(prefixed.as_bytes()),
             Err(Error::InvalidRequest)
         );
     }

@@ -3,7 +3,7 @@ use super::disk::{DirectAlignment, SlabId, SlabLocation};
 use crate::model::KeyId;
 use crate::runtime::collections::{HashMap, HashSet};
 use crate::{
-    error::{Error, Operation, Result},
+    error::{Error, Result},
     model::{
         CurrentVersion, ObjectId, ObjectMetadata, ObjectVersion, PageId, VersionMetadata, WorkerId,
     },
@@ -888,9 +888,6 @@ impl SegmentClock {
         } else {
             Err(Error::Overloaded)
         }
-    }
-    pub fn reclaim(&self) -> Operation<'_, ()> {
-        Box::pin(async move { self.reclaim_now() })
     }
 }
 

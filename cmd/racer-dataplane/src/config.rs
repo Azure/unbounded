@@ -36,7 +36,7 @@ pub struct Config {
     pub cluster: ClusterId,
     /// Resolved by verified bootstrap/local identity recovery before workers start,
     /// not from a caller-provided UID or the Downward API's node name.
-    /// from_env leaves this as UNRESOLVED_NODE_ID; validation is not authentication.
+    /// Environment parsing leaves this unresolved; validation is not authentication.
     pub node: NodeId,
     /// Total thread cap, minimum two; usize::MAX means no configured ceiling.
     /// Control and diagnostics run on I/O threads within this budget.
@@ -70,11 +70,6 @@ pub struct Config {
 }
 
 impl Config {
-    /// Read only supported settings. No files, sockets, threads, or pools are opened.
-    pub fn from_env() -> Result<Self> {
-        Self::from_lookup(env_value)
-    }
-
     /// Process configuration plus trusted operator-local physical associations.
     /// Kept separate from Config so in-process callers must explicitly supply
     /// their own associations rather than inheriting the process environment.
@@ -161,26 +156,15 @@ impl Config {
         };
         let cluster = ClusterId(text("RACER_CLUSTER_ID", None)?);
         let control_endpoint = text("RACER_CONTROL_ENDPOINT", None)?;
-        let enable_rdma = match text("RACER_ENABLE_RDMA", Some("false"))?.as_str() {
-            "true" => true,
-            "false" => false,
-            _ => return Err(Error::InvalidConfiguration),
+        let mut boolean = |name| {
+            text(name, Some("false"))?
+                .parse::<bool>()
+                .map_err(|_| Error::InvalidConfiguration)
         };
-        let allow_smt = match text("RACER_ALLOW_SMT", Some("false"))?.as_str() {
-            "true" => true,
-            "false" => false,
-            _ => return Err(Error::InvalidConfiguration),
-        };
-        let opaque_relay = match text("RACER_OPAQUE_RELAY", Some("false"))?.as_str() {
-            "true" => true,
-            "false" => false,
-            _ => return Err(Error::InvalidConfiguration),
-        };
-        let peer_tcp_nodelay = match text("RACER_PEER_TCP_NODELAY", Some("false"))?.as_str() {
-            "true" => true,
-            "false" => false,
-            _ => return Err(Error::InvalidConfiguration),
-        };
+        let enable_rdma = boolean("RACER_ENABLE_RDMA")?;
+        let allow_smt = boolean("RACER_ALLOW_SMT")?;
+        let opaque_relay = boolean("RACER_OPAQUE_RELAY")?;
+        let peer_tcp_nodelay = boolean("RACER_PEER_TCP_NODELAY")?;
         let peer_listen =
             parse_listener_address(&text("RACER_PEER_LISTEN", Some("0.0.0.0:7443"))?)?;
         let diagnostics_listen =
@@ -582,15 +566,8 @@ fn to_usize(value: u64) -> Result<usize> {
 }
 
 fn valid_uuid(value: &str) -> bool {
-    value.len() == 36
+    crate::security::identity::canonical_uuid(value)
         && value != "00000000-0000-0000-0000-000000000000"
-        && value.bytes().enumerate().all(|(i, b)| {
-            if matches!(i, 8 | 13 | 18 | 23) {
-                b == b'-'
-            } else {
-                b.is_ascii_digit() || matches!(b, b'a'..=b'f')
-            }
-        })
 }
 
 // Kubernetes expands a single bracketed Pod IP template for both IP families.
@@ -709,8 +686,6 @@ mod tests {
 
     #[test]
     fn fabric_configuration_preserves_explicit_labels_and_gid() {
-        assert!(parse_fabric_ports(None).unwrap().is_empty());
-        assert!(parse_fabric_ports(Some("[]")).unwrap().is_empty());
         let ports = parse_fabric_ports(Some(ASSOCIATION)).unwrap();
         assert_eq!(ports[0].fabric, "fabric-a");
         assert_eq!(ports[0].device, "mlx5_0");
@@ -728,69 +703,6 @@ mod tests {
             read_fabric_ports(bytes.as_bytes()).unwrap()[0].fabric,
             "fabric-a"
         );
-    }
-
-    #[test]
-    fn fabric_configuration_rejects_malformed_names_fields_and_gid() {
-        for value in [
-            "",
-            "null",
-            "{}",
-            "[",
-            "[] trailing",
-            "[null]",
-            "[{}]",
-            "\n[]",
-            "[{},]",
-        ] {
-            assert!(parse_fabric_ports(Some(value)).is_err(), "{value}");
-        }
-        for (from, to) in [
-            ("fabric-a", ""),
-            ("fabric-a", " fabric-a"),
-            ("fabric-a", "fabric-a "),
-            ("fabric-a", r"fabric\u0000a"),
-            ("fabric-a", r"fabric\na"),
-            ("mlx5_0", ""),
-            ("mlx5_0", "../mlx5_0"),
-            ("mlx5_0", "mlx5/0"),
-            ("mlx5_0", "."),
-            ("mlx5_0", "-mlx5"),
-            ("mlx5_0", "mlx 0"),
-            ("mlx5_0", "网卡"),
-            ("\"port\":1", "\"port\":0"),
-            ("\"port\":1", "\"port\":256"),
-            ("\"port\":1", "\"port\":-1"),
-            ("\"port\":1", "\"port\":1.0"),
-            ("\"port\":1", "\"port\":\"1\""),
-            ("\"port\":1", "\"port\":1,\"port\":2"),
-            ("\"port\":1", "\"port\":1,\"rail\":7"),
-            (
-                "fe800000000000000000000000001234",
-                "00000000000000000000000000000000",
-            ),
-            (
-                "fe800000000000000000000000001234",
-                "ff020000000000000000000000000001",
-            ),
-            (
-                "fe800000000000000000000000001234",
-                "FE800000000000000000000000001234",
-            ),
-            ("fe800000000000000000000000001234", "fe80::1234"),
-            (
-                "fe800000000000000000000000001234",
-                "g0000000000000000000000000000000",
-            ),
-        ] {
-            assert!(
-                parse_fabric_ports(Some(&ASSOCIATION.replace(from, to))).is_err(),
-                "{to}"
-            );
-        }
-        assert!(parse_fabric_ports(Some(&ASSOCIATION.replace("mlx5_0", &"a".repeat(64)))).is_err());
-        assert!(parse_fabric_document(&[0xff]).is_err());
-        assert!(parse_fabric_ports(Some(&" ".repeat(4097))).is_err());
     }
 
     #[test]
@@ -1032,6 +944,8 @@ mod tests {
             "[null]",
             "[1]",
             "[\n]",
+            "\n[]",
+            "[{},]",
         ] {
             assert!(parse_fabric_ports(Some(value)).is_err(), "{value:?}");
         }
@@ -1043,10 +957,13 @@ mod tests {
             r#"{"fabric":"f","device":"d","port":"1"}"#,
             r#"{"fabric":"f","device":"d","port":1,"rail":0}"#,
             r#"{"fabric":"f","fabric":"g","device":"d","port":1}"#,
+            r#"{"fabric":"f","device":"d","port":1,"port":2}"#,
             r#"{"fabric":"f","device":"d","port":1,"gid":"::1"}"#,
             r#"{"fabric":"f","device":"d","port":1,"gid":"FE800000000000000000000000000001"}"#,
             r#"{"fabric":"f","device":"d","port":1,"gid":"00000000000000000000000000000000"}"#,
             r#"{"fabric":"f","device":"d","port":1,"gid":[]}"#,
+            r#"{"fabric":"f","device":"d","port":1,"gid":"ff020000000000000000000000000001"}"#,
+            r#"{"fabric":"f","device":"d","port":1,"gid":"g0000000000000000000000000000000"}"#,
         ] {
             assert!(
                 parse_fabric_ports(Some(&format!("[{entry}]"))).is_err(),
@@ -1061,6 +978,8 @@ mod tests {
             "mlx/0",
             "mlx\\0",
             "bad name",
+            "-mlx5",
+            "网卡",
             "d\0",
             "d\n",
             "é",
@@ -1069,7 +988,7 @@ mod tests {
             let value = serde_json::json!([{"fabric":"f","device":device,"port":1}]).to_string();
             assert!(parse_fabric_ports(Some(&value)).is_err(), "{device:?}");
         }
-        for fabric in ["", "bad\nlabel", "bad\0label"] {
+        for fabric in ["", "bad\nlabel", "bad\0label", " fabric-a", "fabric-a "] {
             let value = serde_json::json!([{"fabric":fabric,"device":"d","port":1}]).to_string();
             assert!(parse_fabric_ports(Some(&value)).is_err());
         }
@@ -1080,6 +999,8 @@ mod tests {
             assert!(parse_fabric_ports(Some(value)).is_err());
         }
         assert!(parse_fabric_ports(Some(&format!("[]{}", " ".repeat(4095)))).is_err());
+        assert!(parse_fabric_document(&[0xff]).is_err());
+        assert!(parse_fabric_ports(Some(&" ".repeat(4097))).is_err());
     }
 
     #[test]

@@ -20,15 +20,7 @@ pub const MAX_HEAD: usize = 64 * 1024;
 
 /// Canonical Kubernetes UUID spelling. Reject normalization at the trust boundary.
 pub fn uuid(value: &str) -> Result<()> {
-    if value.len() != 36
-        || !value.bytes().enumerate().all(|(i, b)| {
-            if matches!(i, 8 | 13 | 18 | 23) {
-                b == b'-'
-            } else {
-                b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
-            }
-        })
-    {
+    if !super::identity::canonical_uuid(value) {
         return Err(Error::InvalidRequest);
     }
     Ok(())

@@ -8,8 +8,8 @@ use crate::{
     error::{Error, Result},
     memory::page::CiphertextCopy,
     model::{
-        CacheId, CacheKey, KeyId, Nonce, ObjectId, ObjectVersion, PAGE_BYTES, PageEnvelope, PageId,
-        PageNumber, StrongEtag, VersionMetadata,
+        CacheId, CacheKey, KeyId, Nonce, ObjectId, ObjectVersion, PageEnvelope, PageId, PageNumber,
+        StrongEtag, VersionMetadata,
     },
     runtime::reactor::IoBuffer,
 };
@@ -48,16 +48,7 @@ fn layout(page: &CiphertextCopy, generation: Generation) -> Result<RecordLayout>
     let envelope = page.ciphertext.envelope();
     let metadata = page.metadata.immutable();
     metadata.validate_page(envelope)?;
-    if generation.0 == 0
-        || envelope.plaintext_length == 0
-        || u64::from(envelope.plaintext_length) > PAGE_BYTES
-        || envelope.ciphertext_length
-            != envelope
-                .plaintext_length
-                .checked_add(16)
-                .ok_or(Error::CorruptRecord)?
-        || page.ciphertext.bytes().len() != envelope.ciphertext_length as usize
-    {
+    if generation.0 == 0 || page.ciphertext.bytes().len() != envelope.ciphertext_length as usize {
         return Err(Error::CorruptRecord);
     }
     let cache = envelope.page.version.object.cache.0.as_bytes();
@@ -222,12 +213,7 @@ pub fn parse_bytes(bytes: &[u8], extent: DirectExtent) -> Result<DecodedRecord> 
                 .map_err(|_| Error::CorruptRecord)?,
         )
     };
-    if r.at != r.bytes.len()
-        || generation.0 == 0
-        || plaintext_length == 0
-        || u64::from(plaintext_length) > PAGE_BYTES
-        || plaintext_length.checked_add(16) != Some(ciphertext_length)
-    {
+    if r.at != r.bytes.len() || generation.0 == 0 {
         return Err(Error::CorruptRecord);
     }
     let version = ObjectVersion {
@@ -304,7 +290,7 @@ mod tests {
     use super::*;
     use crate::{
         memory::pool::{CiphertextBytes, CiphertextPage},
-        model::{ExpiresAt, ResourceClass},
+        model::{ExpiresAt, PAGE_BYTES, ResourceClass},
         runtime::admission::Admission,
     };
     use std::{sync::Arc, time::UNIX_EPOCH};

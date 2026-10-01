@@ -111,20 +111,29 @@ impl AeadFailure {
     }
 }
 
-struct AeadRing {
-    entries: [Option<(u64, crate::runtime::crypto::CryptoId, AeadFailure)>; AEAD_CAPACITY],
+type AeadRing = Ring<crate::runtime::crypto::CryptoId, AeadFailure, AEAD_CAPACITY>;
+struct Ring<I: Copy, F: Copy, const N: usize> {
+    entries: [Option<(u64, I, F)>; N],
     total: u64,
     next: usize,
     len: usize,
 }
-impl Default for AeadRing {
+impl<I: Copy, F: Copy, const N: usize> Default for Ring<I, F, N> {
     fn default() -> Self {
         Self {
-            entries: [None; AEAD_CAPACITY],
+            entries: [None; N],
             total: 0,
             next: 0,
             len: 0,
         }
+    }
+}
+impl<I: Copy, F: Copy, const N: usize> Ring<I, F, N> {
+    fn push(&mut self, id: I, failure: F) {
+        self.total = self.total.saturating_add(1);
+        self.entries[self.next] = Some((self.total, id, failure));
+        self.next = (self.next + 1) % N;
+        self.len = (self.len + 1).min(N);
     }
 }
 
@@ -246,23 +255,10 @@ impl Failure {
 }
 
 #[derive(Clone, Default)]
-pub struct Failures(Arc<Mutex<Ring>>, Arc<Mutex<AeadRing>>);
-struct Ring {
-    entries: [Option<(u64, WorkerId, Failure)>; CAPACITY],
-    total: u64,
-    next: usize,
-    len: usize,
-}
-impl Default for Ring {
-    fn default() -> Self {
-        Self {
-            entries: [None; CAPACITY],
-            total: 0,
-            next: 0,
-            len: 0,
-        }
-    }
-}
+pub struct Failures(
+    Arc<Mutex<Ring<WorkerId, Failure, CAPACITY>>>,
+    Arc<Mutex<AeadRing>>,
+);
 
 /// Absent in standalone components until the production composition attaches it.
 #[derive(Clone, Default)]
@@ -409,22 +405,14 @@ impl Observer {
             return;
         };
         let mut ring = failures.1.lock().unwrap_or_else(|e| e.into_inner());
-        ring.total = ring.total.saturating_add(1);
-        let next = ring.next;
-        ring.entries[next] = Some((ring.total, id, failure));
-        ring.next = (next + 1) % AEAD_CAPACITY;
-        ring.len = (ring.len + 1).min(AEAD_CAPACITY);
+        ring.push(id, failure);
     }
     pub fn record(&self, failure: Failure) {
         let Some((failures, worker)) = &self.0 else {
             return;
         };
         let mut ring = failures.0.lock().unwrap_or_else(|e| e.into_inner());
-        ring.total = ring.total.saturating_add(1);
-        let next = ring.next;
-        ring.entries[next] = Some((ring.total, *worker, failure));
-        ring.next = (next + 1) % CAPACITY;
-        ring.len = (ring.len + 1).min(CAPACITY);
+        ring.push(*worker, failure);
     }
     pub fn result<T>(&self, stage: Stage, scope: &RequestScope, result: Result<T>) -> Result<T> {
         if let Err(error) = &result {

@@ -2,7 +2,7 @@
 //! Immutable key leases outlive admission; their last completion owner zeroizes
 //! the secret. Secret export is explicit and zeroizing.
 use crate::{
-    control::{enrollment::LocalSigningIdentity, wire::*},
+    control::wire::*,
     error::{Error, Result},
     model::{CacheId, ClusterId, KeyId, NodeId},
 };
@@ -124,9 +124,6 @@ impl SigningIdentity {
             return Err(Error::Unauthorized);
         }
         Ok(self.key.sign(message).to_bytes().to_vec())
-    }
-    pub fn spiffe_id(&self) -> Result<String> {
-        spiffe(&self.cluster, &self.node)
     }
     pub fn export_pkcs8_for_persistence(&self) -> Result<Zeroizing<Vec<u8>>> {
         Ok(Zeroizing::new(
@@ -410,22 +407,7 @@ pub struct KeyLease {
     reference: CacheKeyRef,
     secret: Arc<Secret>,
 }
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub enum KeyPurpose {
-    Page,
-    OriginCredentials,
-    NodeSigning,
-    PeerVerification,
-}
-impl KeyPurpose {
-    fn cache(self) -> Result<CacheKeyPurpose> {
-        match self {
-            Self::Page => Ok(CacheKeyPurpose::Page),
-            Self::OriginCredentials => Ok(CacheKeyPurpose::OriginCredentials),
-            _ => Err(Error::MissingKey),
-        }
-    }
-}
+pub use crate::control::wire::CacheKeyPurpose as KeyPurpose;
 impl KeyLease {
     pub fn id(&self) -> KeyId {
         self.reference.id
@@ -438,7 +420,7 @@ impl KeyLease {
         &self.reference
     }
     pub(crate) fn material(&self, purpose: KeyPurpose) -> Result<&[u8; 32]> {
-        if self.reference.purpose != purpose.cache()? {
+        if self.reference.purpose != purpose {
             return Err(Error::MissingKey);
         }
         Ok(&self.secret.0)
@@ -629,11 +611,6 @@ impl Keyring {
         state.fingerprint = Some(fingerprint);
         Ok(bundle.generation)
     }
-    /// Convert control's private persistence owner using the current peer roots.
-    pub fn install_identity(&self, identity: LocalSigningIdentity) -> Result<()> {
-        let roots = self.peer_trust_roots()?;
-        self.install_signing_identity(identity.signing_identity(&roots)?)
-    }
     pub fn install_signing_identity(&self, identity: Arc<SigningIdentity>) -> Result<()> {
         if identity.node() != &self.node || identity.cluster() != &self.cluster {
             return Err(Error::Unauthorized);
@@ -702,7 +679,7 @@ impl Keyring {
         let reference = CacheKeyRef {
             cache: cache.ok_or(Error::MissingKey)?.clone(),
             id,
-            purpose: purpose.cache()?,
+            purpose,
         };
         let state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
         if state.cluster.as_ref() != Some(&self.cluster) {
@@ -730,7 +707,6 @@ impl Keyring {
         })
     }
     pub fn active(&self, cache: &CacheId, purpose: KeyPurpose) -> Result<KeyLease> {
-        let purpose = purpose.cache()?;
         let state = self.epochs.state.lock().map_err(|_| Error::Unavailable)?;
         if state.cluster.as_ref() != Some(&self.cluster) {
             return Err(Error::MissingKey);

@@ -17,8 +17,21 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-pub const EVENT_COUNT: usize = 78;
-pub const GAUGE_COUNT: usize = 13;
+// Declaration order is the counter index; names are the exported wire contract.
+macro_rules! metric_names {
+    ($kind:ident, $all:ident, $count:ident; $(Self::$variant:ident => $name:literal,)*) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        #[repr(usize)]
+        pub enum $kind { $($variant,)* }
+        pub const $count: usize = [$($name,)*].len();
+        pub const $all: [$kind; $count] = [$($kind::$variant,)*];
+        impl $kind {
+            pub fn name(self) -> &'static str {
+                match self { $(Self::$variant => $name,)* }
+            }
+        }
+    };
+}
 #[derive(Clone, Copy)]
 pub(crate) enum LookupTier {
     Plaintext,
@@ -66,171 +79,7 @@ impl Default for Metrics {
             .unwrap()
     }
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(usize)]
-pub enum Event {
-    PageHedgeStarted,
-    PageHedgeWon,
-    PageHedgeSuppressed,
-    PageHedgeDuplicateBytes,
-    PeerAdmissionAccepted,
-    PeerAdmissionRejected,
-    PeerCircuitRejected,
-    PeerProbe,
-    PeerVerified,
-    PeerLinkFailure,
-    PeerLocalPressure,
-    Request,
-    RequestError,
-    MemoryHit,
-    DiskHit,
-    PeerHit,
-    OriginFill,
-    DirtyDiscard,
-    DiskPublication,
-    Overload,
-    CorruptMiss,
-    DiagnosticAccepted,
-    DiagnosticHealth,
-    DiagnosticReady,
-    DiagnosticMetrics,
-    DiagnosticRejected,
-    DiagnosticIoError,
-    DiagnosticTimeout,
-    PageDecrypt,
-    PeerBootstrap,
-    DiagnosticFailures,
-    DeliveryPipeDrain,
-    DeliveryDirectBytes,
-    CryptoEncryptStarted,
-    CryptoEncryptSuccess,
-    CryptoEncryptFailure,
-    CryptoEncryptBytes,
-    CryptoEncryptExecutionCount,
-    CryptoEncryptExecutionNs,
-    CryptoEncryptQueueCount,
-    CryptoEncryptQueueNs,
-    CryptoDecryptStarted,
-    CryptoDecryptSuccess,
-    CryptoDecryptFailure,
-    CryptoDecryptBytes,
-    CryptoDecryptExecutionCount,
-    CryptoDecryptExecutionNs,
-    CryptoDecryptQueueCount,
-    CryptoDecryptQueueNs,
-    PlaintextLookupHit,
-    PlaintextLookupMiss,
-    PlaintextLookupError,
-    CiphertextLookupHit,
-    CiphertextLookupMiss,
-    CiphertextLookupError,
-    PendingLookupHit,
-    PendingLookupMiss,
-    PendingLookupError,
-    DiskIndexLookupHit,
-    DiskIndexLookupMiss,
-    DiskIndexLookupError,
-    PeerPageCheckoutCount,
-    PeerPageCheckoutNs,
-    PeerPageAuthCount,
-    PeerPageAuthNs,
-    PeerPageHeadCount,
-    PeerPageHeadNs,
-    PeerPageBodyCount,
-    PeerPageBodyNs,
-    PeerPageCensored,
-    CryptoDecryptCrcRejected,
-    CryptoDecryptAeadRejected,
-    FillDecryptDiskCorrupt,
-    FillDecryptRetainedCorrupt,
-    FillDecryptPeerCorrupt,
-    OpaqueRelayBodyCompleted,
-    OpaqueRelayBodyBytes,
-    OpaqueRelayBodyFailed,
-}
-pub const EVENTS: [Event; EVENT_COUNT] = [
-    Event::PageHedgeStarted,
-    Event::PageHedgeWon,
-    Event::PageHedgeSuppressed,
-    Event::PageHedgeDuplicateBytes,
-    Event::PeerAdmissionAccepted,
-    Event::PeerAdmissionRejected,
-    Event::PeerCircuitRejected,
-    Event::PeerProbe,
-    Event::PeerVerified,
-    Event::PeerLinkFailure,
-    Event::PeerLocalPressure,
-    Event::Request,
-    Event::RequestError,
-    Event::MemoryHit,
-    Event::DiskHit,
-    Event::PeerHit,
-    Event::OriginFill,
-    Event::DirtyDiscard,
-    Event::DiskPublication,
-    Event::Overload,
-    Event::CorruptMiss,
-    Event::DiagnosticAccepted,
-    Event::DiagnosticHealth,
-    Event::DiagnosticReady,
-    Event::DiagnosticMetrics,
-    Event::DiagnosticRejected,
-    Event::DiagnosticIoError,
-    Event::DiagnosticTimeout,
-    Event::PageDecrypt,
-    Event::PeerBootstrap,
-    Event::DiagnosticFailures,
-    Event::DeliveryPipeDrain,
-    Event::DeliveryDirectBytes,
-    Event::CryptoEncryptStarted,
-    Event::CryptoEncryptSuccess,
-    Event::CryptoEncryptFailure,
-    Event::CryptoEncryptBytes,
-    Event::CryptoEncryptExecutionCount,
-    Event::CryptoEncryptExecutionNs,
-    Event::CryptoEncryptQueueCount,
-    Event::CryptoEncryptQueueNs,
-    Event::CryptoDecryptStarted,
-    Event::CryptoDecryptSuccess,
-    Event::CryptoDecryptFailure,
-    Event::CryptoDecryptBytes,
-    Event::CryptoDecryptExecutionCount,
-    Event::CryptoDecryptExecutionNs,
-    Event::CryptoDecryptQueueCount,
-    Event::CryptoDecryptQueueNs,
-    Event::PlaintextLookupHit,
-    Event::PlaintextLookupMiss,
-    Event::PlaintextLookupError,
-    Event::CiphertextLookupHit,
-    Event::CiphertextLookupMiss,
-    Event::CiphertextLookupError,
-    Event::PendingLookupHit,
-    Event::PendingLookupMiss,
-    Event::PendingLookupError,
-    Event::DiskIndexLookupHit,
-    Event::DiskIndexLookupMiss,
-    Event::DiskIndexLookupError,
-    Event::PeerPageCheckoutCount,
-    Event::PeerPageCheckoutNs,
-    Event::PeerPageAuthCount,
-    Event::PeerPageAuthNs,
-    Event::PeerPageHeadCount,
-    Event::PeerPageHeadNs,
-    Event::PeerPageBodyCount,
-    Event::PeerPageBodyNs,
-    Event::PeerPageCensored,
-    Event::CryptoDecryptCrcRejected,
-    Event::CryptoDecryptAeadRejected,
-    Event::FillDecryptDiskCorrupt,
-    Event::FillDecryptRetainedCorrupt,
-    Event::FillDecryptPeerCorrupt,
-    Event::OpaqueRelayBodyCompleted,
-    Event::OpaqueRelayBodyBytes,
-    Event::OpaqueRelayBodyFailed,
-];
-impl Event {
-    pub fn name(self) -> &'static str {
-        match self {
+metric_names! { Event, EVENTS, EVENT_COUNT;
             Self::PageHedgeStarted => "racer_page_hedges_started_total",
             Self::PageHedgeWon => "racer_page_hedges_won_total",
             Self::PageHedgeSuppressed => "racer_page_hedges_suppressed_total",
@@ -309,44 +158,8 @@ impl Event {
             Self::OpaqueRelayBodyCompleted => "racer_opaque_relay_body_completed_total",
             Self::OpaqueRelayBodyBytes => "racer_opaque_relay_body_completed_bytes_total",
             Self::OpaqueRelayBodyFailed => "racer_opaque_relay_body_failed_total",
-        }
-    }
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(usize)]
-pub enum Gauge {
-    PeerAdmissionLimit,
-    PeerExchanges,
-    DiagnosticConnections,
-    ActiveRequests,
-    ActiveFills,
-    KeyringGeneration,
-    IdentityExpiresAtSeconds,
-    PendingDiskWrites,
-    ActiveDeliveries,
-    EffectivePayloadBytes,
-    SegmentTailBytes,
-    DiskPageEntries,
-    CheckpointSequence,
-}
-pub const GAUGES: [Gauge; GAUGE_COUNT] = [
-    Gauge::PeerAdmissionLimit,
-    Gauge::PeerExchanges,
-    Gauge::DiagnosticConnections,
-    Gauge::ActiveRequests,
-    Gauge::ActiveFills,
-    Gauge::KeyringGeneration,
-    Gauge::IdentityExpiresAtSeconds,
-    Gauge::PendingDiskWrites,
-    Gauge::ActiveDeliveries,
-    Gauge::EffectivePayloadBytes,
-    Gauge::SegmentTailBytes,
-    Gauge::DiskPageEntries,
-    Gauge::CheckpointSequence,
-];
-impl Gauge {
-    pub fn name(self) -> &'static str {
-        match self {
+metric_names! { Gauge, GAUGES, GAUGE_COUNT;
             Self::PeerAdmissionLimit => "racer_peer_admission_limit",
             Self::PeerExchanges => "racer_peer_exchanges_active",
             Self::DiagnosticConnections => "racer_diagnostic_connections",
@@ -360,8 +173,6 @@ impl Gauge {
             Self::SegmentTailBytes => "racer_segment_tail_bytes",
             Self::DiskPageEntries => "racer_disk_page_index_capacity",
             Self::CheckpointSequence => "racer_checkpoint_sequence",
-        }
-    }
 }
 /// Keep with the actual resource, including through a submitted I/O fence.
 pub struct GaugeLease {
