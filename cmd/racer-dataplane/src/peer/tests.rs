@@ -1,6 +1,8 @@
 use super::*;
 #[path = "body_progress_tests.rs"]
 mod body_progress;
+#[path = "destination_disconnect_tests.rs"]
+mod destination_disconnect;
 #[path = "subscription_tests.rs"]
 mod hot_subscriptions;
 #[path = "opaque_tests.rs"]
