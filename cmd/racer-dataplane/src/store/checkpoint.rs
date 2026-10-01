@@ -154,59 +154,6 @@ impl Checkpointer {
         }
     }
 
-    /// Explicit cache reset, serialized with checkpoint publication. Key/cache
-    /// removal does not require this: recovery filters current UID/key availability.
-    /// Payload files stay intact.
-    pub fn invalidate_persisted(&self) -> Result<()> {
-        if self.frozen.get() {
-            return Err(Error::Overloaded);
-        }
-        for name in CHECKPOINT_NAMES {
-            match fs::remove_file(self.directory.join(name)) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return Err(Error::Io),
-            }
-        }
-        Ok(())
-    }
-
-    /// Asynchronous reset variant. Paths and directory ownership stay with accepted
-    /// filesystem submissions until completion, including on cancellation.
-    pub fn invalidate_persisted_async(
-        &self,
-        reactor: Rc<crate::runtime::reactor::Reactor>,
-        scope: crate::runtime::deadline::RequestScope,
-    ) -> Result<Operation<'static, ()>> {
-        if self.frozen.get() {
-            return Err(Error::Overloaded);
-        }
-        let directory = self.directory.clone();
-        Ok(Box::pin(async move {
-            use std::{ffi::CString, os::unix::ffi::OsStrExt};
-            let path = CString::new(directory.as_os_str().as_bytes())
-                .map_err(|_| Error::InvalidConfiguration)?;
-            let directory = match reactor
-                .file_open(None, path, libc::O_RDONLY | libc::O_DIRECTORY, 0, &scope)
-                .await
-            {
-                Ok(directory) => directory,
-                Err(Error::MissingKey) => return Ok(()),
-                Err(error) => return Err(error),
-            };
-            for name in CHECKPOINT_NAMES {
-                match reactor
-                    .file_unlink(directory.clone(), CString::new(name).unwrap(), &scope)
-                    .await
-                {
-                    Ok(()) | Err(Error::MissingKey) => (),
-                    Err(error) => return Err(error),
-                }
-            }
-            Ok(())
-        }))
-    }
-
     /// One coordinator calls this after all owner-worker snapshots have succeeded.
     /// The coordinator must keep all owners frozen until this operation completes.
     pub fn publish(&self, shards: Vec<ShardImage>) -> Operation<'_, ()> {

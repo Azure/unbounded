@@ -6,7 +6,7 @@ use std::{fs, rc::Rc};
 const SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
 
 #[test]
-fn async_retirement_rejects_frozen_cut_and_canceled_submission() {
+fn canceled_async_publication_preserves_existing_slots_without_submission() {
     use crate::runtime::{admission::Admission, deadline::RequestScope, reactor::Reactor};
     use std::time::{Duration, Instant};
     let directory = Directory::new();
@@ -24,17 +24,11 @@ fn async_retirement_rejects_frozen_cut_and_canceled_submission() {
     for slot in ["checkpoint.0", "checkpoint.1"] {
         fs::write(directory.0.join(slot), b"retained cut").unwrap();
     }
-    block_on(checkpoint.snapshot_shard()).unwrap();
-    assert!(matches!(
-        checkpoint.invalidate_persisted_async(reactor.clone(), scope.clone()),
-        Err(Error::Overloaded)
-    ));
-    checkpoint.finish_snapshot();
     scope.cancel().unwrap();
     assert_eq!(
         block_on(
             checkpoint
-                .invalidate_persisted_async(reactor.clone(), scope)
+                .publish_async(vec![shard()], reactor.clone(), scope, 3, 0, 1024 * 1024)
                 .unwrap()
         ),
         Err(Error::Cancelled)
@@ -46,7 +40,7 @@ fn async_retirement_rejects_frozen_cut_and_canceled_submission() {
 }
 
 #[test]
-fn async_retirement_invalidation_fences_both_slots_and_preserves_failure() {
+fn abandoned_async_publication_fences_io_and_preserves_existing_slots() {
     use crate::runtime::{admission::Admission, deadline::RequestScope, reactor::Reactor};
     use std::{
         task::{Context, Poll},
@@ -84,14 +78,21 @@ fn async_retirement_invalidation_fences_both_slots_and_preserves_failure() {
         fs::write(directory.0.join(slot), b"recoverable cut").unwrap();
     }
     let mut abandoned = checkpoint
-        .invalidate_persisted_async(reactor.clone(), scope())
+        .publish_async(vec![shard()], reactor.clone(), scope(), 3, 0, 1024 * 1024)
         .unwrap();
-    assert!(
-        abandoned
-            .as_mut()
-            .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
-            .is_pending()
-    );
+    // Encoding yields before the first file submission. Stop at the submission
+    // without reaping its completion, so abandonment exercises the actual fence.
+    for _ in 0..16 {
+        assert!(
+            abandoned
+                .as_mut()
+                .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+                .is_pending()
+        );
+        if reactor.in_flight() > 0 {
+            break;
+        }
+    }
     assert!(reactor.in_flight() > 0);
     drop(abandoned);
     let fence_reactor = reactor.clone();
@@ -102,30 +103,12 @@ fn async_retirement_invalidation_fences_both_slots_and_preserves_failure() {
     }))
     .unwrap();
     assert_eq!(reactor.in_flight(), 0);
-    drive(
-        checkpoint
-            .invalidate_persisted_async(reactor.clone(), scope())
-            .unwrap(),
-    )
-    .unwrap();
-    assert!(!directory.0.join("checkpoint.0").exists());
-    assert!(!directory.0.join("checkpoint.1").exists());
-    drive(
-        checkpoint
-            .invalidate_persisted_async(reactor.clone(), scope())
-            .unwrap(),
-    )
-    .unwrap();
-    fs::create_dir(directory.0.join("checkpoint.1")).unwrap();
-    assert_eq!(
-        drive(
-            checkpoint
-                .invalidate_persisted_async(reactor.clone(), scope())
-                .unwrap()
-        ),
-        Err(Error::Io)
-    );
-    assert_eq!(reactor.in_flight(), 0);
+    for slot in ["checkpoint.0", "checkpoint.1"] {
+        assert_eq!(
+            fs::read(directory.0.join(slot)).unwrap(),
+            b"recoverable cut"
+        );
+    }
 }
 fn geometry() -> CheckpointGeometry {
     CheckpointGeometry::new(
@@ -557,22 +540,13 @@ fn invalid_generation_bounds_duplicates_and_descriptor_conflicts_are_rejected() 
 }
 
 #[test]
-fn overlapping_mappings_are_rejected_and_retirement_invalidates_both_slots() {
+fn overlapping_mappings_are_rejected() {
     let mut bad = image(1);
     let mut overlapping = bad.shards[0].index.entries[0].clone();
     overlapping.0.version.object.key = CacheKey([8; 32]);
     overlapping.1.metadata.version = overlapping.0.version.clone();
     bad.shards[0].index.entries.push(overlapping);
     assert!(checkpoint_format::encode(&bad).is_err());
-    let directory = Directory::new();
-    let (index, segments) = state(8);
-    let checkpointer = Checkpointer::new(directory.0.clone(), index, segments);
-    block_on(checkpointer.publish(vec![shard()])).unwrap();
-    block_on(checkpointer.publish(vec![shard()])).unwrap();
-    checkpointer.invalidate_persisted().unwrap();
-    assert!(!directory.0.join("checkpoint.0").exists());
-    assert!(!directory.0.join("checkpoint.1").exists());
-    checkpointer.invalidate_persisted().unwrap();
 }
 
 #[test]
