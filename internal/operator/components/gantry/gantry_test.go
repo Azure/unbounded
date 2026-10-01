@@ -14,7 +14,6 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	schedulingv1 "k8s.io/api/scheduling/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -311,6 +310,12 @@ func containerImage(t *testing.T, obj *unstructured.Unstructured, field, name st
 	return ""
 }
 
+// Historical names are fixtures only, not managed resources.
+const (
+	legacyNodeConfigName          = "gantry-containerd-hosts"
+	legacyNodeConfigDaemonSetName = "gantry-containerd-config"
+)
+
 func TestReconcileAppliesCoreManifestsAndSkipsExamples(t *testing.T) {
 	legacyConfig := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: legacyNodeConfigName}}
 	legacyDaemonSet := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: component.DefaultNamespace, Name: legacyNodeConfigDaemonSetName}}
@@ -345,8 +350,8 @@ func TestReconcileAppliesCoreManifestsAndSkipsExamples(t *testing.T) {
 	}
 
 	for _, obj := range []client.Object{legacyConfig, legacyDaemonSet} {
-		if err := env.Client.Get(t.Context(), client.ObjectKeyFromObject(obj), obj); !apierrors.IsNotFound(err) {
-			t.Fatalf("legacy node-config object %T was not deleted: %v", obj, err)
+		if err := env.Client.Get(t.Context(), client.ObjectKeyFromObject(obj), obj); err != nil {
+			t.Fatalf("unmanaged node-config object %T was changed: %v", obj, err)
 		}
 	}
 
@@ -356,7 +361,7 @@ func TestReconcileAppliesCoreManifestsAndSkipsExamples(t *testing.T) {
 	}
 }
 
-func TestReconcileFailsWhenLegacyNodeConfigCleanupFails(t *testing.T) {
+func TestReconcileDoesNotRequireLegacyNodeConfigCleanup(t *testing.T) {
 	wantErr := errors.New("delete denied")
 	scheme := testScheme(t)
 	applied := false
@@ -376,12 +381,12 @@ func TestReconcileFailsWhenLegacyNodeConfigCleanupFails(t *testing.T) {
 	env := &component.Env{Client: cl, Scheme: scheme, Namespace: component.DefaultNamespace}
 
 	res := reconcile(t, env, []unboundedv1alpha3.Site{*siteWithGantry("edge", nil)})
-	if res.Ready || !errors.Is(res.Err, wantErr) {
-		t.Fatalf("Reconcile = %+v, want failure wrapping %v", res, wantErr)
+	if !res.Ready || res.Err != nil {
+		t.Fatalf("Reconcile = %+v, want ready without delete permissions", res)
 	}
 
-	if applied {
-		t.Fatal("manifests were applied after legacy node-config cleanup failed")
+	if !applied {
+		t.Fatal("manifests were not applied without delete permissions")
 	}
 }
 
@@ -429,8 +434,8 @@ func TestReconcileRetainsExistingWhenAllSitesOptOut(t *testing.T) {
 					t.Fatalf("legacy-only install was retained: result=%+v applied=%#v", res, applied)
 				}
 
-				if err := env.Client.Get(t.Context(), client.ObjectKeyFromObject(tc.existing), tc.existing); !apierrors.IsNotFound(err) {
-					t.Fatalf("legacy-only object %T was not deleted: %v", tc.existing, err)
+				if err := env.Client.Get(t.Context(), client.ObjectKeyFromObject(tc.existing), tc.existing); err != nil {
+					t.Fatalf("unmanaged object %T was changed: %v", tc.existing, err)
 				}
 
 				return
@@ -551,10 +556,7 @@ func reconcile(t *testing.T, env *component.Env, sites []unboundedv1alpha3.Site)
 // TestPlanGolden pins the complete set of operations the gantry component
 // plans.
 //
-// Two properties matter beyond the object set. The legacy node config is
-// removed first and every apply depends on those deletes, so a failure to
-// remove the legacy DaemonSet skips the replacement rather than running both
-// side by side. The operator chart profile omits standalone node configuration
+// The operator chart profile omits standalone node configuration
 // and hardening resources, which remain owned by their respective installers.
 func TestPlanGolden(t *testing.T) {
 	env := testEnv(t)
@@ -568,22 +570,14 @@ func TestPlanGolden(t *testing.T) {
 		t.Fatalf("result = %+v, want ready", res)
 	}
 
-	const after = " [after DaemonSet/unbounded-system/gantry-containerd-config " +
-		"ConfigMap/unbounded-system/gantry-containerd-hosts " +
-		"ClusterRoleBinding/gantry-agent " +
-		"ClusterRole/gantry-agent " +
-		"ConfigMap/unbounded-system/gantry-config]"
+	const after = " [after ConfigMap/unbounded-system/gantry-config]"
 
 	var chairPlan strings.Builder
 	for index := range 64 {
 		fmt.Fprintf(&chairPlan, "CreateIfAbsent Lease/unbounded-system/gantry-chair-%02d%s\n", index, after)
 	}
 
-	want := `Delete DaemonSet/unbounded-system/gantry-containerd-config
-Delete ConfigMap/unbounded-system/gantry-containerd-hosts
-Delete ClusterRoleBinding/gantry-agent
-Delete ClusterRole/gantry-agent
-CreateIfAbsent ConfigMap/unbounded-system/gantry-config
+	want := `CreateIfAbsent ConfigMap/unbounded-system/gantry-config
 Apply DaemonSet/unbounded-system/gantry [overridable]` + after + `
 ` + chairPlan.String() + `Apply PriorityClass/gantry-low` + after + `
 Apply ServiceAccount/unbounded-system/gantry` + after + `
@@ -599,9 +593,8 @@ Apply RoleBinding/unbounded-system/gantry-agent` + after + `
 // TestExecutionOrderGolden pins what the executor runs, as distinct from what
 // the component emits.
 //
-// Gantry is the component where removal order matters: the legacy node-config
-// DaemonSet is deleted before the ConfigMap it mounted, so a failure to remove
-// the workload cannot strip the configuration out from under it.
+// The active config must exist before the workload is applied. No cleanup of
+// resources from unreleased installations is planned.
 func TestExecutionOrderGolden(t *testing.T) {
 	env := testEnv(t)
 
@@ -620,11 +613,7 @@ func TestExecutionOrderGolden(t *testing.T) {
 		fmt.Fprintf(&chairOrder, "CreateIfAbsent Lease/unbounded-system/gantry-chair-%02d\n", index)
 	}
 
-	want := `Delete DaemonSet/unbounded-system/gantry-containerd-config
-Delete ConfigMap/unbounded-system/gantry-containerd-hosts
-Delete ClusterRoleBinding/gantry-agent
-Delete ClusterRole/gantry-agent
-CreateIfAbsent ConfigMap/unbounded-system/gantry-config
+	want := `CreateIfAbsent ConfigMap/unbounded-system/gantry-config
 Apply PriorityClass/gantry-low
 Apply ServiceAccount/unbounded-system/gantry
 Apply Role/unbounded-system/gantry-agent
