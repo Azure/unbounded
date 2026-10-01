@@ -22,7 +22,6 @@ struct State {
     candidate_total: OnceLock<Instant>,
     candidate_idle: OnceLock<Mutex<(std::time::Duration, Instant)>>,
     candidate_body: OnceLock<Mutex<CandidateBody>>,
-    waiters: Mutex<Vec<Waker>>,
     registrations: Mutex<Vec<Weak<futures::task::AtomicWaker>>>,
 }
 struct CandidateBody {
@@ -62,7 +61,6 @@ impl Cancellation {
                 candidate_total: OnceLock::new(),
                 candidate_idle: OnceLock::new(),
                 candidate_body: OnceLock::new(),
-                waiters: Mutex::new(Vec::new()),
                 registrations: Mutex::new(Vec::new()),
             }),
         })
@@ -70,6 +68,8 @@ impl Cancellation {
     pub fn is_cancelled(&self) -> bool {
         self.state.canceled.load(Ordering::Acquire)
     }
+    /// Subscribe for one operation's lifetime, even when several operations share
+    /// an executor waker. Dropping the subscription reclaims its capacity and wake.
     pub fn subscribe(&self) -> Result<CancellationRegistration> {
         let wake = Arc::new(futures::task::AtomicWaker::new());
         let mut entries = self
@@ -87,31 +87,8 @@ impl Cancellation {
             wake,
         })
     }
-    /// Scope-lifetime worker wake. Identical executor wakers coalesce.
-    /// Operation-lifetime waiters must use subscribe so dropping one operation
-    /// cannot detach another operation that shares its executor waker.
-    pub fn register(&self, waker: &Waker) -> Result<()> {
-        let mut waiters = self.state.waiters.lock().map_err(|_| Error::Unavailable)?;
-        if self.is_cancelled() {
-            drop(waiters);
-            waker.wake_by_ref();
-            return Ok(());
-        }
-        if !waiters.iter().any(|old| old.will_wake(waker)) {
-            if waiters.len() >= 1024 {
-                return Err(Error::Overloaded);
-            }
-            waiters.push(waker.clone());
-        }
-        Ok(())
-    }
     pub fn cancel(&self) -> Result<()> {
         self.state.canceled.store(true, Ordering::Release);
-        let waiters =
-            std::mem::take(&mut *self.state.waiters.lock().map_err(|_| Error::Unavailable)?);
-        for waker in waiters {
-            waker.wake();
-        }
         let registrations: Vec<_> = self
             .state
             .registrations
@@ -506,14 +483,10 @@ mod tests {
             RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(2)).unwrap();
         let a = Arc::new(Count(AtomicUsize::new(0)));
         let b = Arc::new(Count(AtomicUsize::new(0)));
-        scope
-            .cancellation
-            .register(&Waker::from(a.clone()))
-            .unwrap();
-        scope
-            .cancellation
-            .register(&Waker::from(b.clone()))
-            .unwrap();
+        let first = scope.cancellation.subscribe().unwrap();
+        let second = scope.cancellation.subscribe().unwrap();
+        first.register(&Waker::from(a.clone()));
+        second.register(&Waker::from(b.clone()));
         let clone = scope.clone();
         assert_eq!(clone.deadline.0, scope.deadline.0);
         clone.cancel().unwrap();

@@ -1073,17 +1073,21 @@ impl Flights {
                 settle(entry, wakes);
             }
         });
-        Box::pin(poll_fn(move |cx| {
-            scope.cancellation.register(cx.waker())?;
-            self.poll_with_context(cx, self.limits.entries)?;
-            let mut table = self.table.borrow_mut();
-            if table.entries.is_empty() && super::drivers::pending() == 0 {
-                return Poll::Ready(Ok(()));
-            }
-            scope.check()?;
-            store_waker(&mut table.drain_waker, cx);
-            Poll::Pending
-        }))
+        Box::pin(async move {
+            let cancellation = scope.cancellation.subscribe()?;
+            poll_fn(move |cx| {
+                cancellation.register(cx.waker());
+                self.poll_with_context(cx, self.limits.entries)?;
+                let mut table = self.table.borrow_mut();
+                if table.entries.is_empty() && super::drivers::pending() == 0 {
+                    return Poll::Ready(Ok(()));
+                }
+                scope.check()?;
+                store_waker(&mut table.drain_waker, cx);
+                Poll::Pending
+            })
+            .await
+        })
     }
 
     /// Retain actual resources before submission. The worker completing the I/O

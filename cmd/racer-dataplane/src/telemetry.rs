@@ -185,8 +185,9 @@ fn serve<'a>(
         let listener = Rc::new(listener);
         let mut accepting = None;
         let mut connections: Vec<Operation<'_, ()>> = Vec::with_capacity(MAX_CONNECTIONS);
+        let cancellation = scope.cancellation.subscribe()?;
         std::future::poll_fn(|cx| {
-            scope.cancellation.register(cx.waker())?;
+            cancellation.register(cx.waker());
             scope.check()?;
             // Every poll performs bounded work. Slow headers cannot monopolize
             // the listener; up to four independent two-second exchanges progress.

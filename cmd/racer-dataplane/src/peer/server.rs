@@ -142,12 +142,10 @@ impl PeerServer {
                         reactor.readiness_with_lease(fd.clone(), libc::POLLIN as u32, (), scope)
                     })
                     .await?;
+                    let cancellation = scope.cancellation.subscribe()?;
                     let offer = std::future::poll_fn(|cx| {
-                        if let Err(error) = scope
-                            .cancellation
-                            .register(cx.waker())
-                            .and_then(|()| scope.check())
-                        {
+                        cancellation.register(cx.waker());
+                        if let Err(error) = scope.check() {
                             return std::task::Poll::Ready(Err(error));
                         }
                         match ingress.reserve(cx.waker()) {

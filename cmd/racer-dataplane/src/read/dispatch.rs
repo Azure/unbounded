@@ -175,6 +175,7 @@ impl Drop for Receipt {
     }
 }
 struct Active {
+    cancellation: Result<crate::runtime::deadline::CancellationRegistration>,
     runnable: Arc<super::drivers::Runnable>,
     future: Operation<'static, ()>,
     scope: RequestScope,
@@ -789,6 +790,7 @@ impl WorkerEndpoint {
                 let active_scope = scope.clone();
                 let reply = command.reply.clone();
                 self.active.push_back(Active {
+                    cancellation: caller.cancellation.subscribe(),
                     runnable: super::drivers::Runnable::new(),
                     scope: active_scope,
                     caller,
@@ -819,8 +821,10 @@ impl WorkerEndpoint {
                 && let Some(mut active) = self.active.pop_front()
             {
                 remaining_polls -= 1;
-                let registration = active.caller.cancellation.register(cx.waker());
-                if registration.is_err()
+                if let Ok(cancellation) = &active.cancellation {
+                    cancellation.register(cx.waker());
+                }
+                if active.cancellation.is_err()
                     || active.reply.abandoned.load(Ordering::Acquire)
                     || active.caller.check().is_err()
                 {
@@ -1232,10 +1236,12 @@ mod tests {
         let order = Rc::new(RefCell::new(Vec::new()));
         for id in 0..3 {
             let order = order.clone();
+            let caller = scope();
             endpoint.active.push_back(Active {
+                cancellation: caller.cancellation.subscribe(),
                 runnable: crate::read::drivers::Runnable::new(),
                 scope: scope(),
-                caller: scope(),
+                caller,
                 reply: Arc::new(Reply {
                     generation: id,
                     abandoned: AtomicBool::new(false),
