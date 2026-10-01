@@ -196,8 +196,9 @@ impl Responses {
                     let reader = if let Some(reader) = first.take() {
                         reader
                     } else {
-                        // Pending next_slice owns no issued reader; dropping that future
-                        // permits release_page to update its credit ledger between polls.
+                        // Pending acquisition and pipe admission live in the stream.
+                        // Drop only the borrowing future so duplex release_page can
+                        // update credits without discarding the pipe waiter's wake.
                         let mut ready = None;
                         std::future::poll_fn(|cx| {
                             if let Err(error) = progress_scope.check() {
