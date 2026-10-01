@@ -74,8 +74,9 @@ by concern or by ownership.
 
 An entry can include `name` alongside `component` and `kind` to select an exact
 workload name.
-Required affinity is intersected with every operator term, including migration
-interlocks, and cannot broaden the operator's placement.
+Required affinity is intersected with every operator term and cannot broaden
+the operator's placement. Site placement uses only `unbounded-cloud.io/site`;
+there are no pre-release migration affinity terms.
 
 ```yaml
 apiVersion: v1
@@ -252,7 +253,7 @@ After merging validated overrides, the operator removes its inherited
 even as `{}` or in a separate contributing entry, is rejected; `null` and deletion
 directives remain forbidden. RollingUpdate settings are otherwise unchanged.
 Removing the override restores the operator's default strategy. This does not
-delete Pods or bypass scheduling and migration guards.
+delete Pods or bypass scheduling guards.
 
 Values are checked against the type Kubernetes requires. Writing `containers:`
 as a mapping rather than a list, or `nodeSelector:` as a list rather than a

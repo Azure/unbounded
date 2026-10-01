@@ -479,11 +479,13 @@ when used, the provider-owned Machine resource identity, UID, and generation.
 The external `providerID` is not part of this snapshot; each reconcile uses its
 current value from the Machine.
 
-Current host identity forms are `spec.host.azure.resourceID` for the built-in
+First-release host identity forms are `spec.host.azure.resourceID` for the built-in
 Azure provider and `spec.host.external`, which accepts either `providerID` or a
-provider-owned `machineRef`. Deprecated top-level `spec.provider` and
-`spec.providerID` remain readable for migration. New `spec.host` ownership
-cannot be combined with those legacy ownership fields.
+provider-owned `machineRef`. Top-level `spec.provider` and `spec.providerID` are
+not supported; there is no pre-release ownership migration. See the
+[current Machine reference](../docs/content/reference/machina-crd.md) for the
+implemented host and operation snapshot contract. Other source-version citations
+in this design remain historical, as identified in the header.
 
 The controller currently recognizes provider poll states `InProgress`,
 `Succeeded`, `Failed`, and `Canceled`. It does not currently expose a

@@ -220,7 +220,9 @@ Resource defaults for both controllers: 100m CPU / 128Mi memory requests,
 Container images are multi-stage builds on Azure Linux 3.0, built with
 `podman`. CRDs are generated with `controller-gen` v0.20.1.
 
-**Build toolchain:** Go 1.25.7, controller-runtime v0.23.3.
+**Build toolchain:** See the checked-in `go.mod` for the Go version and
+controller-runtime dependency. The supported Kubernetes deployment baseline
+is 1.34+, independently of the client library version used to build the tools.
 
 ## See Also
 

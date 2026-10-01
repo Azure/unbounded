@@ -24,7 +24,7 @@ The path set is represented by `goalstates.AgentUpgradePaths`.
 
 | Field | Purpose |
 |-------|---------|
-| `BinaryPath` | Compatibility path, normally `/usr/local/bin/unbounded-agent`. |
+| `BinaryPath` | Bootstrap executable and stable command path, normally `/usr/local/bin/unbounded-agent`. |
 | `BluePath` | First blue-green binary slot. |
 | `GreenPath` | Second blue-green binary slot. |
 | `CurrentPath` | Symlink used by the systemd daemon unit. |
@@ -34,7 +34,7 @@ The path set is represented by `goalstates.AgentUpgradePaths`.
 
 `goalstates.ResolvedAgentUpgradePaths()` resolves environment overrides and
 stores the resolved `CurrentPath` target in `CurrentTargetPath`. If
-`CurrentPath` does not exist, the compatibility `BinaryPath` is used as the
+`CurrentPath` does not exist, the bootstrap `BinaryPath` is used as the
 current target. `NextTargetPath()` then chooses the inactive slot:
 
 ```text
@@ -55,21 +55,21 @@ the systemd unit:
 4. Point `BinaryPath` to `CurrentPath` unless the current target already is
    `BinaryPath`.
 
-This preserves legacy installs while making the daemon run through
-`CurrentPath` for future upgrades.
+This initializes fresh installs and repairs incomplete binary links while
+making the daemon run through `CurrentPath`. Bootstrap seeding and last-good
+recovery are current behavior, not pre-release migration support.
 
 ## Host-driven agent-upgrade command
 
-A newer agent binary also exposes this hidden command:
+The agent binary also exposes this hidden command:
 
 ```text
 unbounded-agent agent-upgrade [--preflight]
 ```
 
 The command is a host-driven alternative to the Kubernetes-driven
-`AgentUpgrade` `MachineOperation`. It is useful for upgrading an existing
-deployment that might not support the `AgentUpgrade` `MachineOperation` yet,
-without reimaging the host or repaving the nspawn worker. It is intended for
+`AgentUpgrade` `MachineOperation`. It allows host-driven activation without
+reimaging the host or repaving the nspawn worker. It is intended for
 host provisioning and management systems that have already
 delivered a candidate binary, including AKS Flex node-side integration. The
 candidate is invoked directly from its staging path:
@@ -334,7 +334,7 @@ startup signal path.
 Each successful upgrade alternates blue and green slots:
 
 ```text
-Initial: current -> legacy or blue
+Initial: current -> bootstrap binary or blue
 Upgrade 1: current -> blue,  last-good -> previous current
 Upgrade 2: current -> green, last-good -> blue
 Upgrade 3: current -> blue,  last-good -> green
