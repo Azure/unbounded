@@ -334,7 +334,7 @@ func TestValidateRejectsExplicitNulls(t *testing.T) {
 
 // TestValidateRejectsReservedMetadataPrefix guards override visibility: a patch
 // that could write the operator's own annotations could hide the fact that an
-// override is in effect, or forge a config hash the reaper gates on.
+// override is in effect, or forge a config hash that suppresses a rollout.
 func TestValidateRejectsReservedMetadataPrefix(t *testing.T) {
 	cases := map[string]string{
 		"workload annotations":     "patch:\n  metadata:\n    annotations:\n      unbounded-cloud.io/override-hash: forged\n",

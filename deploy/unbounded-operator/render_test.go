@@ -115,13 +115,13 @@ func TestOperatorConfigEndpointAndHashRender(t *testing.T) {
 		t.Fatalf("deployment replicas = %d, want 1", deploy.Spec.Replicas)
 	}
 
-	if got := deploy.Spec.Strategy["type"]; got != "Recreate" {
-		t.Fatalf("deployment strategy = %q, want Recreate", got)
+	if got := deploy.Spec.Strategy["type"]; got != "RollingUpdate" {
+		t.Fatalf("deployment strategy = %q, want RollingUpdate", got)
 	}
 
-	rollingUpdate, found := deploy.Spec.Strategy["rollingUpdate"]
-	if !found || rollingUpdate != nil {
-		t.Fatalf("deployment strategy rollingUpdate = %#v (present: %t), want explicit null", rollingUpdate, found)
+	rollingUpdate, ok := deploy.Spec.Strategy["rollingUpdate"].(map[string]any)
+	if !ok || rollingUpdate["maxSurge"] != 0 || rollingUpdate["maxUnavailable"] != 1 {
+		t.Fatalf("deployment rollingUpdate = %#v, want maxSurge=0 maxUnavailable=1 for host-network ports", rollingUpdate)
 	}
 
 	if !deploy.Spec.Template.Spec.HostNetwork {
@@ -180,16 +180,15 @@ func contains(values []string, want string) bool {
 func TestOperatorConfigHashChangesWithEachConfigValue(t *testing.T) {
 	t.Parallel()
 
-	renderHash := func(endpoint, registry, reapLegacyResources string) string {
+	renderHash := func(endpoint, registry string) string {
 		t.Helper()
 
 		outputDir := t.TempDir()
 		if err := render.Render(filepath.Join(repoRoot(t), "deploy", "unbounded-operator"), outputDir, map[string]string{
-			"Namespace":           "unbounded-system",
-			"OperatorImage":       "operator:test",
-			"ImageRegistry":       registry,
-			"APIServerEndpoint":   endpoint,
-			"ReapLegacyResources": reapLegacyResources,
+			"Namespace":         "unbounded-system",
+			"OperatorImage":     "operator:test",
+			"ImageRegistry":     registry,
+			"APIServerEndpoint": endpoint,
 		}); err != nil {
 			t.Fatalf("render.Render: %v", err)
 		}
@@ -203,8 +202,8 @@ func TestOperatorConfigHashChangesWithEachConfigValue(t *testing.T) {
 			t.Fatalf("configmap endpoint = %q, want %q", got, endpoint)
 		}
 
-		if got := cm.Data["UNBOUNDED_REAP_LEGACY_RESOURCES"]; got != reapLegacyResources {
-			t.Fatalf("configmap reap legacy resources = %q, want %q", got, reapLegacyResources)
+		if len(cm.Data) != 2 {
+			t.Fatalf("configmap data = %v, want only endpoint and registry", cm.Data)
 		}
 
 		var deploy struct {
@@ -234,16 +233,12 @@ func TestOperatorConfigHashChangesWithEachConfigValue(t *testing.T) {
 		return gotHash
 	}
 
-	baseline := renderHash("https://api.example.test:6443", "ghcr.io", "true")
-	if got := renderHash("https://other.example.test:6443", "ghcr.io", "true"); got == baseline {
+	baseline := renderHash("https://api.example.test:6443", "ghcr.io")
+	if got := renderHash("https://other.example.test:6443", "ghcr.io"); got == baseline {
 		t.Fatal("changing UNBOUNDED_API_SERVER_ENDPOINT did not change the rendered config hash")
 	}
 
-	if got := renderHash("https://api.example.test:6443", "ghcr.io", "false"); got == baseline {
-		t.Fatal("changing UNBOUNDED_REAP_LEGACY_RESOURCES did not change the rendered config hash")
-	}
-
-	if got := renderHash("https://api.example.test:6443", "registry.example.com", "true"); got == baseline {
+	if got := renderHash("https://api.example.test:6443", "registry.example.com"); got == baseline {
 		t.Fatal("changing UNBOUNDED_IMAGE_REGISTRY did not change the rendered config hash")
 	}
 }
@@ -289,7 +284,6 @@ func TestOperatorRBACIncludesCachedReadKinds(t *testing.T) {
 
 	assertReadOnlyRule("apps", "statefulsets")
 	assertReadOnlyRule("", "nodes")
-	assertReadOnlyRule("net.unbounded-cloud.io", "sitenodeslices")
 
 	for _, rule := range role.Rules {
 		if len(rule.APIGroups) == 1 && rule.APIGroups[0] == "events.k8s.io" &&

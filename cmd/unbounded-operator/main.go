@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -53,15 +52,6 @@ func newCommand(runFn func(context.Context, config) error) *cobra.Command {
 		Use:   "unbounded-operator",
 		Short: "Controller for top-level Unbounded Site configuration",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if !cmd.Flags().Changed("reap-legacy-resources") {
-				reapLegacyResources, err := envBoolDefault("UNBOUNDED_REAP_LEGACY_RESOURCES", true)
-				if err != nil {
-					return err
-				}
-
-				cfg.reapLegacyResources = reapLegacyResources
-			}
-
 			ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer cancel()
 
@@ -74,10 +64,9 @@ func newCommand(runFn func(context.Context, config) error) *cobra.Command {
 	cmd.Flags().StringVar(&cfg.probeAddr, "health-probe-bind-address", ":8081", "Address for health probes")
 	cmd.Flags().BoolVar(&cfg.leaderElection, "leader-elect", true, "Enable leader election")
 	cmd.Flags().StringVar(&cfg.leaderElectionNamespace, "leader-elect-namespace", unbounded.SystemNamespace(), "Namespace for the leader election lease")
-	cmd.Flags().StringVar(&cfg.namespace, "namespace", unbounded.SystemNamespace(), "Namespace the operator reconciles components into and migrates legacy state to")
+	cmd.Flags().StringVar(&cfg.namespace, "namespace", unbounded.SystemNamespace(), "Namespace the operator reconciles components into")
 	cmd.Flags().StringVar(&cfg.imageRegistry, "image-registry", envStringDefault("UNBOUNDED_IMAGE_REGISTRY", "ghcr.io/azure"), "Full image-repository prefix (registry host plus org/namespace) for operator-managed component images (defaults to $UNBOUNDED_IMAGE_REGISTRY or ghcr.io/azure)")
 	cmd.Flags().StringVar(&cfg.apiServerEndpoint, "api-server-endpoint", os.Getenv("UNBOUNDED_API_SERVER_ENDPOINT"), "Kubernetes API server endpoint advertised by machina; overrides auto-discovery from kube-public/cluster-info or the KUBERNETES_SERVICE_HOST FQDN (defaults to $UNBOUNDED_API_SERVER_ENDPOINT)")
-	cmd.Flags().BoolVar(&cfg.reapLegacyResources, "reap-legacy-resources", true, "Translate legacy net-group Sites, migrate state into unbounded-system, and reap the pre-consolidation namespaces (defaults to $UNBOUNDED_REAP_LEGACY_RESOURCES or true)")
 	cmd.CompletionOptions.DisableDefaultCmd = true
 	cmd.SetVersionTemplate(`{{printf "%s\n" .Version}}`)
 
@@ -92,7 +81,6 @@ type config struct {
 	namespace               string
 	imageRegistry           string
 	apiServerEndpoint       string
-	reapLegacyResources     bool
 }
 
 func envStringDefault(name, fallback string) string {
@@ -101,22 +89,6 @@ func envStringDefault(name, fallback string) string {
 	}
 
 	return fallback
-}
-
-// envBoolDefault returns the boolean value of the named environment variable, or
-// fallback when it is unset. Set values must be valid booleans.
-func envBoolDefault(name string, fallback bool) (bool, error) {
-	raw, ok := os.LookupEnv(name)
-	if !ok {
-		return fallback, nil
-	}
-
-	value, err := strconv.ParseBool(raw)
-	if err != nil {
-		return false, fmt.Errorf("parse %s: %w", name, err)
-	}
-
-	return value, nil
 }
 
 // resolveAPIServerEndpoint returns the Kubernetes API server endpoint advertised
@@ -154,7 +126,7 @@ func run(ctx context.Context, cfg config) error {
 	restConfig := ctrl.GetConfigOrDie()
 
 	// Resolve the API server endpoint advertised to provisioned machines before
-	// wiring the reconciler/reaper: an explicit override wins, otherwise it is
+	// wiring the reconciler: an explicit override wins, otherwise it is
 	// discovered from kube-public/cluster-info. Fail hard if neither is
 	// available since machina and metalman require it.
 	clientset, err := kubernetes.NewForConfig(restConfig)
@@ -196,10 +168,7 @@ func run(ctx context.Context, cfg config) error {
 		// read. Everything this operator reconciles lives in one namespace.
 		//
 		// DefaultNamespaces applies only to namespaced kinds, so Sites, Nodes
-		// and CRDs stay cluster-wide, which is what they have to be. The one
-		// component that legitimately reads other namespaces is the legacy
-		// reaper, and it already goes through APIReader precisely because those
-		// reads must bypass the cache.
+		// and CRDs stay cluster-wide, which is what they have to be.
 		Cache: cache.Options{
 			DefaultNamespaces: map[string]cache.Config{namespace: {}},
 		},
@@ -233,22 +202,6 @@ func run(ctx context.Context, cfg config) error {
 		},
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup Site controller: %w", err)
-	}
-
-	if cfg.reapLegacyResources {
-		reaper := &operator.LegacyReaper{
-			Client:            mgr.GetClient(),
-			APIReader:         mgr.GetAPIReader(),
-			TargetNamespace:   namespace,
-			LegacyNamespaces:  operator.LegacyNamespaces,
-			SkipSecretNames:   map[string]struct{}{"unbounded-net-serving-cert": {}},
-			CopyConfigMaps:    []string{"machina-config", "unbounded-net-config"},
-			APIServerEndpoint: cfg.apiServerEndpoint,
-			Recorder:          mgr.GetEventRecorder("unbounded-operator-reaper"),
-		}
-		if err := reaper.SetupWithManager(mgr); err != nil {
-			return fmt.Errorf("setup legacy reaper: %w", err)
-		}
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

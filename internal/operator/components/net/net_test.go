@@ -1429,10 +1429,8 @@ func caBundlesOf(t *testing.T, obj *unstructured.Unstructured) []string {
 //
 // Net is the cluster dataplane and applies the largest object set of any
 // component, including the ValidatingAdmissionPolicy that restricts what its
-// own ServiceAccount may create. The reaper gates its migration on the
-// config-hash annotation the two workloads carry
-// (internal/operator/migrate.go), so an object or annotation silently
-// appearing, disappearing or being renamed here breaks the upgrade path.
+// own ServiceAccount may create. The config-hash annotations ensure that
+// changes to the config roll both workloads.
 //
 // Both workloads depend on the config, so a failure to write the ConfigMap
 // skips them rather than rolling pods that cannot mount it.

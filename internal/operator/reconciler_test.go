@@ -595,7 +595,7 @@ func TestRegistryMaterializedOnceAndInstanceReused(t *testing.T) {
 }
 
 // TestSiteReconcilerSetupRequiresAnAPIReader guards the fallback in
-// Env.LiveReader, for the same reason the reaper guards its own.
+// Env.LiveReader in manager wiring.
 //
 // LiveReader falls back to the cached client when APIReader is nil, which is
 // harmless in a unit test against a fake client and is not harmless under a

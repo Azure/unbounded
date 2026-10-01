@@ -83,7 +83,7 @@ func TestOperatorImagePull(t *testing.T) {
 		h.run("kind", "load", "docker-image", "--name", h.cluster, imageRegistry+"/"+component+":e2e")
 	}
 
-	h.run("make", "unbounded-operator-manifests", "UNBOUNDED_OPERATOR_IMAGE="+imageRegistry+"/unbounded-operator:e2e", "UNBOUNDED_OPERATOR_IMAGE_REGISTRY="+imageRegistry, "UNBOUNDED_OPERATOR_REAP_LEGACY_RESOURCES=false")
+	h.run("make", "unbounded-operator-manifests", "UNBOUNDED_OPERATOR_IMAGE="+imageRegistry+"/unbounded-operator:e2e", "UNBOUNDED_OPERATOR_IMAGE_REGISTRY="+imageRegistry)
 
 	manifests, err := filepath.Glob(filepath.Join(root, "deploy/unbounded-operator/rendered/*.yaml"))
 	require.NoError(t, err)

@@ -11,30 +11,12 @@ import (
 	"strings"
 	"testing"
 
-	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
-	runtimeutil "k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/yaml"
 
 	machinamanifests "github.com/Azure/unbounded/deploy/machina"
 	"github.com/Azure/unbounded/internal/operator/component"
 )
-
-// kindToResource maps the Kinds the reaper deletes (reapableKinds) to their
-// RBAC resource name. Keep in sync with reapableKinds(): a new reaped kind must
-// be added here (and granted deletecollection in the operator ClusterRole),
-// which TestOperatorClusterRoleGrantsReaperDeletes enforces.
-var kindToResource = map[string]string{
-	"Deployment":     "deployments",
-	"DaemonSet":      "daemonsets",
-	"Service":        "services",
-	"ConfigMap":      "configmaps",
-	"Secret":         "secrets",
-	"ServiceAccount": "serviceaccounts",
-	"Role":           "roles",
-	"RoleBinding":    "rolebindings",
-}
 
 // loadOperatorClusterRole parses the operator ClusterRole from its template. The
 // ClusterRole document contains no Go-template actions (only the accompanying
@@ -128,38 +110,28 @@ func TestOperatorClusterRoleAllowsComponentRBACInstall(t *testing.T) {
 	}
 }
 
-// TestOperatorClusterRoleGrantsReaperDeletes guards against the reaper's
-// DeleteAllOf (deletecollection) being forbidden: the operator ClusterRole must
-// grant deletecollection on every kind the reaper deletes by label.
-func TestOperatorClusterRoleGrantsReaperDeletes(t *testing.T) {
+func TestOperatorClusterRoleExcludesMigrationPermissions(t *testing.T) {
 	cr := loadOperatorClusterRole(t)
 
-	scheme := runtimeutil.NewScheme()
-	for _, add := range []func(*runtimeutil.Scheme) error{
-		corev1.AddToScheme,
-		appsv1.AddToScheme,
-		rbacv1.AddToScheme,
-	} {
-		if err := add(scheme); err != nil {
-			t.Fatalf("add to scheme: %v", err)
+	for _, rule := range cr.Rules {
+		if contains(rule.Verbs, "deletecollection") {
+			t.Fatalf("operator must not bulk-delete resources: %#v", rule)
 		}
 	}
 
-	for _, obj := range reapableKinds() {
-		gvks, _, err := scheme.ObjectKinds(obj)
-		if err != nil || len(gvks) == 0 {
-			t.Fatalf("resolve GVK for %T: %v", obj, err)
-		}
-
-		gvk := gvks[0]
-
-		resource, ok := kindToResource[gvk.Kind]
-		if !ok {
-			t.Fatalf("no resource mapping for reaped kind %q; add it to kindToResource and grant deletecollection in the operator ClusterRole", gvk.Kind)
-		}
-
-		if !clusterRoleGrants(cr, gvk.Group, resource, "deletecollection") {
-			t.Fatalf("operator ClusterRole must grant deletecollection on %q (apiGroup %q) for the reaper's DeleteAllOf", resource, gvk.Group)
+	for _, permission := range []struct{ group, resource, verb string }{
+		{"net.unbounded-cloud.io", "sites", "get"},
+		{"net.unbounded-cloud.io", "sitenodeslices", "list"},
+		{"unbounded-cloud.io", "sites", "create"},
+		{"unbounded-cloud.io", "machines", "patch"},
+		{"unbounded-cloud.io", "machineoperationcredentials", "patch"},
+		{"apiextensions.k8s.io", "customresourcedefinitions", "delete"},
+		{"", "namespaces", "delete"},
+		{"", "secrets", "delete"},
+		{"", "services", "delete"},
+	} {
+		if clusterRoleGrants(cr, permission.group, permission.resource, permission.verb) {
+			t.Fatalf("unexpected migration permission: %+v", permission)
 		}
 	}
 }

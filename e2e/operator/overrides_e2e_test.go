@@ -12,7 +12,7 @@
 // a stub and its validation is nearly nonexistent.
 //
 // The whole SiteReconciler runs in-process against a real API server, in the
-// same style as the reaper e2e, so no image build is needed. Driving the real
+// fresh cluster, so no image build is needed. Driving the real
 // reconciler rather than a reimplementation of it is the point: an earlier
 // version of this file rebuilt a simplified copy of the reconcile pass, which
 // meant the parts most likely to be wrong (the failure model, status
@@ -266,8 +266,7 @@ func TestOverridesAgainstRealAPIServer(t *testing.T) {
 	requireBins(t, "kind", "kubectl", "docker")
 
 	kubeconfig := createClusterNamed(t, overridesClusterName)
-	repoRoot := repoRootFromWD(t)
-	applyCRDs(t, kubeconfig, repoRoot)
+	applyCRDs(t, kubeconfig)
 
 	cl := newClient(t, kubeconfig)
 	ctx := t.Context()
@@ -322,6 +321,14 @@ func TestOverridesAgainstRealAPIServer(t *testing.T) {
 
 	t.Run("user annotations on a ServiceAccount survive", func(t *testing.T) {
 		assertServiceAccountAnnotationsSurvive(ctx, t, fixture)
+	})
+
+	t.Run("fresh config rollout and reconciler restart", func(t *testing.T) {
+		assertFreshConfigAndRestart(t, cl)
+	})
+
+	t.Run("CRD deletion repair", func(t *testing.T) {
+		assertCRDRepair(t, kubeconfig, cl)
 	})
 }
 
