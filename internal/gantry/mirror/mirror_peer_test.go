@@ -630,7 +630,7 @@ func TestMirror_PeerFallback_NonLiveCommitDigestMismatchQuarantines(t *testing.T
 
 	var digestMismatches int32
 
-	// No WithLiveStreamThrough: the mirror writes to its content store and
+	// Live streaming never writes to the mirror content store and
 	// commits, so the fake store's Commit returns a wrapped
 	// errdefs.ErrFailedPrecondition exactly like real containerd.
 	m := mirror.New(cfg, fakes.NewCache(), oc,

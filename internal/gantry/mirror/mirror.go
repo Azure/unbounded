@@ -226,15 +226,8 @@ func WithLogger(l *slog.Logger) Option {
 // source of truth and the operator-facing "is origin sick?"
 // alert (p2p_origin_failure_total) stays consistent across both
 // paths and free of false positives from downstream failures.
-// - p2p_origin_pull_success_total{kind} belongs to the mirror
-// (WithOriginSuccessMetric) because origin can't know whether
-// the caller actually committed bytes - see that option's doc.
-// - p2p_origin_pull_failure_total{kind,class} is fed from BOTH
-// halves: origin's failure hook bumps it on true origin-side
-// failures (with double-bump of p2p_origin_failure_total), and
-// the mirror's WithDownstreamFailureMetric bumps it on
-// downstream failures (with class=transient, NO double-bump of
-// p2p_origin_failure_total).
+// Live stream completion/failure is reported through WithOriginStreamMetrics.
+// Background ingest completion is owned by the puller pump, after its commit.
 //
 // Counting any of these at the mirror's WithMetrics hook would
 // silently undercount the please_pull-coordinated path (the bulk of
@@ -1095,11 +1088,8 @@ func (s *Server) serveHeadMiss(ctx context.Context, w http.ResponseWriter, d dig
 // p2p_origin_failure_total{class} bump inside
 // origin.recordFailure on origin-side terminal failures
 // (same WithMetrics closure double-bumps both).
-// - p2p_origin_pull_success_total{kind} bumps HERE after
-// cw.Commit succeeds (and analogously in runOriginPull after
-// that path's Commit). Success cannot live in origin because
-// origin has no way to know whether the caller actually
-// committed the bytes to cache.
+// Live stream completion bumps HERE after the final digest check. Background
+// ingest success remains in runOriginPull after its containerd commit.
 //
 // HEAD takes the separate s.origin.Head path explicitly so it does
 // NOT bump p2p_origin_pull_total: HEAD is metadata-only, it never
