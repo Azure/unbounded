@@ -473,16 +473,10 @@ pub(crate) fn grant(head: &MessageHead) -> Result<super::subscriptions::Transfer
 }
 fn metadata(head: &MessageHead) -> Result<ObjectMetadata> {
     let content_type = match head.unique("racer-metadata-version")? {
-        None => {
-            if head.unique("racer-content-type")?.is_some() {
-                return Err(Error::InvalidRequest);
-            }
-            None
-        }
-        Some(b"2") => Some(crate::model::ContentType::parse(
-            head.unique("racer-content-type")?
-                .ok_or(Error::InvalidRequest)?,
-        )?),
+        Some(b"2") => head
+            .unique("racer-content-type")?
+            .map(crate::model::ContentType::parse)
+            .transpose()?,
         _ => return Err(Error::InvalidRequest),
     };
     Ok(ObjectMetadata {
@@ -623,6 +617,16 @@ mod metadata_tests {
             let head =
                 p::response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path).unwrap();
             assert_eq!(metadata(&head).unwrap(), m);
+            let mut missing_version =
+                p::response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path).unwrap();
+            missing_version
+                .headers
+                .retain(|h| h.name != "racer-metadata-version");
+            assert!(metadata(&missing_version).is_err());
+            assert_eq!(
+                head.unique("racer-metadata-version").unwrap(),
+                Some(b"2".as_slice())
+            );
             assert_eq!(
                 head.unique("content-length").unwrap(),
                 Some(b"0".as_slice())
