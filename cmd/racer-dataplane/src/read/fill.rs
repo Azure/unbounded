@@ -991,6 +991,7 @@ impl Fill {
             page: page.clone(),
             mode: FetchMode::Acquire,
         };
+        let mut hedge_continuation = super::candidates::HedgeContinuation::default();
         if want_plaintext {
             if let Some(result) = self
                 .dependencies
@@ -1002,7 +1003,31 @@ impl Fill {
                     scope,
                     budget,
                     &self.dependencies.admission,
-                    |response| Box::pin(self.decrypt_response(page, response, None, scope)),
+                    &mut hedge_continuation,
+                    |response, child| {
+                        Box::pin(async move {
+                            let copy = response_copy(response.response(), page)?;
+                            if let Some(existing) =
+                                self.retained_metadata(&page.version, &child).await?
+                            {
+                                if !existing.compatible(&copy.metadata.immutable()) {
+                                    return Err(Error::CorruptRecord);
+                                }
+                            }
+                            let result =
+                                self.decrypt_response(page, response, None, &child).await?;
+                            // A sibling may publish while crypto runs. Recheck before
+                            // election, not only after a winner has canceled its peer.
+                            if let Some(existing) =
+                                self.retained_metadata(&page.version, &child).await?
+                            {
+                                if !existing.compatible(&result.metadata.immutable()) {
+                                    return Err(Error::CorruptRecord);
+                                }
+                            }
+                            Ok(result)
+                        })
+                    },
                 )
                 .await?
             {
@@ -1017,7 +1042,7 @@ impl Fill {
         let resolution = self
             .dependencies
             .candidates
-            .resolve_validated(
+            .resolve_after_hedge(
                 crate::topology::placement::Candidates {
                     membership: candidates.membership.clone(),
                     ordered: candidates.ordered.clone(),
@@ -1041,6 +1066,7 @@ impl Fill {
                         }
                     })
                 },
+                hedge_continuation,
             )
             .await?;
         let mut source = Event::PeerHit;

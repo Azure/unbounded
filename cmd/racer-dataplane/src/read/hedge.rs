@@ -9,7 +9,13 @@
 //! One CopyOnly secondary may start; normal acquisition credits are partitioned,
 //! never replenished. Duplicate escrow is held in addition to actual buffer quota,
 //! intentionally over-accounting rather than requiring a transport-wide reservation
-//! handoff. A valid winner waits for the losing exchange/crypto fence before return:
+//! handoff. Admission also preflights two full contender buffers before credits:
+//! the existing serial page plus escrow plus both contenders require 64 MiB of
+//! plaintext capacity in an otherwise empty worker. Low quotas fall back serially.
+//! Pair exchanges have a local one-third-remaining cap; signed authority stays
+//! unchanged. Serial continuation skips the consumed primary, keeps the CopyOnly
+//! secondary eligible for Acquire, and preserves credits for later candidates.
+//! A valid winner waits for the losing exchange/crypto fence before return:
 //! this can limit the latency benefit and is not an early-publication implementation.
 use crate::{
     error::{Error, Result},

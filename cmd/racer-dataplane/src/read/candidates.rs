@@ -50,6 +50,14 @@ pub struct CandidatePolicy {
     credentials: RefCell<Option<Rc<CredentialCrypto>>>,
     published: RefCell<Option<std::sync::Arc<crate::control::snapshot::PublishedState>>>,
 }
+#[derive(Default, Clone, Copy)]
+pub(crate) struct HedgeContinuation {
+    // This is local acquisition progress, never placement/origin authority.
+    pub primary_consumed: bool,
+    pub primary_outcome: Option<ProbeOutcome>,
+    pub stale: bool,
+    pub bounded_routes: bool,
+}
 impl CandidatePolicy {
     /// Only Fill's plaintext fixed-page path calls this. Direct HTTP destinations
     /// prove independent first hops. Drain both attempts before releasing escrow.
@@ -61,7 +69,8 @@ impl CandidatePolicy {
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
         admission: &Rc<crate::runtime::admission::Admission>,
-        validate: impl Fn(VerifiedResponse) -> Operation<'a, T>,
+        continuation: &mut HedgeContinuation,
+        validate: impl Fn(VerifiedResponse, RequestScope) -> Operation<'a, T>,
     ) -> Result<Option<T>> {
         let Some(hedges) = self.hedge.as_ref().filter(|h| h.enabled()) else {
             return Ok(None);
@@ -70,8 +79,8 @@ impl CandidatePolicy {
             && !self.is_candidate(candidates)
             && candidates.ordered.len() >= 2
             && candidates.ordered[0] != candidates.ordered[1]
-            && budget.remaining_attempts() >= 4
-            && budget.remaining_links() >= 8
+            && budget.remaining_attempts() >= 7
+            && budget.remaining_links() >= 16
             && candidates.ordered[..2]
                 .iter()
                 .all(|n| self.peers.direct_hedge_available(&candidates.membership, n));
@@ -92,17 +101,37 @@ impl CandidatePolicy {
                 crate::model::limits::ResourceClass::Ciphertext,
                 crate::model::range::PAGE_BYTES as usize + 16,
             )?;
+            // The caller already holds its serial plaintext page. Escrow is
+            // additional accounting, not a buffer consumed by either validator.
+            // Fund BOTH contenders before spending credits or changing routing.
+            let working_plain = admission.reserve(
+                Some(&context.object.cache),
+                crate::model::limits::ResourceClass::Plaintext,
+                crate::model::range::PAGE_BYTES as usize * 2,
+            )?;
+            let working_cipher = admission.reserve(
+                Some(&context.object.cache),
+                crate::model::limits::ResourceClass::Ciphertext,
+                (crate::model::range::PAGE_BYTES as usize + 16) * 2,
+            )?;
+            drop((working_plain, working_cipher));
             Ok::<_, Error>((slot, plain, cipher))
         })();
         let Ok((slot, _plain, _cipher)) = reservation else {
             hedges.suppressed();
             return Ok(None);
         };
-        let mut secondary_budget = budget.partition(1, 4)?;
-        let mut primary_budget = budget.partition(budget.remaining_attempts() / 2, 4)?;
+        // Pinned direct exchanges consume exactly one link each. Reserve the
+        // remaining original links for serial candidates or one epoch refresh.
+        let mut secondary_budget = budget.partition(1, 1)?;
+        let mut primary_budget = budget.partition(2, 1)?;
         let primary_scope =
             RequestScope::new(scope.request, scope.deadline.0.min(budget.deadline()))?;
         let secondary_scope = RequestScope::new(scope.request, primary_scope.deadline.0)?;
+        let stale = std::cell::Cell::new(false);
+        let primary_outcome = std::cell::Cell::new(None);
+        continuation.primary_consumed = true;
+        continuation.bounded_routes = true;
         let primary = async {
             let response = self
                 .request_mode(
@@ -113,13 +142,26 @@ impl CandidatePolicy {
                     FetchMode::Acquire,
                     &primary_scope,
                     &mut primary_budget,
-                    1,
+                    3,
                     true,
                 )
                 .await?;
+            if matches!(response.response(), PeerResponse::StaleMembership) {
+                stale.set(true);
+                return Err(Error::Unavailable);
+            }
             match classify(response.response(), operation, true)? {
-                Some(_) => Err(Error::Unavailable),
-                None => validate(response).await,
+                Some(outcome) => {
+                    primary_outcome.set(Some(outcome));
+                    Err(Error::Unavailable)
+                }
+                None => {
+                    let result = validate(response, primary_scope.clone()).await;
+                    if matches!(result, Err(Error::CorruptRecord | Error::MissingKey)) {
+                        primary_outcome.set(Some(ProbeOutcome::UnusableCopy));
+                    }
+                    result
+                }
             }
         };
         let secondary = async {
@@ -160,13 +202,17 @@ impl CandidatePolicy {
                     FetchMode::CopyOnly,
                     &secondary_scope,
                     &mut secondary_budget,
-                    1,
+                    3,
                     true,
                 )
                 .await?;
+            if matches!(response.response(), PeerResponse::StaleMembership) {
+                stale.set(true);
+                return Err(Error::Unavailable);
+            }
             match classify(response.response(), operation, false)? {
                 Some(_) => Err(Error::Unavailable),
-                None => validate(response).await,
+                None => validate(response, secondary_scope.clone()).await,
             }
         };
         let result = super::hedge::race(
@@ -180,6 +226,8 @@ impl CandidatePolicy {
         .await;
         budget.reunite(primary_budget)?;
         budget.reunite(secondary_budget)?;
+        continuation.stale = stale.get();
+        continuation.primary_outcome = primary_outcome.get().or(Some(ProbeOutcome::Unreachable));
         check_budget(scope, budget)?;
         match result {
             Ok(result) => Ok(Some(result)),
@@ -189,10 +237,7 @@ impl CandidatePolicy {
                 | Error::Overloaded
                 | Error::CorruptRecord
                 | Error::MissingKey,
-            ) => {
-                budget.note_route_failure();
-                Ok(None)
-            }
+            ) => Ok(None),
             Err(error) => Err(error),
         }
     }
@@ -396,7 +441,36 @@ impl CandidatePolicy {
         validate: impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a,
     ) -> Operation<'a, CandidateResolution<T>> {
         self.resolve_epoch(
-            candidates, context, operation, scope, budget, validate, false,
+            candidates,
+            context,
+            operation,
+            scope,
+            budget,
+            validate,
+            false,
+            HedgeContinuation::default(),
+        )
+    }
+
+    pub(crate) fn resolve_after_hedge<'a, T: 'a>(
+        &'a self,
+        candidates: Candidates,
+        context: &'a OriginContext,
+        operation: PeerOperation,
+        scope: &'a RequestScope,
+        budget: &'a mut AcquisitionBudget,
+        validate: impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a,
+        continuation: HedgeContinuation,
+    ) -> Operation<'a, CandidateResolution<T>> {
+        self.resolve_epoch(
+            candidates,
+            context,
+            operation,
+            scope,
+            budget,
+            validate,
+            false,
+            continuation,
         )
     }
 
@@ -409,12 +483,42 @@ impl CandidatePolicy {
         budget: &'a mut AcquisitionBudget,
         mut validate: impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a,
         retried: bool,
+        continuation: HedgeContinuation,
     ) -> Operation<'a, CandidateResolution<T>> {
         Box::pin(async move {
             check_budget(scope, budget)?;
             let (object, page) = operation_identity(&operation);
             if object != &context.object {
                 return Err(Error::InvalidRequest);
+            }
+            if continuation.stale {
+                let latest = self
+                    .published
+                    .borrow()
+                    .as_ref()
+                    .ok_or(Error::IncompatibleMembership)?
+                    .current()?
+                    .membership
+                    .clone();
+                if retried || latest.version.0 <= candidates.membership.version.0 {
+                    return Err(Error::IncompatibleMembership);
+                }
+                let next = self.candidates_scoped(latest, object, page, scope).await?;
+                return self
+                    .resolve_epoch(
+                        next,
+                        context,
+                        operation,
+                        scope,
+                        budget,
+                        validate,
+                        true,
+                        HedgeContinuation {
+                            bounded_routes: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await;
             }
             // Public Candidates values are not authority. Recompute before origin.
             let expected = self
@@ -435,12 +539,44 @@ impl CandidatePolicy {
             let mut saw_version = false;
             let count = rank.unwrap_or(candidates.ordered.len());
             for (index, destination) in candidates.ordered[..count].iter().enumerate() {
+                if continuation.primary_consumed && index == 0 {
+                    let outcome = continuation
+                        .primary_outcome
+                        .unwrap_or(ProbeOutcome::Unreachable);
+                    saw_version |= outcome == ProbeOutcome::VersionUnavailable;
+                    saw_transient |= matches!(
+                        outcome,
+                        ProbeOutcome::Unreachable
+                            | ProbeOutcome::Overloaded
+                            | ProbeOutcome::UnusableCopy
+                    );
+                    continue;
+                }
                 let mode = if rank.is_some() {
                     FetchMode::CopyOnly
                 } else {
                     FetchMode::Acquire
                 };
-                match self
+                let mut bounded = if continuation.bounded_routes {
+                    // A previous hedge already consumed its primary. Spend no
+                    // more than four links here and retain an Acquire+origin
+                    // allowance for every remaining nonlocal candidate.
+                    Some(
+                        budget.partition(
+                            budget
+                                .remaining_attempts()
+                                .saturating_sub(
+                                    (count - index - 1) as u32 * if rank.is_some() { 1 } else { 2 },
+                                )
+                                .max(1),
+                            budget.remaining_links().min(4),
+                        )?,
+                    )
+                } else {
+                    None
+                };
+                let request_budget = bounded.as_mut().unwrap_or(&mut *budget);
+                let response = self
                     .request(
                         &candidates.membership,
                         destination,
@@ -448,11 +584,14 @@ impl CandidatePolicy {
                         &operation,
                         mode,
                         scope,
-                        budget,
+                        request_budget,
                         (count - index + usize::from(rank.is_some())) as u32,
                     )
-                    .await
-                {
+                    .await;
+                if let Some(bounded) = bounded {
+                    budget.reunite(bounded)?;
+                }
+                match response {
                     Ok(response) => {
                         if matches!(response.response(), PeerResponse::StaleMembership) {
                             if retried {
@@ -474,7 +613,17 @@ impl CandidatePolicy {
                             // cancellation/deadline and already spent link/attempt credits.
                             return self
                                 .resolve_epoch(
-                                    next, context, operation, scope, budget, validate, true,
+                                    next,
+                                    context,
+                                    operation,
+                                    scope,
+                                    budget,
+                                    validate,
+                                    true,
+                                    HedgeContinuation {
+                                        bounded_routes: continuation.bounded_routes,
+                                        ..Default::default()
+                                    },
                                 )
                                 .await;
                         }
@@ -661,7 +810,12 @@ impl CandidatePolicy {
         // every exchange, even when no alternative is affordable.
         // Sign the original hard ceiling before sending; it never renews.
         let deadline = now + (overall - now) / remaining_opportunities.max(1);
-        let attempt_end = now + self.attempt_timeout.min(overall - now);
+        let attempt_end = now
+            + self.attempt_timeout.min(if direct {
+                (overall - now) / 3
+            } else {
+                overall - now
+            });
         // The local exchange may time out before the signed contract. Shortening
         // the latter per attempt would make a later update renew provider authority.
         let signed_deadline = overall;
