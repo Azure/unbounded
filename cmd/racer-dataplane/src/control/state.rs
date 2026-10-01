@@ -9,8 +9,6 @@ use crate::{
 };
 use sha2::{Digest, Sha256};
 use std::{
-    cell::RefCell,
-    collections::BTreeMap,
     path::PathBuf,
     rc::Rc,
     sync::{Arc, Mutex, Weak},
@@ -182,11 +180,6 @@ impl SnapshotStore {
         let prepared = self.prepare(publication)?;
         self.publish_prepared(&prepared, transition)
     }
-    /// Validate the entire downloaded publication before local resource staging.
-    /// Capacity can change while leases drain, so installation rechecks it.
-    pub fn validate(&self, publication: Publication) -> Result<()> {
-        self.prepare(publication).map(|_| ())
-    }
     pub fn prepare(&self, publication: Publication) -> Result<PreparedPublication> {
         if publication.cluster != self.cluster {
             return Err(Error::Unauthorized);
@@ -348,7 +341,7 @@ impl SnapshotStore {
         Ok(next)
     }
 }
-/// Cache definitions and lifecycle events. Removal closes new admission while
+/// Cache definitions. Removal closes new admission while
 /// accepted socket, key, and I/O owners drain independently.
 ///
 /// Socket paths are fixed: /run/racer/<cache name>/client/socket and
@@ -366,20 +359,11 @@ pub struct CacheDefinition {
     /// Must equal /run/racer/<name>/origin/socket, not an arbitrary supplied path.
     pub origin_socket: PathBuf,
 }
-pub enum CacheEvent {
-    Add(CacheDefinition),
-    Update(CacheDefinition),
-    Remove(CacheId),
-}
 /// A sole owner stages all listener/resource changes before publication. Dropping
 /// an uncommitted transition must undo preparation. Commit cannot fail; removal
 /// stops admission and arranges drain/fences before releasing old resources.
 pub trait CacheTransition {
     fn commit(self: Box<Self>);
-}
-#[derive(Default)]
-pub struct CacheRegistry {
-    current: RefCell<BTreeMap<CacheId, CacheDefinition>>,
 }
 pub fn canonical_socket_paths(name: &str) -> Result<(PathBuf, PathBuf)> {
     if name.is_empty()
@@ -419,35 +403,6 @@ pub fn validate_definitions(definitions: &[CacheDefinition]) -> Result<()> {
         }
     }
     Ok(())
-}
-impl CacheRegistry {
-    /// Reject unsafe/duplicate names, noncanonical paths, and socket paths exceeding
-    /// the platform UDS limit. Validate before filesystem access; prevent symlink
-    /// traversal outside the endpoint directories during socket lifecycle work.
-    pub fn reconcile(&self, definitions: &[CacheDefinition]) -> Result<Vec<CacheEvent>> {
-        validate_definitions(definitions)?;
-        let next: BTreeMap<_, _> = definitions
-            .iter()
-            .map(|d| (d.id.clone(), d.clone()))
-            .collect();
-        let mut current = self.current.borrow_mut();
-        let mut events = Vec::new();
-        // Removals precede additions, including replacement of a reused cache name.
-        for id in current.keys() {
-            if !next.contains_key(id) {
-                events.push(CacheEvent::Remove(id.clone()));
-            }
-        }
-        for (id, d) in &next {
-            match current.get(id) {
-                None => events.push(CacheEvent::Add(d.clone())),
-                Some(old) if old != d => events.push(CacheEvent::Update(d.clone())),
-                _ => (),
-            }
-        }
-        *current = next;
-        Ok(events)
-    }
 }
 
 /// Current positive admission set, shared by cache lookups and late publications.

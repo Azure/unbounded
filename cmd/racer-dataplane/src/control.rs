@@ -3,8 +3,6 @@
 pub(crate) mod async_files;
 mod dns;
 pub mod enrollment;
-#[cfg(test)]
-mod files;
 pub mod secrets;
 pub mod state;
 #[cfg(test)]
@@ -15,7 +13,7 @@ pub mod wire;
 use self::{
     enrollment::{Enrollment, LocalSigningIdentity},
     secrets::BundleInstaller,
-    state::{CacheEvent, CacheRegistry, SnapshotStore},
+    state::SnapshotStore,
     transport::{ControlIo, ControlTransport, HttpResponse},
     wire::{EnrollmentRequest, EnrollmentResponse, SnapshotRequest, SnapshotResponse},
 };
@@ -46,7 +44,6 @@ pub struct ControlClient {
     keyring_failures: Cell<u32>,
     keyring_retry_after: Cell<Option<Duration>>,
     snapshots: Rc<SnapshotStore>,
-    caches: Rc<CacheRegistry>,
     identity: RefCell<Option<LocalSigningIdentity>>,
     started: Cell<bool>,
     busy: Cell<bool>,
@@ -57,7 +54,6 @@ pub struct ControlClient {
     retry_after: Cell<Option<Duration>>,
     next: Cell<Option<Instant>>,
     active_scope: RefCell<Option<RequestScope>>,
-    events: RefCell<Vec<CacheEvent>>,
     lifecycle: RefCell<Option<Rc<crate::app::caches::CachePublication>>>,
     projection_error: Cell<Option<Error>>,
     renewal_error: Cell<Option<Error>>,
@@ -87,12 +83,6 @@ fn enter(flag: &Cell<bool>) -> Result<Busy<'_>> {
         Ok(Busy(flag))
     }
 }
-pub struct ControlProgress {
-    pub identity: Option<crate::model::NodeId>,
-    pub snapshot: Option<state::SnapshotLease>,
-    pub cache_events: Vec<CacheEvent>,
-    pub next_attempt: Instant,
-}
 impl ControlClient {
     pub fn new(
         endpoint: ControlEndpoint,
@@ -100,7 +90,6 @@ impl ControlClient {
         keys: Rc<Keyring>,
         secrets: BundleInstaller,
         snapshots: Rc<SnapshotStore>,
-        caches: Rc<CacheRegistry>,
     ) -> Self {
         Self {
             key_transport: ControlTransport::new(ControlEndpoint {
@@ -116,7 +105,6 @@ impl ControlClient {
             keys: RefCell::new(keys),
             secrets,
             snapshots,
-            caches,
             identity: RefCell::new(None),
             started: Cell::new(false),
             busy: Cell::new(false),
@@ -127,7 +115,6 @@ impl ControlClient {
             retry_after: Cell::new(None),
             next: Cell::new(None),
             active_scope: RefCell::new(None),
-            events: RefCell::new(Vec::new()),
             lifecycle: RefCell::new(None),
             projection_error: Cell::new(None),
             renewal_error: Cell::new(None),
@@ -256,58 +243,6 @@ impl ControlClient {
             )?))
         })
     }
-    pub fn run<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, ()> {
-        Box::pin(async move {
-            if self.lifecycle.borrow().is_none() {
-                return Err(Error::InvalidConfiguration);
-            }
-            while !self.started.get() {
-                match self.start(scope).await {
-                    Ok(_) => (),
-                    Err(e) if transient(e) => self.wait_retry(scope).await?,
-                    Err(e) => return Err(e),
-                }
-            }
-            self.activate_identity()?;
-            let mut keyring = Box::pin(async {
-                loop {
-                    self.keyring_progress(scope).await?;
-                }
-                #[allow(unreachable_code)]
-                Ok::<(), Error>(())
-            });
-            let mut topology = Box::pin(async {
-                loop {
-                    scope.check()?;
-                    if self.stopped.get() {
-                        return Ok(());
-                    }
-                    let now = crate::runtime::environment::now();
-                    if let Some(next) = self.next.get().filter(|next| *next > now) {
-                        self.transport.io()?.sleep(next, scope).await?;
-                    }
-                    match self.progress(scope).await {
-                        Ok(_) => (),
-                        Err(
-                            Error::Io
-                            | Error::Unavailable
-                            | Error::Overloaded
-                            | Error::DeadlineExceeded,
-                        ) => (),
-                        Err(e) => return Err(e),
-                    }
-                }
-            });
-            std::future::poll_fn(|cx| {
-                use std::future::Future;
-                if let std::task::Poll::Ready(result) = keyring.as_mut().poll(cx) {
-                    return std::task::Poll::Ready(result);
-                }
-                topology.as_mut().poll(cx)
-            })
-            .await
-        })
-    }
     /// Runtime must attach its owner-local reactor adapter before start.
     pub fn attach_io(&self, io: Rc<dyn ControlIo>) {
         if let Some(reactor) = io.reactor() {
@@ -330,12 +265,6 @@ impl ControlClient {
     }
     pub fn next_attempt(&self) -> Option<Instant> {
         self.next.get()
-    }
-    async fn wait_retry(&self, scope: &RequestScope) -> Result<()> {
-        if let Some(next) = self.next.get() {
-            self.transport.io()?.sleep(next, scope).await?;
-        }
-        Ok(())
     }
     fn backoff(&self) -> Result<Instant> {
         let failures = self.failures.get().saturating_add(1);
@@ -452,7 +381,7 @@ impl ControlClient {
         self.identity.borrow().clone()
     }
     /// One bounded owner turn. Call again at next_attempt; only this owner polls.
-    pub fn progress<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, ControlProgress> {
+    pub fn progress<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, ()> {
         Box::pin(async move {
             let _busy = enter(&self.busy)?;
             scope.check()?;
@@ -467,7 +396,7 @@ impl ControlClient {
             }
             if self.pending.borrow().is_some() {
                 match self.install_pending() {
-                    Ok(()) => return self.state(),
+                    Ok(()) => return Ok(()),
                     Err(Error::Unavailable | Error::Overloaded | Error::Io) => (),
                     Err(error) => return Err(error),
                 }
@@ -509,7 +438,7 @@ impl ControlClient {
                     {
                         self.next.set(Some(crate::runtime::environment::now()));
                     }
-                    self.state()
+                    Ok(())
                 }
                 Err(e) => {
                     if transient(e) {
@@ -805,10 +734,7 @@ impl ControlClient {
             .as_ref()
             .map(|l| l.stage(&publication.snapshot.caches))
             .transpose()?;
-        let snapshot = self.snapshots.publish_prepared(&publication, transition)?;
-        self.events
-            .borrow_mut()
-            .extend(self.caches.reconcile(&snapshot.caches)?);
+        self.snapshots.publish_prepared(&publication, transition)?;
         self.pending.borrow_mut().take();
         self.next.set(Some(crate::runtime::environment::now()));
         Ok(())
@@ -844,17 +770,6 @@ impl ControlClient {
         keys.install_signing_identity(identity.signing_identity(&keys.peer_trust_roots()?)?)?;
         *self.identity.borrow_mut() = Some(identity);
         Ok(())
-    }
-    fn state(&self) -> Result<ControlProgress> {
-        Ok(ControlProgress {
-            identity: self.identity.borrow().as_ref().map(|i| i.node().clone()),
-            snapshot: self.snapshots.current().ok(),
-            cache_events: self.events.borrow_mut().drain(..).collect(),
-            next_attempt: self
-                .next
-                .get()
-                .unwrap_or_else(crate::runtime::environment::now),
-        })
     }
     /// Diagnostic only. Pending receipt is not acceptance or worker application.
     pub(crate) fn membership_diagnostic(&self) -> Result<crate::telemetry::MembershipDiagnostic> {
@@ -949,7 +864,6 @@ mod tests {
             keys.clone(),
             BundleInstaller::new(keys),
             Rc::new(SnapshotStore::new(cluster, Arc::new(PublishedState), 2)),
-            Rc::new(CacheRegistry::default()),
         )
     }
     #[test]

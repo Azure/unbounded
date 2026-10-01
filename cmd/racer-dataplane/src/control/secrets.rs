@@ -55,7 +55,7 @@ impl BundleInstaller {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::{files, testing};
+    use crate::control::{async_files, testing};
     use std::os::unix::fs::symlink;
     #[test]
     fn bundle_installation_is_idempotent_and_rejects_rollback() {
@@ -94,7 +94,23 @@ mod tests {
 
     #[test]
     fn coherent_projection_rejects_partial_and_escaping_links() {
+        let Some(reactor) = testing::reactor() else {
+            return;
+        };
         let d = testing::Directory::new();
+        let scope = testing::scope();
+        let read = || {
+            testing::drive(
+                &reactor,
+                Box::pin(async_files::projected_file(
+                    &reactor,
+                    &d.0,
+                    "bundle.json",
+                    wire::MAX_BUNDLE_BYTES,
+                    &scope,
+                )),
+            )
+        };
         std::fs::create_dir(d.0.join("epoch-a")).unwrap();
         std::fs::write(
             d.0.join("epoch-a/bundle.json"),
@@ -104,21 +120,16 @@ mod tests {
         symlink("epoch-a", d.0.join("..data")).unwrap();
         // Never use the per-file link, even if it points to attacker-selected bytes.
         symlink("/dev/null", d.0.join("bundle.json")).unwrap();
-        let bytes = files::projected_file(&d.0, "bundle.json", wire::MAX_BUNDLE_BYTES).unwrap();
+        let bytes = read().unwrap();
         assert!(wire::decode_bundle(&bytes).is_ok());
         std::fs::create_dir(d.0.join("epoch-b")).unwrap();
         symlink("epoch-b", d.0.join("..next")).unwrap();
         std::fs::rename(d.0.join("..next"), d.0.join("..data")).unwrap();
-        assert!(files::projected_file(&d.0, "bundle.json", wire::MAX_BUNDLE_BYTES).is_err());
+        assert!(read().is_err());
         std::fs::write(d.0.join("epoch-b/bundle.json"), b"{\"generation\":null}").unwrap();
-        assert!(
-            wire::decode_bundle(
-                &files::projected_file(&d.0, "bundle.json", wire::MAX_BUNDLE_BYTES).unwrap()
-            )
-            .is_err()
-        );
+        assert!(wire::decode_bundle(&read().unwrap()).is_err());
         std::fs::remove_file(d.0.join("..data")).unwrap();
         symlink("../", d.0.join("..data")).unwrap();
-        assert!(files::projected_file(&d.0, "bundle.json", wire::MAX_BUNDLE_BYTES).is_err());
+        assert!(read().is_err());
     }
 }

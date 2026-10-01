@@ -182,11 +182,28 @@ impl ControlIo for FixtureIo {
         &'a self,
         path: &'a std::path::Path,
         limit: usize,
-        _: &'a RequestScope,
+        scope: &'a RequestScope,
     ) -> Operation<'a, zeroize::Zeroizing<Vec<u8>>> {
-        Box::pin(
-            async move { super::super::files::read_path(path, limit).map(zeroize::Zeroizing::new) },
-        )
+        Box::pin(async move {
+            use std::os::unix::fs::OpenOptionsExt;
+            scope.check()?;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(path)
+                .map_err(|_| Error::Io)?;
+            if !file.metadata().map_err(|_| Error::Io)?.is_file() {
+                return Err(Error::InvalidRequest);
+            }
+            let mut bytes = zeroize::Zeroizing::new(Vec::new());
+            file.take(limit as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| Error::Io)?;
+            if bytes.len() > limit {
+                return Err(Error::Overloaded);
+            }
+            Ok(bytes)
+        })
     }
     fn resolve<'a>(
         &'a self,

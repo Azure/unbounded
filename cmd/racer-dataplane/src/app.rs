@@ -19,7 +19,6 @@ use crate::{
         ControlClient, ControlEndpoint,
         enrollment::Enrollment,
         secrets::BundleInstaller,
-        state::CacheRegistry,
         state::{PublishedState, SnapshotStore},
         transport::ReactorControlIo,
     },
@@ -270,7 +269,6 @@ fn bootstrap(
             node.publications.clone(),
             config.limits.retained_snapshots.get(),
         )),
-        Rc::new(CacheRegistry::default()),
     );
     control.attach_io(io);
     let mut operation = Box::pin(async {
@@ -486,7 +484,6 @@ impl WorkerApplication {
             node.publications.clone(),
             config.limits.retained_snapshots.get(),
         ));
-        let caches = Rc::new(CacheRegistry::default());
         let keys = Rc::new(Keyring::new(
             config.cluster.clone(),
             config.node.clone(),
@@ -507,7 +504,6 @@ impl WorkerApplication {
                 &runtime,
                 keys.clone(),
                 snapshots.clone(),
-                caches,
             ))
         } else {
             None
@@ -861,7 +857,6 @@ impl WorkerApplication {
         runtime: &WorkerRuntime,
         keys: Rc<Keyring>,
         snapshots: Rc<SnapshotStore>,
-        caches: Rc<CacheRegistry>,
     ) -> Rc<ControlClient> {
         let enrollment = Rc::new(Enrollment::new(
             config.cluster.clone(),
@@ -879,7 +874,6 @@ impl WorkerApplication {
             keys,
             secrets,
             snapshots,
-            caches,
         ));
         control.attach_io(Rc::new(ReactorControlIo::new(runtime.reactor.clone())));
         control
@@ -1216,9 +1210,7 @@ impl WorkerApplication {
             let control = control.clone();
             let turn = scope(crate::control::wire::POLL_WAIT + Duration::from_secs(10))?;
             self.control_scope = Some(turn.clone());
-            self.control_task = Some(Box::pin(async move {
-                control.progress(&turn).await.map(|_| ())
-            }));
+            self.control_task = Some(Box::pin(async move { control.progress(&turn).await }));
         }
         Ok(())
     }
