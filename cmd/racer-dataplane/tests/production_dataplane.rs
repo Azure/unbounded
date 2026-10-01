@@ -1,12 +1,5 @@
 //! Single-node production graph validation. Only control publication, origin data,
 //! and the worker polling loop are fixtures. No read/storage/crypto success doubles.
-#[path = "production/bootstrap.rs"]
-mod bootstrap;
-#[path = "production/bootstrap_pressure.rs"]
-mod bootstrap_pressure;
-#[path = "production/index_pressure.rs"]
-mod index_pressure;
-
 use base64::Engine;
 use racer_dataplane::{
     client::{RequestParser, response::Responses},
@@ -24,7 +17,12 @@ use racer_dataplane::{
     memory::{cache::MemoryCache, delivery::Delivery, pipe::PipePool, pool::BufferPool},
     model::{Limits, PAGE_BYTES, ResourceClass, *},
     origin::OriginClient,
-    peer::{PeerNetwork, Requester, transport::Transfers},
+    peer::{
+        PeerNetwork, Requester,
+        protocol::{FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse},
+        server::LocalPageService,
+        transport::Transfers,
+    },
     read::{
         Coordinator, ReadService,
         candidates::CandidatePolicy,
@@ -46,6 +44,7 @@ use racer_dataplane::{
         certificates::Certificates,
         credentials::CredentialCrypto,
         forwarding::Forwarding,
+        identity::PendingIdentity,
         keyring::{KeyEpochs, Keyring},
         signing::Signatures,
     },
@@ -53,7 +52,12 @@ use racer_dataplane::{
         StoreReader, eviction::SegmentClock, index::Index, segment::Segments, slab::Slabs,
         writer::StoreWriter,
     },
-    topology::{health::LinkHealth, membership::Member, paths::Paths, placement::Placement},
+    topology::{
+        health::LinkHealth,
+        membership::{Member, MembershipLease},
+        paths::{Paths, RouteBudget},
+        placement::Placement,
+    },
 };
 use std::{
     cell::RefCell,
@@ -83,7 +87,7 @@ const CLUSTER: &str = "11111111-1111-4111-8111-111111111111";
 const NODE: &str = "22222222-2222-4222-8222-222222222222";
 const TIMEOUT: Duration = Duration::from_secs(40);
 
-#[path = "hotpath/bench.rs"]
+#[path = "production_dataplane/hotpath.rs"]
 mod hotpath;
 
 fn scope() -> RequestScope {
@@ -362,7 +366,7 @@ fn adapter_connection(
 }
 
 struct Rig {
-    bootstrap: bootstrap::Bootstrap,
+    bootstrap: Bootstrap,
     drivers: Rc<racer_dataplane::read::drivers::DriverQueue>,
     admission: Rc<Admission>,
     reactor: Rc<Reactor>,
@@ -394,6 +398,10 @@ impl Rig {
     fn with_dirty_pages(length: u64, zero_ttl: bool, pages: usize, dirty_pages: usize) -> Self {
         Self::assemble(length, zero_ttl, pages, dirty_pages, None)
     }
+    // One explicit graph serves both pressure scenarios and the worker hotpath.
+    // WorkerApplication owns private key/publication/storage state, so using its
+    // lifecycle here would remove the admission and held-reader controls these
+    // scenarios need. Real executable lifecycle coverage lives in process_restart.
     fn assemble(
         length: u64,
         zero_ttl: bool,
@@ -490,7 +498,7 @@ impl Rig {
                 .encode([i as u8 + 7; 32])
                 .into();
         }
-        let sender_keys = bootstrap::identities(&mut bundle, &keys);
+        let sender_keys = identities(&mut bundle, &keys);
         let published = Arc::new(PublishedState::default());
         let snapshots = Rc::new(SnapshotStore::new(
             ClusterId(CLUSTER.into()),
@@ -615,7 +623,7 @@ impl Rig {
             credentials,
         ));
         let endpoint = RefCell::new(directory.install(worker, coordinator.clone()).unwrap());
-        let bootstrap = bootstrap::Bootstrap::new(
+        let bootstrap = Bootstrap::new(
             sender_keys,
             forwarding,
             admission.clone(),
@@ -760,6 +768,511 @@ impl Rig {
         assert_eq!(self.admission.used(ResourceClass::DirtyCiphertext), 0);
         assert_eq!(self.writer.writes_in_flight(), 0);
     }
+
+    fn bootstrap(&self, key: u8) -> Reply {
+        self.drive(self.bootstrap.acquire(key, &scope())).unwrap()
+    }
+}
+
+// Atomic bootstrap enters the verified local peer service boundary. Signatures,
+// credential opening, origin HTTP, encryption, and persistence are real; the
+// socket/session transport is covered separately from this pressure fixture.
+const REQUESTER: &str = "33333333-3333-4333-8333-333333333333";
+
+struct Bootstrap {
+    sender: Forwarding,
+    receiver: Rc<Forwarding>,
+    credentials: CredentialCrypto,
+    coordinator: Rc<Coordinator>,
+    membership: MembershipLease,
+}
+
+fn identities(bundle: &mut serde_json::Value, keys: &Keyring) -> Rc<Keyring> {
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+    let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+    let ca = params.self_signed(&ca_key).unwrap();
+    let roots = vec![ca.der().to_vec()];
+    bundle["peer_trust_roots"] =
+        serde_json::json!([base64::engine::general_purpose::STANDARD.encode(&roots[0])]);
+    let sender = Rc::new(Keyring::new(
+        ClusterId(CLUSTER.into()),
+        NodeId(REQUESTER.into()),
+        Arc::new(KeyEpochs::default()),
+    ));
+    for keyring in [keys, sender.as_ref()] {
+        keyring
+            .install(wire::decode_bundle(&serde_json::to_vec(bundle).unwrap()).unwrap())
+            .unwrap();
+        let pending = PendingIdentity::generate().unwrap();
+        let secret = pending.export_pkcs8_for_persistence().unwrap();
+        let key = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
+            &rustls::pki_types::PrivatePkcs8KeyDer::from(secret.as_slice()),
+            &rcgen::PKCS_ED25519,
+        )
+        .unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.subject_alt_names = vec![rcgen::SanType::URI(
+            format!("spiffe://{CLUSTER}/node/{}", keyring.node().0)
+                .try_into()
+                .unwrap(),
+        )];
+        params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        let certificate = params.signed_by(&key, &ca, &ca_key).unwrap();
+        keyring
+            .install_signing_identity(Arc::new(
+                pending
+                    .accept(
+                        ClusterId(CLUSTER.into()),
+                        keyring.node().clone(),
+                        vec![certificate.der().to_vec()],
+                        &roots,
+                    )
+                    .unwrap(),
+            ))
+            .unwrap();
+    }
+    sender
+}
+
+impl Bootstrap {
+    fn new(
+        sender: Rc<Keyring>,
+        receiver: Rc<Forwarding>,
+        admission: Rc<Admission>,
+        coordinator: Rc<Coordinator>,
+        membership: MembershipLease,
+    ) -> Self {
+        let certificates = Rc::new(Certificates::new(ClusterId(CLUSTER.into()), sender.clone()));
+        Self {
+            sender: Forwarding::new(Rc::new(Signatures::new(sender.clone(), certificates))),
+            receiver,
+            credentials: CredentialCrypto::new(sender, admission),
+            coordinator,
+            membership,
+        }
+    }
+
+    async fn acquire(&self, key: u8, scope: &RequestScope) -> Result<Reply> {
+        let context = OriginContext {
+            object: ObjectId {
+                cache: CacheId(CACHE.into()),
+                key: CacheKey([key; 32]),
+            },
+            metadata: Some(OpaqueMetadata::from_header(b"fixture-metadata")?),
+            authorization: Some(Authorization::from_header(b"fixture-credential")?),
+        };
+        let attempt = AttemptId(scope.request.0);
+        let request = PeerRequest {
+            operation: PeerOperation::Bootstrap {
+                object: context.object.clone(),
+                mode: FetchMode::Acquire,
+            },
+            origin: self.credentials.seal(&context, attempt, scope)?,
+            route: RouteBudget {
+                membership: self.membership.version,
+                request: scope.request,
+                attempt,
+                destination: NodeId(NODE.into()),
+                visited: vec![NodeId(REQUESTER.into())],
+                remaining_links: 4,
+                remaining_attempts: 8,
+                deadline: scope.deadline,
+            },
+        };
+        let (signed, binding) = self.sender.sign_request(request)?;
+        let verified = self.receiver.verify_request(signed)?;
+        let response_binding = verified.binding().clone();
+        let response = self
+            .coordinator
+            .serve_peer(verified, self.membership.clone(), scope)
+            .await?;
+        let verified = self.sender.verify_response(
+            self.receiver.sign_response(&response_binding, response)?,
+            &binding,
+        )?;
+        match verified.response() {
+            PeerResponse::Bootstrap {
+                metadata,
+                page_zero,
+            } => {
+                let mut body = Vec::new();
+                if let Some(page) = page_zero {
+                    use chacha20poly1305::{KeyInit, XChaCha20Poly1305, aead::AeadInOut};
+                    metadata.immutable().validate_page(page.envelope())?;
+                    assert_eq!(page.envelope().page.number, PageNumber(0));
+                    body = page.bytes().to_vec();
+                    XChaCha20Poly1305::new((&[7; 32]).into())
+                        .decrypt_in_place(
+                            (&page.envelope().nonce.0).into(),
+                            &racer_dataplane::security::aead::page_aad(page.envelope())?,
+                            &mut body,
+                        )
+                        .expect("authenticate actual bootstrap ciphertext");
+                } else {
+                    assert_eq!(metadata.length, 0);
+                }
+                assert_eq!(body.len() as u64, metadata.length.min(P));
+                // Normalize only the assertion view shared with client scenarios.
+                // These fields are not a fabricated HTTP response or read result.
+                Ok(Reply {
+                    status: 200,
+                    fields: BTreeMap::from([
+                        ("etag".into(), metadata.version.etag.as_str().into()),
+                        ("racer-object-length".into(), metadata.length.to_string()),
+                        ("racer-range-start".into(), "0".into()),
+                        ("racer-range-end".into(), body.len().to_string()),
+                        (
+                            "racer-expires-at".into(),
+                            metadata
+                                .expires_at
+                                .0
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis()
+                                .to_string(),
+                        ),
+                    ]),
+                    body,
+                })
+            }
+            PeerResponse::Unavailable | PeerResponse::Overloaded => Ok(Reply {
+                status: 503,
+                fields: BTreeMap::new(),
+                body: vec![],
+            }),
+            _ => panic!("unexpected bootstrap response"),
+        }
+    }
+}
+
+fn page(key: u8, version: u8) -> PageId {
+    PageId {
+        version: ObjectVersion {
+            object: ObjectId {
+                cache: CacheId(CACHE.into()),
+                key: CacheKey([key; 32]),
+            },
+            etag: StrongEtag::parse(format!("\"v{version}\"").as_bytes()).unwrap(),
+        },
+        number: PageNumber(0),
+    }
+}
+
+#[test]
+fn zero_ttl_bootstrap_reclaims_idle_versions_and_new_objects_beyond_byte_budget() {
+    for new_objects in [false, true] {
+        let rig = Rig::new(P, true, 4);
+        for version in 1..=10 {
+            rig.adapter.state.lock().unwrap().version = version;
+            let key = if new_objects { version } else { 0xab };
+            let reply = rig.bootstrap(key);
+            check(&reply, version, 0, P, P);
+            assert_eq!(reply.fields["racer-expires-at"], "0");
+            rig.flush();
+            assert_eq!(rig.adapter.calls().len(), version as usize);
+            assert!(rig.admission.used(ResourceClass::Plaintext) <= 4 * P as usize);
+            if version == 4 {
+                assert_eq!(rig.admission.used(ResourceClass::Plaintext), 4 * P as usize);
+            }
+        }
+        assert!(
+            rig.memory
+                .get(&page(if new_objects { 1 } else { 0xab }, 1))
+                .unwrap()
+                .is_none()
+        );
+        for call in rig.adapter.calls() {
+            assert_eq!(call.method, "GET");
+            assert_eq!(call.pin, None);
+            assert_eq!(call.range.as_deref(), Some("bytes=0-16777215"));
+        }
+        rig.memory.evict_idle(usize::MAX).unwrap();
+        assert_eq!(rig.admission.used(ResourceClass::Plaintext), 0);
+        assert_eq!(
+            rig.admission.used(ResourceClass::Ciphertext),
+            rig.writer.retained_staging_bytes()
+        );
+    }
+}
+
+#[test]
+fn bootstrap_preserves_active_reader_and_inflight_admission_until_cancellation() {
+    let rig = Rig::new(113, true, 2);
+    check(&rig.bootstrap(0xab), 1, 0, 113, 113);
+    rig.flush();
+    let held = rig.memory.get(&page(0xab, 1)).unwrap().unwrap().plaintext;
+    {
+        let mut state = rig.adapter.state.lock().unwrap();
+        state.version = 2;
+        state.paused = true;
+    }
+    let pending_scope = scope();
+    let blocked_scope = scope();
+    let observer = async {
+        std::future::poll_fn(|_| {
+            if rig.adapter.calls().len() == 2 {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        assert_eq!(
+            rig.admission.used(ResourceClass::Plaintext),
+            P as usize + 113
+        );
+        assert_eq!(
+            rig.bootstrap
+                .acquire(3, &blocked_scope)
+                .await
+                .unwrap()
+                .status,
+            503
+        );
+        assert_eq!(
+            rig.adapter.calls().len(),
+            2,
+            "overload must precede origin I/O"
+        );
+        assert_eq!(
+            rig.admission.used(ResourceClass::Plaintext),
+            P as usize + 113
+        );
+        assert!(rig.memory.get(&page(0xab, 1)).unwrap().is_some());
+        assert_eq!(held.bytes()[0], byte(1, 0));
+        pending_scope.cancel().unwrap();
+    };
+    let (pending_result, ()) =
+        rig.drive(async { futures::join!(rig.bootstrap.acquire(2, &pending_scope), observer) });
+    assert!(matches!(pending_result, Err(Error::Cancelled)));
+    rig.drive(std::future::poll_fn(|_| {
+        if rig.admission.used(ResourceClass::Plaintext) == 113 {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }));
+    assert_eq!(rig.admission.used(ResourceClass::Plaintext), 113);
+    rig.adapter.state.lock().unwrap().paused = false;
+    check(&rig.bootstrap(3), 2, 0, 113, 113);
+    rig.flush();
+    // Reclamation must leave the independently held page readable.
+    rig.adapter.state.lock().unwrap().version = 3;
+    check(&rig.bootstrap(4), 3, 0, 113, 113);
+    rig.flush();
+    assert_eq!(held.bytes()[0], byte(1, 0));
+    assert!(rig.memory.get(&page(0xab, 1)).unwrap().is_some());
+    drop(held);
+    rig.memory.evict_idle(usize::MAX).unwrap();
+    assert_eq!(rig.admission.used(ResourceClass::Plaintext), 0);
+    assert_eq!(
+        rig.admission.used(ResourceClass::Ciphertext),
+        rig.writer.retained_staging_bytes()
+    );
+}
+
+#[test]
+fn failed_and_empty_bootstraps_release_reclaimed_plaintext_reservations() {
+    let rig = Rig::new(113, true, 1);
+    check(&rig.bootstrap(0xab), 1, 0, 113, 113);
+    rig.flush();
+    rig.adapter.offline();
+    for attempt in 0..3 {
+        // These are separate half-open probes, rather than retries inside the
+        // circuit's exponential backoff window.
+        thread::sleep(Duration::from_secs(1));
+        assert_eq!(rig.bootstrap(0xab).status, 503);
+        assert_eq!(
+            rig.adapter.calls().len(),
+            attempt + 2,
+            "failure must reach origin"
+        );
+        assert_eq!(rig.admission.used(ResourceClass::Plaintext), 0);
+        assert_eq!(
+            rig.admission.used(ResourceClass::Ciphertext),
+            rig.writer.retained_staging_bytes()
+        );
+        assert_eq!(rig.admission.used(ResourceClass::DirtyCiphertext), 0);
+    }
+    thread::sleep(Duration::from_secs(1));
+    {
+        let mut state = rig.adapter.state.lock().unwrap();
+        state.online = true;
+        state.version = 2;
+        state.length = 0;
+    }
+    let empty = rig.bootstrap(0xab);
+    assert_eq!(empty.status, 200);
+    assert!(empty.body.is_empty());
+    assert_eq!(rig.admission.used(ResourceClass::Plaintext), 0);
+    assert_eq!(
+        rig.admission.used(ResourceClass::Ciphertext),
+        rig.writer.retained_staging_bytes()
+    );
+    rig.adapter.state.lock().unwrap().length = 113;
+    // Use another version because an immutable version's length cannot change.
+    rig.adapter.state.lock().unwrap().version = 3;
+    check(&rig.bootstrap(0xab), 3, 0, 113, 113);
+    rig.flush();
+    assert_eq!(rig.adapter.calls().len(), 6);
+}
+
+#[test]
+fn full_page_writeback_reclaims_idle_ciphertext_at_default_worker_budget() {
+    let rig = Rig::new(P, true, 4);
+    // Leave exactly the default four-worker shard's 64 MiB ciphertext budget.
+    // The fixture otherwise provides additional staging headroom that hides this
+    // failure. This charge is unavailable to reclamation, like another live user.
+    let _outside_worker_budget = rig
+        .admission
+        .reserve(
+            None,
+            ResourceClass::Ciphertext,
+            rig.admission.limit(ResourceClass::Ciphertext) - 64 * 1024 * 1024,
+        )
+        .unwrap();
+    for version in 1..=6 {
+        rig.adapter.state.lock().unwrap().version = version;
+        let read_scope = scope();
+        let reply = rig.drive(rig.bootstrap.acquire(0xab, &read_scope)).unwrap();
+        check(&reply, version, 0, P, P);
+        read_scope.cancel().unwrap();
+        rig.flush();
+        assert_eq!(rig.writer.pending_count(), 0);
+        assert_eq!(rig.writer.discarded_count(), 0);
+        let entries = rig.writer.index().snapshot().unwrap().entries;
+        assert!(
+            entries.iter().any(|(page, _)| page.version.etag
+                == StrongEtag::parse(format!("\"v{version}\"").as_bytes()).unwrap()),
+            "successful full-page fill v{version} lost disk publication with an idle writer and reclaimable cached bytes"
+        );
+        assert!(
+            rig.admission.used(ResourceClass::Ciphertext)
+                <= rig.admission.limit(ResourceClass::Ciphertext)
+        );
+    }
+    assert_eq!(rig.adapter.calls().len(), 6);
+    rig.memory.evict_idle(usize::MAX).unwrap();
+    rig.adapter.offline();
+    check(
+        &rig.subscribe("If-Match: \"v6\"\r\nRange: bytes=0-16777215\r\n"),
+        6,
+        0,
+        P,
+        P,
+    );
+    assert_eq!(
+        rig.adapter.calls().len(),
+        6,
+        "persisted target must be reusable offline"
+    );
+}
+
+#[test]
+fn writeback_staging_preserves_live_readers_and_recovers_after_release() {
+    let rig = Rig::new(P, true, 4);
+    let _outside_worker_budget = rig
+        .admission
+        .reserve(
+            None,
+            ResourceClass::Ciphertext,
+            rig.admission.limit(ResourceClass::Ciphertext) - 64 * 1024 * 1024,
+        )
+        .unwrap();
+    let mut held = Vec::new();
+    for version in 1..=2 {
+        rig.adapter.state.lock().unwrap().version = version;
+        check(&rig.bootstrap(0xab), version, 0, P, P);
+        rig.flush();
+        held.push(rig.memory.get(&page(0xab, version)).unwrap().unwrap());
+    }
+    rig.adapter.state.lock().unwrap().version = 3;
+    check(&rig.bootstrap(0xab), 3, 0, P, P);
+    rig.flush();
+    assert_eq!(
+        rig.writer.index().snapshot().unwrap().entries.len(),
+        2,
+        "live leases cannot be reclaimed to force persistence"
+    );
+    for (index, page) in held.iter().enumerate() {
+        assert_eq!(page.plaintext.bytes()[0], byte(index as u8 + 1, 0));
+        assert!(rig.memory.get(page.plaintext.page()).unwrap().is_some());
+    }
+    drop(held);
+    rig.adapter.state.lock().unwrap().version = 4;
+    check(&rig.bootstrap(0xab), 4, 0, P, P);
+    rig.flush();
+    assert_eq!(rig.writer.discarded_count(), 0);
+    assert!(
+        rig.admission.used(ResourceClass::Ciphertext)
+            <= rig.admission.limit(ResourceClass::Ciphertext)
+    );
+    rig.memory.evict_idle(usize::MAX).unwrap();
+    rig.adapter.offline();
+    let calls = rig.adapter.calls().len();
+    check(
+        &rig.subscribe("If-Match: \"v4\"\r\nRange: bytes=0-\r\n"),
+        4,
+        0,
+        P,
+        P,
+    );
+    assert_eq!(
+        rig.adapter.calls().len(),
+        calls,
+        "released staging must persist v4 for offline reads"
+    );
+}
+
+#[test]
+fn small_versions_keep_persisting_at_index_capacity_and_serve_from_disk_offline() {
+    let rig = Rig::new(113, true, 4);
+    rig.writer.index().set_page_capacity(2).unwrap();
+    for version in 1..=4 {
+        rig.adapter.state.lock().unwrap().version = version;
+        check(&rig.bootstrap(0xab), version, 0, 113, 113);
+        rig.flush();
+        assert!(rig.writer.index().snapshot().unwrap().entries.len() <= 2);
+        rig.memory.evict_idle(usize::MAX).unwrap();
+        assert_eq!(rig.admission.used(ResourceClass::Plaintext), 0);
+        rig.adapter.offline();
+        let calls = rig.adapter.calls().len();
+        check(
+            &rig.subscribe(&format!("If-Match: \"v{version}\"\r\nRange: bytes=0-\r\n")),
+            version,
+            0,
+            113,
+            113,
+        );
+        assert_eq!(
+            rig.adapter.calls().len(),
+            calls,
+            "each newly served version must persist for offline reads"
+        );
+        rig.memory.evict_idle(usize::MAX).unwrap();
+        rig.adapter.state.lock().unwrap().online = true;
+    }
+    assert_eq!(rig.writer.discarded_count(), 0);
+    assert_eq!(rig.adapter.calls().len(), 4);
+    rig.adapter.offline();
+    for version in [3, 4] {
+        check(
+            &rig.subscribe(&format!("If-Match: \"v{version}\"\r\nRange: bytes=0-\r\n")),
+            version,
+            0,
+            113,
+            113,
+        );
+        rig.memory.evict_idle(usize::MAX).unwrap();
+    }
+    assert_eq!(
+        rig.adapter.calls().len(),
+        4,
+        "disk hits must not reach origin"
+    );
 }
 fn request(method: &str, fields: &str) -> String {
     format!(
