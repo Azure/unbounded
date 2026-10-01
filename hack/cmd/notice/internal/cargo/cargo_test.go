@@ -15,7 +15,9 @@ func TestCollectorCollectHermetic(t *testing.T) {
 	root := t.TempDir()
 	cargoHome := t.TempDir()
 	testutil.WriteTree(t, root, map[string]string{
-		"cmd/unbounded-storage/Cargo.toml": `[dependencies]
+		"cmd/racer-dataplane/Cargo.toml": `[package]
+name = "racer-dataplane"
+[dependencies]
 foo = "1"
 
 [build-dependencies]
@@ -27,7 +29,7 @@ linux-only = "3"
 [dev-dependencies]
 test-only = "4"
 `,
-		"cmd/unbounded-storage/Cargo.lock": `version = 4
+		"cmd/racer-dataplane/Cargo.lock": `version = 4
 
 [[package]]
 name = "foo"
@@ -46,7 +48,7 @@ name = "test-only"
 version = "4.0.0"
 
 [[package]]
-name = "unbounded-storage"
+name = "racer-dataplane"
 version = "0.1.0"
 dependencies = [
  "build-helper",
@@ -56,6 +58,7 @@ dependencies = [
 ]
 `,
 	})
+	writePerformanceFixture(t, root, "1.2.3")
 
 	for _, crate := range []string{"foo-1.2.3", "build-helper-2.0.1", "linux-only-3.4.5"} {
 		testutil.WriteTree(t, cargoHome, map[string]string{
@@ -103,14 +106,14 @@ version = "0.8.6"
 name = "rand"
 version = "0.9.2"
 [[package]]
-name = "unbounded-storage"
+name = "racer-dataplane"
 version = "0.1.0"
 dependencies = [
  "rand 0.8.6",
 ]
 `
 
-	versions, err := lockedDirectVersions(lock, direct)
+	versions, err := lockedDirectVersions(lock, "racer-dataplane", direct)
 	if err != nil {
 		t.Fatalf("lockedDirectVersions: %v", err)
 	}
@@ -134,9 +137,10 @@ func TestDirectDependenciesResolvesPackageAlias(t *testing.T) {
 func TestCollectorPrecheckReportsMissingCache(t *testing.T) {
 	root := t.TempDir()
 	testutil.WriteTree(t, root, map[string]string{
-		"cmd/unbounded-storage/Cargo.toml": "[dependencies]\n",
-		"cmd/unbounded-storage/Cargo.lock": "version = 4\n",
+		"cmd/racer-dataplane/Cargo.toml": "[package]\nname = \"racer-dataplane\"\n[dependencies]\n",
+		"cmd/racer-dataplane/Cargo.lock": "version = 4\n",
 	})
+	writePerformanceFixture(t, root, "1.2.3")
 
 	err := New(t.TempDir()).Precheck(root)
 	if err == nil || !strings.Contains(err.Error(), "cargo fetch") {
@@ -148,21 +152,22 @@ func TestCollectorRejectsDuplicateRegistrySources(t *testing.T) {
 	root := t.TempDir()
 	cargoHome := t.TempDir()
 	testutil.WriteTree(t, root, map[string]string{
-		"cmd/unbounded-storage/Cargo.toml": "[dependencies]\nfoo = \"1\"\n",
-		"cmd/unbounded-storage/Cargo.lock": `version = 4
+		"cmd/racer-dataplane/Cargo.toml": "[package]\nname = \"racer-dataplane\"\n[dependencies]\nfoo = \"1\"\n",
+		"cmd/racer-dataplane/Cargo.lock": `version = 4
 
 [[package]]
 name = "foo"
 version = "1.2.3"
 
 [[package]]
-name = "unbounded-storage"
+name = "racer-dataplane"
 version = "0.1.0"
 dependencies = [
  "foo",
 ]
 `,
 	})
+	writePerformanceFixture(t, root, "1.2.3")
 
 	for _, registry := range []string{"first", "second"} {
 		testutil.WriteTree(t, cargoHome, map[string]string{
@@ -180,22 +185,24 @@ func TestCollectorCollectsMultipleLicenseFiles(t *testing.T) {
 	root := t.TempDir()
 	cargoHome := t.TempDir()
 	testutil.WriteTree(t, root, map[string]string{
-		"cmd/unbounded-storage/Cargo.toml": "[dependencies]\nfoo = \"1\"\n",
-		"cmd/unbounded-storage/Cargo.lock": `version = 4
+		"cmd/racer-dataplane/Cargo.toml": "[package]\nname = \"racer-dataplane\"\n[dependencies]\nfoo = \"1\"\n",
+		"cmd/racer-dataplane/Cargo.lock": `version = 4
 
 [[package]]
 name = "foo"
 version = "1.2.3"
 
 [[package]]
-name = "unbounded-storage"
+name = "racer-dataplane"
 version = "0.1.0"
 dependencies = [
  "foo",
 ]
 `,
 	})
+	writePerformanceFixture(t, root, "1.2.3")
 	testutil.WriteTree(t, cargoHome, map[string]string{
+		"registry/src/index/foo-1.2.3/LICENSE":        "Choose either LICENSE-APACHE or LICENSE-MIT, included alongside this index.\n",
 		"registry/src/index/foo-1.2.3/LICENSE-APACHE": testutil.Apache2License(),
 		"registry/src/index/foo-1.2.3/LICENSE-MIT":    testutil.MITLicense("Copyright (c) 2026 Example"),
 	})
@@ -214,25 +221,38 @@ dependencies = [
 	}
 }
 
+func TestLicenseIndexRejectsUnrecognizedLicenseText(t *testing.T) {
+	for _, paths := range [][]string{
+		{"LICENSE"},
+		{"LICENSE", "LICENSE-MIT"},
+		{"LICENSE", "COPYING"},
+	} {
+		if licenseIndex("LICENSE", []byte("Unknown license terms"), paths) {
+			t.Fatalf("unrecognized text accepted for %v", paths)
+		}
+	}
+}
+
 func TestCollectorUsesDeclaredLicenseWithoutLicenseFile(t *testing.T) {
 	root := t.TempDir()
 	cargoHome := t.TempDir()
 	testutil.WriteTree(t, root, map[string]string{
-		"cmd/unbounded-storage/Cargo.toml": "[dependencies]\nfoo = \"1\"\n",
-		"cmd/unbounded-storage/Cargo.lock": `version = 4
+		"cmd/racer-dataplane/Cargo.toml": "[package]\nname = \"racer-dataplane\"\n[dependencies]\nfoo = \"1\"\n",
+		"cmd/racer-dataplane/Cargo.lock": `version = 4
 
 [[package]]
 name = "foo"
 version = "1.2.3"
 
 [[package]]
-name = "unbounded-storage"
+name = "racer-dataplane"
 version = "0.1.0"
 dependencies = [
  "foo",
 ]
 `,
 	})
+	writePerformanceFixture(t, root, "1.2.3")
 	testutil.WriteTree(t, cargoHome, map[string]string{
 		"registry/src/index/foo-1.2.3/Cargo.toml.orig": "[package]\nlicense = \"MIT OR Apache-2.0\"\n",
 	})
@@ -248,5 +268,86 @@ dependencies = [
 
 	if entries[0].License[0].Name != "MIT License" || entries[0].License[1].Name != "Apache License, Version 2.0" {
 		t.Fatalf("licenses = %#v", entries[0].License)
+	}
+}
+
+func writePerformanceFixture(t *testing.T, root, version string) {
+	t.Helper()
+	testutil.WriteTree(t, root, map[string]string{
+		"cmd/racer-loadgen/performance/Cargo.toml": `[package]
+name = "racer-performance-control"
+[dependencies]
+racer-dataplane = { path = "../../racer-dataplane" }
+foo = "1"
+`,
+		"cmd/racer-loadgen/performance/Cargo.lock": `[[package]]
+name = "foo"
+version = "` + version + `"
+[[package]]
+name = "racer-performance-control"
+version = "0.1.0"
+dependencies = [
+ "foo",
+ "racer-dataplane",
+]
+`,
+	})
+}
+
+func TestCollectorRejectsConflictingDirectVersions(t *testing.T) {
+	root := t.TempDir()
+	testutil.WriteTree(t, root, map[string]string{
+		"cmd/racer-dataplane/Cargo.toml": "[package]\nname = \"racer-dataplane\"\n[dependencies]\nfoo = \"1\"\n",
+		"cmd/racer-dataplane/Cargo.lock": `[[package]]
+name = "foo"
+version = "1.2.3"
+[[package]]
+name = "racer-dataplane"
+version = "0.1.0"
+dependencies = [
+ "foo",
+]
+`,
+	})
+	writePerformanceFixture(t, root, "1.2.4")
+
+	_, err := New(t.TempDir()).Collect(root)
+	if err == nil || !strings.Contains(err.Error(), "conflicting direct versions") {
+		t.Fatalf("Collect error = %v", err)
+	}
+}
+
+func TestManifestPackageName(t *testing.T) {
+	for _, tc := range []struct {
+		manifest, want string
+	}{
+		{"[package]\nname = \"racer-performance-control\"\n", "racer-performance-control"},
+		{"[dependencies]\nname = \"not-the-root\"\n", ""},
+		{"[package]\nname = \"\"\n", ""},
+	} {
+		got, err := manifestPackageName(tc.manifest)
+		if got != tc.want || (err != nil) != (tc.want == "") {
+			t.Fatalf("manifestPackageName(%q) = %q, %v", tc.manifest, got, err)
+		}
+	}
+}
+
+func TestLockedDirectVersionsRejectsMissingRoot(t *testing.T) {
+	_, err := lockedDirectVersions("[[package]]\nname = \"other\"\n", "racer-dataplane", nil)
+	if err == nil || !strings.Contains(err.Error(), "racer-dataplane package not found") {
+		t.Fatalf("lockedDirectVersions error = %v", err)
+	}
+}
+
+func TestCollectorPrecheckRequiresEveryManifest(t *testing.T) {
+	root := t.TempDir()
+	testutil.WriteTree(t, root, map[string]string{
+		"cmd/racer-dataplane/Cargo.toml": "[package]\nname = \"racer-dataplane\"\n",
+		"cmd/racer-dataplane/Cargo.lock": "version = 4\n",
+	})
+
+	err := New(t.TempDir()).Precheck(root)
+	if err == nil || !strings.Contains(err.Error(), "cmd/racer-loadgen/performance/Cargo.toml") {
+		t.Fatalf("Precheck error = %v", err)
 	}
 }

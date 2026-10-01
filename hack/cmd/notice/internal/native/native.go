@@ -41,6 +41,12 @@ func (c *Collector) Collect(root string) ([]notice.Entry, error) {
 	}
 
 	versions := makeVersions(string(data), "LIBFABRIC_VERSION", "OPENSSL_VERSION")
+	// The legacy storage source build is absent from current manifests. Keep
+	// supporting its paired pins without inventing dependencies when both vanish.
+	if len(versions) == 0 {
+		return nil, nil
+	}
+
 	for _, name := range []string{"LIBFABRIC_VERSION", "OPENSSL_VERSION"} {
 		if versions[name] == "" {
 			return nil, fmt.Errorf("%s pin not found in Makefile", name)

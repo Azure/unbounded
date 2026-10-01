@@ -1,8 +1,9 @@
 # notice
 
 Generates and verifies the project's `NOTICE` file from direct dependencies in
-`go.mod`, `frontend/package.json`, and `cmd/unbounded-storage/Cargo.toml` plus
-the pinned libfabric and OpenSSL source versions in `Makefile`.
+`go.mod`, `frontend/package.json`, `cmd/racer-dataplane/Cargo.toml`, and
+`cmd/racer-loadgen/performance/Cargo.toml` plus
+any paired libfabric and OpenSSL source pins in `Makefile` (currently absent).
 
 ## Usage
 
@@ -89,12 +90,15 @@ To add a new ecosystem (e.g. PyPI, Cargo):
   Always materialize fixtures dynamically in tests via `testutil.WriteTree`.
 - Cargo collection reads `Cargo.toml` and exact versions from `Cargo.lock`, then
   reads license files from the local Cargo registry source cache. Populate it
-  with `cargo fetch --manifest-path cmd/unbounded-storage/Cargo.toml --locked`.
+  with `cargo fetch --manifest-path <crate>/Cargo.toml --locked` for each Racer
+  crate listed above. Root package names come from the manifests; shared registry
+  dependencies are deduplicated. Conflicting direct versions fail collection.
   Development dependencies are excluded; normal, target, build, and optional
-  direct dependencies are included.
+  direct dependencies are included. Local first-party path dependencies are excluded.
 - Native collection is fully local. Its metadata and canonical license links
   are fixed by the collector while versions come from `LIBFABRIC_VERSION` and
-  `OPENSSL_VERSION` in `Makefile`.
+  `OPENSSL_VERSION` in `Makefile`. With both legacy source pins removed, no native
+  entries are emitted; a partial pair is still rejected.
 - License URL forge dispatch (GitHub, GitLab, cs.opensource.google, Bitbucket)
   lives in `license.BuildURL` as a switch on URL prefix. Add a case here when a
   new forge is needed.

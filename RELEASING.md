@@ -35,13 +35,15 @@ examples below describe release mechanics, not supported upgrade sources.
 Run `make license-check` and `make notice-check` before cutting. NOTICE is
 generated, never edited by hand: install frontend dependencies with `npm ci` in
 `frontend/`, fetch Rust sources with
-`cargo fetch --locked --manifest-path cmd/racer-dataplane/Cargo.toml`, then run
-`make notice`. The collector covers direct Go, npm, and Cargo dependencies,
-including optional production profiling crates; only Cargo dev-only dependencies
-are excluded. CI provisions Rust 1.96.0 and the locked source cache explicitly.
+`cargo fetch --locked --manifest-path cmd/racer-dataplane/Cargo.toml` and
+`cargo fetch --locked --manifest-path cmd/racer-loadgen/performance/Cargo.toml`,
+then run `make notice`. The collector covers direct Go, npm, and registry Cargo
+dependencies, including optional dependencies; Cargo dev-only and local
+first-party dependencies are excluded. CI provisions Rust 1.96.0 and the locked
+source cache explicitly.
 
-All-feature Racer builds require `libunwind-dev` as well as the C toolchain and
-pkg-config; the native RDMA adapter additionally needs `libibverbs-dev`.
+All-feature Racer builds require the C toolchain and pkg-config; the native
+RDMA adapter additionally needs `libibverbs-dev`.
 `make racer-process-restart` selects exactly three privileged restart tests,
 not every ignored process test. The separate `racer-sdk-age` CI job prebuilds
 `pkg/racersdk` with `make racer-sdk-age-build`, then runs only

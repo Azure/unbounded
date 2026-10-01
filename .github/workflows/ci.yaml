@@ -616,6 +616,7 @@ jobs:
           timeout --signal=TERM --kill-after=10s 300s rustup toolchain install 1.96.0 --profile minimal
           timeout --signal=TERM --kill-after=10s 300s rustup override set 1.96.0
           timeout --signal=TERM --kill-after=10s 300s cargo fetch --locked --manifest-path cmd/racer-dataplane/Cargo.toml
+          timeout --signal=TERM --kill-after=10s 300s cargo fetch --locked --manifest-path cmd/racer-loadgen/performance/Cargo.toml
 
       - name: Verify NOTICE
         run: timeout --signal=TERM --kill-after=10s 300s make notice-check

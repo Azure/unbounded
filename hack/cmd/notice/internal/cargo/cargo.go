@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package cargo implements a notice.Collector for direct non-development
-// dependencies of cmd/unbounded-storage.
+// dependencies of the Racer crates.
 package cargo
 
 import (
@@ -18,7 +18,7 @@ import (
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/notice"
 )
 
-const cratePath = "cmd/unbounded-storage"
+var cratePaths = []string{"cmd/racer-dataplane", "cmd/racer-loadgen/performance"}
 
 // Collector reads Cargo.toml and Cargo.lock locally and obtains license text
 // from Cargo's populated registry source cache.
@@ -46,9 +46,11 @@ func (c *Collector) Name() string { return "cargo" }
 
 // Precheck implements notice.Collector.
 func (c *Collector) Precheck(root string) error {
-	for _, name := range []string{"Cargo.toml", "Cargo.lock"} {
-		if _, err := os.Stat(filepath.Join(root, cratePath, name)); err != nil {
-			return fmt.Errorf("stat %s: %w", filepath.Join(cratePath, name), err)
+	for _, cratePath := range cratePaths {
+		for _, name := range []string{"Cargo.toml", "Cargo.lock"} {
+			if _, err := os.Stat(filepath.Join(root, cratePath, name)); err != nil {
+				return fmt.Errorf("stat %s: %w", filepath.Join(cratePath, name), err)
+			}
 		}
 	}
 
@@ -58,7 +60,7 @@ func (c *Collector) Precheck(root string) error {
 	}
 
 	if _, err := os.Stat(filepath.Join(home, "registry", "src")); err != nil {
-		return fmt.Errorf("cargo registry source cache not found; run 'cargo fetch --manifest-path %s/Cargo.toml --locked' first (%w)", cratePath, err)
+		return fmt.Errorf("cargo registry source cache not found; run 'cargo fetch --manifest-path <crate>/Cargo.toml --locked' for each of %v first (%w)", cratePaths, err)
 	}
 
 	return nil
@@ -66,6 +68,36 @@ func (c *Collector) Precheck(root string) error {
 
 // Collect implements notice.Collector.
 func (c *Collector) Collect(root string) ([]notice.Entry, error) {
+	versions := map[string]string{}
+	for _, cratePath := range cratePaths {
+		locked, err := collectVersions(root, cratePath)
+		if err != nil {
+			return nil, err
+		}
+
+		for name, version := range locked {
+			if previous, ok := versions[name]; ok && previous != version {
+				return nil, fmt.Errorf("crate %s has conflicting direct versions %s and %s", name, previous, version)
+			}
+
+			versions[name] = version
+		}
+	}
+
+	entries := make([]notice.Entry, 0, len(versions))
+	for name, version := range versions {
+		entry, err := c.buildEntry(name, version)
+		if err != nil {
+			return nil, fmt.Errorf("crate %s@%s: %w", name, version, err)
+		}
+
+		entries = append(entries, entry)
+	}
+
+	return entries, nil
+}
+
+func collectVersions(root, cratePath string) (map[string]string, error) {
 	manifestPath := filepath.Join(root, cratePath, "Cargo.toml")
 
 	manifest, err := os.ReadFile(manifestPath)
@@ -85,22 +117,38 @@ func (c *Collector) Collect(root string) ([]notice.Entry, error) {
 		return nil, fmt.Errorf("reading %s: %w", lockPath, err)
 	}
 
-	versions, err := lockedDirectVersions(string(lock), direct)
+	name, err := manifestPackageName(string(manifest))
+	if err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", manifestPath, err)
+	}
+
+	versions, err := lockedDirectVersions(string(lock), name, direct)
 	if err != nil {
 		return nil, fmt.Errorf("parsing %s: %w", lockPath, err)
 	}
 
-	entries := make([]notice.Entry, 0, len(versions))
-	for name, version := range versions {
-		entry, err := c.buildEntry(name, version)
-		if err != nil {
-			return nil, fmt.Errorf("crate %s@%s: %w", name, version, err)
+	return versions, nil
+}
+
+func manifestPackageName(data string) (string, error) {
+	section := ""
+
+	for line := range strings.SplitSeq(data, "\n") {
+		line = strings.TrimSpace(strings.SplitN(line, "#", 2)[0])
+		if strings.HasPrefix(line, "[") {
+			section = strings.Trim(line, "[]")
+			continue
 		}
 
-		entries = append(entries, entry)
+		key, value, ok := strings.Cut(line, "=")
+		if ok && section == "package" && strings.TrimSpace(key) == "name" {
+			if name := quotedValue(strings.TrimSpace(value)); name != "" {
+				return name, nil
+			}
+		}
 	}
 
-	return entries, nil
+	return "", fmt.Errorf("missing package name")
 }
 
 func (c *Collector) buildEntry(name, version string) (notice.Entry, error) {
@@ -155,6 +203,10 @@ func (c *Collector) buildEntry(name, version string) (notice.Entry, error) {
 
 		licenseNames, classifyErr := license.Classify(licenseText)
 		if classifyErr != nil {
+			if licenseIndex(licensePath, licenseText, licensePaths) {
+				continue
+			}
+
 			return notice.Entry{}, fmt.Errorf("classifying %s: %w", licensePath, classifyErr)
 		}
 
@@ -187,6 +239,27 @@ func (c *Collector) buildEntry(name, version string) (notice.Entry, error) {
 	}
 
 	return entry, nil
+}
+
+// Some crates use LICENSE only as an index of their full license files.
+// Every referenced companion is still classified separately, failing closed.
+func licenseIndex(path string, text []byte, paths []string) bool {
+	if filepath.Base(path) != "LICENSE" || len(paths) < 2 {
+		return false
+	}
+
+	for _, companion := range paths {
+		if companion == path {
+			continue
+		}
+
+		name := filepath.Base(companion)
+		if !strings.HasPrefix(name, "LICENSE-") || !strings.Contains(string(text), name) {
+			return false
+		}
+	}
+
+	return true
 }
 
 func declaredLicenses(expression, link string) []notice.License {
@@ -276,6 +349,10 @@ func directDependencies(data string) (map[string]dependency, error) {
 		}
 
 		name := strings.Trim(strings.TrimSpace(key), `"'`)
+		// Local path dependencies are first-party crates, not registry sources.
+		if inlineField(value, "path") != "" {
+			continue
+		}
 
 		packageName := name
 		if parsed := inlinePackageName(value); parsed != "" {
@@ -293,9 +370,13 @@ func directDependencies(data string) (map[string]dependency, error) {
 }
 
 func inlinePackageName(value string) string {
+	return inlineField(value, "package")
+}
+
+func inlineField(value, fieldName string) string {
 	for _, field := range strings.Split(strings.Trim(value, " {}"), ",") {
 		key, fieldValue, found := strings.Cut(field, "=")
-		if found && strings.TrimSpace(key) == "package" {
+		if found && strings.TrimSpace(key) == fieldName {
 			return quotedValue(strings.TrimSpace(fieldValue))
 		}
 	}
@@ -308,7 +389,7 @@ func dependencySection(section string) bool {
 		(strings.HasPrefix(section, "target.") && (strings.HasSuffix(section, ".dependencies") || strings.HasSuffix(section, ".build-dependencies")))
 }
 
-func lockedDirectVersions(data string, direct map[string]dependency) (map[string]string, error) {
+func lockedDirectVersions(data, packageName string, direct map[string]dependency) (map[string]string, error) {
 	type pkg struct {
 		name, version string
 		dependencies  []string
@@ -366,14 +447,14 @@ func lockedDirectVersions(data string, direct map[string]dependency) (map[string
 	var root *pkg
 
 	for i := range packages {
-		if packages[i].name == "unbounded-storage" {
+		if packages[i].name == packageName {
 			root = &packages[i]
 			break
 		}
 	}
 
 	if root == nil {
-		return nil, fmt.Errorf("unbounded-storage package not found")
+		return nil, fmt.Errorf("%s package not found", packageName)
 	}
 
 	versions := map[string]string{}
