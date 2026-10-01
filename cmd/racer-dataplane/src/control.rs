@@ -953,6 +953,8 @@ mod tests {
     }
     #[test]
     fn lagging_replica_retries_preserve_state_without_enrollment() {
+        let Some(r) = testing::reactor() else { return };
+        let scope = testing::scope();
         use super::transport::scenarios::{FixtureIo, scripted_server};
         use futures::executor::block_on;
         for pending in [false, true] {
@@ -963,16 +965,16 @@ mod tests {
                 .enrollment
                 .set_peer_trust_roots(vec![ca.der().to_vec()])
                 .unwrap();
-            let request = client.enrollment.prepare_now().unwrap();
-            let identity = client
-                .enrollment
-                .accept_response(testing::issue(
-                    &request,
-                    &ca,
-                    &key,
-                    "22222222-2222-4222-8222-222222222222",
-                ))
-                .unwrap();
+            client.enrollment.attach_reactor(r.clone());
+            let request = testing::drive(&r, client.enrollment.prepare(&scope)).unwrap();
+            let identity = testing::drive(
+                &r,
+                client.enrollment.accept_response_async(
+                    testing::issue(&request, &ca, &key, "22222222-2222-4222-8222-222222222222"),
+                    &scope,
+                ),
+            )
+            .unwrap();
             assert!(!identity.renewal_due());
             *client.identity.borrow_mut() = Some(identity.clone());
             client.started.set(true);
@@ -1042,7 +1044,7 @@ mod tests {
                 }
                 let before = Instant::now();
                 assert!(client.backoff().unwrap() >= before + Duration::from_secs(1));
-                // No token or async enrollment adapter exists in this fixture.
+                // No token exists in this fixture.
                 // A spurious binding recheck would fail instead of returning Ok.
                 assert_eq!(block_on(client.renew_if_due(&scope)), Ok(()));
                 assert_eq!(client.renewal_error(), None);
@@ -1087,19 +1089,20 @@ mod tests {
                 .enrollment
                 .set_peer_trust_roots(vec![ca.der().to_vec()])
                 .unwrap();
-            let request = client.enrollment.prepare_now().unwrap();
-            let old = client
-                .enrollment
-                .accept_response(testing::issue(
-                    &request,
-                    &ca,
-                    &key,
-                    "22222222-2222-4222-8222-222222222222",
-                ))
-                .unwrap();
+            client.enrollment.attach_reactor(r.clone());
+            let scope = testing::scope();
+            let request = testing::drive(&r, client.enrollment.prepare(&scope)).unwrap();
+            let old = testing::drive(
+                &r,
+                client.enrollment.accept_response_async(
+                    testing::issue(&request, &ca, &key, "22222222-2222-4222-8222-222222222222"),
+                    &scope,
+                ),
+            )
+            .unwrap();
             *client.identity.borrow_mut() = Some(old.clone());
             client.started.set(true);
-            let request = client.enrollment.prepare_now().unwrap();
+            let request = testing::drive(&r, client.enrollment.prepare(&scope)).unwrap();
             let response =
                 testing::issue(&request, &ca, &key, "33333333-3333-4333-8333-333333333333");
             let committed = std::fs::read(d.0.join("identity/identity.json")).unwrap();

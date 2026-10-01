@@ -349,6 +349,8 @@ fn authenticated_age_jitter_is_bounded() {
 
 #[test]
 fn pooled_connections_retire_between_requests_and_discard_failures() {
+    let Some(r) = testing::reactor() else { return };
+    let enrollment_scope = testing::scope();
     let d = testing::Directory::new();
     let (ca, key) = testing::ca();
     let enrollment = Enrollment::new(
@@ -359,15 +361,16 @@ fn pooled_connections_retire_between_requests_and_discard_failures() {
     enrollment
         .set_peer_trust_roots(vec![ca.der().to_vec()])
         .unwrap();
-    let request = enrollment.prepare_now().unwrap();
-    let identity = enrollment
-        .accept_response(testing::issue(
-            &request,
-            &ca,
-            &key,
-            "22222222-2222-4222-8222-222222222222",
-        ))
-        .unwrap();
+    enrollment.attach_reactor(r.clone());
+    let request = testing::drive(&r, enrollment.prepare(&enrollment_scope)).unwrap();
+    let identity = testing::drive(
+        &r,
+        enrollment.accept_response_async(
+            testing::issue(&request, &ca, &key, "22222222-2222-4222-8222-222222222222"),
+            &enrollment_scope,
+        ),
+    )
+    .unwrap();
     let response = |status| {
         (
             wire::SNAPSHOT_PATH.to_owned(),
@@ -763,6 +766,8 @@ fn weekly_cross_signed_chains_accept_retained_anchors_only() {
 
 #[test]
 fn weekly_projected_trust_reload_invalidates_idle_transport() {
+    let Some(r) = testing::reactor() else { return };
+    let enrollment_scope = testing::scope();
     let certs = WeeklyCertificates::new();
     let d = testing::Directory::new();
     let trust = d.0.join("ca.crt");
@@ -783,14 +788,21 @@ fn weekly_projected_trust_reload_invalidates_idle_transport() {
     enrollment
         .set_peer_trust_roots(vec![peer_ca.der().to_vec()])
         .unwrap();
-    let identity = enrollment
-        .accept_response(testing::issue(
-            &enrollment.prepare_now().unwrap(),
-            &peer_ca,
-            &peer_key,
-            "22222222-2222-4222-8222-222222222222",
-        ))
-        .unwrap();
+    enrollment.attach_reactor(r.clone());
+    let request = testing::drive(&r, enrollment.prepare(&enrollment_scope)).unwrap();
+    let identity = testing::drive(
+        &r,
+        enrollment.accept_response_async(
+            testing::issue(
+                &request,
+                &peer_ca,
+                &peer_key,
+                "22222222-2222-4222-8222-222222222222",
+            ),
+            &enrollment_scope,
+        ),
+    )
+    .unwrap();
     let server = RotationServer::new(certs.servers[1].clone());
     let transport = server.transport(trust);
     project(0, certs.roots[0].pem());
@@ -849,6 +861,8 @@ fn real_ring_server_auth_and_mutual_tls() {
     tls_fixture(Some(r), false);
 }
 fn tls_fixture(reactor: Option<Rc<crate::runtime::reactor::Reactor>>, trailing: bool) {
+    let Some(r) = testing::reactor() else { return };
+    let enrollment_scope = testing::scope();
     let d = testing::Directory::new();
     let (ca, ca_key) = testing::ca();
     let mut params =
@@ -866,15 +880,21 @@ fn tls_fixture(reactor: Option<Rc<crate::runtime::reactor::Reactor>>, trailing: 
     enrollment
         .set_peer_trust_roots(vec![ca.der().to_vec()])
         .unwrap();
-    let request = enrollment.prepare_now().unwrap();
-    let identity = enrollment
-        .accept_response(testing::issue(
-            &request,
-            &ca,
-            &ca_key,
-            "22222222-2222-4222-8222-222222222222",
-        ))
-        .unwrap();
+    enrollment.attach_reactor(r.clone());
+    let request = testing::drive(&r, enrollment.prepare(&enrollment_scope)).unwrap();
+    let identity = testing::drive(
+        &r,
+        enrollment.accept_response_async(
+            testing::issue(
+                &request,
+                &ca,
+                &ca_key,
+                "22222222-2222-4222-8222-222222222222",
+            ),
+            &enrollment_scope,
+        ),
+    )
+    .unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let mut roots = rustls::RootCertStore::empty();
