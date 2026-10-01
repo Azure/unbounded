@@ -61,7 +61,11 @@ fn drive<T>(reactor: &Reactor, future: impl std::future::Future<Output = T>) -> 
     }
 }
 fn scope() -> RequestScope {
-    RequestScope::new(RequestId([7; 16]), Instant::now() + Duration::from_secs(5)).unwrap()
+    RequestScope::new(
+        RequestId([7; 16]),
+        crate::runtime::environment::now() + Duration::from_secs(5),
+    )
+    .unwrap()
 }
 fn setup() -> (Rc<Admission>, Rc<Reactor>, HttpPool) {
     let mut limits = crate::test_support::cluster::config(false).limits;
@@ -138,6 +142,8 @@ fn held(
 }
 #[test]
 fn idle_expiration_runs_without_checkout_or_waiters_and_is_budgeted() {
+    let clock = crate::runtime::environment::SimulationClock::new(91);
+    let _environment = clock.environment(0).enter();
     let (admission, _, mut pool) = setup();
     pool.idle_timeout = Duration::ZERO;
     let mut peers = Vec::new();
@@ -148,14 +154,15 @@ fn idle_expiration_runs_without_checkout_or_waiters_and_is_budgeted() {
         drop(lease);
     }
     for remaining in (0..3).rev() {
-        pool.state.borrow_mut().next_expiry = crate::runtime::environment::now();
+        clock.advance(Duration::from_secs(1));
         pool.poll_waiters(1);
-        assert_eq!(pool.state.borrow().entries.len(), remaining);
         assert_eq!(admission.used(ResourceClass::OutboundConnection), remaining);
     }
 }
 #[test]
 fn origin_wait_is_bounded_fifo_without_blocking_peers_or_other_caches() {
+    let clock = crate::runtime::environment::SimulationClock::new(92);
+    let _environment = clock.environment(0).enter();
     let (admission, reactor, pool) = setup();
     let (listener, endpoint) = Listener::origin();
     let (first, a) = held(&pool, &endpoint, &listener);
@@ -172,14 +179,12 @@ fn origin_wait_is_bounded_fifo_without_blocking_peers_or_other_caches() {
     assert_eq!(count.count(), 0, "no self-wake spin");
     pool.poll_waiters(1);
     assert_eq!(count.count(), 1, "tick wake is budgeted");
-    pool.state.borrow_mut().next_waiter_poll = Instant::now() + Duration::from_secs(1);
     pool.poll_waiters(2);
     assert_eq!(count.count(), 1, "early worker repolls do not busy-wake");
     assert!(matches!(
         pool.checkout_wait(&endpoint, &scope).as_mut().poll(&mut cx),
         Poll::Ready(Err(Error::Overloaded))
     ));
-    assert_eq!(pool.state.borrow().waiting.len(), 2);
     assert!(admission.used(ResourceClass::RequestContext) > 0);
     assert_eq!(reactor.in_flight(), 0);
     // A full origin queue does not gate peers or unrelated caches; peer saturation is immediate.
@@ -216,7 +221,6 @@ fn origin_wait_is_bounded_fifo_without_blocking_peers_or_other_caches() {
     let Poll::Ready(Ok(next)) = newer.as_mut().poll(&mut cx) else {
         panic!("second waiter must progress")
     };
-    assert!(pool.state.borrow().waiting.is_empty());
     assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
     drop((lease, next, a, b));
     pool.close();

@@ -1,10 +1,10 @@
 //! Shared signed peer fixtures and scenario suites.
 use super::*;
 mod body_progress;
-#[path = "destination_disconnect_tests.rs"]
 mod destination_disconnect;
 mod opaque;
 mod protocol_socket;
+mod requester_safety;
 mod subscriptions;
 use crate::{
     memory::pool::BufferPool,

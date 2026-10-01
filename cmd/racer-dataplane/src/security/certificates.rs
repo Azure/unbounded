@@ -73,6 +73,8 @@ mod tests {
     use super::*;
     #[test]
     fn cache_requires_exact_chain_current_trust_time_and_fresh_signature() {
+        let clock = crate::runtime::environment::SimulationClock::new(93);
+        let _environment = clock.environment(0).enter();
         let (pending, chain, roots) = super::super::identity::tests::issued();
         let keys = Rc::new(Keyring::new(
             ClusterId(CLUSTER.into()),
@@ -104,7 +106,6 @@ mod tests {
         certs
             .verify_signed(&chain, &node, b"message", &signature)
             .unwrap();
-        assert_eq!(certs.cache.borrow().len(), 1);
         assert!(
             certs
                 .verify_signed(&chain, &node, b"tampered", &signature)
@@ -113,14 +114,18 @@ mod tests {
         let mut changed = chain.clone();
         changed[0].push(0);
         assert!(certs.verify(&changed, &node).is_err());
-        // Force expiry of the cached result; validation must replace it.
-        certs.cache.borrow_mut()[0].until = 0;
+        // Exercise expiration through the clock, not the cache implementation.
+        let original = crate::runtime::environment::wall_now();
+        let (_, until) = validity(chain.iter().chain(roots.iter())).unwrap();
+        clock.set_wall_time(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(until + 1),
+        );
+        assert!(certs.verify(&chain, &node).is_err());
+        clock.set_wall_time(original);
         certs.verify(&chain, &node).unwrap();
-        assert!(certs.cache.borrow()[0].until > 0);
         let (_, _, replacement) = super::super::identity::tests::issued();
         keys.install(bundle(2, replacement)).unwrap();
         assert!(certs.verify(&chain, &node).is_err());
-        assert!(certs.cache.borrow().is_empty());
     }
     #[test]
     fn validates_chain_node_and_strict_signature() {

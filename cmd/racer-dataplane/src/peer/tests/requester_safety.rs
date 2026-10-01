@@ -1,5 +1,5 @@
 //! Real socket exchange with the adaptive controller attached to routing/requester.
-use super::*;
+use crate::peer::*;
 use crate::{
     http::{
         Codec,
@@ -172,7 +172,6 @@ fn probe_exchange(opaque: bool, case: &str) {
             .unwrap(),
         ),
     );
-    assert!(Arc::ptr_eq(requester.admission(), &adaptive));
     let mut request = crate::peer::tests::request(&admission, 91);
     let scope = RequestScope::new(
         request.route.request,
@@ -182,6 +181,9 @@ fn probe_exchange(opaque: bool, case: &str) {
     request.route.deadline = scope.deadline;
     request.origin.scope = scope.clone();
     if case == "direct" {
+        let held = adaptive.acquire(&node).unwrap();
+        assert!(!requester.direct_hedge_available(&membership, &node));
+        drop(held);
         request.operation = crate::peer::protocol::Operation::Page {
             page: crate::model::PageId {
                 version: crate::model::ObjectVersion {
