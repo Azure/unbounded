@@ -25,6 +25,28 @@ use std::cell::RefCell;
 use std::time::Instant;
 use std::{rc::Rc, sync::Arc};
 
+fn reserve_hedge_pages(
+    admission: &crate::runtime::admission::Admission,
+    cache: &crate::model::CacheId,
+    pages: usize,
+) -> Result<(
+    crate::runtime::admission::Reservation,
+    crate::runtime::admission::Reservation,
+)> {
+    use crate::model::{PAGE_BYTES, ResourceClass};
+    let plaintext = admission.reserve(
+        Some(cache),
+        ResourceClass::Plaintext,
+        PAGE_BYTES as usize * pages,
+    )?;
+    let ciphertext = admission.reserve(
+        Some(cache),
+        ResourceClass::Ciphertext,
+        (PAGE_BYTES as usize + 16) * pages,
+    )?;
+    Ok((plaintext, ciphertext))
+}
+
 pub struct OriginAuthority {
     membership: MembershipLease,
     node: NodeId,
@@ -51,6 +73,12 @@ pub struct CandidatePolicy {
     peers: Rc<dyn PeerClient>,
     credentials: Rc<CredentialCrypto>,
     published: Arc<crate::control::snapshot::PublishedState>,
+}
+#[derive(Clone, Copy)]
+enum RequestMode {
+    SharedRoute,
+    FundedRoute,
+    DirectHedge,
 }
 #[derive(Default, Clone, Copy)]
 pub(crate) struct HedgeContinuation {
@@ -100,33 +128,15 @@ impl CandidatePolicy {
         check_budget(scope, budget)?;
         let reservation = (|| {
             let slot = hedges.acquire()?;
-            let plain = admission.reserve(
-                Some(&context.object.cache),
-                crate::model::ResourceClass::Plaintext,
-                crate::model::PAGE_BYTES as usize,
-            )?;
-            let cipher = admission.reserve(
-                Some(&context.object.cache),
-                crate::model::ResourceClass::Ciphertext,
-                crate::model::PAGE_BYTES as usize + 16,
-            )?;
+            let escrow = reserve_hedge_pages(admission, &context.object.cache, 1)?;
             // The caller already holds its serial plaintext page. Escrow is
             // additional accounting, not a buffer consumed by either validator.
             // Fund BOTH contenders before spending credits or changing routing.
-            let working_plain = admission.reserve(
-                Some(&context.object.cache),
-                crate::model::ResourceClass::Plaintext,
-                crate::model::PAGE_BYTES as usize * 2,
-            )?;
-            let working_cipher = admission.reserve(
-                Some(&context.object.cache),
-                crate::model::ResourceClass::Ciphertext,
-                (crate::model::PAGE_BYTES as usize + 16) * 2,
-            )?;
-            drop((working_plain, working_cipher));
-            Ok::<_, Error>((slot, plain, cipher))
+            let working = reserve_hedge_pages(admission, &context.object.cache, 2)?;
+            drop(working);
+            Ok::<_, Error>((slot, escrow))
         })();
-        let Ok((slot, _plain, _cipher)) = reservation else {
+        let Ok((slot, _escrow)) = reservation else {
             hedges.suppressed();
             return Ok(None);
         };
@@ -152,8 +162,7 @@ impl CandidatePolicy {
                     &primary_scope,
                     &mut primary_budget,
                     3,
-                    true,
-                    false,
+                    RequestMode::DirectHedge,
                 )
                 .await?;
             if matches!(response.response(), PeerResponse::StaleMembership) {
@@ -184,19 +193,7 @@ impl CandidatePolicy {
             }
             // Recheck local headroom after the delay. The escrow remains held;
             // these trial reservations do not replace actual receive/crypto quota.
-            let capacity = (|| {
-                let plain = admission.reserve(
-                    Some(&context.object.cache),
-                    crate::model::ResourceClass::Plaintext,
-                    crate::model::PAGE_BYTES as usize,
-                )?;
-                let cipher = admission.reserve(
-                    Some(&context.object.cache),
-                    crate::model::ResourceClass::Ciphertext,
-                    crate::model::PAGE_BYTES as usize + 16,
-                )?;
-                Ok::<_, Error>((plain, cipher))
-            })();
+            let capacity = reserve_hedge_pages(admission, &context.object.cache, 1);
             let Ok(capacity) = capacity else {
                 hedges.suppressed();
                 return Err(Error::Overloaded);
@@ -213,8 +210,7 @@ impl CandidatePolicy {
                     &secondary_scope,
                     &mut secondary_budget,
                     3,
-                    true,
-                    false,
+                    RequestMode::DirectHedge,
                 )
                 .await?;
             if matches!(response.response(), PeerResponse::StaleMembership) {
@@ -501,11 +497,9 @@ impl CandidatePolicy {
                 return Err(Error::InvalidRequest);
             }
             if continuation.stale {
-                let latest = self.published.current()?.membership.clone();
-                if retried || latest.version.0 <= candidates.membership.version.0 {
-                    return Err(Error::IncompatibleMembership);
-                }
-                let next = self.candidates_scoped(latest, object, page, scope).await?;
+                let next = self
+                    .refresh_candidates(&candidates, object, page, scope, retried)
+                    .await?;
                 return self
                     .resolve_epoch(
                         next,
@@ -597,8 +591,11 @@ impl CandidatePolicy {
                         scope,
                         request_budget,
                         (count - index + usize::from(rank.is_some())) as u32,
-                        false,
-                        continuation.bounded_routes,
+                        if continuation.bounded_routes {
+                            RequestMode::FundedRoute
+                        } else {
+                            RequestMode::SharedRoute
+                        },
                     )
                     .await;
                 if let Some(bounded) = bounded {
@@ -607,14 +604,9 @@ impl CandidatePolicy {
                 match response {
                     Ok(response) => {
                         if matches!(response.response(), PeerResponse::StaleMembership) {
-                            if retried {
-                                return Err(Error::IncompatibleMembership);
-                            }
-                            let latest = self.published.current()?.membership.clone();
-                            if latest.version.0 <= candidates.membership.version.0 {
-                                return Err(Error::IncompatibleMembership);
-                            }
-                            let next = self.candidates_scoped(latest, object, page, scope).await?;
+                            let next = self
+                                .refresh_candidates(&candidates, object, page, scope, retried)
+                                .await?;
                             // Preserve the original operation (including ETag),
                             // cancellation/deadline and already spent link/attempt credits.
                             return self
@@ -767,6 +759,24 @@ impl CandidatePolicy {
         })
     }
 
+    async fn refresh_candidates(
+        &self,
+        previous: &Candidates,
+        object: &ObjectId,
+        page: PageNumber,
+        scope: &RequestScope,
+        retried: bool,
+    ) -> Result<Candidates> {
+        if retried {
+            return Err(Error::IncompatibleMembership);
+        }
+        let latest = self.published.current()?.membership.clone();
+        if latest.version.0 <= previous.membership.version.0 {
+            return Err(Error::IncompatibleMembership);
+        }
+        self.candidates_scoped(latest, object, page, scope).await
+    }
+
     async fn request(
         &self,
         membership: &MembershipLease,
@@ -787,8 +797,7 @@ impl CandidatePolicy {
             scope,
             budget,
             remaining_opportunities,
-            false,
-            false,
+            RequestMode::SharedRoute,
         )
         .await
     }
@@ -802,8 +811,7 @@ impl CandidatePolicy {
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
         remaining_opportunities: u32,
-        direct: bool,
-        funded_remote: bool,
+        request_mode: RequestMode,
     ) -> Result<VerifiedResponse> {
         check_budget(scope, budget)?;
         // Reserve the complete permitted route before sending. Lost responses cannot
@@ -819,11 +827,13 @@ impl CandidatePolicy {
         // Sign the original hard ceiling before sending; it never renews.
         let deadline = now + (overall - now) / remaining_opportunities.max(1);
         let attempt_end = now
-            + self.attempt_timeout.min(if direct {
-                (overall - now) / 3
-            } else {
-                overall - now
-            });
+            + self
+                .attempt_timeout
+                .min(if matches!(request_mode, RequestMode::DirectHedge) {
+                    (overall - now) / 3
+                } else {
+                    overall - now
+                });
         // The local exchange may time out before the signed contract. Shortening
         // the latter per attempt would make a later update renew provider authority.
         let signed_deadline = overall;
@@ -835,7 +845,7 @@ impl CandidatePolicy {
         let attempts = if matches!(mode, FetchMode::Acquire) {
             // Reserve remote acquisition credits from the same original call.
             // Without a signed response receipt unused remote credits stay spent.
-            let credits = if funded_remote {
+            let credits = if matches!(request_mode, RequestMode::FundedRoute) {
                 budget.remaining_attempts()
             } else {
                 budget
@@ -893,7 +903,7 @@ impl CandidatePolicy {
             },
         };
         let registration = scope.cancellation.subscribe()?;
-        let mut exchange = if direct {
+        let mut exchange = if matches!(request_mode, RequestMode::DirectHedge) {
             self.peers
                 .request_direct(request, membership.clone(), &attempt_scope)
         } else {

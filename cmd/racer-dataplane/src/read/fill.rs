@@ -793,20 +793,19 @@ impl Fill {
         .await
     }
 
-    async fn acquire_once(
+    /// Local copies own ciphertext already; the temporary plaintext reservation
+    /// ends here before network acquisition reserves its independent progress budget.
+    async fn acquire_local_copy(
         &self,
         page: &PageId,
-        membership: MembershipLease,
-        context: &OriginContext,
         scope: &RequestScope,
-        budget: &mut AcquisitionBudget,
         want_plaintext: bool,
-    ) -> Result<AcquiredPage> {
+    ) -> Result<Option<AcquiredPage>> {
         scope.check()?;
         // Pending copies already own ciphertext. Disk owns a separate complete
         // staging/decoded bundle; neither source needs speculative network bytes.
         let plaintext = if want_plaintext {
-            Some(self.reserve_bootstrap(&context.object.cache)?)
+            Some(self.reserve_bootstrap(&page.version.object.cache)?)
         } else {
             None
         };
@@ -845,14 +844,14 @@ impl Fill {
                     },
                     1,
                 )?;
-                return Ok(AcquiredPage::Ciphertext(UnverifiedPage {
+                return Ok(Some(AcquiredPage::Ciphertext(UnverifiedPage {
                     copy,
                     disk_token: token,
-                }));
+                })));
             }
             let reservation = match plaintext {
                 Some(value) => value,
-                None => self.reserve_bootstrap(&context.object.cache)?,
+                None => self.reserve_bootstrap(&page.version.object.cache)?,
             };
             match self.decrypt(page, copy, reservation, scope).await {
                 Ok(result) => {
@@ -865,7 +864,7 @@ impl Fill {
                         },
                         1,
                     )?;
-                    return Ok(result.into());
+                    return Ok(Some(result.into()));
                 }
                 Err(error @ (Error::CorruptRecord | Error::MissingKey)) => {
                     if error == Error::CorruptRecord {
@@ -879,6 +878,21 @@ impl Fill {
             }
         } else {
             drop(plaintext);
+        }
+        Ok(None)
+    }
+
+    async fn acquire_once(
+        &self,
+        page: &PageId,
+        membership: MembershipLease,
+        context: &OriginContext,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+        want_plaintext: bool,
+    ) -> Result<AcquiredPage> {
+        if let Some(result) = self.acquire_local_copy(page, scope, want_plaintext).await? {
+            return Ok(result);
         }
         let candidates = self
             .dependencies
@@ -1014,25 +1028,9 @@ impl Fill {
                 {
                     Ok(origin) => {
                         source = Event::OriginFill;
-                        if origin.metadata.version != page.version {
-                            return Err(Error::CorruptRecord);
-                        }
-                        let expected = origin.metadata.immutable().page_length(page)?;
-                        use crate::runtime::reactor::IoBuffer;
-                        if origin.plaintext.bytes()?.len() != expected as usize {
-                            return Err(Error::CorruptRecord);
-                        }
-                        let (plaintext, ciphertext) = self
-                            .dependencies
-                            .crypto
-                            .encrypt(page.clone(), origin.plaintext, ciphertext, scope)
-                            .await?;
-                        PageResult {
-                            metadata: origin.metadata,
-                            plaintext,
-                            ciphertext,
-                        }
-                        .into()
+                        self.encrypt_origin_page(page, origin, ciphertext, scope)
+                            .await?
+                            .into()
                     }
                     Err(Error::VersionUnavailable) => {
                         let operation = PeerOperation::Page {
@@ -1080,6 +1078,33 @@ impl Fill {
         }
         self.metrics.record(source, 1)?;
         Ok(result)
+    }
+
+    async fn encrypt_origin_page(
+        &self,
+        page: &PageId,
+        origin: crate::origin::page::OriginPage,
+        ciphertext: Reservation,
+        scope: &RequestScope,
+    ) -> Result<PageResult> {
+        use crate::runtime::reactor::IoBuffer;
+        if origin.metadata.version != page.version {
+            return Err(Error::CorruptRecord);
+        }
+        let expected = origin.metadata.immutable().page_length(page)?;
+        if origin.plaintext.bytes()?.len() != expected as usize {
+            return Err(Error::CorruptRecord);
+        }
+        let (plaintext, ciphertext) = self
+            .dependencies
+            .crypto
+            .encrypt(page.clone(), origin.plaintext, ciphertext, scope)
+            .await?;
+        Ok(PageResult {
+            metadata: origin.metadata,
+            plaintext,
+            ciphertext,
+        })
     }
 
     async fn decrypt_response(
