@@ -216,12 +216,12 @@ impl Reactor {
     /// cancellation wins after a successful open. No integer FD can leak on drop.
     pub fn file_open<'a>(
         &'a self,
-        dir: Option<Rc<OwnedFd>>,
+        dir: Option<Rc<Descriptor>>,
         path: CString,
         flags: i32,
         resolve: u64,
         scope: &'a RequestScope,
-    ) -> Operation<'a, Rc<OwnedFd>> {
+    ) -> Operation<'a, Rc<Descriptor>> {
         Box::pin(async move {
             if path.as_bytes().len() > 4096 {
                 return Err(Error::InvalidRequest);
@@ -268,7 +268,7 @@ impl Reactor {
     }
     pub fn file_stat<'a>(
         &'a self,
-        fd: Rc<OwnedFd>,
+        fd: Rc<Descriptor>,
         scope: &'a RequestScope,
     ) -> Operation<'a, libc::statx> {
         Box::pin(async move {
@@ -303,7 +303,11 @@ impl Reactor {
             .await
         })
     }
-    pub fn file_sync<'a>(&'a self, fd: Rc<OwnedFd>, scope: &'a RequestScope) -> Operation<'a, ()> {
+    pub fn file_sync<'a>(
+        &'a self,
+        fd: Rc<Descriptor>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, ()> {
         Box::pin(async move {
             let sqe = submission!(
                 self,
@@ -321,7 +325,7 @@ impl Reactor {
     }
     pub fn file_mkdir<'a>(
         &'a self,
-        dir: Rc<OwnedFd>,
+        dir: Rc<Descriptor>,
         name: CString,
         scope: &'a RequestScope,
     ) -> Operation<'a, ()> {
@@ -347,7 +351,7 @@ impl Reactor {
     }
     pub fn file_rename<'a>(
         &'a self,
-        dir: Rc<OwnedFd>,
+        dir: Rc<Descriptor>,
         from: CString,
         to: CString,
         scope: &'a RequestScope,
@@ -379,7 +383,7 @@ impl Reactor {
     }
     pub fn file_unlink<'a>(
         &'a self,
-        dir: Rc<OwnedFd>,
+        dir: Rc<Descriptor>,
         name: CString,
         scope: &'a RequestScope,
     ) -> Operation<'a, ()> {

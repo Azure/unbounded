@@ -1,6 +1,6 @@
 //! Bounded UDP DNS on the control reactor. TLS, never DNS, authenticates the host.
 use super::transport::ControlIo;
-use crate::runtime::reactor::Descriptor as OwnedFd;
+use crate::runtime::reactor::Descriptor;
 use crate::{
     error::{Error, Result},
     runtime::deadline::RequestScope,
@@ -14,10 +14,10 @@ use std::{
 enum Datagram {
     Real(UdpSocket),
     #[cfg(test)]
-    Sim(Rc<OwnedFd>),
+    Sim(Rc<Descriptor>),
 }
 impl Datagram {
-    fn connect(server: SocketAddr) -> Result<(Self, Rc<OwnedFd>)> {
+    fn connect(server: SocketAddr) -> Result<(Self, Rc<Descriptor>)> {
         #[cfg(test)]
         if let Some(sim) = crate::runtime::reactor::simulation::Simulation::current() {
             let fd = sim
@@ -31,7 +31,7 @@ impl Datagram {
                     .unwrap(),
                 )
                 .map_err(|_| Error::Io)?;
-            let OwnedFd::Sim(handle) = &fd else {
+            let Descriptor::Sim(handle) = &fd else {
                 unreachable!()
             };
             handle.connect_datagram(server).map_err(|_| Error::Io)?;
@@ -46,7 +46,7 @@ impl Datagram {
         .map_err(|_| Error::Io)?;
         socket.set_nonblocking(true).map_err(|_| Error::Io)?;
         socket.connect(server).map_err(|_| Error::Io)?;
-        let fd = Rc::new(OwnedFd::from(socket.try_clone().map_err(|_| Error::Io)?));
+        let fd = Rc::new(Descriptor::from(socket.try_clone().map_err(|_| Error::Io)?));
         Ok((Self::Real(socket), fd))
     }
     fn send(&self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -54,7 +54,7 @@ impl Datagram {
             Self::Real(socket) => socket.send(bytes),
             #[cfg(test)]
             Self::Sim(fd) => {
-                let OwnedFd::Sim(h) = &**fd else {
+                let Descriptor::Sim(h) = &**fd else {
                     unreachable!()
                 };
                 h.send_datagram(bytes)
@@ -66,7 +66,7 @@ impl Datagram {
             Self::Real(socket) => socket.recv(bytes),
             #[cfg(test)]
             Self::Sim(fd) => {
-                let OwnedFd::Sim(h) = &**fd else {
+                let Descriptor::Sim(h) = &**fd else {
                     unreachable!()
                 };
                 h.recv_from(bytes).map(|(n, _)| n)

@@ -113,7 +113,7 @@ fn empty_submit_wait_preserves_submitted_receive_and_external_wake_progress() {
     let (socket, mut peer) = UnixStream::pair().unwrap();
     let drops = Rc::new(Cell::new(0));
     let mut receive = reactor.recv(
-        Rc::new(OwnedFd::from(socket)),
+        Rc::new(Descriptor::from(socket)),
         Buffer(vec![0; 1].into(), drops.clone()),
         Lease(drops.clone()),
         &request,
@@ -205,7 +205,7 @@ fn empty_submit_still_submits_cancel_and_drains_submitted_receive() {
     let (socket, _peer) = UnixStream::pair().unwrap();
     let drops = Rc::new(Cell::new(0));
     let mut receive = reactor.recv(
-        Rc::new(OwnedFd::from(socket)),
+        Rc::new(Descriptor::from(socket)),
         Buffer(vec![0; 1].into(), drops.clone()),
         Lease(drops.clone()),
         &request,

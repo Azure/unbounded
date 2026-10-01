@@ -1,5 +1,5 @@
 //! Bounded file operations issued only through the serving worker's reactor.
-use crate::runtime::reactor::Descriptor as OwnedFd;
+use crate::runtime::reactor::Descriptor;
 use crate::{
     error::{Error, Result},
     runtime::{deadline::RequestScope, reactor::Reactor},
@@ -11,7 +11,7 @@ use std::{
     rc::Rc,
 };
 use zeroize::Zeroizing;
-pub(crate) type Directory = Rc<OwnedFd>;
+pub(crate) type Directory = Rc<Descriptor>;
 const BENEATH: u64 = 0x08;
 const NO_MAGICLINKS: u64 = 0x02;
 const NO_SYMLINKS: u64 = 0x04;

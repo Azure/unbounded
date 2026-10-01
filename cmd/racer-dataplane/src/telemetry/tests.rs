@@ -247,7 +247,7 @@ fn diagnostic_probe_and_monitors_progress_under_sustained_queue_pressure() {
         poll_server(&mut server, &reactor);
     }
     let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
-    let reader = Rc::new(OwnedFd::from(reader));
+    let reader = Rc::new(Descriptor::from(reader));
     let mut pressure = Vec::new();
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     for _ in 0..=8 {
@@ -342,7 +342,7 @@ fn diagnostic_accept_recovers_after_full_entry_table() {
     let scope = scope();
     let mut server = telemetry.serve_listener_with_io(listener, io, &scope);
     let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
-    let reader = Rc::new(OwnedFd::from(reader));
+    let reader = Rc::new(Descriptor::from(reader));
     let mut pressure = Vec::new();
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     // The ordinary partition can fill, but cannot steal the listener's slots.

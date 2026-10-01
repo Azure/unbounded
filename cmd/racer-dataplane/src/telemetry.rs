@@ -4,7 +4,7 @@ pub mod health;
 pub mod metrics;
 pub mod tracing;
 
-use crate::runtime::reactor::Descriptor as OwnedFd;
+use crate::runtime::reactor::Descriptor;
 use crate::{
     error::{Error, Operation, Result},
     model::ResourceClass,
@@ -67,7 +67,7 @@ impl Telemetry {
     ) -> Operation<'a, ()> {
         Box::pin(async move {
             scope.check()?;
-            let listener = OwnedFd::tcp_listener(address)?;
+            let listener = Descriptor::tcp_listener(address)?;
             serve(self, listener, io, scope).await
         })
     }
@@ -171,7 +171,7 @@ impl IoBuffer for Buffer {
 
 fn serve<'a>(
     telemetry: &'a Telemetry,
-    listener: OwnedFd,
+    listener: Descriptor,
     io: Rc<DiagnosticIo>,
     scope: &'a RequestScope,
 ) -> Operation<'a, ()> {
@@ -245,7 +245,7 @@ fn serve<'a>(
 fn exchange<'a>(
     telemetry: &'a Telemetry,
     io: Rc<DiagnosticIo>,
-    fd: Rc<OwnedFd>,
+    fd: Rc<Descriptor>,
     mut buffer: Buffer,
     parent: &'a RequestScope,
 ) -> Operation<'a, ()> {

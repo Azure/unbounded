@@ -4,7 +4,7 @@
 //! retain that charge in the worker-local pool. No descriptor or backing page is
 //! recycled while a reader owns the lease. Writes copy into kernel
 //! pipe pages before splice: socket acceptance is not a userspace page reuse fence.
-use crate::runtime::reactor::Descriptor as OwnedFd;
+use crate::runtime::reactor::Descriptor;
 use crate::{
     error::{Error, Operation, Result},
     model::ResourceClass,
@@ -81,8 +81,8 @@ pub struct PipeLease {
 }
 
 struct PipeResources {
-    read: OwnedFd,
-    write: OwnedFd,
+    read: Descriptor,
+    write: Descriptor,
     capacity: usize,
     buffered: usize,
     // Declared after the descriptors so capacity is returned only after closing.
@@ -208,8 +208,8 @@ impl PipePool {
             return Err(Error::Io);
         }
         // SAFETY: both descriptors were newly created and have unique owners.
-        let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-        let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let read = unsafe { Descriptor::from_raw_fd(fds[0]) };
+        let write = unsafe { Descriptor::from_raw_fd(fds[1]) };
         // SAFETY: fcntl operates on a live descriptor and requires no pointer.
         let mut capacity = unsafe { libc::fcntl(write.as_raw_fd(), libc::F_GETPIPE_SZ) };
         if capacity < 0 {
@@ -254,7 +254,7 @@ impl PipeLease {
     pub(crate) fn prepare_transit(&mut self) {
         let pipe = self.resources.as_mut().unwrap();
         #[cfg(test)]
-        if matches!(pipe.write, OwnedFd::Sim(_)) {
+        if matches!(pipe.write, Descriptor::Sim(_)) {
             return;
         }
         if pipe.capacity < MAX_PIPE_BYTES && pipe.buffered == 0 {
@@ -273,9 +273,13 @@ impl PipeLease {
     }
     /// Receive opaque socket pages directly into an empty bounded pipe. No user
     /// buffer is borrowed or retained by this synchronous nonblocking syscall.
-    pub(crate) fn try_splice_from(&mut self, socket: &OwnedFd, count: usize) -> io::Result<usize> {
+    pub(crate) fn try_splice_from(
+        &mut self,
+        socket: &Descriptor,
+        count: usize,
+    ) -> io::Result<usize> {
         #[cfg(test)]
-        if matches!(socket, OwnedFd::Sim(_)) {
+        if matches!(socket, Descriptor::Sim(_)) {
             return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
         }
         let pipe = self.resources.as_mut().unwrap();
@@ -308,7 +312,7 @@ impl PipeLease {
     pub fn try_write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let pipe = self.resources.as_mut().unwrap();
         #[cfg(test)]
-        if let OwnedFd::Sim(handle) = &pipe.write {
+        if let Descriptor::Sim(handle) = &pipe.write {
             let written = handle.pipe_write(bytes)?;
             pipe.buffered += written;
             return Ok(written);
@@ -331,7 +335,7 @@ impl PipeLease {
     pub fn try_read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         let pipe = self.resources.as_mut().unwrap();
         #[cfg(test)]
-        if let OwnedFd::Sim(handle) = &pipe.read {
+        if let Descriptor::Sim(handle) = &pipe.read {
             let read = handle.pipe_read(bytes)?;
             pipe.buffered -= read;
             return Ok(read);
@@ -349,9 +353,13 @@ impl PipeLease {
         Ok(read)
     }
 
-    pub fn try_splice_descriptor(&mut self, socket: &OwnedFd, count: usize) -> io::Result<usize> {
+    pub fn try_splice_descriptor(
+        &mut self,
+        socket: &Descriptor,
+        count: usize,
+    ) -> io::Result<usize> {
         #[cfg(test)]
-        if let (OwnedFd::Sim(pipe), OwnedFd::Sim(socket)) =
+        if let (Descriptor::Sim(pipe), Descriptor::Sim(socket)) =
             (&self.resources.as_ref().unwrap().read, socket)
         {
             let sent = pipe.splice(socket, count.min(self.buffered()))?;
@@ -405,7 +413,7 @@ impl PipeLease {
         socket: &crate::http::pool::ConnectionLease,
     ) -> io::Result<usize> {
         #[cfg(test)]
-        if matches!(&*socket.fd, OwnedFd::Sim(_)) {
+        if matches!(&*socket.fd, Descriptor::Sim(_)) {
             return self.try_splice_descriptor(&socket.fd, self.buffered());
         }
         self.splice_to_fd(socket.fd.as_raw_fd(), self.buffered())

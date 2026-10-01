@@ -3,7 +3,7 @@ use super::{
     direct::{AlignedBuffer, DirectAlignment, DirectExtent},
     segment::SegmentLease,
 };
-use crate::runtime::reactor::Descriptor as OwnedFd;
+use crate::runtime::reactor::Descriptor;
 use crate::{
     error::{Error, Operation, Result},
     model::{CacheId, PAGE_BYTES, ResourceClass, WorkerId},
@@ -28,7 +28,7 @@ pub struct SlabLocation {
     pub extent: DirectExtent,
 }
 struct OpenSlab {
-    file: Rc<OwnedFd>,
+    file: Rc<Descriptor>,
     alignment: DirectAlignment,
 }
 pub struct Slabs {
@@ -173,7 +173,7 @@ impl Slabs {
             let file = sim
                 .open(None, &path, libc::O_CREAT | libc::O_RDWR | libc::O_DIRECT)
                 .map_err(|_| Error::Io)?;
-            let OwnedFd::Sim(handle) = &file else {
+            let Descriptor::Sim(handle) = &file else {
                 unreachable!()
             };
             handle.lock().map_err(|_| Error::Unavailable)?;
@@ -242,7 +242,7 @@ impl Slabs {
         location: SlabLocation,
         buffer: &AlignedBuffer,
         lease: &SegmentLease,
-    ) -> Result<Rc<OwnedFd>> {
+    ) -> Result<Rc<Descriptor>> {
         let opened = self.opened.borrow();
         let slab = opened.as_ref().ok_or(Error::Unavailable)?;
         slab.alignment.check(location.extent, buffer)?;

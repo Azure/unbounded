@@ -1,6 +1,6 @@
 //! Nonblocking rustls over reactor-owned readiness. No executor or helper thread.
 use super::{ControlEndpoint, enrollment::LocalSigningIdentity, wire};
-use crate::runtime::reactor::Descriptor as OwnedFd;
+use crate::runtime::reactor::Descriptor;
 use crate::{
     error::{Error, Operation, Result},
     runtime::deadline::RequestScope,
@@ -20,7 +20,7 @@ use std::{
 pub trait ControlIo {
     fn ready_charged<'a>(
         &'a self,
-        fd: Rc<OwnedFd>,
+        fd: Rc<Descriptor>,
         read: bool,
         write: bool,
         charge: Option<Rc<crate::runtime::admission::ConnectionReservation>>,
@@ -62,7 +62,7 @@ pub trait ControlIo {
     ) -> Operation<'a, Vec<SocketAddr>>;
     fn ready<'a>(
         &'a self,
-        fd: Rc<OwnedFd>,
+        fd: Rc<Descriptor>,
         read: bool,
         write: bool,
         scope: &'a RequestScope,
@@ -93,7 +93,7 @@ impl ControlIo for ReactorControlIo {
     }
     fn ready<'a>(
         &'a self,
-        fd: Rc<OwnedFd>,
+        fd: Rc<Descriptor>,
         read: bool,
         write: bool,
         scope: &'a RequestScope,
@@ -134,7 +134,7 @@ impl ControlIo for ReactorControlIo {
             if raw < 0 {
                 return Err(Error::Io);
             }
-            let fd = Rc::new(unsafe { OwnedFd::from_raw_fd(raw) });
+            let fd = Rc::new(unsafe { Descriptor::from_raw_fd(raw) });
             let interval = libc::itimerspec {
                 it_interval: libc::timespec {
                     tv_sec: 0,
@@ -168,7 +168,7 @@ pub struct ControlConnection {
     endpoint: crate::model::NodeId,
     charge: Option<Rc<crate::runtime::admission::ConnectionReservation>>,
     stream: ControlStream,
-    fd: Rc<OwnedFd>,
+    fd: Rc<Descriptor>,
     tls: rustls::ClientConnection,
     io: Rc<dyn ControlIo>,
     host: String,
@@ -188,7 +188,7 @@ fn authenticated_age(random: u64) -> Duration {
 enum ControlStream {
     Real(TcpStream),
     #[cfg(test)]
-    Sim(Rc<OwnedFd>),
+    Sim(Rc<Descriptor>),
 }
 impl Read for ControlStream {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
@@ -416,7 +416,7 @@ impl ControlTransport {
                     continue;
                 }
                 if let Ok(stream) = connect_socket(address) {
-                    let fd = Rc::new(OwnedFd::from(stream.try_clone().map_err(|_| Error::Io)?));
+                    let fd = Rc::new(Descriptor::from(stream.try_clone().map_err(|_| Error::Io)?));
                     io.ready_charged(fd.clone(), false, true, charge.clone(), scope)
                         .await?;
                     if stream.take_error().map_err(|_| Error::Io)?.is_none() {
@@ -1040,7 +1040,7 @@ pub(super) mod tests {
         }
         fn ready<'a>(
             &'a self,
-            fd: Rc<OwnedFd>,
+            fd: Rc<Descriptor>,
             read: bool,
             write: bool,
             scope: &'a RequestScope,

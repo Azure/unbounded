@@ -31,7 +31,7 @@ fn provenance_capacity_and_completion_ownership() {
         Err(Error::InvalidConfiguration)
     ));
     let (socket, mut peer) = UnixStream::pair().unwrap();
-    let fd = Rc::new(OwnedFd::from(socket));
+    let fd = Rc::new(Descriptor::from(socket));
     let mut ordinary = reactor.readiness(fd.clone(), libc::POLLIN as u32, &request);
     assert!(poll(&mut ordinary).is_pending());
     let mut overflow = reactor.readiness(fd.clone(), libc::POLLIN as u32, &request);
@@ -85,7 +85,7 @@ fn attachment_cannot_overcommit_existing_ordinary_entries() {
     let reactor = kernel_reactor(2).expect("real io_uring reserved attachment");
     let request = scope();
     let (socket, _peer) = UnixStream::pair().unwrap();
-    let fd = Rc::new(OwnedFd::from(socket));
+    let fd = Rc::new(Descriptor::from(socket));
     let mut first = reactor.readiness(fd.clone(), libc::POLLIN as u32, &request);
     let mut second = reactor.readiness(fd, libc::POLLIN as u32, &request);
     assert!(poll(&mut first).is_pending());
@@ -105,7 +105,7 @@ fn ordinary_completed_reply_does_not_hold_queue_capacity() {
     let reactor = kernel_reactor(1).expect("real io_uring ordinary completion");
     let request = scope();
     let (socket, _peer) = UnixStream::pair().unwrap();
-    let fd = Rc::new(OwnedFd::from(socket));
+    let fd = Rc::new(Descriptor::from(socket));
     let mut send = reactor.send(fd.clone(), buffer(b"x"), (), &request);
     assert!(poll(&mut send).is_pending());
     let deadline = Instant::now() + Duration::from_secs(2);

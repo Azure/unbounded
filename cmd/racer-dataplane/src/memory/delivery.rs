@@ -12,7 +12,7 @@ use super::{
     pipe::{PipeLease, PipePool},
     pool::VerifiedPage,
 };
-use crate::runtime::reactor::Descriptor as OwnedFd;
+use crate::runtime::reactor::Descriptor;
 use crate::{
     error::{Error, Operation, Result},
     http::{io::OwnedBuffer, pool::ConnectionLease},
@@ -85,7 +85,7 @@ pub struct ReaderLease {
     pipe: PipeLease,
     slice: PageSlice,
     sent: usize,
-    connection: Option<Rc<OwnedFd>>,
+    connection: Option<Rc<Descriptor>>,
 }
 
 impl ReaderLease {
@@ -103,7 +103,7 @@ impl ReaderLease {
 
     /// Bind an exclusively owned socket for the legacy finish API. The socket is
     /// closed on completion; use finish_to to recover an HTTP connection lease.
-    pub fn attach_connection(&mut self, connection: OwnedFd) -> Result<()> {
+    pub fn attach_connection(&mut self, connection: Descriptor) -> Result<()> {
         if self.connection.is_some() {
             return Err(Error::InvalidRequest);
         }
@@ -112,7 +112,7 @@ impl ReaderLease {
         Ok(())
     }
 
-    fn try_send(&mut self, connection: &OwnedFd, copying: bool) -> io::Result<usize> {
+    fn try_send(&mut self, connection: &Descriptor, copying: bool) -> io::Result<usize> {
         let start = self.slice.offset as usize + self.sent;
         let count = self.remaining().min(SEND_CHUNK_BYTES);
         let bytes = &self.page.bytes()[start..start + count];
@@ -172,7 +172,7 @@ impl Delivery {
         &self,
         page: VerifiedPage,
         slice: PageSlice,
-        connection: OwnedFd,
+        connection: Descriptor,
     ) -> Result<ReaderLease> {
         let mut reader = self.attach(page, slice)?;
         reader.attach_connection(connection)?;
@@ -360,9 +360,9 @@ impl Delivery {
     pub fn finish_to_socket<'a>(
         &'a self,
         reader: ReaderLease,
-        connection: OwnedFd,
+        connection: Descriptor,
         scope: &'a RequestScope,
-    ) -> Operation<'a, OwnedFd> {
+    ) -> Operation<'a, Descriptor> {
         Box::pin(async move {
             scope.check()?;
             if reader.connection.is_some() {
@@ -381,7 +381,7 @@ impl Delivery {
     async fn send_reader(
         &self,
         mut reader: ReaderLease,
-        connection: Rc<OwnedFd>,
+        connection: Rc<Descriptor>,
         scope: &RequestScope,
     ) -> Result<()> {
         scope.check()?;
@@ -460,7 +460,7 @@ fn splice_unsupported(error: &io::Error) -> bool {
     )
 }
 
-fn validate_socket(connection: &OwnedFd) -> Result<()> {
+fn validate_socket(connection: &Descriptor) -> Result<()> {
     connection.validate_socket()
 }
 

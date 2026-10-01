@@ -22,7 +22,6 @@ use crate::{
 };
 use io_uring::{IoUring, opcode, squeue, types};
 pub mod descriptor;
-use Descriptor as OwnedFd;
 pub use descriptor::Descriptor;
 #[cfg(test)]
 pub mod simulation;
@@ -280,7 +279,7 @@ impl<T> Drop for Waiting<T> {
 
 enum KernelResult {
     Value(i32),
-    Accepted(OwnedFd),
+    Accepted(Descriptor),
 }
 
 impl KernelResult {
@@ -398,7 +397,7 @@ impl<B: IoBuffer> SendBuffer for B {
 /// Reactor-owned submission state. `L` retains connection/segment/other leases.
 /// Stored before the kernel can see any pointer, including across partial I/O.
 struct InFlight<B: IoBuffer, L: 'static> {
-    file: Rc<OwnedFd>,
+    file: Rc<Descriptor>,
     buffer: B,
     lease: L,
 }
@@ -681,7 +680,7 @@ impl Reactor {
 
     fn buffer_io<'a, B: IoBuffer, L: 'static>(
         &'a self,
-        file: Rc<OwnedFd>,
+        file: Rc<Descriptor>,
         buffer: B,
         lease: L,
         scope: &'a RequestScope,
@@ -767,11 +766,11 @@ impl Reactor {
     /// Owned resources can move from one completed operation to the next:
     /// ```no_run
     /// use std::rc::Rc;
-    /// use racer_dataplane::runtime::reactor::Descriptor as OwnedFd;
+    /// use racer_dataplane::runtime::reactor::Descriptor;
     /// use racer_dataplane::{error::Result,
     ///     runtime::{deadline::RequestScope, reactor::{Completion, Reactor}},
     ///     store::{direct::AlignedBuffer, segment::SegmentLease}};
-    /// async fn copy(reactor: &Reactor, fd: Rc<OwnedFd>, buffer: AlignedBuffer,
+    /// async fn copy(reactor: &Reactor, fd: Rc<Descriptor>, buffer: AlignedBuffer,
     ///     lease: SegmentLease, scope: &RequestScope)
     ///     -> Result<Completion<AlignedBuffer, SegmentLease>> {
     ///     let read = reactor.read_at(fd.clone(), 0, buffer, lease, scope).await?;
@@ -781,18 +780,18 @@ impl Reactor {
     /// The retained lease cannot borrow from the waiting future's caller:
     /// ```compile_fail
     /// use std::rc::Rc;
-    /// use racer_dataplane::runtime::reactor::Descriptor as OwnedFd;
+    /// use racer_dataplane::runtime::reactor::Descriptor;
     /// use racer_dataplane::{memory::pool::PlaintextBuffer,
     ///     runtime::{deadline::RequestScope, reactor::Reactor},
     ///     store::segment::SegmentLease};
-    /// fn borrowed(reactor: &Reactor, fd: Rc<OwnedFd>, buffer: PlaintextBuffer,
+    /// fn borrowed(reactor: &Reactor, fd: Rc<Descriptor>, buffer: PlaintextBuffer,
     ///     lease: &SegmentLease, scope: &RequestScope) {
     ///     let _future = reactor.read_at(fd, 0, buffer, lease, scope);
     /// }
     /// ```
     pub fn read_at<'a, B: IoBuffer, L: 'static>(
         &'a self,
-        file: Rc<OwnedFd>,
+        file: Rc<Descriptor>,
         offset: u64,
         buffer: B,
         lease: L,
@@ -809,7 +808,7 @@ impl Reactor {
     }
     pub fn write_at<'a, B: IoBuffer, L: 'static>(
         &'a self,
-        file: Rc<OwnedFd>,
+        file: Rc<Descriptor>,
         offset: u64,
         buffer: B,
         lease: L,
@@ -827,7 +826,7 @@ impl Reactor {
 
     pub fn recv<'a, B: IoBuffer, L: 'static>(
         &'a self,
-        fd: Rc<OwnedFd>,
+        fd: Rc<Descriptor>,
         buffer: B,
         lease: L,
         scope: &'a RequestScope,
@@ -837,7 +836,7 @@ impl Reactor {
 
     pub(crate) fn recv_reserved<'a, B: IoBuffer>(
         &'a self,
-        fd: Rc<OwnedFd>,
+        fd: Rc<Descriptor>,
         buffer: B,
         capacity: Rc<SubmissionCapacity>,
         scope: &'a RequestScope,
@@ -847,7 +846,7 @@ impl Reactor {
 
     pub(crate) fn send_reserved<'a, B: IoBuffer>(
         &'a self,
-        fd: Rc<OwnedFd>,
+        fd: Rc<Descriptor>,
         buffer: B,
         capacity: Rc<SubmissionCapacity>,
         scope: &'a RequestScope,
@@ -857,7 +856,7 @@ impl Reactor {
 
     pub fn send<'a, B: SendBuffer, L: 'static>(
         &'a self,
-        fd: Rc<OwnedFd>,
+        fd: Rc<Descriptor>,
         buffer: B,
         lease: L,
         scope: &'a RequestScope,
@@ -893,7 +892,7 @@ impl Reactor {
 
     pub fn readiness<'a>(
         &'a self,
-        fd: Rc<OwnedFd>,
+        fd: Rc<Descriptor>,
         interest: u32,
         scope: &'a RequestScope,
     ) -> Operation<'a, u32> {
@@ -908,7 +907,7 @@ impl Reactor {
     /// Retain progress admission alongside the descriptor until all CQE fences.
     pub fn readiness_with_lease<'a, L: 'static>(
         &'a self,
-        fd: Rc<OwnedFd>,
+        fd: Rc<Descriptor>,
         interest: u32,
         lease: L,
         scope: &'a RequestScope,
@@ -944,18 +943,18 @@ impl Reactor {
 
     pub fn accept<'a>(
         &'a self,
-        fd: Rc<OwnedFd>,
+        fd: Rc<Descriptor>,
         scope: &'a RequestScope,
-    ) -> Operation<'a, OwnedFd> {
+    ) -> Operation<'a, Descriptor> {
         self.accept_reserved(fd, None, scope)
     }
 
     pub(crate) fn accept_reserved<'a>(
         &'a self,
-        fd: Rc<OwnedFd>,
+        fd: Rc<Descriptor>,
         capacity: Option<Rc<SubmissionCapacity>>,
         scope: &'a RequestScope,
-    ) -> Operation<'a, OwnedFd> {
+    ) -> Operation<'a, Descriptor> {
         Box::pin(async move {
             let sqe = submission!(
                 self,
@@ -984,7 +983,7 @@ impl Reactor {
 
     pub fn connect<'a>(
         &'a self,
-        fd: Rc<OwnedFd>,
+        fd: Rc<Descriptor>,
         address: SocketAddress,
         scope: &'a RequestScope,
     ) -> Operation<'a, ()> {
@@ -996,7 +995,7 @@ impl Reactor {
     /// connect future cannot return its endpoint slot or quota prematurely.
     pub fn connect_with_lease<'a, L: 'static>(
         &'a self,
-        fd: Rc<OwnedFd>,
+        fd: Rc<Descriptor>,
         address: SocketAddress,
         lease: L,
         scope: &'a RequestScope,
@@ -1289,7 +1288,7 @@ impl State {
                 // Raw CQEs supplied by the real backend (and fence tests) transfer
                 // ownership here. Simulated opens already carry a typed owner.
                 KernelResult::Value(fd) if entry.accept && fd >= 0 => {
-                    KernelResult::Accepted(unsafe { OwnedFd::from_raw_fd(fd) })
+                    KernelResult::Accepted(unsafe { Descriptor::from_raw_fd(fd) })
                 }
                 result => result,
             });
@@ -1611,7 +1610,7 @@ mod tests {
         let request = scope();
         let (socket, mut peer) = UnixStream::pair().unwrap();
         socket.set_nonblocking(true).unwrap();
-        let fd = Rc::new(OwnedFd::from(socket));
+        let fd = Rc::new(Descriptor::from(socket));
         let weak = Rc::downgrade(&fd);
         let drops = Rc::new(Cell::new(0));
 
@@ -1716,7 +1715,7 @@ mod tests {
             )
         };
         assert!(fd >= 0);
-        let fd = Rc::new(unsafe { OwnedFd::from_raw_fd(fd) });
+        let fd = Rc::new(unsafe { Descriptor::from_raw_fd(fd) });
         let weak = Rc::downgrade(&fd);
         let drops = Rc::new(Cell::new(0));
         let quota = reactor
@@ -1879,7 +1878,7 @@ mod tests {
         let (socket, _peer) = UnixStream::pair().unwrap();
         let request = scope();
         let mut recv = reactor.recv(
-            Rc::new(OwnedFd::from(socket)),
+            Rc::new(Descriptor::from(socket)),
             buffer(&[0; 8]),
             (),
             &request,
@@ -1914,7 +1913,7 @@ mod tests {
         for cancel_first in [false, true] {
             let reactor = Reactor::new(Rc::new(Admission::new(limits(2))));
             let (socket, _peer) = UnixStream::pair().unwrap();
-            let fd = Rc::new(OwnedFd::from(socket));
+            let fd = Rc::new(Descriptor::from(socket));
             let weak = Rc::downgrade(&fd);
             let drops = Rc::new(Cell::new(0));
             let owned = InFlight {
@@ -2146,7 +2145,7 @@ mod tests {
         reactor.state.borrow_mut().ring = Some(IoUring::new(2).unwrap());
         let scope = scope();
         let (socket, _peer) = UnixStream::pair().unwrap();
-        let fd = Rc::new(OwnedFd::from(socket));
+        let fd = Rc::new(Descriptor::from(socket));
         let mut first = reactor.readiness(fd.clone(), libc::POLLIN as u32, &scope);
         let mut second = reactor.readiness(fd, libc::POLLIN as u32, &scope);
         assert!(poll(&mut first).is_pending());
@@ -2155,7 +2154,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
-        let listener = Rc::new(OwnedFd::from(listener));
+        let listener = Rc::new(Descriptor::from(listener));
         let baseline = reactor.admission.used(ResourceClass::RequestContext);
         let mut raw = reactor.accept(listener.clone(), &scope);
         assert!(matches!(
@@ -2191,7 +2190,7 @@ mod tests {
         };
         let scope = scope();
         let (socket, _peer) = UnixStream::pair().unwrap();
-        let fd = Rc::new(OwnedFd::from(socket));
+        let fd = Rc::new(Descriptor::from(socket));
         let weak = Rc::downgrade(&fd);
         let drops = Rc::new(Cell::new(0));
         let mut receive = reactor.recv(
@@ -2227,7 +2226,7 @@ mod tests {
         };
         let scope = scope();
         let (socket, _peer) = UnixStream::pair().unwrap();
-        let fd = Rc::new(OwnedFd::from(socket));
+        let fd = Rc::new(Descriptor::from(socket));
         let mut ready = reactor.readiness(fd.clone(), libc::POLLIN as u32, &scope);
         assert!(poll(&mut ready).is_pending());
         let id = *reactor.state.borrow().entries.first_key_value().unwrap().0;
@@ -2265,7 +2264,7 @@ mod tests {
         // Anonymous memory-backed regular file avoids filesystem fixture side effects.
         let raw = unsafe { libc::memfd_create(c"reactor-test".as_ptr(), libc::MFD_CLOEXEC) };
         assert!(raw >= 0);
-        let fd = Rc::new(unsafe { OwnedFd::from_raw_fd(raw) });
+        let fd = Rc::new(unsafe { Descriptor::from_raw_fd(raw) });
         let written = drive(
             &reactor,
             reactor.write_at(fd.clone(), 7, buffer(b"payload"), (), &scope),
@@ -2318,8 +2317,8 @@ mod tests {
         reactor.admission.stop();
         let scope = scope();
         let (left, right) = UnixStream::pair().unwrap();
-        let left = Rc::new(OwnedFd::from(left));
-        let right = Rc::new(OwnedFd::from(right));
+        let left = Rc::new(Descriptor::from(left));
+        let right = Rc::new(Descriptor::from(right));
         drive(&reactor, reactor.send(left, buffer(b"drain"), (), &scope)).unwrap();
         let read = drive(
             &reactor,

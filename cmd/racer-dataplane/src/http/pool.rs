@@ -1,6 +1,6 @@
 //! Bounded nonblocking TCP/Unix pools. Unfinished exchanges never return to idle.
 use super::io::OwnedBuffer;
-use crate::runtime::reactor::Descriptor as OwnedFd;
+use crate::runtime::reactor::Descriptor;
 use crate::{
     error::{Error, Operation, Result},
     model::ResourceClass,
@@ -35,7 +35,7 @@ pub enum Endpoint {
 }
 struct Idle {
     session: Option<crate::security::connection::Session>,
-    fd: Rc<OwnedFd>,
+    fd: Rc<Descriptor>,
     reservation: ConnectionReservation,
     since: Instant,
 }
@@ -115,7 +115,7 @@ pub struct ConnectionLease {
     pub(crate) session: Option<crate::security::connection::Session>,
     // Ingress handshake admission follows socket I/O through cancellation fences.
     pub(crate) control_reservation: Option<Reservation>,
-    pub(crate) fd: Rc<OwnedFd>,
+    pub(crate) fd: Rc<Descriptor>,
     reusable: bool,
     pub(crate) reservation: Option<Rc<ConnectionReservation>>,
     pool: Option<ReturnToPool>,
@@ -128,16 +128,19 @@ pub struct ConnectionLease {
 impl ConnectionLease {
     /// Takes ownership of an accepted socket, configures NONBLOCK/CLOEXEC, and
     /// reserves connection admission. No pool return is associated with this FD.
-    pub fn from_accepted(fd: OwnedFd, admission: &Admission) -> Result<Self> {
+    pub fn from_accepted(fd: Descriptor, admission: &Admission) -> Result<Self> {
         let reservation = admission.reserve_connection(ResourceClass::IngressConnection)?;
         Self::from_reserved(fd, reservation)
     }
-    pub(crate) fn from_reserved(fd: OwnedFd, reservation: ConnectionReservation) -> Result<Self> {
+    pub(crate) fn from_reserved(
+        fd: Descriptor,
+        reservation: ConnectionReservation,
+    ) -> Result<Self> {
         set_nonblocking(&fd)?;
         Ok(Self::new(Rc::new(fd), reservation, None))
     }
     fn new(
-        fd: Rc<OwnedFd>,
+        fd: Rc<Descriptor>,
         reservation: ConnectionReservation,
         pool: Option<ReturnToPool>,
     ) -> Self {
@@ -214,7 +217,7 @@ impl ConnectionLease {
     }
     /// Obtain the FD for an owned runtime operation. Pass this entire connection
     /// as the operation's lease; retaining just this FD does not retain admission.
-    pub fn socket(&self) -> Rc<OwnedFd> {
+    pub fn socket(&self) -> Rc<Descriptor> {
         self.fd.clone()
     }
     pub fn poison(&mut self) {
@@ -758,7 +761,7 @@ impl Drop for HttpPool {
     }
 }
 
-fn idle_healthy(fd: &OwnedFd) -> bool {
+fn idle_healthy(fd: &Descriptor) -> bool {
     fd.idle_healthy()
 }
 struct ConnectingSlot(Option<ReturnToPool>);
@@ -778,13 +781,15 @@ impl Drop for ConnectingSlot {
     }
 }
 
-fn set_nonblocking(fd: &OwnedFd) -> Result<()> {
+fn set_nonblocking(fd: &Descriptor) -> Result<()> {
     fd.set_nonblocking()
 }
 
 // Runtime's owned address type is used so connect never borrows sockaddr bytes
 // from a future that may disappear while its SQE is in flight.
-fn create_socket(endpoint: &Endpoint) -> Result<(OwnedFd, crate::runtime::reactor::SocketAddress)> {
+fn create_socket(
+    endpoint: &Endpoint,
+) -> Result<(Descriptor, crate::runtime::reactor::SocketAddress)> {
     use crate::runtime::reactor::SocketAddress;
     let (domain, address) = match endpoint {
         Endpoint::Peer(value) => {
@@ -802,7 +807,7 @@ fn create_socket(endpoint: &Endpoint) -> Result<(OwnedFd, crate::runtime::reacto
             (libc::AF_UNIX, SocketAddress::Unix(path.clone()))
         }
     };
-    Ok((OwnedFd::socket(domain)?, address))
+    Ok((Descriptor::socket(domain)?, address))
 }
 
 #[cfg(test)]

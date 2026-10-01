@@ -10,8 +10,8 @@ fn real_socket_short_io_readiness_eof_and_broken_pipe() {
     let (left, right) = UnixStream::pair().unwrap();
     left.set_nonblocking(true).unwrap();
     right.set_nonblocking(true).unwrap();
-    let left = Rc::new(OwnedFd::from(left));
-    let right = Rc::new(OwnedFd::from(right));
+    let left = Rc::new(Descriptor::from(left));
+    let right = Rc::new(Descriptor::from(right));
     let sent = drive(
         &reactor,
         reactor.send(left.clone(), buffer(b"hello"), (), &scope),
@@ -62,7 +62,7 @@ fn real_connect_lease_survives_cqes_until_result_is_consumed() {
         )
     };
     assert!(raw >= 0);
-    let fd = Rc::new(unsafe { OwnedFd::from_raw_fd(raw) });
+    let fd = Rc::new(unsafe { Descriptor::from_raw_fd(raw) });
     let weak = Rc::downgrade(&fd);
     let drops = Rc::new(Cell::new(0));
     let quota = reactor
@@ -120,7 +120,7 @@ fn real_connect_lease_is_quarantined_after_cancel_and_error() {
             )
         };
         assert!(raw >= 0);
-        let fd = Rc::new(unsafe { OwnedFd::from_raw_fd(raw) });
+        let fd = Rc::new(unsafe { Descriptor::from_raw_fd(raw) });
         let weak = Rc::downgrade(&fd);
         let drops = Rc::new(Cell::new(0));
         let quota = reactor
@@ -170,7 +170,7 @@ fn real_tcp_accept_connect() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
-    let listener = Rc::new(OwnedFd::from(listener));
+    let listener = Rc::new(Descriptor::from(listener));
     let raw = unsafe {
         libc::socket(
             libc::AF_INET,
@@ -179,7 +179,7 @@ fn real_tcp_accept_connect() {
         )
     };
     assert!(raw >= 0);
-    let client = Rc::new(unsafe { OwnedFd::from_raw_fd(raw) });
+    let client = Rc::new(unsafe { Descriptor::from_raw_fd(raw) });
     let mut accept = reactor.accept(listener, &scope);
     assert!(poll(&mut accept).is_pending());
     drive(
@@ -227,7 +227,7 @@ fn real_unix_connect_keeps_sockaddr_alive() {
         )
     };
     assert!(raw >= 0);
-    let client = Rc::new(unsafe { OwnedFd::from_raw_fd(raw) });
+    let client = Rc::new(unsafe { Descriptor::from_raw_fd(raw) });
     let mut accept = reactor.accept(Rc::new(listener.into()), &scope);
     assert!(poll(&mut accept).is_pending());
     drive(
