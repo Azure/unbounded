@@ -513,6 +513,14 @@ impl Keyring {
         // Validate the downloaded epoch before acquiring the shared publication
         // lock. Existing immutable secret leases remain usable during validation.
         for (i, candidate) in bundle.cache_keys.iter().enumerate() {
+            let generation = candidate
+                .key
+                .id
+                .generation()
+                .ok_or(Error::InvalidConfiguration)?;
+            if generation > bundle.generation.0 {
+                return Err(Error::InvalidConfiguration);
+            }
             if !canonical_uuid(&candidate.key.cache.0) {
                 return Err(Error::InvalidConfiguration);
             }
@@ -551,16 +559,18 @@ impl Keyring {
             if state.generation == Some(bundle.generation) {
                 continue;
             }
-            if let Some(generation) = candidate.key.id.generation() {
-                if generation == 0 || generation > bundle.generation.0
-                    // Retiring declarations never admit leases or retain secrets.
-                    // They may persist across many controller overlap bundles.
-                    || (candidate.state != CacheKeyState::Retiring
-                        && state.generation.is_some_and(|g| generation <= g.0)
-                        && !state.entries.iter().any(|e| e.reference == candidate.key))
-                {
-                    return Err(Error::InvalidConfiguration);
-                }
+            let generation = candidate
+                .key
+                .id
+                .generation()
+                .ok_or(Error::InvalidConfiguration)?;
+            // Retiring declarations never admit leases or retain secrets.
+            // They may persist across many controller overlap bundles.
+            if candidate.state != CacheKeyState::Retiring
+                && state.generation.is_some_and(|g| generation <= g.0)
+                && !state.entries.iter().any(|e| e.reference == candidate.key)
+            {
+                return Err(Error::InvalidConfiguration);
             }
             if let Some(old) = state.entries.iter().find(|e| e.reference == candidate.key) {
                 if *old.secret.0 != candidate.material {

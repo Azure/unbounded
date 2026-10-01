@@ -95,6 +95,24 @@ fn generation_bound_ids_reject_resurrection_skips_future_and_zero_epochs() {
     }
     assert_eq!(keys.epochs.state.lock().unwrap().entries.len(), 2);
 }
+
+#[test]
+fn every_install_rejects_opaque_zero_and_future_key_generations() {
+    let keys = keys();
+    let roots = (*keys.peer_trust_roots().unwrap()).clone();
+    for generation in [1, 2] {
+        for id in [
+            KeyId([1; 16]),
+            KeyId(*b"RKG1\0\0\0\0\0\0\0\0\0\0\0\0"),
+            KeyId::from_generation(3, 1).unwrap(),
+        ] {
+            let mut bad = bundle(generation, roots.clone(), CacheKeyState::Active);
+            bad.cache_keys[0].key.id = id;
+            assert_eq!(keys.install(bad), Err(Error::InvalidConfiguration));
+            assert_eq!(keys.generation().unwrap(), Some(1));
+        }
+    }
+}
 fn bundle(generation: u64, roots: Vec<Vec<u8>>, state: CacheKeyState) -> KeyringBundle {
     KeyringBundle {
         schema_version: SCHEMA_VERSION,
@@ -105,7 +123,7 @@ fn bundle(generation: u64, roots: Vec<Vec<u8>>, state: CacheKeyState) -> Keyring
             CacheEncryptionKey {
                 key: CacheKeyRef {
                     cache: CacheId(CACHE.into()),
-                    id: KeyId([1; 16]),
+                    id: KeyId::from_generation(1, 1).unwrap(),
                     purpose: CacheKeyPurpose::Page,
                 },
                 state,
@@ -114,7 +132,7 @@ fn bundle(generation: u64, roots: Vec<Vec<u8>>, state: CacheKeyState) -> Keyring
             CacheEncryptionKey {
                 key: CacheKeyRef {
                     cache: CacheId(CACHE.into()),
-                    id: KeyId([2; 16]),
+                    id: KeyId::from_generation(1, 2).unwrap(),
                     purpose: CacheKeyPurpose::OriginCredentials,
                 },
                 state,
@@ -152,7 +170,7 @@ fn rotation_rejects_rollback_rebinding_and_cross_purpose_use() {
     rotated.cache_keys.push(CacheEncryptionKey {
         key: CacheKeyRef {
             cache: cache.clone(),
-            id: KeyId([3; 16]),
+            id: KeyId::from_generation(2, 3).unwrap(),
             purpose: CacheKeyPurpose::Page,
         },
         state: CacheKeyState::Prepared,
@@ -165,8 +183,12 @@ fn rotation_rejects_rollback_rebinding_and_cross_purpose_use() {
     );
     assert!(keys.active(&cache, KeyPurpose::Page).is_ok());
     assert!(
-        keys.lease(Some(&cache), KeyId([3; 16]), KeyPurpose::Page)
-            .is_ok()
+        keys.lease(
+            Some(&cache),
+            KeyId::from_generation(2, 3).unwrap(),
+            KeyPurpose::Page
+        )
+        .is_ok()
     );
     assert!(
         keys.lease(Some(&cache), lease.id(), KeyPurpose::Page)
@@ -185,7 +207,7 @@ fn retirement_closes_admission_and_last_lease_owns_secret() {
         (*keys.peer_trust_roots().unwrap()).clone(),
         CacheKeyState::Active,
     );
-    next.cache_keys[0].key.id = KeyId([4; 16]);
+    next.cache_keys[0].key.id = KeyId::from_generation(2, 4).unwrap();
     next.cache_keys[0].material = [10; 32];
     next.cache_keys.push(CacheEncryptionKey {
         key: reference.clone(),
@@ -199,7 +221,7 @@ fn retirement_closes_admission_and_last_lease_owns_secret() {
     );
     assert_eq!(
         keys.active(&cache, KeyPurpose::Page).unwrap().id(),
-        KeyId([4; 16])
+        KeyId::from_generation(2, 4).unwrap()
     );
     next.generation = BundleGeneration(3);
     next.cache_keys.pop();
@@ -217,19 +239,18 @@ fn retirement_closes_admission_and_last_lease_owns_secret() {
     assert_eq!(secret.strong_count(), 1);
     drop(lease);
     assert!(secret.upgrade().is_none());
-    // A later generation may reintroduce the immutable UID/key identity.
-    // No process-lifetime tombstones accumulate across projection churn.
+    // A removed epoch cannot be resurrected in a later publication.
     assert!(
         keys.install(bundle(
             4,
             (*keys.peer_trust_roots().unwrap()).clone(),
             CacheKeyState::Active
         ))
-        .is_ok()
+        .is_err()
     );
     assert!(
         keys.lease(Some(&cache), reference.id, KeyPurpose::Page)
-            .is_ok()
+            .is_err()
     );
 }
 #[test]
@@ -245,7 +266,7 @@ fn explicit_retirement_blocks_published_keys_without_external_fences() {
     rotated.cache_keys[0].state = CacheKeyState::Retiring;
     rotated.cache_keys.push(CacheEncryptionKey {
         key: CacheKeyRef {
-            id: KeyId([4; 16]),
+            id: KeyId::from_generation(2, 4).unwrap(),
             ..old.clone()
         },
         state: CacheKeyState::Active,
@@ -342,12 +363,16 @@ fn active_crypto_operation_completes_after_rotation_with_its_original_key_lease(
         (*keys.peer_trust_roots().unwrap()).clone(),
         CacheKeyState::Active,
     );
-    next.cache_keys[0].key.id = KeyId([4; 16]);
+    next.cache_keys[0].key.id = KeyId::from_generation(2, 4).unwrap();
     next.cache_keys[0].material = [10; 32];
     keys.install(next).unwrap();
     assert!(
-        keys.lease(Some(&cache), KeyId([1; 16]), KeyPurpose::Page)
-            .is_err()
+        keys.lease(
+            Some(&cache),
+            KeyId::from_generation(1, 1).unwrap(),
+            KeyPurpose::Page
+        )
+        .is_err()
     );
     assert!(secret.upgrade().is_some());
     engine.poll_budgeted(8).unwrap();
@@ -358,7 +383,10 @@ fn active_crypto_operation_completes_after_rotation_with_its_original_key_lease(
         panic!("held operation did not complete");
     };
     assert_eq!(verified.bytes(), b"abc");
-    assert_eq!(ciphertext.envelope().key_id, KeyId([1; 16]));
+    assert_eq!(
+        ciphertext.envelope().key_id,
+        KeyId::from_generation(1, 1).unwrap()
+    );
     drop(operation);
     assert!(secret.upgrade().is_none());
 }

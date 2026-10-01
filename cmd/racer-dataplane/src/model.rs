@@ -395,11 +395,32 @@ fn token<'a>(rest: &mut &'a [u8]) -> Result<&'a [u8]> {
 // Versioned metadata. TTL controls new unpinned admission, never page eviction.
 
 /// Absolute Unix-millisecond deadline in 0..=i64::MAX, never a stream deadline.
-/// The public tuple field is retained for compatibility; validate before encoding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ExpiresAt(pub std::time::SystemTime);
+pub struct ExpiresAt(std::time::SystemTime);
 
 impl ExpiresAt {
+    #[cfg(test)]
+    pub(crate) fn test_time(time: SystemTime) -> Self {
+        Self::from_unix_millis(
+            time.duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    pub fn from_system_time(time: SystemTime) -> Result<Self> {
+        let value = Self(time);
+        value.to_unix_millis()?;
+        Ok(value)
+    }
+
+    pub fn as_system_time(self) -> SystemTime {
+        self.0
+    }
+
     pub fn from_unix_millis(milliseconds: u64) -> Result<Self> {
         if milliseconds > MAX_WIRE_INTEGER {
             return Err(Error::InvalidRequest);
@@ -559,10 +580,23 @@ pub const AEAD_TAG_BYTES: u32 = 16;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct KeyId(pub [u8; 16]);
 impl KeyId {
-    /// Controller-issued epoch namespace; legacy IDs remain opaque.
+    /// Controller-issued epoch namespace. Zero and opaque IDs are invalid.
     pub(crate) fn generation(self) -> Option<u64> {
         (self.0[..4] == *b"RKG1")
             .then(|| u64::from_be_bytes(self.0[4..12].try_into().expect("generation bytes")))
+            .filter(|generation| *generation != 0)
+    }
+
+    /// Construct an epoch-bound ID with a controller-selected uniqueness suffix.
+    pub fn from_generation(generation: u64, suffix: u32) -> Result<Self> {
+        if generation == 0 {
+            return Err(Error::InvalidConfiguration);
+        }
+        let mut bytes = [0; 16];
+        bytes[..4].copy_from_slice(b"RKG1");
+        bytes[4..12].copy_from_slice(&generation.to_be_bytes());
+        bytes[12..].copy_from_slice(&suffix.to_be_bytes());
+        Ok(Self(bytes))
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1114,7 +1148,10 @@ mod tests {
             UNIX_EPOCH + Duration::from_nanos(1),
             UNIX_EPOCH + Duration::from_millis(MAX_WIRE_INTEGER + 1),
         ] {
-            assert_eq!(ExpiresAt(time).to_unix_millis(), Err(Error::InvalidRequest));
+            assert_eq!(
+                ExpiresAt::from_system_time(time),
+                Err(Error::InvalidRequest)
+            );
         }
     }
 
