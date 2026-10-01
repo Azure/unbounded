@@ -1201,6 +1201,7 @@ impl Drop for ConnectionLease {
 }
 
 pub struct HttpPool {
+    peer_tcp_nodelay: bool,
     reactor: Rc<Reactor>,
     admission: Rc<Admission>,
     per_endpoint: usize,
@@ -1230,6 +1231,7 @@ impl HttpPool {
             reactor,
             admission,
             per_endpoint,
+            peer_tcp_nodelay: false,
             per_origin: per_endpoint,
             max_endpoints,
             idle_timeout,
@@ -1249,6 +1251,11 @@ impl HttpPool {
     /// share the same accounted connection ceiling and bounded endpoint table.
     pub fn with_origin_limit(mut self, per_origin: usize) -> Self {
         self.per_origin = per_origin;
+        self
+    }
+    /// Opt into NODELAY only for outbound peer TCP sockets, never Unix origins.
+    pub fn with_peer_tcp_nodelay(mut self, enabled: bool) -> Self {
+        self.peer_tcp_nodelay = enabled;
         self
     }
     /// Capacity exhaustion fails immediately with Overloaded: there is no hidden
@@ -1509,6 +1516,9 @@ impl HttpPool {
             result => result?,
         };
         let (fd, address) = create_socket(endpoint)?;
+        if matches!(endpoint, Endpoint::Peer(_)) {
+            fd.enable_tcp_nodelay(self.peer_tcp_nodelay)?;
+        }
         let connection = ConnectionLease::new(Rc::new(fd), reservation, slot.0.take());
         Ok((connection, Some(address)))
     }

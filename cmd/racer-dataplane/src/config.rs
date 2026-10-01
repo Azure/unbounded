@@ -47,6 +47,8 @@ pub struct Config {
     pub enable_rdma: bool,
     /// Opt into experimental opaque HTTP transit; materialized relay is the default.
     pub opaque_relay: bool,
+    /// Experimental peer-only TCP_NODELAY; false preserves existing socket defaults.
+    pub peer_tcp_nodelay: bool,
     pub control_endpoint: String,
     pub peer_listen: std::net::SocketAddr,
     pub diagnostics_listen: std::net::SocketAddr,
@@ -171,6 +173,11 @@ impl Config {
             "false" => false,
             _ => return Err(Error::InvalidConfiguration),
         };
+        let peer_tcp_nodelay = match text("RACER_PEER_TCP_NODELAY", Some("false"))?.as_str() {
+            "true" => true,
+            "false" => false,
+            _ => return Err(Error::InvalidConfiguration),
+        };
         let routing_algorithm = match text("RACER_ROUTING_ALGORITHM", Some("5"))?.as_str() {
             "2" => crate::topology::RoutingAlgorithm::V2,
             "3" => crate::topology::RoutingAlgorithm::V3,
@@ -274,6 +281,7 @@ impl Config {
             routing_algorithm,
             enable_rdma,
             opaque_relay,
+            peer_tcp_nodelay,
             control_endpoint,
             peer_listen,
             diagnostics_listen,
@@ -1248,6 +1256,35 @@ mod tests {
             ],
         ] {
             assert!(parse(&pairs).is_err());
+        }
+    }
+
+    #[test]
+    fn peer_tcp_nodelay_requires_exact_boolean_and_defaults_off() {
+        assert!(
+            !Config::from_lookup_with_fabric_ports(lookup)
+                .unwrap()
+                .0
+                .peer_tcp_nodelay
+        );
+        for (value, expected) in [("true", true), ("false", false)] {
+            let (config, _) = Config::from_lookup_with_fabric_ports(|name| {
+                if name == "RACER_PEER_TCP_NODELAY" {
+                    Ok(Some(value.into()))
+                } else {
+                    lookup(name)
+                }
+            })
+            .unwrap();
+            assert_eq!(config.peer_tcp_nodelay, expected);
+        }
+        for value in [
+            "", "1", "0", "TRUE", "False", "auto", " true", "true ", "true\n",
+        ] {
+            assert!(matches!(
+                parse(&[("RACER_PEER_TCP_NODELAY", value)]),
+                Err(Error::InvalidConfiguration)
+            ));
         }
     }
 

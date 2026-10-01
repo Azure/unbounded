@@ -10,6 +10,31 @@ pub enum Descriptor {
 }
 
 impl Descriptor {
+    /// Peer TCP callers only. False leaves the existing socket policy untouched.
+    pub(crate) fn enable_tcp_nodelay(&self, enabled: bool) -> Result<()> {
+        if !enabled {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if matches!(self, Self::Sim(_)) {
+            return Ok(());
+        }
+        let value: libc::c_int = 1;
+        // SAFETY: the descriptor is owned and setsockopt reads one live integer.
+        let result = unsafe {
+            libc::setsockopt(
+                self.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_NODELAY,
+                (&value as *const libc::c_int).cast(),
+                std::mem::size_of_val(&value) as libc::socklen_t,
+            )
+        };
+        if result < 0 {
+            return Err(Error::Io);
+        }
+        Ok(())
+    }
     /// Numeric socket identity only, sampled on failure while the owner is live.
     pub(crate) fn tcp_tuple(&self) -> Option<(std::net::SocketAddr, std::net::SocketAddr)> {
         #[cfg(test)]

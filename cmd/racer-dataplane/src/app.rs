@@ -519,6 +519,7 @@ impl WorkerApplication {
                 admission.clone(),
                 limits.connections_per_neighbor.get(),
             )
+            .with_peer_tcp_nodelay(config.peer_tcp_nodelay)
             .with_origin_limit(
                 config
                     .origin_connections_per_cache
@@ -688,6 +689,7 @@ impl WorkerApplication {
             pipes.clone(),
             transfers,
             crate::peer::server::Settings {
+                tcp_nodelay: config.peer_tcp_nodelay,
                 accept: if distributed {
                     crate::peer::server::AcceptMode::Distributed(node.ingress.clone())
                 } else {

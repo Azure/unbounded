@@ -2,6 +2,118 @@
 use super::test_support::local_worker;
 use super::*;
 
+fn tcp_nodelay(fd: &impl std::os::fd::AsRawFd) -> i32 {
+    let mut value: libc::c_int = -1;
+    let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+    // SAFETY: getsockopt writes only the supplied live integer and length.
+    assert_eq!(
+        unsafe {
+            libc::getsockopt(
+                fd.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_NODELAY,
+                (&mut value as *mut libc::c_int).cast(),
+                &mut length,
+            )
+        },
+        0
+    );
+    value
+}
+
+#[test]
+fn peer_tcp_nodelay_assembled_outbound_and_distributed_accept() {
+    for enabled in [false, true] {
+        let mut config = crate::test_support::cluster::config(false);
+        config.peer_tcp_nodelay = enabled;
+        let node = Arc::new(NodeState::default());
+        let (app, runtime, _) = local_worker(&config, &node, 0);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let scope = scope(Duration::from_secs(5)).unwrap();
+        let mut serving = app.peers.listen(address, &scope);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(serving.as_mut().poll(&mut cx).is_pending());
+        let endpoint = crate::http::connection::Endpoint::Peer(address.to_string());
+        let mut connecting = app.http.checkout(&endpoint, &scope);
+        let mut outbound = None;
+        let mut inbound = None;
+        let until = Instant::now() + Duration::from_secs(3);
+        while outbound.is_none() || inbound.is_none() {
+            if outbound.is_none() {
+                if let Poll::Ready(result) = connecting.as_mut().poll(&mut cx) {
+                    outbound = Some(result.unwrap());
+                }
+            }
+            assert!(serving.as_mut().poll(&mut cx).is_pending());
+            runtime.reactor.poll_budgeted(64).unwrap();
+            if inbound.is_none() {
+                inbound = node
+                    .ingress
+                    .pop_batch::<1>(WorkerId(0), cx.waker(), 1)
+                    .unwrap()[0]
+                    .take();
+            }
+            assert!(Instant::now() < until, "peer socket setup stalled");
+        }
+        assert_eq!(
+            tcp_nodelay(outbound.as_ref().unwrap().socket().as_ref()),
+            i32::from(enabled)
+        );
+        assert_eq!(
+            tcp_nodelay(&inbound.as_ref().unwrap().fd),
+            i32::from(enabled)
+        );
+        drop(connecting);
+        drop(outbound);
+        drop(inbound);
+        scope.cancel().unwrap();
+        loop {
+            runtime.reactor.poll_budgeted(64).unwrap();
+            if let Poll::Ready(result) = serving.as_mut().poll(&mut cx) {
+                assert_eq!(result, Err(Error::Cancelled));
+                break;
+            }
+            assert!(Instant::now() < until, "peer cancellation stalled");
+        }
+        assert_eq!(
+            runtime
+                .admission
+                .used(crate::model::ResourceClass::Connection),
+            0
+        );
+    }
+}
+
+#[test]
+fn peer_tcp_nodelay_accept_failure_closes_owned_socket_and_false_preserves_policy() {
+    use std::io::Read;
+    let mut config = crate::test_support::cluster::config(false);
+    config.peer_tcp_nodelay = true;
+    let (app, _, _) = local_worker(&config, &Arc::new(NodeState::default()), 0);
+    let (socket, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    assert!(matches!(
+        app.peers.configure_accepted(socket.into()),
+        Err(Error::Io)
+    ));
+    assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+
+    config.peer_tcp_nodelay = false;
+    let (app, _, _) = local_worker(&config, &Arc::new(NodeState::default()), 0);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let _peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (socket, _) = listener.accept().unwrap();
+    socket.set_nodelay(true).unwrap();
+    let socket = app.peers.configure_accepted(socket.into()).unwrap();
+    assert_eq!(
+        tcp_nodelay(&socket),
+        1,
+        "false must not rewrite existing policy"
+    );
+}
+
 #[test]
 fn assembly_applies_configured_client_request_timeout() {
     use crate::{

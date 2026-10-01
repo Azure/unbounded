@@ -141,6 +141,30 @@ fn held(
     drive(&pool.reactor, async { futures::try_join!(client, server) }).unwrap()
 }
 #[test]
+fn peer_tcp_nodelay_does_not_touch_unix_or_origin_sockets() {
+    let (admission, reactor, pool) = setup();
+    let pool = pool.with_peer_tcp_nodelay(true);
+    let (listener, endpoint) = Listener::origin();
+    let Endpoint::Unix(path) = endpoint else {
+        panic!()
+    };
+    for endpoint in [
+        Endpoint::Unix(path.clone()),
+        Endpoint::Origin {
+            path,
+            cache: crate::model::CacheId("nodelay-test".into()),
+        },
+    ] {
+        let scope = scope();
+        let connection = drive(&reactor, pool.checkout(&endpoint, &scope)).unwrap();
+        let accepted = listener.accept().unwrap();
+        drop(connection);
+        drop(accepted);
+        assert_eq!(admission.used(ResourceClass::Connection), 0);
+    }
+}
+
+#[test]
 fn idle_expiration_runs_without_checkout_or_waiters_and_is_budgeted() {
     let clock = crate::runtime::environment::SimulationClock::new(91);
     let _environment = clock.environment(0).enter();

@@ -42,12 +42,14 @@ pub(crate) enum AcceptMode {
 }
 
 pub(crate) struct Settings {
+    pub tcp_nodelay: bool,
     pub accept: AcceptMode,
     pub request_timeout: Duration,
     pub opaque_relay: bool,
 }
 
 pub struct PeerServer {
+    tcp_nodelay: bool,
     metrics: crate::telemetry::metrics::Metrics,
     send_crc: Option<(
         crate::telemetry::send_crc::Pair,
@@ -70,6 +72,13 @@ pub struct PeerServer {
     request_timeout: Duration,
 }
 impl PeerServer {
+    pub(crate) fn configure_accepted(
+        &self,
+        fd: crate::runtime::reactor::Descriptor,
+    ) -> crate::error::Result<crate::runtime::reactor::Descriptor> {
+        fd.enable_tcp_nodelay(self.tcp_nodelay)?;
+        Ok(fd)
+    }
     pub(crate) fn with_metrics(mut self, metrics: crate::telemetry::metrics::Metrics) -> Self {
         self.metrics = metrics;
         self
@@ -170,6 +179,7 @@ impl PeerServer {
             pipes,
             transfers,
             Settings {
+                tcp_nodelay: false,
                 accept: AcceptMode::Local,
                 request_timeout: Duration::from_secs(30),
                 opaque_relay: false,
@@ -235,7 +245,7 @@ impl PeerServer {
                         Err(_) => return Err(Error::Io),
                     };
                     offer.deliver(
-                        accepted
+                        self.configure_accepted(accepted)?
                             .into_host()
                             .map_err(|_| Error::InvalidConfiguration)?,
                         crate::runtime::ingress::Kind::Peer,
@@ -253,7 +263,7 @@ impl PeerServer {
                 )
                 .await?;
                 let connection = match crate::http::connection::ConnectionLease::from_accepted(
-                    accepted,
+                    self.configure_accepted(accepted)?,
                     &self.admission,
                 ) {
                     Ok(connection) => connection,
@@ -288,6 +298,7 @@ impl PeerServer {
         Self {
             subscriptions,
             metrics: crate::telemetry::metrics::Metrics::default(),
+            tcp_nodelay: settings.tcp_nodelay,
             send_crc: None,
             placement: crate::topology::placement::Placement::new(64),
             opaque_relay: settings.opaque_relay,
