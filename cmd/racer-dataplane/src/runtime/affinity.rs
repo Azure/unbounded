@@ -20,11 +20,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Role {
-    Reactor,
-    Crypto,
-}
 #[derive(Clone, Debug)]
 pub struct CpuLocation {
     pub cpu: usize,
@@ -66,15 +61,6 @@ pub struct WorkerPair {
     pub io: CpuLocation,
     pub crypto: CpuLocation,
     pub nic: Option<NicLocality>,
-}
-
-impl WorkerPair {
-    pub fn location(&self, role: Role) -> &CpuLocation {
-        match role {
-            Role::Reactor => &self.io,
-            Role::Crypto => &self.crypto,
-        }
-    }
 }
 
 pub struct AffinityPlan {
@@ -120,15 +106,6 @@ impl AffinityPlan {
     ) -> Result<Self> {
         Self::place_with_policy(config.max_threads, topology, rails, config.allow_smt)
     }
-    pub fn pin_current_thread(&self, worker: WorkerId, role: Role) -> Result<()> {
-        let pair = self
-            .pairs
-            .iter()
-            .find(|pair| pair.worker == worker)
-            .ok_or(Error::InvalidConfiguration)?;
-        pin_cpu(pair.location(role).cpu)
-    }
-
     #[cfg(test)]
     fn place(
         max_threads: usize,
@@ -975,8 +952,8 @@ mod tests {
             crypto: cpu,
             nic: None,
         };
-        assert_eq!(pair.location(Role::Reactor).cpu, 0);
-        assert_eq!(pair.location(Role::Crypto).cpu, 0);
+        assert_eq!(pair.io.cpu, 0);
+        assert_eq!(pair.crypto.cpu, 0);
     }
 
     #[test]

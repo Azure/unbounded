@@ -447,6 +447,7 @@ pub struct NativeQueuePair {
     pending: RefCell<BTreeMap<u64, Pending>>,
     // Active remote grants persist independently of their bind CQE.
     windows: RefCell<Vec<Rc<Window>>>,
+    #[cfg(test)]
     expires: Cell<Option<std::time::Instant>>,
 }
 impl NativeQueuePair {
@@ -489,6 +490,7 @@ impl NativeQueuePair {
             next: Cell::new(1),
             pending: RefCell::new(BTreeMap::new()),
             windows: RefCell::new(Vec::new()),
+            #[cfg(test)]
             expires: Cell::new(None),
         }))
     }
@@ -648,6 +650,7 @@ impl NativeQueuePair {
             self.stop()?;
             return Err(Error::Cancelled);
         }
+        #[cfg(test)]
         if self
             .expires
             .get()

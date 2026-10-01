@@ -126,9 +126,6 @@ pub struct CryptoPermit {
 #[derive(Default)]
 struct Measurement {
     checksum_only: bool,
-    // Benchmark control only. No production field, configuration, or runtime knob.
-    #[cfg(test)]
-    disabled: bool,
     decrypt: bool,
     bytes: u64,
     submitted: Option<std::time::Instant>,
@@ -152,15 +149,8 @@ fn elapsed_ns(start: std::time::Instant) -> u64 {
 }
 
 impl CryptoPermit {
-    fn measurement_enabled(&self) -> bool {
-        #[cfg(test)]
-        return !self.measurement.disabled;
-        #[cfg(not(test))]
-        true
-    }
-
     pub(crate) fn execution_start(&self) -> Option<std::time::Instant> {
-        self.measurement_enabled().then(super::environment::now)
+        Some(super::environment::now())
     }
 
     pub(crate) fn executed(&mut self, start: std::time::Instant) {
@@ -252,18 +242,16 @@ pub struct CryptoJob {
 impl CryptoPermit {
     pub fn job(mut self, input: CryptoInput, key: KeyLease, scope: RequestScope) -> CryptoJob {
         use super::reactor::IoBuffer;
-        if self.measurement_enabled() {
-            self.measurement.checksum_only = matches!(input, CryptoInput::Checksum { .. });
-            self.measurement.decrypt = matches!(input, CryptoInput::Decrypt { .. });
-            self.measurement.bytes = match &input {
-                CryptoInput::Encrypt { plaintext, .. } => {
-                    plaintext.bytes().map_or(0, |b| b.len() as u64)
-                }
-                CryptoInput::Decrypt { ciphertext, .. } | CryptoInput::Checksum { ciphertext } => {
-                    u64::from(ciphertext.envelope().plaintext_length)
-                }
-            };
-        }
+        self.measurement.checksum_only = matches!(input, CryptoInput::Checksum { .. });
+        self.measurement.decrypt = matches!(input, CryptoInput::Decrypt { .. });
+        self.measurement.bytes = match &input {
+            CryptoInput::Encrypt { plaintext, .. } => {
+                plaintext.bytes().map_or(0, |b| b.len() as u64)
+            }
+            CryptoInput::Decrypt { ciphertext, .. } | CryptoInput::Checksum { ciphertext } => {
+                u64::from(ciphertext.envelope().plaintext_length)
+            }
+        };
         CryptoJob {
             permit: self,
             input,
@@ -303,8 +291,6 @@ impl CryptoCompletion {
 /// Endpoints move to their respective threads before constructing local services.
 /// They are not Clone: there is exactly one producer/consumer in each direction.
 pub struct IoCryptoPort {
-    #[cfg(test)]
-    attribution_disabled: bool,
     handoff: Arc<Handoff>,
     jobs: Sender<CryptoJob>,
     completions: RefCell<Receiver<CryptoCompletion>>,
@@ -345,8 +331,6 @@ pub fn try_pair(
     });
     Ok((
         IoCryptoPort {
-            #[cfg(test)]
-            attribution_disabled: false,
             handoff: handoff.clone(),
             jobs: jobs_tx,
             completions: RefCell::new(results_rx),
@@ -393,11 +377,7 @@ impl IoCryptoPort {
             aead_failure: None,
             handoff: self.handoff.clone(),
             id,
-            measurement: Measurement {
-                #[cfg(test)]
-                disabled: self.attribution_disabled,
-                ..Measurement::default()
-            },
+            measurement: Measurement::default(),
         }))
     }
 
@@ -417,9 +397,7 @@ impl IoCryptoPort {
         }
         // Capture at publication attempt, not permit reservation/admission. A
         // rejected attempt never reaches dequeue and is overwritten on retry.
-        if job.permit.measurement_enabled() {
-            job.permit.measurement.submitted = Some(super::environment::now());
-        }
+        job.permit.measurement.submitted = Some(super::environment::now());
         self.jobs.try_send(job)?;
         self.handoff.engine_waker.wake();
         Ok(())
@@ -454,10 +432,7 @@ impl CryptoPort {
             .poll_receive(cx);
         match result {
             Poll::Ready(Ok(Some(mut job))) => {
-                if job.permit.measurement_enabled() {
-                    job.permit.measurement.queue_ns =
-                        job.permit.measurement.submitted.map(elapsed_ns);
-                }
+                job.permit.measurement.queue_ns = job.permit.measurement.submitted.map(elapsed_ns);
                 Poll::Ready(Ok(Some(job)))
             }
             other => other,
@@ -699,10 +674,8 @@ impl CryptoClient {
             let Some(completion) = completion else {
                 break;
             };
-            if completion.permit.measurement_enabled() {
-                if let Some(metrics) = self.metrics.borrow().as_ref() {
-                    completion.record(metrics);
-                }
+            if let Some(metrics) = self.metrics.borrow().as_ref() {
+                completion.record(metrics);
             }
             let id = completion.id();
             if let Some(sample) = &completion.permit.send_sample {

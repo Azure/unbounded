@@ -928,9 +928,6 @@ impl RdmaTransfer {
     pub fn drain(&self) -> Operation<'_, ()> {
         self.sessions.drain()
     }
-    pub fn fence_cut(&self) -> Operation<'static, ()> {
-        self.sessions.fence_cut()
-    }
 }
 fn validate_envelope(envelope: &PageEnvelope) -> Result<()> {
     if envelope.plaintext_length == 0

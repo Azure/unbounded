@@ -315,12 +315,6 @@ impl<'a> WorkerGroup<'a> {
         self.run_inner(factory, scope, true)
     }
 
-    /// A handle obtained after startup can stop an owned group. For a blocking
-    /// run, use a cloned cancellation from run_with_scope to request shutdown.
-    pub fn request_stop(&self) {
-        self.control.set_phase(Phase::Drain);
-    }
-
     fn prepare(&mut self, caller_is_worker: bool) -> Result<()> {
         if !self.threads.is_empty() || self.plan.pairs.is_empty() {
             return Err(Error::InvalidConfiguration);
