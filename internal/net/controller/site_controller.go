@@ -1893,29 +1893,7 @@ func (sc *SiteController) assignPodCIDRsForNode(ctx context.Context, node *corev
 		return nil
 	}
 
-	freshNode, err := sc.nodeLister.Get(node.Name)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil
-		}
-
-		return err
-	}
-
-	if nodeHasPodCIDRs(freshNode) {
-		for _, cidr := range nodePodCIDRs(freshNode) {
-			state.allocator.MarkAllocated(cidr)
-		}
-
-		return nil
-	}
-
-	podCIDR, podCIDRs, err := sc.computePodCIDRsForNode(state)
-	if err != nil {
-		return err
-	}
-
-	return sc.patchNodeCIDRs(ctx, node.Name, podCIDR, podCIDRs)
+	return sc.allocateAndPatchNodePodCIDRs(ctx, node.Name, state, "")
 }
 
 func findDuplicateNodePodCIDRs(nodes []*corev1.Node) map[string][]string {
@@ -2103,6 +2081,10 @@ func (sc *SiteController) computePodCIDRsForNode(state *assignmentAllocator) (st
 	if state.allocator.HasIPv6Pools() {
 		ipv6CIDR, err := state.allocator.AllocateIPv6()
 		if err != nil {
+			for _, cidr := range podCIDRs {
+				state.allocator.Release(cidr)
+			}
+
 			if errors.Is(err, allocator.ErrPoolExhausted) {
 				PodCIDRExhaustion.Inc()
 				klog.Fatalf("IPv6 CIDR pool exhausted for site %s assignment %d", state.siteName, state.assignmentIndex)
@@ -2127,62 +2109,101 @@ func (sc *SiteController) computePodCIDRsForNode(state *assignmentAllocator) (st
 	return podCIDR, podCIDRs, nil
 }
 
-func (sc *SiteController) patchNodeCIDRs(ctx context.Context, nodeName, podCIDR string, podCIDRs []string) error {
-	podCIDRsJSON := "["
-
-	for i, cidr := range podCIDRs {
-		if i > 0 {
-			podCIDRsJSON += ","
+// allocateAndPatchNodePodCIDRs allocates pod CIDRs for a node and writes them,
+// along with the site labels when siteName is non-empty, in a single patch.
+//
+// The node is read from the API server rather than the informer cache. A key
+// can be requeued while a previous sync is patching the node, and the next
+// sync can then run before the watch event for that patch reaches the cache.
+// Reading the stale cached node would allocate a second CIDR and attempt an
+// illegal podCIDR change. The patch also carries the observed resourceVersion
+// so a concurrent writer causes a conflict instead of an invalid update.
+func (sc *SiteController) allocateAndPatchNodePodCIDRs(ctx context.Context, nodeName string, state *assignmentAllocator, siteName string) error {
+	liveNode, err := sc.clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
 		}
 
-		podCIDRsJSON += fmt.Sprintf("%q", cidr)
+		return fmt.Errorf("failed to get node %s: %w", nodeName, err)
 	}
 
-	podCIDRsJSON += "]"
+	if nodeHasPodCIDRs(liveNode) {
+		for _, cidr := range nodePodCIDRs(liveNode) {
+			state.allocator.MarkAllocated(cidr)
+		}
 
-	patch := fmt.Sprintf(`{"spec":{"podCIDR":%q,"podCIDRs":%s}}`, podCIDR, podCIDRsJSON)
+		return nil
+	}
 
-	_, err := sc.clientset.CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, []byte(patch), metav1.PatchOptions{})
+	podCIDR, podCIDRs, err := sc.computePodCIDRsForNode(state)
 	if err != nil {
 		return err
 	}
 
-	klog.Infof("Assigned podCIDR=%s, podCIDRs=%v to node %s", podCIDR, podCIDRs, nodeName)
+	if err := sc.patchNodePodCIDRs(ctx, nodeName, liveNode.ResourceVersion, siteName, podCIDR, podCIDRs); err != nil {
+		// Only release when the API server definitively rejected the patch.
+		// For transport errors or timeouts the patch may have been applied,
+		// so keep the CIDRs reserved; the next sync re-reads the node.
+		if patchDefinitelyNotApplied(err) {
+			for _, cidr := range podCIDRs {
+				state.allocator.Release(cidr)
+			}
+		}
+
+		return err
+	}
 
 	return nil
 }
 
-// patchNodeLabelAndCIDRs applies both a site label and pod CIDRs in a single
-// MergePatch to cut the number of API calls in half during scale-in. It sets
-// every site-membership label key (canonical + deprecated) during the
-// deprecation window.
-func (sc *SiteController) patchNodeLabelAndCIDRs(ctx context.Context, nodeName, siteName, podCIDR string, podCIDRs []string) error {
-	labels := map[string]interface{}{}
-	for _, key := range siteLabelKeys() {
-		labels[key] = siteName
-	}
+// patchDefinitelyNotApplied reports whether err is an API server rejection
+// that guarantees the patch was not persisted.
+func patchDefinitelyNotApplied(err error) bool {
+	return apierrors.IsConflict(err) ||
+		apierrors.IsInvalid(err) ||
+		apierrors.IsNotFound(err) ||
+		apierrors.IsForbidden(err) ||
+		apierrors.IsBadRequest(err)
+}
 
-	spec := map[string]interface{}{"podCIDR": podCIDR}
-	if podCIDRs != nil {
-		spec["podCIDRs"] = podCIDRs
-	} else {
-		spec["podCIDRs"] = []string{}
+// patchNodePodCIDRs applies pod CIDRs, and site labels when siteName is
+// non-empty, in a single MergePatch guarded by resourceVersion. Labeling and
+// assigning together cuts API calls in half during scale-in. Every
+// site-membership label key (canonical + deprecated) is set during the
+// deprecation window.
+func (sc *SiteController) patchNodePodCIDRs(ctx context.Context, nodeName, resourceVersion, siteName, podCIDR string, podCIDRs []string) error {
+	metadata := map[string]interface{}{"resourceVersion": resourceVersion}
+
+	if siteName != "" {
+		labels := map[string]interface{}{}
+		for _, key := range siteLabelKeys() {
+			labels[key] = siteName
+		}
+
+		metadata["labels"] = labels
 	}
 
 	patch, err := json.Marshal(map[string]interface{}{
-		"metadata": map[string]interface{}{"labels": labels},
-		"spec":     spec,
+		"metadata": metadata,
+		"spec": map[string]interface{}{
+			"podCIDR":  podCIDR,
+			"podCIDRs": podCIDRs,
+		},
 	})
 	if err != nil {
+		return fmt.Errorf("failed to marshal pod CIDR patch: %w", err)
+	}
+
+	if _, err := sc.clientset.CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
 		return err
 	}
 
-	_, err = sc.clientset.CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, patch, metav1.PatchOptions{})
-	if err != nil {
-		return err
+	if siteName != "" {
+		klog.Infof("Labeled node %s with site %s and assigned podCIDR=%s, podCIDRs=%v", nodeName, siteName, podCIDR, podCIDRs)
+	} else {
+		klog.Infof("Assigned podCIDR=%s, podCIDRs=%v to node %s", podCIDR, podCIDRs, nodeName)
 	}
-
-	klog.Infof("Labeled node %s with site %s and assigned podCIDR=%s, podCIDRs=%v", nodeName, siteName, podCIDR, podCIDRs)
 
 	return nil
 }
@@ -2228,29 +2249,7 @@ func (sc *SiteController) assignPodCIDRsForNodeWithLabel(ctx context.Context, no
 		return nil
 	}
 
-	freshNode, err := sc.nodeLister.Get(node.Name)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil
-		}
-
-		return err
-	}
-
-	if nodeHasPodCIDRs(freshNode) {
-		for _, cidr := range nodePodCIDRs(freshNode) {
-			state.allocator.MarkAllocated(cidr)
-		}
-
-		return nil
-	}
-
-	podCIDR, podCIDRs, err := sc.computePodCIDRsForNode(state)
-	if err != nil {
-		return err
-	}
-
-	return sc.patchNodeLabelAndCIDRs(ctx, node.Name, siteName, podCIDR, podCIDRs)
+	return sc.allocateAndPatchNodePodCIDRs(ctx, node.Name, state, siteName)
 }
 
 // markSlicesDirty signals that SiteNodeSlice objects need rebuilding.
