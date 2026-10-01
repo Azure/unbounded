@@ -36,10 +36,7 @@ pub trait Origin {
         context: &'a OriginContext,
         reservation: Reservation,
         scope: &'a RequestScope,
-    ) -> Operation<'a, MetadataReply> {
-        drop(reservation);
-        self.bootstrap(authority, context, scope)
-    }
+    ) -> Operation<'a, MetadataReply>;
     /// Consume the fill's atomically admitted plaintext budget.
     fn page_reserved<'a>(
         &'a self,
@@ -48,10 +45,7 @@ pub trait Origin {
         page: &'a PageId,
         reservation: Reservation,
         scope: &'a RequestScope,
-    ) -> Operation<'a, OriginPage> {
-        drop(reservation);
-        self.page(authority, context, page, scope)
-    }
+    ) -> Operation<'a, OriginPage>;
     /// Fresh page-zero acquisition. Implementations may return metadata only.
     fn bootstrap<'a>(
         &'a self,

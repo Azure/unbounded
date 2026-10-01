@@ -53,6 +53,15 @@ struct TestOrigin {
     started_pages: RefCell<Vec<u64>>,
 }
 impl Origin for TestOrigin {
+    fn bootstrap_reserved<'a>(
+        &'a self,
+        _: &'a super::super::candidates::OriginAuthority,
+        _: &'a OriginContext,
+        _: Reservation,
+        _: &'a RequestScope,
+    ) -> Operation<'a, MetadataReply> {
+        Box::pin(async { panic!("pinned page fill must not bootstrap metadata") })
+    }
     fn metadata<'a>(
         &'a self,
         _: &'a super::super::candidates::OriginAuthority,
@@ -364,6 +373,7 @@ fn abandoned_acquisition_preserves_peer_scope(metadata: bool) {
             let service = MetadataService::new(
                 f.fill.dependencies.candidates.clone(),
                 Rc::new(metadata::GatedMetadataOrigin {
+                    buffers: f.origin.buffers.clone(),
                     receive: RefCell::new(Some(receive)),
                     calls: Cell::new(0),
                 }),

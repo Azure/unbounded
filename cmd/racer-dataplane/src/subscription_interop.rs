@@ -44,6 +44,35 @@ fn metadata(context: &OriginContext) -> ObjectMetadata {
     }
 }
 impl origin::Origin for GeneratedOrigin {
+    fn bootstrap_reserved<'a>(
+        &'a self,
+        authority: &'a read::candidates::OriginAuthority,
+        context: &'a OriginContext,
+        reservation: Reservation,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, origin::metadata::MetadataReply> {
+        Box::pin(async move {
+            scope.check()?;
+            authority.validate(&context.object, PageNumber(0))?;
+            let metadata = metadata(context);
+            let page = PageId {
+                version: metadata.version.clone(),
+                number: PageNumber(0),
+            };
+            let page_zero = if metadata.length == 0 {
+                None
+            } else {
+                Some(
+                    self.page_reserved(authority, context, &page, reservation, scope)
+                        .await?,
+                )
+            };
+            Ok(origin::metadata::MetadataReply {
+                metadata,
+                page_zero,
+            })
+        })
+    }
     fn metadata<'a>(
         &'a self,
         _: &'a read::candidates::OriginAuthority,

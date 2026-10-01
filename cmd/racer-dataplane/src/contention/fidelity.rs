@@ -428,6 +428,25 @@ impl PeerClient for NoTransport {
     }
 }
 impl Origin for NoTransport {
+    fn bootstrap_reserved<'a>(
+        &'a self,
+        _: &'a OriginAuthority,
+        _: &'a OriginContext,
+        _: crate::runtime::admission::Reservation,
+        _: &'a RequestScope,
+    ) -> Operation<'a, MetadataReply> {
+        Box::pin(async { panic!("bootstrap fixture already owns origin metadata") })
+    }
+    fn page_reserved<'a>(
+        &'a self,
+        _: &'a OriginAuthority,
+        _: &'a OriginContext,
+        _: &'a PageId,
+        _: crate::runtime::admission::Reservation,
+        _: &'a RequestScope,
+    ) -> Operation<'a, OriginPage> {
+        Box::pin(async { panic!("bootstrap fixture already owns origin bytes") })
+    }
     fn metadata<'a>(
         &'a self,
         _: &'a OriginAuthority,

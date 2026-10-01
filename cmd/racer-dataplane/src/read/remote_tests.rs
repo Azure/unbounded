@@ -746,6 +746,31 @@ impl LocalPageService for OwnedCoordinator {
 
 struct MissingOrigin(Rc<Cell<usize>>);
 impl crate::origin::Origin for MissingOrigin {
+    fn bootstrap_reserved<'a>(
+        &'a self,
+        authority: &'a super::candidates::OriginAuthority,
+        context: &'a OriginContext,
+        reservation: crate::runtime::admission::Reservation,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, crate::origin::metadata::MetadataReply> {
+        Box::pin(async move {
+            let result = self
+                .metadata(authority, context, MetadataSelector::Fresh, scope)
+                .await;
+            drop(reservation);
+            result
+        })
+    }
+    fn page_reserved<'a>(
+        &'a self,
+        _: &'a super::candidates::OriginAuthority,
+        _: &'a OriginContext,
+        _: &'a PageId,
+        _: crate::runtime::admission::Reservation,
+        _: &'a RequestScope,
+    ) -> Operation<'a, crate::origin::page::OriginPage> {
+        Box::pin(async { panic!("metadata absence must not fetch pages") })
+    }
     fn metadata<'a>(
         &'a self,
         authority: &'a super::candidates::OriginAuthority,

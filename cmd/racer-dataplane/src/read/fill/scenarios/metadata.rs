@@ -3,6 +3,7 @@ use super::*;
 use crate::read::{candidates::OriginAuthority, drivers};
 
 pub(super) struct GatedMetadataOrigin {
+    pub(super) buffers: Rc<BufferPool>,
     pub(super) receive: RefCell<Option<futures::channel::oneshot::Receiver<MetadataReply>>>,
     pub(super) calls: Cell<usize>,
 }
@@ -15,6 +16,16 @@ struct BootstrapOrigin {
     version: Cell<u8>,
 }
 impl Origin for BootstrapOrigin {
+    fn page_reserved<'a>(
+        &'a self,
+        _: &'a OriginAuthority,
+        _: &'a OriginContext,
+        _: &'a PageId,
+        _: Reservation,
+        _: &'a RequestScope,
+    ) -> Operation<'a, OriginPage> {
+        Box::pin(async { panic!("bootstrap must not refetch page") })
+    }
     fn metadata<'a>(
         &'a self,
         _: &'a OriginAuthority,
@@ -178,6 +189,45 @@ fn bootstrap_rejection_re_elects_and_version_changes_never_mix_pages() {
     assert_eq!(origin.calls.get(), 3, "rejection was not negative-cached");
 }
 impl Origin for GatedMetadataOrigin {
+    fn bootstrap_reserved<'a>(
+        &'a self,
+        authority: &'a OriginAuthority,
+        context: &'a OriginContext,
+        reservation: Reservation,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, MetadataReply> {
+        Box::pin(async move {
+            let mut reply = self
+                .metadata(
+                    authority,
+                    context,
+                    crate::model::MetadataSelector::Fresh,
+                    scope,
+                )
+                .await?;
+            if let Some(page) = reply.page_zero.take() {
+                let bytes = page.plaintext.bytes()?.to_vec();
+                drop(page.plaintext);
+                let mut plaintext = self.buffers.plaintext(reservation, bytes.len())?;
+                plaintext.bytes_mut()?.copy_from_slice(&bytes);
+                reply.page_zero = Some(OriginPage {
+                    metadata: page.metadata,
+                    plaintext,
+                });
+            }
+            Ok(reply)
+        })
+    }
+    fn page_reserved<'a>(
+        &'a self,
+        _: &'a OriginAuthority,
+        _: &'a OriginContext,
+        _: &'a PageId,
+        _: Reservation,
+        _: &'a RequestScope,
+    ) -> Operation<'a, OriginPage> {
+        Box::pin(async { panic!("metadata-only refresh") })
+    }
     fn metadata<'a>(
         &'a self,
         _: &'a OriginAuthority,
@@ -268,6 +318,7 @@ fn bootstrap_after_catalog_eviction_checks_cached_content_type_and_preserves_fre
             };
             let (send, receive) = futures::channel::oneshot::channel();
             let origin = Rc::new(GatedMetadataOrigin {
+                buffers: f.origin.buffers.clone(),
                 receive: RefCell::new(Some(receive)),
                 calls: Cell::new(0),
             });
@@ -370,6 +421,7 @@ fn blocked_metadata_leader_and_follower_notify_without_spinning() {
         let service = MetadataService::new(
             f.fill.dependencies.candidates.clone(),
             Rc::new(GatedMetadataOrigin {
+                buffers: f.origin.buffers.clone(),
                 receive: RefCell::new(Some(receive)),
                 calls: Cell::new(0),
             }),
@@ -474,6 +526,7 @@ fn metadata_deadline_wakes_parked_follower_without_polling_gated_leader() {
         let baseline = admission.used(ResourceClass::RequestContext);
         let (send, receive) = futures::channel::oneshot::channel();
         let origin = Rc::new(GatedMetadataOrigin {
+            buffers: f.origin.buffers.clone(),
             receive: RefCell::new(Some(receive)),
             calls: Cell::new(0),
         });
