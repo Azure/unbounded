@@ -56,6 +56,8 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	f.StringVar(&opts.pull.Namespace, "namespace", "loadgen.invalid", "Gantry upstream registry name sent as ns query parameter")
 	f.IntVar(&opts.pull.Concurrency, "concurrency", 64, "Concurrent image pulls; zero serves only the origin")
 	f.StringVar(&opts.pull.ConcurrencyFile, "concurrency-file", "", "Optional regular file containing concurrency 0-256; polled every second without restarting the origin")
+	f.StringVar(&opts.pull.NodeCapsFile, "node-concurrency-caps-file", "", "Optional versioned node-cap JSON key in the same projected ConfigMap as concurrency-file")
+	f.StringVar(&opts.pull.NodeName, "node-name", "", "Exact Kubernetes node name for optional node concurrency caps")
 	f.IntVar(&opts.pull.LayerConcurrency, "layer-concurrency", 4, "Concurrent layer requests per image pull")
 	f.DurationVar(&opts.pull.Timeout, "pull-timeout", 2*time.Minute, "Deadline for one complete image pull")
 	f.DurationVar(&opts.pull.RetryDelay, "retry-delay", time.Second, "Per-worker delay after failed pulls")

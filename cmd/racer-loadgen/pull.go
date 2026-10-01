@@ -29,6 +29,8 @@ type pullOptions struct {
 	Namespace        string
 	Concurrency      int
 	ConcurrencyFile  string
+	NodeCapsFile     string
+	NodeName         string
 	LayerConcurrency int
 	Timeout          time.Duration
 	RetryDelay       time.Duration
@@ -68,6 +70,10 @@ func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*pu
 	}
 
 	capacity := opts.Concurrency
+	if err := validateNodeCapsOptions(opts); err != nil {
+		return nil, err
+	}
+
 	if opts.ConcurrencyFile != "" {
 		if opts.Concurrency > maxLiveConcurrency {
 			return nil, fmt.Errorf("concurrency must be in [0, %d] when concurrency-file is enabled", maxLiveConcurrency)

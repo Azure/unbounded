@@ -23,10 +23,24 @@ const (
 )
 
 func readConcurrency(path string) (value int, retErr error) {
+	data, err := readControlFile(path, maxConcurrencyFileBytes)
+	if err != nil {
+		return 0, err
+	}
+
+	n, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || n < 0 || n > maxLiveConcurrency {
+		return 0, fmt.Errorf("concurrency file must contain one integer in [0, %d]", maxLiveConcurrency)
+	}
+
+	return n, nil
+}
+
+func readControlFile(path string, limit int64) (data []byte, retErr error) {
 	// Nonblocking open also lets us reject an accidentally configured FIFO.
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	defer func() {
@@ -37,28 +51,23 @@ func readConcurrency(path string) (value int, retErr error) {
 
 	info, err := f.Stat()
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	if !info.Mode().IsRegular() {
-		return 0, fmt.Errorf("concurrency file must be a regular file")
+		return nil, fmt.Errorf("control file must be a regular file")
 	}
 
-	data, err := io.ReadAll(io.LimitReader(f, maxConcurrencyFileBytes+1))
+	data, err = io.ReadAll(io.LimitReader(f, limit+1))
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
-	if len(data) > maxConcurrencyFileBytes {
-		return 0, fmt.Errorf("concurrency file exceeds %d bytes", maxConcurrencyFileBytes)
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("control file exceeds %d bytes", limit)
 	}
 
-	n, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil || n < 0 || n > maxLiveConcurrency {
-		return 0, fmt.Errorf("concurrency file must contain one integer in [0, %d]", maxLiveConcurrency)
-	}
-
-	return n, nil
+	return data, nil
 }
 
 // liveWorkers creates slots lazily up to the largest applied limit (at most 256).
@@ -146,10 +155,26 @@ func (w *liveWorkers) admit(ctx context.Context, id int, next time.Time) bool {
 func (p *puller) runLive(ctx context.Context, interval time.Duration) {
 	pool := &liveWorkers{changed: make(chan struct{})}
 	desired := p.opts.Concurrency
+
+	caps := nodeCapState{global: p.opts.Concurrency, cap: maxLiveConcurrency}
+	if p.opts.NodeCapsFile != "" {
+		desired = 0
+	}
+
 	lastError := ""
 	initialized := false
 	poll := func() {
-		next, err := readConcurrency(p.opts.ConcurrencyFile)
+		var (
+			next int
+			err  error
+		)
+
+		if p.opts.NodeCapsFile != "" {
+			next, err = caps.poll(p.opts)
+		} else {
+			next, err = readConcurrency(p.opts.ConcurrencyFile)
+		}
+
 		if err != nil {
 			if err.Error() != lastError {
 				slog.Warn("concurrency file rejected; retaining safe concurrency", "file", p.opts.ConcurrencyFile, "concurrency", desired, "error", err)
@@ -164,8 +189,10 @@ func (p *puller) runLive(ctx context.Context, interval time.Duration) {
 			lastError = ""
 		}
 
-		if !initialized || (err == nil && next != desired) {
-			if err == nil {
+		// Node-cap errors return a safe nonincreasing value, including global C0.
+		usable := err == nil || p.opts.NodeCapsFile != ""
+		if !initialized || (usable && next != desired) {
+			if usable {
 				desired = next
 			}
 
