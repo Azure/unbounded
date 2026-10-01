@@ -287,18 +287,6 @@ impl Harness {
         }
         let (node, worker, (page, entry)) = &entries[self.rng.pick(entries.len())];
         let object = usize::from_str_radix(&page.version.object.key.to_hex(), 16).unwrap();
-        if object == 0
-            || object == 1
-            || self
-                .catalog
-                .borrow()
-                .current
-                .get(&object)
-                .is_none_or(|v| v.tag.as_bytes() != page.version.etag.as_bytes())
-        {
-            self.traffic(1, false);
-            return;
-        }
         let mut client = self.request_on(object, true, false, *node);
         // The corruption probe must request the selected persisted page rather
         // than a random range that may entirely miss that record.

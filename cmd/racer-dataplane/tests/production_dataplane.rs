@@ -90,6 +90,11 @@ const TIMEOUT: Duration = Duration::from_secs(40);
 
 #[path = "production_dataplane/hotpath.rs"]
 mod hotpath;
+use racer_dataplane as dataplane;
+#[path = "support/enrollment.rs"]
+#[allow(dead_code)]
+mod fixture_io;
+use fixture_io::{fields, read_head};
 
 fn scope() -> RequestScope {
     static NEXT: AtomicUsize = AtomicUsize::new(1);
@@ -236,23 +241,6 @@ impl Drop for Adapter {
             t.join().unwrap();
         }
     }
-}
-fn read_head(stream: &mut UnixStream) -> std::io::Result<String> {
-    let mut raw = Vec::new();
-    while !raw.ends_with(b"\r\n\r\n") {
-        let mut b = [0];
-        stream.read_exact(&mut b)?;
-        raw.push(b[0]);
-        assert!(raw.len() <= 32768, "oversized fixture head");
-    }
-    Ok(String::from_utf8(raw).unwrap())
-}
-fn fields(head: &str) -> BTreeMap<String, String> {
-    head.split("\r\n")
-        .skip(1)
-        .filter_map(|line| line.split_once(':'))
-        .map(|(k, v)| (k.to_ascii_lowercase(), v.trim().to_string()))
-        .collect()
 }
 fn byte(version: u8, offset: u64) -> u8 {
     version.wrapping_mul(37).wrapping_add((offset % 251) as u8)

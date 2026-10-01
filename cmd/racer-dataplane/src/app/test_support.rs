@@ -88,30 +88,18 @@ impl EnrollmentHandler {
             return error_response(status);
         }
         let node = self.binding.lock().unwrap().clone();
-        let der = rustls::pki_types::CertificateSigningRequestDer::from(request.csr_der.clone());
-        let mut csr = rcgen::CertificateSigningRequestParams::from_der(&der).unwrap();
         let not_before = std::time::SystemTime::now()
             - Duration::from_secs(self.age.load(Ordering::Acquire) as u64);
-        csr.params.not_before = not_before.into();
-        csr.params.not_after = (not_before + Duration::from_secs(86400)).into();
-        csr.params.subject_alt_names = vec![rcgen::SanType::URI(
-            format!("spiffe://{}/node/{}", request.cluster.0, node.0)
-                .try_into()
-                .unwrap(),
-        )];
-        csr.params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
-        csr.params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-        let cert = csr.signed_by(&self.ca, &self.ca_key).unwrap();
         self.issued.fetch_add(1, Ordering::Release);
         (
             200,
-            wire::encode_enrollment_response(&wire::EnrollmentResponse {
-                schema_version: 1,
-                cluster: request.cluster,
-                node,
-                enrollment: request.enrollment,
-                certificate_chain: vec![cert.der().to_vec()],
-            })
+            wire::encode_enrollment_response(&crate::control::testing::issue_at(
+                &request,
+                &self.ca,
+                &self.ca_key,
+                &node.0,
+                not_before,
+            ))
             .unwrap(),
         )
     }
@@ -323,14 +311,7 @@ fn control_tls() -> (
     rcgen::KeyPair,
     Arc<rustls::ServerConfig>,
 ) {
-    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    ca_params.key_usages = vec![
-        rcgen::KeyUsagePurpose::KeyCertSign,
-        rcgen::KeyUsagePurpose::CrlSign,
-    ];
-    let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
-    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let (ca, ca_key) = crate::control::testing::ca();
     let server_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
     let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];

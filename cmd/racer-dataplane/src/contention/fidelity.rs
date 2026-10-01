@@ -14,10 +14,6 @@ use crate::{
         PageEnvelope, PageId, PageNumber, RequestId, StrongEtag, VersionMetadata, WorkerId,
     },
     origin::{Origin, metadata::MetadataReply, page::OriginPage},
-    peer::{
-        PeerClient,
-        protocol::{PeerRequest, VerifiedResponse},
-    },
     read::{
         candidates::{CandidatePolicy, OriginAuthority},
         dispatch::WorkerDirectory,
@@ -428,31 +424,6 @@ fn fair_reclamation_matches_metadata_trace_and_keeps_other_cache() {
 }
 
 struct NoTransport;
-impl PeerClient for NoTransport {
-    fn direct_hedge_available(
-        &self,
-        _: &crate::topology::membership::MembershipLease,
-        _: &crate::model::NodeId,
-    ) -> bool {
-        false
-    }
-    fn request_direct<'a>(
-        &'a self,
-        _: PeerRequest,
-        _: crate::topology::membership::MembershipLease,
-        _: &'a RequestScope,
-    ) -> Operation<'a, VerifiedResponse> {
-        panic!("bootstrap fixture must not hedge to a peer")
-    }
-    fn request<'a>(
-        &'a self,
-        _: PeerRequest,
-        _: crate::topology::membership::MembershipLease,
-        _: &'a RequestScope,
-    ) -> Operation<'a, VerifiedResponse> {
-        Box::pin(async { panic!("bootstrap fixture must not use a peer") })
-    }
-}
 impl Origin for NoTransport {
     fn bootstrap_reserved<'a>(
         &'a self,
@@ -568,7 +539,7 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
     let (port, engine_port) = crypto::pair(worker, 0, NonZeroUsize::new(4).unwrap());
     let client = Rc::new(CryptoClient::new(port));
     let mut engine = PageCryptoEngine::new(CryptoRuntime { port: engine_port });
-    let peers = Rc::new(NoTransport);
+    let peers = Rc::new(crate::test_support::NoPeers);
     let node = crate::model::NodeId(crate::security::identity::tests::NODE.into());
     let membership = Arc::new(
         Membership::validate(

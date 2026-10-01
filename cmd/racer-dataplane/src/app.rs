@@ -84,7 +84,140 @@ mod native;
 #[cfg(test)]
 mod peer_tests;
 mod recovery;
-mod sizing;
+mod sizing {
+    use super::*;
+    use std::num::NonZeroUsize;
+
+    pub(super) fn partition_limits_with_cause(
+        node: &Limits,
+        workers: usize,
+        rdma: bool,
+    ) -> std::result::Result<Limits, (&'static str, Error)> {
+        let invalid = |dimension| (dimension, Error::InvalidConfiguration);
+        if workers == 0 {
+            return Err(invalid("io_workers"));
+        }
+        let mut limits = node.clone();
+        for (dimension, value) in [
+            ("plaintext_bytes", &mut limits.plaintext_bytes),
+            ("ciphertext_bytes", &mut limits.ciphertext_bytes),
+            ("dirty_bytes", &mut limits.dirty_bytes),
+            ("request_context_bytes", &mut limits.request_context_bytes),
+            ("flights", &mut limits.flights),
+            ("queue_entries", &mut limits.queue_entries),
+            ("client_connections", &mut limits.client_connections),
+            ("pipes", &mut limits.pipes),
+            ("cached_rankings", &mut limits.cached_rankings),
+            ("cached_paths", &mut limits.cached_paths),
+            ("metadata_entries", &mut limits.metadata_entries),
+            ("relay_transfers", &mut limits.relay_transfers),
+        ] {
+            *value = NonZeroUsize::new(value.get() / workers).ok_or_else(|| invalid(dimension))?;
+        }
+        if rdma {
+            limits.registered_bytes = NonZeroUsize::new(node.registered_bytes.get() / workers)
+                .ok_or_else(|| invalid("registered_bytes"))?;
+        }
+        let page = crate::model::PAGE_BYTES as usize;
+        let window = limits.range_window_pages.get();
+        for (dimension, insufficient) in [
+            (
+                "plaintext_bytes",
+                limits.plaintext_bytes.get() < (window + 1) * page,
+            ),
+            (
+                "ciphertext_bytes",
+                limits.ciphertext_bytes.get()
+                    < (window + 1) * (page + 16) + crate::store::format::MAX_HEADER_BYTES,
+            ),
+            ("dirty_bytes", limits.dirty_bytes.get() < page + 16),
+            (
+                "registered_bytes",
+                rdma && native::slot_count(&limits).map_err(|error| ("registered_bytes", error))?
+                    == 0,
+            ),
+            (
+                "request_context_bytes",
+                limits.request_context_bytes.get()
+                    < crate::peer::protocol::MIN_REQUEST_CONTEXT_BYTES
+                        + 4 * limits.header_bytes.get().max(crate::model::MAX_FIELD_BYTES),
+            ),
+            ("queue_entries", limits.queue_entries.get() < 2),
+            (
+                "client_connections",
+                limits.client_connections < limits.connections_per_neighbor,
+            ),
+        ] {
+            if insufficient {
+                return Err(invalid(dimension));
+            }
+        }
+        // Snapshot polling, renewal, and key delivery need independent control slots.
+        let admission = Admission::new(limits.clone());
+        if admission.limit(crate::model::ResourceClass::ControlConnection) < 3 {
+            return Err(invalid("control_connections"));
+        }
+        Ok(limits)
+    }
+
+    pub(super) fn log_worker_plan(stage: &str, plan: &AffinityPlan) {
+        let groups = plan.crypto_groups();
+        eprintln!(
+            "racer-dataplane: stage=worker-plan state={stage} io_workers={} crypto_workers={}",
+            plan.pairs.len(),
+            groups.len()
+        );
+        for indices in groups {
+            let crypto = &plan.pairs[indices[0]].crypto;
+            let io = indices
+                .iter()
+                .map(|&index| {
+                    let pair = &plan.pairs[index];
+                    (pair.worker.0, pair.io.cpu, pair.io.numa_node)
+                })
+                .collect::<Vec<_>>();
+            eprintln!(
+                "racer-dataplane: stage=worker-placement state={stage} crypto_cpu={} crypto_numa={:?} io_worker_cpu_numa={io:?}",
+                crypto.cpu, crypto.numa_node
+            );
+        }
+    }
+
+    pub(super) fn size_workers(
+        node: &Limits,
+        plan: &mut AffinityPlan,
+        rdma: bool,
+    ) -> Result<Limits> {
+        // Reduce shards to fund progress, then rebalance shared crypto execution.
+        let mut count = plan.pairs.len();
+        let mut limiting_resource = None;
+        loop {
+            match partition_limits_with_cause(node, count, rdma) {
+                Ok(limits) => {
+                    if count != plan.pairs.len() {
+                        eprintln!(
+                            "racer-dataplane: stage=worker-sizing planned_io={} final_io={count} limiting_resource={}",
+                            plan.pairs.len(),
+                            limiting_resource.unwrap_or("unknown")
+                        );
+                        plan.reduce_workers(count);
+                    }
+                    return Ok(limits);
+                }
+                Err((dimension, _)) if count > 1 => {
+                    limiting_resource = Some(dimension);
+                    count -= 1;
+                }
+                Err((dimension, error)) => {
+                    eprintln!(
+                        "racer-dataplane: stage=worker-sizing io_workers={count} limiting_resource={dimension} error={error:?}"
+                    );
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
 #[cfg(test)]
 use sizing::partition_limits_with_cause;
 use sizing::{log_worker_plan, size_workers};
@@ -243,34 +376,21 @@ fn bootstrap(
 ) -> Result<NodeId> {
     let admission = Rc::new(Admission::new(limits.clone()));
     let reactor = Rc::new(Reactor::new(admission));
-    let io = Rc::new(ReactorControlIo::new(reactor.clone()));
     let unresolved = Rc::new(Keyring::new(
         config.cluster.clone(),
         NodeId(String::new()),
         node.keys.clone(),
     ));
-    let projection = BundleInstaller::new(unresolved.clone());
-    let enrollment = Rc::new(Enrollment::new(
-        config.cluster.clone(),
-        config.service_account_token.clone(),
-        config.identity_directory.clone(),
-    ));
-    enrollment.set_shares(config.shares);
-    let control = ControlClient::new(
-        ControlEndpoint {
-            url: config.control_endpoint.clone(),
-            trust_bundle: config.trust_bundle.clone(),
-        },
-        enrollment,
+    let control = WorkerApplication::assemble_control(
+        config,
+        reactor.clone(),
         unresolved,
-        projection,
         Rc::new(SnapshotStore::new(
             config.cluster.clone(),
             node.publications.clone(),
             config.limits.retained_snapshots.get(),
         )),
     );
-    control.attach_io(io);
     let mut operation = Box::pin(async {
         let identity = loop {
             match control.start(startup).await {
@@ -501,7 +621,7 @@ impl WorkerApplication {
         let control = if worker == node.control_worker {
             Some(Self::assemble_control(
                 config,
-                &runtime,
+                runtime.reactor.clone(),
                 keys.clone(),
                 snapshots.clone(),
             ))
@@ -854,7 +974,7 @@ impl WorkerApplication {
 
     fn assemble_control(
         config: &Config,
-        runtime: &WorkerRuntime,
+        reactor: Rc<Reactor>,
         keys: Rc<Keyring>,
         snapshots: Rc<SnapshotStore>,
     ) -> Rc<ControlClient> {
@@ -875,7 +995,7 @@ impl WorkerApplication {
             secrets,
             snapshots,
         ));
-        control.attach_io(Rc::new(ReactorControlIo::new(runtime.reactor.clone())));
+        control.attach_io(Rc::new(ReactorControlIo::new(reactor)));
         control
     }
 
@@ -1446,7 +1566,146 @@ mod integration_tests;
 mod test_support;
 
 #[cfg(test)]
-mod lifetime_tests;
+mod lifetime_tests {
+    use super::*;
+
+    #[test]
+    fn removal_visibility_changes_without_worker_or_checkpoint_barriers() {
+        let config = crate::test_support::cluster::config(false);
+        let node = Arc::new(NodeState::default());
+        let (worker, _, _) = test_support::local_worker(&config, &node, 0);
+        let cache = test_support::definition();
+        let availability = crate::control::state::Availability::new(
+            node.publications.clone(),
+            worker.keys.clone(),
+        );
+        for (sequence, present) in [(1, true), (2, false), (3, true)] {
+            worker
+                .snapshots
+                .publish(test_support::publication(
+                    &config,
+                    sequence,
+                    if present { vec![cache.clone()] } else { vec![] },
+                ))
+                .unwrap();
+            assert_eq!(availability.cache(&cache.id), present);
+        }
+    }
+
+    #[test]
+    fn non_listener_worker_installs_nonempty_cache_set_without_binding_paths() {
+        let config = crate::test_support::cluster::config(false);
+        let node = Arc::new(NodeState::default());
+        let (mut worker, _, _) = test_support::local_worker(&config, &node, 1);
+        let definition = test_support::definition();
+        worker
+            .snapshots
+            .publish(test_support::publication(
+                &config,
+                1,
+                vec![definition.clone()],
+            ))
+            .unwrap();
+        worker
+            .refresh_snapshot(&scope(Duration::from_secs(1)).unwrap())
+            .unwrap();
+        assert_eq!(worker.caches, vec![definition]);
+        assert!(worker.peer_task.is_none());
+        assert!(worker.diagnostic_task.is_none());
+        assert!(worker.prepared_listeners.borrow().is_none());
+    }
+
+    #[test]
+    fn snapshot_refresh_retries_canceled_publication_and_applies_skipped_removal() {
+        use crate::control::wire;
+        let config = crate::test_support::cluster::config(false);
+        let node = Arc::new(NodeState::default());
+        let (mut worker, _, _) = test_support::local_worker(&config, &node, 1);
+        let original = test_support::definition();
+        let current_scope = scope(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            worker.refresh_snapshot(&current_scope),
+            Err(Error::Unavailable)
+        );
+        worker
+            .snapshots
+            .publish(test_support::publication(
+                &config,
+                1,
+                vec![original.clone()],
+            ))
+            .unwrap();
+        worker.refresh_snapshot(&current_scope).unwrap();
+        assert_eq!(worker.caches, vec![original.clone()]);
+        let (_, _, roots) = crate::security::identity::tests::issued();
+        worker
+            .keys
+            .install(wire::KeyringBundle {
+                schema_version: wire::SCHEMA_VERSION,
+                cluster: config.cluster.clone(),
+                generation: wire::BundleGeneration(1),
+                peer_trust_roots: roots,
+                cache_keys: vec![wire::CacheEncryptionKey {
+                    key: wire::CacheKeyRef {
+                        cache: original.id.clone(),
+                        id: crate::model::KeyId::from_generation(1, 7).unwrap(),
+                        purpose: wire::CacheKeyPurpose::Page,
+                    },
+                    state: wire::CacheKeyState::Active,
+                    material: [19; 32],
+                }],
+            })
+            .unwrap();
+        let page = test_support::page(&worker);
+        let page_id = page.plaintext.page().clone();
+        let retained_plaintext = Arc::downgrade(&page.plaintext.inner);
+        let retained_ciphertext = Arc::downgrade(&page.ciphertext.inner);
+        let metadata = page.metadata.immutable();
+        let index = worker.store.writer.index().clone();
+        index.publish_version(metadata.clone()).unwrap();
+        worker.memory.publish(page).unwrap();
+        assert!(worker.memory.get(&page_id).unwrap().is_some());
+        assert_eq!(retained_plaintext.strong_count(), 1);
+        assert_eq!(retained_ciphertext.strong_count(), 1);
+        assert_eq!(index.snapshot_metadata(), vec![metadata.clone()]);
+
+        // Skip the empty publication: the next refresh must still retire the old UID.
+        worker
+            .snapshots
+            .publish(test_support::publication(&config, 2, vec![]))
+            .unwrap();
+        let mut replacement = original.clone();
+        replacement.id = crate::model::CacheId("55555555-5555-4555-8555-555555555555".into());
+        worker
+            .snapshots
+            .publish(test_support::publication(
+                &config,
+                3,
+                vec![replacement.clone()],
+            ))
+            .unwrap();
+        assert_eq!(retained_plaintext.strong_count(), 1);
+        assert_eq!(retained_ciphertext.strong_count(), 1);
+        assert_eq!(index.snapshot_metadata(), vec![metadata]);
+        let canceled = scope(Duration::from_secs(1)).unwrap();
+        canceled.cancel().unwrap();
+        assert_eq!(worker.refresh_snapshot(&canceled), Err(Error::Cancelled));
+        assert_eq!(worker.caches, vec![original]);
+        assert_eq!(worker.snapshot_sequence, Some(wire::PublicationSequence(1)));
+        // Removal precedes the scope check, even though installation must retry.
+        assert!(retained_plaintext.upgrade().is_none());
+        assert!(retained_ciphertext.upgrade().is_none());
+        assert!(index.snapshot_metadata().is_empty());
+        worker.refresh_snapshot(&current_scope).unwrap();
+        assert_eq!(worker.caches, vec![replacement]);
+        assert_eq!(worker.snapshot_sequence, Some(wire::PublicationSequence(3)));
+        worker.refresh_snapshot(&canceled).unwrap();
+        assert!(worker.memory.get(&page_id).unwrap().is_none());
+        assert!(index.snapshot_metadata().is_empty());
+        assert!(worker.peer_task.is_none());
+        assert!(worker.prepared_listeners.borrow().is_none());
+    }
+}
 
 #[cfg(test)]
 pub(crate) mod tests {

@@ -1,5 +1,115 @@
 //! Deterministic test-only seams; no fake implementation is linked into production.
-pub mod clock;
+pub mod clock {
+    use crate::{
+        error::{Error, Result},
+        runtime::deadline::Deadline,
+    };
+    use std::{
+        cell::Cell,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    };
+
+    /// Pure deadline/freshness fixture. Reactor timers use SimulationClock.
+    pub struct Clock {
+        now: Cell<Instant>,
+        wall: Cell<SystemTime>,
+    }
+    impl Default for Clock {
+        fn default() -> Self {
+            Self {
+                now: Cell::new(Instant::now()),
+                wall: Cell::new(UNIX_EPOCH),
+            }
+        }
+    }
+    impl Clock {
+        pub fn now(&self) -> Instant {
+            self.now.get()
+        }
+        pub fn wall(&self) -> SystemTime {
+            self.wall.get()
+        }
+        pub fn advance(&self, duration: Duration) -> Result<()> {
+            let now = self
+                .now()
+                .checked_add(duration)
+                .ok_or(Error::InvalidRange)?;
+            let wall = self
+                .wall()
+                .checked_add(duration)
+                .ok_or(Error::InvalidRange)?;
+            self.now.set(now);
+            self.wall.set(wall);
+            Ok(())
+        }
+        pub fn jump_wall(&self, time: SystemTime) {
+            self.wall.set(time);
+        }
+        pub fn check_deadline(&self, deadline: Deadline) -> Result<()> {
+            if self.now() >= deadline.0 {
+                Err(Error::DeadlineExceeded)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    #[test]
+    fn wall_corrections_do_not_extend_original_deadlines() {
+        let clock = Clock::default();
+        let original = clock.now();
+        let deadline = Deadline(original + Duration::from_secs(2));
+        clock.advance(Duration::from_secs(1)).unwrap();
+        clock.jump_wall(UNIX_EPOCH - Duration::from_secs(100));
+        assert_eq!(clock.now(), original + Duration::from_secs(1));
+        assert_eq!(clock.check_deadline(deadline), Ok(()));
+        clock.advance(Duration::from_secs(1)).unwrap();
+        assert_eq!(clock.check_deadline(deadline), Err(Error::DeadlineExceeded));
+        let before = (clock.now(), clock.wall());
+        assert_eq!(clock.advance(Duration::MAX), Err(Error::InvalidRange));
+        assert_eq!((clock.now(), clock.wall()), before);
+    }
+    #[test]
+    fn wall_time_drives_freshness_but_expired_versions_still_answer_pins() {
+        use crate::model::{
+            CacheId, CacheKey, CurrentVersion, ExpiresAt, ObjectId, ObjectVersion, StrongEtag,
+            VersionMetadata,
+        };
+        let clock = Clock::default();
+        let descriptor = VersionMetadata {
+            content_type: None,
+            version: ObjectVersion {
+                object: ObjectId {
+                    cache: CacheId("cache".into()),
+                    key: CacheKey([0; 32]),
+                },
+                etag: StrongEtag::test_value("v1"),
+            },
+            length: 42,
+        };
+        let current = CurrentVersion {
+            version: descriptor.version.clone(),
+            expires_at: ExpiresAt::test_time(clock.wall() + Duration::from_secs(2)),
+        };
+        assert_eq!(
+            current
+                .resolve(&descriptor, clock.wall())
+                .unwrap()
+                .unwrap()
+                .length,
+            42
+        );
+        clock.advance(Duration::from_secs(2)).unwrap();
+        assert_eq!(current.resolve(&descriptor, clock.wall()), Ok(None));
+        assert_eq!(descriptor.for_pin().length, 42);
+        assert_eq!(
+            descriptor.for_pin().expires_at,
+            ExpiresAt::from_system_time(UNIX_EPOCH).unwrap()
+        );
+        let monotonic = clock.now();
+        clock.jump_wall(UNIX_EPOCH);
+        assert_eq!(clock.now(), monotonic);
+    }
+}
 pub mod origin;
 
 /// Minimal real control-plane state for storage and flight fixtures. Callers with

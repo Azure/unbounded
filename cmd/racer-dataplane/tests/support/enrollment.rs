@@ -1,9 +1,14 @@
-use racer_dataplane::{
+use super::dataplane;
+use dataplane::{
     error::Operation,
     model::Limits,
     runtime::{admission::Admission, reactor::Reactor},
 };
-use std::{num::NonZeroUsize, rc::Rc, time::{Duration, Instant}};
+use std::{
+    num::NonZeroUsize,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 pub fn reactor() -> Rc<Reactor> {
     let n = NonZeroUsize::new(1024 * 1024).unwrap();
@@ -31,7 +36,7 @@ pub fn reactor() -> Rc<Reactor> {
     reactor
 }
 
-pub fn drive<T>(reactor: &Reactor, mut future: Operation<'_, T>) -> racer_dataplane::error::Result<T> {
+pub fn drive<T>(reactor: &Reactor, mut future: Operation<'_, T>) -> dataplane::error::Result<T> {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if let std::task::Poll::Ready(result) = future.as_mut().poll(
@@ -44,4 +49,22 @@ pub fn drive<T>(reactor: &Reactor, mut future: Operation<'_, T>) -> racer_datapl
             reactor.wait(Duration::from_millis(1))?;
         }
     }
+}
+
+pub fn read_head(stream: &mut impl std::io::Read) -> std::io::Result<String> {
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let mut byte = [0];
+        stream.read_exact(&mut byte)?;
+        head.push(byte[0]);
+        assert!(head.len() <= 32768, "oversized fixture head");
+    }
+    Ok(String::from_utf8(head).unwrap())
+}
+pub fn fields(head: &str) -> std::collections::BTreeMap<String, String> {
+    head.lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .map(|(key, value)| (key.to_ascii_lowercase(), value.trim().to_owned()))
+        .collect()
 }

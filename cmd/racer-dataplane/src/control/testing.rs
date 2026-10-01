@@ -1,8 +1,13 @@
 //! Test fixtures generate ephemeral keys only inside the crate's target directory.
+use crate as dataplane;
 use std::{
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
 };
+#[path = "../../tests/support/enrollment.rs"]
+#[allow(dead_code)]
+mod io;
+pub(super) use io::drive;
 pub(super) struct Directory(pub PathBuf);
 impl Directory {
     pub fn new() -> Self {
@@ -30,7 +35,7 @@ pub(super) fn scope() -> crate::runtime::deadline::RequestScope {
     )
     .unwrap()
 }
-pub(super) fn ca() -> (rcgen::Certificate, rcgen::KeyPair) {
+pub(crate) fn ca() -> (rcgen::Certificate, rcgen::KeyPair) {
     let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     params.key_usages = vec![
@@ -54,53 +59,7 @@ pub(super) fn reactor() -> Option<std::rc::Rc<crate::runtime::reactor::Reactor>>
         }
         Err(e) => panic!("io_uring setup: {e}"),
     }
-    let n = std::num::NonZeroUsize::new(1024 * 1024).unwrap();
-    let limits = crate::model::Limits {
-        plaintext_bytes: n,
-        ciphertext_bytes: n,
-        dirty_bytes: n,
-        registered_bytes: n,
-        request_context_bytes: n,
-        flights: n,
-        waiters_per_flight: n,
-        queue_entries: std::num::NonZeroUsize::new(32).unwrap(),
-        connections_per_neighbor: n,
-        client_connections: n,
-        pipes: n,
-        range_window_pages: n,
-        header_bytes: n,
-        cached_rankings: n,
-        cached_paths: n,
-        retained_snapshots: n,
-        metadata_entries: n,
-        relay_transfers: n,
-    };
-    let r = std::rc::Rc::new(crate::runtime::reactor::Reactor::new(std::rc::Rc::new(
-        crate::runtime::admission::Admission::new(limits),
-    )));
-    r.init().unwrap();
-    Some(r)
-}
-pub(super) fn drive<T>(
-    r: &crate::runtime::reactor::Reactor,
-    mut future: crate::error::Operation<'_, T>,
-) -> crate::error::Result<T> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
-        if let std::task::Poll::Ready(result) = future.as_mut().poll(
-            &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
-        ) {
-            return result;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "control reactor stalled"
-        );
-        // Give completed work back to the future before waiting for more I/O.
-        if r.poll_budgeted(8)? == 0 {
-            r.wait(std::time::Duration::from_millis(1))?;
-        }
-    }
+    Some(io::reactor())
 }
 pub(super) fn issue(
     request: &super::wire::EnrollmentRequest,
@@ -108,13 +67,25 @@ pub(super) fn issue(
     key: &rcgen::KeyPair,
     node: &str,
 ) -> super::wire::EnrollmentResponse {
+    issue_at(
+        request,
+        ca,
+        key,
+        node,
+        crate::runtime::environment::wall_now() - std::time::Duration::from_secs(1),
+    )
+}
+pub(crate) fn issue_at(
+    request: &super::wire::EnrollmentRequest,
+    ca: &rcgen::Certificate,
+    key: &rcgen::KeyPair,
+    node: &str,
+    not_before: std::time::SystemTime,
+) -> super::wire::EnrollmentResponse {
     let der = rustls::pki_types::CertificateSigningRequestDer::from(request.csr_der.clone());
     let mut csr = rcgen::CertificateSigningRequestParams::from_der(&der).unwrap();
-    csr.params.not_before =
-        (crate::runtime::environment::wall_now() - std::time::Duration::from_secs(1)).into();
-    csr.params.not_after = (crate::runtime::environment::wall_now()
-        + std::time::Duration::from_secs(86400 - 1))
-    .into();
+    csr.params.not_before = not_before.into();
+    csr.params.not_after = (not_before + std::time::Duration::from_secs(86400)).into();
     csr.params.subject_alt_names = vec![rcgen::SanType::URI(
         format!("spiffe://{}/node/{node}", request.cluster.0)
             .try_into()

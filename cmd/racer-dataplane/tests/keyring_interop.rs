@@ -2,6 +2,7 @@
 //! internal/racer, which owns the loopback server and ephemeral fixture directory.
 //! Only readiness and trust-file reads use a test adapter; TLS, HTTP, enrollment,
 //! and wire decoding are production implementations.
+use racer_dataplane as dataplane;
 use racer_dataplane::{
     control::{ControlEndpoint, enrollment::Enrollment, transport::*, wire},
     error::{Error, Operation},
@@ -142,6 +143,7 @@ fn go_controller_keyring_bootstrap_mtls_and_rotation() {
             .set_peer_trust_roots(initial.peer_trust_roots.clone())
             .unwrap();
         #[path = "support/enrollment.rs"]
+        #[allow(dead_code)]
         mod enrollment_io;
         let reactor = enrollment_io::reactor();
         enrollment.attach_reactor(reactor.clone());

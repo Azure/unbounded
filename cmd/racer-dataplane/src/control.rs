@@ -6,7 +6,7 @@ pub mod enrollment;
 pub mod secrets;
 pub mod state;
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 pub mod transport;
 pub mod wire;
 

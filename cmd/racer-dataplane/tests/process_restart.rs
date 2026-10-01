@@ -5,7 +5,11 @@
 #[path = "process_restart/throughput.rs"]
 mod throughput;
 
+use racer_dataplane as dataplane;
 use racer_dataplane::{model::PAGE_BYTES, store::checkpoint};
+#[path = "support/enrollment.rs"]
+mod enrollment_io;
+use enrollment_io::{fields, read_head};
 use std::{
     collections::BTreeMap,
     ffi::CString,
@@ -1007,23 +1011,6 @@ impl Drop for Process {
     }
 }
 
-fn read_head(stream: &mut impl Read) -> io::Result<String> {
-    let mut head = Vec::new();
-    while !head.ends_with(b"\r\n\r\n") {
-        let mut byte = [0];
-        stream.read_exact(&mut byte)?;
-        head.push(byte[0]);
-        assert!(head.len() <= 32768, "oversized HTTP head");
-    }
-    Ok(String::from_utf8(head).unwrap())
-}
-fn fields(head: &str) -> BTreeMap<String, String> {
-    head.lines()
-        .skip(1)
-        .filter_map(|line| line.split_once(':'))
-        .map(|(key, value)| (key.to_ascii_lowercase(), value.trim().to_owned()))
-        .collect()
-}
 struct Reply {
     status: u16,
     fields: BTreeMap<String, String>,
@@ -1096,8 +1083,6 @@ fn enrolled_identity(
         .unwrap();
     // Verify the persisted certificate's chain, SAN, validity, request correlation,
     // and local key pairing rather than comparing opaque identity.json bytes.
-    #[path = "support/enrollment.rs"]
-    mod enrollment_io;
     let reactor = enrollment_io::reactor();
     enrollment.attach_reactor(reactor.clone());
     let scope = racer_dataplane::runtime::deadline::RequestScope::new(
