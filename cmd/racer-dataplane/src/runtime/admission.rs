@@ -65,6 +65,28 @@ pub struct Admission {
     buffers: Arc<Mutex<Vec<(Vec<u8>, Reservation)>>>,
 }
 
+/// Read-only worker quota counters, including reservations released on other threads.
+/// Retaining this handle does not retain reservations or pooled payload buffers.
+pub(crate) struct AdmissionUsage {
+    totals: Arc<Counters>,
+    relay_limit: usize,
+    ciphertext_limit: usize,
+}
+impl AdmissionUsage {
+    pub(crate) fn relay(&self) -> (usize, usize) {
+        (
+            self.totals.used[index(ResourceClass::Relay)].load(Ordering::Acquire),
+            self.relay_limit,
+        )
+    }
+    pub(crate) fn ciphertext(&self) -> (usize, usize) {
+        (
+            self.totals.used[index(ResourceClass::Ciphertext)].load(Ordering::Acquire),
+            self.ciphertext_limit,
+        )
+    }
+}
+
 /// Ownership of a charge, released only when its last containing allocation dies.
 pub struct Reservation {
     class: ResourceClass,
@@ -287,6 +309,13 @@ impl ConnectionAdmission {
     }
 }
 impl Admission {
+    pub(crate) fn usage(&self) -> AdmissionUsage {
+        AdmissionUsage {
+            totals: self.totals.clone(),
+            relay_limit: self.limit(ResourceClass::Relay),
+            ciphertext_limit: self.limit(ResourceClass::Ciphertext),
+        }
+    }
     pub(crate) fn set_observer(&self, observer: crate::telemetry::failures::Observer) {
         *self.observer.borrow_mut() = observer;
     }

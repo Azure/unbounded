@@ -615,6 +615,73 @@ fn fixed_parser_and_worst_case_response_bounds() {
 }
 
 #[test]
+fn metrics_http_response_exports_worker_quotas_with_bounded_output() {
+    use crate::{model::identity::WorkerId, telemetry::metrics::Metrics};
+    let workers = Metrics::for_workers(64).unwrap();
+    let admissions: Vec<_> = workers
+        .iter()
+        .enumerate()
+        .map(|(index, metrics)| {
+            let mut limits = crate::test_support::cluster::config(false).limits;
+            limits.relay_transfers = std::num::NonZeroUsize::new(usize::MAX).unwrap();
+            limits.ciphertext_bytes = std::num::NonZeroUsize::new(usize::MAX).unwrap();
+            let admission = Admission::new(limits);
+            metrics
+                .observe_admission(WorkerId(u16::MAX - index as u16), admission.usage())
+                .unwrap();
+            admission
+        })
+        .collect();
+    let charges: Vec<_> = admissions
+        .iter()
+        .map(|admission| {
+            (
+                admission
+                    .reserve(None, ResourceClass::Relay, usize::MAX)
+                    .unwrap(),
+                admission
+                    .reserve(None, ResourceClass::Ciphertext, usize::MAX)
+                    .unwrap(),
+            )
+        })
+        .collect();
+    let mut telemetry = Telemetry::default();
+    telemetry.metrics = workers[0].clone();
+    for event in super::super::metrics::EVENTS {
+        telemetry.metrics.record(event, u64::MAX).unwrap();
+    }
+    let mut bytes = [0; MAX_RESPONSE_BYTES];
+    let length = respond(&telemetry, Route::Metrics, true, &mut bytes).unwrap();
+    assert_response(&bytes[..length], "200 OK", None);
+    let text = std::str::from_utf8(&bytes[..length]).unwrap();
+    assert!(length < MAX_RESPONSE_BYTES);
+    for name in [
+        "relay_used",
+        "relay_limit",
+        "ciphertext_used_bytes",
+        "ciphertext_limit_bytes",
+    ] {
+        assert!(text.contains(&format!("# TYPE racer_worker_{name} gauge\n")));
+        assert!(text.contains(&format!(
+            "racer_worker_{name}{{worker=\"65535\"}} {}\n",
+            usize::MAX
+        )));
+    }
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.contains("{worker="))
+            .count(),
+        4 * 64
+    );
+    let mut small = [0; 512];
+    assert!(matches!(
+        respond(&telemetry, Route::Metrics, true, &mut small),
+        Err(Error::Internal)
+    ));
+    drop(charges);
+}
+
+#[test]
 fn unattached_serving_fails_closed_and_attachment_capacity_rolls_back() {
     let telemetry = Telemetry::default();
     let scope = scope();

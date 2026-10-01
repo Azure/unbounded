@@ -609,6 +609,7 @@ impl WorkerApplication {
             })
             .clone();
         admission.set_observer(node.failures.observer(worker));
+        metrics.observe_admission(worker, admission.usage())?;
         node.ingress.install(worker, &admission)?;
         let reactor = runtime.reactor.clone();
         let limits = admission.limits();
@@ -1818,6 +1819,40 @@ pub(crate) mod tests {
 
     pub(crate) fn wake_test_coordinator() -> Rc<Coordinator> {
         wake_test_worker().coordinator
+    }
+
+    #[test]
+    fn assembled_worker_exports_live_quota_gauges() {
+        use crate::model::limits::ResourceClass;
+        let worker = wake_test_worker();
+        let relay = worker
+            .runtime
+            .admission
+            .reserve(None, ResourceClass::Relay, 1)
+            .unwrap();
+        let ciphertext = worker
+            .runtime
+            .admission
+            .reserve(None, ResourceClass::Ciphertext, 17)
+            .unwrap();
+        let mut output = String::new();
+        worker
+            .telemetry
+            .metrics
+            .write_prometheus(&mut output)
+            .unwrap();
+        assert!(output.contains("racer_worker_relay_used{worker=\"0\"} 1\n"));
+        assert!(output.contains("racer_worker_ciphertext_used_bytes{worker=\"0\"} 17\n"));
+        for (name, class) in [
+            ("relay_limit", ResourceClass::Relay),
+            ("ciphertext_limit_bytes", ResourceClass::Ciphertext),
+        ] {
+            assert!(output.contains(&format!(
+                "racer_worker_{name}{{worker=\"0\"}} {}\n",
+                worker.runtime.admission.limit(class)
+            )));
+        }
+        drop((relay, ciphertext));
     }
 
     #[test]
