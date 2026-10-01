@@ -926,7 +926,7 @@ func requestStatusViaPortForward(
 		Timeout: timeout,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
-				MinVersion: tls.VersionTLS12,
+				MinVersion: tls.VersionTLS13,
 				RootCAs:    caPool,
 				ServerName: fmt.Sprintf("unbounded-net-controller.%s.svc", ns),
 			},

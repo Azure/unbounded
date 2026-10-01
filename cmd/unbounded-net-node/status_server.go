@@ -606,7 +606,7 @@ func startStatusPublishers(ctx context.Context, cfg *config, healthState *nodeHe
 func newStatusPushHTTPClient(timeout time.Duration) *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone() //nolint:errcheck
 	tlsConfig := &tls.Config{
-		MinVersion: tls.VersionTLS12,
+		MinVersion: tls.VersionTLS13,
 	}
 
 	pool := x509.NewCertPool()

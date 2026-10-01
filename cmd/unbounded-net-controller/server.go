@@ -8,6 +8,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1415,6 +1416,10 @@ func (tlsErrorFilterWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+func unifiedTLSConfig(getCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error), clientCAs *x509.CertPool) *tls.Config {
+	return &tls.Config{MinVersion: tls.VersionTLS13, GetCertificate: getCertificate, ClientAuth: tls.VerifyClientCertIfGiven, ClientCAs: clientCAs}
+}
+
 // serveUnifiedServer starts a TLS server that serves probes, webhooks, status,
 // push, and dashboard endpoints on a single port. The certificate is obtained
 // from the CertManager, and the front-proxy client CAs from the webhook server
@@ -1426,12 +1431,7 @@ func serveUnifiedServer(ctx context.Context, port int, mux *http.ServeMux, certM
 
 	httpMiddleware := metrics.NewHTTPMiddleware("unbounded_cni_controller")
 
-	tlsConfig := &tls.Config{
-		MinVersion:     tls.VersionTLS12,
-		GetCertificate: certMgr.GetCertificateFunc(),
-		ClientAuth:     tls.VerifyClientCertIfGiven,
-		ClientCAs:      webhookServer.GetClientCAs(),
-	}
+	tlsConfig := unifiedTLSConfig(certMgr.GetCertificateFunc(), webhookServer.GetClientCAs())
 
 	server := &http.Server{
 		Addr:              addr,
