@@ -102,7 +102,7 @@ pub struct HttpIo {
     reactor: Rc<Reactor>,
     codec: super::Codec,
     send_body_limit: u64,
-    admission: Option<Rc<Admission>>,
+    admission: Rc<Admission>,
     idle_buffer: Rc<RefCell<Option<OwnedBuffer>>>,
 }
 
@@ -157,17 +157,7 @@ impl HttpIo {
     pub(crate) fn reactor(&self) -> &Rc<Reactor> {
         &self.reactor
     }
-    pub fn new(reactor: Rc<Reactor>, codec: super::Codec) -> Self {
-        Self {
-            reactor,
-            send_body_limit: codec.body_limit(),
-            codec,
-            admission: None,
-            idle_buffer: Rc::default(),
-        }
-    }
-    /// Production constructor. The legacy constructor is retained for composition
-    /// compatibility, but head staging requires explicitly supplied admission.
+    /// Every head and body staging allocation uses this worker's admission owner.
     pub fn with_admission(
         reactor: Rc<Reactor>,
         codec: super::Codec,
@@ -177,7 +167,7 @@ impl HttpIo {
             reactor,
             send_body_limit: codec.body_limit(),
             codec,
-            admission: Some(admission),
+            admission,
             idle_buffer: Rc::default(),
         }
     }
@@ -201,10 +191,7 @@ impl HttpIo {
         io
     }
     pub fn buffer(&self, length: usize) -> Result<OwnedBuffer> {
-        let admission = self
-            .admission
-            .as_deref()
-            .ok_or(Error::InvalidConfiguration)?;
+        let admission = &self.admission;
         if admission.is_stopped() {
             return Err(Error::Unavailable);
         }
@@ -213,12 +200,7 @@ impl HttpIo {
             Some(buffer) if buffer.bytes.len() == length => buffer,
             other => {
                 drop(other);
-                OwnedBuffer::new(
-                    self.admission
-                        .as_deref()
-                        .ok_or(Error::InvalidConfiguration)?,
-                    length,
-                )?
+                OwnedBuffer::new(&self.admission, length)?
             }
         };
         // Retain at most one ordinary head-sized allocation, never a maximum
@@ -335,8 +317,6 @@ impl HttpIo {
                     let size = codec.decoded_allocation(&buffer.bytes[..used])?;
                     Some(
                         self.admission
-                            .as_deref()
-                            .ok_or(Error::InvalidConfiguration)?
                             .reserve(None, ResourceClass::RequestContext, size)?,
                     )
                 } else {
@@ -437,15 +417,11 @@ impl HttpIo {
             // Admit signing and encoding scratch before either can allocate.
             // Only the encoded head needs to remain staged across socket I/O,
             // not the endpoint's maximum legal envelope size.
-            let scratch = self
-                .admission
-                .as_deref()
-                .ok_or(Error::InvalidConfiguration)?
-                .reserve(
-                    None,
-                    ResourceClass::RequestContext,
-                    self.codec.header_limit().max(1),
-                )?;
+            let scratch = self.admission.reserve(
+                None,
+                ResourceClass::RequestContext,
+                self.codec.header_limit().max(1),
+            )?;
             let head = if let Some(session) = connection.session.as_mut() {
                 session.sign(head)?
             } else {
