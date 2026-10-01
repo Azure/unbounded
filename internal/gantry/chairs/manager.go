@@ -378,14 +378,14 @@ func (m *Manager) attemptClaim(ctx context.Context) {
 	reserved := m.reserved != nil
 	selectionReady := m.selectionReady
 	bootstrapReady := m.bootstrapReady
-	legacySkipClaim := held || reserved || m.knownFull || m.claiming ||
+	fixedTargetSkipClaim := held || reserved || m.knownFull || m.claiming ||
 		(selectionReady && bootstrapReady && !m.participating)
 
 	// Bootstrap failure is a separate condition from a completed election. A
 	// non-holder whose initial dials all failed still needs the snapshot below,
 	// because observe is what retries Connect; returning here on knownFull
 	// alone would leave it disconnected until the next epoch.
-	if m.opts.HolderTarget == nil && legacySkipClaim && bootstrapReady {
+	if m.opts.HolderTarget == nil && fixedTargetSkipClaim && bootstrapReady {
 		m.mu.Unlock()
 		return
 	}
