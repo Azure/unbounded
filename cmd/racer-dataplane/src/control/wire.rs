@@ -746,7 +746,11 @@ mod codec {
         use super::*;
         #[test]
         fn site_only_deltas_add_change_remove_and_reject_tampering() {
-            let mut base = decode_publication(include_bytes!("testdata/publication.json")).unwrap();
+            let mut base = decode_publication(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../internal/racer/wire/testdata/publication.json"
+            )))
+            .unwrap();
             base.sequence.0 = 1;
             base.membership_version.0 = 1;
             for site in ["Site_1.a-b", "site2", ""] {
@@ -777,7 +781,11 @@ mod codec {
 
         #[test]
         fn delta_add_remove_update_hash_and_replay() {
-            let mut base = decode_publication(include_bytes!("testdata/publication.json")).unwrap();
+            let mut base = decode_publication(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../internal/racer/wire/testdata/publication.json"
+            )))
+            .unwrap();
             base.sequence.0 = 1;
             base.membership_version.0 = 1;
             let mut next = base.clone();
@@ -983,11 +991,23 @@ mod codec {
     mod tests {
         use super::*;
         use sha2::{Digest, Sha256};
-        // Copied public vectors from the Go wire package. No private certificate key.
-        const PUBLICATION: &str = include_str!("testdata/publication.json");
-        const REQUEST: &str = include_str!("testdata/bootstrap-request.json");
-        const RESPONSE: &str = include_str!("testdata/bootstrap-response.json");
-        const BUNDLE: &str = include_str!("testdata/bundle.json");
+        // Shared public vectors from the Go wire package. No private certificate key.
+        const PUBLICATION: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../internal/racer/wire/testdata/publication.json"
+        ));
+        const REQUEST: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../internal/racer/wire/testdata/bootstrap-request.json"
+        ));
+        const RESPONSE: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../internal/racer/wire/testdata/bootstrap-response.json"
+        ));
+        const BUNDLE: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../internal/racer/wire/testdata/bundle.json"
+        ));
         #[test]
         fn key_material_requires_exact_length_canonical_padding_and_trailing_bits() {
             let canonical = STANDARD.encode([0xa7; 32]);
@@ -1026,7 +1046,10 @@ mod codec {
         #[test]
         fn go_delta_vector_applies_exactly_and_rejects_tampering() {
             let base = decode_publication(br#"{"schema_version":1,"cluster":"11111111-1111-4111-8111-111111111111","sequence":"1","membership_version":"1","members":[{"node":"22222222-2222-4222-8222-222222222222","shares":4,"peer_endpoint":"127.0.0.1:7443","rails":[],"alignment_enabled":true,"site":""},{"node":"33333333-3333-4333-8333-333333333333","shares":4,"peer_endpoint":"127.0.0.2:7443","rails":[],"alignment_enabled":true,"site":""}],"caches":[]}"#).unwrap();
-            let delta = include_str!("../../../../internal/racer/wire/testdata/delta.json");
+            let delta = include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../internal/racer/wire/testdata/delta.json"
+            ));
             let next = apply_delta(&base, delta.as_bytes()).unwrap();
             assert_eq!(next.sequence.0, 2);
             assert_eq!(next.members.len(), 2);

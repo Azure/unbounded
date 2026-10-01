@@ -471,10 +471,12 @@ mod cache_tests {
     use super::*;
     #[test]
     fn replacement_definitions_and_socket_paths_are_validated() {
-        let mut defs =
-            crate::control::wire::decode_publication(include_bytes!("testdata/publication.json"))
-                .unwrap()
-                .caches;
+        let mut defs = crate::control::wire::decode_publication(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../internal/racer/wire/testdata/publication.json"
+        )))
+        .unwrap()
+        .caches;
         validate_definitions(&defs).unwrap();
         defs[0].id.0 = "66666666-6666-4666-8666-666666666666".into();
         validate_definitions(&defs).unwrap();
@@ -504,9 +506,11 @@ mod cache_tests {
 mod publication_tests {
     use super::*;
     fn publication(sequence: u64) -> Publication {
-        let mut p =
-            crate::control::wire::decode_publication(include_bytes!("testdata/publication.json"))
-                .unwrap();
+        let mut p = crate::control::wire::decode_publication(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../internal/racer/wire/testdata/publication.json"
+        )))
+        .unwrap();
         p.sequence.0 = sequence;
         p.membership_version.0 = 1;
         // Lifecycle cases use ASCII fabric IDs; wire parity has separate coverage.

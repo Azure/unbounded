@@ -68,9 +68,11 @@ pub mod secrets {
         #[test]
         fn bundle_installation_is_idempotent_and_rejects_rollback() {
             use crate::security::identity::{KeyEpochs, KeyPurpose};
-            let publication =
-                wire::decode_publication(include_bytes!("control/testdata/publication.json"))
-                    .unwrap();
+            let publication = wire::decode_publication(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../internal/racer/wire/testdata/publication.json"
+            )))
+            .unwrap();
             let keys = Rc::new(Keyring::new(
                 publication.cluster,
                 publication.members[0].node.clone(),
@@ -78,8 +80,11 @@ pub mod secrets {
             ));
             let installer = BundleInstaller::new(keys.clone());
             let (ca, _) = testing::ca();
-            let mut bundle =
-                wire::decode_bundle(include_bytes!("control/testdata/bundle.json")).unwrap();
+            let mut bundle = wire::decode_bundle(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../internal/racer/wire/testdata/bundle.json"
+            )))
+            .unwrap();
             bundle.generation = BundleGeneration(2);
             bundle.peer_trust_roots = vec![ca.der().to_vec()];
             // Retain page keys only: the wire vector repeats material across purposes.
@@ -120,7 +125,10 @@ pub mod secrets {
             std::fs::create_dir(d.0.join("epoch-a")).unwrap();
             std::fs::write(
                 d.0.join("epoch-a/bundle.json"),
-                include_bytes!("control/testdata/bundle.json"),
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../internal/racer/wire/testdata/bundle.json"
+                )),
             )
             .unwrap();
             symlink("epoch-a", d.0.join("..data")).unwrap();
@@ -1126,9 +1134,11 @@ mod tests {
             assert!(!identity.renewal_due());
             *client.identity.borrow_mut() = Some(identity.clone());
             client.started.set(true);
-            let mut publication =
-                wire::decode_publication(include_bytes!("control/testdata/publication.json"))
-                    .unwrap();
+            let mut publication = wire::decode_publication(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../internal/racer/wire/testdata/publication.json"
+            )))
+            .unwrap();
             publication.sequence = wire::PublicationSequence(10);
             let accepted = client.snapshots.publish(publication.clone()).unwrap();
             let cursor = if pending {
@@ -1347,8 +1357,11 @@ mod tests {
         let d = testing::Directory::new();
         let client = client(&d);
         let (ca, _) = testing::ca();
-        let mut bundle =
-            wire::decode_bundle(include_bytes!("control/testdata/bundle.json")).unwrap();
+        let mut bundle = wire::decode_bundle(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../internal/racer/wire/testdata/bundle.json"
+        )))
+        .unwrap();
         bundle.generation.0 = 2;
         bundle.peer_trust_roots = vec![ca.der().to_vec()];
         // Production rejects material reuse across independent key purposes.
