@@ -710,7 +710,6 @@ upstream_registries:
   - name: registry.example.com
     endpoint: https://registry.example.com
     credentials_path: /etc/gantry/creds.txt
-coord_peer_authz_enforce: true
 coord_max_digests_per_request: 12
 coord_max_concurrent_pulls: 4
 peer_fetch_timeout: 45m
@@ -724,10 +723,6 @@ log_level: debug
 
 	if len(c.UpstreamRegistries) != 1 || c.UpstreamRegistries[0].Name != "registry.example.com" {
 		t.Errorf("upstream overlay failed: %+v", c.UpstreamRegistries)
-	}
-
-	if !c.CoordPeerAuthzEnforce {
-		t.Error("CoordPeerAuthzEnforce = false, want true")
 	}
 
 	if c.CoordMaxDigestsPerRequest != 12 {
@@ -831,34 +826,27 @@ func TestResolveUpstream(t *testing.T) {
 	}
 }
 
-// removed the gantry-cache storage backend; Validate must
-// emit a clear migration error so an operator running an old
-// ConfigMap doesn't see a generic "unknown storage_mode" message.
+// Removed storage selection is rejected by strict YAML decoding.
 func TestValidate_RejectsLegacyGantryCacheMode(t *testing.T) {
 	c := NewDefault()
 	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
-	c.StorageMode = "gantry-cache"
 
-	err := c.Validate()
+	err := c.LoadYAML(strings.NewReader("storage_mode: gantry-cache"))
 	if err == nil {
 		t.Fatal("expected validate error for storage_mode=gantry-cache")
 	}
 
-	if !strings.Contains(err.Error(), "removed") || !strings.Contains(err.Error(), "containerd") {
-		t.Errorf("error %q should mention removal + containerd migration", err)
+	if !strings.Contains(err.Error(), "storage_mode") {
+		t.Errorf("error %q should name the removed field", err)
 	}
 }
 
-// An empty StorageMode is a misconfiguration after (NewDefault
-// sets containerd; an explicit empty string means the operator zeroed
-// it deliberately). Validate must catch that, not silently treat it
-// as containerd.
+// Empty values do not restore the removed storage selector.
 func TestValidate_EmptyStorageModeRejected(t *testing.T) {
 	c := NewDefault()
 	c.UpstreamRegistries = []UpstreamRegistry{{Name: "r", Endpoint: "https://r"}}
-	c.StorageMode = ""
 
-	err := c.Validate()
+	err := c.LoadYAML(strings.NewReader("storage_mode: ''"))
 	if err == nil || !strings.Contains(err.Error(), "storage_mode") {
 		t.Fatalf("want storage_mode error, got %v", err)
 	}
@@ -890,7 +878,7 @@ func TestValidate_ContainerdLeaseCleanupIntervalMustBePositive(t *testing.T) {
 	}
 }
 
-// storage_mode=containerd requires a containerd socket. The
+// The containerd backend requires a containerd socket. The
 // agent has no other way to reach the content store.
 func TestValidate_ContainerdModeRequiresSocket(t *testing.T) {
 	c := NewDefault()
@@ -900,5 +888,32 @@ func TestValidate_ContainerdModeRequiresSocket(t *testing.T) {
 	err := c.Validate()
 	if err == nil || !strings.Contains(err.Error(), "containerd_socket") {
 		t.Fatalf("want containerd_socket error, got %v", err)
+	}
+}
+
+func TestCompatibilitySwitchesRemoved(t *testing.T) {
+	for _, key := range []string{"storage_mode", "coord_peer_authz_enforce", "coord_require_chair_assignment"} {
+		c := NewDefault()
+		if err := c.LoadYAML(strings.NewReader(key + ": false")); err == nil {
+			t.Errorf("removed YAML key %s accepted", key)
+		}
+
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		c.BindFlags(fs)
+
+		if fs.Lookup(strings.ReplaceAll(key, "_", "-")) != nil {
+			t.Errorf("removed flag %s retained", key)
+		}
+
+		before := *c
+		if err := c.LoadEnv(func(k string) string {
+			if k == "GANTRY_"+strings.ToUpper(key) {
+				return "invalid-removed-value"
+			}
+
+			return ""
+		}); err != nil || !reflect.DeepEqual(before, *c) {
+			t.Errorf("removed env %s changed configuration: %v", key, err)
+		}
 	}
 }

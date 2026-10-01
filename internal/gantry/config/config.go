@@ -35,21 +35,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Recognized StorageMode values.
-const (
-	// StorageModeContainerd routes reads/writes through the local
-	// containerd content store (plan). This is the only
-	// accepted storage mode; the legacy hostPath "gantry-cache" mode
-	// was removed in plan .
-	StorageModeContainerd = "containerd"
-
-	// storageModeGantryCache is the legacy hostPath cache mode that
-	// was removed in plan . It is referenced only by
-	// Validate to surface a clear migration error to operators who
-	// still have storage_mode: gantry-cache in their ConfigMap.
-	storageModeGantryCache = "gantry-cache"
-)
-
 // Config is the typed configuration surface.
 //
 // Fields carry YAML tags matching the file names, except environment-only
@@ -207,21 +192,6 @@ type Config struct {
 	ChairSeedCount  int           `yaml:"chair_seed_count"`
 	ChairAPITimeout time.Duration `yaml:"chair_api_timeout"`
 
-	// ---------- Storage backend ----------
-
-	// StorageMode selects which backend the agent uses as the read/write
-	// content store. Only "containerd" is supported - the legacy
-	// "gantry-cache" hostPath backend was removed. The field is
-	// retained so existing ConfigMaps that still set it to "containerd"
-	// continue to parse, and so a clear migration error surfaces for
-	// any operator still on "gantry-cache". It is not exposed as a
-	// CLI flag or env var because there is no other valid value to
-	// select.
-	//
-	// Default is "containerd". Exposed via the
-	// gantry_storage_mode_info metric for observability.
-	StorageMode string `yaml:"storage_mode"`
-
 	// ---------- containerd integration (cdsub) ----------
 
 	// ContainerdSocket is the path to the containerd gRPC API socket
@@ -229,8 +199,7 @@ type Config struct {
 	// and announce them on the DHT (the design doc image-event -> Provide loop),
 	// that the transfer endpoint reads from on cache miss to serve
 	// peers without a re-download, and that the puller writes into on
-	// background origin pulls (storage_mode=containerd is the only
-	// supported mode; see).
+	// background origin pulls in the containerd backend.
 	//
 	// REQUIRED in legacy mode, where Validate rejects an empty value.
 	// Racer mode does not use containerd. The default deploy manifests set it to
@@ -268,17 +237,6 @@ type Config struct {
 	UpstreamRegistries []UpstreamRegistry `yaml:"upstream_registries"`
 
 	// ---------- Coordination ----------
-
-	// CoordPeerAuthzEnforce is retained so existing ConfigMaps parse, but
-	// coord peer authorization was removed with the membership view it
-	// compared against. Validate rejects true rather than accepting a
-	// setting that would silently do nothing.
-	CoordPeerAuthzEnforce bool `yaml:"coord_peer_authz_enforce"`
-
-	// CoordRequireChairAssignment rejects legacy please_pull requests that do
-	// not carry a Lease chair generation. Keep false during a mixed-version
-	// rollout, then enable it after every agent supports chair metadata.
-	CoordRequireChairAssignment bool `yaml:"coord_require_chair_assignment"`
 
 	// CoordMaxDigestsPerRequest caps a single please_pull batch. The default
 	// 256 is intentionally far above normal manifest child counts while staying
@@ -464,8 +422,6 @@ func NewDefault() *Config {
 		ChairSeedCount:           8,
 		ChairAPITimeout:          5 * time.Second,
 
-		StorageMode: StorageModeContainerd,
-
 		ContainerdSocket:               "/run/containerd/containerd.sock",
 		ContainerdNamespace:            "k8s.io",
 		ContainerdLeaseTTL:             60 * time.Minute,
@@ -473,8 +429,6 @@ func NewDefault() *Config {
 
 		UpstreamRegistries: nil,
 
-		CoordPeerAuthzEnforce:       false,
-		CoordRequireChairAssignment: false,
 		CoordMaxDigestsPerRequest:   256,
 		CoordMaxConcurrentPulls:     16,
 		OriginPullProgressTimeout:   5 * time.Minute,
@@ -614,8 +568,6 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setDur("CONTAINERD_LEASE_TTL", &c.ContainerdLeaseTTL)
 	setDur("CONTAINERD_LEASE_CLEANUP_INTERVAL", &c.ContainerdLeaseCleanupInterval)
 
-	setBool("COORD_PEER_AUTHZ_ENFORCE", &c.CoordPeerAuthzEnforce)
-	setBool("COORD_REQUIRE_CHAIR_ASSIGNMENT", &c.CoordRequireChairAssignment)
 	setInt("COORD_MAX_DIGESTS_PER_REQUEST", &c.CoordMaxDigestsPerRequest)
 	setInt("COORD_MAX_CONCURRENT_PULLS", &c.CoordMaxConcurrentPulls)
 	setDur("ORIGIN_PULL_PROGRESS_TIMEOUT", &c.OriginPullProgressTimeout)
@@ -695,11 +647,9 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 
 	fs.StringVar(&c.ContainerdSocket, "containerd-socket", c.ContainerdSocket, "containerd gRPC socket path (required in legacy mode; unused with GANTRY_RACER_ENABLED=true)")
 	fs.StringVar(&c.ContainerdNamespace, "containerd-namespace", c.ContainerdNamespace, "containerd namespace cdsub watches (default k8s.io)")
-	fs.DurationVar(&c.ContainerdLeaseTTL, "containerd-lease-ttl", c.ContainerdLeaseTTL, "TTL for containerd content leases attached by Gantry on ingest (storage_mode=containerd only)")
-	fs.DurationVar(&c.ContainerdLeaseCleanupInterval, "containerd-lease-cleanup-interval", c.ContainerdLeaseCleanupInterval, "period of the expired-lease sweep loop (storage_mode=containerd only)")
+	fs.DurationVar(&c.ContainerdLeaseTTL, "containerd-lease-ttl", c.ContainerdLeaseTTL, "TTL for containerd content leases attached by Gantry on ingest")
+	fs.DurationVar(&c.ContainerdLeaseCleanupInterval, "containerd-lease-cleanup-interval", c.ContainerdLeaseCleanupInterval, "period of the expired-lease sweep loop")
 
-	fs.BoolVar(&c.CoordPeerAuthzEnforce, "coord-peer-authz-enforce", c.CoordPeerAuthzEnforce, "unsupported in Lease-chair mode; validation requires false")
-	fs.BoolVar(&c.CoordRequireChairAssignment, "coord-require-chair-assignment", c.CoordRequireChairAssignment, "reject legacy please_pull requests without Lease-chair metadata after rollout")
 	fs.IntVar(&c.CoordMaxDigestsPerRequest, "coord-max-digests-per-request", c.CoordMaxDigestsPerRequest, "maximum digests accepted in one please_pull batch")
 	fs.IntVar(&c.CoordMaxConcurrentPulls, "coord-max-concurrent-pulls", c.CoordMaxConcurrentPulls, "maximum background origin pulls started by inbound please_pull")
 	fs.DurationVar(&c.OriginPullProgressTimeout, "origin-pull-progress-timeout", c.OriginPullProgressTimeout, "maximum time a detached origin response body may make no progress (0 disables)")
@@ -892,31 +842,16 @@ func (c *Config) Validate() error {
 
 	mustAddr("transfer_listen", c.TransferListen)
 
-	// Deprecated cache fields remain accepted but unused.
-	switch c.StorageMode {
-	case StorageModeContainerd:
-		// valid
-	case storageModeGantryCache:
-		errs = append(errs, errors.New("storage_mode \"gantry-cache\" was removed in ; set storage_mode: containerd and remove the cache_dir/cache_budget_bytes hostPath volume from your DaemonSet"))
-	case "":
-		errs = append(errs, errors.New("storage_mode: required (must be \"containerd\")"))
-	default:
-		errs = append(errs, fmt.Errorf("storage_mode %q: must be \"containerd\"", c.StorageMode))
+	if c.ContainerdSocket == "" {
+		errs = append(errs, errors.New("containerd_socket: required for the containerd backend"))
 	}
 
-	if c.StorageMode == StorageModeContainerd && c.ContainerdSocket == "" {
-		errs = append(errs, errors.New("storage_mode=containerd requires containerd_socket to be set"))
+	if c.ContainerdLeaseTTL <= 0 {
+		errs = append(errs, fmt.Errorf("containerd_lease_ttl: must be > 0, got %s", c.ContainerdLeaseTTL))
 	}
 
-	if c.StorageMode == StorageModeContainerd {
-		// Positive values keep the cleanup loop from spinning.
-		if c.ContainerdLeaseTTL <= 0 {
-			errs = append(errs, fmt.Errorf("containerd_lease_ttl: must be > 0 in storage_mode=containerd, got %s", c.ContainerdLeaseTTL))
-		}
-
-		if c.ContainerdLeaseCleanupInterval <= 0 {
-			errs = append(errs, fmt.Errorf("containerd_lease_cleanup_interval: must be > 0 in storage_mode=containerd, got %s", c.ContainerdLeaseCleanupInterval))
-		}
+	if c.ContainerdLeaseCleanupInterval <= 0 {
+		errs = append(errs, fmt.Errorf("containerd_lease_cleanup_interval: must be > 0, got %s", c.ContainerdLeaseCleanupInterval))
 	}
 
 	if c.ChairLeaseDuration <= 0 {
@@ -987,10 +922,6 @@ func (c *Config) Validate() error {
 
 	if c.ChairAPITimeout <= 0 {
 		errs = append(errs, fmt.Errorf("chair_api_timeout: must be > 0, got %v", c.ChairAPITimeout))
-	}
-
-	if c.CoordPeerAuthzEnforce {
-		errs = append(errs, errors.New("coord_peer_authz_enforce cannot be enabled with Lease-chair discovery: the design has no pod-membership identity oracle"))
 	}
 
 	if c.CoordMaxDigestsPerRequest < 1 {

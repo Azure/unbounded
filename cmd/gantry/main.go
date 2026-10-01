@@ -156,7 +156,7 @@ func runAgent(args []string) error {
 	p9 := newPhase9Metrics(reg)
 	// Storage mode info: emit a single time-series at 1 for the
 	// active backend so dashboards can filter by it.
-	p9.storageMode.WithLabelValues(config.StorageModeContainerd).Set(1)
+	p9.storageMode.WithLabelValues("containerd").Set(1)
 
 	// Origin clients (+ live-stream split). See agent_origin.go
 	// for the full rationale of the two-client split and the
@@ -405,7 +405,7 @@ func runAgent(args []string) error {
 		}),
 		coord.WithNegativeCache(negCacheAdapter{c: negCache}),
 		coord.WithPullerPump(pullerPump),
-		coord.WithRequireChairAssignment(c.CoordRequireChairAssignment),
+		coord.WithRequireChairAssignment(true),
 		coord.WithMaxDigestsPerPleasePull(c.CoordMaxDigestsPerRequest),
 	}
 	if chairManager != nil {

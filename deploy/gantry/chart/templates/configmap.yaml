@@ -37,7 +37,6 @@ data:
     chair_seed_count: 8
     chair_api_timeout: "5s"
 
-    storage_mode: "containerd"
     containerd_socket: {{ .Values.containerd.socketPath | quote }}
     containerd_namespace: {{ .Values.containerd.namespace | quote }}
     containerd_lease_ttl: "60m"
@@ -55,8 +54,6 @@ data:
         {{- end }}
       {{- end }}
 
-    coord_peer_authz_enforce: false
-    coord_require_chair_assignment: false
     coord_max_digests_per_request: 256
     coord_max_concurrent_pulls: 16
     peer_fetch_timeout: "15m"
