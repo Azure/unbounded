@@ -907,7 +907,7 @@ func integrationEnrollment(t *testing.T, rc *rest.Config, c client.Client, a *Ap
 
 	eventually(t, "managed Pod published through informer", func() bool {
 		p, err := a.Server.Publications.Current()
-		return err == nil && strings.Contains(p.Encoding(), string(node.UID))
+		return err == nil && strings.Contains(p.encoded, string(node.UID))
 	})
 
 	kube, err := kubernetes.NewForConfig(rc)

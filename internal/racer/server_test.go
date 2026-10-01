@@ -137,7 +137,7 @@ func TestAuthenticatedSharesProposalAndExplicitNodePrecedence(t *testing.T) {
 
 	published := reconcileTopology(t, f.a.Topology, f.ctx)
 
-	publication, err := wire.DecodePublication(strings.NewReader(published.Encoding()))
+	publication, err := wire.DecodePublication(strings.NewReader(published.encoded))
 	if err != nil || publication.Members[0].Shares != 9 {
 		t.Fatalf("proposal not published: %+v %v", publication, err)
 	}
@@ -153,7 +153,7 @@ func TestAuthenticatedSharesProposalAndExplicitNodePrecedence(t *testing.T) {
 
 	published = reconcileTopology(t, f.a.Topology, f.ctx)
 
-	publication, err = wire.DecodePublication(strings.NewReader(published.Encoding()))
+	publication, err = wire.DecodePublication(strings.NewReader(published.encoded))
 	if err != nil || publication.Members[0].Shares != 12 {
 		t.Fatalf("explicit shares lost: %+v %v", publication, err)
 	}

@@ -24,7 +24,9 @@ import (
 )
 
 type Server struct {
+	// Config is construction input; runtime settings are frozen on first use.
 	Config             Config
+	config             Config
 	Trust              *Trust
 	Bootstrap          *Bootstrap
 	Publications       *Publications
@@ -53,7 +55,9 @@ func (*Server) NeedLeaderElection() bool { return false }
 // The caller owns the reload lifetime and must supply and cancel a cancelable
 // context, including when listener setup fails. Start owns this context itself.
 func (s *Server) TLSConfig(ctx context.Context) (*tls.Config, error) {
-	if err := s.Config.Validate(); err != nil {
+	s.initializeAdmission()
+
+	if err := s.config.Validate(); err != nil {
 		return nil, err
 	}
 
@@ -69,7 +73,7 @@ func (s *Server) TLSConfig(ctx context.Context) (*tls.Config, error) {
 		return nil, err
 	}
 
-	reloader, err := newServingCertificateReloader(s.Config.TLSCertificateFile, s.Config.TLSPrivateKeyFile)
+	reloader, err := newServingCertificateReloader(s.config.TLSCertificateFile, s.config.TLSPrivateKeyFile)
 	if err != nil {
 		return nil, wire.Unavailable
 	}
@@ -115,11 +119,13 @@ func (s *Server) tlsConfigWithCertificate(ctx context.Context, certificate func(
 // Start opens TLS before public readiness so controller replication cannot
 // deadlock on bootstrap. Process cancellation closes connections and polls.
 func (s *Server) Start(ctx context.Context) error {
-	if err := s.Config.Validate(); err != nil {
+	s.initializeAdmission()
+
+	if err := s.config.Validate(); err != nil {
 		return err
 	}
 
-	if s.Config.ControlAddress == "" || s.Config.TLSCertificateFile == "" || s.Config.TLSPrivateKeyFile == "" {
+	if s.config.ControlAddress == "" || s.config.TLSCertificateFile == "" || s.config.TLSPrivateKeyFile == "" {
 		return wire.InvalidRequest
 	}
 
@@ -135,7 +141,7 @@ func (s *Server) Start(ctx context.Context) error {
 		return err
 	}
 
-	listener, err := (&net.ListenConfig{}).Listen(serving, "tcp", s.Config.ControlAddress)
+	listener, err := (&net.ListenConfig{}).Listen(serving, "tcp", s.config.ControlAddress)
 	if err != nil {
 		return err
 	}
@@ -146,17 +152,19 @@ func (s *Server) Start(ctx context.Context) error {
 // serve owns the listener and every accepted connection. Close, rather than a
 // grace period for active traffic, is required as soon as the process stops.
 func (s *Server) serve(ctx context.Context, listener net.Listener, config *tls.Config) error {
+	s.initializeAdmission()
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	server := &http.Server{
 		Handler:           s.Handler(),
 		TLSConfig:         config,
-		ReadHeaderTimeout: s.Config.Limits.WriteTimeout,
-		ReadTimeout:       s.Config.Limits.WriteTimeout,
-		WriteTimeout:      wire.PollWait + 3*s.Config.Limits.WriteTimeout,
+		ReadHeaderTimeout: s.config.Limits.WriteTimeout,
+		ReadTimeout:       s.config.Limits.WriteTimeout,
+		WriteTimeout:      wire.PollWait + 3*s.config.Limits.WriteTimeout,
 		IdleTimeout:       wire.PollWait,
-		MaxHeaderBytes:    s.Config.Limits.HeaderBytes,
+		MaxHeaderBytes:    s.config.Limits.HeaderBytes,
 		BaseContext:       func(net.Listener) context.Context { return ctx },
 	}
 
@@ -196,7 +204,7 @@ func (s *Server) serve(ctx context.Context, listener net.Listener, config *tls.C
 	s.Lifecycle.SetServingReady(false)
 	cancel()
 
-	shutdown, stop := context.WithTimeout(context.Background(), s.Config.Limits.ShutdownTimeout)
+	shutdown, stop := context.WithTimeout(context.Background(), s.config.Limits.ShutdownTimeout)
 	defer stop()
 
 	closed := make(chan error, 1)
@@ -238,14 +246,15 @@ func (s *Server) serve(ctx context.Context, listener net.Listener, config *tls.C
 
 func (s *Server) initializeAdmission() {
 	s.once.Do(func() {
-		s.polls = newIdentityAdmission[wire.NodeID](s.Config.Limits.MaxPolls)
-		s.keyringPolls = newIdentityAdmission[wire.NodeID](s.Config.Limits.MaxPolls)
-		s.replicationPolls = newIdentityAdmission[string](s.Config.Limits.MaxConcurrentBootstrap)
-		s.authSlots = make(chan struct{}, max(0, s.Config.Limits.MaxConcurrentBootstrap))
+		s.config = s.Config.effective()
+		s.polls = newIdentityAdmission[wire.NodeID](s.config.Limits.MaxPolls)
+		s.keyringPolls = newIdentityAdmission[wire.NodeID](s.config.Limits.MaxPolls)
+		s.replicationPolls = newIdentityAdmission[string](s.config.Limits.MaxConcurrentBootstrap)
+		s.authSlots = make(chan struct{}, max(0, s.config.Limits.MaxConcurrentBootstrap))
 		// API-backed bearer authentication must not starve local TLS authentication.
 		// Enrollment and keyring bearer checks share this bounded API work pool.
-		s.bootstrapSlots = make(chan struct{}, max(0, s.Config.Limits.MaxConcurrentBootstrap))
-		s.writes = make(chan struct{}, max(0, s.Config.Limits.MaxConcurrentWrites))
+		s.bootstrapSlots = make(chan struct{}, max(0, s.config.Limits.MaxConcurrentBootstrap))
+		s.writes = make(chan struct{}, max(0, s.config.Limits.MaxConcurrentWrites))
 	})
 }
 
@@ -295,7 +304,7 @@ func (s *Server) Handler() http.Handler {
 	s.initializeAdmission()
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		responseControl(http.NewResponseController(w).SetWriteDeadline(time.Now().Add(s.Config.Limits.WriteTimeout)))
+		responseControl(http.NewResponseController(w).SetWriteDeadline(time.Now().Add(s.config.Limits.WriteTimeout)))
 		// net/http permits parser slop above MaxHeaderBytes. Apply the configured
 		// application bound as well, before any authentication/API work.
 		headerBytes := len(r.RequestURI) + len(r.Host)
@@ -305,7 +314,7 @@ func (s *Server) Handler() http.Handler {
 			}
 		}
 
-		if s.Config.Limits.HeaderBytes > 0 && headerBytes > s.Config.Limits.HeaderBytes {
+		if s.config.Limits.HeaderBytes > 0 && headerBytes > s.config.Limits.HeaderBytes {
 			writeFailure(w, wire.TooLarge)
 			return
 		}
@@ -369,7 +378,7 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release(s.bootstrapSlots)
 
-	ctx, cancel := context.WithTimeout(r.Context(), s.Config.Limits.WriteTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), s.config.Limits.WriteTimeout)
 	defer cancel()
 
 	deadline, _ := ctx.Deadline()
@@ -444,10 +453,10 @@ func (s *Server) authenticateSnapshot(ctx context.Context, state *tls.Connection
 	}
 	defer release(s.authSlots)
 
-	ctx, cancel := context.WithTimeout(ctx, s.Config.Limits.WriteTimeout)
+	ctx, cancel := context.WithTimeout(ctx, s.config.Limits.WriteTimeout)
 	defer cancel()
 
-	return AuthenticateCertificate(ctx, s.Trust, s.Config, state)
+	return AuthenticateCertificate(ctx, s.Trust, s.config, state)
 }
 
 func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
@@ -474,7 +483,7 @@ func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	// A long poll does not consume a write slot. Give its eventual response a
 	// fresh bounded write window, capped by the verified chain's expiration.
-	responseControl(http.NewResponseController(w).SetWriteDeadline(minTime(identity.expires, time.Now().Add(wire.PollWait+s.Config.Limits.WriteTimeout))))
+	responseControl(http.NewResponseController(w).SetWriteDeadline(minTime(identity.expires, time.Now().Add(wire.PollWait+s.config.Limits.WriteTimeout))))
 
 	publication, err := s.Publications.Wait(ctx, identity, after)
 	if !time.Now().Before(identity.expires) {
@@ -484,7 +493,7 @@ func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// Expiration forbids snapshot bytes, but a bounded error can still tell
 		// a pooled client to recover its expired identity through bootstrap.
-		responseControl(http.NewResponseController(w).SetWriteDeadline(time.Now().Add(s.Config.Limits.WriteTimeout)))
+		responseControl(http.NewResponseController(w).SetWriteDeadline(time.Now().Add(s.config.Limits.WriteTimeout)))
 		writeFailure(w, err)
 
 		return
@@ -523,16 +532,17 @@ func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeCtx, cancelWrite, err := image.writeContext(trustCtx)
+	boundedCtx, stopWindow := context.WithTimeout(trustCtx, s.config.Limits.WriteTimeout)
+	defer stopWindow()
+
+	writeCtx, cancelWrite, err := image.writeContext(boundedCtx)
 	if err != nil {
 		writeFailure(w, err)
 		return
 	}
 	defer cancelWrite()
 
-	freshUntil, _ := writeCtx.Deadline()
-	deadline := minTime(identity.expires, time.Now().Add(s.Config.Limits.WriteTimeout))
-	deadline = minTime(deadline, freshUntil)
+	deadline, _ := writeCtx.Deadline()
 
 	stopWrite := boundConnection(writeCtx, deadline)
 	defer stopWrite()
@@ -542,19 +552,31 @@ func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 
 	if publication == nil {
 		w.WriteHeader(http.StatusNoContent)
-		responseControl(http.NewResponseController(w).Flush())
+		flushResponse(writeCtx, w)
 
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 
-	if _, err := publication.ForBase(r.Header.Get(wire.DeltaHeader)).WriteTo(requestWriter{ctx: writeCtx, writer: w}); err != nil {
+	if _, err := publication.ForBase(r.Header.Get(wire.DeltaHeader)).writeTo(writeCtx, w); err != nil {
 		// A partial JSON response cannot be repaired with a protocol error.
 		panic(http.ErrAbortHandler)
 	}
 
+	flushResponse(writeCtx, w)
+}
+
+func flushResponse(ctx context.Context, w http.ResponseWriter) {
+	if ctx.Err() != nil {
+		panic(http.ErrAbortHandler)
+	}
+
 	responseControl(http.NewResponseController(w).Flush())
+
+	if ctx.Err() != nil {
+		panic(http.ErrAbortHandler)
+	}
 }
 
 // The production HTTP/1 server supports these operations. In-memory handler
@@ -741,7 +763,7 @@ func (s *Server) authenticateKeyring(r *http.Request) (NodeIdentity, error) {
 	}
 	defer release(s.bootstrapSlots)
 
-	ctx, cancel := context.WithTimeout(r.Context(), s.Config.Limits.WriteTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), s.config.Limits.WriteTimeout)
 	defer cancel()
 
 	return s.Bootstrap.Authenticate(ctx, r)
@@ -769,7 +791,7 @@ func (s *Server) serveKeyring(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithDeadline(r.Context(), identity.expires)
 	defer cancel()
 
-	responseControl(http.NewResponseController(w).SetWriteDeadline(minTime(identity.expires, time.Now().Add(wire.PollWait+2*s.Config.Limits.WriteTimeout))))
+	responseControl(http.NewResponseController(w).SetWriteDeadline(minTime(identity.expires, time.Now().Add(wire.PollWait+2*s.config.Limits.WriteTimeout))))
 
 	bundle, err := s.Trust.waitKeyring(ctx, after)
 	if !time.Now().Before(identity.expires) {
@@ -777,7 +799,7 @@ func (s *Server) serveKeyring(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
-		responseControl(http.NewResponseController(w).SetWriteDeadline(time.Now().Add(s.Config.Limits.WriteTimeout)))
+		responseControl(http.NewResponseController(w).SetWriteDeadline(time.Now().Add(s.config.Limits.WriteTimeout)))
 		writeFailure(w, err)
 
 		return
@@ -815,7 +837,7 @@ func (s *Server) serveKeyring(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err != nil {
-		responseControl(http.NewResponseController(w).SetWriteDeadline(time.Now().Add(s.Config.Limits.WriteTimeout)))
+		responseControl(http.NewResponseController(w).SetWriteDeadline(time.Now().Add(s.config.Limits.WriteTimeout)))
 		writeFailure(w, err)
 
 		return
@@ -839,7 +861,7 @@ func (s *Server) serveKeyring(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release(s.writes)
 
-	deadline := minTime(identity.expires, time.Now().Add(s.Config.Limits.WriteTimeout))
+	deadline := minTime(identity.expires, time.Now().Add(s.config.Limits.WriteTimeout))
 	if freshness, ok := ctx.Deadline(); ok {
 		deadline = minTime(deadline, freshness)
 	}

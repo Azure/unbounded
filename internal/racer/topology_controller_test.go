@@ -130,11 +130,11 @@ func TestTopologyOwnershipHistoryAndCatalogRestart(t *testing.T) {
 			require.Same(t, first, reconcileTopology(t, r, t.Context()), "cache waits for committed keys")
 			runKeys(t, a.Keyring)
 			withCache := reconcileTopology(t, r, t.Context())
-			published, err := wire.DecodePublication(strings.NewReader(withCache.Encoding()))
+			published, err := wire.DecodePublication(strings.NewReader(withCache.encoded))
 			require.NoError(t, err)
 			require.Equal(t, []wire.CacheDefinition{{ID: testOtherUID, Name: "cache-a", ClientSocket: "/run/racer/cache-a/client/socket", OriginSocket: "/run/racer/cache-a/origin/socket"}}, published.Caches)
 			require.Len(t, published.Members, 1)
-			require.Equal(t, first.Version().MembershipVersion, withCache.Version().MembershipVersion)
+			require.Equal(t, first.record.MembershipVersion, withCache.record.MembershipVersion)
 
 			// The workload was recreated while the old Pod still exists. A fresh
 			// process must recover history, not admit that Pod under its stale UID.
@@ -147,7 +147,7 @@ func TestTopologyOwnershipHistoryAndCatalogRestart(t *testing.T) {
 			a = Assemble(r.Config, r.Client, r.APIReader)
 			r = a.Topology
 			restarted := reconcileTopology(t, r, t.Context())
-			require.Equal(t, withCache.Encoding(), restarted.Encoding())
+			require.Equal(t, withCache.encoded, restarted.encoded)
 			require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(&node), &node))
 			require.Equal(t, history, node.Annotations[admittedMemberAnnotation])
 
@@ -156,7 +156,7 @@ func TestTopologyOwnershipHistoryAndCatalogRestart(t *testing.T) {
 			replacement.OwnerReferences[0] = *metav1.NewControllerRef(ds, appsv1.SchemeGroupVersion.WithKind("DaemonSet"))
 			require.NoError(t, r.Create(t.Context(), &replacement))
 			recovered := reconcileTopology(t, r, t.Context())
-			published, err = wire.DecodePublication(strings.NewReader(recovered.Encoding()))
+			published, err = wire.DecodePublication(strings.NewReader(recovered.encoded))
 			require.NoError(t, err)
 			require.Equal(t, "[2001:db8::2]:7443", published.Members[0].PeerEndpoint)
 			require.Equal(t, uint32(8), published.Members[0].Shares)
@@ -185,7 +185,7 @@ func TestTopologyOwnershipHistoryAndCatalogRestart(t *testing.T) {
 			node.Labels = map[string]string{wire.ExclusionLabel: ""}
 			require.NoError(t, r.Update(t.Context(), &node))
 			excluded := reconcileTopology(t, r, t.Context())
-			published, err = wire.DecodePublication(strings.NewReader(excluded.Encoding()))
+			published, err = wire.DecodePublication(strings.NewReader(excluded.encoded))
 			require.NoError(t, err)
 			require.Empty(t, published.Members)
 			require.Empty(t, published.Caches)
@@ -231,7 +231,7 @@ func TestTopologyCustomWorkloadOwnership(t *testing.T) {
 			}
 
 			committed := reconcileTopology(t, r, t.Context())
-			published, err := wire.DecodePublication(strings.NewReader(committed.Encoding()))
+			published, err := wire.DecodePublication(strings.NewReader(committed.encoded))
 			require.NoError(t, err)
 			require.NoError(t, r.Get(t.Context(), client.ObjectKeyFromObject(&node), &node))
 

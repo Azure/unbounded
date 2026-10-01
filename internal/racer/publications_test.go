@@ -67,27 +67,27 @@ func TestPublicationDeltaSelectionAndDisconnectedFallback(t *testing.T) {
 	members[id] = m
 	next := install()
 
-	delta := next.ForBase(base.Version().ContentHash)
-	if len(delta.Encoding()) >= len(next.Encoding()) {
+	delta := next.ForBase(base.record.ContentHash)
+	if len(delta.encoded) >= len(next.encoded) {
 		t.Fatal("delta was not selected")
 	}
 
-	decoded, err := wire.DecodePublication(strings.NewReader(base.Encoding()))
+	decoded, err := wire.DecodePublication(strings.NewReader(base.encoded))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	applied, err := wire.ApplyDelta(decoded, strings.NewReader(delta.Encoding()))
+	applied, err := wire.ApplyDelta(decoded, strings.NewReader(delta.encoded))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	hash, _, err := wire.ContentHashes(applied)
-	if err != nil || hash != next.Version().ContentHash {
+	if err != nil || hash != next.record.ContentHash {
 		t.Fatalf("target mismatch: %v", err)
 	}
 
-	if next.ForBase("missing") != next || next.ForBase("") != next {
+	if next.ForBase("missing").encoded != next.encoded || next.ForBase("").encoded != next.encoded {
 		t.Fatal("missing-base fallback failed")
 	}
 }
@@ -134,7 +134,7 @@ func TestPublicationCurrentAndSubscribe(t *testing.T) {
 		}
 
 		current, changed, err = p.CurrentAndSubscribe()
-		if err != nil || current.Encoding() != installed.Encoding() || current.authority == installed.authority || installed.authority.Err() == nil {
+		if err != nil || current.encoded != installed.encoded || current.authority == installed.authority || installed.authority.Err() == nil {
 			t.Fatalf("resumed publication: %p, %v", current, err)
 		}
 
@@ -172,7 +172,7 @@ func TestPublicationBoundsOverflowAndInstallProof(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	previous := p.Version()
+	previous := p.record
 
 	previous.Sequence = ^wire.Sequence(0)
 	if _, err := r.Publications.Prepare(previous, "rv", nil, cache); !errors.Is(err, wire.Unavailable) {
@@ -190,14 +190,14 @@ func TestPublicationBoundsOverflowAndInstallProof(t *testing.T) {
 		t.Fatalf("membership overflow: %v", err)
 	}
 
-	if _, err := r.Publications.Prepare(p.Version(), "rv", AcceptedMembers{testNodeUID: {Node: testOtherUID}}, nil); !errors.Is(err, wire.InvalidRequest) {
+	if _, err := r.Publications.Prepare(p.record, "rv", AcceptedMembers{testNodeUID: {Node: testOtherUID}}, nil); !errors.Is(err, wire.InvalidRequest) {
 		t.Fatalf("map identity: %v", err)
 	}
 
 	oversized := members[testNodeUID]
 
 	oversized.Rails = []wire.Rail{{Fabric: strings.Repeat("a", wire.MaxPublicationBytes)}}
-	if _, err := r.Publications.Prepare(p.Version(), "rv", AcceptedMembers{testNodeUID: oversized}, nil); !errors.Is(err, wire.TooLarge) {
+	if _, err := r.Publications.Prepare(p.record, "rv", AcceptedMembers{testNodeUID: oversized}, nil); !errors.Is(err, wire.TooLarge) {
 		t.Fatalf("oversized candidate: %v", err)
 	}
 }
@@ -233,7 +233,7 @@ func TestPublicationDeepIsolationAndReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	decoded, err := wire.DecodePublication(strings.NewReader(committed.Encoding()))
+	decoded, err := wire.DecodePublication(strings.NewReader(committed.encoded))
 	if err != nil || len(decoded.Members) != 1 || *decoded.Members[0].Rails[0].NUMANode != 1 {
 		t.Fatalf("mutable alias: %+v, %v", decoded, err)
 	}
@@ -263,7 +263,7 @@ func TestPollValidationAndCancellation(t *testing.T) {
 
 		current := reconcileTopology(t, r, leader)
 		identity := pollIdentity(r.Config, testNodeUID)
-		sequence := current.Version().Sequence
+		sequence := current.record.Sequence
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -337,7 +337,7 @@ func TestPollValidationAndCancellation(t *testing.T) {
 			t.Fatalf("immediate poll after leadership loss: %p, %v", got, err)
 		}
 
-		if _, err := current.WriteTo(io.Discard); !errors.Is(err, context.Canceled) {
+		if _, _, err := current.writeContext(t.Context()); !errors.Is(err, context.Canceled) {
 			t.Fatalf("write after leadership: %v", err)
 		}
 	})
@@ -346,7 +346,7 @@ func TestPollValidationAndCancellation(t *testing.T) {
 func TestPollImmediateReturnsWithoutAllocations(t *testing.T) {
 	r := initializedTopology(t)
 	ctx := context.Background()
-	previous := reconcileTopology(t, r, ctx).Version().Sequence
+	previous := reconcileTopology(t, r, ctx).record.Sequence
 	cache := catalogCache("cache", testNodeUID)
 
 	if err := r.Create(ctx, &cache); err != nil {
@@ -394,7 +394,7 @@ func TestPollCertificateExpiration(t *testing.T) {
 				p := reconcileTopology(t, r, context.Background())
 				identity := pollIdentity(r.Config, testNodeUID)
 				identity.expires = time.Now().Add(time.Second)
-				sequence := p.Version().Sequence
+				sequence := p.record.Sequence
 				ctx := context.Background()
 
 				if name == "with context deadline" {
@@ -419,7 +419,7 @@ func TestPollNormalTimeout(t *testing.T) {
 		r.Publications.maxAge = 2 * wire.PollWait
 		p := reconcileTopology(t, r, context.Background())
 		identity := pollIdentity(r.Config, testNodeUID)
-		sequence := p.Version().Sequence
+		sequence := p.record.Sequence
 		start := time.Now()
 
 		got, err := r.Publications.Wait(context.Background(), identity, &sequence)
@@ -437,7 +437,7 @@ func TestDurableLossWithdrawsPublication(t *testing.T) {
 		defer cancel()
 
 		p := reconcileTopology(t, r, ctx)
-		sequence := p.Version().Sequence
+		sequence := p.record.Sequence
 		done := make(chan error, 1)
 
 		go func() {
@@ -478,7 +478,7 @@ func TestPollFanoutSharesOnePublication(t *testing.T) {
 		defer cancel()
 
 		current := reconcileTopology(t, r, ctx)
-		sequence := current.Version().Sequence
+		sequence := current.record.Sequence
 
 		const count = 256
 
@@ -540,15 +540,73 @@ func TestPublicationWriteScratchAndCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	p := &CommittedPublication{leadership: ctx, encoded: strings.Repeat("x", 100_000)}
+	p := publicationResponse{encoded: strings.Repeat("x", 100_000)}
+	if n, err := p.writeTo(ctx, shortPublicationWriter{}); !errors.Is(err, io.ErrShortWrite) || n != 1 {
+		t.Fatalf("short write: %d, %v", n, err)
+	}
 
 	w := &boundedWriter{}
-	if n, err := p.WriteTo(w); err != nil || n != 100_000 || w.largest > 32*1024 || w.calls != 4 {
+	if n, err := p.writeTo(ctx, w); err != nil || n != 100_000 || w.largest > 32*1024 || w.calls != 4 {
 		t.Fatalf("unbounded write scratch: %d, %v, %+v", n, err, w)
 	}
 
 	w = &boundedWriter{cancel: cancel}
-	if n, err := p.WriteTo(w); !errors.Is(err, context.Canceled) || n != 32*1024 || w.calls != 1 {
+	if n, err := p.writeTo(ctx, w); !errors.Is(err, context.Canceled) || n != 32*1024 || w.calls != 1 {
 		t.Fatalf("write ignored cancellation: %d, %v", n, err)
+	}
+}
+
+type shortPublicationWriter struct{}
+
+func (shortPublicationWriter) Write([]byte) (int, error) { return 1, nil }
+
+func TestPublicationAdmissionRequiresOwner(t *testing.T) {
+	for _, image := range []*CommittedPublication{nil, {}, {leadership: t.Context()}} {
+		if _, _, err := image.writeContext(t.Context()); !errors.Is(err, wire.Unavailable) {
+			t.Fatalf("ownerless write admitted: %v", err)
+		}
+	}
+}
+
+func TestPublicationInstalledStateNeverExceedsHighWater(t *testing.T) {
+	for _, mutation := range []string{"cluster", "sequence", "membership", "same-sequence hash"} {
+		t.Run(mutation, func(t *testing.T) {
+			r := initializedTopology(t)
+
+			image := reconcileTopology(t, r, t.Context())
+			if r.Publications.observed != image.record {
+				t.Fatal("install did not observe record")
+			}
+
+			newer := image.record
+			newer.Sequence += 2
+
+			newer.MembershipVersion++
+			if err := r.Publications.confirm(newer); err != nil {
+				t.Fatal(err)
+			}
+
+			next := *image
+			next.record = newer
+
+			switch mutation {
+			case "cluster":
+				next.record.Cluster = testNodeUID
+			case "sequence":
+				next.record.Sequence--
+			case "membership":
+				next.record.MembershipVersion--
+			case "same-sequence hash":
+				next.record.ContentHash = strings.Repeat("a", 64)
+			}
+
+			if err := r.Publications.Install(&next); !errors.Is(err, wire.Conflict) {
+				t.Fatalf("high-water bypass: %v", err)
+			}
+
+			if r.Publications.current != image || r.Publications.observed != newer {
+				t.Fatal("rejected install mutated state")
+			}
+		})
 	}
 }

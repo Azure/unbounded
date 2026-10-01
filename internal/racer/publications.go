@@ -58,37 +58,21 @@ type CommittedPublication struct {
 	authority  context.Context
 }
 
-func (p *CommittedPublication) Version() VersionRecord { return p.record }
+// publicationResponse is a response-only view, never installable state. The
+// caller owns one admitted image context through both write and flush.
+type publicationResponse struct{ encoded string }
 
-// Encoding is an immutable shared string, never a mutable byte slice. HTTP serving
-// should use WriteTo under its write semaphore/deadline; it makes no snapshot copy.
-func (p *CommittedPublication) Encoding() string { return p.encoded }
-
-func (p *CommittedPublication) WriteTo(w io.Writer) (int64, error) {
-	if p == nil || p.leadership == nil {
-		return 0, wire.Unavailable
-	}
-
-	ctx, cancel, err := p.writeContext(p.leadership)
-	if err != nil {
-		return 0, err
-	}
-	defer cancel()
-
+func (p publicationResponse) writeTo(ctx context.Context, w io.Writer) (int64, error) {
 	var written int64
 
 	for remaining := p.encoded; remaining != ""; {
-		if p.authority != nil && p.authority.Err() != nil {
-			return written, wire.Unavailable
-		}
-
 		if err := ctx.Err(); err != nil {
 			return written, err
 		}
 		// ResponseWriter need not implement StringWriter. Limit conversion scratch
 		// to 32 KiB rather than allocating a full publication for every response.
 		chunk := remaining[:min(len(remaining), 32*1024)]
-		n, err := io.WriteString(w, chunk)
+		n, err := io.WriteString(requestWriter{ctx: ctx, writer: w}, chunk)
 
 		written += int64(n)
 		if err != nil {
@@ -102,10 +86,6 @@ func (p *CommittedPublication) WriteTo(w io.Writer) (int64, error) {
 		remaining = remaining[n:]
 	}
 
-	if p.authority != nil && p.authority.Err() != nil {
-		return written, wire.Unavailable
-	}
-
 	return written, ctx.Err()
 }
 
@@ -113,9 +93,8 @@ func (p *CommittedPublication) WriteTo(w io.Writer) (int64, error) {
 // freshness deadline at write admission. Later confirmations cannot extend an
 // in-flight response, and supersession or suspension permanently revokes it.
 func (p *CommittedPublication) writeContext(parent context.Context) (context.Context, context.CancelFunc, error) {
-	if p.owner == nil {
-		ctx, cancel := context.WithCancel(parent)
-		return ctx, cancel, nil
+	if p == nil || p.owner == nil {
+		return nil, nil, wire.Unavailable
 	}
 
 	owner := p.owner
@@ -133,7 +112,26 @@ func (p *CommittedPublication) writeContext(parent context.Context) (context.Con
 	ctx, cancel := context.WithDeadline(parent, owner.confirmed.Add(owner.maxAge))
 	stop := context.AfterFunc(p.authority, cancel)
 
-	return ctx, func() { stop(); cancel() }, nil
+	return publicationWriteContext{Context: ctx, authority: p.authority}, func() { stop(); cancel() }, nil
+}
+
+// Cancellation callbacks close transports asynchronously. Check the image's
+// authority synchronously too, so an unblocked writer cannot race revocation.
+type publicationWriteContext struct {
+	context.Context
+	authority context.Context
+}
+
+func (c publicationWriteContext) Err() error {
+	if err := c.authority.Err(); err != nil {
+		return err
+	}
+
+	if deadline, ok := c.Deadline(); ok && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+
+	return c.Context.Err()
 }
 
 // Publications owns only the current immutable publication and one broadcast
@@ -265,12 +263,12 @@ func (r *TopologyReconciler) CommitVersion(ctx context.Context, p *PreparedPubli
 
 // ForBase returns a shared bounded delta only for the exact authenticated cursor.
 // Coalesced/skipped updates and controller restarts automatically use the full image.
-func (p *CommittedPublication) ForBase(hash string) *CommittedPublication {
+func (p *CommittedPublication) ForBase(hash string) publicationResponse {
 	if hash == "" || hash != p.deltaBase || p.delta == "" {
-		return p
+		return publicationResponse{encoded: p.encoded}
 	}
 
-	return &CommittedPublication{owner: p.owner, record: p.record, encoded: p.delta, leadership: p.leadership, authority: p.authority}
+	return publicationResponse{encoded: p.delta}
 }
 
 func (p *Publications) Install(next *CommittedPublication) error {
@@ -296,10 +294,8 @@ func (p *Publications) Install(next *CommittedPublication) error {
 	}
 
 	if current := p.current; current != nil {
-		if current.record.Cluster != next.record.Cluster || next.record.Sequence < current.record.Sequence || next.record.MembershipVersion < current.record.MembershipVersion {
-			return wire.Conflict
-		}
-
+		// observeLocked is the sole counter/hash high-water guard. Installed
+		// state can only lag that observation, never exceed it.
 		if next.record.Sequence == current.record.Sequence {
 			if next.record != current.record || next.encoded != current.encoded {
 				return wire.Conflict

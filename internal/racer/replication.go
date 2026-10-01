@@ -345,7 +345,7 @@ func (s *Server) serveReplication(w http.ResponseWriter, request *http.Request) 
 		return
 	}
 
-	authCtx, cancel := context.WithTimeout(request.Context(), s.Config.Limits.WriteTimeout)
+	authCtx, cancel := context.WithTimeout(request.Context(), s.config.Limits.WriteTimeout)
 	uid, expires, err := r.authenticate(authCtx, request)
 
 	cancel()
@@ -374,7 +374,7 @@ func (s *Server) serveReplication(w http.ResponseWriter, request *http.Request) 
 	stop := context.AfterFunc(leader, cancel)
 	defer stop()
 
-	responseControl(http.NewResponseController(w).SetWriteDeadline(time.Now().Add(r.interval() + s.Config.Limits.WriteTimeout)))
+	responseControl(http.NewResponseController(w).SetWriteDeadline(time.Now().Add(r.interval() + s.config.Limits.WriteTimeout)))
 
 	var publication *CommittedPublication
 
@@ -418,18 +418,18 @@ func (s *Server) serveReplication(w http.ResponseWriter, request *http.Request) 
 	}
 	defer release(s.writes)
 
-	authorityCtx, stopAuthority, err := publication.writeContext(request.Context())
+	windowCtx, stopWrite := context.WithDeadline(request.Context(), minTime(expires, time.Now().Add(s.config.Limits.WriteTimeout)))
+	defer stopWrite()
+
+	stopLeader := context.AfterFunc(leader, stopWrite)
+	defer stopLeader()
+
+	writeCtx, stopAuthority, err := publication.writeContext(windowCtx)
 	if err != nil {
 		writeFailure(w, err)
 		return
 	}
 	defer stopAuthority()
-
-	writeCtx, stopWrite := context.WithDeadline(authorityCtx, minTime(expires, time.Now().Add(s.Config.Limits.WriteTimeout)))
-	defer stopWrite()
-
-	stopLeader := context.AfterFunc(leader, stopWrite)
-	defer stopLeader()
 
 	deadline, _ := writeCtx.Deadline()
 
@@ -442,14 +442,14 @@ func (s *Server) serveReplication(w http.ResponseWriter, request *http.Request) 
 
 	if unchanged {
 		w.WriteHeader(http.StatusNoContent)
-		responseControl(http.NewResponseController(w).Flush())
+		flushResponse(writeCtx, w)
 
 		return
 	}
 
-	if _, err := publication.WriteTo(requestWriter{ctx: writeCtx, writer: w}); err != nil {
+	if _, err := publication.ForBase("").writeTo(writeCtx, w); err != nil {
 		panic(http.ErrAbortHandler)
 	}
 
-	responseControl(http.NewResponseController(w).Flush())
+	flushResponse(writeCtx, w)
 }

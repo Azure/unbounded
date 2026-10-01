@@ -104,7 +104,7 @@ func TestTopologySiteChangesPersistAcrossRestart(t *testing.T) {
 	pod := memberPod("a", 1, "192.0.2.1")
 	r := initializedTopology(t, &node, &pod, &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: DataplaneDaemonSetName, Namespace: "racer", UID: testDaemonSetUID}})
 	first := reconcileTopology(t, r, t.Context())
-	base, err := wire.DecodePublication(strings.NewReader(first.Encoding()))
+	base, err := wire.DecodePublication(strings.NewReader(first.encoded))
 	require.NoError(t, err)
 	require.Equal(t, "site-a", base.Members[0].Site)
 
@@ -121,7 +121,7 @@ func TestTopologySiteChangesPersistAcrossRestart(t *testing.T) {
 		// Drop all in-memory history before processing the changed boundary.
 		r = Assemble(r.Config, r.Client, r.APIReader).Topology
 		committed := reconcileTopology(t, r, t.Context())
-		next, err := wire.DecodePublication(strings.NewReader(committed.Encoding()))
+		next, err := wire.DecodePublication(strings.NewReader(committed.encoded))
 		require.NoError(t, err)
 		require.Equal(t, site, next.Members[0].Site)
 		require.Equal(t, base.Members[0].Rails, next.Members[0].Rails)
@@ -146,7 +146,7 @@ func TestTopologySiteChangesPersistAcrossRestart(t *testing.T) {
 		require.Equal(t, next.Members[0], saved)
 
 		r = Assemble(r.Config, r.Client, r.APIReader).Topology
-		require.Equal(t, committed.Encoding(), reconcileTopology(t, r, t.Context()).Encoding())
+		require.Equal(t, committed.encoded, reconcileTopology(t, r, t.Context()).encoded)
 
 		base = next
 	}

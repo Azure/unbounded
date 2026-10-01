@@ -226,7 +226,7 @@ func assertPublishedKeys(t *testing.T, r *TopologyReconciler, count int) {
 	t.Helper()
 	p := reconcileTopology(t, r, t.Context())
 
-	v, err := wire.DecodePublication(strings.NewReader(p.Encoding()))
+	v, err := wire.DecodePublication(strings.NewReader(p.encoded))
 	if err != nil || len(v.Caches) != count {
 		t.Fatalf("published caches=%d, want %d: %v", len(v.Caches), count, err)
 	}

@@ -30,8 +30,10 @@ func TestAdmissionLimitsFrozen(t *testing.T) {
 	s.initializeAdmission()
 	s.Config.Limits.MaxPolls = 2
 	s.Config.Limits.MaxConcurrentBootstrap = 2
+	s.Config.Limits.HeaderBytes = 1
 	s.initializeAdmission()
 	require.Equal(t, 1, s.polls.limit)
 	require.Equal(t, 1, s.keyringPolls.limit)
 	require.Equal(t, cap(s.bootstrapSlots), s.replicationPolls.limit)
+	require.NotEqual(t, s.Config.Limits.HeaderBytes, s.config.Limits.HeaderBytes)
 }

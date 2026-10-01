@@ -4,6 +4,7 @@
 package racer
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -111,14 +112,14 @@ func TestReplicaObservedHighWaterWithoutImage(t *testing.T) {
 				runKeys(t, f.a.Keyring)
 
 				recovered := reconcileTopology(t, f.a.Topology, f.ctx)
-				if recovered.Version().Sequence != newer.Sequence+1 || recovered.Version().MembershipVersion != newer.MembershipVersion {
+				if recovered.record.Sequence != newer.Sequence+1 || recovered.record.MembershipVersion != newer.MembershipVersion {
 					t.Fatal("recovery reset counters or changed unchanged membership")
 				}
 
 				response = httptest.NewRecorder()
 				f.a.Server.Handler().ServeHTTP(response, request.Clone(f.ctx))
 
-				if response.Code != http.StatusOK || response.Body.String() != recovered.Encoding() {
+				if response.Code != http.StatusOK || response.Body.String() != recovered.encoded {
 					t.Fatalf("reconciled authority not served: %d", response.Code)
 				}
 			})
@@ -152,7 +153,13 @@ func TestPublicationWriteAuthorityRevocation(t *testing.T) {
 				w := &firstChunkWriter{entered: make(chan struct{}), unblock: make(chan struct{})}
 				done := make(chan error, 1)
 
-				go func() { _, err := copy.WriteTo(w); done <- err }()
+				writeCtx, stopWrite, err := copy.writeContext(t.Context())
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer stopWrite()
+
+				go func() { _, err := copy.ForBase("").writeTo(writeCtx, w); done <- err }()
 
 				<-w.entered
 
@@ -254,13 +261,79 @@ func TestRevokedDeltaCannotBorrowNewAuthority(t *testing.T) {
 	copy.deltaBase = "base"
 	delta := copy.ForBase("base")
 
+	writeCtx, cancel, err := copy.writeContext(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+
 	r.Publications.Suspend()
 
 	if err := r.Publications.Install(p); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := delta.WriteTo(io.Discard); !errors.Is(err, wire.Unavailable) {
+	<-writeCtx.Done()
+
+	if _, err := delta.writeTo(writeCtx, io.Discard); !errors.Is(err, context.Canceled) {
 		t.Fatalf("revoked delta: %v", err)
+	}
+
+	if _, _, err := copy.writeContext(t.Context()); !errors.Is(err, wire.Unavailable) {
+		t.Fatalf("old image borrowed new authority: %v", err)
+	}
+}
+
+func TestSnapshotAuthorityHeldThroughFlush(t *testing.T) {
+	for _, action := range []string{"suspend", "freshness"} {
+		t.Run(action, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newServingFixture(t)
+				f.a.Server.Publications.maxAge = 5 * time.Second
+				w := &blockingResponse{ResponseRecorder: httptest.NewRecorder(), entered: make(chan struct{}), unblock: make(chan struct{}), blockFlush: true}
+				request := httptest.NewRequest(http.MethodGet, wire.SnapshotPath, nil)
+				request.TLS = f.requestState(t)
+				done := make(chan any, 1)
+
+				go func() { defer func() { done <- recover() }(); f.a.Server.Handler().ServeHTTP(w, request) }()
+
+				<-w.entered
+
+				image, err := f.a.Server.Publications.Current()
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				if action == "suspend" {
+					f.a.Server.Publications.Suspend()
+
+					if err := f.a.Server.Publications.Install(image); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					time.Sleep(3 * time.Second)
+
+					if err := f.a.Server.Publications.confirm(image.record); err != nil {
+						t.Fatal(err)
+					}
+
+					time.Sleep(2 * time.Second)
+				}
+
+				if len(f.a.Server.writes) != 1 || f.a.Server.polls.count() != 1 {
+					t.Fatal("flush released admission")
+				}
+
+				close(w.unblock)
+
+				if aborted := <-done; aborted != http.ErrAbortHandler {
+					t.Fatalf("revoked flush completed: %v", aborted)
+				}
+
+				if len(f.a.Server.writes) != 0 || f.a.Server.polls.count() != 0 {
+					t.Fatal("aborted flush leaked admission")
+				}
+			})
+		})
 	}
 }

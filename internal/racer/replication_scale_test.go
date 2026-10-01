@@ -239,7 +239,7 @@ func replicatedServingSmoke(t *testing.T, count int) {
 	}})
 
 	// Initial publisher installation uses the same canonical/durable validation.
-	image, err := wire.DecodePublication(strings.NewReader(base.Encoding()))
+	image, err := wire.DecodePublication(strings.NewReader(base.encoded))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,12 +284,12 @@ func replicatedServingSmoke(t *testing.T, count int) {
 			}
 
 			current, err := r.a.Server.Publications.Current()
-			if err != nil || current.Encoding() != publication.Encoding() {
+			if err != nil || current.encoded != publication.encoded {
 				t.Fatal("replica diverged", err)
 			}
 		}
 
-		t.Logf("replication sequence=%d elapsed=%s mock_token_reviews=%d", publication.Version().Sequence, time.Since(start), reviews.Load())
+		t.Logf("replication sequence=%d elapsed=%s mock_token_reviews=%d", publication.record.Sequence, time.Since(start), reviews.Load())
 	}
 	replicate(base)
 
@@ -335,7 +335,7 @@ func replicatedServingSmoke(t *testing.T, count int) {
 
 	defer func() { cancel(); <-observed }()
 
-	t.Logf("clients=%d replicas=3 GOMAXPROCS=%d setup=%s full_bytes=%d max_writes=%d max_auth=%d", count, runtime.GOMAXPROCS(0), time.Since(setup), len(base.Encoding()), leader.a.Server.Config.Limits.MaxConcurrentWrites, leader.a.Server.Config.Limits.MaxConcurrentBootstrap)
+	t.Logf("clients=%d replicas=3 GOMAXPROCS=%d setup=%s full_bytes=%d max_writes=%d max_auth=%d", count, runtime.GOMAXPROCS(0), time.Since(setup), len(base.encoded), leader.a.Server.Config.Limits.MaxConcurrentWrites, leader.a.Server.Config.Limits.MaxConcurrentBootstrap)
 	replicationSmokeStats(t, "baseline", replicas)
 
 	var (
@@ -444,7 +444,7 @@ func replicatedServingSmoke(t *testing.T, count int) {
 	collect := func(phase string, started time.Time, results <-chan replicationSmokeResult, want *CommittedPublication) {
 		t.Helper()
 
-		digest := sha256.Sum256([]byte(want.Encoding()))
+		digest := sha256.Sum256([]byte(want.encoded))
 		latencies := make([]time.Duration, 0, count)
 
 		var total int64
@@ -452,7 +452,7 @@ func replicatedServingSmoke(t *testing.T, count int) {
 		for range peers {
 			select {
 			case result := <-results:
-				if result.err != nil || result.digest != digest || result.bytes != int64(len(want.Encoding())) {
+				if result.err != nil || result.digest != digest || result.bytes != int64(len(want.encoded)) {
 					t.Fatalf("%s client=%d bytes=%d err=%v digest_match=%v", phase, result.index, result.bytes, result.err, result.digest == digest)
 				}
 
@@ -472,7 +472,7 @@ func replicatedServingSmoke(t *testing.T, count int) {
 
 	for phase := range 2 {
 		start = time.Now()
-		results := run(base.Version().Sequence, false)
+		results := run(base.record.Sequence, false)
 		replicationSmokePark(t, ctx, replicas, count, results)
 		replicationSmokeStats(t, "parked", replicas)
 
@@ -491,7 +491,7 @@ func replicatedServingSmoke(t *testing.T, count int) {
 		start = time.Now()
 		base = replicationSmokePublish(t, ctx, f.a.Topology, members)
 
-		image, err := wire.DecodePublication(strings.NewReader(base.Encoding()))
+		image, err := wire.DecodePublication(strings.NewReader(base.encoded))
 		if err != nil {
 			t.Fatal(err)
 		}

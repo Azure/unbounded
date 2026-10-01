@@ -76,7 +76,7 @@ func TestServerScale(t *testing.T) {
 				t.Fatalf("accepted %d of %d", len(r.Accepted), count)
 			}
 
-			t.Logf("members=%d cold_reconcile=%s allocated_bytes=%d publication_bytes=%d", count, cold, after.TotalAlloc-before.TotalAlloc, len(first.Encoding()))
+			t.Logf("members=%d cold_reconcile=%s allocated_bytes=%d publication_bytes=%d", count, cold, after.TotalAlloc-before.TotalAlloc, len(first.encoded))
 
 			start = time.Now()
 
@@ -239,7 +239,7 @@ func scaleFanout(t *testing.T, r *TopologyReconciler, ctx context.Context, count
 		t.Fatal(err)
 	}
 
-	sequence := current.Version().Sequence
+	sequence := current.record.Sequence
 	server := &Server{Config: r.Config}
 	server.initializeAdmission()
 
@@ -326,5 +326,5 @@ func scaleFanout(t *testing.T, r *TopologyReconciler, ctx context.Context, count
 	}
 
 	awaitServerPolls(t, server, 0)
-	t.Logf("waiters=%d GOMAXPROCS=%d admission=%s install=%s all_delivered=%s heap_delta=%d stack_delta=%d next_bytes=%d", count, runtime.GOMAXPROCS(0), admit, install, fanout, int64(parked.HeapAlloc)-int64(before.HeapAlloc), int64(parked.StackInuse)-int64(before.StackInuse), len(next.Encoding()))
+	t.Logf("waiters=%d GOMAXPROCS=%d admission=%s install=%s all_delivered=%s heap_delta=%d stack_delta=%d next_bytes=%d", count, runtime.GOMAXPROCS(0), admit, install, fanout, int64(parked.HeapAlloc)-int64(before.HeapAlloc), int64(parked.StackInuse)-int64(before.StackInuse), len(next.encoded))
 }

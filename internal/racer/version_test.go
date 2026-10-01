@@ -281,7 +281,7 @@ func TestTopologyNamespaceOwnershipAndMissingDaemonSet(t *testing.T) {
 	}
 
 	r = Assemble(r.Config, r.Client, r.APIReader).Topology
-	if restarted := reconcileTopology(t, r, ctx); restarted.Version() != member.Version() || restarted.Encoding() != member.Encoding() {
+	if restarted := reconcileTopology(t, r, ctx); restarted.record != member.record || restarted.encoded != member.encoded {
 		t.Fatal("cold restart changed admitted membership during workload gap")
 	}
 
@@ -360,7 +360,7 @@ func TestVersionCountersAndCrashAfterCommit(t *testing.T) {
 	ctx := context.Background()
 
 	empty := reconcileTopology(t, r, ctx)
-	if v := empty.Version(); v.Sequence != 1 || v.MembershipVersion != 1 {
+	if v := empty.record; v.Sequence != 1 || v.MembershipVersion != 1 {
 		t.Fatalf("initial counters: %+v", v)
 	}
 
@@ -376,7 +376,7 @@ func TestVersionCountersAndCrashAfterCommit(t *testing.T) {
 	runKeys(t, Assemble(r.Config, r.Client, r.APIReader).Keyring)
 
 	catalog := reconcileTopology(t, r, ctx)
-	if v := catalog.Version(); v.Sequence != 2 || v.MembershipVersion != 1 {
+	if v := catalog.record; v.Sequence != 2 || v.MembershipVersion != 1 {
 		t.Fatalf("catalog counters: %+v", v)
 	}
 
@@ -390,7 +390,7 @@ func TestVersionCountersAndCrashAfterCommit(t *testing.T) {
 	}
 
 	member := reconcileTopology(t, r, ctx)
-	if v := member.Version(); v.Sequence != 3 || v.MembershipVersion != 2 {
+	if v := member.record; v.Sequence != 3 || v.MembershipVersion != 2 {
 		t.Fatalf("member counters: %+v", v)
 	}
 
@@ -419,7 +419,7 @@ func TestVersionCountersAndCrashAfterCommit(t *testing.T) {
 	r = Assemble(r.Config, r.Client, r.APIReader).Topology
 
 	recovered := reconcileTopology(t, r, ctx)
-	if v := recovered.Version(); v.Sequence != 5 || v.MembershipVersion != 4 {
+	if v := recovered.record; v.Sequence != 5 || v.MembershipVersion != 4 {
 		t.Fatalf("recovery reused an unserved counter: %+v", v)
 	}
 }
@@ -460,7 +460,7 @@ func TestCASConflictRetriesFreshInputsAndKeepsHistory(t *testing.T) {
 	}
 
 	next := reconcileTopology(t, r, ctx)
-	if r.Accepted[testNodeUID].Shares != 9 || next.Version().Sequence != initial.Version().Sequence+1 {
+	if r.Accepted[testNodeUID].Shares != 9 || next.record.Sequence != initial.record.Sequence+1 {
 		t.Fatal("retry reused stale inputs")
 	}
 }

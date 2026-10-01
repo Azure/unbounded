@@ -37,7 +37,7 @@ func TestReplicaInstallationAndFreshness(t *testing.T) {
 
 		follower.Server.Publications.bindProcess(process)
 
-		image, err := wire.DecodePublication(strings.NewReader(publication.Encoding()))
+		image, err := wire.DecodePublication(strings.NewReader(publication.encoded))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -54,13 +54,13 @@ func TestReplicaInstallationAndFreshness(t *testing.T) {
 		}
 
 		current, err := follower.Server.Publications.Current()
-		if err != nil || current.Encoding() != publication.Encoding() {
+		if err != nil || current.encoded != publication.encoded {
 			t.Fatal("replica did not install canonical image", err)
 		}
 
 		time.Sleep(20 * time.Second)
 
-		if err := follower.Server.Publications.confirm(publication.Version()); err != nil {
+		if err := follower.Server.Publications.confirm(publication.record); err != nil {
 			t.Fatal(err)
 		}
 
@@ -84,7 +84,7 @@ func TestReplicaInstallationAndFreshness(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		rollback := publication.Version()
+		rollback := publication.record
 
 		rollback.ContentHash = strings.Repeat("0", 64)
 		if follower.Server.Publications.confirm(rollback) == nil {
