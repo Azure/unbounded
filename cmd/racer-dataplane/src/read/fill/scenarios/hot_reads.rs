@@ -108,7 +108,7 @@ impl LocalPageService for Gate {
         })
     }
 }
-fn coordinator(
+pub(super) fn coordinator(
     f: &Fixture,
     signer: &Rc<Signatures>,
     membership: &MembershipLease,

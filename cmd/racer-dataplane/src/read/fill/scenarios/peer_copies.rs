@@ -97,6 +97,31 @@ impl PeerClient for ScriptedPeers {
                 scope.check()?;
             }
             let response = match reply {
+                Reply::Copy(copy)
+                    if matches!(request.operation, PeerOperation::Subscribe { .. }) =>
+                {
+                    let PeerOperation::Subscribe { subscription, .. } = &request.operation else {
+                        unreachable!()
+                    };
+                    PeerResponse::Selected {
+                        grant: crate::peer::subscriptions::TransferGrant {
+                            subscription_id: subscription.id,
+                            sequence: subscription.sequence,
+                            page: copy.ciphertext.envelope().page.clone(),
+                            membership: request.route.membership,
+                            receiver: node(self.local),
+                            deadline: crate::security::protocol::number(
+                                &crate::security::protocol::request_head(&request)?,
+                                "racer-route-deadline",
+                            )?,
+                            remaining_page_budget: subscription.page_budget - 1,
+                            remaining_byte_budget: subscription.byte_budget
+                                - copy.ciphertext.bytes().len() as u64,
+                        },
+                        metadata: copy.metadata,
+                        ciphertext: copy.ciphertext,
+                    }
+                }
                 Reply::Copy(copy) => PeerResponse::Page {
                     metadata: copy.metadata,
                     ciphertext: copy.ciphertext,
@@ -161,6 +186,76 @@ fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Ve
     ));
     f.fill = Fill::new(dependencies);
     (peers, ordered)
+}
+
+#[test]
+fn invalid_signed_selection_falls_back_without_resetting_acquisition_budget() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
+    for missing_key in [false, true] {
+        for origin in [false, true] {
+            let mut f = fixture();
+            let (peers, ordered) = install_peers(&mut f, Some(1));
+            let good = encrypted_copy(&mut f);
+            let bad = unusable_copy(&f, &good, missing_key);
+            peers.replies.borrow_mut().extend([
+                (ordered[0].clone(), Reply::Copy(bad)),
+                (
+                    ordered[0].clone(),
+                    if origin {
+                        Reply::Miss
+                    } else {
+                        Reply::Copy(good)
+                    },
+                ),
+            ]);
+            let signers = network(4);
+            let (_local, mut endpoint, _published) = super::hot_reads::coordinator(
+                &f,
+                &signers[peers.local],
+                &f.membership,
+                peers.clone(),
+            );
+            let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
+            let demand = crate::peer::subscriptions::Demand::new(vec![
+                crate::peer::subscriptions::PageInterval { start: 0, end: 1 },
+            ])
+            .unwrap();
+            let mut work = Box::pin(f.fill.select_subscription(
+                f.page.version.clone(),
+                demand,
+                f.membership.clone(),
+                &f.context,
+                &f.scope,
+                &mut budget,
+            ));
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            let mut result = None;
+            for _ in 0..4096 {
+                if let Poll::Ready(value) = work.as_mut().poll(&mut cx) {
+                    result = Some(value);
+                    break;
+                }
+                endpoint.poll(&mut cx, 64).unwrap();
+                crate::read::drivers::poll(&mut cx, 64);
+                f.engine.poll_budgeted(64).unwrap();
+                f.crypto.poll_budgeted(64).unwrap();
+                f.reactor.poll_budgeted(64).unwrap();
+            }
+            drop(work);
+            assert_eq!(
+                result.expect("bounded fallback").unwrap().plaintext.bytes(),
+                b"abc"
+            );
+            assert_eq!(f.origin.calls.get(), usize::from(origin));
+            assert_eq!(peers.calls.borrow().len(), 2);
+            assert!(peers.replies.borrow().is_empty());
+            assert!(budget.remaining_attempts() < 10);
+            assert!(budget.remaining_links() < 18);
+            assert_eq!(budget.deadline(), f.scope.deadline.0);
+            endpoint.uninstall().unwrap();
+        }
+    }
 }
 
 #[test]

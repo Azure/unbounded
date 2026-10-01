@@ -154,15 +154,26 @@ impl Fill {
             let PeerResponse::Selected { grant, .. } = response.response() else {
                 return Err(Error::CorruptRecord);
             };
-            let copy = response_copy(response.response(), &grant.page)?;
-            drop(response);
-            // Allocate and authenticate on the stable owner, which can reclaim
-            // every payload charge retained by its page cache.
-            return self
-                .dependencies
-                .metadata_owner
-                .accept_selected(copy, scope)
-                .await;
+            let page = grant.page.clone();
+            let accepted = async {
+                let copy = response_copy(response.response(), &page)?;
+                drop(response);
+                // Allocate and authenticate on the stable owner, which can reclaim
+                // every payload charge retained by its page cache.
+                self.dependencies
+                    .metadata_owner
+                    .accept_selected(copy, scope)
+                    .await
+            }
+            .await;
+            match accepted {
+                Ok(page) => return Ok(page),
+                // A signed selection is not evidence of usable ciphertext. Fall
+                // through once to ordinary ranked acquisition with the SAME
+                // context and remaining budget; never recursively resubscribe.
+                Err(Error::CorruptRecord | Error::MissingKey) => {}
+                Err(error) => return Err(error),
+            }
         }
         self.dependencies
             .metadata_owner
