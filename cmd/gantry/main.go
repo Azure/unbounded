@@ -238,7 +238,7 @@ func runAgent(args []string) error {
 	noDialableTransferAddr := transferAddrFamilyMismatch(c.TransferListen, c.PodIP)
 
 	if c.ChairNamespace != "" {
-		chairClient, err = chairs.NewClientset(c.MembersKubeconfig)
+		chairClient, err = chairs.NewClientset(c.ChairKubeconfig)
 		if err != nil {
 			return err
 		}

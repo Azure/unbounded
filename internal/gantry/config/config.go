@@ -173,19 +173,19 @@ type Config struct {
 	// port by convention, the same way they share the transfer port.
 	ChairListen string `yaml:"chair_listen"`
 
-	// ---------- Kubernetes identity and legacy membership fields ----------
+	// ---------- Kubernetes identity and chair access ----------
 
-	// NodeName is retained for configuration compatibility. Chair selection
-	// uses the persistent libp2p peer ID instead.
+	// NodeName identifies this node in layer-completion metrics. Chair
+	// selection uses the persistent libp2p peer ID instead.
 	NodeName string `yaml:"node_name"`
 
 	// PodIP rewrites wildcard listeners into the addresses stored in chair
 	// Leases.
 	PodIP string `yaml:"pod_ip"`
 
-	// MembersKubeconfig is retained by name for compatibility and is used by
-	// the chair Lease client. Empty selects in-cluster credentials.
-	MembersKubeconfig string `yaml:"members_kubeconfig"`
+	// ChairKubeconfig is used by the chair Lease client. Empty selects
+	// in-cluster credentials.
+	ChairKubeconfig string `yaml:"chair_kubeconfig"`
 
 	// ---------- Lease chairs ----------
 
@@ -528,8 +528,8 @@ func NewDefault() *Config {
 		Libp2pConnManagerGrace:            time.Minute,
 		ChairListen:                       "0.0.0.0:5002",
 
-		NodeName:          "",
-		MembersKubeconfig: "",
+		NodeName:        "",
+		ChairKubeconfig: "",
 
 		ChairNamespace:           "",
 		ChairLeaseDuration:       time.Minute,
@@ -696,7 +696,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 
 	setStr("NODE_NAME", &c.NodeName)
 	setStr("POD_IP", &c.PodIP)
-	setStr("MEMBERS_KUBECONFIG", &c.MembersKubeconfig)
+	setStr("CHAIR_KUBECONFIG", &c.ChairKubeconfig)
 	setStr("CHAIR_NAMESPACE", &c.ChairNamespace)
 	setDur("CHAIR_LEASE_DURATION", &c.ChairLeaseDuration)
 	setDur("CHAIR_RENEW_PERIOD", &c.ChairRenewPeriod)
@@ -797,9 +797,9 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.DurationVar(&c.Libp2pConnManagerGrace, "libp2p-conn-manager-grace", c.Libp2pConnManagerGrace, "minimum connection age before it becomes a trim candidate")
 	fs.StringVar(&c.ChairListen, "chair-listen", c.ChairListen, "address for the HTTPS cold-start please_pull endpoint")
 
-	fs.StringVar(&c.NodeName, "node-name", c.NodeName, "legacy no-op Kubernetes node name")
+	fs.StringVar(&c.NodeName, "node-name", c.NodeName, "Kubernetes node name used in layer-completion metrics")
 	fs.StringVar(&c.PodIP, "pod-ip", c.PodIP, "Kubernetes pod IP of this agent (Downward API status.podIP); used to rewrite 0.0.0.0 listeners into dialable advertised addresses")
-	fs.StringVar(&c.MembersKubeconfig, "members-kubeconfig", c.MembersKubeconfig, "optional kubeconfig for chair Lease access (empty = in-cluster)")
+	fs.StringVar(&c.ChairKubeconfig, "chair-kubeconfig", c.ChairKubeconfig, "optional kubeconfig for chair Lease access (empty = in-cluster)")
 	fs.StringVar(&c.ChairNamespace, "chair-namespace", c.ChairNamespace, "namespace containing the 64 Gantry chair Leases")
 	fs.DurationVar(&c.ChairLeaseDuration, "chair-lease-duration", c.ChairLeaseDuration, "heartbeat expiry for a chair holder")
 	fs.DurationVar(&c.ChairRenewPeriod, "chair-renew-period", c.ChairRenewPeriod, "chair heartbeat renewal period")
