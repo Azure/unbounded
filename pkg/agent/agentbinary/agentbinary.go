@@ -42,8 +42,8 @@ func installFromFile(sourcePath, targetPath string, perm os.FileMode) (err error
 	return nil
 }
 
-// EnsureDaemonBinaryLinks initializes daemon current, last-good, and
-// compatibility binary links.
+// EnsureDaemonBinaryLinks initializes daemon current, last-good, and command
+// binary links, including the binary staged by a fresh bootstrap installation.
 func EnsureDaemonBinaryLinks(ctx context.Context, log *slog.Logger, paths goalstates.AgentUpgradePaths) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -83,9 +83,8 @@ func EnsureDaemonBinaryLinks(ctx context.Context, log *slog.Logger, paths goalst
 	}
 
 	if currentTarget != paths.BinaryPath {
-		// Do not replace the compatibility path when the current symlink
-		// already resolves to that path. That preserves legacy installs and
-		// avoids creating a BinaryPath -> CurrentPath -> BinaryPath loop.
+		// Do not replace the command path when the current symlink already
+		// resolves to it; avoid a BinaryPath -> CurrentPath -> BinaryPath loop.
 		if err := utilio.UpdateSymlink(paths.BinaryPath, paths.CurrentPath); err != nil {
 			return fmt.Errorf("initialize daemon compatibility symlink: %w", err)
 		}
