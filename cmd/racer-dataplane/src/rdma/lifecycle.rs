@@ -1104,13 +1104,1106 @@ impl<S: CryptoService> CryptoService for WithNative<S> {
 }
 
 #[cfg(test)]
-mod receive_tests;
+mod receive_tests {
+    //! Deterministic mailbox schedules through the authenticated receive completion path.
+    use super::mailbox_tests::{envelope, header, scope, verified};
+    use super::tests::{claim, mark_connected, provision_test};
+    use super::*;
+    use crate::{
+        model::{ResourceClass, TransferId},
+        rdma::{
+            COMPLETION_HEADER, Devices, RdmaTransfer, SessionLease, Sessions, completion_bytes,
+        },
+        runtime::{admission::Admission, environment},
+        security::connection::signature_tests::network,
+    };
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use std::{
+        task::{Context, Poll},
+        time::Duration,
+    };
+
+    #[test]
+    fn receive_completion_waits_for_invalidation_mailbox() {
+        receive_contended(false, None);
+    }
+
+    #[test]
+    fn receive_completion_waits_for_fenced_readback_mailbox() {
+        receive_contended(true, None);
+    }
+
+    #[test]
+    fn receive_completion_contention_obeys_cancellation_and_deadline() {
+        for readback in [false, true] {
+            for error in [Error::Cancelled, Error::DeadlineExceeded] {
+                receive_contended(readback, Some(error));
+            }
+        }
+    }
+
+    #[test]
+    fn receive_completion_does_not_retry_ciphertext_quota_exhaustion() {
+        receive_contended(false, Some(Error::Overloaded));
+    }
+
+    fn receive_contended(readback: bool, terminal: Option<Error>) {
+        receive_case(readback, terminal, false);
+    }
+
+    #[test]
+    fn successful_invalidation_cancel_and_expiry_leave_failed_terminal_fence_quarantined() {
+        for error in [Error::Cancelled, Error::DeadlineExceeded] {
+            receive_case(true, Some(error), true);
+        }
+    }
+
+    fn receive_case(readback: bool, terminal: Option<Error>, failed_fence: bool) {
+        let clock = environment::SimulationClock::new(61);
+        let _time = clock.environment(0).enter();
+        let (io, port) = pair(1).unwrap();
+        let io = Rc::new(io);
+        let mut native = NativeService::new(port);
+        let charged = provision_test(&mut native, 0);
+        let qp = claim(&io);
+        let peer_metrics = crate::telemetry::metrics::Metrics::default();
+        let peer_admission = crate::peer::adaptive::AdaptivePeers::new(
+            crate::peer::adaptive::Config {
+                total: 1,
+                per_peer: 1,
+            },
+            peer_metrics.clone(),
+        )
+        .unwrap();
+        let peer = crate::model::NodeId("native-peer".into());
+        let permit = peer_admission.acquire(&peer).unwrap();
+        io.shared.slots[0].mailbox.lock().unwrap().peer_admission = Some(permit);
+        mark_connected(&qp, &mut native);
+        let signers = network(2);
+        let session = SessionLease::test(qp.clone(), signers[0].node().clone());
+        let devices = Rc::new(Devices::new());
+        let sessions = Rc::new(Sessions::new(devices.clone(), 1));
+        let admission = Rc::new(Admission::new(
+            crate::test_support::cluster::config(true).limits,
+        ));
+        let transfer = RdmaTransfer::new(sessions);
+        let envelope = envelope();
+        let mut scope = scope();
+        let id = TransferId([4; 16]);
+        native.resources[0]
+            .as_ref()
+            .unwrap()
+            .region
+            .copy_from(&[0xa5; 32])
+            .unwrap();
+        let grant =
+            futures::executor::block_on(transfer.prepare_receive(&session, &envelope, id, &scope))
+                .unwrap();
+        native.poll_budgeted(1).unwrap();
+        ffi::lifetime_tests::complete(1, 0, 5);
+        native.poll_budgeted(1).unwrap();
+        grant.descriptor().unwrap();
+        let completion = verified(
+            &signers,
+            vec![header(
+                COMPLETION_HEADER,
+                STANDARD
+                    .encode(completion_bytes(session.binding(), id))
+                    .into_bytes(),
+            )],
+        );
+        // Expire only the finish scope; the grant remains valid so admission/binding
+        // cannot be mistaken for the receive-completion deadline check.
+        if terminal == Some(Error::DeadlineExceeded) {
+            scope.deadline.0 = environment::now() + Duration::from_secs(1);
+        }
+        let quota = (terminal == Some(Error::Overloaded)).then(|| {
+            admission
+                .reserve(
+                    None,
+                    ResourceClass::Ciphertext,
+                    admission.limit(ResourceClass::Ciphertext),
+                )
+                .unwrap()
+        });
+        let mut finish =
+            transfer.finish_receive(&session, grant, &completion, envelope, &admission, &scope);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        if readback {
+            assert!(finish.as_mut().poll(&mut cx).is_pending());
+            native.poll_budgeted(1).unwrap();
+            ffi::lifetime_tests::complete(2, 0, 6);
+            native.poll_budgeted(1).unwrap();
+            assert!(finish.as_mut().poll(&mut cx).is_pending());
+            assert!(!qp.stopped());
+            if failed_fence {
+                ffi::lifetime_tests::fail_stop(true);
+            }
+            native.poll_budgeted(1).unwrap();
+            assert_eq!(qp.stopped(), !failed_fence);
+        }
+        // Hold the same mutex as the native role at invalidation submission or
+        // immediately after it publishes the fence, before it releases the mailbox.
+        let guard = io.shared.slots[0].mailbox.lock().unwrap();
+        if terminal != Some(Error::Overloaded) {
+            match finish.as_mut().poll(&mut cx) {
+                Poll::Pending => {}
+                Poll::Ready(Err(error)) => {
+                    panic!("mailbox contention failed an admitted receive: {error:?}")
+                }
+                Poll::Ready(Ok(_)) => panic!("readback bypassed the held mailbox"),
+            }
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 32);
+        }
+        if terminal == Some(Error::Cancelled) {
+            scope.cancel().unwrap();
+        }
+        if terminal == Some(Error::DeadlineExceeded) {
+            clock.advance(Duration::from_secs(1));
+        }
+        if let Some(error) = terminal {
+            assert!(matches!(finish.as_mut().poll(&mut cx), Poll::Ready(Err(e)) if e == error));
+        }
+        drop(guard);
+        if terminal.is_none() {
+            if !readback {
+                assert!(finish.as_mut().poll(&mut cx).is_pending());
+                native.poll_budgeted(1).unwrap();
+                ffi::lifetime_tests::complete(2, 0, 6);
+                native.poll_budgeted(1).unwrap();
+                assert!(finish.as_mut().poll(&mut cx).is_pending());
+                native.poll_budgeted(1).unwrap();
+            }
+            let Poll::Ready(Ok(page)) = finish.as_mut().poll(&mut cx) else {
+                panic!("receive did not finish after mailbox release")
+            };
+            assert_eq!(page.bytes(), &[0xa5; 32]);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 32);
+            drop(page);
+        }
+        drop(finish);
+        drop(quota);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+        if failed_fence {
+            assert!(!qp.stopped());
+            assert_eq!(charged.get(), 1);
+            assert!(
+                native.resources[0]
+                    .as_ref()
+                    .unwrap()
+                    .region
+                    .copy_to()
+                    .is_err()
+            );
+            // Even the final I/O owner can disappear before fencing. The native
+            // allocation and quota remain quarantined and the slot cannot be claimed.
+            drop(session);
+            drop(qp);
+            assert_eq!(
+                peer_metrics.gauge(crate::telemetry::metrics::Gauge::PeerExchanges),
+                1
+            );
+            assert!(matches!(
+                peer_admission.acquire(&peer),
+                Err(Error::Overloaded)
+            ));
+            native.resources[0].as_mut().unwrap().next_retry = None;
+            native.poll_budgeted(1).unwrap();
+            assert_eq!(charged.get(), 1);
+            assert_eq!(io.shared.slots[0].state.load(Ordering::Acquire), OWNED);
+            ffi::lifetime_tests::fail_stop(false);
+            native.resources[0].as_mut().unwrap().next_retry = None;
+            native.poll_budgeted(1).unwrap();
+            assert_eq!(io.shared.slots[0].state.load(Ordering::Acquire), READY);
+            assert_eq!(
+                peer_metrics.gauge(crate::telemetry::metrics::Gauge::PeerExchanges),
+                0
+            );
+            native.close();
+            native.poll_budgeted(1).unwrap();
+            assert!(native.drained());
+            assert_eq!(charged.get(), 0);
+            return;
+        }
+        native.poll_budgeted(1).unwrap();
+        assert!(qp.stopped());
+        assert_eq!(charged.get(), 1);
+        assert_eq!(io.shared.slots[0].state.load(Ordering::Acquire), OWNED);
+        drop(session);
+        drop(qp);
+        native.poll_budgeted(1).unwrap();
+        assert_eq!(io.shared.slots[0].state.load(Ordering::Acquire), READY);
+        native.close();
+        native.poll_budgeted(1).unwrap();
+        assert!(native.drained());
+        assert_eq!(charged.get(), 0);
+    }
+}
 
 #[cfg(test)]
-mod mailbox_tests;
+mod mailbox_tests {
+    //! Hold native mailboxes at each public handoff, independently of thread timing.
+    use super::tests::{claim, mark_connected, provision_test};
+    use super::*;
+    use crate::{
+        error::Operation,
+        http::{Header, MessageHead, StartLine},
+        memory::pool::BufferPool,
+        model::{
+            CacheId, CacheKey, KeyId, Nonce, ObjectId, ObjectVersion, PageEnvelope, PageId,
+            PageNumber, RequestId, ResourceClass, StrongEtag, TransferId,
+        },
+        rdma::{
+            AuthenticatedDescriptor, DESCRIPTOR_HEADER, Devices, Grant, RdmaTransfer,
+            RegisteredLease, SETUP_BINDING_HEADER, SETUP_HEADER, SessionLease, Sessions,
+            lifecycle::{QueuePairHandle, Region},
+        },
+        runtime::{admission::Admission, environment},
+        security::connection::{Signatures, VerifiedHead, signature_tests::network},
+    };
+    use std::{
+        task::{Context, Poll},
+        time::Duration,
+    };
+
+    pub(super) fn scope() -> RequestScope {
+        RequestScope::new(
+            RequestId([1; 16]),
+            environment::now() + Duration::from_secs(10),
+        )
+        .unwrap()
+    }
+    pub(super) fn poll<T>(operation: &mut Operation<'_, T>) -> Poll<Result<T>> {
+        operation
+            .as_mut()
+            .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+    }
+    fn done<T>(operation: &mut Operation<'_, T>) -> T {
+        match poll(operation) {
+            Poll::Ready(Ok(value)) => value,
+            Poll::Ready(Err(error)) => panic!("unexpected error: {error:?}"),
+            Poll::Pending => panic!("unexpected pending operation"),
+        }
+    }
+    pub(super) fn verified(signers: &[Rc<Signatures>], headers: Vec<Header>) -> VerifiedHead {
+        let mut headers = headers;
+        headers.push(Header {
+            name: "racer-receiver".into(),
+            value: signers[1].node().0.as_bytes().to_vec(),
+        });
+        signers[1]
+            .verify_proof(
+                signers[0]
+                    .sign(MessageHead {
+                        start: StartLine::Request {
+                            method: "POST".into(),
+                            target: "/racer/peer/v1/rdma".into(),
+                        },
+                        headers,
+                    })
+                    .unwrap(),
+            )
+            .unwrap()
+    }
+    pub(super) fn header(name: &str, value: Vec<u8>) -> Header {
+        Header {
+            name: name.into(),
+            value,
+        }
+    }
+
+    #[test]
+    fn sessions_admit_64_neighbors_but_keep_per_neighbor_and_total_bounds() {
+        let signers = network(2);
+        let peer = verified(&signers, vec![]);
+        let (io, port) = pair(2).unwrap();
+        let io = Rc::new(io);
+        let mut native = NativeService::new(port);
+        provision_test(&mut native, 0);
+        provision_test(&mut native, 1);
+        let devices = Rc::new(Devices::test(io));
+        let qp = match QueuePairHandle::poll_new(devices.select(RailId(0)).unwrap().handle) {
+            Poll::Ready(Ok(qp)) => qp,
+            _ => panic!("fixture QP unavailable"),
+        };
+        let sessions = Sessions::new(devices, 1);
+        // Synthetic live entries isolate session admission from the native QP pool.
+        for i in 0..63 {
+            sessions.track_peer_test(crate::model::NodeId(format!("peer-{i}")), qp.clone());
+        }
+        let scope = scope();
+        let prepared = done(&mut sessions.prepare(&peer.peer, RailId(0), &scope));
+        assert!(matches!(
+            poll(&mut sessions.prepare(&peer.peer, RailId(0), &scope)),
+            Poll::Ready(Err(Error::Overloaded))
+        ));
+        drop(prepared);
+        sessions.track_peer_test(crate::model::NodeId("peer-63".into()), qp);
+        assert!(matches!(
+            poll(&mut sessions.prepare(&peer.peer, RailId(0), &scope)),
+            Poll::Ready(Err(Error::Overloaded))
+        ));
+    }
+
+    #[test]
+    fn signed_setup_waits_for_slot_and_connect_mailboxes_without_consuming_admission() {
+        let signers = network(2);
+        let peer = verified(&signers, vec![]);
+        let (io, port) = pair(2).unwrap();
+        let io = Rc::new(io);
+        let mut native = NativeService::new(port);
+        provision_test(&mut native, 0);
+        provision_test(&mut native, 1);
+        let sessions = Sessions::new(Rc::new(Devices::test(io.clone())), 2);
+        let scope = scope();
+        let mut prepare = sessions.prepare(&peer.peer, RailId(0), &scope);
+        let guard0 = io.shared.slots[0].mailbox.lock().unwrap();
+        let guard1 = io.shared.slots[1].mailbox.lock().unwrap();
+        assert!(poll(&mut prepare).is_pending());
+        assert_eq!(io.shared.slots[0].state.load(Ordering::Acquire), READY);
+        drop((guard0, guard1));
+        let prepared = done(&mut prepare);
+        drop(prepare);
+        let remote = done(&mut sessions.prepare(&peer.peer, RailId(0), &scope));
+        let device = Rc::new(crate::rdma::lifecycle::DeviceHandle {
+            port: io.clone(),
+            rail: RailId(0),
+            generation: io.shared.generation.load(Ordering::Acquire),
+        });
+        assert!(matches!(
+            QueuePairHandle::poll_new(device),
+            Poll::Ready(Err(Error::Overloaded))
+        ));
+        assert!(matches!(
+            poll(&mut sessions.prepare(&peer.peer, RailId(0), &scope)),
+            Poll::Ready(Err(Error::Overloaded))
+        ));
+        let ack = verified(
+            &signers,
+            vec![
+                header(SETUP_HEADER, remote.setup().header_value()),
+                header(
+                    SETUP_BINDING_HEADER,
+                    prepared.setup().binding_header_value(),
+                ),
+            ],
+        );
+        let mut finish = prepared.finish(&ack, &scope);
+        let guard = io.shared.slots[0].mailbox.lock().unwrap();
+        assert!(poll(&mut finish).is_pending());
+        assert!(!io.shared.slots[0].cancel.load(Ordering::Acquire));
+        drop(guard);
+        let session = done(&mut finish);
+        drop(finish);
+        let mut ready = session.wait_ready(&scope);
+        assert!(poll(&mut ready).is_pending());
+        native.poll_budgeted(2).unwrap();
+        let guard = io.shared.slots[0].mailbox.lock().unwrap();
+        assert!(poll(&mut ready).is_pending());
+        drop(guard);
+        done(&mut ready);
+        assert!(session.ready());
+    }
+
+    pub(super) fn envelope() -> PageEnvelope {
+        PageEnvelope {
+            page: PageId {
+                version: ObjectVersion {
+                    object: ObjectId {
+                        cache: CacheId("mailbox-test".into()),
+                        key: CacheKey([1; 32]),
+                    },
+                    etag: StrongEtag::test_value("v1"),
+                },
+                number: PageNumber(0),
+            },
+            key_id: KeyId([1; 16]),
+            nonce: Nonce([2; 24]),
+            plaintext_length: 16,
+            ciphertext_length: 32,
+        }
+    }
+
+    #[test]
+    fn receive_preparation_and_sender_wait_at_every_buffer_and_command_boundary() {
+        sender_case(None);
+    }
+
+    #[test]
+    fn successful_write_cancel_and_expiry_leave_failed_terminal_fence_quarantined() {
+        for error in [Error::Cancelled, Error::DeadlineExceeded] {
+            sender_case(Some(error));
+        }
+    }
+
+    fn sender_case(terminal: Option<Error>) {
+        let clock = environment::SimulationClock::new(62);
+        let _time = clock.environment(0).enter();
+        let signers = network(2);
+        let (io, port) = pair(2).unwrap();
+        let io = Rc::new(io);
+        let mut native = NativeService::new(port);
+        provision_test(&mut native, 0);
+        let charged = provision_test(&mut native, 1);
+        let receiver = claim(&io);
+        let sender = claim(&io);
+        mark_connected(&receiver, &mut native);
+        mark_connected(&sender, &mut native);
+        let receive = SessionLease::test(receiver.clone(), signers[0].node().clone());
+        let send = SessionLease::test(sender.clone(), signers[0].node().clone());
+        let devices = Rc::new(Devices::test(io.clone()));
+        let admission = Rc::new(Admission::new(
+            crate::test_support::cluster::config(true).limits,
+        ));
+        let transfer = RdmaTransfer::new(Rc::new(Sessions::new(devices, 2)));
+        let mut scope = scope();
+        if terminal == Some(Error::DeadlineExceeded) {
+            scope.deadline.0 = environment::now() + Duration::from_secs(1);
+        }
+        let envelope = envelope();
+        let id = TransferId([9; 16]);
+        let mut prepare = transfer.prepare_receive(&receive, &envelope, id, &scope);
+        let guard = io.shared.slots[0].mailbox.lock().unwrap();
+        assert!(poll(&mut prepare).is_pending());
+        drop(guard);
+        let grant = done(&mut prepare);
+        drop(prepare);
+        native.poll_budgeted(2).unwrap();
+        ffi::lifetime_tests::complete(1, 0, 5);
+        native.poll_budgeted(2).unwrap();
+        done(&mut grant.wait_bound(&scope));
+        let signed = verified(
+            &signers,
+            vec![header(DESCRIPTOR_HEADER, grant.header_value().unwrap())],
+        );
+        let descriptor = AuthenticatedDescriptor::from_verified(&signed, &send, id).unwrap();
+        let page = BufferPool::new(admission.clone())
+            .ciphertext(
+                admission
+                    .reserve(
+                        Some(&envelope.page.version.object.cache),
+                        ResourceClass::Ciphertext,
+                        32,
+                    )
+                    .unwrap(),
+                envelope,
+                vec![0xa5; 32],
+            )
+            .unwrap();
+        let mut sending = transfer.send_to(&send, page, descriptor, &scope);
+        let guard = io.shared.slots[1].mailbox.lock().unwrap();
+        assert!(poll(&mut sending).is_pending());
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 32);
+        drop(guard);
+        assert!(poll(&mut sending).is_pending());
+        native.poll_budgeted(2).unwrap();
+        ffi::lifetime_tests::complete(1, 0, 1);
+        native.poll_budgeted(2).unwrap();
+        assert!(poll(&mut sending).is_pending());
+        if let Some(error) = terminal {
+            ffi::lifetime_tests::fail_stop(true);
+            native.poll_budgeted(2).unwrap();
+            assert!(!sender.stopped());
+            assert!(poll(&mut sending).is_pending());
+            if error == Error::Cancelled {
+                scope.cancel().unwrap();
+            } else {
+                clock.advance(Duration::from_secs(1));
+            }
+            assert!(matches!(poll(&mut sending), Poll::Ready(Err(e)) if e == error));
+            drop(sending);
+            assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+            drop((send, sender));
+            native.resources[1].as_mut().unwrap().next_retry = None;
+            native.poll_budgeted(2).unwrap();
+            assert_eq!(charged.get(), 1);
+            assert_eq!(io.shared.slots[1].state.load(Ordering::Acquire), OWNED);
+            assert!(!io.shared.slots[1].fenced.load(Ordering::Acquire));
+            ffi::lifetime_tests::fail_stop(false);
+            native.resources[1].as_mut().unwrap().next_retry = None;
+            native.poll_budgeted(2).unwrap();
+            assert_eq!(io.shared.slots[1].state.load(Ordering::Acquire), READY);
+            drop((grant, receive, receiver));
+            native.close();
+            native.poll_budgeted(2).unwrap();
+            assert!(native.drained());
+            assert_eq!(charged.get(), 0);
+            return;
+        }
+        native.poll_budgeted(2).unwrap();
+        done(&mut sending);
+        drop(sending);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+
+        // Independent public buffer copy and grant bind boundaries after acquisition.
+        drop(grant);
+        native.poll_budgeted(2).unwrap();
+        drop((receive, send, receiver, sender));
+        native.poll_budgeted(2).unwrap();
+        let qp = claim(&io);
+        mark_connected(&qp, &mut native);
+        let session = SessionLease::test(qp.clone(), signers[0].node().clone());
+        let mut buffer = done(&mut RegisteredLease::acquire(&session, 32, &scope));
+        let mut copy = buffer.copy_from(&[0x5a; 32], &scope);
+        let guard = io.shared.slots[0].mailbox.lock().unwrap();
+        assert!(poll(&mut copy).is_pending());
+        drop(guard);
+        done(&mut copy);
+        drop(copy);
+        let mut bind = Grant::bind(&session, buffer, id, &scope);
+        let guard = io.shared.slots[0].mailbox.lock().unwrap();
+        assert!(poll(&mut bind).is_pending());
+        assert!(!io.shared.slots[0].cancel.load(Ordering::Acquire));
+        drop(guard);
+        let grant = done(&mut bind);
+        drop(bind);
+        native.poll_budgeted(2).unwrap();
+        ffi::lifetime_tests::complete(1, 0, 5);
+        native.poll_budgeted(2).unwrap();
+        done(&mut grant.wait_bound(&scope));
+        let guard = io.shared.slots[0].mailbox.lock().unwrap();
+        assert!(grant.header_value().is_ok(), "bound descriptor is cached");
+        drop(guard);
+    }
+
+    #[test]
+    fn command_poll_distinguishes_contended_completion_from_full_queue() {
+        let (io, port) = pair(1).unwrap();
+        let io = Rc::new(io);
+        let mut native = NativeService::new(port);
+        provision_test(&mut native, 0);
+        let qp = claim(&io);
+        mark_connected(&qp, &mut native);
+        let region = Region::acquire(&qp, 32).unwrap();
+        assert!(matches!(
+            Region::poll_acquire(&qp, 32),
+            Poll::Ready(Err(Error::Overloaded))
+        ));
+        let guard = io.shared.slots[0].mailbox.lock().unwrap();
+        assert!(qp.poll_write(region.clone(), 4096, 7).is_pending());
+        drop(guard);
+        assert!(matches!(
+            qp.poll_write(region.clone(), 4096, 7),
+            Poll::Ready(Ok(_))
+        ));
+        assert!(matches!(
+            qp.poll_write(region.clone(), 4096, 7),
+            Poll::Ready(Err(Error::Overloaded))
+        ));
+        native.poll_budgeted(1).unwrap();
+        ffi::lifetime_tests::complete(1, 0, 1);
+        native.poll_budgeted(1).unwrap();
+        let guard = io.shared.slots[0].mailbox.lock().unwrap();
+        assert!(qp.poll_write(region.clone(), 4096, 7).is_pending());
+        drop(guard);
+        assert!(matches!(qp.poll_write(region, 4096, 7), Poll::Ready(Ok(_))));
+    }
+
+    #[test]
+    fn contended_grant_cancel_expiry_and_drop_abort_without_submitting_bind() {
+        for mode in 0..3 {
+            let clock = environment::SimulationClock::new(63);
+            let _time = clock.environment(0).enter();
+            let (io, port) = pair(1).unwrap();
+            let io = Rc::new(io);
+            let mut native = NativeService::new(port);
+            let charged = provision_test(&mut native, 0);
+            let qp = claim(&io);
+            mark_connected(&qp, &mut native);
+            let session = SessionLease::test(qp.clone(), crate::model::NodeId("peer".into()));
+            let mut scope = scope();
+            assert!(matches!(
+                poll(&mut RegisteredLease::acquire(&session, 33, &scope)),
+                Poll::Ready(Err(Error::Overloaded))
+            ));
+            let buffer = done(&mut RegisteredLease::acquire(&session, 32, &scope));
+            if mode == 1 {
+                scope.deadline.0 = environment::now() + Duration::from_secs(1);
+            }
+            let mut bind = Grant::bind(&session, buffer, TransferId([1; 16]), &scope);
+            let guard = io.shared.slots[0].mailbox.lock().unwrap();
+            assert!(poll(&mut bind).is_pending());
+            match mode {
+                0 => {
+                    scope.cancel().unwrap();
+                    assert!(matches!(
+                        poll(&mut bind),
+                        Poll::Ready(Err(Error::Cancelled))
+                    ));
+                }
+                1 => {
+                    clock.advance(Duration::from_secs(1));
+                    assert!(matches!(
+                        poll(&mut bind),
+                        Poll::Ready(Err(Error::DeadlineExceeded))
+                    ));
+                }
+                _ => {}
+            }
+            drop(bind);
+            assert!(guard.command.is_none());
+            assert!(io.shared.slots[0].cancel.load(Ordering::Acquire));
+            assert!(!qp.stopped());
+            assert_eq!(charged.get(), 1);
+            drop(guard);
+            native.poll_budgeted(1).unwrap();
+            assert!(qp.stopped());
+            drop((session, qp));
+            native.poll_budgeted(1).unwrap();
+            assert_eq!(io.shared.slots[0].state.load(Ordering::Acquire), READY);
+            native.close();
+            native.poll_budgeted(1).unwrap();
+            assert_eq!(charged.get(), 0);
+        }
+    }
+
+    #[test]
+    fn canceled_or_abandoned_contended_signed_setup_releases_only_after_fence() {
+        let signers = network(2);
+        let peer = verified(&signers, vec![]);
+        for cancel in [false, true] {
+            let (io, port) = pair(2).unwrap();
+            let io = Rc::new(io);
+            let mut native = NativeService::new(port);
+            provision_test(&mut native, 0);
+            provision_test(&mut native, 1);
+            let sessions = Sessions::new(Rc::new(Devices::test(io.clone())), 2);
+            let scope = scope();
+            let prepared = done(&mut sessions.prepare(&peer.peer, RailId(0), &scope));
+            let remote = done(&mut sessions.prepare(&peer.peer, RailId(0), &scope));
+            let ack = verified(
+                &signers,
+                vec![
+                    header(SETUP_HEADER, remote.setup().header_value()),
+                    header(
+                        SETUP_BINDING_HEADER,
+                        prepared.setup().binding_header_value(),
+                    ),
+                ],
+            );
+            let mut finish = prepared.finish(&ack, &scope);
+            let guard = io.shared.slots[0].mailbox.lock().unwrap();
+            assert!(poll(&mut finish).is_pending());
+            if cancel {
+                scope.cancel().unwrap();
+                assert!(matches!(
+                    poll(&mut finish),
+                    Poll::Ready(Err(Error::Cancelled))
+                ));
+            }
+            drop(finish);
+            assert!(guard.command.is_none());
+            assert!(io.shared.slots[0].cancel.load(Ordering::Acquire));
+            assert!(!io.shared.slots[0].fenced.load(Ordering::Acquire));
+            drop(guard);
+            native.poll_budgeted(2).unwrap();
+            sessions.progress().unwrap();
+            native.poll_budgeted(2).unwrap();
+            assert_eq!(io.shared.slots[0].state.load(Ordering::Acquire), READY);
+        }
+    }
+
+    #[test]
+    fn activation_contention_retains_quota_and_cancellation_releases_unsubmitted_configuration() {
+        for activation_lock in [false, true] {
+            let (io, port) = pair(1).unwrap();
+            let mut native = NativeService::new(port);
+            let admission = Admission::new(crate::test_support::cluster::config(true).limits);
+            let scope = scope();
+            let quotas = vec![
+                admission
+                    .reserve(None, ResourceClass::Registered, 8192)
+                    .unwrap(),
+            ];
+            let mut configure: Operation<'_, ()> =
+                Box::pin(io.configure(vec![], vec![], quotas, 4096, &scope));
+            let config = (!activation_lock).then(|| io.shared.config.lock().unwrap());
+            let activation = activation_lock.then(|| io.shared.activation.lock().unwrap());
+            assert!(poll(&mut configure).is_pending());
+            assert_eq!(admission.used(ResourceClass::Registered), 8192);
+            scope.cancel().unwrap();
+            assert!(matches!(
+                poll(&mut configure),
+                Poll::Ready(Err(Error::Cancelled))
+            ));
+            drop(configure);
+            assert_eq!(admission.used(ResourceClass::Registered), 0);
+            assert!(!io.shared.configured.load(Ordering::Acquire));
+            drop((config, activation));
+            let scope = super::mailbox_tests::scope();
+            let mut configure: Operation<'_, ()> = Box::pin(io.configure(
+                vec![],
+                vec![],
+                vec![admission.reserve(None, ResourceClass::Registered, 8192).unwrap()],
+                4096,
+                &scope,
+            ));
+            done(&mut configure);
+            native.poll_budgeted(1).unwrap();
+            assert_eq!(admission.used(ResourceClass::Registered), 0);
+        }
+    }
+
+    #[test]
+    fn poisoned_mailbox_is_terminal_io_error_not_contention() {
+        let mutex = std::sync::Mutex::new(());
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = mutex.lock().unwrap();
+            panic!("poison test mailbox");
+        });
+        assert!(matches!(
+            crate::rdma::lifecycle::try_mailbox(&mutex),
+            Poll::Ready(Err(Error::Io))
+        ));
+    }
+}
 
 #[cfg(test)]
-mod activation_tests;
+mod activation_tests {
+    //! Configured production activation through the simulated native ABI, not injected slots.
+    use super::*;
+    use crate::{
+        memory::pool::BufferPool,
+        model::{ResourceClass, *},
+        rdma::Devices,
+        runtime::{admission::Admission, crypto, worker::CryptoRuntime},
+        security::{aead::PageCryptoEngine, identity::KeyPurpose},
+    };
+    use simulation::{Fault, Operation as NativeOp};
+    use std::task::{Context, Poll};
+
+    fn fixture(
+        slots: usize,
+    ) -> (
+        simulation::Simulation,
+        Devices,
+        NativeService,
+        Admission,
+        RequestScope,
+    ) {
+        let sim = simulation::Simulation::new()
+            .with_devices(vec![simulation::Device::new("sim0", [1; 16])])
+            .unwrap();
+        let (io, port) = pair(slots).unwrap();
+        let native = {
+            let _environment = sim.enter();
+            NativeService::new(port)
+        };
+        let devices = Devices::new();
+        devices.attach(io).unwrap();
+        let admission = Admission::new(crate::test_support::cluster::config(true).limits);
+        let scope = RequestScope::new(
+            RequestId([1; 16]),
+            crate::runtime::environment::now() + std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        (sim, devices, native, admission, scope)
+    }
+
+    fn activate<'a>(
+        devices: &'a Devices,
+        admission: &'a Admission,
+        scope: &'a RequestScope,
+    ) -> crate::error::Operation<'a, Vec<RailMapping>> {
+        devices.activate(
+            vec![RailMapping {
+                rail: RailId(0),
+                fabric: "sim".into(),
+                numa_node: None,
+            }],
+            vec![FabricPort {
+                fabric: "sim".into(),
+                device: "sim0".into(),
+                port: 1,
+                gid: None,
+            }],
+            admission,
+            4096,
+            scope,
+        )
+    }
+
+    #[test]
+    fn configured_activation_spends_budget_and_yields_to_sibling_page_jobs() {
+        let (sim, devices, mut native, admission, scope) = fixture(4);
+        let shared = native.port.shared.clone();
+        let mut activation = activate(&devices, &admission, &scope);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(activation.as_mut().poll(&mut cx).is_pending());
+        assert!(
+            !native.drained(),
+            "queued configuration owns accepted quota"
+        );
+        native.poll_budgeted(0).unwrap();
+        assert!(sim.trace().is_empty());
+        assert_eq!(admission.used(ResourceClass::Registered), 4 * 8192);
+
+        // Real page jobs on a sibling engine, polled on this same thread between
+        // native turns just as the shared executor does. No synthetic progress counter.
+        let keys = crate::security::identity::keyring_tests::keys();
+        let page = PageId {
+            version: ObjectVersion {
+                object: ObjectId {
+                    cache: CacheId(crate::security::identity::tests::CACHE.into()),
+                    key: CacheKey([3; 32]),
+                },
+                etag: StrongEtag::test_value("v1"),
+            },
+            number: PageNumber(0),
+        };
+        let cache = &page.version.object.cache;
+        let sibling_admission = Rc::new(Admission::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let pool = BufferPool::new(sibling_admission.clone());
+        let (io, port) = crypto::pair(WorkerId(1), 1, std::num::NonZeroUsize::new(1).unwrap());
+        let mut sibling = PageCryptoEngine::new(CryptoRuntime { port });
+        for turn in 0..5 {
+            let Poll::Ready(Ok(permit)) = io.poll_reserve(
+                &mut cx,
+                crypto::CryptoId {
+                    worker: WorkerId(1),
+                    generation: 1,
+                    sequence: turn + 1,
+                },
+            ) else {
+                panic!("reserve")
+            };
+            assert!(
+                io.try_submit(
+                    permit.job(
+                        crypto::CryptoInput::Encrypt {
+                            page: page.clone(),
+                            plaintext: pool
+                                .plaintext(
+                                    sibling_admission
+                                        .reserve(Some(cache), ResourceClass::Plaintext, 5)
+                                        .unwrap(),
+                                    5
+                                )
+                                .unwrap(),
+                            ciphertext: sibling_admission
+                                .reserve(Some(cache), ResourceClass::Ciphertext, 21)
+                                .unwrap(),
+                        },
+                        keys.active(cache, KeyPurpose::Page).unwrap(),
+                        scope.clone(),
+                    )
+                )
+                .is_ok()
+            );
+            native.poll_budgeted(1).unwrap();
+            let trace = sim.take_trace();
+            assert_eq!(
+                trace
+                    .iter()
+                    .filter(|event| event.operation == NativeOp::Register)
+                    .count(),
+                usize::from(turn != 0)
+            );
+            assert_eq!(native.resources.iter().flatten().count(), turn as usize);
+            if turn < 4 {
+                assert!(activation.as_mut().poll(&mut cx).is_pending());
+                assert!(
+                    shared
+                        .slots
+                        .iter()
+                        .all(|slot| slot.state.load(Ordering::Acquire) == IDLE)
+                );
+                assert!(!devices.ready(RailId(0)));
+            }
+            sibling.poll_budgeted(1).unwrap();
+            let Poll::Ready(Ok(Some(completion))) = io.poll_completion(&mut cx) else {
+                panic!("sibling must progress")
+            };
+            assert!(matches!(
+                completion.outcome,
+                crypto::CryptoOutcome::Completed(_)
+            ));
+            drop(completion);
+            assert_eq!(sibling_admission.used(ResourceClass::Plaintext), 0);
+        }
+        assert!(matches!(
+            activation.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(_))
+        ));
+        drop(activation);
+        assert!(devices.ready(RailId(0)));
+        devices.close();
+        for remaining in (0..4).rev() {
+            native.poll_budgeted(1).unwrap();
+            assert_eq!(native.resources.iter().flatten().count(), remaining);
+        }
+        assert_eq!(admission.used(ResourceClass::Registered), 0);
+        assert_eq!(sim.live_resources(), 0);
+    }
+
+    #[test]
+    fn partial_activation_errors_fence_before_retry_without_publishing_readiness() {
+        for failure in [NativeOp::Register, NativeOp::Qp, NativeOp::Window] {
+            let (sim, devices, mut native, admission, scope) = fixture(3);
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            let mut activation = activate(&devices, &admission, &scope);
+            assert!(activation.as_mut().poll(&mut cx).is_pending());
+            native.poll_budgeted(2).unwrap(); // Discovery plus exactly one slot.
+            assert_eq!(native.resources.iter().flatten().count(), 1);
+            sim.fault(failure, Fault::Reject);
+            native.poll_budgeted(1).unwrap();
+            assert!(matches!(
+                activation.as_mut().poll(&mut cx),
+                Poll::Ready(Err(Error::Unavailable))
+            ));
+            drop(activation);
+            assert!(!devices.ready(RailId(0)));
+            assert!(
+                native
+                    .port
+                    .shared
+                    .slots
+                    .iter()
+                    .all(|slot| slot.state.load(Ordering::Acquire) == IDLE)
+            );
+            sim.fault(NativeOp::Stop, Fault::Reject);
+            native.poll_budgeted(1).unwrap();
+            assert!(native.resources[0].is_some());
+            assert!(!native.port.shared.drained.load(Ordering::Acquire));
+            assert!(admission.used(ResourceClass::Registered) >= 8192);
+            let mut retry = activate(&devices, &admission, &scope);
+            assert!(matches!(
+                retry.as_mut().poll(&mut cx),
+                Poll::Ready(Err(Error::Overloaded))
+            ));
+            drop(retry);
+            native.resources[0].as_mut().unwrap().next_retry = None;
+            native.poll_budgeted(3).unwrap();
+            assert!(native.port.shared.drained.load(Ordering::Acquire));
+            assert_eq!(admission.used(ResourceClass::Registered), 0);
+            assert_eq!(sim.live_resources(), 0);
+            let mut retry = activate(&devices, &admission, &scope);
+            assert!(retry.as_mut().poll(&mut cx).is_pending());
+            native.poll_budgeted(3).unwrap();
+            assert!(retry.as_mut().poll(&mut cx).is_pending());
+            native.poll_budgeted(1).unwrap();
+            assert!(matches!(retry.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+            drop(retry);
+            devices.close();
+            native.poll_budgeted(3).unwrap();
+            assert_eq!(admission.used(ResourceClass::Registered), 0);
+            assert_eq!(sim.live_resources(), 0);
+        }
+    }
+
+    #[test]
+    fn abandoned_activation_cleans_queued_discovered_and_partial_owners() {
+        for turns in 0..=3 {
+            let (sim, devices, mut native, admission, scope) = fixture(4);
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            let mut activation = activate(&devices, &admission, &scope);
+            assert!(activation.as_mut().poll(&mut cx).is_pending());
+            native.poll_budgeted(turns).unwrap();
+            assert!(!native.drained());
+            drop(activation);
+            native.poll_budgeted(1).unwrap();
+            native.poll_budgeted(4).unwrap();
+            assert!(native.drained());
+            assert!(native.port.shared.drained.load(Ordering::Acquire));
+            assert!(!devices.ready(RailId(0)));
+            assert_eq!(admission.used(ResourceClass::Registered), 0);
+            assert_eq!(sim.live_resources(), 0);
+        }
+    }
+
+    #[test]
+    fn activation_mailbox_contention_consumes_turn_without_losing_quota() {
+        let (sim, devices, mut native, admission, scope) = fixture(2);
+        let shared = native.port.shared.clone();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut activation = activate(&devices, &admission, &scope);
+        assert!(activation.as_mut().poll(&mut cx).is_pending());
+        native.poll_budgeted(1).unwrap();
+        sim.take_trace();
+        let guard = shared.slots[0].mailbox.lock().unwrap();
+        native.poll_budgeted(1).unwrap();
+        assert!(sim.trace().is_empty());
+        assert_eq!(admission.used(ResourceClass::Registered), 2 * 8192);
+        drop(guard);
+        native.poll_budgeted(2).unwrap();
+        assert!(matches!(
+            activation.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(_))
+        ));
+        drop(activation);
+        devices.close();
+        native.poll_budgeted(2).unwrap();
+        assert_eq!(admission.used(ResourceClass::Registered), 0);
+        assert_eq!(sim.live_resources(), 0);
+    }
+
+    #[test]
+    fn configured_native_wrapper_drain_fences_one_slot_per_poll() {
+        let (sim, devices, native, admission, scope) = fixture(4);
+        let (io, port) = crypto::pair(WorkerId(0), 1, std::num::NonZeroUsize::new(1).unwrap());
+        io.close_submissions().unwrap();
+        let mut service = WithNative {
+            inner: PageCryptoEngine::new(CryptoRuntime { port }),
+            native,
+        };
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut activation = activate(&devices, &admission, &scope);
+        assert!(activation.as_mut().poll(&mut cx).is_pending());
+        service.poll_budgeted(4).unwrap();
+        service.poll_budgeted(1).unwrap();
+        assert!(matches!(
+            activation.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(_))
+        ));
+        drop(activation);
+        sim.take_trace();
+        let mut drain = service.drain(&scope);
+        for slot in 0..4 {
+            let result = drain.as_mut().poll(&mut cx);
+            if slot < 3 {
+                assert!(result.is_pending());
+                assert_eq!(admission.used(ResourceClass::Registered), 4 * 8192);
+            } else {
+                assert_eq!(result, Poll::Ready(Ok(())));
+            }
+            assert_eq!(
+                sim.take_trace()
+                    .iter()
+                    .filter(|event| event.operation == NativeOp::Stop)
+                    .count(),
+                1
+            );
+        }
+        drop(drain);
+        assert_eq!(admission.used(ResourceClass::Registered), 0);
+        assert_eq!(sim.live_resources(), 0);
+    }
+
+    #[test]
+    fn cancellation_between_activation_turns_preserves_partial_owners_until_fenced() {
+        let (sim, devices, mut native, admission, scope) = fixture(4);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut activation = activate(&devices, &admission, &scope);
+        assert!(activation.as_mut().poll(&mut cx).is_pending());
+        native.poll_budgeted(2).unwrap();
+        scope.cancel().unwrap();
+        assert!(matches!(
+            activation.as_mut().poll(&mut cx),
+            Poll::Ready(Err(Error::Cancelled))
+        ));
+        drop(activation);
+        assert_eq!(admission.used(ResourceClass::Registered), 4 * 8192);
+        native.poll_budgeted(1).unwrap(); // Drop only the unprovisioned configuration.
+        assert_eq!(admission.used(ResourceClass::Registered), 8192);
+        assert!(!native.drained());
+        native.poll_budgeted(1).unwrap();
+        assert!(native.drained());
+        assert_eq!(admission.used(ResourceClass::Registered), 0);
+        assert_eq!(sim.live_resources(), 0);
+    }
+}
 
 #[cfg(test)]
 mod tests {
