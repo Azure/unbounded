@@ -2,6 +2,7 @@
 use super::*;
 mod body_progress;
 mod destination_disconnect;
+mod encrypted_http;
 mod opaque;
 mod protocol_socket;
 mod requester_safety;
