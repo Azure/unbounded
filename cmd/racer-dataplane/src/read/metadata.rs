@@ -17,7 +17,7 @@ use crate::{
     },
     origin::Origin,
     peer::{
-        requester::PeerClient,
+        PeerClient,
         wire::{FetchMode, Operation as PeerOperation, PeerResponse},
     },
     runtime::deadline::RequestScope,

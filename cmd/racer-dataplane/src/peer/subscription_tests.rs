@@ -84,7 +84,7 @@ fn copy(admission: &Rc<Admission>, page: PageId) -> CiphertextCopy {
 #[test]
 fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failures() {
     struct Never;
-    impl requester::PeerTransport for Never {
+    impl PeerTransport for Never {
         fn exchange<'a>(
             &'a self,
             _: wire::SignedRequest,
@@ -166,7 +166,7 @@ fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failure
         );
         let destination = Rc::new(Forwarding::new(signers[2].clone()));
         let relay = Rc::new(
-            relay::Relay::new(
+            Relay::new(
                 Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
                 destination.clone(),
                 Rc::new(Never),
@@ -342,7 +342,7 @@ fn subscription_selection_is_canonical_signed_and_bound_to_exact_grant() {
 fn subscription_runs_through_real_tcp_requester_session_and_provider() {
     use crate::{
         http::pool::{ConnectionLease, HttpPool},
-        peer::requester::PeerClient,
+        peer::PeerClient,
     };
     struct Local(Rc<Admission>);
     impl server::LocalPageService for Local {
@@ -370,7 +370,7 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
             })
         }
     }
-    impl requester::PeerTransport for Local {
+    impl PeerTransport for Local {
         fn exchange<'a>(
             &'a self,
             _: wire::SignedRequest,
@@ -428,7 +428,7 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
     let local = Rc::new(Local(admission.clone()));
     let codec = Rc::new(codec(&admission));
     let relay = Rc::new(
-        relay::Relay::new(
+        Relay::new(
             paths.clone(),
             destination.clone(),
             local.clone(),
@@ -449,7 +449,7 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
         .with_wire(admission.clone(), codec)
         .with_signatures(signers[0].clone()),
     );
-    let requester = requester::Requester::new(
+    let requester = Requester::new(
         paths,
         Rc::new(Forwarding::new(signers[0].clone())),
         transfers,

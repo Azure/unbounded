@@ -15,7 +15,7 @@ use crate::{
     },
     origin::{Origin, metadata::MetadataReply, page::OriginPage},
     peer::{
-        requester::PeerClient,
+        PeerClient,
         wire::{PeerRequest, VerifiedResponse},
     },
     read::{

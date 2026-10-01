@@ -112,7 +112,7 @@ impl origin::Origin for GeneratedOrigin {
     }
 }
 struct NoPeer;
-impl peer::requester::PeerClient for NoPeer {
+impl peer::PeerClient for NoPeer {
     fn request<'a>(
         &'a self,
         _: peer::wire::PeerRequest,

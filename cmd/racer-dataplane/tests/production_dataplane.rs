@@ -24,7 +24,7 @@ use racer_dataplane::{
     memory::{cache::MemoryCache, delivery::Delivery, pipe::PipePool, pool::BufferPool},
     model::{Limits, PAGE_BYTES, ResourceClass, *},
     origin::OriginClient,
-    peer::{PeerNetwork, requester::Requester, transfer::Transfers},
+    peer::{PeerNetwork, Requester, transfer::Transfers},
     read::{
         Coordinator, ReadService,
         candidates::CandidatePolicy,

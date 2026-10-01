@@ -476,7 +476,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
     };
     use std::{cell::Cell, num::NonZeroU32};
     struct NeverTransport;
-    impl requester::PeerTransport for NeverTransport {
+    impl PeerTransport for NeverTransport {
         fn exchange<'a>(
             &'a self,
             _: wire::SignedRequest,
@@ -539,7 +539,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
     );
     let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4));
     let relay = Rc::new(
-        relay::Relay::new(
+        Relay::new(
             paths,
             destination.clone(),
             Rc::new(NeverTransport),
@@ -706,7 +706,7 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
         auth: Forwarding,
         fail: bool,
     }
-    impl requester::PeerTransport for Destination {
+    impl PeerTransport for Destination {
         fn exchange<'a>(
             &'a self,
             request: wire::SignedRequest,
@@ -766,7 +766,7 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
             )
             .unwrap(),
         );
-        let relay = relay::Relay::new(
+        let relay = Relay::new(
             Rc::new(Paths::new(Rc::new(LinkHealth), 1)),
             forwarding.clone(),
             Rc::new(Destination {
@@ -930,7 +930,7 @@ fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction(
 
 #[test]
 fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
-    use super::requester::PeerClient;
+    use super::PeerClient;
     use crate::{
         http::{codec::Codec, io::HttpIo, pool::HttpPool},
         runtime::reactor::Reactor,
@@ -982,7 +982,7 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
         4,
         crate::topology::RoutingAlgorithm::V3,
     ));
-    let requester = requester::Requester::new(
+    let requester = Requester::new(
         paths.clone(),
         Rc::new(Forwarding::new(signers[0].clone())),
         transfers,
@@ -1017,7 +1017,7 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
         .sign_request_to(page_request, &NodeId(B.into()))
         .unwrap();
     assert!(matches!(
-        futures::executor::block_on(requester::PeerTransport::exchange(
+        futures::executor::block_on(PeerTransport::exchange(
             &requester,
             wrong,
             members.clone(),
@@ -1072,7 +1072,7 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
 
 #[test]
 fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
-    use super::requester::PeerClient;
+    use super::PeerClient;
     use crate::{
         http::{
             codec::Codec,
@@ -1091,7 +1091,7 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
         task::{Context, Poll},
     };
     struct NeverTransport;
-    impl requester::PeerTransport for NeverTransport {
+    impl PeerTransport for NeverTransport {
         fn exchange<'a>(
             &'a self,
             _: wire::SignedRequest,
@@ -1203,7 +1203,7 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
         super::adaptive::AdaptivePeers::new(Default::default(), metrics.clone()).unwrap();
     let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4).with_peer_admission(adaptive));
     let relay = Rc::new(
-        relay::Relay::new(
+        Relay::new(
             paths.clone(),
             destination_auth.clone(),
             Rc::new(NeverTransport),
@@ -1223,7 +1223,7 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
     .with_wire(codec)
     .with_signatures(signers[2].clone());
     let health = paths.link_health();
-    let requester = requester::Requester::new(
+    let requester = Requester::new(
         paths,
         Rc::new(Forwarding::new(signers[0].clone())),
         transfers,
@@ -1293,7 +1293,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
     };
 
     struct Never;
-    impl requester::PeerTransport for Never {
+    impl PeerTransport for Never {
         fn exchange<'a>(
             &'a self,
             _: wire::SignedRequest,
@@ -1346,7 +1346,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
         ));
         let (signers, _) = identities();
         let forwarding = Rc::new(Forwarding::new(signers[2].clone()));
-        let relay = Rc::new(relay::Relay::new(
+        let relay = Rc::new(Relay::new(
             Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
             forwarding.clone(),
             Rc::new(Never),
@@ -1757,7 +1757,7 @@ mod established_sessions {
             })
         }
     }
-    impl requester::PeerTransport for CountedService {
+    impl PeerTransport for CountedService {
         fn exchange<'a>(
             &'a self,
             _: wire::SignedRequest,
@@ -1817,7 +1817,7 @@ mod established_sessions {
                 .unwrap(),
             );
             let relay = Rc::new(
-                relay::Relay::new(
+                Relay::new(
                     Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
                     forwarding.clone(),
                     service.clone(),

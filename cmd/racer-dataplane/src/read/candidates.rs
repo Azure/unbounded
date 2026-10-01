@@ -6,7 +6,7 @@ use crate::{
     error::{Error, Operation, Result},
     model::{AttemptId, MetadataSelector, NodeId, ObjectId, OriginContext, PageNumber},
     peer::{
-        requester::PeerClient,
+        PeerClient,
         wire::{
             FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse, VerifiedResponse,
         },

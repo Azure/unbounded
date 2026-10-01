@@ -10,8 +10,7 @@ use crate::{
     memory::{delivery::Delivery, pipe::PipePool},
     model::{ByteRange, MembershipVersion},
     peer::{
-        PeerNetwork,
-        requester::PeerTransport,
+        PeerNetwork, PeerTransport,
         server::{LocalPageService, PeerServer},
         wire::{PeerRequest, SignedRequest, SignedResponse, VerifiedResponse},
     },
@@ -597,7 +596,7 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
                 .with_wire(admission, codec)
                 .with_signatures(signers[i].clone()),
             );
-            let requester = Rc::new(crate::peer::requester::Requester::new(
+            let requester = Rc::new(crate::peer::Requester::new(
                 Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
                 Rc::new(Forwarding::new(signers[i].clone())),
                 transfers,
@@ -626,7 +625,7 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
     let auth = Rc::new(Forwarding::new(signers[2].clone()));
     let network = Rc::new(PeerNetwork::new(node(2), publications[2].clone()).unwrap());
     let relay = Rc::new(
-        crate::peer::relay::Relay::new(
+        crate::peer::Relay::new(
             Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
             auth.clone(),
             Rc::new(NoPeer),

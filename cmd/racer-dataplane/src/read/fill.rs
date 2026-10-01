@@ -21,7 +21,7 @@ use crate::{
     model::{ObjectMetadata, OriginContext, PAGE_BYTES, PageId, ResourceClass, VersionMetadata},
     origin::Origin,
     peer::{
-        requester::PeerClient,
+        PeerClient,
         wire::{FetchMode, Operation as PeerOperation, PeerResponse},
     },
     runtime::{

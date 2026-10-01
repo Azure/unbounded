@@ -12,9 +12,7 @@ use crate::{
     memory::pool::BufferPool,
     model::{ExpiresAt, MetadataSelector, ObjectMetadata, OriginContext, *},
     peer::{
-        PeerNetwork,
-        relay::Relay,
-        requester::{PeerTransport, Requester},
+        PeerNetwork, PeerTransport, Relay, Requester,
         server::{LocalPageService, PeerServer},
         transfer::Transfers,
         wire::{self, FetchMode, PeerResponse, SignedRequest, SignedResponse, VerifiedRequest},
@@ -201,7 +199,7 @@ fn remote_origin_absence_preserves_fresh_404_pinned_412_and_later_cached_version
 
 #[test]
 fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
-    use crate::peer::requester::PeerClient;
+    use crate::peer::PeerClient;
     struct NoPeers;
     impl PeerClient for NoPeers {
         fn request<'a>(
@@ -513,26 +511,25 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         transfers,
         source_network,
     ));
-    let requester: Rc<dyn crate::peer::requester::PeerClient> =
-        if matches!(absence, Some(Absence::Pinned)) {
-            Rc::new(PinnedFallback {
-                requester,
-                destination,
-                sender: Forwarding::new(a.signatures.clone()),
-                receivers: identities
-                    .iter()
-                    .skip(2)
-                    .map(|id| {
-                        (
-                            id.signatures.node().clone(),
-                            Forwarding::new(id.signatures.clone()),
-                        )
-                    })
-                    .collect(),
-            })
-        } else {
-            requester
-        };
+    let requester: Rc<dyn crate::peer::PeerClient> = if matches!(absence, Some(Absence::Pinned)) {
+        Rc::new(PinnedFallback {
+            requester,
+            destination,
+            sender: Forwarding::new(a.signatures.clone()),
+            receivers: identities
+                .iter()
+                .skip(2)
+                .map(|id| {
+                    (
+                        id.signatures.node().clone(),
+                        Forwarding::new(id.signatures.clone()),
+                    )
+                })
+                .collect(),
+        })
+    } else {
+        requester
+    };
     let ingress_calls = Rc::new(Cell::new(0));
     let ingress = matches!(absence, Some(Absence::Fresh | Absence::Subscription)).then(|| {
         metadata_coordinator(
@@ -765,7 +762,7 @@ struct PinnedFallback {
     sender: Forwarding,
     receivers: Vec<(NodeId, Forwarding)>,
 }
-impl crate::peer::requester::PeerClient for PinnedFallback {
+impl crate::peer::PeerClient for PinnedFallback {
     fn request<'a>(
         &'a self,
         request: wire::PeerRequest,
@@ -774,7 +771,7 @@ impl crate::peer::requester::PeerClient for PinnedFallback {
     ) -> Operation<'a, wire::VerifiedResponse> {
         Box::pin(async move {
             if request.route.destination == self.destination {
-                return crate::peer::requester::PeerClient::request(
+                return crate::peer::PeerClient::request(
                     self.requester.as_ref(),
                     request,
                     membership,
@@ -853,7 +850,7 @@ struct CachedCopies {
     calls: Rc<RefCell<Vec<NodeId>>>,
     metadata: Option<ObjectMetadata>,
 }
-impl crate::peer::requester::PeerClient for CachedCopies {
+impl crate::peer::PeerClient for CachedCopies {
     fn request<'a>(
         &'a self,
         request: wire::PeerRequest,
@@ -901,7 +898,7 @@ fn metadata_coordinator(
     keys: Rc<Keyring>,
     admission: Rc<Admission>,
     reactor: Rc<Reactor>,
-    peers: Rc<dyn crate::peer::requester::PeerClient>,
+    peers: Rc<dyn crate::peer::PeerClient>,
     calls: Rc<Cell<usize>>,
 ) -> (Rc<super::Coordinator>, super::dispatch::WorkerEndpoint) {
     metadata_coordinator_with_newer_publication(
@@ -915,7 +912,7 @@ fn metadata_coordinator_with_newer_publication(
     keys: Rc<Keyring>,
     admission: Rc<Admission>,
     reactor: Rc<Reactor>,
-    peers: Rc<dyn crate::peer::requester::PeerClient>,
+    peers: Rc<dyn crate::peer::PeerClient>,
     calls: Rc<Cell<usize>>,
     newer_publication: bool,
 ) -> (Rc<super::Coordinator>, super::dispatch::WorkerEndpoint) {

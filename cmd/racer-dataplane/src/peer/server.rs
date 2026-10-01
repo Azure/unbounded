@@ -1,6 +1,6 @@
 //! Authenticate, replay-check, authorize, and admit before local dispatch or relay.
 use super::{
-    relay::Relay,
+    Relay,
     wire::{PeerResponse, SignedRequest, SignedResponse, VerifiedRequest},
 };
 use crate::{
@@ -1297,7 +1297,7 @@ mod tests {
         use crate::{
             http::{codec::Codec, io::HttpIo, pool::ConnectionLease},
             memory::pool::BufferPool,
-            peer::{requester::PeerTransport, wire::SecurityCodec},
+            peer::{PeerTransport, wire::SecurityCodec},
             runtime::{environment::SimulationClock, reactor::Reactor},
             security::connection::tests::{finish, hello},
             topology::{health::LinkHealth, paths::Paths},

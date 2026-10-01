@@ -185,7 +185,7 @@ fn socket_root_is_lexical_and_preserves_canonical_publications() {
 fn real_uds_root_remapping_keeps_public_authority_and_http_validation() {
     use crate::{
         peer::{
-            requester::PeerClient,
+            PeerClient,
             wire::{FetchMode, Operation as PeerOperation, PeerRequest, VerifiedResponse},
         },
         read::candidates::{CandidatePolicy, CandidateResolution},
@@ -792,7 +792,7 @@ fn public_operations_reject_wrong_authority_before_io() {
     use crate::{
         model::{MembershipVersion, NodeId},
         peer::{
-            requester::PeerClient,
+            PeerClient,
             wire::{FetchMode, Operation as PeerOperation, PeerRequest, VerifiedResponse},
         },
         read::candidates::{CandidatePolicy, CandidateResolution},

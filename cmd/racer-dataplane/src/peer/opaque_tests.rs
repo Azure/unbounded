@@ -134,14 +134,14 @@ fn exchange(
             .with_signatures(signers[1].clone()),
     );
     let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4));
-    let requester = Rc::new(requester::Requester::new(
+    let requester = Rc::new(Requester::new(
         paths.clone(),
         auth.clone(),
         transfers.clone(),
         network.clone(),
     ));
     let relay = Rc::new(
-        relay::Relay::new(paths, auth.clone(), requester, admissions[1].clone())
+        Relay::new(paths, auth.clone(), requester, admissions[1].clone())
             .with_network(network.clone()),
     );
     let server = server::PeerServer::new(
