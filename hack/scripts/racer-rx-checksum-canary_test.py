@@ -1,0 +1,243 @@
+# Copyright (c) Microsoft Corporation.
+# SPDX-License-Identifier: Apache-2.0
+"""Offline only: mocked commands and fake settings, no Kubernetes access."""
+import copy
+import importlib.util
+from pathlib import Path
+import subprocess
+import signal
+import os
+import unittest
+from unittest.mock import patch
+
+SPEC = importlib.util.spec_from_file_location("rx", Path(__file__).with_name("racer-rx-checksum-canary.py"))
+rx = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(rx)
+
+
+def original():
+    return {d: {"rx-checksumming": ("on", False), "generic-receive-offload": ("on", False)}
+            for d in ("eth0", rx.VF)}
+
+
+class Host:
+    def __init__(self):
+        self.data = original()
+        self.writes = []
+        self.fail = False
+
+    def features(self):
+        return copy.deepcopy(self.data)
+
+    def write(self, value):
+        self.writes.append(value)
+        for dev in self.data:
+            self.data[dev]["rx-checksumming"] = (value, False)
+        if self.fail and value == "off":
+            raise RuntimeError("lost acknowledgement")
+
+
+def row():
+    return dict(health="ok", ready="ready", load={"racer_loadgen_applied_concurrency": 8,
+                "racer_loadgen_verified_bytes_total": 1}, dataplane={"racer_crypto_decrypt_aead_rejected_total": 1,
+                "racer_crypto_decrypt_crc_rejected_total": 0},
+                nic={k: 1 for k in ("rx_packets", "rx_bytes", "rx_csum_none", "rx_csum_complete", "rx_csum_unnecessary")},
+                tcp_csum=1, aead={"total": 1})
+
+
+class Tests(unittest.TestCase):
+    def test_success_and_restore(self):
+        h = Host()
+        stages = []
+        rx.changed(h, dict(original=original(), not_after=1e20, concurrency=8),
+                   report=lambda *a, **k: None, stage_fn=lambda *a, **k: stages.append(a[1]))
+        self.assertEqual(h.writes, ["off", "on"])
+        self.assertEqual(stages, ["off"])
+
+    def test_error_term_and_uncertain_write_restore(self):
+        for kind in ("error", "term", "write", "dependent"):
+            h = Host()
+            h.fail = kind == "write"
+            def stage(*a, **k):
+                if kind == "term":
+                    rx.stop(15, None)
+                raise RuntimeError("collector failure")
+            def report(event, **fields):
+                if kind == "dependent" and event == "before_mutation":
+                    h.data[rx.VF]["generic-receive-offload"] = ("off", False)
+            with self.assertRaises(RuntimeError):
+                rx.changed(h, dict(original=original(), not_after=1e20, concurrency=8),
+                           report=report, stage_fn=stage)
+            self.assertEqual(h.writes[-1], "on")
+
+    def test_reject_diagnostic_digest_and_readiness_abort(self):
+        a, b = row(), row()
+        b["dataplane"]["racer_crypto_decrypt_aead_rejected_total"] += 1
+        rx.safety(a, b, 8)
+        b["load"]['racer_loadgen_pull_failures_total{reason="digest_mismatch"}'] = 1
+        with self.assertRaisesRegex(RuntimeError, "digest"):
+            rx.safety(a, b, 8)
+        b = row()
+        b["ready"] = "no"
+        with self.assertRaisesRegex(RuntimeError, "readiness"):
+            rx.safety(a, b, 8)
+
+    def test_no_recurrence_no_mutation_or_restore(self):
+        rows = [dict(event="original", original=original()),
+                dict(event="summary", fresh_pair_rejects=0, ring_gap=False, verified_bytes=99)]
+        with patch.object(rx, "preflight", return_value={}), patch.object(rx, "remote", return_value=rows) as remote, \
+                patch.object(rx, "independent_restore") as restore, patch.object(rx, "emit"):
+            rx.run(type("Args", (), {"concurrency": 8})())
+        self.assertEqual(remote.call_count, 1)
+        restore.assert_not_called()
+
+    def test_parent_restore_on_failed_remote(self):
+        rows = [dict(event="original", original=original()),
+                dict(event="summary", fresh_pair_rejects=1, ring_gap=False, verified_bytes=99,
+                     nic_delta={"rx_bytes": 99}, state={"previous": row(), "seen": []})]
+        with patch.object(rx, "preflight", return_value={}), patch.object(rx, "remote", side_effect=[rows, RuntimeError("exec")]), \
+                patch.object(rx, "independent_restore") as restore, patch.object(rx.time, "sleep"), \
+                patch.object(rx.time, "monotonic", side_effect=[0, 0, 131]):
+            with self.assertRaises(RuntimeError):
+                rx.run(type("Args", (), {"concurrency": 8})())
+        restore.assert_called_once_with(original())
+
+    def test_feature_readback_all_features(self):
+        data = original()
+        rx.check_features(data, copy.deepcopy(data), "on")
+        data[rx.VF]["generic-receive-offload"] = ("off", False)
+        with self.assertRaises(RuntimeError):
+            rx.check_features(original(), data, "on")
+
+    def test_shell_error_and_term_traps_mocked(self):
+        for ending in ("return 7", "kill -TERM $$; return 7"):
+            prelude = '''hostname() { printf '%s\\n' aks-adsv5-13731677-vmss00000w; }
+ethtool() { printf 'RESTORED\\n' >&2; }
+timeout() { shift 3; "$@"; }
+sleep() { return 0; }
+python3() { ENDING; }
+'''.replace("ENDING", ending)
+            with self.assertRaises(subprocess.CalledProcessError) as caught:
+                rx.command(["sh", "-c", prelude + rx.remote_shell(True)], 3)
+            self.assertIn("RESTORED", caught.exception.stderr)
+        self.assertNotIn("ethtool -K", rx.remote_shell(False))
+
+    def test_external_timeout(self):
+        with patch.object(rx.subprocess, "run") as run:
+            rx.command(["fake"], 3)
+        self.assertEqual(run.call_args.args[0][:4], ["timeout", "--signal=TERM", "--kill-after=10s", "3s"])
+
+    def test_cleanup_masks_repeated_term(self):
+        old = signal.signal(signal.SIGTERM, rx.stop)
+        try:
+            with rx.cleanup_signals():
+                os.kill(os.getpid(), signal.SIGTERM)
+                os.kill(os.getpid(), signal.SIGTERM)
+            self.assertIs(signal.getsignal(signal.SIGTERM), rx.stop)
+        finally:
+            signal.signal(signal.SIGTERM, old)
+
+    def test_cross_stage_digest_aborts_before_off(self):
+        h = Host()
+        b = row()
+        b["features"] = h.features()
+        b["load"]['racer_loadgen_pull_failures_total{reason="digest_mismatch"}'] = 1
+        h.snapshot = lambda: b
+        with self.assertRaisesRegex(RuntimeError, "digest"):
+            rx.changed(h, dict(original=original(), not_after=1e20, concurrency=8,
+                               state={"previous": row()}), report=lambda *a, **k: None)
+        self.assertEqual(h.writes, [])
+
+    def test_expiry_rechecked_after_reporting(self):
+        h = Host()
+        config = dict(original=original(), not_after=1e20, concurrency=8)
+        def report(*a, **k):
+            config["not_after"] = 0
+        with self.assertRaisesRegex(RuntimeError, "expired"):
+            rx.changed(h, config, report=report)
+        self.assertNotIn("off", h.writes)
+
+    def test_stream_preserves_checkpoints_before_failure(self):
+        with patch.object(rx, "emit") as emit:
+            with self.assertRaisesRegex(RuntimeError, "remote failed"):
+                rx.stream(["python3", "-c", 'print(\'{"event":"checkpoint"}\',flush=True);exit(2)'], 3)
+        emit.assert_called_once_with("remote", record={"event": "checkpoint"})
+
+    def test_real_shell_source_argument_and_watchdog_cleanup(self):
+        # Real python, no stdin ambiguity; all host reads/writes are shell fakes.
+        prelude = '''hostname() { printf '%s\\n' aks-adsv5-13731677-vmss00000w; }
+ethtool() { printf 'RESTORED\\n' >&2; }
+timeout() { shift 3; "$@"; }
+'''
+        out = rx.command(["sh", "-c", prelude + rx.remote_shell(True), "test",
+                          'import sys; print(sys.argv[1]);', "SOURCE_OK"], 3)
+        self.assertEqual(out.strip(), "SOURCE_OK")
+
+    def test_watchdog_is_independent_and_bounded(self):
+        script = rx.remote_shell(True)
+        self.assertIn("time.sleep(110)", script)
+        self.assertIn('kill -TERM "$watchdog"', script)
+        self.assertIn('wait "$watchdog"', script)
+        self.assertIn('wait "$child"', script)
+        self.assertNotIn('python3 -u -B - "$@"', script)
+
+    def test_watchdog_action_without_polling(self):
+        # Execute the exact embedded watchdog with sleep and subprocess mocked.
+        script = rx.remote_shell(True)
+        source = script.split("python3 -B -c '", 1)[1].split("' </dev/null", 1)[0]
+        with patch.object(rx.time, "sleep") as sleep, patch.object(subprocess, "run") as run:
+            exec(source, {})
+        sleep.assert_called_once_with(110)
+        self.assertEqual(run.call_args.args[0], ["timeout", "--signal=TERM", "--kill-after=10s",
+                                                "3s", "ethtool", "-K", "eth0", "rx", "on"])
+
+    def test_independent_restore_verifies_both_interfaces(self):
+        text = "Features for interface:\nrx-checksumming: on\ngeneric-receive-offload: on\n"
+        with patch.object(rx, "command", side_effect=["", text, text]) as command, patch.object(rx, "emit"):
+            rx.independent_restore(original())
+        self.assertEqual(command.call_count, 3)
+        self.assertIn(rx.VF, command.call_args_list[-1].args[0])
+        with patch.object(rx, "command", side_effect=["", text, text.replace("rx-checksumming: on", "rx-checksumming: off")]), patch.object(rx, "emit"):
+            with self.assertRaises(RuntimeError):
+                rx.independent_restore(original())
+
+    def test_restore_signal_is_ignored_inside_host_finally(self):
+        h = Host()
+        write = h.write
+        def signal_write(value):
+            if value == "on":
+                os.kill(os.getpid(), signal.SIGTERM)
+            write(value)
+        h.write = signal_write
+        old = signal.signal(signal.SIGTERM, rx.stop)
+        try:
+            rx.changed(h, dict(original=original(), not_after=1e20, concurrency=8),
+                       report=lambda *a, **k: None, stage_fn=lambda *a, **k: None)
+        finally:
+            signal.signal(signal.SIGTERM, old)
+        self.assertEqual(h.writes, ["off", "on"])
+
+    def test_stage_fresh_pair_deduplicates_and_carries_state(self):
+        h = Host()
+        now = [0]
+        def snapshot():
+            b = row()
+            b.update(mono=now[0], ms=int(now[0]*1000), features=h.features())
+            b["load"]["racer_loadgen_verified_bytes_total"] += now[0]
+            b["aead"] = dict(total=1 + int(now[0] > 0), records=[])
+            if now[0]:
+                b["aead"]["records"] = [dict(seq="2", ms="1000", remote=rx.SENDER,
+                    acquisition="a", attempt="b", page="c", crc="d")]
+            return b
+        h.snapshot = snapshot
+        state = {}
+        summary = rx.stage(h, "baseline", 45, original(), "on", 8,
+                           report=lambda *a, **k: None, clock=lambda: now[0],
+                           sleep=lambda n: now.__setitem__(0, now[0]+n), state=state)
+        self.assertEqual(summary["fresh_pair_rejects"], 1)
+        self.assertEqual(now[0], 45)
+        self.assertEqual(state["previous"]["aead"]["total"], 2)
+
+
+if __name__ == "__main__":
+    unittest.main()
