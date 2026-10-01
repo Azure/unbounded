@@ -571,7 +571,6 @@ fn raw_endpoints_fragmentation_readiness_redaction_and_data_admission_stop() {
     assert!(text.contains("racer_ready 0\n"));
     assert!(!text.contains("synthetic"));
     assert!(!text.contains("Authorization"));
-    assert_eq!(telemetry.tracing.snapshot(&mut [None; 1]).unwrap(), 0);
     telemetry
         .failures
         .observer(crate::model::WorkerId(1))

@@ -3,7 +3,6 @@ pub mod failures;
 pub mod health;
 pub mod metrics;
 pub mod send_crc;
-pub mod tracing;
 
 use crate::runtime::reactor::Descriptor;
 use crate::{
@@ -37,7 +36,6 @@ pub struct Telemetry {
     pub failures: failures::Failures,
     pub metrics: metrics::Metrics,
     pub health: health::Health,
-    pub tracing: tracing::Tracing,
     io: OnceCell<Rc<DiagnosticIo>>,
 }
 
