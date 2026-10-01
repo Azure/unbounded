@@ -28,7 +28,9 @@ use crate::{
         credentials::CredentialCrypto,
     },
     store::{
-        StoreReader, eviction::SegmentClock, index::Index, segment::Segments, slab::Slabs,
+        StoreReader,
+        catalog::{Index, SegmentClock, Segments},
+        disk::Slabs,
         writer::StoreWriter,
     },
     test_support::origin::AdapterOrigin,
@@ -61,11 +63,12 @@ impl ReadWorker {
     ) -> Self {
         let origin = AdapterOrigin::new(&cache.name, metadata);
         let keys = Rc::new(crate::security::identity::keyring_tests::keys());
-        let snapshots = Rc::new(SnapshotStore::new(
-            keys.cluster().clone(),
-            Arc::new(PublishedState::default()),
-            2,
+        let publications = Arc::new(PublishedState::default());
+        let availability = Rc::new(crate::control::availability::Availability::new(
+            publications.clone(),
+            keys.clone(),
         ));
+        let snapshots = Rc::new(SnapshotStore::new(keys.cluster().clone(), publications, 2));
         snapshots
             .publish(Publication {
                 schema_version: 1,
@@ -90,7 +93,7 @@ impl ReadWorker {
             )
             .unwrap(),
         );
-        let buffers = Rc::new(BufferPool::new(admission.clone()));
+        let buffers = BufferPool::new(admission.clone());
         let index = Rc::new(Index::new(WorkerId(0), 16));
         let segments = Rc::new(Segments::new(WorkerId(0), 64 * 1024 * 1024));
         // Reads use an empty disk index. No slabs need to be opened or written.
@@ -138,7 +141,7 @@ impl ReadWorker {
             writer: writer.clone(),
             origin: client.clone(),
             candidates: candidates.clone(),
-            flights: Rc::new(Flights::new(admission.clone())),
+            flights: Rc::new(Flights::new(admission.clone(), availability.clone())),
             crypto: Rc::new(PageCrypto::new(keys, crypto.clone())),
             credentials: credentials.clone(),
             admission,
@@ -163,6 +166,7 @@ impl ReadWorker {
             fill,
             streams.clone(),
             credentials,
+            availability,
         ));
         let endpoint = directory.install(WorkerId(0), coordinator.clone()).unwrap();
         Self {
