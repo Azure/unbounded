@@ -324,7 +324,7 @@ pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
 fn metadata(head: &mut MessageHead, metadata: &ObjectMetadata) -> Result<()> {
     version(head, &metadata.version)?;
     push(head, "racer-length", metadata.length);
-    push(head, "racer-expires", millis(metadata.expires_at.0)?);
+    push(head, "racer-expires", metadata.expires_at.to_header()?);
     push(head, "racer-metadata-version", 2);
     if let Some(content_type) = &metadata.content_type {
         push(head, "racer-content-type", content_type.as_str());
