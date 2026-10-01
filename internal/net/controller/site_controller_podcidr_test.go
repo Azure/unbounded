@@ -34,6 +34,8 @@ type podCIDRTestHarness struct {
 	sites   []unboundedv1alpha3.Site
 	cached  *corev1.Node
 	patches [][]byte
+	// patchErr, when set, is returned for every patch after it is recorded.
+	patchErr error
 }
 
 // newPodCIDRTestHarness builds a SiteController whose informer cache holds a
@@ -100,6 +102,10 @@ func newPodCIDRTestHarness(t *testing.T, liveNode *corev1.Node) *podCIDRTestHarn
 
 	client.PrependReactor("patch", "nodes", func(action clienttesting.Action) (bool, runtime.Object, error) {
 		h.patches = append(h.patches, action.(clienttesting.PatchAction).GetPatch())
+		if h.patchErr != nil {
+			return true, nil, h.patchErr
+		}
+
 		return false, nil, nil
 	})
 
@@ -107,9 +113,23 @@ func newPodCIDRTestHarness(t *testing.T, liveNode *corev1.Node) *podCIDRTestHarn
 }
 
 func (h *podCIDRTestHarness) failPatches(err error) {
-	h.client.PrependReactor("patch", "nodes", func(clienttesting.Action) (bool, runtime.Object, error) {
-		return true, nil, err
-	})
+	h.patchErr = err
+}
+
+// setLiveNode replaces the node stored on the fake API server.
+func (h *podCIDRTestHarness) setLiveNode(t *testing.T, node *corev1.Node) {
+	t.Helper()
+
+	if err := h.client.Tracker().Update(schema.GroupVersionResource{Version: "v1", Resource: "nodes"}, node, ""); err != nil {
+		t.Fatalf("update live node: %v", err)
+	}
+}
+
+func (h *podCIDRTestHarness) pending(nodeName string) *pendingPodCIDRAssignment {
+	h.sc.pendingPodCIDRsLock.Lock()
+	defer h.sc.pendingPodCIDRsLock.Unlock()
+
+	return h.sc.pendingPodCIDRs[nodeName]
 }
 
 func liveNodeWithRV(resourceVersion string, podCIDRs ...string) *corev1.Node {
@@ -233,13 +253,14 @@ func TestAssignPodCIDRsWithoutLabelOmitsLabels(t *testing.T) {
 	}
 }
 
-func TestAssignPodCIDRsReleasesOnDefinitivePatchRejection(t *testing.T) {
+func TestAssignPodCIDRsKeepsPendingReservationOnPatchFailure(t *testing.T) {
 	gr := schema.GroupResource{Resource: "nodes"}
 
 	cases := map[string]error{
 		"conflict":  apierrors.NewConflict(gr, podCIDRTestNode, errors.New("resourceVersion changed")),
 		"invalid":   apierrors.NewInvalid(schema.GroupKind{Kind: "Node"}, podCIDRTestNode, nil),
-		"not-found": apierrors.NewNotFound(gr, podCIDRTestNode),
+		"timeout":   apierrors.NewTimeoutError("request timed out", 1),
+		"transport": errors.New("connection reset by peer"),
 	}
 
 	for name, patchErr := range cases {
@@ -247,32 +268,54 @@ func TestAssignPodCIDRsReleasesOnDefinitivePatchRejection(t *testing.T) {
 			h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
 			h.failPatches(patchErr)
 
-			err := h.sc.assignPodCIDRsForNodeWithLabel(context.Background(), h.cached, h.sites, "site-a")
-			if err == nil {
+			if err := h.sc.assignPodCIDRsForNodeWithLabel(context.Background(), h.cached, h.sites, "site-a"); err == nil {
 				t.Fatal("expected patch error")
 			}
 
-			if h.state.allocator.IsAllocated("10.244.0.0/24") {
-				t.Fatal("CIDR from a rejected patch was not released")
+			if !h.state.allocator.IsAllocated("10.244.0.0/24") {
+				t.Fatal("CIDR was released after a failed patch without confirming the node state")
+			}
+
+			pending := h.pending(podCIDRTestNode)
+			if pending == nil || pending.podCIDR != "10.244.0.0/24" {
+				t.Fatalf("pending assignment = %+v, want 10.244.0.0/24", pending)
 			}
 		})
 	}
 }
 
-func TestAssignPodCIDRsReleasesOnAmbiguousPatchErrorWhenNotApplied(t *testing.T) {
+func TestAssignPodCIDRsReusesPendingReservationOnNextSync(t *testing.T) {
 	h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
-	h.failPatches(errors.New("connection reset by peer"))
+	h.failPatches(apierrors.NewTimeoutError("request timed out", 1))
 
 	if err := h.sc.assignPodCIDRsForNode(context.Background(), h.cached, h.sites, "site-a"); err == nil {
 		t.Fatal("expected patch error")
 	}
 
-	if h.state.allocator.IsAllocated("10.244.0.0/24") {
-		t.Fatal("CIDR was not released after the assignment failed and the node does not hold it")
+	h.failPatches(nil)
+
+	if err := h.sc.assignPodCIDRsForNode(context.Background(), h.cached, h.sites, "site-a"); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+
+	if got := decodePatch(t, h.patches[len(h.patches)-1])["spec"]["podCIDR"]; got != "10.244.0.0/24" {
+		t.Fatalf("second sync patched podCIDR %v, want pending 10.244.0.0/24", got)
+	}
+
+	if h.state.allocator.IsAllocated("10.244.1.0/24") {
+		t.Fatal("second sync allocated a new CIDR instead of reusing the pending one")
+	}
+
+	if h.pending(podCIDRTestNode) != nil {
+		t.Fatal("pending assignment was not cleared after a successful patch")
+	}
+
+	if !h.state.allocator.IsAllocated("10.244.0.0/24") {
+		t.Fatal("assigned CIDR is not marked allocated")
 	}
 }
 
-func TestAssignPodCIDRsKeepsAllocationWhenFailedPatchWasApplied(t *testing.T) {
+func TestAssignPodCIDRsAdoptsPatchAppliedDespiteError(t *testing.T) {
 	h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
 	applyPatch := clienttesting.ObjectReaction(h.client.Tracker())
 	h.client.PrependReactor("patch", "nodes", func(action clienttesting.Action) (bool, runtime.Object, error) {
@@ -290,6 +333,89 @@ func TestAssignPodCIDRsKeepsAllocationWhenFailedPatchWasApplied(t *testing.T) {
 
 	if !h.state.allocator.IsAllocated("10.244.0.0/24") {
 		t.Fatal("CIDR held by the node was released after a lost patch response")
+	}
+
+	if err := h.sc.assignPodCIDRsForNode(context.Background(), h.cached, h.sites, "site-a"); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+
+	if h.pending(podCIDRTestNode) != nil {
+		t.Fatal("pending assignment was not cleared after the node was observed holding it")
+	}
+
+	if !h.state.allocator.IsAllocated("10.244.0.0/24") {
+		t.Fatal("CIDR held by the node was released when adopting it")
+	}
+}
+
+func TestAssignPodCIDRsReleasesPendingWhenNodeHoldsOtherCIDRs(t *testing.T) {
+	h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
+	h.failPatches(apierrors.NewTimeoutError("request timed out", 1))
+
+	if err := h.sc.assignPodCIDRsForNode(context.Background(), h.cached, h.sites, "site-a"); err == nil {
+		t.Fatal("expected patch error")
+	}
+
+	h.setLiveNode(t, liveNodeWithRV("6", "10.244.7.0/24"))
+
+	if err := h.sc.assignPodCIDRsForNode(context.Background(), h.cached, h.sites, "site-a"); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+
+	if h.state.allocator.IsAllocated("10.244.0.0/24") {
+		t.Fatal("pending CIDR was not released after the node was observed holding other CIDRs")
+	}
+
+	if !h.state.allocator.IsAllocated("10.244.7.0/24") {
+		t.Fatal("node's CIDR was not marked allocated")
+	}
+
+	if h.pending(podCIDRTestNode) != nil {
+		t.Fatal("pending assignment was not cleared")
+	}
+}
+
+func TestAssignPodCIDRsReleasesPendingWhenNodeDeleted(t *testing.T) {
+	h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
+	h.failPatches(apierrors.NewTimeoutError("request timed out", 1))
+
+	if err := h.sc.assignPodCIDRsForNode(context.Background(), h.cached, h.sites, "site-a"); err == nil {
+		t.Fatal("expected patch error")
+	}
+
+	if err := h.client.Tracker().Delete(schema.GroupVersionResource{Version: "v1", Resource: "nodes"}, "", podCIDRTestNode); err != nil {
+		t.Fatalf("delete node: %v", err)
+	}
+
+	if err := h.sc.assignPodCIDRsForNode(context.Background(), h.cached, h.sites, "site-a"); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+
+	if h.state.allocator.IsAllocated("10.244.0.0/24") {
+		t.Fatal("pending CIDR was not released after the node was deleted")
+	}
+}
+
+func TestReleasePendingPodCIDRsMatchesNodeUID(t *testing.T) {
+	live := liveNodeWithRV("4")
+	live.UID = "uid-new"
+	h := newPodCIDRTestHarness(t, live)
+	h.failPatches(apierrors.NewTimeoutError("request timed out", 1))
+
+	if err := h.sc.assignPodCIDRsForNode(context.Background(), h.cached, h.sites, "site-a"); err == nil {
+		t.Fatal("expected patch error")
+	}
+
+	h.sc.releasePendingPodCIDRs(podCIDRTestNode, "uid-old", nil)
+
+	if h.pending(podCIDRTestNode) == nil || !h.state.allocator.IsAllocated("10.244.0.0/24") {
+		t.Fatal("delete of a previous node incarnation released the current node's pending CIDRs")
+	}
+
+	h.sc.releasePendingPodCIDRs(podCIDRTestNode, "uid-new", nil)
+
+	if h.pending(podCIDRTestNode) != nil || h.state.allocator.IsAllocated("10.244.0.0/24") {
+		t.Fatal("delete of the current node incarnation did not release its pending CIDRs")
 	}
 }
 
@@ -312,8 +438,106 @@ func TestAssignPodCIDRsAllocatesOnceAcrossExhaustedConflictRetries(t *testing.T)
 		}
 	}
 
-	if h.state.allocator.IsAllocated("10.244.0.0/24") {
-		t.Fatal("CIDR was not released after conflict retries were exhausted")
+	if h.state.allocator.IsAllocated("10.244.1.0/24") {
+		t.Fatal("conflict retries allocated more than one CIDR")
+	}
+}
+
+func TestAssignPodCIDRsPendingFromPreviousAssignment(t *testing.T) {
+	newState := func(t *testing.T, pool string) *assignmentAllocator {
+		t.Helper()
+
+		_, ipNet, err := net.ParseCIDR(pool)
+		if err != nil {
+			t.Fatalf("parse pool: %v", err)
+		}
+
+		alloc, err := allocator.NewAllocator([]*net.IPNet{ipNet}, nil, 24, 64)
+		if err != nil {
+			t.Fatalf("NewAllocator: %v", err)
+		}
+
+		return &assignmentAllocator{siteName: "site-a", allocator: alloc}
+	}
+
+	t.Run("same-resource-version-blocks", func(t *testing.T) {
+		h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
+		h.failPatches(apierrors.NewTimeoutError("request timed out", 1))
+
+		if err := h.sc.allocateAndPatchNodePodCIDRs(context.Background(), podCIDRTestNode, h.state, ""); err == nil {
+			t.Fatal("expected patch error")
+		}
+
+		other := newState(t, "10.250.0.0/16")
+		h.failPatches(nil)
+
+		if err := h.sc.allocateAndPatchNodePodCIDRs(context.Background(), podCIDRTestNode, other, ""); err == nil {
+			t.Fatal("expected an error while the previous patch may still apply")
+		}
+
+		if !h.state.allocator.IsAllocated("10.244.0.0/24") {
+			t.Fatal("previous assignment's CIDR was released while its patch may still apply")
+		}
+
+		if other.allocator.IsAllocated("10.250.0.0/24") {
+			t.Fatal("a second CIDR was allocated while the previous patch may still apply")
+		}
+	})
+
+	t.Run("changed-resource-version-releases", func(t *testing.T) {
+		h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
+		h.failPatches(apierrors.NewTimeoutError("request timed out", 1))
+
+		if err := h.sc.allocateAndPatchNodePodCIDRs(context.Background(), podCIDRTestNode, h.state, ""); err == nil {
+			t.Fatal("expected patch error")
+		}
+
+		h.setLiveNode(t, liveNodeWithRV("8"))
+
+		other := newState(t, "10.250.0.0/16")
+		h.failPatches(nil)
+
+		if err := h.sc.allocateAndPatchNodePodCIDRs(context.Background(), podCIDRTestNode, other, ""); err != nil {
+			t.Fatalf("expected allocation from the new assignment, got %v", err)
+		}
+
+		if h.state.allocator.IsAllocated("10.244.0.0/24") {
+			t.Fatal("previous assignment's CIDR was not released after its patch could no longer apply")
+		}
+
+		if !other.allocator.IsAllocated("10.250.0.0/24") {
+			t.Fatal("new assignment's CIDR was not allocated")
+		}
+	})
+}
+
+func TestSeedAllocatorsMarksPendingPodCIDRs(t *testing.T) {
+	h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
+	h.failPatches(apierrors.NewTimeoutError("request timed out", 1))
+
+	if err := h.sc.assignPodCIDRsForNode(context.Background(), h.cached, h.sites, "site-a"); err == nil {
+		t.Fatal("expected patch error")
+	}
+
+	_, pool, err := net.ParseCIDR("10.244.0.0/16")
+	if err != nil {
+		t.Fatalf("parse pool: %v", err)
+	}
+
+	rebuilt, err := allocator.NewAllocator([]*net.IPNet{pool}, nil, 24, 64)
+	if err != nil {
+		t.Fatalf("NewAllocator: %v", err)
+	}
+
+	key := assignmentKey("site-a", 1)
+	h.sc.assignmentAllocators[key] = &assignmentAllocator{siteName: "site-a", assignmentIndex: 1, allocator: rebuilt}
+
+	if err := h.sc.seedAllocatorsForNodes(map[string]struct{}{key: {}}); err != nil {
+		t.Fatalf("seedAllocatorsForNodes: %v", err)
+	}
+
+	if !rebuilt.IsAllocated("10.244.0.0/24") {
+		t.Fatal("new allocator was not seeded with pending CIDRs")
 	}
 }
 
@@ -360,11 +584,14 @@ func (h *podCIDRTestHarness) failFirstPatchWithConflict(t *testing.T, concurrent
 
 	attempts := 0
 
-	h.client.PrependReactor("patch", "nodes", func(clienttesting.Action) (bool, runtime.Object, error) {
+	h.client.PrependReactor("patch", "nodes", func(action clienttesting.Action) (bool, runtime.Object, error) {
 		attempts++
 		if attempts > 1 {
 			return false, nil, nil
 		}
+
+		// This reactor runs before the harness recorder, so record here.
+		h.patches = append(h.patches, action.(clienttesting.PatchAction).GetPatch())
 
 		node, err := h.client.Tracker().Get(schema.GroupVersionResource{Version: "v1", Resource: "nodes"}, "", podCIDRTestNode)
 		if err != nil {

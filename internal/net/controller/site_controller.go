@@ -171,6 +171,23 @@ type SiteController struct {
 	// Tracks last duplicate podCIDR report to avoid repetitive log spam
 	duplicatePodCIDRReport     string
 	duplicatePodCIDRReportLock sync.Mutex
+
+	// pendingPodCIDRs holds CIDRs allocated for a node whose assignment patch
+	// has not been confirmed. They stay reserved until the node is observed
+	// holding CIDRs, is deleted, or can no longer receive the patch.
+	pendingPodCIDRs     map[string]*pendingPodCIDRAssignment
+	pendingPodCIDRsLock sync.Mutex
+}
+
+// pendingPodCIDRAssignment is an unconfirmed pod CIDR allocation for a node.
+type pendingPodCIDRAssignment struct {
+	uid types.UID
+	// resourceVersion is the precondition of the most recent patch attempt.
+	// That patch can only apply while the node is still at this version.
+	resourceVersion string
+	podCIDR         string
+	podCIDRs        []string
+	allocator       *allocator.Allocator
 }
 
 // NewSiteController creates a new site controller.
@@ -738,6 +755,16 @@ func (sc *SiteController) seedAllocatorsForNodes(keysToSeed map[string]struct{})
 			allocatedCIDRs[cidr] = struct{}{}
 		}
 	}
+
+	// Unconfirmed assignments may still be applied, so their CIDRs must stay
+	// reserved in any newly created allocator as well.
+	sc.pendingPodCIDRsLock.Lock()
+	for _, pending := range sc.pendingPodCIDRs {
+		for _, cidr := range pending.podCIDRs {
+			allocatedCIDRs[cidr] = struct{}{}
+		}
+	}
+	sc.pendingPodCIDRsLock.Unlock()
 
 	if len(allocatedCIDRs) == 0 {
 		return nil
@@ -2122,20 +2149,21 @@ func (sc *SiteController) computePodCIDRsForNode(state *assignmentAllocator) (st
 //
 // Conflicts are expected while a node is starting up because kubelet and
 // other agents update it frequently, so they are retried here with a fresh
-// read rather than surfacing as sync errors. CIDRs are allocated once and
-// reused across retries. They are released only if the assignment fails
-// entirely, or if the node turns out to already have different CIDRs.
+// read rather than surfacing as sync errors.
+//
+// Allocated CIDRs are recorded as a pending assignment and reused by every
+// retry and later sync until the outcome is known. A failed patch never
+// releases them, because a request that timed out may still be applied and
+// releasing would let another node receive the same CIDR. See
+// pendingPodCIDRsForNode for when a pending assignment is released.
 func (sc *SiteController) allocateAndPatchNodePodCIDRs(ctx context.Context, nodeName string, state *assignmentAllocator, siteName string) error {
-	var (
-		podCIDR  string
-		podCIDRs []string
-		applied  bool
-	)
-
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		liveNode, err := sc.clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 		if err != nil {
 			if apierrors.IsNotFound(err) {
+				// A deleted node cannot receive a pending patch; a recreated
+				// node has a new resourceVersion, which fails its precondition.
+				sc.releasePendingPodCIDRs(nodeName, "", nil)
 				return nil
 			}
 
@@ -2143,59 +2171,138 @@ func (sc *SiteController) allocateAndPatchNodePodCIDRs(ctx context.Context, node
 		}
 
 		if nodeHasPodCIDRs(liveNode) {
-			// Another writer, or an earlier attempt whose response was lost,
-			// already assigned CIDRs. Adopt them; any of our CIDRs not in use
-			// on the node are released below.
-			for _, cidr := range nodePodCIDRs(liveNode) {
+			held := nodePodCIDRs(liveNode)
+			for _, cidr := range held {
 				state.allocator.MarkAllocated(cidr)
 			}
+
+			// podCIDR is immutable once set, so no pending patch can change
+			// it. Release pending CIDRs the node does not hold.
+			sc.releasePendingPodCIDRs(nodeName, "", held)
 
 			return nil
 		}
 
-		if podCIDRs == nil {
-			podCIDR, podCIDRs, err = sc.computePodCIDRsForNode(state)
-			if err != nil {
-				return err
-			}
+		podCIDR, podCIDRs, err := sc.pendingPodCIDRsForNode(liveNode, state)
+		if err != nil {
+			return err
 		}
 
 		if err := sc.patchNodePodCIDRs(ctx, nodeName, liveNode.ResourceVersion, siteName, podCIDR, podCIDRs); err != nil {
 			return err
 		}
 
-		applied = true
+		sc.clearPendingPodCIDRs(nodeName)
 
 		return nil
 	})
-
-	if !applied && podCIDRs != nil {
-		sc.releaseUnusedPodCIDRs(ctx, nodeName, state, podCIDRs)
-	}
-
-	return err
 }
 
-// releaseUnusedPodCIDRs releases CIDRs allocated for a node whose assignment
-// did not complete, keeping any that the node is known to hold. CIDRs are
-// released when the node cannot be read, so a lost response for an applied
-// patch is recovered by the next sync re-marking the node's CIDRs.
-func (sc *SiteController) releaseUnusedPodCIDRs(ctx context.Context, nodeName string, state *assignmentAllocator, podCIDRs []string) {
-	inUse := map[string]struct{}{}
+// pendingPodCIDRsForNode returns the CIDRs to patch onto liveNode, which must
+// not already hold pod CIDRs. It reuses an existing pending assignment for the
+// node when it fits the node's current assignment, and otherwise allocates new
+// CIDRs. Either way, the returned CIDRs are recorded as pending at liveNode's
+// resourceVersion before the caller patches.
+//
+// A pending assignment from a different allocator is only released once
+// liveNode's UID or resourceVersion differs from its last patch attempt, which
+// proves that attempt can never apply. Until then an error is returned so the
+// node is retried later.
+func (sc *SiteController) pendingPodCIDRsForNode(liveNode *corev1.Node, state *assignmentAllocator) (string, []string, error) {
+	sc.pendingPodCIDRsLock.Lock()
+	defer sc.pendingPodCIDRsLock.Unlock()
 
-	if liveNode, err := sc.clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{}); err == nil {
-		for _, cidr := range nodePodCIDRs(liveNode) {
-			inUse[cidr] = struct{}{}
+	if sc.pendingPodCIDRs == nil {
+		sc.pendingPodCIDRs = make(map[string]*pendingPodCIDRAssignment)
+	}
+
+	pending := sc.pendingPodCIDRs[liveNode.Name]
+	if pending != nil {
+		if pending.allocator == state.allocator || allocatorContainsAll(state.allocator, pending.podCIDRs) {
+			for _, cidr := range pending.podCIDRs {
+				state.allocator.MarkAllocated(cidr)
+			}
+
+			pending.uid = liveNode.UID
+			pending.resourceVersion = liveNode.ResourceVersion
+			pending.allocator = state.allocator
+
+			return pending.podCIDR, pending.podCIDRs, nil
+		}
+
+		if pending.uid == liveNode.UID && pending.resourceVersion == liveNode.ResourceVersion {
+			return "", nil, fmt.Errorf("node %s has unconfirmed pod CIDRs %v from a previous assignment that may still be applied", liveNode.Name, pending.podCIDRs)
+		}
+
+		for _, cidr := range pending.podCIDRs {
+			pending.allocator.Release(cidr)
+		}
+
+		delete(sc.pendingPodCIDRs, liveNode.Name)
+	}
+
+	podCIDR, podCIDRs, err := sc.computePodCIDRsForNode(state)
+	if err != nil {
+		return "", nil, err
+	}
+
+	sc.pendingPodCIDRs[liveNode.Name] = &pendingPodCIDRAssignment{
+		uid:             liveNode.UID,
+		resourceVersion: liveNode.ResourceVersion,
+		podCIDR:         podCIDR,
+		podCIDRs:        podCIDRs,
+		allocator:       state.allocator,
+	}
+
+	return podCIDR, podCIDRs, nil
+}
+
+func allocatorContainsAll(alloc *allocator.Allocator, cidrs []string) bool {
+	for _, cidr := range cidrs {
+		if !alloc.ContainsCIDR(cidr) {
+			return false
 		}
 	}
 
-	for _, cidr := range podCIDRs {
-		if _, ok := inUse[cidr]; ok {
+	return true
+}
+
+// clearPendingPodCIDRs forgets a node's pending assignment after its patch
+// succeeded. The CIDRs remain allocated because the node now holds them.
+func (sc *SiteController) clearPendingPodCIDRs(nodeName string) {
+	sc.pendingPodCIDRsLock.Lock()
+	defer sc.pendingPodCIDRsLock.Unlock()
+
+	delete(sc.pendingPodCIDRs, nodeName)
+}
+
+// releasePendingPodCIDRs releases a node's pending CIDRs, except those in keep,
+// and forgets the pending assignment. When uid is non-empty, only a pending
+// assignment recorded for that node UID is released, so a delete event for an
+// earlier incarnation of a node cannot release a recreated node's CIDRs.
+func (sc *SiteController) releasePendingPodCIDRs(nodeName string, uid types.UID, keep []string) {
+	sc.pendingPodCIDRsLock.Lock()
+	defer sc.pendingPodCIDRsLock.Unlock()
+
+	pending := sc.pendingPodCIDRs[nodeName]
+	if pending == nil || (uid != "" && pending.uid != uid) {
+		return
+	}
+
+	kept := make(map[string]struct{}, len(keep))
+	for _, cidr := range keep {
+		kept[cidr] = struct{}{}
+	}
+
+	for _, cidr := range pending.podCIDRs {
+		if _, ok := kept[cidr]; ok {
 			continue
 		}
 
-		state.allocator.Release(cidr)
+		pending.allocator.Release(cidr)
 	}
+
+	delete(sc.pendingPodCIDRs, nodeName)
 }
 
 // patchNodePodCIDRs applies pod CIDRs, and site labels when siteName is
@@ -2316,6 +2423,9 @@ func (sc *SiteController) markNodeCIDRsAllocated(node *corev1.Node, sites []unbo
 }
 
 func (sc *SiteController) releaseNodeCIDRs(node *corev1.Node) {
+	// CIDRs the node held are released below, subject to the duplicate check.
+	sc.releasePendingPodCIDRs(node.Name, node.UID, nodePodCIDRs(node))
+
 	sc.sitesCacheLock.RLock()
 	sites := sc.sitesCache
 	sc.sitesCacheLock.RUnlock()
