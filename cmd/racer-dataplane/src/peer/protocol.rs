@@ -12,11 +12,7 @@ use crate::{
     topology::routing::RouteBudget,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use std::{
-    rc::Rc,
-    sync::Arc,
-    time::{Duration, UNIX_EPOCH},
-};
+use std::{rc::Rc, sync::Arc};
 
 pub use crate::security::forwarding::{RequestBinding, VerifiedRequest, VerifiedResponse};
 
@@ -483,17 +479,14 @@ fn metadata(head: &MessageHead) -> Result<ObjectMetadata> {
         content_type,
         version: version(head)?,
         length: p::number(head, "racer-length")?,
-        expires_at: ExpiresAt(
-            UNIX_EPOCH
-                .checked_add(Duration::from_millis(p::number(head, "racer-expires")?))
-                .ok_or(Error::InvalidRequest)?,
-        ),
+        expires_at: ExpiresAt::from_unix_millis(p::number(head, "racer-expires")?)?,
     })
 }
 
 #[cfg(test)]
 mod metadata_tests {
     use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
     #[test]
     fn received_page_keeps_one_charge_and_rejects_foreign_reservations() {
         use crate::security::forwarding::ForwardedHead;
@@ -515,7 +508,7 @@ mod metadata_tests {
                 etag: StrongEtag::test_value("v1"),
             },
             length: 3,
-            expires_at: ExpiresAt(UNIX_EPOCH),
+            expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
         };
         let page = buffers
             .ciphertext(
@@ -606,7 +599,7 @@ mod metadata_tests {
                 etag: StrongEtag::test_value("v1"),
             },
             length: 17,
-            expires_at: ExpiresAt(UNIX_EPOCH),
+            expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
         };
         let path = [NodeId(crate::security::identity::tests::NODE.into())];
         for typed in [false, true] {

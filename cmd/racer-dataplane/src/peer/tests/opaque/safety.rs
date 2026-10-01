@@ -158,7 +158,7 @@ fn wrong_equal_length_body_through_opaque_relay_fails_aead_then_recovers() {
             keys.push(CacheEncryptionKey {
                 key: CacheKeyRef {
                     cache: CacheId(CACHE.into()),
-                    id: KeyId([7; 16]),
+                    id: KeyId::from_generation(1, 7).unwrap(),
                     purpose: CacheKeyPurpose::Page,
                 },
                 state: CacheKeyState::Active,

@@ -75,7 +75,7 @@ fn copy(admission: &Rc<Admission>, page: PageId) -> CiphertextCopy {
             version: page.version,
             length,
             content_type: None,
-            expires_at: ExpiresAt(UNIX_EPOCH),
+            expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
         },
         ciphertext,
     }
@@ -779,7 +779,7 @@ fn retained_subscription_cannot_complete_after_request_mac_key_retirement() {
     }
     let mut replacement = crate::security::connection::signature_tests::mac_test_key(CACHE);
     for key in &mut replacement {
-        key.key.id.0[0] ^= 1;
+        key.key.id.0[4..12].copy_from_slice(&2u64.to_be_bytes());
         key.material[0] ^= 1;
     }
     retired.extend(replacement);

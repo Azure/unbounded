@@ -702,7 +702,7 @@ mod tests {
                     checksum: Default::default(),
                     envelope: PageEnvelope {
                         page,
-                        key_id: KeyId([1; 16]),
+                        key_id: KeyId::from_generation(1, 1).unwrap(),
                         nonce: Nonce([2; 24]),
                         plaintext_length: length as u32,
                         ciphertext_length: length as u32 + 16,
@@ -1208,7 +1208,7 @@ mod tests {
                 etag: StrongEtag::test_value("v1"),
             },
             length: PAGE_BYTES + 7,
-            expires_at: ExpiresAt(std::time::UNIX_EPOCH),
+            expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
         }
     }
     #[test]
@@ -1310,7 +1310,7 @@ mod tests {
     fn stream_pin_rejects_version_or_length_changes_but_not_expiration() {
         let expected = metadata();
         let mut actual = expected.clone();
-        actual.expires_at = ExpiresAt(std::time::SystemTime::now());
+        actual.expires_at = ExpiresAt::test_time(std::time::SystemTime::now());
         assert_eq!(validate_pin(&expected, &actual), Ok(()));
         actual.length += 1;
         assert_eq!(validate_pin(&expected, &actual), Err(Error::CorruptRecord));

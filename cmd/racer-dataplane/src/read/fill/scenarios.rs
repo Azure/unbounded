@@ -231,7 +231,7 @@ fn fixture_with_caches(
             etag: StrongEtag::parse(b"\"v1\"").unwrap(),
         },
         length,
-        expires_at: ExpiresAt(std::time::UNIX_EPOCH),
+        expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
     };
     let page = PageId {
         version: metadata.version.clone(),

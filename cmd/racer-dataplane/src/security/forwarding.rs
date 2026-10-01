@@ -1016,7 +1016,7 @@ mod tests {
                 etag: StrongEtag::test_value("bootstrap"),
             },
             length: 0,
-            expires_at: ExpiresAt(std::time::UNIX_EPOCH),
+            expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
         };
         let empty = protocol::response_head(
             &PeerResponse::Bootstrap {
@@ -1493,7 +1493,7 @@ mod tests {
             content_type: None,
             version: page.version.clone(),
             length: 7,
-            expires_at: ExpiresAt(std::time::SystemTime::now()),
+            expires_at: ExpiresAt::test_time(std::time::SystemTime::now()),
         };
         let ciphertext = CiphertextPage {
             provenance: None,
@@ -1528,7 +1528,11 @@ mod tests {
                 2 => envelope.plaintext_length += 1,
                 3 => envelope.ciphertext_length += 1,
                 4 => m.length += 1,
-                _ => m.expires_at.0 += Duration::from_millis(1),
+                _ => {
+                    m.expires_at =
+                        ExpiresAt::from_unix_millis(m.expires_at.to_unix_millis().unwrap() + 1)
+                            .unwrap()
+                }
             }
             let body = CiphertextPage {
                 provenance: None,
@@ -1638,7 +1642,7 @@ mod tests {
                 content_type: None,
                 version: page.version.clone(),
                 length: page.number.0 * PAGE_BYTES + 3,
-                expires_at: ExpiresAt(std::time::SystemTime::now()),
+                expires_at: ExpiresAt::test_time(std::time::SystemTime::now()),
             };
             let ciphertext = CiphertextPage {
                 provenance: None,
@@ -1821,7 +1825,7 @@ mod tests {
                 etag: StrongEtag::parse(b"\"version\"").unwrap(),
             },
             length: 20,
-            expires_at: ExpiresAt(std::time::SystemTime::now()),
+            expires_at: ExpiresAt::test_time(std::time::SystemTime::now()),
         };
         f[2].sign_response(admitted.binding(), PeerResponse::Metadata(good.clone()))
             .unwrap();
@@ -1880,7 +1884,7 @@ mod tests {
                 etag: StrongEtag::parse(b"\"version\"").unwrap(),
             },
             length: 20,
-            expires_at: ExpiresAt(std::time::SystemTime::now()),
+            expires_at: ExpiresAt::test_time(std::time::SystemTime::now()),
         };
         assert!(
             relay
@@ -1936,7 +1940,7 @@ mod tests {
             content_type: None,
             version: page.version.clone(),
             length: 3,
-            expires_at: ExpiresAt(std::time::SystemTime::now()),
+            expires_at: ExpiresAt::test_time(std::time::SystemTime::now()),
         };
         let envelope = PageEnvelope {
             page: page.clone(),
@@ -1978,7 +1982,11 @@ mod tests {
             match change {
                 0 => e.nonce.0[0] ^= 1,
                 1 => e.key_id.0[0] ^= 1,
-                2 => m.expires_at.0 += Duration::from_secs(1),
+                2 => {
+                    m.expires_at =
+                        ExpiresAt::from_unix_millis(m.expires_at.to_unix_millis().unwrap() + 1000)
+                            .unwrap()
+                }
                 3 => m.length += 1,
                 _ => e.page.number.0 += 1,
             }

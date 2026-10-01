@@ -197,7 +197,7 @@ fn retained_page(
                     .unwrap(),
                 crate::model::PageEnvelope {
                     page: id,
-                    key_id: crate::model::KeyId([1; 16]),
+                    key_id: crate::model::KeyId::from_generation(1, 1).unwrap(),
                     nonce: crate::model::Nonce([2; 24]),
                     plaintext_length: 3,
                     ciphertext_length: 19,

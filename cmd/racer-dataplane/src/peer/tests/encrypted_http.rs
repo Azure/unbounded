@@ -60,7 +60,7 @@ fn production_aad_http_roundtrip_cancel_reuse_and_mismatched_body() {
             keys.push(CacheEncryptionKey {
                 key: CacheKeyRef {
                     cache: CacheId(CACHE.into()),
-                    id: KeyId([7; 16]),
+                    id: KeyId::from_generation(1, 7).unwrap(),
                     purpose: CacheKeyPurpose::Page,
                 },
                 state: CacheKeyState::Active,
@@ -202,7 +202,9 @@ fn production_aad_http_roundtrip_cancel_reuse_and_mismatched_body() {
                         content_type: None,
                         version: ciphertext.envelope().page.version.clone(),
                         length: length as u64,
-                        expires_at: ExpiresAt(SystemTime::now() + Duration::from_secs(60)),
+                        expires_at: ExpiresAt::test_time(
+                            SystemTime::now() + Duration::from_secs(60),
+                        ),
                     },
                     ciphertext: ciphertext.clone(),
                 },

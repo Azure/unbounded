@@ -1175,7 +1175,7 @@ mod tests {
                     version: page.version,
                     length: 3,
                     content_type: None,
-                    expires_at: ExpiresAt(UNIX_EPOCH),
+                    expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
                 },
                 ciphertext,
             },

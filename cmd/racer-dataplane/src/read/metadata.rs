@@ -964,7 +964,7 @@ pub(crate) mod tests {
                 etag: StrongEtag::test_value(etag),
             },
             length,
-            expires_at: ExpiresAt(UNIX_EPOCH),
+            expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
         }
     }
     fn key() -> RefreshKey {
@@ -1255,7 +1255,7 @@ pub(crate) mod tests {
         let index = Index::new(WorkerId(0), 4, crate::test_support::availability());
         let old = metadata("old", 7);
         let mut new = metadata("new", 900);
-        new.expires_at = ExpiresAt(SystemTime::now() + Duration::from_secs(60));
+        new.expires_at = ExpiresAt::test_time(SystemTime::now() + Duration::from_secs(60));
         index.publish_version(old.immutable()).unwrap();
         index.publish_current(new.clone()).unwrap();
         assert_eq!(

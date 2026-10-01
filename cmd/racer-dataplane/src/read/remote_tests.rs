@@ -50,7 +50,7 @@ fn identities(nodes: &[NodeId]) -> Vec<Identity> {
         keys.push(crate::control::wire::CacheEncryptionKey {
             key: crate::control::wire::CacheKeyRef {
                 cache: CacheId(CACHE.into()),
-                id: KeyId([1; 16]),
+                id: KeyId::from_generation(1, 1).unwrap(),
                 purpose: crate::control::wire::CacheKeyPurpose::Page,
             },
             state: crate::control::wire::CacheKeyState::Active,
@@ -390,7 +390,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
             etag: StrongEtag::parse(b"\"remote\"").unwrap(),
         },
         length: 71,
-        expires_at: ExpiresAt(std::time::SystemTime::now() + Duration::from_secs(60)),
+        expires_at: ExpiresAt::test_time(std::time::SystemTime::now() + Duration::from_secs(60)),
     };
     let origin_calls = missing_adapter();
     let copy_calls = Rc::new(RefCell::new(Vec::new()));
@@ -662,13 +662,13 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
             assert_eq!(
                 value
                     .expires_at
-                    .0
+                    .as_system_time()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_millis(),
                 metadata
                     .expires_at
-                    .0
+                    .as_system_time()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_millis()
@@ -774,7 +774,7 @@ fn missing_adapter() -> Rc<AdapterOrigin> {
                 etag: StrongEtag::test_value("missing"),
             },
             length: 0,
-            expires_at: ExpiresAt(std::time::UNIX_EPOCH),
+            expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
         },
     ));
     adapter.set_missing(true);

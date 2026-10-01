@@ -358,7 +358,9 @@ impl RelayFixture {
                 etag: StrongEtag::test_value("v1"),
             },
             length: plaintext.len() as u64,
-            expires_at: ExpiresAt(std::time::SystemTime::now() + Duration::from_secs(60)),
+            expires_at: ExpiresAt::test_time(
+                std::time::SystemTime::now() + Duration::from_secs(60),
+            ),
         };
         let envelope = PageEnvelope {
             page: PageId {

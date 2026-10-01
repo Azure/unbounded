@@ -159,7 +159,7 @@ fn offer_fallback(sender_failure: bool, rejected_sites: Option<[&str; 2]>, wrong
             content_type: None,
             version,
             length: 19,
-            expires_at: ExpiresAt(std::time::UNIX_EPOCH),
+            expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
         },
         ciphertext: page,
     };
@@ -572,7 +572,7 @@ fn native_roundtrip(simulated: bool, reverse: bool, rejected_site: Option<&str>,
             content_type: None,
             version,
             length: 128,
-            expires_at: ExpiresAt(std::time::UNIX_EPOCH),
+            expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
         },
         ciphertext: page,
     };

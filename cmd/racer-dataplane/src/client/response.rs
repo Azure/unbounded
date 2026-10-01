@@ -263,7 +263,7 @@ fn error_head(error: Error) -> Result<MessageHead> {
 fn success_head(metadata: &ObjectMetadata, range: Option<ResolvedRange>) -> Result<MessageHead> {
     let expiry = metadata
         .expires_at
-        .0
+        .as_system_time()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| Error::BadGateway)?;
     if metadata.length > i64::MAX as u64
@@ -324,7 +324,8 @@ mod tests {
                 etag: StrongEtag::parse(b"\"a,b\\c\"").unwrap(),
             },
             length,
-            expires_at: ExpiresAt(UNIX_EPOCH + Duration::from_millis(123456)),
+            expires_at: ExpiresAt::from_system_time(UNIX_EPOCH + Duration::from_millis(123456))
+                .unwrap(),
         }
     }
 
@@ -422,9 +423,7 @@ mod tests {
             UNIX_EPOCH + Duration::from_nanos(1),
             UNIX_EPOCH + Duration::from_millis(i64::MAX as u64 + 1),
         ] {
-            let mut metadata = metadata(1);
-            metadata.expires_at = ExpiresAt(expires_at);
-            assert!(success_head(&metadata, None).is_err());
+            assert!(ExpiresAt::from_system_time(expires_at).is_err());
         }
         assert!(success_head(&metadata(1), Some(ByteRange::From(0).resolve(2).unwrap())).is_err());
     }

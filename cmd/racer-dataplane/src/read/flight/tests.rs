@@ -163,7 +163,7 @@ fn result(flights: &Flights, page: PageId) -> PageResult {
             content_type: None,
             version: page.version.clone(),
             length: 3,
-            expires_at: ExpiresAt(std::time::UNIX_EPOCH),
+            expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
         },
         plaintext: VerifiedPage {
             inner: Arc::new(VerifiedBytes {
@@ -181,7 +181,7 @@ fn result(flights: &Flights, page: PageId) -> PageResult {
                 checksum: std::sync::OnceLock::new(),
                 envelope: PageEnvelope {
                     page,
-                    key_id: KeyId([1; 16]),
+                    key_id: KeyId::from_generation(1, 1).unwrap(),
                     nonce: Nonce([0; 24]),
                     plaintext_length: 3,
                     ciphertext_length: 19,

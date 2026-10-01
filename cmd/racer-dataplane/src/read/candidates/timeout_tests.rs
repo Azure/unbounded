@@ -56,7 +56,9 @@ impl Peers {
                 etag: StrongEtag::test_value("fallback"),
             },
             length: 17,
-            expires_at: ExpiresAt(std::time::SystemTime::now() + Duration::from_secs(60)),
+            expires_at: ExpiresAt::test_time(
+                std::time::SystemTime::now() + Duration::from_secs(60),
+            ),
         };
         let response = match &request.operation {
             PeerOperation::Subscribe { .. } | PeerOperation::Page { .. } => PeerResponse::Miss,

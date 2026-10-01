@@ -636,14 +636,14 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
 #[test]
 fn v3_equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
     equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction(
-        crate::topology::RoutingAlgorithm::V3,
+        crate::topology::RoutingAlgorithm::V5,
     );
 }
 
 #[test]
 fn v4_equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
     equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction(
-        crate::topology::RoutingAlgorithm::V4,
+        crate::topology::RoutingAlgorithm::V5,
     );
 }
 
@@ -678,9 +678,7 @@ fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction(
                 .map(|(i, node)| Member {
                     node: NodeId(node),
                     shares: std::num::NonZeroU32::new(
-                        if matches!(algorithm, RoutingAlgorithm::V4 | RoutingAlgorithm::V5)
-                            && i % 3 == 0
-                        {
+                        if matches!(algorithm, RoutingAlgorithm::V5) && i % 3 == 0 {
                             1
                         } else {
                             4
@@ -823,7 +821,7 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
     let paths = Rc::new(Paths::with_algorithm(
         health.clone(),
         4,
-        crate::topology::RoutingAlgorithm::V3,
+        crate::topology::RoutingAlgorithm::V5,
     ));
     let requester = Requester::new(
         paths.clone(),
@@ -1437,7 +1435,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
             content_type: None,
             version,
             length: 8192,
-            expires_at: ExpiresAt(std::time::UNIX_EPOCH),
+            expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
         },
         ciphertext: page,
     };
@@ -1614,12 +1612,7 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
     let neighbors = Graph::new(membership.clone()).neighbors(&local).unwrap();
     assert!(neighbors.len() < membership.members().len() - 1);
     assert_eq!(neighbors.len(), 62);
-    for algorithm in [
-        crate::topology::RoutingAlgorithm::V2,
-        crate::topology::RoutingAlgorithm::V3,
-        crate::topology::RoutingAlgorithm::V4,
-        crate::topology::RoutingAlgorithm::V5,
-    ] {
+    for algorithm in [crate::topology::RoutingAlgorithm::V5] {
         let explicit = PeerNetwork::with_algorithm(
             local.clone(),
             Arc::new(crate::control::state::PublishedState::default()),

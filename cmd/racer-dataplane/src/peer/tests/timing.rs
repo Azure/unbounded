@@ -30,7 +30,7 @@ fn page_response(admission: &Rc<Admission>, request: &PeerRequest) -> PeerRespon
             content_type: None,
             version: page.version.clone(),
             length: 3,
-            expires_at: crate::model::ExpiresAt(
+            expires_at: crate::model::ExpiresAt::test_time(
                 crate::runtime::environment::wall_now() + Duration::from_secs(60),
             ),
         },

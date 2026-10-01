@@ -120,7 +120,7 @@ fn page_result(admission: &Admission, page: &PageId) -> crate::memory::page::Pag
             content_type: None,
             version: page.version.clone(),
             length: 3,
-            expires_at: ExpiresAt(std::time::UNIX_EPOCH),
+            expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
         },
         plaintext: VerifiedPage {
             inner: Arc::new(VerifiedBytes {

@@ -40,7 +40,7 @@ fn metadata(context: &OriginContext) -> ObjectMetadata {
         },
         length,
         content_type: None,
-        expires_at: ExpiresAt(UNIX_EPOCH),
+        expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
     }
 }
 impl origin::Origin for GeneratedOrigin {
@@ -468,7 +468,7 @@ fn interop_keys() -> security::identity::Keyring {
             .map(|(i, purpose)| CacheEncryptionKey {
                 key: CacheKeyRef {
                     cache: CacheId("33333333-3333-4333-8333-333333333333".into()),
-                    id: KeyId([i as u8 + 1; 16]),
+                    id: KeyId::from_generation(1, i as u32 + 1).unwrap(),
                     purpose,
                 },
                 state: CacheKeyState::Active,

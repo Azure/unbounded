@@ -24,7 +24,7 @@ pub(crate) fn mac_test_keys() -> Vec<crate::control::wire::CacheEncryptionKey> {
         .map(|(i, cache)| CacheEncryptionKey {
             key: CacheKeyRef {
                 cache: crate::model::CacheId(cache),
-                id: crate::model::KeyId([100 + i as u8; 16]),
+                id: crate::model::KeyId::from_generation(1, 100 + i as u32).unwrap(),
                 purpose: CacheKeyPurpose::OriginCredentials,
             },
             state: CacheKeyState::Active,
@@ -210,7 +210,7 @@ fn request_mac_rotates_and_rejects_missing_retired_or_mutated_tags() {
         }
         let mut active = mac_test_keys();
         for key in &mut active {
-            key.key.id.0[0] ^= 1;
+            key.key.id.0[4..12].copy_from_slice(&2u64.to_be_bytes());
             key.material[0] ^= 1;
         }
         keys.extend(active);

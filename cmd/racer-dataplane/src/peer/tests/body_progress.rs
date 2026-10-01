@@ -244,7 +244,7 @@ impl BodyFixture {
                         content_type: None,
                         version: page.version.clone(),
                         length: length as u64,
-                        expires_at: ExpiresAt(
+                        expires_at: ExpiresAt::test_time(
                             std::time::SystemTime::now() + Duration::from_secs(60),
                         ),
                     },

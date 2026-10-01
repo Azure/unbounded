@@ -1514,7 +1514,7 @@ mod tests {
                 etag: StrongEtag::test_value("v1"),
             },
             length: 0,
-            expires_at: ExpiresAt(std::time::UNIX_EPOCH),
+            expires_at: ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
         };
         assert_eq!(
             classify(&PeerResponse::Metadata(metadata.clone()), &operation, false),

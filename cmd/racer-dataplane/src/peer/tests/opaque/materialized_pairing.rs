@@ -72,7 +72,7 @@ fn materialized_pairing_survives_concurrent_short_reads_cancel_and_pool_reuse() 
     } = RelayFixture::with_pool_limit(true, 2);
     assert!(!server.opaque_relay());
     metadata.length = 3 * crate::model::PAGE_BYTES;
-    metadata.expires_at = ExpiresAt(
+    metadata.expires_at = ExpiresAt::test_time(
         std::time::UNIX_EPOCH
             + Duration::from_secs(
                 std::time::SystemTime::now()
