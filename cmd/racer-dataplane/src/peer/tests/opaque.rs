@@ -11,7 +11,7 @@ use crate::{
     topology::{
         health::LinkHealth,
         membership::{Member, Membership},
-        paths::Paths,
+        routing::Paths,
     },
 };
 use chacha20poly1305::{

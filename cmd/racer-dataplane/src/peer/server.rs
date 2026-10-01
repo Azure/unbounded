@@ -1328,7 +1328,7 @@ mod tests {
             peer::{PeerTransport, protocol::SecurityCodec},
             runtime::{environment::SimulationClock, reactor::Reactor},
             security::connection::tests::{finish, hello},
-            topology::{health::LinkHealth, paths::Paths},
+            topology::{health::LinkHealth, routing::Paths},
         };
 
         struct Never;

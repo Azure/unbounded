@@ -8,7 +8,7 @@ use crate::{
     topology::{
         health::LinkHealth,
         membership::{Member, Membership},
-        paths::Paths,
+        routing::Paths,
     },
 };
 use std::{

@@ -19,7 +19,7 @@ use crate::{
     runtime::admission::Admission,
     runtime::deadline::RequestScope,
     security::forwarding::Forwarding,
-    topology::{membership::MembershipLease, paths::Paths, rails},
+    topology::{membership::MembershipLease, rails, routing::Paths},
 };
 use std::{rc::Rc, sync::Arc};
 
@@ -67,7 +67,7 @@ impl PeerNetwork {
         membership: &MembershipLease,
         node: &NodeId,
     ) -> Result<crate::http::connection::Endpoint> {
-        if !crate::topology::Graph::with_algorithm(membership.clone(), self.algorithm)
+        if !crate::topology::routing::Graph::with_algorithm(membership.clone(), self.algorithm)
             .neighbors(&self.local)?
             .contains(node)
         {
@@ -114,9 +114,9 @@ pub(crate) fn check_membership(
 }
 
 pub(crate) fn search_budget(
-    route: &crate::topology::paths::RouteBudget,
+    route: &crate::topology::routing::RouteBudget,
     local: &NodeId,
-) -> Result<crate::topology::paths::RouteBudget> {
+) -> Result<crate::topology::routing::RouteBudget> {
     let mut budget = route.clone();
     if budget.visited.last() == Some(local) {
         budget.visited.pop();
@@ -220,7 +220,7 @@ impl Relay {
                 .remaining_links
                 .checked_sub(1)
                 .ok_or(Error::HopBudgetExhausted)?;
-            let outbound_budget = crate::topology::paths::RouteBudget {
+            let outbound_budget = crate::topology::routing::RouteBudget {
                 membership: budget.membership,
                 request: budget.request,
                 attempt: budget.attempt,

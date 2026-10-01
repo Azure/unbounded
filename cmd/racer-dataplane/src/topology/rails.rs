@@ -3,7 +3,7 @@
 //! reports or overrides membership. Missing/incompatible mappings fall back to HTTP.
 use super::{
     hash,
-    paths::{FAILURE_LINKS, Route},
+    routing::{FAILURE_LINKS, Route},
 };
 use crate::{
     error::{Error, Result},

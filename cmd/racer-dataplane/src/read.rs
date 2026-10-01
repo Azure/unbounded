@@ -62,7 +62,7 @@ pub(crate) fn default_budget(scope: &RequestScope) -> AcquisitionBudget {
     AcquisitionBudget::new(scope.deadline.0, 32, 96)
 }
 pub(crate) fn inherited_budget(
-    route: &crate::topology::paths::RouteBudget,
+    route: &crate::topology::routing::RouteBudget,
     scope: &RequestScope,
 ) -> Result<AcquisitionBudget> {
     scope.check()?;
@@ -433,7 +433,7 @@ mod tests {
             now + std::time::Duration::from_secs(60),
         )
         .unwrap();
-        let mut route = crate::topology::paths::RouteBudget {
+        let mut route = crate::topology::routing::RouteBudget {
             membership: crate::model::MembershipVersion(1),
             request: scope.request,
             attempt: AttemptId([2; 16]),

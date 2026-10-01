@@ -9,7 +9,7 @@ fn worker_subscriptions_contend_across_servers_and_recover_after_release() {
             protocol::{FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse},
             subscriptions::{Demand, PageInterval, Subscription},
         },
-        topology::paths::RouteBudget,
+        topology::routing::RouteBudget,
     };
 
     let sim = Simulation::new();
@@ -145,7 +145,7 @@ fn worker_subscriptions_contend_across_servers_and_recover_after_release() {
 fn completed_peer_dispatches_do_not_exhaust_worker_cancellation() {
     use crate::model::{MetadataSelector, OriginContext};
     use crate::peer::protocol::{FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse};
-    use crate::topology::paths::RouteBudget;
+    use crate::topology::routing::RouteBudget;
     use futures::{Stream, stream::FuturesUnordered};
 
     let sim = Simulation::new();

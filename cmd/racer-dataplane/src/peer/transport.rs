@@ -367,7 +367,7 @@ impl Transfers {
             }
         }
         crate::topology::rails::select_hop(
-            &crate::topology::paths::Route {
+            &crate::topology::routing::Route {
                 membership: membership.clone(),
                 nodes: path,
             },

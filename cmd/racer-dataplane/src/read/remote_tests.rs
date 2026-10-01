@@ -26,8 +26,8 @@ use crate::{
     topology::{
         health::LinkHealth,
         membership::{Member, Membership},
-        paths::Paths,
         placement::Placement,
+        routing::Paths,
     },
 };
 use std::{
@@ -214,7 +214,7 @@ fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
             origin: CredentialCrypto::new(ids[0].keys.clone(), admission.clone())
                 .seal(&context, attempt, &scope)
                 .unwrap(),
-            route: crate::topology::paths::RouteBudget {
+            route: crate::topology::routing::RouteBudget {
                 membership: membership.version,
                 request: scope.request,
                 attempt,

@@ -65,7 +65,7 @@ use crate::{
         writer::StoreWriter,
     },
     telemetry::Telemetry,
-    topology::{health::LinkHealth, paths::Paths, placement::Placement},
+    topology::{health::LinkHealth, placement::Placement, routing::Paths},
 };
 #[cfg(test)]
 use std::{collections::VecDeque, num::NonZeroUsize, time::Instant};

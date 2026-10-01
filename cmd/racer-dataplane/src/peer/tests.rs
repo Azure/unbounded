@@ -25,7 +25,7 @@ use crate::{
         forwarding::Forwarding,
         identity::{Certificates, Keyring},
     },
-    topology::paths::RouteBudget,
+    topology::routing::RouteBudget,
 };
 use std::{
     rc::Rc,

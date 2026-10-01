@@ -11,7 +11,7 @@
 //!     peer::{server::LocalPageService, protocol::{PeerRequest, VerifiedResponse}},
 //!     runtime::deadline::RequestScope,
 //!     security::forwarding::Forwarding,
-//!     topology::{membership::MembershipLease, paths::RouteBudget},
+//!     topology::{membership::MembershipLease, routing::RouteBudget},
 //! };
 //!
 //! async fn round_trip(
@@ -49,7 +49,7 @@ use crate::{
     http::{MessageHead, StartLine},
     model::NodeId,
     peer::protocol::{PeerRequest, PeerResponse, SignedRequest, SignedResponse},
-    topology::paths::RouteBudget,
+    topology::routing::RouteBudget,
 };
 use std::{rc::Rc, sync::Arc};
 pub struct Forwarding {

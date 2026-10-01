@@ -324,7 +324,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
         topology::{
             health::LinkHealth,
             membership::{Member, Membership},
-            paths::Paths,
+            routing::Paths,
         },
     };
     use std::{cell::Cell, num::NonZeroU32};
@@ -534,7 +534,7 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
     use crate::topology::{
         health::LinkHealth,
         membership::{Member, Membership},
-        paths::Paths,
+        routing::Paths,
     };
     struct Destination {
         auth: Forwarding,
@@ -661,7 +661,7 @@ fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction(
         RoutingAlgorithm,
         health::{LinkHealth, LinkOutcome},
         membership::{Member, Membership},
-        paths::Paths,
+        routing::Paths,
     };
     let signers = signers();
     let admission = Rc::new(Admission::new(
@@ -776,7 +776,7 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
         topology::{
             health::LinkHealth,
             membership::{Member, Membership},
-            paths::Paths,
+            routing::Paths,
         },
     };
     use std::task::{Context, Poll};
@@ -939,7 +939,7 @@ fn signed_tcp_case(case: &str) {
         topology::{
             health::LinkHealth,
             membership::{Member, Membership},
-            paths::Paths,
+            routing::Paths,
         },
     };
     use std::{
@@ -1165,7 +1165,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
             connection::{ConnectionLease, HttpIo},
         },
         runtime::reactor::Reactor,
-        topology::{health::LinkHealth, paths::Paths},
+        topology::{health::LinkHealth, routing::Paths},
     };
     use std::{
         future::Future,
@@ -1530,8 +1530,8 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
 #[test]
 fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
     use crate::topology::{
-        Graph,
         membership::{Member, Membership},
+        routing::Graph,
     };
     let membership = Arc::new(
         Membership::validate(
@@ -1625,7 +1625,7 @@ mod established_sessions {
         topology::{
             health::LinkHealth,
             membership::{Member, Membership},
-            paths::Paths,
+            routing::Paths,
         },
     };
     use std::{

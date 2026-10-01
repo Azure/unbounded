@@ -9,7 +9,7 @@ use crate::{
     },
     runtime::{admission::Admission, deadline::RequestScope},
     security::{connection::SignedHead, forwarding::ForwardedHead, protocol as p},
-    topology::paths::RouteBudget,
+    topology::routing::RouteBudget,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use std::{

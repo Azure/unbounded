@@ -7,7 +7,7 @@ use crate::{
     model::{NodeId, ObjectId, ObjectMetadata, ObjectVersion, PAGE_BYTES},
     peer::protocol::{FetchMode, Operation, PeerRequest, PeerResponse},
     runtime::deadline::Deadline,
-    topology::paths::RouteBudget,
+    topology::routing::RouteBudget,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 #[cfg(test)]

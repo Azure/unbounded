@@ -193,7 +193,7 @@ use crate::{
         connection,
         connection::signature_tests::{network, node},
     },
-    topology::paths::RouteBudget,
+    topology::routing::RouteBudget,
 };
 use std::{future::Future, os::unix::net::UnixStream};
 

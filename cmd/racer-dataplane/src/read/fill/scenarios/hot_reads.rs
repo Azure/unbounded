@@ -28,7 +28,7 @@ use crate::{
         },
         forwarding::Forwarding,
     },
-    topology::{health::LinkHealth, paths::Paths},
+    topology::{health::LinkHealth, routing::Paths},
 };
 
 struct Link {

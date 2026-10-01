@@ -15,8 +15,8 @@ use crate::{
     security::credentials::CredentialCrypto,
     topology::{
         membership::MembershipLease,
-        paths::RouteBudget,
         placement::{Candidates, Placement},
+        routing::RouteBudget,
     },
 };
 #[cfg(test)]
@@ -859,7 +859,7 @@ impl CandidatePolicy {
         let mut complete_by = attempt_end;
         if remaining_opportunities > 1
             && budget.remaining_attempts() > 0
-            && budget.remaining_links() >= crate::topology::paths::FAILURE_LINKS
+            && budget.remaining_links() >= crate::topology::routing::FAILURE_LINKS
         {
             // Reserve at most half the original post-share interval for fallback,
             // including subscription/fixed-page fallback. The local cap may be tighter.
