@@ -307,7 +307,7 @@ func printNodeRoutes(w io.Writer, node statusv1alpha1.NodeStatusResponse, useCol
 			expText := fmt.Sprintf("%t", expected)
 			preText := fmt.Sprintf("%t", present)
 
-			if !isWireguardKind(kind) {
+			if !isTunnelKind(kind) {
 				expText = "n/a"
 				preText = "n/a"
 			}
@@ -338,7 +338,7 @@ func printNodeRoutes(w io.Writer, node statusv1alpha1.NodeStatusResponse, useCol
 				info = "-"
 			}
 
-			if useColor && isWireguardKind(kind) {
+			if useColor && isTunnelKind(kind) {
 				if expected == present {
 					expText = colorize(expText, "green")
 					preText = colorize(preText, "green")

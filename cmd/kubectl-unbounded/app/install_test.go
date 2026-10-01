@@ -55,14 +55,13 @@ func TestInstallCommandFlags(t *testing.T) {
 	}
 }
 
-func TestInstallRejectsLegacyNamespace(t *testing.T) {
+func TestInstallAllowsCustomNamespace(t *testing.T) {
 	for _, ns := range []string{"unbounded-kube", "unbounded-net"} {
-		h := installHandler{namespace: ns, logger: discardLogger()}
+		cli, _ := newCapturingInstallClient()
+		h := installHandler{namespace: ns, logger: discardLogger(), kubeResourcesCli: cli}
 
 		err := h.execute(context.Background())
-		require.Error(t, err, "install into legacy namespace %q must be rejected", ns)
-		require.Contains(t, err.Error(), "legacy namespace")
-		require.Contains(t, err.Error(), ns)
+		require.NoError(t, err)
 	}
 }
 
@@ -172,9 +171,8 @@ func TestMutateOperatorObjectWritesConfigEndpoint(t *testing.T) {
 	h := &installHandler{
 		namespace: "unbounded-system",
 		operatorConfigData: map[string]string{
-			"UNBOUNDED_API_SERVER_ENDPOINT":   "https://api.example.test:6443",
-			"UNBOUNDED_IMAGE_REGISTRY":        "ghcr.io",
-			"UNBOUNDED_REAP_LEGACY_RESOURCES": "true",
+			"UNBOUNDED_API_SERVER_ENDPOINT": "https://api.example.test:6443",
+			"UNBOUNDED_IMAGE_REGISTRY":      "ghcr.io",
 		},
 	}
 
@@ -193,19 +191,18 @@ func TestMutateOperatorObjectWritesConfigEndpoint(t *testing.T) {
 
 	got, _, err = unstructured.NestedString(obj.Object, "data", "UNBOUNDED_REAP_LEGACY_RESOURCES")
 	require.NoError(t, err)
-	require.Equal(t, "true", got)
+	require.Empty(t, got)
 }
 
-func TestInstallMergesLiveReaperConfig(t *testing.T) {
+func TestInstallDropsLiveReaperConfig(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name           string
 		existingConfig *unstructured.Unstructured
-		wantReaper     string
 	}{
 		{
-			name: "existing false remains false",
+			name: "existing reaper setting is dropped",
 			existingConfig: &unstructured.Unstructured{Object: map[string]any{
 				"apiVersion": "v1",
 				"kind":       "ConfigMap",
@@ -218,10 +215,9 @@ func TestInstallMergesLiveReaperConfig(t *testing.T) {
 					"UNBOUNDED_REAP_LEGACY_RESOURCES": "FALSE",
 				},
 			}},
-			wantReaper: "false",
 		},
 		{
-			name: "existing config without reaper defaults true",
+			name: "existing config without reaper",
 			existingConfig: &unstructured.Unstructured{Object: map[string]any{
 				"apiVersion": "v1",
 				"kind":       "ConfigMap",
@@ -231,11 +227,9 @@ func TestInstallMergesLiveReaperConfig(t *testing.T) {
 				},
 				"data": map[string]any{"UNBOUNDED_API_SERVER_ENDPOINT": "https://old.example.test:6443"},
 			}},
-			wantReaper: "true",
 		},
 		{
-			name:       "missing config defaults true",
-			wantReaper: "true",
+			name: "missing config",
 		},
 	}
 
@@ -270,9 +264,8 @@ func TestInstallMergesLiveReaperConfig(t *testing.T) {
 			wantRegistry, err := (&installHandler{}).embeddedImageRegistry()
 			require.NoError(t, err)
 			require.Equal(t, map[string]string{
-				"UNBOUNDED_API_SERVER_ENDPOINT":   "https://api.example.test:6443",
-				"UNBOUNDED_IMAGE_REGISTRY":        wantRegistry,
-				"UNBOUNDED_REAP_LEGACY_RESOURCES": tt.wantReaper,
+				"UNBOUNDED_API_SERVER_ENDPOINT": "https://api.example.test:6443",
+				"UNBOUNDED_IMAGE_REGISTRY":      wantRegistry,
 			}, data)
 
 			gotHash, found, err := unstructured.NestedString(captured.deployment.Object, "spec", "template", "metadata", "annotations", operatorConfigHashAnnotation)
@@ -627,7 +620,7 @@ data:
 	})
 }
 
-func TestInstallRejectsInvalidLiveReaperConfigBeforeApply(t *testing.T) {
+func TestInstallIgnoresRemovedReaperConfig(t *testing.T) {
 	t.Parallel()
 
 	existing := &unstructured.Unstructured{Object: map[string]any{
@@ -647,9 +640,8 @@ func TestInstallRejectsInvalidLiveReaperConfigBeforeApply(t *testing.T) {
 	}
 
 	err := h.execute(context.Background())
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "UNBOUNDED_REAP_LEGACY_RESOURCES")
-	require.Zero(t, captured.applyCount)
+	require.NoError(t, err)
+	require.Positive(t, captured.applyCount)
 }
 
 func TestInstallExecuteReinitializesDerivedConfig(t *testing.T) {
@@ -679,7 +671,7 @@ func TestInstallExecuteReinitializesDerivedConfig(t *testing.T) {
 
 	firstData, _, err := unstructured.NestedStringMap(first.configMap.Object, "data")
 	require.NoError(t, err)
-	require.Equal(t, "false", firstData["UNBOUNDED_REAP_LEGACY_RESOURCES"])
+	require.NotContains(t, firstData, "UNBOUNDED_REAP_LEGACY_RESOURCES")
 	require.Equal(t, "https://preserved.example.test:6443", firstData["UNBOUNDED_API_SERVER_ENDPOINT"])
 
 	secondClient, second := newCapturingInstallClient()
@@ -691,7 +683,7 @@ func TestInstallExecuteReinitializesDerivedConfig(t *testing.T) {
 
 	secondData, _, err := unstructured.NestedStringMap(second.configMap.Object, "data")
 	require.NoError(t, err)
-	require.Equal(t, "true", secondData["UNBOUNDED_REAP_LEGACY_RESOURCES"])
+	require.NotContains(t, secondData, "UNBOUNDED_REAP_LEGACY_RESOURCES")
 	require.Equal(t, "", secondData["UNBOUNDED_API_SERVER_ENDPOINT"])
 
 	_, found, err := unstructured.NestedString(second.deployment.Object, "spec", "template", "metadata", "annotations", operatorCRDRepairAnnotation)

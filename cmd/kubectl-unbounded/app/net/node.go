@@ -28,7 +28,6 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/remotecommand"
 
-	netstatus "github.com/Azure/unbounded/internal/net/status"
 	statusv1alpha1 "github.com/Azure/unbounded/internal/net/status/v1alpha1"
 )
 
@@ -266,7 +265,7 @@ func fetchClusterSummary(rt *pluginRuntime, cmd *cobra.Command, opts nodeStatusF
 	return decodeClusterSummary(raw)
 }
 
-// decodeClusterSummary projects legacy full responses once, never retaining details.
+// decodeClusterSummary accepts the controller's summary response.
 func decodeClusterSummary(raw []byte) (clusterSummary, error) {
 	var shape map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &shape); err != nil {
@@ -278,45 +277,9 @@ func decodeClusterSummary(raw []byte) (clusterSummary, error) {
 		return summary, fmt.Errorf("decode cluster overview: %w", err)
 	}
 
-	if _, ok := shape["nodeSummaries"]; ok {
-		return summary, nil
+	if _, ok := shape["nodeSummaries"]; !ok {
+		return summary, fmt.Errorf("malformed cluster overview: missing nodeSummaries")
 	}
-
-	if _, ok := shape["nodes"]; !ok {
-		return summary, fmt.Errorf("malformed cluster overview: missing nodeSummaries or nodes")
-	}
-
-	var legacy clusterStatusResponse
-	if err := json.Unmarshal(raw, &legacy); err != nil {
-		return summary, fmt.Errorf("decode legacy cluster overview: %w", err)
-	}
-
-	summary.NodeSummaries = make([]nodeSummary, 0, len(legacy.Nodes))
-
-	now := time.Now()
-	for _, node := range legacy.Nodes {
-		overview := netstatus.OverviewFromStatus(&node, now)
-		// Keep the metadata allocation independent of the full diagnostic payload.
-		info := node.NodeInfo
-
-		entry := nodeSummary{
-			NodeInfo: &info, LastPushTime: node.LastPushTime,
-			WireGuardOnline: node.NodeInfo.WireGuard != nil && node.NodeInfo.WireGuard.Interface != "",
-			Name:            node.NodeInfo.Name, SiteName: node.NodeInfo.SiteName,
-			IsGateway: node.NodeInfo.IsGateway, K8sReady: node.NodeInfo.K8sReady,
-			StatusSource: node.StatusSource, FetchError: node.FetchError,
-			PeerCount: overview.PeerCount, HealthyPeers: overview.HealthyPeers, RouteCount: overview.RouteCount,
-			RouteMismatch: overview.RouteMismatch, ErrorCount: len(node.NodeErrors),
-			CniStatus: cniStatusLabel(node, legacy.PullEnabled), CniTone: statusTone(node, legacy.PullEnabled),
-		}
-		if len(node.NodeErrors) > 0 {
-			entry.FirstError = node.NodeErrors[0].Message
-		}
-
-		summary.NodeSummaries = append(summary.NodeSummaries, entry)
-	}
-
-	summary.NodeCount = len(summary.NodeSummaries)
 
 	return summary, nil
 }
