@@ -983,18 +983,7 @@ mod tests {
         assert_eq!(counts.dropped.get(), dropped);
         assert_eq!(counts.consumed.get(), consumed);
     }
-    fn drive<T>(reactor: &crate::runtime::reactor::Reactor, future: impl Future<Output = T>) -> T {
-        let mut future = std::pin::pin!(future);
-        let watchdog = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Poll::Ready(result) = poll(future.as_mut()) {
-                return result;
-            }
-            assert!(Instant::now() < watchdog, "accept did not finish");
-            reactor.poll_budgeted(128).unwrap();
-            reactor.wait(Duration::from_millis(1)).unwrap();
-        }
-    }
+    use crate::http::connection::io_tests::drive;
 
     #[test]
     fn materialized_transit_fin_and_parent_cancel_fence_head_and_body() {

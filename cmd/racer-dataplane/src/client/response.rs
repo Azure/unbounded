@@ -37,6 +37,7 @@ impl Responses {
     }
     /// Version unavailable -> 412, transient unavailable -> 503, range -> 206.
     /// Define malformed/unsatisfiable/unsupported method mappings in one place.
+    #[cfg(test)]
     pub fn error_head(&self, error: Error) -> Result<MessageHead> {
         error_head(error)
     }

@@ -53,6 +53,7 @@ impl Demand {
         self.0.is_empty()
     }
 
+    #[cfg(test)]
     pub fn page_count(&self) -> u64 {
         // Disjoint intervals in [0, u64::MAX) cannot overflow this sum.
         self.0.iter().map(|i| i.end - i.start).sum()
@@ -204,6 +205,7 @@ impl Subscriptions {
         result
     }
 
+    #[cfg(test)]
     pub fn prune(&self, now_ms: u64) {
         self.with_state(Some(now_ms), |_| ());
     }
@@ -681,18 +683,19 @@ impl Waiter {
             })
         })
     }
+    #[cfg(test)]
     pub fn try_result(&mut self, now_ms: u64) -> Result<Option<Completion>> {
-        match self.poll_inner(None, now_ms) {
+        match self.poll_result(
+            &mut Context::from_waker(futures::task::noop_waker_ref()),
+            now_ms,
+        ) {
             Poll::Ready(result) => result.map(Some),
             Poll::Pending => Ok(None),
         }
     }
 
     pub fn poll_result(&mut self, cx: &mut Context<'_>, now_ms: u64) -> Poll<Result<Completion>> {
-        self.poll_inner(Some(cx.waker()), now_ms)
-    }
-
-    fn poll_inner(&mut self, waker: Option<&Waker>, now_ms: u64) -> Poll<Result<Completion>> {
+        let waker = cx.waker();
         let Some(token) = self.token else {
             return Poll::Ready(Err(Error::StaleFlight));
         };
@@ -713,11 +716,10 @@ impl Waiter {
                 }
                 return Poll::Ready(pending.result.expect("ready"));
             }
-            if let Some(waker) = waker
-                && !pending
-                    .waker
-                    .as_ref()
-                    .is_some_and(|old| old.will_wake(waker))
+            if !pending
+                .waker
+                .as_ref()
+                .is_some_and(|old| old.will_wake(waker))
             {
                 pending.waker = Some(waker.clone());
             }

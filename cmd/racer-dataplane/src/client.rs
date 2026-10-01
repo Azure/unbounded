@@ -533,19 +533,7 @@ mod tests {
 
     #[test]
     fn sdk_total_head_limit_includes_unknown_fields() {
-        let prefix = format!(
-            "HEAD /v2/objects/{} HTTP/1.1\r\nHost: racer\r\nX-Padding: ",
-            "0".repeat(64)
-        );
-        let mut raw = prefix.into_bytes();
-        raw.resize(MAX_HEAD_BYTES - 4, b'x');
-        raw.extend_from_slice(b"\r\n\r\n");
-        let codec = Codec::new(MAX_HEAD_BYTES, 0);
-        let (head, consumed) = codec.decode_head(&raw).unwrap().unwrap();
-        assert_eq!(consumed, MAX_HEAD_BYTES);
-        assert!(parse(head).is_ok());
-        raw.insert(raw.len() - 4, b'x');
-        assert!(codec.decode_head(&raw).is_err());
+        check_raw_head_limits(&[MAX_HEAD_BYTES], &[" "], &[""]);
     }
 
     #[test]
@@ -563,34 +551,11 @@ mod tests {
 
     #[test]
     fn raw_head_limit_is_independent_of_unknown_field_whitespace() {
-        let codec = Codec::new(MAX_HEAD_BYTES, 0);
-        for separator in ["", " ", "\t", "  ", " \t"] {
-            for trailing in ["", " ", "\t"] {
-                for length in [MAX_HEAD_BYTES - 1, MAX_HEAD_BYTES, MAX_HEAD_BYTES + 1] {
-                    let prefix = format!(
-                        "HEAD /v2/objects/{} HTTP/1.1\r\nHost: racer\r\nX-Empty:\r\nX-Padding:{separator}",
-                        "0".repeat(64)
-                    );
-                    let mut raw = prefix.into_bytes();
-                    raw.resize(length - trailing.len() - 4, b'x');
-                    raw.extend_from_slice(trailing.as_bytes());
-                    raw.extend_from_slice(b"\r\n\r\n");
-                    if length > MAX_HEAD_BYTES {
-                        assert!(matches!(
-                            codec.decode_head(&raw),
-                            Err(Error::HeaderTooLarge)
-                        ));
-                    } else {
-                        let (head, consumed) = codec.decode_head(&raw).unwrap().unwrap();
-                        assert_eq!(consumed, length);
-                        assert!(
-                            parse(head).is_ok(),
-                            "separator={separator:?}, trailing={trailing:?}"
-                        );
-                    }
-                }
-            }
-        }
+        check_raw_head_limits(
+            &[MAX_HEAD_BYTES],
+            &["", " ", "\t", "  ", " \t"],
+            &["", " ", "\t"],
+        );
     }
 
     #[test]
@@ -632,9 +597,13 @@ mod tests {
 
     #[test]
     fn raw_head_limit_does_not_assume_unknown_header_whitespace() {
-        for separator in ["", " ", "\t", "  ", " \t"] {
-            for trailing in ["", " ", "\t"] {
-                for limit in [512, MAX_HEAD_BYTES] {
+        check_raw_head_limits(&[512], &["", " ", "\t", "  ", " \t"], &["", " ", "\t"]);
+    }
+
+    fn check_raw_head_limits(limits: &[usize], separators: &[&str], trailing_values: &[&str]) {
+        for separator in separators {
+            for trailing in trailing_values {
+                for &limit in limits {
                     let parser = RequestParser::new(limit);
                     let codec = Codec::new(parser.header_limit(), 0);
                     let prefix = format!(

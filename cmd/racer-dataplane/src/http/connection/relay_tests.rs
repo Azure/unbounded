@@ -26,19 +26,7 @@ fn pair() -> (TcpStream, TcpStream) {
 fn poll<F: Future + ?Sized>(future: std::pin::Pin<&mut F>) -> Poll<F::Output> {
     future.poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
 }
-fn drive<T>(reactor: &Reactor, work: impl Future<Output = T>) -> T {
-    let mut work = std::pin::pin!(work);
-    let until = Instant::now() + Duration::from_secs(8);
-    loop {
-        if let Poll::Ready(result) = poll(work.as_mut()) {
-            return result;
-        }
-        assert!(Instant::now() < until);
-        if reactor.poll_budgeted(128).unwrap() == 0 {
-            std::thread::yield_now();
-        }
-    }
-}
+use super::io_tests::drive;
 
 // Match the production service's wake-driven FuturesUnordered and reactor wait,
 // rather than repeatedly polling a blocked future with a noop waker.

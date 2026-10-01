@@ -601,10 +601,7 @@ fn subscription_selection_is_canonical_signed_and_bound_to_exact_grant() {
 
 #[test]
 fn subscription_runs_through_real_tcp_requester_session_and_provider() {
-    use crate::{
-        http::connection::{ConnectionLease, HttpPool},
-        peer::PeerClient,
-    };
+    use crate::{http::connection::ConnectionLease, peer::PeerClient};
     struct Local(Rc<Admission>);
     impl server::LocalPageService for Local {
         fn serve_peer<'a>(
@@ -642,15 +639,15 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
         }
     }
     let signers = signers();
-    let admission = Rc::new(Admission::new(
-        crate::test_support::cluster::config(false).limits,
-    ));
-    let reactor = Rc::new(Reactor::new(admission.clone()));
-    let io = Rc::new(HttpIo::with_admission(
-        reactor.clone(),
-        Codec::new(protocol::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
-        admission.clone(),
-    ));
+    let fixture = SocketFixture::new(2);
+    let transfers = fixture.transfers(signers[0].clone());
+    let SocketFixture {
+        admission,
+        reactor,
+        io,
+        codec,
+        ..
+    } = fixture;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
@@ -688,7 +685,6 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
     let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4));
     let destination = Rc::new(Forwarding::new(signers[2].clone()));
     let local = Rc::new(Local(admission.clone()));
-    let codec = Rc::new(codec(&admission));
     let relay = Rc::new(Relay::new(
         paths.clone(),
         destination.clone(),
@@ -705,14 +701,6 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
         codec.clone(),
         signers[2].clone(),
     );
-    let transfers = Rc::new(transport::Transfers::new(
-        Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2)),
-        io,
-        None,
-        admission.clone(),
-        codec,
-        signers[0].clone(),
-    ));
     let requester = Requester::new(
         paths,
         Rc::new(Forwarding::new(signers[0].clone())),

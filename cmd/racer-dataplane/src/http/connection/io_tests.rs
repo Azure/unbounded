@@ -27,7 +27,7 @@ fn setup() -> (Rc<Admission>, Rc<Reactor>, HttpIo, RequestScope) {
         RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(10)).unwrap();
     (admission, reactor, io, scope)
 }
-fn drive<T>(reactor: &Reactor, future: impl Future<Output = T>) -> T {
+pub(crate) fn drive<T>(reactor: &Reactor, future: impl Future<Output = T>) -> T {
     let mut future = std::pin::pin!(future);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let deadline = Instant::now() + Duration::from_secs(12);

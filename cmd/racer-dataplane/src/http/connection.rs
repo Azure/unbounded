@@ -25,7 +25,7 @@ use std::{
 use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(test)]
-mod io_tests;
+pub(crate) mod io_tests;
 
 /// Bounded, address-stable staging storage. Constructor reserves quota before
 /// allocation; ownership includes that quota through reactor completion.
@@ -221,6 +221,7 @@ impl HttpIo {
         }
         Ok(buffer)
     }
+    #[cfg(test)]
     pub fn retained_buffer_bytes(&self) -> usize {
         self.idle_buffer
             .borrow()
@@ -1154,6 +1155,7 @@ impl ConnectionLease {
     pub fn is_reusable(&self) -> bool {
         self.reusable
     }
+    #[cfg(test)]
     pub fn remaining_body(&self) -> Option<u64> {
         self.rx_remaining
     }
@@ -1541,15 +1543,10 @@ impl HttpPool {
             .connect_with_lease(connection.socket(), address, connection, scope)
             .await
     }
+    #[cfg(test)]
     pub fn expire_idle(&self) {
-        let now = crate::runtime::environment::now();
-        let mut state = self.state.borrow_mut();
-        state.entries.retain(|_, entry| {
-            entry
-                .idle
-                .retain(|idle| now.duration_since(idle.since) < self.idle_timeout);
-            entry.active != 0 || !entry.idle.is_empty()
-        });
+        self.state.borrow_mut().next_expiry = crate::runtime::environment::now();
+        self.expire_idle_budgeted(usize::MAX);
     }
     /// Autonomous worker tick: visit at most `budget` endpoint buckets, resuming
     /// from an ordered cursor. No checkout or waiter is required for expiration.

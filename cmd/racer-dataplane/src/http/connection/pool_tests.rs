@@ -48,18 +48,7 @@ impl Drop for Listener {
         }
     }
 }
-fn drive<T>(reactor: &Reactor, future: impl std::future::Future<Output = T>) -> T {
-    let mut future = std::pin::pin!(future);
-    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
-            return result;
-        }
-        assert!(Instant::now() < deadline, "bounded pool exchange");
-        reactor.poll_budgeted(128).unwrap();
-    }
-}
+use super::io_tests::drive;
 fn scope() -> RequestScope {
     RequestScope::new(
         RequestId([7; 16]),

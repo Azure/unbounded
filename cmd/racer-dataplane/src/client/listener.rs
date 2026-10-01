@@ -573,6 +573,7 @@ impl ClientListeners {
         self.active.borrow().len()
     }
 
+    #[cfg(test)]
     pub fn active_connections_for(&self, cache: &CacheId) -> usize {
         self.active
             .borrow()
@@ -612,32 +613,6 @@ impl ClientListeners {
             active.cancellation.cancel()?;
         }
         Ok(())
-    }
-
-    pub fn drain_cache<'a>(
-        &'a self,
-        cache: &'a CacheId,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, ()> {
-        Box::pin(async move {
-            self.stop_cache(cache);
-            std::future::poll_fn(|cx| {
-                if let Err(error) = scope.check() {
-                    let _ = self.cancel_cache(cache);
-                    return Poll::Ready(Err(error));
-                }
-                if let Err(error) = self.poll_budgeted(cx, 64) {
-                    return Poll::Ready(Err(error));
-                }
-                if self.active_connections_for(cache) == 0 {
-                    Poll::Ready(Ok(()))
-                } else {
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
-            })
-            .await
-        })
     }
 
     pub fn stop_admission(&self) {

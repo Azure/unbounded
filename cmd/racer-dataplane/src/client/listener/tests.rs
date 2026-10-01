@@ -1,8 +1,265 @@
 //! Client socket scenarios: ownership, publication, HTTP delivery, and retirement.
 use super::*;
 use std::time::Instant;
-mod acquisition;
-mod directory;
+mod acquisition {
+    use super::*;
+
+    #[test]
+    fn raw_uds_late_rust_acquisition_failure_never_appends_second_status() {
+        use crate::model::PAGE_BYTES;
+        let (fixture, pipes) = body_fixture_with_large_page(16, false, true);
+        let metadata = body_metadata(3 * PAGE_BYTES + 13);
+        let worker = fixture.worker.as_ref().unwrap();
+        worker.origin.set_version(metadata.clone());
+        worker.origin.set_body(vec![b'x'; metadata.length as usize]);
+        let mut socket = fixture.connect();
+        socket.write_all(&request("POST", "If-Match: \"v1\"\r\nRange: bytes=0-\r\nRacer-Page-Credits: 1\r\nRacer-Byte-Credits: 16777216\r\nRacer-Ordered: 1\r\n")).unwrap();
+        let mut raw = fixture.receive(&mut socket, false);
+        let end = raw.windows(4).position(|part| part == b"\r\n\r\n").unwrap() + 4;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while raw.len() < end + PAGE_BYTES as usize + 21 {
+            fixture.pump(64);
+            let mut bytes = [0; 65536];
+            match socket.read(&mut bytes) {
+                Ok(0) => panic!("first page truncated"),
+                Ok(n) => raw.extend_from_slice(&bytes[..n]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => (),
+                Err(error) => panic!("{error}"),
+            }
+            assert!(Instant::now() < deadline);
+        }
+        let mut release = [0; 12];
+        release[8..].copy_from_slice(&(PAGE_BYTES as u32).to_be_bytes());
+        socket.write_all(&release).unwrap();
+        raw.extend(fixture.receive(&mut socket, true));
+        let head = std::str::from_utf8(&raw[..end])
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(head.starts_with("http/1.1 200 "));
+        assert!(head.contains("content-length: 50331766\r\n"));
+        assert!(head.contains("racer-object-length: 50331661\r\n"));
+        assert!(head.contains("racer-range-start: 0\r\n"));
+        assert!(head.contains("racer-range-end: 50331661\r\n"));
+        assert!(!head.contains("content-range:"));
+        assert_eq!(raw.len() - end, PAGE_BYTES as usize + 21);
+        let mut frame = [0; 21];
+        frame[0] = 1;
+        frame[17..].copy_from_slice(&(PAGE_BYTES as u32).to_be_bytes());
+        assert_eq!(&raw[end..end + 21], &frame);
+        assert!(raw[end + 21..].iter().all(|byte| *byte == b'x'));
+        assert_eq!(
+            raw.windows(8).filter(|part| *part == b"HTTP/1.1").count(),
+            1
+        );
+        assert_only_idle_pipes(&fixture, &pipes);
+    }
+
+    #[test]
+    fn coordinator_enforces_pinned_head_and_unsatisfiable_range_length() {
+        for (length, fields, status) in [
+            (4, "", "200"),
+            (4, "If-Match: \"v1\"\r\n", "200"),
+            (4, "If-Match: \"old\"\r\n", "412"),
+            (4, "Range: bytes=4-\r\n", "416"),
+            (0, "Range: bytes=0-\r\n", "416"),
+        ] {
+            let (fixture, _pipes) = body_fixture(16, false);
+            fixture
+                .worker
+                .as_ref()
+                .unwrap()
+                .origin
+                .set_version(body_metadata(length));
+            let method = if status == "416" { "POST" } else { "HEAD" };
+            let mut socket = fixture.connect();
+            socket
+                .write_all(&request(method, &format!("{fields}Connection: close\r\n")))
+                .unwrap();
+            let response = String::from_utf8(fixture.receive(&mut socket, true)).unwrap();
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status} ")),
+                "{response}"
+            );
+            if status == "416" {
+                assert!(
+                    response.contains(&format!("Content-Range: bytes */{length}\r\n")),
+                    "{response}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_uds_first_rust_acquisition_failure_returns_complete_503() {
+        let (fixture, pipes) = body_fixture(16, true);
+        let mut socket = start_body(&fixture);
+        let text = String::from_utf8(fixture.receive(&mut socket, true))
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(text.starts_with("http/1.1 503 "));
+        assert!(text.contains("content-length: 0\r\n"));
+        assert!(!text.contains("content-range:"));
+        assert_eq!(text.matches("http/1.1").count(), 1);
+        assert_eq!(text.find("\r\n\r\n").unwrap() + 4, text.len());
+        assert_only_idle_pipes(&fixture, &pipes);
+    }
+}
+
+fn body_metadata(length: u64) -> ObjectMetadata {
+    ObjectMetadata {
+        content_type: None,
+        version: ObjectVersion {
+            object: crate::model::ObjectId {
+                cache: definition().id,
+                key: crate::model::CacheKey([0; 32]),
+            },
+            etag: StrongEtag::parse(b"\"v1\"").unwrap(),
+        },
+        length,
+        expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
+    }
+}
+mod directory {
+    use super::*;
+    fn assert_identity(before: &fs::Metadata, after: &fs::Metadata, mode: u32) {
+        assert!(same_inode(before, after));
+        assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
+        assert_eq!(after.mode() & 0o7777, mode);
+    }
+    #[test]
+    fn startup_hardens_existing_client_directory_without_changing_ancestors() {
+        for mode in [0o777, 0o775, 0o757, 0o770, 0o722, 0o2775, 0o1777] {
+            let fixture = Fixture::new();
+            let path = fixture.socket().parent().unwrap().to_owned();
+            fs::create_dir_all(&path).unwrap();
+            let cache = path.parent().unwrap();
+            let origin = cache.join("origin");
+            fs::create_dir(&origin).unwrap();
+            for ancestor in [&fixture.root.0, cache, &origin] {
+                fs::set_permissions(ancestor, fs::Permissions::from_mode(0o777)).unwrap();
+            }
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            let before = fs::metadata(&path).unwrap();
+            fixture.reconcile(&[definition()]).unwrap();
+            assert_identity(&before, &fs::metadata(&path).unwrap(), mode & !0o022);
+            for ancestor in [&fixture.root.0, cache, &origin] {
+                assert_eq!(fs::metadata(ancestor).unwrap().mode() & 0o7777, 0o777);
+            }
+            assert_eq!(
+                fs::metadata(fixture.socket()).unwrap().mode() & 0o777,
+                0o666
+            );
+            let mut socket = fixture.connect();
+            socket
+                .write_all(&request("HEAD", "Connection: close\r\n"))
+                .unwrap();
+            assert!(
+                fixture
+                    .receive(&mut socket, true)
+                    .starts_with(b"HTTP/1.1 200")
+            );
+        }
+    }
+    #[test]
+    fn secure_client_directory_permissions_are_unchanged() {
+        for mode in [0o755, 0o750, 0o700, 0o500, 0o2750, 0o1700] {
+            let root = Root::new();
+            let directory = open_directory(&root.0).unwrap();
+            directory
+                .set_permissions(fs::Permissions::from_mode(mode))
+                .unwrap();
+            let before = directory.metadata().unwrap();
+            prepare_client_directory(&directory).unwrap();
+            prepare_client_directory(&directory).unwrap();
+            let after = directory.metadata().unwrap();
+            assert_identity(&before, &after, mode);
+            assert_eq!(
+                (after.ctime(), after.ctime_nsec()),
+                (before.ctime(), before.ctime_nsec())
+            );
+            directory
+                .set_permissions(fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+    }
+    #[test]
+    fn client_directory_preparation_pins_inode_across_path_replacement() {
+        for symlink in [false, true] {
+            let root = Root::new();
+            let parent = open_directory(&root.0).unwrap();
+            let directory = child_directory(&parent, b"client").unwrap();
+            directory
+                .set_permissions(fs::Permissions::from_mode(0o777))
+                .unwrap();
+            let path = root.0.join("client");
+            let moved = root.0.join("moved");
+            let target = root.0.join("target");
+            fs::create_dir(&target).unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o777)).unwrap();
+            fs::rename(&path, &moved).unwrap();
+            if symlink {
+                std::os::unix::fs::symlink(&target, &path).unwrap();
+                assert!(child_directory(&parent, b"client").is_err());
+            } else {
+                fs::create_dir(&path).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
+            }
+            prepare_client_directory(&directory).unwrap();
+            assert_eq!(fs::metadata(&moved).unwrap().mode() & 0o7777, 0o755);
+            assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o777);
+            assert_eq!(fs::metadata(&target).unwrap().mode() & 0o7777, 0o777);
+        }
+    }
+    #[test]
+    fn client_directory_preparation_rejects_non_directories_and_chmod_failure() {
+        let root = Root::new();
+        let path = root.0.join("file");
+        fs::write(&path, b"preserve").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        assert_eq!(
+            prepare_client_directory(&File::open(&path).unwrap()),
+            Err(Error::Io)
+        );
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o666);
+        assert_eq!(fs::read(&path).unwrap(), b"preserve");
+        fs::set_permissions(&root.0, fs::Permissions::from_mode(0o777)).unwrap();
+        // O_PATH supports fstat but not fchmod, deterministically exercising failure.
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&root.0)
+            .unwrap();
+        assert_eq!(prepare_client_directory(&directory), Err(Error::Io));
+        assert_eq!(directory.metadata().unwrap().mode() & 0o7777, 0o777);
+        let link = root.0.join("link");
+        std::os::unix::fs::symlink(&root.0, &link).unwrap();
+        let link = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(link)
+            .unwrap();
+        assert_eq!(prepare_client_directory(&link), Err(Error::Io));
+        assert_eq!(directory.metadata().unwrap().mode() & 0o7777, 0o777);
+    }
+    #[test]
+    fn startup_rejects_foreign_owned_directory_without_chmod() {
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let fixture = Fixture::new();
+        let path = fixture.socket().parent().unwrap().to_owned();
+        fs::create_dir_all(&path).unwrap();
+        let directory = File::open(&path).unwrap();
+        assert_eq!(unsafe { libc::fchown(directory.as_raw_fd(), 1, !0) }, 0);
+        directory
+            .set_permissions(fs::Permissions::from_mode(0o777))
+            .unwrap();
+        assert_eq!(fixture.reconcile(&[definition()]), Err(Error::Io));
+        assert_eq!(directory.metadata().unwrap().uid(), 1);
+        assert_eq!(directory.metadata().unwrap().mode() & 0o7777, 0o777);
+        assert_eq!(fs::read_dir(&path).unwrap().count(), 0);
+    }
+}
 mod recovery;
 
 #[test]
@@ -1816,7 +2073,11 @@ fn per_cache_cancellation_drains_active_read_and_keeps_other_cache() {
             .receive(&mut socket, true)
             .starts_with(b"HTTP/1.1 503")
     );
-    futures::executor::block_on(fixture.listeners.drain_cache(&definition().id, &scope())).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fixture.listeners.active_connections_for(&definition().id) != 0 {
+        fixture.pump(64);
+        assert!(Instant::now() < deadline, "canceled cache did not drain");
+    }
     assert_eq!(
         fixture.listeners.active_connections_for(&definition().id),
         0

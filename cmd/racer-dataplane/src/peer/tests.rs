@@ -111,13 +111,16 @@ pub(crate) struct SocketFixture {
 
 impl SocketFixture {
     pub fn new(pool_limit: usize) -> Self {
+        Self::with_body_limit(pool_limit, PAGE_BYTES + 16)
+    }
+    pub fn with_body_limit(pool_limit: usize, body_limit: u64) -> Self {
         let admission = Rc::new(Admission::new(
             crate::test_support::cluster::config(false).limits,
         ));
         let reactor = Rc::new(crate::runtime::reactor::Reactor::new(admission.clone()));
         let io = Rc::new(crate::http::connection::HttpIo::with_admission(
             reactor.clone(),
-            crate::http::Codec::new(protocol::MAX_ENVELOPE_HEAD, PAGE_BYTES + 16),
+            crate::http::Codec::new(protocol::MAX_ENVELOPE_HEAD, body_limit),
             admission.clone(),
         ));
         Self {
