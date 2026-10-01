@@ -341,6 +341,81 @@ fn drive<T>(reactor: &Reactor, future: impl Future<Output = T>) -> T {
 }
 
 #[test]
+fn shared_adapter_controls_real_head_bootstrap_pin_and_rejection() {
+    use crate::{
+        model::{ExpiresAt, ObjectMetadata, ObjectVersion},
+        test_support::origin::{AdapterOrigin, RequestKind},
+    };
+    let (client, admission, reactor, snapshot) = published_client();
+    let mut context = context();
+    context.object.cache = snapshot.caches[0].id.clone();
+    let mut metadata = ObjectMetadata {
+        version: ObjectVersion {
+            object: context.object.clone(),
+            etag: StrongEtag::test_value("v1"),
+        },
+        length: 3,
+        content_type: None,
+        expires_at: ExpiresAt(std::time::UNIX_EPOCH + Duration::from_secs(1234)),
+    };
+    let adapter = AdapterOrigin::new("cache-a", metadata.clone());
+    let client = remap(client, adapter.root.clone()).unwrap();
+    let endpoint = client.endpoint(&context).unwrap();
+    let scope = scope();
+    let head = drive(
+        &reactor,
+        client.metadata_at(&endpoint, &context, MetadataSelector::Fresh, &scope),
+    )
+    .unwrap();
+    assert_eq!(head.metadata, metadata);
+    adapter.set_body(b"xyz".to_vec());
+    let initial = drive(&reactor, client.bootstrap_at(&endpoint, &context, &scope)).unwrap();
+    assert_eq!(
+        initial.page_zero.unwrap().plaintext.bytes().unwrap(),
+        b"xyz"
+    );
+    let page = PageId {
+        version: metadata.version.clone(),
+        number: PageNumber(0),
+    };
+    adapter.delay(RequestKind::PinnedGet, Duration::from_millis(5));
+    adapter.block(RequestKind::PinnedGet);
+    let mut pending = Box::pin(client.page_at(&endpoint, &context, &page, &scope));
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while adapter.count(RequestKind::PinnedGet) == 0 {
+        assert!(pending.as_mut().poll(&mut cx).is_pending());
+        reactor.poll_budgeted(128).unwrap();
+        reactor.wait(Duration::from_millis(1)).unwrap();
+        assert!(Instant::now() < deadline);
+    }
+    assert!(pending.as_mut().poll(&mut cx).is_pending());
+    adapter.release(RequestKind::PinnedGet);
+    assert_eq!(
+        drive(&reactor, pending).unwrap().plaintext.bytes().unwrap(),
+        b"xyz"
+    );
+    metadata.version.etag = StrongEtag::test_value("v2");
+    adapter.set_version(metadata);
+    assert!(matches!(
+        drive(&reactor, client.page_at(&endpoint, &context, &page, &scope)),
+        Err(Error::VersionUnavailable)
+    ));
+    adapter.reject_next(RequestKind::Head, 403);
+    assert!(matches!(
+        drive(
+            &reactor,
+            client.metadata_at(&endpoint, &context, MetadataSelector::Fresh, &scope)
+        ),
+        Err(Error::OriginForbidden)
+    ));
+    assert_eq!(adapter.count(RequestKind::Head), 2);
+    assert_eq!(adapter.count(RequestKind::InitialGet), 1);
+    assert_eq!(adapter.count(RequestKind::PinnedGet), 2);
+    assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+}
+
+#[test]
 fn same_name_new_uid_dials_replacement_without_reusing_old_keepalive() {
     use std::os::fd::AsRawFd;
     let directory_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

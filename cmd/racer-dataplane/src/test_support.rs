@@ -1,5 +1,19 @@
 //! Deterministic test-only seams; no fake implementation is linked into production.
 pub mod clock;
+pub mod origin;
+
+pub struct NoPeers;
+
+impl crate::peer::PeerClient for NoPeers {
+    fn request<'a>(
+        &'a self,
+        _: crate::peer::protocol::PeerRequest,
+        _: crate::topology::membership::MembershipLease,
+        _: &'a crate::runtime::deadline::RequestScope,
+    ) -> crate::error::Operation<'a, crate::peer::protocol::VerifiedResponse> {
+        Box::pin(async { panic!("local origin scenario must not contact peers") })
+    }
+}
 
 /// Side-effect-free configuration for assembled worker scenarios.
 pub mod cluster {
