@@ -13,7 +13,6 @@ import (
 type machineHostKind string
 
 const (
-	machineHostKindLegacy   machineHostKind = "legacy"
 	machineHostKindNetboot  machineHostKind = "netboot"
 	machineHostKindAzure    machineHostKind = "azure"
 	machineHostKindExternal machineHostKind = "external"
@@ -33,11 +32,7 @@ func resolveMachineHost(machine *unboundedv1alpha3.Machine) (resolvedMachineHost
 
 	host := machine.Spec.Host
 	if host == nil || (host.Netboot == nil && host.Azure == nil && host.External == nil) {
-		return resolvedMachineHost{
-			kind:       machineHostKindLegacy,
-			provider:   strings.TrimSpace(machine.Spec.Provider),
-			providerID: machine.Spec.ProviderID,
-		}, nil
+		return resolvedMachineHost{}, fmt.Errorf("machine %s spec.host must set exactly one of netboot, azure, or external", machine.Name)
 	}
 
 	variants := 0
@@ -55,10 +50,6 @@ func resolveMachineHost(machine *unboundedv1alpha3.Machine) (resolvedMachineHost
 
 	if variants != 1 {
 		return resolvedMachineHost{}, fmt.Errorf("machine %s spec.host must set exactly one of netboot, azure, or external", machine.Name)
-	}
-
-	if machine.Spec.PXE != nil || strings.TrimSpace(machine.Spec.Provider) != "" || strings.TrimSpace(machine.Spec.ProviderID) != "" {
-		return resolvedMachineHost{}, fmt.Errorf("machine %s spec.host ownership cannot be combined with legacy spec.pxe, spec.provider, or spec.providerID", machine.Name)
 	}
 
 	if host.Netboot != nil {

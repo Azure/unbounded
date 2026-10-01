@@ -1129,10 +1129,6 @@ func isBareMetalRedfishMachine(machine *v1alpha3.Machine) bool {
 }
 
 func isExternalProviderMachine(machine *v1alpha3.Machine) bool {
-	if machine.Spec.Provider != "" || machine.Spec.ProviderID != "" {
-		return true
-	}
-
 	return machine.Spec.Host != nil && (machine.Spec.Host.Azure != nil || machine.Spec.Host.External != nil)
 }
 

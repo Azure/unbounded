@@ -61,17 +61,11 @@ func TestResolveMachineHost(t *testing.T) {
 			want: resolvedMachineHost{kind: machineHostKindNetboot},
 		},
 		{
-			name: "legacy provider remains readable",
+			name: "reject image without owner",
 			spec: unboundedv1alpha3.MachineSpec{
-				Provider:   "LegacyProvider",
-				ProviderID: "legacy://machine-1",
-				Host:       &unboundedv1alpha3.HostSpec{Image: "image-v2"},
+				Host: &unboundedv1alpha3.HostSpec{Image: "image-v2"},
 			},
-			want: resolvedMachineHost{
-				kind:       machineHostKindLegacy,
-				provider:   "LegacyProvider",
-				providerID: "legacy://machine-1",
-			},
+			wantErr: "exactly one",
 		},
 		{
 			name: "reject multiple canonical owners",
@@ -82,14 +76,9 @@ func TestResolveMachineHost(t *testing.T) {
 			wantErr: "exactly one",
 		},
 		{
-			name: "reject canonical and legacy ownership",
-			spec: unboundedv1alpha3.MachineSpec{
-				Provider: "LegacyProvider",
-				Host: &unboundedv1alpha3.HostSpec{
-					Azure: &unboundedv1alpha3.AzureHostSpec{ResourceID: "azure-resource"},
-				},
-			},
-			wantErr: "cannot be combined",
+			name:    "reject missing host",
+			spec:    unboundedv1alpha3.MachineSpec{},
+			wantErr: "exactly one",
 		},
 		{
 			name: "reject external host without identity",
@@ -120,12 +109,13 @@ func TestResolveMachineHost(t *testing.T) {
 func TestMachineSpecNetbootPrefersCanonicalHost(t *testing.T) {
 	t.Parallel()
 
-	legacy := &unboundedv1alpha3.PXESpec{Image: "legacy"}
 	canonical := &unboundedv1alpha3.PXESpec{Image: "canonical"}
 	spec := &unboundedv1alpha3.MachineSpec{
-		PXE:  legacy,
 		Host: &unboundedv1alpha3.HostSpec{Netboot: canonical},
 	}
 
 	require.Same(t, canonical, spec.Netboot())
+	require.Nil(t, (*unboundedv1alpha3.MachineSpec)(nil).Netboot())
+	require.Nil(t, (&unboundedv1alpha3.MachineSpec{}).Netboot())
+	require.Nil(t, (&unboundedv1alpha3.MachineSpec{Host: &unboundedv1alpha3.HostSpec{}}).Netboot())
 }

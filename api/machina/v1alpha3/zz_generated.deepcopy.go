@@ -1075,11 +1075,6 @@ func (in *MachineSpec) DeepCopyInto(out *MachineSpec) {
 		*out = new(SSHSpec)
 		(*in).DeepCopyInto(*out)
 	}
-	if in.PXE != nil {
-		in, out := &in.PXE, &out.PXE
-		*out = new(PXESpec)
-		(*in).DeepCopyInto(*out)
-	}
 	if in.Kubernetes != nil {
 		in, out := &in.Kubernetes, &out.Kubernetes
 		*out = new(KubernetesSpec)

@@ -120,12 +120,6 @@ func resolveImageID(oldInstance core.Instance, request machineops.OperationReque
 		return imageID, nil
 	}
 
-	// Keep the legacy MachineOperation parameter as a temporary compatibility
-	// path while callers migrate image selection to Machine.spec.host.image.
-	if imageID := strings.TrimSpace(request.Parameters[parameterImageID]); imageID != "" {
-		return imageID, nil
-	}
-
 	if source, ok := oldInstance.SourceDetails.(core.InstanceSourceViaImageDetails); ok && source.ImageId != nil && strings.TrimSpace(*source.ImageId) != "" {
 		return *source.ImageId, nil
 	}
@@ -138,7 +132,7 @@ func resolveImageID(oldInstance core.Instance, request machineops.OperationReque
 		return *oldInstance.ImageId, nil
 	}
 
-	return "", fmt.Errorf("cannot determine the current OCI image; set Machine spec.host.image or spec.parameters.%s", parameterImageID)
+	return "", fmt.Errorf("cannot determine the current OCI image; set Machine spec.host.image")
 }
 
 func buildReplacementLaunchDetails(oldInstance core.Instance, primaryVNIC core.Vnic, imageID string, request machineops.OperationRequest) (core.LaunchInstanceDetails, error) {

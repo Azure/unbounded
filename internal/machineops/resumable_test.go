@@ -75,7 +75,7 @@ func TestLongRunningOperationPollsCurrentMachineProviderID(t *testing.T) {
 	t.Parallel()
 
 	machine, op, credential := newResumableTestObjects("machine-1", "op-1")
-	machine.Spec.ProviderID = "test:///nodes/replacement-machine-1"
+	machine.Spec.Host.External.ProviderID = "test:///nodes/replacement-machine-1"
 	op.Status.Phase = unboundedv1alpha3.OperationPhaseInProgress
 	op.Status.Targets = []unboundedv1alpha3.MachineOperationTargetStatus{{
 		MachineRef:         machine.Name,
@@ -96,7 +96,7 @@ func TestLongRunningOperationPollsCurrentMachineProviderID(t *testing.T) {
 
 	reconcileOperation(t, reconciler, op.Name)
 
-	require.Equal(t, []string{machine.Spec.ProviderID}, provider.pollProviderIDs)
+	require.Equal(t, []string{machine.Spec.Host.External.ProviderID}, provider.pollProviderIDs)
 }
 
 func TestLongRunningOperationRejectsPersistedHandleFromDifferentProvider(t *testing.T) {
@@ -137,6 +137,7 @@ func TestLongRunningOperationPollDoesNotRebuildReplacementBootstrapData(t *testi
 		Phase:              unboundedv1alpha3.OperationPhaseInProgress,
 		Stage:              unboundedv1alpha3.OperationStageWaitingProvider,
 		ObservedGeneration: machine.Generation,
+		Input:              &unboundedv1alpha3.MachineOperationTargetInput{ProvisioningFormat: unboundedv1alpha3.ProvisioningFormatCloudInit},
 		ProviderOperation: &unboundedv1alpha3.ProviderOperationStatus{
 			Provider:    testLongRunningProviderName,
 			OperationID: "provider-op-1",
@@ -637,7 +638,7 @@ func TestLongRunningOperationPermanentPollFailureFailsOperation(t *testing.T) {
 
 func newResumableTestObjects(machineName, operationName string) (*unboundedv1alpha3.Machine, *unboundedv1alpha3.MachineOperation, *unboundedv1alpha3.MachineOperationCredential) {
 	machine := newExternalMachine(machineName, testLongRunningProviderName)
-	machine.Spec.ProviderID = "test:///nodes/" + machineName
+	machine.Spec.Host.External.ProviderID = "test:///nodes/" + machineName
 	machine.Generation = 4
 	op := newMachineOperation(operationName, machineName, unboundedv1alpha3.OperationHostReboot)
 	op.UID = types.UID(operationName + "-uid")

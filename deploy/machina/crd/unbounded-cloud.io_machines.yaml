@@ -292,8 +292,7 @@ spec:
               host:
                 description: |-
                   Host contains desired host settings and exactly one optional host owner.
-                  New Machines should set one of Netboot, Azure, or External. Image alone
-                  may be used with deprecated ownership fields during migration.
+                  Host operations require one of Netboot, Azure, or External.
                 properties:
                   azure:
                     description: Azure identifies an Azure VM managed by the built-in
@@ -548,9 +547,9 @@ spec:
                   provisioningFormat:
                     description: |-
                       ProvisioningFormat declares the first-boot format for the desired host
-                      image. When preserving an image, omission falls back to the installed
-                      observation, then CloudInit for legacy hosts. Image identifiers are opaque;
-                      an explicit replacement image on a known Ignition host requires a format.
+                      image. When preserving an image, omission uses the installed observation
+                      if available. An explicit replacement image requires a declared format;
+                      image identifiers are opaque. Unknown formats are not inferred.
                     enum:
                     - CloudInit
                     - Ignition
@@ -613,201 +612,6 @@ spec:
                       When omitted the controller falls back to the cluster's
                       Kubernetes version.
                     type: string
-                type: object
-              provider:
-                description: |-
-                  Provider identifies the legacy external control provider for this machine.
-                  New callers should use Host.External.Provider or Host.Azure.
-                minLength: 1
-                type: string
-              providerID:
-                description: |-
-                  ProviderID identifies the underlying infrastructure resource for this
-                  machine, using a Kubernetes-style provider ID such as
-                  azure:///subscriptions/.../virtualMachines/name or oci://ocid1.instance...
-
-                  This is a legacy field. New callers should use Host.External.ProviderID,
-                  Host.External.MachineRef, or Host.Azure.ResourceID.
-                type: string
-              pxe:
-                description: |-
-                  PXE contains legacy PXE boot configuration for the machine. New callers
-                  should use Host.Netboot.
-                properties:
-                  architecture:
-                    default: amd64
-                    description: |-
-                      Architecture is the target CPU architecture for PXE boot artifacts and
-                      machine images.
-                    enum:
-                    - amd64
-                    - arm64
-                    type: string
-                  bootProtocol:
-                    default: PXE
-                    description: |-
-                      BootProtocol selects how metalman should trigger network boot for
-                      repaves. PXE uses DHCP/TFTP bootfile options. HTTP uses Redfish UEFI
-                      HTTP boot with a URL derived from the netboot image metadata.
-                    enum:
-                    - PXE
-                    - HTTP
-                    type: string
-                  cloudInit:
-                    description: |-
-                      CloudInit contains optional cloud-init customization for PXE-booted
-                      machines.
-                    properties:
-                      userDataConfigMapRef:
-                        description: |-
-                          UserDataConfigMapRef references a ConfigMap containing custom
-                          cloud-init user-data. The referenced key (default "user-data")
-                          must contain a valid cloud-init configuration (e.g. a
-                          #cloud-config YAML document).
-                        properties:
-                          key:
-                            default: user-data
-                            description: Key within the ConfigMap.
-                            type: string
-                          name:
-                            description: Name of the ConfigMap.
-                            type: string
-                          namespace:
-                            description: Namespace of the ConfigMap.
-                            type: string
-                        required:
-                        - name
-                        - namespace
-                        type: object
-                    type: object
-                  dhcpLeases:
-                    description: |-
-                      DHCPLeases defines static IPv4 provisioning network settings. PXE boot
-                      uses them as DHCP leases. HTTP boot uses the first entry to configure the
-                      Redfish UEFI HTTP boot client.
-                    items:
-                      description: DHCPLease defines static IPv4 provisioning network
-                        settings.
-                      properties:
-                        dns:
-                          description: DNS is a list of DNS server addresses.
-                          items:
-                            type: string
-                          type: array
-                        gateway:
-                          description: Gateway is the default gateway.
-                          type: string
-                        ipv4:
-                          description: IPv4 is the IP address to assign.
-                          type: string
-                        mac:
-                          description: MAC is the MAC address of the network interface.
-                          type: string
-                        subnetMask:
-                          description: SubnetMask is the subnet mask for the lease.
-                          type: string
-                      required:
-                      - gateway
-                      - ipv4
-                      - mac
-                      - subnetMask
-                      type: object
-                    type: array
-                  image:
-                    description: |-
-                      Image is an OCI image reference containing the machine disk image.
-                      The image must contain /disk/disk.img.gz.
-                      Example: "ghcr.io/azure/host-ubuntu2404:v1"
-                    type: string
-                  netbootImage:
-                    description: |-
-                      NetbootImage is an OCI image reference containing the PXE boot
-                      artifacts used to install Image. When omitted, metalman uses the
-                      default netboot image that corresponds to its release.
-                    type: string
-                  netbootPullSecretRef:
-                    description: |-
-                      NetbootPullSecretRef references a Docker registry credential Secret used to
-                      pull NetbootImage. It is ignored when NetbootImage is omitted; metalman's
-                      configured default netboot pull secret is used for the default netboot image.
-                      The Secret must be type kubernetes.io/dockerconfigjson or
-                      kubernetes.io/dockercfg.
-                    properties:
-                      name:
-                        description: Name of the secret.
-                        minLength: 1
-                        type: string
-                      namespace:
-                        description: Namespace of the secret.
-                        minLength: 1
-                        type: string
-                    required:
-                    - name
-                    - namespace
-                    type: object
-                  pullSecretRef:
-                    description: |-
-                      PullSecretRef references a Docker registry credential Secret used to pull
-                      Image. The Secret must be type kubernetes.io/dockerconfigjson or
-                      kubernetes.io/dockercfg.
-                    properties:
-                      name:
-                        description: Name of the secret.
-                        minLength: 1
-                        type: string
-                      namespace:
-                        description: Namespace of the secret.
-                        minLength: 1
-                        type: string
-                    required:
-                    - name
-                    - namespace
-                    type: object
-                  redfish:
-                    description: Redfish configures optional Redfish BMC access.
-                    properties:
-                      deviceID:
-                        default: "1"
-                        description: DeviceID is the Redfish system device ID. Defaults
-                          to "1".
-                        type: string
-                      passwordRef:
-                        description: PasswordRef references a secret containing the
-                          Redfish password.
-                        properties:
-                          key:
-                            default: ssh-privatekey
-                            description: Key within the secret.
-                            type: string
-                          name:
-                            description: Name of the secret.
-                            type: string
-                          namespace:
-                            description: Namespace of the secret.
-                            type: string
-                        required:
-                        - name
-                        - namespace
-                        type: object
-                      url:
-                        description: URL is the Redfish endpoint URL.
-                        type: string
-                      username:
-                        description: Username is the Redfish username.
-                        type: string
-                    required:
-                    - passwordRef
-                    - url
-                    - username
-                    type: object
-                  targetDisk:
-                    description: |-
-                      TargetDisk is the block device the installer writes the machine image to.
-                      Examples: /dev/nvme0n1, /dev/sda, /dev/disk/by-id/...
-                      When omitted, the installer chooses a target disk automatically.
-                    type: string
-                required:
-                - image
                 type: object
               ssh:
                 description: |-
@@ -886,15 +690,6 @@ spec:
                 - privateKeyRef
                 type: object
             type: object
-            x-kubernetes-validations:
-            - message: provider is immutable once set
-              rule: '!has(oldSelf.provider) || (has(self.provider) && self.provider
-                == oldSelf.provider)'
-            - message: host ownership cannot be combined with legacy pxe, provider,
-                or providerID fields
-              rule: '!has(self.host) || (!has(self.host.netboot) && !has(self.host.azure)
-                && !has(self.host.external)) || (!has(self.pxe) && !has(self.provider)
-                && !has(self.providerID))'
           status:
             description: MachineStatus defines the observed state of a Machine.
             properties:

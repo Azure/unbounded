@@ -158,7 +158,7 @@ func TestProviderExecuteHostReplaceRequiresUserData(t *testing.T) {
 	}}
 	machine := &unboundedv1alpha3.Machine{}
 	machine.Name = "machine-1"
-	machine.Spec.ProviderID = "oci://old-instance"
+	machine.Spec.Host = &unboundedv1alpha3.HostSpec{External: &unboundedv1alpha3.ExternalHostSpec{Provider: unboundedv1alpha3.ExternalProviderOCIInstance, ProviderID: "oci://old-instance"}}
 
 	_, err := provider.Execute(context.Background(), machineops.OperationRequest{MachineName: machine.Name, ProviderID: "oci://old-instance", Operation: unboundedv1alpha3.OperationHostReplace})
 	require.Error(t, err)
@@ -196,7 +196,7 @@ func TestProviderExecuteHostReplacePreservesCurrentImage(t *testing.T) {
 	provider := &Provider{NewClient: func() (computeClient, error) { return client, nil }}
 	machine := &unboundedv1alpha3.Machine{}
 	machine.Name = "machine-1"
-	machine.Spec.ProviderID = "oci://old-instance"
+	machine.Spec.Host = &unboundedv1alpha3.HostSpec{External: &unboundedv1alpha3.ExternalHostSpec{Provider: unboundedv1alpha3.ExternalProviderOCIInstance, ProviderID: "oci://old-instance"}}
 
 	result, err := provider.Execute(context.Background(), machineops.OperationRequest{
 		MachineName:     machine.Name,
@@ -239,7 +239,7 @@ func TestProviderExecuteHostReplaceImageIDOverride(t *testing.T) {
 	provider := &Provider{NewClient: func() (computeClient, error) { return client, nil }}
 	machine := &unboundedv1alpha3.Machine{}
 	machine.Name = "machine-1"
-	machine.Spec.ProviderID = "oci://old-instance"
+	machine.Spec.Host = &unboundedv1alpha3.HostSpec{External: &unboundedv1alpha3.ExternalHostSpec{Provider: unboundedv1alpha3.ExternalProviderOCIInstance, ProviderID: "oci://old-instance"}}
 
 	_, err := provider.Execute(context.Background(), machineops.OperationRequest{
 		MachineName:     machine.Name,
@@ -263,7 +263,7 @@ func TestProviderExecuteHostReplacePreflightsBeforeStop(t *testing.T) {
 	provider := &Provider{NewClient: func() (computeClient, error) { return client, nil }}
 	machine := &unboundedv1alpha3.Machine{}
 	machine.Name = "machine-1"
-	machine.Spec.ProviderID = "oci://old-instance"
+	machine.Spec.Host = &unboundedv1alpha3.HostSpec{External: &unboundedv1alpha3.ExternalHostSpec{Provider: unboundedv1alpha3.ExternalProviderOCIInstance, ProviderID: "oci://old-instance"}}
 
 	_, err := provider.Execute(context.Background(), machineops.OperationRequest{
 		MachineName:     machine.Name,
@@ -289,7 +289,7 @@ func TestProviderExecuteHostReplaceWaitsForStoppingInstance(t *testing.T) {
 	provider := &Provider{NewClient: func() (computeClient, error) { return client, nil }}
 	machine := &unboundedv1alpha3.Machine{}
 	machine.Name = "machine-1"
-	machine.Spec.ProviderID = "oci://old-instance"
+	machine.Spec.Host = &unboundedv1alpha3.HostSpec{External: &unboundedv1alpha3.ExternalHostSpec{Provider: unboundedv1alpha3.ExternalProviderOCIInstance, ProviderID: "oci://old-instance"}}
 
 	result, err := provider.Execute(context.Background(), machineops.OperationRequest{
 		MachineName:     machine.Name,
@@ -315,7 +315,7 @@ func TestProviderExecuteHostReplaceFailsWithDataVolume(t *testing.T) {
 	provider := &Provider{NewClient: func() (computeClient, error) { return client, nil }}
 	machine := &unboundedv1alpha3.Machine{}
 	machine.Name = "machine-1"
-	machine.Spec.ProviderID = "oci://old-instance"
+	machine.Spec.Host = &unboundedv1alpha3.HostSpec{External: &unboundedv1alpha3.ExternalHostSpec{Provider: unboundedv1alpha3.ExternalProviderOCIInstance, ProviderID: "oci://old-instance"}}
 
 	_, err := provider.Execute(context.Background(), machineops.OperationRequest{
 		MachineName:     machine.Name,
@@ -349,7 +349,7 @@ func TestProviderExecuteHostReplaceReusesTaggedReplacement(t *testing.T) {
 	provider := &Provider{NewClient: func() (computeClient, error) { return client, nil }}
 	machine := &unboundedv1alpha3.Machine{}
 	machine.Name = "machine-1"
-	machine.Spec.ProviderID = "oci://old-instance"
+	machine.Spec.Host = &unboundedv1alpha3.HostSpec{External: &unboundedv1alpha3.ExternalHostSpec{Provider: unboundedv1alpha3.ExternalProviderOCIInstance, ProviderID: "oci://old-instance"}}
 
 	result, err := provider.Execute(context.Background(), machineops.OperationRequest{
 		MachineName:     machine.Name,
@@ -384,7 +384,7 @@ func TestProviderExecuteHostReplaceAfterProviderIDHandoffReturnsCleanup(t *testi
 	provider := &Provider{NewClient: func() (computeClient, error) { return client, nil }}
 	machine := &unboundedv1alpha3.Machine{}
 	machine.Name = "machine-1"
-	machine.Spec.ProviderID = "oci://new-instance"
+	machine.Spec.Host = &unboundedv1alpha3.HostSpec{External: &unboundedv1alpha3.ExternalHostSpec{Provider: unboundedv1alpha3.ExternalProviderOCIInstance, ProviderID: "oci://new-instance"}}
 
 	result, err := provider.Execute(context.Background(), machineops.OperationRequest{
 		MachineName:     machine.Name,
@@ -408,7 +408,7 @@ func TestProviderCleanupTerminatesOldInstance(t *testing.T) {
 	provider := &Provider{NewClient: func() (computeClient, error) { return client, nil }}
 	machine := &unboundedv1alpha3.Machine{}
 	machine.Name = "machine-1"
-	machine.Spec.ProviderID = "oci://new-instance"
+	machine.Spec.Host = &unboundedv1alpha3.HostSpec{External: &unboundedv1alpha3.ExternalHostSpec{Provider: unboundedv1alpha3.ExternalProviderOCIInstance, ProviderID: "oci://new-instance"}}
 
 	err := provider.Cleanup(context.Background(), machineops.OperationRequest{
 		MachineName:   machine.Name,

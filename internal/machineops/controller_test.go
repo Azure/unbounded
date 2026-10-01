@@ -33,8 +33,6 @@ func TestMachineOperationReconciler_CompletesSupportedOperation(t *testing.T) {
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderAzureVM)
 	machine.Generation = 3
-	machine.Spec.Provider = ""
-	machine.Spec.ProviderID = ""
 	machine.Spec.Host = &unboundedv1alpha3.HostSpec{Azure: &unboundedv1alpha3.AzureHostSpec{
 		ResourceID: "azure:///subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/machine-1",
 	}}
@@ -76,10 +74,9 @@ func TestMachineOperationReconciler_SnapshotsProviderRefAndHostImage(t *testing.
 	machine := newExternalMachine("machine-1", "ExampleCloud")
 	machine.UID = "machine-uid"
 	machine.Generation = 7
-	machine.Spec.Provider = ""
-	machine.Spec.ProviderID = ""
 	machine.Spec.Host = &unboundedv1alpha3.HostSpec{
-		Image: "image-v2",
+		Image:              "image-v2",
+		ProvisioningFormat: unboundedv1alpha3.ProvisioningFormatCloudInit,
 		External: &unboundedv1alpha3.ExternalHostSpec{
 			Provider: "ExampleCloud",
 			MachineRef: &unboundedv1alpha3.ProviderMachineReference{
@@ -169,8 +166,6 @@ func TestMachineOperationReconciler_RejectsMismatchedProviderRefKind(t *testing.
 
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", "ExampleCloud")
-	machine.Spec.Provider = ""
-	machine.Spec.ProviderID = ""
 	machine.Spec.Host = &unboundedv1alpha3.HostSpec{
 		External: &unboundedv1alpha3.ExternalHostSpec{
 			Provider: "ExampleCloud",
@@ -702,8 +697,6 @@ func TestMachineOperationReconciler_PatchesReplacementProviderIDBeforeCleanup(t 
 	require.NoError(t, corev1.AddToScheme(s))
 
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderOCIInstance)
-	machine.Spec.Provider = ""
-	machine.Spec.ProviderID = ""
 	machine.Spec.Host = &unboundedv1alpha3.HostSpec{External: &unboundedv1alpha3.ExternalHostSpec{
 		Provider:   unboundedv1alpha3.ExternalProviderOCIInstance,
 		ProviderID: "oci://old-instance",
@@ -782,7 +775,7 @@ func TestMachineOperationReconciler_FailsUnsupportedExternalOperation(t *testing
 
 	s := newOperationTestScheme(t)
 	machine := newExternalMachine("machine-1", unboundedv1alpha3.ExternalProviderOCIInstance)
-	machine.Spec.ProviderID = "oci://ocid1.instance.oc1.test"
+	machine.Spec.Host.External.ProviderID = "oci://ocid1.instance.oc1.test"
 	op := newMachineOperation("op-1", "machine-1", unboundedv1alpha3.OperationHostReplace)
 	provider := &recordingProvider{provider: unboundedv1alpha3.ExternalProviderOCIInstance, supported: map[unboundedv1alpha3.OperationKind]bool{}}
 
@@ -1051,9 +1044,12 @@ func newExternalMachine(name, provider string) *unboundedv1alpha3.Machine {
 			Labels: map[string]string{unboundedv1alpha3.MachineSiteLabelKey: "site-a"},
 		},
 		Spec: unboundedv1alpha3.MachineSpec{
-			Provider:   provider,
-			ProviderID: "azure:///subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/" + name,
+			Host: &unboundedv1alpha3.HostSpec{External: &unboundedv1alpha3.ExternalHostSpec{
+				Provider:   provider,
+				ProviderID: "azure:///subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/" + name,
+			}},
 		},
+		Status: unboundedv1alpha3.MachineStatus{ObservedProvisioningFormat: unboundedv1alpha3.ProvisioningFormatCloudInit},
 	}
 }
 
