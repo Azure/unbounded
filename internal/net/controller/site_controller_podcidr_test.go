@@ -259,7 +259,7 @@ func TestAssignPodCIDRsReleasesOnDefinitivePatchRejection(t *testing.T) {
 	}
 }
 
-func TestAssignPodCIDRsKeepsAllocationOnAmbiguousPatchError(t *testing.T) {
+func TestAssignPodCIDRsReleasesOnAmbiguousPatchErrorWhenNotApplied(t *testing.T) {
 	h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
 	h.failPatches(errors.New("connection reset by peer"))
 
@@ -267,8 +267,53 @@ func TestAssignPodCIDRsKeepsAllocationOnAmbiguousPatchError(t *testing.T) {
 		t.Fatal("expected patch error")
 	}
 
+	if h.state.allocator.IsAllocated("10.244.0.0/24") {
+		t.Fatal("CIDR was not released after the assignment failed and the node does not hold it")
+	}
+}
+
+func TestAssignPodCIDRsKeepsAllocationWhenFailedPatchWasApplied(t *testing.T) {
+	h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
+	applyPatch := clienttesting.ObjectReaction(h.client.Tracker())
+	h.client.PrependReactor("patch", "nodes", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		// Apply the patch, then report a timeout as if the response was lost.
+		if _, _, err := applyPatch(action); err != nil {
+			t.Errorf("apply patch: %v", err)
+		}
+
+		return true, nil, apierrors.NewTimeoutError("response lost", 1)
+	})
+
+	if err := h.sc.assignPodCIDRsForNode(context.Background(), h.cached, h.sites, "site-a"); err == nil {
+		t.Fatal("expected patch error")
+	}
+
 	if !h.state.allocator.IsAllocated("10.244.0.0/24") {
-		t.Fatal("CIDR was released after an ambiguous error where the patch may have been applied")
+		t.Fatal("CIDR held by the node was released after a lost patch response")
+	}
+}
+
+func TestAssignPodCIDRsAllocatesOnceAcrossExhaustedConflictRetries(t *testing.T) {
+	h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
+	h.failPatches(apierrors.NewConflict(schema.GroupResource{Resource: "nodes"}, podCIDRTestNode, errors.New("resourceVersion changed")))
+
+	err := h.sc.assignPodCIDRsForNodeWithLabel(context.Background(), h.cached, h.sites, "site-a")
+	if !apierrors.IsConflict(err) {
+		t.Fatalf("expected conflict after retries are exhausted, got %v", err)
+	}
+
+	if len(h.patches) < 2 {
+		t.Fatalf("expected conflicts to be retried, got %d patch attempts", len(h.patches))
+	}
+
+	for i, raw := range h.patches {
+		if got := decodePatch(t, raw)["spec"]["podCIDR"]; got != "10.244.0.0/24" {
+			t.Fatalf("patch attempt %d podCIDR = %v, want the single allocation 10.244.0.0/24", i, got)
+		}
+	}
+
+	if h.state.allocator.IsAllocated("10.244.0.0/24") {
+		t.Fatal("CIDR was not released after conflict retries were exhausted")
 	}
 }
 
@@ -365,11 +410,15 @@ func TestAssignPodCIDRsRetriesOnConflict(t *testing.T) {
 	}
 
 	if got := decodePatch(t, h.patches[1])["spec"]["podCIDR"]; got != "10.244.0.0/24" {
-		t.Fatalf("retry patch podCIDR = %v, want released CIDR 10.244.0.0/24 reused", got)
+		t.Fatalf("retry patch podCIDR = %v, want original allocation 10.244.0.0/24 reused", got)
+	}
+
+	if !h.state.allocator.IsAllocated("10.244.0.0/24") {
+		t.Fatal("assigned CIDR is not marked allocated after the retry")
 	}
 
 	if h.state.allocator.IsAllocated("10.244.1.0/24") {
-		t.Fatal("conflict retry leaked an extra CIDR allocation")
+		t.Fatal("conflict retry allocated an extra CIDR")
 	}
 
 	node, err := h.client.CoreV1().Nodes().Get(context.Background(), podCIDRTestNode, metav1.GetOptions{})

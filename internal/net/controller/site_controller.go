@@ -2122,63 +2122,80 @@ func (sc *SiteController) computePodCIDRsForNode(state *assignmentAllocator) (st
 //
 // Conflicts are expected while a node is starting up because kubelet and
 // other agents update it frequently, so they are retried here with a fresh
-// read rather than surfacing as sync errors. Each failed attempt releases its
-// CIDRs before the next attempt allocates again.
+// read rather than surfacing as sync errors. CIDRs are allocated once and
+// reused across retries. They are released only if the assignment fails
+// entirely, or if the node turns out to already have different CIDRs.
 func (sc *SiteController) allocateAndPatchNodePodCIDRs(ctx context.Context, nodeName string, state *assignmentAllocator, siteName string) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		return sc.tryAllocateAndPatchNodePodCIDRs(ctx, nodeName, state, siteName)
-	})
-}
+	var (
+		podCIDR  string
+		podCIDRs []string
+		applied  bool
+	)
 
-// tryAllocateAndPatchNodePodCIDRs performs a single read-allocate-patch attempt
-// for allocateAndPatchNodePodCIDRs.
-func (sc *SiteController) tryAllocateAndPatchNodePodCIDRs(ctx context.Context, nodeName string, state *assignmentAllocator, siteName string) error {
-	liveNode, err := sc.clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
-	if err != nil {
-		if apierrors.IsNotFound(err) {
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		liveNode, err := sc.clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+
+			return fmt.Errorf("failed to get node %s: %w", nodeName, err)
+		}
+
+		if nodeHasPodCIDRs(liveNode) {
+			// Another writer, or an earlier attempt whose response was lost,
+			// already assigned CIDRs. Adopt them; any of our CIDRs not in use
+			// on the node are released below.
+			for _, cidr := range nodePodCIDRs(liveNode) {
+				state.allocator.MarkAllocated(cidr)
+			}
+
 			return nil
 		}
 
-		return fmt.Errorf("failed to get node %s: %w", nodeName, err)
-	}
-
-	if nodeHasPodCIDRs(liveNode) {
-		for _, cidr := range nodePodCIDRs(liveNode) {
-			state.allocator.MarkAllocated(cidr)
-		}
-
-		return nil
-	}
-
-	podCIDR, podCIDRs, err := sc.computePodCIDRsForNode(state)
-	if err != nil {
-		return err
-	}
-
-	if err := sc.patchNodePodCIDRs(ctx, nodeName, liveNode.ResourceVersion, siteName, podCIDR, podCIDRs); err != nil {
-		// Only release when the API server definitively rejected the patch.
-		// For transport errors or timeouts the patch may have been applied,
-		// so keep the CIDRs reserved; the next sync re-reads the node.
-		if patchDefinitelyNotApplied(err) {
-			for _, cidr := range podCIDRs {
-				state.allocator.Release(cidr)
+		if podCIDRs == nil {
+			podCIDR, podCIDRs, err = sc.computePodCIDRsForNode(state)
+			if err != nil {
+				return err
 			}
 		}
 
-		return err
+		if err := sc.patchNodePodCIDRs(ctx, nodeName, liveNode.ResourceVersion, siteName, podCIDR, podCIDRs); err != nil {
+			return err
+		}
+
+		applied = true
+
+		return nil
+	})
+
+	if !applied && podCIDRs != nil {
+		sc.releaseUnusedPodCIDRs(ctx, nodeName, state, podCIDRs)
 	}
 
-	return nil
+	return err
 }
 
-// patchDefinitelyNotApplied reports whether err is an API server rejection
-// that guarantees the patch was not persisted.
-func patchDefinitelyNotApplied(err error) bool {
-	return apierrors.IsConflict(err) ||
-		apierrors.IsInvalid(err) ||
-		apierrors.IsNotFound(err) ||
-		apierrors.IsForbidden(err) ||
-		apierrors.IsBadRequest(err)
+// releaseUnusedPodCIDRs releases CIDRs allocated for a node whose assignment
+// did not complete, keeping any that the node is known to hold. CIDRs are
+// released when the node cannot be read, so a lost response for an applied
+// patch is recovered by the next sync re-marking the node's CIDRs.
+func (sc *SiteController) releaseUnusedPodCIDRs(ctx context.Context, nodeName string, state *assignmentAllocator, podCIDRs []string) {
+	inUse := map[string]struct{}{}
+
+	if liveNode, err := sc.clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{}); err == nil {
+		for _, cidr := range nodePodCIDRs(liveNode) {
+			inUse[cidr] = struct{}{}
+		}
+	}
+
+	for _, cidr := range podCIDRs {
+		if _, ok := inUse[cidr]; ok {
+			continue
+		}
+
+		state.allocator.Release(cidr)
+	}
 }
 
 // patchNodePodCIDRs applies pod CIDRs, and site labels when siteName is
