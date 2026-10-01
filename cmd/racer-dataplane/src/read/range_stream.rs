@@ -773,6 +773,12 @@ mod tests {
             ));
         }
         stream.configure_subscription(4, PAGE_BYTES, true).unwrap();
+        // Injected ready pages still need the scheduler's exact credit reservations.
+        let demand = stream.subscription.as_mut().unwrap();
+        for number in 0..2 {
+            assert_eq!(demand.select(), Some(PageNumber(number)));
+            demand.completed(PageNumber(number));
+        }
         for number in 0..2 {
             let reader = futures::executor::block_on(stream.next_slice())
                 .unwrap()
@@ -869,6 +875,18 @@ mod tests {
                     .configure_subscription(2, PAGE_BYTES, ordered)
                     .unwrap();
                 stream.next_page = None;
+                let demand = stream.subscription.as_mut().unwrap();
+                for number in 0..2 {
+                    assert_eq!(demand.select(), Some(PageNumber(number)));
+                    demand.completed(PageNumber(number));
+                }
+                if !ordered {
+                    let (_, WindowPage::Ready(Ok(result))) = stream.ready.pop_front().unwrap()
+                    else {
+                        panic!()
+                    };
+                    stream.selected_ready = Some(result);
+                }
                 let first = futures::executor::block_on(stream.next_slice())
                     .unwrap()
                     .unwrap();
@@ -929,6 +947,7 @@ mod tests {
                     _ => drop((stream, held)),
                 }
                 assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
+                admission.reclaim_buffers();
                 assert_eq!(admission.used(ResourceClass::Plaintext), 0);
                 assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
             }

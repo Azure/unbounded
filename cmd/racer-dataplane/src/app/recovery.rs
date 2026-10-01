@@ -743,7 +743,7 @@ mod tests {
     #[test]
     fn distinct_live_catalog_and_page_capacities_select_an_installable_cut() {
         let node = NodeState::new(vec![WorkerId(0)], 16).unwrap();
-        let keys = crate::security::keyring::tests::keys();
+        let keys = crate::security::identity::keyring_tests::keys();
         let geometry = [(WorkerId(0), geometry())].into_iter().collect();
         let candidate = |sequence, count| {
             let mut cut = image(sequence, &[WorkerId(0)]);

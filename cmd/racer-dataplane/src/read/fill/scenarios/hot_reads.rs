@@ -345,6 +345,7 @@ fn ordered_acquisition_window_is_not_an_unreleased_credit_ceiling() {
                     peer_endpoint: "127.0.0.1:8000".into(),
                     rails: vec![],
                     alignment_enabled: false,
+                    site: String::new(),
                 }],
             )
             .unwrap(),

@@ -298,6 +298,7 @@ fn signed_ingress_cold_selection_is_bounded_cancellable_and_does_not_block_other
                     peer_endpoint: "127.0.0.1:8000".into(),
                     rails: vec![],
                     alignment_enabled: false,
+                    site: String::new(),
                 })
                 .collect(),
         )
@@ -307,7 +308,7 @@ fn signed_ingress_cold_selection_is_bounded_cancellable_and_does_not_block_other
     let network = Rc::new(
         PeerNetwork::new(
             NodeId(C.into()),
-            crate::control::snapshot::PublishedState::for_membership(membership),
+            crate::control::state::PublishedState::for_membership(membership),
         )
         .unwrap(),
     );
@@ -355,8 +356,8 @@ fn signed_ingress_cold_selection_is_bounded_cancellable_and_does_not_block_other
     .unwrap();
     let contract = subscription.clone();
     let (signed, _) = sender.sign_request(request).unwrap();
-    let (wire, _) = WireCodec::decode(
-        WireCodec::encode(&signed.authentication, false, 0).unwrap(),
+    let (wire, _) = decode_envelope(
+        encode_envelope(&signed.authentication, false, 0).unwrap(),
         false,
     )
     .unwrap();
@@ -422,8 +423,8 @@ fn signed_ingress_cold_selection_is_bounded_cancellable_and_does_not_block_other
         mode: FetchMode::Acquire,
     };
     let (signed, binding) = sender.sign_request(request).unwrap();
-    let (wire, _) = WireCodec::decode(
-        WireCodec::encode(&signed.authentication, false, 0).unwrap(),
+    let (wire, _) = decode_envelope(
+        encode_envelope(&signed.authentication, false, 0).unwrap(),
         false,
     )
     .unwrap();

@@ -111,6 +111,12 @@ impl PeerServer {
         )
     }
     #[cfg(test)]
+    pub(crate) fn subscription_owner(
+        &self,
+    ) -> &std::sync::Arc<super::subscriptions::Subscriptions> {
+        &self.subscriptions
+    }
+    #[cfg(test)]
     pub(crate) fn transport_io(&self) -> &Rc<crate::http::connection::HttpIo> {
         &self.io
     }
