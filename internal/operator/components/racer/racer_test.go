@@ -144,8 +144,12 @@ func TestLifecycleWithoutSites(t *testing.T) {
 	deployment := &appsv1.Deployment{}
 	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, controllerName), deployment))
 	require.Equal(t, env.Config.Image(controllerName), deployment.Spec.Template.Spec.Containers[0].Image)
-	require.Equal(t, appsv1.RecreateDeploymentStrategyType, deployment.Spec.Strategy.Type)
-	require.Nil(t, deployment.Spec.Strategy.RollingUpdate)
+	require.Equal(t, appsv1.RollingUpdateDeploymentStrategyType, deployment.Spec.Strategy.Type)
+	require.NotNil(t, deployment.Spec.Strategy.RollingUpdate)
+	require.NotNil(t, deployment.Spec.Strategy.RollingUpdate.MaxUnavailable)
+	require.NotNil(t, deployment.Spec.Strategy.RollingUpdate.MaxSurge)
+	require.Zero(t, deployment.Spec.Strategy.RollingUpdate.MaxUnavailable.IntValue())
+	require.Equal(t, 1, deployment.Spec.Strategy.RollingUpdate.MaxSurge.IntValue())
 	require.EqualValues(t, 3, *deployment.Spec.Replicas)
 	pod := deployment.Spec.Template.Spec
 	controller := pod.Containers[0]

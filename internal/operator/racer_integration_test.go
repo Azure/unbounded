@@ -103,8 +103,12 @@ func TestEnvtestRacerProvisioning(t *testing.T) {
 	deployment := &appsv1.Deployment{}
 
 	require.Eventually(t, func() bool { return c.Get(ctx, key("racer-controller"), deployment) == nil }, 20*time.Second, 100*time.Millisecond)
-	require.Equal(t, appsv1.RecreateDeploymentStrategyType, deployment.Spec.Strategy.Type)
-	require.Nil(t, deployment.Spec.Strategy.RollingUpdate)
+	require.Equal(t, appsv1.RollingUpdateDeploymentStrategyType, deployment.Spec.Strategy.Type)
+	require.NotNil(t, deployment.Spec.Strategy.RollingUpdate)
+	require.NotNil(t, deployment.Spec.Strategy.RollingUpdate.MaxUnavailable)
+	require.NotNil(t, deployment.Spec.Strategy.RollingUpdate.MaxSurge)
+	require.Zero(t, deployment.Spec.Strategy.RollingUpdate.MaxUnavailable.IntValue())
+	require.Equal(t, 1, deployment.Spec.Strategy.RollingUpdate.MaxSurge.IntValue())
 
 	_, err = app.Keyring.Reconcile(ctx, ctrl.Request{})
 	require.NoError(t, err)

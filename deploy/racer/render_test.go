@@ -138,10 +138,9 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 
 			decode("controller.yaml", &deployment, &service)
 
-			// Old leaders cannot replicate snapshots to new followers. Retain
-			// Recreate for this migration even though all synced replicas serve.
-			if deployment.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType || deployment.Spec.Strategy.RollingUpdate != nil {
-				t.Fatalf("initial replication migration requires Recreate without rollingUpdate settings: %+v", deployment.Spec.Strategy)
+			budget := deployment.Spec.Strategy.RollingUpdate
+			if deployment.Spec.Strategy.Type != appsv1.RollingUpdateDeploymentStrategyType || budget == nil || budget.MaxUnavailable == nil || budget.MaxSurge == nil || budget.MaxUnavailable.IntValue() != 0 || budget.MaxSurge.IntValue() != 1 {
+				t.Fatalf("controller rollout must preserve serving replicas with one surge: %+v", deployment.Spec.Strategy)
 			}
 
 			pod := deployment.Spec.Template.Spec
@@ -256,7 +255,7 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 	}
 }
 
-func TestRenderedControllerClearsRollingUpdateBudget(t *testing.T) {
+func TestRenderedControllerPreservesServingReplicasDuringRollout(t *testing.T) {
 	out := t.TempDir()
 	if err := render.Render(".", out, map[string]string{}); err != nil {
 		t.Fatal(err)
@@ -272,11 +271,11 @@ func TestRenderedControllerClearsRollingUpdateBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Omitting this field leaves an existing API-defaulted budget behind with
-	// client-side apply. Recreate admission rejects a non-null rollingUpdate.
-	budget, found, err := unstructured.NestedFieldNoCopy(deployment.Object, "spec", "strategy", "rollingUpdate")
-	if err != nil || !found || budget != nil {
-		t.Fatalf("updates must explicitly clear the old rollingUpdate budget: value=%v found=%t err=%v", budget, found, err)
+	for field, want := range map[string]int64{"maxUnavailable": 0, "maxSurge": 1} {
+		value, found, err := unstructured.NestedInt64(deployment.Object, "spec", "strategy", "rollingUpdate", field)
+		if err != nil || !found || value != want {
+			t.Fatalf("rollout %s must be explicit: value=%v want=%v found=%t err=%v", field, value, want, found, err)
+		}
 	}
 }
 
