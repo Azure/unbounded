@@ -824,7 +824,6 @@ impl WorkerApplication {
             admission.clone(),
             network.clone(),
         ));
-        let dispatcher = Rc::new(node.workers.clone());
         #[cfg(not(test))]
         let distributed = true;
         #[cfg(test)]
@@ -833,7 +832,7 @@ impl WorkerApplication {
             io.clone(),
             forwarding,
             admission.clone(),
-            dispatcher.clone(),
+            Rc::new(node.workers.clone()),
             relay,
             wire,
             signatures,
