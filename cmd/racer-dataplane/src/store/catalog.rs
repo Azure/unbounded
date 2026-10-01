@@ -290,12 +290,11 @@ impl Index {
         Ok(count)
     }
     /// Compare the complete mapping before removing, preserving replacement writes.
-    pub fn remove_if_matches(&self, page: &PageId, location: &RecordLocation) -> Result<()> {
+    pub fn remove_if_matches(&self, page: &PageId, location: &RecordLocation) {
         let mut s = self.state.borrow_mut();
         if s.pages.get(page).is_some_and(|p| &p.location == location) {
             Self::remove_page(&mut s, page);
         }
-        Ok(())
     }
     pub fn snapshot(&self) -> Result<IndexSnapshot> {
         let s = self.state.borrow();
@@ -833,7 +832,7 @@ impl SegmentClock {
                 continue;
             }
             for (victim, location) in self.index.segment_entries_bounded(id, 1) {
-                self.index.remove_if_matches(&victim, &location)?;
+                self.index.remove_if_matches(&victim, &location);
             }
             if self.index.preflight_capacity(page).is_ok() {
                 return Ok(());
@@ -868,7 +867,7 @@ impl SegmentClock {
             }
             self.segments.begin_evict(id)?;
             for (page, location) in self.index.segment_entries_bounded(id, entries_left) {
-                self.index.remove_if_matches(&page, &location)?;
+                self.index.remove_if_matches(&page, &location);
                 entries_left -= 1;
             }
             if !self.index.segment_empty(id) {
@@ -1059,16 +1058,14 @@ mod tests {
         let (_, replacement) = indexed(old.metadata.clone(), 1);
         index.publish(page.clone(), replacement.clone()).unwrap();
         assert!(index.segment_empty(SegmentId(0)));
-        index.remove_if_matches(&page, &old.location).unwrap();
+        index.remove_if_matches(&page, &old.location);
         assert_eq!(
             index.lookup(&page).unwrap().unwrap().location,
             replacement.location
         );
         let (other, entry) = indexed(descriptor("other", 1), 2);
         assert_eq!(index.publish(other, entry), Err(Error::Overloaded));
-        index
-            .remove_if_matches(&page, &replacement.location)
-            .unwrap();
+        index.remove_if_matches(&page, &replacement.location);
         assert!(index.version(&page.version).unwrap().is_none());
     }
     #[test]
@@ -1094,9 +1091,7 @@ mod tests {
             replacement.location
         );
         assert_eq!(index.preflight_capacity(&other), Err(Error::Overloaded));
-        index
-            .remove_if_matches(&page, &replacement.location)
-            .unwrap();
+        index.remove_if_matches(&page, &replacement.location);
         assert_eq!(index.preflight_capacity(&other), Ok(()));
         index.publish(other, other_entry).unwrap();
     }

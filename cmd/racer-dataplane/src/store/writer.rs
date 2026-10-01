@@ -42,14 +42,6 @@ pub struct StoreWriter {
     discarded: Cell<u64>,
     closed: Cell<bool>,
 }
-pub struct DirtyTicket {
-    id: u64,
-}
-impl DirtyTicket {
-    pub fn id(&self) -> u64 {
-        self.id
-    }
-}
 impl StoreWriter {
     pub fn new(
         index: Rc<Index>,
@@ -123,7 +115,7 @@ impl StoreWriter {
         self.availability
             .page(&e.page.version.object.cache, e.key_id)
     }
-    pub fn enqueue(&self, page: CiphertextCopy, dirty: Reservation) -> Result<DirtyTicket> {
+    pub fn enqueue(&self, page: CiphertextCopy, dirty: Reservation) -> Result<u64> {
         let cache = page.metadata.version.object.cache.clone();
         self.enqueue_reclaiming(page, dirty, |length| {
             self.slabs.reserve_staging(length, &cache)
@@ -137,7 +129,7 @@ impl StoreWriter {
         page: CiphertextCopy,
         dirty: Reservation,
         reserve_staging: impl FnOnce(usize) -> Result<Reservation>,
-    ) -> Result<DirtyTicket> {
+    ) -> Result<u64> {
         if self.closed.get() {
             return Err(Error::Unavailable);
         }
@@ -172,9 +164,7 @@ impl StoreWriter {
         }
         let pending = self.pending.borrow();
         if let Some(existing) = pending.get(&id) {
-            return Ok(DirtyTicket {
-                id: existing.ticket,
-            });
+            return Ok(existing.ticket);
         }
         if pending.len() >= self.capacity.get() {
             return Err(Error::Overloaded);
@@ -206,7 +196,7 @@ impl StoreWriter {
             },
         );
         self.queue.borrow_mut().push_back(id);
-        Ok(DirtyTicket { id: ticket })
+        Ok(ticket)
     }
     pub fn copy_only(&self, page: &PageId) -> Result<Option<CiphertextCopy>> {
         Ok(self

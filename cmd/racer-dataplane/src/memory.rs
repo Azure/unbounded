@@ -81,7 +81,8 @@ pub mod page {
 
         /// Structural agreement only. Authentication remains the fill/crypto boundary.
         pub fn validate_metadata(&self) -> crate::error::Result<()> {
-            validate_ciphertext(&self.metadata, &self.ciphertext)?;
+            self.metadata.validate()?;
+            validate_ciphertext_length(&self.ciphertext)?;
             validate_association(
                 &self.metadata,
                 self.plaintext.page(),
@@ -109,6 +110,9 @@ pub mod page {
     ) -> crate::error::Result<()> {
         metadata.validate()?;
         metadata.immutable().validate_page(ciphertext.envelope())?;
+        validate_ciphertext_length(ciphertext)
+    }
+    fn validate_ciphertext_length(ciphertext: &CiphertextPage) -> crate::error::Result<()> {
         if ciphertext.bytes().len() != ciphertext.envelope().ciphertext_length as usize {
             return Err(crate::error::Error::CorruptRecord);
         }

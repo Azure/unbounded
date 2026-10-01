@@ -380,7 +380,7 @@ impl Fixture {
                 .unwrap(),
         }
     }
-    fn enqueue(&self, copy: CiphertextCopy) -> Result<writer::DirtyTicket> {
+    fn enqueue(&self, copy: CiphertextCopy) -> Result<u64> {
         let dirty = self.admission.reserve(
             Some(&copy.metadata.version.object.cache),
             ResourceClass::DirtyCiphertext,
@@ -648,7 +648,7 @@ fn dirty_queue_is_bounded_and_cache_removal_discards_without_io() {
     let first = f.copy(1, 3);
     let id = first.ciphertext.envelope().page.clone();
     let ticket = f.enqueue(first.clone()).unwrap();
-    assert_eq!(f.enqueue(first).unwrap().id(), ticket.id());
+    assert_eq!(f.enqueue(first).unwrap(), ticket);
     f.enqueue(f.copy(2, 3)).unwrap();
     assert!(matches!(f.enqueue(f.copy(3, 3)), Err(Error::Overloaded)));
     assert_eq!(
@@ -858,7 +858,7 @@ fn real_writer_rechecks_index_capacity_and_replaces_same_page_when_full() {
     drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap();
     let latest = index.lookup(&first_id).unwrap().unwrap().location;
     assert_ne!(latest, replacement);
-    index.remove_if_matches(&first_id, &replacement).unwrap();
+    index.remove_if_matches(&first_id, &replacement);
     assert_eq!(index.lookup(&first_id).unwrap().unwrap().location, latest);
     f.enqueue(f.copy(2, 64)).unwrap();
     assert_eq!(
@@ -1157,7 +1157,7 @@ fn cache_removal_during_write_fences_late_publication() {
     // Reinsert the same immutable page while the original submitted write still
     // owns its segment/buffer. The old completion cannot publish or remove it.
     let replacement = f.enqueue(f.copy(1, 64)).unwrap();
-    assert!(replacement.id() > 1);
+    assert!(replacement > 1);
     drive(&f.reactor, operation).unwrap();
     assert!(f.store.writer.index().lookup(&id).unwrap().is_none());
     assert_eq!(f.store.writer.pending_count(), 1);

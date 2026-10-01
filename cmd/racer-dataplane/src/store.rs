@@ -108,7 +108,8 @@ impl StoreReader {
             .record(crate::telemetry::metrics::Event::CorruptMiss, 1);
     }
     pub fn invalidate(&self, token: &ReadToken) -> Result<()> {
-        self.index.remove_if_matches(&token.page, &token.location)
+        self.index.remove_if_matches(&token.page, &token.location);
+        Ok(())
     }
     pub fn read_with_token<'a>(
         &'a self,
