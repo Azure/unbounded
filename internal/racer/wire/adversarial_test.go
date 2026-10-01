@@ -266,6 +266,30 @@ func TestUnknownFieldsAndExactNames(t *testing.T) {
 	}
 }
 
+func TestValidatedOriginalBytesPreserveEscapes(t *testing.T) {
+	for _, name := range []string{"publication.json", "bootstrap-request.json", "bootstrap-response.json", "bundle.json"} {
+		t.Run(name, func(t *testing.T) {
+			original := fixture(t, name)
+
+			want, err := vectorRoundTrip(name, original)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Escaped exact field names and scalar text are valid, but escaped
+			// aliases must still be rejected as duplicates before typed decoding.
+			escaped := bytes.ReplaceAll(original, []byte(`"schema_version"`), []byte(`"schema_versi\u006fn"`))
+			escaped = bytes.ReplaceAll(escaped, []byte(`"18446744073709551615"`), []byte(`"\u00318446744073709551615"`))
+			escaped = bytes.ReplaceAll(escaped, []byte(`11111111-`), []byte(`\u00311111111-`))
+
+			got, err := vectorRoundTrip(name, escaped)
+			if err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("escaped document changed semantics: %v", err)
+			}
+		})
+	}
+}
+
 func TestBundleValidationAndKeyIsolation(t *testing.T) {
 	b, err := DecodeBundle(bytes.NewReader(fixture(t, "bundle.json")))
 	if err != nil {

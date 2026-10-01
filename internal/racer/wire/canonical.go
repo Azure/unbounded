@@ -14,11 +14,12 @@ import (
 
 // EncodePublication sorts copies of the input collections, never caller state.
 func EncodePublication(v Publication) ([]byte, error) {
-	if err := validatePublication(v, true); err != nil {
+	c, err := newCanonicalCandidate(v, true)
+	if err != nil {
 		return nil, err
 	}
 
-	return encode(canonicalPublication(v), MaxPublicationBytes)
+	return c.EncodePublication(v.Sequence, v.MembershipVersion)
 }
 
 func DecodePublication(r io.Reader) (Publication, error) {
@@ -66,7 +67,11 @@ type CanonicalCandidate struct {
 // NewCanonicalCandidate validates and copies content once. Input counters are
 // ignored; final encoding checks the assigned counters and complete byte bound.
 func NewCanonicalCandidate(v Publication) (CanonicalCandidate, error) {
-	if err := validatePublication(v, false); err != nil {
+	return newCanonicalCandidate(v, false)
+}
+
+func newCanonicalCandidate(v Publication, counters bool) (CanonicalCandidate, error) {
+	if err := validatePublication(v, counters); err != nil {
 		return CanonicalCandidate{}, err
 	}
 
@@ -165,11 +170,13 @@ type Delta struct {
 }
 
 func EncodeDelta(base, next Publication) ([]byte, error) {
-	if err := validatePublication(base, true); err != nil {
+	b, err := newCanonicalCandidate(base, true)
+	if err != nil {
 		return nil, err
 	}
 
-	if err := validatePublication(next, true); err != nil {
+	n, err := newCanonicalCandidate(next, true)
+	if err != nil {
 		return nil, err
 	}
 
@@ -177,15 +184,14 @@ func EncodeDelta(base, next Publication) ([]byte, error) {
 		return nil, Conflict
 	}
 
-	base = canonicalPublication(base)
-	next = canonicalPublication(next)
+	base, next = b.publication, n.publication
 
-	bh, _, err := ContentHashes(base)
+	bh, _, err := b.ContentHashes()
 	if err != nil {
 		return nil, err
 	}
 
-	nh, _, err := ContentHashes(next)
+	nh, _, err := n.ContentHashes()
 	if err != nil {
 		return nil, err
 	}
@@ -258,11 +264,12 @@ func ApplyDelta(base Publication, reader io.Reader) (Publication, error) {
 		next.Members = append(next.Members, m)
 	}
 
-	if err := validatePublication(next, true); err != nil {
+	candidate, err := newCanonicalCandidate(next, true)
+	if err != nil {
 		return Publication{}, err
 	}
 
-	hash, _, err = ContentHashes(next)
+	hash, _, err = candidate.ContentHashes()
 	if err != nil {
 		return Publication{}, err
 	}
@@ -271,5 +278,5 @@ func ApplyDelta(base Publication, reader io.Reader) (Publication, error) {
 		return Publication{}, Conflict
 	}
 
-	return canonicalPublication(next), nil
+	return candidate.publication, nil
 }

@@ -207,12 +207,8 @@ func decode(r io.Reader, limit int, v any) error {
 	if err = checkShape(tree, reflect.TypeOf(v).Elem(), false); err != nil {
 		return err
 	}
-	// Re-encode only after exact-name validation, including every nested field.
-	b, err = json.Marshal(tree)
-	if err != nil {
-		return InvalidRequest
-	}
-
+	// The original bytes are safe only after duplicate, exact-name, shape, and
+	// primitive checks above. Do not serialize the validation tree a second time.
 	if err = json.Unmarshal(b, v); err != nil {
 		return InvalidRequest
 	}
