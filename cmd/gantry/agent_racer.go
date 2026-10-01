@@ -15,8 +15,6 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/net/netutil"
-
 	"github.com/Azure/unbounded/internal/gantry/config"
 	"github.com/Azure/unbounded/internal/gantry/metrics"
 	"github.com/Azure/unbounded/internal/gantry/mirror"
@@ -133,7 +131,7 @@ func serveRacerAgent(ctx context.Context, c *config.Config, logger *slog.Logger,
 		limit = 512
 	}
 
-	listener = netutil.LimitListener(listener, limit)
+	listener = limitRacerListener(listener, limit)
 	mirrorHTTP := &http.Server{Handler: mirror.RacerHTTPHandler(mirrorSrv.Handler(), c.RacerWriteTimeout, telemetry.mirrorResponse), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 32 * 1024}
 	servers = append(servers, mirrorHTTP)
 	mirrorErrors := make(chan error, 1)
