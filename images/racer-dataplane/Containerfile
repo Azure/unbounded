@@ -27,12 +27,12 @@ COPY cmd/racer-dataplane/Cargo.toml cmd/racer-dataplane/Cargo.lock ./
 COPY cmd/racer-dataplane/src ./src
 COPY cmd/racer-dataplane/native/rdma.c ./native/rdma.c
 COPY images/racer-dataplane/build-native.sh ./build-native.sh
+COPY images/racer-dataplane/check-debug-info.sh ./check-debug-info.sh
 RUN set -eu; \
     mkdir -p /out/usr/local/bin /out/usr/local/lib; \
     set --; \
     if [ "$RACER_HEAP_PROFILING" = true ]; then \
         set -- --features heap-profiling; \
-        export CARGO_PROFILE_RELEASE_DEBUG=1; \
     fi; \
     if [ "$RACER_NATIVE_RDMA" = true ]; then \
         cargo build --locked --release --bin racer-dataplane --no-default-features --features rdma "$@"; \
@@ -40,6 +40,7 @@ RUN set -eu; \
     else \
         cargo build --locked --release --bin racer-dataplane --no-default-features "$@"; \
     fi; \
+    sh ./check-debug-info.sh target/release/racer-dataplane; \
     install -m 0755 target/release/racer-dataplane /out/usr/local/bin/racer-dataplane
 
 FROM ${RUNTIME_IMAGE}

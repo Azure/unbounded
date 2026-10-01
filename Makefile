@@ -618,6 +618,7 @@ racer-dataplane-build: ## Build the locked Rust release binary; optionally enabl
 	$(RACER_CARGO) build --locked --release --manifest-path cmd/racer-dataplane/Cargo.toml \
 		--target-dir "$(RACER_CARGO_TARGET_DIR)" --bin racer-dataplane \
 		--no-default-features $(if $(filter true,$(RACER_NATIVE_RDMA)),--features rdma)
+	sh images/racer-dataplane/check-debug-info.sh "$(RACER_CARGO_TARGET_DIR)/release/racer-dataplane"
 	install -D -m 0755 "$(RACER_CARGO_TARGET_DIR)/release/racer-dataplane" "$(RACER_DATAPLANE_BIN)"
 
 racer-dataplane-native-build: ## Compile against installed libibverbs headers and libraries

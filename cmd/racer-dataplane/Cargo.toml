@@ -49,6 +49,10 @@ zeroize = "1"
 flate2 = "1"
 prost = "0.14"
 
+# Keep source locations and inline frames for Parca, independent of heap profiling.
+[profile.release]
+debug = 1
+
 # Full-page crypto and exhaustive topology checks dominate unoptimized test runs.
 # Keep debug assertions, overflow checks, and debug info while optimizing hot loops.
 [profile.test]
