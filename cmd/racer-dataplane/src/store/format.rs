@@ -389,7 +389,7 @@ mod tests {
         "5825196396c3fc29342422518a98d9fe550bcdb05701b97aadcb9c02271f3f03";
 
     #[test]
-    fn legacy_wire_bytes_and_reused_padding_across_page_and_alignment_boundaries() {
+    fn current_wire_bytes_and_reused_padding_across_page_and_alignment_boundaries() {
         let admission = admission();
         // Normal v4 header is 181 bytes, plus a 16-byte tag. Straddle both units.
         for (length, number, maximum, geometry, offset) in [
@@ -418,7 +418,6 @@ mod tests {
             let mut page = page(&admission, length, number, &cache, &etag);
             let alignment = DirectAlignment::validate(geometry.0, geometry.1, geometry.2).unwrap();
             let logical = logical_length(&page).unwrap();
-            assert_eq!(logical, LegacyCodec.logical_length(&page).unwrap() + 12);
             assert_eq!(
                 logical,
                 128 + 12 + cache.len() + etag.len() + 2 + 32 + length + 16
@@ -428,19 +427,6 @@ mod tests {
             staging.bytes_mut().unwrap().fill(0xa5);
             let mut encoded =
                 encode_at(&page, Generation(u64::MAX), alignment, offset, staging).unwrap();
-            let legacy = LegacyCodec
-                .encode_at(
-                    &page,
-                    Generation(u64::MAX),
-                    alignment,
-                    offset,
-                    buffer(
-                        &admission,
-                        alignment,
-                        alignment.extent(offset, logical - 12).unwrap().length(),
-                    ),
-                )
-                .unwrap();
             assert_eq!(
                 parse(&encoded.buffer, encoded.header.extent)
                     .unwrap()
@@ -448,16 +434,11 @@ mod tests {
                     .envelope,
                 *page.ciphertext.envelope()
             );
-            assert!(matches!(
-                parse(&legacy.buffer, legacy.header.extent),
-                Err(Error::CorruptRecord)
-            ));
             assert_eq!(encoded.header.extent, extent);
             assert_eq!(
                 decode(&encoded.buffer, &encoded.header).unwrap(),
                 *page.ciphertext.envelope()
             );
-            drop(legacy);
 
             // Reuse an actual record, shortening ciphertext into the old payload
             // when possible. This catches stale bytes at the new padding boundary.
@@ -491,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_inputs_keep_legacy_errors_before_geometry_checks() {
+    fn malformed_inputs_reject_record_errors_before_geometry_checks() {
         let admission = admission();
         let alignment = DirectAlignment::validate(512, 512, 512).unwrap();
         let mutations: &[fn(&mut CiphertextCopy)] = &[
@@ -562,7 +543,6 @@ mod tests {
             let mut page = page(&admission, 3, 0, "cache", "v1");
             mutate(&mut page);
             assert_eq!(logical_length(&page), Err(Error::CorruptRecord));
-            assert_eq!(logical_length(&page), LegacyCodec.logical_length(&page));
             let baseline = admission.used(ResourceClass::Ciphertext);
             for generation in [Generation(0), Generation(1)] {
                 // Bad offset/size must not mask the record error.
@@ -574,17 +554,7 @@ mod tests {
                     buffer(&admission, alignment, 1024),
                 )
                 .err();
-                let legacy = LegacyCodec
-                    .encode_at(
-                        &page,
-                        generation,
-                        alignment,
-                        1,
-                        buffer(&admission, alignment, 1024),
-                    )
-                    .err();
                 assert_eq!(actual, Some(Error::CorruptRecord));
-                assert_eq!(actual, legacy);
                 assert_eq!(admission.used(ResourceClass::Ciphertext), baseline);
             }
         }
@@ -602,10 +572,6 @@ mod tests {
         ] {
             page.metadata.expires_at = ExpiresAt(expiry);
             assert_eq!(logical_length(&page), Ok(200));
-            assert_eq!(
-                logical_length(&page),
-                LegacyCodec.logical_length(&page).map(|length| length + 12)
-            );
             let encoded = encode(
                 &page,
                 Generation(7),
@@ -674,18 +640,6 @@ mod tests {
                 encode_at(&page, Generation(1), alignment, offset, staging).err(),
                 Some(expected)
             );
-            assert_eq!(
-                LegacyCodec
-                    .encode_at(
-                        &page,
-                        Generation(1),
-                        alignment,
-                        offset,
-                        buffer(&admission, normal, length)
-                    )
-                    .err(),
-                Some(expected)
-            );
             assert_eq!(admission.used(ResourceClass::Ciphertext), baseline);
         }
     }
@@ -700,7 +654,7 @@ mod tests {
         let admission = admission();
         let alignment = DirectAlignment::validate(4096, 4096, 4096).unwrap();
         println!(
-            "memory-only; 5 samples, alternating legacy/new order; median [min,max] ns/record; GiB/s uses logical record bytes (sizing does not touch payload)"
+            "memory-only; 5 samples; median [min,max] ns/record; GiB/s uses logical record bytes (sizing does not touch payload)"
         );
         for (size, length) in [("tiny", 3), ("full", PAGE_BYTES as usize)] {
             for (ids, cache, etag) in [
@@ -722,7 +676,7 @@ mod tests {
                     } else {
                         32
                     };
-                    let mut run = |legacy: bool, count: usize| {
+                    let mut run = |count: usize| {
                         let start = Instant::now();
                         for _ in 0..count {
                             let page = black_box(&page);
@@ -732,34 +686,17 @@ mod tests {
                                 _ => 0,
                             };
                             for _ in 0..sizing_count {
-                                black_box(
-                                    if legacy {
-                                        LegacyCodec.logical_length(black_box(page))
-                                    } else {
-                                        logical_length(black_box(page))
-                                    }
-                                    .unwrap(),
-                                );
+                                black_box(logical_length(black_box(page)).unwrap());
                             }
                             if mode != "sizing" {
                                 let buffer = black_box(staging.take().unwrap());
-                                let encoded = if legacy {
-                                    LegacyCodec.encode_at(
-                                        page,
-                                        black_box(Generation(7)),
-                                        black_box(alignment),
-                                        black_box(4096),
-                                        buffer,
-                                    )
-                                } else {
-                                    encode_at(
-                                        page,
-                                        black_box(Generation(7)),
-                                        black_box(alignment),
-                                        black_box(4096),
-                                        buffer,
-                                    )
-                                }
+                                let encoded = encode_at(
+                                    page,
+                                    black_box(Generation(7)),
+                                    black_box(alignment),
+                                    black_box(4096),
+                                    buffer,
+                                )
                                 .unwrap();
                                 black_box(encoded.buffer.bytes().unwrap());
                                 black_box(&encoded.header);
@@ -768,61 +705,36 @@ mod tests {
                         }
                         start.elapsed().as_nanos() as f64 / count as f64
                     };
-                    for legacy in [true, false] {
-                        run(legacy, iterations / 4);
-                    }
-                    let mut samples = [Vec::new(), Vec::new()];
-                    for sample in 0..5 {
-                        for index in if sample % 2 == 0 { [0, 1] } else { [1, 0] } {
-                            samples[index].push(run(index == 0, iterations));
-                        }
-                    }
-                    for (index, values) in samples.iter_mut().enumerate() {
-                        values.sort_by(f64::total_cmp);
-                        let ns = values[2];
-                        let gib = logical as f64 / (1u64 << 30) as f64 / (ns / 1e9);
-                        println!(
-                            "{size}/{ids} {mode} {} n={iterations}: {ns:.1} [{:.1},{:.1}] ns/record, {gib:.3} logical GiB/s",
-                            if index == 0 { "legacy" } else { "new" },
-                            values[0],
-                            values[4]
-                        );
-                    }
+                    run(iterations / 4);
+                    let mut values: Vec<_> = (0..5).map(|_| run(iterations)).collect();
+                    values.sort_by(f64::total_cmp);
+                    let ns = values[2];
+                    let gib = logical as f64 / (1u64 << 30) as f64 / (ns / 1e9);
+                    println!(
+                        "{size}/{ids} {mode} n={iterations}: {ns:.1} [{:.1},{:.1}] ns/record, {gib:.3} logical GiB/s",
+                        values[0], values[4]
+                    );
                 }
             }
         }
     }
 
     #[test]
-    fn frozen_v1_record_and_hash() {
-        let admission = admission();
-        let page = page(&admission, 3, 0, "cache", "v1");
-        let alignment = DirectAlignment::validate(512, 512, 512).unwrap();
-        let encoded = LegacyCodec
-            .encode_at(
-                &page,
-                Generation(7),
-                alignment,
-                0,
-                buffer(&admission, alignment, 512),
-            )
-            .unwrap();
+    fn frozen_v1_record_is_rejected() {
         let mut expected = unhex(GOLDEN_LOGICAL);
-        assert_eq!(logical_length(&page).unwrap(), expected.len() + 12);
         expected.resize(512, 0);
-        assert_eq!(encoded.buffer.bytes().unwrap(), expected);
         assert_eq!(
             Sha256::digest(&expected).as_slice(),
             unhex(GOLDEN_RECORD_SHA256)
         );
         assert!(matches!(
-            parse(&encoded.buffer, encoded.header.extent),
+            parse_bytes(&expected, DirectExtent::checked(0, 512).unwrap()),
             Err(Error::CorruptRecord)
         ));
     }
 
     #[test]
-    fn version_two_records_preserve_bounded_content_type_and_reject_malformed_values() {
+    fn current_records_preserve_bounded_content_type_and_reject_malformed_values() {
         let admission = admission();
         let mut page = page(&admission, 3, 0, "cache", "v1");
         page.metadata.content_type = Some(crate::model::ContentType::parse(b"text/plain").unwrap());
@@ -941,95 +853,6 @@ mod tests {
         ));
     }
 
-    // Frozen pre-optimization implementation. Keep independent of the new layout
-    // and serializer: both regression comparisons and the memory benchmark use it.
-    struct LegacyCodec;
-    impl LegacyCodec {
-        fn header_bytes(&self, page: &CiphertextCopy, generation: Generation) -> Result<Vec<u8>> {
-            let envelope = page.ciphertext.envelope();
-            let metadata = page.metadata.immutable();
-            metadata.validate_page(envelope)?;
-            if generation.0 == 0
-                || envelope.plaintext_length == 0
-                || u64::from(envelope.plaintext_length) > PAGE_BYTES
-                || envelope.ciphertext_length
-                    != envelope
-                        .plaintext_length
-                        .checked_add(16)
-                        .ok_or(Error::CorruptRecord)?
-                || page.ciphertext.bytes().len() != envelope.ciphertext_length as usize
-            {
-                return Err(Error::CorruptRecord);
-            }
-            let cache = envelope.page.version.object.cache.0.as_bytes();
-            let etag = envelope.page.version.etag.as_bytes();
-            if cache.is_empty()
-                || cache.len() > MAX_ID_BYTES
-                || etag.is_empty()
-                || etag.len() > MAX_ETAG_BYTES
-            {
-                return Err(Error::CorruptRecord);
-            }
-            let mut out = Vec::with_capacity(MAX_HEADER_BYTES);
-            out.extend_from_slice(MAGIC);
-            out.extend_from_slice(&1u32.to_le_bytes());
-            out.extend_from_slice(&0u32.to_le_bytes());
-            out.extend_from_slice(&generation.0.to_le_bytes());
-            out.extend_from_slice(&metadata.length.to_le_bytes());
-            out.extend_from_slice(&envelope.page.number.0.to_le_bytes());
-            out.extend_from_slice(&envelope.plaintext_length.to_le_bytes());
-            out.extend_from_slice(&envelope.ciphertext_length.to_le_bytes());
-            out.extend_from_slice(&envelope.key_id.0);
-            out.extend_from_slice(&envelope.nonce.0);
-            out.extend_from_slice(&envelope.page.version.object.key.0);
-            out.extend_from_slice(&(cache.len() as u32).to_le_bytes());
-            out.extend_from_slice(&(etag.len() as u32).to_le_bytes());
-            out.extend_from_slice(cache);
-            out.extend_from_slice(etag);
-            let len = out.len() + 32;
-            if len > MAX_HEADER_BYTES {
-                return Err(Error::CorruptRecord);
-            }
-            out[12..16].copy_from_slice(&(len as u32).to_le_bytes());
-            let digest = Sha256::digest(&out);
-            out.extend_from_slice(&digest);
-            Ok(out)
-        }
-        fn logical_length(&self, page: &CiphertextCopy) -> Result<usize> {
-            self.header_bytes(page, Generation(1))?
-                .len()
-                .checked_add(page.ciphertext.bytes().len())
-                .ok_or(Error::CorruptRecord)
-        }
-        fn encode_at(
-            &self,
-            page: &CiphertextCopy,
-            generation: Generation,
-            alignment: DirectAlignment,
-            offset: u64,
-            mut buffer: AlignedBuffer,
-        ) -> Result<EncodedRecord> {
-            let header = self.header_bytes(page, generation)?;
-            let logical_bytes = header.len() + page.ciphertext.bytes().len();
-            let extent = alignment.extent(offset, logical_bytes)?;
-            alignment.check(extent, &buffer)?;
-            let bytes = buffer.bytes_mut()?;
-            bytes.fill(0);
-            bytes[..header.len()].copy_from_slice(&header);
-            bytes[header.len()..logical_bytes].copy_from_slice(page.ciphertext.bytes());
-            Ok(EncodedRecord {
-                header: RecordHeader {
-                    format_version: 1,
-                    generation,
-                    envelope: page.ciphertext.envelope().clone(),
-                    metadata: page.metadata.immutable(),
-                    logical_bytes: logical_bytes as u64,
-                    extent,
-                },
-                buffer,
-            })
-        }
-    }
     #[test]
     fn malformed_frames_are_rejected_without_unbounded_allocations() {
         for len in [1, 16, 512] {
