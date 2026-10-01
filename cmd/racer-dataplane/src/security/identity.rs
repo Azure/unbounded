@@ -564,10 +564,8 @@ impl Keyring {
                 .id
                 .generation()
                 .ok_or(Error::InvalidConfiguration)?;
-            // Retiring declarations never admit leases or retain secrets.
-            // They may persist across many controller overlap bundles.
-            if candidate.state != CacheKeyState::Retiring
-                && state.generation.is_some_and(|g| generation <= g.0)
+            // Removed IDs cannot reenter admission, even as prepared keys.
+            if state.generation.is_some_and(|g| generation <= g.0)
                 && !state.entries.iter().any(|e| e.reference == candidate.key)
             {
                 return Err(Error::InvalidConfiguration);
@@ -594,23 +592,16 @@ impl Keyring {
         }
         // Removed entries need no tombstone or polling state. Accepted jobs own
         // their Arc independently, including jobs whose caller has timed out.
-        state.entries.retain(|entry| {
-            bundle
-                .cache_keys
-                .iter()
-                .any(|k| k.key == entry.reference && k.state != CacheKeyState::Retiring)
+        state.entries.retain_mut(|entry| {
+            if let Some(key) = bundle.cache_keys.iter().find(|k| k.key == entry.reference) {
+                entry.state = key.state;
+                true
+            } else {
+                false
+            }
         });
-        for entry in &mut state.entries {
-            entry.state = bundle
-                .cache_keys
-                .iter()
-                .find(|k| k.key == entry.reference)
-                .map_or(CacheKeyState::Retiring, |k| k.state);
-        }
         for candidate in &bundle.cache_keys {
-            if candidate.state != CacheKeyState::Retiring
-                && !state.entries.iter().any(|e| e.reference == candidate.key)
-            {
+            if !state.entries.iter().any(|e| e.reference == candidate.key) {
                 state.entries.push(Entry {
                     reference: candidate.key.clone(),
                     state: candidate.state,

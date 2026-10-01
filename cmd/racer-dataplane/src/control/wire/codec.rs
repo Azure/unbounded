@@ -720,7 +720,6 @@ pub fn decode_bundle(b: &[u8]) -> Result<KeyringBundle> {
         let state = match k.state.as_str() {
             "prepared" => CacheKeyState::Prepared,
             "active" => CacheKeyState::Active,
-            "retiring" => CacheKeyState::Retiring,
             _ => return Err(Error::InvalidRequest),
         };
         let id: [u8; 16] = bytes(&k.id)?
@@ -782,7 +781,6 @@ pub fn encode_bundle(b: &KeyringBundle) -> Result<Vec<u8>> {
                 state: match k.state {
                     CacheKeyState::Prepared => "prepared",
                     CacheKeyState::Active => "active",
-                    CacheKeyState::Retiring => "retiring",
                 }
                 .into(),
                 material: STANDARD.encode(k.material),

@@ -37,7 +37,7 @@ func TestKeyringDeliveryEncodingBoundsAndGeneration(t *testing.T) {
 		copy(ref.ID, "RKG1")
 		binary.BigEndian.PutUint64(ref.ID[4:12], n+10)
 
-		key, err := NewCacheKey(ref, RetiringKey, [32]byte{})
+		key, err := NewCacheKey(ref, PreparedKey, [32]byte{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -53,6 +53,34 @@ func TestKeyringDeliveryEncodingBoundsAndGeneration(t *testing.T) {
 func TestBundleEncodingCannotBypassCodec(t *testing.T) {
 	if _, err := json.Marshal(KeyringBundle{}); !errors.Is(err, UnsupportedVersion) {
 		t.Fatalf("standard encoder bypassed bundle validation: %v", err)
+	}
+}
+
+func TestRetiringKeyStateIsRejected(t *testing.T) {
+	raw := fixture(t, "bundle.json")
+	// Replace prepared, not active: an active key remains, so rejection must
+	// enforce the enum rather than merely the one-active-key requirement.
+	changed := bytes.Replace(raw, []byte(`"state":"prepared"`), []byte(`"state":"retiring"`), 1)
+	if bytes.Equal(raw, changed) {
+		t.Fatal("mutation did not match")
+	}
+
+	if _, err := DecodeBundle(bytes.NewReader(changed)); !errors.Is(err, InvalidRequest) {
+		t.Fatalf("retiring wire state accepted: %v", err)
+	}
+
+	bundle, err := DecodeBundle(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := NewCacheKey(bundle.CacheKeys[0].Key, KeyState("retiring"), [32]byte{}); !errors.Is(err, InvalidRequest) {
+		t.Fatalf("retiring constructor state accepted: %v", err)
+	}
+
+	bundle.CacheKeys[1].State = KeyState("retiring")
+	if _, err := EncodeBundle(bundle); !errors.Is(err, InvalidRequest) {
+		t.Fatalf("retiring encoder state accepted: %v", err)
 	}
 }
 

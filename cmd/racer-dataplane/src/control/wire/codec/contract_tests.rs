@@ -200,6 +200,17 @@ fn shared_rejection_vectors() {
 }
 
 #[test]
+fn retiring_state_is_rejected_with_active_key_present() {
+    let input = String::from_utf8(fixture("bundle.json")).unwrap();
+    let changed = input.replacen("\"state\":\"prepared\"", "\"state\":\"retiring\"", 1);
+    assert_ne!(changed, input);
+    assert_eq!(
+        decode_bundle(changed.as_bytes()).err(),
+        Some(Error::InvalidRequest)
+    );
+}
+
+#[test]
 fn hash_semantics() {
     let mut p = decode_publication(fixture("publication.json").as_slice()).unwrap();
     let hashes = content_hashes(&p).unwrap();

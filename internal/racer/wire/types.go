@@ -108,7 +108,6 @@ const (
 	OriginCredentialsKey KeyPurpose = "origin_credentials"
 	PreparedKey          KeyState   = "prepared"
 	ActiveKey            KeyState   = "active"
-	RetiringKey          KeyState   = "retiring"
 )
 
 type CacheKeyRef struct {
@@ -130,7 +129,7 @@ func (CacheKey) GoString() string { return "<redacted cache key>" }
 
 // NewCacheKey is the only material ingress besides bounded bundle decoding.
 func NewCacheKey(ref CacheKeyRef, state KeyState, material [32]byte) (CacheKey, error) {
-	if !ValidUUID(string(ref.Cache)) || len(ref.ID) != 16 || string(ref.ID[:4]) != "RKG1" || binary.BigEndian.Uint64(ref.ID[4:12]) == 0 || (ref.Purpose != PageKey && ref.Purpose != OriginCredentialsKey) || (state != PreparedKey && state != ActiveKey && state != RetiringKey) {
+	if !ValidUUID(string(ref.Cache)) || len(ref.ID) != 16 || string(ref.ID[:4]) != "RKG1" || binary.BigEndian.Uint64(ref.ID[4:12]) == 0 || (ref.Purpose != PageKey && ref.Purpose != OriginCredentialsKey) || (state != PreparedKey && state != ActiveKey) {
 		return CacheKey{}, InvalidRequest
 	}
 

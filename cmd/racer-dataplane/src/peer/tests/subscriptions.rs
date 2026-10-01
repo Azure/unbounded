@@ -761,7 +761,6 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
 
 #[test]
 fn retained_subscription_cannot_complete_after_request_mac_key_retirement() {
-    use crate::control::wire::CacheKeyState;
     let (signers, discovery) = identities();
     let sender = Forwarding::new(signers[0].clone());
     let destination = Forwarding::new(signers[2].clone());
@@ -773,22 +772,17 @@ fn retained_subscription_cannot_complete_after_request_mac_key_retirement() {
         .unwrap();
     let admitted = destination.verify_request(request).unwrap();
     let keys = &discovery[2].0;
-    let mut retired = crate::security::connection::signature_tests::mac_test_key(CACHE);
-    for key in &mut retired {
-        key.state = CacheKeyState::Retiring;
-    }
     let mut replacement = crate::security::connection::signature_tests::mac_test_key(CACHE);
     for key in &mut replacement {
         key.key.id.0[4..12].copy_from_slice(&2u64.to_be_bytes());
         key.material[0] ^= 1;
     }
-    retired.extend(replacement);
     keys.install(KeyringBundle {
         schema_version: SCHEMA_VERSION,
         cluster: ClusterId(CLUSTER.into()),
         generation: BundleGeneration(2),
         peer_trust_roots: (*keys.peer_trust_roots().unwrap()).clone(),
-        cache_keys: retired,
+        cache_keys: replacement,
     })
     .unwrap();
     assert!(

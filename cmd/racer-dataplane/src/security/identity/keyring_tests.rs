@@ -69,28 +69,26 @@ fn generation_bound_ids_reject_resurrection_skips_future_and_zero_epochs() {
     assert_eq!(keys.install(next), Ok(BundleGeneration(100)));
     assert_eq!(keys.epochs.state.lock().unwrap().entries.len(), 2);
     let mut overlap = rotation_bundle(101, roots.clone());
-    let mut retiring = rotation_bundle(100, roots).cache_keys;
-    for key in &mut retiring {
-        key.state = CacheKeyState::Retiring;
-    }
-    overlap.cache_keys.extend(retiring);
+    let removed = rotation_bundle(100, roots).cache_keys;
     keys.install(overlap.clone()).unwrap();
-    let old = &overlap.cache_keys[2].key;
+    let old = &removed[0].key;
     assert_eq!(keys.install(overlap.clone()), Ok(BundleGeneration(101)));
     assert!(
         keys.lease(Some(&old.cache), old.id, KeyPurpose::Page)
             .is_err()
     );
-    // Controller overlap keeps declaring retired epochs after secrets are gone.
+    // Later bundles and exact replays continue to omit removed epochs.
     overlap.generation = BundleGeneration(102);
     assert_eq!(keys.install(overlap.clone()), Ok(BundleGeneration(102)));
     for admission in [CacheKeyState::Active, CacheKeyState::Prepared] {
         let mut resurrected = overlap.clone();
         resurrected.generation = BundleGeneration(103);
-        resurrected.cache_keys[2].state = admission;
+        let mut old = removed[0].clone();
+        old.state = admission;
         if admission == CacheKeyState::Active {
-            resurrected.cache_keys[0].state = CacheKeyState::Retiring;
+            resurrected.cache_keys.remove(0);
         }
+        resurrected.cache_keys.push(old);
         assert_eq!(keys.install(resurrected), Err(Error::InvalidConfiguration));
     }
     assert_eq!(keys.epochs.state.lock().unwrap().entries.len(), 2);
@@ -176,7 +174,7 @@ fn rotation_rejects_rollback_rebinding_and_cross_purpose_use() {
         state: CacheKeyState::Prepared,
         material: [9; 32],
     });
-    keys.install(rotated).unwrap();
+    keys.install(rotated.clone()).unwrap();
     assert!(
         keys.install(bundle(1, roots, CacheKeyState::Active))
             .is_err()
@@ -195,6 +193,31 @@ fn rotation_rejects_rollback_rebinding_and_cross_purpose_use() {
             .is_ok()
     );
     assert_eq!(lease.material(KeyPurpose::Page).unwrap(), &[7; 32]);
+    assert_eq!(
+        keys.active(&cache, KeyPurpose::Page).unwrap().id(),
+        lease.id()
+    );
+    let prepared = keys
+        .lease(
+            Some(&cache),
+            KeyId::from_generation(2, 3).unwrap(),
+            KeyPurpose::Page,
+        )
+        .unwrap();
+    assert_eq!(prepared.material(KeyPurpose::Page).unwrap(), &[9; 32]);
+    // Activation retains the prepared material and drops the replaced key.
+    rotated.generation = BundleGeneration(3);
+    rotated.cache_keys.remove(0);
+    rotated.cache_keys[1].state = CacheKeyState::Active;
+    keys.install(rotated).unwrap();
+    let active = keys.active(&cache, KeyPurpose::Page).unwrap();
+    assert_eq!(active.id(), prepared.id());
+    assert!(Arc::ptr_eq(&active.secret, &prepared.secret));
+    assert!(
+        keys.lease(Some(&cache), lease.id(), KeyPurpose::Page)
+            .is_err()
+    );
+    assert_eq!(lease.material(KeyPurpose::Page).unwrap(), &[7; 32]);
 }
 #[test]
 fn retirement_closes_admission_and_last_lease_owns_secret() {
@@ -209,11 +232,6 @@ fn retirement_closes_admission_and_last_lease_owns_secret() {
     );
     next.cache_keys[0].key.id = KeyId::from_generation(2, 4).unwrap();
     next.cache_keys[0].material = [10; 32];
-    next.cache_keys.push(CacheEncryptionKey {
-        key: reference.clone(),
-        state: CacheKeyState::Retiring,
-        material: [7; 32],
-    });
     keys.install(next.clone()).unwrap();
     assert!(
         keys.lease(Some(&cache), reference.id, KeyPurpose::Page)
@@ -224,12 +242,7 @@ fn retirement_closes_admission_and_last_lease_owns_secret() {
         KeyId::from_generation(2, 4).unwrap()
     );
     next.generation = BundleGeneration(3);
-    next.cache_keys.pop();
     keys.install(next).unwrap();
-    assert!(
-        keys.lease(Some(&cache), lease.id(), KeyPurpose::Page)
-            .is_err()
-    );
     assert!(
         keys.lease(Some(&cache), lease.id(), KeyPurpose::Page)
             .is_err()
@@ -263,15 +276,14 @@ fn explicit_retirement_blocks_published_keys_without_external_fences() {
     let roots = (*keys.peer_trust_roots().unwrap()).clone();
     let mut rotated = bundle(2, roots, CacheKeyState::Active);
     let old = rotated.cache_keys[0].key.clone();
-    rotated.cache_keys[0].state = CacheKeyState::Retiring;
-    rotated.cache_keys.push(CacheEncryptionKey {
+    rotated.cache_keys[0] = CacheEncryptionKey {
         key: CacheKeyRef {
             id: KeyId::from_generation(2, 4).unwrap(),
             ..old.clone()
         },
         state: CacheKeyState::Active,
         material: [10; 32],
-    });
+    };
     keys.install(rotated.clone()).unwrap();
     assert_eq!(keys.generation().unwrap(), Some(2));
     assert_eq!(held.material(KeyPurpose::Page).unwrap(), &[7; 32]);
@@ -389,6 +401,63 @@ fn active_crypto_operation_completes_after_rotation_with_its_original_key_lease(
     );
     drop(operation);
     assert!(secret.upgrade().is_none());
+}
+
+#[test]
+fn removal_of_all_keys_preserves_leases_and_rejects_resurrection() {
+    let keys = keys();
+    let cache = CacheId(CACHE.into());
+    let held = keys.active(&cache, KeyPurpose::Page).unwrap();
+    let roots = (*keys.peer_trust_roots().unwrap()).clone();
+    let mut empty = bundle(2, roots.clone(), CacheKeyState::Active);
+    empty.cache_keys.clear();
+    keys.install(empty.clone()).unwrap();
+    keys.install(empty).unwrap();
+    assert!(keys.epochs.state.lock().unwrap().entries.is_empty());
+    assert!(keys.active(&cache, KeyPurpose::Page).is_err());
+    assert!(
+        keys.lease(Some(&cache), held.id(), KeyPurpose::Page)
+            .is_err()
+    );
+    assert_eq!(held.material(KeyPurpose::Page).unwrap(), &[7; 32]);
+    let mut resurrected = rotation_bundle(3, roots.clone());
+    let mut old = bundle(1, roots.clone(), CacheKeyState::Prepared).cache_keys;
+    resurrected.cache_keys.append(&mut old);
+    assert_eq!(keys.install(resurrected), Err(Error::InvalidConfiguration));
+    assert_eq!(keys.generation().unwrap(), Some(2));
+    keys.install(rotation_bundle(3, roots)).unwrap();
+    assert!(keys.active(&cache, KeyPurpose::Page).is_ok());
+    assert_eq!(held.material(KeyPurpose::Page).unwrap(), &[7; 32]);
+}
+
+#[test]
+fn capacity_is_bounded_by_current_bundle_not_outstanding_leases() {
+    let keys = keys();
+    let held = keys
+        .active(&CacheId(CACHE.into()), KeyPurpose::Page)
+        .unwrap();
+    let roots = (*keys.peer_trust_roots().unwrap()).clone();
+    let mut full = rotation_bundle(2, roots.clone());
+    let template = full.cache_keys[0].clone();
+    full.cache_keys = (0..4096u32)
+        .map(|i| {
+            let mut key = template.clone();
+            key.key.cache = CacheId(format!("{i:08x}-1111-4111-8111-111111111111"));
+            key.key.id = KeyId::from_generation(2, i).unwrap();
+            key.material[8..12].copy_from_slice(&i.to_be_bytes());
+            key
+        })
+        .collect();
+    keys.install(full.clone()).unwrap();
+    assert_eq!(keys.epochs.state.lock().unwrap().entries.len(), 4096);
+    full.generation = BundleGeneration(3);
+    full.cache_keys.push(template);
+    assert_eq!(keys.install(full), Err(Error::InvalidConfiguration));
+    assert_eq!(keys.generation().unwrap(), Some(2));
+    assert_eq!(keys.epochs.state.lock().unwrap().entries.len(), 4096);
+    keys.install(rotation_bundle(3, roots)).unwrap();
+    assert_eq!(keys.epochs.state.lock().unwrap().entries.len(), 2);
+    assert_eq!(held.material(KeyPurpose::Page).unwrap(), &[7; 32]);
 }
 
 #[test]

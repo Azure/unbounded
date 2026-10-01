@@ -206,14 +206,9 @@ fn request_mac_rotates_and_rejects_missing_retired_or_mutated_tags() {
     for signer in &network {
         let mut keys = mac_test_keys();
         for key in &mut keys {
-            key.state = CacheKeyState::Retiring;
-        }
-        let mut active = mac_test_keys();
-        for key in &mut active {
             key.key.id.0[4..12].copy_from_slice(&2u64.to_be_bytes());
             key.material[0] ^= 1;
         }
-        keys.extend(active);
         signer
             .keys
             .install(KeyringBundle {
@@ -227,7 +222,7 @@ fn request_mac_rotates_and_rejects_missing_retired_or_mutated_tags() {
     }
     assert!(
         network[1].verify_proof(clone_head(&old)).is_err(),
-        "retiring epoch closes new admission"
+        "removed epoch closes new admission"
     );
     let current = network[0].sign(make()).unwrap();
     assert!(network[1].verify_proof(current).is_ok());

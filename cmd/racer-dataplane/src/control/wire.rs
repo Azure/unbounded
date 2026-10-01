@@ -85,7 +85,6 @@ pub enum CacheKeyPurpose {
 pub enum CacheKeyState {
     Prepared,
     Active,
-    Retiring,
 }
 /// Cache-scoped reference prevents retirement of an unrelated key or purpose.
 #[derive(Clone, Debug, Eq, PartialEq)]
