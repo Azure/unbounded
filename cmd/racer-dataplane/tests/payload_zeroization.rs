@@ -197,8 +197,11 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
         NodeId("22222222-2222-4222-8222-222222222222".into()),
         Arc::new(KeyEpochs::default()),
     );
-    let mut bundle: serde_json::Value =
-        serde_json::from_slice(include_bytes!("../src/control/testdata/bundle.json")).unwrap();
+    let mut bundle: serde_json::Value = serde_json::from_slice(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../internal/racer/wire/testdata/bundle.json"
+    )))
+    .unwrap();
     for (i, key) in bundle["cache_keys"]
         .as_array_mut()
         .unwrap()

@@ -2325,10 +2325,12 @@ pub(crate) mod tests {
             assert_eq!(worker.poll_budgeted(&mut cx, 0), Err(Error::Unavailable));
             assert_eq!(worker.poll_budgeted(&mut cx, 1), Err(Error::Unavailable));
             // Admission bounds retained generations once across the node.
-            let mut publication = crate::control::wire::decode_publication(include_bytes!(
-                "control/testdata/publication.json"
-            ))
-            .unwrap();
+            let mut publication =
+                crate::control::wire::decode_publication(include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../internal/racer/wire/testdata/publication.json"
+                )))
+                .unwrap();
             publication.cluster = config.cluster.clone();
             let mut requests = Vec::new();
             for version in 1..=config.limits.retained_snapshots.get() + 1 {
@@ -2356,9 +2358,10 @@ pub(crate) mod tests {
     #[test]
     fn multiworker_memberships_retire_after_request_leases_and_reuse_capacity() {
         use crate::{model::MembershipVersion, peer::PeerNetwork};
-        let mut publication = crate::control::wire::decode_publication(include_bytes!(
-            "control/testdata/publication.json"
-        ))
+        let mut publication = crate::control::wire::decode_publication(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../internal/racer/wire/testdata/publication.json"
+        )))
         .unwrap();
         let local = publication.members[0].node.clone();
         let neighbor = publication.members[1].node.clone();
