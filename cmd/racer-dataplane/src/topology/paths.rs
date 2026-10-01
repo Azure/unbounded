@@ -2,10 +2,10 @@
 use super::{
     RoutingAlgorithm,
     equal_cost::EqualCostSearch,
-    graph::{neighbor_positions, neighbor_positions_for},
     hash,
     health::LinkHealth,
     membership::{Membership, MembershipLease},
+    neighbor_positions, neighbor_positions_for,
 };
 use crate::{
     error::{Error, Operation, Result},

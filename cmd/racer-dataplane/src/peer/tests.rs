@@ -1627,7 +1627,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
 #[test]
 fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
     use crate::topology::{
-        graph::Graph,
+        Graph,
         membership::{Member, Membership},
     };
     let membership = Arc::new(

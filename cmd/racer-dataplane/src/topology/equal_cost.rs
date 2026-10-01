@@ -6,7 +6,7 @@
 //! that layer the two balls are disjoint, so each intersection has minimum total
 //! distance. Store one meeting per first hop (at most 64), not one per full path.
 //! Reconstruct one canonical witness per bit. Relays reselect at their own hop.
-use super::{MAX_DEGREE, RoutingAlgorithm, graph::neighbor_positions_for, paths::PathKey};
+use super::{MAX_DEGREE, RoutingAlgorithm, neighbor_positions_for, paths::PathKey};
 use crate::{
     error::{Error, Result},
     runtime::deadline::Deadline,
