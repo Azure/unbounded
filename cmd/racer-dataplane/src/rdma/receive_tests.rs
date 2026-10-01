@@ -74,7 +74,7 @@ fn receive_case(readback: bool, terminal: Option<Error>, failed_fence: bool) {
         peer_metrics.clone(),
     )
     .unwrap();
-    let peer = crate::model::identity::NodeId("native-peer".into());
+    let peer = crate::model::NodeId("native-peer".into());
     let permit = peer_admission.acquire(&peer).unwrap();
     io.shared.slots[0].mailbox.lock().unwrap().peer_admission = Some(permit);
     mark_connected(&qp, &mut native);

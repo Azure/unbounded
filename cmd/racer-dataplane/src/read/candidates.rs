@@ -100,26 +100,26 @@ impl CandidatePolicy {
             let slot = hedges.acquire()?;
             let plain = admission.reserve(
                 Some(&context.object.cache),
-                crate::model::limits::ResourceClass::Plaintext,
-                crate::model::range::PAGE_BYTES as usize,
+                crate::model::ResourceClass::Plaintext,
+                crate::model::PAGE_BYTES as usize,
             )?;
             let cipher = admission.reserve(
                 Some(&context.object.cache),
-                crate::model::limits::ResourceClass::Ciphertext,
-                crate::model::range::PAGE_BYTES as usize + 16,
+                crate::model::ResourceClass::Ciphertext,
+                crate::model::PAGE_BYTES as usize + 16,
             )?;
             // The caller already holds its serial plaintext page. Escrow is
             // additional accounting, not a buffer consumed by either validator.
             // Fund BOTH contenders before spending credits or changing routing.
             let working_plain = admission.reserve(
                 Some(&context.object.cache),
-                crate::model::limits::ResourceClass::Plaintext,
-                crate::model::range::PAGE_BYTES as usize * 2,
+                crate::model::ResourceClass::Plaintext,
+                crate::model::PAGE_BYTES as usize * 2,
             )?;
             let working_cipher = admission.reserve(
                 Some(&context.object.cache),
-                crate::model::limits::ResourceClass::Ciphertext,
-                (crate::model::range::PAGE_BYTES as usize + 16) * 2,
+                crate::model::ResourceClass::Ciphertext,
+                (crate::model::PAGE_BYTES as usize + 16) * 2,
             )?;
             drop((working_plain, working_cipher));
             Ok::<_, Error>((slot, plain, cipher))
@@ -185,13 +185,13 @@ impl CandidatePolicy {
             let capacity = (|| {
                 let plain = admission.reserve(
                     Some(&context.object.cache),
-                    crate::model::limits::ResourceClass::Plaintext,
-                    crate::model::range::PAGE_BYTES as usize,
+                    crate::model::ResourceClass::Plaintext,
+                    crate::model::PAGE_BYTES as usize,
                 )?;
                 let cipher = admission.reserve(
                     Some(&context.object.cache),
-                    crate::model::limits::ResourceClass::Ciphertext,
-                    crate::model::range::PAGE_BYTES as usize + 16,
+                    crate::model::ResourceClass::Ciphertext,
+                    crate::model::PAGE_BYTES as usize + 16,
                 )?;
                 Ok::<_, Error>((plain, cipher))
             })();

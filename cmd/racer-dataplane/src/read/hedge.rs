@@ -31,7 +31,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const DUPLICATE_BYTES: usize = crate::model::range::PAGE_BYTES as usize * 2 + 16;
+pub const DUPLICATE_BYTES: usize = crate::model::PAGE_BYTES as usize * 2 + 16;
 #[derive(Clone, Copy)]
 pub struct Config {
     pub delay: Duration,
@@ -281,7 +281,7 @@ fn recoverable(error: Error) -> bool {
 mod tests {
     use super::*;
     use crate::{
-        model::identity::RequestId,
+        model::RequestId,
         runtime::{
             deadline::RequestScope,
             environment::{SimulationClock, now},

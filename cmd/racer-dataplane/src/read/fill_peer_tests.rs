@@ -451,7 +451,7 @@ fn hedge_stale_membership_refreshes_once_without_fresh_credits() {
             let metrics = enable_hedge(&mut f, &peers);
             let latest = Arc::new(
                 Membership::validate(
-                    crate::model::identity::MembershipVersion(2),
+                    crate::model::MembershipVersion(2),
                     f.membership.members().to_vec(),
                 )
                 .unwrap(),
@@ -916,10 +916,10 @@ fn hedge_authenticated_metadata_conflict_cannot_win_over_retained_descriptor() {
     for content_type in [false, true] {
         let mut f = fixture_with(PAGE_BYTES + 3, None);
         let (peers, ordered) = install_peers(&mut f, None);
-        f.page.number = crate::model::identity::PageNumber(1);
+        f.page.number = crate::model::PageNumber(1);
         let mut retained = encrypted_copy(&mut f);
         retained.metadata.content_type =
-            Some(crate::model::metadata::ContentType::parse(b"application/expected").unwrap());
+            Some(crate::model::ContentType::parse(b"application/expected").unwrap());
         f.fill
             .dependencies
             .memory
@@ -928,7 +928,7 @@ fn hedge_authenticated_metadata_conflict_cannot_win_over_retained_descriptor() {
                 disk_token: None,
             })
             .unwrap();
-        f.page.number = crate::model::identity::PageNumber(0);
+        f.page.number = crate::model::PageNumber(0);
         let reserved = f
             .fill
             .reserve_progress(&f.context.object.cache, false)
@@ -958,7 +958,7 @@ fn hedge_authenticated_metadata_conflict_cannot_win_over_retained_descriptor() {
         let mut bad = good.clone();
         if content_type {
             bad.metadata.content_type =
-                Some(crate::model::metadata::ContentType::parse(b"application/conflict").unwrap());
+                Some(crate::model::ContentType::parse(b"application/conflict").unwrap());
         } else {
             bad.metadata.length += 1;
         }

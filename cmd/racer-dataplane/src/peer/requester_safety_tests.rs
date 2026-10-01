@@ -6,11 +6,11 @@ use crate::{
         io::HttpIo,
         pool::{ConnectionLease, HttpPool},
     },
-    model::{identity::MembershipVersion, limits::ResourceClass},
+    model::{MembershipVersion, ResourceClass},
     peer::{
         adaptive::{AdaptivePeers, Outcome},
         transfer::RelayResponse,
-        wire::{LogicalCodec, PeerResponse, SecurityCodec, WireCodec},
+        wire::{PeerResponse, SecurityCodec, WireCodec},
     },
     runtime::{
         admission::Admission,
@@ -50,9 +50,7 @@ fn page_hedge_does_not_treat_multihop_destination_as_independent_first_hop() {
             MembershipVersion(1),
             (0..1500)
                 .map(|i| Member {
-                    node: crate::model::identity::NodeId(format!(
-                        "{i:08x}-1111-4111-8111-111111111111"
-                    )),
+                    node: crate::model::NodeId(format!("{i:08x}-1111-4111-8111-111111111111")),
                     shares: std::num::NonZeroU32::new(1).unwrap(),
                     peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
                     rails: vec![],
@@ -89,11 +87,10 @@ fn page_hedge_does_not_treat_multihop_destination_as_independent_first_hop() {
     let signers = crate::peer::tests::signers();
     let requester = Requester::new(
         Rc::new(Paths::new(Rc::new(LinkHealth), 4).with_peer_admission(adaptive)),
-        Rc::new(Rails),
         Rc::new(Forwarding::new(signers[0].clone())),
         Rc::new(Transfers::new(pool, io, None)),
-    )
-    .with_network(network);
+        network,
+    );
     assert!(!requester.direct_hedge_available(&members, &nonneighbor.node));
 }
 
@@ -154,14 +151,18 @@ fn probe_exchange(opaque: bool, case: &str) {
     }
     let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4).with_peer_admission(adaptive.clone()));
     let forwarding = Rc::new(Forwarding::new(signers[0].clone()));
-    let requester = Requester::new(paths, Rc::new(Rails), forwarding.clone(), transfers)
-        .with_network(Rc::new(
+    let requester = Requester::new(
+        paths,
+        forwarding.clone(),
+        transfers,
+        Rc::new(
             crate::peer::PeerNetwork::new(
                 signers[0].node().clone(),
                 crate::control::snapshot::PublishedState::for_membership(membership.clone()),
             )
             .unwrap(),
-        ));
+        ),
+    );
     assert!(Arc::ptr_eq(requester.admission(), &adaptive));
     let mut request = crate::peer::tests::request(&admission, 91);
     let scope = RequestScope::new(
@@ -173,12 +174,12 @@ fn probe_exchange(opaque: bool, case: &str) {
     request.origin.scope = scope.clone();
     if case == "direct" {
         request.operation = crate::peer::wire::Operation::Page {
-            page: crate::model::identity::PageId {
-                version: crate::model::identity::ObjectVersion {
+            page: crate::model::PageId {
+                version: crate::model::ObjectVersion {
                     object: request.origin.object.clone(),
-                    etag: crate::model::identity::StrongEtag::test_value("hedge"),
+                    etag: crate::model::StrongEtag::test_value("hedge"),
                 },
-                number: crate::model::identity::PageNumber(0),
+                number: crate::model::PageNumber(0),
             },
             mode: crate::peer::wire::FetchMode::CopyOnly,
         };

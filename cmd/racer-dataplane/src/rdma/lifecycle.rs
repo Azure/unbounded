@@ -754,7 +754,7 @@ mod tests {
             metrics.clone(),
         )
         .unwrap();
-        let peer = crate::model::identity::NodeId("native-peer".into());
+        let peer = crate::model::NodeId("native-peer".into());
         let permit = admission.acquire(&peer).unwrap();
         let std::task::Poll::Ready(Ok(qp)) = QueuePairHandle::poll_new_admitted(
             Rc::new(DeviceHandle {
@@ -798,7 +798,7 @@ mod tests {
             metrics.clone(),
         )
         .unwrap();
-        let peer = crate::model::identity::NodeId("native-quarantine".into());
+        let peer = crate::model::NodeId("native-quarantine".into());
         let permit = admission.acquire(&peer).unwrap();
         let std::task::Poll::Ready(Ok(qp)) = QueuePairHandle::poll_new_admitted(
             Rc::new(DeviceHandle {

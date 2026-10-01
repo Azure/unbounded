@@ -80,13 +80,13 @@ fn observe_read(
 #[test]
 fn adaptive_socket_attribution_ignores_local_pressure_and_expired_scope() {
     let scope = RequestScope::new(
-        crate::model::identity::RequestId([91; 16]),
+        crate::model::RequestId([91; 16]),
         crate::runtime::environment::now() + std::time::Duration::from_secs(10),
     )
     .unwrap();
     let owner =
         super::adaptive::AdaptivePeers::new(Default::default(), Default::default()).unwrap();
-    let node = crate::model::identity::NodeId("peer".into());
+    let node = crate::model::NodeId("peer".into());
     let permit = Some(owner.acquire(&node).unwrap());
     let failed = Rc::new(std::cell::Cell::new(false));
     for error in [

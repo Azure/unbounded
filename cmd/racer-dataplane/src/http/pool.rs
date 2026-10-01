@@ -717,11 +717,11 @@ fn adaptive_checkout_attributes_actual_connect_completion_errno() {
             metrics.clone(),
         )
         .unwrap();
-        let node = crate::model::identity::NodeId("peer".into());
+        let node = crate::model::NodeId("peer".into());
         let permit = peers.acquire(&node).unwrap();
         let failure = Rc::new(std::cell::Cell::new(false));
         let scope = RequestScope::new(
-            crate::model::identity::RequestId([88; 16]),
+            crate::model::RequestId([88; 16]),
             crate::runtime::environment::now() + Duration::from_secs(5),
         )
         .unwrap();

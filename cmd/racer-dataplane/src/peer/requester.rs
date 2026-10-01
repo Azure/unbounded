@@ -16,7 +16,7 @@ pub trait PeerClient {
     fn direct_hedge_available(
         &self,
         _membership: &MembershipLease,
-        _destination: &crate::model::identity::NodeId,
+        _destination: &crate::model::NodeId,
     ) -> bool {
         false
     }
@@ -123,11 +123,9 @@ impl PeerClient for Requester {
     fn direct_hedge_available(
         &self,
         membership: &MembershipLease,
-        destination: &crate::model::identity::NodeId,
+        destination: &crate::model::NodeId,
     ) -> bool {
-        self.network
-            .as_ref()
-            .is_some_and(|n| n.endpoint(membership, destination).is_ok())
+        self.network.endpoint(membership, destination).is_ok()
             && self.health.available(destination).unwrap_or(false)
             && self
                 .paths
