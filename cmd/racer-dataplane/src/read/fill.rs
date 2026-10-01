@@ -263,8 +263,10 @@ impl Fill {
         reserve: impl Fn() -> Result<Reservation>,
     ) -> Result<Reservation> {
         let mut result = reserve();
-        // At most a cache-fairness pass and a global-deficit pass. No await allows
-        // new local charges to interleave; remote completions can only free bytes.
+        // At most two bounded scans, rechecking cache/global pressure each time.
+        // Zero released bytes does not mean exhaustion: the memory cursor may
+        // have crossed only busy or other-cache entries. No await allows new
+        // local charges to interleave; remote completions can only free bytes.
         for _ in 0..2 {
             if !matches!(result, Err(Error::Overloaded)) {
                 break;
@@ -276,23 +278,18 @@ impl Fill {
             else {
                 break;
             };
-            let mut released =
+            let released =
                 self.dependencies
                     .memory
                     .reclaim_idle(class, owner.as_ref(), bytes, |page| {
                         self.dependencies.writer.discard_idle_copy(page)
                     });
             if released < bytes && matches!(class, ResourceClass::Ciphertext) {
-                released = released.saturating_add(
-                    self.dependencies
-                        .writer
-                        .reclaim_ciphertext(owner.as_ref(), bytes - released),
-                );
+                self.dependencies
+                    .writer
+                    .reclaim_ciphertext(owner.as_ref(), bytes - released);
             }
             result = reserve();
-            if released == 0 {
-                break;
-            }
         }
         result
     }
