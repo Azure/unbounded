@@ -3,7 +3,7 @@
 //! Only readiness and trust-file reads use a test adapter; TLS, HTTP, enrollment,
 //! and wire decoding are production implementations.
 use racer_dataplane::{
-    control::{client::ControlEndpoint, enrollment::Enrollment, transport::*, wire},
+    control::{ControlEndpoint, enrollment::Enrollment, transport::*, wire},
     error::{Error, Operation},
     model::{ClusterId, RequestId},
     runtime::{deadline::RequestScope, reactor::Descriptor},

@@ -36,18 +36,9 @@ pub trait CacheTransition {
 pub trait CacheLifecycle {
     fn stage(&self, definitions: &[CacheDefinition]) -> Result<Box<dyn CacheTransition>>;
 }
+#[derive(Default)]
 pub struct CacheRegistry {
     current: RefCell<BTreeMap<CacheId, CacheDefinition>>,
-}
-// Preserve side-effect-free scaffold construction syntax.
-#[allow(non_upper_case_globals)]
-pub const CacheRegistry: CacheRegistry = CacheRegistry {
-    current: RefCell::new(BTreeMap::new()),
-};
-impl Default for CacheRegistry {
-    fn default() -> Self {
-        CacheRegistry
-    }
 }
 pub fn canonical_socket_paths(name: &str) -> Result<(PathBuf, PathBuf)> {
     if name.is_empty()
@@ -122,7 +113,7 @@ mod tests {
     use super::*;
     #[test]
     fn replacement_removes_before_add_and_invalid_update_is_atomic() {
-        let registry = CacheRegistry;
+        let registry = CacheRegistry::default();
         let mut defs =
             crate::control::wire::decode_publication(include_bytes!("testdata/publication.json"))
                 .unwrap()

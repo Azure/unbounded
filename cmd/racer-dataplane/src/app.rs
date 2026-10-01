@@ -16,8 +16,8 @@ use crate::{
     client::{listener::ClientListeners, request::RequestParser, response::Responses},
     config::Config,
     control::{
+        ControlClient, ControlEndpoint,
         caches::CacheRegistry,
-        client::{ControlClient, ControlEndpoint},
         enrollment::Enrollment,
         secrets::BundleInstaller,
         snapshot::{PublishedState, SnapshotStore},
@@ -394,7 +394,7 @@ fn bootstrap(
             node.publications.clone(),
             config.limits.retained_snapshots.get(),
         )),
-        Rc::new(CacheRegistry),
+        Rc::new(CacheRegistry::default()),
     );
     control.attach_io(io);
     let mut operation = Box::pin(async {
@@ -597,7 +597,7 @@ impl WorkerApplication {
             node.publications.clone(),
             config.limits.retained_snapshots.get(),
         ));
-        let caches = Rc::new(CacheRegistry);
+        let caches = Rc::new(CacheRegistry::default());
         let keys = Rc::new(Keyring::new(
             config.cluster.clone(),
             config.node.clone(),

@@ -1,5 +1,5 @@
 //! Nonblocking rustls over reactor-owned readiness. No executor or helper thread.
-use super::{client::ControlEndpoint, enrollment::LocalSigningIdentity, wire};
+use super::{ControlEndpoint, enrollment::LocalSigningIdentity, wire};
 use crate::runtime::reactor::Descriptor as OwnedFd;
 use crate::{
     error::{Error, Operation, Result},
