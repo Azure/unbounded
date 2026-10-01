@@ -556,6 +556,7 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
                 peer_endpoint: "127.0.0.1:8000".into(),
                 rails: vec![],
                 alignment_enabled: false,
+                site: String::new(),
             }],
         )
         .unwrap(),

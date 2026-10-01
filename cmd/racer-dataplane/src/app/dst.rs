@@ -1607,6 +1607,7 @@ fn member(config: &Config) -> crate::topology::membership::Member {
             vec![]
         },
         alignment_enabled: config.enable_rdma,
+        site: "site1".into(),
     }
 }
 #[derive(Clone, Copy)]

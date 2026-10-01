@@ -152,6 +152,7 @@ fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failure
                         peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
                         rails: vec![],
                         alignment_enabled: false,
+                        site: String::new(),
                     })
                     .collect(),
             )
@@ -408,6 +409,7 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
                     },
                     rails: vec![],
                     alignment_enabled: false,
+                    site: String::new(),
                 })
                 .collect(),
         )

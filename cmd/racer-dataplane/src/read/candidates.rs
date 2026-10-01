@@ -1284,6 +1284,7 @@ mod tests {
                         peer_endpoint: format!("127.0.0.1:{}", 8000 + n),
                         rails: vec![],
                         alignment_enabled: true,
+                        site: "site1".into(),
                     })
                     .collect(),
             )
@@ -1552,6 +1553,7 @@ mod tests {
                         peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
                         rails: vec![],
                         alignment_enabled: false,
+                        site: String::new(),
                     })
                     .collect(),
             )

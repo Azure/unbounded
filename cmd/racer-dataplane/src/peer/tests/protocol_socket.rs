@@ -378,6 +378,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
                     peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
                     rails: vec![],
                     alignment_enabled: false,
+                    site: String::new(),
                 })
                 .collect(),
         )
@@ -454,6 +455,7 @@ fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
                     peer_endpoint: format!("127.0.0.1:{}", 9000 + index),
                     rails: vec![],
                     alignment_enabled: false,
+                    site: String::new(),
                 })
                 .collect(),
         )
@@ -586,6 +588,7 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
                         peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
                         rails: vec![],
                         alignment_enabled: false,
+                        site: String::new(),
                     })
                     .collect(),
             )
@@ -687,6 +690,7 @@ fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction(
                     peer_endpoint: "127.0.0.1:7443".into(),
                     rails: vec![],
                     alignment_enabled: false,
+                    site: String::new(),
                 })
                 .collect(),
         )
@@ -809,6 +813,7 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
                     peer_endpoint: address.clone(),
                     rails: vec![],
                     alignment_enabled: false,
+                    site: String::new(),
                 })
                 .collect(),
         )
@@ -1020,6 +1025,7 @@ fn signed_tcp_case(case: &str) {
                     },
                     rails: vec![],
                     alignment_enabled: false,
+                    site: String::new(),
                 })
                 .collect(),
         )
@@ -1537,6 +1543,7 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
                     peer_endpoint: format!("127.0.0.1:{}", 8000 + index),
                     rails: vec![],
                     alignment_enabled: false,
+                    site: String::new(),
                 })
                 .collect(),
         )
@@ -1689,6 +1696,7 @@ mod established_sessions {
                             peer_endpoint: format!("127.0.0.1:{}", 9000 + i),
                             rails: vec![],
                             alignment_enabled: false,
+                            site: String::new(),
                         })
                         .collect(),
                 )

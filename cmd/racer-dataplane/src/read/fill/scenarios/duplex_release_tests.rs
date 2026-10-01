@@ -48,6 +48,7 @@ fn run(mode: &str) {
                 peer_endpoint: "127.0.0.1:8000".into(),
                 rails: vec![],
                 alignment_enabled: false,
+                site: String::new(),
             }],
         )
         .unwrap(),

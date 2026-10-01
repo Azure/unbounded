@@ -482,6 +482,7 @@ pub(super) fn publication(
             peer_endpoint: "127.0.0.1:7443".into(),
             rails: vec![],
             alignment_enabled: false,
+            site: String::new(),
         }],
         caches,
     }

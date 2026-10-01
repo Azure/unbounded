@@ -333,6 +333,8 @@ struct MemberDto {
     peer_endpoint: String,
     rails: Vec<Rail>,
     alignment_enabled: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    site: String,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Cache {
@@ -380,7 +382,10 @@ fn publication_from_dto(p: PublicationDto) -> Result<Publication> {
         }
         let endpoint: std::net::SocketAddr =
             m.peer_endpoint.parse().map_err(|_| Error::InvalidRequest)?;
-        if endpoint.port() == 0 || m.peer_endpoint.contains('%') {
+        if endpoint.port() == 0
+            || m.peer_endpoint.contains('%')
+            || !crate::topology::membership::valid_site(&m.site)
+        {
             return Err(Error::InvalidRequest);
         }
         let mut ids = HashSet::default();
@@ -402,6 +407,7 @@ fn publication_from_dto(p: PublicationDto) -> Result<Publication> {
             peer_endpoint: m.peer_endpoint,
             rails,
             alignment_enabled: m.alignment_enabled,
+            site: m.site,
         });
     }
     members.sort_by(|a, b| a.node.cmp(&b.node));
@@ -448,6 +454,7 @@ fn dto(p: &Publication) -> Result<PublicationDto> {
             peer_endpoint: m.peer_endpoint.clone(),
             rails,
             alignment_enabled: m.alignment_enabled,
+            site: m.site.clone(),
         });
     }
     members.sort_by(|a, b| a.node.cmp(&b.node));

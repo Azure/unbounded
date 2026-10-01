@@ -519,6 +519,7 @@ impl Rig {
                     peer_endpoint: "127.0.0.1:8000".into(),
                     rails: vec![],
                     alignment_enabled: false,
+                    site: String::new(),
                 }],
                 caches: vec![CacheDefinition {
                     id: CacheId(CACHE.into()),

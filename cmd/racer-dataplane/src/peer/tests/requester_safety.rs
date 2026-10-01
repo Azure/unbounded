@@ -54,6 +54,7 @@ fn page_hedge_does_not_treat_multihop_destination_as_independent_first_hop() {
                     peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
                     rails: vec![],
                     alignment_enabled: false,
+                    site: String::new(),
                 })
                 .collect(),
         )
@@ -137,6 +138,7 @@ fn probe_exchange(opaque: bool, case: &str) {
                     peer_endpoint: address.clone(),
                     rails: vec![],
                     alignment_enabled: false,
+                    site: String::new(),
                 })
                 .collect(),
         )

@@ -126,6 +126,7 @@ fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Ve
                     peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
                     rails: vec![],
                     alignment_enabled: false,
+                    site: String::new(),
                 })
                 .collect(),
         )

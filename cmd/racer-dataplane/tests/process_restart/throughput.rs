@@ -918,6 +918,7 @@ fn production_peer_and_failed_neighbor_progress() {
                 peer_endpoint: socket.local_addr().unwrap().to_string(),
                 rails: vec![],
                 alignment_enabled: false,
+                site: String::new(),
             })
             .collect();
         control.publication.lock().unwrap().members = members.clone();
@@ -1049,6 +1050,7 @@ fn production_remote_bootstrap_one_get_and_empty() {
                 peer_endpoint: socket.local_addr().unwrap().to_string(),
                 rails: vec![],
                 alignment_enabled: false,
+                site: String::new(),
             })
             .collect();
         control.publication.lock().unwrap().members = members.clone();

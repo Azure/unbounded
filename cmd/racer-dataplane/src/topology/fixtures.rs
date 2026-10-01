@@ -14,6 +14,7 @@ pub(super) fn member(index: usize, shares: u32) -> Member {
         peer_endpoint: "127.0.0.1:8080".into(),
         rails: vec![],
         alignment_enabled: true,
+        site: String::new(),
     }
 }
 

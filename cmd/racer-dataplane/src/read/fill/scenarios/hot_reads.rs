@@ -189,6 +189,7 @@ fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
                 peer_endpoint: "127.0.0.1:8000".into(),
                 rails: vec![],
                 alignment_enabled: false,
+                site: String::new(),
             }],
         )
         .unwrap(),
@@ -326,6 +327,7 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
                     peer_endpoint: "127.0.0.1:8000".into(),
                     rails: vec![],
                     alignment_enabled: false,
+                    site: String::new(),
                 }],
             )
             .unwrap(),
@@ -563,6 +565,7 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
                     },
                     rails: vec![],
                     alignment_enabled: false,
+                    site: String::new(),
                 })
                 .collect(),
         )

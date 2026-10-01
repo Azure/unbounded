@@ -160,6 +160,7 @@ fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
                 peer_endpoint: "127.0.0.1:8000".into(),
                 rails: vec![],
                 alignment_enabled: false,
+                site: String::new(),
             }],
         )
         .unwrap(),
@@ -309,6 +310,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
                 peer_endpoint: address.clone(),
                 rails: vec![],
                 alignment_enabled: false,
+                site: String::new(),
             })
             .collect(),
     };

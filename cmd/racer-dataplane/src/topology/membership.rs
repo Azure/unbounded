@@ -2,7 +2,7 @@
 //!
 //! Readiness never changes ownership. Exclusions, weights, additions, and deletions
 //! do. Retain bounded old snapshots until their in-flight leases are released.
-//! Endpoint/rail/alignment changes also advance membership version, but placement
+//! Endpoint/rail/alignment/Site changes also advance membership version, but placement
 //! depends only on node IDs and shares. All inputs are controller-accepted values.
 use super::rails::RailMapping;
 use crate::{
@@ -20,6 +20,7 @@ pub struct Member {
     pub peer_endpoint: String,
     pub rails: Vec<RailMapping>,
     pub alignment_enabled: bool,
+    pub site: String,
 }
 #[derive(Debug)]
 pub struct Membership {
@@ -43,7 +44,7 @@ impl Membership {
             return Err(Error::InvalidConfiguration);
         }
         for member in &mut members {
-            if !valid_identity(&member.node.0) {
+            if !valid_identity(&member.node.0) || !valid_site(&member.site) {
                 return Err(Error::InvalidConfiguration);
             }
             let endpoint: SocketAddr = member
@@ -96,6 +97,7 @@ impl Membership {
                 .map(|m| {
                     m.node.0.capacity()
                         + m.peer_endpoint.capacity()
+                        + m.site.capacity()
                         + m.rails.capacity() * std::mem::size_of::<RailMapping>()
                         + m.rails.iter().map(|r| r.fabric.capacity()).sum::<usize>()
                 })
@@ -174,6 +176,16 @@ impl Membership {
     }
 }
 
+pub(crate) fn valid_site(value: &str) -> bool {
+    value.is_empty()
+        || (value.len() <= 63
+            && value.as_bytes()[0].is_ascii_alphanumeric()
+            && value.as_bytes()[value.len() - 1].is_ascii_alphanumeric()
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')))
+}
+
 fn valid_identity(value: &str) -> bool {
     !value.is_empty() && value.len() <= 256 && value.bytes().all(|byte| byte.is_ascii_graphic())
 }
@@ -192,6 +204,26 @@ mod tests {
         fixtures::member,
         rails::{RailId, RailMapping},
     };
+
+    #[test]
+    fn site_label_grammar_and_retained_bytes() {
+        for site in ["", "A", "Site_1.west-2", &"a".repeat(63)] {
+            let mut node = member(0, 1);
+            node.site = site.into();
+            assert!(Membership::validate(MembershipVersion(1), vec![node]).is_ok());
+        }
+        for site in ["-a", "a-", ".a", "a_", "a/b", "a b", "é", &"a".repeat(64)] {
+            let mut node = member(0, 1);
+            node.site = site.into();
+            assert!(Membership::validate(MembershipVersion(1), vec![node]).is_err());
+        }
+        let original = Membership::validate(MembershipVersion(1), vec![member(0, 1)]).unwrap();
+        let mut node = member(0, 1);
+        node.site = "west".into();
+        let changed = Membership::validate(MembershipVersion(2), vec![node]).unwrap();
+        assert_eq!(changed.placement_identity(), original.placement_identity());
+        assert_eq!(changed.retained_bytes(), original.retained_bytes() + 4);
+    }
 
     #[test]
     fn validates_and_freezes_sorted_members() {

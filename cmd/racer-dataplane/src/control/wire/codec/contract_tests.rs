@@ -46,6 +46,36 @@ fn shared_publication_vectors() {
 }
 
 #[test]
+fn site_wire_defaults_validation_and_hashes() {
+    let mut p = decode_publication(&fixture("publication.json")).unwrap();
+    assert!(p.members.iter().all(|m| m.site.is_empty()));
+    let legacy = encode_publication(&p).unwrap();
+    assert!(
+        !String::from_utf8(legacy.clone())
+            .unwrap()
+            .contains("\"site\"")
+    );
+    let original = content_hashes(&p).unwrap();
+    for site in ["west", "Site_1.west-2", &"A".repeat(63)] {
+        p.members[0].site = site.into();
+        let encoded = encode_publication(&p).unwrap();
+        assert_eq!(decode_publication(&encoded).unwrap().members[0].site, site);
+        let changed = content_hashes(&p).unwrap();
+        assert_ne!(changed.0, original.0);
+        assert_ne!(changed.1, original.1);
+    }
+    for site in ["-a", "a-", "a_", ".a", "a/b", "é", &"a".repeat(64)] {
+        p.members[0].site = site.into();
+        assert_eq!(encode_publication(&p), Err(Error::InvalidRequest));
+        let mut json: Value = serde_json::from_slice(&legacy).unwrap();
+        json["members"][0]["site"] = site.into();
+        assert!(decode_publication(&serde_json::to_vec(&json).unwrap()).is_err());
+    }
+    p.members[0].site.clear();
+    assert_eq!(encode_publication(&p).unwrap(), legacy);
+}
+
+#[test]
 fn shared_bootstrap_and_bundle_vectors() {
     for name in [
         "bootstrap-request.json",
@@ -246,6 +276,7 @@ fn maximum_membership() {
             peer_endpoint: "192.0.2.1:1".into(),
             rails: vec![],
             alignment_enabled: false,
+            site: String::new(),
         })
         .collect();
     let b = encode_publication(&p).unwrap();

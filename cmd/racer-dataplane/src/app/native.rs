@@ -756,6 +756,7 @@ mod tests {
                         vec![]
                     },
                     alignment_enabled: aligned,
+                    site: "site1".into(),
                 }],
                 caches: vec![],
             })

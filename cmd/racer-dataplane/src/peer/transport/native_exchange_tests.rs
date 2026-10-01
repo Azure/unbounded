@@ -513,6 +513,7 @@ fn native_provider_signed_setup_grant_write_completion_roundtrip() {
                     peer_endpoint: format!("127.0.0.1:{}", 9000 + i),
                     rails: mappings.clone(),
                     alignment_enabled: true,
+                    site: "site1".into(),
                 })
                 .collect(),
         )

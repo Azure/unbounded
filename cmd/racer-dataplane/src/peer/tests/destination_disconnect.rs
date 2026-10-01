@@ -175,6 +175,7 @@ fn destination_exchange(order: CompletionOrder) {
                     peer_endpoint: format!("127.0.0.1:{}", 9000 + i),
                     rails: vec![],
                     alignment_enabled: false,
+                    site: String::new(),
                 })
                 .collect(),
         )
