@@ -83,7 +83,6 @@ struct Entry {
     waiter_cursor: u64,
     operations: HashMap<u64, Option<Retained>>,
     ciphertext: Option<UnverifiedPage>,
-    drain_waker: Option<Waker>,
     _reservation: Reservation,
 }
 struct WaiterRecord {
@@ -437,13 +436,6 @@ pub enum FlightState {
     Removed,
 }
 
-/// Non-cloneable observation of retained canceled/abandoned work. Dropping this
-/// ticket or its drain future leaves the worker responsible for reaping it.
-pub struct DrainTicket {
-    flights: Rc<Flights>,
-    fence: Fence,
-}
-
 impl AcquisitionWaiter<'_> {
     /// Independent deadline/cancellation. Lead is emitted once per election;
     /// retry elects only a still-live caller with remaining original credits.
@@ -575,9 +567,6 @@ impl CopyWaiter<'_> {
                 Poll::Pending
             })
         }))
-    }
-    pub fn detach(mut self) -> Result<FlightState> {
-        self.registration.detach()
     }
 }
 
@@ -754,7 +743,6 @@ impl Flights {
                         waiter_cursor: 0,
                         operations: HashMap::default(),
                         ciphertext: None,
-                        drain_waker: None,
                         _reservation: flight,
                     },
                 );
@@ -925,49 +913,6 @@ impl Flights {
         })
     }
 
-    /// Acquiring -> Draining. Revoke publication, request cancellation, and retain
-    /// all accepted operations/reservations until their actual completions. Token
-    /// drop, driver-future drop, and supplying-caller cancellation use this path.
-    /// The abandoned supplier becomes ineligible (Cancelled); independent callers
-    /// remain registered and can be elected only after the old generation drains.
-    pub fn abandon(&self, mut leader: FlightLeader) -> Result<DrainTicket> {
-        self.update(|table, wakes| {
-            let entry = self.leader_entry(table, &leader, wakes)?;
-            revoke(entry, Error::Cancelled, wakes);
-            leader.active = false;
-            Ok(DrainTicket {
-                flights: leader.flights.clone(),
-                fence: leader.fence.clone(),
-            })
-        })
-    }
-
-    /// Draining -> RetryPending (eligible live acquisition caller), Failed (only
-    /// copy waiters remain), or Removed (last waiter gone). Retain the page slot
-    /// while draining: a new join cannot start overlapping acquisition. The worker
-    /// drives completion accounting even if nobody polls this observation future.
-    pub fn finish_draining(&self, ticket: DrainTicket) -> Operation<'_, FlightState> {
-        Box::pin(poll_fn(move |cx| {
-            self.update(|table, wakes| {
-                if !Rc::ptr_eq(&self.owner, &ticket.flights.owner) {
-                    return Poll::Ready(Err(Error::StaleFlight));
-                }
-                let Some(entry) = table.entries.get_mut(&ticket.fence.page) else {
-                    return Poll::Ready(Ok(FlightState::Removed));
-                };
-                if let Err(error) = ticket.fence.validate(&entry.fence) {
-                    return Poll::Ready(Err(error));
-                }
-                refresh(entry, wakes);
-                if !matches!(entry.phase, Phase::Draining(_)) {
-                    return Poll::Ready(Ok(entry.phase.state()));
-                }
-                store_waker(&mut entry.drain_waker, cx);
-                Poll::Pending
-            })
-        }))
-    }
-
     /// I/O worker lifecycle hook, called even with no remaining request futures.
     /// Process detach/abandon notifications and already-reaped runtime completions,
     /// check their fences, wake/elect live callers, and remove quiescent entries.
@@ -1035,9 +980,6 @@ impl Flights {
                     }
                     refresh(entry, wakes);
                     if entry.waiters.is_empty() && entry.operations.is_empty() {
-                        if let Some(waker) = entry.drain_waker.take() {
-                            wakes.push(waker);
-                        }
                         table.entries.remove(&page);
                         table.sweep.remove(&id);
                     }
@@ -1150,17 +1092,14 @@ impl Flights {
             }
             Ok(())
         })?;
-        self.update(|table, wakes| {
+        self.update(|table, _wakes| {
             if table
                 .entries
                 .get(&fence.page)
                 .is_some_and(|entry| entry.waiters.is_empty() && entry.operations.is_empty())
             {
-                if let Some(mut entry) = table.entries.remove(&fence.page) {
+                if let Some(entry) = table.entries.remove(&fence.page) {
                     table.sweep.remove(&entry.fence.incarnation);
-                    if let Some(waker) = entry.drain_waker.take() {
-                        wakes.push(waker);
-                    }
                 }
             }
             Ok(())
@@ -1200,9 +1139,6 @@ fn notify(entry: &mut Entry, wakes: &mut Vec<Waker>) {
         if let Some(waker) = waiter.waker.take() {
             wakes.push(waker);
         }
-    }
-    if let Some(waker) = entry.drain_waker.take() {
-        wakes.push(waker);
     }
 }
 fn eligible(waiter: &WaiterRecord) -> bool {
@@ -1347,9 +1283,6 @@ impl Registration {
             }
             refresh(entry, wakes);
             if entry.waiters.is_empty() && entry.operations.is_empty() {
-                if let Some(waker) = entry.drain_waker.take() {
-                    wakes.push(waker);
-                }
                 table.entries.remove(&self.fence.page);
                 table.sweep.remove(&self.fence.incarnation);
                 if let Some(waker) = table.drain_waker.take() {

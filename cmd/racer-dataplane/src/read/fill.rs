@@ -1270,10 +1270,6 @@ impl Fill {
             Ok(()) | Err(Error::Overloaded | Error::Unavailable | Error::MissingKey) => {}
             Err(error) => return Err(error),
         }
-        self.dependencies
-            .metadata_owner
-            .subscriptions
-            .resident(result.plaintext.page().clone());
         // A descriptor catalog is an optimization. Every retained page owns its
         // immutable descriptor even when the catalog mailbox/capacity is saturated.
         match self

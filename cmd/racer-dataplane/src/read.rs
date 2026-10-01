@@ -109,22 +109,11 @@ impl Coordinator {
         let attempt = envelope.attempt;
         self.credentials.open_charged(envelope, request, attempt)
     }
-    /// Explicit original-budget entry point for callers with tighter admission
-    /// policies. Ownership passes to a returned body without creating new credits.
-    pub fn read_with_budget<'a>(
-        &'a self,
-        request: ClientRequest,
-        scope: &'a RequestScope,
-        budget: AcquisitionBudget,
-    ) -> Operation<'a, ReadResponse> {
-        self.read_budgeted(request, scope, budget, false)
-    }
     fn read_budgeted<'a>(
         &'a self,
         request: ClientRequest,
         scope: &'a RequestScope,
         mut budget: AcquisitionBudget,
-        client_pages: bool,
     ) -> Operation<'a, ReadResponse> {
         Box::pin(async move {
             scope.check()?;
@@ -168,24 +157,13 @@ impl Coordinator {
                     }
                     let range =
                         resolve_range(range.unwrap_or(ByteRange::From(0)), metadata.length)?;
-                    let mut body = if client_pages {
-                        self.streams.open(
-                            metadata.clone(),
-                            range,
-                            origin,
-                            membership,
-                            scope.clone(),
-                        )?
-                    } else {
-                        self.streams.open_with_budget(
-                            metadata.clone(),
-                            range,
-                            origin,
-                            membership,
-                            scope.clone(),
-                            budget,
-                        )?
-                    };
+                    let mut body = self.streams.open(
+                        metadata.clone(),
+                        range,
+                        origin,
+                        membership,
+                        scope.clone(),
+                    )?;
                     body.configure_subscription(page_credits, byte_credits, ordered)?;
                     Ok(ReadResponse {
                         metadata,
@@ -224,7 +202,7 @@ impl ReadService for Coordinator {
         request: ClientRequest,
         scope: &'a RequestScope,
     ) -> Operation<'a, ReadResponse> {
-        self.read_budgeted(request, scope, default_budget(scope), true)
+        self.read_budgeted(request, scope, default_budget(scope))
     }
 }
 impl LocalPageService for Coordinator {

@@ -16,8 +16,6 @@ struct Demand {
     next: u64,
     end: u64,
     selected: BTreeSet<u64>,
-    queued: VecDeque<PageNumber>,
-    pending: BTreeSet<PageNumber>,
     credits: Credits,
     turn: bool,
     gate_ticket: Option<u64>,
@@ -31,8 +29,6 @@ struct State {
     fixed: BTreeMap<ObjectVersion, usize>,
     sequence: u64,
     demands: BTreeMap<u64, Demand>,
-    pending: BTreeMap<PageId, usize>,
-    resident: VecDeque<PageId>,
 }
 pub(crate) struct Scheduler {
     capacity: usize,
@@ -96,8 +92,6 @@ impl Scheduler {
                 fixed: BTreeMap::new(),
                 sequence: 0,
                 demands: BTreeMap::new(),
-                pending: BTreeMap::new(),
-                resident: VecDeque::new(),
             }),
         })
     }
@@ -126,8 +120,6 @@ impl Scheduler {
                 next: range.first_page().0,
                 end: range.last_page().0 + 1,
                 selected: BTreeSet::new(),
-                queued: VecDeque::new(),
-                pending: BTreeSet::new(),
                 credits,
                 turn: false,
                 gate_ticket: None,
@@ -137,19 +129,6 @@ impl Scheduler {
             scheduler: self.clone(),
             id,
         })
-    }
-    /// A bounded hint only. The stable page owner still validates every acquisition.
-    /// Publication never retains payloads or caller context in the scheduler.
-    pub(crate) fn resident(&self, page: PageId) {
-        let mut state = self.state.lock().unwrap();
-        self.note_resident(&mut state, page);
-    }
-    fn note_resident(&self, state: &mut State, page: PageId) {
-        state.resident.retain(|p| p != &page);
-        state.resident.push_back(page);
-        while state.resident.len() > self.capacity.saturating_mul(64) {
-            state.resident.pop_front();
-        }
     }
 }
 pub(crate) struct DemandLease {
@@ -351,110 +330,6 @@ impl DemandLease {
             demand,
         })))
     }
-    /// Select from the entire compact demand, not a consumer sliding window.
-    /// At most 64 holes and 64 outstanding assignments per subscriber are retained.
-    /// Every other assignment advances its oldest head, even under hot-page load.
-    #[cfg(test)]
-    pub(crate) fn select(&mut self) -> Option<PageNumber> {
-        let mut state = self.scheduler.state.lock().unwrap();
-        if let Some(number) = state.demands.get_mut(&self.id)?.queued.pop_front() {
-            return Some(number);
-        }
-        let demand = state.demands.get(&self.id)?;
-        if demand.next == demand.end || !demand.eligible(demand.next) {
-            return None;
-        }
-        let mut number = demand.next;
-        if !demand.credits.ordered && demand.turn {
-            let mut best = (0, 0, 0);
-            // Candidate state is bounded by admitted subscribers, never object size.
-            // Hot and in-flight pages may be arbitrarily far from the ordered head.
-            for candidate in state
-                .resident
-                .iter()
-                .chain(state.pending.keys())
-                .filter(|p| p.version == demand.version)
-                .map(|p| p.number.0)
-                .chain(
-                    state
-                        .demands
-                        .values()
-                        .filter(|d| d.version == demand.version)
-                        .map(|d| d.next),
-                )
-            {
-                if !demand.eligible(candidate) {
-                    continue;
-                }
-                let page = PageId {
-                    version: demand.version.clone(),
-                    number: PageNumber(candidate),
-                };
-                let shared = state
-                    .demands
-                    .values()
-                    .filter(|other| other.version == demand.version && other.eligible(candidate))
-                    .count();
-                let score = (
-                    usize::from(state.resident.contains(&page)),
-                    usize::from(state.pending.contains_key(&page)),
-                    shared,
-                );
-                if score > best {
-                    best = score;
-                    number = candidate;
-                }
-            }
-        }
-        let page = PageId {
-            version: demand.version.clone(),
-            number: PageNumber(number),
-        };
-        // Fan out the same assignment to every capacity-bearing eligible subscriber.
-        // Each one subsequently enters Fill with its OWN request context and budget.
-        let mut assigned = 0;
-        for demand in state.demands.values_mut() {
-            if demand.version != page.version || !demand.eligible(number) {
-                continue;
-            }
-            let length = demand
-                .range
-                .slice_at(page.number)
-                .expect("eligible assignment has a valid slice")
-                .expect("eligible assignment is inside demand")
-                .length;
-            demand
-                .credits
-                .reserve(page.number, length)
-                .expect("eligibility reserved exact capacity under the same lock");
-            demand.turn = !demand.turn;
-            demand.selected.insert(number);
-            while demand.selected.remove(&demand.next) {
-                demand.next += 1;
-            }
-            demand.pending.insert(page.number);
-            demand.queued.push_back(page.number);
-            assigned += 1;
-        }
-        *state.pending.entry(page).or_default() += assigned;
-        state.demands.get_mut(&self.id)?.queued.pop_front()
-    }
-    #[cfg(test)]
-    pub(crate) fn completed(&mut self, number: PageNumber) {
-        let mut state = self.scheduler.state.lock().unwrap();
-        let Some(demand) = state.demands.get_mut(&self.id) else {
-            return;
-        };
-        if !demand.pending.remove(&number) {
-            return;
-        }
-        let page = PageId {
-            version: demand.version.clone(),
-            number,
-        };
-        remove_pending(&mut state, &page);
-        self.scheduler.note_resident(&mut state, page);
-    }
     pub(crate) fn issued(&mut self, number: PageNumber) -> Result<()> {
         self.scheduler
             .state
@@ -485,13 +360,7 @@ impl DemandLease {
     pub(crate) fn exhausted(&self) -> bool {
         let state = self.scheduler.state.lock().unwrap();
         let demand = &state.demands[&self.id];
-        demand.next == demand.end && demand.queued.is_empty()
-    }
-    #[cfg(test)]
-    pub(crate) fn ready_to_select(&self) -> bool {
-        let state = self.scheduler.state.lock().unwrap();
-        let demand = &state.demands[&self.id];
-        !demand.queued.is_empty() || demand.eligible(demand.next)
+        demand.next == demand.end
     }
 }
 impl State {
@@ -564,27 +433,10 @@ impl Demand {
             .is_some_and(|slice| self.credits.can_reserve(slice.length))
     }
 }
-fn remove_pending(state: &mut State, page: &PageId) {
-    if let Some(count) = state.pending.get_mut(page) {
-        *count -= 1;
-        if *count == 0 {
-            state.pending.remove(page);
-        }
-    }
-}
 impl Drop for DemandLease {
     fn drop(&mut self) {
         let mut state = self.scheduler.state.lock().unwrap();
         if let Some(demand) = state.demands.remove(&self.id) {
-            for number in demand.pending {
-                remove_pending(
-                    &mut state,
-                    &PageId {
-                        version: demand.version.clone(),
-                        number,
-                    },
-                );
-            }
             // A canceled waiter must not strand the next ticket. Wake outside
             // the lock; accepted work still owns its separate completion guard.
             let wake = state
@@ -657,9 +509,10 @@ impl Credits {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::model::{ByteRange, CacheId, CacheKey, ObjectId, StrongEtag};
+    use std::task::{Context, Poll};
     fn version() -> ObjectVersion {
         ObjectVersion {
             object: ObjectId {
@@ -668,6 +521,49 @@ mod tests {
             },
             etag: StrongEtag::test_value("v1"),
         }
+    }
+
+    pub(crate) fn ordered(reader: &mut DemandLease) -> Option<PageNumber> {
+        match reader.poll_ordered(&mut Context::from_waker(futures::task::noop_waker_ref())) {
+            Poll::Ready(Ok(Some((page, guard)))) => {
+                drop(guard);
+                Some(page)
+            }
+            Poll::Ready(Ok(None)) | Poll::Pending => None,
+            Poll::Ready(Err(error)) => panic!("ordered assignment: {error:?}"),
+        }
+    }
+
+    pub(crate) fn selection(reader: &mut DemandLease) -> Selection {
+        match reader.poll_next(&mut Context::from_waker(futures::task::noop_waker_ref())) {
+            Poll::Ready(Ok(Next::Select(selection))) => selection,
+            _ => panic!("expected provider selection"),
+        }
+    }
+
+    pub(crate) fn selected(reader: &mut DemandLease) -> Option<PageNumber> {
+        match reader.poll_next(&mut Context::from_waker(futures::task::noop_waker_ref())) {
+            Poll::Ready(Ok(Next::Page(page))) => Some(page.plaintext.page().number),
+            Poll::Pending | Poll::Ready(Ok(Next::End)) => None,
+            _ => panic!("expected completed provider page"),
+        }
+    }
+
+    fn complete(selection: Selection, number: u64, length: u64) {
+        let metadata = crate::model::ObjectMetadata {
+            version: selection.version.clone(),
+            length,
+            content_type: None,
+            expires_at: crate::model::ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
+        };
+        let admission = crate::runtime::admission::Admission::new(
+            crate::test_support::cluster::config(false).limits,
+        );
+        selection
+            .complete(super::super::range_stream::tests::page_result(
+                &admission, &metadata, number,
+            ))
+            .unwrap();
     }
 
     #[test]
@@ -1028,11 +924,10 @@ mod tests {
             scheduler.register(version(), range, 2, 2 * PAGE_BYTES, true),
             Err(Error::Overloaded)
         ));
-        assert_eq!(first.select(), Some(PageNumber(0)));
-        assert_eq!(first.select(), Some(PageNumber(1)));
-        first.completed(PageNumber(1));
-        assert_eq!(second.select(), Some(PageNumber(0)));
-        assert_eq!(second.select(), Some(PageNumber(1)));
+        assert_eq!(ordered(&mut first), Some(PageNumber(0)));
+        assert_eq!(ordered(&mut first), Some(PageNumber(1)));
+        assert_eq!(ordered(&mut second), Some(PageNumber(0)));
+        assert_eq!(ordered(&mut second), Some(PageNumber(1)));
         let state = scheduler.state.lock().unwrap();
         assert_eq!(state.demands.len(), 2);
         assert!(
@@ -1046,31 +941,24 @@ mod tests {
         drop(second);
         let state = scheduler.state.lock().unwrap();
         assert!(state.demands.is_empty());
-        assert!(state.pending.is_empty());
+        assert!(state.fixed.is_empty());
     }
     #[test]
-    fn unordered_ranks_recent_verified_pages_but_alternates_head_progress() {
+    fn unordered_provider_can_select_distant_pages_but_alternates_head_progress() {
         let scheduler = Scheduler::new(2);
         let range = ByteRange::From(0).resolve(100 * PAGE_BYTES).unwrap();
-        let mut hot = scheduler
-            .register(
-                version(),
-                ByteRange::From(5 * PAGE_BYTES)
-                    .resolve(100 * PAGE_BYTES)
-                    .unwrap(),
-                2,
-                2 * PAGE_BYTES,
-                true,
-            )
-            .unwrap();
-        assert_eq!(hot.select(), Some(PageNumber(5)));
-        hot.completed(PageNumber(5));
         let mut reader = scheduler
             .register(version(), range, 3, 3 * PAGE_BYTES, false)
             .unwrap();
-        assert_eq!(reader.select(), Some(PageNumber(0)));
-        assert_eq!(reader.select(), Some(PageNumber(5)));
-        assert_eq!(reader.select(), Some(PageNumber(1)));
+        for number in [0, 5, 1] {
+            let choice = selection(&mut reader);
+            assert!(choice.demand.contains(number));
+            if number != 5 {
+                assert_eq!(choice.demand.page_count(), 1);
+            }
+            complete(choice, number, range.end());
+            assert_eq!(selected(&mut reader), Some(PageNumber(number)));
+        }
     }
 
     #[test]
@@ -1091,38 +979,36 @@ mod tests {
         let other = scheduler
             .register(other_version, range, 2, 2 * PAGE_BYTES, false)
             .unwrap();
-        assert_eq!(first.select(), Some(PageNumber(0)));
-        scheduler.resident(PageId {
-            version: version(),
-            number: PageNumber(900_000),
-        });
-        assert_eq!(first.select(), Some(PageNumber(900_000)));
-        assert_eq!(second.select(), Some(PageNumber(0)));
-        assert_eq!(second.select(), Some(PageNumber(900_000)));
-        assert_eq!(slow.select(), Some(PageNumber(0)));
-        assert_eq!(slow.select(), None);
-        assert!(!slow.ready_to_select());
+        complete(selection(&mut first), 0, range.end());
+        assert_eq!(selected(&mut first), Some(PageNumber(0)));
+        complete(selection(&mut first), 900_000, range.end());
+        assert_eq!(selected(&mut first), Some(PageNumber(900_000)));
+        assert_eq!(selected(&mut second), Some(PageNumber(0)));
+        assert_eq!(selected(&mut second), Some(PageNumber(900_000)));
+        assert_eq!(selected(&mut slow), Some(PageNumber(0)));
+        assert_eq!(selected(&mut slow), None);
         assert!(!slow.exhausted());
         assert!(
             scheduler.state.lock().unwrap().demands[&other.id]
-                .queued
+                .results
                 .is_empty()
         );
-        first.completed(PageNumber(0));
         first.issued(PageNumber(0)).unwrap();
         first.release(PageNumber(0), PAGE_BYTES as u32).unwrap();
+        let choice = selection(&mut first);
         assert_eq!(
-            first.select(),
-            Some(PageNumber(1)),
-            "head progress despite hot demand"
+            choice.demand.intervals(),
+            &[crate::peer::subscriptions::PageInterval { start: 1, end: 2 }]
         );
+        complete(choice, 1, range.end());
+        assert_eq!(selected(&mut first), Some(PageNumber(1)));
         assert_eq!(
-            slow.select(),
+            selected(&mut slow),
             None,
             "slow subscriber reserves no additional work"
         );
         drop((first, second, slow, other));
-        assert!(scheduler.state.lock().unwrap().pending.is_empty());
+        assert!(scheduler.state.lock().unwrap().demands.is_empty());
     }
 
     #[test]
@@ -1134,22 +1020,24 @@ mod tests {
             .unwrap();
         let mut seen = BTreeSet::new();
         for turn in 0..1000 {
-            scheduler.resident(PageId {
-                version: version(),
-                number: PageNumber(900_000 + turn),
-            });
-            let number = reader.select().unwrap();
+            let choice = selection(&mut reader);
+            let hot = 900_000 + turn;
+            let number = if choice.demand.contains(hot) {
+                hot
+            } else {
+                choice.demand.intervals()[0].start
+            };
+            complete(choice, number, range.end());
+            let number = selected(&mut reader).unwrap();
             assert!(seen.insert(number));
-            reader.completed(number);
             reader.issued(number).unwrap();
             reader.release(number, PAGE_BYTES as u32).unwrap();
             let state = scheduler.state.lock().unwrap();
             let demand = &state.demands[&reader.id];
             assert!(demand.selected.len() <= 64);
-            assert!(demand.pending.is_empty());
+            assert!(demand.results.is_empty());
             assert!(demand.credits.outstanding.is_empty());
-            assert!(state.resident.len() <= 64);
-            assert!(state.pending.is_empty());
+            assert!(state.selecting.is_empty());
         }
         assert!(scheduler.state.lock().unwrap().demands[&reader.id].next >= 500);
     }
@@ -1163,23 +1051,22 @@ mod tests {
         let mut reader = scheduler
             .register(version(), range, 2, PAGE_BYTES, true)
             .unwrap();
-        assert_eq!(reader.select(), Some(PageNumber(0)));
-        assert_eq!(reader.select(), Some(PageNumber(1)));
+        assert_eq!(ordered(&mut reader), Some(PageNumber(0)));
+        assert_eq!(ordered(&mut reader), Some(PageNumber(1)));
         assert!(reader.exhausted());
-        assert_eq!(reader.select(), None);
+        assert_eq!(ordered(&mut reader), None);
         assert_eq!(
             scheduler.state.lock().unwrap().demands[&reader.id]
                 .credits
                 .used,
             8
         );
-        reader.completed(PageNumber(0));
         reader.issued(PageNumber(0)).unwrap();
         assert_eq!(reader.release(PageNumber(0), 5), Err(Error::InvalidRequest));
         reader.release(PageNumber(0), 3).unwrap();
         assert_eq!(reader.release(PageNumber(0), 3), Err(Error::InvalidRequest));
         drop(reader);
-        assert!(scheduler.state.lock().unwrap().pending.is_empty());
+        assert!(scheduler.state.lock().unwrap().demands.is_empty());
     }
 
     #[test]
@@ -1198,23 +1085,28 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(supplier.select(), Some(PageNumber(800_000)));
+        let pending = selection(&mut supplier);
         let mut reader = scheduler
             .register(version(), range, 2, 2 * PAGE_BYTES, false)
             .unwrap();
-        assert_eq!(reader.select(), Some(PageNumber(0)));
-        assert_eq!(reader.select(), Some(PageNumber(800_000)));
+        assert_eq!(selected(&mut reader), None);
+        complete(pending, 800_000, length);
+        assert_eq!(selected(&mut supplier), Some(PageNumber(800_000)));
+        complete(selection(&mut reader), 0, length);
+        assert_eq!(selected(&mut reader), Some(PageNumber(0)));
+        complete(selection(&mut reader), 800_000, length);
+        assert_eq!(selected(&mut reader), Some(PageNumber(800_000)));
         let page = PageId {
             version: version(),
             number: PageNumber(800_000),
         };
-        assert_eq!(scheduler.state.lock().unwrap().pending[&page], 2);
+        assert_eq!(scheduler.state.lock().unwrap().demands.len(), 2);
         drop(supplier);
-        assert_eq!(scheduler.state.lock().unwrap().pending[&page], 1);
-        reader.completed(page.number);
+        assert_eq!(scheduler.state.lock().unwrap().demands.len(), 1);
         reader.issued(page.number).unwrap();
         reader.release(page.number, PAGE_BYTES as u32).unwrap();
-        assert_eq!(reader.select(), Some(PageNumber(1)));
+        complete(selection(&mut reader), 1, length);
+        assert_eq!(selected(&mut reader), Some(PageNumber(1)));
     }
 
     #[test]

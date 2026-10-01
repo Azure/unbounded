@@ -139,26 +139,6 @@ impl RangeStreams {
         };
         self.open_budget(metadata, range, context, membership, scope, budget)
     }
-    /// The original aggregate budget belongs to the stream, with no retry/fanout reset.
-    #[allow(clippy::too_many_arguments)]
-    pub fn open_with_budget(
-        &self,
-        metadata: ObjectMetadata,
-        range: ResolvedRange,
-        context: OriginContext,
-        membership: MembershipLease,
-        scope: RequestScope,
-        budget: AcquisitionBudget,
-    ) -> Result<RangeStream> {
-        self.open_budget(
-            metadata,
-            range,
-            context,
-            membership,
-            scope,
-            RangeBudget::Shared(budget),
-        )
-    }
     #[allow(clippy::too_many_arguments)]
     fn open_budget(
         &self,
@@ -659,7 +639,7 @@ fn validate_pin(expected: &ObjectMetadata, actual: &ObjectMetadata) -> Result<()
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::model::{
         ByteRange, CacheId, CacheKey, ExpiresAt, ObjectId, ObjectVersion, PAGE_BYTES, StrongEtag,
@@ -670,7 +650,7 @@ mod tests {
         };
         (budget.remaining_attempts(), budget.remaining_links())
     }
-    fn page_result(
+    pub(crate) fn page_result(
         admission: &crate::runtime::admission::Admission,
         metadata: &ObjectMetadata,
         number: u64,
@@ -777,8 +757,10 @@ mod tests {
         // Injected ready pages still need the scheduler's exact credit reservations.
         let demand = stream.subscription.as_mut().unwrap();
         for number in 0..2 {
-            assert_eq!(demand.select(), Some(PageNumber(number)));
-            demand.completed(PageNumber(number));
+            assert_eq!(
+                super::super::subscription::tests::ordered(demand),
+                Some(PageNumber(number))
+            );
         }
         for number in 0..2 {
             let reader = futures::executor::block_on(stream.next_slice())
@@ -878,8 +860,20 @@ mod tests {
                 stream.next_page = None;
                 let demand = stream.subscription.as_mut().unwrap();
                 for number in 0..2 {
-                    assert_eq!(demand.select(), Some(PageNumber(number)));
-                    demand.completed(PageNumber(number));
+                    if ordered {
+                        assert_eq!(
+                            super::super::subscription::tests::ordered(demand),
+                            Some(PageNumber(number))
+                        );
+                    } else {
+                        super::super::subscription::tests::selection(demand)
+                            .complete(page_result(&admission, &metadata, number))
+                            .unwrap();
+                        assert_eq!(
+                            super::super::subscription::tests::selected(demand),
+                            Some(PageNumber(number))
+                        );
+                    }
                 }
                 if !ordered {
                     let (_, WindowPage::Ready(Ok(result))) = stream.ready.pop_front().unwrap()
@@ -966,7 +960,7 @@ mod tests {
             crate::test_support::cluster::config(false).limits,
         ));
         let reactor = Rc::new(Reactor::new(admission.clone()));
-        let pipes = Rc::new(PipePool::new(admission, reactor));
+        let pipes = Rc::new(PipePool::new(admission.clone(), reactor));
         let directory = Arc::new(
             WorkerDirectory::new(
                 Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
@@ -1000,8 +994,13 @@ mod tests {
         stream.configure_subscription(1, PAGE_BYTES, false).unwrap();
         // Model a delivered page still owned by a slow caller.
         let demand = stream.subscription.as_mut().unwrap();
-        assert_eq!(demand.select(), Some(PageNumber(0)));
-        demand.completed(PageNumber(0));
+        super::super::subscription::tests::selection(demand)
+            .complete(page_result(&admission, &metadata, 0))
+            .unwrap();
+        assert_eq!(
+            super::super::subscription::tests::selected(demand),
+            Some(PageNumber(0))
+        );
         demand.issued(PageNumber(0)).unwrap();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(stream.next_slice().as_mut().poll(&mut cx).is_pending());

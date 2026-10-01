@@ -478,19 +478,6 @@ impl WorkerDirectory {
         completion.value
     }
 
-    pub fn resolve_metadata<'a>(
-        &'a self,
-        selector: MetadataSelector,
-        membership: MembershipLease,
-        context: &'a OriginContext,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, ObjectMetadata> {
-        Box::pin(async move {
-            let mut budget = super::default_budget(scope);
-            self.resolve_with_budget(selector, membership, context, scope, &mut budget)
-                .await
-        })
-    }
     pub fn resolve_with_budget<'a>(
         &'a self,
         selector: MetadataSelector,

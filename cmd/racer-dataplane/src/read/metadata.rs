@@ -923,15 +923,7 @@ fn validate_metadata(
     selector: &MetadataSelector,
     metadata: &ObjectMetadata,
 ) -> Result<()> {
-    if &metadata.version.object != object {
-        return Err(Error::CorruptRecord);
-    }
-    if let MetadataSelector::Pinned(etag) = selector {
-        if &metadata.version.etag != etag {
-            return Err(Error::VersionUnavailable);
-        }
-    }
-    Ok(())
+    super::validate_metadata(metadata, object, selector)
 }
 
 fn validate_bootstrap_metadata(expected: &ObjectMetadata, actual: &ObjectMetadata) -> Result<()> {

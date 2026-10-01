@@ -112,25 +112,15 @@ impl DriverQueue {
         };
         drivers.extend(self.new.borrow_mut().drain(..).map(|operation| Driver {
             operation,
-            wake: Arc::new(Runnable {
-                ready: AtomicBool::new(true),
-                owner: futures::task::AtomicWaker::new(),
-            }),
+            wake: Runnable::new(),
         }));
         for _ in 0..budget.min(drivers.len()) {
             let Some(mut driver) = drivers.pop_front() else {
                 break;
             };
-            driver.wake.owner.register(cx.waker());
-            if !driver.wake.ready.swap(false, Ordering::AcqRel) {
-                drivers.push_back(driver);
-                continue;
-            }
-            let waker = Waker::from(driver.wake.clone());
             match driver
-                .operation
-                .as_mut()
-                .poll(&mut Context::from_waker(&waker))
+                .wake
+                .poll(std::pin::Pin::new(&mut driver.operation), cx, false)
             {
                 Poll::Ready(_) => self.count.set(self.count.get() - 1),
                 Poll::Pending => drivers.push_back(driver),

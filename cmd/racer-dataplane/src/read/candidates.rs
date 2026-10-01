@@ -387,15 +387,6 @@ impl CandidatePolicy {
     pub fn maintain(&self, membership: &MembershipLease) -> Result<()> {
         self.placement.maintain(membership)
     }
-    pub fn candidates_async<'a>(
-        &'a self,
-        membership: MembershipLease,
-        object: &ObjectId,
-        page: PageNumber,
-    ) -> Operation<'a, Candidates> {
-        self.placement.rank_async(membership, object, page)
-    }
-
     pub fn candidates_scoped<'a>(
         &'a self,
         membership: MembershipLease,
@@ -429,29 +420,13 @@ impl CandidatePolicy {
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
     ) -> Operation<'a, CandidateResolution> {
-        self.resolve_validated(candidates, context, operation, scope, budget, |response| {
-            Box::pin(async move { Ok(response) })
-        })
-    }
-
-    /// Validate a copy before accepting its source. The same ranked loop retains
-    /// predecessor evidence and spent credits across failed content validation.
-    pub(crate) fn resolve_validated<'a, T: 'a>(
-        &'a self,
-        candidates: Candidates,
-        context: &'a OriginContext,
-        operation: PeerOperation,
-        scope: &'a RequestScope,
-        budget: &'a mut AcquisitionBudget,
-        validate: impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a,
-    ) -> Operation<'a, CandidateResolution<T>> {
         self.resolve_epoch(
             candidates,
             context,
             operation,
             scope,
             budget,
-            validate,
+            |response| Box::pin(async move { Ok(response) }),
             false,
             HedgeContinuation::default(),
         )

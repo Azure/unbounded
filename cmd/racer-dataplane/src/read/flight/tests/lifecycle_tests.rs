@@ -444,8 +444,12 @@ fn abandoned_drain_observer_and_expired_shutdown_cannot_release_work() {
     let mut a = join(&flights, &context, &scope, &mut a_budget);
     let leader = lead(&mut a);
     let operation = flights.retain_operation(&leader, ()).unwrap();
-    let ticket = flights.abandon(leader).unwrap();
-    assert!(poll(flights.finish_draining(ticket)).is_pending());
+    drop(leader);
+    assert!(operation.cancellation_requested());
+    assert!(matches!(
+        flights.table.borrow().entries[&fence().page].phase,
+        Phase::Draining(_)
+    ));
     let expired = RequestScope::new(crate::model::RequestId([1; 16]), Instant::now()).unwrap();
     assert!(matches!(
         poll(flights.drain(&expired)),
