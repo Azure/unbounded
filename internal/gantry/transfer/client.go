@@ -5,7 +5,6 @@ package transfer
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -16,8 +15,6 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/net/http2"
-
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/oci"
@@ -25,7 +22,7 @@ import (
 )
 
 // Client implements ifaces.PeerDialer over HTTP/2 cleartext (h2c).
-// Reuse a single Client across all peers - the underlying http2.Transport
+// Reuse a single Client across all peers - the underlying http.Transport
 // pools per-host connections internally.
 type Client struct {
 	hc          *http.Client
@@ -79,16 +76,19 @@ func NewClient(opts ...ClientOption) *Client {
 		fn(&o)
 	}
 
-	tr := &http2.Transport{
-		// AllowHTTP permits HTTP/2 over plain-text http URLs.
-		AllowHTTP: true,
-		// DialTLSContext is reused for non-TLS dials when AllowHTTP is true.
-		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+	protocols := new(http.Protocols)
+	protocols.SetUnencryptedHTTP2(true)
+
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			d := &net.Dialer{Timeout: o.dialTimeout}
 			return d.DialContext(ctx, network, addr)
 		},
-		ReadIdleTimeout:  o.readIdleTimeout,
-		MaxReadFrameSize: peerMaxReadFrameSize,
+		Protocols: protocols,
+		HTTP2: &http.HTTP2Config{
+			SendPingTimeout:  o.readIdleTimeout,
+			MaxReadFrameSize: peerMaxReadFrameSize,
+		},
 	}
 
 	return &Client{
