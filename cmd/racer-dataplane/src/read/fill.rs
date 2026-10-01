@@ -1341,7 +1341,7 @@ fn validate_copy(copy: &crate::memory::page::CiphertextCopy, page: &PageId) -> R
 }
 fn merge_metadata(
     found: &mut Option<VersionMetadata>,
-    mut descriptor: VersionMetadata,
+    descriptor: VersionMetadata,
     version: &crate::model::ObjectVersion,
 ) -> Result<()> {
     if &descriptor.version != version
@@ -1350,9 +1350,6 @@ fn merge_metadata(
             .is_some_and(|old| !old.compatible(&descriptor))
     {
         return Err(Error::CorruptRecord);
-    }
-    if descriptor.content_type.is_none() {
-        descriptor.content_type = found.as_ref().and_then(|old| old.content_type.clone());
     }
     *found = Some(descriptor);
     Ok(())

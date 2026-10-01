@@ -72,7 +72,7 @@ mod tests {
         let installer = BundleInstaller::new(keys.clone());
         let (ca, _) = testing::ca();
         let mut bundle = wire::decode_bundle(include_bytes!("testdata/bundle.json")).unwrap();
-        bundle.generation = BundleGeneration(1);
+        bundle.generation = BundleGeneration(2);
         bundle.peer_trust_roots = vec![ca.der().to_vec()];
         // The shared fixture repeats material across purposes. Keep only page keys,
         // since production security correctly rejects cross-purpose key reuse.
@@ -81,14 +81,14 @@ mod tests {
         for _ in 0..2 {
             assert_eq!(
                 installer.install(bundle.clone()).unwrap().0,
-                BundleGeneration(1)
+                BundleGeneration(2)
             );
             assert!(keys.active(&cache, KeyPurpose::Page).is_ok());
         }
         assert!(wire::decode_bundle(b"{}").is_err());
         bundle.generation = BundleGeneration(0);
         assert!(installer.install(bundle).is_err());
-        assert_eq!(installer.generation(), Some(BundleGeneration(1)));
+        assert_eq!(installer.generation(), Some(BundleGeneration(2)));
         assert!(keys.active(&cache, KeyPurpose::Page).is_ok());
     }
 

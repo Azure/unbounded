@@ -316,8 +316,8 @@ fn bootstrap_after_catalog_eviction_checks_cached_content_type_and_preserves_fre
         for (cached_type, fresh_type, conflict) in [
             (Some("text/plain"), Some("text/html"), true),
             (Some("text/html"), Some("text/plain"), true),
-            (Some("text/plain"), None, false),
-            (None, Some("text/plain"), false),
+            (Some("text/plain"), None, true),
+            (None, Some("text/plain"), true),
             (Some("text/plain"), Some("text/plain"), false),
             (None, None, false),
         ] {
@@ -425,10 +425,7 @@ fn bootstrap_after_catalog_eviction_checks_cached_content_type_and_preserves_fre
                 else {
                     panic!("nonempty bootstrap")
                 };
-                let expected = fresh
-                    .content_type
-                    .clone()
-                    .or_else(|| cached.metadata.content_type.clone());
+                let expected = fresh.content_type.clone();
                 assert_eq!(metadata.content_type, expected);
                 assert_eq!(metadata.expires_at, fresh.expires_at);
                 assert_eq!(ciphertext.envelope().page.version, metadata.version);

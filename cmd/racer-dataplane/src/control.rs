@@ -1202,17 +1202,17 @@ mod tests {
         let (ca, _) = testing::ca();
         let mut bundle =
             wire::decode_bundle(include_bytes!("control/testdata/bundle.json")).unwrap();
-        bundle.generation.0 = 1;
+        bundle.generation.0 = 2;
         bundle.peer_trust_roots = vec![ca.der().to_vec()];
         // Production rejects material reuse across independent key purposes.
         bundle.cache_keys[2].material = [2; 32];
         assert_eq!(
             client.secrets.install(bundle.clone()).unwrap().0,
-            wire::BundleGeneration(1)
+            wire::BundleGeneration(2)
         );
         assert_eq!(
             client.secrets.install(bundle.clone()).unwrap().0,
-            wire::BundleGeneration(1)
+            wire::BundleGeneration(2)
         );
         bundle.cache_keys[0].material = [3; 32];
         assert!(matches!(
@@ -1227,13 +1227,13 @@ mod tests {
                         body: b"{}".to_vec(),
                         retry_after: None
                     },
-                    Some(wire::BundleGeneration(1))
+                    Some(wire::BundleGeneration(2))
                 )
                 .is_err()
         );
         bundle.generation = wire::BundleGeneration(0);
         assert!(client.secrets.install(bundle.clone()).is_err());
-        assert_eq!(client.secrets.generation(), Some(wire::BundleGeneration(1)));
+        assert_eq!(client.secrets.generation(), Some(wire::BundleGeneration(2)));
         assert!(
             client
                 .keys
