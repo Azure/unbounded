@@ -24,7 +24,6 @@ import (
 	"k8s.io/klog/v2"
 
 	unboundedv1alpha3 "github.com/Azure/unbounded/api/machina/v1alpha3"
-	unboundednetv1alpha1 "github.com/Azure/unbounded/api/net/v1alpha1"
 	unboundednet "github.com/Azure/unbounded/internal/net/client/unboundednet"
 	"github.com/Azure/unbounded/internal/unbounded"
 )
@@ -449,8 +448,7 @@ func buildNodeAdmissionPatch(podCIDR string, podCIDRs []string, siteName string)
 	}
 
 	if siteName != "" {
-		// Dual-write the canonical (unbounded-cloud.io/site) and deprecated
-		// (net.unbounded-cloud.io/site) keys during the deprecation window.
+		// Publish only the canonical site-membership label.
 		for _, key := range nodeSiteLabelKeys() {
 			patches = append(patches,
 				map[string]interface{}{"op": "add", "path": "/metadata/labels/" + escapeJSONPointer(key), "value": siteName},
@@ -465,7 +463,7 @@ func buildNodeAdmissionPatch(podCIDR string, podCIDRs []string, siteName string)
 
 // nodeSiteLabelKeys are the node site-membership label keys, canonical first.
 func nodeSiteLabelKeys() []string {
-	return []string{unboundedv1alpha3.MachineSiteLabelKey, unboundednetv1alpha1.SiteLabelKey}
+	return []string{unboundedv1alpha3.MachineSiteLabelKey}
 }
 
 // escapeJSONPointer escapes a string for use in a JSON Pointer path segment

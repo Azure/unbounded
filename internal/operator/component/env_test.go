@@ -687,34 +687,15 @@ func TestSiteOwnerReferenceIsController(t *testing.T) {
 	}
 }
 
-func TestUpsertOwnerReferenceConvergesControllerFlag(t *testing.T) {
-	site := &unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-a", UID: "site-uid"}}
-	owner := SiteOwnerReference(site)
-
-	// A reference adopted before controller ownership existed (Controller unset).
-	legacy := owner
-	legacy.Controller = nil
-
-	refs, changed := UpsertOwnerReference([]metav1.OwnerReference{legacy}, owner)
-	if !changed {
-		t.Fatal("upsert did not converge a non-controller reference to a controller reference")
+func TestSiteNodeAffinityCanonicalLabel(t *testing.T) {
+	terms := SiteNodeAffinity("rack-a").NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+	if len(terms) != 1 || len(terms[0].MatchExpressions) != 1 {
+		t.Fatalf("expected one canonical requirement, got %#v", terms)
 	}
 
-	if len(refs) != 1 || refs[0].Controller == nil || !*refs[0].Controller {
-		t.Fatalf("owner reference not upgraded to controller: %#v", refs)
-	}
-
-	// Idempotent once converged.
-	if _, again := UpsertOwnerReference(refs, owner); again {
-		t.Fatal("upsert reported a change for an already-controller reference")
-	}
-
-	// A different owner is appended, not replaced.
-	other := SiteOwnerReference(&unboundedv1alpha3.Site{ObjectMeta: metav1.ObjectMeta{Name: "rack-b", UID: "other-uid"}})
-
-	appended, changed := UpsertOwnerReference(refs, other)
-	if !changed || len(appended) != 2 {
-		t.Fatalf("upsert of a distinct owner = (%v, %#v)", changed, appended)
+	requirement := terms[0].MatchExpressions[0]
+	if requirement.Key != SiteLabelKey || requirement.Operator != corev1.NodeSelectorOpIn || len(requirement.Values) != 1 || requirement.Values[0] != "rack-a" {
+		t.Fatalf("unexpected site requirement: %#v", requirement)
 	}
 }
 

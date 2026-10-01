@@ -759,7 +759,7 @@ the node agent.
 
 | Label | Applied To | Description |
 |-------|-----------|-------------|
-| `unbounded-cloud.io/site` | Node | Site membership. Set by Site controller. Supersedes the deprecated `net.unbounded-cloud.io/site` (still written during the deprecation window). |
+| `unbounded-cloud.io/site` | Node | Canonical site membership. Set by Site controller. The old `net.unbounded-cloud.io/site` key is not read or written. |
 | `app.kubernetes.io/name: unbounded-net` | CRDs | Identifies unbounded-net resources. |
 
 ### Annotations

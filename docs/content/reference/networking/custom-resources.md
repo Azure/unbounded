@@ -410,7 +410,7 @@ deterministic name order and the first profile is kept.
 
 | Label | Applied To | Description |
 |-------|-----------|-------------|
-| `unbounded-cloud.io/site` | Node | Site membership (set by controller). Supersedes the deprecated `net.unbounded-cloud.io/site`, which the controller still writes alongside it during the deprecation window. |
+| `unbounded-cloud.io/site` | Node | Canonical site membership (set by controller). The old `net.unbounded-cloud.io/site` key is not read or written. |
 
 ### Annotations
 

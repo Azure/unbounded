@@ -66,11 +66,10 @@ Nodes in different Sites, or nodes without a Site, use HTTP. A multi-hop route
 can mix transports: for `A → B → C`, if A and B belong to one Site and C belongs
 to another, A-B can use RDMA while B-C uses HTTP.
 
-Racer reads `unbounded-cloud.io/site` from each Node, falling back to the
-deprecated `net.unbounded-cloud.io/site` when the canonical value is empty.
-There is no separate Racer fabric-ID annotation. Both labels must be removed
-or emptied to clear membership when the deprecated label is still present.
-The networking controller manages these labels from Site configuration.
+Site membership uses only `unbounded-cloud.io/site` on each Node. There is no
+separate Racer fabric-ID annotation. Removing or emptying the canonical label
+clears membership; the old `net.unbounded-cloud.io/site` label is not supported.
+The networking controller manages the canonical label from Site configuration.
 
 Site membership is necessary but not sufficient for RDMA: existing RDMA
 enablement, aligned rail mappings, matching per-rail fabric labels, and local

@@ -42,15 +42,8 @@ import (
 
 const (
 	// canonicalSiteLabelKey is the canonical site-membership label the
-	// controller applies to Nodes (shared with the Machine site label). It
-	// supersedes deprecatedSiteLabelKey.
+	// controller applies to Nodes (shared with the Machine site label).
 	canonicalSiteLabelKey = unboundedv1alpha3.MachineSiteLabelKey
-
-	// deprecatedSiteLabelKey is the pre-rename site label. During the
-	// deprecation window the controller dual-writes it alongside the canonical
-	// label and falls back to reading it, so in-flight upgrades and older
-	// consumers keep working. A future release removes it.
-	deprecatedSiteLabelKey = unboundednetv1alpha1.SiteLabelKey
 
 	// WireGuardPubKeyAnnotation is the annotation key for a node's WireGuard public key
 	WireGuardPubKeyAnnotation = "net.unbounded-cloud.io/wg-pubkey"
@@ -81,18 +74,6 @@ var siteNodeSliceGVR = schema.GroupVersionResource{
 	Group:    "net.unbounded-cloud.io",
 	Version:  "v1alpha1",
 	Resource: "sitenodeslices",
-}
-
-// legacySiteGVR is the pre-migration net-group Site resource. During the
-// unbounded-system migration a SiteNodeSlice may still reference a Site that
-// has not yet been translated into the machina group (siteGVR); that Site
-// continues to exist here until the operator's reaper deletes the legacy CRD.
-// Orphan cleanup consults this group so it never deletes a live site's slices
-// mid-migration.
-var legacySiteGVR = schema.GroupVersionResource{
-	Group:    "net.unbounded-cloud.io",
-	Version:  "v1alpha1",
-	Resource: "sites",
 }
 
 var gatewayPoolGVRSite = schema.GroupVersionResource{
@@ -1274,9 +1255,8 @@ func (sc *SiteController) cleanupOrphanSiteNodeSlices(ctx context.Context) error
 	}
 
 	// Establish that the Site source is healthy and populated before concluding
-	// that any slice is orphaned. A failed or empty live Site listing (Sites not
-	// yet translated into the machina group during the unbounded-system
-	// migration, or the Site CRD briefly unavailable) must never be read as
+	// that any slice is orphaned. A failed or empty live Site listing (for
+	// example, the Site CRD briefly unavailable) must never be read as
 	// "every Site was deleted": doing so would delete every SiteNodeSlice
 	// cluster-wide and tear down all inter-node tunnels. Legitimate whole-Site
 	// deletion is handled by owner-reference garbage collection, so skipping
@@ -1333,26 +1313,10 @@ func (sc *SiteController) cleanupOrphanSiteNodeSlices(ctx context.Context) error
 			if _, live := liveSiteNames[siteName]; live {
 				continue
 			}
-
-			// Migration guard: the Site may not have been translated into the
-			// machina group yet while its legacy net-group Site still exists.
-			// Such a slice is not an orphan; deleting it would tear down a live
-			// site's tunnels mid-migration. Only a Site absent from BOTH groups
-			// is genuinely gone.
-			legacyPresent, err := sc.legacySiteExists(ctx, siteName)
-			if err != nil {
-				cleanupErrors = append(cleanupErrors, fmt.Errorf("check legacy site %s for slice %s: %w", siteName, name, err))
-
-				continue
-			}
-
-			if legacyPresent {
-				continue
-			}
 		}
 
 		// Either the slice carries no siteName (it can never be reconciled) or
-		// its Site is absent from both the machina and legacy groups. The Site
+		// its Site is absent from the canonical group. The Site
 		// source is confirmed healthy and non-empty, so this is a genuine orphan.
 		if err := deleteLiveSiteNodeSlice(ctx, resource, liveSlice); err != nil && !apierrors.IsNotFound(err) {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("delete orphan slice %s: %w", name, err))
@@ -1360,24 +1324,6 @@ func (sc *SiteController) cleanupOrphanSiteNodeSlices(ctx context.Context) error
 	}
 
 	return errors.Join(cleanupErrors...)
-}
-
-// legacySiteExists reports whether a pre-migration net-group Site with the given
-// name still exists. It lets orphan cleanup avoid deleting SiteNodeSlices for
-// Sites that have not yet been translated into the machina group during the
-// unbounded-system migration. A missing legacy Site object, or a legacy Site CRD
-// that has already been reaped (its API path returns NotFound), both report
-// false.
-func (sc *SiteController) legacySiteExists(ctx context.Context, name string) (bool, error) {
-	_, err := sc.dynamicClient.Resource(legacySiteGVR).Get(ctx, name, metav1.GetOptions{})
-	switch {
-	case err == nil:
-		return true, nil
-	case apierrors.IsNotFound(err):
-		return false, nil
-	default:
-		return false, fmt.Errorf("get legacy site %s: %w", name, err)
-	}
 }
 
 func deleteLiveSiteNodeSlice(ctx context.Context, resource dynamic.ResourceInterface, liveSlice *unstructured.Unstructured) error {
@@ -2154,8 +2100,7 @@ func (sc *SiteController) patchNodeCIDRs(ctx context.Context, nodeName, podCIDR 
 
 // patchNodeLabelAndCIDRs applies both a site label and pod CIDRs in a single
 // MergePatch to cut the number of API calls in half during scale-in. It sets
-// every site-membership label key (canonical + deprecated) during the
-// deprecation window.
+// the canonical site-membership label key.
 func (sc *SiteController) patchNodeLabelAndCIDRs(ctx context.Context, nodeName, siteName, podCIDR string, podCIDRs []string) error {
 	labels := map[string]interface{}{}
 	for _, key := range siteLabelKeys() {
@@ -2403,15 +2348,12 @@ func (sc *SiteController) GetSiteForNode(node *corev1.Node) string {
 
 // Helper functions
 
-// siteLabelKeys are the node site-membership label keys in priority order:
-// canonical first, deprecated fallback.
+// siteLabelKeys are the node site-membership label keys.
 func siteLabelKeys() []string {
-	return []string{canonicalSiteLabelKey, deprecatedSiteLabelKey}
+	return []string{canonicalSiteLabelKey}
 }
 
-// NodeSiteLabel returns the site a Node belongs to, preferring the canonical
-// label (unbounded-cloud.io/site) and falling back to the deprecated
-// net.unbounded-cloud.io/site.
+// NodeSiteLabel returns the site a Node belongs to using unbounded-cloud.io/site.
 func NodeSiteLabel(node *corev1.Node) string {
 	if node.Labels == nil {
 		return ""
@@ -2427,9 +2369,7 @@ func NodeSiteLabel(node *corev1.Node) string {
 }
 
 // nodeSiteLabelsCurrent reports whether the Node already carries siteName under
-// every site-membership key (or, when siteName is empty, carries none). It
-// drives dual-write so a Node labeled only with the deprecated key by an older
-// controller is converged to also carry the canonical key.
+// the canonical site-membership key (or, when siteName is empty, carries none).
 func nodeSiteLabelsCurrent(node *corev1.Node, siteName string) bool {
 	if siteName == "" {
 		return NodeSiteLabel(node) == ""
