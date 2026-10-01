@@ -163,7 +163,7 @@ fn fixture_with_availability(
     let worker = WorkerId(0);
     let admission = Rc::new(Admission::new(config.limits.clone()));
     let keys = Rc::new(crate::security::identity::keyring_tests::keys());
-    let availability = crate::control::availability::for_caches(
+    let availability = crate::control::state::for_caches(
         keys.clone(),
         vec![CacheId(crate::security::identity::tests::CACHE.into())],
     );
@@ -290,7 +290,7 @@ fn fixture_with_availability(
         if check_availability {
             availability
         } else {
-            crate::control::availability::Availability::permissive_for_tests()
+            crate::control::state::Availability::permissive_for_tests()
         },
     ));
     let fill = Fill::new(FillDependencies {
@@ -348,7 +348,7 @@ fn adapter_client(
     adapter: &crate::test_support::origin::AdapterOrigin,
 ) -> Rc<crate::origin::OriginClient> {
     use crate::control::{
-        snapshot::{PublishedState, SnapshotStore},
+        state::{PublishedState, SnapshotStore},
         wire::{Publication, PublicationSequence, SCHEMA_VERSION},
     };
     let snapshots = Rc::new(SnapshotStore::new(
@@ -357,7 +357,7 @@ fn adapter_client(
         2,
     ));
     let (client_socket, origin_socket) =
-        crate::control::caches::canonical_socket_paths("fixture").unwrap();
+        crate::control::state::canonical_socket_paths("fixture").unwrap();
     snapshots
         .publish(Publication {
             schema_version: SCHEMA_VERSION,
@@ -365,7 +365,7 @@ fn adapter_client(
             sequence: PublicationSequence(1),
             membership_version: f.membership.version,
             members: f.membership.members().to_vec(),
-            caches: vec![crate::control::caches::CacheDefinition {
+            caches: vec![crate::control::state::CacheDefinition {
                 id: f.context.object.cache.clone(),
                 name: "fixture".into(),
                 client_socket,
@@ -1005,8 +1005,8 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
         use crate::{
             client::{ClientRequest, ReadKind},
             control::{
-                caches::CacheDefinition,
-                snapshot::{PublishedState, SnapshotStore},
+                state::CacheDefinition,
+                state::{PublishedState, SnapshotStore},
                 wire::*,
             },
             memory::{delivery::Delivery, pipe::PipePool},
@@ -1023,7 +1023,7 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
             2,
         ));
         let (client_socket, origin_socket) =
-            crate::control::caches::canonical_socket_paths("rotation").unwrap();
+            crate::control::state::canonical_socket_paths("rotation").unwrap();
         snapshots
             .publish(Publication {
                 schema_version: SCHEMA_VERSION,
@@ -1068,7 +1068,7 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
             fill.clone(),
             streams,
             fill.dependencies.credentials.clone(),
-            crate::control::availability::Availability::permissive_for_tests(),
+            crate::control::state::Availability::permissive_for_tests(),
         ));
         let mut endpoint = owners.install(WorkerId(0), coordinator.clone()).unwrap();
         for ordered in [false, true] {

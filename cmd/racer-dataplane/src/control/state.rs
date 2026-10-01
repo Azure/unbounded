@@ -1,15 +1,20 @@
 //! Validate and atomically publish complete immutable state; retain last good state.
-use super::{
-    caches::CacheDefinition,
-    wire::{Publication, PublicationSequence},
-};
+use super::wire::{Publication, PublicationSequence};
 use crate::{
     error::{Error, Result},
-    model::{ClusterId, MembershipVersion},
+    model::{CacheId, ClusterId, KeyId, MembershipVersion},
+    runtime::collections::HashSet,
+    security::identity::{KeyPurpose, Keyring},
     topology::membership::{Membership, MembershipLease},
 };
 use sha2::{Digest, Sha256};
-use std::sync::{Arc, Mutex, Weak};
+use std::{
+    cell::RefCell,
+    collections::BTreeMap,
+    path::PathBuf,
+    rc::Rc,
+    sync::{Arc, Mutex, Weak},
+};
 pub struct Snapshot {
     pub cluster: ClusterId,
     pub sequence: PublicationSequence,
@@ -157,7 +162,7 @@ impl SnapshotStore {
     pub fn publish_staged(
         &self,
         publication: Publication,
-        transition: Option<Box<dyn super::caches::CacheTransition>>,
+        transition: Option<Box<dyn CacheTransition>>,
     ) -> Result<SnapshotLease> {
         let prepared = self.prepare(publication)?;
         self.publish_prepared(&prepared, transition)
@@ -232,7 +237,7 @@ impl SnapshotStore {
     pub fn publish_prepared(
         &self,
         prepared: &PreparedPublication,
-        transition: Option<Box<dyn super::caches::CacheTransition>>,
+        transition: Option<Box<dyn CacheTransition>>,
     ) -> Result<SnapshotLease> {
         let mut state = self
             .published
@@ -328,6 +333,199 @@ impl SnapshotStore {
         Ok(next)
     }
 }
+/// Cache definitions and lifecycle events. Removal closes new admission while
+/// accepted socket, key, and I/O owners drain independently.
+///
+/// Socket paths are fixed: /run/racer/<cache name>/client/socket and
+/// /run/racer/<cache name>/origin/socket. Separate endpoint directories let pods
+/// mount only the endpoint authorized by a future admission controller. The
+/// dataplane owns the client listener; the application adapter owns the origin
+/// listener. Never unlink an adapter-owned origin socket during cache removal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CacheDefinition {
+    pub id: CacheId,
+    /// ClusterCache name, distinct from its UID and one safe path component.
+    pub name: String,
+    /// Must equal /run/racer/<name>/client/socket, not an arbitrary supplied path.
+    pub client_socket: PathBuf,
+    /// Must equal /run/racer/<name>/origin/socket, not an arbitrary supplied path.
+    pub origin_socket: PathBuf,
+}
+pub enum CacheEvent {
+    Add(CacheDefinition),
+    Update(CacheDefinition),
+    Remove(CacheId),
+}
+/// A sole owner stages all listener/resource changes before publication. Dropping
+/// an uncommitted transition must undo preparation. Commit cannot fail; removal
+/// stops admission and arranges drain/fences before releasing old resources.
+pub trait CacheTransition {
+    fn commit(self: Box<Self>);
+}
+#[derive(Default)]
+pub struct CacheRegistry {
+    current: RefCell<BTreeMap<CacheId, CacheDefinition>>,
+}
+pub fn canonical_socket_paths(name: &str) -> Result<(PathBuf, PathBuf)> {
+    if name.is_empty()
+        || name.len() > 253
+        || !name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label.bytes().enumerate().all(|(i, b)| {
+                    b.is_ascii_lowercase()
+                        || b.is_ascii_digit()
+                        || b == b'-' && i != 0 && i + 1 != label.len()
+                })
+        })
+    {
+        return Err(Error::InvalidRequest);
+    }
+    let client = format!("/run/racer/{name}/client/socket");
+    let origin = format!("/run/racer/{name}/origin/socket");
+    if client.len() > 107 || origin.len() > 107 {
+        return Err(Error::InvalidRequest);
+    }
+    Ok((client.into(), origin.into()))
+}
+pub fn validate_definitions(definitions: &[CacheDefinition]) -> Result<()> {
+    let mut ids = HashSet::default();
+    let mut names = HashSet::default();
+    for d in definitions {
+        if !super::wire::valid_uuid(&d.id.0) || !ids.insert(&d.id) || !names.insert(&d.name) {
+            return Err(Error::InvalidRequest);
+        }
+        let (client, origin) = canonical_socket_paths(&d.name)?;
+        // Path equality normalizes separators; the wire requires exact strings.
+        if d.client_socket.as_os_str() != client.as_os_str()
+            || d.origin_socket.as_os_str() != origin.as_os_str()
+        {
+            return Err(Error::InvalidRequest);
+        }
+    }
+    Ok(())
+}
+impl CacheRegistry {
+    /// Reject unsafe/duplicate names, noncanonical paths, and socket paths exceeding
+    /// the platform UDS limit. Validate before filesystem access; prevent symlink
+    /// traversal outside the endpoint directories during socket lifecycle work.
+    pub fn reconcile(&self, definitions: &[CacheDefinition]) -> Result<Vec<CacheEvent>> {
+        validate_definitions(definitions)?;
+        let next: BTreeMap<_, _> = definitions
+            .iter()
+            .map(|d| (d.id.clone(), d.clone()))
+            .collect();
+        let mut current = self.current.borrow_mut();
+        let mut events = Vec::new();
+        // Removals precede additions, including replacement of a reused cache name.
+        for id in current.keys() {
+            if !next.contains_key(id) {
+                events.push(CacheEvent::Remove(id.clone()));
+            }
+        }
+        for (id, d) in &next {
+            match current.get(id) {
+                None => events.push(CacheEvent::Add(d.clone())),
+                Some(old) if old != d => events.push(CacheEvent::Update(d.clone())),
+                _ => (),
+            }
+        }
+        *current = next;
+        Ok(events)
+    }
+}
+
+/// Current positive admission set, shared by cache lookups and late publications.
+/// No removal history is needed: an absent UID/key is a miss. Reintroducing a UID
+/// denotes the same immutable namespace; a different namespace requires a new UID.
+pub struct Availability {
+    publications: Arc<PublishedState>,
+    keys: Rc<Keyring>,
+    #[cfg(test)]
+    permissive: bool,
+}
+impl Availability {
+    pub fn new(publications: Arc<PublishedState>, keys: Rc<Keyring>) -> Self {
+        Self {
+            publications,
+            keys,
+            #[cfg(test)]
+            permissive: false,
+        }
+    }
+    /// Isolated state-machine tests explicitly opt out of control-plane admission.
+    #[cfg(test)]
+    pub(crate) fn permissive_for_tests() -> Rc<Self> {
+        Rc::new(Self {
+            publications: Arc::new(PublishedState::default()),
+            keys: Rc::new(crate::security::identity::keyring_tests::keys()),
+            permissive: true,
+        })
+    }
+    pub fn cache(&self, cache: &CacheId) -> bool {
+        #[cfg(test)]
+        if self.permissive {
+            return true;
+        }
+        self.publications
+            .current()
+            .is_ok_and(|s| s.caches.iter().any(|c| &c.id == cache))
+    }
+    pub fn metadata(&self, cache: &CacheId) -> bool {
+        #[cfg(test)]
+        if self.permissive {
+            return true;
+        }
+        self.cache(cache) && self.keys.active(cache, KeyPurpose::Page).is_ok()
+    }
+    pub fn page(&self, cache: &CacheId, key: KeyId) -> bool {
+        #[cfg(test)]
+        if self.permissive {
+            return true;
+        }
+        self.cache(cache) && self.keys.lease(Some(cache), key, KeyPurpose::Page).is_ok()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn for_caches(keys: Rc<Keyring>, caches: Vec<CacheId>) -> Rc<Availability> {
+    use super::wire::*;
+    let publications = Arc::new(PublishedState::default());
+    SnapshotStore::new(keys.cluster().clone(), publications.clone(), 1)
+        .publish(Publication {
+            schema_version: SCHEMA_VERSION,
+            cluster: keys.cluster().clone(),
+            sequence: PublicationSequence(1),
+            membership_version: crate::model::MembershipVersion(1),
+            members: vec![crate::topology::membership::Member {
+                node: keys.node().clone(),
+                shares: std::num::NonZeroU32::new(1).unwrap(),
+                peer_endpoint: "127.0.0.1:7443".into(),
+                rails: vec![],
+                alignment_enabled: false,
+                site: String::new(),
+            }],
+            caches: caches
+                .into_iter()
+                .enumerate()
+                .map(|(i, id)| {
+                    let name = format!("rotation-{i}");
+                    let (client_socket, origin_socket) = canonical_socket_paths(&name).unwrap();
+                    CacheDefinition {
+                        id,
+                        name,
+                        client_socket,
+                        origin_socket,
+                    }
+                })
+                .collect(),
+        })
+        .unwrap();
+    Rc::new(Availability::new(publications, keys))
+}
+
+#[cfg(test)]
+mod cache_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,7 +694,7 @@ mod tests {
     #[test]
     fn staged_resources_commit_only_on_accepted_replacement() {
         struct Transition(std::rc::Rc<std::cell::Cell<usize>>);
-        impl super::super::caches::CacheTransition for Transition {
+        impl CacheTransition for Transition {
             fn commit(self: Box<Self>) {
                 self.0.set(self.0.get() + 1);
             }

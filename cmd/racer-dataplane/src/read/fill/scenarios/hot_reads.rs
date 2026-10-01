@@ -5,7 +5,7 @@ use super::*;
 use crate::{
     client::{ClientRequest, ReadKind},
     control::{
-        snapshot::{PublishedState, SnapshotStore},
+        state::{PublishedState, SnapshotStore},
         wire::*,
     },
     http::{Codec, connection::HttpIo},
@@ -125,7 +125,7 @@ fn coordinator(
         2,
     ));
     let (client_socket, origin_socket) =
-        crate::control::caches::canonical_socket_paths("hot-read").unwrap();
+        crate::control::state::canonical_socket_paths("hot-read").unwrap();
     snapshots
         .publish(Publication {
             schema_version: SCHEMA_VERSION,
@@ -133,7 +133,7 @@ fn coordinator(
             sequence: PublicationSequence(1),
             membership_version: membership.version,
             members: membership.members().to_vec(),
-            caches: vec![crate::control::caches::CacheDefinition {
+            caches: vec![crate::control::state::CacheDefinition {
                 id: f.context.object.cache.clone(),
                 name: "hot-read".into(),
                 client_socket,
@@ -179,7 +179,7 @@ fn coordinator(
         fill.clone(),
         streams,
         fill.dependencies.credentials.clone(),
-        crate::control::availability::Availability::permissive_for_tests(),
+        crate::control::state::Availability::permissive_for_tests(),
     ));
     let endpoint = owners.install(WorkerId(0), local.clone()).unwrap();
     (local, endpoint, published)

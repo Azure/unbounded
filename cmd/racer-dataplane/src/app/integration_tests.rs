@@ -534,7 +534,7 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
     let diagnostic_address = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     config.diagnostics_listen = diagnostic_address.local_addr().unwrap();
     drop(diagnostic_address);
-    let keep = crate::control::caches::CacheDefinition {
+    let keep = crate::control::state::CacheDefinition {
         id: CacheId("44444444-4444-4444-8444-444444444444".into()),
         name: "keep".into(),
         client_socket: "/run/racer/keep/client/socket".into(),

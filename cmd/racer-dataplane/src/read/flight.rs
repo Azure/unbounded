@@ -38,7 +38,7 @@ use std::{
 
 pub struct Flights {
     admission: Rc<Admission>,
-    availability: Rc<crate::control::availability::Availability>,
+    availability: Rc<crate::control::state::Availability>,
     owner: Rc<()>,
     limits: FlightLimits,
     table: RefCell<Table>,
@@ -584,7 +584,7 @@ impl CopyWaiter<'_> {
 impl Flights {
     pub fn new(
         admission: Rc<Admission>,
-        availability: Rc<crate::control::availability::Availability>,
+        availability: Rc<crate::control::state::Availability>,
     ) -> Self {
         let limits = FlightLimits {
             entries: admission.limits().flights.get(),
@@ -603,7 +603,7 @@ impl Flights {
 
     pub fn with_limits(
         admission: Rc<Admission>,
-        availability: Rc<crate::control::availability::Availability>,
+        availability: Rc<crate::control::state::Availability>,
         limits: FlightLimits,
     ) -> Result<Self> {
         if limits.entries == 0

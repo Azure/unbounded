@@ -1526,7 +1526,7 @@ fn raw_uds_sequential_requests_do_not_inherit_opaque_context() {
 
 #[test]
 fn cache_names_validate_dns_labels_and_complete_socket_path() {
-    use racer_dataplane::control::caches::canonical_socket_paths;
+    use racer_dataplane::control::state::canonical_socket_paths;
     for name in ["a", "a-b.c9", "0"] {
         assert!(canonical_socket_paths(name).is_ok());
     }

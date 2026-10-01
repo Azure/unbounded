@@ -1,5 +1,5 @@
 //! Bounded HTTPS/JSON v1 and keyring bundle DTOs.
-use super::caches::CacheDefinition;
+use super::state::CacheDefinition;
 use crate::{
     model::{CacheId, ClusterId, KeyId, MembershipVersion, NodeId},
     topology::membership::Member,

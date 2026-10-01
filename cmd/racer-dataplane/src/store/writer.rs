@@ -38,7 +38,7 @@ pub struct StoreWriter {
     capacity: Cell<usize>,
     busy: Cell<bool>,
     active_scope: RefCell<Option<RequestScope>>,
-    availability: Option<Rc<crate::control::availability::Availability>>,
+    availability: Option<Rc<crate::control::state::Availability>>,
     discarded: Cell<u64>,
     closed: Cell<bool>,
 }
@@ -75,7 +75,7 @@ impl StoreWriter {
     }
     pub fn with_availability(
         mut self,
-        availability: Rc<crate::control::availability::Availability>,
+        availability: Rc<crate::control::state::Availability>,
     ) -> Self {
         self.availability = Some(availability);
         self

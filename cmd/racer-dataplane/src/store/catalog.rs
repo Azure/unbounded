@@ -26,7 +26,7 @@ pub struct Index {
     metadata_capacity: usize,
     page_capacity: Cell<usize>,
     state: RefCell<State>,
-    availability: Option<std::rc::Rc<crate::control::availability::Availability>>,
+    availability: Option<std::rc::Rc<crate::control::state::Availability>>,
     reserved: Cell<usize>,
 }
 #[derive(Default)]
@@ -110,7 +110,7 @@ impl Index {
     }
     pub fn with_availability(
         mut self,
-        availability: std::rc::Rc<crate::control::availability::Availability>,
+        availability: std::rc::Rc<crate::control::state::Availability>,
     ) -> Self {
         self.availability = Some(availability);
         self

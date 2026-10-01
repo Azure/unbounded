@@ -64,7 +64,7 @@ fn page_hedge_does_not_treat_multihop_destination_as_independent_first_hop() {
     let network = Rc::new(
         crate::peer::PeerNetwork::new(
             local.clone(),
-            crate::control::snapshot::PublishedState::for_membership(members.clone()),
+            crate::control::state::PublishedState::for_membership(members.clone()),
         )
         .unwrap(),
     );
@@ -169,7 +169,7 @@ fn probe_exchange(opaque: bool, case: &str) {
         Rc::new(
             crate::peer::PeerNetwork::new(
                 signers[0].node().clone(),
-                crate::control::snapshot::PublishedState::for_membership(membership.clone()),
+                crate::control::state::PublishedState::for_membership(membership.clone()),
             )
             .unwrap(),
         ),

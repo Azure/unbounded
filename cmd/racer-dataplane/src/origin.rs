@@ -5,10 +5,7 @@
 //! persist headers or retain them in pooled connections after an operation ends.
 use self::{metadata::MetadataReply, page::OriginPage};
 use crate::{
-    control::{
-        caches::{CacheDefinition, canonical_socket_paths},
-        snapshot::SnapshotStore,
-    },
+    control::state::{CacheDefinition, SnapshotStore, canonical_socket_paths},
     error::{Error, Operation, Result},
     http::{
         Header, MessageHead, StartLine,

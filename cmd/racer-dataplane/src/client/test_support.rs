@@ -1,8 +1,7 @@
 //! Real read ownership behind client wire scenarios. Only the UDS adapter is scripted.
 use crate::{
     control::{
-        caches::CacheDefinition,
-        snapshot::{PublishedState, SnapshotStore},
+        state::{CacheDefinition, PublishedState, SnapshotStore},
         wire::{Publication, PublicationSequence},
     },
     memory::{cache::MemoryCache, delivery::Delivery, pool::BufferPool},
@@ -64,7 +63,7 @@ impl ReadWorker {
         let origin = AdapterOrigin::new(&cache.name, metadata);
         let keys = Rc::new(crate::security::identity::keyring_tests::keys());
         let publications = Arc::new(PublishedState::default());
-        let availability = Rc::new(crate::control::availability::Availability::new(
+        let availability = Rc::new(crate::control::state::Availability::new(
             publications.clone(),
             keys.clone(),
         ));

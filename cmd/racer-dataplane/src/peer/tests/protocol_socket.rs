@@ -387,7 +387,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
     let network = Rc::new(
         PeerNetwork::new(
             NodeId(C.into()),
-            crate::control::snapshot::PublishedState::for_membership(membership),
+            crate::control::state::PublishedState::for_membership(membership),
         )
         .unwrap(),
     );
@@ -465,7 +465,7 @@ fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
     let network = Rc::new(
         PeerNetwork::new(
             NodeId(C.into()),
-            crate::control::snapshot::PublishedState::for_membership(membership),
+            crate::control::state::PublishedState::for_membership(membership),
         )
         .unwrap(),
     );
@@ -597,7 +597,7 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
         let network = Rc::new(
             PeerNetwork::new(
                 NodeId(B.into()),
-                crate::control::snapshot::PublishedState::for_membership(membership.clone()),
+                crate::control::state::PublishedState::for_membership(membership.clone()),
             )
             .unwrap(),
         );
@@ -832,7 +832,7 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
         Rc::new(
             PeerNetwork::new(
                 NodeId(A.into()),
-                crate::control::snapshot::PublishedState::for_membership(members.clone()),
+                crate::control::state::PublishedState::for_membership(members.clone()),
             )
             .unwrap(),
         ),
@@ -1034,14 +1034,14 @@ fn signed_tcp_case(case: &str) {
     let source_network = Rc::new(
         PeerNetwork::new(
             NodeId(A.into()),
-            crate::control::snapshot::PublishedState::for_membership(membership.clone()),
+            crate::control::state::PublishedState::for_membership(membership.clone()),
         )
         .unwrap(),
     );
     let destination_network = Rc::new(
         PeerNetwork::new(
             NodeId(C.into()),
-            crate::control::snapshot::PublishedState::for_membership(membership.clone()),
+            crate::control::state::PublishedState::for_membership(membership.clone()),
         )
         .unwrap(),
     );
@@ -1552,7 +1552,7 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
     let local = membership.members()[0].node.clone();
     let network = PeerNetwork::new(
         local.clone(),
-        Arc::new(crate::control::snapshot::PublishedState::default()),
+        Arc::new(crate::control::state::PublishedState::default()),
     )
     .unwrap();
     assert!(matches!(
@@ -1570,7 +1570,7 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
     ] {
         let explicit = PeerNetwork::with_algorithm(
             local.clone(),
-            Arc::new(crate::control::snapshot::PublishedState::default()),
+            Arc::new(crate::control::state::PublishedState::default()),
             algorithm,
         )
         .unwrap();
@@ -1705,7 +1705,7 @@ mod established_sessions {
             let network = Rc::new(
                 PeerNetwork::new(
                     NodeId(C.into()),
-                    crate::control::snapshot::PublishedState::for_membership(membership),
+                    crate::control::state::PublishedState::for_membership(membership),
                 )
                 .unwrap(),
             );

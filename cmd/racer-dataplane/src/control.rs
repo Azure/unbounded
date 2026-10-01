@@ -1,23 +1,20 @@
 //! HTTPS enrollment, snapshot polling, and independent network keyring delivery.
 //! Bounded long polls, accepted cursors, jittered retry; no node/status reporting.
 pub(crate) mod async_files;
-pub mod availability;
-pub mod caches;
 mod dns;
 pub mod enrollment;
 mod files;
 pub mod secrets;
-pub mod snapshot;
+pub mod state;
 #[cfg(test)]
 mod testing;
 pub mod transport;
 pub mod wire;
 
 use self::{
-    caches::{CacheEvent, CacheRegistry},
     enrollment::{Enrollment, LocalSigningIdentity},
     secrets::BundleInstaller,
-    snapshot::SnapshotStore,
+    state::{CacheEvent, CacheRegistry, SnapshotStore},
     transport::{ControlIo, ControlTransport, HttpResponse},
     wire::{EnrollmentRequest, EnrollmentResponse, SnapshotRequest, SnapshotResponse},
 };
@@ -67,7 +64,7 @@ pub struct ControlClient {
     startup_bundle: RefCell<Option<wire::KeyringBundle>>,
     binding_check: Cell<bool>,
     restart_required: Cell<bool>,
-    pending: RefCell<Option<Rc<snapshot::PreparedPublication>>>,
+    pending: RefCell<Option<Rc<state::PreparedPublication>>>,
     install_next: Cell<Option<Instant>>,
 }
 struct Busy<'a>(&'a Cell<bool>);
@@ -91,7 +88,7 @@ fn enter(flag: &Cell<bool>) -> Result<Busy<'_>> {
 }
 pub struct ControlProgress {
     pub identity: Option<crate::model::NodeId>,
-    pub snapshot: Option<snapshot::SnapshotLease>,
+    pub snapshot: Option<state::SnapshotLease>,
     pub cache_events: Vec<CacheEvent>,
     pub next_attempt: Instant,
 }
@@ -911,7 +908,7 @@ fn transient(e: Error) -> bool {
 mod tests {
     use super::*;
     use crate::{
-        control::{snapshot::PublishedState, testing},
+        control::{state::PublishedState, testing},
         model::{ClusterId, NodeId},
         security::identity::KeyEpochs,
     };

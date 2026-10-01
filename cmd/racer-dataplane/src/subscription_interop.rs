@@ -173,7 +173,7 @@ struct SubscriptionFixture {
     writer: Rc<store::writer::StoreWriter>,
     memory: Rc<memory::cache::MemoryCache>,
     admission: Rc<Admission>,
-    cache: control::caches::CacheDefinition,
+    cache: control::state::CacheDefinition,
     scope: RequestScope,
 }
 
@@ -181,8 +181,7 @@ impl SubscriptionFixture {
     fn construct(root: PathBuf) -> Self {
         use client::{RequestParser, listener::ClientListeners, response::Responses};
         use control::{
-            caches::CacheDefinition,
-            snapshot::{PublishedState, SnapshotStore},
+            state::{CacheDefinition, PublishedState, SnapshotStore},
             wire::*,
         };
         use memory::{cache::MemoryCache, delivery::Delivery, pipe::PipePool, pool::BufferPool};
@@ -217,13 +216,13 @@ impl SubscriptionFixture {
         let buffers = BufferPool::new(admission.clone());
         let keys = Rc::new(interop_keys());
         let published = Arc::new(PublishedState::default());
-        let availability = Rc::new(control::availability::Availability::new(
+        let availability = Rc::new(control::state::Availability::new(
             published.clone(),
             keys.clone(),
         ));
         let snapshots = Rc::new(SnapshotStore::new(keys.cluster().clone(), published, 2));
         let (client_socket, origin_socket) =
-            control::caches::canonical_socket_paths("interop").unwrap();
+            control::state::canonical_socket_paths("interop").unwrap();
         let cache = CacheDefinition {
             id: CacheId("33333333-3333-4333-8333-333333333333".into()),
             name: "interop".into(),

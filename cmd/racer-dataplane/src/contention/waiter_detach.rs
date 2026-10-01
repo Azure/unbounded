@@ -64,7 +64,7 @@ fn terminal_waiter_replacement_matches_production_before_completion() {
         let real = Rc::new(Admission::new(sim.workers[0].admission.limits().clone()));
         let flights = Rc::new(Flights::new(
             real.clone(),
-            crate::control::availability::Availability::permissive_for_tests(),
+            crate::control::state::Availability::permissive_for_tests(),
         ));
         let page = PageId {
             version: ObjectVersion {

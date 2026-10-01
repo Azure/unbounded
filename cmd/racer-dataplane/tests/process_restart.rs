@@ -44,7 +44,7 @@ mod control {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use racer_dataplane::{
         control::{
-            caches::{CacheDefinition, canonical_socket_paths},
+            state::{CacheDefinition, canonical_socket_paths},
             wire,
         },
         model::{CacheId, ClusterId, MembershipVersion, NodeId},

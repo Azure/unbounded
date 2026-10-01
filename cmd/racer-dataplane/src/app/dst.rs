@@ -2,7 +2,7 @@
 //! The oracle owns immutable origin versions, never consults placement or cache data.
 use super::*;
 use crate::{
-    control::{caches::CacheDefinition, wire},
+    control::{state::CacheDefinition, wire},
     model::{KeyId, PAGE_BYTES, ResourceClass, *},
     runtime::{
         environment::SimulationClock,
@@ -227,7 +227,7 @@ fn node_id(id: usize) -> NodeId {
 fn cache(id: usize) -> CacheDefinition {
     let name = format!("dst-{id}");
     let (client_socket, origin_socket) =
-        crate::control::caches::canonical_socket_paths(&name).unwrap();
+        crate::control::state::canonical_socket_paths(&name).unwrap();
     CacheDefinition {
         name,
         id: CacheId("33333333-3333-4333-8333-333333333333".into()),

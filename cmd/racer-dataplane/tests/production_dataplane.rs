@@ -4,8 +4,7 @@ use base64::Engine;
 use racer_dataplane::{
     client::{RequestParser, response::Responses},
     control::{
-        caches::{CacheDefinition, canonical_socket_paths},
-        snapshot::{PublishedState, SnapshotStore},
+        state::{CacheDefinition, PublishedState, SnapshotStore, canonical_socket_paths},
         wire::{self, Publication, PublicationSequence},
     },
     error::{Error, Operation, Result},
@@ -532,7 +531,7 @@ impl Rig {
                 )
             }
         };
-        let availability = Rc::new(racer_dataplane::control::availability::Availability::new(
+        let availability = Rc::new(racer_dataplane::control::state::Availability::new(
             published.clone(),
             keys.clone(),
         ));

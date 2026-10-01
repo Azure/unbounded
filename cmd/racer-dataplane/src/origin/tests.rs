@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    control::snapshot::PublishedState,
+    control::state::PublishedState,
     http::Codec,
     model::{
         Authorization, CacheId, CacheKey, ClusterId, Limits, ObjectId, OpaqueMetadata, RequestId,
@@ -107,7 +107,7 @@ fn published_client() -> (
     OriginClient,
     Rc<Admission>,
     Rc<Reactor>,
-    crate::control::snapshot::SnapshotLease,
+    crate::control::state::SnapshotLease,
 ) {
     let (mut client, admission, reactor) = client();
     let publication = crate::control::wire::decode_publication(include_bytes!(

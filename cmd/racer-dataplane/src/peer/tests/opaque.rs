@@ -146,7 +146,7 @@ impl RelayFixture {
         let network = Rc::new(
             PeerNetwork::new(
                 NodeId(B.into()),
-                crate::control::snapshot::PublishedState::for_membership(membership),
+                crate::control::state::PublishedState::for_membership(membership),
             )
             .unwrap(),
         );

@@ -1,7 +1,7 @@
 //! Controllable adapter boundary shared by read and client scenarios.
 //! The client, HTTP parser, reactor, and plaintext admission remain production code.
 use crate::{
-    control::snapshot::SnapshotStore,
+    control::state::SnapshotStore,
     http::{
         Codec,
         connection::{HttpIo, HttpPool},

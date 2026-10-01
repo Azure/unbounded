@@ -1,5 +1,5 @@
 use super::*;
-use crate::control::caches::canonical_socket_paths;
+use crate::control::state::canonical_socket_paths;
 use sha2::{Digest, Sha256};
 
 fn content_hashes(p: &Publication) -> Result<(String, String)> {

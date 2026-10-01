@@ -26,14 +26,14 @@ use std::{rc::Rc, sync::Arc};
 /// Outbound operations route directly from their retained membership lease.
 pub struct PeerNetwork {
     pub local: NodeId,
-    published: Arc<crate::control::snapshot::PublishedState>,
+    published: Arc<crate::control::state::PublishedState>,
     algorithm: crate::topology::RoutingAlgorithm,
 }
 
 impl PeerNetwork {
     pub fn new(
         local: NodeId,
-        published: Arc<crate::control::snapshot::PublishedState>,
+        published: Arc<crate::control::state::PublishedState>,
     ) -> Result<Self> {
         Self::with_algorithm(
             local,
@@ -44,7 +44,7 @@ impl PeerNetwork {
 
     pub fn with_algorithm(
         local: NodeId,
-        published: Arc<crate::control::snapshot::PublishedState>,
+        published: Arc<crate::control::state::PublishedState>,
         algorithm: crate::topology::RoutingAlgorithm,
     ) -> Result<Self> {
         if local.0.is_empty() {

@@ -7,10 +7,8 @@ fn removal_visibility_changes_without_worker_or_checkpoint_barriers() {
     let node = Arc::new(NodeState::default());
     let (worker, _, _) = test_support::local_worker(&config, &node, 0);
     let cache = test_support::definition();
-    let availability = crate::control::availability::Availability::new(
-        node.publications.clone(),
-        worker.keys.clone(),
-    );
+    let availability =
+        crate::control::state::Availability::new(node.publications.clone(), worker.keys.clone());
     worker
         .snapshots
         .publish(test_support::publication(&config, 1, vec![cache.clone()]))

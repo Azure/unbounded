@@ -479,7 +479,7 @@ fn hedge_stale_membership_refreshes_once_without_fresh_credits() {
                     Rc::new(Placement::new(16)),
                     peers.clone(),
                     deps.credentials.clone(),
-                    crate::control::snapshot::PublishedState::for_membership(latest.clone()),
+                    crate::control::state::PublishedState::for_membership(latest.clone()),
                 )
                 .with_hedges(deps.candidates.hedge_owner().unwrap().clone()),
             );
@@ -588,7 +588,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
     let _owner = queue.enter();
     use crate::{
         control::{
-            snapshot::{PublishedState, SnapshotStore},
+            state::{PublishedState, SnapshotStore},
             wire::{Publication, PublicationSequence, SCHEMA_VERSION},
         },
         memory::{delivery::Delivery, pipe::PipePool},
@@ -758,7 +758,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
                     sequence: PublicationSequence(1),
                     membership_version: membership.version,
                     members: membership.members().to_vec(),
-                    caches: vec![crate::control::caches::CacheDefinition {
+                    caches: vec![crate::control::state::CacheDefinition {
                         id: f.context.object.cache.clone(),
                         name: "cold".into(),
                         client_socket: "/run/racer/cold/client/socket".into(),
@@ -792,7 +792,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
                 fill.clone(),
                 streams,
                 fill.dependencies.credentials.clone(),
-                crate::control::availability::Availability::permissive_for_tests(),
+                crate::control::state::Availability::permissive_for_tests(),
             ));
             endpoints.push(owners.install(WorkerId(0), coordinator.clone()).unwrap());
             mesh.nodes.borrow_mut().push(coordinator);

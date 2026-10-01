@@ -328,7 +328,7 @@ fn select(
     workers: &WorkerDirectory,
     capacity: usize,
     keys: &Keyring,
-    caches: &[crate::control::caches::CacheDefinition],
+    caches: &[crate::control::state::CacheDefinition],
 ) -> Option<CheckpointImage> {
     candidates.sort_by_key(|image| std::cmp::Reverse(image.sequence));
     candidates.into_iter().find_map(|mut image| {
@@ -380,7 +380,7 @@ mod tests {
         )
         .unwrap()
     }
-    fn caches() -> Vec<crate::control::caches::CacheDefinition> {
+    fn caches() -> Vec<crate::control::state::CacheDefinition> {
         let mut cache = super::super::test_support::definition();
         cache.id = crate::model::CacheId(crate::security::identity::tests::CACHE.into());
         vec![cache]

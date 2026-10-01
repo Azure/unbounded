@@ -269,7 +269,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     let queue = Rc::new(crate::read::drivers::DriverQueue::default());
     let _owner = queue.enter();
     use crate::control::{
-        snapshot::{PublishedState, SnapshotStore},
+        state::{PublishedState, SnapshotStore},
         wire::{Publication, PublicationSequence},
     };
     let object = ObjectId {
@@ -287,7 +287,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         cluster: ClusterId(CLUSTER.into()),
         sequence: PublicationSequence(1),
         membership_version: MembershipVersion(1),
-        caches: vec![crate::control::caches::CacheDefinition {
+        caches: vec![crate::control::state::CacheDefinition {
             id: CacheId(CACHE.into()),
             name: "remote".into(),
             client_socket: "/run/racer/remote/client/socket".into(),
@@ -874,7 +874,7 @@ fn metadata_coordinator_with_newer_publication(
 ) -> (Rc<super::Coordinator>, super::dispatch::WorkerEndpoint) {
     use crate::{
         control::{
-            snapshot::{PublishedState, SnapshotStore},
+            state::{PublishedState, SnapshotStore},
             wire::{Publication, PublicationSequence},
         },
         memory::{cache::MemoryCache, delivery::Delivery, pipe::PipePool},
@@ -901,7 +901,7 @@ fn metadata_coordinator_with_newer_publication(
         sequence: PublicationSequence(1),
         membership_version: membership.version,
         members: membership.members().to_vec(),
-        caches: vec![crate::control::caches::CacheDefinition {
+        caches: vec![crate::control::state::CacheDefinition {
             id: CacheId(CACHE.into()),
             name: "remote".into(),
             client_socket: "/run/racer/remote/client/socket".into(),
@@ -968,7 +968,7 @@ fn metadata_coordinator_with_newer_publication(
         candidates: candidates.clone(),
         flights: Rc::new(super::flight::Flights::new(
             admission.clone(),
-            crate::control::availability::Availability::permissive_for_tests(),
+            crate::control::state::Availability::permissive_for_tests(),
         )),
         crypto: Rc::new(PageCrypto::new(keys, Rc::new(CryptoClient::new(port)))),
         credentials: credentials.clone(),
@@ -1001,7 +1001,7 @@ fn metadata_coordinator_with_newer_publication(
         fill,
         streams,
         credentials,
-        crate::control::availability::Availability::permissive_for_tests(),
+        crate::control::state::Availability::permissive_for_tests(),
     ));
     let endpoint = owners.install(WorkerId(0), coordinator.clone()).unwrap();
     (coordinator, endpoint)

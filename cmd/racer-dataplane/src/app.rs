@@ -17,10 +17,10 @@ use crate::{
     config::Config,
     control::{
         ControlClient, ControlEndpoint,
-        caches::CacheRegistry,
         enrollment::Enrollment,
         secrets::BundleInstaller,
-        snapshot::{PublishedState, SnapshotStore},
+        state::CacheRegistry,
+        state::{PublishedState, SnapshotStore},
         transport::ReactorControlIo,
     },
     error::{Error, Operation, Result},
@@ -434,7 +434,7 @@ pub struct WorkerApplication {
     stopping: bool,
     snapshot_sequence: Option<crate::control::wire::PublicationSequence>,
     memory: Rc<MemoryCache>,
-    caches: Vec<crate::control::caches::CacheDefinition>,
+    caches: Vec<crate::control::state::CacheDefinition>,
     slab_directory: std::path::PathBuf,
     prepared_listeners: Rc<std::cell::RefCell<Option<crate::client::listener::PreparedListeners>>>,
     cache_prepare_task: Option<Operation<'static, ()>>,
@@ -488,7 +488,7 @@ impl WorkerApplication {
             node.keys.clone(),
         ));
         let certificates = Rc::new(Certificates::new(config.cluster.clone(), keys.clone()));
-        let availability = Rc::new(crate::control::availability::Availability::new(
+        let availability = Rc::new(crate::control::state::Availability::new(
             node.publications.clone(),
             keys.clone(),
         ));
@@ -773,7 +773,7 @@ impl WorkerApplication {
         config: &Config,
         node: &NodeState,
         snapshots: Rc<SnapshotStore>,
-        availability: Rc<crate::control::availability::Availability>,
+        availability: Rc<crate::control::state::Availability>,
         delivery: Rc<Delivery>,
         metrics: &crate::telemetry::metrics::Metrics,
         dependencies: FillDependencies,
@@ -881,7 +881,7 @@ impl WorkerApplication {
         worker: WorkerId,
         runtime: &WorkerRuntime,
         buffers: BufferPool,
-        availability: Rc<crate::control::availability::Availability>,
+        availability: Rc<crate::control::state::Availability>,
         metrics: &crate::telemetry::metrics::Metrics,
     ) -> Result<Store> {
         let limits = runtime.admission.limits();

@@ -455,10 +455,10 @@ pub(super) fn local_worker_with_fabric(
     )
 }
 
-pub(super) fn definition() -> crate::control::caches::CacheDefinition {
+pub(super) fn definition() -> crate::control::state::CacheDefinition {
     let (client_socket, origin_socket) =
-        crate::control::caches::canonical_socket_paths("app-lifecycle").unwrap();
-    crate::control::caches::CacheDefinition {
+        crate::control::state::canonical_socket_paths("app-lifecycle").unwrap();
+    crate::control::state::CacheDefinition {
         id: crate::model::CacheId("33333333-3333-4333-8333-333333333333".into()),
         name: "app-lifecycle".into(),
         client_socket,
@@ -469,7 +469,7 @@ pub(super) fn definition() -> crate::control::caches::CacheDefinition {
 pub(super) fn publication(
     config: &Config,
     sequence: u64,
-    caches: Vec<crate::control::caches::CacheDefinition>,
+    caches: Vec<crate::control::state::CacheDefinition>,
 ) -> wire::Publication {
     wire::Publication {
         schema_version: 1,

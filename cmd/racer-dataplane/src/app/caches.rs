@@ -3,7 +3,7 @@ use super::*;
 use crate::runtime::collections::HashSet;
 use crate::{
     client::listener::PreparedListeners,
-    control::caches::{CacheDefinition, CacheTransition},
+    control::state::{CacheDefinition, CacheTransition},
 };
 use std::cell::RefCell;
 
@@ -59,7 +59,7 @@ impl CachePublication {
         &self,
         definitions: &[CacheDefinition],
     ) -> Result<Box<dyn CacheTransition>> {
-        crate::control::caches::validate_definitions(definitions)?;
+        crate::control::state::validate_definitions(definitions)?;
         let mut cut = self.node.cache_cut.lock().map_err(|_| Error::Unavailable)?;
         if cut.generation == 0 || cut.definitions != definitions {
             if definitions.len() > self.capacity {

@@ -202,7 +202,7 @@ impl DestinationFixture {
         let network = Rc::new(
             PeerNetwork::new(
                 NodeId(C.into()),
-                crate::control::snapshot::PublishedState::for_membership(membership.clone()),
+                crate::control::state::PublishedState::for_membership(membership.clone()),
             )
             .unwrap(),
         );
@@ -218,7 +218,7 @@ impl DestinationFixture {
         };
         let flights = Rc::new(Flights::new(
             admission.clone(),
-            crate::control::availability::Availability::permissive_for_tests(),
+            crate::control::state::Availability::permissive_for_tests(),
         ));
         let service = Rc::new(PendingPage {
             flights: flights.clone(),

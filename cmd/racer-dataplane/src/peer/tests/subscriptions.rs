@@ -161,7 +161,7 @@ fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failure
         let network = Rc::new(
             PeerNetwork::new(
                 NodeId(C.into()),
-                crate::control::snapshot::PublishedState::for_membership(membership),
+                crate::control::state::PublishedState::for_membership(membership),
             )
             .unwrap(),
         );
@@ -419,7 +419,7 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
         Rc::new(
             PeerNetwork::new(
                 NodeId(node.into()),
-                crate::control::snapshot::PublishedState::for_membership(membership.clone()),
+                crate::control::state::PublishedState::for_membership(membership.clone()),
             )
             .unwrap(),
         )

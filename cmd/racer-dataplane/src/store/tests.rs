@@ -885,7 +885,7 @@ fn retirement_during_write_fences_late_publication() {
 #[test]
 fn sustained_rotation_reclaims_history_and_fences_held_pages_and_write_completions() {
     use crate::{
-        control::availability::for_caches,
+        control::state::for_caches,
         memory::{cache::MemoryCache, pool::tests::bundle_for},
         security::identity::{
             KeyPurpose,

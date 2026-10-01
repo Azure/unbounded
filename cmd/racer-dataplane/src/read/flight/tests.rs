@@ -33,7 +33,7 @@ fn flights(limits: FlightLimits) -> Rc<Flights> {
             Rc::new(Admission::new(
                 crate::test_support::cluster::config(false).limits,
             )),
-            crate::control::availability::Availability::permissive_for_tests(),
+            crate::control::state::Availability::permissive_for_tests(),
             limits,
         )
         .unwrap(),

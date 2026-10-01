@@ -72,7 +72,7 @@ pub struct CandidatePolicy {
     placement: Rc<Placement>,
     peers: Rc<dyn PeerClient>,
     credentials: Rc<CredentialCrypto>,
-    published: Arc<crate::control::snapshot::PublishedState>,
+    published: Arc<crate::control::state::PublishedState>,
 }
 #[derive(Clone, Copy)]
 enum RequestMode {
@@ -339,7 +339,7 @@ impl CandidatePolicy {
         placement: Rc<Placement>,
         peers: Rc<dyn PeerClient>,
         credentials: Rc<CredentialCrypto>,
-        published: Arc<crate::control::snapshot::PublishedState>,
+        published: Arc<crate::control::state::PublishedState>,
     ) -> Self {
         Self {
             hedge: None,

@@ -20,7 +20,7 @@ use self::{
 };
 use crate::{
     client::{ClientRequest, ReadKind},
-    control::snapshot::SnapshotStore,
+    control::state::SnapshotStore,
     error::{Error, Operation, Result},
     model::{
         ByteRange, MetadataSelector, ObjectId, ObjectMetadata, OriginContext, PeerOriginContext,
@@ -54,7 +54,7 @@ pub struct Coordinator {
     pub(super) fill: Rc<Fill>,
     streams: Rc<RangeStreams>,
     pub(super) credentials: Rc<CredentialCrypto>,
-    availability: Rc<crate::control::availability::Availability>,
+    availability: Rc<crate::control::state::Availability>,
 }
 // Metadata/bootstrap allowance. Normal pinned client ranges admit bounded page
 // acquisitions separately; this is not a ceiling on successful pages delivered.
@@ -93,7 +93,7 @@ impl Coordinator {
         fill: Rc<Fill>,
         streams: Rc<RangeStreams>,
         credentials: Rc<CredentialCrypto>,
-        availability: Rc<crate::control::availability::Availability>,
+        availability: Rc<crate::control::state::Availability>,
     ) -> Self {
         Self {
             snapshots,

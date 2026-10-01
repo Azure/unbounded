@@ -421,7 +421,7 @@ fn publication_from_dto(p: PublicationDto) -> Result<Publication> {
             origin_socket: c.origin_socket.into(),
         })
         .collect();
-    crate::control::caches::validate_definitions(&caches)?;
+    crate::control::state::validate_definitions(&caches)?;
     caches.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(Publication {
         schema_version: p.schema_version,

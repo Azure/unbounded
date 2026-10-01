@@ -3,7 +3,7 @@
 //! from the origin directory so pods receive only their authorized endpoint.
 use super::{RequestParser, response::Responses};
 use crate::{
-    control::caches::CacheDefinition,
+    control::state::CacheDefinition,
     error::{Error, Operation, Result},
     http::connection::{ConnectionLease, HttpIo},
     model::{CacheId, RequestId},
@@ -300,7 +300,7 @@ impl ClientListeners {
     ) -> Operation<'a, PreparedListeners> {
         Box::pin(async move {
             scope.check()?;
-            crate::control::caches::validate_definitions(definitions)?;
+            crate::control::state::validate_definitions(definitions)?;
             if !self.accepting.get() {
                 return Err(Error::Unavailable);
             }
@@ -1036,7 +1036,7 @@ impl PreparedListeners {
     }
 }
 
-impl crate::control::caches::CacheTransition for PreparedListeners {
+impl crate::control::state::CacheTransition for PreparedListeners {
     fn commit(self: Box<Self>) {
         (*self).commit();
     }
