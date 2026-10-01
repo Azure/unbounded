@@ -16,9 +16,6 @@ thread_local! {
     // Only selection is thread-local. Workers own the actual queues and permits
     // retain their original owner across nested scopes and deferred submission.
     static CURRENT: RefCell<Option<Rc<DriverQueue>>> = const { RefCell::new(None) };
-    // Standalone component tests historically drive without a worker graph.
-    #[cfg(test)]
-    static STANDALONE: Rc<DriverQueue> = Rc::new(DriverQueue::default());
 }
 const MAX_DRIVERS: usize = 1024;
 
@@ -168,10 +165,7 @@ impl<F> Drop for Queued<F> {
 }
 
 fn current() -> Option<Rc<DriverQueue>> {
-    let queue = CURRENT.with(|current| current.borrow().clone());
-    #[cfg(test)]
-    let queue = queue.or_else(|| Some(STANDALONE.with(Rc::clone)));
-    queue
+    CURRENT.with(|current| current.borrow().clone())
 }
 
 pub struct Permit {
@@ -287,6 +281,8 @@ mod tests {
     }
     #[test]
     fn owned_operation_progresses_after_request_receiver_disappears() {
+        let queue = Rc::new(DriverQueue::default());
+        let _owner = queue.enter();
         let complete = Rc::new(Cell::new(false));
         let observed = complete.clone();
         let (completion, fence) = oneshot::channel::<()>();
@@ -311,6 +307,8 @@ mod tests {
     }
     #[test]
     fn nested_bootstrap_driver_is_polled_without_recursive_table_borrow() {
+        let queue = Rc::new(DriverQueue::default());
+        let _owner = queue.enter();
         let (send, mut result) = oneshot::channel();
         spawn(Box::pin(async move {
             let (child, receive) = oneshot::channel();
@@ -330,5 +328,19 @@ mod tests {
         }
         assert_eq!(result.try_recv().unwrap(), Some(7));
         assert_eq!(pending(), 0);
+    }
+
+    #[test]
+    fn acquisition_requires_an_installed_worker_queue() {
+        assert!(matches!(reserve(), Err(Error::InvalidConfiguration)));
+        let queue = Rc::new(DriverQueue::default());
+        {
+            let _owner = queue.enter();
+            let permit = reserve().unwrap();
+            assert_eq!(queue.pending(), 1);
+            drop(permit);
+            assert_eq!(queue.pending(), 0);
+        }
+        assert!(matches!(reserve(), Err(Error::InvalidConfiguration)));
     }
 }

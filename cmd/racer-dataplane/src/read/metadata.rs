@@ -1086,6 +1086,8 @@ pub(crate) mod tests {
 
     #[test]
     fn worker_driver_retains_leadership_after_request_drop_until_completion() {
+        let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+        let _owner = queue.enter();
         let table = Rc::new(RefreshTable::default());
         let request = table.join(key(), 1).unwrap();
         let follower = table.join(key(), 1).unwrap();

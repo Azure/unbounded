@@ -481,6 +481,8 @@ fn completed_fill_waits_release_shared_cancellation_capacity() {
 
 #[test]
 fn selected_owner_reclaims_foreign_receive_charges_across_full_pages() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     use crate::model::PAGE_BYTES;
     use std::num::NonZeroUsize;
     let mut limits = crate::test_support::cluster::config(false).limits;
@@ -586,6 +588,8 @@ fn selected_owner_reclaims_foreign_receive_charges_across_full_pages() {
 
 #[test]
 fn verified_selected_handoff_retains_foreign_worker_charges_without_copying() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let mut source = fixture();
     let target = fixture();
     let mut budget = AcquisitionBudget::new(source.scope.deadline.0, 8, 16);
@@ -646,6 +650,8 @@ fn verified_selected_handoff_retains_foreign_worker_charges_without_copying() {
 
 #[test]
 fn prefetched_corrupt_ciphertext_falls_back_without_exposing_plaintext() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let mut f = fixture();
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
     let result = drive(
@@ -715,6 +721,8 @@ fn prefetched_corrupt_ciphertext_falls_back_without_exposing_plaintext() {
 
 #[test]
 fn ciphertext_ready_promotes_once_for_concurrent_plaintext_readers() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let mut f = fixture();
     let metrics = Metrics::default();
     f.fill.metrics = metrics.clone();
@@ -813,6 +821,8 @@ fn ciphertext_ready_promotes_once_for_concurrent_plaintext_readers() {
 
 #[test]
 fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     use crate::security::keyring::{KeyPurpose, tests::rotation_bundle};
     let mut f = fixture_with_availability(3, None, true);
     let flights = f.fill.dependencies.flights.clone();
@@ -1179,6 +1189,8 @@ impl Origin for BootstrapOrigin {
 
 #[test]
 fn bootstrap_rejection_re_elects_and_version_changes_never_mix_pages() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     use crate::read::metadata::{MetadataDependencies, MetadataService};
     let mut f = fixture();
     let origin = Rc::new(BootstrapOrigin {
@@ -1304,6 +1316,8 @@ impl Origin for GatedMetadataOrigin {
 
 #[test]
 fn bootstrap_after_catalog_eviction_checks_cached_content_type_and_preserves_fresh_expiry() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     use crate::{
         model::ContentType,
         read::metadata::{MetadataDependencies, MetadataService},
@@ -1456,6 +1470,8 @@ fn bootstrap_after_catalog_eviction_checks_cached_content_type_and_preserves_fre
 
 #[test]
 fn blocked_metadata_leader_and_follower_notify_without_spinning() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     use crate::{
         model::MetadataSelector,
         read::metadata::{MetadataDependencies, MetadataService},
@@ -1556,6 +1572,8 @@ fn blocked_metadata_leader_and_follower_notify_without_spinning() {
 
 #[test]
 fn metadata_deadline_wakes_parked_follower_without_polling_gated_leader() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     use crate::{
         model::MetadataSelector,
         read::metadata::{MetadataDependencies, MetadataService, tests::assert_ingress_counts},
@@ -1705,6 +1723,8 @@ fn metadata_deadline_wakes_parked_follower_without_polling_gated_leader() {
 
 #[test]
 fn concurrent_readers_share_origin_encryption_and_pending_original_ciphertext() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let mut f = fixture();
     let mut a = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
     let mut b = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
@@ -1763,6 +1783,8 @@ fn concurrent_readers_share_origin_encryption_and_pending_original_ciphertext() 
 
 #[test]
 fn ciphertext_origin_fill_retains_verified_publication_without_a_plaintext_waiter() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let mut f = fixture();
     f.context.authorization =
         Some(crate::model::Authorization::from_header(b"test-supplier-credential").unwrap());
@@ -1909,6 +1931,8 @@ fn cold_disk_fixture() -> Fixture {
 
 #[test]
 fn concurrent_cold_disk_copy_only_shares_io_and_retains_original_ciphertext() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let mut f = cold_disk_fixture();
     let disk_hits = f.fill.metrics.count(Event::DiskIndexLookupHit);
     let cipher_misses = f.fill.metrics.count(Event::CiphertextLookupMiss);
@@ -1993,6 +2017,8 @@ fn concurrent_cold_disk_copy_only_shares_io_and_retains_original_ciphertext() {
 
 #[test]
 fn detached_copy_only_keeps_disk_fence_and_independent_waiters() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let f = cold_disk_fixture();
     let caller = RequestScope::new(RequestId([9; 16]), f.scope.deadline.0).unwrap();
     let mut first = f.fill.copy_only(&f.page, &caller);
@@ -2024,6 +2050,8 @@ fn detached_copy_only_keeps_disk_fence_and_independent_waiters() {
 
 #[test]
 fn copy_only_miss_releases_shared_scope_subscriptions_across_cohorts() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     use futures::{StreamExt, stream::FuturesUnordered};
     let mut f = fixture();
     for _ in 0..1100 {
@@ -2050,6 +2078,8 @@ fn copy_only_miss_releases_shared_scope_subscriptions_across_cohorts() {
 
 #[test]
 fn cancelled_before_lookup_has_no_outcome() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let f = fixture();
     f.scope.cancel().unwrap();
     assert!(matches!(
@@ -2076,6 +2106,8 @@ fn cancelled_before_lookup_has_no_outcome() {
 
 #[test]
 fn lookup_plaintext_and_pending_hits_do_not_probe_disk() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let mut f = fixture();
     assert!(f.fill.cached_page(&f.page, &f.scope).unwrap().is_none());
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
@@ -2139,6 +2171,8 @@ fn lookup_plaintext_and_pending_hits_do_not_probe_disk() {
 
 #[test]
 fn copy_only_local_state_admission_failure_releases_all_reservations() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let mut f = fixture();
     let admission = &f.fill.dependencies.admission;
     let pressure = admission
@@ -2185,6 +2219,8 @@ fn peer_bootstrap_disk_copy_reclaims_idle_ciphertext_before_fresh_acquisition() 
 }
 
 fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.plaintext_bytes = std::num::NonZeroUsize::new(512 * 1024 * 1024).unwrap();
     limits.ciphertext_bytes = limits.plaintext_bytes;
@@ -2370,6 +2406,8 @@ fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
 
 #[test]
 fn copy_only_miss_has_no_origin_side_effect_and_wrong_context_never_joins() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let mut f = fixture();
     assert!(
         drive(
@@ -2403,6 +2441,8 @@ fn copy_only_miss_has_no_origin_side_effect_and_wrong_context_never_joins() {
 
 #[test]
 fn rejected_origin_supplier_does_not_fail_an_independent_coalesced_reader() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let mut f = fixture();
     f.origin.reject_once.set(true);
     let mut a = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
@@ -2433,6 +2473,8 @@ fn rejected_origin_supplier_does_not_fail_an_independent_coalesced_reader() {
 
 #[test]
 fn canceled_supplier_retains_crypto_fence_before_replacement_origin_work() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let mut f = fixture();
     let mut a = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
     let second_scope = RequestScope::new(RequestId([2; 16]), f.scope.deadline.0).unwrap();

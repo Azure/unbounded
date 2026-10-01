@@ -1566,6 +1566,8 @@ mod tests {
     }
     #[test]
     fn origin_fill_preserves_ciphertext_for_memory_and_pending_candidate_copy() {
+        let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+        let _owner = queue.enter();
         let mut rig = rig();
         let context = OriginContext {
             object: rig.page.version.object.clone(),

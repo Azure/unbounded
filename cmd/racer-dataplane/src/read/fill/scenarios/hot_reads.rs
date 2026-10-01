@@ -171,6 +171,8 @@ fn coordinator(
 
 #[test]
 fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let signers = network(1);
     let mut f = fixture_with(3 * PAGE_BYTES + 7, None);
     f.reactor.init().unwrap();
@@ -305,6 +307,8 @@ fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
 
 #[test]
 fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fence() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     for mode in ["success", "cancel", "drop", "failure"] {
         let signers = network(1);
         let mut f = fixture_with(2 * PAGE_BYTES + 7, None);
@@ -533,6 +537,8 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
 
 #[test]
 fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_local_readers() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let signers = network(3);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();

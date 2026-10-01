@@ -155,6 +155,8 @@ fn forbidden_is_caller_only_and_peer_auth_is_terminal() {
 
 #[test]
 fn worker_poll_drives_owned_completion_after_waiter_disappears() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let flights = flights(FlightLimits::default());
     let (context, scope) = (origin(), scope());
     let mut a_budget = budget();

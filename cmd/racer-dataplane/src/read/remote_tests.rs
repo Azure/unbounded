@@ -194,6 +194,8 @@ fn remote_origin_absence_preserves_fresh_404_pinned_412_and_later_cached_version
 
 #[test]
 fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     use crate::peer::PeerClient;
     struct NoPeers;
     impl PeerClient for NoPeers {
@@ -331,6 +333,8 @@ fn live_read_routes_after_cache_only_publication_and_membership_update() {
 }
 
 fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn: bool) {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     use crate::control::{
         snapshot::{PublishedState, SnapshotStore},
         wire::{Publication, PublicationSequence},

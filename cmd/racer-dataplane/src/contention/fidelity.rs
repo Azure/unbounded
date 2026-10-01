@@ -577,6 +577,8 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
     };
     let scope = scope();
     let mut budget = AcquisitionBudget::new(scope.deadline.0, 4, 8);
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let mut read = fill.publish_bootstrap_with_context(
         OriginPage {
             metadata: metadata.for_pin(),

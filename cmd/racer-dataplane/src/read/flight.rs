@@ -1662,6 +1662,8 @@ mod tests {
 
     #[test]
     fn driver_queue_progresses_after_all_request_waiters_are_dropped() {
+        let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+        let _owner = queue.enter();
         let flights = flights(FlightLimits::default());
         let (context, scope) = (origin(), scope());
         let mut a_budget = budget();
@@ -1826,6 +1828,8 @@ mod tests {
 
     #[test]
     fn worker_poll_drives_parent_owned_queue_after_caller_drop() {
+        let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+        let _owner = queue.enter();
         let flights = flights(FlightLimits::default());
         let (context, scope) = (origin(), scope());
         let mut budget = budget();

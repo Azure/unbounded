@@ -3,6 +3,8 @@ use super::*;
 
 #[test]
 fn sequential_full_pages_reclaim_idle_bytes_and_preserve_busy_reader_leases() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     for (pages, ciphertext_pages, dirty_pages, hold_bundle) in
         [(8, 4, 2, false), (8, 3, 1, false), (12, 3, 2, true)]
     {
@@ -85,6 +87,8 @@ fn sequential_full_pages_reclaim_idle_bytes_and_preserve_busy_reader_leases() {
 
 #[test]
 fn bootstrap_admission_discards_queued_copy_before_evicting_idle_bundle() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.plaintext_bytes = std::num::NonZeroUsize::new(PAGE_BYTES as usize).unwrap();
     let mut f = fixture_with(3, Some(limits));
@@ -261,6 +265,8 @@ fn global_plaintext_deficit_counts_plaintext_not_combined_bundle_bytes() {
 
 #[test]
 fn dirty_only_pressure_skips_persistence_without_flushing_memory_or_queue() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let mut f = fixture();
     let cache = &f.context.object.cache;
     let page = retained_page(&f, cache, "queued", ResourceClass::Plaintext, 3, true);

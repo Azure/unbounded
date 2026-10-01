@@ -158,6 +158,8 @@ fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Ve
 
 #[test]
 fn hedged_plaintext_validates_aead_and_preserves_singleflight_and_original_credits() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     for corrupt in [false, true] {
         let mut f = fixture();
         let (peers, ordered) = install_peers(&mut f, None);
@@ -249,6 +251,8 @@ fn hedged_plaintext_validates_aead_and_preserves_singleflight_and_original_credi
 
 #[test]
 fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     for reason in ["route", "credits", "memory", "slots"] {
         let mut f = fixture();
         let (peers, ordered) = install_peers(&mut f, None);
@@ -379,6 +383,8 @@ fn enable_hedge(f: &mut Fixture, peers: &Rc<ScriptedPeers>) -> crate::telemetry:
 
 #[test]
 fn hedge_stalled_primary_copy_miss_keeps_time_and_credits_for_later_acquire() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     for third in [false, true] {
         let clock = crate::runtime::environment::SimulationClock::new(920);
         let _env = clock.environment(0).enter();
@@ -438,6 +444,8 @@ fn hedge_stalled_primary_copy_miss_keeps_time_and_credits_for_later_acquire() {
 
 #[test]
 fn hedge_stale_membership_refreshes_once_without_fresh_credits() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     for stale_again in [false, true] {
         for secondary_stale in [false, true] {
             let mut f = fixture();
@@ -504,6 +512,8 @@ fn hedge_stale_membership_refreshes_once_without_fresh_credits() {
 
 #[test]
 fn hedge_continuation_preserves_version_failure_and_never_restarts_consumed_primary() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let mut f = fixture();
     let (peers, ordered) = install_peers(&mut f, None);
     let metrics = enable_hedge(&mut f, &peers);
@@ -525,6 +535,8 @@ fn hedge_continuation_preserves_version_failure_and_never_restarts_consumed_prim
 
 #[test]
 fn hedge_default_budget_never_sends_underfunded_second_cold_fallback() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let mut f = fixture();
     let (peers, ordered) = install_peers(&mut f, None);
     let metrics = enable_hedge(&mut f, &peers);
@@ -550,6 +562,8 @@ fn hedge_default_budget_never_sends_underfunded_second_cold_fallback() {
 
 #[test]
 fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_original_budget() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     use crate::{
         control::{
             snapshot::{PublishedState, SnapshotStore},
@@ -841,6 +855,8 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
 
 #[test]
 fn hedge_full_page_exact_plaintext_quotas_suppress_before_spending_serial_credits() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     for pages in [2, 3, 4] {
         let mut limits = crate::test_support::cluster::config(false).limits;
         limits.plaintext_bytes = std::num::NonZeroUsize::new(PAGE_BYTES as usize * pages).unwrap();
@@ -911,6 +927,8 @@ fn hedge_full_page_exact_plaintext_quotas_suppress_before_spending_serial_credit
 
 #[test]
 fn hedge_authenticated_metadata_conflict_cannot_win_over_retained_descriptor() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     for content_type in [false, true] {
         let mut f = fixture_with(PAGE_BYTES + 3, None);
         let (peers, ordered) = install_peers(&mut f, None);
@@ -983,6 +1001,8 @@ fn hedge_authenticated_metadata_conflict_cannot_win_over_retained_descriptor() {
 
 #[test]
 fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let mut f = fixture();
     let (peers, ordered) = install_peers(&mut f, None);
     let good = encrypted_copy(&mut f);
@@ -1059,6 +1079,8 @@ fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
 
 #[test]
 fn hedge_child_cancellation_removes_crypto_admission_wait_without_canceling_accepted_job() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.queue_entries = std::num::NonZeroUsize::new(1).unwrap();
     let mut f = fixture_with(3, Some(limits));
@@ -1187,6 +1209,8 @@ fn assert_unpublished(f: &Fixture) {
 
 #[test]
 fn unusable_peer_copy_advances_to_alternate_or_authorized_origin() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     for missing_key in [false, true] {
         for (rank, use_origin) in [(None, false), (Some(2), false), (Some(2), true)] {
             let mut f = fixture();
@@ -1251,6 +1275,8 @@ fn unusable_peer_copy_advances_to_alternate_or_authorized_origin() {
 
 #[test]
 fn peer_ciphertext_from_another_version_cannot_be_published_under_the_pin() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let mut f = fixture();
     let (peers, ordered) = install_peers(&mut f, Some(1));
     let pinned = f.page.version.etag.clone();
@@ -1298,6 +1324,8 @@ fn peer_ciphertext_from_another_version_cannot_be_published_under_the_pin() {
 
 #[test]
 fn origin_version_miss_checks_every_later_copy_without_claiming_false_absence() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     for healthy_last in [false, true] {
         let mut f = fixture();
         let (peers, ordered) = install_peers(&mut f, Some(0));
@@ -1337,6 +1365,8 @@ fn origin_version_miss_checks_every_later_copy_without_claiming_false_absence() 
 
 #[test]
 fn corrupt_predecessor_evidence_survives_origin_and_later_copy_misses() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let mut f = fixture();
     let (peers, ordered) = install_peers(&mut f, Some(1));
     f.origin.version_unavailable.set(true);
@@ -1359,6 +1389,8 @@ fn corrupt_predecessor_evidence_survives_origin_and_later_copy_misses() {
 
 #[test]
 fn corrupt_copies_exhaust_sources_or_original_credits_without_origin_for_noncandidate() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     for (attempts, links, expected_calls, expected_error) in [
         (8, 16, 3, Error::Unavailable),
         (1, 16, 1, Error::Unavailable),
@@ -1396,6 +1428,8 @@ fn corrupt_copies_exhaust_sources_or_original_credits_without_origin_for_noncand
 
 #[test]
 fn unauthorized_after_corrupt_copy_is_terminal_not_origin_evidence() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let mut f = fixture();
     let (peers, ordered) = install_peers(&mut f, Some(2));
     let good = encrypted_copy(&mut f);
@@ -1417,6 +1451,8 @@ fn unauthorized_after_corrupt_copy_is_terminal_not_origin_evidence() {
 
 #[test]
 fn corrupt_copy_cannot_extend_original_budget_deadline() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
     let mut f = fixture();
     let (peers, ordered) = install_peers(&mut f, Some(2));
     let good = encrypted_copy(&mut f);
