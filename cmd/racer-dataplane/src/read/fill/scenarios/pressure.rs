@@ -201,6 +201,68 @@ fn retained_page(
 }
 
 #[test]
+fn reclamation_uses_second_bounded_scan_without_revoking_readers_or_spinning() {
+    for class in [ResourceClass::Plaintext, ResourceClass::Ciphertext] {
+        for (busy_count, idle_tail) in [(256, true), (256, false), (512, true)] {
+            let mut limits = crate::test_support::cluster::config(false).limits;
+            limits.metadata_entries = std::num::NonZeroUsize::new(1024).unwrap();
+            let f = fixture_with(3, Some(limits));
+            let cache = &f.context.object.cache;
+            let deps = &f.fill.dependencies;
+            let amount = if matches!(class, ResourceClass::Plaintext) {
+                3
+            } else {
+                19
+            };
+            let mut readers = Vec::new();
+            for n in 0..busy_count {
+                let id = retained_page(&f, cache, &format!("busy-{n}"), class, amount, false);
+                readers.push(deps.memory.get(&id).unwrap().unwrap());
+            }
+            let tail =
+                idle_tail.then(|| retained_page(&f, cache, "idle-tail", class, amount, false));
+            let used = deps.admission.used(class);
+            let _pressure = deps
+                .admission
+                .reserve(None, class, deps.admission.limit(class) - used)
+                .unwrap();
+            let attempts = Cell::new(0);
+            let result = f.fill.reserve_reclaiming(cache, class, amount, || {
+                attempts.set(attempts.get() + 1);
+                deps.admission.reserve(Some(cache), class, amount)
+            });
+            if busy_count == 256 && idle_tail {
+                assert!(
+                    result.is_ok(),
+                    "idle tail beyond first scan must admit: {class:?}, {:?}",
+                    result.as_ref().err()
+                );
+                assert!(deps.memory.get(tail.as_ref().unwrap()).unwrap().is_none());
+            } else {
+                assert!(matches!(result, Err(Error::Overloaded)));
+                if let Some(tail) = &tail {
+                    assert!(
+                        deps.memory.get(tail).unwrap().is_some(),
+                        "must not scan beyond existing two-pass bound"
+                    );
+                }
+            }
+            assert_eq!(
+                attempts.get(),
+                3,
+                "initial admission plus two bounded scans"
+            );
+            for reader in &readers {
+                assert_eq!(reader.plaintext.bytes(), &[1; 3]);
+                assert_eq!(reader.ciphertext.bytes(), &[2; 19]);
+                assert!(deps.memory.get(reader.plaintext.page()).unwrap().is_some());
+            }
+            assert_eq!(deps.writer.discarded_count(), 0);
+        }
+    }
+}
+
+#[test]
 fn fair_share_one_page_deficit_preserves_other_caches_and_remaining_working_set() {
     for class in [ResourceClass::Plaintext, ResourceClass::Ciphertext] {
         let amount = PAGE_BYTES as usize + 16;
