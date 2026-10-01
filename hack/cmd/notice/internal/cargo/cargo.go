@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package cargo implements a notice.Collector for direct non-development
-// dependencies of cmd/racer-dataplane, including optional production features.
+// dependencies of cmd/unbounded-storage.
 package cargo
 
 import (
@@ -18,7 +18,7 @@ import (
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/notice"
 )
 
-const cratePath = "cmd/racer-dataplane"
+const cratePath = "cmd/unbounded-storage"
 
 // Collector reads Cargo.toml and Cargo.lock locally and obtains license text
 // from Cargo's populated registry source cache.
@@ -78,11 +78,6 @@ func (c *Collector) Collect(root string) ([]notice.Entry, error) {
 		return nil, fmt.Errorf("parsing %s: %w", manifestPath, err)
 	}
 
-	rootName := packageField(string(manifest), "name")
-	if rootName == "" {
-		return nil, fmt.Errorf("package name missing in %s", manifestPath)
-	}
-
 	lockPath := filepath.Join(root, cratePath, "Cargo.lock")
 
 	lock, err := os.ReadFile(lockPath)
@@ -90,7 +85,7 @@ func (c *Collector) Collect(root string) ([]notice.Entry, error) {
 		return nil, fmt.Errorf("reading %s: %w", lockPath, err)
 	}
 
-	versions, err := lockedDirectVersions(string(lock), rootName, direct)
+	versions, err := lockedDirectVersions(string(lock), direct)
 	if err != nil {
 		return nil, fmt.Errorf("parsing %s: %w", lockPath, err)
 	}
@@ -138,11 +133,17 @@ func (c *Collector) buildEntry(name, version string) (notice.Entry, error) {
 			Dependency: name,
 			Ecosystem:  c.Name(),
 			Copyright:  []string{"See crate source"},
-			License:    declaredLicenses(declaredLicense, fmt.Sprintf("https://docs.rs/crate/%s/%s/source/Cargo.toml.orig", name, version)),
+			License: declaredLicenses(
+				declaredLicense,
+				fmt.Sprintf("https://docs.rs/crate/%s/%s/source/Cargo.toml.orig", name, version),
+			),
 		}, nil
 	}
 
-	entry := notice.Entry{Dependency: name, Ecosystem: c.Name()}
+	entry := notice.Entry{
+		Dependency: name,
+		Ecosystem:  c.Name(),
+	}
 	seenLicenses := map[string]bool{}
 	seenCopyrights := map[string]bool{}
 
@@ -154,12 +155,6 @@ func (c *Collector) buildEntry(name, version string) (notice.Entry, error) {
 
 		licenseNames, classifyErr := license.Classify(licenseText)
 		if classifyErr != nil {
-			// Some crates ship a LICENSE index pointing to separate license texts.
-			// Only skip an unclassified index when it names another collected file.
-			if licenseIndex(licensePath, licenseText, licensePaths) {
-				continue
-			}
-
 			return notice.Entry{}, fmt.Errorf("classifying %s: %w", licensePath, classifyErr)
 		}
 
@@ -186,24 +181,12 @@ func (c *Collector) buildEntry(name, version string) (notice.Entry, error) {
 	}
 
 	if len(entry.Copyright) > 1 {
-		entry.Copyright = slices.DeleteFunc(entry.Copyright, func(value string) bool { return value == "See LICENSE file" })
+		entry.Copyright = slices.DeleteFunc(entry.Copyright, func(value string) bool {
+			return value == "See LICENSE file"
+		})
 	}
 
 	return entry, nil
-}
-
-func licenseIndex(path string, text []byte, paths []string) bool {
-	if filepath.Base(path) != "LICENSE" {
-		return false
-	}
-
-	for _, other := range paths {
-		if other != path && strings.Contains(string(text), filepath.Base(other)) {
-			return true
-		}
-	}
-
-	return false
 }
 
 func declaredLicenses(expression, link string) []notice.License {
@@ -211,7 +194,9 @@ func declaredLicenses(expression, link string) []notice.License {
 
 	var licenses []notice.License
 
-	for _, part := range strings.FieldsFunc(expression, func(r rune) bool { return r == ' ' || r == '(' || r == ')' }) {
+	for _, part := range strings.FieldsFunc(expression, func(r rune) bool {
+		return r == ' ' || r == '(' || r == ')'
+	}) {
 		if part == "OR" || part == "AND" || part == "WITH" {
 			continue
 		}
@@ -323,7 +308,7 @@ func dependencySection(section string) bool {
 		(strings.HasPrefix(section, "target.") && (strings.HasSuffix(section, ".dependencies") || strings.HasSuffix(section, ".build-dependencies")))
 }
 
-func lockedDirectVersions(data, rootName string, direct map[string]dependency) (map[string]string, error) {
+func lockedDirectVersions(data string, direct map[string]dependency) (map[string]string, error) {
 	type pkg struct {
 		name, version string
 		dependencies  []string
@@ -381,14 +366,14 @@ func lockedDirectVersions(data, rootName string, direct map[string]dependency) (
 	var root *pkg
 
 	for i := range packages {
-		if packages[i].name == rootName {
+		if packages[i].name == "unbounded-storage" {
 			root = &packages[i]
 			break
 		}
 	}
 
 	if root == nil {
-		return nil, fmt.Errorf("%s package not found", rootName)
+		return nil, fmt.Errorf("unbounded-storage package not found")
 	}
 
 	versions := map[string]string{}
@@ -458,26 +443,6 @@ func quotedValue(value string) string {
 	return value[1 : len(value)-1]
 }
 
-func packageField(data, field string) string {
-	section := ""
-
-	scanner := bufio.NewScanner(strings.NewReader(data))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, "[") {
-			section = strings.Trim(line, "[]")
-			continue
-		}
-
-		key, value, ok := strings.Cut(line, "=")
-		if ok && section == "package" && strings.TrimSpace(key) == field {
-			return quotedValue(strings.TrimSpace(value))
-		}
-	}
-
-	return ""
-}
-
 func crateLicense(dir string) string {
 	for _, name := range []string{"Cargo.toml.orig", "Cargo.toml"} {
 		data, err := os.ReadFile(filepath.Join(dir, name))
@@ -485,8 +450,19 @@ func crateLicense(dir string) string {
 			continue
 		}
 
-		if value := packageField(string(data), "license"); value != "" {
-			return value
+		section := ""
+
+		scanner := bufio.NewScanner(strings.NewReader(string(data)))
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if strings.HasPrefix(line, "[") {
+				section = strings.Trim(line, "[]")
+				continue
+			}
+
+			if section == "package" && strings.HasPrefix(line, "license =") {
+				return quotedValue(strings.TrimSpace(strings.TrimPrefix(line, "license =")))
+			}
 		}
 	}
 

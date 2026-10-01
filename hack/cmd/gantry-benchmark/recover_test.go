@@ -16,7 +16,7 @@ func TestAcceptCurrentDirectConfig(t *testing.T) {
 		OriginalGantryConfigSHA: gantryConfigSHA("chair_seed_count: 50\n"),
 		GantryRestored:          true,
 	}
-	current := "chair_holder_count: 64\nchair_seed_count: 8\n"
+	current := "chair_count: 64\nchair_seed_count: 8\n"
 
 	updated, err := acceptCurrentDirectConfig(state, current, gantryConfigSHA(current))
 	if err != nil {
@@ -31,7 +31,7 @@ func TestAcceptCurrentDirectConfig(t *testing.T) {
 }
 
 func TestAcceptCurrentDirectConfigRejectsUnsafeRecovery(t *testing.T) {
-	current := "chair_holder_count: 64\nchair_seed_count: 8\n"
+	current := "chair_count: 64\nchair_seed_count: 8\n"
 	original := "chair_seed_count: 50\n"
 	tests := []struct {
 		name     string
