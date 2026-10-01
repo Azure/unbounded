@@ -277,6 +277,8 @@ func runWithOriginStarter(parent context.Context, opts options, startOrigin orig
 
 		p.batches = catalog.batches
 		if p.opts.Backend == "uds" {
+			p.logUDSMemory()
+
 			var (
 				adapter racersdk.Origin
 				probe   racersdk.Key

@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -22,6 +23,7 @@ type blobResponse struct {
 	success bool
 	// SDK metadata describes the total object, independently of the stream length.
 	totalSize *int64
+	etag      *string
 }
 
 func (p *puller) acquireHTTP(ctx context.Context, kind string, desc ocispec.Descriptor) (blobResponse, error) {
@@ -68,7 +70,7 @@ func sdkClientConfig(opts pullOptions, capacity int) (racersdk.ClientConfig, err
 	limit := max(1, capacity*blobConcurrency)
 
 	return racersdk.ClientConfig{
-		Cache: cache, MaxConnections: limit, MaxQueuedRequests: limit,
+		Cache: cache, MaxConnections: limit, MaxQueuedRequests: limit, PageWindow: 1,
 		QueueTimeout: opts.Timeout, ResponseHeaderTimeout: opts.Timeout, BodyReadTimeout: opts.Timeout,
 	}, nil
 }
@@ -90,6 +92,29 @@ func (p *puller) configureUDS(capacity int) error {
 	return nil
 }
 
+func (p *puller) logUDSMemory() {
+	workers := p.opts.Concurrency
+	if p.opts.ConcurrencyFile != "" {
+		workers = maxLiveConcurrency
+	}
+
+	perBatch := 0
+	for _, batch := range p.batches {
+		perBatch = max(perBatch, min(p.opts.BlobConcurrency, len(batch.blobs)))
+		if len(batch.prefix) > 0 {
+			perBatch = max(perBatch, 1)
+		}
+	}
+
+	reads := workers * perBatch
+	// This is SDK page storage, not total RSS: protocol, socket, verification,
+	// origin, and runtime allocations are additional. Admission is not reduced.
+	slog.Warn("UDS reads buffer one page each; provision memory for configured admission",
+		"max_concurrent_reads", reads, "max_workers", workers, "reads_per_batch", perBatch, "page_credits", 1,
+		"page_buffer_bytes_per_read", uint64(racersdk.PageSize),
+		"page_buffer_bound_bytes", float64(reads)*float64(racersdk.PageSize))
+}
+
 func udsAcquirer(client *racersdk.Client) func(context.Context, string, ocispec.Descriptor) (blobResponse, error) {
 	return func(ctx context.Context, _ string, desc ocispec.Descriptor) (blobResponse, error) {
 		key, err := racersdk.ParseKey(desc.Digest.Encoded())
@@ -97,18 +122,20 @@ func udsAcquirer(client *racersdk.Client) func(context.Context, string, ocispec.
 			return blobResponse{}, err
 		}
 
-		pin, err := racersdk.ParseETag(`"` + desc.Digest.String() + `"`)
-		if err != nil {
-			return blobResponse{}, err
-		}
-
-		value, err := client.Get(ctx, racersdk.Request{Key: key}, racersdk.ReadOptions{Pin: pin})
+		// Match Gantry's ordinary full-object read: let Racer select fresh
+		// metadata, then validate it. One credit bounds ordered Get to one page.
+		value, err := client.Get(ctx, racersdk.Request{Key: key}, udsReadOptions())
 		if err != nil {
 			return blobResponse{}, err
 		}
 
 		size := int64(value.Metadata().Size)
+		etag := value.Metadata().ETag.String()
 
-		return blobResponse{body: value, success: true, totalSize: &size}, nil
+		return blobResponse{body: value, success: true, totalSize: &size, etag: &etag}, nil
 	}
+}
+
+func udsReadOptions() racersdk.ReadOptions {
+	return racersdk.ReadOptions{PageCredits: 1}
 }

@@ -274,3 +274,33 @@ type corruptBody struct {
 	io.Reader
 	io.Closer
 }
+
+func TestGantryGenericBlobs(t *testing.T) {
+	// The mirror and Gantry origin adapter are real; the SDK fake is noncaching.
+	catalog, err := newBlobCatalog(t.Context(), "benchmark/blobs", "generic-gantry", 2, int64(racersdk.PageSize)+71)
+	require.NoError(t, err)
+
+	upstreamServer := httptest.NewServer(catalog.handler())
+	t.Cleanup(upstreamServer.Close)
+	cfg := &config.Config{RacerEnabled: true, UpstreamRegistries: []config.UpstreamRegistry{{Name: "loadgen.invalid", Endpoint: upstreamServer.URL}}}
+	upstream, err := origin.New(cfg)
+	require.NoError(t, err)
+	client, cleanup, err := racersdk.NewFakeClient(gantryracer.Origin(cfg, upstream))
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+
+	server := httptest.NewServer(mirror.New(cfg, nil, upstream, mirror.WithRacer(client)).Handler())
+	t.Cleanup(server.Close)
+	opts := pullTestOptions(server.URL)
+	opts.Namespace = "loadgen.invalid"
+	p, metrics := pullTestNew(t, &syntheticImage{repository: catalog.repository}, opts)
+	p.opts.DiagnoseIntegrity = true
+	require.NoError(t, p.configureDiagnostics(catalog))
+
+	for _, batch := range catalog.batches {
+		require.NoError(t, p.pullBatch(t.Context(), batch))
+	}
+
+	require.Equal(t, float64(2*(int64(racersdk.PageSize)+71)), testutil.ToFloat64(metrics.verifiedBytes))
+	require.Equal(t, float64(2), testutil.ToFloat64(metrics.requests.WithLabelValues("blob", "success")))
+}

@@ -381,6 +381,11 @@ func (p *puller) fetch(ctx context.Context, kind string, desc ocispec.Descriptor
 		return fmt.Errorf("%s %s: metadata size %d, expected %d", kind, desc.Digest, *response.totalSize, desc.Size)
 	}
 
+	if response.etag != nil && *response.etag != `"`+desc.Digest.String()+`"` {
+		reason = failureOther
+		return fmt.Errorf("%s %s: metadata ETag mismatch", kind, desc.Digest)
+	}
+
 	if n != desc.Size {
 		reason = failureSize
 		if n < desc.Size {
