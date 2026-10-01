@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 )
@@ -71,7 +72,10 @@ func (w *racerDeadlineWriter) Write(p []byte) (int, error) {
 }
 
 func TestRacerIOBoundedWritesAndFlush(t *testing.T) {
+	const batch = 256 * 1024
+
 	w := &racerDeadlineWriter{ResponseRecorder: httptest.NewRecorder()}
+	data := bytes.Repeat([]byte("xyz"), batch+1)[:3*batch+1]
 
 	var observed RacerHTTPObservation
 
@@ -86,7 +90,7 @@ func TestRacerIOBoundedWritesAndFlush(t *testing.T) {
 
 		wrapped.WriteHeader(http.StatusPartialContent)
 
-		if _, err := io.Copy(wrapped, bytes.NewReader(make([]byte, 3*racerWriteChunk+1))); err != nil {
+		if _, err := io.Copy(wrapped, bytes.NewReader(data)); err != nil {
 			t.Fatal(err)
 		}
 
@@ -96,7 +100,7 @@ func TestRacerIOBoundedWritesAndFlush(t *testing.T) {
 
 	handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/", nil))
 
-	if len(w.sizes) != 4 || w.sizes[3] != 1 || !w.Flushed {
+	if !slices.Equal(w.sizes, []int{batch, batch, batch, 1}) || !bytes.Equal(w.Body.Bytes(), data) || !w.Flushed {
 		t.Fatalf("writes=%v flushed=%v", w.sizes, w.Flushed)
 	}
 
@@ -106,8 +110,35 @@ func TestRacerIOBoundedWritesAndFlush(t *testing.T) {
 		}
 	}
 
-	if len(w.deadlines) < 7 || observed.Status != http.StatusPartialContent || observed.Bytes != 3*racerWriteChunk+1 || observed.Aborted || observed.Duration <= 0 {
+	if len(w.deadlines) != 7 || observed.Status != http.StatusPartialContent || observed.Bytes != int64(len(data)) || observed.Aborted || observed.Duration <= 0 {
 		t.Fatalf("observation=%+v deadlines=%v", observed, w.deadlines)
+	}
+}
+
+type racerShortWriter struct {
+	*racerDeadlineWriter
+}
+
+func (w *racerShortWriter) Write(p []byte) (int, error) {
+	if len(w.sizes) > 0 {
+		return w.racerDeadlineWriter.Write(p[:7])
+	}
+
+	return w.racerDeadlineWriter.Write(p)
+}
+
+func TestRacerIOBatchedShortWrite(t *testing.T) {
+	const batch = 256 * 1024
+
+	w := &racerShortWriter{&racerDeadlineWriter{ResponseRecorder: httptest.NewRecorder()}}
+	wrapped := &racerResponseWriter{ResponseWriter: w, timeout: time.Second}
+	n, err := wrapped.Write(make([]byte, 3*batch))
+	if n != batch+7 || !errors.Is(err, io.ErrShortWrite) || !wrapped.failed || wrapped.bytes != int64(n) {
+		t.Fatalf("bytes=%d err=%v failed=%v accounted=%d", n, err, wrapped.failed, wrapped.bytes)
+	}
+
+	if !slices.Equal(w.sizes, []int{batch, 7}) || len(w.deadlines) != 3 {
+		t.Fatalf("writes=%v deadlines=%v", w.sizes, w.deadlines)
 	}
 }
 

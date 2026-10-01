@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-const racerWriteChunk = 32 * 1024
+const racerWriteChunk = 256 * 1024
 
 // Socket transfers avoid scratch copying; amortize ReadFrom, deadline and pipe
 // setup over a larger bounded batch without changing fallback write granularity.
