@@ -19,7 +19,6 @@ pub struct Responses {
     io: Rc<HttpIo>,
     delivery: Rc<Delivery>,
 }
-#[path = "subscription.rs"]
 mod subscription;
 impl Responses {
     pub fn new(io: Rc<HttpIo>, delivery: Rc<Delivery>) -> Self {

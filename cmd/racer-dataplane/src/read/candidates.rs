@@ -1171,7 +1171,6 @@ fn classify(
 }
 
 #[cfg(test)]
-#[path = "candidate_timeout_tests.rs"]
 mod timeout_tests;
 
 #[cfg(test)]

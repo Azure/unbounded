@@ -1390,9 +1390,7 @@ fn validate_context(page: &PageId, context: &OriginContext) -> Result<()> {
 }
 
 #[cfg(test)]
-#[path = "."]
 mod tests {
-    #[path = "flight_lifecycle_tests.rs"]
     mod lifecycle_tests;
 
     use super::*;

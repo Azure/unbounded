@@ -1506,5 +1506,4 @@ thread_local! {
     static FAIL_RENAME_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
 }
 #[cfg(test)]
-#[path = "listener_tests.rs"]
 mod tests;

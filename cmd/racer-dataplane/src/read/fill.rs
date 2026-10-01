@@ -1319,8 +1319,7 @@ fn merge_metadata(
     Ok(())
 }
 #[cfg(test)]
-#[path = "fill_tests.rs"]
-mod integration_tests;
+mod scenarios;
 #[cfg(test)]
 mod tests {
     use super::*;
