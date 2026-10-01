@@ -697,11 +697,11 @@ pub(crate) mod tests {
         let mut previous = None;
         for sequence in 1..=2 {
             let wire = a
-                .sign(crate::peer::protocol::WireCodec::encode(&auth, false, 0).unwrap())
+                .sign(crate::peer::protocol::encode_envelope(&auth, false, 0).unwrap())
                 .unwrap();
             let copy = clone_head(&wire);
             let decoded = b.admit(wire).unwrap();
-            let (retained, _) = crate::peer::protocol::WireCodec::decode(decoded, false).unwrap();
+            let (retained, _) = crate::peer::protocol::decode_envelope(decoded, false).unwrap();
             assert_eq!(retained.original.signature, proof.signature);
             assert_eq!(b.rx, sequence);
             if let Some(old) = previous {

@@ -217,7 +217,7 @@ fn offer_fallback(sender_failure: bool, rejected_sites: Option<[&str; 2]>, wrong
         )
         .unwrap();
     let previous = signed_digest(&offer).unwrap();
-    let mut offered = WireCodec::encode(&authentication, true, 0).unwrap();
+    let mut offered = encode_envelope(&authentication, true, 0).unwrap();
     attach(&mut offered, &offer).unwrap();
     let response = SignedResponse {
         authentication,
@@ -245,7 +245,7 @@ fn offer_fallback(sender_failure: bool, rejected_sites: Option<[&str; 2]>, wrong
         let sent = receiver.io.send_head(a, initial, &scope).await?;
         let mut received = receiver.io.receive_head(sent.connection, &scope).await?;
         let offer = detach(&mut received.value)?.unwrap();
-        let (auth, _) = WireCodec::decode(received.value, true)?;
+        let (auth, _) = decode_envelope(received.value, true)?;
         let mut original = binding.clone();
         original.response = [0; 32];
         if sender_failure {
@@ -688,7 +688,7 @@ fn native_roundtrip(simulated: bool, reverse: bool, rejected_site: Option<&str>,
         let sent = receiver.io.send_head(a, initial, &scope).await?;
         let mut offered = receiver.io.receive_head(sent.connection, &scope).await?;
         let control = detach(&mut offered.value)?;
-        let (auth, length) = WireCodec::decode(offered.value, true)?;
+        let (auth, length) = decode_envelope(offered.value, true)?;
         if reject_sender {
             assert!(control.is_none());
             let (_, body) = receiver
@@ -739,7 +739,7 @@ fn native_roundtrip(simulated: bool, reverse: bool, rejected_site: Option<&str>,
         if reject_sender {
             assert!(!sent);
             assert_eq!(sender.native.as_ref().unwrap().prepare_attempts.get(), 0);
-            let head = WireCodec::encode(&response.authentication, true, 144)?;
+            let head = encode_envelope(&response.authentication, true, 144)?;
             conn = sender.io.send_head(conn, head, &scope).await?.connection;
             let PeerResponse::Page { ciphertext, .. } = &response.response else {
                 unreachable!()

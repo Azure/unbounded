@@ -197,8 +197,8 @@ fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failure
         let first_scope = first.origin.scope().clone();
         let (first, first_binding) = senders[0].sign_request(first).unwrap();
         // Exercise the actual versioned wire and canonical logical decoding.
-        let (first, _) = WireCodec::decode(
-            WireCodec::encode(&first.authentication, false, 0).unwrap(),
+        let (first, _) = decode_envelope(
+            encode_envelope(&first.authentication, false, 0).unwrap(),
             false,
         )
         .unwrap();
@@ -232,8 +232,8 @@ fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failure
         assert_eq!(grant.page.number.0, 8);
         assert_eq!(grant.receiver.0, B);
         let body = ciphertext.bytes().to_vec();
-        let (encoded, length) = WireCodec::decode(
-            WireCodec::encode(&second.authentication, true, body.len()).unwrap(),
+        let (encoded, length) = decode_envelope(
+            encode_envelope(&second.authentication, true, body.len()).unwrap(),
             true,
         )
         .unwrap();

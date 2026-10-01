@@ -1134,7 +1134,7 @@ mod tests {
 
         // Real wire framing and canonical logical decode retain the effective
         // balance independently of the immutable original signed ceiling.
-        use crate::peer::protocol::{SecurityCodec, WireCodec};
+        use crate::peer::protocol::{SecurityCodec, decode_envelope, encode_envelope};
         let scope = forwarded.request.origin.scope().clone();
         let admission = Rc::new(Admission::new(
             crate::test_support::cluster::config(false).limits,
@@ -1143,8 +1143,8 @@ mod tests {
             admission.clone(),
             crate::memory::pool::BufferPool::new(admission),
         );
-        let (auth, _) = WireCodec::decode(
-            WireCodec::encode(&forwarded.authentication, false, 0).unwrap(),
+        let (auth, _) = decode_envelope(
+            encode_envelope(&forwarded.authentication, false, 0).unwrap(),
             false,
         )
         .unwrap();

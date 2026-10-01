@@ -1,5 +1,7 @@
 //! Transport-neutral ciphertext lifecycle, selecting HTTP or authenticated RDMA.
-use super::protocol::{PeerResponse, SecurityCodec, SignedRequest, SignedResponse, WireCodec};
+use super::protocol::{
+    PeerResponse, SecurityCodec, SignedRequest, SignedResponse, decode_envelope, encode_envelope,
+};
 use crate::telemetry::failures::{BodyProgress, Detail, Failure, Stage, timestamp};
 use crate::{
     error::{Error, Operation, Result},
@@ -268,7 +270,7 @@ pub(super) fn detach(head: &mut MessageHead) -> Result<Option<SignedHead>> {
 }
 fn frame(signed: SignedHead) -> Result<MessageHead> {
     let response = matches!(signed.head.start, StartLine::Response { .. });
-    WireCodec::encode(
+    encode_envelope(
         &ForwardedHead {
             original: Arc::new(signed),
             hops: vec![],
@@ -278,7 +280,7 @@ fn frame(signed: SignedHead) -> Result<MessageHead> {
     )
 }
 fn unframe(head: MessageHead, response: bool) -> Result<SignedHead> {
-    let (auth, len) = WireCodec::decode(head, response)?;
+    let (auth, len) = decode_envelope(head, response)?;
     if len != 0 || !auth.hops.is_empty() {
         return Err(Error::InvalidRequest);
     }
@@ -433,7 +435,7 @@ impl Transfers {
             vec![extension(SETUP_HEADER, local_setup.clone())],
         )?;
         let mut previous = signed_digest(&offer)?;
-        let mut head = WireCodec::encode(&response.authentication, true, 0)?;
+        let mut head = encode_envelope(&response.authentication, true, 0)?;
         attach(&mut head, &offer)?;
         connection = self.io.send_head(connection, head, scope).await?.connection;
         connection.next_round()?;
@@ -633,7 +635,7 @@ impl Transfers {
             ciphertext.bytes().len(),
             vec![],
         )?;
-        let mut head = WireCodec::encode(&response.authentication, true, ciphertext.bytes().len())?;
+        let mut head = encode_envelope(&response.authentication, true, ciphertext.bytes().len())?;
         attach(&mut head, &finish)?;
         let connection = self.io.send_head(connection, head, scope).await?.connection;
         let written = self
@@ -1046,7 +1048,7 @@ impl Transfers {
         let connection = self.write_control(connection, fallback, scope).await?;
         let mut received = self.io.receive_head(connection, scope).await?;
         let control = detach(&mut received.value)?.ok_or(Error::Unauthorized)?;
-        let (returned, length) = WireCodec::decode(received.value, true)?;
+        let (returned, length) = decode_envelope(received.value, true)?;
         if envelope_digest(&returned)? != binding.response {
             return Err(Error::Unauthorized);
         }
@@ -1304,7 +1306,7 @@ impl Transfers {
                     .ok_or(Error::InvalidRequest)?
                     .max(1),
             )?;
-            let mut head = WireCodec::encode(&request.authentication, false, 0)?;
+            let mut head = encode_envelope(&request.authentication, false, 0)?;
             let signatures = self.signatures.clone();
             let peer = crate::security::connection::receiver(
                 &request
@@ -1382,7 +1384,7 @@ impl Transfers {
             } else {
                 None
             };
-            let (authentication, length) = WireCodec::decode(received.value, true)?;
+            let (authentication, length) = decode_envelope(received.value, true)?;
             if let Some(control) = control {
                 let (binding, accept, peer) = native.ok_or(Error::Unauthorized)?;
                 if length != 0 {

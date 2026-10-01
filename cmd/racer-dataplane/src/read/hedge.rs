@@ -340,7 +340,7 @@ mod tests {
                     let parsed = codec.decode_head(bytes);
                     let error = match parsed {
                         Err(e) => e,
-                        Ok(Some((head, _))) => crate::peer::protocol::WireCodec::decode(head, true)
+                        Ok(Some((head, _))) => crate::peer::protocol::decode_envelope(head, true)
                             .err()
                             .expect("missing signed wire envelope"),
                         _ => panic!("complete malformed frame"),

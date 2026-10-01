@@ -16,8 +16,8 @@ fn signed_opaque_relay_roundtrip_and_exact_attempt_binding() {
     let scope = local.origin.scope().clone();
     let (signed, outstanding) = auth[0].sign_request_to(local, signers[1].node()).unwrap();
     let signature = signed.authentication.original.signature.clone();
-    let (envelope, _) = WireCodec::decode(
-        WireCodec::encode(&signed.authentication, false, 0).unwrap(),
+    let (envelope, _) = decode_envelope(
+        encode_envelope(&signed.authentication, false, 0).unwrap(),
         false,
     )
     .unwrap();
@@ -46,8 +46,8 @@ fn signed_opaque_relay_roundtrip_and_exact_attempt_binding() {
             .ciphertext,
         vec![5; 32]
     );
-    let (envelope, _) = WireCodec::decode(
-        WireCodec::encode(&forwarded.authentication, false, 0).unwrap(),
+    let (envelope, _) = decode_envelope(
+        encode_envelope(&forwarded.authentication, false, 0).unwrap(),
         false,
     )
     .unwrap();
@@ -63,8 +63,8 @@ fn signed_opaque_relay_roundtrip_and_exact_attempt_binding() {
         .append_response(verified, signers[0].node())
         .unwrap();
     assert_eq!(reply.authentication.original.signature, reply_signature);
-    let (envelope, _) = WireCodec::decode(
-        WireCodec::encode(&reply.authentication, true, 0).unwrap(),
+    let (envelope, _) = decode_envelope(
+        encode_envelope(&reply.authentication, true, 0).unwrap(),
         true,
     )
     .unwrap();
@@ -193,12 +193,12 @@ fn not_found_is_authenticated_through_relay_and_restricted_to_fresh_acquire() {
             original.signature
         );
         // The outer HTTP status is framing, while the inner 404 and outcome are signed.
-        let envelope = WireCodec::encode(&reverse_response.authentication, true, 0).unwrap();
+        let envelope = encode_envelope(&reverse_response.authentication, true, 0).unwrap();
         assert!(matches!(
             envelope.start,
             StartLine::Response { status: 200 }
         ));
-        let (envelope, length) = WireCodec::decode(envelope, true).unwrap();
+        let (envelope, length) = decode_envelope(envelope, true).unwrap();
         assert_eq!(length, 0);
         let decoded = codec.response(envelope, vec![], &scope).unwrap();
         let (_, other) = auth[0]
@@ -280,8 +280,8 @@ fn changed_operation_credentials_replay_and_deadlines_fail() {
         .ciphertext[0] ^= 1;
     assert!(receiver.verify_request(signed).is_err());
     let (signed, _) = sender.sign_request(request(&admission, 2)).unwrap();
-    let (envelope, _) = WireCodec::decode(
-        WireCodec::encode(&signed.authentication, false, 0).unwrap(),
+    let (envelope, _) = decode_envelope(
+        encode_envelope(&signed.authentication, false, 0).unwrap(),
         false,
     )
     .unwrap();
@@ -718,8 +718,8 @@ fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction(
             .unwrap();
         let receiver =
             crate::security::connection::receiver(&signed.authentication.original.head).unwrap();
-        let (envelope, _) = WireCodec::decode(
-            WireCodec::encode(&signed.authentication, false, 0).unwrap(),
+        let (envelope, _) = decode_envelope(
+            encode_envelope(&signed.authentication, false, 0).unwrap(),
             false,
         )
         .unwrap();
@@ -1465,7 +1465,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
             conn = io
                 .send_head(
                     conn,
-                    WireCodec::encode(&authentication, true, body.len())?,
+                    encode_envelope(&authentication, true, body.len())?,
                     &scope,
                 )
                 .await?
@@ -1768,7 +1768,7 @@ mod established_sessions {
             let (signed, _) = Forwarding::new(self.signers[0].clone())
                 .sign_request(request)
                 .unwrap();
-            WireCodec::encode(&signed.authentication, false, 0).unwrap()
+            encode_envelope(&signed.authentication, false, 0).unwrap()
         }
         // First successful dispatch uses the production server's accept path.
         fn first(&self) -> (ConnectionLease, ConnectionLease) {

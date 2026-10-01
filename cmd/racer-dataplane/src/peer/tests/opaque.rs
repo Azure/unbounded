@@ -215,7 +215,7 @@ fn exchange(
         let mut conn = connection::accept(&ios[2], conn, signers[2].clone(), &scope).await?;
         for i in 0..rounds {
             let received = ios[2].receive_head(conn, &scope).await?;
-            let (head, length) = WireCodec::decode(received.value, false)?;
+            let (head, length) = decode_envelope(received.value, false)?;
             assert_eq!(length, 0);
             let request = codec(&admissions[2]).request(head, &scope)?;
             let auth = Forwarding::new(signers[2].clone());
@@ -246,7 +246,7 @@ fn exchange(
             };
             let response = auth.sign_response(request.binding(), response)?;
             conn = received.connection;
-            let head = WireCodec::encode(&response.authentication, true, body.len())?;
+            let head = encode_envelope(&response.authentication, true, body.len())?;
             if truncated && i + 1 == rounds {
                 conn = ios[2].send_head(conn, head, &scope).await?.connection;
                 let done = ios[2]
@@ -336,11 +336,11 @@ fn exchange(
             let received = ios[0]
                 .exchange_head(
                     conn,
-                    WireCodec::encode(&signed.authentication, false, 0)?,
+                    encode_envelope(&signed.authentication, false, 0)?,
                     &scope,
                 )
                 .await?;
-            let (head, length) = WireCodec::decode(received.value, true)?;
+            let (head, length) = decode_envelope(received.value, true)?;
             assert_eq!(head.hops.len(), 1);
             assert_eq!(length, body.len());
             conn = received.connection;

@@ -104,124 +104,120 @@ pub const MIN_REQUEST_CONTEXT_BYTES: usize = 8 * MAX_ENVELOPE_HEAD;
 
 /// Versioned HTTP envelope. Signed header values and signatures are preserved using
 /// the HTTP codec; this wrapper is framing only and is never a signing authority.
-pub struct WireCodec;
-impl WireCodec {
-    pub fn encode(
-        authentication: &ForwardedHead,
-        response: bool,
-        body_length: usize,
-    ) -> Result<MessageHead> {
-        if authentication.hops.len() > MAX_HOPS
-            || body_length > crate::model::PAGE_BYTES as usize + 16
-            || (!response && body_length != 0)
-        {
-            return Err(Error::InvalidRequest);
-        }
-        let mut headers = vec![
-            Header {
-                name: "racer-peer-version".into(),
-                value: VERSION.as_bytes().to_vec(),
-            },
-            Header {
-                name: "content-length".into(),
-                value: body_length.to_string().into_bytes(),
-            },
-            Header {
-                name: "racer-original".into(),
-                value: encode_signed(&authentication.original)?,
-            },
-        ];
-        for (index, head) in authentication.hops.iter().enumerate() {
-            headers.push(Header {
-                name: format!("racer-hop-{index}"),
-                value: encode_signed(head)?,
-            });
-        }
-        let head = MessageHead {
-            start: if response {
-                StartLine::Response { status: 200 }
-            } else {
-                StartLine::Request {
-                    method: "POST".into(),
-                    target: REQUEST_TARGET.into(),
-                }
-            },
-            headers,
-        };
-        Codec::new(MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16).encode_head(&head)?;
-        Ok(head)
+pub fn encode_envelope(
+    authentication: &ForwardedHead,
+    response: bool,
+    body_length: usize,
+) -> Result<MessageHead> {
+    if authentication.hops.len() > MAX_HOPS
+        || body_length > crate::model::PAGE_BYTES as usize + 16
+        || (!response && body_length != 0)
+    {
+        return Err(Error::InvalidRequest);
     }
-    pub fn decode(head: MessageHead, response: bool) -> Result<(ForwardedHead, usize)> {
-        match (&head.start, response) {
-            (StartLine::Request { method, target }, false)
-                if method == "POST" && target == REQUEST_TARGET => {}
-            (StartLine::Response { status: 200 }, true) => {}
-            _ => return Err(Error::InvalidRequest),
-        }
-        let mut original = None;
-        let mut version = false;
-        let mut length = None;
-        let mut hops = std::collections::BTreeMap::new();
-        let mut seen = crate::runtime::collections::HashSet::default();
-        let mut total = 0usize;
-        for header in head.headers {
-            total = total
-                .checked_add(header.name.len())
-                .and_then(|n| n.checked_add(header.value.len()))
-                .ok_or(Error::InvalidRequest)?;
-            if total > MAX_ENVELOPE_HEAD {
-                return Err(Error::InvalidRequest);
-            }
-            let name = header.name.to_ascii_lowercase();
-            if !seen.insert(name.clone()) {
-                return Err(Error::InvalidRequest);
-            }
-            match name.as_str() {
-                "racer-peer-version" => {
-                    if header.value != VERSION.as_bytes() {
-                        return Err(Error::InvalidRequest);
-                    }
-                    version = true;
-                }
-                "content-length" => {
-                    let text =
-                        std::str::from_utf8(&header.value).map_err(|_| Error::InvalidRequest)?;
-                    let parsed = text.parse::<usize>().map_err(|_| Error::InvalidRequest)?;
-                    if text != parsed.to_string() {
-                        return Err(Error::InvalidRequest);
-                    }
-                    length = Some(parsed);
-                }
-                "racer-original" => original = Some(Arc::new(decode_signed(&header.value)?)),
-                "connection" | "host" => {}
-                _ => {
-                    let suffix = name
-                        .strip_prefix("racer-hop-")
-                        .ok_or(Error::InvalidRequest)?;
-                    let index = suffix.parse::<usize>().map_err(|_| Error::InvalidRequest)?;
-                    if index >= MAX_HOPS || suffix != index.to_string() {
-                        return Err(Error::InvalidRequest);
-                    }
-                    hops.insert(index, decode_signed(&header.value)?);
-                }
-            }
-        }
-        let length = length.ok_or(Error::InvalidRequest)?;
-        if !version || length > crate::model::PAGE_BYTES as usize + 16 || (!response && length != 0)
-        {
-            return Err(Error::InvalidRequest);
-        }
-        if hops.keys().copied().ne(0..hops.len()) {
-            return Err(Error::InvalidRequest);
-        }
-        Ok((
-            ForwardedHead {
-                original: original.ok_or(Error::InvalidRequest)?,
-                hops: hops.into_values().collect(),
-            },
-            length,
-        ))
+    let mut headers = vec![
+        Header {
+            name: "racer-peer-version".into(),
+            value: VERSION.as_bytes().to_vec(),
+        },
+        Header {
+            name: "content-length".into(),
+            value: body_length.to_string().into_bytes(),
+        },
+        Header {
+            name: "racer-original".into(),
+            value: encode_signed(&authentication.original)?,
+        },
+    ];
+    for (index, head) in authentication.hops.iter().enumerate() {
+        headers.push(Header {
+            name: format!("racer-hop-{index}"),
+            value: encode_signed(head)?,
+        });
     }
+    let head = MessageHead {
+        start: if response {
+            StartLine::Response { status: 200 }
+        } else {
+            StartLine::Request {
+                method: "POST".into(),
+                target: REQUEST_TARGET.into(),
+            }
+        },
+        headers,
+    };
+    Codec::new(MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16).encode_head(&head)?;
+    Ok(head)
+}
+/// Decode framing only; proof verification and socket replay admission are separate.
+pub fn decode_envelope(head: MessageHead, response: bool) -> Result<(ForwardedHead, usize)> {
+    match (&head.start, response) {
+        (StartLine::Request { method, target }, false)
+            if method == "POST" && target == REQUEST_TARGET => {}
+        (StartLine::Response { status: 200 }, true) => {}
+        _ => return Err(Error::InvalidRequest),
+    }
+    let mut original = None;
+    let mut version = false;
+    let mut length = None;
+    let mut hops = std::collections::BTreeMap::new();
+    let mut seen = crate::runtime::collections::HashSet::default();
+    let mut total = 0usize;
+    for header in head.headers {
+        total = total
+            .checked_add(header.name.len())
+            .and_then(|n| n.checked_add(header.value.len()))
+            .ok_or(Error::InvalidRequest)?;
+        if total > MAX_ENVELOPE_HEAD {
+            return Err(Error::InvalidRequest);
+        }
+        let name = header.name.to_ascii_lowercase();
+        if !seen.insert(name.clone()) {
+            return Err(Error::InvalidRequest);
+        }
+        match name.as_str() {
+            "racer-peer-version" => {
+                if header.value != VERSION.as_bytes() {
+                    return Err(Error::InvalidRequest);
+                }
+                version = true;
+            }
+            "content-length" => {
+                let text = std::str::from_utf8(&header.value).map_err(|_| Error::InvalidRequest)?;
+                let parsed = text.parse::<usize>().map_err(|_| Error::InvalidRequest)?;
+                if text != parsed.to_string() {
+                    return Err(Error::InvalidRequest);
+                }
+                length = Some(parsed);
+            }
+            "racer-original" => original = Some(Arc::new(decode_signed(&header.value)?)),
+            "connection" | "host" => {}
+            _ => {
+                let suffix = name
+                    .strip_prefix("racer-hop-")
+                    .ok_or(Error::InvalidRequest)?;
+                let index = suffix.parse::<usize>().map_err(|_| Error::InvalidRequest)?;
+                if index >= MAX_HOPS || suffix != index.to_string() {
+                    return Err(Error::InvalidRequest);
+                }
+                hops.insert(index, decode_signed(&header.value)?);
+            }
+        }
+    }
+    let length = length.ok_or(Error::InvalidRequest)?;
+    if !version || length > crate::model::PAGE_BYTES as usize + 16 || (!response && length != 0) {
+        return Err(Error::InvalidRequest);
+    }
+    if hops.keys().copied().ne(0..hops.len()) {
+        return Err(Error::InvalidRequest);
+    }
+    Ok((
+        ForwardedHead {
+            original: original.ok_or(Error::InvalidRequest)?,
+            hops: hops.into_values().collect(),
+        },
+        length,
+    ))
 }
 pub(crate) fn encode_signed(head: &SignedHead) -> Result<Vec<u8>> {
     if head.signature.len() != 64 {
@@ -276,7 +272,7 @@ mod envelope_tests {
     fn envelope_preserves_signature_and_opaque_headers() {
         let original = envelope();
         let (decoded, length) =
-            WireCodec::decode(WireCodec::encode(&original, true, 27).unwrap(), true).unwrap();
+            decode_envelope(encode_envelope(&original, true, 27).unwrap(), true).unwrap();
         assert_eq!(length, 27);
         assert_eq!(decoded.original.signature, original.original.signature);
         assert_eq!(decoded.original.head.headers[0].value, b"AAEC/w==");
@@ -284,33 +280,33 @@ mod envelope_tests {
     #[test]
     fn rejects_versions_duplicates_holes_and_request_bodies() {
         for version in ["1", "2", "3", "4", "6"] {
-            let mut head = WireCodec::encode(&envelope(), false, 0).unwrap();
+            let mut head = encode_envelope(&envelope(), false, 0).unwrap();
             head.headers[0].value = version.as_bytes().to_vec();
-            assert!(WireCodec::decode(head, false).is_err());
+            assert!(decode_envelope(head, false).is_err());
         }
-        let mut legacy = WireCodec::encode(&envelope(), false, 0).unwrap();
+        let mut legacy = encode_envelope(&envelope(), false, 0).unwrap();
         legacy.start = StartLine::Request {
             method: "POST".into(),
             target: "/racer/peer/v2/exchange".into(),
         };
-        assert!(WireCodec::decode(legacy, false).is_err());
-        let mut head = WireCodec::encode(&envelope(), false, 0).unwrap();
+        assert!(decode_envelope(legacy, false).is_err());
+        let mut head = encode_envelope(&envelope(), false, 0).unwrap();
         head.headers[0].value = b"1".to_vec();
-        assert!(WireCodec::decode(head, false).is_err());
-        let mut head = WireCodec::encode(&envelope(), false, 0).unwrap();
+        assert!(decode_envelope(head, false).is_err());
+        let mut head = encode_envelope(&envelope(), false, 0).unwrap();
         head.headers.push(Header {
             name: "Content-Length".into(),
             value: b"0".to_vec(),
         });
-        assert!(WireCodec::decode(head, false).is_err());
-        let mut head = WireCodec::encode(&envelope(), false, 0).unwrap();
+        assert!(decode_envelope(head, false).is_err());
+        let mut head = encode_envelope(&envelope(), false, 0).unwrap();
         head.headers.push(Header {
             name: "racer-hop-1".into(),
             value: encode_signed(&envelope().original).unwrap(),
         });
-        assert!(WireCodec::decode(head, false).is_err());
-        assert!(WireCodec::encode(&envelope(), false, 1).is_err());
-        assert!(WireCodec::encode(&envelope(), true, usize::MAX).is_err());
+        assert!(decode_envelope(head, false).is_err());
+        assert!(encode_envelope(&envelope(), false, 1).is_err());
+        assert!(encode_envelope(&envelope(), true, usize::MAX).is_err());
     }
     #[test]
     fn rejects_trailing_or_oversized_embedded_head() {
@@ -363,12 +359,12 @@ mod envelope_tests {
                 .map(|_| decode_signed(&encoded).unwrap())
                 .collect(),
         };
-        let mut outer = WireCodec::encode(&envelope, true, 0).unwrap();
+        let mut outer = encode_envelope(&envelope, true, 0).unwrap();
         crate::security::protocol::push(&mut outer, "racer-receiver", &signers[1].node().0);
         let outer = signers[0].sign_fields(outer).unwrap();
         signers[1].verify_proof(outer).unwrap();
         envelope.hops.push(decode_signed(&encoded).unwrap());
-        assert!(WireCodec::encode(&envelope, true, 0).is_err());
+        assert!(encode_envelope(&envelope, true, 0).is_err());
         let mut too_large = decode_signed(&encoded).unwrap();
         too_large
             .head

@@ -186,7 +186,8 @@ use crate::{
     http::{Codec, Header, MessageHead, StartLine, connection::ConnectionLease},
     model::{ExpiresAt, MetadataSelector, ObjectMetadata, ResourceClass, *},
     peer::protocol::{
-        self, FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse, WireCodec,
+        self, FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse, decode_envelope,
+        encode_envelope,
     },
     security::{
         connection,
@@ -304,7 +305,7 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
     };
     let (mut request, binding) = forwarding[0].sign_request_to(request, &node(1)).unwrap();
     assert!(
-        WireCodec::encode(&request.authentication, false, 0)
+        encode_envelope(&request.authentication, false, 0)
             .unwrap()
             .unique("racer-original")
             .unwrap()
@@ -327,7 +328,7 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
             )
         })
         .unwrap();
-        let head = WireCodec::encode(&request.authentication, false, 0).unwrap();
+        let head = encode_envelope(&request.authentication, false, 0).unwrap();
         let (sent, received) = drive(reactor, async {
             futures::try_join!(
                 io.send_head(left, head, &scope),
@@ -336,7 +337,7 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
         })
         .unwrap();
         sockets.push((sent.connection, received.connection));
-        let (auth, length) = WireCodec::decode(received.value, false).unwrap();
+        let (auth, length) = decode_envelope(received.value, false).unwrap();
         assert_eq!(length, 0);
         assert_eq!(auth.hops.len(), index - 1);
         let decoded = codec.request(auth, &scope).unwrap();
@@ -391,7 +392,7 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
     drop(opened);
     for index in (1..=protocol::MAX_HOPS).rev() {
         let (left, right) = sockets.pop().unwrap();
-        let head = WireCodec::encode(&response.authentication, true, 0).unwrap();
+        let head = encode_envelope(&response.authentication, true, 0).unwrap();
         let (sent, received) = drive(reactor, async {
             futures::try_join!(
                 io.send_head(right, head, &scope),
@@ -399,7 +400,7 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
             )
         })
         .unwrap();
-        let (auth, _) = WireCodec::decode(received.value, true).unwrap();
+        let (auth, _) = decode_envelope(received.value, true).unwrap();
         let verified = forwarding[index - 1]
             .verify_response(
                 codec.response(auth, vec![], &scope).unwrap(),

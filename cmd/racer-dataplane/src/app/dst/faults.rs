@@ -142,7 +142,7 @@ impl Harness {
     pub(super) fn peer_security(&mut self) {
         use crate::{
             http::{Codec, MessageHead, StartLine},
-            peer::protocol::WireCodec,
+            peer::protocol::encode_envelope,
             security::protocol as p,
         };
         let receiver = self.rng.pick(self.nodes.len());
@@ -175,7 +175,7 @@ impl Harness {
             original: Arc::new(signed),
             hops: vec![],
         };
-        let wire = WireCodec::encode(&envelope, false, 0).unwrap();
+        let wire = encode_envelope(&envelope, false, 0).unwrap();
         let bytes = Codec::new(32768, u64::MAX).encode_head(&wire).unwrap();
         if self.security_faults.is_empty() {
             self.security_faults.extend([true, false]);
@@ -196,7 +196,7 @@ impl Harness {
             );
             self.coverage.action("peer-replay");
         } else {
-            // WireCodec wraps the signed original in a base64 field. Mutate the
+            // The envelope wraps the signed original in a base64 field. Mutate the
             // signed signature before encoding so the outer HTTP remains legal.
             let original = &envelope.original;
             let mut signed = crate::security::connection::signature_tests::clone_head(original);
@@ -213,7 +213,7 @@ impl Harness {
                 b'A'
             };
             signed.signature[0] ^= 1;
-            let wire = WireCodec::encode(
+            let wire = encode_envelope(
                 &crate::security::forwarding::ForwardedHead {
                     original: Arc::new(signed),
                     hops: vec![],

@@ -261,7 +261,7 @@ fn destination_exchange(order: CompletionOrder) {
         mode: FetchMode::CopyOnly,
     };
     let (signed, binding) = sender.sign_request(request).unwrap();
-    let head = WireCodec::encode(&signed.authentication, false, 0).unwrap();
+    let head = encode_envelope(&signed.authentication, false, 0).unwrap();
     let client = drive(&reactor, async {
         let sending = async {
             let client = crate::security::connection::connect(
@@ -341,7 +341,7 @@ fn destination_exchange(order: CompletionOrder) {
             let returned = drive(&reactor, work.as_mut()).unwrap();
             assert_eq!(reactor.in_flight(), 0, "success must fence the FIN watch");
             let received = drive(&reactor, io.receive_head(client.connection, &parent)).unwrap();
-            let (head, length) = WireCodec::decode(received.value, true).unwrap();
+            let (head, length) = decode_envelope(received.value, true).unwrap();
             assert_eq!(length, result.ciphertext.bytes().len());
             let mut connection = received.connection;
             let mut bytes = Vec::new();

@@ -130,7 +130,7 @@ fn body_cases(cases: &[&str]) {
                 crate::security::connection::accept(&io, conn, signers[2].clone(), &server_scope)
                     .await?;
             let received = io.receive_head(conn, &server_scope).await?;
-            let (head, _) = WireCodec::decode(received.value, false)?;
+            let (head, _) = decode_envelope(received.value, false)?;
             let remote_auth = Forwarding::new(signers[2].clone());
             let req =
                 remote_auth.verify_request(codec(&admission).request(head, &server_scope)?)?;
@@ -188,7 +188,7 @@ fn body_cases(cases: &[&str]) {
             let mut conn = io
                 .send_head(
                     received.connection,
-                    WireCodec::encode(&response.authentication, true, length + 16)?,
+                    encode_envelope(&response.authentication, true, length + 16)?,
                     &server_scope,
                 )
                 .await?

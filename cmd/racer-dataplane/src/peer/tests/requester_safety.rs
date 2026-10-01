@@ -8,7 +8,7 @@ use crate::{
     model::{MembershipVersion, ResourceClass},
     peer::{
         adaptive::{AdaptivePeers, Outcome},
-        protocol::{PeerResponse, SecurityCodec, WireCodec},
+        protocol::{PeerResponse, SecurityCodec, decode_envelope, encode_envelope},
         transport::RelayResponse,
     },
     runtime::{
@@ -210,7 +210,7 @@ fn probe_exchange(opaque: bool, case: &str) {
         let conn = ConnectionLease::from_accepted(fd, &admission)?;
         let conn = connection::accept(&io, conn, signers[2].clone(), &scope).await?;
         let received = io.receive_head(conn, &scope).await?;
-        let (head, length) = WireCodec::decode(received.value, false)?;
+        let (head, length) = decode_envelope(received.value, false)?;
         assert_eq!(length, 0);
         let auth = Forwarding::new(signers[2].clone());
         let request = auth.verify_request(codec.request(head, &scope)?)?;
@@ -232,7 +232,7 @@ fn probe_exchange(opaque: bool, case: &str) {
                 .unwrap()
                 .value = b"overloaded".to_vec();
         }
-        let head = WireCodec::encode(&response.authentication, true, 0)?;
+        let head = encode_envelope(&response.authentication, true, 0)?;
         let sent = io.send_head(received.connection, head, &scope).await?;
         drop(sent);
         Ok::<_, Error>(())

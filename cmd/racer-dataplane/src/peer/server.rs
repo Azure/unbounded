@@ -249,7 +249,7 @@ impl PeerServer {
         scope: &'a RequestScope,
     ) -> Operation<'a, crate::http::connection::ConnectionLease> {
         Box::pin(async move {
-            use super::protocol::WireCodec;
+            use super::protocol::{decode_envelope, encode_envelope};
             scope.check()?;
             let codec = &self.wire;
             // One fixed budget for handshake reads, verification, signing, writes,
@@ -278,7 +278,7 @@ impl PeerServer {
                     .max(1),
             )?;
             let native_control = super::transport::detach(&mut received.value)?;
-            let (authentication, length) = WireCodec::decode(received.value, false)?;
+            let (authentication, length) = decode_envelope(received.value, false)?;
             if length != 0 {
                 return Err(Error::InvalidRequest);
             }
@@ -352,7 +352,7 @@ impl PeerServer {
                             connection,
                             length,
                         }) => {
-                            let head = WireCodec::encode(&authentication, true, length)?;
+                            let head = encode_envelope(&authentication, true, length)?;
                             received.connection.relay_peer = Some(connection);
                             let mut connection = self
                                 .io
@@ -473,7 +473,7 @@ impl PeerServer {
             } => ciphertext.bytes(),
             _ => &[],
         };
-        let head = super::protocol::WireCodec::encode(&response.authentication, true, body.len())?;
+        let head = super::protocol::encode_envelope(&response.authentication, true, body.len())?;
         let sent = self.io.send_head(connection, head, scope).await?;
         let mut connection = sent.connection;
         if !body.is_empty() {
