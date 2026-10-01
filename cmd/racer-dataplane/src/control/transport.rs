@@ -642,33 +642,7 @@ impl ControlConnection {
         scope: &'a RequestScope,
     ) -> Operation<'a, HttpResponse> {
         Box::pin(async move {
-            if !matches!(method, "GET" | "POST")
-                || !path.starts_with('/')
-                || path.bytes().any(|b| b <= 32 || b >= 127)
-                || token.is_some_and(|t| t.bytes().any(|b| b <= 32 || b >= 127))
-            {
-                return Err(Error::InvalidRequest);
-            }
-            let mut request = zeroize::Zeroizing::new(format!(
-                "{method} {path} HTTP/1.1\r\nHost: {}\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n",
-                self.host,
-                body.len()
-            ));
-            if let Some(token) = token {
-                request.reserve(token.len() + 32);
-                request.push_str("Authorization: Bearer ");
-                request.push_str(token);
-                request.push_str("\r\n");
-            }
-            if let Some(base) = base {
-                if base.len() != 64 || !base.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    return Err(Error::InvalidRequest);
-                }
-                request.push_str("X-Racer-Delta-Base: ");
-                request.push_str(base);
-                request.push_str("\r\n");
-            }
-            request.push_str("\r\n");
+            let request = request_head(&self.host, method, path, token, body.len(), base)?;
             for bytes in [request.as_bytes(), body] {
                 let mut offset = 0;
                 while offset < bytes.len() {
@@ -721,64 +695,13 @@ impl ControlConnection {
                     zeroize::Zeroizing::new(received[header_len..].to_vec())
                 }
                 Framing::Chunked => {
-                    let mut raw = zeroize::Zeroizing::new(received[header_len..].to_vec());
-                    let mut body = zeroize::Zeroizing::new(Vec::new());
                     let bound = if status == 200 {
                         limit
                     } else {
                         wire::MAX_ENROLLMENT_BYTES
                     };
-                    loop {
-                        let line_end = loop {
-                            if let Some(n) = raw.windows(2).position(|w| w == b"\r\n") {
-                                break n;
-                            }
-                            if raw.len() > 128 {
-                                return Err(Error::InvalidRequest);
-                            }
-                            self.receive(&mut raw, &mut scratch[..], scope).await?;
-                        };
-                        if line_end == 0
-                            || line_end > 16
-                            || !raw[..line_end].iter().all(u8::is_ascii_hexdigit)
-                        {
-                            return Err(Error::InvalidRequest);
-                        }
-                        let length = usize::from_str_radix(
-                            std::str::from_utf8(&raw[..line_end])
-                                .map_err(|_| Error::InvalidRequest)?,
-                            16,
-                        )
-                        .map_err(|_| Error::Overloaded)?;
-                        raw.drain(..line_end + 2);
-                        if length > bound - body.len() {
-                            return Err(Error::Overloaded);
-                        }
-                        let mut remaining = length;
-                        while remaining != 0 {
-                            if raw.is_empty() {
-                                self.receive(&mut raw, &mut scratch[..], scope).await?;
-                            }
-                            let n = remaining.min(raw.len());
-                            append_sensitive(&mut body, &raw[..n]);
-                            raw.drain(..n);
-                            remaining -= n;
-                        }
-                        while raw.len() < 2 {
-                            self.receive(&mut raw, &mut scratch[..], scope).await?;
-                        }
-                        if &raw[..2] != b"\r\n" {
-                            return Err(Error::InvalidRequest);
-                        }
-                        raw.drain(..2);
-                        if length == 0 {
-                            if !raw.is_empty() {
-                                return Err(Error::InvalidRequest);
-                            }
-                            break;
-                        }
-                    }
-                    body
+                    self.receive_chunked(&received[header_len..], bound, &mut scratch[..], scope)
+                        .await?
                 }
             };
             self.check(scope)?;
@@ -805,6 +728,64 @@ impl ControlConnection {
             })
         })
     }
+    async fn receive_chunked(
+        &mut self,
+        initial: &[u8],
+        bound: usize,
+        scratch: &mut [u8],
+        scope: &RequestScope,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        let mut raw = zeroize::Zeroizing::new(initial.to_vec());
+        let mut body = zeroize::Zeroizing::new(Vec::new());
+        loop {
+            let line_end = loop {
+                if let Some(n) = raw.windows(2).position(|w| w == b"\r\n") {
+                    break n;
+                }
+                if raw.len() > 128 {
+                    return Err(Error::InvalidRequest);
+                }
+                self.receive(&mut raw, scratch, scope).await?;
+            };
+            if line_end == 0 || line_end > 16 || !raw[..line_end].iter().all(u8::is_ascii_hexdigit)
+            {
+                return Err(Error::InvalidRequest);
+            }
+            let length = usize::from_str_radix(
+                std::str::from_utf8(&raw[..line_end]).map_err(|_| Error::InvalidRequest)?,
+                16,
+            )
+            .map_err(|_| Error::Overloaded)?;
+            raw.drain(..line_end + 2);
+            if length > bound - body.len() {
+                return Err(Error::Overloaded);
+            }
+            let mut remaining = length;
+            while remaining != 0 {
+                if raw.is_empty() {
+                    self.receive(&mut raw, scratch, scope).await?;
+                }
+                let n = remaining.min(raw.len());
+                append_sensitive(&mut body, &raw[..n]);
+                raw.drain(..n);
+                remaining -= n;
+            }
+            while raw.len() < 2 {
+                self.receive(&mut raw, scratch, scope).await?;
+            }
+            if &raw[..2] != b"\r\n" {
+                return Err(Error::InvalidRequest);
+            }
+            raw.drain(..2);
+            if length == 0 {
+                if !raw.is_empty() {
+                    return Err(Error::InvalidRequest);
+                }
+                return Ok(body);
+            }
+        }
+    }
+
     async fn receive(
         &mut self,
         into: &mut zeroize::Zeroizing<Vec<u8>>,
@@ -825,6 +806,54 @@ impl ControlConnection {
         }
     }
 }
+fn request_head(
+    host: &str,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body_length: usize,
+    base: Option<&str>,
+) -> Result<zeroize::Zeroizing<String>> {
+    const MAX_HEAD: usize = 16384;
+    if !matches!(method, "GET" | "POST")
+        || !path.starts_with('/')
+        || path.bytes().any(|b| b <= 32 || b >= 127)
+        || host.bytes().any(|b| b <= 32 || b >= 127)
+        || token.is_some_and(|t| t.bytes().any(|b| b <= 32 || b >= 127))
+        || base.is_some_and(|b| b.len() != 64 || !b.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err(Error::InvalidRequest);
+    }
+    // Bound allocation before copying bearer credentials. Reserve once, so a
+    // String growth cannot free an allocation still containing a token.
+    let capacity = [
+        host.len(),
+        path.len(),
+        token.map_or(0, str::len),
+        base.map_or(0, str::len),
+    ]
+    .into_iter()
+    .try_fold(256usize, |total, len| total.checked_add(len))
+    .filter(|size| *size <= MAX_HEAD)
+    .ok_or(Error::Overloaded)?;
+    let mut request = zeroize::Zeroizing::new(String::with_capacity(capacity));
+    use std::fmt::Write;
+    write!(request, "{method} {path} HTTP/1.1\r\nHost: {host}\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {body_length}\r\nConnection: keep-alive\r\n")
+        .map_err(|_| Error::Internal)?;
+    if let Some(token) = token {
+        request.push_str("Authorization: Bearer ");
+        request.push_str(token);
+        request.push_str("\r\n");
+    }
+    if let Some(base) = base {
+        request.push_str("X-Racer-Delta-Base: ");
+        request.push_str(base);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    Ok(request)
+}
+
 // Grow without freeing an allocation containing plaintext key material.
 fn append_sensitive(into: &mut zeroize::Zeroizing<Vec<u8>>, bytes: &[u8]) {
     if into.capacity() - into.len() < bytes.len() {
@@ -1016,6 +1045,55 @@ fn retry_delay(bytes: &[u8]) -> Result<Duration> {
 pub(super) mod tests {
     use super::*;
     use crate::control::{enrollment::Enrollment, testing};
+
+    #[test]
+    fn request_heads_validate_and_bound_credentials_before_copying() {
+        let base = "a".repeat(64);
+        let head = request_head(
+            "controller:443",
+            "POST",
+            "/enroll",
+            Some("secret"),
+            42,
+            Some(&base),
+        )
+        .unwrap();
+        assert!(head.starts_with("POST /enroll HTTP/1.1\r\nHost: controller:443\r\n"));
+        assert!(head.contains("Content-Length: 42\r\n"));
+        assert!(head.contains("Authorization: Bearer secret\r\n"));
+        assert!(head.ends_with(&format!("X-Racer-Delta-Base: {base}\r\n\r\n")));
+        for (method, path, token, base) in [
+            ("DELETE", "/enroll", None, None),
+            ("GET", "enroll", None, None),
+            ("GET", "/bad\r\n", None, None),
+            ("GET", "/enroll", Some("bad\r\n"), None),
+            ("GET", "/enroll", None, Some("bad")),
+        ] {
+            assert_eq!(
+                request_head("controller", method, path, token, 0, base),
+                Err(Error::InvalidRequest)
+            );
+        }
+        assert_eq!(
+            request_head("controller\r\n", "GET", "/", None, 0, None),
+            Err(Error::InvalidRequest)
+        );
+        assert_eq!(
+            request_head("controller", "GET", "/", Some(&"a".repeat(16384)), 0, None),
+            Err(Error::Overloaded)
+        );
+        assert_eq!(
+            request_head(
+                "controller",
+                "GET",
+                &format!("/{}", "a".repeat(16384)),
+                None,
+                0,
+                None
+            ),
+            Err(Error::Overloaded)
+        );
+    }
     /// Test-only synchronous driver. Production uses ReactorControlIo and never
     /// calls poll from within a future; this drives real loopback TLS fixtures.
     pub(in crate::control) struct FixtureIo;
