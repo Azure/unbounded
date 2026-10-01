@@ -4,16 +4,25 @@
 package racer
 
 import (
+	"context"
+	"encoding/base64"
+	"fmt"
+	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
+	authv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/Azure/unbounded/internal/operator/component"
 	racercore "github.com/Azure/unbounded/internal/racer"
+	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
 func TestRacerNetworkConfiguration(t *testing.T) {
@@ -73,19 +82,49 @@ func TestRacerNetworkConfiguration(t *testing.T) {
 	// The fake SSA persistence path does not allocate API server UIDs.
 	ds.UID = "managed-daemonset"
 	require.NoError(t, env.Client.Update(t.Context(), ds))
-	ownership, err := racercore.ReadDataplaneWorkloadIdentities(t.Context(), env.Client, env.Namespace)
-	require.NoError(t, err)
+
+	sa := &corev1.ServiceAccount{}
+	require.NoError(t, env.Client.Get(t.Context(), objectKey(env, cfg.DataplaneServiceAccount), sa))
+	sa.UID = "managed-sa"
+	require.NoError(t, env.Client.Update(t.Context(), sa))
+
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node", UID: "00000000-0000-0000-0000-000000000001"}}
+	require.NoError(t, env.Client.Create(t.Context(), node))
+	reviewer := interceptor.NewClient(env.Client.(client.WithWatch), interceptor.Funcs{Create: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.CreateOption) error {
+		review := obj.(*authv1.TokenReview)
+		review.Status = authv1.TokenReviewStatus{Authenticated: true, Audiences: []string{wire.TokenAudience}, User: authv1.UserInfo{
+			Username: "system:serviceaccount:" + env.Namespace + ":" + sa.Name, UID: string(sa.UID),
+			Extra: map[string]authv1.ExtraValue{
+				"authentication.kubernetes.io/pod-name": {"managed"}, "authentication.kubernetes.io/pod-uid": {"pod"},
+				"authentication.kubernetes.io/node-name": {node.Name}, "authentication.kubernetes.io/node-uid": {string(node.UID)},
+			},
+		}}
+
+		return nil
+	}})
+	bootstrap := racercore.Bootstrap{Client: reviewer, APIReader: env.Client, Config: cfg}
+	token := "e30." + base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, time.Now().Add(time.Hour).Unix()))) + ".signature"
+	request := httptest.NewRequest("POST", wire.BootstrapPath, nil)
+	request.Header.Set("Authorization", "Bearer "+token)
 
 	for _, ip := range []string{"10.0.0.12", "fd00::12"} {
 		managed := corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{Namespace: env.Namespace, UID: "pod", OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "DaemonSet", Name: ds.Name, UID: ds.UID, Controller: ptr.To(true)}}},
+			ObjectMeta: metav1.ObjectMeta{Name: "managed", Namespace: env.Namespace, UID: "pod", OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "DaemonSet", Name: ds.Name, UID: ds.UID, Controller: ptr.To(true)}}},
 			Spec:       pod, Status: corev1.PodStatus{PodIP: ip},
 		}
 		managed.Spec.NodeName = "node"
-		require.True(t, ownership.Owns(&managed))
+		require.NoError(t, env.Client.Create(t.Context(), &managed))
+		managed.UID = "pod"
+		require.NoError(t, env.Client.Update(t.Context(), &managed))
+		identity, err := bootstrap.Authenticate(t.Context(), request)
+		require.NoError(t, err)
+		require.Equal(t, wire.NodeID(node.UID), identity.Node())
 
 		managed.OwnerReferences = nil
-		require.False(t, ownership.Owns(&managed))
+		require.NoError(t, env.Client.Update(t.Context(), &managed))
+		_, err = bootstrap.Authenticate(t.Context(), request)
+		require.ErrorIs(t, err, wire.Forbidden)
+		require.NoError(t, env.Client.Delete(t.Context(), &managed))
 	}
 
 	// Removing the opt-in restores ordinary Pod networking and legacy ports.
