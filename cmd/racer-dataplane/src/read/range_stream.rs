@@ -20,11 +20,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Only client range progress creates a new allowance. An explicit aggregate
-/// budget is conserved across pages, just like budgets passed to peer acquisition.
+/// Client range progress admits independent pages under bounded child allowances.
 enum RangeBudget {
-    ClientPages { deadline: Instant },
-    ProgressingPages { timeout: Duration },
+    ClientPages {
+        deadline: Instant,
+    },
+    ProgressingPages {
+        timeout: Duration,
+    },
+    #[cfg(test)]
     Shared(AcquisitionBudget),
 }
 #[cfg(test)]
@@ -35,7 +39,7 @@ pub(crate) fn client_page_budget_for_test(deadline: Instant) -> AcquisitionBudge
         .unwrap()
 }
 impl RangeBudget {
-    fn next_page(&mut self, pending: bool) -> Result<Option<AcquisitionBudget>> {
+    fn next_page(&mut self, _pending: bool) -> Result<Option<AcquisitionBudget>> {
         match self {
             Self::ProgressingPages { timeout } => Ok(Some(AcquisitionBudget::new(
                 crate::runtime::environment::now() + *timeout,
@@ -48,20 +52,22 @@ impl RangeBudget {
                 }
                 Ok(Some(AcquisitionBudget::new(*deadline, 8, 16)))
             }
+            #[cfg(test)]
             Self::Shared(budget) => {
                 let attempts = budget.remaining_attempts().min(8);
                 let links = budget.remaining_links().min(16);
-                if pending && (attempts == 0 || links < 4) {
+                if _pending && (attempts == 0 || links < 4) {
                     return Ok(None);
                 }
                 budget.partition(attempts, links).map(Some)
             }
         }
     }
-    fn complete(&mut self, remaining: AcquisitionBudget) -> Result<()> {
+    fn complete(&mut self, _remaining: AcquisitionBudget) -> Result<()> {
         match self {
             Self::ClientPages { .. } | Self::ProgressingPages { .. } => Ok(()),
-            Self::Shared(budget) => budget.reunite(remaining),
+            #[cfg(test)]
+            Self::Shared(budget) => budget.reunite(_remaining),
         }
     }
 }
@@ -125,7 +131,7 @@ impl RangeStreams {
         self
     }
     /// Open a client range with a bounded allowance for each distinct page and
-    /// the original request deadline. Use open_with_budget for an aggregate cap.
+    /// the original request deadline.
     pub fn open(
         &self,
         metadata: ObjectMetadata,

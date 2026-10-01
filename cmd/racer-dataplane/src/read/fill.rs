@@ -629,11 +629,9 @@ impl Fill {
             super::drivers::poll(cx, 64);
             acquisition.cancellation.register(cx.waker());
             acquisition.scope.check()?;
-            match std::pin::Pin::new(&mut receive).poll(cx) {
-                std::task::Poll::Ready(Ok(value)) => std::task::Poll::Ready(Ok(value)),
-                std::task::Poll::Ready(Err(_)) => std::task::Poll::Ready(Err(Error::Unavailable)),
-                std::task::Poll::Pending => std::task::Poll::Pending,
-            }
+            std::pin::Pin::new(&mut receive)
+                .poll(cx)
+                .map(|result| result.map_err(|_| Error::Unavailable))
         })
         .await?;
         *acquisition.budget = remaining;

@@ -1315,6 +1315,9 @@ mod tests {
     }
     #[test]
     fn only_candidates_mint_authority_after_ordered_copy_probes() {
+        ordered_predecessor_probes(4);
+    }
+    fn ordered_predecessor_probes(attempts: u32) {
         let (membership, placement, context, scope, credentials) = fixture();
         let ordered = placement
             .rank(membership.clone(), &context.object, PageNumber(0))
@@ -1334,7 +1337,7 @@ mod tests {
         let candidates = policy
             .candidates(membership, &context.object, PageNumber(0))
             .unwrap();
-        let mut budget = AcquisitionBudget::new(scope.deadline.0, 4, 8);
+        let mut budget = AcquisitionBudget::new(scope.deadline.0, attempts, 8);
         let result = futures::executor::block_on(policy.resolve_with_budget(
             candidates,
             &context,
@@ -1355,7 +1358,7 @@ mod tests {
             *peer.calls.borrow(),
             vec![(ordered[0].clone(), true), (ordered[1].clone(), true)]
         );
-        assert_eq!(budget.remaining_attempts(), 2);
+        assert_eq!(budget.remaining_attempts(), attempts - 2);
         assert_eq!(budget.remaining_links(), 0);
         assert_eq!(
             authority.validate(&context.object, PageNumber(1)),
@@ -1595,51 +1598,7 @@ mod tests {
     }
     #[test]
     fn backup_probes_only_predecessors_in_order_before_scoped_origin_authority() {
-        futures::executor::block_on(async {
-            let membership = membership();
-            let candidates = Placement::new(8)
-                .rank(membership, &object(), PageNumber(0))
-                .unwrap();
-            let expected = candidates.ordered[..2].to_vec();
-            let peers = Rc::new(RecordedPeer {
-                calls: RefCell::new(vec![]),
-                error: Error::Unavailable,
-            });
-            let policy = policy(candidates.ordered[2].clone(), peers.clone());
-            let context = OriginContext {
-                object: object(),
-                metadata: None,
-                authorization: None,
-            };
-            let scope = scope();
-            let mut budget = AcquisitionBudget::new(scope.deadline.0, 3, 8);
-            let operation = PeerOperation::Metadata {
-                object: object(),
-                selector: MetadataSelector::Fresh,
-                mode: FetchMode::Acquire,
-            };
-            let CandidateResolution::Origin(authority) = policy
-                .resolve_with_budget(candidates, &context, operation, &scope, &mut budget)
-                .await
-                .unwrap()
-            else {
-                panic!("expected authority")
-            };
-            assert_eq!(
-                *peers.calls.borrow(),
-                expected
-                    .into_iter()
-                    .map(|node| (node, true))
-                    .collect::<Vec<_>>()
-            );
-            assert_eq!(authority.validate(&object(), PageNumber(0)), Ok(()));
-            assert_eq!(
-                authority.validate(&object(), PageNumber(1)),
-                Err(Error::Unauthorized)
-            );
-            assert_eq!(budget.remaining_attempts(), 1);
-            assert_eq!(budget.remaining_links(), 0);
-        });
+        ordered_predecessor_probes(3);
     }
     #[test]
     fn noncandidate_acquires_from_candidates_and_never_mints_origin_authority() {

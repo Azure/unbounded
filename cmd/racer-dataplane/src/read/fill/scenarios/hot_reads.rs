@@ -1,6 +1,561 @@
 //! Production coordinator/range/selection/Fill graph across authenticated nodes.
-#[path = "duplex_release_tests.rs"]
-mod duplex_release;
+mod duplex_release {
+    //! Exercise release credit through the real duplex response, not release_page.
+    use super::*;
+    use crate::{client::response::Responses, http::connection::ConnectionLease};
+    use std::io::{Read, Write};
+
+    #[test]
+    fn duplex_exact_release_before_final_send_cqe_is_provisional() {
+        use crate::runtime::reactor::simulation::{Fault, Simulation};
+        for mode in ["valid", "duplicate", "malformed", "short", "drop"] {
+            let sim = Simulation::new();
+            let _sim = sim.enter();
+            let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+            let _owner = queue.enter();
+            let signers = network(1);
+            let mut f = fixture();
+            f.reactor.init().unwrap();
+            let membership = Arc::new(
+                Membership::validate(
+                    MembershipVersion(1),
+                    vec![Member {
+                        node: signers[0].node().clone(),
+                        shares: NonZeroU32::new(1).unwrap(),
+                        peer_endpoint: "127.0.0.1:8000".into(),
+                        rails: vec![],
+                        alignment_enabled: false,
+                        site: String::new(),
+                    }],
+                )
+                .unwrap(),
+            );
+            let (local, mut endpoint, _publication) =
+                coordinator(&f, &signers[0], &membership, Rc::new(NoPeer));
+            let response = futures::executor::block_on(local.read(
+                ClientRequest {
+                    kind: ReadKind::Subscription {
+                        pin: Some(f.page.version.etag.clone()),
+                        range: None,
+                        page_credits: 1,
+                        byte_credits: PAGE_BYTES,
+                        ordered: true,
+                    },
+                    origin: OriginContext {
+                        object: f.context.object.clone(),
+                        metadata: None,
+                        authorization: None,
+                    },
+                },
+                &f.scope,
+            ))
+            .unwrap();
+            let admission = f.fill.dependencies.admission.clone();
+            let delivery = Rc::new(Delivery::new(
+                Rc::new(PipePool::new(admission.clone(), f.reactor.clone())),
+                Duration::from_secs(30),
+            ));
+            let io = Rc::new(HttpIo::with_admission(
+                f.reactor.clone(),
+                Codec::new(32768, i64::MAX as u64),
+                admission.clone(),
+            ));
+            let responses = Responses::new(io, delivery);
+            let (socket, client) = sim.socket_pair();
+            let connection = ConnectionLease::from_accepted(socket, &admission).unwrap();
+            let mut send = responses.send_subscription_unobserved(
+                connection,
+                response,
+                &f.scope,
+                Duration::from_secs(30),
+            );
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            let mut bytes = Vec::new();
+            let mut pump = |endpoint: &mut crate::read::dispatch::WorkerEndpoint| {
+                endpoint.poll(&mut cx, 64).unwrap();
+                crate::read::drivers::poll(&mut cx, 64);
+                f.engine.poll_budgeted(64).unwrap();
+                f.crypto.poll_budgeted(64).unwrap();
+                f.reactor.poll_budgeted(64).unwrap();
+            };
+            let mut poll_cx = Context::from_waker(futures::task::noop_waker_ref());
+            let mut head_end = None;
+            for _ in 0..1024 {
+                assert!(send.as_mut().poll(&mut poll_cx).is_pending());
+                pump(&mut endpoint);
+                let mut scratch = [0; 32768];
+                if let Ok(n) = client.try_recv(&mut scratch) {
+                    bytes.extend_from_slice(&scratch[..n]);
+                }
+                head_end = bytes
+                    .windows(4)
+                    .position(|b| b == b"\r\n\r\n")
+                    .map(|i| i + 4);
+                if head_end.is_some_and(|n| bytes.len() == n + 21) {
+                    break;
+                }
+            }
+            let end = head_end.unwrap();
+            assert_eq!(bytes.len(), end + 21);
+            // Force the payload's final owned send, execute it, but withhold its CQE.
+            sim.inject("splice", Fault::Errno(libc::EOPNOTSUPP));
+            sim.inject("send", Fault::Errno(libc::EAGAIN));
+            sim.inject("send", Fault::HoldCompletion(40));
+            if mode == "short" {
+                sim.set_max_chunk(2);
+            }
+            let mut payload = [0; 3];
+            let mut received = None;
+            for _ in 0..8 {
+                assert!(send.as_mut().poll(&mut poll_cx).is_pending());
+                pump(&mut endpoint);
+                if let Ok(n) = client.try_recv(&mut payload) {
+                    received = Some(n);
+                    break;
+                }
+            }
+            let n = received.expect("final send executed before held completion");
+            assert_eq!(n, if mode == "short" { 2 } else { 3 });
+            assert_eq!(&payload[..n], &b"abc"[..n]);
+            assert!(f.reactor.in_flight() > 0);
+            assert_eq!(admission.used(ResourceClass::Pipe), 1);
+            sim.set_max_chunk(usize::MAX);
+            let mut release = [0; 12];
+            release[8..]
+                .copy_from_slice(&(if mode == "malformed" { 2u32 } else { 3 }).to_be_bytes());
+            assert_eq!(client.try_send(&release).unwrap(), 12);
+            if mode == "duplicate" {
+                assert_eq!(client.try_send(&release).unwrap(), 12);
+            }
+            let observed = send.as_mut().poll(&mut poll_cx);
+            if matches!(mode, "duplicate" | "malformed") {
+                assert!(matches!(observed, Poll::Ready(Err(Error::InvalidRequest))));
+            } else {
+                assert!(observed.is_pending());
+            }
+            assert_eq!(
+                admission.used(ResourceClass::Pipe),
+                1,
+                "release cannot drop CQE owners"
+            );
+            if mode == "drop" || matches!(mode, "duplicate" | "malformed") {
+                drop(send);
+                for _ in 0..128 {
+                    pump(&mut endpoint);
+                }
+            } else {
+                let mut result = None;
+                for _ in 0..128 {
+                    pump(&mut endpoint);
+                    if let Poll::Ready(value) = send.as_mut().poll(&mut poll_cx) {
+                        result = Some(value);
+                        break;
+                    }
+                }
+                let result = result.expect("held CQE eventually observed");
+                if mode == "short" {
+                    assert!(matches!(result, Err(Error::InvalidRequest)));
+                } else {
+                    assert!(result.is_ok());
+                }
+                drop(send);
+            }
+            for _ in 0..128 {
+                pump(&mut endpoint);
+            }
+            assert_eq!(f.reactor.in_flight(), 0);
+            assert_eq!(admission.used(ResourceClass::Pipe), 0);
+            assert_eq!(admission.used(ResourceClass::Connection), 0);
+            endpoint.uninstall().unwrap();
+        }
+    }
+    #[test]
+    fn duplex_release_replenishes_acquisition_while_next_page_write_is_blocked() {
+        run("valid");
+    }
+    #[test]
+    fn duplex_release_malformed_length_and_incomplete_page_are_rejected_while_blocked() {
+        run("malformed");
+        run("incomplete");
+    }
+    #[test]
+    fn duplex_release_eof_cancellation_and_drop_drain_owned_write_fences() {
+        run("eof");
+        run("cancel");
+        run("drop");
+    }
+    #[test]
+    fn duplex_release_stalled_writer_expires_but_progressing_writer_outlives_read_deadline() {
+        run("deadline");
+        run("progress");
+    }
+    #[test]
+    fn duplex_release_partial_frame_survives_delivery_to_next_slice_transition() {
+        run("transition");
+    }
+
+    fn run(mode: &str) {
+        let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+        let _owner = queue.enter();
+        let clock = crate::runtime::environment::SimulationClock::new(311);
+        let environment = clock.environment(0);
+        let _clock = environment.enter();
+        let signers = network(1);
+        let mut f = fixture_with(2 * PAGE_BYTES + 7, None);
+        f.reactor.init().unwrap();
+        let membership = Arc::new(
+            Membership::validate(
+                MembershipVersion(1),
+                vec![Member {
+                    node: signers[0].node().clone(),
+                    shares: NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: "127.0.0.1:8000".into(),
+                    rails: vec![],
+                    alignment_enabled: false,
+                    site: String::new(),
+                }],
+            )
+            .unwrap(),
+        );
+        let (local, mut endpoint, _publication) =
+            coordinator(&f, &signers[0], &membership, Rc::new(NoPeer));
+        let scope = RequestScope::new(
+            f.scope.request,
+            crate::runtime::environment::now() + Duration::from_secs(60),
+        )
+        .unwrap();
+        let request = ClientRequest {
+            kind: ReadKind::Subscription {
+                pin: Some(f.page.version.etag.clone()),
+                range: Some(ByteRange::From(PAGE_BYTES - 1)),
+                page_credits: 2,
+                byte_credits: 2 * PAGE_BYTES,
+                ordered: true,
+            },
+            origin: OriginContext {
+                object: f.context.object.clone(),
+                metadata: None,
+                authorization: None,
+            },
+        };
+        let response = futures::executor::block_on(local.read(request, &scope)).unwrap();
+        let admission = f.fill.dependencies.admission.clone();
+        let delivery = Rc::new(Delivery::new(
+            Rc::new(PipePool::new(admission.clone(), f.reactor.clone())),
+            Duration::from_secs(30),
+        ));
+        let io = Rc::new(HttpIo::with_admission(
+            f.reactor.clone(),
+            Codec::new(32768, i64::MAX as u64),
+            admission.clone(),
+        ));
+        let responses = Responses::new(io, delivery.clone());
+        let (socket, mut client) = std::os::unix::net::UnixStream::pair().unwrap();
+        client.set_nonblocking(true).unwrap();
+        let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+        let mut send = responses.send_subscription_unobserved(
+            connection,
+            response,
+            &scope,
+            Duration::from_secs(30),
+        );
+        #[derive(Default)]
+        struct Wakes(std::sync::atomic::AtomicUsize);
+        impl futures::task::ArcWake for Wakes {
+            fn wake_by_ref(this: &Arc<Self>) {
+                this.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let wakes = Arc::new(Wakes::default());
+        let waker = futures::task::waker(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut pump = |endpoint: &mut crate::read::dispatch::WorkerEndpoint| {
+            pump_worker(endpoint, &mut f.engine, &f.crypto, &f.reactor);
+        };
+        // Read just the HTTP head, complete one-byte page zero, and page-one frame.
+        // Leaving the entire page-one payload unread forces actual socket backpressure.
+        let mut prefix = Vec::new();
+        let mut head_end = None;
+        for _ in 0..8192 {
+            if let Poll::Ready(result) = send.as_mut().poll(&mut cx) {
+                panic!("response completed before prefix: {:?}", result.err());
+            }
+            pump(&mut endpoint);
+            let mut byte = [0];
+            match client.read(&mut byte) {
+                Ok(1) => prefix.push(byte[0]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                other => panic!("prefix read: {other:?}"),
+            }
+            if head_end.is_none() && prefix.ends_with(b"\r\n\r\n") {
+                head_end = Some(prefix.len());
+            }
+            if head_end.is_some_and(|end| prefix.len() == end + 43) {
+                break;
+            }
+        }
+        let end = head_end.expect("HTTP response head");
+        assert_eq!(prefix.len(), end + 43);
+        let page_frame = |number: u64, offset: u64, length: u32| {
+            let mut frame = vec![1];
+            frame.extend(number.to_be_bytes());
+            frame.extend(offset.to_be_bytes());
+            frame.extend(length.to_be_bytes());
+            frame
+        };
+        assert_eq!(&prefix[end..end + 21], page_frame(0, PAGE_BYTES - 1, 1));
+        assert_eq!(prefix[end + 21], 0);
+        assert_eq!(
+            &prefix[end + 22..],
+            page_frame(1, PAGE_BYTES, PAGE_BYTES as u32)
+        );
+        for _ in 0..128 {
+            assert!(send.as_mut().poll(&mut cx).is_pending());
+            pump(&mut endpoint);
+        }
+        assert_eq!(&*f.origin.started_pages.borrow(), &[0, 1]);
+        assert!(
+            f.reactor.in_flight() > 0,
+            "blocked send owns a completion fence"
+        );
+        // An independent reader retains the same immutable page with its own pipe.
+        let other_scope = RequestScope::new(f.scope.request, scope.deadline.0).unwrap();
+        let other = delivery
+            .attach(
+                f.fill
+                    .dependencies
+                    .memory
+                    .get(&f.page)
+                    .unwrap()
+                    .unwrap()
+                    .plaintext,
+                crate::model::PageSlice {
+                    page: PageNumber(0),
+                    offset: (PAGE_BYTES - 1) as u32,
+                    length: 1,
+                },
+            )
+            .unwrap();
+        let mut release = [0; 12];
+        release[8..].copy_from_slice(&1u32.to_be_bytes());
+        // Pump only the reactor after sending input. A blocked writer must be woken
+        // by POLLIN, rather than relying on unrelated output/acquisition wakeups.
+        let before = wakes.0.load(std::sync::atomic::Ordering::Relaxed);
+        client.write_all(&release[..5]).unwrap();
+        for _ in 0..128 {
+            pump(&mut endpoint);
+            if wakes.0.load(std::sync::atomic::Ordering::Relaxed) > before {
+                break;
+            }
+        }
+        assert!(
+            wakes.0.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "release input wakes blocked delivery"
+        );
+        for _ in 0..128 {
+            assert!(send.as_mut().poll(&mut cx).is_pending());
+            pump(&mut endpoint);
+        }
+        assert_eq!(
+            &*f.origin.started_pages.borrow(),
+            &[0, 1],
+            "partial release grants no credit"
+        );
+        let mut received = Vec::new();
+        if matches!(
+            mode,
+            "malformed" | "incomplete" | "eof" | "cancel" | "drop" | "deadline"
+        ) {
+            let expected = match mode {
+                "malformed" => {
+                    release[8..].copy_from_slice(&2u32.to_be_bytes());
+                    client.write_all(&release[5..]).unwrap();
+                    Error::InvalidRequest
+                }
+                "incomplete" => {
+                    release[5..8].copy_from_slice(&[0, 0, 1]);
+                    release[8..].copy_from_slice(&(PAGE_BYTES as u32).to_be_bytes());
+                    client.write_all(&release[5..]).unwrap();
+                    Error::InvalidRequest
+                }
+                "eof" => {
+                    client.shutdown(std::net::Shutdown::Write).unwrap();
+                    Error::Io
+                }
+                "cancel" => {
+                    scope.cancel().unwrap();
+                    Error::Cancelled
+                }
+                "deadline" => {
+                    clock.advance(Duration::from_secs(31));
+                    Error::DeadlineExceeded
+                }
+                "drop" => Error::Cancelled,
+                _ => unreachable!(),
+            };
+            if mode != "drop" {
+                let mut error = None;
+                for _ in 0..1024 {
+                    if let Poll::Ready(result) = send.as_mut().poll(&mut cx) {
+                        error = Some(result.err().expect("blocked response must fail"));
+                        break;
+                    }
+                    pump(&mut endpoint);
+                }
+                assert_eq!(error, Some(expected), "{mode}");
+            }
+            drop(send);
+            if matches!(mode, "malformed" | "incomplete" | "eof" | "drop") {
+                assert!(
+                    f.reactor.in_flight() > 0,
+                    "abandonment does not drop accepted write ownership before its fence"
+                );
+            }
+            assert_eq!(
+                &*f.origin.started_pages.borrow(),
+                &[0, 1],
+                "invalid release never grants acquisition credit"
+            );
+        } else {
+            if mode == "transition" {
+                // Finish page one with the page-zero release still incomplete. The
+                // next_slice credit wait must resume that parser, not start a new frame.
+                for _ in 0..8192 {
+                    assert!(send.as_mut().poll(&mut cx).is_pending());
+                    pump(&mut endpoint);
+                    let mut bytes = [0; 65536];
+                    match client.read(&mut bytes) {
+                        Ok(n) => received.extend_from_slice(&bytes[..n]),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        other => panic!("transition read: {other:?}"),
+                    }
+                    if received.len() == PAGE_BYTES as usize {
+                        break;
+                    }
+                }
+                assert_eq!(received.len(), PAGE_BYTES as usize);
+                for _ in 0..128 {
+                    assert!(send.as_mut().poll(&mut cx).is_pending());
+                    pump(&mut endpoint);
+                }
+                assert_eq!(&*f.origin.started_pages.borrow(), &[0, 1]);
+            }
+            if mode == "progress" {
+                // Free socket capacity and let delivery make progress before the read
+                // alarm expires. The receive side must not impose a total page deadline.
+                clock.advance(Duration::from_secs(20));
+                for _ in 0..32 {
+                    let mut bytes = [0; 65536];
+                    match client.read(&mut bytes) {
+                        Ok(n) if n > 0 => received.extend_from_slice(&bytes[..n]),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        other => panic!("progress drain: {other:?}"),
+                    }
+                }
+                assert!(!received.is_empty());
+                for _ in 0..128 {
+                    assert!(send.as_mut().poll(&mut cx).is_pending());
+                    pump(&mut endpoint);
+                }
+                let mut bytes = [0; 65536];
+                let n = client
+                    .read(&mut bytes)
+                    .expect("writer refilled the drained socket");
+                assert!(n > 0);
+                received.extend_from_slice(&bytes[..n]);
+                clock.advance(Duration::from_secs(11));
+                for _ in 0..128 {
+                    assert!(send.as_mut().poll(&mut cx).is_pending());
+                    pump(&mut endpoint);
+                }
+            }
+            client.write_all(&release[5..]).unwrap();
+            let third = PageId {
+                version: f.page.version.clone(),
+                number: PageNumber(2),
+            };
+            for _ in 0..4096 {
+                assert!(send.as_mut().poll(&mut cx).is_pending());
+                pump(&mut endpoint);
+                if f.fill.dependencies.memory.get(&third).unwrap().is_some() {
+                    break;
+                }
+            }
+            assert_eq!(
+                &*f.origin.started_pages.borrow(),
+                &[0, 1, 2],
+                "wire release must refill acquisition before page-one write completes"
+            );
+            assert!(f.fill.dependencies.memory.get(&third).unwrap().is_some());
+            let mut done = None;
+            for _ in 0..8192 {
+                if done.is_none()
+                    && let Poll::Ready(result) = send.as_mut().poll(&mut cx)
+                {
+                    done = Some(result.unwrap());
+                }
+                pump(&mut endpoint);
+                let mut bytes = [0; 65536];
+                match client.read(&mut bytes) {
+                    Ok(n) => received.extend_from_slice(&bytes[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    other => panic!("payload read: {other:?}"),
+                }
+                if done.is_some() && received.len() == PAGE_BYTES as usize + 21 + 7 + 21 {
+                    break;
+                }
+            }
+            assert!(
+                done.is_some(),
+                "subscription completed without final releases"
+            );
+            let n = PAGE_BYTES as usize;
+            assert_eq!(received.len(), n + 49);
+            assert!(received[..n].iter().all(|b| *b == 1));
+            assert_eq!(&received[n..n + 21], page_frame(2, 2 * PAGE_BYTES, 7));
+            assert_eq!(&received[n + 21..n + 28], &[2; 7]);
+            let mut completion = vec![2];
+            completion.extend(3u64.to_be_bytes());
+            completion.extend((PAGE_BYTES + 8).to_be_bytes());
+            completion.extend(0u32.to_be_bytes());
+            assert_eq!(&received[n + 28..], completion);
+            drop((send, done));
+        }
+        assert_eq!(other.bytes_sent(), 0);
+        assert!(!other_scope.cancellation.is_cancelled());
+        let (socket, mut independent_client) = std::os::unix::net::UnixStream::pair().unwrap();
+        independent_client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+        // Model a sent one-byte response head for this independent delivery fixture.
+        connection.tx_remaining = Some(1);
+        let mut finish = delivery.finish_to(other, connection, &other_scope);
+        let mut finished = false;
+        for _ in 0..1024 {
+            if let Poll::Ready(result) = finish.as_mut().poll(&mut cx) {
+                result.unwrap();
+                finished = true;
+                break;
+            }
+            pump(&mut endpoint);
+        }
+        assert!(finished, "independent reader completes");
+        drop(finish);
+        let mut byte = [255];
+        independent_client.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, [0], "other reader retains its own page and cursor");
+        for _ in 0..128 {
+            pump(&mut endpoint);
+        }
+        assert_eq!(
+            f.reactor.in_flight(),
+            0,
+            "all socket completion fences drained"
+        );
+        endpoint.uninstall().unwrap();
+    }
+}
 use super::*;
 use crate::{
     client::{ClientRequest, ReadKind},
@@ -240,12 +795,7 @@ fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
     let mut unordered = open(false, 1, PAGE_BYTES - 1);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let mut pump = |endpoint: &mut crate::read::dispatch::WorkerEndpoint| {
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        endpoint.poll(&mut cx, 64).unwrap();
-        crate::read::drivers::poll(&mut cx, 64);
-        f.engine.poll_budgeted(64).unwrap();
-        f.crypto.poll_budgeted(64).unwrap();
-        f.reactor.poll_budgeted(128).unwrap();
+        pump_worker(endpoint, &mut f.engine, &f.crypto, &f.reactor);
     };
     f.origin.blocked_pages.borrow_mut().insert(0);
     for _ in 0..32 {
@@ -379,12 +929,7 @@ fn ordered_acquisition_window_is_not_an_unreleased_credit_ceiling() {
         .unwrap();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let mut pump = |endpoint: &mut crate::read::dispatch::WorkerEndpoint| {
-            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-            endpoint.poll(&mut cx, 64).unwrap();
-            crate::read::drivers::poll(&mut cx, 64);
-            f.engine.poll_budgeted(64).unwrap();
-            f.crypto.poll_budgeted(64).unwrap();
-            f.reactor.poll_budgeted(128).unwrap();
+            pump_worker(endpoint, &mut f.engine, &f.crypto, &f.reactor);
         };
         // Complete acquisitions without delivery: even four credits must not
         // create more than the coordinator's two acquisition/ready slots.
