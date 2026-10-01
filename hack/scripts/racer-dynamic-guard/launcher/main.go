@@ -1,5 +1,8 @@
 //go:build linux
 
+// Copyright (c) Microsoft Corporation.
+// SPDX-License-Identifier: Apache-2.0
+
 // racer-guard-launch checks the local root-owned guard before every DP exec.
 package main
 
