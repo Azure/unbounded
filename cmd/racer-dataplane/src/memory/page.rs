@@ -24,7 +24,7 @@ pub struct CiphertextCopy {
 #[derive(Clone)]
 pub struct UnverifiedPage {
     pub copy: CiphertextCopy,
-    pub(crate) disk_token: Option<crate::store::reader::ReadToken>,
+    pub(crate) disk_token: Option<crate::store::ReadToken>,
 }
 
 #[derive(Clone)]

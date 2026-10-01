@@ -29,7 +29,7 @@ use crate::{
         deadline::RequestScope,
     },
     security::{aead::PageCrypto, credentials::CredentialCrypto},
-    store::{reader::StoreReader, writer::StoreWriter},
+    store::{StoreReader, writer::StoreWriter},
     telemetry::metrics::{Event, Gauge, LookupTier, Metrics},
     topology::membership::MembershipLease,
 };

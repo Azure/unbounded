@@ -147,7 +147,7 @@ fn go_sdk_subscription_server() {
         credentials::CredentialCrypto,
     };
     use store::{
-        eviction::SegmentClock, index::Index, reader::StoreReader, segment::Segments, slab::Slabs,
+        eviction::SegmentClock, index::Index, StoreReader, segment::Segments, slab::Slabs,
         writer::StoreWriter,
     };
 

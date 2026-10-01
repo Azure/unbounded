@@ -58,12 +58,11 @@ use crate::{
         signing::Signatures,
     },
     store::{
-        Store,
+        Store, StoreReader,
         checkpoint::Checkpointer,
         checkpoint_format::{CheckpointGeometry, ShardImage},
         eviction::SegmentClock,
         index::Index,
-        reader::StoreReader,
         recovery::Recovery,
         segment::Segments,
         slab::Slabs,

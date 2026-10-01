@@ -1,5 +1,4 @@
 use super::*;
-#[path = "index_pressure_tests.rs"]
 mod index_pressure;
 use crate::{
     error::{Error, Result},
@@ -47,11 +46,14 @@ struct Fixture {
     admission: Rc<Admission>,
     reactor: Rc<Reactor>,
     pool: Rc<BufferPool>,
+    segments: Rc<segment::Segments>,
     _directory: Directory,
 }
 impl Fixture {
     fn new() -> Self {
-        let directory = Directory::new();
+        Self::in_directory(Directory::new())
+    }
+    fn in_directory(directory: Directory) -> Self {
         let metrics = crate::telemetry::metrics::Metrics::default();
         let admission = Rc::new(Admission::new(
             crate::test_support::cluster::config(false).limits,
@@ -73,7 +75,7 @@ impl Fixture {
             32 * 1024 * 1024,
         ));
         let reader = Rc::new(
-            reader::StoreReader::new(
+            StoreReader::new(
                 eviction.clone(),
                 index.clone(),
                 segments.clone(),
@@ -94,7 +96,7 @@ impl Fixture {
                 index.clone(),
                 segments.clone(),
             )),
-            recovery: recovery::Recovery::new(directory.0.clone(), index, segments),
+            recovery: recovery::Recovery::new(directory.0.clone(), index, segments.clone()),
             eviction,
         };
         store.configure(admission.clone(), 2, 16).unwrap();
@@ -104,6 +106,7 @@ impl Fixture {
             admission,
             reactor,
             pool,
+            segments,
             _directory: directory,
         }
     }
@@ -153,6 +156,22 @@ impl Fixture {
             copy.ciphertext.bytes().len(),
         )?;
         self.store.writer.enqueue(copy, dirty)
+    }
+
+    fn restart(self) -> Self {
+        let Self {
+            metrics,
+            store,
+            admission,
+            reactor,
+            pool,
+            segments,
+            _directory,
+        } = self;
+        assert!(store.writer.is_idle());
+        assert_eq!(reactor.in_flight(), 0);
+        drop((store, reactor, pool, segments, admission, metrics));
+        Self::in_directory(_directory)
     }
 }
 fn scope() -> RequestScope {
@@ -352,9 +371,7 @@ fn segment_images(
     segment::SegmentState,
     u64,
 )> {
-    f.store
-        .writer
-        .segments_for_test()
+    f.segments
         .snapshot()
         .unwrap()
         .into_iter()
@@ -369,7 +386,7 @@ fn index_capacity_rejection_preserves_segments_and_releases_all_charges_without_
     // A writer without a configured clock must still reject safely, before I/O.
     f.store.writer = Rc::new(writer::StoreWriter::new(
         f.store.writer.index().clone(),
-        f.store.writer.segments_for_test().clone(),
+        f.segments.clone(),
         f.store.writer.slabs().clone(),
     ));
     let index = f.store.writer.index();
@@ -386,9 +403,7 @@ fn index_capacity_rejection_preserves_segments_and_releases_all_charges_without_
     let retained = f.copy(3, 64);
     let retained_id = retained.ciphertext.envelope().page.clone();
     let append = f
-        .store
-        .writer
-        .segments_for_test()
+        .segments
         .append(alignment.extent(0, 512).unwrap().length())
         .unwrap();
     let location = index::RecordLocation {
@@ -546,6 +561,78 @@ fn real_writer_rechecks_index_capacity_and_replaces_same_page_when_full() {
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
     f.store.writer.reclaim_idle_buffer();
     assert_eq!(f.admission.used(ResourceClass::Ciphertext), 0);
+}
+
+#[test]
+fn persistence_pressure_and_restart_preserve_only_live_pages() {
+    for (capacity, length) in [(1, 3), (2, 4096), (4, 65536)] {
+        let f = Fixture::new();
+        f.store.writer.index().set_page_capacity(capacity).unwrap();
+        drive(&f.reactor, f.store.open()).unwrap();
+        let request = scope();
+        let mut expected = Vec::new();
+        for number in 1..=6 {
+            let page = f.copy(number, length);
+            expected.push(page.ciphertext.envelope().page.clone());
+            f.enqueue(page).unwrap();
+            drive(&f.reactor, f.store.writer.progress(8, &request)).unwrap();
+            let copy = drive(
+                &f.reactor,
+                f.store.reader.read(expected.last().unwrap(), &request),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(copy.ciphertext.bytes(), vec![number; length + 16]);
+        }
+        let live: Vec<_> = expected
+            .iter()
+            .map(|id| {
+                drive(&f.reactor, f.store.reader.read(id, &request))
+                    .unwrap()
+                    .is_some()
+            })
+            .collect();
+        assert!(live.iter().filter(|&&present| present).count() <= capacity);
+        assert!(live.last().copied().unwrap());
+        let image = drive(&f.reactor, f.store.checkpoint.snapshot_shard()).unwrap();
+        drive(&f.reactor, f.store.checkpoint.publish(vec![image])).unwrap();
+        f.store.checkpoint.finish_snapshot();
+        assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
+
+        // Drop every old component, then reopen the same actual slab/checkpoint files.
+        let f = f.restart();
+        // Ring teardown may release the kernel's final file reference after the
+        // userspace owners drop. Bound the wait for the exclusive slab lock;
+        // an actual leaked owner must still fail the restart scenario.
+        let unlock_deadline = Instant::now() + Duration::from_secs(2);
+        let alignment = loop {
+            match drive(&f.reactor, f.store.open()) {
+                Ok(alignment) => break alignment,
+                Err(Error::Unavailable) if Instant::now() < unlock_deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                result => panic!("slab did not reopen after owner teardown: {result:?}"),
+            }
+        };
+        let image = drive(&f.reactor, f.store.recovery.load(alignment))
+            .unwrap()
+            .unwrap();
+        drive(
+            &f.reactor,
+            f.store
+                .recovery
+                .install_shard(image.shards.into_iter().next()),
+        )
+        .unwrap();
+        for (index, id) in expected.iter().enumerate() {
+            let copy = drive(&f.reactor, f.store.reader.read(id, &request)).unwrap();
+            assert_eq!(copy.is_some(), live[index]);
+            if let Some(copy) = copy {
+                assert_eq!(copy.ciphertext.bytes(), vec![index as u8 + 1; length + 16]);
+                assert_eq!(copy.ciphertext.envelope().page, *id);
+            }
+        }
+    }
 }
 
 #[test]
@@ -1017,7 +1104,7 @@ fn shutdown_deadline_discards_second_copy_and_fences_submitted_first_copy() {
     assert_eq!(f.store.writer.pending_count(), 1);
     assert!(!f.store.writer.is_idle());
     assert!(f.admission.used(ResourceClass::DirtyCiphertext) > 0);
-    let submitted = f.store.writer.segments_for_test();
+    let submitted = &f.segments;
     let mut snapshot = submitted.snapshot().unwrap();
     snapshot[0].state = segment::SegmentState::Sealed;
     // Active segment leases prohibit restore/reuse even though queued work is gone.
@@ -1157,7 +1244,7 @@ fn unreclaimable_segment_pressure_discards_copies_without_fatal_progress_error()
     f.reactor.init().unwrap();
     f.enqueue(f.copy(1, 64)).unwrap();
     f.enqueue(f.copy(2, 64)).unwrap();
-    let segments = f.store.writer.segments_for_test();
+    let segments = &f.segments;
     let first = segments.append(32 * 1024 * 1024).unwrap();
     let second = segments.append(32 * 1024 * 1024).unwrap();
     f.admission.stop();

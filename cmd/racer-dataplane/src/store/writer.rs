@@ -115,10 +115,6 @@ impl StoreWriter {
     pub fn slabs(&self) -> &Rc<Slabs> {
         &self.slabs
     }
-    #[cfg(test)]
-    pub(super) fn segments_for_test(&self) -> &Rc<Segments> {
-        &self.segments
-    }
     pub fn index(&self) -> &Rc<Index> {
         &self.index
     }

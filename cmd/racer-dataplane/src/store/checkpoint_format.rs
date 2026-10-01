@@ -550,5 +550,4 @@ impl<'a> Decoder<'a> {
 }
 
 #[cfg(test)]
-#[path = "checkpoint_tests.rs"]
 mod tests;

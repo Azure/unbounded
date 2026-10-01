@@ -35,7 +35,7 @@ use crate::{
         credentials::CredentialCrypto,
     },
     store::{
-        eviction::SegmentClock, index::Index, reader::StoreReader, segment::Segments, slab::Slabs,
+        StoreReader, eviction::SegmentClock, index::Index, segment::Segments, slab::Slabs,
         writer::StoreWriter,
     },
     topology::{

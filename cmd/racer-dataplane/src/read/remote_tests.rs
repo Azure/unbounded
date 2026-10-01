@@ -939,8 +939,8 @@ fn metadata_coordinator_with_newer_publication(
         },
         security::aead::PageCrypto,
         store::{
-            eviction::SegmentClock, index::Index, reader::StoreReader, segment::Segments,
-            slab::Slabs, writer::StoreWriter,
+            StoreReader, eviction::SegmentClock, index::Index, segment::Segments, slab::Slabs,
+            writer::StoreWriter,
         },
     };
     let snapshots = Rc::new(SnapshotStore::new(

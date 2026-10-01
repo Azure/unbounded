@@ -30,7 +30,7 @@ fn small_records_turn_over_open_segment_and_checkpoint_recovers_only_live_mappin
     let second = persist(&f, 2);
     let before = segment_images(&f);
     assert_eq!(before[0].2, segment::SegmentState::Open);
-    assert_eq!(f.store.writer.segments_for_test().free_count(), 1);
+    assert_eq!(f.segments.free_count(), 1);
     let third = persist(&f, 3);
     let fourth = persist(&f, 4);
     assert!(index.lookup(&first).unwrap().is_none());
@@ -112,14 +112,10 @@ fn index_eviction_during_read_cannot_resurrect_copy_or_recycle_active_generation
     );
     persist(&f, 2);
     assert!(drive(&f.reactor, read).unwrap().is_none());
-    f.store
-        .writer
-        .segments_for_test()
-        .validate_location(&old)
-        .unwrap();
+    f.segments.validate_location(&old).unwrap();
 
     // Seal the old open segment, then exercise the normal slab-pressure fence.
-    let segments = f.store.writer.segments_for_test();
+    let segments = &f.segments;
     drop(segments.append(32 * 1024 * 1024).unwrap());
     let clock = eviction::SegmentClock::new(index.clone(), segments.clone(), 2);
     assert_eq!(clock.reclaim_now(), Err(Error::Overloaded));
