@@ -9,6 +9,114 @@ pub(super) struct GatedMetadataOrigin {
 }
 
 #[test]
+fn metadata_cohorts_refresh_zero_ttl_and_do_not_negative_cache_adapter_failure() {
+    use crate::{
+        model::MetadataSelector,
+        read::metadata::{MetadataDependencies, MetadataService},
+        test_support::origin::{AdapterOrigin, RequestKind},
+    };
+    for failure in [None, Some(502)] {
+        let clock = crate::runtime::environment::SimulationClock::new_at(
+            71,
+            Instant::now(),
+            std::time::SystemTime::now(),
+        );
+        let environment = clock.environment(1);
+        let _environment = environment.enter();
+        let queue = Rc::new(drivers::DriverQueue::default());
+        let _owner = queue.enter();
+        let mut f = fixture();
+        let adapter = AdapterOrigin::new("fixture", f.origin.metadata.clone());
+        adapter.block(RequestKind::Head);
+        if let Some(status) = failure {
+            adapter.reject_next(RequestKind::Head, status);
+        }
+        let service = MetadataService::new(
+            f.fill.dependencies.candidates.clone(),
+            adapter_client(&f, &adapter),
+            f.fill.dependencies.credentials.clone(),
+            1,
+            MetadataDependencies {
+                index: Rc::new(Index::new(WorkerId(0), 8)),
+                fill: Rc::new(Fill::new(f.fill.dependencies.clone())),
+                owners: f.fill.dependencies.metadata_owner.clone(),
+            },
+        );
+        let mut first = service.resolve(
+            MetadataSelector::Fresh,
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+        );
+        let mut second = service.resolve(
+            MetadataSelector::Fresh,
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+        );
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        adapter.release(RequestKind::Head);
+        let (a, b) = drive_io(
+            async { futures::join!(first.as_mut(), second.as_mut()) },
+            &f.reactor,
+            &mut f.engine,
+            &f.crypto,
+        );
+        if failure.is_some() {
+            assert_eq!(a, Err(Error::BadGateway));
+            assert_eq!(b, Err(Error::BadGateway));
+        } else {
+            assert_eq!(a.unwrap(), f.origin.metadata);
+            assert_eq!(b.unwrap(), f.origin.metadata);
+        }
+        assert_eq!(
+            adapter.count(RequestKind::Head),
+            1,
+            "registered cohort shares one HEAD"
+        );
+        // Protocol failures back off the real client's transport circuit. Advancing
+        // its clock lets this assertion distinguish backoff from negative caching.
+        clock.advance(Duration::from_secs(2));
+        // A new zero-TTL cohort must perform I/O even while completed futures live.
+        adapter.block(RequestKind::Head);
+        let mut next = service.resolve(
+            MetadataSelector::Fresh,
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+        );
+        let pending = next.as_mut().poll(&mut cx);
+        assert!(
+            pending.is_pending(),
+            "failure={failure:?}, result={pending:?}"
+        );
+        drop((first, second));
+        let follower = service.resolve(
+            MetadataSelector::Fresh,
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+        );
+        adapter.release(RequestKind::Head);
+        let (a, b) = drive_io(
+            async { futures::join!(next, follower) },
+            &f.reactor,
+            &mut f.engine,
+            &f.crypto,
+        );
+        assert_eq!(a.unwrap(), f.origin.metadata);
+        assert_eq!(b.unwrap(), f.origin.metadata);
+        assert_eq!(
+            adapter.count(RequestKind::Head),
+            2,
+            "stale detach preserves new cohort; failures are not cached"
+        );
+    }
+}
+
+#[test]
 fn bootstrap_rejection_re_elects_and_version_changes_never_mix_pages() {
     let queue = Rc::new(drivers::DriverQueue::default());
     let _owner = queue.enter();

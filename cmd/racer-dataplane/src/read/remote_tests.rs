@@ -22,6 +22,7 @@ use crate::{
         credentials::CredentialCrypto, forwarding::Forwarding, identity::Keyring,
         test_support::Identity,
     },
+    test_support::origin::AdapterOrigin,
     topology::{
         health::LinkHealth,
         membership::{Member, Membership},
@@ -157,13 +158,14 @@ fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
     let admission = Rc::new(Admission::new(
         crate::test_support::cluster::config(false).limits,
     ));
-    let calls = Rc::new(Cell::new(0));
+    let calls = missing_adapter();
+    let reactor = Rc::new(Reactor::new(admission.clone()));
     let (coordinator, _endpoint) = metadata_coordinator_with_newer_publication(
         &node(1),
         &membership,
         ids[1].keys.clone(),
         admission.clone(),
-        Rc::new(Reactor::new(admission.clone())),
+        reactor.clone(),
         Rc::new(NoPeers),
         calls.clone(),
         true,
@@ -226,11 +228,10 @@ fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
         let (signed, binding) = sender.sign_request(request).unwrap();
         let admitted = receiver.verify_request(signed).unwrap();
         let response_binding = admitted.binding().clone();
-        let result = futures::executor::block_on(coordinator.serve_peer(
-            admitted,
-            membership.clone(),
-            &scope,
-        ))
+        let result = drive_origin(
+            &reactor,
+            coordinator.serve_peer(admitted, membership.clone(), &scope),
+        )
         .unwrap();
         assert!(match index {
             0 | 1 => matches!(result, PeerResponse::Miss),
@@ -243,7 +244,7 @@ fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
                 &binding,
             )
             .unwrap();
-        assert_eq!(calls.get(), index.saturating_sub(1));
+        assert_eq!(calls.calls().len(), index.saturating_sub(1));
     }
 }
 
@@ -381,7 +382,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         length: 71,
         expires_at: ExpiresAt(std::time::SystemTime::now() + Duration::from_secs(60)),
     };
-    let origin_calls = Rc::new(Cell::new(0));
+    let origin_calls = missing_adapter();
     let copy_calls = Rc::new(RefCell::new(Vec::new()));
     let local = absence
         .filter(|case| !matches!(case, Absence::Pinned))
@@ -458,7 +459,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     } else {
         requester
     };
-    let ingress_calls = Rc::new(Cell::new(0));
+    let ingress_calls = missing_adapter();
     let ingress = matches!(absence, Some(Absence::Fresh | Absence::Subscription)).then(|| {
         metadata_coordinator(
             &source,
@@ -612,7 +613,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         );
     }
     assert_eq!(
-        ingress_calls.get(),
+        ingress_calls.calls().len(),
         0,
         "noncandidate ingress cannot call origin"
     );
@@ -667,7 +668,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     assert_eq!(calls.get(), 1);
     if let Some(case) = absence {
         assert_eq!(
-            origin_calls.get(),
+            origin_calls.calls().len(),
             usize::from(!matches!(case, Absence::Pinned))
         );
         assert_eq!(
@@ -750,67 +751,37 @@ impl LocalPageService for OwnedCoordinator {
     }
 }
 
-struct MissingOrigin(Rc<Cell<usize>>);
-impl crate::origin::Origin for MissingOrigin {
-    fn bootstrap_reserved<'a>(
-        &'a self,
-        authority: &'a super::candidates::OriginAuthority,
-        context: &'a OriginContext,
-        reservation: crate::runtime::admission::Reservation,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, crate::origin::metadata::MetadataReply> {
-        Box::pin(async move {
-            let result = self
-                .metadata(authority, context, MetadataSelector::Fresh, scope)
-                .await;
-            drop(reservation);
-            result
-        })
-    }
-    fn page_reserved<'a>(
-        &'a self,
-        _: &'a super::candidates::OriginAuthority,
-        _: &'a OriginContext,
-        _: &'a PageId,
-        _: crate::runtime::admission::Reservation,
-        _: &'a RequestScope,
-    ) -> Operation<'a, crate::origin::page::OriginPage> {
-        Box::pin(async { panic!("metadata absence must not fetch pages") })
-    }
-    fn metadata<'a>(
-        &'a self,
-        authority: &'a super::candidates::OriginAuthority,
-        context: &'a OriginContext,
-        selector: MetadataSelector,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, crate::origin::metadata::MetadataReply> {
-        Box::pin(async move {
-            scope.check()?;
-            authority.validate(&context.object, PageNumber(0))?;
-            self.0.set(self.0.get() + 1);
-            let status = if matches!(selector, MetadataSelector::Fresh) {
-                404
-            } else {
-                412
-            };
-            let raw = format!("HTTP/1.1 {status} Result\r\nContent-Length: 0\r\n\r\n");
-            let (head, _) = Codec::new(32768, 0).decode_head(raw.as_bytes())?.unwrap();
-            crate::origin::metadata::validate(&head, &context.object).map(|metadata| {
-                crate::origin::metadata::MetadataReply {
-                    metadata,
-                    page_zero: None,
-                }
-            })
-        })
-    }
-    fn page<'a>(
-        &'a self,
-        _: &'a super::candidates::OriginAuthority,
-        _: &'a OriginContext,
-        _: &'a PageId,
-        _: &'a RequestScope,
-    ) -> Operation<'a, crate::origin::page::OriginPage> {
-        Box::pin(async { panic!("metadata absence must not fetch pages") })
+fn missing_adapter() -> Rc<AdapterOrigin> {
+    let adapter = Rc::new(AdapterOrigin::new(
+        "remote",
+        ObjectMetadata {
+            content_type: None,
+            version: ObjectVersion {
+                object: ObjectId {
+                    cache: CacheId(CACHE.into()),
+                    key: CacheKey([3; 32]),
+                },
+                etag: StrongEtag::test_value("missing"),
+            },
+            length: 0,
+            expires_at: ExpiresAt(std::time::UNIX_EPOCH),
+        },
+    ));
+    adapter.set_missing(true);
+    adapter
+}
+
+fn drive_origin<T>(reactor: &Reactor, future: impl std::future::Future<Output = T>) -> T {
+    let mut future = std::pin::pin!(future);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "origin absence exchange stalled");
+        reactor.poll_budgeted(128).unwrap();
+        reactor.wait(Duration::from_millis(1)).unwrap();
     }
 }
 
@@ -875,8 +846,8 @@ impl crate::peer::PeerClient for CachedCopies {
     }
 }
 
-// Production read graph with only origin replies and later-candidate caches as
-// doubles. No slab I/O or page crypto is needed for these metadata-only requests.
+// Production read graph and origin client; only the adapter boundary and later
+// candidate caches are doubles. Metadata-only requests need no slab I/O or crypto.
 fn metadata_coordinator(
     node: &NodeId,
     membership: &Arc<Membership>,
@@ -884,10 +855,10 @@ fn metadata_coordinator(
     admission: Rc<Admission>,
     reactor: Rc<Reactor>,
     peers: Rc<dyn crate::peer::PeerClient>,
-    calls: Rc<Cell<usize>>,
+    adapter: Rc<AdapterOrigin>,
 ) -> (Rc<super::Coordinator>, super::dispatch::WorkerEndpoint) {
     metadata_coordinator_with_newer_publication(
-        node, membership, keys, admission, reactor, peers, calls, false,
+        node, membership, keys, admission, reactor, peers, adapter, false,
     )
 }
 
@@ -898,7 +869,7 @@ fn metadata_coordinator_with_newer_publication(
     admission: Rc<Admission>,
     reactor: Rc<Reactor>,
     peers: Rc<dyn crate::peer::PeerClient>,
-    calls: Rc<Cell<usize>>,
+    adapter: Rc<AdapterOrigin>,
     newer_publication: bool,
 ) -> (Rc<super::Coordinator>, super::dispatch::WorkerEndpoint) {
     use crate::{
@@ -973,7 +944,12 @@ fn metadata_coordinator_with_newer_publication(
         credentials.clone(),
         Arc::new(Default::default()),
     ));
-    let origin = Rc::new(MissingOrigin(calls));
+    let origin = adapter.client(
+        snapshots.clone(),
+        admission.clone(),
+        reactor.clone(),
+        buffers.clone(),
+    );
     let owners = Arc::new(
         super::dispatch::WorkerDirectory::new(
             Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),

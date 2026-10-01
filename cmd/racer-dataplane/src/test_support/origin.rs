@@ -45,6 +45,7 @@ pub struct Call {
 
 struct State {
     metadata: ObjectMetadata,
+    missing: bool,
     body: Option<Vec<u8>>,
     calls: Vec<Call>,
     rejections: BTreeMap<RequestKind, VecDeque<u16>>,
@@ -88,6 +89,7 @@ impl AdapterOrigin {
         listener.set_nonblocking(true).unwrap();
         let state = Arc::new(Mutex::new(State {
             metadata,
+            missing: false,
             body: None,
             calls: vec![],
             rejections: BTreeMap::new(),
@@ -156,6 +158,10 @@ impl AdapterOrigin {
 
     pub fn set_version(&self, metadata: ObjectMetadata) {
         self.state.lock().unwrap().metadata = metadata;
+    }
+    /// Missing current objects return 404; unsatisfied explicit pins return 412.
+    pub fn set_missing(&self, missing: bool) {
+        self.state.lock().unwrap().missing = missing;
     }
     pub fn set_body(&self, body: Vec<u8>) {
         let mut state = self.state.lock().unwrap();
@@ -304,7 +310,9 @@ fn serve(mut stream: UnixStream, state: &Mutex<State>, stop: &AtomicBool) {
         });
     let metadata = &state.metadata;
     let status = rejected.unwrap_or_else(|| {
-        if call
+        if state.missing {
+            if call.if_match.is_some() { 412 } else { 404 }
+        } else if call
             .if_match
             .as_deref()
             .is_some_and(|etag| etag != metadata.version.etag.as_bytes())

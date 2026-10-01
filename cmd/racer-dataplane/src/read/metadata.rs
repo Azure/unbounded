@@ -1114,38 +1114,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn coalesces_refresh_and_zero_ttl_admits_only_registered_cohort() {
-        let table = Rc::new(RefreshTable::default());
-        let first = table.join(key(), 1).unwrap();
-        let second = table.join(key(), 1).unwrap();
-        let waker = noop_waker();
-        assert!(matches!(
-            first.event(&waker),
-            Poll::Ready(RefreshEvent::Lead)
-        ));
-        assert!(second.event(&waker).is_pending());
-        first.finish(Ok(output()));
-        let Poll::Ready(RefreshEvent::Complete(Ok(result))) = second.event(&waker) else {
-            panic!("cohort did not complete")
-        };
-        assert_eq!(result.metadata.length, 0);
-        assert_eq!(result.metadata.expires_at.0, UNIX_EPOCH);
-        let next = table.join(key(), 1).unwrap();
-        assert!(!Rc::ptr_eq(&first.refresh, &next.refresh));
-        assert!(matches!(
-            next.event(&waker),
-            Poll::Ready(RefreshEvent::Lead)
-        ));
-        drop(first);
-        drop(second);
-        // A stale cohort's final detach must not remove the replacement.
-        assert_eq!(table.active.borrow().len(), 1);
-        drop(next);
-        assert_eq!(table.registrations.get(), 0);
-        assert!(table.active.borrow().is_empty());
-    }
-
-    #[test]
     fn rejected_or_canceled_leader_does_not_fail_other_callers() {
         let table = Rc::new(RefreshTable::default());
         let first = table.join(key(), 1).unwrap();
@@ -1233,23 +1201,6 @@ pub(crate) mod tests {
         );
         assert!(matches!(table.join(different, 1), Err(Error::Overloaded)));
         drop(first);
-    }
-
-    #[test]
-    fn terminal_failure_is_shared_but_never_negative_cached() {
-        let table = Rc::new(RefreshTable::default());
-        let first = table.join(key(), 1).unwrap();
-        let second = table.join(key(), 1).unwrap();
-        first.finish(Err(Error::CorruptRecord));
-        assert!(matches!(
-            second.event(&noop_waker()),
-            Poll::Ready(RefreshEvent::Complete(Err(Error::CorruptRecord)))
-        ));
-        let next = table.join(key(), 1).unwrap();
-        assert!(matches!(
-            next.event(&noop_waker()),
-            Poll::Ready(RefreshEvent::Lead)
-        ));
     }
 
     #[test]
