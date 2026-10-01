@@ -18,7 +18,7 @@ func TestConfigDeploymentIdentityAndBounds(t *testing.T) {
 		"namespace":                  func(c *Config) { c.Namespace = "../namespace" },
 		"missing marker name":        func(c *Config) { c.InstallationConfigMapName = "" },
 		"aliased durable objects":    func(c *Config) { c.InstallationConfigMapName = c.VersionConfigMapName },
-		"aliased credential secrets": func(c *Config) { c.IssuerSecretName = c.KeyringSecretName },
+		"aliased credential secrets": func(c *Config) { c.CredentialsSecretName = "" },
 		"no preparation":             func(c *Config) { c.Rotation.PrepareFor = 0 },
 		"short overlap":              func(c *Config) { c.Rotation.RetainFor = wire.CertificateLifetime - 1 },
 		"short interval":             func(c *Config) { c.Rotation.Interval = c.Rotation.PrepareFor - 1 },
@@ -50,9 +50,10 @@ func TestConfigDeploymentIdentityAndBounds(t *testing.T) {
 
 	t.Setenv("RACER_PEER_PORT", "65535")
 	t.Setenv("RACER_INSTALLATION_CONFIGMAP_NAME", "permanent-installation")
+	t.Setenv("RACER_CREDENTIALS_SECRET_NAME", "custom-credentials")
 
 	loaded, err := LoadConfig()
-	if err != nil || loaded.PeerPort != 65535 || loaded.InstallationConfigMapName != "permanent-installation" {
+	if err != nil || loaded.PeerPort != 65535 || loaded.InstallationConfigMapName != "permanent-installation" || loaded.CredentialsSecretName != "custom-credentials" {
 		t.Fatalf("deployment overrides: %+v, %v", loaded, err)
 	}
 }

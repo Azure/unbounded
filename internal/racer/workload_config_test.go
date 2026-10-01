@@ -151,7 +151,7 @@ func TestWorkloadIgnoresLegacyKeyringSecret(t *testing.T) {
 	values := map[string]string{
 		"RACER_CLUSTER_ID": string(want.Cluster), "POD_NAMESPACE": want.Namespace,
 		"RACER_CONTROL_URL": want.ControlURL, "RACER_DATAPLANE_IMAGE": want.DataplaneImage,
-		"RACER_KEYRING_SECRET_NAME": "../obsolete",
+		"RACER_CREDENTIALS_SECRET_NAME": "../obsolete",
 	}
 
 	cfg, err := WorkloadConfigFromLookup(func(key string) (string, bool) {

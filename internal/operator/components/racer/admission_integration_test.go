@@ -68,8 +68,10 @@ func TestEnvtestRuntimeSecretAdmission(t *testing.T) {
 		return denied(c.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "not-allowed", Namespace: env.Namespace}}, client.DryRunAll))
 	}, 30*time.Second, 100*time.Millisecond)
 
-	for _, secretName := range []string{"racer-issuer", "racer-keyring"} {
-		t.Run(secretName, func(t *testing.T) {
+	for _, entry := range []string{"issuer.json", "bundle.json", "rotation.json"} {
+		t.Run(entry, func(t *testing.T) {
+			secretName := "racer-credentials"
+
 			for _, tc := range []struct {
 				name        string
 				typeName    corev1.SecretType
@@ -87,7 +89,7 @@ func TestEnvtestRuntimeSecretAdmission(t *testing.T) {
 				{name: "sa-uid", typeName: corev1.SecretTypeOpaque, annotations: map[string]string{corev1.ServiceAccountUIDKey: "uid"}},
 			} {
 				t.Run(tc.name, func(t *testing.T) {
-					obj := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: env.Namespace, Annotations: tc.annotations}, Type: tc.typeName}
+					obj := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: secretName, Namespace: env.Namespace, Annotations: tc.annotations}, Type: tc.typeName, Data: map[string][]byte{entry: []byte("{}")}}
 					require.True(t, apierrors.IsNotFound(env.Client.Get(ctx, objectKey(env, secretName), &corev1.Secret{})))
 
 					err := c.Create(ctx, obj, client.DryRunAll)

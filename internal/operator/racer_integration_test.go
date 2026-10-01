@@ -124,7 +124,7 @@ func TestEnvtestRacerProvisioning(t *testing.T) {
 		integrationRacerWriteScope(t, rc, c, namespace)
 	})
 
-	for _, name := range []string{"racer-controller-tls", "racer-issuer", "racer-keyring"} {
+	for _, name := range []string{"racer-controller-tls", "racer-credentials"} {
 		require.NoError(t, c.Get(ctx, key(name), &corev1.Secret{}))
 	}
 	// Lost counters must not make either provisioner or normal startup reset.
@@ -278,7 +278,7 @@ func integrationRacerWriteScope(t *testing.T, rc *rest.Config, admin client.Clie
 		require.True(t, apierrors.IsForbidden(c.Create(ctx, obj, client.DryRunAll)))
 	}
 
-	for _, name := range []string{"racer-issuer", "racer-keyring"} {
+	for _, name := range []string{"racer-credentials"} {
 		obj := &corev1.Secret{}
 		require.NoError(t, c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, obj))
 		require.NoError(t, c.Update(ctx, obj, client.DryRunAll))

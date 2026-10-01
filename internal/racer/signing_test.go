@@ -39,8 +39,7 @@ func writeSigningCredentials(t *testing.T, r *KeyringReconciler, b wire.KeyringB
 	}
 
 	for name, data := range map[string]map[string][]byte{
-		r.Config.IssuerSecretName:  {"issuer.json": material},
-		r.Config.KeyringSecretName: {"bundle.json": bundle, "rotation.json": rotation},
+		r.Config.CredentialsSecretName: {"issuer.json": material, "bundle.json": bundle, "rotation.json": rotation},
 	} {
 		secret := &corev1.Secret{}
 		if err := r.APIReader.Get(t.Context(), client.ObjectKey{Namespace: r.Config.Namespace, Name: name}, secret); err != nil {
@@ -99,8 +98,16 @@ func TestSigningRejectsCorruptPrivateEntries(t *testing.T) {
 				case "retiring":
 					b.PeerTrustRoots = append(b.PeerTrustRoots, m.Keys[id].Certificate)
 					s.Retiring[id] = s.NextRotation.Add(time.Hour)
-				case "pending":
-					m.Pending = id
+				case "extra", "pending":
+					// Former unpublished roles are now rejected even when well formed.
+					writeSigningCredentials(t, r, b, s, m)
+
+					if _, err := loadSigning(t.Context(), r.APIReader, r.Config, *now); !errors.Is(err, wire.Unavailable) {
+						t.Fatalf("unpublished private material accepted: %v", err)
+					}
+					// Publish the root to exercise every corruption below independently.
+					b.PeerTrustRoots = append(b.PeerTrustRoots, m.Keys[id].Certificate)
+					s.Retiring[id] = s.NextRotation.Add(time.Hour)
 				}
 
 				writeSigningCredentials(t, r, b, s, m)
@@ -113,11 +120,7 @@ func TestSigningRejectsCorruptPrivateEntries(t *testing.T) {
 
 				switch corruption {
 				case "missing":
-					// An extra entry has no reference requiring its presence.
-					// Make it a dangling pending reference for this case.
-					if role == "extra" {
-						m.Pending = id
-					}
+					// Every private entry has a published root requiring its presence.
 				case "root binding":
 					m.Keys["wrong fingerprint"] = bad
 				case "certificate":
@@ -173,10 +176,6 @@ func TestSigningRejectsCorruptPrivateEntries(t *testing.T) {
 					if at, ok := s.Retiring[id]; ok {
 						delete(s.Retiring, id)
 						s.Retiring[nextID] = at
-					}
-
-					if m.Pending == id {
-						m.Pending = nextID
 					}
 				}
 
@@ -268,12 +267,15 @@ func TestSigningPoolOnlyIncludesTimeValidPublishedRoots(t *testing.T) {
 		id := rootID(material.Certificate)
 		m.Keys[id] = material
 
-		if role == "extra" {
-			continue
-		}
+		if role == "extra" || role == "pending" {
+			writeSigningCredentials(t, r, b, s, m)
 
-		if role == "pending" {
-			m.Pending = id
+			if _, err := loadSigning(t.Context(), r.APIReader, r.Config, *now); !errors.Is(err, wire.Unavailable) {
+				t.Fatalf("unpublished private material accepted: %v", err)
+			}
+
+			delete(m.Keys, id)
+
 			continue
 		}
 

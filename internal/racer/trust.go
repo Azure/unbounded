@@ -8,8 +8,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"strings"
 	"sync"
 	"time"
@@ -241,56 +243,54 @@ func shouldInvalidateTrust(err error) bool {
 const credentialClaim = "racer.unbounded-cloud.io/credentials"
 
 func validCredentialClaim(cfg Config, claim string) bool {
-	return strings.HasPrefix(claim, cfg.IssuerSecretName+"/"+cfg.KeyringSecretName+"/")
+	name, fingerprint, ok := strings.Cut(claim, "/")
+	decoded, err := hex.DecodeString(fingerprint)
+
+	return ok && name == cfg.CredentialsSecretName && err == nil && len(decoded) == sha256.Size && fingerprint == hex.EncodeToString(decoded)
 }
 
 type credentialState struct {
-	issuer   *corev1.Secret
-	shared   *corev1.Secret
-	bundle   wire.KeyringBundle
-	rotation RotationState
-	material issuerMaterial
+	secret     *corev1.Secret
+	bundle     wire.KeyringBundle
+	rotation   RotationState
+	material   issuerMaterial
+	generation wire.Generation
 	// Parsed once per authoritative read, never used to install candidate trust.
 	signing map[string]parsedSigning
 }
 
 func readCredentials(ctx context.Context, reader client.Reader, cfg Config, claim string) (credentialState, error) {
 	var (
-		issuer, shared corev1.Secret
-		b              wire.KeyringBundle
-		s              RotationState
-		material       issuerMaterial
+		secret   corev1.Secret
+		b        wire.KeyringBundle
+		s        RotationState
+		material issuerMaterial
 	)
 
-	for _, entry := range []struct {
-		name   string
-		secret *corev1.Secret
-	}{{cfg.IssuerSecretName, &issuer}, {cfg.KeyringSecretName, &shared}} {
-		if err := ctx.Err(); err != nil {
-			return credentialState{}, err
-		}
+	if err := ctx.Err(); err != nil {
+		return credentialState{}, err
+	}
 
-		if err := reader.Get(ctx, client.ObjectKey{Namespace: cfg.Namespace, Name: entry.name}, entry.secret); err != nil {
-			return credentialState{}, authorityReadFailure(err)
-		}
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: cfg.Namespace, Name: cfg.CredentialsSecretName}, &secret); err != nil {
+		return credentialState{}, authorityReadFailure(err)
+	}
 
-		if claim == "" || entry.secret.Annotations[credentialClaim] != claim || entry.secret.DeletionTimestamp != nil || entry.secret.ResourceVersion == "" {
-			return credentialState{}, wire.Unavailable
-		}
+	if !validCredentialClaim(cfg, claim) || secret.Annotations[credentialClaim] != claim || secret.DeletionTimestamp != nil || secret.ResourceVersion == "" {
+		return credentialState{}, wire.Unavailable
 	}
 
 	var err error
 
-	b, err = wire.DecodeBundle(bytes.NewReader(shared.Data["bundle.json"]))
+	b, err = wire.DecodeBundle(bytes.NewReader(secret.Data["bundle.json"]))
 	if err != nil {
 		return credentialState{}, err
 	}
 
-	if b.Cluster != cfg.Cluster || json.Unmarshal(shared.Data["rotation.json"], &s) != nil || json.Unmarshal(issuer.Data["issuer.json"], &material) != nil {
+	if b.Cluster != cfg.Cluster || decodeCredentialMetadata(secret.Data["rotation.json"], &s) != nil || decodeCredentialMetadata(secret.Data["issuer.json"], &material) != nil {
 		return credentialState{}, wire.Unavailable
 	}
 
-	credentials := credentialState{issuer: &issuer, shared: &shared, bundle: b, rotation: s, material: material}
+	credentials := credentialState{secret: &secret, bundle: b, rotation: s, material: material, generation: b.Generation}
 	if err := credentials.validateRotation(); err != nil {
 		return credentialState{}, err
 	}
@@ -298,9 +298,24 @@ func readCredentials(ctx context.Context, reader client.Reader, cfg Config, clai
 	return credentials, nil
 }
 
+func decodeCredentialMetadata(data []byte, out any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+
+	if err := decoder.Decode(out); err != nil {
+		return err
+	}
+
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return wire.Unavailable
+	}
+
+	return nil
+}
+
 func (c *credentialState) validateRotation() error {
 	b, s, m := c.bundle, c.rotation, c.material
-	if s.NextRotation.IsZero() || s.Retiring == nil || !containsRoot(b, s.ActiveIssuer) || (s.PreparedIssuer == "") != s.ActivateAt.IsZero() {
+	if len(m.Keys) != len(b.PeerTrustRoots) || s.NextRotation.IsZero() || s.Retiring == nil || !containsRoot(b, s.ActiveIssuer) || (s.PreparedIssuer == "") != s.ActivateAt.IsZero() {
 		return wire.Unavailable
 	}
 
@@ -342,10 +357,6 @@ func (c *credentialState) validateRotation() error {
 	prepared := map[string]bool{}
 
 	for _, key := range b.CacheKeys {
-		if key.State == wire.RetiringKey {
-			required[keyID(key)] = struct{}{}
-		}
-
 		if key.State == wire.PreparedKey {
 			scope := string(key.Key.Cache) + "/" + string(key.Key.Purpose)
 			if s.ActivateAt.IsZero() || prepared[scope] {
@@ -362,12 +373,6 @@ func (c *credentialState) validateRotation() error {
 
 	for id := range required {
 		if at, ok := s.Retiring[id]; !ok || at.IsZero() {
-			return wire.Unavailable
-		}
-	}
-
-	if m.Pending != "" {
-		if _, ok := m.Keys[m.Pending]; !ok {
 			return wire.Unavailable
 		}
 	}

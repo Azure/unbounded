@@ -89,10 +89,10 @@ func (r *KeyringReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl
 
 func (r *KeyringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		Named("racer-keyring").
+		Named("racer-credentials").
 		WatchesRawSource(initialEnqueue()).
 		Watches(&racerv1.ClusterCache{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(cacheChanges())).
-		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(namedChanges(r.Config.Namespace, r.Config.IssuerSecretName, r.Config.KeyringSecretName))).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(namedChanges(r.Config.Namespace, r.Config.CredentialsSecretName))).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(versionChanges(r.Config))).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Complete(r)
@@ -156,44 +156,30 @@ func (r *KeyringReconciler) reconcileKeys(ctx context.Context) (ctrl.Result, err
 	now := r.now()
 	credentials.discardStalePreparation(r.Config, now)
 
-	issuerChanged, err := credentials.prepareIssuer(r.Config, now)
+	if err := credentials.prepareIssuer(r.Config, now); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	var encoded []byte
+
+	credentials.bundle, credentials.rotation, encoded, err = planRotation(r.Config.Rotation, credentials.bundle, credentials.rotation, catalog, now, nextGeneration(credentials.bundle.Generation))
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	credentials.bundle, credentials.rotation, err = PlanRotation(r.Config.Rotation, credentials.bundle, credentials.rotation, catalog, now)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	bundleChanged, err := credentials.encodeRotation(issuerChanged)
+	bundleChanged, err := credentials.encodeRotation(encoded)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
 	if bundleChanged {
-		// Private write-ahead material must be durable before publishing its root.
-		if issuerChanged {
-			if err := ctx.Err(); err != nil {
-				return ctrl.Result{}, err
-			}
-
-			if err := r.Update(ctx, credentials.issuer); err != nil {
-				return ctrl.Result{}, err
-			}
-		}
-
 		if err := ctx.Err(); err != nil {
 			return ctrl.Result{}, err
 		}
 
-		if err := r.Update(ctx, credentials.shared); err != nil {
+		if err := r.Update(ctx, credentials.secret); err != nil {
 			return ctrl.Result{}, err
 		}
-	}
-
-	if err := r.pruneIssuerMaterial(ctx, &credentials); err != nil {
-		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{RequeueAfter: max(time.Second, credentials.rotation.nextTransition().Sub(now))}, nil
@@ -229,69 +215,41 @@ func (c *credentialState) discardStalePreparation(cfg Config, now time.Time) {
 	}
 }
 
-func (c *credentialState) prepareIssuer(cfg Config, now time.Time) (bool, error) {
+func (c *credentialState) prepareIssuer(cfg Config, now time.Time) error {
 	b, s, material := &c.bundle, &c.rotation, &c.material
-	issuerChanged := false
 
 	if s.ActivateAt.IsZero() && !now.Before(s.NextRotation) {
-		// An unreferenced pending root is a recoverable write-ahead record. Reuse
-		// it after ambiguous writes instead of generating a different replacement.
-		pending := material.Pending
-		if pending != "" && !containsRoot(*b, pending) {
-			cert := c.signing[pending].certificate
-
-			if now.Add(cfg.Rotation.PrepareFor + cfg.certificateLifetime()).After(cert.NotAfter) {
-				pending = ""
-			}
+		cert, key, err := generateIssuer(now, cfg)
+		if err != nil {
+			return err
 		}
 
-		if pending == "" || containsRoot(*b, pending) {
-			cert, key, err := generateIssuer(now, cfg)
-			if err != nil {
-				return false, err
-			}
-
-			pending = rootID(cert)
-
-			next := issuerMaterial{Pending: pending, Keys: map[string]signingMaterial{pending: {Certificate: cert, PrivateKey: key}}}
-			for id, key := range material.Keys {
-				next.Keys[id] = key
-			}
-
-			*material = next
-			issuerChanged = true
-		}
-
-		b.PeerTrustRoots = append(b.PeerTrustRoots, material.Keys[pending].Certificate)
-		s.PreparedIssuer = pending
+		id := rootID(cert)
+		material.Keys[id] = signingMaterial{Certificate: cert, PrivateKey: key}
+		b.PeerTrustRoots = append(b.PeerTrustRoots, cert)
+		s.PreparedIssuer = id
 	}
 
-	return issuerChanged, nil
+	return nil
 }
 
 // encodeRotation validates the complete candidate, including its publication
-// generation, before either Secret can be written.
-func (c *credentialState) encodeRotation(issuerChanged bool) (bool, error) {
-	candidate := c.bundle
-	if candidate.Generation < math.MaxUint64 {
-		candidate.Generation++
+// generation, before the single Secret CAS. Reuse the planner's encoded bundle.
+func (c *credentialState) encodeRotation(encoded []byte) (bool, error) {
+	clean := issuerMaterial{Keys: map[string]signingMaterial{}}
+
+	for _, root := range c.bundle.PeerTrustRoots {
+		id := rootID(root)
+		clean.Keys[id] = c.material.Keys[id]
 	}
 
-	encoded, err := wire.EncodeBundle(candidate)
-	if err != nil {
+	c.material = clean
+	if err := c.validateRotation(); err != nil {
 		return false, err
 	}
 
-	previous, err := wire.DecodeBundle(bytes.NewReader(c.shared.Data["bundle.json"]))
-	if err != nil {
-		return false, err
-	}
-
-	previous.Generation = candidate.Generation
-
-	previousEncoded, err := wire.EncodeBundle(previous)
-	if err != nil {
-		return false, err
+	if c.bundle.Generation == c.generation {
+		return false, nil
 	}
 
 	stateBytes, err := json.Marshal(c.rotation)
@@ -299,78 +257,26 @@ func (c *credentialState) encodeRotation(issuerChanged bool) (bool, error) {
 		return false, err
 	}
 
-	if bytes.Equal(encoded, previousEncoded) && bytes.Equal(stateBytes, c.shared.Data["rotation.json"]) {
-		return false, nil
-	}
-
-	if c.bundle.Generation == math.MaxUint64 {
-		return false, wire.Unavailable
-	}
-
-	c.bundle.Generation++
-
-	c.shared.Data["bundle.json"], err = wire.EncodeBundle(c.bundle)
+	materialBytes, err := json.Marshal(c.material)
 	if err != nil {
 		return false, err
 	}
 
-	c.shared.Data["rotation.json"] = stateBytes
-
-	if issuerChanged {
-		c.issuer.Data["issuer.json"], err = json.Marshal(c.material)
-		if err != nil {
-			return false, err
-		}
-	}
+	c.secret.Data["bundle.json"] = encoded
+	c.secret.Data["rotation.json"] = stateBytes
+	c.secret.Data["issuer.json"] = materialBytes
 
 	return true, nil
 }
 
-func (r *KeyringReconciler) pruneIssuerMaterial(ctx context.Context, c *credentialState) error {
-	// Remove private material only after the common bundle no longer references
-	// it. A crash here leaves harmless extra private keys, never dangling trust.
-	next, material, issuer := c.bundle, c.material, c.issuer
-	clean := issuerMaterial{Pending: material.Pending, Keys: map[string]signingMaterial{}}
-
-	for _, root := range next.PeerTrustRoots {
-		id := rootID(root)
-		clean.Keys[id] = material.Keys[id]
-	}
-
-	if !containsRoot(next, clean.Pending) {
-		clean.Pending = ""
-	}
-
-	if !reflect.DeepEqual(clean, material) {
-		var err error
-
-		issuer.Data["issuer.json"], err = json.Marshal(clean)
-		if err != nil {
-			return err
-		}
-
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
-		if err := r.Update(ctx, issuer); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
 func (r *KeyringReconciler) initializeKeys(ctx context.Context, version *corev1.ConfigMap, catalog []wire.CacheDefinition) (ctrl.Result, error) {
-	for _, name := range []string{r.Config.IssuerSecretName, r.Config.KeyringSecretName} {
-		err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: r.Config.Namespace, Name: name}, &corev1.Secret{})
-		if !apierrors.IsNotFound(err) {
-			if err != nil {
-				return ctrl.Result{}, err
-			}
-
-			return ctrl.Result{}, wire.Unavailable
+	err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: r.Config.Namespace, Name: r.Config.CredentialsSecretName}, &corev1.Secret{})
+	if !apierrors.IsNotFound(err) {
+		if err != nil {
+			return ctrl.Result{}, err
 		}
+
+		return ctrl.Result{}, wire.Unavailable
 	}
 
 	now := r.now()
@@ -389,22 +295,40 @@ func (r *KeyringReconciler) initializeKeys(ctx context.Context, version *corev1.
 		return ctrl.Result{}, err
 	}
 
-	b, s, err = planRotation(r.Config.Rotation, b, s, catalog, now, 1)
+	var encoded []byte
+
+	b, s, encoded, err = planRotation(r.Config.Rotation, b, s, catalog, now, 1)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
 	s.NextRotation = now.Add(r.Config.Rotation.Interval - r.Config.Rotation.PrepareFor)
 
-	encoded, err := wire.EncodeBundle(b)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
 	// The permanent claim is on the already-required version object. Topology
 	// preserves annotations with its CAS. Missing Secrets after this claim never
 	// authorize Create on recovery, even when the first create response was lost.
-	claim := fmt.Sprintf("%s/%s/%s", r.Config.IssuerSecretName, r.Config.KeyringSecretName, id)
+	claim := fmt.Sprintf("%s/%s", r.Config.CredentialsSecretName, id)
 	version.Annotations[credentialClaim] = claim
+
+	secret := credentialSecret(r.Config, r.Config.CredentialsSecretName, claim)
+	material := issuerMaterial{Keys: map[string]signingMaterial{id: {Certificate: cert, PrivateKey: key}}}
+
+	secret.Data["issuer.json"], err = json.Marshal(material)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	secret.Data["bundle.json"] = encoded
+
+	secret.Data["rotation.json"], err = json.Marshal(s)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	candidate := credentialState{bundle: b, rotation: s, material: material}
+	if err := candidate.validateRotation(); err != nil {
+		return ctrl.Result{}, err
+	}
 
 	if err := ctx.Err(); err != nil {
 		return ctrl.Result{}, err
@@ -414,29 +338,12 @@ func (r *KeyringReconciler) initializeKeys(ctx context.Context, version *corev1.
 		return ctrl.Result{}, err
 	}
 
-	issuer := credentialSecret(r.Config, r.Config.IssuerSecretName, claim)
-
-	issuer.Data["issuer.json"], err = json.Marshal(issuerMaterial{Keys: map[string]signingMaterial{id: {Certificate: cert, PrivateKey: key}}})
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	shared := credentialSecret(r.Config, r.Config.KeyringSecretName, claim)
-	shared.Data["bundle.json"] = encoded
-
-	shared.Data["rotation.json"], err = json.Marshal(s)
-	if err != nil {
+	if err := r.Create(ctx, secret); err != nil {
 		return ctrl.Result{}, err
-	}
-
-	for _, secret := range []*corev1.Secret{issuer, shared} {
-		if err := ctx.Err(); err != nil {
-			return ctrl.Result{}, err
-		}
-
-		if err := r.Create(ctx, secret); err != nil {
-			return ctrl.Result{}, err
-		}
 	}
 
 	return ctrl.Result{RequeueAfter: max(time.Second, r.Config.Rotation.Interval-r.Config.Rotation.PrepareFor)}, nil
@@ -448,14 +355,14 @@ type RotationPolicy struct {
 	RetainFor  time.Duration
 }
 
-// RotationState is controller-only metadata beside bundle.json in the shared
+// RotationState is controller-only metadata beside bundle.json in the credentials
 // Secret. Primary timestamps suffice to derive scheduling deadlines after restart.
 type RotationState struct {
 	NextRotation   time.Time            `json:"next_rotation"`
 	ActivateAt     time.Time            `json:"activate_at"`
 	ActiveIssuer   string               `json:"active_issuer"`
 	PreparedIssuer string               `json:"prepared_issuer"`
-	Retiring       map[string]time.Time `json:"retiring"`
+	Retiring       map[string]time.Time `json:"retiring"` // Root fingerprints only.
 }
 
 func rootID(der []byte) string { sum := sha256.Sum256(der); return hex.EncodeToString(sum[:]) }
@@ -506,24 +413,30 @@ func newCacheKey(cache wire.CacheID, purpose wire.KeyPurpose, state wire.KeyStat
 // PlanRotation owns its output and plans transitions using the supplied policy.
 // Deadlines are measured from actual transitions, never advanced through
 // missed intervals after downtime. Issuer staging is done by reconcileKeys before
-// this planner; publication persists private material first.
+// this planner; publication persists all credentials atomically.
 func PlanRotation(policy RotationPolicy, b wire.KeyringBundle, s RotationState, catalog []wire.CacheDefinition, now time.Time) (wire.KeyringBundle, RotationState, error) {
-	var creationGeneration wire.Generation
-	if b.Generation < math.MaxUint64 {
-		creationGeneration = b.Generation + 1
+	b, s, _, err := planRotation(policy, b, s, catalog, now, nextGeneration(b.Generation))
+	return b, s, err
+}
+
+func nextGeneration(g wire.Generation) wire.Generation {
+	if g == math.MaxUint64 {
+		return 0
 	}
 
-	return planRotation(policy, b, s, catalog, now, creationGeneration)
+	return g + 1
 }
 
 // creationGeneration is the publication that will first contain new keys. Zero
 // forbids key creation when generations are exhausted, while allowing idle plans.
-func planRotation(policy RotationPolicy, b wire.KeyringBundle, s RotationState, catalog []wire.CacheDefinition, now time.Time, creationGeneration wire.Generation) (wire.KeyringBundle, RotationState, error) {
+func planRotation(policy RotationPolicy, b wire.KeyringBundle, s RotationState, catalog []wire.CacheDefinition, now time.Time, creationGeneration wire.Generation) (wire.KeyringBundle, RotationState, []byte, error) {
 	// Keep wire validation and the encoded size bound at the input boundary.
 	// Ownership does not require decoding the just-validated representation.
 	if _, err := wire.EncodeBundle(b); err != nil {
-		return wire.KeyringBundle{}, RotationState{}, err
+		return wire.KeyringBundle{}, RotationState{}, nil, err
 	}
+
+	original, originalState := b, s
 
 	rootsCopy := make([][]byte, len(b.PeerTrustRoots))
 	for i, root := range b.PeerTrustRoots {
@@ -550,7 +463,7 @@ func planRotation(policy RotationPolicy, b wire.KeyringBundle, s RotationState, 
 	wanted := map[wire.CacheID]bool{}
 	for _, cache := range catalog {
 		if !wire.ValidUUID(string(cache.ID)) || wanted[cache.ID] {
-			return b, s, wire.InvalidRequest
+			return b, s, nil, wire.InvalidRequest
 		}
 
 		wanted[cache.ID] = true
@@ -558,9 +471,7 @@ func planRotation(policy RotationPolicy, b wire.KeyringBundle, s RotationState, 
 
 	keys := b.CacheKeys[:0]
 	for _, k := range b.CacheKeys {
-		deadline, retiring := s.Retiring[keyID(k)]
-		if !wanted[k.Key.Cache] || retiring && !now.Before(deadline) {
-			delete(s.Retiring, keyID(k))
+		if !wanted[k.Key.Cache] {
 			continue
 		}
 
@@ -592,7 +503,7 @@ func planRotation(policy RotationPolicy, b wire.KeyringBundle, s RotationState, 
 			if !present[string(cache.ID)+"/"+string(purpose)] {
 				k, err := newCacheKey(cache.ID, purpose, wire.ActiveKey, creationGeneration)
 				if err != nil {
-					return b, s, err
+					return b, s, nil, err
 				}
 
 				b.CacheKeys = append(b.CacheKeys, k)
@@ -609,20 +520,21 @@ func planRotation(policy RotationPolicy, b wire.KeyringBundle, s RotationState, 
 			}
 		}
 
-		for i := range b.CacheKeys {
-			k := &b.CacheKeys[i]
+		keys := b.CacheKeys[:0]
+		for _, k := range b.CacheKeys {
 			// A cache added during preparation can have only its initial active key.
-			if k.State == wire.ActiveKey && prepared[keyScope(*k)] {
-				k.State = wire.RetiringKey
-				s.Retiring[keyID(*k)] = now.Add(policy.RetainFor)
+			if k.State == wire.ActiveKey && prepared[keyScope(k)] {
+				continue
 			}
+
+			if k.State == wire.PreparedKey {
+				k.State = wire.ActiveKey
+			}
+
+			keys = append(keys, k)
 		}
 
-		for i := range b.CacheKeys {
-			if b.CacheKeys[i].State == wire.PreparedKey {
-				b.CacheKeys[i].State = wire.ActiveKey
-			}
-		}
+		b.CacheKeys = keys
 
 		s.Retiring[s.ActiveIssuer] = now.Add(policy.RetainFor)
 		s.ActiveIssuer, s.PreparedIssuer = s.PreparedIssuer, ""
@@ -630,7 +542,7 @@ func planRotation(policy RotationPolicy, b wire.KeyringBundle, s RotationState, 
 		s.NextRotation = now.Add(policy.Interval - policy.PrepareFor)
 	} else if s.ActivateAt.IsZero() && !now.Before(s.NextRotation) {
 		if s.PreparedIssuer == "" {
-			return b, s, wire.Unavailable
+			return b, s, nil, wire.Unavailable
 		}
 
 		var prepared []wire.CacheKey
@@ -642,7 +554,7 @@ func planRotation(policy RotationPolicy, b wire.KeyringBundle, s RotationState, 
 
 			next, err := newCacheKey(k.Key.Cache, k.Key.Purpose, wire.PreparedKey, creationGeneration)
 			if err != nil {
-				return b, s, err
+				return b, s, nil, err
 			}
 
 			prepared = append(prepared, next)
@@ -652,16 +564,27 @@ func planRotation(policy RotationPolicy, b wire.KeyringBundle, s RotationState, 
 		s.ActivateAt = now.Add(policy.PrepareFor)
 	}
 
-	candidate := b
-	if creationGeneration > candidate.Generation {
-		candidate.Generation = creationGeneration
+	// Generation is the final publication version, not a rotation ordinal.
+	// Normalize empty collections for the comparison without consuming a version.
+	if len(original.CacheKeys) == 0 {
+		original.CacheKeys = []wire.CacheKey{}
 	}
 
-	if _, err := wire.EncodeBundle(candidate); err != nil {
-		return b, s, err
+	if originalState.Retiring == nil {
+		originalState.Retiring = map[string]time.Time{}
 	}
 
-	return b, s, nil
+	if !reflect.DeepEqual(original, b) || !reflect.DeepEqual(originalState, s) {
+		if creationGeneration == 0 {
+			return b, s, nil, wire.Unavailable
+		}
+
+		b.Generation = creationGeneration
+	}
+
+	encoded, err := wire.EncodeBundle(b)
+
+	return b, s, encoded, err
 }
 
 func containsRoot(b wire.KeyringBundle, id string) bool {
@@ -678,10 +601,10 @@ func containsRoot(b wire.KeyringBundle, id string) bool {
 // serial-number and ASN.1 time length variation. generateIssuer enforces it.
 const reservedRootBytes = 1024
 
-// catalogCapacity reserves active + prepared + ceil(retention / cycle) retiring
-// generations. Actual activations are at least Interval apart. The
-// extra prepared slot is reserved even when the oldest retiree expires before
-// preparation. This deliberately favors a stable limit over phase-dependent fit.
+// catalogCapacity reserves active + prepared key generations and
+// active + prepared + ceil(retention / cycle) roots. Actual activations are at
+// least Interval apart. The extra prepared slot is reserved even when the oldest
+// retiree expires before preparation. This favors a stable limit over phase-dependent fit.
 func catalogCapacity(cfg Config, b wire.KeyringBundle) (int, error) {
 	cycle := cfg.Rotation.Interval
 
@@ -729,7 +652,7 @@ func catalogCapacity(cfg Config, b wire.KeyringBundle) (int, error) {
 		return 0, err
 	}
 
-	pairCost := len(withKeys) - len(empty) + 1 + 2*(len(wire.RetiringKey)-len(wire.ActiveKey))
+	pairCost := len(withKeys) - len(empty) + 1 + 2*(len(wire.PreparedKey)-len(wire.ActiveKey))
 	envelope := len(empty) - base64.StdEncoding.EncodedLen(len(probe.PeerTrustRoots[0])) - 2
 
 	available := wire.MaxBundleBytes - envelope - int(generations)*rootCost
@@ -737,7 +660,7 @@ func catalogCapacity(cfg Config, b wire.KeyringBundle) (int, error) {
 		return 0, fmt.Errorf("rotation trust reserve: %w", wire.TooLarge)
 	}
 
-	return available / (int(generations) * pairCost), nil
+	return available / (2 * pairCost), nil
 }
 
 // keyedCaches is the durable admission record: both active purposes must exist.

@@ -20,12 +20,12 @@ spec:
     - expression: >-
         request.userInfo.username == 'system:serviceaccount:' + request.namespace + ':racer-controller' &&
         ((request.resource.resource == 'configmaps' && object.metadata.name in ['racer-installation', 'racer-version']) ||
-         (request.resource.resource == 'secrets' && object.metadata.name in ['racer-issuer', 'racer-keyring'] &&
+         (request.resource.resource == 'secrets' && object.metadata.name == 'racer-credentials' &&
           object.type == 'Opaque' &&
           (!has(object.metadata.annotations) ||
            (!('kubernetes.io/service-account.name' in object.metadata.annotations) &&
             !('kubernetes.io/service-account.uid' in object.metadata.annotations)))))
-      message: Racer may only write its runtime installation/version and Opaque issuer/keyring objects without service-account annotations
+      message: Racer may only write its runtime installation/version objects and Opaque credentials Secret without service-account annotations
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

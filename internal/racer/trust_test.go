@@ -116,7 +116,7 @@ func TestObservedInvalidTrustCannotRecoverFromReadFailure(t *testing.T) {
 
 			shared := &corev1.Secret{}
 
-			key := client.ObjectKey{Namespace: f.a.Keyring.Config.Namespace, Name: f.a.Keyring.Config.KeyringSecretName}
+			key := client.ObjectKey{Namespace: f.a.Keyring.Config.Namespace, Name: f.a.Keyring.Config.CredentialsSecretName}
 			if err := f.a.Topology.Get(f.ctx, key, shared); err != nil {
 				t.Fatal(err)
 			}
@@ -182,8 +182,12 @@ func TestObservedInvalidTrustCannotRecoverFromReadFailure(t *testing.T) {
 }
 
 func TestTrustReadOutageAtEachAuthorityRead(t *testing.T) {
-	for _, resource := range []string{"racer-installation", "racer-version", "racer-issuer", "racer-keyring"} {
+	for _, resource := range []string{"racer-installation", "racer-version", "issuer.json", "bundle.json"} {
 		t.Run(resource, func(t *testing.T) {
+			if resource == "issuer.json" || resource == "bundle.json" {
+				resource = "racer-credentials"
+			}
+
 			f := newServingFixture(t)
 			reads := 0
 
@@ -207,9 +211,14 @@ func TestTrustReadOutageAtEachAuthorityRead(t *testing.T) {
 }
 
 func TestTrustRequiresFreshPostReconcileCredentials(t *testing.T) {
-	for _, resource := range []string{"racer-installation", "racer-version", "racer-issuer", "racer-keyring"} {
+	for _, resource := range []string{"racer-installation", "racer-version", "issuer.json", "bundle.json"} {
 		for _, failure := range []string{"outage", "deleted", "malformed"} {
 			t.Run(resource+"/"+failure, func(t *testing.T) {
+				resourceName := resource
+				if resource == "issuer.json" || resource == "bundle.json" {
+					resourceName = "racer-credentials"
+				}
+
 				r, now := testKeyring(t)
 				runKeys(t, r)
 				_, _, initial, _ := keyState(t, r)
@@ -227,7 +236,7 @@ func TestTrustRequiresFreshPostReconcileCredentials(t *testing.T) {
 
 				reads := 0
 				r.APIReader = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-					if key.Name == resource {
+					if key.Name == resourceName {
 						reads++
 						if reads == 2 {
 							switch failure {
@@ -313,7 +322,7 @@ func TestKeyringCancellationOverridesPostReconcileReadFailure(t *testing.T) {
 
 			reads := 0
 			r.APIReader = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-				if key.Name == r.Config.KeyringSecretName {
+				if key.Name == r.Config.CredentialsSecretName {
 					reads++
 					if reads == 2 {
 						defer cancel()

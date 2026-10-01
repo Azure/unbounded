@@ -57,8 +57,7 @@ type signingMaterial struct {
 }
 
 type issuerMaterial struct {
-	Pending string                     `json:"pending,omitempty"`
-	Keys    map[string]signingMaterial `json:"keys"`
+	Keys map[string]signingMaterial `json:"keys"`
 }
 
 func (signingMaterial) String() string   { return "<redacted issuer>" }

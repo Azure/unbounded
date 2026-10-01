@@ -123,8 +123,8 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 				}
 			}
 
-			if cfg.KeyringSecretName != "racer-keyring" {
-				t.Fatal("controller durable keyring Secret configuration must remain")
+			if cfg.CredentialsSecretName != "racer-credentials" {
+				t.Fatal("controller atomic credentials Secret configuration missing")
 			}
 
 			if trust.Namespace != namespace || trust.Name != workloadCfg.BootstrapTrustConfigMap || trust.Data["ca.crt"] != data["BootstrapCA"] {
@@ -208,6 +208,22 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 			)
 
 			decode("rbac.yaml", &controllerSA, &dataplaneSA, &clusterRole, &clusterBinding, &role, &binding)
+
+			credentialWrites := false
+
+			for _, rule := range role.Rules {
+				if slices.Contains(rule.Resources, "secrets") && (slices.Contains(rule.Verbs, "update") || slices.Contains(rule.Verbs, "patch")) {
+					if !slices.Equal(rule.ResourceNames, []string{cfg.CredentialsSecretName}) {
+						t.Fatal("credential update RBAC must name only the atomic Secret")
+					}
+
+					credentialWrites = true
+				}
+			}
+
+			if !credentialWrites {
+				t.Fatal("credential CAS RBAC missing")
+			}
 
 			if dataplaneSA.Namespace != namespace || dataplaneSA.Name != ds.Spec.Template.Spec.ServiceAccountName || dataplaneSA.AutomountServiceAccountToken == nil || *dataplaneSA.AutomountServiceAccountToken {
 				t.Fatal("dataplane service account mismatch")

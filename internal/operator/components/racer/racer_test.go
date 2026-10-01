@@ -251,7 +251,7 @@ func TestLifecycleWithoutSites(t *testing.T) {
 		require.NotNil(t, volumes[name].HostPath)
 	}
 
-	for _, name := range []string{"racer-issuer", "racer-keyring"} {
+	for _, name := range []string{"racer-credentials"} {
 		require.NoError(t, env.Client.Get(t.Context(), objectKey(env, name), &corev1.Secret{}))
 	}
 

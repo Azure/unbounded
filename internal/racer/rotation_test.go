@@ -62,7 +62,7 @@ func keyState(t *testing.T, r *KeyringReconciler) (*corev1.Secret, wire.KeyringB
 		t.Fatal(err)
 	}
 
-	return credentials.shared, credentials.bundle, credentials.rotation, credentials.material
+	return credentials.secret, credentials.bundle, credentials.rotation, credentials.material
 }
 
 func TestKeyringRotationLifecycle(t *testing.T) {
@@ -132,7 +132,7 @@ func TestKeyringRotationLifecycle(t *testing.T) {
 	runKeys(t, restarted)
 
 	_, activated, active, _ := keyState(t, r)
-	if activated.Generation != 3 || active.ActiveIssuer != prepared.PreparedIssuer || active.PreparedIssuer != "" || len(active.Retiring) != 3 {
+	if activated.Generation != 3 || active.ActiveIssuer != prepared.PreparedIssuer || active.PreparedIssuer != "" || len(active.Retiring) != 1 || len(activated.CacheKeys) != 2 {
 		t.Fatal("activation/overlap incorrect")
 	}
 
@@ -141,7 +141,7 @@ func TestKeyringRotationLifecycle(t *testing.T) {
 			t.Fatal("prepared key not activated")
 		}
 
-		if !reflect.DeepEqual(k.Key, staged.CacheKeys[i].Key) || !k.EqualMaterial(staged.CacheKeys[i]) {
+		if !reflect.DeepEqual(k.Key, staged.CacheKeys[i+2].Key) || !k.EqualMaterial(staged.CacheKeys[i+2]) {
 			t.Fatal("activation changed key identity or material")
 		}
 	}
@@ -155,7 +155,7 @@ func TestKeyringRotationLifecycle(t *testing.T) {
 	runKeys(t, restarted)
 
 	_, overlap, overlapping, _ := keyState(t, r)
-	if len(overlap.PeerTrustRoots) != 3 || len(overlap.CacheKeys) != 6 {
+	if len(overlap.PeerTrustRoots) != 3 || len(overlap.CacheKeys) != 2 {
 		t.Fatal("multiple retiring generations lost")
 	}
 
@@ -164,7 +164,7 @@ func TestKeyringRotationLifecycle(t *testing.T) {
 	runKeys(t, restarted)
 
 	_, pruned, prunedState, material := keyState(t, r)
-	if containsRoot(pruned, state.ActiveIssuer) || len(pruned.CacheKeys) != 6 || len(material.Keys) != 3 || !prunedState.Retiring[active.ActiveIssuer].Equal(overlapping.Retiring[active.ActiveIssuer]) {
+	if containsRoot(pruned, state.ActiveIssuer) || len(pruned.CacheKeys) != 4 || len(material.Keys) != 3 || !prunedState.Retiring[active.ActiveIssuer].Equal(overlapping.Retiring[active.ActiveIssuer]) {
 		t.Fatal("retirement pruning/reset")
 	}
 	// Topology CAS preserves the one-way initialization claim.
@@ -320,8 +320,6 @@ func TestKeyringCatalogAndBounds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	b.Generation++
 
 	state.PreparedIssuer = state.ActiveIssuer
 	if _, _, err := PlanRotation(r.Config.Rotation, b, state, catalog, state.NextRotation); !errors.Is(err, wire.TooLarge) {
@@ -534,16 +532,10 @@ func TestKeyringCorruptionAndGenerationExhaustion(t *testing.T) {
 
 				shared.Data["rotation.json"], _ = json.Marshal(s)
 			case "zero key retirement", "missing key retirement":
-				for _, key := range b.CacheKeys {
-					if key.State == wire.RetiringKey {
-						if corrupt == "zero key retirement" {
-							s.Retiring[keyID(key)] = time.Time{}
-						} else {
-							delete(s.Retiring, keyID(key))
-						}
-
-						break
-					}
+				// Symmetric retirement metadata is never valid, with or without a deadline.
+				s.Retiring[keyID(b.CacheKeys[0])] = time.Time{}
+				if corrupt == "missing key retirement" {
+					s.Retiring[keyID(b.CacheKeys[0])] = s.NextRotation
 				}
 
 				shared.Data["rotation.json"], _ = json.Marshal(s)
@@ -565,15 +557,7 @@ func TestKeyringCorruptionAndGenerationExhaustion(t *testing.T) {
 			case "binding":
 				shared.Annotations[credentialClaim] = "foreign"
 			case "private key":
-				issuer := &corev1.Secret{}
-				if err := r.APIReader.Get(context.Background(), client.ObjectKey{Namespace: r.Config.Namespace, Name: r.Config.IssuerSecretName}, issuer); err != nil {
-					t.Fatal(err)
-				}
-
-				issuer.Data["issuer.json"] = []byte("{}")
-				if err := r.Update(context.Background(), issuer); err != nil {
-					t.Fatal(err)
-				}
+				shared.Data["issuer.json"] = []byte("{}")
 			}
 
 			if err := r.Update(context.Background(), shared); err != nil {

@@ -7,6 +7,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,13 +46,13 @@ func TestKeyringRotationCrashRecovery(t *testing.T) {
 				base := r.Client.(client.WithWatch)
 				boom := errors.New("lost response")
 				failed := false
+				original, _, _, _ := keyState(t, r)
 				r.Client = interceptor.NewClient(base, interceptor.Funcs{Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-					kind := "issuer"
-					if obj.GetName() == r.Config.KeyringSecretName {
-						kind = "bundle"
+					if obj.GetName() != r.Config.CredentialsSecretName {
+						t.Fatal("rotation wrote outside the credentials CAS")
 					}
 
-					if failure == "before "+kind && !failed {
+					if strings.HasPrefix(failure, "before ") && !failed {
 						failed = true
 						return boom
 					}
@@ -59,7 +61,7 @@ func TestKeyringRotationCrashRecovery(t *testing.T) {
 						return err
 					}
 
-					if failure == "after "+kind && !failed {
+					if strings.HasPrefix(failure, "after ") && !failed {
 						failed = true
 						return boom
 					}
@@ -68,11 +70,15 @@ func TestKeyringRotationCrashRecovery(t *testing.T) {
 				}})
 
 				_, err := r.Reconcile(context.Background(), ctrl.Request{})
-				if failed && (!errors.Is(err, boom) || trustReady(r.Trust)) {
+				if !failed || !errors.Is(err, boom) || trustReady(r.Trust) {
 					t.Fatalf("write failure accepted: %v", err)
 				}
-				// Every intermediate durable pair must still be structurally readable.
-				_, before, beforeState, beforeMaterial := keyState(t, r)
+				// Former two-Secret boundaries now fail one coherent atomic version.
+				committed, before, beforeState, _ := keyState(t, r)
+				if strings.HasPrefix(failure, "before ") && !reflect.DeepEqual(original.Data, committed.Data) {
+					t.Fatal("failed CAS partially changed credentials")
+				}
+
 				recovered := Assemble(r.Config, base, base).Keyring
 				recovered.Now = r.Now
 				runKeys(t, recovered)
@@ -82,8 +88,8 @@ func TestKeyringRotationCrashRecovery(t *testing.T) {
 					t.Fatal("generation reset")
 				}
 
-				if phase == "stage" && beforeMaterial.Pending != "" && afterState.PreparedIssuer != beforeMaterial.Pending {
-					t.Fatal("pending private material replaced on recovery")
+				if strings.HasPrefix(failure, "after ") && (after.Generation != before.Generation || !reflect.DeepEqual(afterState, beforeState)) {
+					t.Fatal("committed atomic publication replaced on recovery")
 				}
 
 				if !beforeState.ActivateAt.IsZero() && !afterState.ActivateAt.IsZero() && !beforeState.ActivateAt.Equal(afterState.ActivateAt) {
@@ -114,13 +120,13 @@ func TestKeyringPrivatePruneRecovery(t *testing.T) {
 			boom := errors.New("private prune interrupted")
 
 			r.Client = interceptor.NewClient(base, interceptor.Funcs{Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-				if obj.GetName() != r.Config.IssuerSecretName {
+				if obj.GetName() != r.Config.CredentialsSecretName {
 					return c.Update(ctx, obj, opts...)
 				}
 
 				_, b, _, _ := keyState(t, r)
-				if containsRoot(b, initial.ActiveIssuer) {
-					t.Fatal("private pruning preceded trust removal")
+				if !containsRoot(b, initial.ActiveIssuer) {
+					t.Fatal("root changed before atomic pruning")
 				}
 
 				if afterWrite {
@@ -135,12 +141,22 @@ func TestKeyringPrivatePruneRecovery(t *testing.T) {
 				t.Fatalf("prune interruption: %v", err)
 			}
 
-			_, before, _, _ := keyState(t, r)
+			_, before, _, beforeMaterial := keyState(t, r)
+			if containsRoot(before, initial.ActiveIssuer) == afterWrite || (len(beforeMaterial.Keys) == 2) == afterWrite {
+				t.Fatal("root and private key cleanup were not atomic")
+			}
+
 			r.Client = base
 			runKeys(t, r)
 
 			_, after, _, material := keyState(t, r)
-			if before.Generation != after.Generation || len(material.Keys) != 1 {
+
+			wantGeneration := before.Generation
+			if !afterWrite {
+				wantGeneration++
+			}
+
+			if wantGeneration != after.Generation || len(material.Keys) != 1 || containsRoot(after, initial.ActiveIssuer) {
 				t.Fatal("prune recovery changed publication or retained private material")
 			}
 		})
@@ -154,7 +170,7 @@ func TestKeyringBundleConflictKeepsPendingIssuer(t *testing.T) {
 	*now = initial.NextRotation
 	base := r.Client.(client.WithWatch)
 	r.Client = interceptor.NewClient(base, interceptor.Funcs{Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-		if obj.GetName() == r.Config.KeyringSecretName {
+		if obj.GetName() == r.Config.CredentialsSecretName {
 			return apierrors.NewConflict(corev1.Resource("secrets"), obj.GetName(), wire.Conflict)
 		}
 
@@ -167,7 +183,7 @@ func TestKeyringBundleConflictKeepsPendingIssuer(t *testing.T) {
 	}
 
 	_, b, _, material := keyState(t, r)
-	if b.Generation != 1 || material.Pending == "" || containsRoot(b, material.Pending) {
+	if b.Generation != 1 || len(material.Keys) != 1 || !containsRoot(b, initial.ActiveIssuer) {
 		t.Fatal("conflicting bundle became authoritative")
 	}
 
@@ -175,8 +191,8 @@ func TestKeyringBundleConflictKeepsPendingIssuer(t *testing.T) {
 	runKeys(t, r)
 
 	_, b, state, _ := keyState(t, r)
-	if state.PreparedIssuer != material.Pending || b.Generation != 2 {
-		t.Fatal("conflict regenerated pending issuer")
+	if state.PreparedIssuer == "" || state.PreparedIssuer == initial.ActiveIssuer || b.Generation != 2 {
+		t.Fatal("conflict recovery did not publish a coherent preparation")
 	}
 }
 
@@ -204,12 +220,7 @@ func TestKeyringInitializationNeverResurrects(t *testing.T) {
 					return nil
 				},
 				Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-					kind := "issuer"
-					if obj.GetName() == r.Config.KeyringSecretName {
-						kind = "bundle"
-					}
-
-					if failure == "before "+kind {
+					if failure == "before issuer" || failure == "before bundle" {
 						return boom
 					}
 
@@ -217,7 +228,7 @@ func TestKeyringInitializationNeverResurrects(t *testing.T) {
 						return err
 					}
 
-					if failure == "after "+kind {
+					if failure == "after issuer" || failure == "after bundle" {
 						return boom
 					}
 
@@ -232,7 +243,7 @@ func TestKeyringInitializationNeverResurrects(t *testing.T) {
 			recovered.Now = r.Now
 
 			_, err := recovered.Reconcile(context.Background(), ctrl.Request{})
-			if failure == "before claim" || failure == "after bundle" {
+			if failure == "before claim" || failure == "after issuer" || failure == "after bundle" {
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -248,8 +259,8 @@ func TestKeyringInitializationNeverResurrects(t *testing.T) {
 			issuer := testIssuer(r)
 			runKeys(t, r)
 
-			for _, name := range []string{r.Config.IssuerSecretName, r.Config.KeyringSecretName} {
-				if lost == "both" || lost == "issuer" && name == r.Config.IssuerSecretName || lost == "bundle" && name == r.Config.KeyringSecretName {
+			for _, name := range []string{r.Config.CredentialsSecretName} {
+				if lost == "both" || lost == "issuer" || lost == "bundle" {
 					if err := r.Delete(context.Background(), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: r.Config.Namespace, Name: name}}); err != nil {
 						t.Fatal(err)
 					}
@@ -307,7 +318,7 @@ func TestKeyringConflictCancellationAndAuthoritativeReads(t *testing.T) {
 				Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
 					writes++
 
-					if cancelAt == "issuer" && obj.GetName() == r.Config.IssuerSecretName || cancelAt == "bundle" && obj.GetName() == r.Config.KeyringSecretName {
+					if (cancelAt == "issuer" || cancelAt == "bundle") && obj.GetName() == r.Config.CredentialsSecretName {
 						cancel()
 					}
 

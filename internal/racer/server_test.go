@@ -473,19 +473,10 @@ func TestPooledTLSRetiredTrustAndNoResumption(t *testing.T) {
 	}
 
 	id := rootID(der)
-	material.Keys[id] = signingMaterial{Certificate: der, PrivateKey: key}
+	material.Keys = map[string]signingMaterial{id: {Certificate: der, PrivateKey: key}}
 
-	issuer := &corev1.Secret{}
-	if err := f.a.Topology.Get(f.ctx, client.ObjectKey{Namespace: "racer", Name: f.a.Keyring.Config.IssuerSecretName}, issuer); err != nil {
-		t.Fatal(err)
-	}
-
-	issuer.Data["issuer.json"], err = json.Marshal(material)
+	shared.Data["issuer.json"], err = json.Marshal(material)
 	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := f.a.Topology.Update(f.ctx, issuer); err != nil {
 		t.Fatal(err)
 	}
 

@@ -240,8 +240,7 @@ type Config struct {
 	PeerPort                  uint16
 	DataplaneServiceAccount   string
 	DaemonSetName             string
-	IssuerSecretName          string
-	KeyringSecretName         string
+	CredentialsSecretName     string
 	VersionConfigMapName      string
 	InstallationConfigMapName string
 	Limits                    Limits
@@ -298,8 +297,7 @@ func ConfigFromLookup(lookup func(string) (string, bool)) (Config, error) {
 		PeerPort:                  uint16(port),
 		DataplaneServiceAccount:   env("RACER_DATAPLANE_SERVICE_ACCOUNT", "racer-dataplane"),
 		DaemonSetName:             env("RACER_DAEMONSET_NAME", "racer-dataplane"),
-		IssuerSecretName:          env("RACER_ISSUER_SECRET_NAME", "racer-issuer"),
-		KeyringSecretName:         env("RACER_KEYRING_SECRET_NAME", "racer-keyring"),
+		CredentialsSecretName:     env("RACER_CREDENTIALS_SECRET_NAME", "racer-credentials"),
 		VersionConfigMapName:      env("RACER_VERSION_CONFIGMAP_NAME", "racer-version"),
 		InstallationConfigMapName: env("RACER_INSTALLATION_CONFIGMAP_NAME", "racer-installation"),
 		PodName:                   env("POD_NAME", ""),
@@ -381,7 +379,7 @@ func (c Config) Validate() error {
 		return fmt.Errorf("cluster, namespace, or peer port: %w", wire.InvalidRequest)
 	}
 
-	for _, name := range []string{c.VersionConfigMapName, c.InstallationConfigMapName, c.DaemonSetName, c.IssuerSecretName, c.KeyringSecretName, c.DataplaneServiceAccount} {
+	for _, name := range []string{c.VersionConfigMapName, c.InstallationConfigMapName, c.DaemonSetName, c.CredentialsSecretName, c.DataplaneServiceAccount} {
 		if len(validation.IsDNS1123Subdomain(name)) != 0 {
 			return fmt.Errorf("resource name: %w", wire.InvalidRequest)
 		}
@@ -400,8 +398,7 @@ func (c Config) Validate() error {
 		return fmt.Errorf("certificate lifetime: %w", wire.InvalidRequest)
 	}
 
-	if c.IssuerSecretName == c.KeyringSecretName ||
-		c.Rotation.PrepareFor <= 0 || c.Rotation.Interval < c.Rotation.PrepareFor || c.Rotation.RetainFor < lifetime ||
+	if c.Rotation.PrepareFor <= 0 || c.Rotation.Interval < c.Rotation.PrepareFor || c.Rotation.RetainFor < lifetime ||
 		c.Rotation.Interval > 365*24*time.Hour || c.Rotation.RetainFor > 365*24*time.Hour {
 		return fmt.Errorf("credential names or rotation policy: %w", wire.InvalidRequest)
 	}

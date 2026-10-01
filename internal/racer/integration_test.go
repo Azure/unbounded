@@ -310,7 +310,7 @@ func integrationRotation(t *testing.T, c client.Client) {
 		name   string
 		secret string
 		after  bool
-	}{{"stage-private", r.Config.IssuerSecretName, true}, {"activate-bundle", r.Config.KeyringSecretName, true}, {"prune-private", r.Config.IssuerSecretName, false}} {
+	}{{"stage-private", r.Config.CredentialsSecretName, true}, {"activate-bundle", r.Config.CredentialsSecretName, true}, {"prune-private", r.Config.CredentialsSecretName, false}} {
 		boom := errors.New(step.name)
 		failed := false
 
@@ -341,20 +341,20 @@ func integrationRotation(t *testing.T, c client.Client) {
 
 		switch step.name {
 		case "stage-private":
-			if before.Generation != initial.Generation || private.Pending == "" || next.PreparedIssuer != private.Pending || len(after.CacheKeys) != 4 {
-				t.Fatal("staging recovery replaced write-ahead issuer or lost keys")
+			if before.Generation != initial.Generation+1 || len(private.Keys) != 2 || next.PreparedIssuer != beforeState.PreparedIssuer || len(after.CacheKeys) != 4 {
+				t.Fatal("staging recovery replaced committed credentials or lost keys")
 			}
 
 			now = next.ActivateAt
 		case "activate-bundle":
-			if after.Generation != before.Generation || next.ActiveIssuer != beforeState.ActiveIssuer || len(next.Retiring) != 3 {
+			if after.Generation != before.Generation || next.ActiveIssuer != beforeState.ActiveIssuer || len(next.Retiring) != 1 || len(after.CacheKeys) != 2 {
 				t.Fatal("activation recovery reset committed generation/deadlines")
 			}
 
 			now = next.Retiring[oldIssuer]
 		case "prune-private":
-			if containsRoot(before, oldIssuer) || len(private.Keys) != 2 || len(material.Keys) != 1 || after.Generation != before.Generation || len(after.CacheKeys) != 2 {
-				t.Fatal("private pruning ordering/recovery")
+			if !containsRoot(before, oldIssuer) || len(private.Keys) != 2 || len(material.Keys) != 1 || after.Generation != before.Generation+1 || len(after.CacheKeys) != 2 || containsRoot(after, oldIssuer) {
+				t.Fatal("atomic root/private pruning recovery")
 			}
 		}
 

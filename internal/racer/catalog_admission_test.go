@@ -48,14 +48,14 @@ func TestCatalogCapacityBoundary(t *testing.T) {
 
 	t.Logf("default admitted maximum: %d", capacity)
 	// Check the conservative byte envelope independently: max generation, four
-	// generations of both purposes, longest state, and maximum reserved roots.
+	// roots, two generations of both purposes, and the longest state.
 	for _, count := range []int{capacity, capacity + 1} {
 		keys := []map[string]any{}
 
 		for _, cache := range capacityCaches(count) {
-			for range 4 {
+			for range 2 {
 				for _, purpose := range []wire.KeyPurpose{wire.PageKey, wire.OriginCredentialsKey} {
-					keys = append(keys, map[string]any{"cache": cache.UID, "id": make([]byte, 16), "purpose": purpose, "state": wire.RetiringKey, "material": make([]byte, 32)})
+					keys = append(keys, map[string]any{"cache": cache.UID, "id": make([]byte, 16), "purpose": purpose, "state": wire.PreparedKey, "material": make([]byte, 32)})
 				}
 			}
 		}
@@ -208,7 +208,7 @@ func TestCatalogAdmissionGrowthRemovalAndRestart(t *testing.T) {
 		t.Fatal("deletion did not admit next waiting UID")
 	}
 	// Missing/corrupt durable credentials remain fail-closed in both controllers.
-	shared := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: r.Config.Namespace, Name: r.Config.KeyringSecretName}}
+	shared := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: r.Config.Namespace, Name: r.Config.CredentialsSecretName}}
 	if err := r.Delete(t.Context(), shared); err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +339,7 @@ func TestCatalogAdmissionSerializesPublicationAndPruning(t *testing.T) {
 	a.Topology.APIReader = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
 		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 			err := c.Get(ctx, key, obj, opts...)
-			if key.Name == r.Config.KeyringSecretName {
+			if key.Name == r.Config.CredentialsSecretName {
 				close(read)
 				<-proceed
 			}
