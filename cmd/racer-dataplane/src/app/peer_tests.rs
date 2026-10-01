@@ -362,7 +362,7 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
     let head = MessageHead {
         start: StartLine::Request {
             method: "HEAD".into(),
-            target: format!("/v1/objects/{}", "ab".repeat(32)),
+            target: format!("/v2/objects/{}", "ab".repeat(32)),
         },
         headers: vec![
             Header {

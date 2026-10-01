@@ -1133,7 +1133,7 @@ fn production_remote_bootstrap_one_get_and_empty() {
         );
         // HEAD on a distinct cold key must issue HEAD only and no page request.
         let mut head_socket = connect(&socket_path(&processes[receiver], 0)).unwrap();
-        write!(head_socket, "HEAD /v1/objects/{:064x} HTTP/1.1\r\nHost: racer\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nConnection: close\r\n\r\n", 1).unwrap();
+        write!(head_socket, "HEAD /v2/objects/{:064x} HTTP/1.1\r\nHost: racer\r\nAuthorization: fixture-credential\r\nRacer-Metadata: fixture-metadata\r\nConnection: close\r\n\r\n", 1).unwrap();
         let head = read_head(&mut head_socket).unwrap();
         assert!(head.starts_with("HTTP/1.1 200 "));
         assert_eq!(fields(&head)["content-length"], length.to_string());

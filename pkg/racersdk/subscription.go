@@ -316,7 +316,7 @@ func (s *PageStream) parseHead(head []byte, o ReadOptions) error {
 		return bad
 	}
 
-	if o.Metadata != nil && (o.Metadata.Size != m.Size || o.Metadata.ETag != m.ETag || o.Metadata.ContentType != "" && m.ContentType != "" && o.Metadata.ContentType != m.ContentType) {
+	if o.Metadata != nil && (o.Metadata.Size != m.Size || o.Metadata.ETag != m.ETag || o.Metadata.ContentType != m.ContentType) {
 		return bad
 	}
 

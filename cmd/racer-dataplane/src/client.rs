@@ -211,12 +211,7 @@ impl RequestParser {
         if host != Some(true) {
             return Err(Error::InvalidRequest.into());
         }
-        // HEAD remains available for internal metadata users on the old endpoint.
-        let key = if method == "HEAD" {
-            parse_key(&target, "/v1/objects/").or_else(|_| parse_key(&target, "/v2/objects/"))?
-        } else {
-            parse_key(&target, "/v2/objects/")?
-        };
+        let key = parse_key(&target, "/v2/objects/")?;
         let kind = match method.as_str() {
             "HEAD" if range.is_none() => match pin {
                 Some(etag) => ReadKind::HeadPinned { etag },
@@ -585,7 +580,7 @@ mod tests {
     #[test]
     fn sdk_total_head_limit_includes_unknown_fields() {
         let prefix = format!(
-            "HEAD /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nX-Padding: ",
+            "HEAD /v2/objects/{} HTTP/1.1\r\nHost: racer\r\nX-Padding: ",
             "0".repeat(64)
         );
         let mut raw = prefix.into_bytes();
@@ -600,13 +595,26 @@ mod tests {
     }
 
     #[test]
+    fn head_rejects_legacy_endpoint() {
+        let codec = Codec::new(MAX_HEAD_BYTES, 0);
+        for endpoint in ["v1", "v2"] {
+            let raw = format!(
+                "HEAD /{endpoint}/objects/{} HTTP/1.1\r\nHost: racer\r\n\r\n",
+                "0".repeat(64)
+            );
+            let (head, _) = codec.decode_head(raw.as_bytes()).unwrap().unwrap();
+            assert_eq!(parse(head).is_ok(), endpoint == "v2");
+        }
+    }
+
+    #[test]
     fn raw_head_limit_is_independent_of_unknown_field_whitespace() {
         let codec = Codec::new(MAX_HEAD_BYTES, 0);
         for separator in ["", " ", "\t", "  ", " \t"] {
             for trailing in ["", " ", "\t"] {
                 for length in [MAX_HEAD_BYTES - 1, MAX_HEAD_BYTES, MAX_HEAD_BYTES + 1] {
                     let prefix = format!(
-                        "HEAD /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nX-Empty:\r\nX-Padding:{separator}",
+                        "HEAD /v2/objects/{} HTTP/1.1\r\nHost: racer\r\nX-Empty:\r\nX-Padding:{separator}",
                         "0".repeat(64)
                     );
                     let mut raw = prefix.into_bytes();
@@ -635,7 +643,7 @@ mod tests {
     fn sdk_raw_head_preserves_non_utf8_and_rejects_normalization() {
         let codec = Codec::new(MAX_HEAD_BYTES, 0);
         let mut raw = format!(
-            "HEAD /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nRacer-Metadata: opaque,",
+            "HEAD /v2/objects/{} HTTP/1.1\r\nHost: racer\r\nRacer-Metadata: opaque,",
             "0".repeat(64)
         )
         .into_bytes();
@@ -656,7 +664,7 @@ mod tests {
             " secret\t",
         ] {
             let raw = format!(
-                "HEAD /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nAuthorization:{value}\r\n\r\n",
+                "HEAD /v2/objects/{} HTTP/1.1\r\nHost: racer\r\nAuthorization:{value}\r\n\r\n",
                 "0".repeat(64)
             );
             let rejected = match codec.decode_head(raw.as_bytes()) {
@@ -676,7 +684,7 @@ mod tests {
                     let parser = RequestParser::new(limit);
                     let codec = Codec::new(parser.header_limit(), 0);
                     let prefix = format!(
-                        "HEAD /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nX:{separator}",
+                        "HEAD /v2/objects/{} HTTP/1.1\r\nHost: racer\r\nX:{separator}",
                         "0".repeat(64)
                     );
                     let suffix = format!("{trailing}\r\nY:\r\n\r\n");

@@ -197,7 +197,7 @@ func (b *responseBody) Close() error {
 }
 
 func (v *Value) openHead(r OriginRequest) (Metadata, error) {
-	head, err := requestHead(r)
+	head, err := clientHead(r)
 	if err != nil {
 		return Metadata{}, err
 	}

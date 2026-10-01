@@ -1020,7 +1020,8 @@ impl Harness {
         } else {
             String::new()
         };
-        let request = format!("{} /v1/objects/{} HTTP/1.1\r\nHost: racer\r\n{pin}{range}Racer-Metadata: dst opaque metadata\r\nAuthorization: Bearer dst-fixture\r\nConnection: close\r\n\r\n", if head { "HEAD" } else { "GET" }, key(object)).into_bytes();
+        let endpoint = if head { "v2" } else { "v1" };
+        let request = format!("{} /{endpoint}/objects/{} HTTP/1.1\r\nHost: racer\r\n{pin}{range}Racer-Metadata: dst opaque metadata\r\nAuthorization: Bearer dst-fixture\r\nConnection: close\r\n\r\n", if head { "HEAD" } else { "GET" }, key(object)).into_bytes();
         let fd = self
             .sim
             .connect(SocketAddress::Unix(

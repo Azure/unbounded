@@ -66,7 +66,7 @@ func pageForwarder(t *testing.T, path string, size int64) http.Handler {
 		if r.Method == http.MethodPost {
 			serveFakeSubscription(w, r, transport)
 		} else {
-			serveFakePages(w, r, transport)
+			serveFakeHead(w, r, transport)
 		}
 	})
 }

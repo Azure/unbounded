@@ -6,6 +6,7 @@ package racersdk
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
@@ -90,6 +91,7 @@ func TestStreamingHTTP2UpstreamWaits(t *testing.T) {
 				}
 			}))
 			server.EnableHTTP2 = true
+			server.TLS = &tls.Config{MinVersion: tls.VersionTLS13}
 
 			server.StartTLS()
 			defer server.Close()
@@ -204,6 +206,7 @@ func TestStreamingHTTP2BlockedDestinationCancellation(t *testing.T) {
 		}
 	}))
 	server.EnableHTTP2 = true
+	server.TLS = &tls.Config{MinVersion: tls.VersionTLS13}
 
 	server.StartTLS()
 	defer server.Close()

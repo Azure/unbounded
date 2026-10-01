@@ -449,6 +449,38 @@ func TestFrameReaderBoundaries(t *testing.T) {
 	}
 }
 
+func TestClientHeadIsV2WithoutChangingOrigin(t *testing.T) {
+	r := OriginRequest{operation: OperationHead}
+
+	head, err := clientHead(r)
+	if err != nil || !bytes.HasPrefix(head, []byte("HEAD /v2/objects/")) {
+		t.Fatal(string(head), err)
+	}
+
+	head, err = requestHead(r)
+	if err != nil || !bytes.HasPrefix(head, []byte("HEAD /v1/objects/")) {
+		t.Fatal(string(head), err)
+	}
+}
+
+func TestSnapshotContentTypeMustMatchIncludingPresence(t *testing.T) {
+	for _, initial := range []string{"", "text/plain", "application/octet-stream"} {
+		for _, next := range []string{"", "text/plain", "application/octet-stream"} {
+			fields := "Content-Length: 0\r\nETag: \"v\"\r\nRacer-Expires-At: 0\r\n"
+			if next != "" {
+				fields += "Racer-Content-Type: " + next + "\r\n"
+			}
+
+			snapshot := Metadata{ETag: ETag{value: `"v"`}, ContentType: initial}
+
+			_, err := parseResponseHead(rawResponse(200, fields), OriginRequest{operation: OperationHead}, &snapshot)
+			if (err == nil) != (initial == next) {
+				t.Fatalf("MIME %q -> %q: %v", initial, next, err)
+			}
+		}
+	}
+}
+
 func FuzzWireHead(f *testing.F) {
 	for _, head := range [][]byte{rawRequest("HEAD", ""), rawRequest("GET", "Range: bytes=0-16777215\r\nAuthorization: opaque\xff\r\n"), rawRequest("HEAD", "Content-Length: 0\r\nContent-Length: 0\r\n"), rawResponse(200, "Content-Length: 0\r\nETag: \"\"\r\nRacer-Expires-At: 0\r\nContent-Type: application/octet-stream\r\n"), rawResponse(416, "Content-Length: 0\r\nContent-Range: bytes */9223372036854775807\r\n")} {
 		f.Add(head)

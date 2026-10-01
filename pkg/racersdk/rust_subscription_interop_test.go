@@ -114,6 +114,12 @@ func TestRustSubscriptionInterop(t *testing.T) {
 	defer closeBody(client)
 
 	for key, size := range []int64{0, 4096, int64(PageSize), 3*int64(PageSize) + 13} {
+		t.Run("Stat/"+strconv.FormatInt(size, 10), func(t *testing.T) {
+			metadata, err := client.Stat(ctx, Request{Key: Key{byte(key)}})
+			if err != nil || metadata.Size != ByteLength(size) {
+				t.Fatal("v2 HEAD metadata", metadata, err)
+			}
+		})
 		t.Run("Get/"+strconv.FormatInt(size, 10), func(t *testing.T) {
 			value, err := client.Get(ctx, Request{Key: Key{byte(key)}})
 			if err != nil {

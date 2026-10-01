@@ -26,7 +26,7 @@ import (
 // production endpoint overrides. Client and origin resource defaults apply.
 //
 // The fake forwards request metadata and authorization unchanged. It supports
-// v1 reads and credit-controlled v2 subscriptions, forwarding pinned continuations
+// v2 HEAD and credit-controlled subscriptions, forwarding pinned continuations
 // as whole-page origin requests without object-sized buffering. Origin
 // callback errors before response headers retain their HTTP classification;
 // later errors abort the stream. Origin must obey the same cancellation/body
@@ -143,12 +143,12 @@ func NewFakeClient(origin Origin) (*Client, func(), error) {
 	}
 
 	address, err := start(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.RequestURI, "/v2/") {
+		if r.Method == http.MethodPost && strings.HasPrefix(r.RequestURI, clientObjectPrefix) {
 			serveFakeSubscription(w, r, transport)
 			return
 		}
 
-		serveFakePages(w, r, transport)
+		serveFakeHead(w, r, transport)
 	}), false)
 	if err != nil {
 		cleanup()
@@ -557,10 +557,14 @@ func fakePage(ctx context.Context, transport *http.Transport, request OriginRequ
 	return res, response, err
 }
 
-func serveFakePages(w http.ResponseWriter, r *http.Request, transport *http.Transport) {
+func serveFakeHead(w http.ResponseWriter, r *http.Request, transport *http.Transport) {
+	if r.Method != http.MethodHead || !strings.HasPrefix(r.RequestURI, clientObjectPrefix) {
+		writeOriginErrorResponse(w, 400, Metadata{})
+		return
+	}
 	// Reconstruct a canonical descriptor from the real Client's HTTP request.
 	var raw bytes.Buffer
-	raw.WriteString(r.Method + " " + r.RequestURI + " HTTP/1.1\r\nHost: " + r.Host + "\r\n")
+	raw.WriteString(r.Method + " " + objectPrefix + strings.TrimPrefix(r.RequestURI, clientObjectPrefix) + " HTTP/1.1\r\nHost: " + r.Host + "\r\n")
 
 	if err := r.Header.Write(&raw); err != nil {
 		writeOriginErrorResponse(w, 400, Metadata{})
@@ -575,112 +579,20 @@ func serveFakePages(w http.ResponseWriter, r *http.Request, transport *http.Tran
 		return
 	}
 
-	page := request
-	if page.operation == OperationPinned {
-		page.byteRange.first = page.byteRange.first / uint64(PageSize) * uint64(PageSize)
-		page.byteRange.last = nominalPageEnd(page.byteRange.first)
+	res, _, err := fakePage(r.Context(), transport, request, nil)
+	if res != nil {
+		defer closeBody(res.Body)
 	}
 
-	var snapshot *Metadata
-
-	buffer := make([]byte, copyBufferSize)
-
-	for {
-		res, response, err := fakePage(r.Context(), transport, page, snapshot)
-		if err != nil {
-			if res != nil {
-				defer closeBody(res.Body)
-			}
-
-			if snapshot != nil {
-				panic(http.ErrAbortHandler)
-			}
-
-			var typed *Error
-			if res != nil && errors.As(err, &typed) && typed.StatusCode() != 0 {
-				for name, values := range res.Header {
-					w.Header()[name] = values
-				}
-
-				w.WriteHeader(res.StatusCode)
-			} else {
-				writeOriginErrorResponse(w, 502, Metadata{})
-			}
-
-			return
-		}
-
-		if snapshot == nil {
-			for name, values := range res.Header {
-				w.Header()[name] = values
-			}
-
-			if request.operation == OperationPinned {
-				first, last, err := request.byteRange.resolve(response.metadata.Size)
-				if err != nil {
-					closeBody(res.Body)
-					writeOriginErrorResponse(w, 502, Metadata{})
-
-					return
-				}
-
-				cr, err := contentRangeValue(first, last, response.metadata.Size)
-				if err != nil {
-					closeBody(res.Body)
-					writeOriginErrorResponse(w, 502, Metadata{})
-
-					return
-				}
-
-				w.Header().Set("Content-Range", cr)
-				w.Header().Set("Content-Length", strconv.FormatUint(uint64(last-first)+1, 10))
-			}
-
-			w.WriteHeader(res.StatusCode)
-
-			if err := http.NewResponseController(w).Flush(); err != nil {
-				closeBody(res.Body)
-				panic(http.ErrAbortHandler)
-			}
-
-			snapshot = &response.metadata
-		}
-
-		if request.operation == OperationHead {
-			closeBody(res.Body)
-			return
-		}
-
-		if request.operation == OperationPinned {
-			first, last := max(uint64(response.first), request.byteRange.first), min(uint64(response.last), request.byteRange.last)
-
-			_, err = io.CopyN(io.Discard, res.Body, int64(first-uint64(response.first)))
-			if err == nil {
-				_, err = io.CopyBuffer(w, io.LimitReader(res.Body, int64(last-first+1)), buffer)
-			}
-
-			if err == nil {
-				_, err = io.CopyBuffer(io.Discard, res.Body, buffer)
-			}
-		} else {
-			_, err = io.CopyBuffer(w, res.Body, buffer)
-		}
-
-		closeBody(res.Body)
-
-		if err != nil {
-			panic(http.ErrAbortHandler)
-		}
-
-		if err := http.NewResponseController(w).Flush(); err != nil {
-			panic(http.ErrAbortHandler)
-		}
-
-		if request.operation == OperationBootstrap || uint64(response.last) >= request.byteRange.last || ByteLength(response.last)+1 >= snapshot.Size {
-			return
-		}
-
-		page.byteRange.first = uint64(response.last) + 1
-		page.byteRange.last = nominalPageEnd(page.byteRange.first)
+	var typed *Error
+	if err != nil && (res == nil || !errors.As(err, &typed) || typed.StatusCode() == 0) {
+		writeOriginErrorResponse(w, 502, Metadata{})
+		return
 	}
+
+	for name, values := range res.Header {
+		w.Header()[name] = values
+	}
+
+	w.WriteHeader(res.StatusCode)
 }

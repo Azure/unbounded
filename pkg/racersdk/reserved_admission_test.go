@@ -373,7 +373,7 @@ func TestSmallObjectPinnedRangeAndHeadSizeValidation(t *testing.T) {
 	}
 }
 
-func TestContentTypeLegacyCompatibilityAndRawWhitespace(t *testing.T) {
+func TestContentTypeExactCompatibilityAndRawWhitespace(t *testing.T) {
 	for _, initial := range []string{"", "text/plain"} {
 		for _, current := range []string{"", "text/plain", "application/json"} {
 			m := originMeta(3)
@@ -388,7 +388,7 @@ func TestContentTypeLegacyCompatibilityAndRawWhitespace(t *testing.T) {
 			c := testClient(t, path, 1)
 
 			v, err := c.Get(context.Background(), Request{}, ReadOptions{Metadata: &m})
-			if initial != "" && current != "" && initial != current {
+			if initial != current {
 				assertKind(t, err, ErrorProtocol)
 				continue
 			}

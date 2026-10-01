@@ -153,7 +153,7 @@ func (h *harness) lifecycleRead(ctx context.Context, node peerNode, socket, id, 
 	}
 	if method == http.MethodHead {
 		args = append(args, "--head")
-		args = append(args, "http://racer/v1/objects/"+strings.TrimPrefix(id, "sha256:"))
+		args = append(args, "http://racer/v2/objects/"+strings.TrimPrefix(id, "sha256:"))
 	} else {
 		method = http.MethodPost
 		args = append(args, "-X", method, "-H", "Content-Length: 0", "-H", "Racer-Page-Credits: 1", "-H", "Racer-Byte-Credits: 16777216", "-H", "Racer-Ordered: 1")

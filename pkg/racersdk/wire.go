@@ -14,6 +14,8 @@ import (
 
 const objectPrefix = "/v1/objects/"
 
+const clientObjectPrefix = "/v2/objects/"
+
 func decimal(s string) (uint64, error) {
 	if s == "" || len(s) > 19 || len(s) > 1 && s[0] == '0' {
 		return 0, failure(ErrorProtocol, "decimal", nil)
@@ -303,6 +305,19 @@ func requestHeaders(r OriginRequest) http.Header {
 
 // requestHead serializes a validated operation directly to HTTP/1.1.
 func requestHead(r OriginRequest) ([]byte, error) {
+	return requestHeadAt(r, objectPrefix)
+}
+
+// clientHead keeps Stat on the current client endpoint without changing origin callbacks.
+func clientHead(r OriginRequest) ([]byte, error) {
+	if r.operation != OperationHead {
+		return nil, failure(ErrorInvalidArgument, "client HEAD", nil)
+	}
+
+	return requestHeadAt(r, clientObjectPrefix)
+}
+
+func requestHeadAt(r OriginRequest, prefix string) ([]byte, error) {
 	if err := validateRequest(r); err != nil {
 		return nil, err
 	}
@@ -313,7 +328,7 @@ func requestHead(r OriginRequest) ([]byte, error) {
 	}
 
 	var b strings.Builder
-	b.WriteString(method + " " + objectPrefix + r.key.String() + " HTTP/1.1\r\nHost: racer\r\n")
+	b.WriteString(method + " " + prefix + r.key.String() + " HTTP/1.1\r\nHost: racer\r\n")
 
 	if r.byteRange.present {
 		b.WriteString("Range: " + rangeValue(r.byteRange) + "\r\n")
@@ -483,7 +498,7 @@ func parseResponseHead(head []byte, request OriginRequest, snapshot *Metadata) (
 		}
 	}
 
-	if snapshot != nil && (snapshot.Size != result.metadata.Size || snapshot.ETag != result.metadata.ETag || snapshot.ContentType != "" && result.metadata.ContentType != "" && snapshot.ContentType != result.metadata.ContentType) {
+	if snapshot != nil && (snapshot.Size != result.metadata.Size || snapshot.ETag != result.metadata.ETag || snapshot.ContentType != result.metadata.ContentType) {
 		return wireResponse{}, bad
 	}
 

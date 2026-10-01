@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
@@ -615,7 +616,7 @@ func TestStreamingTLSFallback(t *testing.T) {
 	}))
 	c := testClient(t, path, 1)
 
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		v, err := c.GetStreaming(r.Context(), Request{})
 		if err != nil {
 			t.Error(err)
@@ -629,6 +630,9 @@ func TestStreamingTLSFallback(t *testing.T) {
 			t.Error(n, err)
 		}
 	}))
+	server.TLS = &tls.Config{MinVersion: tls.VersionTLS13}
+
+	server.StartTLS()
 	defer server.Close()
 
 	r, err := server.Client().Get(server.URL)
@@ -675,6 +679,7 @@ func TestStreamingHTTP2Success(t *testing.T) {
 				}
 			}))
 			server.EnableHTTP2 = true
+			server.TLS = &tls.Config{MinVersion: tls.VersionTLS13}
 
 			server.StartTLS()
 			defer server.Close()

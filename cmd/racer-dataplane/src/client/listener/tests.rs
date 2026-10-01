@@ -525,7 +525,7 @@ fn configured_timeout_bounds_idle_partial_headers_and_keepalive() {
         let started = Instant::now();
         if mode == "partial" {
             sleep_until(started + timeout / 2);
-            socket.write_all(b"HEAD /v1/objects/").unwrap();
+            socket.write_all(b"HEAD /v2/objects/").unwrap();
             for _ in 0..16 {
                 fixture.pump(16);
             }

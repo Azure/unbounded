@@ -655,7 +655,7 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
     ))
     .unwrap();
     client.set_nonblocking(true).unwrap();
-    client.write_all(format!("HEAD /v1/objects/{} HTTP/1.1\r\nHost: racer\r\nIf-Match: \"kept\"\r\nConnection: close\r\n\r\n", "0".repeat(64)).as_bytes()).unwrap();
+    client.write_all(format!("HEAD /v2/objects/{} HTTP/1.1\r\nHost: racer\r\nIf-Match: \"kept\"\r\nConnection: close\r\n\r\n", "0".repeat(64)).as_bytes()).unwrap();
     let mut response = Vec::new();
     while !response.windows(4).any(|w| w == b"\r\n\r\n") {
         runtime.reactor.poll_budgeted(64).unwrap();
