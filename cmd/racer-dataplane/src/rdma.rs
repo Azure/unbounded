@@ -112,7 +112,8 @@ impl SetupParameters {
     }
 }
 /// The security owner must cover these extension headers in the signature's
-/// component list. VerifiedHead establishes identity, freshness and replay checks.
+/// component list. VerifiedHead establishes identity and freshness; the connection
+/// session performs replay admission before native control dispatch.
 pub(crate) fn signed_value(head: &VerifiedHead, name: &str, bound: usize) -> Result<Vec<u8>> {
     let value = head.signed.head.unique(name)?.ok_or(Error::Unauthorized)?;
     if value.len() > bound * 2 {

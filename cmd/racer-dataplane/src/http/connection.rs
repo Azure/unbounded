@@ -1244,15 +1244,7 @@ impl HttpPool {
         endpoint: &'a Endpoint,
         scope: &'a RequestScope,
     ) -> Operation<'a, ConnectionLease> {
-        self.checkout_relay(endpoint, None, scope)
-    }
-    pub(crate) fn checkout_relay<'a>(
-        &'a self,
-        endpoint: &'a Endpoint,
-        relay: Option<Rc<Reservation>>,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, ConnectionLease> {
-        self.checkout_peer(endpoint, relay, None, None, scope)
+        self.checkout_peer(endpoint, None, None, None, scope)
     }
     pub(crate) fn checkout_peer<'a>(
         &'a self,

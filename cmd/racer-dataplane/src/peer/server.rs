@@ -268,28 +268,9 @@ impl PeerServer {
                 self.request_timeout,
                 crate::runtime::environment::now(),
             )?;
-            let signatures = self.signatures.clone();
-            let connection = if connection.session.is_none() {
-                let mut connection = connection;
-                connection.control_reservation = Some(self.admission.reserve(
-                    None,
-                    ResourceClass::ControlProgress,
-                    1,
-                )?);
-                let mut connection = crate::security::connection::accept(
-                    &self.io,
-                    connection,
-                    signatures,
-                    &header_scope,
-                )
+            let connection = self
+                .authenticate_connection(connection, &header_scope)
                 .await?;
-                // Successful accept has fenced every control operation. On error
-                // or abandonment the reactor-owned connection retains this charge.
-                connection.control_reservation.take();
-                connection
-            } else {
-                connection
-            };
             let mut received = self.io.receive_head(connection, &header_scope).await?;
             let head_bytes = received.value.headers.iter().try_fold(0usize, |n, h| {
                 n.checked_add(h.name.len())
@@ -450,42 +431,81 @@ impl PeerServer {
                     return Ok(connection);
                 }
             }
-            let body = match &response.response {
-                PeerResponse::Page { ciphertext, .. }
-                | PeerResponse::Selected { ciphertext, .. } => ciphertext.bytes(),
-                PeerResponse::Bootstrap {
-                    page_zero: Some(ciphertext),
-                    ..
-                } => ciphertext.bytes(),
-                _ => &[],
-            };
-            let head = WireCodec::encode(&response.authentication, true, body.len())?;
-            let sent = self.io.send_head(connection, head, &request_scope).await?;
-            let mut connection = sent.connection;
-            if !body.is_empty() {
-                let ciphertext = match &response.response {
-                    PeerResponse::Page { ciphertext, .. }
-                    | PeerResponse::Selected { ciphertext, .. }
-                    | PeerResponse::Bootstrap {
-                        page_zero: Some(ciphertext),
-                        ..
-                    } => ciphertext,
-                    _ => return Err(Error::InvalidRequest),
-                };
-                let sent = self
-                    .io
-                    .write_body(connection, ciphertext.clone(), &request_scope)
-                    .await?;
-                if sent.bytes != body.len() {
-                    return Err(Error::Io);
-                }
-                connection = sent.lease;
-            }
-            connection.finish_exchange()?;
-            connection.relay_reservation = None;
+            let connection = self
+                .send_http_response(connection, &response, &request_scope)
+                .await?;
             drop(membership);
             Ok(connection)
         })
+    }
+
+    async fn authenticate_connection(
+        &self,
+        mut connection: crate::http::connection::ConnectionLease,
+        scope: &RequestScope,
+    ) -> crate::error::Result<crate::http::connection::ConnectionLease> {
+        if connection.session.is_some() {
+            return Ok(connection);
+        }
+        connection.control_reservation = Some(self.admission.reserve(
+            None,
+            ResourceClass::ControlProgress,
+            1,
+        )?);
+        let mut connection = crate::security::connection::accept(
+            &self.io,
+            connection,
+            self.signatures.clone(),
+            scope,
+        )
+        .await?;
+        // Successful accept has fenced every control operation. On error or
+        // abandonment the reactor-owned connection retains this charge.
+        connection.control_reservation.take();
+        Ok(connection)
+    }
+
+    async fn send_http_response(
+        &self,
+        connection: crate::http::connection::ConnectionLease,
+        response: &SignedResponse,
+        scope: &RequestScope,
+    ) -> crate::error::Result<crate::http::connection::ConnectionLease> {
+        let body = match &response.response {
+            PeerResponse::Page { ciphertext, .. } | PeerResponse::Selected { ciphertext, .. } => {
+                ciphertext.bytes()
+            }
+            PeerResponse::Bootstrap {
+                page_zero: Some(ciphertext),
+                ..
+            } => ciphertext.bytes(),
+            _ => &[],
+        };
+        let head = super::protocol::WireCodec::encode(&response.authentication, true, body.len())?;
+        let sent = self.io.send_head(connection, head, scope).await?;
+        let mut connection = sent.connection;
+        if !body.is_empty() {
+            let ciphertext = match &response.response {
+                PeerResponse::Page { ciphertext, .. }
+                | PeerResponse::Selected { ciphertext, .. }
+                | PeerResponse::Bootstrap {
+                    page_zero: Some(ciphertext),
+                    ..
+                } => ciphertext,
+                _ => return Err(Error::InvalidRequest),
+            };
+            let sent = self
+                .io
+                .write_body(connection, ciphertext.clone(), scope)
+                .await?;
+            if sent.bytes != body.len() {
+                return Err(Error::Io);
+            }
+            connection = sent.lease;
+        }
+        connection.finish_exchange()?;
+        connection.relay_reservation = None;
+        Ok(connection)
     }
     /// Verify the complete ingress envelope before service or relay. Sign a local
     /// result against its binding; return a relayed signed result without replacing

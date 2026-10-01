@@ -449,7 +449,7 @@ impl State {
         let Some(key) = self.flights.remove(&flight) else {
             return;
         };
-        // Bounded by max_pending. No per-flight list accumulates cancelled IDs.
+        // Bounded by max_pending. No per-flight list accumulates canceled IDs.
         let mut tokens: Vec<_> = self
             .pending
             .iter()

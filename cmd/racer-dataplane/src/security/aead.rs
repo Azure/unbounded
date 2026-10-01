@@ -174,143 +174,9 @@ impl PageCryptoEngine {
             key,
             scope,
         } = job;
-        let prepared: Result<(PageEnvelope, Zeroizing<Vec<u8>>)> = (|| {
-            scope.check()?;
-            let cipher = XChaCha20Poly1305::new(key.material(KeyPurpose::Page)?.into());
-            let (envelope, mut bytes) = match &input {
-                CryptoInput::Encrypt {
-                    page,
-                    plaintext,
-                    ciphertext,
-                } => {
-                    if key.cache() != &page.version.object.cache {
-                        return Err(Error::MissingKey);
-                    }
-                    let raw = plaintext.bytes()?;
-                    plaintext
-                        .reservation()
-                        .validate(ResourceClass::Plaintext, raw.len())?;
-                    if plaintext.reservation().cache() != Some(&page.version.object.cache) {
-                        return Err(Error::InvalidConfiguration);
-                    }
-                    let length = u32::try_from(raw.len()).map_err(|_| Error::InvalidRequest)?;
-                    let envelope = PageEnvelope {
-                        page: page.clone(),
-                        key_id: key.id(),
-                        nonce: fresh_nonce()?,
-                        plaintext_length: length,
-                        ciphertext_length: length.checked_add(16).ok_or(Error::InvalidRequest)?,
-                    };
-                    let aad = page_aad(&envelope)?;
-                    ciphertext.validate(
-                        ResourceClass::Ciphertext,
-                        envelope.ciphertext_length as usize,
-                    )?;
-                    if ciphertext.cache() != Some(&page.version.object.cache) {
-                        return Err(Error::InvalidConfiguration);
-                    }
-                    let mut bytes =
-                        Zeroizing::new(ciphertext.buffer(envelope.ciphertext_length as usize)?);
-                    // Input remains immutable until the final cancellation check.
-                    // Admission supplies initialized output, including the tag tail.
-                    let (output, tag_out) = bytes.split_at_mut(raw.len());
-                    let tag = cipher
-                        .encrypt_inout_detached(
-                            (&envelope.nonce.0).into(),
-                            &aad,
-                            InOutBuf::new(raw, output).map_err(|_| Error::CorruptRecord)?,
-                        )
-                        .map_err(|_| Error::CorruptRecord)?;
-                    tag_out.copy_from_slice(&tag);
-                    (envelope, bytes)
-                }
-                CryptoInput::Decrypt {
-                    ciphertext,
-                    plaintext,
-                } => {
-                    let envelope = ciphertext.envelope();
-                    ciphertext.verify_checksum()?;
-                    if key.cache() != &envelope.page.version.object.cache
-                        || key.id() != envelope.key_id
-                    {
-                        return Err(Error::MissingKey);
-                    }
-                    let aad = page_aad(envelope)?;
-                    if ciphertext.bytes().len() != envelope.ciphertext_length as usize {
-                        return Err(Error::CorruptRecord);
-                    }
-                    plaintext
-                        .validate(ResourceClass::Plaintext, envelope.plaintext_length as usize)?;
-                    if plaintext.cache() != Some(&envelope.page.version.object.cache) {
-                        return Err(Error::InvalidConfiguration);
-                    }
-                    // Detached decryption allocates only plaintext-length storage,
-                    // never an uncharged tag-sized tail under plaintext admission.
-                    let length = envelope.plaintext_length as usize;
-                    let mut bytes = Zeroizing::new(plaintext.buffer(length)?);
-                    let tag = chacha20poly1305::Tag::try_from(&ciphertext.bytes()[length..])
-                        .map_err(|_| Error::CorruptRecord)?;
-                    cipher
-                        .decrypt_inout_detached(
-                            (&envelope.nonce.0).into(),
-                            &aad,
-                            InOutBuf::new(&ciphertext.bytes()[..length], &mut bytes)
-                                .map_err(|_| Error::CorruptRecord)?,
-                            &tag,
-                        )
-                        .map_err(|_| Error::CorruptRecord)?;
-                    (envelope.clone(), bytes)
-                }
-            };
-            scope.check()?;
-            Ok((envelope, std::mem::take(&mut bytes)))
-        })();
-        let outcome = match prepared {
+        let outcome = match Self::prepare(&input, &key, &scope) {
             Err(error) => CryptoOutcome::Failed { input, error },
-            Ok((envelope, mut bytes)) => match input {
-                CryptoInput::Encrypt {
-                    page,
-                    plaintext,
-                    mut ciphertext,
-                } => {
-                    let (plain, reservation) = plaintext.into_parts();
-                    ciphertext
-                        .shrink(bytes.capacity())
-                        .expect("validated crypto capacity");
-                    let plain = VerifiedPage {
-                        inner: Arc::new(VerifiedBytes {
-                            page,
-                            bytes: plain.into_vec(),
-                            reservation,
-                        }),
-                    };
-                    let encrypted = CiphertextPage {
-                        inner: Arc::new(CiphertextBytes {
-                            checksum: std::sync::OnceLock::from(super::crc64::checksum(&bytes)),
-                            envelope,
-                            bytes: std::mem::take(&mut *bytes),
-                            reservation: ciphertext,
-                        }),
-                    };
-                    CryptoOutcome::Completed(CryptoOutput::Encrypted(plain, encrypted))
-                }
-                CryptoInput::Decrypt {
-                    ciphertext,
-                    mut plaintext,
-                } => {
-                    plaintext
-                        .shrink(bytes.capacity())
-                        .expect("validated crypto capacity");
-                    let page = VerifiedPage {
-                        inner: Arc::new(VerifiedBytes {
-                            page: envelope.page,
-                            bytes: std::mem::take(&mut *bytes),
-                            reservation: plaintext,
-                        }),
-                    };
-                    CryptoOutcome::Completed(CryptoOutput::Decrypted(page, ciphertext))
-                }
-            },
+            Ok((envelope, bytes)) => Self::complete(input, envelope, bytes),
         };
         if let Some(start) = measurement_start {
             permit.executed(start);
@@ -319,6 +185,153 @@ impl PageCryptoEngine {
             permit,
             outcome,
             key,
+        }
+    }
+
+    /// Borrow every quota owner until crypto and the final cancellation check succeed.
+    fn prepare(
+        input: &CryptoInput,
+        key: &super::keyring::KeyLease,
+        scope: &RequestScope,
+    ) -> Result<(PageEnvelope, Zeroizing<Vec<u8>>)> {
+        scope.check()?;
+        let cipher = XChaCha20Poly1305::new(key.material(KeyPurpose::Page)?.into());
+        let (envelope, mut bytes) = match input {
+            CryptoInput::Encrypt {
+                page,
+                plaintext,
+                ciphertext,
+            } => {
+                if key.cache() != &page.version.object.cache {
+                    return Err(Error::MissingKey);
+                }
+                let raw = plaintext.bytes()?;
+                plaintext
+                    .reservation()
+                    .validate(ResourceClass::Plaintext, raw.len())?;
+                if plaintext.reservation().cache() != Some(&page.version.object.cache) {
+                    return Err(Error::InvalidConfiguration);
+                }
+                let length = u32::try_from(raw.len()).map_err(|_| Error::InvalidRequest)?;
+                let envelope = PageEnvelope {
+                    page: page.clone(),
+                    key_id: key.id(),
+                    nonce: fresh_nonce()?,
+                    plaintext_length: length,
+                    ciphertext_length: length.checked_add(16).ok_or(Error::InvalidRequest)?,
+                };
+                let aad = page_aad(&envelope)?;
+                ciphertext.validate(
+                    ResourceClass::Ciphertext,
+                    envelope.ciphertext_length as usize,
+                )?;
+                if ciphertext.cache() != Some(&page.version.object.cache) {
+                    return Err(Error::InvalidConfiguration);
+                }
+                let mut bytes =
+                    Zeroizing::new(ciphertext.buffer(envelope.ciphertext_length as usize)?);
+                // Input remains immutable until the final cancellation check.
+                // Admission supplies initialized output, including the tag tail.
+                let (output, tag_out) = bytes.split_at_mut(raw.len());
+                let tag = cipher
+                    .encrypt_inout_detached(
+                        (&envelope.nonce.0).into(),
+                        &aad,
+                        InOutBuf::new(raw, output).map_err(|_| Error::CorruptRecord)?,
+                    )
+                    .map_err(|_| Error::CorruptRecord)?;
+                tag_out.copy_from_slice(&tag);
+                (envelope, bytes)
+            }
+            CryptoInput::Decrypt {
+                ciphertext,
+                plaintext,
+            } => {
+                let envelope = ciphertext.envelope();
+                ciphertext.verify_checksum()?;
+                if key.cache() != &envelope.page.version.object.cache || key.id() != envelope.key_id
+                {
+                    return Err(Error::MissingKey);
+                }
+                let aad = page_aad(envelope)?;
+                if ciphertext.bytes().len() != envelope.ciphertext_length as usize {
+                    return Err(Error::CorruptRecord);
+                }
+                plaintext.validate(ResourceClass::Plaintext, envelope.plaintext_length as usize)?;
+                if plaintext.cache() != Some(&envelope.page.version.object.cache) {
+                    return Err(Error::InvalidConfiguration);
+                }
+                // Detached decryption allocates only plaintext-length storage,
+                // never an uncharged tag-sized tail under plaintext admission.
+                let length = envelope.plaintext_length as usize;
+                let mut bytes = Zeroizing::new(plaintext.buffer(length)?);
+                let tag = chacha20poly1305::Tag::try_from(&ciphertext.bytes()[length..])
+                    .map_err(|_| Error::CorruptRecord)?;
+                cipher
+                    .decrypt_inout_detached(
+                        (&envelope.nonce.0).into(),
+                        &aad,
+                        InOutBuf::new(&ciphertext.bytes()[..length], &mut bytes)
+                            .map_err(|_| Error::CorruptRecord)?,
+                        &tag,
+                    )
+                    .map_err(|_| Error::CorruptRecord)?;
+                (envelope.clone(), bytes)
+            }
+        };
+        scope.check()?;
+        Ok((envelope, std::mem::take(&mut bytes)))
+    }
+
+    /// Infallible ownership transfer after preparation; failures never consume input.
+    fn complete(
+        input: CryptoInput,
+        envelope: PageEnvelope,
+        mut bytes: Zeroizing<Vec<u8>>,
+    ) -> CryptoOutcome {
+        match input {
+            CryptoInput::Encrypt {
+                page,
+                plaintext,
+                mut ciphertext,
+            } => {
+                let (plain, reservation) = plaintext.into_parts();
+                ciphertext
+                    .shrink(bytes.capacity())
+                    .expect("validated crypto capacity");
+                let plain = VerifiedPage {
+                    inner: Arc::new(VerifiedBytes {
+                        page,
+                        bytes: plain.into_vec(),
+                        reservation,
+                    }),
+                };
+                let encrypted = CiphertextPage {
+                    inner: Arc::new(CiphertextBytes {
+                        checksum: std::sync::OnceLock::from(super::crc64::checksum(&bytes)),
+                        envelope,
+                        bytes: std::mem::take(&mut *bytes),
+                        reservation: ciphertext,
+                    }),
+                };
+                CryptoOutcome::Completed(CryptoOutput::Encrypted(plain, encrypted))
+            }
+            CryptoInput::Decrypt {
+                ciphertext,
+                mut plaintext,
+            } => {
+                plaintext
+                    .shrink(bytes.capacity())
+                    .expect("validated crypto capacity");
+                let page = VerifiedPage {
+                    inner: Arc::new(VerifiedBytes {
+                        page: envelope.page,
+                        bytes: std::mem::take(&mut *bytes),
+                        reservation: plaintext,
+                    }),
+                };
+                CryptoOutcome::Completed(CryptoOutput::Decrypted(page, ciphertext))
+            }
         }
     }
     fn drive(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {

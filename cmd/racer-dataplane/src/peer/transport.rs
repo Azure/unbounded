@@ -325,7 +325,8 @@ impl Transfers {
         membership: &crate::topology::membership::MembershipLease,
         scope: &RequestScope,
     ) -> Result<(ConnectionLease, bool)> {
-        let (signatures, sessions) = self.native.as_ref().ok_or(Error::InvalidConfiguration)?;
+        let sessions = self.native.as_ref().ok_or(Error::InvalidConfiguration)?;
+        let signatures = &self.signatures;
         let Some(rdma) = &self.rdma else {
             return Ok((connection, false));
         };
@@ -503,7 +504,7 @@ impl Transfers {
         previous: [u8; 32],
         scope: &RequestScope,
     ) -> Result<(ConnectionLease, bool)> {
-        let (signatures, _) = self.native.as_ref().ok_or(Error::InvalidConfiguration)?;
+        let signatures = &self.signatures;
         let failed = binding.sign(signatures, peer, Phase::Failed, &previous, 0, vec![])?;
         let previous = signed_digest(&failed)?;
         connection = self.write_control(connection, failed, scope).await?;
@@ -540,7 +541,7 @@ impl Transfers {
         #[cfg(test)]
         self.native_fallbacks.set(self.native_fallbacks.get() + 1);
         scope.check()?;
-        let (signatures, _) = self.native.as_ref().ok_or(Error::InvalidConfiguration)?;
+        let signatures = &self.signatures;
         let (PeerResponse::Page { ciphertext, .. } | PeerResponse::Selected { ciphertext, .. }) =
             &response.response
         else {
@@ -572,9 +573,10 @@ impl Transfers {
         let TransportPlan::Rdma { rail } = plan else {
             return Ok(None);
         };
-        let Some((signatures, sessions)) = &self.native else {
+        let Some(sessions) = &self.native else {
             return Ok(None);
         };
+        let signatures = &self.signatures;
         if !sessions.ready(rail) || !self.rdma.as_ref().is_some_and(|rdma| rdma.ready(rail)) {
             return Ok(None);
         }
@@ -601,9 +603,10 @@ impl Transfers {
         control: SignedHead,
         scope: &RequestScope,
     ) -> Result<Option<(Binding, VerifiedHead)>> {
-        let Some((signatures, _)) = &self.native else {
+        let Some(_) = &self.native else {
             return Ok(None);
         };
+        let signatures = &self.signatures;
         let binding = Binding::parse_accept(&control)?;
         if binding.request != envelope_digest(&request.authentication)?
             || binding.response != [0; 32]
@@ -689,7 +692,8 @@ impl Transfers {
         offer: SignedHead,
         scope: &RequestScope,
     ) -> Result<SignedResponse> {
-        let (signatures, sessions) = self.native.as_ref().ok_or(Error::InvalidConfiguration)?;
+        let sessions = self.native.as_ref().ok_or(Error::InvalidConfiguration)?;
+        let signatures = &self.signatures;
         let rdma = self.rdma.as_ref().ok_or(Error::Unavailable)?;
         let (admission, _) = &self.wire;
         binding.response = envelope_digest(&authentication)?;
@@ -915,7 +919,7 @@ impl Transfers {
         scope: &RequestScope,
     ) -> Result<SignedResponse> {
         scope.check()?;
-        let (signatures, _) = self.native.as_ref().ok_or(Error::InvalidConfiguration)?;
+        let signatures = &self.signatures;
         let fallback = binding.sign(signatures, peer, Phase::Fallback, &previous, 0, vec![])?;
         let previous = signed_digest(&fallback)?;
         let connection = self.write_control(connection, fallback, scope).await?;
@@ -1066,10 +1070,7 @@ pub struct Transfers {
     pub(super) io: Rc<HttpIo>,
     pub(super) rdma: Option<Rc<RdmaTransfer>>,
     pub(super) wire: (Rc<Admission>, Rc<SecurityCodec>),
-    pub(super) native: Option<(
-        Rc<crate::security::signing::Signatures>,
-        Rc<crate::rdma::Sessions>,
-    )>,
+    pub(super) native: Option<Rc<crate::rdma::Sessions>>,
 }
 impl Transfers {
     /// Authentication and charged decoding are mandatory, even for HTTP-only peers.
@@ -1106,7 +1107,7 @@ impl Transfers {
         }
     }
     pub fn with_native(mut self, sessions: Rc<crate::rdma::Sessions>) -> Self {
-        self.native = Some((self.signatures.clone(), sessions));
+        self.native = Some(sessions);
         self
     }
     pub(crate) fn with_reclamation(
@@ -1280,125 +1281,152 @@ impl Transfers {
                     length,
                 });
             }
-            let mut connection = received.connection;
-            let (body, staging_reservation) = if length == 0 {
-                (Vec::new(), None)
-            } else {
-                let cache = &request.request.origin.object.cache;
-                let mut reservation =
-                    admission.reserve(Some(cache), ResourceClass::Ciphertext, length);
-                if matches!(reservation, Err(Error::Overloaded))
-                    && let Some(reclaim) = &self.reclaim
-                {
-                    reclaim(cache, length);
-                    reservation = admission.reserve(Some(cache), ResourceClass::Ciphertext, length);
-                }
-                let mut buffer = WireBuffer::reserved(
-                    observer.result(Stage::PeerReceiveAdmission, scope, reservation)?,
+            let (mut connection, body, staging_reservation) = self
+                .receive_http_body(
+                    received.connection,
                     length,
-                )?;
-                let mut offset = 0;
-                let mut first = None;
-                let mut last = None;
-                let mut reads = 0u32;
-                // Capture numeric identity once; failed I/O consumes the lease.
-                // Do not retain the descriptor or extend socket/quota ownership.
-                let tuple = connection.socket().tcp_tuple();
-                let record = |error,
-                              offset,
-                              first: Option<std::time::Instant>,
-                              last: Option<std::time::Instant>,
-                              reads| {
-                    let mut remote = [b'?'; 36];
-                    if crate::security::certificates::canonical_uuid(&peer.0) {
-                        remote.copy_from_slice(peer.0.as_bytes());
-                    }
-                    observer.record(
-                        Failure::new(Stage::PeerReceiveBody, error)
-                            .request(scope)
-                            .attempt(request.request.route.attempt)
-                            .detail(Detail::Body(BodyProgress {
-                                received: offset as u32,
-                                expected: length as u32,
-                                reads,
-                                first: first.map(timestamp).unwrap_or_default(),
-                                last: last.map(timestamp).unwrap_or_default(),
-                                now: timestamp(crate::runtime::environment::now()),
-                                original: scope
-                                    .body_deadlines
-                                    .map(|d| timestamp(d.0))
-                                    .unwrap_or_default(),
-                                share: scope
-                                    .body_deadlines
-                                    .map(|d| timestamp(d.1))
-                                    .unwrap_or_default(),
-                                signed: timestamp(request.request.route.deadline.0),
-                                remote,
-                                tuple,
-                            })),
-                    );
-                };
-                while offset < length {
-                    let completion = match self
-                        .io
-                        .read_body_range(connection, buffer, offset..length, scope)
-                        .await
-                    {
-                        Ok(completion) => completion,
-                        Err(error) => {
-                            record(error, offset, first, last, reads);
-                            return Err(error);
-                        }
-                    };
-                    let bytes =
-                        observe_read(Ok(completion.bytes), &peer_admission, &failure, scope)?;
-                    if bytes == 0 || bytes > length - offset {
-                        record(Error::Io, offset, first, last, reads);
-                        return Err(Error::Io);
-                    }
-                    offset += completion.bytes;
-                    let now = crate::runtime::environment::now();
-                    first.get_or_insert(now);
-                    last = Some(now);
-                    reads = reads.saturating_add(1);
-                    if let Err(error) = scope.candidate_body_progress(offset, length) {
-                        record(error, offset, first, last, reads);
-                        return Err(error);
-                    }
-                    connection = completion.lease;
-                    buffer = completion.buffer;
-                }
-                let (bytes, reservation) = buffer.into_parts();
-                (bytes, Some(reservation))
-            };
+                    &request,
+                    &peer,
+                    &peer_admission,
+                    &failure,
+                    scope,
+                )
+                .await?;
             scope.check()?;
             let response = observer.result(
                 Stage::PeerDecode,
                 scope,
                 codec.response_reserved(authentication, body, staging_reservation, scope),
             )?;
-            // Logical decoding must account for every body byte before pooling.
-            match &response.response {
-                PeerResponse::Bootstrap {
-                    page_zero: Some(ciphertext),
-                    ..
-                } if ciphertext.bytes().len() == length => {}
-                PeerResponse::Bootstrap {
-                    page_zero: Some(_), ..
-                } => return Err(Error::InvalidRequest),
-                PeerResponse::Page { ciphertext, .. }
-                | PeerResponse::Selected { ciphertext, .. }
-                    if ciphertext.bytes().len() == length => {}
-                PeerResponse::Page { .. } | PeerResponse::Selected { .. } => {
-                    return Err(Error::InvalidRequest);
-                }
-                _ if length == 0 => {}
-                _ => return Err(Error::InvalidRequest),
-            }
+            validate_body_length(&response.response, length)?;
             connection.finish_exchange()?;
             Ok(RelayResponse::Complete(response))
         })
     }
+
+    async fn receive_http_body(
+        &self,
+        mut connection: ConnectionLease,
+        length: usize,
+        request: &SignedRequest,
+        peer: &NodeId,
+        peer_admission: &Option<std::sync::Arc<super::adaptive::Permit>>,
+        failure: &Rc<std::cell::Cell<bool>>,
+        scope: &RequestScope,
+    ) -> Result<(ConnectionLease, Vec<u8>, Option<Reservation>)> {
+        let (admission, _) = &self.wire;
+        let observer = admission.observer();
+        let (body, staging_reservation) = if length == 0 {
+            (Vec::new(), None)
+        } else {
+            let cache = &request.request.origin.object.cache;
+            let mut reservation = admission.reserve(Some(cache), ResourceClass::Ciphertext, length);
+            if matches!(reservation, Err(Error::Overloaded))
+                && let Some(reclaim) = &self.reclaim
+            {
+                reclaim(cache, length);
+                reservation = admission.reserve(Some(cache), ResourceClass::Ciphertext, length);
+            }
+            let mut buffer = WireBuffer::reserved(
+                observer.result(Stage::PeerReceiveAdmission, scope, reservation)?,
+                length,
+            )?;
+            let mut offset = 0;
+            let mut first = None;
+            let mut last = None;
+            let mut reads = 0u32;
+            // Capture numeric identity once; failed I/O consumes the lease.
+            // Do not retain the descriptor or extend socket/quota ownership.
+            let tuple = connection.socket().tcp_tuple();
+            let record = |error,
+                          offset,
+                          first: Option<std::time::Instant>,
+                          last: Option<std::time::Instant>,
+                          reads| {
+                let mut remote = [b'?'; 36];
+                if crate::security::certificates::canonical_uuid(&peer.0) {
+                    remote.copy_from_slice(peer.0.as_bytes());
+                }
+                observer.record(
+                    Failure::new(Stage::PeerReceiveBody, error)
+                        .request(scope)
+                        .attempt(request.request.route.attempt)
+                        .detail(Detail::Body(BodyProgress {
+                            received: offset as u32,
+                            expected: length as u32,
+                            reads,
+                            first: first.map(timestamp).unwrap_or_default(),
+                            last: last.map(timestamp).unwrap_or_default(),
+                            now: timestamp(crate::runtime::environment::now()),
+                            original: scope
+                                .body_deadlines
+                                .map(|d| timestamp(d.0))
+                                .unwrap_or_default(),
+                            share: scope
+                                .body_deadlines
+                                .map(|d| timestamp(d.1))
+                                .unwrap_or_default(),
+                            signed: timestamp(request.request.route.deadline.0),
+                            remote,
+                            tuple,
+                        })),
+                );
+            };
+            while offset < length {
+                let completion = match self
+                    .io
+                    .read_body_range(connection, buffer, offset..length, scope)
+                    .await
+                {
+                    Ok(completion) => completion,
+                    Err(error) => {
+                        record(error, offset, first, last, reads);
+                        return Err(error);
+                    }
+                };
+                let bytes = observe_read(Ok(completion.bytes), peer_admission, failure, scope)?;
+                if bytes == 0 || bytes > length - offset {
+                    record(Error::Io, offset, first, last, reads);
+                    return Err(Error::Io);
+                }
+                offset += completion.bytes;
+                let now = crate::runtime::environment::now();
+                first.get_or_insert(now);
+                last = Some(now);
+                reads = reads.saturating_add(1);
+                if let Err(error) = scope.candidate_body_progress(offset, length) {
+                    record(error, offset, first, last, reads);
+                    return Err(error);
+                }
+                connection = completion.lease;
+                buffer = completion.buffer;
+            }
+            let (bytes, reservation) = buffer.into_parts();
+            (bytes, Some(reservation))
+        };
+        Ok((connection, body, staging_reservation))
+    }
+}
+
+/// Logical decoding must account for every body byte before pooling.
+fn validate_body_length(response: &PeerResponse, length: usize) -> Result<()> {
+    match response {
+        PeerResponse::Bootstrap {
+            page_zero: Some(ciphertext),
+            ..
+        } if ciphertext.bytes().len() == length => {}
+        PeerResponse::Bootstrap {
+            page_zero: Some(_), ..
+        } => return Err(Error::InvalidRequest),
+        PeerResponse::Page { ciphertext, .. } | PeerResponse::Selected { ciphertext, .. }
+            if ciphertext.bytes().len() == length => {}
+        PeerResponse::Page { .. } | PeerResponse::Selected { .. } => {
+            return Err(Error::InvalidRequest);
+        }
+        _ if length == 0 => {}
+        _ => return Err(Error::InvalidRequest),
+    }
+    Ok(())
 }
 #[cfg(test)]
 mod tests {
