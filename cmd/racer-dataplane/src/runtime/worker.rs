@@ -832,9 +832,20 @@ fn io_thread(
         control.lock().ready += 1;
         control.changed.notify_all();
         let check_scope = control.lock().check_scope;
-        if check_scope {
-            record(&control, startup.cancellation.register(&waker));
-        }
+        let _cancellation = if check_scope {
+            match startup.cancellation.subscribe() {
+                Ok(registration) => {
+                    registration.register(&waker);
+                    Some(registration)
+                }
+                Err(error) => {
+                    control.fail(error);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let mut cx = Context::from_waker(&waker);
         while !control.stopping(&startup) {
             runtime.crypto.register_driver(&waker);
@@ -917,7 +928,16 @@ fn crypto_thread(
             }
         }
     }
-    record(&control, startup.cancellation.register(&waker));
+    let _cancellation = match startup.cancellation.subscribe() {
+        Ok(registration) => {
+            registration.register(&waker);
+            Some(registration)
+        }
+        Err(error) => {
+            control.fail(error);
+            None
+        }
+    };
     let mut ready = false;
     let indices = services.iter().map(|(index, _)| *index).collect::<Vec<_>>();
     {
@@ -1330,6 +1350,32 @@ mod tests {
         assert!(position("crypto-drain") < position("crypto-shutdown"));
         assert!(events.contains(&"io-shutdown"));
         assert_eq!(group.control.lock().done, 2);
+        // Completed workers cannot retain cancellation slots in the caller's scope.
+        let registrations = (0..1024)
+            .map(|_| scope.cancellation.subscribe().unwrap())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            scope.cancellation.subscribe(),
+            Err(Error::Overloaded)
+        ));
+        drop(registrations);
+    }
+
+    #[test]
+    fn cancellation_subscription_failure_tears_down_built_services() {
+        let (mut group, factory) = fixture(3);
+        let events = factory.events.clone();
+        let scope = lifecycle_scope().unwrap();
+        let _registrations = (0..1024)
+            .map(|_| scope.cancellation.subscribe().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            group.start(Arc::new(factory), &scope),
+            Err(Error::Overloaded)
+        );
+        assert!(group.threads.is_empty());
+        assert_eq!(group.control.lock().done, 2);
+        assert!(events.lock().unwrap().contains(&"crypto-shutdown"));
     }
 
     #[test]

@@ -319,7 +319,6 @@ impl PageCryptoEngine {
             permit,
             outcome,
             key,
-            scope,
         }
     }
     fn drive(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {

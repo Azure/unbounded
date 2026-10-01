@@ -480,6 +480,26 @@ mod tests {
         cancellation.cancel().unwrap();
         assert_eq!(count.0.load(Ordering::Relaxed), 1);
     }
+
+    #[test]
+    fn dropping_subscription_releases_executor_resources_before_scope_ends() {
+        let cancellation = Cancellation::new().unwrap();
+        let executor = Arc::new(Count(AtomicUsize::new(0)));
+        let weak = Arc::downgrade(&executor);
+        let registration = cancellation.subscribe().unwrap();
+        registration.register(&Waker::from(executor));
+        assert!(weak.upgrade().is_some());
+        drop(registration);
+        assert!(weak.upgrade().is_none());
+        assert!(!cancellation.is_cancelled());
+
+        // A worker that subscribes after cancellation must still be notified.
+        cancellation.cancel().unwrap();
+        let executor = Arc::new(Count(AtomicUsize::new(0)));
+        let registration = cancellation.subscribe().unwrap();
+        registration.register(&Waker::from(executor.clone()));
+        assert_eq!(executor.0.load(Ordering::Relaxed), 1);
+    }
     #[test]
     fn clones_preserve_deadline_and_wake_independent_waiters() {
         let scope =

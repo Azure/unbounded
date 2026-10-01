@@ -259,7 +259,6 @@ pub struct CryptoCompletion {
     pub(crate) permit: CryptoPermit,
     pub(crate) outcome: CryptoOutcome,
     pub(crate) key: KeyLease,
-    pub(crate) scope: RequestScope,
 }
 
 impl CryptoCompletion {
@@ -1329,7 +1328,7 @@ mod tests {
             permit,
             input,
             key,
-            scope: job_scope,
+            scope: _,
         } = job;
         assert!(
             engine
@@ -1340,7 +1339,6 @@ mod tests {
                         error: Error::Cancelled
                     },
                     key,
-                    scope: job_scope
                 })
                 .is_ok()
         );
@@ -1423,7 +1421,7 @@ mod tests {
             permit,
             input,
             key,
-            scope,
+            scope: _,
         } = job;
         assert!(
             engine
@@ -1434,7 +1432,6 @@ mod tests {
                         error: Error::Cancelled
                     },
                     key,
-                    scope
                 })
                 .is_ok()
         );
@@ -1473,7 +1470,7 @@ mod tests {
             permit,
             input,
             key,
-            scope: job_scope,
+            scope: _,
         } = job;
         assert!(
             engine
@@ -1484,7 +1481,6 @@ mod tests {
                         error: Error::Cancelled
                     },
                     key,
-                    scope: job_scope
                 })
                 .is_ok()
         );
@@ -1687,7 +1683,7 @@ mod tests {
             permit,
             input,
             key,
-            scope,
+            scope: _,
         } = job;
         assert!(
             engine
@@ -1698,7 +1694,6 @@ mod tests {
                         error: Error::Cancelled
                     },
                     key,
-                    scope
                 })
                 .is_ok()
         );
