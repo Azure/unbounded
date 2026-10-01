@@ -5,7 +5,7 @@ use crate::{
     http::{
         MessageHead, StartLine,
         connection::ConnectionLease,
-        io::{HttpIo, OwnedBuffer},
+        connection::{HttpIo, OwnedBuffer},
     },
     model::{ObjectMetadata, PAGE_BYTES, PageNumber, ResolvedRange},
     read::{ReadResponse, range_stream::RangeStream},

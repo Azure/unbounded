@@ -39,7 +39,7 @@ pub struct PeerServer {
     opaque_relay: bool,
     pipes: Rc<crate::memory::pipe::PipePool>,
     ingress: Option<std::sync::Arc<crate::runtime::ingress::Ingress>>,
-    io: Rc<crate::http::io::HttpIo>,
+    io: Rc<crate::http::connection::HttpIo>,
     forwarding: Rc<Forwarding>,
     admission: Rc<Admission>,
     local: Rc<dyn LocalPageService>,
@@ -64,7 +64,7 @@ impl PeerServer {
         self
     }
     #[cfg(test)]
-    pub(crate) fn transport_io(&self) -> &Rc<crate::http::io::HttpIo> {
+    pub(crate) fn transport_io(&self) -> &Rc<crate::http::connection::HttpIo> {
         assert!(Rc::ptr_eq(
             &self.io,
             self.transfers.as_ref().unwrap().transport_io()
@@ -160,7 +160,7 @@ impl PeerServer {
         })
     }
     pub fn new(
-        io: Rc<crate::http::io::HttpIo>,
+        io: Rc<crate::http::connection::HttpIo>,
         forwarding: Rc<Forwarding>,
         admission: Rc<Admission>,
         local: Rc<dyn LocalPageService>,
@@ -695,7 +695,7 @@ where
 }
 /// Cancel an abandoned HTTP exchange without dropping work before its completion fences.
 async fn materialized_exchange<T>(
-    io: &crate::http::io::HttpIo,
+    io: &crate::http::connection::HttpIo,
     connection: &crate::http::connection::ConnectionLease,
     parent: &RequestScope,
     exchange: &RequestScope,
@@ -842,7 +842,10 @@ mod tests {
     #[test]
     fn materialized_transit_fin_and_parent_cancel_fence_head_and_body() {
         use crate::{
-            http::{Codec, connection::ConnectionLease, io::HttpIo},
+            http::{
+                Codec,
+                connection::{ConnectionLease, HttpIo},
+            },
             runtime::reactor::Reactor,
         };
         use std::net::{Shutdown, TcpListener, TcpStream};
@@ -956,7 +959,10 @@ mod tests {
     #[test]
     fn materialized_transit_success_fences_watch_before_keepalive() {
         use crate::{
-            http::{Codec, connection::ConnectionLease, io::HttpIo},
+            http::{
+                Codec,
+                connection::{ConnectionLease, HttpIo},
+            },
             runtime::reactor::Reactor,
         };
         let admission = Rc::new(Admission::new(
@@ -1266,7 +1272,10 @@ mod tests {
     #[test]
     fn backpressured_handshake_responses_keep_fixed_deadline_and_fenced_admission() {
         use crate::{
-            http::{Codec, connection::ConnectionLease, io::HttpIo},
+            http::{
+                Codec,
+                connection::{ConnectionLease, HttpIo},
+            },
             memory::pool::BufferPool,
             peer::{PeerTransport, protocol::SecurityCodec},
             runtime::{environment::SimulationClock, reactor::Reactor},

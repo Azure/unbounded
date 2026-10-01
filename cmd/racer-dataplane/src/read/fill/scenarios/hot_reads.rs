@@ -6,7 +6,7 @@ use crate::{
         snapshot::{PublishedState, SnapshotStore},
         wire::*,
     },
-    http::{Codec, io::HttpIo},
+    http::{Codec, connection::HttpIo},
     memory::{delivery::Delivery, pipe::PipePool},
     model::{ByteRange, MembershipVersion},
     peer::{

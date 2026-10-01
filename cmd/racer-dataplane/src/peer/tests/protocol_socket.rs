@@ -319,7 +319,7 @@ fn search_view_consumes_ingress_without_changing_signed_route() {
 #[test]
 fn server_authenticates_before_copy_only_service_and_signs_failures() {
     use crate::{
-        http::{Codec, io::HttpIo},
+        http::{Codec, connection::HttpIo},
         runtime::reactor::Reactor,
         topology::{
             health::LinkHealth,
@@ -764,7 +764,10 @@ fn equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction(
 fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
     use super::PeerClient;
     use crate::{
-        http::{Codec, connection::HttpPool, io::HttpIo},
+        http::{
+            Codec,
+            connection::{HttpIo, HttpPool},
+        },
         runtime::reactor::Reactor,
         topology::{
             health::LinkHealth,
@@ -911,8 +914,8 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
     use crate::{
         http::{
             Codec,
+            connection::HttpIo,
             connection::{ConnectionLease, HttpPool},
-            io::HttpIo,
         },
         runtime::reactor::Reactor,
         topology::{
@@ -1094,7 +1097,10 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
 #[test]
 fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
     use crate::{
-        http::{Codec, connection::ConnectionLease, io::HttpIo},
+        http::{
+            Codec,
+            connection::{ConnectionLease, HttpIo},
+        },
         runtime::reactor::Reactor,
         topology::{health::LinkHealth, paths::Paths},
     };
@@ -1296,8 +1302,8 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     use crate::{
         http::{
             Codec,
+            connection::HttpIo,
             connection::{Endpoint, HttpPool},
-            io::HttpIo,
         },
         model::{ExpiresAt, ObjectMetadata, PageEnvelope},
         runtime::reactor::Reactor,
@@ -1548,7 +1554,10 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
 mod established_sessions {
     use super::*;
     use crate::{
-        http::{Codec, connection::ConnectionLease, io::HttpIo},
+        http::{
+            Codec,
+            connection::{ConnectionLease, HttpIo},
+        },
         runtime::{reactor::IoBuffer, reactor::Reactor},
         security::{connection, protocol as p},
         topology::{

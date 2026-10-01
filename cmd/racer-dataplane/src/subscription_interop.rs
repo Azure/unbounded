@@ -277,7 +277,7 @@ fn go_sdk_subscription_server() {
         credentials,
     ));
     let mut endpoint = directory.install(WorkerId(0), coordinator.clone()).unwrap();
-    let io = Rc::new(http::io::HttpIo::with_admission(
+    let io = Rc::new(http::connection::HttpIo::with_admission(
         reactor.clone(),
         http::Codec::new(32768, i64::MAX as u64),
         admission.clone(),

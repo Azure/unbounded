@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    http::{Codec, io::HttpIo},
+    http::{Codec, connection::HttpIo},
     memory::page::CiphertextCopy,
     model::{ExpiresAt, ObjectMetadata, PageEnvelope},
     peer::subscriptions::{Demand, PageInterval, Subscription, TransferGrant},

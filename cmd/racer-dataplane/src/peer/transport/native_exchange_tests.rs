@@ -1,7 +1,10 @@
 //! Signed native offer/fallback exchanges over real sockets and optional hardware.
 use super::*;
 use crate::{
-    http::{Codec, MessageHead, StartLine, connection::HttpPool, io::HttpIo},
+    http::{
+        Codec, MessageHead, StartLine,
+        connection::{HttpIo, HttpPool},
+    },
     memory::pool::BufferPool,
     model::{ExpiresAt, KeyId, Nonce, ObjectMetadata, PageEnvelope, ResourceClass, *},
     rdma::{Devices, RdmaTransfer, Sessions},

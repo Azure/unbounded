@@ -4,7 +4,10 @@
 use racer_dataplane::{
     client::{ClientRequest, ReadKind, RequestParser, response::Responses},
     error::{Error, Result},
-    http::{Codec, Header, MessageHead, StartLine, connection::ConnectionLease, io::HttpIo},
+    http::{
+        Codec, Header, MessageHead, StartLine,
+        connection::{ConnectionLease, HttpIo},
+    },
     memory::{delivery::Delivery, pipe::PipePool},
     model::{
         ByteRange, CacheId, CacheKey, ExpiresAt, Limits, ObjectId, ObjectMetadata, ObjectVersion,

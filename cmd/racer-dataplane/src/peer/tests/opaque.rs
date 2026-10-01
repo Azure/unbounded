@@ -2,8 +2,8 @@ use super::*;
 use crate::{
     http::{
         Codec,
+        connection::{BufferRange, HttpIo},
         connection::{ConnectionLease, HttpPool},
-        io::{BufferRange, HttpIo},
     },
     model::{ExpiresAt, ObjectMetadata, PageEnvelope},
     runtime::reactor::{IoBuffer, Reactor},

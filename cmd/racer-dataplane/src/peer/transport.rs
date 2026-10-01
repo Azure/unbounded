@@ -4,8 +4,8 @@ use crate::telemetry::failures::{BodyProgress, Detail, Failure, Stage, timestamp
 use crate::{
     error::{Error, Operation, Result},
     http::{
+        connection::HttpIo,
         connection::{ConnectionLease, HttpPool},
-        io::HttpIo,
     },
     memory::pool::CiphertextPage,
     model::{NodeId, ResourceClass, TransferId},
@@ -1081,7 +1081,7 @@ impl Transfers {
     /// Authentication and charged decoding are mandatory, even for HTTP-only peers.
     ///
     /// ```compile_fail
-    /// use racer_dataplane::{http::{io::HttpIo, connection::HttpPool}, peer::transport::Transfers};
+    /// use racer_dataplane::{http::connection::{HttpIo, HttpPool}, peer::transport::Transfers};
     /// use std::rc::Rc;
     /// fn unsigned(pool: Rc<HttpPool>, io: Rc<HttpIo>) {
     ///     let _ = Transfers::new(pool, io, None);

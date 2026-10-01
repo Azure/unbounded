@@ -1,5 +1,5 @@
 //! Exclusive HTTP connections and bounded TCP/Unix reuse. Unfinished exchanges close.
-use super::io::{HttpIo, OwnedBuffer};
+use super::{MessageHead, StartLine};
 use crate::runtime::reactor::Descriptor;
 use crate::{
     error::{Error, Operation, Result},
@@ -8,7 +8,7 @@ use crate::{
     runtime::{
         admission::{Admission, ConnectionReservation, Reservation},
         deadline::RequestScope,
-        reactor::{IoBuffer, Reactor},
+        reactor::{Completion, IoBuffer, Reactor, SendBuffer},
     },
 };
 use std::{
@@ -16,11 +16,719 @@ use std::{
     collections::{BTreeMap, VecDeque},
     future::poll_fn,
     net::SocketAddr,
+    ops::Range,
     path::PathBuf,
     rc::{Rc, Weak},
     task::{Poll, Waker},
     time::{Duration, Instant},
 };
+use zeroize::{Zeroize, Zeroizing};
+
+#[cfg(test)]
+mod io_tests;
+
+/// Bounded, address-stable staging storage. Constructor reserves quota before
+/// allocation; ownership includes that quota through reactor completion.
+pub struct OwnedBuffer {
+    bytes: Box<[u8]>,
+    reservation: Option<Reservation>,
+    pool: Weak<RefCell<Option<OwnedBuffer>>>,
+}
+impl Drop for OwnedBuffer {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+        if let Some(pool) = self.pool.upgrade() {
+            if let Ok(mut idle) = pool.try_borrow_mut() {
+                if idle.is_none() {
+                    *idle = Some(Self {
+                        bytes: std::mem::take(&mut self.bytes),
+                        reservation: self.reservation.take(),
+                        pool: Weak::new(),
+                    });
+                }
+            }
+        }
+    }
+}
+impl OwnedBuffer {
+    pub fn new(admission: &Admission, length: usize) -> Result<Self> {
+        let reservation = admission.reserve(None, ResourceClass::RequestContext, length.max(1))?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length)
+            .map_err(|_| Error::Overloaded)?;
+        bytes.resize(length, 0);
+        Ok(Self {
+            bytes: bytes.into_boxed_slice(),
+            reservation: Some(reservation),
+            pool: Weak::new(),
+        })
+    }
+    pub fn copy_from(admission: &Admission, bytes: &[u8]) -> Result<Self> {
+        let mut buffer = Self::new(admission, bytes.len())?;
+        buffer.bytes.copy_from_slice(bytes);
+        Ok(buffer)
+    }
+}
+impl crate::runtime::reactor::sealed::Sealed for OwnedBuffer {}
+impl IoBuffer for OwnedBuffer {
+    fn bytes(&self) -> Result<&[u8]> {
+        Ok(&self.bytes)
+    }
+    fn bytes_mut(&mut self) -> Result<&mut [u8]> {
+        Ok(&mut self.bytes)
+    }
+}
+/// Owns the full backing allocation while exposing a fixed subrange to one SQE.
+/// Construct a new view after completion instead of mutating an in-flight view.
+pub struct BufferRange<B: IoBuffer> {
+    buffer: B,
+    range: Range<usize>,
+}
+impl<B: IoBuffer> BufferRange<B> {
+    pub fn new(buffer: B, range: Range<usize>) -> Result<Self> {
+        if range.start > range.end || range.end > buffer.bytes()?.len() {
+            return Err(Error::InvalidRequest);
+        }
+        Ok(Self { buffer, range })
+    }
+    pub fn into_inner(self) -> B {
+        self.buffer
+    }
+}
+impl<B: IoBuffer> crate::runtime::reactor::sealed::Sealed for BufferRange<B> {}
+impl<B: IoBuffer> IoBuffer for BufferRange<B> {
+    fn bytes(&self) -> Result<&[u8]> {
+        Ok(&self.buffer.bytes()?[self.range.clone()])
+    }
+    fn bytes_mut(&mut self) -> Result<&mut [u8]> {
+        Ok(&mut self.buffer.bytes_mut()?[self.range.clone()])
+    }
+}
+/// Socket operations retain buffers through partial I/O and cancellation completion.
+/// Connections transfer by value, so abandonment cannot recycle a kernel-owned socket.
+pub struct HttpIo {
+    reactor: Rc<Reactor>,
+    codec: super::Codec,
+    send_body_limit: u64,
+    admission: Rc<Admission>,
+    idle_buffer: Rc<RefCell<Option<OwnedBuffer>>>,
+}
+/// Immutable subrange owner; cannot be submitted to a receive operation.
+struct SendRange<B: SendBuffer> {
+    buffer: B,
+    range: Range<usize>,
+}
+impl<B: SendBuffer> crate::runtime::reactor::sealed::Sealed for SendRange<B> {}
+impl<B: SendBuffer> SendBuffer for SendRange<B> {
+    fn send_bytes(&self) -> Result<&[u8]> {
+        Ok(&self.buffer.send_bytes()?[self.range.clone()])
+    }
+}
+/// A completed head operation, including the still-exclusively-owned connection.
+///
+/// Head and body operations transfer ownership in both directions:
+/// ```no_run
+/// use racer_dataplane::{error::Result,
+///     http::connection::{HttpIo, ConnectionLease}, memory::pool::PlaintextBuffer,
+///     runtime::{deadline::RequestScope, reactor::Completion}};
+/// async fn exchange(io: &HttpIo, connection: ConnectionLease,
+///     buffer: PlaintextBuffer, scope: &RequestScope)
+///     -> Result<Completion<PlaintextBuffer, ConnectionLease>> {
+///     let head = io.receive_head(connection, scope).await?;
+///     let sent = io.send_head(head.connection, head.value, scope).await?;
+///     let body = io.read_body(sent.connection, buffer, scope).await?;
+///     io.write_body(body.lease, body.buffer, scope).await
+/// }
+/// ```
+pub struct HeadCompletion<T> {
+    pub connection: ConnectionLease,
+    pub value: T,
+    // Retained alongside the decoded value, including its field descriptors.
+    _decoded: Option<Reservation>,
+}
+impl HttpIo {
+    /// Watch hangup without consuming request bytes. The pending poll retains both
+    /// descriptor and connection admission through its cancellation CQE.
+    pub(crate) fn disconnected<'a>(
+        &'a self,
+        connection: &ConnectionLease,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, u32> {
+        self.reactor.readiness_with_lease(
+            connection.socket(),
+            libc::POLLHUP as u32,
+            connection.reservation.clone(),
+            scope,
+        )
+    }
+    pub(crate) fn reactor(&self) -> &Rc<Reactor> {
+        &self.reactor
+    }
+    /// Every head and body staging allocation uses this worker's admission owner.
+    pub fn with_admission(
+        reactor: Rc<Reactor>,
+        codec: super::Codec,
+        admission: Rc<Admission>,
+    ) -> Self {
+        Self {
+            reactor,
+            send_body_limit: codec.body_limit(),
+            codec,
+            admission,
+            idle_buffer: Rc::default(),
+        }
+    }
+    /// Local client responses stream an entire object range rather than one page.
+    /// Only sending permits SDK-sized ranges; receiving retains the page cap.
+    /// These are framing limits; body storage remains page-window admitted.
+    pub fn for_clients(reactor: Rc<Reactor>, admission: Rc<Admission>) -> Self {
+        let mut io = Self::with_admission(
+            reactor,
+            super::Codec::new(
+                admission
+                    .limits()
+                    .header_bytes
+                    .get()
+                    .min(super::MAX_HEAD_BYTES),
+                crate::model::PAGE_BYTES + 16,
+            ),
+            admission,
+        );
+        io.send_body_limit = i64::MAX as u64;
+        io
+    }
+    pub fn buffer(&self, length: usize) -> Result<OwnedBuffer> {
+        let admission = &self.admission;
+        if admission.is_stopped() {
+            return Err(Error::Unavailable);
+        }
+        let idle = self.idle_buffer.borrow_mut().take();
+        let mut buffer = match idle {
+            Some(buffer) if buffer.bytes.len() == length => buffer,
+            other => {
+                drop(other);
+                OwnedBuffer::new(&self.admission, length)?
+            }
+        };
+        // Retain at most one ordinary head-sized allocation, never a maximum
+        // multi-hop envelope that could monopolize shared context admission.
+        if length <= 65536 {
+            buffer.pool = Rc::downgrade(&self.idle_buffer);
+        }
+        Ok(buffer)
+    }
+    pub fn retained_buffer_bytes(&self) -> usize {
+        self.idle_buffer
+            .borrow()
+            .as_ref()
+            .and_then(|b| b.reservation.as_ref())
+            .map_or(0, Reservation::amount)
+    }
+    pub fn reclaim_buffer(&self) {
+        self.idle_buffer.borrow_mut().take();
+    }
+    /// Share reactor/admission while applying a smaller endpoint-specific head cap.
+    pub fn capped(&self, header_limit: usize) -> Self {
+        Self {
+            reactor: self.reactor.clone(),
+            codec: self.codec.limited(header_limit),
+            send_body_limit: self.send_body_limit,
+            admission: self.admission.clone(),
+            idle_buffer: self.idle_buffer.clone(),
+        }
+    }
+    pub fn receive_head<'a>(
+        &'a self,
+        connection: ConnectionLease,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, HeadCompletion<MessageHead>> {
+        self.receive_head_limited(connection, scope, self.codec.header_limit())
+    }
+    /// Applies a caller's smaller head cap before receiving/allocating a head.
+    /// Client/origin adapters use 32 KiB even if another protocol raises its cap.
+    pub fn receive_head_limited<'a>(
+        &'a self,
+        connection: ConnectionLease,
+        scope: &'a RequestScope,
+        header_limit: usize,
+    ) -> Operation<'a, HeadCompletion<MessageHead>> {
+        Box::pin(async move {
+            let completed = self
+                .receive_head_outcome(connection, scope, header_limit, false)
+                .await?;
+            Ok(HeadCompletion {
+                connection: completed.connection,
+                value: completed.value?,
+                _decoded: completed._decoded,
+            })
+        })
+    }
+    /// Request ingress with recoverable parsing failures. The outer error means
+    /// I/O, cancellation, or resource failure and closes the connection. An inner
+    /// InvalidRequest/HeaderTooLarge returns a fenced, poisoned connection on
+    /// which the server may send an empty 400/431 response, then close it.
+    /// All rejected bytes are zeroized and no unread data is retained for reuse.
+    pub fn receive_request_head_limited<'a>(
+        &'a self,
+        connection: ConnectionLease,
+        scope: &'a RequestScope,
+        header_limit: usize,
+    ) -> Operation<'a, HeadCompletion<Result<MessageHead>>> {
+        self.receive_head_outcome(connection, scope, header_limit, true)
+    }
+    fn receive_head_outcome<'a>(
+        &'a self,
+        mut connection: ConnectionLease,
+        scope: &'a RequestScope,
+        header_limit: usize,
+        request_only: bool,
+    ) -> Operation<'a, HeadCompletion<Result<MessageHead>>> {
+        Box::pin(async move {
+            scope.check()?;
+            if connection.rx_remaining.is_some_and(|n| n != 0) {
+                return Err(Error::InvalidRequest);
+            }
+            connection.begin_io();
+            let codec = self.codec.limited(header_limit);
+            let ahead_length = connection
+                .read_ahead
+                .as_ref()
+                .map_or(0, |(_, range)| range.len());
+            let mut buffer = self.buffer(codec.header_limit().min(4096.max(ahead_length)))?;
+            let mut used = 0;
+            let mut scanned: usize = 0;
+            if let Some((ahead, range)) = connection.read_ahead.take() {
+                if range.len() > buffer.bytes.len() {
+                    drop(ahead);
+                    drop(buffer);
+                    return Ok(rejected_head(connection, Error::HeaderTooLarge));
+                }
+                used = range.len();
+                buffer.bytes[..used].copy_from_slice(&ahead.bytes[range]);
+            }
+            loop {
+                // Scan each received byte once, including the delimiter overlap.
+                // Large peer heads must not cause quadratic rescans on trickled I/O.
+                let complete = buffer.bytes[scanned.saturating_sub(3)..used]
+                    .windows(4)
+                    .any(|w| w == b"\r\n\r\n");
+                let malformed = !complete
+                    && (scanned.saturating_sub(1)..used).any(|i| {
+                        (buffer.bytes[i] == b'\n' && (i == 0 || buffer.bytes[i - 1] != b'\r'))
+                            || (buffer.bytes[i] == b'\r'
+                                && i + 1 < used
+                                && buffer.bytes[i + 1] != b'\n')
+                    });
+                scanned = used;
+                let decoded_charge = if complete {
+                    let size = codec.decoded_allocation(&buffer.bytes[..used])?;
+                    Some(
+                        self.admission
+                            .reserve(None, ResourceClass::RequestContext, size)?,
+                    )
+                } else {
+                    None
+                };
+                let decoded = match if complete || malformed || used == codec.header_limit() {
+                    codec.decode_head(&buffer.bytes[..used])
+                } else {
+                    Ok(None)
+                } {
+                    Ok(decoded) => decoded,
+                    Err(error @ (Error::InvalidRequest | Error::HeaderTooLarge)) => {
+                        drop(buffer);
+                        return Ok(rejected_head(connection, error));
+                    }
+                    Err(error) => return Err(error),
+                };
+                if let Some((head, end)) = decoded {
+                    if request_only && !matches!(head.start, StartLine::Request { .. }) {
+                        drop(buffer);
+                        return Ok(rejected_head(connection, Error::InvalidRequest));
+                    }
+                    let length = match self.framing(&head, connection.request_is_head) {
+                        Ok(length) => length,
+                        Err(error @ (Error::InvalidRequest | Error::HeaderTooLarge)) => {
+                            drop(buffer);
+                            return Ok(rejected_head(connection, error));
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    connection.close |= head.closes_connection()?;
+                    if let StartLine::Request { method, .. } = &head.start {
+                        connection.request_is_head = method == "HEAD";
+                    }
+                    connection.rx_remaining = Some(length);
+                    // The rest of this allocation may survive as read-ahead.
+                    // Credentials in its consumed head must not survive with it.
+                    buffer.bytes[..end].zeroize();
+                    if used > end {
+                        connection.read_ahead = Some((buffer, end..used));
+                    }
+                    let head = if let Some(session) = connection.session.as_mut() {
+                        session.admit(head)?
+                    } else {
+                        head
+                    };
+                    return Ok(HeadCompletion {
+                        connection,
+                        value: Ok(head),
+                        _decoded: decoded_charge,
+                    });
+                }
+                if used == buffer.bytes.len() {
+                    let size = used.saturating_mul(2).min(codec.header_limit());
+                    if size <= used {
+                        return Ok(rejected_head(connection, Error::HeaderTooLarge));
+                    }
+                    // The previous receive completed before growth. Both old and
+                    // new allocations remain admitted during the copy; drop wipes
+                    // the old head before the new allocation is submitted.
+                    let mut larger = self.buffer(size)?;
+                    larger.bytes[..used].copy_from_slice(&buffer.bytes[..used]);
+                    buffer = larger;
+                }
+                let end = buffer.bytes.len();
+                let completion = self
+                    .reactor
+                    .recv(
+                        connection.fd.clone(),
+                        BufferRange::new(buffer, used..end)?,
+                        connection,
+                        scope,
+                    )
+                    .await?;
+                if completion.bytes == 0 || completion.bytes > end - used {
+                    return Err(Error::Io);
+                }
+                used = used.checked_add(completion.bytes).ok_or(Error::Io)?;
+                buffer = completion.buffer.into_inner();
+                connection = completion.lease;
+            }
+        })
+    }
+    pub fn send_head<'a>(
+        &'a self,
+        mut connection: ConnectionLease,
+        head: MessageHead,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, HeadCompletion<()>> {
+        Box::pin(async move {
+            scope.check()?;
+            if connection.tx_remaining.is_some_and(|n| n != 0) {
+                return Err(Error::InvalidRequest);
+            }
+            connection.begin_io();
+            let length =
+                Self::framing_with_limit(&head, connection.request_is_head, self.send_body_limit)?;
+            // Admit signing and encoding scratch before either can allocate.
+            // Only the encoded head needs to remain staged across socket I/O,
+            // not the endpoint's maximum legal envelope size.
+            let scratch = self.admission.reserve(
+                None,
+                ResourceClass::RequestContext,
+                self.codec.header_limit().max(1),
+            )?;
+            let head = if let Some(session) = connection.session.as_mut() {
+                session.sign(head)?
+            } else {
+                head
+            };
+            connection.close |= head.closes_connection()?;
+            if let StartLine::Request { method, .. } = &head.start {
+                connection.request_is_head = method == "HEAD";
+            }
+            let encoded = Zeroizing::new(self.codec.encode_head(&head)?);
+            let mut buffer = self.buffer(encoded.len())?;
+            buffer.bytes[..encoded.len()].copy_from_slice(&encoded);
+            let encoded_length = encoded.len();
+            drop(encoded);
+            drop(scratch);
+            let mut offset = 0;
+            while offset < encoded_length {
+                let completion = self
+                    .reactor
+                    .send(
+                        connection.fd.clone(),
+                        BufferRange::new(buffer, offset..encoded_length)?,
+                        connection,
+                        scope,
+                    )
+                    .await?;
+                if completion.bytes == 0 || completion.bytes > encoded_length - offset {
+                    return Err(Error::Io);
+                }
+                offset += completion.bytes;
+                buffer = completion.buffer.into_inner();
+                connection = completion.lease;
+            }
+            drop(head);
+            connection.tx_remaining = Some(length);
+            Ok(HeadCompletion {
+                connection,
+                value: (),
+                _decoded: None,
+            })
+        })
+    }
+    /// Stream bounded chunks; endpoint controls expected body length and validation.
+    /// Borrowed destinations cannot survive abandonment of a submitted operation:
+    /// ```compile_fail
+    /// use racer_dataplane::{http::connection::{HttpIo, ConnectionLease},
+    ///     runtime::deadline::RequestScope};
+    /// fn borrowed(io: &HttpIo, connection: ConnectionLease, scope: &RequestScope) {
+    ///     let mut bytes = [0; 16];
+    ///     let _future = io.read_body(connection, &mut bytes[..], scope);
+    /// }
+    /// ```
+    pub fn read_body<'a, B: IoBuffer>(
+        &'a self,
+        connection: ConnectionLease,
+        buffer: B,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Completion<B, ConnectionLease>> {
+        Box::pin(async move {
+            let length = buffer.bytes()?.len();
+            self.read_body_range(connection, buffer, 0..length, scope)
+                .await
+        })
+    }
+    /// Transfer an admitted mutable or immutable owner, never a borrowed slice.
+    /// ```compile_fail
+    /// use racer_dataplane::{http::connection::{HttpIo, ConnectionLease},
+    ///     runtime::deadline::RequestScope};
+    /// fn borrowed(io: &HttpIo, connection: ConnectionLease, scope: &RequestScope) {
+    ///     let bytes = [0; 16];
+    ///     let _future = io.write_body(connection, &bytes[..], scope);
+    /// }
+    /// ```
+    pub fn write_body<'a, B: SendBuffer>(
+        &'a self,
+        connection: ConnectionLease,
+        buffer: B,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Completion<B, ConnectionLease>> {
+        Box::pin(async move {
+            let length = buffer.send_bytes()?.len();
+            self.write_body_range(connection, buffer, 0..length, scope)
+                .await
+        })
+    }
+    /// Reads at most the specified range and remaining fixed-length body. A short
+    /// read is returned explicitly; zero means the complete body was consumed.
+    pub fn read_body_range<'a, B: IoBuffer>(
+        &'a self,
+        mut connection: ConnectionLease,
+        mut buffer: B,
+        range: Range<usize>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Completion<B, ConnectionLease>> {
+        Box::pin(async move {
+            scope.check()?;
+            connection.begin_io();
+            if range.start > range.end || range.end > buffer.bytes()?.len() {
+                return Err(Error::InvalidRequest);
+            }
+            let remaining = connection.rx_remaining.ok_or(Error::InvalidRequest)?;
+            let length = range
+                .len()
+                .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+            if length == 0 && remaining != 0 {
+                return Err(Error::InvalidRequest);
+            }
+            if length == 0 {
+                return Ok(Completion {
+                    buffer,
+                    bytes: 0,
+                    lease: connection,
+                });
+            }
+            if let Some((ahead, mut available)) = connection.read_ahead.take() {
+                let count = length.min(available.len());
+                buffer.bytes_mut()?[range.start..range.start + count]
+                    .copy_from_slice(&ahead.bytes[available.start..available.start + count]);
+                available.start += count;
+                if !available.is_empty() {
+                    connection.read_ahead = Some((ahead, available));
+                }
+                connection.rx_remaining = Some(remaining - count as u64);
+                return Ok(Completion {
+                    buffer,
+                    bytes: count,
+                    lease: connection,
+                });
+            }
+            let completion = self
+                .reactor
+                .recv(
+                    connection.fd.clone(),
+                    BufferRange::new(buffer, range.start..range.start + length)?,
+                    connection,
+                    scope,
+                )
+                .await?;
+            if completion.bytes == 0 || completion.bytes > length {
+                return Err(Error::Io);
+            }
+            connection = completion.lease;
+            connection.rx_remaining = Some(remaining - completion.bytes as u64);
+            Ok(Completion {
+                buffer: completion.buffer.into_inner(),
+                bytes: completion.bytes,
+                lease: connection,
+            })
+        })
+    }
+    /// Writes exactly this initialized subrange through partial sends. The full
+    /// buffer allocation and connection remain completion-owned at every send.
+    pub fn write_body_range<'a, B: SendBuffer>(
+        &'a self,
+        mut connection: ConnectionLease,
+        mut buffer: B,
+        range: Range<usize>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Completion<B, ConnectionLease>> {
+        Box::pin(async move {
+            scope.check()?;
+            connection.begin_io();
+            if range.start > range.end || range.end > buffer.send_bytes()?.len() {
+                return Err(Error::InvalidRequest);
+            }
+            let remaining = connection.tx_remaining.ok_or(Error::InvalidRequest)?;
+            if range.len() as u64 > remaining {
+                return Err(Error::InvalidRequest);
+            }
+            let mut offset = range.start;
+            while offset < range.end {
+                let completion = self
+                    .reactor
+                    .send(
+                        connection.fd.clone(),
+                        SendRange {
+                            buffer,
+                            range: offset..range.end,
+                        },
+                        connection,
+                        scope,
+                    )
+                    .await?;
+                if completion.bytes == 0 || completion.bytes > range.end - offset {
+                    return Err(Error::Io);
+                }
+                offset += completion.bytes;
+                buffer = completion.buffer.buffer;
+                connection = completion.lease;
+            }
+            connection.tx_remaining = Some(remaining - range.len() as u64);
+            Ok(Completion {
+                buffer,
+                bytes: range.len(),
+                lease: connection,
+            })
+        })
+    }
+    /// Send a bodyless request and receive its response head. The caller owns
+    /// consumption of the response body and finish_exchange/pool return.
+    pub fn exchange_head<'a>(
+        &'a self,
+        connection: ConnectionLease,
+        request: MessageHead,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, HeadCompletion<MessageHead>> {
+        Box::pin(async move {
+            if !matches!(request.start, StartLine::Request { .. })
+                || request.content_length()?.unwrap_or(0) != 0
+            {
+                return Err(Error::InvalidRequest);
+            }
+            let sent = self.send_head(connection, request, scope).await?;
+            let received = self.receive_head(sent.connection, scope).await?;
+            if !matches!(received.value.start, StartLine::Response { .. }) {
+                return Err(Error::InvalidRequest);
+            }
+            Ok(received)
+        })
+    }
+    /// Collect a bounded response body. Intended for control messages; pages can
+    /// stream via read_body_range without an additional full-size allocation.
+    pub fn collect_body<'a>(
+        &'a self,
+        mut connection: ConnectionLease,
+        maximum: usize,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Completion<OwnedBuffer, ConnectionLease>> {
+        Box::pin(async move {
+            scope.check()?;
+            let length = usize::try_from(connection.rx_remaining.ok_or(Error::InvalidRequest)?)
+                .map_err(|_| Error::InvalidRequest)?;
+            if length > maximum {
+                return Err(Error::InvalidRequest);
+            }
+            let mut buffer = self.buffer(length)?;
+            let mut offset = 0;
+            while offset < length {
+                let completion = self
+                    .read_body_range(connection, buffer, offset..length, scope)
+                    .await?;
+                if completion.bytes == 0 {
+                    return Err(Error::Io);
+                }
+                offset += completion.bytes;
+                buffer = completion.buffer;
+                connection = completion.lease;
+            }
+            Ok(Completion {
+                buffer,
+                bytes: length,
+                lease: connection,
+            })
+        })
+    }
+    fn framing(&self, head: &MessageHead, request_is_head: bool) -> Result<u64> {
+        Self::framing_with_limit(head, request_is_head, self.codec.body_limit())
+    }
+    fn framing_with_limit(
+        head: &MessageHead,
+        request_is_head: bool,
+        body_limit: u64,
+    ) -> Result<u64> {
+        let length = head.content_length()?;
+        let body = match head.start {
+            StartLine::Request { .. } => length.unwrap_or(0),
+            StartLine::Response { status: 100..=199 } => return Err(Error::InvalidRequest),
+            StartLine::Response { status: 204 } => {
+                if length.is_some_and(|n| n != 0) {
+                    return Err(Error::InvalidRequest);
+                }
+                0
+            }
+            StartLine::Response { status: 304 } => 0,
+            StartLine::Response { .. } if request_is_head => 0,
+            StartLine::Response { .. } => length.ok_or(Error::InvalidRequest)?,
+        };
+        if body > body_limit {
+            return Err(Error::InvalidRequest);
+        }
+        Ok(body)
+    }
+}
+fn rejected_head(
+    mut connection: ConnectionLease,
+    error: Error,
+) -> HeadCompletion<Result<MessageHead>> {
+    connection.poison();
+    connection.read_ahead = None;
+    // Unknown framing must not be declared consumed. This prevents successful
+    // finish_exchange even if the caller sends its error response successfully.
+    connection.rx_remaining = None;
+    connection.request_is_head = false;
+    HeadCompletion {
+        connection,
+        value: Err(error),
+        _decoded: None,
+    }
+}
 
 #[cfg(test)]
 mod relay_tests;
@@ -1028,569 +1736,4 @@ fn create_socket(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::http::{Codec, Header, MessageHead, StartLine};
-    use crate::{model::RequestId, test_support::WakeCounter};
-    use std::{sync::Arc, task::Context};
-
-    enum Listener {
-        Tcp(std::net::TcpListener),
-        Unix(std::os::unix::net::UnixListener, PathBuf),
-    }
-    impl Listener {
-        fn peer() -> (Self, Endpoint) {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
-            listener.set_nonblocking(true).unwrap();
-            (Self::Tcp(listener), endpoint)
-        }
-        fn origin() -> (Self, Endpoint) {
-            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let path = PathBuf::from(format!(
-                "pool-test-{}-{}.sock",
-                std::process::id(),
-                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
-            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-            listener.set_nonblocking(true).unwrap();
-            (Self::Unix(listener, path.clone()), Endpoint::Unix(path))
-        }
-        fn accept(&self) -> Option<Descriptor> {
-            let result = match self {
-                Self::Tcp(listener) => listener.accept().map(|(socket, _)| socket.into()),
-                Self::Unix(listener, path) => {
-                    assert!(path.exists());
-                    listener.accept().map(|(socket, _)| socket.into())
-                }
-            };
-            match result {
-                Ok(socket) => Some(socket),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
-                Err(error) => panic!("accept: {error}"),
-            }
-        }
-    }
-    impl Drop for Listener {
-        fn drop(&mut self) {
-            if let Self::Unix(_, path) = self {
-                std::fs::remove_file(path).unwrap();
-            }
-        }
-    }
-    fn drive<T>(reactor: &Reactor, future: impl std::future::Future<Output = T>) -> T {
-        let mut future = std::pin::pin!(future);
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
-                return result;
-            }
-            assert!(Instant::now() < deadline, "bounded pool exchange");
-            reactor.poll_budgeted(128).unwrap();
-        }
-    }
-
-    fn scope() -> RequestScope {
-        RequestScope::new(RequestId([7; 16]), Instant::now() + Duration::from_secs(5)).unwrap()
-    }
-
-    fn setup() -> (Rc<Admission>, Rc<Reactor>, HttpPool) {
-        let mut limits = crate::test_support::cluster::config(false).limits;
-        limits.queue_entries = std::num::NonZeroUsize::new(2).unwrap();
-        let admission = Rc::new(Admission::new(limits));
-        let reactor = Rc::new(Reactor::new(admission.clone()));
-        reactor.init().unwrap();
-        let pool = HttpPool::new(reactor.clone(), admission.clone(), 1).with_origin_limit(2);
-        (admission, reactor, pool)
-    }
-
-    // Hold a real checked-out connection only after a complete head/body exchange.
-    fn held(
-        pool: &HttpPool,
-        endpoint: &Endpoint,
-        listener: &Listener,
-    ) -> (ConnectionLease, ConnectionLease) {
-        let scope = scope();
-        let io = HttpIo::with_admission(
-            pool.reactor.clone(),
-            Codec::new(4096, 16),
-            pool.admission.clone(),
-        );
-        let client = async {
-            let connection = pool.checkout_metadata(endpoint, &scope).await?;
-            let request = MessageHead {
-                start: StartLine::Request {
-                    method: "GET".into(),
-                    target: "/pool".into(),
-                },
-                headers: vec![Header {
-                    name: "content-length".into(),
-                    value: b"0".to_vec(),
-                }],
-            };
-            let sent = io.send_head(connection, request, &scope).await?;
-            let received = io.receive_head(sent.connection, &scope).await?;
-            assert!(matches!(
-                received.value.start,
-                StartLine::Response { status: 200 }
-            ));
-            let read = io
-                .read_body(received.connection, io.buffer(1)?, &scope)
-                .await?;
-            assert_eq!(read.bytes, 1);
-            assert_eq!(read.buffer.bytes()?, b"x");
-            let mut connection = read.lease;
-            connection.finish_exchange()?;
-            Ok::<_, Error>(connection)
-        };
-        let server = async {
-            let socket =
-                std::future::poll_fn(|_| listener.accept().map_or(Poll::Pending, Poll::Ready))
-                    .await;
-            let connection = ConnectionLease::from_accepted(socket, &pool.admission)?;
-            let received = io.receive_head(connection, &scope).await?;
-            assert!(
-                matches!(received.value.start, StartLine::Request { ref target, .. } if target == "/pool")
-            );
-            let response = MessageHead {
-                start: StartLine::Response { status: 200 },
-                headers: vec![Header {
-                    name: "content-length".into(),
-                    value: b"1".to_vec(),
-                }],
-            };
-            let sent = io.send_head(received.connection, response, &scope).await?;
-            let mut buffer = io.buffer(1)?;
-            buffer.bytes_mut()?.copy_from_slice(b"x");
-            let sent = io.write_body(sent.connection, buffer, &scope).await?;
-            let mut connection = sent.lease;
-            connection.finish_exchange()?;
-            Ok::<_, Error>(connection)
-        };
-        drive(&pool.reactor, async { futures::try_join!(client, server) }).unwrap()
-    }
-
-    #[test]
-    fn idle_expiration_runs_without_checkout_or_waiters_and_is_budgeted() {
-        let (admission, _, mut pool) = setup();
-        pool.idle_timeout = Duration::ZERO;
-        let mut peers = Vec::new();
-        for _ in 1..=3 {
-            let (listener, endpoint) = Listener::peer();
-            let (lease, peer) = held(&pool, &endpoint, &listener);
-            peers.push(peer);
-            drop(lease);
-        }
-        for remaining in (0..3).rev() {
-            pool.state.borrow_mut().next_expiry = crate::runtime::environment::now();
-            pool.poll_waiters(1);
-            assert_eq!(pool.state.borrow().entries.len(), remaining);
-            assert_eq!(admission.used(ResourceClass::OutboundConnection), remaining);
-        }
-    }
-    #[test]
-    fn origin_wait_is_bounded_fifo_without_blocking_peers_or_other_caches() {
-        let (admission, reactor, pool) = setup();
-        let (listener, endpoint) = Listener::origin();
-        let (first, a) = held(&pool, &endpoint, &listener);
-        let (second, b) = held(&pool, &endpoint, &listener);
-        let baseline = admission.used(ResourceClass::RequestContext);
-        let scope = scope();
-        let count = Arc::new(WakeCounter::default());
-        let waker = Waker::from(count.clone());
-        let mut cx = Context::from_waker(&waker);
-        let mut older = pool.checkout_wait(&endpoint, &scope);
-        let mut newer = pool.checkout_wait(&endpoint, &scope);
-        assert!(older.as_mut().poll(&mut cx).is_pending());
-        assert!(newer.as_mut().poll(&mut cx).is_pending());
-        assert_eq!(count.count(), 0, "no self-wake spin");
-        pool.poll_waiters(1);
-        assert_eq!(count.count(), 1, "tick wake is budgeted");
-        pool.state.borrow_mut().next_waiter_poll = Instant::now() + Duration::from_secs(1);
-        pool.poll_waiters(2);
-        assert_eq!(count.count(), 1, "early worker repolls do not busy-wake");
-        assert!(matches!(
-            pool.checkout_wait(&endpoint, &scope).as_mut().poll(&mut cx),
-            Poll::Ready(Err(Error::Overloaded))
-        ));
-        assert_eq!(pool.state.borrow().waiting.len(), 2);
-        assert!(admission.used(ResourceClass::RequestContext) > 0);
-        assert_eq!(reactor.in_flight(), 0);
-
-        // A full origin queue does not gate a peer or an unrelated cache. Peer
-        // saturation remains immediate so routing can try another candidate.
-        for (listener, other) in [Listener::peer(), Listener::origin()] {
-            let (lease, _peer) = held(&pool, &other, &listener);
-            if matches!(other, Endpoint::Peer(_)) {
-                assert!(matches!(
-                    pool.checkout(&other, &scope).as_mut().poll(&mut cx),
-                    Poll::Ready(Err(Error::Overloaded))
-                ));
-            }
-            drop(lease);
-            let Poll::Ready(Ok(lease)) = pool.checkout_wait(&other, &scope).as_mut().poll(&mut cx)
-            else {
-                panic!("unrelated endpoint blocked")
-            };
-            drop(lease);
-        }
-        let control = admission
-            .reserve(None, ResourceClass::ControlProgress, 1)
-            .unwrap();
-        drop(control);
-        drop(first);
-        assert!(count.count() > 0);
-        assert!(
-            newer.as_mut().poll(&mut cx).is_pending(),
-            "FIFO cannot be bypassed"
-        );
-        let Poll::Ready(Ok(lease)) = older.as_mut().poll(&mut cx) else {
-            panic!("oldest must reuse released slot")
-        };
-        assert!(newer.as_mut().poll(&mut cx).is_pending());
-        drop(second);
-        let Poll::Ready(Ok(next)) = newer.as_mut().poll(&mut cx) else {
-            panic!("second waiter must progress")
-        };
-        assert!(pool.state.borrow().waiting.is_empty());
-        assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
-        drop((lease, next, a, b));
-        pool.close();
-        assert_eq!(admission.used(ResourceClass::Connection), 0);
-    }
-
-    #[test]
-    fn waiting_cancel_deadline_close_stop_and_drop_release_only_waiter_quota() {
-        for case in ["cancel", "deadline", "close", "stop", "drop"] {
-            let (admission, reactor, pool) = setup();
-            let (listener, endpoint) = Listener::peer();
-            let (held, peer) = held(&pool, &endpoint, &listener);
-            let baseline = admission.used(ResourceClass::RequestContext);
-            let mut scope = scope();
-            if case == "deadline" {
-                scope.deadline.0 = Instant::now() + Duration::from_millis(20);
-            }
-            let count = Arc::new(WakeCounter::default());
-            let waker = Waker::from(count.clone());
-            let mut cx = Context::from_waker(&waker);
-            let mut wait = pool.checkout_wait(&endpoint, &scope);
-            assert!(wait.as_mut().poll(&mut cx).is_pending());
-            let expected = match case {
-                "cancel" => {
-                    scope.cancel().unwrap();
-                    Error::Cancelled
-                }
-                "deadline" => {
-                    std::thread::sleep(Duration::from_millis(30));
-                    pool.poll_waiters(1);
-                    Error::DeadlineExceeded
-                }
-                "close" => {
-                    pool.close();
-                    Error::Unavailable
-                }
-                "stop" => {
-                    admission.stop();
-                    pool.poll_waiters(1);
-                    Error::Unavailable
-                }
-                _ => Error::Internal,
-            };
-            if case != "drop" {
-                assert!(count.count() > 0);
-                assert!(
-                    matches!(wait.as_mut().poll(&mut cx), Poll::Ready(Err(error)) if error == expected)
-                );
-            }
-            drop(wait);
-            assert!(pool.state.borrow().waiting.is_empty());
-            assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
-            assert_eq!(admission.used(ResourceClass::OutboundConnection), 1);
-            assert_eq!(reactor.in_flight(), 0);
-            drop((held, peer));
-            pool.close();
-            assert_eq!(admission.used(ResourceClass::Connection), 0);
-        }
-    }
-
-    #[test]
-    fn worker_tick_wakes_bounded_round_robin_waiters_even_in_nested_executor() {
-        use futures::{Stream, stream::FuturesUnordered};
-        let (_, _, pool) = setup();
-        let (listener, endpoint) = Listener::peer();
-        let (_held, _peer) = held(&pool, &endpoint, &listener);
-        let mut scope = scope();
-        scope.deadline.0 = Instant::now() + Duration::from_millis(20);
-        let mut futures = FuturesUnordered::new();
-        futures.push(pool.checkout_wait(&endpoint, &scope));
-        futures.push(pool.checkout_wait(&endpoint, &scope));
-        let count = Arc::new(WakeCounter::default());
-        let waker = Waker::from(count.clone());
-        let mut cx = Context::from_waker(&waker);
-        assert!(
-            std::pin::Pin::new(&mut futures)
-                .poll_next(&mut cx)
-                .is_pending()
-        );
-        std::thread::sleep(Duration::from_millis(30));
-        // Outer polling alone does not drive a sleeping child.
-        assert!(
-            std::pin::Pin::new(&mut futures)
-                .poll_next(&mut cx)
-                .is_pending()
-        );
-        pool.poll_waiters(0);
-        assert!(
-            std::pin::Pin::new(&mut futures)
-                .poll_next(&mut cx)
-                .is_pending()
-        );
-        for _ in 0..2 {
-            pool.poll_waiters(1);
-            assert!(matches!(
-                std::pin::Pin::new(&mut futures).poll_next(&mut cx),
-                Poll::Ready(Some(Err(Error::DeadlineExceeded)))
-            ));
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        assert!(pool.state.borrow().waiting.is_empty());
-    }
-
-    #[test]
-    fn waiting_connection_quota_releases_and_connect_abandonment_keeps_fence() {
-        let (admission, reactor, pool) = setup();
-        reactor.init().unwrap();
-        let baseline = admission.used(ResourceClass::RequestContext);
-        let quota = admission
-            .reserve(
-                None,
-                ResourceClass::Connection,
-                admission.limit(ResourceClass::Connection),
-            )
-            .unwrap();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
-        let scope = scope();
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        let mut wait = pool.checkout_wait(&endpoint, &scope);
-        assert!(wait.as_mut().poll(&mut cx).is_pending());
-        assert_eq!(reactor.in_flight(), 0);
-        assert!(
-            pool.state.borrow().entries.is_empty(),
-            "no slot held waiting for global quota"
-        );
-        drop(quota);
-        pool.poll_waiters(1);
-        assert!(wait.as_mut().poll(&mut cx).is_pending());
-        assert!(pool.state.borrow().waiting.is_empty());
-        assert_eq!(reactor.in_flight(), 1);
-        drop(wait);
-        assert_eq!(admission.used(ResourceClass::Connection), 1);
-        assert_eq!(pool.state.borrow().entries[&endpoint].active, 1);
-        assert!(matches!(
-            pool.checkout(&endpoint, &scope).as_mut().poll(&mut cx),
-            Poll::Ready(Err(Error::Overloaded))
-        ));
-        while reactor.in_flight() != 0 {
-            scope.check().unwrap();
-            reactor.poll_budgeted(32).unwrap();
-            reactor.wait(Duration::from_millis(1)).unwrap();
-        }
-        assert!(pool.state.borrow().entries.is_empty());
-        assert_eq!(admission.used(ResourceClass::Connection), 0);
-        assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
-    }
-
-    #[test]
-    fn waiting_endpoint_table_and_context_pressure_remain_bounded() {
-        let (admission, reactor, mut pool) = setup();
-        pool.max_endpoints = 1;
-        let (listener, first) = Listener::peer();
-        let (second_listener, second) = Listener::peer();
-        let (held, peer) = held(&pool, &first, &listener);
-        let baseline = admission.used(ResourceClass::RequestContext);
-        let scope = scope();
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        let context = admission
-            .reserve(
-                None,
-                ResourceClass::RequestContext,
-                admission.limit(ResourceClass::RequestContext) - baseline,
-            )
-            .unwrap();
-        assert!(matches!(
-            pool.checkout_wait(&second, &scope).as_mut().poll(&mut cx),
-            Poll::Ready(Err(Error::Overloaded))
-        ));
-        assert!(pool.state.borrow().waiting.is_empty());
-        assert_eq!(pool.state.borrow().entries.len(), 1);
-        drop(context);
-        let mut wait = pool.checkout_wait(&second, &scope);
-        assert!(wait.as_mut().poll(&mut cx).is_pending());
-        assert_eq!(pool.state.borrow().entries.len(), 1);
-        drop(held);
-        // An idle-only endpoint is evicted by a real checkout rather than waiting
-        // for idle timeout to free the endpoint table.
-        let connection = drive(&reactor, wait.as_mut()).unwrap();
-        assert!(second_listener.accept().is_some());
-        assert_eq!(pool.state.borrow().entries.len(), 1);
-        assert!(!pool.state.borrow().entries.contains_key(&first));
-        drop((connection, wait, peer));
-        assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
-        assert_eq!(admission.used(ResourceClass::Connection), 0);
-    }
-
-    #[test]
-    fn origin_uid_churn_preserves_endpoint_and_connection_bounds() {
-        let (admission, _, mut pool) = setup();
-        pool.max_endpoints = 1;
-        let (listener, endpoint) = Listener::origin();
-        let Endpoint::Unix(path) = endpoint else {
-            unreachable!()
-        };
-        let origin = |uid: usize| Endpoint::Origin {
-            cache: crate::model::CacheId(format!("cache-{uid}")),
-            path: path.clone(),
-        };
-        let (first, peer) = held(&pool, &origin(0), &listener);
-        assert!(matches!(
-            pool.prepare_connection(&origin(1)),
-            Err(Error::Overloaded)
-        ));
-        assert_eq!(pool.state.borrow().entries.len(), 1);
-        drop((first, peer));
-        for uid in 1..32 {
-            let (connection, peer) = held(&pool, &origin(uid), &listener);
-            assert_eq!(pool.state.borrow().entries.len(), 1);
-            assert_eq!(admission.used(ResourceClass::OutboundConnection), 1);
-            drop((connection, peer));
-        }
-        pool.close();
-        assert_eq!(admission.used(ResourceClass::Connection), 0);
-    }
-
-    #[test]
-    fn origin_cap_is_independent_of_peer_cap_and_idle_quota_is_reclaimed() {
-        let (admission, _, pool) = setup();
-        let (listener, endpoint) = Listener::origin();
-        let Endpoint::Unix(path) = endpoint else {
-            unreachable!()
-        };
-        let origin = Endpoint::Origin {
-            cache: crate::model::CacheId("cache".into()),
-            path,
-        };
-        let (first, a) = held(&pool, &origin, &listener);
-        let (second, b) = held(&pool, &origin, &listener);
-        drop(second);
-        let (second, address) = pool.prepare_connection(&origin).unwrap();
-        assert!(
-            address.is_none(),
-            "second origin slot available despite peer cap one"
-        );
-        assert!(matches!(
-            pool.prepare_connection(&origin),
-            Err(Error::Overloaded)
-        ));
-        drop((first, second, a, b));
-        let quota = admission
-            .reserve(
-                None,
-                ResourceClass::Connection,
-                admission.limit(ResourceClass::Connection) - 1,
-            )
-            .unwrap();
-        let other = Endpoint::Peer("127.0.0.1:9".into());
-        let (lease, _) = pool.prepare_connection(&other).unwrap();
-        assert_eq!(pool.state.borrow().entries[&origin].idle.len(), 0);
-        drop((lease, quota));
-        assert_eq!(admission.used(ResourceClass::Connection), 0);
-    }
-
-    #[test]
-    fn metadata_bypasses_queued_pages_within_existing_origin_cap() {
-        let (admission, _, pool) = setup();
-        let (listener, endpoint) = Listener::origin();
-        let Endpoint::Unix(path) = endpoint else {
-            unreachable!()
-        };
-        let endpoint = Endpoint::Origin {
-            cache: crate::model::CacheId("cache".into()),
-            path,
-        };
-        let (first, a) = held(&pool, &endpoint, &listener);
-        let (idle, b) = held(&pool, &endpoint, &listener);
-        let baseline = admission.used(ResourceClass::RequestContext);
-        drop(idle);
-        let scope = scope();
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        let mut page = pool.checkout_wait(&endpoint, &scope);
-        assert!(page.as_mut().poll(&mut cx).is_pending());
-        let mut metadata = pool.checkout_metadata(&endpoint, &scope);
-        let Poll::Ready(Ok(metadata)) = metadata.as_mut().poll(&mut cx) else {
-            panic!("metadata queued behind page");
-        };
-        assert_eq!(pool.state.borrow().entries[&endpoint].active, 2);
-        assert!(page.as_mut().poll(&mut cx).is_pending());
-        drop((metadata, first, page, a, b));
-        pool.close();
-        assert_eq!(admission.used(ResourceClass::Connection), 0);
-        assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
-    }
-
-    #[test]
-    fn invalidated_active_generation_cannot_reenter_idle_and_expiry_releases_quota() {
-        let (admission, _, mut pool) = setup();
-        pool.idle_timeout = Duration::ZERO;
-        let (listener, endpoint) = Listener::peer();
-        for invalidate in [true, false] {
-            let (connection, peer) = held(&pool, &endpoint, &listener);
-            if invalidate {
-                pool.invalidate(&endpoint);
-            }
-            drop((connection, peer));
-            assert_eq!(
-                admission.used(ResourceClass::Connection),
-                usize::from(!invalidate)
-            );
-            pool.expire_idle();
-            assert_eq!(admission.used(ResourceClass::Connection), 0);
-            assert!(pool.state.borrow().entries.is_empty());
-        }
-    }
-    #[test]
-    fn opaque_staging_and_connection_reservations_survive_reactor_abandonment() {
-        use super::super::io::OwnedBuffer;
-        use crate::model::RequestId;
-        use std::task::{Context, Poll};
-        let admission = Rc::new(Admission::new(
-            crate::test_support::cluster::config(false).limits,
-        ));
-        let reactor = Rc::new(Reactor::new(admission.clone()));
-        reactor.init().unwrap();
-        let baseline = admission.used(ResourceClass::RequestContext);
-        let pool = HttpPool::new(reactor.clone(), admission.clone(), 1);
-        let (listener, endpoint) = Listener::peer();
-        let (connection, peer) = held(&pool, &endpoint, &listener);
-        let scope =
-            RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(5)).unwrap();
-        let staging = OwnedBuffer::new(&admission, 4096).unwrap();
-        let mut receive = reactor.recv(connection.socket(), staging, connection, &scope);
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        assert!(matches!(receive.as_mut().poll(&mut cx), Poll::Pending));
-        drop(receive);
-        drop(pool);
-        assert_eq!(admission.used(ResourceClass::OutboundConnection), 1);
-        assert!(admission.used(ResourceClass::RequestContext) >= baseline + 4096);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while reactor.in_flight() != 0 {
-            assert!(Instant::now() < deadline);
-            reactor.poll_budgeted(32).unwrap();
-            reactor.wait(Duration::from_millis(1)).unwrap();
-        }
-        drop(peer);
-        assert_eq!(admission.used(ResourceClass::Connection), 0);
-        assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
-    }
-}
+mod pool_tests;

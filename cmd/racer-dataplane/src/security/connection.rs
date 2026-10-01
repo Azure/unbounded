@@ -5,7 +5,10 @@ use super::{
 };
 use crate::{
     error::{Error, Result},
-    http::{MessageHead, StartLine, connection::ConnectionLease, io::HttpIo},
+    http::{
+        MessageHead, StartLine,
+        connection::{ConnectionLease, HttpIo},
+    },
     model::NodeId,
     runtime::deadline::RequestScope,
 };

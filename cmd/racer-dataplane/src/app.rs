@@ -24,7 +24,7 @@ use crate::{
         transport::ReactorControlIo,
     },
     error::{Error, Operation, Result},
-    http::{connection::HttpPool, io::HttpIo},
+    http::connection::{HttpIo, HttpPool},
     memory::{cache::MemoryCache, delivery::Delivery, pipe::PipePool, pool::BufferPool},
     model::{Limits, NodeId, RequestId, WorkerId},
     origin::{Origin, OriginClient},
