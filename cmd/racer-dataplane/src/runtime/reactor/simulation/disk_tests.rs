@@ -1,4 +1,77 @@
+use super::io_tests::{reactor, scope};
 use super::*;
+
+#[test]
+fn delayed_completion_and_fault_trace_replay_exactly() {
+    fn run() -> Vec<Event> {
+        let sim = Simulation::new();
+        let _environment = sim.enter();
+        let r = reactor();
+        let scope = scope();
+        sim.write_file(Path::new("/file"), b"abc").unwrap();
+        sim.inject("open", Fault::Delay(2));
+        let fd = drive(
+            &r,
+            r.file_open(
+                None,
+                CString::new("/file").unwrap(),
+                libc::O_RDONLY,
+                0,
+                &scope,
+            ),
+        )
+        .unwrap();
+        sim.inject("read", Fault::Errno(libc::EIO));
+        assert!(matches!(
+            drive(&r, r.read_at(fd, 0, r.file_buffer(3).unwrap(), (), &scope)),
+            Err(Error::Io)
+        ));
+        sim.trace()
+    }
+    assert_eq!(run(), run());
+}
+
+#[test]
+fn real_slab_open_is_sparse_exclusive_and_checks_direct_geometry() {
+    use crate::{model::WorkerId, store::slab::Slabs};
+    let sim = Simulation::new();
+    let _environment = sim.enter();
+    let r = Rc::new(reactor());
+    let slabs = Slabs::new(
+        WorkerId(0),
+        "/slabs".into(),
+        r.clone(),
+        64 * 1024 * 1024,
+        32 * 1024 * 1024,
+    );
+    assert!(slabs.open_now().is_ok());
+    let other = Slabs::new(
+        WorkerId(0),
+        "/slabs".into(),
+        r.clone(),
+        64 * 1024 * 1024,
+        32 * 1024 * 1024,
+    );
+    assert_eq!(other.open_now(), Err(Error::Unavailable));
+    // A failed second flock must not unlock the first file description.
+    assert_eq!(other.open_now(), Err(Error::Unavailable));
+    drop(slabs);
+    assert!(other.open_now().is_ok());
+    let path = Path::new("/slabs/worker-0-slab-0.dat");
+    let file = Rc::new(sim.open(None, path, libc::O_RDWR | libc::O_DIRECT).unwrap());
+    let scope = scope();
+    assert!(matches!(
+        drive(
+            &r,
+            r.write_at(file, 1, r.file_bytes(b"bad").unwrap(), (), &scope)
+        ),
+        Err(Error::Io)
+    ));
+    let w = sim.0.borrow();
+    let node = w.paths[path].borrow();
+    assert_eq!(node.length, 64 * 1024 * 1024);
+    assert!(node.pages.is_empty());
+}
 
 #[test]
 fn sparse_page_copies_preserve_boundaries_holes_and_snapshots() {
