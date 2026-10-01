@@ -173,8 +173,11 @@ fn duplicate_owners_match_full_page_occupancy_until_each_last_owner() {
     assert_eq!((PLAIN, CIPHER), (16 * 1024 * 1024, 16 * 1024 * 1024 + 16));
     let model = admission(2);
     let real = admission(2);
-    let cache = CacheId("owners".into());
-    let memory = MemoryCache::new(BufferPool::new(real.clone()));
+    let cache = CacheId(crate::security::identity::tests::CACHE.into());
+    let memory = MemoryCache::new(
+        BufferPool::new(real.clone()),
+        crate::test_support::availability(),
+    );
     let retained = MetadataOwners::reserve(&model, &cache);
     let page = allocated_page(&real, &cache, "v1", PLAIN);
     let id = page.plaintext.page().clone();
@@ -252,10 +255,13 @@ fn fair_reclamation_matches_metadata_trace_and_keeps_other_cache() {
             ..Config::default()
         });
         let real = admission(4);
-        let memory = MemoryCache::new(BufferPool::new(real.clone()));
-        // reserve_page uses numeric cache IDs, including for fair-share scope.
-        let a = CacheId("0".into());
-        let b = CacheId("1".into());
+        // The simulator uses numeric IDs; the real cache uses published UUIDs.
+        let a = CacheId(crate::security::identity::tests::CACHE.into());
+        let b = CacheId("44444444-4444-4444-8444-444444444444".into());
+        let memory = MemoryCache::new(
+            BufferPool::new(real.clone()),
+            crate::test_support::availability_for(vec![a.clone(), b.clone()]),
+        );
         let keys = [(1, 0, 0), (0, 1, 0), (0, 2, 0)];
         let mut ids = Vec::new();
         for (key, (cache, version)) in
@@ -297,14 +303,17 @@ fn fair_reclamation_matches_metadata_trace_and_keeps_other_cache() {
         };
         assert_eq!(model.report.evictions, 0);
         assert!(model.workers[0].cache.values().all(Bundle::idle));
-        for admission in [&model.workers[0].admission, real.as_ref()] {
+        for (admission, a) in [
+            (&model.workers[0].admission, &CacheId("0".into())),
+            (real.as_ref(), &a),
+        ] {
             assert!(matches!(
-                admission.reserve(Some(&a), class, amount),
+                admission.reserve(Some(a), class, amount),
                 Err(Error::Overloaded)
             ));
             // Local deficit takes precedence over global spare room,
             // runtime/admission.rs:149-156. Evicting B cannot remedy A's share.
-            let (owner, deficit) = admission.reclamation(&a, class, amount).unwrap();
+            let (owner, deficit) = admission.reclamation(a, class, amount).unwrap();
             assert_eq!(owner, Some(a.clone()));
             assert!(deficit > 0 && deficit <= amount);
         }
@@ -497,7 +506,9 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
         .reserve(Some(&cache), ResourceClass::DirtyCiphertext, CIPHER)
         .unwrap();
     let buffers = BufferPool::new(real.clone());
-    let memory = Rc::new(MemoryCache::new(buffers.clone()));
+    let keys = Rc::new(crate::security::identity::keyring_tests::keys());
+    let availability = crate::control::state::for_caches(keys.clone(), vec![cache.clone()]);
+    let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
     let mut old_model = MetadataOwners::reserve(&model, &cache);
     Arc::get_mut(&mut old_model.bundle.plain)
         .unwrap()
@@ -529,7 +540,7 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
     assert!(next_model.bundle.idle());
 
     let worker = WorkerId(0);
-    let index = Rc::new(Index::new(worker, 16));
+    let index = Rc::new(Index::new(worker, 16, availability.clone()));
     let segments = Rc::new(Segments::new(worker, 64 * 1024 * 1024));
     // Never opened: dirty saturation must bypass writer enqueue and all disk I/O.
     let slabs = Rc::new(Slabs::new(
@@ -548,8 +559,12 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
         slabs.clone(),
         buffers.clone(),
     ));
-    let writer = Rc::new(StoreWriter::new(index, segments, slabs));
-    let keys = Rc::new(crate::security::identity::keyring_tests::keys());
+    let writer = Rc::new(StoreWriter::new(
+        index,
+        segments,
+        slabs,
+        availability.clone(),
+    ));
     let (port, engine_port) = crypto::pair(worker, 0, NonZeroUsize::new(4).unwrap());
     let client = Rc::new(CryptoClient::new(port));
     let mut engine = PageCryptoEngine::new(CryptoRuntime { port: engine_port });
@@ -582,10 +597,7 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
             Rc::new(CredentialCrypto::new(keys.clone(), real.clone())),
             Arc::new(Default::default()),
         )),
-        flights: Rc::new(Flights::new(
-            real.clone(),
-            crate::control::state::Availability::permissive_for_tests(),
-        )),
+        flights: Rc::new(Flights::new(real.clone(), availability)),
         crypto: Rc::new(PageCrypto::new(keys.clone(), client.clone())),
         credentials: Rc::new(CredentialCrypto::new(keys, real.clone())),
         admission: real.clone(),

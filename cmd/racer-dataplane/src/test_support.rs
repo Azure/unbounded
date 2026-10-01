@@ -2,6 +2,22 @@
 pub mod clock;
 pub mod origin;
 
+/// Minimal real control-plane state for storage and flight fixtures. Callers with
+/// rotating keys or publications should share their own Availability instead.
+pub fn availability() -> std::rc::Rc<crate::control::state::Availability> {
+    availability_for(vec![crate::model::CacheId(
+        crate::security::identity::tests::CACHE.into(),
+    )])
+}
+pub fn availability_for(
+    caches: Vec<crate::model::CacheId>,
+) -> std::rc::Rc<crate::control::state::Availability> {
+    crate::control::state::for_caches(
+        std::rc::Rc::new(crate::security::identity::keyring_tests::keys_for(&caches)),
+        caches,
+    )
+}
+
 pub struct NoPeers;
 
 impl crate::peer::PeerClient for NoPeers {

@@ -33,7 +33,7 @@ fn flights(limits: FlightLimits) -> Rc<Flights> {
             Rc::new(Admission::new(
                 crate::test_support::cluster::config(false).limits,
             )),
-            crate::control::state::Availability::permissive_for_tests(),
+            crate::test_support::availability(),
             limits,
         )
         .unwrap(),
@@ -180,7 +180,7 @@ fn result(flights: &Flights, page: PageId) -> PageResult {
                 checksum: std::sync::OnceLock::new(),
                 envelope: PageEnvelope {
                     page,
-                    key_id: KeyId([0; 16]),
+                    key_id: KeyId([1; 16]),
                     nonce: Nonce([0; 24]),
                     plaintext_length: 3,
                     ciphertext_length: 19,
@@ -479,7 +479,7 @@ fn fence() -> Fence {
         page: PageId {
             version: ObjectVersion {
                 object: ObjectId {
-                    cache: CacheId("cache".into()),
+                    cache: CacheId(crate::security::identity::tests::CACHE.into()),
                     key: CacheKey([0; 32]),
                 },
                 etag: StrongEtag::test_value("v1"),

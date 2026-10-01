@@ -263,7 +263,7 @@ pub(crate) mod tests {
                 content_type: None,
                 version: ObjectVersion {
                     object: ObjectId {
-                        cache: CacheId("cache".into()),
+                        cache: CacheId(crate::security::identity::tests::CACHE.into()),
                         key: CacheKey([0; 32]),
                     },
                     etag: StrongEtag::test_value(version),

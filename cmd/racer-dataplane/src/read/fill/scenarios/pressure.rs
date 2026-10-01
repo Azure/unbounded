@@ -123,7 +123,14 @@ fn bootstrap_admission_discards_queued_copy_before_evicting_idle_bundle() {
         dependencies.credentials.clone(),
         8,
         MetadataDependencies {
-            index: Rc::new(Index::new(WorkerId(0), 8)),
+            index: Rc::new(Index::new(
+                WorkerId(0),
+                8,
+                crate::control::state::for_caches(
+                    f.keys.clone(),
+                    vec![f.context.object.cache.clone()],
+                ),
+            )),
             fill: Rc::new(Fill::new(dependencies.clone())),
             owners: dependencies.metadata_owner.clone(),
         },
@@ -296,10 +303,18 @@ fn fair_share_one_page_deficit_preserves_other_caches_and_remaining_working_set(
         let mut limits = crate::test_support::cluster::config(false).limits;
         limits.plaintext_bytes = std::num::NonZeroUsize::new(6 * amount + 64).unwrap();
         limits.ciphertext_bytes = std::num::NonZeroUsize::new(6 * amount + 64).unwrap();
-        let f = fixture_with(3, Some(limits));
+        let other_cache = CacheId("44444444-4444-4444-8444-444444444444".into());
+        let f = fixture_with_caches(
+            3,
+            Some(limits),
+            vec![
+                CacheId(crate::security::identity::tests::CACHE.into()),
+                other_cache.clone(),
+            ],
+        );
         let cache = &f.context.object.cache;
         let queued = matches!(class, ResourceClass::Plaintext);
-        let other = retained_page(&f, &CacheId("other".into()), "other", class, amount, queued);
+        let other = retained_page(&f, &other_cache, "other", class, amount, queued);
         let first = retained_page(&f, cache, "first", class, amount, queued);
         let second = retained_page(&f, cache, "second", class, amount, queued);
         let third = retained_page(&f, cache, "third", class, amount, queued);

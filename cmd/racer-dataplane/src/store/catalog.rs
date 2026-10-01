@@ -26,7 +26,7 @@ pub struct Index {
     metadata_capacity: usize,
     page_capacity: Cell<usize>,
     state: RefCell<State>,
-    availability: Option<std::rc::Rc<crate::control::state::Availability>>,
+    availability: Rc<crate::control::state::Availability>,
     reserved: Cell<usize>,
 }
 #[derive(Default)]
@@ -98,25 +98,22 @@ impl IndexSnapshot {
     }
 }
 impl Index {
-    pub fn new(worker: WorkerId, metadata_capacity: usize) -> Self {
+    pub fn new(
+        worker: WorkerId,
+        metadata_capacity: usize,
+        availability: Rc<crate::control::state::Availability>,
+    ) -> Self {
         Self {
             worker,
             metadata_capacity,
             page_capacity: Cell::new(65536),
             state: RefCell::new(State::default()),
-            availability: None,
+            availability,
             reserved: Cell::new(0),
         }
     }
-    pub fn with_availability(
-        mut self,
-        availability: std::rc::Rc<crate::control::state::Availability>,
-    ) -> Self {
-        self.availability = Some(availability);
-        self
-    }
     fn available(&self, cache: &crate::model::CacheId) -> bool {
-        self.availability.as_ref().is_none_or(|a| a.metadata(cache))
+        self.availability.metadata(cache)
     }
     pub fn worker(&self) -> WorkerId {
         self.worker
@@ -140,11 +137,7 @@ impl Index {
             .borrow()
             .pages
             .get(page)
-            .filter(|e| {
-                self.availability
-                    .as_ref()
-                    .is_none_or(|a| a.page(&page.version.object.cache, e.key_id))
-            })
+            .filter(|e| self.availability.page(&page.version.object.cache, e.key_id))
             .cloned())
     }
     /// Allocation-free capacity preflight, not a slot reservation. Replacements
@@ -183,10 +176,9 @@ impl Index {
     /// Atomically publish a completed record with its immutable descriptor. Reject
     /// conflicting lengths for one version; never update current-version freshness.
     pub fn publish(&self, page: PageId, entry: IndexedPage) -> Result<()> {
-        if self
+        if !self
             .availability
-            .as_ref()
-            .is_some_and(|a| !a.page(&page.version.object.cache, entry.key_id))
+            .page(&page.version.object.cache, entry.key_id)
         {
             return Ok(());
         }
@@ -361,7 +353,11 @@ impl Index {
     /// Validate identity/length agreement and catalog bounds; clear all freshness.
     pub fn restore(&self, snapshot: IndexSnapshot) -> Result<()> {
         self.validate_snapshot(&snapshot)?;
-        let replacement = Index::new(self.worker, self.metadata_capacity);
+        let replacement = Index::new(
+            self.worker,
+            self.metadata_capacity,
+            self.availability.clone(),
+        );
         replacement.set_page_capacity(self.page_capacity.get())?;
         for (p, e) in snapshot.entries {
             replacement.publish(p, e)?;
@@ -373,10 +369,14 @@ impl Index {
         Ok(())
     }
     pub fn validate_snapshot(&self, snapshot: &IndexSnapshot) -> Result<()> {
+        snapshot.validate_capacity(self.page_capacity.get(), self.metadata_capacity)
+    }
+}
+impl IndexSnapshot {
+    pub fn validate_capacity(&self, page_capacity: usize, metadata_capacity: usize) -> Result<()> {
+        let snapshot = self;
         // Reject downsized cuts before allocating descriptor/duplicate tables.
-        if snapshot.entries.len() > self.page_capacity.get()
-            || snapshot.metadata.len() > self.metadata_capacity
-        {
+        if snapshot.entries.len() > page_capacity || snapshot.metadata.len() > metadata_capacity {
             return Err(Error::CorruptRecord);
         }
         snapshot.validate_metadata()?;
@@ -385,7 +385,7 @@ impl Index {
             .iter()
             .chain(snapshot.entries.iter().map(|(_, e)| &e.metadata))
         {
-            Self::validate_descriptor(m)?;
+            Index::validate_descriptor(m)?;
         }
         let mut pages = HashSet::default();
         let mut versions = HashSet::default();
@@ -399,6 +399,8 @@ impl Index {
         }
         Ok(())
     }
+}
+impl Index {
     pub fn segment_entries(&self, segment: SegmentId) -> Vec<(PageId, RecordLocation)> {
         self.segment_entries_bounded(segment, usize::MAX)
     }

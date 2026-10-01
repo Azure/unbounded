@@ -530,8 +530,7 @@ impl WorkerApplication {
             admission.clone(),
         ));
         let buffers = BufferPool::new(admission.clone());
-        let memory =
-            Rc::new(MemoryCache::new(buffers.clone()).with_availability(availability.clone()));
+        let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
         let pipes = Rc::new(PipePool::new(admission.clone(), reactor.clone()));
         let delivery = Rc::new(
             Delivery::new(pipes.clone(), config.reader_stall_timeout).with_metrics(metrics.clone()),
@@ -886,10 +885,11 @@ impl WorkerApplication {
         metrics: &crate::telemetry::metrics::Metrics,
     ) -> Result<Store> {
         let limits = runtime.admission.limits();
-        let index = Rc::new(
-            Index::new(worker, limits.metadata_entries.get())
-                .with_availability(availability.clone()),
-        );
+        let index = Rc::new(Index::new(
+            worker,
+            limits.metadata_entries.get(),
+            availability.clone(),
+        ));
         let segments = Rc::new(Segments::new(worker, config.segment_bytes));
         let eviction = Rc::new(SegmentClock::new(
             index.clone(),
@@ -915,8 +915,7 @@ impl WorkerApplication {
             .with_metrics(metrics.clone()),
         );
         let writer = Rc::new(
-            StoreWriter::new(index.clone(), segments.clone(), slabs)
-                .with_availability(availability)
+            StoreWriter::new(index.clone(), segments.clone(), slabs, availability)
                 .with_metrics(metrics.clone()),
         );
         writer.configure(

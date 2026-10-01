@@ -136,7 +136,7 @@ fn page_result(admission: &Admission, page: &PageId) -> crate::memory::page::Pag
                 checksum: std::sync::OnceLock::new(),
                 envelope: PageEnvelope {
                     page: page.clone(),
-                    key_id: KeyId([0; 16]),
+                    key_id: KeyId([1; 16]),
                     nonce: Nonce([0; 24]),
                     plaintext_length: 3,
                     ciphertext_length: 19,
@@ -218,7 +218,7 @@ impl DestinationFixture {
         };
         let flights = Rc::new(Flights::new(
             admission.clone(),
-            crate::control::state::Availability::permissive_for_tests(),
+            crate::test_support::availability_for(vec![CacheId(CACHE.into())]),
         ));
         let service = Rc::new(PendingPage {
             flights: flights.clone(),

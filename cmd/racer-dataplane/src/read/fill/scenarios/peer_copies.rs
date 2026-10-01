@@ -746,11 +746,12 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
             deps.candidates = Rc::new(policy);
             f.fill = Fill::new(deps);
             let fill = Rc::new(f.fill.clone());
-            let snapshots = Rc::new(SnapshotStore::new(
-                f.keys.cluster().clone(),
-                Arc::new(PublishedState::default()),
-                4,
+            let published = Arc::new(PublishedState::default());
+            let availability = Rc::new(crate::control::state::Availability::new(
+                published.clone(),
+                f.keys.clone(),
             ));
+            let snapshots = Rc::new(SnapshotStore::new(f.keys.cluster().clone(), published, 4));
             snapshots
                 .publish(Publication {
                     schema_version: SCHEMA_VERSION,
@@ -773,7 +774,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
                 fill.dependencies.credentials.clone(),
                 16,
                 MetadataDependencies {
-                    index: Rc::new(Index::new(WorkerId(0), 16)),
+                    index: Rc::new(Index::new(WorkerId(0), 16, availability.clone())),
                     owners: owners.clone(),
                     fill: fill.clone(),
                 },
@@ -792,7 +793,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
                 fill.clone(),
                 streams,
                 fill.dependencies.credentials.clone(),
-                crate::control::state::Availability::permissive_for_tests(),
+                availability,
             ));
             endpoints.push(owners.install(WorkerId(0), coordinator.clone()).unwrap());
             mesh.nodes.borrow_mut().push(coordinator);

@@ -140,12 +140,16 @@ fn fixture() -> Fixture {
     fixture_with(3, None)
 }
 fn fixture_with(length: u64, limits: Option<crate::model::Limits>) -> Fixture {
-    fixture_with_availability(length, limits, false)
+    fixture_with_caches(
+        length,
+        limits,
+        vec![CacheId(crate::security::identity::tests::CACHE.into())],
+    )
 }
-fn fixture_with_availability(
+fn fixture_with_caches(
     length: u64,
     limits: Option<crate::model::Limits>,
-    check_availability: bool,
+    caches: Vec<CacheId>,
 ) -> Fixture {
     let mut config = crate::test_support::cluster::config(false);
     if let Some(limits) = limits {
@@ -153,25 +157,12 @@ fn fixture_with_availability(
     }
     let worker = WorkerId(0);
     let admission = Rc::new(Admission::new(config.limits.clone()));
-    let keys = Rc::new(crate::security::identity::keyring_tests::keys());
-    let availability = crate::control::state::for_caches(
-        keys.clone(),
-        vec![CacheId(crate::security::identity::tests::CACHE.into())],
-    );
+    let keys = Rc::new(crate::security::identity::keyring_tests::keys_for(&caches));
+    let availability = crate::control::state::for_caches(keys.clone(), caches);
     let buffers = BufferPool::new(admission.clone());
-    let memory = MemoryCache::new(buffers.clone());
-    let memory = Rc::new(if check_availability {
-        memory.with_availability(availability.clone())
-    } else {
-        memory
-    });
+    let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
     let reactor = Rc::new(Reactor::new(admission.clone()));
-    let index = Index::new(worker, 16);
-    let index = Rc::new(if check_availability {
-        index.with_availability(availability.clone())
-    } else {
-        index
-    });
+    let index = Rc::new(Index::new(worker, 16, availability.clone()));
     let segments = Rc::new(Segments::new(worker, 64 * 1024 * 1024));
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -204,12 +195,12 @@ fn fixture_with_availability(
         )
         .with_metrics(metrics.clone()),
     );
-    let writer = StoreWriter::new(index, segments, slabs);
-    let writer = Rc::new(if check_availability {
-        writer.with_availability(availability.clone())
-    } else {
-        writer
-    });
+    let writer = Rc::new(StoreWriter::new(
+        index,
+        segments,
+        slabs,
+        availability.clone(),
+    ));
     let context = OriginContext {
         object: ObjectId {
             cache: CacheId("33333333-3333-4333-8333-333333333333".into()),
@@ -276,14 +267,7 @@ fn fixture_with_availability(
         )
         .unwrap(),
     );
-    let flights = Rc::new(Flights::new(
-        admission.clone(),
-        if check_availability {
-            availability
-        } else {
-            crate::control::state::Availability::permissive_for_tests()
-        },
-    ));
+    let flights = Rc::new(Flights::new(admission.clone(), availability));
     let fill = Fill::new(FillDependencies {
         memory,
         buffers,
@@ -427,7 +411,14 @@ fn abandoned_acquisition_preserves_peer_scope(metadata: bool) {
                 f.fill.dependencies.credentials.clone(),
                 4,
                 MetadataDependencies {
-                    index: Rc::new(Index::new(WorkerId(0), 4)),
+                    index: Rc::new(Index::new(
+                        WorkerId(0),
+                        4,
+                        crate::control::state::for_caches(
+                            f.keys.clone(),
+                            vec![f.context.object.cache.clone()],
+                        ),
+                    )),
                     owners: f.fill.dependencies.metadata_owner.clone(),
                     fill: Rc::new(Fill::new(f.fill.dependencies.clone())),
                 },
@@ -880,7 +871,7 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
     let queue = Rc::new(crate::read::drivers::DriverQueue::default());
     let _owner = queue.enter();
     use crate::security::identity::{KeyPurpose, keyring_tests::rotation_bundle};
-    let mut f = fixture_with_availability(3, None, true);
+    let mut f = fixture_with(3, None);
     let flights = f.fill.dependencies.flights.clone();
     let mut held_budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
     let JoinedFlight::Waiter(mut held) = flights
@@ -1008,11 +999,12 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
                 range_stream::RangeStreams,
             },
         };
-        let snapshots = Rc::new(SnapshotStore::new(
-            f.keys.cluster().clone(),
-            Arc::new(PublishedState::default()),
-            2,
+        let published = Arc::new(PublishedState::default());
+        let availability = Rc::new(crate::control::state::Availability::new(
+            published.clone(),
+            f.keys.clone(),
         ));
+        let snapshots = Rc::new(SnapshotStore::new(f.keys.cluster().clone(), published, 2));
         let (client_socket, origin_socket) =
             crate::control::state::canonical_socket_paths("rotation").unwrap();
         snapshots
@@ -1038,7 +1030,7 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
             fill.dependencies.credentials.clone(),
             16,
             MetadataDependencies {
-                index: Rc::new(Index::new(WorkerId(0), 16)),
+                index: Rc::new(Index::new(WorkerId(0), 16, availability.clone())),
                 owners: owners.clone(),
                 fill: fill.clone(),
             },
@@ -1059,7 +1051,7 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
             fill.clone(),
             streams,
             fill.dependencies.credentials.clone(),
-            crate::control::state::Availability::permissive_for_tests(),
+            availability,
         ));
         let mut endpoint = owners.install(WorkerId(0), coordinator.clone()).unwrap();
         for ordered in [false, true] {
@@ -1728,7 +1720,11 @@ fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
     let failures = crate::telemetry::failures::Failures::default();
     deps.admission.set_observer(failures.observer(WorkerId(0)));
     use crate::read::metadata::{MetadataDependencies, MetadataService};
-    let index = Rc::new(Index::new(WorkerId(0), 64));
+    let index = Rc::new(Index::new(
+        WorkerId(0),
+        64,
+        crate::control::state::for_caches(f.keys.clone(), vec![f.context.object.cache.clone()]),
+    ));
     let mut fresh = metadata.clone();
     fresh.expires_at = ExpiresAt::from_unix_millis(
         std::time::SystemTime::now()

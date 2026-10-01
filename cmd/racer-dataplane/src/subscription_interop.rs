@@ -245,7 +245,7 @@ impl SubscriptionFixture {
             )
             .unwrap(),
         );
-        let index = Rc::new(Index::new(WorkerId(0), 16));
+        let index = Rc::new(Index::new(WorkerId(0), 16, availability.clone()));
         let segments = Rc::new(Segments::new(WorkerId(0), 64 * 1024 * 1024));
         let slabs = Rc::new(Slabs::new(
             WorkerId(0),
@@ -260,6 +260,7 @@ impl SubscriptionFixture {
             index.clone(),
             segments.clone(),
             slabs.clone(),
+            availability.clone(),
         ));
         let disk = Rc::new(StoreReader::new(
             Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1)),
@@ -281,7 +282,7 @@ impl SubscriptionFixture {
             Arc::new(Default::default()),
         ));
         let origin = Rc::new(GeneratedOrigin(buffers.clone()));
-        let memory = Rc::new(MemoryCache::new(buffers.clone()));
+        let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
         let fill = Rc::new(Fill::new(FillDependencies {
             memory: memory.clone(),
             buffers,

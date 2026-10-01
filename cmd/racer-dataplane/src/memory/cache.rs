@@ -66,32 +66,23 @@ pub struct MemoryCache {
     entries: RefCell<Entries>,
     ciphertext_entries: RefCell<BTreeMap<PageId, super::page::UnverifiedPage>>,
     ciphertext_cursor: RefCell<Option<PageId>>,
-    availability: Option<Rc<crate::control::state::Availability>>,
+    availability: Rc<crate::control::state::Availability>,
 }
 impl MemoryCache {
-    pub fn new(pool: BufferPool) -> Self {
+    pub fn new(pool: BufferPool, availability: Rc<crate::control::state::Availability>) -> Self {
         Self {
             pool,
             entries: RefCell::new(Entries::default()),
             ciphertext_entries: RefCell::new(BTreeMap::new()),
             ciphertext_cursor: RefCell::new(None),
-            availability: None,
+            availability,
         }
     }
-    pub fn with_availability(
-        mut self,
-        availability: Rc<crate::control::state::Availability>,
-    ) -> Self {
-        self.availability = Some(availability);
-        self
-    }
     fn available(&self, page: &PageResult) -> bool {
-        self.availability.as_ref().is_none_or(|a| {
-            a.page(
-                &page.metadata.version.object.cache,
-                page.ciphertext.envelope().key_id,
-            )
-        })
+        self.availability.page(
+            &page.metadata.version.object.cache,
+            page.ciphertext.envelope().key_id,
+        )
     }
     pub fn get(&self, page: &PageId) -> Result<Option<PageResult>> {
         let mut entries = self.entries.borrow_mut();
@@ -120,12 +111,10 @@ impl MemoryCache {
     pub(crate) fn unverified(&self, page: &PageId) -> Result<Option<super::page::UnverifiedPage>> {
         let mut entries = self.ciphertext_entries.borrow_mut();
         if entries.get(page).is_some_and(|entry| {
-            self.availability.as_ref().is_some_and(|a| {
-                !a.page(
-                    &page.version.object.cache,
-                    entry.copy.ciphertext.envelope().key_id,
-                )
-            })
+            !self.availability.page(
+                &page.version.object.cache,
+                entry.copy.ciphertext.envelope().key_id,
+            )
         }) {
             entries.remove(page);
         }
@@ -134,12 +123,10 @@ impl MemoryCache {
     pub(crate) fn publish_ciphertext(&self, page: super::page::UnverifiedPage) -> Result<()> {
         self.pool.validate_ciphertext(&page.copy)?;
         let id = &page.copy.ciphertext.envelope().page;
-        if self.availability.as_ref().is_some_and(|a| {
-            !a.page(
-                &id.version.object.cache,
-                page.copy.ciphertext.envelope().key_id,
-            )
-        }) {
+        if !self.availability.page(
+            &id.version.object.cache,
+            page.copy.ciphertext.envelope().key_id,
+        ) {
             return Err(Error::MissingKey);
         }
         let mut entries = self.ciphertext_entries.borrow_mut();
@@ -169,11 +156,7 @@ impl MemoryCache {
     fn publish_validated(&self, page: PageResult) -> Result<()> {
         let id = page.plaintext.page();
         self.ciphertext_entries.borrow_mut().remove(id);
-        if self
-            .availability
-            .as_ref()
-            .is_some_and(|a| !a.cache(&id.version.object.cache))
-        {
+        if !self.availability.cache(&id.version.object.cache) {
             return Err(Error::Unavailable);
         }
         if !self.available(&page) {
@@ -234,12 +217,10 @@ impl MemoryCache {
             .values()
             .find(|entry| {
                 &entry.copy.metadata.version == version
-                    && self.availability.as_ref().is_none_or(|a| {
-                        a.page(
-                            &version.object.cache,
-                            entry.copy.ciphertext.envelope().key_id,
-                        )
-                    })
+                    && self.availability.page(
+                        &version.object.cache,
+                        entry.copy.ciphertext.envelope().key_id,
+                    )
             })
             .map(|entry| entry.copy.metadata.immutable()))
     }
@@ -402,7 +383,10 @@ mod tests {
     #[test]
     fn ciphertext_residency_is_distinct_bounded_and_conditionally_invalidated() {
         let admission = admission(2);
-        let cache = MemoryCache::new(BufferPool::new(admission.clone()));
+        let cache = MemoryCache::new(
+            BufferPool::new(admission.clone()),
+            crate::test_support::availability(),
+        );
         let first = bundle(&admission, "cipher");
         let id = first.plaintext.page().clone();
         let unverified = super::super::page::UnverifiedPage {
@@ -435,7 +419,10 @@ mod tests {
     #[test]
     fn bounded_reclamation_advances_past_a_busy_prefix() {
         let admission = admission(300);
-        let cache = MemoryCache::new(BufferPool::new(admission.clone()));
+        let cache = MemoryCache::new(
+            BufferPool::new(admission.clone()),
+            crate::test_support::availability(),
+        );
         let mut busy = Vec::new();
         let mut ids = Vec::new();
         for n in 0..300 {
@@ -470,7 +457,10 @@ mod tests {
     #[test]
     fn busy_leases_protect_both_allocations_and_eviction_releases_idle_bytes() {
         let admission = admission(8);
-        let cache = MemoryCache::new(BufferPool::new(admission.clone()));
+        let cache = MemoryCache::new(
+            BufferPool::new(admission.clone()),
+            crate::test_support::availability(),
+        );
         let page = bundle(&admission, "v1");
         let id = page.plaintext.page().clone();
         cache.publish(page).unwrap();
@@ -490,7 +480,10 @@ mod tests {
     #[test]
     fn duplicate_preserves_original_ciphertext_metadata_and_expired_deadline() {
         let admission = admission(8);
-        let cache = MemoryCache::new(BufferPool::new(admission.clone()));
+        let cache = MemoryCache::new(
+            BufferPool::new(admission.clone()),
+            crate::test_support::availability(),
+        );
         let page = bundle(&admission, "v1");
         let id = page.plaintext.page().clone();
         let original = page.ciphertext.envelope().clone();
@@ -516,7 +509,10 @@ mod tests {
     #[test]
     fn capacity_evicts_least_recent_idle_entry_and_rejects_all_busy() {
         let admission = admission(2);
-        let cache = MemoryCache::new(BufferPool::new(admission.clone()));
+        let cache = MemoryCache::new(
+            BufferPool::new(admission.clone()),
+            crate::test_support::availability(),
+        );
         let first = bundle(&admission, "v1");
         let first_id = first.plaintext.page().clone();
         let second = bundle(&admission, "v2");
@@ -548,7 +544,10 @@ mod tests {
     #[test]
     fn publication_rejects_foreign_undercharged_and_conflicting_bundles() {
         let admission = admission(8);
-        let cache = MemoryCache::new(BufferPool::new(admission.clone()));
+        let cache = MemoryCache::new(
+            BufferPool::new(admission.clone()),
+            crate::test_support::availability(),
+        );
         assert_eq!(
             cache.publish(bundle(&self::admission(8), "v1")),
             Err(Error::InvalidConfiguration)
@@ -594,11 +593,16 @@ mod tests {
     #[test]
     fn eviction_is_cache_scoped_and_preserves_live_leases() {
         let admission = admission(8);
-        let cache = MemoryCache::new(BufferPool::new(admission.clone()));
+        let other_cache = CacheId("44444444-4444-4444-8444-444444444444".into());
+        let availability = crate::test_support::availability_for(vec![
+            CacheId(crate::security::identity::tests::CACHE.into()),
+            other_cache.clone(),
+        ]);
+        let cache = MemoryCache::new(BufferPool::new(admission.clone()), availability);
         let page = bundle(&admission, "v1");
         let id = page.plaintext.page().clone();
         let mut other_descriptor = page.metadata.immutable();
-        other_descriptor.version.object.cache = CacheId("other".into());
+        other_descriptor.version.object.cache = other_cache;
         let other = bundle_for(&admission, other_descriptor.clone());
         let other_id = other.plaintext.page().clone();
         cache.publish(page.clone()).unwrap();
@@ -623,7 +627,10 @@ mod tests {
     #[test]
     fn eviction_is_idempotent_and_churn_needs_no_tombstones() {
         let admission = admission(1);
-        let cache = MemoryCache::new(BufferPool::new(admission));
+        let cache = MemoryCache::new(
+            BufferPool::new(admission),
+            crate::test_support::availability(),
+        );
         let id = CacheId("cache".into());
         assert_eq!(cache.retire_key(&id, KeyId([1; 16])), Ok(0));
         assert_eq!(cache.retire_key(&id, KeyId([1; 16])), Ok(0));
@@ -647,8 +654,10 @@ mod tests {
         let caches: Vec<_> = (0..356)
             .map(|cache| CacheId(format!("{cache:08x}-0000-4000-8000-000000000000")))
             .collect();
-        let memory = MemoryCache::new(BufferPool::new(admission.clone()))
-            .with_availability(for_caches(keys.clone(), caches.clone()));
+        let memory = MemoryCache::new(
+            BufferPool::new(admission.clone()),
+            for_caches(keys.clone(), caches.clone()),
+        );
         let mut previous: Vec<crate::control::wire::CacheKeyRef> = Vec::new();
         for generation in 2u64..=6 {
             let mut next = rotation_bundle(generation, roots.clone());
@@ -665,13 +674,7 @@ mod tests {
             for key in previous {
                 if key.purpose == CacheKeyPurpose::Page {
                     assert_eq!(memory.retire_key(&key.cache, key.id), Ok(0));
-                    assert!(
-                        !memory
-                            .availability
-                            .as_ref()
-                            .unwrap()
-                            .page(&key.cache, key.id)
-                    );
+                    assert!(!memory.availability.page(&key.cache, key.id));
                 }
             }
             previous = next.cache_keys.iter().map(|key| key.key.clone()).collect();

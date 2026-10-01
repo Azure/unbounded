@@ -958,7 +958,7 @@ pub(crate) mod tests {
             content_type: None,
             version: ObjectVersion {
                 object: ObjectId {
-                    cache: CacheId("cache".into()),
+                    cache: CacheId(crate::security::identity::tests::CACHE.into()),
                     key: CacheKey([0; 32]),
                 },
                 etag: StrongEtag::test_value(etag),
@@ -1252,7 +1252,7 @@ pub(crate) mod tests {
             mono + Duration::from_secs(4)
         ));
         assert_eq!(clock.epoch, 2);
-        let index = Index::new(WorkerId(0), 4);
+        let index = Index::new(WorkerId(0), 4, crate::test_support::availability());
         let old = metadata("old", 7);
         let mut new = metadata("new", 900);
         new.expires_at = ExpiresAt(SystemTime::now() + Duration::from_secs(60));

@@ -64,12 +64,12 @@ fn terminal_waiter_replacement_matches_production_before_completion() {
         let real = Rc::new(Admission::new(sim.workers[0].admission.limits().clone()));
         let flights = Rc::new(Flights::new(
             real.clone(),
-            crate::control::state::Availability::permissive_for_tests(),
+            crate::test_support::availability(),
         ));
         let page = PageId {
             version: ObjectVersion {
                 object: ObjectId {
-                    cache: CacheId("0".into()),
+                    cache: CacheId(crate::security::identity::tests::CACHE.into()),
                     key: CacheKey([0; 32]),
                 },
                 etag: StrongEtag::test_value("v1"),

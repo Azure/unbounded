@@ -56,7 +56,15 @@ fn busy_victim_waits_and_clock_makes_progress() {
         .unwrap();
     let held = segments.append(512).unwrap();
     drop(segments.append(512).unwrap());
-    let clock = SegmentClock::new(Rc::new(Index::new(WorkerId(0), 1)), segments.clone(), 2);
+    let clock = SegmentClock::new(
+        Rc::new(Index::new(
+            WorkerId(0),
+            1,
+            crate::test_support::availability(),
+        )),
+        segments.clone(),
+        2,
+    );
     clock.mark_read(SegmentId(1)).unwrap();
     assert_eq!(clock.reclaim_now(), Err(Error::Overloaded));
     assert_eq!(segments.free_count(), 1);

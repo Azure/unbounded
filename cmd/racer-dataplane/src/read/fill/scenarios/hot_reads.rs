@@ -119,6 +119,10 @@ fn coordinator(
     Arc<PublishedState>,
 ) {
     let published = Arc::new(PublishedState::default());
+    let availability = Rc::new(crate::control::state::Availability::new(
+        published.clone(),
+        f.keys.clone(),
+    ));
     let snapshots = Rc::new(SnapshotStore::new(
         f.keys.cluster().clone(),
         published.clone(),
@@ -157,7 +161,7 @@ fn coordinator(
         fill.dependencies.credentials.clone(),
         32,
         MetadataDependencies {
-            index: Rc::new(Index::new(WorkerId(0), 32)),
+            index: Rc::new(Index::new(WorkerId(0), 32, availability.clone())),
             owners: owners.clone(),
             fill: fill.clone(),
         },
@@ -179,7 +183,7 @@ fn coordinator(
         fill.clone(),
         streams,
         fill.dependencies.credentials.clone(),
-        crate::control::state::Availability::permissive_for_tests(),
+        availability,
     ));
     let endpoint = owners.install(WorkerId(0), local.clone()).unwrap();
     (local, endpoint, published)

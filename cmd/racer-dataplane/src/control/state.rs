@@ -441,48 +441,20 @@ impl CacheRegistry {
 pub struct Availability {
     publications: Arc<PublishedState>,
     keys: Rc<Keyring>,
-    #[cfg(test)]
-    permissive: bool,
 }
 impl Availability {
     pub fn new(publications: Arc<PublishedState>, keys: Rc<Keyring>) -> Self {
-        Self {
-            publications,
-            keys,
-            #[cfg(test)]
-            permissive: false,
-        }
-    }
-    /// Isolated state-machine tests explicitly opt out of control-plane admission.
-    #[cfg(test)]
-    pub(crate) fn permissive_for_tests() -> Rc<Self> {
-        Rc::new(Self {
-            publications: Arc::new(PublishedState::default()),
-            keys: Rc::new(crate::security::identity::keyring_tests::keys()),
-            permissive: true,
-        })
+        Self { publications, keys }
     }
     pub fn cache(&self, cache: &CacheId) -> bool {
-        #[cfg(test)]
-        if self.permissive {
-            return true;
-        }
         self.publications
             .current()
             .is_ok_and(|s| s.caches.iter().any(|c| &c.id == cache))
     }
     pub fn metadata(&self, cache: &CacheId) -> bool {
-        #[cfg(test)]
-        if self.permissive {
-            return true;
-        }
         self.cache(cache) && self.keys.active(cache, KeyPurpose::Page).is_ok()
     }
     pub fn page(&self, cache: &CacheId, key: KeyId) -> bool {
-        #[cfg(test)]
-        if self.permissive {
-            return true;
-        }
         self.cache(cache) && self.keys.lease(Some(cache), key, KeyPurpose::Page).is_ok()
     }
 }

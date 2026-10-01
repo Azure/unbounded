@@ -142,7 +142,7 @@ fn descriptor(etag: &str, length: u64) -> VersionMetadata {
         content_type: None,
         version: ObjectVersion {
             object: ObjectId {
-                cache: CacheId("cache".into()),
+                cache: CacheId(crate::security::identity::tests::CACHE.into()),
                 key: CacheKey([7; 32]),
             },
             etag: StrongEtag::parse(format!("\"{etag}\"").as_bytes()).unwrap(),
@@ -153,7 +153,11 @@ fn descriptor(etag: &str, length: u64) -> VersionMetadata {
 
 fn state(capacity: usize) -> (Rc<Index>, Rc<Segments>) {
     let g = geometry();
-    let index = Rc::new(Index::new(WorkerId(0), capacity));
+    let index = Rc::new(Index::new(
+        WorkerId(0),
+        capacity,
+        crate::test_support::availability(),
+    ));
     let segments = Rc::new(Segments::new(WorkerId(0), g.segment_bytes));
     segments
         .configure(
@@ -189,7 +193,7 @@ fn shard() -> ShardImage {
                     location: lease.location,
                 },
                 metadata,
-                key_id: KeyId([9; 16]),
+                key_id: KeyId([1; 16]),
             },
         )
         .unwrap();
@@ -346,7 +350,7 @@ fn binary_round_trip_retains_locations_keys_metadata_and_is_send() {
     assert_eq!(shard.geometry, geometry());
     let (_, entry) = &shard.index.entries[0];
     assert_eq!(entry.metadata, descriptor("v1", 17));
-    assert_eq!(entry.key_id, KeyId([9; 16]));
+    assert_eq!(entry.key_id, KeyId([1; 16]));
     assert_eq!(entry.location.location.extent.length(), 4096);
     assert!(
         shard

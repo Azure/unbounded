@@ -378,9 +378,13 @@ fn validate_candidate(
         if geometry.get(&shard.worker) != Some(&shard.geometry) || shard.validate().is_err() {
             return None;
         }
-        let index = Index::new(shard.worker, metadata_capacity);
-        index.set_page_capacity(page_capacity).ok()?;
-        index.validate_snapshot(&shard.index).ok()?;
+        if page_capacity == 0 {
+            return None;
+        }
+        shard
+            .index
+            .validate_capacity(page_capacity, metadata_capacity)
+            .ok()?;
         if shard
             .index
             .entries
@@ -631,7 +635,11 @@ mod tests {
         .unwrap();
         assert!(keyless.shards[0].index.entries.is_empty());
         assert!(keyless.shards[0].index.metadata.is_empty());
-        let index = Rc::new(Index::new(WorkerId(0), 16));
+        let index = Rc::new(Index::new(
+            WorkerId(0),
+            16,
+            crate::test_support::availability(),
+        ));
         let segments = Rc::new(Segments::new(WorkerId(0), g.segment_bytes));
         segments
             .configure(

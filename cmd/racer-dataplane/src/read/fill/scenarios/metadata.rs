@@ -37,7 +37,14 @@ fn metadata_cohorts_refresh_zero_ttl_and_do_not_negative_cache_adapter_failure()
             f.fill.dependencies.credentials.clone(),
             1,
             MetadataDependencies {
-                index: Rc::new(Index::new(WorkerId(0), 8)),
+                index: Rc::new(Index::new(
+                    WorkerId(0),
+                    8,
+                    crate::control::state::for_caches(
+                        f.keys.clone(),
+                        vec![f.context.object.cache.clone()],
+                    ),
+                )),
                 fill: Rc::new(Fill::new(f.fill.dependencies.clone())),
                 owners: f.fill.dependencies.metadata_owner.clone(),
             },
@@ -133,7 +140,14 @@ fn bootstrap_rejection_re_elects_and_version_changes_never_mix_pages() {
         f.fill.dependencies.credentials.clone(),
         8,
         MetadataDependencies {
-            index: Rc::new(Index::new(WorkerId(0), 8)),
+            index: Rc::new(Index::new(
+                WorkerId(0),
+                8,
+                crate::control::state::for_caches(
+                    f.keys.clone(),
+                    vec![f.context.object.cache.clone()],
+                ),
+            )),
             fill: Rc::new(Fill::new(f.fill.dependencies.clone())),
             owners: f.fill.dependencies.metadata_owner.clone(),
         },
@@ -331,7 +345,14 @@ fn bootstrap_after_catalog_eviction_checks_cached_content_type_and_preserves_fre
                 .remove_cache(&f.context.object.cache)
                 .unwrap();
             f.fill.dependencies.memory.publish(cached.clone()).unwrap();
-            let index = Rc::new(Index::new(WorkerId(0), 4));
+            let index = Rc::new(Index::new(
+                WorkerId(0),
+                4,
+                crate::control::state::for_caches(
+                    f.keys.clone(),
+                    vec![f.context.object.cache.clone()],
+                ),
+            ));
             index.publish_version(cached.metadata.immutable()).unwrap();
             assert_eq!(index.evict_metadata(1).unwrap(), 1);
             assert!(index.version(&f.page.version).unwrap().is_none());
@@ -468,7 +489,14 @@ fn blocked_metadata_leader_and_follower_notify_without_spinning() {
             f.fill.dependencies.credentials.clone(),
             4,
             MetadataDependencies {
-                index: Rc::new(Index::new(WorkerId(0), 4)),
+                index: Rc::new(Index::new(
+                    WorkerId(0),
+                    4,
+                    crate::control::state::for_caches(
+                        f.keys.clone(),
+                        vec![f.context.object.cache.clone()],
+                    ),
+                )),
                 owners: f.fill.dependencies.metadata_owner.clone(),
                 fill: Rc::new(Fill::new(f.fill.dependencies.clone())),
             },
@@ -576,7 +604,14 @@ fn metadata_deadline_wakes_parked_follower_without_polling_gated_leader() {
             f.fill.dependencies.credentials.clone(),
             1,
             MetadataDependencies {
-                index: Rc::new(Index::new(WorkerId(0), 4)),
+                index: Rc::new(Index::new(
+                    WorkerId(0),
+                    4,
+                    crate::control::state::for_caches(
+                        f.keys.clone(),
+                        vec![f.context.object.cache.clone()],
+                    ),
+                )),
                 owners: f.fill.dependencies.metadata_owner.clone(),
                 fill: Rc::new(Fill::new(f.fill.dependencies.clone())),
             },

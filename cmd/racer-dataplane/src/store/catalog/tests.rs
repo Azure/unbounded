@@ -6,7 +6,7 @@ use crate::{
 
 #[test]
 fn content_type_survives_catalog_and_legacy_refresh_and_rejects_conflicts() {
-    let index = Index::new(WorkerId(0), 8);
+    let index = Index::new(WorkerId(0), 8, crate::test_support::availability());
     let legacy = descriptor("v1", 3);
     index.publish_version(legacy.clone()).unwrap();
     let mut typed = legacy.clone();
@@ -25,7 +25,7 @@ fn descriptor(etag: &str, length: u64) -> VersionMetadata {
         content_type: None,
         version: ObjectVersion {
             object: ObjectId {
-                cache: CacheId("cache".into()),
+                cache: CacheId(crate::security::identity::tests::CACHE.into()),
                 key: CacheKey([0; 32]),
             },
             etag: StrongEtag::test_value(etag),
@@ -89,7 +89,7 @@ fn indexed(metadata: VersionMetadata, segment: u64) -> (PageId, IndexedPage) {
 
 #[test]
 fn catalog_eviction_preserves_pages_and_conditional_removal_preserves_replacement() {
-    let index = Index::new(WorkerId(0), 1);
+    let index = Index::new(WorkerId(0), 1, crate::test_support::availability());
     index.set_page_capacity(1).unwrap();
     let (page, old) = indexed(descriptor("old", 17), 0);
     index.publish_version(old.metadata.clone()).unwrap();
@@ -114,7 +114,7 @@ fn catalog_eviction_preserves_pages_and_conditional_removal_preserves_replacemen
 
 #[test]
 fn capacity_preflight_allows_replacement_and_reopens_only_after_removal() {
-    let index = Index::new(WorkerId(0), 1);
+    let index = Index::new(WorkerId(0), 1, crate::test_support::availability());
     index.set_page_capacity(1).unwrap();
     let (page, entry) = indexed(descriptor("first", 17), 0);
     let (other, other_entry) = indexed(descriptor("other", 17), 1);
@@ -145,7 +145,7 @@ fn capacity_preflight_allows_replacement_and_reopens_only_after_removal() {
 
 #[test]
 fn restore_is_atomic_and_drops_freshness() {
-    let index = Index::new(WorkerId(0), 2);
+    let index = Index::new(WorkerId(0), 2, crate::test_support::availability());
     let m = descriptor("v1", 17);
     let mut current = m.for_pin();
     current.expires_at.0 = std::time::SystemTime::now() + std::time::Duration::from_secs(60);

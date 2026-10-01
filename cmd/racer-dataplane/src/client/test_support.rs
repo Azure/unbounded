@@ -94,7 +94,7 @@ impl ReadWorker {
             .unwrap(),
         );
         let buffers = BufferPool::new(admission.clone());
-        let index = Rc::new(Index::new(WorkerId(0), 16));
+        let index = Rc::new(Index::new(WorkerId(0), 16, availability.clone()));
         let segments = Rc::new(Segments::new(WorkerId(0), 64 * 1024 * 1024));
         // Reads use an empty disk index. No slabs need to be opened or written.
         let slabs = Rc::new(Slabs::new(
@@ -109,6 +109,7 @@ impl ReadWorker {
             index.clone(),
             segments.clone(),
             slabs.clone(),
+            availability.clone(),
         ));
         let disk = Rc::new(StoreReader::new(
             Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1)),
@@ -133,7 +134,7 @@ impl ReadWorker {
             reactor,
             buffers.clone(),
         );
-        let memory = Rc::new(MemoryCache::new(buffers.clone()));
+        let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
         let fill = Rc::new(Fill::new(FillDependencies {
             memory: memory.clone(),
             buffers,

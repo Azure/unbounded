@@ -38,7 +38,7 @@ pub struct StoreWriter {
     capacity: Cell<usize>,
     busy: Cell<bool>,
     active_scope: RefCell<Option<RequestScope>>,
-    availability: Option<Rc<crate::control::state::Availability>>,
+    availability: Rc<crate::control::state::Availability>,
     discarded: Cell<u64>,
     closed: Cell<bool>,
 }
@@ -51,7 +51,12 @@ impl DirtyTicket {
     }
 }
 impl StoreWriter {
-    pub fn new(index: Rc<Index>, segments: Rc<Segments>, slabs: Rc<Slabs>) -> Self {
+    pub fn new(
+        index: Rc<Index>,
+        segments: Rc<Segments>,
+        slabs: Rc<Slabs>,
+        availability: Rc<crate::control::state::Availability>,
+    ) -> Self {
         Self {
             metrics: crate::telemetry::metrics::Metrics::default(),
             index,
@@ -64,20 +69,13 @@ impl StoreWriter {
             capacity: Cell::new(64),
             busy: Cell::new(false),
             active_scope: RefCell::new(None),
-            availability: None,
+            availability,
             discarded: Cell::new(0),
             closed: Cell::new(false),
         }
     }
     pub fn with_metrics(mut self, metrics: crate::telemetry::metrics::Metrics) -> Self {
         self.metrics = metrics;
-        self
-    }
-    pub fn with_availability(
-        mut self,
-        availability: Rc<crate::control::state::Availability>,
-    ) -> Self {
-        self.availability = Some(availability);
         self
     }
     pub fn configure(
@@ -123,8 +121,7 @@ impl StoreWriter {
     fn allowed(&self, page: &CiphertextCopy) -> bool {
         let e = page.ciphertext.envelope();
         self.availability
-            .as_ref()
-            .is_none_or(|a| a.page(&e.page.version.object.cache, e.key_id))
+            .page(&e.page.version.object.cache, e.key_id)
     }
     pub fn enqueue(&self, page: CiphertextCopy, dirty: Reservation) -> Result<DirtyTicket> {
         let cache = page.metadata.version.object.cache.clone();

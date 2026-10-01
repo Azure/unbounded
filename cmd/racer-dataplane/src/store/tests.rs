@@ -54,13 +54,19 @@ impl Fixture {
         Self::in_directory(Directory::new())
     }
     fn in_directory(directory: Directory) -> Self {
+        Self::assemble(directory, crate::test_support::availability())
+    }
+    fn assemble(
+        directory: Directory,
+        availability: Rc<crate::control::state::Availability>,
+    ) -> Self {
         let metrics = crate::telemetry::metrics::Metrics::default();
         let admission = Rc::new(Admission::new(
             crate::test_support::cluster::config(false).limits,
         ));
         let reactor = Rc::new(Reactor::new(admission.clone()));
         let pool = BufferPool::new(admission.clone());
-        let index = Rc::new(catalog::Index::new(WorkerId(0), 16));
+        let index = Rc::new(catalog::Index::new(WorkerId(0), 16, availability.clone()));
         let segments = Rc::new(catalog::Segments::new(WorkerId(0), 32 * 1024 * 1024));
         let eviction = Rc::new(catalog::SegmentClock::new(
             index.clone(),
@@ -86,7 +92,7 @@ impl Fixture {
             .with_metrics(metrics.clone()),
         );
         let writer = Rc::new(
-            writer::StoreWriter::new(index.clone(), segments.clone(), slabs)
+            writer::StoreWriter::new(index.clone(), segments.clone(), slabs, availability)
                 .with_metrics(metrics.clone()),
         );
         let store = Store {
@@ -119,7 +125,7 @@ impl Fixture {
     fn copy(&self, number: u8, length: usize) -> CiphertextCopy {
         let version = ObjectVersion {
             object: ObjectId {
-                cache: CacheId("cache".into()),
+                cache: CacheId(crate::security::identity::tests::CACHE.into()),
                 key: CacheKey([number; 32]),
             },
             etag: StrongEtag::parse(b"\"v1\"").unwrap(),
@@ -182,6 +188,85 @@ impl Fixture {
 }
 fn scope() -> RequestScope {
     RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(10)).unwrap()
+}
+
+#[test]
+fn storage_requires_published_cache_and_live_keys_including_restore() {
+    use crate::{
+        control::state::{Availability, PublishedState, for_caches},
+        memory::{cache::MemoryCache, pool::tests::bundle_for},
+        security::identity::keyring_tests::{keys, rotation_bundle},
+    };
+    use std::sync::Arc;
+
+    for mode in ["unpublished", "absent", "keyless", "available"] {
+        let keys = Rc::new(keys());
+        let cache = CacheId(crate::security::identity::tests::CACHE.into());
+        let availability = match mode {
+            "unpublished" => Rc::new(Availability::new(
+                Arc::new(PublishedState::default()),
+                keys.clone(),
+            )),
+            "absent" => for_caches(keys.clone(), vec![]),
+            _ => for_caches(keys.clone(), vec![cache.clone()]),
+        };
+        let revoke = || {
+            let mut next = rotation_bundle(2, (*keys.peer_trust_roots().unwrap()).clone());
+            next.cache_keys.clear();
+            keys.install(next).unwrap();
+        };
+        if mode == "keyless" {
+            revoke();
+        }
+        let f = Fixture::assemble(Directory::new(), availability.clone());
+        let memory = MemoryCache::new(f.pool.clone(), availability);
+        let copy = f.copy(1, 3);
+        let descriptor = copy.metadata.immutable();
+        let page = bundle_for(&f.admission, descriptor.clone());
+        let id = page.plaintext.page().clone();
+        let index = f.store.writer.index();
+        index.publish_version(descriptor.clone()).unwrap();
+        if mode != "available" {
+            assert!(index.version(&id.version).unwrap().is_none());
+            assert_eq!(
+                memory.publish(page.clone()),
+                Err(if mode == "keyless" {
+                    Error::MissingKey
+                } else {
+                    Error::Unavailable
+                })
+            );
+            assert_eq!(
+                memory.publish_ciphertext(crate::memory::page::UnverifiedPage {
+                    copy: page.copy(),
+                    disk_token: None
+                }),
+                Err(Error::MissingKey)
+            );
+            assert!(matches!(f.enqueue(copy), Err(Error::MissingKey)));
+            assert_eq!(f.store.writer.pending_count(), 0);
+            assert!(memory.get(&id).unwrap().is_none());
+            continue;
+        }
+        futures::executor::block_on(f.store.open()).unwrap();
+        f.reactor.init().unwrap();
+        f.enqueue(copy).unwrap();
+        drive(&f.reactor, f.store.writer.progress(1, &scope())).unwrap();
+        memory.publish(page.clone()).unwrap();
+        assert!(memory.get(&id).unwrap().is_some());
+        assert!(index.lookup(&id).unwrap().is_some());
+        assert_eq!(index.version(&id.version).unwrap(), Some(descriptor));
+        let snapshot = index.snapshot().unwrap();
+        revoke();
+        assert!(memory.get(&id).unwrap().is_none());
+        assert!(index.lookup(&id).unwrap().is_none());
+        assert_eq!(memory.publish(page.clone()), Err(Error::MissingKey));
+        assert!(matches!(f.enqueue(page.copy()), Err(Error::MissingKey)));
+        index.restore(snapshot).unwrap();
+        assert!(index.snapshot().unwrap().entries.is_empty());
+        assert!(index.snapshot().unwrap().metadata.is_empty());
+        assert_eq!(page.plaintext.bytes(), &[1; 3]);
+    }
 }
 fn drive<T>(reactor: &Reactor, future: impl Future<Output = Result<T>>) -> Result<T> {
     let mut future = std::pin::pin!(future);
@@ -355,7 +440,10 @@ fn dirty_queue_is_bounded_and_retirement_discards_without_io() {
     assert!(f.store.writer.copy_only(&id).unwrap().is_some());
     f.store
         .writer
-        .retire_key(&CacheId("cache".into()), KeyId([1; 16]))
+        .retire_key(
+            &CacheId(crate::security::identity::tests::CACHE.into()),
+            KeyId([1; 16]),
+        )
         .unwrap();
     assert_eq!(f.store.writer.pending_count(), 0);
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
@@ -394,6 +482,7 @@ fn index_capacity_rejection_preserves_segments_and_releases_all_charges_without_
         f.store.writer.index().clone(),
         f.segments.clone(),
         f.store.writer.slabs().clone(),
+        crate::test_support::availability(),
     ));
     let index = f.store.writer.index();
     index.set_page_capacity(1).unwrap();
@@ -847,7 +936,10 @@ fn retirement_during_write_fences_late_publication() {
     assert!(operation.as_mut().poll(&mut cx).is_pending());
     f.store
         .writer
-        .retire_key(&CacheId("cache".into()), KeyId([1; 16]))
+        .retire_key(
+            &CacheId(crate::security::identity::tests::CACHE.into()),
+            KeyId([1; 16]),
+        )
         .unwrap();
     // Reinsert the same immutable page while the original submitted write still
     // owns its segment/buffer. The old completion cannot publish or remove it.
@@ -893,18 +985,12 @@ fn sustained_rotation_reclaims_history_and_fences_held_pages_and_write_completio
         },
     };
     use std::sync::Arc;
-    let mut f = Fixture::new();
     let keys = Rc::new(keys());
     let roots = (*keys.peer_trust_roots().unwrap()).clone();
     let cache = CacheId(crate::security::identity::tests::CACHE.into());
     let availability = for_caches(keys.clone(), vec![cache.clone()]);
-    f.store.writer = Rc::new(
-        Rc::try_unwrap(f.store.writer)
-            .ok()
-            .unwrap()
-            .with_availability(availability.clone()),
-    );
-    let memory = MemoryCache::new(f.pool.clone()).with_availability(availability);
+    let f = Fixture::assemble(Directory::new(), availability.clone());
+    let memory = MemoryCache::new(f.pool.clone(), availability);
     futures::executor::block_on(f.store.open()).unwrap();
     f.reactor.init().unwrap();
     let mut descriptor = f.copy(1, 3).metadata.immutable();
@@ -1018,7 +1104,10 @@ fn truncated_payload_is_a_miss_and_write_failure_releases_dirty_accounting() {
     assert_eq!(f.store.writer.pending_count(), 0);
     f.store
         .writer
-        .retire_key(&CacheId("cache".into()), KeyId([1; 16]))
+        .retire_key(
+            &CacheId(crate::security::identity::tests::CACHE.into()),
+            KeyId([1; 16]),
+        )
         .unwrap();
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
 }
@@ -1147,10 +1236,10 @@ fn incremental_ciphertext_reclamation_preserves_submitted_fence_and_remaining_qu
     assert!(write.as_mut().poll(&mut cx).is_pending());
     assert_eq!(f.store.writer.writes_in_flight(), 1);
     let before = f.admission.used(ResourceClass::Ciphertext);
-    let released = f
-        .store
-        .writer
-        .reclaim_ciphertext(Some(&CacheId("cache".into())), 1);
+    let released = f.store.writer.reclaim_ciphertext(
+        Some(&CacheId(crate::security::identity::tests::CACHE.into())),
+        1,
+    );
     assert!(released > 0);
     assert_eq!(
         before - f.admission.used(ResourceClass::Ciphertext),

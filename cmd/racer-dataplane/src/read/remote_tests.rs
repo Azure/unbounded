@@ -46,7 +46,17 @@ fn node(n: usize) -> NodeId {
 }
 fn identities(nodes: &[NodeId]) -> Vec<Identity> {
     crate::security::test_support::identities(ClusterId(CLUSTER.into()), nodes, || {
-        crate::security::connection::signature_tests::mac_test_key(CACHE)
+        let mut keys = crate::security::connection::signature_tests::mac_test_key(CACHE);
+        keys.push(crate::control::wire::CacheEncryptionKey {
+            key: crate::control::wire::CacheKeyRef {
+                cache: CacheId(CACHE.into()),
+                id: KeyId([1; 16]),
+                purpose: crate::control::wire::CacheKeyPurpose::Page,
+            },
+            state: crate::control::wire::CacheKeyState::Active,
+            material: [7; 32],
+        });
+        keys
     })
 }
 struct NeverRelay;
@@ -890,11 +900,12 @@ fn metadata_coordinator_with_newer_publication(
             writer::StoreWriter,
         },
     };
-    let snapshots = Rc::new(SnapshotStore::new(
-        ClusterId(CLUSTER.into()),
-        Arc::new(PublishedState::default()),
-        4,
+    let published = Arc::new(PublishedState::default());
+    let availability = Rc::new(crate::control::state::Availability::new(
+        published.clone(),
+        keys.clone(),
     ));
+    let snapshots = Rc::new(SnapshotStore::new(ClusterId(CLUSTER.into()), published, 4));
     let mut publication = Publication {
         schema_version: SCHEMA_VERSION,
         cluster: ClusterId(CLUSTER.into()),
@@ -918,7 +929,7 @@ fn metadata_coordinator_with_newer_publication(
         // membership has advanced and no longer includes this candidate.
     }
     let buffers = BufferPool::new(admission.clone());
-    let index = Rc::new(Index::new(WorkerId(0), 16));
+    let index = Rc::new(Index::new(WorkerId(0), 16, availability.clone()));
     let segments = Rc::new(Segments::new(WorkerId(0), 64 * 1024 * 1024));
     let slabs = Rc::new(Slabs::new(
         WorkerId(0),
@@ -935,7 +946,12 @@ fn metadata_coordinator_with_newer_publication(
         slabs.clone(),
         buffers.clone(),
     ));
-    let writer = Rc::new(StoreWriter::new(index.clone(), segments, slabs));
+    let writer = Rc::new(StoreWriter::new(
+        index.clone(),
+        segments,
+        slabs,
+        availability.clone(),
+    ));
     let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
     let candidates = Rc::new(CandidatePolicy::new(
         node.clone(),
@@ -960,7 +976,7 @@ fn metadata_coordinator_with_newer_publication(
     );
     let (port, _engine) = crypto::pair(WorkerId(0), 0, std::num::NonZeroUsize::new(16).unwrap());
     let fill = Rc::new(super::fill::Fill::new(super::fill::FillDependencies {
-        memory: Rc::new(MemoryCache::new(buffers.clone())),
+        memory: Rc::new(MemoryCache::new(buffers.clone(), availability.clone())),
         buffers,
         disk,
         writer,
@@ -968,7 +984,7 @@ fn metadata_coordinator_with_newer_publication(
         candidates: candidates.clone(),
         flights: Rc::new(super::flight::Flights::new(
             admission.clone(),
-            crate::control::state::Availability::permissive_for_tests(),
+            availability.clone(),
         )),
         crypto: Rc::new(PageCrypto::new(keys, Rc::new(CryptoClient::new(port)))),
         credentials: credentials.clone(),
@@ -1001,7 +1017,7 @@ fn metadata_coordinator_with_newer_publication(
         fill,
         streams,
         credentials,
-        crate::control::state::Availability::permissive_for_tests(),
+        availability,
     ));
     let endpoint = owners.install(WorkerId(0), coordinator.clone()).unwrap();
     (coordinator, endpoint)

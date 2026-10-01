@@ -152,7 +152,10 @@ fn retirement_during_pressure_write_prevents_late_publication() {
     assert!(f.store.writer.index().lookup(&first).unwrap().is_none());
     f.store
         .writer
-        .retire_key(&CacheId("cache".into()), KeyId([1; 16]))
+        .retire_key(
+            &CacheId(crate::security::identity::tests::CACHE.into()),
+            KeyId([1; 16]),
+        )
         .unwrap();
     drive(&f.reactor, write).unwrap();
     assert!(f.store.writer.index().lookup(&second).unwrap().is_none());
@@ -166,7 +169,11 @@ fn retirement_during_pressure_write_prevents_late_publication() {
 #[test]
 fn index_clock_gives_recent_segments_a_second_chance_and_handles_no_victim() {
     let f = Fixture::new();
-    let index = Rc::new(catalog::Index::new(WorkerId(0), 2));
+    let index = Rc::new(catalog::Index::new(
+        WorkerId(0),
+        2,
+        crate::test_support::availability(),
+    ));
     index.set_page_capacity(2).unwrap();
     let segments = Rc::new(catalog::Segments::new(WorkerId(0), 512));
     segments

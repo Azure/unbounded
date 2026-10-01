@@ -457,7 +457,13 @@ impl Rig {
         ));
         let http = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 8));
         let buffers = BufferPool::new(admission.clone());
-        let memory = Rc::new(MemoryCache::new(buffers.clone()));
+        let (keys, sender_keys) = fixture_keys();
+        let published = Arc::new(PublishedState::default());
+        let availability = Rc::new(racer_dataplane::control::state::Availability::new(
+            published.clone(),
+            keys.clone(),
+        ));
+        let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
         let (index, disk, writer) = open_fixture_storage(
             worker,
             scratch.path.join("slabs"),
@@ -466,9 +472,8 @@ impl Rig {
             &reactor,
             &admission,
             buffers.clone(),
+            availability,
         );
-        let (keys, sender_keys) = fixture_keys();
-        let published = Arc::new(PublishedState::default());
         let snapshots = Rc::new(SnapshotStore::new(
             ClusterId(CLUSTER.into()),
             published.clone(),
@@ -750,8 +755,9 @@ fn open_fixture_storage(
     reactor: &Rc<Reactor>,
     admission: &Rc<Admission>,
     buffers: BufferPool,
+    availability: Rc<racer_dataplane::control::state::Availability>,
 ) -> (Rc<Index>, Rc<StoreReader>, Rc<StoreWriter>) {
-    let index = Rc::new(Index::new(worker, entries));
+    let index = Rc::new(Index::new(worker, entries, availability.clone()));
     let segments = Rc::new(Segments::new(worker, 64 * 1024 * 1024));
     let slabs = Rc::new(Slabs::new(
         worker,
@@ -769,7 +775,12 @@ fn open_fixture_storage(
         slabs.clone(),
         buffers,
     ));
-    let writer = Rc::new(StoreWriter::new(index.clone(), segments, slabs));
+    let writer = Rc::new(StoreWriter::new(
+        index.clone(),
+        segments,
+        slabs,
+        availability,
+    ));
     writer
         .configure(admission.clone(), eviction, 64, entries)
         .unwrap();

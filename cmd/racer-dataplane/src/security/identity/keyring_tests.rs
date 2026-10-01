@@ -1,14 +1,28 @@
 use super::tests::{CACHE, CLUSTER, NODE};
 use super::*;
 pub(crate) fn keys() -> Keyring {
+    keys_for(&[CacheId(CACHE.into())])
+}
+pub(crate) fn keys_for(caches: &[CacheId]) -> Keyring {
     let (_, _, roots) = super::super::identity::tests::issued();
     let keys = Keyring::new(
         ClusterId(CLUSTER.into()),
         NodeId(NODE.into()),
         Arc::new(KeyEpochs::default()),
     );
-    keys.install(bundle(1, roots, CacheKeyState::Active))
-        .unwrap();
+    let mut initial = bundle(1, roots, CacheKeyState::Active);
+    let templates = std::mem::take(&mut initial.cache_keys);
+    for (i, cache) in caches.iter().enumerate() {
+        for template in &templates {
+            let mut key = template.clone();
+            key.key.cache = cache.clone();
+            if i != 0 {
+                key.material[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            }
+            initial.cache_keys.push(key);
+        }
+    }
+    keys.install(initial).unwrap();
     keys
 }
 pub(crate) fn rotation_bundle(generation: u64, roots: Vec<Vec<u8>>) -> KeyringBundle {
