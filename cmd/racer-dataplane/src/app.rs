@@ -29,7 +29,7 @@ use crate::{
     model::{Limits, NodeId, RequestId, WorkerId},
     origin::{Origin, OriginClient},
     peer::{Relay, Requester, server::PeerServer, transfer::Transfers},
-    rdma::{Devices, session::Sessions, transfer::RdmaTransfer},
+    rdma::{Devices, RdmaTransfer, session::Sessions},
     read::{
         Coordinator,
         candidates::CandidatePolicy,

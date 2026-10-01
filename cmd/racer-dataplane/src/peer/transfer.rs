@@ -6,7 +6,7 @@ use crate::{
     http::{io::HttpIo, pool::HttpPool},
     memory::pool::CiphertextPage,
     model::ResourceClass,
-    rdma::transfer::RdmaTransfer,
+    rdma::RdmaTransfer,
     runtime::deadline::RequestScope,
     runtime::{
         admission::{Admission, Reservation},
@@ -225,7 +225,7 @@ impl Transfers {
         page: CiphertextPage,
         descriptor: crate::rdma::permission::AuthenticatedDescriptor,
         scope: &'a RequestScope,
-    ) -> Operation<'a, crate::rdma::transfer::SendCompletion> {
+    ) -> Operation<'a, crate::rdma::SendCompletion> {
         Box::pin(async move {
             scope.check()?;
             if session.peer() != destination {

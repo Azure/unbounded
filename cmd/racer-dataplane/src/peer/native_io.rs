@@ -43,7 +43,7 @@ mod tests {
         http::{Codec, MessageHead, StartLine, io::HttpIo, pool::HttpPool},
         memory::pool::BufferPool,
         model::{ExpiresAt, KeyId, Nonce, ObjectMetadata, PageEnvelope, ResourceClass, *},
-        rdma::{Devices, session::Sessions, transfer::RdmaTransfer},
+        rdma::{Devices, RdmaTransfer, session::Sessions},
         runtime::{admission::Admission, reactor::Reactor},
         security::{protocol as p, signing::Signatures},
     };
