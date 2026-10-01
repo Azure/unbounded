@@ -29,14 +29,16 @@ mod io_tests;
 
 /// Bounded, address-stable staging storage. Constructor reserves quota before
 /// allocation; ownership includes that quota through reactor completion.
+/// Vec avoids Box move retagging; its private backing is never resized after construction.
 pub struct OwnedBuffer {
-    bytes: Box<[u8]>,
+    bytes: Vec<u8>,
     reservation: Option<Reservation>,
     pool: Weak<RefCell<Option<OwnedBuffer>>>,
 }
 impl Drop for OwnedBuffer {
     fn drop(&mut self) {
-        self.bytes.zeroize();
+        // Wipe without clearing the length needed by the idle-buffer pool.
+        self.bytes.as_mut_slice().zeroize();
         if let Some(pool) = self.pool.upgrade() {
             if let Ok(mut idle) = pool.try_borrow_mut() {
                 if idle.is_none() {
@@ -58,8 +60,9 @@ impl OwnedBuffer {
             .try_reserve_exact(length)
             .map_err(|_| Error::Overloaded)?;
         bytes.resize(length, 0);
+        // Normalize capacity to the charged length before deriving any I/O pointer.
         Ok(Self {
-            bytes: bytes.into_boxed_slice(),
+            bytes: bytes.into_boxed_slice().into_vec(),
             reservation: Some(reservation),
             pool: Weak::new(),
         })

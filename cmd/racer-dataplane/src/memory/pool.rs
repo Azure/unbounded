@@ -13,13 +13,13 @@ pub struct BufferPool {
 /// Mutable staging buffer, not proof of authentication and not client-deliverable.
 /// Fixed-size owned backing stays at the same address when this owner moves.
 pub struct PlaintextBuffer {
-    bytes: Box<[u8]>,
+    bytes: Vec<u8>,
     reservation: Option<Reservation>,
 }
 impl PlaintextBuffer {
     pub(crate) fn into_parts(mut self) -> (Box<[u8]>, Reservation) {
         (
-            std::mem::take(&mut self.bytes),
+            std::mem::take(&mut self.bytes).into_boxed_slice(),
             self.reservation.take().expect("owned reservation"),
         )
     }
@@ -30,7 +30,7 @@ impl PlaintextBuffer {
 impl Drop for PlaintextBuffer {
     fn drop(&mut self) {
         if let Some(reservation) = &mut self.reservation {
-            reservation.recycle(std::mem::take(&mut self.bytes).into_vec());
+            reservation.recycle(std::mem::take(&mut self.bytes));
         }
     }
 }
@@ -93,7 +93,8 @@ impl BufferPool {
             reservation.cache(),
         )?;
         let bytes = reservation.buffer(length)?;
-        let bytes = bytes.into_boxed_slice();
+        // Keep exact charged capacity, but no Box while reactor pointers are live.
+        let bytes = bytes.into_boxed_slice().into_vec();
         reservation.shrink(bytes.len())?;
         Ok(PlaintextBuffer {
             bytes,

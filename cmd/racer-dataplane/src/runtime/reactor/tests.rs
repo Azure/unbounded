@@ -21,7 +21,7 @@ impl std::task::Wake for Count {
     }
 }
 
-struct Buffer(Box<[u8]>, Rc<Cell<usize>>);
+struct Buffer(Vec<u8>, Rc<Cell<usize>>);
 impl sealed::Sealed for Buffer {}
 impl IoBuffer for Buffer {
     fn bytes(&self) -> Result<&[u8]> {
@@ -44,6 +44,43 @@ impl Drop for Lease {
 }
 fn buffer(bytes: &[u8]) -> Buffer {
     Buffer(bytes.into(), Rc::new(Cell::new(0)))
+}
+
+#[test]
+fn movable_production_buffers_preserve_subrange_through_completion() {
+    use crate::{
+        http::connection::{BufferRange, OwnedBuffer},
+        memory::pool::BufferPool,
+        peer::transport::WireBuffer,
+    };
+    fn check<B: IoBuffer>(buffer: B) {
+        let mut range = BufferRange::new(buffer, 1..2).unwrap();
+        let ptr = range.bytes_mut().unwrap().as_mut_ptr();
+        let finish: Box<dyn FnOnce() -> B> = Box::new(move || range.into_inner());
+        // SAFETY: completion owns the fixed backing until after this write.
+        unsafe { ptr.write(7) };
+        let buffer = finish();
+        assert_eq!(buffer.bytes().unwrap(), &[0, 7, 0]);
+    }
+    let admission = Rc::new(Admission::new(limits(4)));
+    check(OwnedBuffer::new(&admission, 3).unwrap());
+    check(WireBuffer::new(&admission, 3).unwrap());
+    let pool = BufferPool::new(admission.clone());
+    check(
+        pool.plaintext(
+            admission
+                .reserve(
+                    Some(&crate::model::CacheId("provenance".into())),
+                    ResourceClass::Plaintext,
+                    3,
+                )
+                .unwrap(),
+            3,
+        )
+        .unwrap(),
+    );
+    let reactor = Reactor::new(admission);
+    check(reactor.file_buffer(3).unwrap());
 }
 fn limits(capacity: usize) -> Limits {
     let n = NonZeroUsize::new(1024 * 1024).unwrap();

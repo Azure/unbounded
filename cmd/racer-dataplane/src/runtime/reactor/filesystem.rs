@@ -5,7 +5,7 @@ use std::ffi::CString;
 use zeroize::Zeroize;
 
 pub struct Buffer {
-    data: Box<[u8]>,
+    data: Vec<u8>,
     start: usize,
     _quota: Reservation,
 }
@@ -148,7 +148,7 @@ impl IoBuffer for Buffer {
 }
 impl Drop for Buffer {
     fn drop(&mut self) {
-        self.data.zeroize();
+        self.data.as_mut_slice().zeroize();
     }
 }
 impl Buffer {
@@ -202,7 +202,7 @@ impl Reactor {
             self.admission
                 .reserve_completion(None, ResourceClass::RequestContext, length)?;
         Ok(Buffer {
-            data: vec![0; length].into_boxed_slice(),
+            data: vec![0; length],
             start: 0,
             _quota: quota,
         })

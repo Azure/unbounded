@@ -64,3 +64,9 @@ for model, flags in (("stacked", []), ("tree", ["-Zmiri-tree-borrows"])):
             raise SystemExit(f"Missing success assertion: {model} {case}")
 (BASE / "results.txt").write_text("\n".join(results) + "\n")
 print("\n".join(results))
+for model, flags in (("stacked", []), ("tree", ["-Zmiri-tree-borrows"])):
+    code = run(f"{model}-lifecycle", [str(BIN / "miri"), "--sysroot",
+               ENV["MIRI_SYSROOT"], "--edition=2024", *flags,
+               str(Path(__file__).with_name("lifecycle.rs"))], 10)
+    if code != 0:
+        raise SystemExit(f"Lifecycle proof failed: {model} exit={code}")

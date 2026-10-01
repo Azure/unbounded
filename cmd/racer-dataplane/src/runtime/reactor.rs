@@ -340,6 +340,10 @@ pub(crate) mod sealed {
 /// mutable aliases. Ownership includes the allocation's quota reservation. Neither
 /// the allocation nor that reservation may be freed/recycled before the final fence.
 /// `'static` excludes request-scoped borrows; it does not require leaking memory.
+/// Derived raw pointers must also remain valid across owner moves into completion
+/// closures. Stable addresses alone are insufficient: Box backing is retagged on
+/// moves in Miri's aliasing models. Use private, non-resizing Vec storage or an
+/// explicitly managed allocation; never reborrow its bytes while I/O is pending.
 ///
 /// Inline storage is address-unstable when its owner moves and cannot opt in:
 /// ```compile_fail

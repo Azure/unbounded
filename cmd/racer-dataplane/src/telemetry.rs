@@ -171,7 +171,7 @@ impl DiagnosticIo {
             return Err(Error::Overloaded);
         }
         let gauge = metrics.lease(Gauge::DiagnosticConnections)?;
-        let bytes = Box::new([0; MAX_RESPONSE_BYTES]);
+        let bytes = vec![0; MAX_RESPONSE_BYTES];
         self.resources.active.set(self.resources.active.get() + 1);
         Ok(Buffer {
             bytes,
@@ -189,7 +189,7 @@ impl Drop for Serving {
     }
 }
 struct Buffer {
-    bytes: Box<[u8; MAX_RESPONSE_BYTES]>,
+    bytes: Vec<u8>,
     start: usize,
     end: usize,
     resources: Rc<Resources>,
@@ -197,7 +197,7 @@ struct Buffer {
 }
 impl Drop for Buffer {
     fn drop(&mut self) {
-        self.bytes.zeroize();
+        self.bytes.as_mut_slice().zeroize();
         self.resources.active.set(self.resources.active.get() - 1);
     }
 }
@@ -328,7 +328,7 @@ fn exchange<'a>(
             }
         };
         // Headers are never retained in decoded objects, traces, or responses.
-        buffer.bytes.zeroize();
+        buffer.bytes.as_mut_slice().zeroize();
         let length = respond(
             telemetry,
             route,

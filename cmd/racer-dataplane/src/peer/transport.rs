@@ -1073,8 +1073,10 @@ impl Transfers {
 }
 
 /// Stable, quota-owned transport staging. Never contains plaintext page data.
+/// Construction normalizes capacity before pointer extraction; Vec backing then
+/// stays fixed while ownership moves through reactor completion closures.
 pub(crate) struct WireBuffer {
-    bytes: Box<[u8]>,
+    bytes: Vec<u8>,
     _reservation: Reservation,
 }
 impl WireBuffer {
@@ -1084,7 +1086,7 @@ impl WireBuffer {
         }
         let reservation = admission.reserve(None, ResourceClass::Ciphertext, length)?;
         Ok(Self {
-            bytes: reservation.buffer(length)?.into_boxed_slice(),
+            bytes: reservation.buffer(length)?.into_boxed_slice().into_vec(),
             _reservation: reservation,
         })
     }
@@ -1094,12 +1096,12 @@ impl WireBuffer {
             return Err(Error::InvalidRequest);
         }
         Ok(Self {
-            bytes: reservation.buffer(length)?.into_boxed_slice(),
+            bytes: reservation.buffer(length)?.into_boxed_slice().into_vec(),
             _reservation: reservation,
         })
     }
     pub(crate) fn into_parts(self) -> (Vec<u8>, Reservation) {
-        (self.bytes.into_vec(), self._reservation)
+        (self.bytes, self._reservation)
     }
 }
 impl crate::runtime::reactor::sealed::Sealed for WireBuffer {}

@@ -102,7 +102,38 @@ pointer exposure, and does not validate all cancellation or completion behavior.
 The next narrower integration step is a Miri-compatible production simulator
 receive using `WireBuffer` and `BufferRange`; the simulator dereferences its saved
 pointer at `runtime/reactor/simulation.rs:1453-1459`. Keep unrelated unsupported
-FFI outside that test. No production fix is included here.
+FFI outside that test. The original diagnostic commit contains no production fix;
+the subsequent backing change is described below.
 
 There is no demonstrated causal link to AEAD failures or the historical
 matched-envelope send/receive CRC discrepancy.
+
+## Fixed movable backing follow-up
+
+Production movable IoBuffer storage now uses private Vec backing in WireBuffer,
+OwnedBuffer, PlaintextBuffer, filesystem Buffer, and telemetry Buffer. The reactor
+test Buffer follows the same rule. BufferRange delegates; AlignedBuffer and its
+test View retain their existing managed allocation. Constructor normalization
+through `into_boxed_slice().into_vec()` preserves the previous exact capacity
+before pointers are derived. Plaintext converts to Box only at completed export.
+Slice zeroization preserves pooled lengths; no in-flight resize API was added.
+
+`lifecycle.rs` additionally checks success, error, canceled completion, and an
+abandoned reply using the fixed Vec handoff shape. Both tested models pass. Its
+ordinary fill models destructor access, not cryptographic zeroization; production
+continues using zeroize or reservation recycling. The test models the point after
+CQE fencing, not the CQE protocol itself. Existing production reactor tests cover
+that protocol. The production-buffer subrange regression uses actual constructors
+for HTTP, wire, plaintext, and filesystem buffers.
+
+Validation of the backing change:
+
+- The focused production group (reactor tests, HTTP connections, memory pool,
+  wire checkout, telemetry, and filesystem buffers) passed 116 tests with zero
+  failures; two preexisting opt-in benchmarks were ignored.
+- `cargo fmt --all -- --check` passed for the dataplane; standalone fixtures also
+  passed rustfmt checking.
+- `cargo check --locked --offline --all-targets --features rdma,subscription-interop`
+  passed. Optional heap-profiling was not enabled.
+- The Miri lifecycle passes use the exact pinned version above. Production tests
+  and target checks use rustc 1.96.0 (ac68faa20 2026-05-25).
