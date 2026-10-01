@@ -8,6 +8,8 @@ import subprocess
 import signal
 import os
 import json
+import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -269,6 +271,69 @@ python3() { ENDING; }
         self.assertEqual(emit.call_args_list[0].args, ("remote",))
         self.assertEqual(emit.call_args_list[0].kwargs, dict(record={"event": "checkpoint"}))
         self.assertEqual(emit.call_args_list[-1].kwargs["status"], 2)
+
+    def test_stream_cleans_exited_wrapper_group_without_buffering(self):
+        # Real exited timeout wrapper with a TERM-resistant same-group child.
+        # The test owns fallback cleanup; setsid() children are out of scope.
+        for keep_pipe in (False, True):
+            with self.subTest(keep_pipe=keep_pipe), tempfile.TemporaryDirectory(
+                    dir=Path(__file__).resolve().parents[2]) as directory:
+                pidfile = Path(directory) / "pid"
+                source = '''import os,signal,sys,time
+ready_r,ready_w=os.pipe()
+pid=os.fork()
+if pid:
+ os.close(ready_w)
+ os.read(ready_r,1)
+ print('{"event":"ready"}',flush=True)
+ os._exit(0)
+os.close(ready_r)
+signal.signal(signal.SIGTERM,signal.SIG_IGN)
+with open(sys.argv[1],"w") as out: out.write(str(os.getpid()))
+if sys.argv[2]=="False":
+ os.close(1);os.close(2)
+os.write(ready_w,b"x")
+time.sleep(30)
+'''
+                popen = subprocess.Popen
+                wrappers = []
+                def launch(*args, **kwargs):
+                    proc = popen(*args, **kwargs)
+                    wrappers.append(proc)
+                    return proc
+                def emit(*args, **kwargs):
+                    self.assertEqual(wrappers[0].wait(timeout=2), 0)
+                    if keep_pipe:
+                        raise RuntimeError("stop collection")
+                try:
+                    with patch.object(rx.subprocess, "Popen", side_effect=launch), \
+                            patch.object(rx, "emit", side_effect=emit), \
+                            patch.object(subprocess.Popen, "communicate", side_effect=AssertionError("must not buffer")):
+                        if keep_pipe:
+                            with self.assertRaisesRegex(RuntimeError, "stop collection"):
+                                rx.stream(["python3", "-B", "-c", source, str(pidfile), str(keep_pipe)], 3)
+                        else:
+                            self.assertEqual(rx.stream(["python3", "-B", "-c", source,
+                                                        str(pidfile), str(keep_pipe)], 3), [{"event": "ready"}])
+                    pid = int(pidfile.read_text())
+                    for _ in range(100):
+                        try:
+                            stopped = Path(f"/proc/{pid}/stat").read_text().split(")", 1)[1].split()[0] == "Z"
+                        except (FileNotFoundError, ProcessLookupError):
+                            stopped = True
+                        if stopped:
+                            break
+                        time.sleep(.01)
+                    else:
+                        self.fail("same-group descendant survived stream cleanup")
+                    self.assertTrue(wrappers[0].stdout.closed)
+                    self.assertEqual(wrappers[0].returncode, 0)
+                finally:
+                    if pidfile.exists():
+                        try:
+                            os.kill(int(pidfile.read_text()), signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
 
     def test_uppercase_hostname_runs_real_remote_baseline_entry(self):
         # Real shell + Python + main entry; fake only host data and stage clock.

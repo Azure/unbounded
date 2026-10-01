@@ -434,14 +434,24 @@ def stream(argv, seconds):
         return rows
     finally:
         with cleanup_signals():
-            if proc.poll() is None:
-                os.killpg(proc.pid, signal.SIGTERM)
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                    proc.wait(timeout=2)
+            # Discard unread output without communicate(), which could buffer an
+            # unbounded descendant stream. Wrapper exit/EOF does not imply that
+            # its process group is empty. setsid() descendants are not contained.
             proc.stdout.close()
+            try:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+            finally:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait(timeout=2)
 
 
 def independent_restore(original):
