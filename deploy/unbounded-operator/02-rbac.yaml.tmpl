@@ -36,18 +36,15 @@ rules:
     verbs: ["get", "list", "watch"]
   # Read-only, and only ever read: a component that registers admission
   # webhooks or an aggregated API points them at a Service, and a registration
-  # whose backend is not serving is worse than none. Endpoints answer whether
+  # whose backend is not serving is worse than none. EndpointSlices answer whether
   # anything is actually behind that Service. The net controller Service has no
   # selector - its leader pod writes these itself - so there is no other way to
   # tell a running backend from a Deployment that merely exists.
   #
   # The verbs are exactly what the reads need and no more. These go through
-  # Env.LiveReader, which bypasses the manager cache. Both endpoint objects use
-  # the Service's own name, so get suffices. Neither is watched, which is the
+  # Env.LiveReader, which bypasses the manager cache. The EndpointSlice uses
+  # the Service's own name, so get suffices. It is not watched, which is the
   # point of reading them live.
-  - apiGroups: [""]
-    resources: ["endpoints"]
-    verbs: ["get"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["get"]

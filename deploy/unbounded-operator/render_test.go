@@ -264,6 +264,12 @@ func TestOperatorRBACIncludesCachedReadKinds(t *testing.T) {
 	}
 	readYAML(t, filepath.Join(outputDir, "02-rbac.yaml"), &role)
 
+	for _, rule := range role.Rules {
+		if contains(rule.Resources, "endpoints") {
+			t.Fatal("operator retains retired Endpoints permissions")
+		}
+	}
+
 	assertReadOnlyRule := func(group, resource string) {
 		t.Helper()
 

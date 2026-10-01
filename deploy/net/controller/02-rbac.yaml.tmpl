@@ -153,15 +153,6 @@ rules:
     resources: ["endpointslices"]
     resourceNames: ["unbounded-net-controller"]
     verbs: ["get", "update", "delete"]
-  # Endpoints: leader manages the legacy resource required by APIService availability
-  # checks on Kubernetes 1.33 and earlier.
-  - apiGroups: [""]
-    resources: ["endpoints"]
-    verbs: ["create"]
-  - apiGroups: [""]
-    resources: ["endpoints"]
-    resourceNames: ["unbounded-net-controller"]
-    verbs: ["get", "update", "delete"]
   # Secrets: store serving certificate TLS material.
   # Create cannot be constrained by resourceNames in RBAC, so split create from named-object ops.
   # The create verb below allows creating arbitrary secrets in the namespace; RBAC cannot scope
