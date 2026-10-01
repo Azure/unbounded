@@ -1,20 +1,689 @@
 //! Transport-neutral ciphertext lifecycle, selecting HTTP or authenticated RDMA.
-use super::protocol::{PeerResponse, SecurityCodec, SignedRequest, SignedResponse, WireCodec};
+use super::{
+    native::{self, Binding, Phase, extension},
+    protocol::{PeerResponse, SecurityCodec, SignedRequest, SignedResponse, WireCodec},
+};
 use crate::telemetry::failures::{BodyProgress, Detail, Failure, Stage, timestamp};
 use crate::{
     error::{Error, Operation, Result},
-    http::{io::HttpIo, pool::HttpPool},
+    http::{
+        io::HttpIo,
+        pool::{ConnectionLease, HttpPool},
+    },
     memory::pool::CiphertextPage,
-    model::ResourceClass,
+    model::{NodeId, ResourceClass},
     rdma::RdmaTransfer,
+    rdma::{
+        permission::{AuthenticatedDescriptor, COMPLETION_HEADER, DESCRIPTOR_HEADER},
+        session::{SETUP_BINDING_HEADER, SETUP_HEADER, SetupParameters},
+    },
     runtime::deadline::RequestScope,
     runtime::{
         admission::{Admission, Reservation},
         reactor::IoBuffer,
     },
+    security::{
+        forwarding::ForwardedHead,
+        signing::{SignedHead, VerifiedHead, signed_digest},
+    },
     topology::rails::TransportPlan,
 };
-use std::rc::Rc;
+use std::{rc::Rc, time::Duration};
+
+#[cfg(test)]
+mod native_exchange_tests;
+
+fn recoverable(error: Error) -> bool {
+    matches!(error, Error::Unavailable | Error::Io | Error::Overloaded)
+}
+fn native_scope(scope: &RequestScope) -> RequestScope {
+    let mut bounded = scope.clone();
+    bounded.deadline.0 = bounded
+        .deadline
+        .0
+        .min(crate::runtime::environment::now() + Duration::from_secs(5));
+    bounded
+}
+fn native_failure(error: Error, scope: &RequestScope) -> bool {
+    scope.check().is_ok() && (recoverable(error) || error == Error::DeadlineExceeded)
+}
+async fn fence(session: &crate::rdma::session::SessionLease, scope: &RequestScope) -> Result<()> {
+    let cancellation = scope.cancellation.subscribe()?;
+    futures::future::poll_fn(|cx| {
+        cancellation.register(cx.waker());
+        session.abort()?;
+        scope.check()?;
+        session.qp.poll_stopped(cx)
+    })
+    .await
+}
+
+impl Transfers {
+    pub(super) async fn send_native(
+        &self,
+        mut connection: ConnectionLease,
+        response: &SignedResponse,
+        admitted: (Binding, VerifiedHead),
+        membership: &crate::topology::membership::MembershipLease,
+        scope: &RequestScope,
+    ) -> Result<(ConnectionLease, bool)> {
+        let (signatures, sessions) = self.native.as_ref().ok_or(Error::InvalidConfiguration)?;
+        let Some(rdma) = &self.rdma else {
+            return Ok((connection, false));
+        };
+        let (PeerResponse::Page { ciphertext, .. } | PeerResponse::Selected { ciphertext, .. }) =
+            &response.response
+        else {
+            return Ok((connection, false));
+        };
+        let (mut binding, accept) = admitted;
+        if binding.membership != membership.version.0 {
+            return Err(Error::IncompatibleMembership);
+        }
+        let mut bounded_scope = scope.clone();
+        bounded_scope.deadline.0 = bounded_scope
+            .deadline
+            .0
+            .min(crate::security::protocol::decode_deadline(binding.deadline)?.0);
+        let scope = &bounded_scope;
+        scope.check()?;
+        let peer = accept.peer.node();
+        let path = crate::security::protocol::decode_nodes(
+            crate::security::protocol::field(
+                &response.authentication.original.head,
+                "racer-response-path",
+            )?
+            .as_bytes(),
+        )?;
+        let route = crate::topology::paths::Route {
+            membership: membership.clone(),
+            nodes: path,
+        };
+        if crate::topology::rails::select(&route, &ciphertext.envelope().page)?
+            != (TransportPlan::Rdma { rail: binding.rail })
+            || !rdma.ready(binding.rail)
+        {
+            return Ok((connection, false));
+        }
+        let prepared = match sessions.prepare(&accept.peer, binding.rail, scope).await {
+            Ok(p) => p,
+            Err(e) if recoverable(e) => return Ok((connection, false)),
+            Err(e) => return Err(e),
+        };
+        binding.response = native::envelope_digest(&response.authentication)?;
+        let local_setup = prepared.setup().header_value();
+        let offer = binding.sign(
+            signatures,
+            peer,
+            Phase::Offer,
+            &signed_digest(&accept.signed)?,
+            0,
+            vec![extension(SETUP_HEADER, local_setup.clone())],
+        )?;
+        let mut previous = signed_digest(&offer)?;
+        let mut head = WireCodec::encode(&response.authentication, true, 0)?;
+        native::attach(&mut head, &offer)?;
+        connection = self.io.send_head(connection, head, scope).await?.connection;
+        connection.next_round()?;
+        let (conn, setup) = self.read_control(connection, false, scope).await?;
+        connection = conn;
+        let (setup, phase) = binding.verify(
+            signatures,
+            peer,
+            setup,
+            &[Phase::Setup, Phase::Fallback],
+            &previous,
+            0,
+            scope,
+        )?;
+        previous = signed_digest(&setup.signed)?;
+        if phase == Phase::Fallback {
+            drop(prepared);
+            return self
+                .send_fallback(connection, response, &binding, peer, previous, scope)
+                .await;
+        }
+        let remote = SetupParameters::from_verified(&setup, binding.rail)?;
+        let session = match prepared.finish(&setup, scope).await {
+            Ok(session) => session,
+            Err(error) if recoverable(error) => {
+                return self
+                    .failed_then_fallback(connection, response, &binding, peer, previous, scope)
+                    .await;
+            }
+            Err(error) => return Err(error),
+        };
+        let ready = binding.sign(
+            signatures,
+            peer,
+            Phase::Ready,
+            &previous,
+            0,
+            vec![
+                extension(SETUP_HEADER, local_setup),
+                extension(SETUP_BINDING_HEADER, remote.binding_header_value()),
+            ],
+        )?;
+        previous = signed_digest(&ready)?;
+        connection = self.write_control(connection, ready, scope).await?;
+        connection.next_round()?;
+        let (conn, grant) = self.read_control(connection, false, scope).await?;
+        connection = conn;
+        let (grant, phase) = binding.verify(
+            signatures,
+            peer,
+            grant,
+            &[Phase::Grant, Phase::Fallback],
+            &previous,
+            0,
+            scope,
+        )?;
+        previous = signed_digest(&grant.signed)?;
+        if phase == Phase::Fallback {
+            fence(&session, scope).await?;
+            return self
+                .send_fallback(connection, response, &binding, peer, previous, scope)
+                .await;
+        }
+        let descriptor =
+            AuthenticatedDescriptor::from_verified(&grant, &session, binding.transfer)?;
+        let native_deadline = native_scope(scope);
+        let complete = match rdma
+            .send_to(&session, ciphertext.clone(), descriptor, &native_deadline)
+            .await
+        {
+            Ok(complete) => complete,
+            Err(error) if native_failure(error, scope) => {
+                fence(&session, scope).await?;
+                return self
+                    .failed_then_fallback(connection, response, &binding, peer, previous, scope)
+                    .await;
+            }
+            Err(error) => return Err(error),
+        };
+        let complete = binding.sign(
+            signatures,
+            peer,
+            Phase::Complete,
+            &previous,
+            0,
+            vec![extension(COMPLETION_HEADER, complete.header_value())],
+        )?;
+        previous = signed_digest(&complete)?;
+        connection = self.write_control(connection, complete, scope).await?;
+        connection.next_round()?;
+        let (conn, done) = self.read_control(connection, false, scope).await?;
+        connection = conn;
+        let (done, phase) = binding.verify(
+            signatures,
+            peer,
+            done,
+            &[Phase::Done, Phase::Fallback],
+            &previous,
+            0,
+            scope,
+        )?;
+        previous = signed_digest(&done.signed)?;
+        if phase == Phase::Fallback {
+            fence(&session, scope).await?;
+            return self
+                .send_fallback(connection, response, &binding, peer, previous, scope)
+                .await;
+        }
+        let finish = binding.sign(signatures, peer, Phase::Finish, &previous, 0, vec![])?;
+        connection = self.write_control(connection, finish, scope).await?;
+        #[cfg(test)]
+        self.native_completed.set(self.native_completed.get() + 1);
+        Ok((connection, true))
+    }
+    async fn failed_then_fallback(
+        &self,
+        mut connection: ConnectionLease,
+        response: &SignedResponse,
+        binding: &Binding,
+        peer: &NodeId,
+        previous: [u8; 32],
+        scope: &RequestScope,
+    ) -> Result<(ConnectionLease, bool)> {
+        let (signatures, _) = self.native.as_ref().ok_or(Error::InvalidConfiguration)?;
+        let failed = binding.sign(signatures, peer, Phase::Failed, &previous, 0, vec![])?;
+        let previous = signed_digest(&failed)?;
+        connection = self.write_control(connection, failed, scope).await?;
+        connection.next_round()?;
+        let (connection, fallback) = self.read_control(connection, false, scope).await?;
+        let (fallback, _) = binding.verify(
+            signatures,
+            peer,
+            fallback,
+            &[Phase::Fallback],
+            &previous,
+            0,
+            scope,
+        )?;
+        self.send_fallback(
+            connection,
+            response,
+            binding,
+            peer,
+            signed_digest(&fallback.signed)?,
+            scope,
+        )
+        .await
+    }
+    async fn send_fallback(
+        &self,
+        connection: ConnectionLease,
+        response: &SignedResponse,
+        binding: &Binding,
+        peer: &NodeId,
+        previous: [u8; 32],
+        scope: &RequestScope,
+    ) -> Result<(ConnectionLease, bool)> {
+        #[cfg(test)]
+        self.native_fallbacks.set(self.native_fallbacks.get() + 1);
+        scope.check()?;
+        let (signatures, _) = self.native.as_ref().ok_or(Error::InvalidConfiguration)?;
+        let (PeerResponse::Page { ciphertext, .. } | PeerResponse::Selected { ciphertext, .. }) =
+            &response.response
+        else {
+            return Err(Error::InvalidRequest);
+        };
+        let finish = binding.sign(
+            signatures,
+            peer,
+            Phase::Finish,
+            &previous,
+            ciphertext.bytes().len(),
+            vec![],
+        )?;
+        let mut head = WireCodec::encode(&response.authentication, true, ciphertext.bytes().len())?;
+        native::attach(&mut head, &finish)?;
+        let connection = self.io.send_head(connection, head, scope).await?.connection;
+        let written = self
+            .io
+            .write_body(connection, ciphertext.clone(), scope)
+            .await?;
+        Ok((written.lease, true))
+    }
+    pub(super) fn accept_native(
+        &self,
+        request: &SignedRequest,
+        plan: TransportPlan,
+        scope: &RequestScope,
+    ) -> Result<Option<(Binding, SignedHead, NodeId)>> {
+        let TransportPlan::Rdma { rail } = plan else {
+            return Ok(None);
+        };
+        let Some((signatures, sessions)) = &self.native else {
+            return Ok(None);
+        };
+        if !sessions.ready(rail) || !self.rdma.as_ref().is_some_and(|rdma| rdma.ready(rail)) {
+            return Ok(None);
+        }
+        let peer = crate::security::signing::receiver(
+            &request
+                .authentication
+                .hops
+                .last()
+                .unwrap_or(&request.authentication.original)
+                .head,
+        )?;
+        let binding = Binding::request(
+            &request.authentication,
+            request.request.route.membership.0,
+            scope,
+            rail,
+        )?;
+        let accept = binding.sign(signatures, &peer, Phase::Accept, &[0; 32], 0, vec![])?;
+        Ok(Some((binding, accept, peer)))
+    }
+    pub(super) fn admit_native(
+        &self,
+        request: &SignedRequest,
+        control: SignedHead,
+        scope: &RequestScope,
+    ) -> Result<Option<(Binding, VerifiedHead)>> {
+        let Some((signatures, _)) = &self.native else {
+            return Ok(None);
+        };
+        let binding = Binding::parse_accept(&control)?;
+        if binding.request != native::envelope_digest(&request.authentication)?
+            || binding.response != [0; 32]
+            || binding.membership != request.request.route.membership.0
+            || binding.deadline
+                > crate::security::protocol::encode_deadline(request.request.route.deadline)?
+        {
+            return Err(Error::Unauthorized);
+        }
+        let peer = crate::security::signing::node_field(
+            &request
+                .authentication
+                .hops
+                .last()
+                .unwrap_or(&request.authentication.original)
+                .head,
+            "racer-signer",
+        )?;
+        let (verified, _) = binding.verify(
+            signatures,
+            &peer,
+            control,
+            &[Phase::Accept],
+            &[0; 32],
+            0,
+            scope,
+        )?;
+        Ok(Some((binding, verified)))
+    }
+    async fn write_control(
+        &self,
+        connection: ConnectionLease,
+        signed: SignedHead,
+        scope: &RequestScope,
+    ) -> Result<ConnectionLease> {
+        Ok(self
+            .io
+            .send_head(connection, native::frame(signed)?, scope)
+            .await?
+            .connection)
+    }
+    async fn read_control(
+        &self,
+        connection: ConnectionLease,
+        response: bool,
+        scope: &RequestScope,
+    ) -> Result<(ConnectionLease, SignedHead)> {
+        let received = self.io.receive_head(connection, scope).await?;
+        Ok((
+            received.connection,
+            native::unframe(received.value, response)?,
+        ))
+    }
+    async fn read_ciphertext(
+        &self,
+        mut connection: ConnectionLease,
+        length: usize,
+        scope: &RequestScope,
+    ) -> Result<(ConnectionLease, WireBuffer)> {
+        let (admission, _) = &self.wire;
+        let mut buffer = WireBuffer::new(admission, length)?;
+        let mut offset = 0;
+        while offset < length {
+            let read = self
+                .io
+                .read_body_range(connection, buffer, offset..length, scope)
+                .await?;
+            if read.bytes == 0 || read.bytes > length - offset {
+                return Err(Error::Io);
+            }
+            offset += read.bytes;
+            connection = read.lease;
+            buffer = read.buffer;
+        }
+        Ok((connection, buffer))
+    }
+    /// A completed control round always pairs one request and one response before
+    /// resetting HTTP framing. No pipelining or detached state map is required.
+    pub(super) async fn receive_native(
+        &self,
+        mut connection: ConnectionLease,
+        authentication: ForwardedHead,
+        mut binding: Binding,
+        accept: SignedHead,
+        peer: NodeId,
+        offer: SignedHead,
+        scope: &RequestScope,
+    ) -> Result<SignedResponse> {
+        let (signatures, sessions) = self.native.as_ref().ok_or(Error::InvalidConfiguration)?;
+        let rdma = self.rdma.as_ref().ok_or(Error::Unavailable)?;
+        let (admission, _) = &self.wire;
+        binding.response = native::envelope_digest(&authentication)?;
+        let (offer, _) = binding.verify(
+            signatures,
+            &peer,
+            offer,
+            &[Phase::Offer],
+            &signed_digest(&accept)?,
+            0,
+            scope,
+        )?;
+        let (metadata, envelope) = super::protocol::page_descriptor(&authentication.original.head)?;
+        let remote = SetupParameters::from_verified(&offer, binding.rail)?;
+        let mut previous = signed_digest(&offer.signed)?;
+        connection.next_round()?;
+        let prepared = match sessions
+            .prepare_admitted(&offer.peer, binding.rail, connection.peer_admission.clone(), scope)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) if recoverable(error) => {
+                return self
+                    .receive_fallback(connection, authentication, &binding, &peer, previous, scope)
+                    .await;
+            }
+            Err(error) => return Err(error),
+        };
+        let local_setup = prepared.setup().header_value();
+        let setup = binding.sign(
+            signatures,
+            &peer,
+            Phase::Setup,
+            &previous,
+            0,
+            vec![
+                extension(SETUP_HEADER, local_setup),
+                extension(SETUP_BINDING_HEADER, remote.binding_header_value()),
+            ],
+        )?;
+        previous = signed_digest(&setup)?;
+        connection = self.write_control(connection, setup, scope).await?;
+        let (conn, ready) = self.read_control(connection, true, scope).await?;
+        connection = conn;
+        let (ready, phase) = binding.verify(
+            signatures,
+            &peer,
+            ready,
+            &[Phase::Ready, Phase::Failed],
+            &previous,
+            0,
+            scope,
+        )?;
+        previous = signed_digest(&ready.signed)?;
+        connection.next_round()?;
+        if phase == Phase::Failed {
+            drop(prepared);
+            return self
+                .receive_fallback(connection, authentication, &binding, &peer, previous, scope)
+                .await;
+        }
+        if SetupParameters::from_verified(&ready, binding.rail)?.encoded != remote.encoded {
+            return Err(Error::Unauthorized);
+        }
+        let session = match prepared.finish(&ready, scope).await {
+            Ok(session) => session,
+            Err(error) if recoverable(error) => {
+                return self
+                    .receive_fallback(connection, authentication, &binding, &peer, previous, scope)
+                    .await;
+            }
+            Err(error) => return Err(error),
+        };
+        let native_deadline = native_scope(scope);
+        if let Err(error) = session.wait_ready(&native_deadline).await {
+            fence(&session, scope).await?;
+            if native_failure(error, scope) {
+                return self
+                    .receive_fallback(connection, authentication, &binding, &peer, previous, scope)
+                    .await;
+            }
+            return Err(error);
+        }
+        let grant = match rdma
+            .prepare_receive(&session, &envelope, binding.transfer, scope)
+            .await
+        {
+            Ok(grant) => grant,
+            Err(error) if recoverable(error) => {
+                fence(&session, scope).await?;
+                return self
+                    .receive_fallback(connection, authentication, &binding, &peer, previous, scope)
+                    .await;
+            }
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = grant.wait_bound(&native_deadline).await {
+            fence(&session, scope).await?;
+            drop(grant);
+            if native_failure(error, scope) {
+                return self
+                    .receive_fallback(connection, authentication, &binding, &peer, previous, scope)
+                    .await;
+            }
+            return Err(error);
+        }
+        let request = binding.sign(
+            signatures,
+            &peer,
+            Phase::Grant,
+            &previous,
+            0,
+            vec![extension(DESCRIPTOR_HEADER, grant.header_value()?)],
+        )?;
+        previous = signed_digest(&request)?;
+        connection = self.write_control(connection, request, scope).await?;
+        let (conn, completed) = self.read_control(connection, true, scope).await?;
+        connection = conn;
+        let (completed, phase) = binding.verify(
+            signatures,
+            &peer,
+            completed,
+            &[Phase::Complete, Phase::Failed],
+            &previous,
+            0,
+            scope,
+        )?;
+        previous = signed_digest(&completed.signed)?;
+        connection.next_round()?;
+        if phase == Phase::Failed {
+            fence(&session, scope).await?;
+            drop(grant);
+            return self
+                .receive_fallback(connection, authentication, &binding, &peer, previous, scope)
+                .await;
+        }
+        let native_deadline = native_scope(scope);
+        let page = match rdma
+            .finish_receive(
+                &session,
+                grant,
+                &completed,
+                envelope,
+                admission,
+                &native_deadline,
+            )
+            .await
+        {
+            Ok(page) => page,
+            Err(error) if native_failure(error, scope) => {
+                fence(&session, scope).await?;
+                return self
+                    .receive_fallback(connection, authentication, &binding, &peer, previous, scope)
+                    .await;
+            }
+            Err(error) => return Err(error),
+        };
+        #[cfg(test)]
+        self.native_completions
+            .set(self.native_completions.get() + 1);
+        let done = binding.sign(signatures, &peer, Phase::Done, &previous, 0, vec![])?;
+        previous = signed_digest(&done)?;
+        connection = self.write_control(connection, done, scope).await?;
+        let (mut conn, finish) = self.read_control(connection, true, scope).await?;
+        binding.verify(
+            signatures,
+            &peer,
+            finish,
+            &[Phase::Finish],
+            &previous,
+            0,
+            scope,
+        )?;
+        // The original envelope is verified by the requester/relay's outstanding
+        // binding after this transport returns. No plaintext is published here.
+        let response =
+            if crate::security::protocol::field(&authentication.original.head, "racer-outcome")?
+                == "selected"
+            {
+                PeerResponse::Selected {
+                    metadata,
+                    ciphertext: page,
+                    grant: super::protocol::grant(&authentication.original.head)?,
+                }
+            } else {
+                PeerResponse::Page {
+                    metadata,
+                    ciphertext: page,
+                }
+            };
+        let original = &authentication.original.head;
+        let request_digest = crate::security::protocol::decode_binary(
+            crate::security::protocol::field(original, "racer-request-binding")?.as_bytes(),
+        )?
+        .try_into()
+        .map_err(|_| Error::InvalidRequest)?;
+        let path = crate::security::protocol::decode_nodes(
+            crate::security::protocol::field(original, "racer-response-path")?.as_bytes(),
+        )?;
+        crate::security::protocol::agrees(
+            original,
+            &crate::security::protocol::response_head(&response, &request_digest, &path)?,
+            false,
+        )?;
+        conn.finish_exchange()?;
+        Ok(SignedResponse {
+            authentication,
+            response,
+        })
+    }
+    async fn receive_fallback(
+        &self,
+        connection: ConnectionLease,
+        authentication: ForwardedHead,
+        binding: &Binding,
+        peer: &NodeId,
+        previous: [u8; 32],
+        scope: &RequestScope,
+    ) -> Result<SignedResponse> {
+        scope.check()?;
+        let (signatures, _) = self.native.as_ref().ok_or(Error::InvalidConfiguration)?;
+        let fallback = binding.sign(signatures, peer, Phase::Fallback, &previous, 0, vec![])?;
+        let previous = signed_digest(&fallback)?;
+        let connection = self.write_control(connection, fallback, scope).await?;
+        let mut received = self.io.receive_head(connection, scope).await?;
+        let control = native::detach(&mut received.value)?.ok_or(Error::Unauthorized)?;
+        let (returned, length) = WireCodec::decode(received.value, true)?;
+        if native::envelope_digest(&returned)? != binding.response {
+            return Err(Error::Unauthorized);
+        }
+        binding.verify(
+            signatures,
+            peer,
+            control,
+            &[Phase::Finish],
+            &previous,
+            length,
+            scope,
+        )?;
+        let (mut connection, buffer) = self
+            .read_ciphertext(received.connection, length, scope)
+            .await?;
+        let (bytes, _reservation) = buffer.into_parts();
+        let (_, codec) = &self.wire;
+        let response = codec.response(authentication, bytes, scope)?;
+        connection.finish_exchange()?;
+        Ok(response)
+    }
+}
 
 /// Stable, quota-owned transport staging. Never contains plaintext page data.
 pub(crate) struct WireBuffer {
