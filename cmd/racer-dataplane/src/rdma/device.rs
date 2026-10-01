@@ -35,7 +35,7 @@ pub struct DiscoveredPort {
     pub gid: [u8; 16],
     pub numa_node: Option<usize>,
 }
-pub(crate) fn discovered_port(device: &ffi::DeviceHandle) -> Result<DiscoveredPort> {
+pub(crate) fn discovered_port(device: &ffi::NativeDevice) -> Result<DiscoveredPort> {
     Ok(DiscoveredPort {
         device: device.name.clone(),
         port: device.endpoint.port,

@@ -842,22 +842,22 @@ mod tests {
     fn connected(
         sim: &Simulation,
     ) -> (
-        Rc<QueuePairHandle>,
-        Rc<QueuePairHandle>,
-        Rc<Region>,
-        Rc<Region>,
+        Rc<NativeQueuePair>,
+        Rc<NativeQueuePair>,
+        Rc<NativeRegion>,
+        Rc<NativeRegion>,
     ) {
         let node = sim
             .with_devices(vec![Device::new("sim0", [1; 16])])
             .unwrap();
         let _scope = node.enter();
         let device = Rc::new(Verbs.discover().unwrap().remove(0));
-        let sender = QueuePairHandle::new(device.clone()).unwrap();
-        let receiver = QueuePairHandle::new(device.clone()).unwrap();
+        let sender = NativeQueuePair::new(device.clone()).unwrap();
+        let receiver = NativeQueuePair::new(device.clone()).unwrap();
         sender.connect(receiver.endpoint).unwrap();
         receiver.connect(sender.endpoint).unwrap();
-        let source = Region::new(device.clone(), 32, lifetime_tests::quota().0).unwrap();
-        let target = Region::new(device, 32, lifetime_tests::quota().0).unwrap();
+        let source = NativeRegion::new(device.clone(), 32, lifetime_tests::quota().0).unwrap();
+        let target = NativeRegion::new(device, 32, lifetime_tests::quota().0).unwrap();
         source.resize(17).unwrap();
         target.resize(17).unwrap();
         source.copy_from(&[0xa5; 17]).unwrap();
@@ -903,13 +903,13 @@ mod tests {
             let (quota, charged) = lifetime_tests::quota();
             {
                 let (sender, receiver, source, _) = connected(&sim);
-                let target = Region::new(sender.device().clone(), 32, quota).unwrap();
+                let target = NativeRegion::new(sender.device().clone(), 32, quota).unwrap();
                 target.resize(17).unwrap();
                 let (window, bind) = receiver.bind(target.clone()).unwrap();
                 assert_eq!(receiver.progress(), Ok(1));
                 assert_eq!(bind.result(), Some(Ok(())));
-                let fallback_sender = QueuePairHandle::new(sender.device().clone()).unwrap();
-                let fallback_receiver = QueuePairHandle::new(sender.device().clone()).unwrap();
+                let fallback_sender = NativeQueuePair::new(sender.device().clone()).unwrap();
+                let fallback_receiver = NativeQueuePair::new(sender.device().clone()).unwrap();
                 fallback_sender.connect(fallback_receiver.endpoint).unwrap();
                 fallback_receiver.connect(fallback_sender.endpoint).unwrap();
                 sim.fault(Operation::Write, Fault::Delay(1));
@@ -1051,7 +1051,7 @@ mod tests {
                     2 => (target.address() + 1, window.key),
                     _ => (target.address(), window.key),
                 };
-                let stranger = QueuePairHandle::new(sender.device().clone()).unwrap();
+                let stranger = NativeQueuePair::new(sender.device().clone()).unwrap();
                 stranger.connect(receiver.endpoint).unwrap();
                 let writer = if case == 3 { &stranger } else { &sender };
                 writer.write(source, address, key).unwrap();
@@ -1184,7 +1184,7 @@ mod tests {
                 assert!(Verbs.discover().unwrap().is_empty());
             }
             assert_eq!(Verbs.discover().unwrap().len(), 1);
-            let region = Region::new(device, 32, lifetime_tests::quota().0).unwrap();
+            let region = NativeRegion::new(device, 32, lifetime_tests::quota().0).unwrap();
             let address = region.address();
             drop(scope);
             drop(region);

@@ -250,16 +250,16 @@ impl Drop for IoPort {
 }
 
 struct Resource {
-    device: Rc<ffi::DeviceHandle>,
-    region: Rc<ffi::Region>,
-    qp: Option<Rc<ffi::QueuePairHandle>>,
+    device: Rc<ffi::NativeDevice>,
+    region: Rc<ffi::NativeRegion>,
+    qp: Option<Rc<ffi::NativeQueuePair>>,
     window: Option<Rc<ffi::Window>>,
     pending: Option<ffi::Ticket>,
     stopping: bool,
     next_retry: Option<std::time::Instant>,
 }
 struct Activation {
-    devices: Vec<Rc<ffi::DeviceHandle>>,
+    devices: Vec<Rc<ffi::NativeDevice>>,
     selected: Vec<(RailMapping, usize)>,
     quotas: std::vec::IntoIter<Reservation>,
     bytes: usize,
@@ -351,7 +351,7 @@ impl NativeService {
             .try_reserve_exact(activation.bytes)
             .map_err(|_| Error::Overloaded)?;
         mailbox.bytes.resize(activation.bytes, 0);
-        let region = ffi::Region::new(device.clone(), activation.bytes, quota)?;
+        let region = ffi::NativeRegion::new(device.clone(), activation.bytes, quota)?;
         self.resources[i] = Some(Resource {
             device: device.clone(),
             region,
@@ -362,7 +362,7 @@ impl NativeService {
             next_retry: None,
         });
         let resource = self.resources[i].as_mut().unwrap();
-        resource.qp = Some(ffi::QueuePairHandle::new(device)?);
+        resource.qp = Some(ffi::NativeQueuePair::new(device)?);
         let qp = resource.qp.as_ref().unwrap();
         qp.probe_window()?;
         mailbox.rail = rail.rail;
@@ -525,7 +525,7 @@ impl NativeService {
             }
             // Replenish the QP outside request turns. MR stays registered for the
             // entire bounded pool lifetime. Never reuse a QP/remote capability.
-            match ffi::QueuePairHandle::new(resource.device.clone()) {
+            match ffi::NativeQueuePair::new(resource.device.clone()) {
                 Ok(qp) => {
                     mailbox.endpoint = Some(qp.endpoint);
                     resource.qp = Some(qp);

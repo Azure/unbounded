@@ -216,13 +216,13 @@ impl Drop for Api {
     }
 }
 
-pub struct DeviceHandle {
+pub struct NativeDevice {
     api: Rc<Api>,
     raw: NonNull<c_void>,
     pub name: String,
     pub endpoint: Endpoint,
 }
-impl DeviceHandle {
+impl NativeDevice {
     pub(crate) fn numa_node(&self) -> Option<usize> {
         #[cfg(test)]
         if simulation::is_api(&self.api) {
@@ -241,7 +241,7 @@ impl DeviceHandle {
         .ok()
     }
 }
-impl Drop for DeviceHandle {
+impl Drop for NativeDevice {
     fn drop(&mut self) {
         if unsafe { (self.api.close)(self.raw.as_ptr()) } != 0 {
             std::mem::forget(self.api.clone());
@@ -250,7 +250,7 @@ impl Drop for DeviceHandle {
 }
 
 impl Verbs {
-    pub fn discover(&self) -> Result<Vec<DeviceHandle>> {
+    pub fn discover(&self) -> Result<Vec<NativeDevice>> {
         #[cfg(test)]
         let api = match simulation::current() {
             Some(_) => simulation::api(),
@@ -282,7 +282,7 @@ impl Verbs {
             let Some(raw) = NonNull::new(unsafe { (api.open)(port.name.as_ptr()) }) else {
                 continue;
             };
-            devices.push(DeviceHandle {
+            devices.push(NativeDevice {
                 api: api.clone(),
                 raw,
                 name,
@@ -303,17 +303,17 @@ impl Verbs {
 
 /// Native memory is never referenced while remotely writable or locally in flight.
 /// Quota is attached inside the native owner, including intentional quarantine leaks.
-pub(crate) struct Region {
-    device: Rc<DeviceHandle>,
+pub(crate) struct NativeRegion {
+    device: Rc<NativeDevice>,
     raw: NonNull<c_void>,
     length: usize,
     used: Cell<usize>,
     quota: Option<Arc<Reservation>>,
     busy: Cell<bool>,
 }
-impl Region {
+impl NativeRegion {
     pub(crate) fn new(
-        device: Rc<DeviceHandle>,
+        device: Rc<NativeDevice>,
         length: usize,
         quota: Arc<Reservation>,
     ) -> Result<Rc<Self>> {
@@ -386,7 +386,7 @@ impl Region {
         .to_vec())
     }
 }
-impl Drop for Region {
+impl Drop for NativeRegion {
     fn drop(&mut self) {
         if unsafe { (self.device.api.deregister)(self.raw.as_ptr()) } != 0 {
             std::mem::forget(self.device.clone());
@@ -396,10 +396,10 @@ impl Drop for Region {
 }
 
 pub(crate) struct Window {
-    device: Rc<DeviceHandle>,
+    device: Rc<NativeDevice>,
     raw: NonNull<c_void>,
     pub(crate) key: u32,
-    region: Rc<Region>,
+    region: Rc<NativeRegion>,
 }
 impl Drop for Window {
     fn drop(&mut self) {
@@ -426,7 +426,7 @@ struct Pending {
     ticket: Ticket,
     opcode: u32,
     // Ownership survives future cancellation and failed CQ polling.
-    region: Option<Rc<Region>>,
+    region: Option<Rc<NativeRegion>>,
     _window: Option<Rc<Window>>,
 }
 impl Pending {
@@ -439,8 +439,8 @@ impl Pending {
     }
 }
 
-pub struct QueuePairHandle {
-    device: Rc<DeviceHandle>,
+pub struct NativeQueuePair {
+    device: Rc<NativeDevice>,
     raw: NonNull<c_void>,
     pub endpoint: Endpoint,
     stopped: Cell<bool>,
@@ -452,8 +452,8 @@ pub struct QueuePairHandle {
     windows: RefCell<Vec<Rc<Window>>>,
     expires: Cell<Option<std::time::Instant>>,
 }
-impl QueuePairHandle {
-    pub(crate) fn new(device: Rc<DeviceHandle>) -> Result<Rc<Self>> {
+impl NativeQueuePair {
+    pub(crate) fn new(device: Rc<NativeDevice>) -> Result<Rc<Self>> {
         let mut qpn = 0;
         let raw = NonNull::new(unsafe {
             (device.api.qp)(device.raw.as_ptr(), device.endpoint.port, 64, &mut qpn)
@@ -512,7 +512,7 @@ impl QueuePairHandle {
         Ok(())
     }
     #[cfg(test)]
-    pub(crate) fn device(&self) -> &Rc<DeviceHandle> {
+    pub(crate) fn device(&self) -> &Rc<NativeDevice> {
         &self.device
     }
     pub(crate) fn probe_window(&self) -> Result<()> {
@@ -540,7 +540,7 @@ impl QueuePairHandle {
     fn reserve(
         &self,
         opcode: u32,
-        region: Option<Rc<Region>>,
+        region: Option<Rc<NativeRegion>>,
         window: Option<Rc<Window>>,
     ) -> Result<(u64, Ticket)> {
         if !self.ready() {
@@ -573,7 +573,7 @@ impl QueuePairHandle {
         }
         Ok(())
     }
-    pub(crate) fn bind(&self, region: Rc<Region>) -> Result<(Rc<Window>, Ticket)> {
+    pub(crate) fn bind(&self, region: Rc<NativeRegion>) -> Result<(Rc<Window>, Ticket)> {
         if !Rc::ptr_eq(&region.device, &self.device)
             || region.busy.get()
             || !self.windows.borrow().is_empty()
@@ -619,7 +619,7 @@ impl QueuePairHandle {
         self.submitted(id, rc)?;
         Ok(ticket)
     }
-    pub(crate) fn write(&self, region: Rc<Region>, address: u64, key: u32) -> Result<Ticket> {
+    pub(crate) fn write(&self, region: Rc<NativeRegion>, address: u64, key: u32) -> Result<Ticket> {
         if !Rc::ptr_eq(&region.device, &self.device)
             || region.busy.get()
             || address.checked_add(region.length as u64).is_none()
@@ -701,7 +701,7 @@ impl QueuePairHandle {
         Ok(())
     }
 }
-impl Drop for QueuePairHandle {
+impl Drop for NativeQueuePair {
     fn drop(&mut self) {
         if self.stop().is_err() {
             std::mem::forget(std::mem::take(self.pending.get_mut()));

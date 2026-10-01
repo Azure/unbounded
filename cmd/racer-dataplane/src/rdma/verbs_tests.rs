@@ -139,7 +139,7 @@ pub(crate) fn quota() -> (Arc<Reservation>, QuotaObserver) {
         .unwrap();
     (Arc::new(reservation), QuotaObserver(admission))
 }
-pub(crate) fn fixture() -> (Rc<QueuePairHandle>, Rc<Region>, QuotaObserver) {
+pub(crate) fn fixture() -> (Rc<NativeQueuePair>, Rc<NativeRegion>, QuotaObserver) {
     FAULTS.with_borrow_mut(|f| *f = Faults::default());
     let api = Rc::new(Api {
         library: None,
@@ -160,7 +160,7 @@ pub(crate) fn fixture() -> (Rc<QueuePairHandle>, Rc<Region>, QuotaObserver) {
         write,
         poll,
     });
-    let device = Rc::new(DeviceHandle {
+    let device = Rc::new(NativeDevice {
         api,
         raw: NonNull::new(pointer()).unwrap(),
         name: "test-only".into(),
@@ -174,10 +174,10 @@ pub(crate) fn fixture() -> (Rc<QueuePairHandle>, Rc<Region>, QuotaObserver) {
             link_layer: 1,
         },
     });
-    let qp = QueuePairHandle::new(device.clone()).unwrap();
+    let qp = NativeQueuePair::new(device.clone()).unwrap();
     qp.connect(qp.endpoint).unwrap();
     let (quota, charged) = quota();
-    let region = Region::new(device, 32, quota).unwrap();
+    let region = NativeRegion::new(device, 32, quota).unwrap();
     (qp, region, charged)
 }
 pub(crate) fn complete(id: u64, status: u32, opcode: u32) {
@@ -186,9 +186,9 @@ pub(crate) fn complete(id: u64, status: u32, opcode: u32) {
 pub(crate) fn fail_stop(fail: bool) {
     FAULTS.with_borrow_mut(|f| f.stop_fails = fail);
 }
-pub(crate) fn fresh_fixture() -> (Rc<QueuePairHandle>, Rc<Region>, QuotaObserver) {
+pub(crate) fn fresh_fixture() -> (Rc<NativeQueuePair>, Rc<NativeRegion>, QuotaObserver) {
     let (qp, region, charged) = fixture();
-    let fresh = QueuePairHandle::new(qp.device.clone()).unwrap();
+    let fresh = NativeQueuePair::new(qp.device.clone()).unwrap();
     (fresh, region, charged)
 }
 
@@ -284,7 +284,7 @@ fn write_success_and_post_rejection_have_distinct_release_paths() {
 fn reversed_completions_release_only_their_own_allocation() {
     let (qp, first, first_charge) = fixture();
     let (quota, second_charge) = quota();
-    let second = Region::new(qp.device.clone(), 32, quota).unwrap();
+    let second = NativeRegion::new(qp.device.clone(), 32, quota).unwrap();
     let one = qp.write(first.clone(), 4096, 7).unwrap();
     let two = qp.write(second.clone(), 8192, 8).unwrap();
     drop(first);
@@ -381,15 +381,15 @@ fn native_available_provider_write_bind_invalidate_and_fence() {
             .find(|d| d.name == name)
             .expect("selected provider not active or no type-2B support"),
     );
-    let receiver = QueuePairHandle::new(device.clone()).unwrap();
-    let sender = QueuePairHandle::new(device.clone()).unwrap();
+    let receiver = NativeQueuePair::new(device.clone()).unwrap();
+    let sender = NativeQueuePair::new(device.clone()).unwrap();
     receiver.connect(sender.endpoint).unwrap();
     sender.connect(receiver.endpoint).unwrap();
-    let destination = Region::new(device.clone(), 4096, quota().0).unwrap();
-    let source = Region::new(device.clone(), 4096, quota().0).unwrap();
+    let destination = NativeRegion::new(device.clone(), 4096, quota().0).unwrap();
+    let source = NativeRegion::new(device.clone(), 4096, quota().0).unwrap();
     source.copy_from(&vec![0xa5; 4096]).unwrap();
     let (window, bind) = receiver.bind(destination.clone()).unwrap();
-    fn wait(qp: &QueuePairHandle, ticket: &Ticket) {
+    fn wait(qp: &NativeQueuePair, ticket: &Ticket) {
         let until = Instant::now() + Duration::from_secs(10);
         while ticket.result().is_none() {
             assert!(Instant::now() < until, "native CQ timeout");
@@ -409,7 +409,7 @@ fn native_available_provider_write_bind_invalidate_and_fence() {
     // A completed local invalidation must reject a subsequent write using the
     // old capability. It still does not authorize CPU access before the fence.
     assert_eq!(destination.copy_to(), Err(Error::Unavailable));
-    let stale = Region::new(device, 4096, quota().0).unwrap();
+    let stale = NativeRegion::new(device, 4096, quota().0).unwrap();
     stale.copy_from(&vec![0xff; 4096]).unwrap();
     let rejected = sender
         .write(stale, destination.address(), stale_key)
