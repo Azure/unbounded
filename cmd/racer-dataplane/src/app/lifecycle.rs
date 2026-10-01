@@ -73,9 +73,7 @@ impl WorkerApplication {
         Ok(())
     }
     pub(super) fn observe_health(&self) -> Result<()> {
-        let Some(node) = &self.node else {
-            return Ok(());
-        };
+        let node = &self.node;
         let now = crate::runtime::environment::now();
         if self.control.is_some() {
             self.telemetry.metrics.set_gauge(
@@ -153,11 +151,7 @@ impl WorkerApplication {
                 self.directory
                     .install(self.worker, self.coordinator.clone())?,
             );
-            let node = self
-                .node
-                .as_ref()
-                .ok_or(Error::InvalidConfiguration)?
-                .clone();
+            let node = self.node.clone();
             node.prepared.fetch_add(1, Ordering::Release);
             self.attach_cache_adapter();
             if let Some(control) = self.control.clone() {

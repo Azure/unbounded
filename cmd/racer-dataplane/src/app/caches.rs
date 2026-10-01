@@ -101,18 +101,16 @@ impl CachePublication {
 }
 impl WorkerApplication {
     pub(super) fn attach_cache_adapter(&self) {
-        if let (Some(control), Some(node)) = (&self.control, &self.node) {
+        if let Some(control) = &self.control {
             control.attach_cache_publication(Rc::new(CachePublication {
-                node: node.clone(),
+                node: self.node.clone(),
                 listeners: self.prepared_listeners.clone(),
                 capacity: self.runtime.admission.limits().metadata_entries.get(),
             }));
         }
     }
     pub(super) fn poll_cache_preparation(&mut self, cx: &mut Context<'_>) -> Result<()> {
-        let Some(node) = self.node.clone() else {
-            return Ok(());
-        };
+        let node = self.node.clone();
         let (generation, definitions) = {
             let cut = node.cache_cut.lock().map_err(|_| Error::Unavailable)?;
             if cut.generation == 0 || cut.committed || cut.prepared.contains(&self.worker) {
@@ -196,7 +194,9 @@ mod tests {
             admission,
             crypto: Rc::new(crate::runtime::crypto::CryptoClient::new(io)),
         };
-        let worker = WorkerApplication::assemble(&config, &node, WorkerId(0), runtime).unwrap();
+        let worker =
+            WorkerApplication::assemble(&config, node.clone(), WorkerId(0), runtime, Vec::new())
+                .unwrap();
         let adapter = CachePublication {
             node: node.clone(),
             listeners: worker.prepared_listeners.clone(),

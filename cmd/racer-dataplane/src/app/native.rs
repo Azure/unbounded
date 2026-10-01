@@ -726,8 +726,14 @@ mod tests {
             admission,
             crypto: Rc::new(CryptoClient::new(io)),
         };
-        let mut worker =
-            WorkerApplication::assemble(&app.config, &app.node, WorkerId(0), runtime).unwrap();
+        let mut worker = WorkerApplication::assemble(
+            &app.config,
+            app.node.clone(),
+            WorkerId(0),
+            runtime,
+            app.fabric_ports.clone(),
+        )
+        .unwrap();
         worker.fabric_ports = app.fabric_ports.clone();
         worker
             .snapshots

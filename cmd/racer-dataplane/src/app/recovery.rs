@@ -18,7 +18,7 @@ pub(super) struct RecoveryCut {
 
 impl WorkerApplication {
     pub(super) async fn checkpoint(&self, deadline: &RequestScope) -> Result<()> {
-        let node = self.node.as_ref().ok_or(Error::InvalidConfiguration)?;
+        let node = &self.node;
         let mut image = match self.store.checkpoint.snapshot_shard().await {
             Ok(image) => image,
             Err(error) => {
@@ -93,9 +93,7 @@ impl WorkerApplication {
     }
 
     pub(super) fn poll_checkpoint(&mut self, cx: &mut Context<'_>) -> Result<()> {
-        let Some(node) = &self.node else {
-            return Ok(());
-        };
+        let node = &self.node;
         if !self.started {
             return Ok(());
         }
@@ -223,7 +221,7 @@ impl WorkerApplication {
         geometry: CheckpointGeometry,
         startup: &RequestScope,
     ) -> Result<()> {
-        let node = self.node.as_ref().ok_or(Error::InvalidConfiguration)?;
+        let node = &self.node;
         node.recovery
             .lock()
             .map_err(|_| Error::Unavailable)?

@@ -540,7 +540,7 @@ pub struct WorkerApplication {
     native_retry: std::time::Instant,
     telemetry: Rc<Telemetry>,
     directory: Arc<WorkerDirectory>,
-    node: Option<Arc<NodeState>>,
+    node: Arc<NodeState>,
     endpoint: Option<WorkerEndpoint>,
     control_task: Option<Operation<'static, ()>>,
     keyring_task: Option<Operation<'static, ()>>,
@@ -578,9 +578,10 @@ impl WorkerApplication {
     /// listener work to page/metadata owners before any acquisition is dispatched.
     pub fn assemble(
         config: &Config,
-        node: &NodeState,
+        node: Arc<NodeState>,
         worker: WorkerId,
         runtime: WorkerRuntime,
+        fabric_ports: Vec<crate::rdma::FabricPort>,
     ) -> Result<Self> {
         let environment = crate::runtime::environment::Environment::current();
         let metrics = node
@@ -627,26 +628,13 @@ impl WorkerApplication {
         let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
         let crypto = Rc::new(PageCrypto::new(keys.clone(), runtime.crypto.clone()));
         let control = if worker == node.control_worker {
-            let enrollment = Rc::new(Enrollment::new(
-                config.cluster.clone(),
-                config.service_account_token.clone(),
-                config.identity_directory.clone(),
-            ));
-            enrollment.set_shares(config.shares);
-            let secrets = BundleInstaller::new(keys.clone());
-            let control = Rc::new(ControlClient::new(
-                ControlEndpoint {
-                    url: config.control_endpoint.clone(),
-                    trust_bundle: config.trust_bundle.clone(),
-                },
-                enrollment,
+            Some(Self::assemble_control(
+                config,
+                &runtime,
                 keys.clone(),
-                secrets,
                 snapshots.clone(),
                 caches,
-            ));
-            control.attach_io(Rc::new(ReactorControlIo::new(reactor.clone())));
-            Some(control)
+            ))
         } else {
             None
         };
@@ -680,55 +668,18 @@ impl WorkerApplication {
             Delivery::new(pipes.clone(), config.reader_stall_timeout).with_metrics(metrics.clone()),
         );
 
-        let index = Rc::new(
-            Index::new(worker, limits.metadata_entries.get())
-                .with_availability(availability.clone()),
-        );
-        let segments = Rc::new(Segments::new(worker, config.segment_bytes));
-        let eviction = Rc::new(SegmentClock::new(
-            index.clone(),
-            segments.clone(),
-            config.free_segment_reserve,
-        ));
-        let slabs = Rc::new(Slabs::new(
+        let store = Self::assemble_storage(
+            config,
+            &node,
             worker,
-            config.slab_directory.clone(),
-            reactor.clone(),
-            config.slab_bytes,
-            config.segment_bytes,
-        ));
-        let disk = Rc::new(
-            StoreReader::new(
-                eviction.clone(),
-                index.clone(),
-                segments.clone(),
-                slabs.clone(),
-                buffers.clone(),
-            )
-            .with_metrics(metrics.clone()),
-        );
-        let writer = Rc::new(
-            StoreWriter::new(index.clone(), segments.clone(), slabs)
-                .with_availability(availability.clone())
-                .with_metrics(metrics.clone()),
-        );
-        writer.configure(
-            admission.clone(),
-            eviction.clone(),
-            limits.queue_entries.get(),
-            (config.disk_page_entries.get() / node.count).max(1),
+            &runtime,
+            buffers.clone(),
+            availability.clone(),
+            &metrics,
         )?;
-        let store = Store {
-            reader: disk.clone(),
-            writer: writer.clone(),
-            checkpoint: Rc::new(Checkpointer::new(
-                config.slab_directory.clone(),
-                index.clone(),
-                segments.clone(),
-            )),
-            recovery: Recovery::new(config.slab_directory.clone(), index.clone(), segments),
-            eviction,
-        };
+        let disk = store.reader.clone();
+        let writer = store.writer.clone();
+        let index = writer.index().clone();
 
         let (sessions, rdma, devices) = if config.enable_rdma {
             let devices = Rc::new(Devices::new());
@@ -773,26 +724,11 @@ impl WorkerApplication {
             wire.clone(),
             signatures.clone(),
         )
-        .with_reclamation({
-            let admission = admission.clone();
-            let memory = memory.clone();
-            let writer = writer.clone();
-            move |cache, amount| {
-                let class = crate::model::ResourceClass::Ciphertext;
-                for _ in 0..2 {
-                    let Some((owner, bytes)) = admission.reclamation(cache, class, amount) else {
-                        break;
-                    };
-                    let released = memory.reclaim_idle(class, owner.as_ref(), bytes, |page| {
-                        writer.discard_idle_copy(page)
-                    });
-                    if released < bytes {
-                        writer.reclaim_ciphertext(owner.as_ref(), bytes - released);
-                    }
-                    admission.reclaim_buffers();
-                }
-            }
-        });
+        .with_reclamation(Self::ciphertext_reclaimer(
+            admission.clone(),
+            memory.clone(),
+            writer.clone(),
+        ));
         let transfers = Rc::new(match &sessions {
             Some(sessions) => transfers.with_native(sessions.clone()),
             None => transfers,
@@ -952,14 +888,14 @@ impl WorkerApplication {
             flights,
             rdma,
             devices,
-            fabric_ports: Vec::new(),
+            fabric_ports,
             actual_rails: Vec::new(),
             native_numa: node.native.numa(worker)?,
             native_task: None,
             native_retry: crate::runtime::environment::now(),
             telemetry: Rc::new(telemetry),
             directory: node.workers.clone(),
-            node: None,
+            node,
             endpoint: None,
             control_task: None,
             keyring_task: None,
@@ -992,6 +928,118 @@ impl WorkerApplication {
             control_scope: None,
             next_health: crate::runtime::environment::now(),
         })
+    }
+
+    fn assemble_control(
+        config: &Config,
+        runtime: &WorkerRuntime,
+        keys: Rc<Keyring>,
+        snapshots: Rc<SnapshotStore>,
+        caches: Rc<CacheRegistry>,
+    ) -> Rc<ControlClient> {
+        let enrollment = Rc::new(Enrollment::new(
+            config.cluster.clone(),
+            config.service_account_token.clone(),
+            config.identity_directory.clone(),
+        ));
+        enrollment.set_shares(config.shares);
+        let secrets = BundleInstaller::new(keys.clone());
+        let control = Rc::new(ControlClient::new(
+            ControlEndpoint {
+                url: config.control_endpoint.clone(),
+                trust_bundle: config.trust_bundle.clone(),
+            },
+            enrollment,
+            keys,
+            secrets,
+            snapshots,
+            caches,
+        ));
+        control.attach_io(Rc::new(ReactorControlIo::new(runtime.reactor.clone())));
+        control
+    }
+
+    fn assemble_storage(
+        config: &Config,
+        node: &NodeState,
+        worker: WorkerId,
+        runtime: &WorkerRuntime,
+        buffers: Rc<BufferPool>,
+        availability: Rc<crate::control::availability::Availability>,
+        metrics: &crate::telemetry::metrics::Metrics,
+    ) -> Result<Store> {
+        let limits = runtime.admission.limits();
+        let index = Rc::new(
+            Index::new(worker, limits.metadata_entries.get())
+                .with_availability(availability.clone()),
+        );
+        let segments = Rc::new(Segments::new(worker, config.segment_bytes));
+        let eviction = Rc::new(SegmentClock::new(
+            index.clone(),
+            segments.clone(),
+            config.free_segment_reserve,
+        ));
+        let slabs = Rc::new(Slabs::new(
+            worker,
+            config.slab_directory.clone(),
+            runtime.reactor.clone(),
+            config.slab_bytes,
+            config.segment_bytes,
+        ));
+        let reader = Rc::new(
+            StoreReader::new(
+                eviction.clone(),
+                index.clone(),
+                segments.clone(),
+                slabs.clone(),
+                buffers,
+            )
+            .with_metrics(metrics.clone()),
+        );
+        let writer = Rc::new(
+            StoreWriter::new(index.clone(), segments.clone(), slabs)
+                .with_availability(availability)
+                .with_metrics(metrics.clone()),
+        );
+        writer.configure(
+            runtime.admission.clone(),
+            eviction.clone(),
+            limits.queue_entries.get(),
+            (config.disk_page_entries.get() / node.count).max(1),
+        )?;
+        Ok(Store {
+            reader,
+            writer,
+            checkpoint: Rc::new(Checkpointer::new(
+                config.slab_directory.clone(),
+                index.clone(),
+                segments.clone(),
+            )),
+            recovery: Recovery::new(config.slab_directory.clone(), index, segments),
+            eviction,
+        })
+    }
+
+    fn ciphertext_reclaimer(
+        admission: Rc<Admission>,
+        memory: Rc<MemoryCache>,
+        writer: Rc<StoreWriter>,
+    ) -> impl Fn(&crate::model::CacheId, usize) {
+        move |cache, amount| {
+            let class = crate::model::ResourceClass::Ciphertext;
+            for _ in 0..2 {
+                let Some((owner, bytes)) = admission.reclamation(cache, class, amount) else {
+                    break;
+                };
+                let released = memory.reclaim_idle(class, owner.as_ref(), bytes, |page| {
+                    writer.discard_idle_copy(page)
+                });
+                if released < bytes {
+                    writer.reclaim_ciphertext(owner.as_ref(), bytes - released);
+                }
+                admission.reclaim_buffers();
+            }
+        }
     }
 
     fn refresh_snapshot(&mut self, current_scope: &RequestScope) -> Result<()> {
@@ -1047,7 +1095,7 @@ impl WorkerApplication {
         if work_budget == 0 {
             return Ok(());
         }
-        if let Some(hedges) = self.node.as_ref().and_then(|n| n.hedges.get()) {
+        if let Some(hedges) = self.node.hedges.get() {
             hedges.poll();
         }
         let budget = work_budget.min(64);
@@ -1061,8 +1109,9 @@ impl WorkerApplication {
             }
         }
         self.poll_checkpoint(cx)?;
-        if let Some(node) = &self.node {
-            for accepted in node
+        {
+            for accepted in self
+                .node
                 .ingress
                 .pop_batch::<64>(self.worker, cx.waker(), budget)?
                 .into_iter()
@@ -1181,11 +1230,11 @@ impl WorkerApplication {
         {
             result?;
         }
-        let checkpoint_waiting = self.node.as_ref().is_some_and(|node| {
-            node.periodic_checkpoint
-                .lock()
-                .is_ok_and(|cut| cut.periodic_generation != 0 && cut.result.is_none())
-        });
+        let checkpoint_waiting = self
+            .node
+            .periodic_checkpoint
+            .lock()
+            .is_ok_and(|cut| cut.periodic_generation != 0 && cut.result.is_none());
         if !checkpoint_waiting
             && self.writer_task.is_none()
             && self.store.writer.pending_count() != 0
@@ -1288,10 +1337,13 @@ impl WorkerFactory for Application {
         self.limits.clone()
     }
     fn build(&self, worker: WorkerId, runtime: WorkerRuntime) -> Result<Box<dyn WorkerService>> {
-        let mut application =
-            WorkerApplication::assemble(&self.config, &self.node, worker, runtime)?;
-        application.node = Some(self.node.clone());
-        application.fabric_ports = self.fabric_ports.clone();
+        let application = WorkerApplication::assemble(
+            &self.config,
+            self.node.clone(),
+            worker,
+            runtime,
+            self.fabric_ports.clone(),
+        )?;
         Ok(Box::new(application))
     }
     fn build_crypto(
@@ -1321,9 +1373,7 @@ impl WorkerService for WorkerApplication {
         let _environment = self.environment.enter();
         let _queue = self.drivers.enter();
         self.stopping = true;
-        if let Some(node) = &self.node {
-            node.ingress.close(self.worker);
-        }
+        self.node.ingress.close(self.worker);
         if let Some(scope) = &self.task_scope {
             scope.cancel()?;
         }
@@ -1434,12 +1484,11 @@ impl WorkerService for WorkerApplication {
             })
             .await?;
             if let Some(error) = first_error {
-                if let Some(node) = &self.node {
-                    node.checkpoint
-                        .lock()
-                        .map_err(|_| Error::Unavailable)?
-                        .result = Some(Err(error));
-                }
+                self.node
+                    .checkpoint
+                    .lock()
+                    .map_err(|_| Error::Unavailable)?
+                    .result = Some(Err(error));
                 return Err(error);
             }
             if self.started {
@@ -1629,13 +1678,14 @@ pub(crate) mod tests {
         let (io, _engine) = crypto::pair(WorkerId(0), 0, config.limits.queue_entries);
         WorkerApplication::assemble(
             &config,
-            &NodeState::default(),
+            Arc::new(NodeState::default()),
             WorkerId(0),
             WorkerRuntime {
                 reactor: Rc::new(Reactor::new(admission.clone())),
                 admission,
                 crypto: Rc::new(CryptoClient::new(io)),
             },
+            Vec::new(),
         )
         .unwrap()
     }
@@ -1788,9 +1838,15 @@ pub(crate) mod tests {
             let _engine = application
                 .build_crypto(WorkerId(0), CryptoRuntime { port: engine })
                 .unwrap();
-            let node = NodeState::default();
-            let mut worker = WorkerApplication::assemble(&config, &node, WorkerId(0), runtime)
-                .expect("valid side-effect-free worker composition");
+            let node = Arc::new(NodeState::default());
+            let mut worker = WorkerApplication::assemble(
+                &config,
+                node.clone(),
+                WorkerId(0),
+                runtime,
+                Vec::new(),
+            )
+            .expect("valid side-effect-free worker composition");
             assert!(worker.control.is_some());
             assert_eq!(worker.rdma.is_some(), enable_rdma);
             assert_eq!(
@@ -1819,8 +1875,14 @@ pub(crate) mod tests {
                     },
                 )
                 .unwrap();
-            let second = WorkerApplication::assemble(&config, &node, WorkerId(1), second_runtime)
-                .expect("valid second worker composition");
+            let second = WorkerApplication::assemble(
+                &config,
+                node.clone(),
+                WorkerId(1),
+                second_runtime,
+                Vec::new(),
+            )
+            .expect("valid second worker composition");
             assert!(
                 second.control.is_none(),
                 "only one worker enrolls and publishes"

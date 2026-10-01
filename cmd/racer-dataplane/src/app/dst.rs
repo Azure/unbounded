@@ -642,16 +642,19 @@ impl Harness {
                 .prepare(worker_ids.into_iter(), &config.limits)
                 .unwrap();
         }
-        let (mut app, runtime, engine) = integration_tests::local_worker(&config, &node, 0);
-        let crypto = node.native.crypto(WorkerId(0), engine).unwrap();
-        if self.native {
-            app.fabric_ports = vec![crate::rdma::FabricPort {
+        let fabric_ports = if self.native {
+            vec![crate::rdma::FabricPort {
                 fabric: "dst-fabric".into(),
                 device,
                 port: 1,
                 gid: Some(gid),
-            }];
-        }
+            }]
+        } else {
+            Vec::new()
+        };
+        let (mut app, runtime, engine) =
+            integration_tests::local_worker_with_fabric(&config, &node, 0, fabric_ports);
+        let crypto = node.native.crypto(WorkerId(0), engine).unwrap();
         app.keys.install(self.bundle(&config, 1)).unwrap();
         app.keys
             .install_signing_identity(self.identity(&config, id))
@@ -1314,7 +1317,7 @@ impl Harness {
         for node in &mut self.nodes {
             node.workers[0].app.control = node.control.clone();
             staged.push(caches::CachePublication {
-                node: node.workers[0].app.node.as_ref().unwrap().clone(),
+                node: node.workers[0].app.node.clone(),
                 listeners: node.workers[0].app.prepared_listeners.clone(),
                 capacity: node.config.limits.metadata_entries.get(),
             });
@@ -1965,13 +1968,7 @@ fn phase5_default_grace_staggered_nodes_and_periodic_checkpoint_traffic() {
     // Replace only the store's admission policy, retaining each real node's
     // registry and all production peer/read dependencies.
     for node in &mut harness.nodes {
-        let published = node.workers[0]
-            .app
-            .node
-            .as_ref()
-            .unwrap()
-            .publications
-            .clone();
+        let published = node.workers[0].app.node.publications.clone();
         node.workers[0].app.snapshots = Rc::new(SnapshotStore::new(
             node.config.cluster.clone(),
             published,
@@ -2001,8 +1998,6 @@ fn phase5_default_grace_staggered_nodes_and_periodic_checkpoint_traffic() {
             node.workers[0]
                 .app
                 .node
-                .as_ref()
-                .unwrap()
                 .publications
                 .membership(old)
                 .is_ok()

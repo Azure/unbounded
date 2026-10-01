@@ -12,6 +12,15 @@ pub(super) fn local_worker(
     node: &Arc<NodeState>,
     id: u16,
 ) -> (WorkerApplication, WorkerRuntime, PageCryptoEngine) {
+    local_worker_with_fabric(config, node, id, Vec::new())
+}
+
+pub(super) fn local_worker_with_fabric(
+    config: &Config,
+    node: &Arc<NodeState>,
+    id: u16,
+    fabric_ports: Vec<crate::rdma::FabricPort>,
+) -> (WorkerApplication, WorkerRuntime, PageCryptoEngine) {
     let worker = WorkerId(id);
     let admission = Rc::new(Admission::new(config.limits.clone()));
     let (io, engine) = crate::runtime::crypto::pair(worker, 0, config.limits.queue_entries);
@@ -25,8 +34,8 @@ pub(super) fn local_worker(
         admission: runtime.admission.clone(),
         crypto: runtime.crypto.clone(),
     };
-    let mut app = WorkerApplication::assemble(config, node, worker, local).unwrap();
-    app.node = Some(node.clone());
+    let app =
+        WorkerApplication::assemble(config, node.clone(), worker, local, fabric_ports).unwrap();
     (
         app,
         runtime,
@@ -1821,8 +1830,8 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
         admission: runtime.admission.clone(),
         crypto: runtime.crypto.clone(),
     };
-    let mut worker = WorkerApplication::assemble(&config, &node, WorkerId(0), local).unwrap();
-    worker.node = Some(node.clone());
+    let mut worker =
+        WorkerApplication::assemble(&config, node.clone(), WorkerId(0), local, Vec::new()).unwrap();
     let startup = scope(Duration::from_secs(15)).unwrap();
     drive(&runtime, &mut engine, worker.start(&startup)).unwrap();
     assert!(node.observations.health.ready());
