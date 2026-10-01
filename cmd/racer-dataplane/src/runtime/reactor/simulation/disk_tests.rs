@@ -344,14 +344,11 @@ fn partition_stalls_established_streams_and_connects_then_heals_without_loss() {
     assert!(weak.upgrade().is_none());
 }
 use crate::{
-    error::{Error, Operation, Result},
+    error::{Error, Result},
     model::RequestId,
     runtime::{admission::Admission, deadline::RequestScope, reactor::Reactor},
 };
-use std::{
-    task::{Context, Poll},
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 fn setup() -> (Simulation, Environment, Reactor, RequestScope) {
     let sim = Simulation::new();
@@ -366,19 +363,7 @@ fn setup() -> (Simulation, Environment, Reactor, RequestScope) {
     .unwrap();
     (sim, environment, r, scope)
 }
-fn poll<T>(op: &mut Operation<'_, T>) -> Poll<Result<T>> {
-    op.as_mut()
-        .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
-}
-fn drive<T>(r: &Reactor, mut op: Operation<'_, T>) -> Result<T> {
-    for _ in 0..100 {
-        if let Poll::Ready(result) = poll(&mut op) {
-            return result;
-        }
-        r.poll_budgeted(16)?;
-    }
-    panic!("disk operation stalled")
-}
+use super::io_tests::{drive, poll};
 fn open(sim: &Simulation, path: &str) -> Rc<Descriptor> {
     Rc::new(sim.open(None, Path::new(path), libc::O_RDWR).unwrap())
 }

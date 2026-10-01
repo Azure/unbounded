@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_support::WakeCounter;
 
 struct Fixture {
     admission: std::rc::Rc<crate::runtime::admission::Admission>,
@@ -147,24 +148,13 @@ fn accepted_deadline_expiry_waits_for_engine_completion() {
 
 #[test]
 fn abandoned_task_cannot_replace_worker_completion_wake() {
-    use crate::{model::RequestId, runtime::admission::Admission};
-    struct Count(AtomicUsize);
-    impl std::task::Wake for Count {
-        fn wake(self: Arc<Self>) {
-            self.0.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    let admission = std::rc::Rc::new(Admission::new(
-        crate::test_support::cluster::config(false).limits,
-    ));
-    let (io, mut engine) = pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
-    let client = CryptoClient::new(io);
-    let scope = RequestScope::new(
-        RequestId([0; 16]),
-        std::time::Instant::now() + std::time::Duration::from_secs(5),
-    )
-    .unwrap();
-    let driver = Arc::new(Count(AtomicUsize::new(0)));
+    let Fixture {
+        admission,
+        client,
+        mut engine,
+        scope,
+    } = Fixture::new();
+    let driver = Arc::new(WakeCounter::default());
     client.register_driver(&Waker::from(driver.clone()));
     let mut future = client.execute(input(&admission), key(), &scope);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -192,30 +182,20 @@ fn abandoned_task_cannot_replace_worker_completion_wake() {
             })
             .is_ok()
     );
-    assert_eq!(driver.0.load(Ordering::Relaxed), 1);
+    assert_eq!(driver.count(), 1);
     client.poll_budgeted(1).unwrap();
     assert_eq!(client.outstanding(), 0);
 }
 
 #[test]
 fn drain_scope_cancellation_wakes_even_with_unconsumed_result() {
-    use crate::{model::RequestId, runtime::admission::Admission};
-    struct Count(AtomicUsize);
-    impl std::task::Wake for Count {
-        fn wake(self: Arc<Self>) {
-            self.0.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    let admission = std::rc::Rc::new(Admission::new(
-        crate::test_support::cluster::config(false).limits,
-    ));
-    let (io, mut engine) = pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
-    let client = CryptoClient::new(io);
-    let scope = RequestScope::new(
-        RequestId([0; 16]),
-        std::time::Instant::now() + std::time::Duration::from_secs(5),
-    )
-    .unwrap();
+    use crate::model::RequestId;
+    let Fixture {
+        admission,
+        client,
+        mut engine,
+        scope,
+    } = Fixture::new();
     let mut future = client.execute(input(&admission), key(), &scope);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(future.as_mut().poll(&mut cx).is_pending());
@@ -243,13 +223,13 @@ fn drain_scope_cancellation_wakes_even_with_unconsumed_result() {
     );
     client.poll_budgeted(1).unwrap();
     let drain_scope = RequestScope::new(RequestId([1; 16]), scope.deadline.0).unwrap();
-    let count = Arc::new(Count(AtomicUsize::new(0)));
+    let count = Arc::new(WakeCounter::default());
     let waker = Waker::from(count.clone());
     let mut drain_cx = Context::from_waker(&waker);
     let mut drain = client.drain(&drain_scope);
     assert!(drain.as_mut().poll(&mut drain_cx).is_pending());
     drain_scope.cancel().unwrap();
-    assert!(count.0.load(Ordering::Relaxed) > 0);
+    assert!(count.count() > 0);
     assert!(matches!(
         drain.as_mut().poll(&mut drain_cx),
         Poll::Ready(Ok(()))

@@ -227,8 +227,12 @@ impl<'a> WorkerGroup<'a> {
                 let mut group = WorkerGroup::new(plan);
                 group.control = control.clone();
                 group.generation = generation;
-                if let Err(error) = group.run_prepared(&*factory, &startup, false, allocate) {
-                    control.fail(error);
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    group.run_prepared(&*factory, &startup, false, allocate)
+                })) {
+                    Ok(Ok(())) => (),
+                    Ok(Err(error)) => control.fail(error),
+                    Err(_) => control.fail(Error::Io),
                 }
             })
             .map_err(|_| Error::Io)?;
@@ -348,7 +352,13 @@ impl<'a> WorkerGroup<'a> {
         let mut engines = Vec::new();
         for &index in indices {
             let pair = self.plan.pairs[index].clone();
-            match allocate(pair.worker, self.generation, capacity) {
+            // Report allocation panics before the scoped join so already-started
+            // siblings see Drain rather than waiting forever for missing I/O.
+            let allocated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                allocate(pair.worker, self.generation, capacity)
+            }))
+            .unwrap_or(Err(Error::Io));
+            match allocated {
                 Ok((io, engine)) => {
                     engines.push((index, pair.worker, engine));
                     ios.push((index, pair, io));
@@ -1424,6 +1434,19 @@ mod tests {
         );
         io.close_submissions().unwrap();
         assert_eq!(count.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn coordinator_panic_reports_failure_and_joins_without_waiting_for_startup_deadline() {
+        let (mut group, factory) = fixture(3);
+        let scope = lifecycle_scope().unwrap();
+        assert_eq!(
+            group.start_with_allocator(Arc::new(factory), &scope, |_, _, _| {
+                panic!("injected allocation panic")
+            }),
+            Err(Error::Io)
+        );
+        assert!(group.threads.is_empty());
     }
 
     #[test]

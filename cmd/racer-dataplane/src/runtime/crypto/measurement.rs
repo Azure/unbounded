@@ -281,53 +281,25 @@ fn measurements_account_once_at_reap_even_for_cancel_and_abandon() {
                     .unwrap()
             };
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-            let mut data = input(&admission);
-            if decrypt {
-                let (setup, _setup_engine) = pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
-                let Poll::Ready(Ok(permit)) = setup.poll_reserve(
-                    &mut cx,
-                    CryptoId {
-                        worker: WorkerId(0),
-                        generation: 0,
-                        sequence: 0,
-                    },
-                ) else {
-                    panic!("permit")
-                };
-                let result = crate::security::aead::PageCryptoEngine::process(permit.job(
-                    data,
-                    lease(),
-                    scope.clone(),
-                ));
-                let CryptoOutcome::Completed(CryptoOutput::Encrypted(plain, mut ciphertext)) =
-                    result.outcome
-                else {
-                    panic!("encrypted")
-                };
-                drop(plain);
-                if matches!(mode, "failure" | "aead" | "abandon_crc" | "abandon_aead") {
-                    let inner = Arc::get_mut(&mut ciphertext.inner).unwrap();
-                    inner.bytes[0] ^= 1;
-                    if matches!(mode, "aead" | "abandon_aead") {
-                        // Peer bytes without a persisted CRC must still fail AEAD.
-                        inner.checksum = std::sync::OnceLock::new();
-                    }
+            let mut data = measurement_input(
+                &admission,
+                &cache,
+                lease(),
+                &scope,
+                decrypt,
+                matches!(mode, "failure" | "aead" | "abandon_crc" | "abandon_aead"),
+            );
+            if let CryptoInput::Decrypt { ciphertext, .. } = &mut data {
+                if matches!(mode, "aead" | "abandon_aead") {
+                    // Peer bytes without a persisted CRC must still fail AEAD.
+                    Arc::get_mut(&mut ciphertext.inner).unwrap().checksum =
+                        std::sync::OnceLock::new();
                 }
                 if mode == "malformed" {
                     Arc::get_mut(&mut ciphertext.inner)
                         .unwrap()
                         .envelope
                         .ciphertext_length += 1;
-                }
-                data = CryptoInput::Decrypt {
-                    ciphertext,
-                    plaintext: admission
-                        .reserve(Some(&cache), crate::model::ResourceClass::Plaintext, 1)
-                        .unwrap(),
-                };
-            } else if mode == "failure" {
-                if let CryptoInput::Encrypt { page, .. } = &mut data {
-                    page.version.object.cache.0 = "wrong".into();
                 }
             }
             // Admission delay must not leak into residence.
