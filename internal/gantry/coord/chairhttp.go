@@ -125,7 +125,12 @@ func serveChairHTTP(w http.ResponseWriter, r *http.Request, local ifaces.LocalCh
 		return
 	}
 
-	if len(digests) > DefaultMaxDigestsPerPleasePull {
+	limit := DefaultMaxDigestsPerPleasePull
+	if bounded, ok := local.(interface{ MaxDigestsPerRequest() int }); ok && bounded.MaxDigestsPerRequest() > 0 {
+		limit = bounded.MaxDigestsPerRequest()
+	}
+
+	if len(digests) > limit {
 		http.Error(w, "too many digests", http.StatusBadRequest)
 		return
 	}

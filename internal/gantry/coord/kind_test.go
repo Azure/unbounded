@@ -54,3 +54,55 @@ func TestWireKindRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+func TestHTTPSRejectsMissingAssignmentAndMalformedAuthorization(t *testing.T) {
+	for _, req := range []*coordv1.PleasePullRequest{
+		{Kind: coordv1.PleasePullRequest_KIND_BLOB},
+		{Kind: coordv1.PleasePullRequest_KIND_BLOB, ChairAssignment: &coordv1.ChairAssignment{Generation: -1, AssignmentEpoch: 1}},
+		{Kind: coordv1.PleasePullRequest_KIND_BLOB, ChairAssignment: &coordv1.ChairAssignment{Generation: 1, AssignmentEpoch: 1}, Authorization: "Basic invalid"},
+	} {
+		body, err := proto.Marshal(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		w := httptest.NewRecorder()
+		NewChairHTTPHandler(nil, nil).ServeHTTP(w, httptest.NewRequest(http.MethodPost, ChairHTTPPath, bytes.NewReader(body)))
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("invalid request status = %d", w.Code)
+		}
+	}
+}
+
+func TestHTTPSUsesConfiguredBatchLimit(t *testing.T) {
+	for _, limit := range []int{1, 300} {
+		s := NewServer(WithMaxDigestsPerPleasePull(limit))
+
+		req := &coordv1.PleasePullRequest{
+			Kind:             coordv1.PleasePullRequest_KIND_BLOB,
+			UpstreamRegistry: "registry.example", Repository: "repo",
+			ChairAssignment: &coordv1.ChairAssignment{Generation: 1, AssignmentEpoch: 1},
+		}
+		for range 257 {
+			req.Digests = append(req.Digests, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+		}
+
+		body, err := proto.Marshal(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		w := httptest.NewRecorder()
+		NewChairHTTPHandler(s, nil).ServeHTTP(w, httptest.NewRequest(http.MethodPost, ChairHTTPPath, bytes.NewReader(body)))
+
+		want := http.StatusOK // Valid batch, but stale chair outcomes since no validator is wired.
+		if limit == 1 {
+			want = http.StatusBadRequest
+		}
+
+		if w.Code != want {
+			t.Fatalf("limit %d: got %d want %d", limit, w.Code, want)
+		}
+	}
+}

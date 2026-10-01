@@ -92,6 +92,9 @@ func declineReason(res PumpResult) string {
 
 type Option func(*Server)
 
+// MaxDigestsPerRequest exposes the configured wire admission limit to HTTPS.
+func (s *Server) MaxDigestsPerRequest() int { return s.maxDigestsPerPleasePull }
+
 func WithLogger(l *slog.Logger) Option {
 	return func(s *Server) {
 		if l != nil {
