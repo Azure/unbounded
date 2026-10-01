@@ -156,9 +156,9 @@ fn exchange(
         admissions[1].clone(),
         Rc::new(Never),
         relay,
+        Rc::new(codec(&admissions[1])),
+        signers[1].clone(),
     )
-    .with_wire(Rc::new(codec(&admissions[1])))
-    .with_signatures(signers[1].clone())
     .with_transfers(transfers)
     .with_opaque_relay(!materialized);
     let scope =

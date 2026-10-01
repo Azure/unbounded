@@ -411,6 +411,8 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
         admission.clone(),
         Rc::new(Service(calls.clone())),
         relay,
+        Rc::new(codec(&admission)),
+        signers[2].clone(),
     );
     let local = request(&admission, 1);
     let scope = local.origin.scope().clone();
@@ -1038,10 +1040,10 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
         admission.clone(),
         Rc::new(Local),
         relay,
+        codec,
+        signers[2].clone(),
     )
-    .with_request_timeout(Duration::from_secs(5))
-    .with_wire(codec)
-    .with_signatures(signers[2].clone());
+    .with_request_timeout(Duration::from_secs(5));
     let health = paths.link_health();
     let requester = Requester::new(
         paths,
@@ -1172,16 +1174,16 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
             admission.clone(),
             Rc::new(Never),
             relay,
+            Rc::new(codec(&admission)),
+            signers[2].clone(),
         )
-        .with_wire(Rc::new(codec(&admission)))
         .with_request_timeout(if matches!(case, "listener" | "cancel" | "drop") {
             Duration::from_secs(60)
         } else if case == "idle" {
             Duration::from_secs(5)
         } else {
             Duration::from_millis(30)
-        })
-        .with_signatures(signers[2].clone());
+        });
         let scope = RequestScope::new(
             RequestId([7; 16]),
             Instant::now()
@@ -1642,10 +1644,15 @@ mod established_sessions {
                 admission.clone(),
                 network.clone(),
             ));
-            let server =
-                server::PeerServer::new(io.clone(), forwarding, admission.clone(), service, relay)
-                    .with_wire(Rc::new(codec(&admission)))
-                    .with_signatures(signers[2].clone());
+            let server = server::PeerServer::new(
+                io.clone(),
+                forwarding,
+                admission.clone(),
+                service,
+                relay,
+                Rc::new(codec(&admission)),
+                signers[2].clone(),
+            );
             Self {
                 admission,
                 reactor,

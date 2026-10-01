@@ -642,9 +642,9 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
         admission,
         gate.clone(),
         relay,
-    )
-    .with_wire(codec)
-    .with_signatures(signers[2].clone());
+        codec,
+        signers[2].clone(),
+    );
     let serving_scope = RequestScope::new(
         RequestId([99; 16]),
         Instant::now() + Duration::from_secs(30),

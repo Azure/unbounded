@@ -44,8 +44,8 @@ pub struct PeerServer {
     admission: Rc<Admission>,
     local: Rc<dyn LocalPageService>,
     relay: Rc<Relay>,
-    wire: Option<Rc<super::wire::SecurityCodec>>,
-    signatures: Option<Rc<crate::security::signing::Signatures>>,
+    wire: Rc<super::wire::SecurityCodec>,
+    signatures: Rc<crate::security::signing::Signatures>,
     transfers: Option<Rc<super::transfer::Transfers>>,
     request_timeout: Duration,
 }
@@ -165,6 +165,8 @@ impl PeerServer {
         admission: Rc<Admission>,
         local: Rc<dyn LocalPageService>,
         relay: Rc<Relay>,
+        wire: Rc<super::wire::SecurityCodec>,
+        signatures: Rc<crate::security::signing::Signatures>,
     ) -> Self {
         Self {
             subscriptions: std::sync::Arc::new(
@@ -182,8 +184,8 @@ impl PeerServer {
             admission,
             local,
             relay,
-            wire: None,
-            signatures: None,
+            wire,
+            signatures,
             transfers: None,
             request_timeout: Duration::from_secs(30),
         }
@@ -210,14 +212,6 @@ impl PeerServer {
         self.pipes = pipes;
         self
     }
-    pub fn with_wire(mut self, wire: Rc<super::wire::SecurityCodec>) -> Self {
-        self.wire = Some(wire);
-        self
-    }
-    pub fn with_signatures(mut self, signatures: Rc<crate::security::signing::Signatures>) -> Self {
-        self.signatures = Some(signatures);
-        self
-    }
 
     /// Serve one complete exchange. The listener may reuse the returned connection
     /// only when the HTTP layer confirms both bodies were fully consumed.
@@ -229,7 +223,7 @@ impl PeerServer {
         Box::pin(async move {
             use super::wire::WireCodec;
             scope.check()?;
-            let codec = self.wire.as_ref().ok_or(Error::InvalidConfiguration)?;
+            let codec = &self.wire;
             // One fixed budget for handshake reads, verification, signing, writes,
             // and the incoming application head. Partial progress never renews it.
             // Only application dispatch/response I/O use the signed deadline below.
@@ -238,11 +232,7 @@ impl PeerServer {
                 self.request_timeout,
                 crate::runtime::environment::now(),
             )?;
-            let signatures = self
-                .signatures
-                .as_ref()
-                .ok_or(Error::InvalidConfiguration)?
-                .clone();
+            let signatures = self.signatures.clone();
             let connection = if connection.session.is_none() {
                 let mut connection = connection;
                 connection.control_reservation = Some(self.admission.reserve(
@@ -1385,18 +1375,21 @@ mod tests {
                         .unwrap(),
                     ),
                 ));
-                let server =
-                    PeerServer::new(io, forwarding, admission.clone(), Rc::new(Never), relay)
-                        .with_wire(Rc::new(SecurityCodec::new(
-                            admission.clone(),
-                            Rc::new(BufferPool::new(admission.clone())),
-                        )))
-                        .with_signatures(signers[1].clone())
-                        .with_request_timeout(Duration::from_secs(if end == "handshake-cap" {
-                            60
-                        } else {
-                            4
-                        }));
+                let server = PeerServer::new(
+                    io,
+                    forwarding,
+                    admission.clone(),
+                    Rc::new(Never),
+                    relay,
+                    Rc::new(SecurityCodec::new(
+                        admission.clone(),
+                        Rc::new(BufferPool::new(admission.clone())),
+                    )),
+                    signers[1].clone(),
+                )
+                .with_request_timeout(Duration::from_secs(
+                    if end == "handshake-cap" { 60 } else { 4 },
+                ));
                 let scope = RequestScope::new(
                     RequestId([5; 16]),
                     crate::runtime::environment::now() + Duration::from_secs(365 * 24 * 3600),

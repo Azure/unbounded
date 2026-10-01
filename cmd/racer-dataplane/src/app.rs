@@ -896,12 +896,12 @@ impl WorkerApplication {
             admission.clone(),
             dispatcher.clone(),
             relay,
+            wire,
+            signatures,
         )
         .with_subscriptions(node.subscriptions.clone())
         .with_request_timeout(config.request_timeout)
         .with_opaque_relay(config.opaque_relay)
-        .with_wire(wire)
-        .with_signatures(signatures)
         .with_transfers(transfers)
         .with_pipes(pipes.clone());
         #[cfg(not(test))]
