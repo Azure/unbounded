@@ -11,8 +11,8 @@ use crate::{
     },
     rdma::{
         AuthenticatedDescriptor, DESCRIPTOR_HEADER, Devices, Grant, RdmaTransfer, RegisteredLease,
+        SETUP_BINDING_HEADER, SETUP_HEADER, SessionLease, Sessions,
         lifecycle::{QueuePairHandle, Region},
-        session::{SETUP_BINDING_HEADER, SETUP_HEADER, SessionLease, Sessions},
     },
     runtime::{admission::Admission, environment},
     security::signing::{Signatures, VerifiedHead, tests::network},

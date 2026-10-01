@@ -7,10 +7,7 @@ use crate::{
         CacheId, CacheKey, KeyId, Nonce, ObjectId, ObjectVersion, PageEnvelope, PageId, PageNumber,
         RequestId, ResourceClass, StrongEtag, TransferId,
     },
-    rdma::{
-        COMPLETION_HEADER, Devices, RdmaTransfer, completion_bytes,
-        session::{SessionLease, Sessions},
-    },
+    rdma::{COMPLETION_HEADER, Devices, RdmaTransfer, SessionLease, Sessions, completion_bytes},
     runtime::{admission::Admission, deadline::RequestScope, environment},
     security::signing::tests::network,
 };

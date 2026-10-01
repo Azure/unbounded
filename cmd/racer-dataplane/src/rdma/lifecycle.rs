@@ -1118,7 +1118,7 @@ mod activation_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rdma::{Devices, session::Sessions};
+    use crate::rdma::{Devices, Sessions};
     use std::task::Context;
 
     pub(super) fn provision_test(

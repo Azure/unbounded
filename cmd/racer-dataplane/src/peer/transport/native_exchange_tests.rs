@@ -4,7 +4,7 @@ use crate::{
     http::{Codec, MessageHead, StartLine, connection::HttpPool, io::HttpIo},
     memory::pool::BufferPool,
     model::{ExpiresAt, KeyId, Nonce, ObjectMetadata, PageEnvelope, ResourceClass, *},
-    rdma::{Devices, RdmaTransfer, session::Sessions},
+    rdma::{Devices, RdmaTransfer, Sessions},
     runtime::{admission::Admission, reactor::Reactor},
     security::{protocol as p, signing::Signatures},
 };

@@ -11,8 +11,8 @@ use crate::{
     model::{NodeId, ResourceClass, TransferId},
     rdma::RdmaTransfer,
     rdma::{
-        AuthenticatedDescriptor, COMPLETION_HEADER, DESCRIPTOR_HEADER,
-        session::{SETUP_BINDING_HEADER, SETUP_HEADER, SetupParameters},
+        AuthenticatedDescriptor, COMPLETION_HEADER, DESCRIPTOR_HEADER, SETUP_BINDING_HEADER,
+        SETUP_HEADER, SetupParameters,
     },
     runtime::deadline::RequestScope,
     runtime::{
@@ -306,7 +306,7 @@ fn native_scope(scope: &RequestScope) -> RequestScope {
 fn native_failure(error: Error, scope: &RequestScope) -> bool {
     scope.check().is_ok() && (recoverable(error) || error == Error::DeadlineExceeded)
 }
-async fn fence(session: &crate::rdma::session::SessionLease, scope: &RequestScope) -> Result<()> {
+async fn fence(session: &crate::rdma::SessionLease, scope: &RequestScope) -> Result<()> {
     let cancellation = scope.cancellation.subscribe()?;
     futures::future::poll_fn(|cx| {
         cancellation.register(cx.waker());
@@ -1070,7 +1070,7 @@ pub struct Transfers {
     pub(super) wire: (Rc<Admission>, Rc<SecurityCodec>),
     pub(super) native: Option<(
         Rc<crate::security::signing::Signatures>,
-        Rc<crate::rdma::session::Sessions>,
+        Rc<crate::rdma::Sessions>,
     )>,
 }
 impl Transfers {
@@ -1111,7 +1111,7 @@ impl Transfers {
             native: None,
         }
     }
-    pub fn with_native(mut self, sessions: Rc<crate::rdma::session::Sessions>) -> Self {
+    pub fn with_native(mut self, sessions: Rc<crate::rdma::Sessions>) -> Self {
         self.native = Some((self.signatures.clone(), sessions));
         self
     }
@@ -1128,7 +1128,7 @@ impl Transfers {
         &self,
         proposed: TransportPlan,
         capabilities: Capabilities,
-        session: Option<&crate::rdma::session::SessionLease>,
+        session: Option<&crate::rdma::SessionLease>,
     ) -> TransportPlan {
         match proposed {
             TransportPlan::Rdma { rail }
@@ -1146,7 +1146,7 @@ impl Transfers {
     pub fn send_scoped<'a>(
         &'a self,
         destination: &'a crate::model::NodeId,
-        session: &'a crate::rdma::session::SessionLease,
+        session: &'a crate::rdma::SessionLease,
         page: CiphertextPage,
         descriptor: crate::rdma::AuthenticatedDescriptor,
         scope: &'a RequestScope,
@@ -1167,7 +1167,7 @@ impl Transfers {
     pub fn prepare_receive<'a>(
         &'a self,
         source: &'a crate::model::NodeId,
-        session: &'a crate::rdma::session::SessionLease,
+        session: &'a crate::rdma::SessionLease,
         envelope: &'a crate::model::PageEnvelope,
         transfer: crate::model::TransferId,
         scope: &'a RequestScope,
@@ -1186,7 +1186,7 @@ impl Transfers {
 
     pub fn finish_receive<'a>(
         &'a self,
-        session: &'a crate::rdma::session::SessionLease,
+        session: &'a crate::rdma::SessionLease,
         grant: crate::rdma::Grant,
         completion: &'a crate::security::signing::VerifiedHead,
         envelope: crate::model::PageEnvelope,
