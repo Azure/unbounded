@@ -615,6 +615,37 @@ pub fn apply_delta(base: &Publication, bytes: &[u8]) -> Result<Publication> {
 mod delta_tests {
     use super::*;
     #[test]
+    fn site_only_deltas_add_change_remove_and_reject_tampering() {
+        let mut base = decode_publication(include_bytes!("../testdata/publication.json")).unwrap();
+        base.sequence.0 = 1;
+        base.membership_version.0 = 1;
+        for site in ["Site_1.a-b", "site2", ""] {
+            let mut next = base.clone();
+            next.sequence.0 += 1;
+            next.membership_version.0 += 1;
+            next.members[0].site = site.into();
+            let dto = dto(&next).unwrap();
+            let mut delta = serde_json::json!({
+                "delta_version":1,"cluster":base.cluster.0,"base_sequence":base.sequence.0.to_string(),
+                "base_hash":content_hash(&base).unwrap(),"sequence":next.sequence.0.to_string(),
+                "membership_version":next.membership_version.0.to_string(),"content_hash":content_hash(&next).unwrap(),
+                "upsert_members":[dto.members[0]],"remove_members":[],"caches":dto.caches
+            });
+            let accepted = apply_delta(&base, &serde_json::to_vec(&delta).unwrap()).unwrap();
+            assert_eq!(accepted.members[0].site, site);
+            assert_eq!(
+                encode_publication(&accepted).unwrap(),
+                encode_publication(&next).unwrap()
+            );
+            for bad in ["other", "-invalid"] {
+                delta["upsert_members"][0]["site"] = bad.into();
+                assert!(apply_delta(&base, &serde_json::to_vec(&delta).unwrap()).is_err());
+            }
+            base = accepted;
+        }
+    }
+
+    #[test]
     fn delta_add_remove_update_hash_and_replay() {
         let mut base = decode_publication(include_bytes!("../testdata/publication.json")).unwrap();
         base.sequence.0 = 1;

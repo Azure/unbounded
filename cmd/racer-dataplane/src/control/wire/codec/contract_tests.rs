@@ -73,6 +73,14 @@ fn site_wire_defaults_validation_and_hashes() {
     }
     p.members[0].site.clear();
     assert_eq!(encode_publication(&p).unwrap(), legacy);
+    for value in ["null", "1", "true", "[]", "{}", "\"a\",\"site\":\"b\""] {
+        let raw = String::from_utf8(legacy.clone()).unwrap().replacen(
+            "\"alignment_enabled\":true",
+            &format!("\"alignment_enabled\":true,\"site\":{value}"),
+            1,
+        );
+        assert!(decode_publication(raw.as_bytes()).is_err(), "{value}");
+    }
 }
 
 #[test]

@@ -467,6 +467,33 @@ mod tests {
         assert!(store.publish(changed).is_ok());
     }
     #[test]
+    fn site_changes_require_new_membership_and_preserve_leased_history() {
+        let store = SnapshotStore::new(publication(1).cluster, Arc::new(PublishedState), 3);
+        let old = store.publish(publication(1)).unwrap();
+        let mut next = publication(2);
+        next.members[0].site = "site1".into();
+        assert!(matches!(
+            store.publish(next.clone()),
+            Err(Error::IncompatibleMembership)
+        ));
+        next.membership_version.0 = 2;
+        let current = store.publish(next).unwrap();
+        assert!(old.membership.members()[0].site.is_empty());
+        assert_eq!(current.membership.members()[0].site, "site1");
+        assert_eq!(
+            old.membership.placement_identity(),
+            current.membership.placement_identity()
+        );
+        let mut removed = publication(3);
+        removed.membership_version.0 = 3;
+        assert!(
+            store.publish(removed).unwrap().membership.members()[0]
+                .site
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn staged_resources_commit_only_on_accepted_replacement() {
         struct Transition(std::rc::Rc<std::cell::Cell<usize>>);
         impl super::super::caches::CacheTransition for Transition {
