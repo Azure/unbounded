@@ -366,7 +366,7 @@ impl ControlTransport {
             let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
                 rustls::crypto::ring::default_provider(),
             ))
-            .with_safe_default_protocol_versions()
+            .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|_| Error::Unauthorized)?
             .with_root_certificates(roots);
             let mut config = if let Some(i) = identity {
@@ -394,38 +394,7 @@ impl ControlTransport {
             if addresses.is_empty() || addresses.len() > 64 {
                 return Err(Error::Unavailable);
             }
-            let mut connected = None;
-            for address in addresses {
-                scope.check()?;
-                let charge = io
-                    .reactor()
-                    .map(|r| {
-                        r.reserve_connection(crate::model::ResourceClass::ControlConnection)
-                            .map(Rc::new)
-                    })
-                    .transpose()?;
-                #[cfg(test)]
-                if let Some(sim) = crate::runtime::reactor::simulation::Simulation::current() {
-                    if let Ok(fd) =
-                        sim.connect(crate::runtime::reactor::SocketAddress::Inet(address))
-                    {
-                        let fd = Rc::new(fd);
-                        connected = Some((ControlStream::Sim(fd.clone()), fd, charge));
-                        break;
-                    }
-                    continue;
-                }
-                if let Ok(stream) = connect_socket(address) {
-                    let fd = Rc::new(Descriptor::from(stream.try_clone().map_err(|_| Error::Io)?));
-                    io.ready_charged(fd.clone(), false, true, charge.clone(), scope)
-                        .await?;
-                    if stream.take_error().map_err(|_| Error::Io)?.is_none() {
-                        connected = Some((ControlStream::Real(stream), fd, charge));
-                        break;
-                    }
-                }
-            }
-            let (stream, fd, charge) = connected.ok_or(Error::Unavailable)?;
+            let (stream, fd, charge) = connect_addresses(io.as_ref(), &addresses, scope).await?;
             let server = rustls::pki_types::ServerName::try_from(endpoint.host)
                 .map_err(|_| Error::InvalidConfiguration)?;
             let mut tls = rustls::ClientConnection::new(Arc::new(config), server)
@@ -467,6 +436,62 @@ impl ControlTransport {
         })
     }
 }
+type Connected = (
+    ControlStream,
+    Rc<Descriptor>,
+    Option<Rc<crate::runtime::admission::ConnectionReservation>>,
+);
+
+async fn connect_addresses(
+    io: &dyn ControlIo,
+    addresses: &[SocketAddr],
+    scope: &RequestScope,
+) -> Result<Connected> {
+    for (index, address) in addresses.iter().enumerate() {
+        scope.check()?;
+        // Reserve a share for every remaining address and one for TLS. A local
+        // blackhole must not consume the parent's entire connection deadline.
+        let now = crate::runtime::environment::now();
+        let share =
+            scope.deadline.0.saturating_duration_since(now) / (addresses.len() - index + 1) as u32;
+        let mut attempt = scope.clone();
+        attempt.deadline.0 = now + share.min(Duration::from_secs(5));
+        let charge = io
+            .reactor()
+            .map(|r| {
+                r.reserve_connection(crate::model::ResourceClass::ControlConnection)
+                    .map(Rc::new)
+            })
+            .transpose()?;
+        #[cfg(test)]
+        if let Some(sim) = crate::runtime::reactor::simulation::Simulation::current() {
+            if let Ok(fd) = sim.connect(crate::runtime::reactor::SocketAddress::Inet(*address)) {
+                let fd = Rc::new(fd);
+                return Ok((ControlStream::Sim(fd.clone()), fd, charge));
+            }
+            continue;
+        }
+        if let Ok(stream) = connect_socket(*address) {
+            let fd = Rc::new(Descriptor::from(stream.try_clone().map_err(|_| Error::Io)?));
+            let ready = io
+                .ready_charged(fd.clone(), false, true, charge.clone(), &attempt)
+                .await;
+            // Cancellation and overall expiry always win over local retry.
+            scope.check()?;
+            match ready {
+                Ok(()) => {}
+                Err(Error::DeadlineExceeded | Error::Io | Error::Unavailable) => continue,
+                Err(error) => return Err(error),
+            }
+            if stream.take_error().map_err(|_| Error::Io)?.is_none() {
+                return Ok((ControlStream::Real(stream), fd, charge));
+            }
+        }
+    }
+    scope.check()?;
+    Err(Error::Unavailable)
+}
+
 fn connect_socket(address: SocketAddr) -> Result<TcpStream> {
     let domain = if address.is_ipv4() {
         libc::AF_INET

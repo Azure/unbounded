@@ -2,6 +2,130 @@ use super::*;
 use crate::control::{enrollment::Enrollment, testing};
 
 #[test]
+fn real_connect_readiness_blackhole_yields_to_next_address_and_cleans_fds() {
+    use std::{
+        cell::Cell,
+        future::Future,
+        task::{Context, Poll},
+    };
+    struct ConnectIo {
+        driver: ReactorControlIo,
+        calls: Cell<usize>,
+        held: RefCell<Option<std::rc::Weak<Descriptor>>>,
+        mode: &'static str,
+        parent_deadline: Instant,
+    }
+    impl ControlIo for ConnectIo {
+        fn resolve<'a>(
+            &'a self,
+            _: &'a str,
+            _: u16,
+            _: &'a RequestScope,
+        ) -> Operation<'a, Vec<SocketAddr>> {
+            unreachable!()
+        }
+        fn ready<'a>(
+            &'a self,
+            fd: Rc<Descriptor>,
+            read: bool,
+            write: bool,
+            scope: &'a RequestScope,
+        ) -> Operation<'a, ()> {
+            Box::pin(async move {
+                let call = self.calls.get();
+                self.calls.set(call + 1);
+                if call != 0 {
+                    return self.driver.ready(fd, read, write, scope).await;
+                }
+                *self.held.borrow_mut() = Some(Rc::downgrade(&fd));
+                assert!(scope.deadline.0 < self.parent_deadline);
+                if self.mode == "cancel" {
+                    scope.cancel()?;
+                }
+                // Suppress this real socket's writable notification, modeling a
+                // SYN blackhole at the readiness boundary (not Simulation::connect).
+                // The timer and cancellation still use the real reactor.
+                let mut wait = scope.clone();
+                if self.mode == "parent" {
+                    wait.deadline.0 = self.parent_deadline;
+                }
+                self.driver
+                    .sleep(wait.deadline.0 + Duration::from_millis(1), &wait)
+                    .await
+            })
+        }
+        fn sleep<'a>(&'a self, until: Instant, scope: &'a RequestScope) -> Operation<'a, ()> {
+            self.driver.sleep(until, scope)
+        }
+    }
+    for mode in ["local", "cancel", "parent"] {
+        let admission = Rc::new(crate::runtime::admission::Admission::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let reactor = Rc::new(crate::runtime::reactor::Reactor::new(admission));
+        reactor.init().unwrap();
+        let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let healthy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addresses = [first.local_addr().unwrap(), healthy.local_addr().unwrap()];
+        let scope = RequestScope::new(
+            crate::model::RequestId([7; 16]),
+            Instant::now() + Duration::from_millis(300),
+        )
+        .unwrap();
+        let io = ConnectIo {
+            driver: ReactorControlIo::new(reactor.clone()),
+            calls: Cell::new(0),
+            held: RefCell::new(None),
+            mode,
+            parent_deadline: scope.deadline.0,
+        };
+        let mut connect = Box::pin(connect_addresses(&io, &addresses, &scope));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let watchdog = Instant::now() + Duration::from_secs(2);
+        let result = loop {
+            if let Poll::Ready(result) = connect.as_mut().poll(&mut cx) {
+                break result;
+            }
+            assert!(Instant::now() < watchdog);
+            reactor.poll_budgeted(64).unwrap();
+            reactor.wait(Duration::from_millis(1)).unwrap();
+        };
+        drop(connect);
+        match mode {
+            "local" => {
+                let (stream, fd, charge) = result.unwrap();
+                assert_eq!(io.calls.get(), 2);
+                assert!(
+                    Instant::now() < scope.deadline.0,
+                    "TLS retains overall budget"
+                );
+                let ControlStream::Real(stream) = stream else {
+                    panic!("must exercise OS socket")
+                };
+                assert_eq!(stream.peer_addr().unwrap(), addresses[1]);
+                drop((stream, fd, charge));
+            }
+            "cancel" => assert!(matches!(result, Err(Error::Cancelled))),
+            _ => assert!(matches!(result, Err(Error::DeadlineExceeded))),
+        }
+        if mode != "local" {
+            assert_eq!(io.calls.get(), 1);
+        }
+        assert!(io.held.borrow().as_ref().unwrap().upgrade().is_none());
+        let (mut closed, _) = first.accept().unwrap();
+        closed
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        assert_eq!(
+            closed.read(&mut [0; 1]).unwrap(),
+            0,
+            "both failed socket FDs closed"
+        );
+        assert_eq!(reactor.in_flight(), 0);
+    }
+}
+
+#[test]
 fn request_heads_validate_and_bound_credentials_before_copying() {
     let base = "a".repeat(64);
     let head = request_head(
@@ -830,9 +954,12 @@ fn tls_fixture(reactor: Option<Rc<crate::runtime::reactor::Reactor>>, trailing: 
         }
     };
     let first = run(Box::pin(async {
-        transport
-            .bootstrap(&scope)
-            .await?
+        let connection = transport.bootstrap(&scope).await?;
+        assert_eq!(
+            connection.tls.protocol_version(),
+            Some(rustls::ProtocolVersion::TLSv1_3)
+        );
+        connection
             .request(
                 "POST",
                 wire::BOOTSTRAP_PATH,
@@ -849,9 +976,12 @@ fn tls_fixture(reactor: Option<Rc<crate::runtime::reactor::Reactor>>, trailing: 
         assert_eq!(first.unwrap().body, b"{}");
     }
     let second = run(Box::pin(async {
-        transport
-            .authenticated(&identity, &scope)
-            .await?
+        let connection = transport.authenticated(&identity, &scope).await?;
+        assert_eq!(
+            connection.tls.protocol_version(),
+            Some(rustls::ProtocolVersion::TLSv1_3)
+        );
+        connection
             .request("GET", wire::SNAPSHOT_PATH, None, &[], 65536, &scope)
             .await
     }));
