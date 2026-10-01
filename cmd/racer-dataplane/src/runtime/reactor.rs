@@ -51,6 +51,7 @@ enum Submission {
 }
 // Control-owned filesystem extension; shares this reactor's completion fences.
 pub mod filesystem;
+mod syscall_arg;
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
@@ -67,6 +68,7 @@ use std::{
     task::{Context, Poll, Waker},
     time::Duration,
 };
+use syscall_arg::SyscallArg;
 
 pub struct Reactor {
     environment: super::environment::Environment,
@@ -1025,12 +1027,8 @@ impl Reactor {
                     fd: fd.clone(),
                     address: destination
                 },
-                opcode::Connect::new(
-                    types::Fd(fd.as_raw_fd()),
-                    (&*address as *const libc::sockaddr_storage).cast(),
-                    len,
-                )
-                .build()
+                opcode::Connect::new(types::Fd(fd.as_raw_fd()), address.as_ptr().cast(), len,)
+                    .build()
             );
             self.submit(sqe, scope, false, move |result| {
                 drop((fd, address));
@@ -1384,10 +1382,11 @@ impl Drop for State {
 
 fn encode_address(
     address: SocketAddress,
-) -> Result<(Box<libc::sockaddr_storage>, libc::socklen_t)> {
+) -> Result<(SyscallArg<libc::sockaddr_storage>, libc::socklen_t)> {
     // SAFETY: all-zero sockaddr storage is valid and sufficiently aligned for
-    // every supported sockaddr variant. Box keeps its address stable across moves.
-    let mut storage: Box<libc::sockaddr_storage> = Box::new(unsafe { std::mem::zeroed() });
+    // every supported sockaddr variant. The owner preserves pointer provenance
+    // as well as the allocation address across completion-closure moves.
+    let mut storage = SyscallArg::<libc::sockaddr_storage>::new(unsafe { std::mem::zeroed() });
     let len = match address {
         SocketAddress::Inet(SocketAddr::V4(address)) => {
             let value = libc::sockaddr_in {
@@ -1399,10 +1398,7 @@ fn encode_address(
                 sin_zero: [0; 8],
             };
             unsafe {
-                std::ptr::write(
-                    (&mut *storage as *mut libc::sockaddr_storage).cast::<libc::sockaddr_in>(),
-                    value,
-                );
+                std::ptr::write(storage.as_mut_ptr().cast::<libc::sockaddr_in>(), value);
             }
             std::mem::size_of::<libc::sockaddr_in>()
         }
@@ -1417,10 +1413,7 @@ fn encode_address(
                 sin6_scope_id: address.scope_id(),
             };
             unsafe {
-                std::ptr::write(
-                    (&mut *storage as *mut libc::sockaddr_storage).cast::<libc::sockaddr_in6>(),
-                    value,
-                );
+                std::ptr::write(storage.as_mut_ptr().cast::<libc::sockaddr_in6>(), value);
             }
             std::mem::size_of::<libc::sockaddr_in6>()
         }
@@ -1435,10 +1428,7 @@ fn encode_address(
                 *dst = *src as libc::c_char;
             }
             unsafe {
-                std::ptr::write(
-                    (&mut *storage as *mut libc::sockaddr_storage).cast::<libc::sockaddr_un>(),
-                    value,
-                );
+                std::ptr::write(storage.as_mut_ptr().cast::<libc::sockaddr_un>(), value);
             }
             std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1
         }

@@ -24,14 +24,19 @@ fn sockaddr_encoding_is_owned_and_validated() {
     let (address, len) =
         encode_address(SocketAddress::Inet("127.0.0.1:1234".parse().unwrap())).unwrap();
     assert_eq!(len as usize, std::mem::size_of::<libc::sockaddr_in>());
-    let value =
-        unsafe { &*(&*address as *const libc::sockaddr_storage).cast::<libc::sockaddr_in>() };
+    let value = unsafe { &*address.as_ptr().cast::<libc::sockaddr_in>() };
     assert_eq!(value.sin_port, 1234u16.to_be());
     assert_eq!(value.sin_addr.s_addr.to_ne_bytes(), [127, 0, 0, 1]);
     let (address, _) = encode_address(SocketAddress::Inet("[::1]:4321".parse().unwrap())).unwrap();
-    assert_eq!(address.ss_family, libc::AF_INET6 as libc::sa_family_t);
+    assert_eq!(
+        address.into_inner().ss_family,
+        libc::AF_INET6 as libc::sa_family_t
+    );
     let (address, len) = encode_address(SocketAddress::Unix("/a/b".into())).unwrap();
-    assert_eq!(address.ss_family, libc::AF_UNIX as libc::sa_family_t);
+    assert_eq!(
+        address.into_inner().ss_family,
+        libc::AF_UNIX as libc::sa_family_t
+    );
     assert_eq!(
         len as usize,
         std::mem::offset_of!(libc::sockaddr_un, sun_path) + 5

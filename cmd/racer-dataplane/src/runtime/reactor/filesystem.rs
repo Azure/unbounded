@@ -231,7 +231,7 @@ impl Reactor {
                 ResourceClass::RequestContext,
                 path.as_bytes().len() + 128,
             )?;
-            let how = Box::new(
+            let how = SyscallArg::new(
                 types::OpenHow::new()
                     .flags((flags | libc::O_CLOEXEC | libc::O_NONBLOCK) as u64)
                     .mode(if flags & libc::O_CREAT != 0 { 0o600 } else { 0 })
@@ -248,7 +248,7 @@ impl Reactor {
                 opcode::OpenAt2::new(
                     types::Fd(dir.as_ref().map_or(libc::AT_FDCWD, |d| d.as_raw_fd())),
                     path.as_ptr(),
-                    &*how,
+                    how.as_ptr(),
                 )
                 .build()
                 .flags(squeue::Flags::ASYNC)
@@ -277,17 +277,17 @@ impl Reactor {
                 ResourceClass::RequestContext,
                 std::mem::size_of::<libc::statx>(),
             )?;
-            let mut stat: Box<libc::statx> = Box::new(unsafe { std::mem::zeroed() });
+            let mut stat = SyscallArg::<libc::statx>::new(unsafe { std::mem::zeroed() });
             let sqe = submission!(
                 self,
                 simulation::Op::Stat {
                     fd: fd.clone(),
-                    ptr: &mut *stat
+                    ptr: stat.as_mut_ptr()
                 },
                 opcode::Statx::new(
                     types::Fd(fd.as_raw_fd()),
                     c"".as_ptr(),
-                    (&mut *stat as *mut libc::statx).cast(),
+                    stat.as_mut_ptr().cast(),
                 )
                 .flags(libc::AT_EMPTY_PATH)
                 .mask(libc::STATX_BASIC_STATS)
@@ -298,7 +298,7 @@ impl Reactor {
                 let _quota = quota;
                 value(result)?;
                 drop(fd);
-                Ok(*stat)
+                Ok(stat.into_inner())
             })?
             .await
         })
