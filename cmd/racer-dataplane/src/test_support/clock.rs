@@ -161,46 +161,6 @@ impl Drop for Timer {
     }
 }
 
-/// Stable FIFO ordering at equal timestamps, even when time advances across events.
-pub struct Schedule<T> {
-    clock: Clock,
-    sequence: u64,
-    events: BTreeMap<(Duration, u64), T>,
-}
-
-impl<T> Schedule<T> {
-    pub fn new(clock: Clock) -> Self {
-        Self {
-            clock,
-            sequence: 0,
-            events: BTreeMap::new(),
-        }
-    }
-
-    pub fn push(&mut self, at: Duration, event: T) -> Result<()> {
-        let next = self.sequence.checked_add(1).ok_or(Error::Overloaded)?;
-        self.events.insert((at, self.sequence), event);
-        self.sequence = next;
-        Ok(())
-    }
-
-    pub fn pop_ready(&mut self) -> Option<T> {
-        if self
-            .events
-            .first_key_value()
-            .is_some_and(|((at, _), _)| *at <= self.clock.elapsed())
-        {
-            self.events.pop_first().map(|(_, event)| event)
-        } else {
-            None
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.events.len()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,22 +227,6 @@ mod tests {
         clock.advance(Duration::from_secs(1)).unwrap();
         assert_eq!(second.count(), 1);
         assert!(clock.0.borrow().timers.is_empty());
-    }
-
-    #[test]
-    fn fault_schedule_orders_due_time_then_insertion_without_sleeping() {
-        let clock = Clock::default();
-        let mut schedule = Schedule::new(clock.clone());
-        for (at, value) in [(2, 'b'), (1, 'a'), (2, 'c'), (3, 'd')] {
-            schedule.push(Duration::from_secs(at), value).unwrap();
-        }
-        assert_eq!(schedule.pop_ready(), None);
-        clock.advance(Duration::from_secs(2)).unwrap();
-        assert_eq!(schedule.pop_ready(), Some('a'));
-        assert_eq!(schedule.pop_ready(), Some('b'));
-        assert_eq!(schedule.pop_ready(), Some('c'));
-        assert_eq!(schedule.pop_ready(), None);
-        assert_eq!(schedule.len(), 1);
     }
 
     #[test]
