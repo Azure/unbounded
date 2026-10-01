@@ -130,7 +130,7 @@ func (t *Trust) writeContext(parent context.Context) (context.Context, context.C
 
 	stop := context.AfterFunc(t.authority, cancel)
 
-	return ctx, func() { stop(); cancel() }, nil
+	return authorityWriteContext{Context: ctx, authority: t.authority, parent: parent}, func() { stop(); cancel() }, nil
 }
 
 func (t *Trust) invalidate() {
@@ -283,7 +283,7 @@ func readCredentials(ctx context.Context, reader client.Reader, cfg Config, clai
 
 	b, err = wire.DecodeBundle(bytes.NewReader(secret.Data["bundle.json"]))
 	if err != nil {
-		return credentialState{}, err
+		return credentialState{}, wire.Unavailable
 	}
 
 	if b.Cluster != cfg.Cluster || decodeCredentialMetadata(secret.Data["rotation.json"], &s) != nil || decodeCredentialMetadata(secret.Data["issuer.json"], &material) != nil {

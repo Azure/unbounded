@@ -32,6 +32,7 @@ import (
 )
 
 type TopologyReconciler struct {
+	settings frozenConfig
 	client.Client
 	APIReader    client.Reader
 	Config       Config
@@ -41,6 +42,8 @@ type TopologyReconciler struct {
 	Trust        *Trust
 }
 
+func (r *TopologyReconciler) runtimeConfig() Config { return r.settings.get(&r.Config) }
+
 // Reconcile builds from the synchronized cache, reads the version ConfigMap
 // authoritatively, commits counters/hashes with CAS, then installs the result.
 // Conflicts requeue from fresh inputs; missing established counters fail closed.
@@ -49,7 +52,7 @@ func (r *TopologyReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctr
 		return ctrl.Result{}, reconcile.TerminalError(err)
 	}
 
-	if err := r.Config.Validate(); err != nil {
+	if err := r.runtimeConfig().Validate(); err != nil {
 		return ctrl.Result{}, reconcile.TerminalError(err)
 	}
 
@@ -88,6 +91,7 @@ type topologyUpdate struct {
 // publish protects authoritative reads, CAS, and local installation. Annotation
 // writes are recovery hints, not authority, and must not block trust observation.
 func (r *TopologyReconciler) publish(ctx context.Context) (topologyUpdate, error) {
+	cfg := r.runtimeConfig()
 	if r.CatalogGate != nil {
 		if err := r.CatalogGate.Acquire(ctx); err != nil {
 			return topologyUpdate{}, err
@@ -99,7 +103,7 @@ func (r *TopologyReconciler) publish(ctx context.Context) (topologyUpdate, error
 		return topologyUpdate{}, err
 	}
 
-	cm, previous, err := readVersion(ctx, r.APIReader, r.Config)
+	cm, previous, err := readVersion(ctx, r.APIReader, cfg)
 	if err != nil {
 		r.suspendInvalidAuthority(err)
 		return topologyUpdate{}, err
@@ -124,7 +128,7 @@ func (r *TopologyReconciler) publish(ctx context.Context) (topologyUpdate, error
 	// before its keys exist; only the subsequent Secret event may publish it.
 	// Read authoritatively so a stale informer cannot admit rejected growth.
 	if claim := cm.Annotations[credentialClaim]; claim != "" {
-		credentials, err := readCredentials(ctx, r.APIReader, r.Config, claim)
+		credentials, err := readCredentials(ctx, r.APIReader, cfg, claim)
 		if err != nil {
 			r.suspendInvalidAuthority(err)
 			return topologyUpdate{}, err
@@ -144,7 +148,7 @@ func (r *TopologyReconciler) publish(ctx context.Context) (topologyUpdate, error
 		catalog = nil
 	}
 
-	ownership, err := readManagedWorkloadIdentities(ctx, r.APIReader, r.Config)
+	ownership, err := readManagedWorkloadIdentities(ctx, r.APIReader, cfg)
 	if err != nil {
 		return topologyUpdate{}, err
 	}
@@ -158,14 +162,14 @@ func (r *TopologyReconciler) publish(ctx context.Context) (topologyUpdate, error
 		}
 
 		var list corev1.PodList
-		if err := r.List(ctx, &list, client.InNamespace(r.Config.Namespace), client.MatchingFields{podNodeIndex: node.Name}); err != nil {
+		if err := r.List(ctx, &list, client.InNamespace(cfg.Namespace), client.MatchingFields{podNodeIndex: node.Name}); err != nil {
 			return topologyUpdate{}, err
 		}
 
 		podsByNode[node.Name] = list.Items
 	}
 
-	candidate, diagnostics, err := reconcileMembers(nodes.Items, podsByNode, ownership, r.Accepted, r.Config.PeerPort)
+	candidate, diagnostics, err := reconcileMembers(nodes.Items, podsByNode, ownership, r.Accepted, cfg.PeerPort)
 	if err != nil {
 		return topologyUpdate{}, err
 	}
@@ -243,6 +247,8 @@ func (r *TopologyReconciler) annotate(ctx context.Context, update topologyUpdate
 }
 
 func (r *TopologyReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	cfg := r.runtimeConfig()
+
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Pod{}, podNodeIndex, podNodeKeys); err != nil {
 		return err
 	}
@@ -251,11 +257,11 @@ func (r *TopologyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Named("racer-topology").
 		WatchesRawSource(initialEnqueue()).
 		Watches(&corev1.Node{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(nodeChanges())).
-		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(managedPodChanges(r.Config))).
-		Watches(&appsv1.DaemonSet{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(namedChanges(r.Config.Namespace, managedWorkloadNames(r.Config)...))).
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(managedPodChanges(cfg))).
+		Watches(&appsv1.DaemonSet{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(namedChanges(cfg.Namespace, managedWorkloadNames(cfg)...))).
 		Watches(&racerv1.ClusterCache{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(cacheChanges())).
-		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(namedChanges(r.Config.Namespace, r.Config.CredentialsSecretName))).
-		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(versionChanges(r.Config))).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(namedChanges(cfg.Namespace, cfg.CredentialsSecretName))).
+		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(versionChanges(cfg))).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Complete(r)
 }

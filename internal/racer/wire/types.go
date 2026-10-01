@@ -439,6 +439,7 @@ func validateBundle(v KeyringBundle) error {
 	}
 
 	seen := map[identity]bool{}
+	materials := map[[32]byte]bool{}
 	active := map[scope]int{}
 
 	for _, k := range v.CacheKeys {
@@ -453,11 +454,12 @@ func validateBundle(v KeyringBundle) error {
 		s := scope{k.Key.Cache, k.Key.Purpose}
 
 		id := identity{s, string(k.Key.ID)}
-		if seen[id] {
+		if seen[id] || materials[k.material] {
 			return InvalidRequest
 		}
 
 		seen[id] = true
+		materials[k.material] = true
 
 		if _, ok := active[s]; !ok {
 			active[s] = 0

@@ -34,6 +34,7 @@ const (
 // Replication observes durable authority on every replica. No request from a
 // dataplane performs these reads. Only the elected publisher supplies image bytes.
 type Replication struct {
+	settings     frozenConfig
 	Config       Config
 	Client       client.Client
 	APIReader    client.Reader
@@ -43,6 +44,8 @@ type Replication struct {
 	mu           sync.Mutex
 	leader       context.Context
 }
+
+func (r *Replication) runtimeConfig() Config { return r.settings.get(&r.Config) }
 
 type publisherLifetime struct{ replication *Replication }
 
@@ -66,7 +69,7 @@ func (r *Replication) isLeader() bool {
 func (*Replication) NeedLeaderElection() bool { return false }
 
 func (r *Replication) interval() time.Duration {
-	return min(5*time.Second, r.Config.snapshotMaxAge()/3)
+	return min(5*time.Second, r.runtimeConfig().SnapshotMaxAge/3)
 }
 
 func (r *Replication) Start(ctx context.Context) error {
@@ -92,7 +95,7 @@ func (r *Replication) Start(ctx context.Context) error {
 
 	for ctx.Err() == nil {
 		if !r.isLeader() {
-			poll, cancel := context.WithTimeout(ctx, 2*r.interval()+r.Config.Limits.WriteTimeout)
+			poll, cancel := context.WithTimeout(ctx, 2*r.interval()+r.runtimeConfig().Limits.WriteTimeout)
 			if err := r.poll(poll, ctx); err != nil && ctx.Err() == nil {
 				ctrl.LoggerFrom(ctx).V(1).Info("snapshot replication retry", "error", err)
 			}
@@ -126,13 +129,13 @@ func (r *Replication) observe(ctx context.Context) {
 	}
 	defer r.CatalogGate.Release()
 
-	state, err := loadSigning(ctx, r.APIReader, r.Config, time.Now())
+	state, err := loadSigning(ctx, r.APIReader, r.runtimeConfig(), time.Now())
 	if err == nil {
 		err = r.Trust.install(ctx, state.roots, state.bundle)
 	}
 
 	if err == nil {
-		_, record, readErr := readVersion(ctx, r.APIReader, r.Config)
+		_, record, readErr := readVersion(ctx, r.APIReader, r.runtimeConfig())
 
 		err = readErr
 		if err == nil {
@@ -171,7 +174,7 @@ func (r *Replication) installReplica(ctx, process context.Context, image wire.Pu
 	}
 	defer r.CatalogGate.Release()
 
-	_, record, err := readVersion(ctx, r.APIReader, r.Config)
+	_, record, err := readVersion(ctx, r.APIReader, r.runtimeConfig())
 	if err != nil {
 		if shouldInvalidateTrust(err) {
 			r.Publications.Suspend()
@@ -195,7 +198,7 @@ func (r *Replication) installReplica(ctx, process context.Context, image wire.Pu
 
 func (r *Replication) leaderAddress(ctx context.Context) (string, error) {
 	var lease coordv1.Lease
-	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: r.Config.Namespace, Name: "racer-controller"}, &lease); err != nil {
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: r.runtimeConfig().Namespace, Name: "racer-controller"}, &lease); err != nil {
 		return "", err
 	}
 
@@ -209,7 +212,7 @@ func (r *Replication) leaderAddress(ctx context.Context) (string, error) {
 	}
 
 	var pod corev1.Pod
-	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: r.Config.Namespace, Name: name}, &pod); err != nil {
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: r.runtimeConfig().Namespace, Name: name}, &pod); err != nil {
 		return "", err
 	}
 
@@ -217,11 +220,11 @@ func (r *Replication) leaderAddress(ctx context.Context) (string, error) {
 		return "", wire.Unavailable
 	}
 
-	return net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(r.Config.ReplicationPort))), nil
+	return net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(r.runtimeConfig().ReplicationPort))), nil
 }
 
 func (r *Replication) controllerPod(pod *corev1.Pod) bool {
-	return pod.Namespace == r.Config.Namespace && pod.UID != "" && pod.DeletionTimestamp == nil && pod.Spec.ServiceAccountName == r.Config.ControllerServiceAccount && pod.Status.Phase != corev1.PodFailed && pod.Status.Phase != corev1.PodSucceeded
+	return pod.Namespace == r.runtimeConfig().Namespace && pod.UID != "" && pod.DeletionTimestamp == nil && pod.Spec.ServiceAccountName == r.runtimeConfig().ControllerServiceAccount && pod.Status.Phase != corev1.PodFailed && pod.Status.Phase != corev1.PodSucceeded
 }
 
 func (r *Replication) poll(ctx, process context.Context) error {
@@ -230,7 +233,7 @@ func (r *Replication) poll(ctx, process context.Context) error {
 		return err
 	}
 
-	pem, err := os.ReadFile(r.Config.ReplicationTrustFile)
+	pem, err := os.ReadFile(r.runtimeConfig().ReplicationTrustFile)
 	if err != nil {
 		return err
 	}
@@ -240,12 +243,12 @@ func (r *Replication) poll(ctx, process context.Context) error {
 		return wire.Unavailable
 	}
 
-	token, err := os.ReadFile(r.Config.ReplicationTokenFile)
+	token, err := os.ReadFile(r.runtimeConfig().ReplicationTokenFile)
 	if err != nil {
 		return err
 	}
 
-	transport := &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: roots, ServerName: r.Config.ReplicationServerName}, TLSHandshakeTimeout: r.interval(), DisableKeepAlives: true}
+	transport := &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: roots, ServerName: r.runtimeConfig().ReplicationServerName}, TLSHandshakeTimeout: r.interval(), DisableKeepAlives: true}
 	defer transport.CloseIdleConnections()
 
 	httpClient := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
@@ -295,7 +298,7 @@ func (r *Replication) authenticate(ctx context.Context, request *http.Request) (
 		return "", time.Time{}, err
 	}
 
-	if status.User.Username != "system:serviceaccount:"+r.Config.Namespace+":"+r.Config.ControllerServiceAccount {
+	if status.User.Username != "system:serviceaccount:"+r.runtimeConfig().Namespace+":"+r.runtimeConfig().ControllerServiceAccount {
 		return "", time.Time{}, wire.Forbidden
 	}
 
@@ -305,7 +308,7 @@ func (r *Replication) authenticate(ctx context.Context, request *http.Request) (
 	}
 
 	var pod corev1.Pod
-	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: r.Config.Namespace, Name: name}, &pod); err != nil {
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: r.runtimeConfig().Namespace, Name: name}, &pod); err != nil {
 		return "", time.Time{}, authorizationError(err)
 	}
 
@@ -314,7 +317,7 @@ func (r *Replication) authenticate(ctx context.Context, request *http.Request) (
 	}
 
 	var sa corev1.ServiceAccount
-	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: r.Config.Namespace, Name: r.Config.ControllerServiceAccount}, &sa); err != nil {
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: r.runtimeConfig().Namespace, Name: r.runtimeConfig().ControllerServiceAccount}, &sa); err != nil {
 		return "", time.Time{}, authorizationError(err)
 	}
 

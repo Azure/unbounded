@@ -221,6 +221,8 @@ func regenerateSharedVectors(t *testing.T) {
 		copy(id, "RKG1")
 		binary.BigEndian.PutUint64(id[4:12], uint64(i%2+1))
 		bundle.CacheKeys[i].ID = id
+		// Deterministic public test material must be unique across refs too.
+		bundle.CacheKeys[i].Material = bytes.Repeat([]byte{byte(i)}, 32)
 	}
 
 	b, err = json.Marshal(bundle)

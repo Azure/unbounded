@@ -58,9 +58,9 @@ type Application struct {
 func Assemble(cfg Config, c client.Client, reader client.Reader) *Application {
 	cfg = cfg.effective()
 	publications := NewPublications()
-	publications.maxAge = cfg.snapshotMaxAge()
+	publications.maxAge = cfg.SnapshotMaxAge
 	lifecycle := newLifecycle(publications)
-	trust := &Trust{maxAge: cfg.snapshotMaxAge()}
+	trust := &Trust{maxAge: cfg.SnapshotMaxAge}
 	issuer := &Issuer{APIReader: reader, Config: cfg, Trust: trust}
 	bootstrap := &Bootstrap{Client: c, APIReader: reader, Config: cfg, Issuer: issuer}
 	// Serialize credential admission/pruning with topology's authoritative read
@@ -194,7 +194,7 @@ func Run(ctx context.Context, cfg Config) error {
 // The writer need not have a running cache; all reads use the authoritative reader
 // supplied to Assemble. Constructors and recovery never grant serving authority.
 func (a *Application) Recover(ctx context.Context, writer client.Writer) error {
-	cfg, reader := a.Topology.Config, a.Topology.APIReader
+	cfg, reader := a.Topology.runtimeConfig(), a.Topology.APIReader
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
@@ -349,28 +349,40 @@ func ConfigFromLookup(lookup func(string) (string, bool)) (Config, error) {
 		}
 	}
 
+	cfg = cfg.effective()
+
 	return cfg, cfg.Validate()
 }
 
-// A zero value preserves the lifetime used by existing programmatic callers.
-func (c Config) certificateLifetime() time.Duration {
+// effective resolves optional lifetimes without I/O or validation side effects.
+// Zero retains the defaults accepted by programmatic callers.
+func (c Config) effective() Config {
 	if c.CertificateLifetime == 0 {
-		return wire.CertificateLifetime
+		c.CertificateLifetime = wire.CertificateLifetime
 	}
 
-	return c.CertificateLifetime
-}
-
-// effective resolves optional lifetimes once at composition without I/O or
-// validation side effects. Programmatic boundary methods still validate inputs.
-func (c Config) effective() Config {
-	c.CertificateLifetime = c.certificateLifetime()
-	c.SnapshotMaxAge = c.snapshotMaxAge()
+	if c.SnapshotMaxAge == 0 {
+		c.SnapshotMaxAge = 30 * time.Second
+	}
 
 	return c
 }
 
+// frozenConfig retains a component's construction inputs at first use. Exported
+// Config fields remain fixture-friendly before that boundary, but are never read
+// again at runtime. Pass a pointer so even later calls do not read mutable input.
+type frozenConfig struct {
+	once  sync.Once
+	value Config
+}
+
+func (f *frozenConfig) get(input *Config) Config {
+	f.once.Do(func() { f.value = input.effective() })
+	return f.value
+}
+
 func (c Config) Validate() error {
+	c = c.effective()
 	if c.SnapshotMaxAge < 0 || c.SnapshotMaxAge > 0 && c.SnapshotMaxAge < time.Second {
 		return fmt.Errorf("snapshot maximum age: %w", wire.InvalidRequest)
 	}
@@ -393,7 +405,7 @@ func (c Config) Validate() error {
 
 	// Two minutes leaves a full poll turn between renewal at two-thirds of the
 	// lifetime and expiry. X.509 and rotation deadlines have second precision.
-	lifetime := c.certificateLifetime()
+	lifetime := c.CertificateLifetime
 	if lifetime < 2*time.Minute || lifetime > wire.CertificateLifetime || lifetime%time.Second != 0 {
 		return fmt.Errorf("certificate lifetime: %w", wire.InvalidRequest)
 	}
@@ -404,14 +416,6 @@ func (c Config) Validate() error {
 	}
 
 	return nil
-}
-
-func (c Config) snapshotMaxAge() time.Duration {
-	if c.SnapshotMaxAge == 0 {
-		return 30 * time.Second
-	}
-
-	return c.SnapshotMaxAge
 }
 
 func (c Config) validateReplication() error {

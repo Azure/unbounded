@@ -110,23 +110,28 @@ func (p *CommittedPublication) writeContext(parent context.Context) (context.Con
 	ctx, cancel := context.WithDeadline(parent, owner.confirmed.Add(owner.maxAge))
 	stop := context.AfterFunc(p.authority, cancel)
 
-	return publicationWriteContext{Context: ctx, authority: p.authority}, func() { stop(); cancel() }, nil
+	return authorityWriteContext{Context: ctx, authority: p.authority, parent: parent}, func() { stop(); cancel() }, nil
 }
 
-// Cancellation callbacks close transports asynchronously. Check the image's
+// Cancellation callbacks close transports asynchronously. Check the captured
 // authority synchronously too, so an unblocked writer cannot race revocation.
-type publicationWriteContext struct {
+type authorityWriteContext struct {
 	context.Context
 	authority context.Context
+	parent    context.Context
 }
 
-func (c publicationWriteContext) Err() error {
+func (c authorityWriteContext) Err() error {
 	if err := c.authority.Err(); err != nil {
 		return err
 	}
 
 	if deadline, ok := c.Deadline(); ok && !time.Now().Before(deadline) {
 		return context.DeadlineExceeded
+	}
+
+	if err := c.parent.Err(); err != nil {
+		return err
 	}
 
 	return c.Context.Err()
@@ -224,15 +229,17 @@ func (p *Publications) Prepare(previous VersionRecord, resourceVersion string, m
 // CommitVersion mints publisher installable state after a resource-version CAS.
 // Even unchanged content is CAS-confirmed; its counters and bytes remain identical.
 func (r *TopologyReconciler) CommitVersion(ctx context.Context, p *PreparedPublication) (*CommittedPublication, error) {
+	cfg := r.runtimeConfig()
+
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
-	if p == nil || p.owner != r.Publications || p.previous.Cluster != r.Config.Cluster {
+	if p == nil || p.owner != r.Publications || p.previous.Cluster != cfg.Cluster {
 		return nil, wire.InvalidRequest
 	}
 
-	cm, previous, err := readVersion(ctx, r.APIReader, r.Config)
+	cm, previous, err := readVersion(ctx, r.APIReader, cfg)
 	if err != nil {
 		r.suspendInvalidAuthority(err)
 		return nil, err

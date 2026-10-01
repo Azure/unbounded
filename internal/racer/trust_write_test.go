@@ -5,6 +5,7 @@ package racer
 
 import (
 	"bytes"
+	"context"
 	"crypto/x509"
 	"net"
 	"net/http"
@@ -15,6 +16,140 @@ import (
 
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
+
+type completionResponse struct {
+	*httptest.ResponseRecorder
+	onWrite func()
+	onFlush func()
+}
+
+func (w *completionResponse) Write(p []byte) (int, error) {
+	n, err := w.ResponseRecorder.Write(p)
+	if w.onWrite != nil {
+		w.onWrite()
+	}
+
+	return n, err
+}
+
+func (w *completionResponse) Flush() {
+	w.ResponseRecorder.Flush()
+
+	if w.onFlush != nil {
+		w.onFlush()
+	}
+}
+
+func TestTrustAuthorityImmediateCompletion(t *testing.T) {
+	for _, route := range []string{"bootstrap", "keyring", "keyring empty", "snapshot"} {
+		for _, stage := range []string{"write", "flush"} {
+			if route == "keyring empty" && stage == "write" {
+				continue
+			}
+
+			for _, change := range []string{"invalidate", "recover", "rotate"} {
+				t.Run(route+"/"+stage+"/"+change, func(t *testing.T) {
+					synctest.Test(t, func(t *testing.T) {
+						f := newServingFixture(t)
+						s := f.a.Server
+						_, bundle, _, _ := keyState(t, f.a.Keyring)
+
+						roots, err := s.Trust.pool()
+						if err != nil {
+							t.Fatal(err)
+						}
+
+						request := httptest.NewRequest(http.MethodGet, wire.SnapshotPath, nil)
+
+						switch route {
+						case "bootstrap":
+							encoded, err := wire.EncodeBootstrapRequest(f.request)
+							if err != nil {
+								t.Fatal(err)
+							}
+
+							request = httptest.NewRequest(http.MethodPost, wire.BootstrapPath, bytes.NewReader(encoded))
+							request.Header.Set("Content-Type", "application/json")
+							request.Header.Set("Authorization", "Bearer "+f.token)
+						case "keyring":
+							request = httptest.NewRequest(http.MethodGet, wire.KeyringPath, nil)
+						case "keyring empty":
+							request = httptest.NewRequest(http.MethodGet, wire.KeyringPath+"?after=1", nil)
+							// Keep both stores fresh throughout the no-change poll.
+							s.Trust.maxAge = 2 * wire.PollWait
+							s.Publications.maxAge = 2 * wire.PollWait
+						}
+
+						request.TLS = f.requestState(t)
+						called := false
+						changeAuthority := func() {
+							called = true
+
+							if change != "rotate" {
+								s.Trust.invalidate()
+							}
+
+							if change != "invalidate" {
+								bundle.Generation++
+								if err := s.Trust.install(t.Context(), roots, bundle); err != nil {
+									t.Fatal(err)
+								}
+							}
+							// Deliberately do not yield or wait for cancellation callbacks.
+						}
+
+						w := &completionResponse{ResponseRecorder: httptest.NewRecorder()}
+						if stage == "write" {
+							w.onWrite = changeAuthority
+						} else {
+							w.onFlush = changeAuthority
+						}
+
+						var aborted any
+
+						func() {
+							defer func() { aborted = recover() }()
+
+							s.Handler().ServeHTTP(w, request)
+						}()
+
+						if !called {
+							t.Fatal("completion hook not reached", w.Code)
+						}
+
+						if change == "rotate" {
+							if aborted != nil {
+								t.Fatalf("ordinary rotation aborted admitted response: %v", aborted)
+							}
+						} else if aborted != http.ErrAbortHandler {
+							t.Fatalf("revoked response completed: %v", aborted)
+						}
+
+						if len(s.writes) != 0 || len(s.bootstrapSlots) != 0 || s.keyringPolls.count() != 0 || s.polls.count() != 0 {
+							t.Fatal("completion leaked admission")
+						}
+					})
+				})
+			}
+		}
+	}
+}
+
+func TestTrustAuthoritySynchronousRevocation(t *testing.T) {
+	f := newServingFixture(t)
+
+	ctx, cancel, err := f.a.Server.Trust.writeContext(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+
+	f.a.Server.Trust.invalidate()
+
+	if ctx.Err() != context.Canceled {
+		t.Fatal("revocation depends on callback scheduling")
+	}
+}
 
 func TestPublicBlockedWriteTrustAuthority(t *testing.T) {
 	for _, route := range []string{"snapshot", "bootstrap", "keyring"} {

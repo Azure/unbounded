@@ -33,6 +33,7 @@ import (
 )
 
 type KeyringReconciler struct {
+	settings frozenConfig
 	client.Client
 	APIReader   client.Reader
 	Config      Config
@@ -40,6 +41,8 @@ type KeyringReconciler struct {
 	Now         func() time.Time
 	CatalogGate *CatalogGate
 }
+
+func (r *KeyringReconciler) runtimeConfig() Config { return r.settings.get(&r.Config) }
 
 // Reconcile creates/rotates issuer and cache keys through ordinary Secret CAS,
 // stages trust before using a new issuer, and returns RequeueAfter for deadlines.
@@ -61,7 +64,7 @@ func (r *KeyringReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl
 	if err == nil {
 		var state signingState
 
-		state, err = loadSigning(ctx, r.APIReader, r.Config, r.now())
+		state, err = loadSigning(ctx, r.APIReader, r.runtimeConfig(), r.now())
 		if err == nil && r.Trust != nil {
 			err = r.Trust.install(ctx, state.roots, state.bundle)
 		}
@@ -88,12 +91,14 @@ func (r *KeyringReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl
 }
 
 func (r *KeyringReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	cfg := r.runtimeConfig()
+
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("racer-credentials").
 		WatchesRawSource(initialEnqueue()).
 		Watches(&racerv1.ClusterCache{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(cacheChanges())).
-		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(namedChanges(r.Config.Namespace, r.Config.CredentialsSecretName))).
-		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(versionChanges(r.Config))).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(namedChanges(cfg.Namespace, cfg.CredentialsSecretName))).
+		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(singleton), builder.WithPredicates(versionChanges(cfg))).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
 		Complete(r)
 }
@@ -111,15 +116,17 @@ func credentialSecret(cfg Config, name, claim string) *corev1.Secret {
 }
 
 func (r *KeyringReconciler) reconcileKeys(ctx context.Context) (ctrl.Result, error) {
+	cfg := r.runtimeConfig()
+
 	if err := ctx.Err(); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	if err := r.Config.Validate(); err != nil {
+	if err := cfg.Validate(); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	version, _, err := readVersion(ctx, r.APIReader, r.Config)
+	version, _, err := readVersion(ctx, r.APIReader, cfg)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -139,30 +146,30 @@ func (r *KeyringReconciler) reconcileKeys(ctx context.Context) (ctrl.Result, err
 		return r.initializeKeys(ctx, version, catalog)
 	}
 
-	if !validCredentialClaim(r.Config, claim) {
+	if !validCredentialClaim(cfg, claim) {
 		return ctrl.Result{}, wire.Unavailable
 	}
 
-	credentials, err := readCredentials(ctx, r.APIReader, r.Config, claim)
+	credentials, err := readCredentials(ctx, r.APIReader, cfg, claim)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	catalog, err = admitCatalog(ctx, r.Config, catalog, credentials.bundle)
+	catalog, err = admitCatalog(ctx, cfg, catalog, credentials.bundle)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
 	now := r.now()
-	credentials.discardStalePreparation(r.Config, now)
+	credentials.discardStalePreparation(cfg, now)
 
-	if err := credentials.prepareIssuer(r.Config, now); err != nil {
+	if err := credentials.prepareIssuer(cfg, now); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	var encoded []byte
 
-	credentials.bundle, credentials.rotation, encoded, err = planRotation(r.Config.Rotation, credentials.bundle, credentials.rotation, catalog, now, nextGeneration(credentials.bundle.Generation))
+	credentials.bundle, credentials.rotation, encoded, err = planRotation(cfg.Rotation, credentials.bundle, credentials.rotation, catalog, now, nextGeneration(credentials.bundle.Generation))
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -192,7 +199,7 @@ func (c *credentialState) discardStalePreparation(cfg Config, now time.Time) {
 	if s.PreparedIssuer != "" {
 		cert := c.signing[s.PreparedIssuer].certificate
 
-		if now.Add(cfg.Rotation.PrepareFor + cfg.certificateLifetime()).After(cert.NotAfter) {
+		if now.Add(cfg.Rotation.PrepareFor + cfg.CertificateLifetime).After(cert.NotAfter) {
 			roots := b.PeerTrustRoots[:0]
 			for _, root := range b.PeerTrustRoots {
 				if rootID(root) != s.PreparedIssuer {
@@ -270,7 +277,9 @@ func (c *credentialState) encodeRotation(encoded []byte) (bool, error) {
 }
 
 func (r *KeyringReconciler) initializeKeys(ctx context.Context, version *corev1.ConfigMap, catalog []wire.CacheDefinition) (ctrl.Result, error) {
-	err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: r.Config.Namespace, Name: r.Config.CredentialsSecretName}, &corev1.Secret{})
+	cfg := r.runtimeConfig()
+
+	err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: cfg.Namespace, Name: cfg.CredentialsSecretName}, &corev1.Secret{})
 	if !apierrors.IsNotFound(err) {
 		if err != nil {
 			return ctrl.Result{}, err
@@ -281,36 +290,36 @@ func (r *KeyringReconciler) initializeKeys(ctx context.Context, version *corev1.
 
 	now := r.now()
 
-	cert, key, err := generateIssuer(now, r.Config)
+	cert, key, err := generateIssuer(now, cfg)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
 	id := rootID(cert)
-	b := wire.KeyringBundle{SchemaVersion: wire.SchemaVersion, Cluster: r.Config.Cluster, Generation: 1, PeerTrustRoots: [][]byte{cert}}
-	s := RotationState{ActiveIssuer: id, NextRotation: now.Add(r.Config.Rotation.Interval), Retiring: map[string]time.Time{}}
+	b := wire.KeyringBundle{SchemaVersion: wire.SchemaVersion, Cluster: cfg.Cluster, Generation: 1, PeerTrustRoots: [][]byte{cert}}
+	s := RotationState{ActiveIssuer: id, NextRotation: now.Add(cfg.Rotation.Interval), Retiring: map[string]time.Time{}}
 
-	catalog, err = admitCatalog(ctx, r.Config, catalog, b)
+	catalog, err = admitCatalog(ctx, cfg, catalog, b)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
 	var encoded []byte
 
-	b, s, encoded, err = planRotation(r.Config.Rotation, b, s, catalog, now, 1)
+	b, s, encoded, err = planRotation(cfg.Rotation, b, s, catalog, now, 1)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	s.NextRotation = now.Add(r.Config.Rotation.Interval - r.Config.Rotation.PrepareFor)
+	s.NextRotation = now.Add(cfg.Rotation.Interval - cfg.Rotation.PrepareFor)
 
 	// The permanent claim is on the already-required version object. Topology
 	// preserves annotations with its CAS. Missing Secrets after this claim never
 	// authorize Create on recovery, even when the first create response was lost.
-	claim := fmt.Sprintf("%s/%s", r.Config.CredentialsSecretName, id)
+	claim := fmt.Sprintf("%s/%s", cfg.CredentialsSecretName, id)
 	version.Annotations[credentialClaim] = claim
 
-	secret := credentialSecret(r.Config, r.Config.CredentialsSecretName, claim)
+	secret := credentialSecret(cfg, cfg.CredentialsSecretName, claim)
 	material := issuerMaterial{Keys: map[string]signingMaterial{id: {Certificate: cert, PrivateKey: key}}}
 
 	secret.Data["issuer.json"], err = json.Marshal(material)
@@ -346,7 +355,7 @@ func (r *KeyringReconciler) initializeKeys(ctx context.Context, version *corev1.
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{RequeueAfter: max(time.Second, r.Config.Rotation.Interval-r.Config.Rotation.PrepareFor)}, nil
+	return ctrl.Result{RequeueAfter: max(time.Second, cfg.Rotation.Interval-cfg.Rotation.PrepareFor)}, nil
 }
 
 type RotationPolicy struct {
@@ -634,12 +643,12 @@ func catalogCapacity(cfg Config, b wire.KeyringBundle) (int, error) {
 		return 0, err
 	}
 
-	for _, purpose := range []wire.KeyPurpose{wire.PageKey, wire.OriginCredentialsKey} {
+	for i, purpose := range []wire.KeyPurpose{wire.PageKey, wire.OriginCredentialsKey} {
 		id := make([]byte, 16)
 		copy(id, "RKG1")
 		binary.BigEndian.PutUint64(id[4:12], 1)
 
-		key, err := wire.NewCacheKey(wire.CacheKeyRef{Cache: wire.CacheID(cfg.Cluster), Purpose: purpose, ID: id}, wire.ActiveKey, [32]byte{})
+		key, err := wire.NewCacheKey(wire.CacheKeyRef{Cache: wire.CacheID(cfg.Cluster), Purpose: purpose, ID: id}, wire.ActiveKey, [32]byte{byte(i)})
 		if err != nil {
 			return 0, err
 		}

@@ -218,8 +218,8 @@ func TestSigningActiveLifetimeBoundary(t *testing.T) {
 	}{
 		{"not yet valid", cert.NotBefore.Add(-time.Second), false},
 		{"starts now", cert.NotBefore, true},
-		{"full leaf lifetime", cert.NotAfter.Add(-r.Config.certificateLifetime()), true},
-		{"short by one second", cert.NotAfter.Add(-r.Config.certificateLifetime()).Add(time.Second), false},
+		{"full leaf lifetime", cert.NotAfter.Add(-r.Config.CertificateLifetime), true},
+		{"short by one second", cert.NotAfter.Add(-r.Config.CertificateLifetime).Add(time.Second), false},
 		{"expired", cert.NotAfter, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

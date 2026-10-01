@@ -444,7 +444,7 @@ func (s *Server) serveBootstrap(w http.ResponseWriter, r *http.Request) {
 		panic(http.ErrAbortHandler)
 	}
 
-	responseControl(http.NewResponseController(w).Flush())
+	flushResponse(trustCtx, w)
 }
 
 func (s *Server) authenticateSnapshot(ctx context.Context, state *tls.ConnectionState) (NodeIdentity, error) {
@@ -535,7 +535,9 @@ func (s *Server) serveSnapshot(w http.ResponseWriter, r *http.Request) {
 	boundedCtx, stopWindow := context.WithTimeout(trustCtx, s.config.Limits.WriteTimeout)
 	defer stopWindow()
 
-	writeCtx, cancelWrite, err := image.writeContext(boundedCtx)
+	// Keep the trust guard visible through the timeout child: context children
+	// otherwise observe authority revocation only after its cancellation callback.
+	writeCtx, cancelWrite, err := image.writeContext(authorityWriteContext{Context: boundedCtx, authority: trustCtx, parent: trustCtx})
 	if err != nil {
 		writeFailure(w, err)
 		return
@@ -635,7 +637,12 @@ func (w requestWriter) Write(b []byte) (int, error) {
 		return 0, err
 	}
 
-	return w.writer.Write(b)
+	n, err := w.writer.Write(b)
+	if err == nil {
+		err = w.ctx.Err()
+	}
+
+	return n, err
 }
 
 func snapshotCursor(r *http.Request) (*wire.Sequence, error) {
@@ -874,7 +881,7 @@ func (s *Server) serveKeyring(w http.ResponseWriter, r *http.Request) {
 
 	if bundle == nil {
 		w.WriteHeader(http.StatusNoContent)
-		responseControl(http.NewResponseController(w).Flush())
+		flushResponse(ctx, w)
 
 		return
 	}
@@ -886,5 +893,5 @@ func (s *Server) serveKeyring(w http.ResponseWriter, r *http.Request) {
 		panic(http.ErrAbortHandler)
 	}
 
-	responseControl(http.NewResponseController(w).Flush())
+	flushResponse(ctx, w)
 }

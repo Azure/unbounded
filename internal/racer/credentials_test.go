@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -81,13 +82,23 @@ func TestCredentialsClaimValidation(t *testing.T) {
 }
 
 func TestCredentialsMissingOrLegacyEntriesNeverRegenerate(t *testing.T) {
-	for _, corruption := range []string{"issuer.json", "bundle.json", "rotation.json", "pending", "trailing metadata", "symmetric retirement"} {
+	for _, corruption := range []string{"issuer.json", "bundle.json", "rotation.json", "pending", "trailing metadata", "symmetric retirement", "duplicate material"} {
 		t.Run(corruption, func(t *testing.T) {
 			r, _ := testKeyring(t)
 			runKeys(t, r)
 			secret, bundle, state, material := keyState(t, r)
 
 			switch corruption {
+			case "duplicate material":
+				var document map[string]any
+				if err := json.Unmarshal(secret.Data["bundle.json"], &document); err != nil {
+					t.Fatal(err)
+				}
+
+				keys := document["cache_keys"].([]any)
+				keys[1].(map[string]any)["material"] = keys[0].(map[string]any)["material"]
+				document["generation"] = fmt.Sprint(uint64(bundle.Generation + 1))
+				secret.Data["bundle.json"], _ = json.Marshal(document)
 			case "pending":
 				secret.Data["issuer.json"], _ = json.Marshal(map[string]any{"keys": material.Keys, "pending": state.ActiveIssuer})
 			case "trailing metadata":
@@ -117,6 +128,8 @@ func TestCredentialsMissingOrLegacyEntriesNeverRegenerate(t *testing.T) {
 			})
 			if _, err := r.Reconcile(t.Context(), ctrl.Request{}); err == nil || trustReady(r.Trust) {
 				t.Fatal("corrupt atomic version accepted")
+			} else if corruption == "duplicate material" && !errors.Is(err, wire.Unavailable) {
+				t.Fatalf("committed duplicate material should be unavailable: %v", err)
 			}
 		})
 	}
@@ -227,7 +240,7 @@ func TestCredentialsStalePreparationReplacementIsAtomic(t *testing.T) {
 			_, bundle, state, material := keyState(t, r)
 			oldID := state.PreparedIssuer
 			short := editSigningCertificate(t, material.Keys[oldID], func(cert *x509.Certificate) {
-				cert.NotAfter = now.Add(r.Config.Rotation.PrepareFor + r.Config.certificateLifetime() - time.Second)
+				cert.NotAfter = now.Add(r.Config.Rotation.PrepareFor + r.Config.CertificateLifetime - time.Second)
 			})
 			shortID := rootID(short.Certificate)
 

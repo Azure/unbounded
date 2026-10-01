@@ -452,8 +452,18 @@ func TestPlanRotationInputValidation(t *testing.T) {
 
 			b.CacheKeys = make([]wire.CacheKey, 4000)
 			for i := range b.CacheKeys {
-				b.CacheKeys[i] = key
-				b.CacheKeys[i].Key.Cache = wire.CacheID(fmt.Sprintf("%08x-0000-0000-0000-000000000000", i+1))
+				ref := key.Key
+				ref.Cache = wire.CacheID(fmt.Sprintf("%08x-0000-0000-0000-000000000000", i+1))
+
+				var material [32]byte
+				binary.BigEndian.PutUint64(material[:8], uint64(i+1))
+
+				var err error
+
+				b.CacheKeys[i], err = wire.NewCacheKey(ref, key.State, material)
+				if err != nil {
+					t.Fatal(err)
+				}
 			}
 		}, wire.TooLarge},
 	} {

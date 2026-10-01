@@ -4,12 +4,125 @@
 package racer
 
 import (
+	"bytes"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
+
+func TestFrozenConfigUsedByRuntimeOperations(t *testing.T) {
+	f := newServingFixture(t)
+	a := f.a
+	b := a.Server.Bootstrap
+	request := httptest.NewRequest(http.MethodGet, wire.KeyringPath, nil)
+	request.Header.Set("Authorization", "Bearer "+f.token)
+
+	identity, err := b.Authenticate(f.ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a.Replication.observe(f.ctx)
+	handler := a.Server.Handler()
+	// All components have crossed real operational boundaries, not just getters.
+	for _, input := range []*Config{&a.Topology.Config, &a.Keyring.Config, &a.Replication.Config, &a.Server.Config, &b.Config, &b.Issuer.Config} {
+		*input = Config{}
+	}
+
+	runKeys(t, a.Keyring)
+	reconcileTopology(t, a.Topology, f.ctx)
+	a.Replication.observe(f.ctx)
+
+	if _, err := b.Authenticate(f.ctx, request); err != nil {
+		t.Fatal("bootstrap reread config", err)
+	}
+
+	encoded, err := b.Issuer.Issue(f.ctx, identity, f.request)
+	if err != nil {
+		t.Fatal("issuer reread config", err)
+	}
+
+	if response, err := wire.DecodeBootstrapResponse(bytes.NewReader(encoded)); err != nil || response.Cluster != f.request.Cluster {
+		t.Fatal("issued identity changed", err)
+	}
+
+	request.TLS = f.requestState(t)
+	request.Header.Del("Authorization")
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, request)
+
+	if w.Code != http.StatusOK {
+		t.Fatal("serving/replication reread config", w.Code)
+	}
+}
+
+func TestComponentConfigFreezesDefaultsAtFirstUse(t *testing.T) {
+	a := Assemble(Config{}, nil, nil)
+	// Assemble remains a pure scaffold, even with an invalid zero config.
+	for name, component := range map[string]struct {
+		input *Config
+		get   func() Config
+	}{
+		"topology":    {&a.Topology.Config, a.Topology.runtimeConfig},
+		"keyring":     {&a.Keyring.Config, a.Keyring.runtimeConfig},
+		"replication": {&a.Replication.Config, a.Replication.runtimeConfig},
+		"bootstrap":   {&a.Server.Bootstrap.Config, a.Server.Bootstrap.runtimeConfig},
+		"issuer":      {&a.Server.Bootstrap.Issuer.Config, a.Server.Bootstrap.Issuer.runtimeConfig},
+		"server":      {&a.Server.Config, func() Config { a.Server.initializeAdmission(); return a.Server.config }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			*component.input = testConfig(t)
+			component.input.CertificateLifetime = 0
+			component.input.SnapshotMaxAge = 0
+			component.input.PeerPort = 9443
+
+			want := component.input.effective()
+			if err := component.input.Validate(); err != nil {
+				t.Fatal("zero optional lifetimes rejected", err)
+			}
+
+			if got := component.get(); got != want || got.CertificateLifetime != wire.CertificateLifetime || got.SnapshotMaxAge != 30*time.Second {
+				t.Fatal("first use ignored pre-use inputs/defaults")
+			}
+
+			*component.input = Config{}
+
+			var readers sync.WaitGroup
+			for range 8 {
+				readers.Go(func() {
+					if component.get() != want {
+						t.Error("runtime reread mutated construction inputs")
+					}
+				})
+			}
+
+			readers.Wait()
+		})
+	}
+}
+
+func TestDirectComponentConfigDefaults(t *testing.T) {
+	for name, get := range map[string]func() Config{
+		"topology":    (&TopologyReconciler{}).runtimeConfig,
+		"keyring":     (&KeyringReconciler{}).runtimeConfig,
+		"bootstrap":   (&Bootstrap{}).runtimeConfig,
+		"issuer":      (&Issuer{}).runtimeConfig,
+		"replication": (&Replication{}).runtimeConfig,
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := get()
+			if cfg.CertificateLifetime != wire.CertificateLifetime || cfg.SnapshotMaxAge != 30*time.Second {
+				t.Fatal("direct zero-default semantics lost")
+			}
+		})
+	}
+}
 
 func TestConfigDeploymentIdentityAndBounds(t *testing.T) {
 	cfg := testConfig(t)
@@ -79,7 +192,7 @@ func TestConfigShortRotationDurations(t *testing.T) {
 	testConfig(t)
 
 	cfg, err := LoadConfig()
-	if err != nil || cfg.certificateLifetime() != wire.CertificateLifetime {
+	if err != nil || cfg.CertificateLifetime != wire.CertificateLifetime {
 		t.Fatalf("default lifetime: %v", err)
 	}
 
@@ -93,7 +206,7 @@ func TestConfigShortRotationDurations(t *testing.T) {
 	}
 
 	cfg, err = LoadConfig()
-	if err != nil || cfg.certificateLifetime() != 2*time.Minute || cfg.Rotation != (RotationPolicy{5 * time.Minute, 20 * time.Second, 2 * time.Minute}) {
+	if err != nil || cfg.CertificateLifetime != 2*time.Minute || cfg.Rotation != (RotationPolicy{5 * time.Minute, 20 * time.Second, 2 * time.Minute}) {
 		t.Fatalf("short rotation config: %v", err)
 	}
 
@@ -149,7 +262,7 @@ func TestConfigDurationsUseProvidedLookup(t *testing.T) {
 	delete(values, "RACER_ROTATION_RETAIN_FOR")
 
 	cfg, err = ConfigFromLookup(lookup)
-	if err != nil || cfg.certificateLifetime() != wire.CertificateLifetime || cfg.Rotation.RetainFor != 48*time.Hour {
+	if err != nil || cfg.CertificateLifetime != wire.CertificateLifetime || cfg.Rotation.RetainFor != 48*time.Hour {
 		t.Fatalf("absent custom values did not use defaults: %v", err)
 	}
 }

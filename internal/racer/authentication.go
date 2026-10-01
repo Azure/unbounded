@@ -44,12 +44,15 @@ func (i NodeIdentity) Expires() time.Time      { return i.expires }
 // Issuer accesses a controller-only Secret. Its private key is never projected
 // into dataplane Pods or included in a response or diagnostic.
 type Issuer struct {
+	settings    frozenConfig
 	APIReader   client.Reader
 	Config      Config
 	Trust       *Trust
 	CatalogGate *CatalogGate
 	Now         func() time.Time
 }
+
+func (i *Issuer) runtimeConfig() Config { return i.settings.get(&i.Config) }
 
 type signingMaterial struct {
 	Certificate []byte `json:"certificate"`
@@ -75,6 +78,8 @@ func serialNumber() (*big.Int, error) {
 }
 
 func generateIssuer(now time.Time, cfg Config) ([]byte, []byte, error) {
+	cfg = cfg.effective()
+
 	pub, key, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, nil, err
@@ -85,7 +90,7 @@ func generateIssuer(now time.Time, cfg Config) ([]byte, []byte, error) {
 		return nil, nil, err
 	}
 
-	template := &x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: "Racer " + string(cfg.Cluster)}, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(cfg.Rotation.Interval + cfg.Rotation.PrepareFor + cfg.Rotation.RetainFor + 2*cfg.certificateLifetime()), IsCA: true, BasicConstraintsValid: true, MaxPathLenZero: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign}
+	template := &x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: "Racer " + string(cfg.Cluster)}, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(cfg.Rotation.Interval + cfg.Rotation.PrepareFor + cfg.Rotation.RetainFor + 2*cfg.CertificateLifetime), IsCA: true, BasicConstraintsValid: true, MaxPathLenZero: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign}
 
 	cert, err := x509.CreateCertificate(rand.Reader, template, template, pub, key)
 	if err != nil {
@@ -135,6 +140,8 @@ type signingState struct {
 }
 
 func loadSigning(ctx context.Context, reader client.Reader, cfg Config, now time.Time) (signingState, error) {
+	cfg = cfg.effective()
+
 	if err := ctx.Err(); err != nil {
 		return signingState{}, err
 	}
@@ -161,7 +168,7 @@ func loadSigning(ctx context.Context, reader client.Reader, cfg Config, now time
 	active := credentials.signing[credentials.rotation.ActiveIssuer]
 	cert, key := active.certificate, active.key
 
-	if now.Before(cert.NotBefore) || now.Add(cfg.certificateLifetime()).After(cert.NotAfter) {
+	if now.Before(cert.NotBefore) || now.Add(cfg.CertificateLifetime).After(cert.NotAfter) {
 		return signingState{}, wire.Unavailable
 	}
 
@@ -204,7 +211,7 @@ func (i *Issuer) loadSigning(ctx context.Context, now time.Time) (signingState, 
 		defer i.CatalogGate.Release()
 	}
 
-	state, err := loadSigning(ctx, i.APIReader, i.Config, now)
+	state, err := loadSigning(ctx, i.APIReader, i.runtimeConfig(), now)
 	if shouldInvalidateTrust(err) {
 		i.Trust.invalidate()
 	}
@@ -216,12 +223,14 @@ func (i *Issuer) loadSigning(ctx context.Context, now time.Time) (signingState, 
 // extensions and requested usages are discarded. Enrollment is correlation only.
 // It returns an owned, validated JSON response within the bootstrap wire bound.
 func (i *Issuer) Issue(ctx context.Context, identity NodeIdentity, request wire.BootstrapRequest) ([]byte, error) {
+	cfg := i.runtimeConfig()
+
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
 	now := i.now()
-	if identity.cluster != i.Config.Cluster || !wire.ValidUUID(string(identity.node)) || !identity.expires.After(now) {
+	if identity.cluster != cfg.Cluster || !wire.ValidUUID(string(identity.node)) || !identity.expires.After(now) {
 		return nil, wire.Forbidden
 	}
 
@@ -254,7 +263,7 @@ func (i *Issuer) Issue(ctx context.Context, identity NodeIdentity, request wire.
 	}
 
 	uri := &url.URL{Scheme: "spiffe", Host: string(identity.cluster), Path: "/node/" + string(identity.node)}
-	template := &x509.Certificate{SerialNumber: serial, NotBefore: now, NotAfter: now.Add(i.Config.certificateLifetime()), BasicConstraintsValid: true, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, URIs: []*url.URL{uri}}
+	template := &x509.Certificate{SerialNumber: serial, NotBefore: now, NotAfter: now.Add(cfg.CertificateLifetime), BasicConstraintsValid: true, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, URIs: []*url.URL{uri}}
 
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -352,16 +361,21 @@ func AuthenticateCertificate(ctx context.Context, trust *Trust, cfg Config, stat
 }
 
 type Bootstrap struct {
+	settings  frozenConfig
 	Client    client.Client
 	APIReader client.Reader
 	Config    Config
 	Issuer    *Issuer
 }
 
+func (b *Bootstrap) runtimeConfig() Config { return b.settings.get(&b.Config) }
+
 // Authenticate performs TokenReview for racer-control, checks the live bound Pod
 // UID and authorized ServiceAccount/workload, and resolves its assigned Node UID.
 // Token contents, CSR contents, and requested names are not authority on their own.
 func (b *Bootstrap) Authenticate(ctx context.Context, r *http.Request) (NodeIdentity, error) {
+	cfg := b.runtimeConfig()
+
 	if err := ctx.Err(); err != nil {
 		return NodeIdentity{}, err
 	}
@@ -370,12 +384,12 @@ func (b *Bootstrap) Authenticate(ctx context.Context, r *http.Request) (NodeIden
 		return NodeIdentity{}, wire.Unavailable
 	}
 
-	status, token, err := reviewBearer(ctx, b.Client, r, wire.TokenAudience, b.Config.Limits.HeaderBytes)
+	status, token, err := reviewBearer(ctx, b.Client, r, wire.TokenAudience, cfg.Limits.HeaderBytes)
 	if err != nil {
 		return NodeIdentity{}, err
 	}
 
-	if status.User.Username != "system:serviceaccount:"+b.Config.Namespace+":"+b.Config.DataplaneServiceAccount {
+	if status.User.Username != "system:serviceaccount:"+cfg.Namespace+":"+cfg.DataplaneServiceAccount {
 		return NodeIdentity{}, wire.Forbidden
 	}
 	// TokenReview authenticates the token. Its JWT expiration is used only to
@@ -391,7 +405,7 @@ func (b *Bootstrap) Authenticate(ctx context.Context, r *http.Request) (NodeIden
 	}
 
 	var pod corev1.Pod
-	if err := b.APIReader.Get(ctx, client.ObjectKey{Namespace: b.Config.Namespace, Name: podName}, &pod); err != nil {
+	if err := b.APIReader.Get(ctx, client.ObjectKey{Namespace: cfg.Namespace, Name: podName}, &pod); err != nil {
 		return NodeIdentity{}, authorizationError(err)
 	}
 
@@ -399,7 +413,7 @@ func (b *Bootstrap) Authenticate(ctx context.Context, r *http.Request) (NodeIden
 		return NodeIdentity{}, wire.Forbidden
 	}
 
-	if err := authorizePod(ctx, b.APIReader, b.Config, &pod, status.User.UID); err != nil {
+	if err := authorizePod(ctx, b.APIReader, cfg, &pod, status.User.UID); err != nil {
 		return NodeIdentity{}, err
 	}
 
@@ -426,7 +440,7 @@ func (b *Bootstrap) Authenticate(ctx context.Context, r *http.Request) (NodeIden
 		return NodeIdentity{}, wire.Unauthenticated
 	}
 
-	return NodeIdentity{cluster: b.Config.Cluster, node: wire.NodeID(node.UID), nodeName: node.Name, expires: expires}, nil
+	return NodeIdentity{cluster: cfg.Cluster, node: wire.NodeID(node.UID), nodeName: node.Name, expires: expires}, nil
 }
 
 func singleExtra(user authv1.UserInfo, key string) string {

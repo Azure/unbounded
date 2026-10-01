@@ -37,7 +37,10 @@ func TestKeyringDeliveryEncodingBoundsAndGeneration(t *testing.T) {
 		copy(ref.ID, "RKG1")
 		binary.BigEndian.PutUint64(ref.ID[4:12], n+10)
 
-		key, err := NewCacheKey(ref, PreparedKey, [32]byte{})
+		var material [32]byte
+		binary.BigEndian.PutUint64(material[:8], n+10)
+
+		key, err := NewCacheKey(ref, PreparedKey, material)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -53,6 +56,66 @@ func TestKeyringDeliveryEncodingBoundsAndGeneration(t *testing.T) {
 func TestBundleEncodingCannotBypassCodec(t *testing.T) {
 	if _, err := json.Marshal(KeyringBundle{}); !errors.Is(err, UnsupportedVersion) {
 		t.Fatalf("standard encoder bypassed bundle validation: %v", err)
+	}
+}
+
+// Rust IdentityManager::install also rejects material shared by distinct refs,
+// regardless of scope or state. Keep both Go codec directions equally strict.
+func TestBundleDuplicateMaterialParity(t *testing.T) {
+	for _, scope := range []string{"id", "purpose", "cache"} {
+		t.Run(scope, func(t *testing.T) {
+			bundle, err := DecodeBundle(bytes.NewReader(fixture(t, "bundle.json")))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			first := bundle.CacheKeys[0]
+			second := first
+			second.Key.ID = bytes.Clone(first.Key.ID)
+
+			switch scope {
+			case "id":
+				second.Key.ID[15]++
+				second.State = PreparedKey
+			case "purpose":
+				second.Key.Purpose = OriginCredentialsKey
+				if first.Key.Purpose == OriginCredentialsKey {
+					second.Key.Purpose = PageKey
+				}
+			case "cache":
+				second.Key.Cache = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+			}
+
+			second.material[0] ^= 0xff
+			bundle.CacheKeys = []CacheKey{first, second}
+
+			valid, err := EncodeBundle(bundle)
+			if err != nil {
+				t.Fatal("distinct material rejected", err)
+			}
+
+			var document map[string]any
+			if err := json.Unmarshal(valid, &document); err != nil {
+				t.Fatal(err)
+			}
+
+			keys := document["cache_keys"].([]any)
+			keys[1].(map[string]any)["material"] = keys[0].(map[string]any)["material"]
+
+			corrupt, err := json.Marshal(document)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := DecodeBundle(bytes.NewReader(corrupt)); !errors.Is(err, InvalidRequest) {
+				t.Fatalf("decoder accepted duplicate material: %v", err)
+			}
+
+			bundle.CacheKeys[1].material = first.material
+			if _, err := EncodeBundle(bundle); !errors.Is(err, InvalidRequest) {
+				t.Fatalf("encoder accepted duplicate material: %v", err)
+			}
+		})
 	}
 }
 
