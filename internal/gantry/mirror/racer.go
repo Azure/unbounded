@@ -83,7 +83,10 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, upstream, re
 			return
 		}
 
-		options = []racersdk.ReadOptions{{Offset: racersdk.ByteOffset(offset), Pin: metadata.ETag, Metadata: &metadata, SmallObject: metadata.Size <= racersdk.PageSize}}
+		// Pass the version pin, not Metadata: the SDK preserves a supplied
+		// snapshot even when the peer omits or adds an optional MIME type.
+		// Gantry must compare the returned metadata exactly before serving it.
+		options = []racersdk.ReadOptions{{Offset: racersdk.ByteOffset(offset), Pin: metadata.ETag, SmallObject: metadata.Size <= racersdk.PageSize}}
 	}
 
 	if kind == ifaces.KindManifest {
@@ -100,7 +103,7 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, upstream, re
 
 	actual := value.Metadata()
 	if !validRacerMetadata(actual, d) || (ranged && (actual.Size != metadata.Size ||
-		(actual.ContentType != "" && metadata.ContentType != "" && actual.ContentType != metadata.ContentType))) {
+		actual.ContentType != metadata.ContentType)) {
 		http.Error(w, "invalid Racer metadata", http.StatusBadGateway)
 		return
 	}
@@ -111,8 +114,7 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, upstream, re
 	}
 
 	if ranged {
-		// Optional media type may be absent on a legacy peer. Keep the selected
-		// snapshot rather than changing headers as later metadata arrives.
+		// The returned size, digest, and MIME type match the selected snapshot.
 		actual = metadata
 	}
 

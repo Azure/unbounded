@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"mime"
 	"net/url"
 	"strings"
 	"time"
@@ -109,10 +108,17 @@ func parseAuthorization(value string) (racersdk.Authorization, error) {
 	return racersdk.ParseAuthorization(normalized)
 }
 
+// Upstream requires metadata and bounded reads. The adapter never opens an
+// unbounded stream and truncates it locally to simulate a range request.
+type Upstream interface {
+	Head(context.Context, ifaces.OriginRef) (int64, string, error)
+	ifaces.OriginRangePuller
+}
+
 // Origin returns a concurrent callback using only configured registry names and
 // aliases. The allowlist is copied at construction; upstream owns registry I/O,
 // including authentication, redirects, cancellation, and offset validation.
-func Origin(cfg *config.Config, upstream ifaces.OriginPuller) racersdk.Origin {
+func Origin(cfg *config.Config, upstream Upstream) racersdk.Origin {
 	registries := make(map[string]bool)
 
 	if cfg != nil {
@@ -185,7 +191,7 @@ func decodeReference(key racersdk.Key, metadata racersdk.AdapterMetadata) (iface
 	return ref, validateRef(ref)
 }
 
-func open(ctx context.Context, upstream ifaces.OriginPuller, ref ifaces.OriginRef, operation racersdk.Operation, pin racersdk.ETag, page racersdk.Range) (racersdk.Metadata, io.ReadCloser, error) {
+func open(ctx context.Context, upstream Upstream, ref ifaces.OriginRef, operation racersdk.Operation, pin racersdk.ETag, page racersdk.Range) (racersdk.Metadata, io.ReadCloser, error) {
 	if err := ctx.Err(); err != nil {
 		return racersdk.Metadata{}, nil, classifyError(err)
 	}
@@ -209,8 +215,8 @@ func open(ctx context.Context, upstream ifaces.OriginPuller, ref ifaces.OriginRe
 		return racersdk.Metadata{}, nil, racersdk.NewOriginError(racersdk.ErrorInternal, nil)
 	}
 
-	if bounded, ok := upstream.(ifaces.OriginRangePuller); ok && operation != racersdk.OperationHead {
-		return openRange(ctx, bounded, ref, operation, tag, page)
+	if operation != racersdk.OperationHead {
+		return openRange(ctx, upstream, ref, operation, tag, page)
 	}
 
 	size, contentType, err := upstream.Head(ctx, ref)
@@ -227,32 +233,8 @@ func open(ctx context.Context, upstream ifaces.OriginPuller, ref ifaces.OriginRe
 		ContentType: contentType,
 		ExpiresAt:   time.Now().Add(metadataTTL).Truncate(time.Millisecond),
 	}
-	if operation == racersdk.OperationHead || operation == racersdk.OperationBootstrap && size == 0 {
-		return metadata, nil, nil
-	}
 
-	first, last, err := page.Resolve(metadata.Size)
-	if err != nil {
-		return metadata, nil, classifyError(err)
-	}
-
-	ref.Offset = int64(first)
-	if isManifest(contentType) {
-		// HEAD may have fallen back from blobs to manifests. Pull only performs
-		// that fallback at offset zero, so select the discovered route explicitly.
-		ref.Kind = ifaces.KindManifest
-	}
-
-	body, pulledSize, err := upstream.Pull(ctx, ref)
-	if err != nil {
-		return metadata, body, classifyError(err)
-	}
-
-	if pulledSize != size || body == nil {
-		return metadata, body, racersdk.NewOriginError(racersdk.ErrorBadGateway, nil)
-	}
-
-	return metadata, &pageBody{Reader: io.LimitReader(body, int64(last-first)+1), upstream: body}, nil
+	return metadata, nil, nil
 }
 
 func openRange(ctx context.Context, upstream ifaces.OriginRangePuller, ref ifaces.OriginRef, operation racersdk.Operation, tag racersdk.ETag, page racersdk.Range) (racersdk.Metadata, io.ReadCloser, error) {
@@ -292,31 +274,6 @@ func openRange(ctx context.Context, upstream ifaces.OriginRangePuller, ref iface
 	// The bounded origin owns framing; the SDK checks exact body length and
 	// metadata consistency across pinned pages. Do not hide excess bytes here.
 	return metadata, body, nil
-}
-
-// pageBody supports legacy external OriginPullers without bounded reads. Close
-// delegates directly to the upstream body, without a lock held by a blocked Read.
-type pageBody struct {
-	io.Reader
-	upstream io.ReadCloser
-}
-
-func (b *pageBody) Close() error { return b.upstream.Close() }
-
-func isManifest(contentType string) bool {
-	mediaType, _, err := mime.ParseMediaType(contentType)
-	if err != nil {
-		return false
-	}
-
-	switch mediaType {
-	case "application/vnd.oci.image.manifest.v1+json", "application/vnd.oci.image.index.v1+json",
-		"application/vnd.docker.distribution.manifest.v1+json", "application/vnd.docker.distribution.manifest.v1+prettyjws",
-		"application/vnd.docker.distribution.manifest.v2+json", "application/vnd.docker.distribution.manifest.list.v2+json":
-		return true
-	default:
-		return false
-	}
 }
 
 func classifyError(err error) error {

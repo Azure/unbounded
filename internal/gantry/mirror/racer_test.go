@@ -219,15 +219,17 @@ func (u *racerRegistry) Head(ctx context.Context, ref ifaces.OriginRef) (int64, 
 	return int64(len(u.data)), u.contentType, nil
 }
 
-func (u *racerRegistry) Pull(ctx context.Context, ref ifaces.OriginRef) (io.ReadCloser, int64, error) {
+func (u *racerRegistry) PullRange(ctx context.Context, ref ifaces.OriginRef, length int64) (io.ReadCloser, int64, string, error) {
 	u.check(ctx, ref)
 	u.pulls.Add(1)
 
-	if ref.Offset < 0 || ref.Offset >= int64(len(u.data)) {
-		return nil, 0, errors.New("invalid registry offset")
+	if ref.Offset < 0 || ref.Offset >= int64(len(u.data)) || length <= 0 {
+		return nil, 0, "", errors.New("invalid registry range")
 	}
 
-	return io.NopCloser(bytes.NewReader(u.data[ref.Offset:])), int64(len(u.data)), nil
+	end := ref.Offset + min(length, int64(len(u.data))-ref.Offset)
+
+	return io.NopCloser(bytes.NewReader(u.data[ref.Offset:end])), int64(len(u.data)), u.contentType, nil
 }
 
 func TestRacerGETAndHEAD(t *testing.T) {
@@ -480,7 +482,7 @@ func TestRacerSDKRequestTranscript(t *testing.T) {
 				return
 			}
 
-			if len(options) != 1 || options[0].Offset != racersdk.ByteOffset(racersdk.PageSize+7) || options[0].Length != 0 || options[0].Pin.String() != `"`+d.String()+`"` || options[0].Metadata == nil || options[0].Metadata.Size != racersdk.ByteLength(len(data)) {
+			if len(options) != 1 || options[0].Offset != racersdk.ByteOffset(racersdk.PageSize+7) || options[0].Length != 0 || options[0].Pin.String() != `"`+d.String()+`"` || options[0].Metadata != nil {
 				t.Fatal("resume must use exact offset, through-EOF length, and selected digest pin")
 			}
 		})
@@ -547,9 +549,9 @@ func TestRacerOptionalContentTypeKeepsSnapshot(t *testing.T) {
 				server := racerServer(t, racerConfig(), client, &racerLegacyTrap{})
 
 				resp := racerRequest(t, server, http.MethodGet, "blobs", d, "bytes=4-", "")
-				if tc.initial != "" && tc.returned != "" && tc.initial != tc.returned {
+				if tc.initial != tc.returned {
 					if resp.StatusCode != http.StatusBadGateway || resp.Header.Get("Gantry-Mirrored") != "" {
-						t.Fatal("conflicting present media types were accepted")
+						t.Fatal("changed media type snapshot was accepted")
 					}
 
 					return
@@ -960,8 +962,8 @@ func TestRacerAuthenticationProbeAndDelegatedCredentials(t *testing.T) {
 				t.Fatalf("authenticated read: status=%d bytes=%d err=%v", resp.StatusCode, len(got), err)
 			}
 
-			if trap.probes.Load() != 1 || calls.Load() != 2 || upstream.heads.Load() != 2 || upstream.pulls.Load() != 2 {
-				t.Fatalf("probe/page counts = %d/%d/%d/%d; want 1/2/2/2", trap.probes.Load(), calls.Load(), upstream.heads.Load(), upstream.pulls.Load())
+			if trap.probes.Load() != 1 || calls.Load() != 2 || upstream.heads.Load() != 0 || upstream.pulls.Load() != 2 {
+				t.Fatalf("probe/page counts = %d/%d/%d/%d; want 1/2/0/2", trap.probes.Load(), calls.Load(), upstream.heads.Load(), upstream.pulls.Load())
 			}
 		})
 	}

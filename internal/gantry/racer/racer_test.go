@@ -34,6 +34,14 @@ type testUpstream struct {
 	pulls atomic.Int64
 }
 
+// pageBody bounds fixture bytes while preserving cancellation through Close.
+type pageBody struct {
+	io.Reader
+	upstream io.ReadCloser
+}
+
+func (b *pageBody) Close() error { return b.upstream.Close() }
+
 func (u *testUpstream) Head(ctx context.Context, ref ifaces.OriginRef) (int64, string, error) {
 	u.heads.Add(1)
 	return u.head(ctx, ref)
