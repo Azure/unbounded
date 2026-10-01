@@ -1538,7 +1538,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
             // A proposed native route without native capability must complete the
             // real signed exchange over HTTP, not merely pass a selector test.
             let result = transfers
-                .exchange_inner(
+                .exchange_timed(
                     endpoint.clone(),
                     signed,
                     plan,
@@ -1546,6 +1546,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
                     None,
                     None,
                     Rc::new(std::cell::Cell::new(false)),
+                    None,
                     &scope,
                 )
                 .await;

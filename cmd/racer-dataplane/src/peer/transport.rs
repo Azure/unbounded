@@ -1242,30 +1242,6 @@ impl Transfers {
     }
     /// The signed envelope and HTTP ciphertext share one exclusive pooled socket.
     /// A failed/abandoned exchange is never marked reusable.
-    #[cfg(test)]
-    pub(crate) fn exchange_inner<'a>(
-        &'a self,
-        endpoint: crate::http::connection::Endpoint,
-        request: SignedRequest,
-        plan: TransportPlan,
-        membership: Option<crate::topology::membership::MembershipLease>,
-        relay: Option<Rc<Reservation>>,
-        peer_admission: Option<std::sync::Arc<super::adaptive::Permit>>,
-        failure: Rc<std::cell::Cell<bool>>,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, RelayResponse> {
-        self.exchange_timed(
-            endpoint,
-            request,
-            plan,
-            membership,
-            relay,
-            peer_admission,
-            failure,
-            None,
-            scope,
-        )
-    }
     pub(super) fn exchange_timed<'a>(
         &'a self,
         endpoint: crate::http::connection::Endpoint,
