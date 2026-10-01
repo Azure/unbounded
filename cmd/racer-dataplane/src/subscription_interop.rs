@@ -124,6 +124,21 @@ impl origin::Origin for GeneratedOrigin {
 }
 struct NoPeer;
 impl peer::PeerClient for NoPeer {
+    fn direct_hedge_available(
+        &self,
+        _: &topology::membership::MembershipLease,
+        _: &crate::model::NodeId,
+    ) -> bool {
+        false
+    }
+    fn request_direct<'a>(
+        &'a self,
+        _: peer::protocol::PeerRequest,
+        _: topology::membership::MembershipLease,
+        _: &'a RequestScope,
+    ) -> Operation<'a, peer::protocol::VerifiedResponse> {
+        panic!("single-node fixture must not hedge to a peer")
+    }
     fn request<'a>(
         &'a self,
         _: peer::protocol::PeerRequest,

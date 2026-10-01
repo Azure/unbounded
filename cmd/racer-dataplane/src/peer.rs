@@ -273,23 +273,24 @@ impl Relay {
     }
 }
 
+/// Candidate-policy boundary with one shipping implementation, [`Requester`].
+/// Precise-fence fixtures hold completion after cancellation to prove fallback
+/// cannot reuse accepted work early; real socket timing cannot prescribe that
+/// boundary. Ordinary transport behavior is covered by signed socket exchanges.
+/// Implementations must explicitly declare and implement direct hedge behavior.
 pub trait PeerClient {
     /// Conservative hedge capability: the destination must itself be the first hop.
     fn direct_hedge_available(
         &self,
-        _membership: &MembershipLease,
-        _destination: &crate::model::NodeId,
-    ) -> bool {
-        false
-    }
+        membership: &MembershipLease,
+        destination: &crate::model::NodeId,
+    ) -> bool;
     fn request_direct<'a>(
         &'a self,
-        _request: PeerRequest,
-        _membership: MembershipLease,
-        _scope: &'a RequestScope,
-    ) -> Operation<'a, VerifiedResponse> {
-        Box::pin(async { Err(Error::Unavailable) })
-    }
+        request: PeerRequest,
+        membership: MembershipLease,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, VerifiedResponse>;
     /// Carry the originating operation's lease through routing and completion.
     /// Cancellation does not release accepted transport work before its fence.
     fn request<'a>(
@@ -302,6 +303,8 @@ pub trait PeerClient {
 /// Owned signed-envelope exchange shared by requesters and opaque relays.
 /// Receiving a signed response does not authenticate it: callers must verify it
 /// against their retained request binding before use or reverse forwarding.
+/// The test seam drives signed relay outcomes and asserts destination-only paths
+/// never forward; production uses [`Requester`] for both complete and opaque I/O.
 ///
 /// ```no_run
 /// use racer_dataplane::{error::Result, peer::{PeerClient, PeerTransport,

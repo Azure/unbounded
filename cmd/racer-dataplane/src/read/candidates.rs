@@ -1174,6 +1174,17 @@ mod tests {
     fn candidate_failure_routes_spend_initial_allowance_with_four_then_eight_link_ceiling() {
         struct Routes(RefCell<Vec<(u8, u32)>>);
         impl PeerClient for Routes {
+            fn direct_hedge_available(&self, _: &MembershipLease, _: &NodeId) -> bool {
+                false
+            }
+            fn request_direct<'a>(
+                &'a self,
+                _: PeerRequest,
+                _: MembershipLease,
+                _: &'a RequestScope,
+            ) -> Operation<'a, VerifiedResponse> {
+                panic!("route-budget fixture does not admit direct hedges")
+            }
             fn request<'a>(
                 &'a self,
                 request: PeerRequest,
@@ -1238,6 +1249,17 @@ mod tests {
         error: Error,
     }
     impl PeerClient for ProbePeer {
+        fn direct_hedge_available(&self, _: &MembershipLease, _: &NodeId) -> bool {
+            false
+        }
+        fn request_direct<'a>(
+            &'a self,
+            _: PeerRequest,
+            _: MembershipLease,
+            _: &'a RequestScope,
+        ) -> Operation<'a, VerifiedResponse> {
+            panic!("probe fixture does not admit direct hedges")
+        }
         fn request<'a>(
             &'a self,
             request: PeerRequest,
@@ -1516,6 +1538,17 @@ mod tests {
         error: Error,
     }
     impl PeerClient for RecordedPeer {
+        fn direct_hedge_available(&self, _: &MembershipLease, _: &NodeId) -> bool {
+            false
+        }
+        fn request_direct<'a>(
+            &'a self,
+            _: PeerRequest,
+            _: MembershipLease,
+            _: &'a RequestScope,
+        ) -> Operation<'a, VerifiedResponse> {
+            panic!("candidate-recording fixture does not admit direct hedges")
+        }
         fn request<'a>(
             &'a self,
             request: PeerRequest,

@@ -5,6 +5,21 @@ pub mod origin;
 pub struct NoPeers;
 
 impl crate::peer::PeerClient for NoPeers {
+    fn direct_hedge_available(
+        &self,
+        _: &crate::topology::membership::MembershipLease,
+        _: &crate::model::NodeId,
+    ) -> bool {
+        false
+    }
+    fn request_direct<'a>(
+        &'a self,
+        _: crate::peer::protocol::PeerRequest,
+        _: crate::topology::membership::MembershipLease,
+        _: &'a crate::runtime::deadline::RequestScope,
+    ) -> crate::error::Operation<'a, crate::peer::protocol::VerifiedResponse> {
+        panic!("local origin scenario must not hedge to a peer")
+    }
     fn request<'a>(
         &'a self,
         _: crate::peer::protocol::PeerRequest,

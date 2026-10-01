@@ -36,6 +36,17 @@ struct Link {
     demands: Rc<RefCell<Vec<u64>>>,
 }
 impl PeerClient for Link {
+    fn direct_hedge_available(&self, _: &MembershipLease, _: &crate::model::NodeId) -> bool {
+        false
+    }
+    fn request_direct<'a>(
+        &'a self,
+        _: PeerRequest,
+        _: MembershipLease,
+        _: &'a RequestScope,
+    ) -> Operation<'a, VerifiedResponse> {
+        panic!("hot-read demand fixture does not admit direct hedges")
+    }
     fn request<'a>(
         &'a self,
         request: PeerRequest,

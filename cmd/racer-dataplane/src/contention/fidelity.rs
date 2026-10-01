@@ -420,6 +420,21 @@ fn fair_reclamation_matches_metadata_trace_and_keeps_other_cache() {
 
 struct NoTransport;
 impl PeerClient for NoTransport {
+    fn direct_hedge_available(
+        &self,
+        _: &crate::topology::membership::MembershipLease,
+        _: &crate::model::NodeId,
+    ) -> bool {
+        false
+    }
+    fn request_direct<'a>(
+        &'a self,
+        _: PeerRequest,
+        _: crate::topology::membership::MembershipLease,
+        _: &'a RequestScope,
+    ) -> Operation<'a, VerifiedResponse> {
+        panic!("bootstrap fixture must not hedge to a peer")
+    }
     fn request<'a>(
         &'a self,
         _: PeerRequest,

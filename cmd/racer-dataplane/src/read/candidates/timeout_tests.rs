@@ -70,6 +70,21 @@ impl Peers {
 }
 
 impl PeerClient for Peers {
+    fn direct_hedge_available(
+        &self,
+        _: &crate::topology::membership::MembershipLease,
+        _: &NodeId,
+    ) -> bool {
+        false
+    }
+    fn request_direct<'a>(
+        &'a self,
+        _: PeerRequest,
+        _: crate::topology::membership::MembershipLease,
+        _: &'a RequestScope,
+    ) -> Operation<'a, VerifiedResponse> {
+        panic!("completion-fence fixture does not admit direct hedges")
+    }
     fn request<'a>(
         &'a self,
         request: PeerRequest,

@@ -693,6 +693,21 @@ struct PinnedFallback {
     receivers: Vec<(NodeId, Forwarding)>,
 }
 impl crate::peer::PeerClient for PinnedFallback {
+    fn direct_hedge_available(
+        &self,
+        _: &crate::topology::membership::MembershipLease,
+        _: &NodeId,
+    ) -> bool {
+        false
+    }
+    fn request_direct<'a>(
+        &'a self,
+        _: protocol::PeerRequest,
+        _: crate::topology::membership::MembershipLease,
+        _: &'a RequestScope,
+    ) -> Operation<'a, protocol::VerifiedResponse> {
+        panic!("pinned fallback fixture does not admit direct hedges")
+    }
     fn request<'a>(
         &'a self,
         request: protocol::PeerRequest,
@@ -806,6 +821,21 @@ struct CachedCopies {
     metadata: Option<ObjectMetadata>,
 }
 impl crate::peer::PeerClient for CachedCopies {
+    fn direct_hedge_available(
+        &self,
+        _: &crate::topology::membership::MembershipLease,
+        _: &NodeId,
+    ) -> bool {
+        false
+    }
+    fn request_direct<'a>(
+        &'a self,
+        _: protocol::PeerRequest,
+        _: crate::topology::membership::MembershipLease,
+        _: &'a RequestScope,
+    ) -> Operation<'a, protocol::VerifiedResponse> {
+        panic!("metadata copy fixture does not admit direct hedges")
+    }
     fn request<'a>(
         &'a self,
         request: protocol::PeerRequest,
