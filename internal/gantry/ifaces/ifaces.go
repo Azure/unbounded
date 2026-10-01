@@ -73,14 +73,12 @@ type ContentWriter interface {
 // Implemented by internal/members .
 // ---------------------------------------------------------------------------
 
-// NodeID is the stable identity used by HRW (the step 3) - typically the
-// pod or node name. It MUST be stable across an individual node's lifetime
-// and identical across all agents' views (modulo informer lag, the design doc).
-type NodeID string
+// PeerID is the serialized libp2p identity, never a Kubernetes node name.
+type PeerID string
 
 // Node is one entry in the cluster-membership view.
 type Node struct {
-	ID NodeID
+	ID PeerID
 
 	// Addr is the network address to reach this node's transfer
 	// endpoint (HTTP/2 on the configured transfer port). When the
@@ -109,7 +107,7 @@ type Node struct {
 // PeerEndpoint is a libp2p identity plus the addresses needed for
 // coordination, DHT bootstrap, and content transfer.
 type PeerEndpoint struct {
-	PeerID       NodeID
+	PeerID       PeerID
 	P2PAddrs     []string
 	TransferAddr string
 }
@@ -322,7 +320,7 @@ type PeerMetadataDialer interface {
 
 // Provider is one entry returned by DHT.FindProviders.
 type Provider struct {
-	NodeID NodeID
+	PeerID PeerID
 	Addr   string
 }
 
@@ -399,12 +397,12 @@ type ChairCoordinator interface {
 // ChairRotationCoordinator asks a peer to reserve a chair for the next
 // assignment epoch.
 type ChairRotationCoordinator interface {
-	OfferChair(ctx context.Context, peer NodeID, assignment ChairAssignment) (PeerEndpoint, bool, error)
+	OfferChair(ctx context.Context, peer PeerID, assignment ChairAssignment) (PeerEndpoint, bool, error)
 }
 
 // ChairSuccessor accepts or declines a planned chair assignment.
 type ChairSuccessor interface {
-	AcceptChair(ctx context.Context, proposer NodeID, assignment ChairAssignment) (PeerEndpoint, bool)
+	AcceptChair(ctx context.Context, proposer PeerID, assignment ChairAssignment) (PeerEndpoint, bool)
 }
 
 // LocalPullStarter starts an origin pull on the local node without

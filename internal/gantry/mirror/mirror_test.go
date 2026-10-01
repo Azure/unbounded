@@ -1079,7 +1079,7 @@ func TestMirror_LiveStreamThrough_PeerBypassesLocalWriterAndReadvertise(t *testi
 	peerDialer.Register("10.0.0.8:5001", peerCache)
 
 	dht := fakes.NewDHT()
-	dht.Inject(d, ifaces.Provider{NodeID: ifaces.NodeID("peer-a"), Addr: "10.0.0.8:5001"})
+	dht.Inject(d, ifaces.Provider{PeerID: "peer-a", Addr: "10.0.0.8:5001"})
 
 	var liveCompleted int32
 

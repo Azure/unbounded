@@ -485,7 +485,7 @@ func (h *Host) FindProviders(ctx context.Context, d digest.Digest) ([]ifaces.Pro
 		// require another DHT round-trip.
 		h.h.Peerstore().AddAddrs(ai.ID, ai.Addrs, peerstore.AddressTTL)
 		out = append(out, ifaces.Provider{
-			NodeID: ifaces.NodeID(ai.ID.String()),
+			PeerID: ifaces.PeerID(ai.ID.String()),
 			Addr:   addr,
 		})
 	}

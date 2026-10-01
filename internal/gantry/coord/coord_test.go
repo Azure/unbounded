@@ -58,7 +58,7 @@ type acceptingChairSuccessor struct {
 	endpoint ifaces.PeerEndpoint
 }
 
-func (s acceptingChairSuccessor) AcceptChair(_ context.Context, _ ifaces.NodeID, a ifaces.ChairAssignment) (ifaces.PeerEndpoint, bool) {
+func (s acceptingChairSuccessor) AcceptChair(_ context.Context, _ ifaces.PeerID, a ifaces.ChairAssignment) (ifaces.PeerEndpoint, bool) {
 	return s.endpoint, a == s.want
 }
 
@@ -72,7 +72,7 @@ func chairFixture(t *testing.T, pump coord.PullerPump, opts ...coord.Option) (*c
 	port, id := startChairServer(t, srv)
 	cli := coord.NewChairHTTPClient(coord.ChairHTTPOptions{Port: port, Timeout: 5 * time.Second})
 
-	return srv, cli, ifaces.PeerEndpoint{PeerID: ifaces.NodeID(id.String()), TransferAddr: "127.0.0.1:5001"}
+	return srv, cli, ifaces.PeerEndpoint{PeerID: ifaces.PeerID(id.String()), TransferAddr: "127.0.0.1:5001"}
 }
 
 // The old intent tests now verify the removed wire fields cannot start work.
@@ -179,10 +179,10 @@ func TestPleasePullChair_StaleAssignmentDoesNotStartPump(t *testing.T) {
 
 func TestOfferChairReturnsAcceptedSuccessorEndpoint(t *testing.T) {
 	a, b := makeHostPair(t)
-	want := ifaces.PeerEndpoint{PeerID: ifaces.NodeID(b.ID().String()), TransferAddr: "10.0.0.5:5001", P2PAddrs: []string{"/ip4/10.0.0.5/tcp/4001"}}
+	want := ifaces.PeerEndpoint{PeerID: ifaces.PeerID(b.ID().String()), TransferAddr: "10.0.0.5:5001", P2PAddrs: []string{"/ip4/10.0.0.5/tcp/4001"}}
 	coord.NewServer(coord.WithChairSuccessor(acceptingChairSuccessor{want: testAssignment, endpoint: want})).Bind(b)
 
-	got, accepted, err := coord.NewClient(a).OfferChair(t.Context(), ifaces.NodeID(b.ID().String()), testAssignment)
+	got, accepted, err := coord.NewClient(a).OfferChair(t.Context(), ifaces.PeerID(b.ID().String()), testAssignment)
 	if err != nil || !accepted || got.PeerID != want.PeerID || got.TransferAddr != want.TransferAddr || len(got.P2PAddrs) != 1 {
 		t.Fatalf("got=%+v accepted=%v err=%v", got, accepted, err)
 	}
@@ -303,7 +303,7 @@ func invalidOfferTarget(t *testing.T, id string) {
 	t.Helper()
 
 	a, _ := makeHostPair(t)
-	if _, _, err := coord.NewClient(a).OfferChair(t.Context(), ifaces.NodeID(id), testAssignment); err == nil {
+	if _, _, err := coord.NewClient(a).OfferChair(t.Context(), ifaces.PeerID(id), testAssignment); err == nil {
 		t.Fatal("membership alias accepted")
 	}
 }

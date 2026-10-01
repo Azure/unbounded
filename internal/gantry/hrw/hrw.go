@@ -47,7 +47,7 @@ type Scored struct {
 // Score computes the rendezvous score for a single (node, digest) pair.
 // Exposed for tests and for callers that want to inspect raw scores
 // (e.g., to report this node's own rank in PullIntentResponse).
-func Score(nodeID ifaces.NodeID, d digest.Digest) [sha256.Size]byte {
+func Score(nodeID ifaces.PeerID, d digest.Digest) [sha256.Size]byte {
 	h := sha256.New()
 	// Order is `node_id || digest`. Reversing the order would change
 	// every score in the cluster - DO NOT swap without a coordinated
@@ -103,49 +103,6 @@ func TopK(candidates []ifaces.Node, d digest.Digest, k int) []Scored {
 	return out
 }
 
-// RankOf returns the 0-based rank of nodeID inside cluster for digest d,
-// or -1 if nodeID is not in cluster. Used by `pull_intent_query`
-// responders to report their own rank back to the requester so the
-// requester can detect informer-divergence (the design doc) and emit
-// `p2p_hrw_rank_mismatch_total` (the design doc).
-//
-// Note this scores every member; for large clusters this is intentionally
-// O(N) - there is no faster way to learn one's own rank without scoring
-// every candidate.
-func RankOf(cluster []ifaces.Node, nodeID ifaces.NodeID, d digest.Digest) int32 {
-	target := Score(nodeID, d)
-	betterCount := int32(0)
-	found := false
-
-	for _, n := range cluster {
-		if n.ID == nodeID {
-			found = true
-			continue
-		}
-
-		s := Score(n.ID, d)
-		// "Better" means strictly higher score. Strict comparison is
-		// load-bearing - equal-score collisions are vanishingly rare
-		// under SHA-256 but if they occur, the requester and responder
-		// must both apply identical tie-breaking. Lexicographic node-ID
-		// ordering serves as the tie-break.
-		switch scoreCmp(s, target) {
-		case +1:
-			betterCount++
-		case 0:
-			if string(n.ID) > string(nodeID) {
-				betterCount++
-			}
-		}
-	}
-
-	if !found {
-		return -1
-	}
-
-	return betterCount
-}
-
 // ---------------------------------------------------------------------------
 // Internal: min-heap of Scored entries keyed by ascending Score.
 // ---------------------------------------------------------------------------
@@ -168,7 +125,6 @@ func (h *minHeap) Pop() interface{} {
 func (h *minHeap) peek() Scored { return h.items[0] }
 
 func scoreLess(a, b [sha256.Size]byte) bool { return bytes.Compare(a[:], b[:]) < 0 }
-func scoreCmp(a, b [sha256.Size]byte) int   { return bytes.Compare(a[:], b[:]) }
 
 // scoredLess is the ID-aware less-than used by TopK's heap. Equal
 // SHA-256 scores resolve by lexicographic node-ID ordering (the

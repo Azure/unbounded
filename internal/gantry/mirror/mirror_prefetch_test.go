@@ -375,7 +375,7 @@ func TestMirror_Prefetch_FiresOnPeerServedManifestWithLiveStreamThrough(t *testi
 	dialer.Put("10.0.0.1:5001", d, body)
 
 	dht := fakes.NewDHT()
-	dht.Inject(d, ifaces.Provider{NodeID: "peer-a", Addr: "10.0.0.1:5001"})
+	dht.Inject(d, ifaces.Provider{PeerID: "peer-a", Addr: "10.0.0.1:5001"})
 
 	cfg, originSrc := newMirrorOriginNotFound(t)
 	spy := newPrefetchSpy()

@@ -95,7 +95,7 @@ type backupDiscovery struct {
 
 func (d *backupDiscovery) FindProviders(context.Context, digest.Digest) ([]ifaces.Provider, error) {
 	if d.ready.Load() {
-		return []ifaces.Provider{{NodeID: "backup", Addr: "backup:5001"}}, nil
+		return []ifaces.Provider{{PeerID: "backup", Addr: "backup:5001"}}, nil
 	}
 
 	return nil, nil
@@ -118,7 +118,7 @@ func TestChairResolverDoesNotBackfillFailedSeeds(t *testing.T) {
 	}
 
 	resolver := newTestChairResolver(&chairSnapshotStub{snapshot: snapshot}, coord, &stubDisco{
-		providers: [][]ifaces.Provider{{{NodeID: "seed", Addr: "seed:5001"}}},
+		providers: [][]ifaces.Provider{{{PeerID: "seed", Addr: "seed:5001"}}},
 	})
 
 	resolution, err := resolver.Resolve(context.Background(), d, ifaces.KindBlob, "registry.example.com", "repo/image", 0)
@@ -126,7 +126,7 @@ func TestChairResolverDoesNotBackfillFailedSeeds(t *testing.T) {
 		t.Fatalf("Resolve: %v", err)
 	}
 
-	if len(resolution.Providers) != 1 || resolution.Providers[0].NodeID != "seed" {
+	if len(resolution.Providers) != 1 || resolution.Providers[0].PeerID != "seed" {
 		t.Fatalf("providers = %+v", resolution.Providers)
 	}
 
@@ -152,7 +152,7 @@ func TestChairResolverUsesAvailableSmallCohort(t *testing.T) {
 	coord := &chairCoordStub{}
 	resolver := coldstart.NewChairResolver(coldstart.ChairOptions{
 		Chairs:       &chairSnapshotStub{snapshot: snapshot},
-		Discovery:    &stubDisco{providers: [][]ifaces.Provider{{{NodeID: "seed", Addr: "seed:5001"}}}},
+		Discovery:    &stubDisco{providers: [][]ifaces.Provider{{{PeerID: "seed", Addr: "seed:5001"}}}},
 		Coord:        coord,
 		Inflight:     inflight.New(inflight.DefaultStalls(), nil),
 		SelfPeerID:   "self",
@@ -195,7 +195,7 @@ func TestChairResolverPreservesHolderToSeedRatio(t *testing.T) {
 			coord := &chairCoordStub{}
 			resolver := coldstart.NewChairResolver(coldstart.ChairOptions{
 				Chairs:       &chairSnapshotStub{snapshot: snapshot},
-				Discovery:    &stubDisco{providers: [][]ifaces.Provider{{{NodeID: "seed", Addr: "seed:5001"}}}},
+				Discovery:    &stubDisco{providers: [][]ifaces.Provider{{{PeerID: "seed", Addr: "seed:5001"}}}},
 				Coord:        coord,
 				Inflight:     inflight.New(inflight.DefaultStalls(), nil),
 				SelfPeerID:   "self",
@@ -259,7 +259,7 @@ func TestChairResolverRefreshesStaleChairBeforeUsingBackup(t *testing.T) {
 	cache := &chairSnapshotStub{snapshot: snapshot}
 	coord := &chairCoordStub{staleFirst: map[uint32]bool{uint32(ranked[0].ID): true}}
 	resolver := newTestChairResolver(cache, coord, &stubDisco{
-		providers: [][]ifaces.Provider{{{NodeID: "seed", Addr: "seed:5001"}}},
+		providers: [][]ifaces.Provider{{{PeerID: "seed", Addr: "seed:5001"}}},
 	})
 
 	if _, err := resolver.Resolve(context.Background(), d, ifaces.KindBlob, "registry.example.com", "repo/image", 0); err != nil {
@@ -334,7 +334,7 @@ func TestChairResolverUsesBackupAfterAcceptedPullNeverAdvertises(t *testing.T) {
 		t.Fatalf("Resolve: %v", err)
 	}
 
-	if len(resolution.Providers) != 1 || resolution.Providers[0].NodeID != "backup" {
+	if len(resolution.Providers) != 1 || resolution.Providers[0].PeerID != "backup" {
 		t.Fatalf("providers = %+v, want backup provider", resolution.Providers)
 	}
 
@@ -369,7 +369,7 @@ func (d *afterCoordCallsDiscovery) FindProviders(context.Context, digest.Digest)
 	d.coord.mu.Unlock()
 
 	if calls >= d.min {
-		return []ifaces.Provider{{NodeID: "seed", Addr: "seed:5001"}}, nil
+		return []ifaces.Provider{{PeerID: "seed", Addr: "seed:5001"}}, nil
 	}
 
 	return nil, nil
@@ -605,7 +605,7 @@ func fullChairSnapshot(epoch int64) chairs.Snapshot {
 		snapshot.Chairs = append(snapshot.Chairs, chairs.Chair{
 			ID: chairs.ID(index),
 			Holder: chairs.Holder{
-				PeerID:       ifaces.NodeID(fmt.Sprintf("peer-%02d", index)),
+				PeerID:       ifaces.PeerID(fmt.Sprintf("peer-%02d", index)),
 				P2PAddrs:     []string{fmt.Sprintf("/ip4/10.0.0.%d/tcp/4001/p2p/peer-%02d", index+1, index)},
 				TransferAddr: fmt.Sprintf("10.0.0.%d:5001", index+1),
 			},

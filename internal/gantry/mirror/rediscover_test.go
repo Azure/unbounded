@@ -94,7 +94,7 @@ func TestMirror_Rediscover_PicksUpFinisherMidSwarm(t *testing.T) {
 	// spinning in its re-discovery loop.
 	go func() {
 		time.Sleep(300 * time.Millisecond)
-		dht.Inject(d, ifaces.Provider{NodeID: "finisher", Addr: peerAddr})
+		dht.Inject(d, ifaces.Provider{PeerID: "finisher", Addr: peerAddr})
 	}()
 
 	resp, err := http.Get(srv.URL + "/v2/r/blobs/" + d.String())
@@ -187,7 +187,7 @@ func TestMirror_Rediscover_ColdExhaustedFlushesHeadersBeforeLateProvider(t *test
 		t.Fatalf("peer calls before advertise = %d, want 0", got)
 	}
 
-	dht.Inject(d, ifaces.Provider{NodeID: "late-seed", Addr: lateAddr})
+	dht.Inject(d, ifaces.Provider{PeerID: "late-seed", Addr: lateAddr})
 
 	got, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -269,7 +269,7 @@ func TestMirror_Rediscover_SilentNoProviderRoundFlushesHeaders(t *testing.T) {
 		t.Fatalf("peer calls before advertise = %d, want 0", got)
 	}
 
-	dht.Inject(d, ifaces.Provider{NodeID: "late-seed", Addr: lateAddr})
+	dht.Inject(d, ifaces.Provider{PeerID: "late-seed", Addr: lateAddr})
 
 	got, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -411,7 +411,7 @@ func TestMirror_Rediscover_HeadersFlushedBeforeBlockingColdStart(t *testing.T) {
 		t.Fatalf("Content-Length = %d, want %d", got, len(body))
 	}
 
-	dht.Inject(d, ifaces.Provider{NodeID: "late-seed", Addr: lateAddr})
+	dht.Inject(d, ifaces.Provider{PeerID: "late-seed", Addr: lateAddr})
 	release()
 
 	got, err := io.ReadAll(resp.Body)

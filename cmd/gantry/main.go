@@ -449,7 +449,7 @@ func runAgent(args []string) error {
 			Coord:        chairCoord,
 			LocalPull:    coordServer,
 			Inflight:     inflightMap,
-			SelfPeerID:   ifaces.NodeID(disco.PeerID().String()),
+			SelfPeerID:   ifaces.PeerID(disco.PeerID().String()),
 			CurrentEpoch: chairManager.CurrentEpoch,
 			InstallHolder: func(holder chairs.Holder) error {
 				return installChairHolder(disco.LibP2P().Peerstore(), holder)
@@ -594,8 +594,7 @@ func runAgent(args []string) error {
 		mirror.WithDiscovery(disco, peerClient),
 		mirror.WithPeerBudgets(0, c.PeerFetchTimeout, 0),
 		mirror.WithPeerRediscover(c.PeerRediscoverBudget, c.PeerRediscoverBackoff),
-		mirror.WithSelfNodeID(ifaces.NodeID(disco.PeerID().String())),
-		mirror.WithSelfPeerID(ifaces.NodeID(disco.PeerID().String())),
+		mirror.WithSelfPeerID(ifaces.PeerID(disco.PeerID().String())),
 		mirror.WithPeerMetrics(
 			func(outcome string) {
 				p2.peerFetch.WithLabelValues(outcome).Inc()
@@ -1235,7 +1234,7 @@ func chairSelfHolder(c *config.Config, disco *discovery.Host) chairs.Holder {
 	}
 
 	return chairs.Holder{
-		PeerID:       ifaces.NodeID(peerID.String()),
+		PeerID:       ifaces.PeerID(peerID.String()),
 		P2PAddrs:     addresses,
 		TransferAddr: advertisedTransferAddr(c.TransferListen, c.PodIP),
 	}
@@ -1259,7 +1258,7 @@ func connectedChairCandidates(disco *discovery.Host) []chairs.Holder {
 			rawAddresses = append(rawAddresses, address.String())
 		}
 
-		candidates = append(candidates, chairs.Holder{PeerID: ifaces.NodeID(peerID.String()), P2PAddrs: rawAddresses})
+		candidates = append(candidates, chairs.Holder{PeerID: ifaces.PeerID(peerID.String()), P2PAddrs: rawAddresses})
 	}
 
 	return candidates

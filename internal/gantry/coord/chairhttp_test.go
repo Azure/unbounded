@@ -100,7 +100,7 @@ func TestChairHTTPRoundTripDeliversRequestAndOutcome(t *testing.T) {
 	assignment := ifaces.ChairAssignment{ChairID: 7, Generation: 3, AssignmentEpoch: 11}
 
 	endpoint := ifaces.PeerEndpoint{
-		PeerID:       ifaces.NodeID(id.String()),
+		PeerID:       ifaces.PeerID(id.String()),
 		TransferAddr: net.JoinHostPort("127.0.0.1", "5001"),
 	}
 
@@ -147,7 +147,7 @@ func TestChairHTTPRejectsUnexpectedPeerIdentity(t *testing.T) {
 	cli := coord.NewChairHTTPClient(coord.ChairHTTPOptions{Port: port, Timeout: 10 * time.Second})
 
 	endpoint := ifaces.PeerEndpoint{
-		PeerID:       ifaces.NodeID(impostor.String()),
+		PeerID:       ifaces.PeerID(impostor.String()),
 		TransferAddr: net.JoinHostPort("127.0.0.1", "5001"),
 	}
 
@@ -247,7 +247,7 @@ func TestChairHTTPDialIsBoundedAgainstStalledTLS(t *testing.T) {
 	}
 
 	client := coord.NewChairHTTPClient(coord.ChairHTTPOptions{Port: port, Timeout: 2 * time.Second})
-	endpoint := ifaces.PeerEndpoint{PeerID: ifaces.NodeID(pid.String()), TransferAddr: "127.0.0.1:1"}
+	endpoint := ifaces.PeerEndpoint{PeerID: ifaces.PeerID(pid.String()), TransferAddr: "127.0.0.1:1"}
 	d := digest.MustParse("sha256:" + strings.Repeat("a", 64))
 
 	start := time.Now()

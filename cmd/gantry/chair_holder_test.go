@@ -36,7 +36,7 @@ func TestInstallChairHolderReplacesStaleAddresses(t *testing.T) {
 	fresh := "/ip4/10.0.0.2/tcp/4001/p2p/" + target.ID().String()
 
 	if err := installChairHolder(caller.Peerstore(), chairs.Holder{
-		PeerID:   ifaces.NodeID(target.ID().String()),
+		PeerID:   ifaces.PeerID(target.ID().String()),
 		P2PAddrs: []string{fresh},
 	}); err != nil {
 		t.Fatalf("installChairHolder: %v", err)

@@ -225,7 +225,7 @@ func (m *Manager) ValidateChair(_ context.Context, assignment ifaces.ChairAssign
 		(assignment.AssignmentEpoch == epoch || assignment.AssignmentEpoch == epoch-1)
 }
 
-func (m *Manager) AcceptChair(ctx context.Context, proposer ifaces.NodeID, assignment ifaces.ChairAssignment) (ifaces.PeerEndpoint, bool) {
+func (m *Manager) AcceptChair(ctx context.Context, proposer ifaces.PeerID, assignment ifaces.ChairAssignment) (ifaces.PeerEndpoint, bool) {
 	if assignment.ChairID >= Count || assignment.AssignmentEpoch != m.CurrentEpoch()+1 {
 		return ifaces.PeerEndpoint{}, false
 	}
@@ -714,7 +714,7 @@ func (m *Manager) prepareRotation(ctx context.Context, held Chair) {
 
 	m.observe(ctx, snapshot)
 
-	chairHolders := make(map[ifaces.NodeID]struct{}, len(snapshot.Chairs))
+	chairHolders := make(map[ifaces.PeerID]struct{}, len(snapshot.Chairs))
 	for _, chair := range snapshot.Chairs {
 		if chair.Occupied() {
 			chairHolders[chair.Holder.PeerID] = struct{}{}
@@ -906,7 +906,7 @@ func (m *Manager) apiContext(parent context.Context) (context.Context, context.C
 	return context.WithTimeout(parent, m.opts.APITimeout)
 }
 
-func claimEligible(peerID ifaces.NodeID, epoch int64, round, initialDivisor uint64) bool {
+func claimEligible(peerID ifaces.PeerID, epoch int64, round, initialDivisor uint64) bool {
 	divisor := initialDivisor
 	for index := uint64(0); index < round && divisor > 1; index++ {
 		divisor = (divisor + 1) / 2

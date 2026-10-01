@@ -114,8 +114,7 @@ type Server struct {
 	// single-shot provider attempt.
 	peerRediscoverBudget  time.Duration
 	peerRediscoverBackoff time.Duration
-	selfNodeID            ifaces.NodeID
-	selfPeerID            ifaces.NodeID
+	selfPeerID            ifaces.PeerID
 
 	staleProviderTTL         time.Duration
 	unavailablePeerTTL       time.Duration
@@ -518,17 +517,10 @@ func WithPeerRediscover(budget, backoff time.Duration) Option {
 	}
 }
 
-// WithSelfNodeID configures the local Kubernetes node identity used to filter
-// stale self provider records after a local cache miss. Membership/cold-start
-// providers use Kubernetes node names as NodeID values.
-func WithSelfNodeID(id ifaces.NodeID) Option {
-	return func(s *Server) { s.selfNodeID = id }
-}
-
 // WithSelfPeerID configures the local libp2p peer identity used to filter stale
 // self provider records from DHT lookup results after a local cache miss. DHT
 // providers use libp2p peer IDs as NodeID values.
-func WithSelfPeerID(id ifaces.NodeID) Option {
+func WithSelfPeerID(id ifaces.PeerID) Option {
 	return func(s *Server) { s.selfPeerID = id }
 }
 
@@ -1429,7 +1421,7 @@ func (s *livePeerStream) append(src io.Reader, d digest.Digest, size int64) (int
 
 type providerDigestKey struct {
 	digest digest.Digest
-	nodeID ifaces.NodeID
+	peerID ifaces.PeerID
 	addr   string
 }
 
@@ -2065,7 +2057,7 @@ func (s *Server) fetchOneProvider(ctx context.Context, w http.ResponseWriter, r 
 		s.bumpPeerFetchLatency(label, fetchStart)
 		logger.Debug("mirror: peer fetch failed",
 			slog.String("peer", p.Addr),
-			slog.String("node", string(p.NodeID)),
+			slog.String("peer_id", string(p.PeerID)),
 			slog.String("outcome", label),
 			slog.Any("err", err),
 		)
@@ -2198,7 +2190,7 @@ func (s *Server) filterProvidersForDigest(d digest.Digest, providers []ifaces.Pr
 			continue
 		}
 
-		key := providerDigestKey{digest: d, nodeID: p.NodeID, addr: p.Addr}
+		key := providerDigestKey{digest: d, peerID: p.PeerID, addr: p.Addr}
 		if s.isProviderInWindow(s.staleProviders, key, now) {
 			summary.staleFiltered++
 			continue
@@ -2232,8 +2224,7 @@ func (s *Server) filterProvidersForDigest(d digest.Digest, providers []ifaces.Pr
 }
 
 func (s *Server) isSelfProvider(p ifaces.Provider) bool {
-	return (s.selfNodeID != "" && p.NodeID == s.selfNodeID) ||
-		(s.selfPeerID != "" && p.NodeID == s.selfPeerID)
+	return s.selfPeerID != "" && p.PeerID == s.selfPeerID
 }
 
 func updatePeerSummary(summary peerAttemptSummary, outcome peerFetchOutcomeKind) peerAttemptSummary {
@@ -2364,7 +2355,7 @@ func (s *Server) markProviderStale(d digest.Digest, p ifaces.Provider) {
 
 	now := time.Now()
 	s.sweepProviderFailuresLocked(now)
-	s.staleProviders[providerDigestKey{digest: d, nodeID: p.NodeID, addr: p.Addr}] = now.Add(s.staleProviderTTL)
+	s.staleProviders[providerDigestKey{digest: d, peerID: p.PeerID, addr: p.Addr}] = now.Add(s.staleProviderTTL)
 }
 
 func (s *Server) markProviderSuspicious(d digest.Digest, p ifaces.Provider) {
@@ -2377,7 +2368,7 @@ func (s *Server) markProviderSuspicious(d digest.Digest, p ifaces.Provider) {
 
 	now := time.Now()
 	s.sweepProviderFailuresLocked(now)
-	s.suspiciousProviders[providerDigestKey{digest: d, nodeID: p.NodeID, addr: p.Addr}] = now.Add(s.suspiciousPeerTTL)
+	s.suspiciousProviders[providerDigestKey{digest: d, peerID: p.PeerID, addr: p.Addr}] = now.Add(s.suspiciousPeerTTL)
 }
 
 func (s *Server) markProviderUnavailable(p ifaces.Provider) {

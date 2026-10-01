@@ -23,14 +23,14 @@ type rotationStub struct {
 	calls    []ifaces.ChairAssignment
 }
 
-func (stub *rotationStub) OfferChair(_ context.Context, _ ifaces.NodeID, assignment ifaces.ChairAssignment) (ifaces.PeerEndpoint, bool, error) {
+func (stub *rotationStub) OfferChair(_ context.Context, _ ifaces.PeerID, assignment ifaces.ChairAssignment) (ifaces.PeerEndpoint, bool, error) {
 	stub.calls = append(stub.calls, assignment)
 	return stub.endpoint, true, nil
 }
 
 func TestClaimEligibilityOnlyWidens(t *testing.T) {
 	for index := range 10_000 {
-		peerID := ifaces.NodeID(fmt.Sprintf("peer-%05d", index))
+		peerID := ifaces.PeerID(fmt.Sprintf("peer-%05d", index))
 		eligible := false
 
 		for round := uint64(0); round < 12; round++ {
@@ -51,7 +51,7 @@ func TestClaimEligibilityEventuallyIncludesEntireCluster(t *testing.T) {
 	countAtRoundHundred := 0
 
 	for index := range clusterSize {
-		peerID := ifaces.NodeID(fmt.Sprintf("peer-%06d", index))
+		peerID := ifaces.PeerID(fmt.Sprintf("peer-%06d", index))
 		if claimEligible(peerID, 11, 0, 2048) {
 			countAtRoundZero++
 		}
@@ -77,7 +77,7 @@ func TestManagersClaimOnlyProportionalTargetSlots(t *testing.T) {
 	for index := range 10 {
 		manager := NewManager(ManagerOptions{
 			Store:               store,
-			Self:                Holder{PeerID: ifaces.NodeID(fmt.Sprintf("peer-%d", index)), P2PAddrs: []string{fmt.Sprintf("/ip4/10.0.0.%d/tcp/4001", index+1)}, TransferAddr: fmt.Sprintf("10.0.0.%d:5001", index+1)},
+			Self:                Holder{PeerID: ifaces.PeerID(fmt.Sprintf("peer-%d", index)), P2PAddrs: []string{fmt.Sprintf("/ip4/10.0.0.%d/tcp/4001", index+1)}, TransferAddr: fmt.Sprintf("10.0.0.%d:5001", index+1)},
 			Now:                 func() time.Time { return time.Unix(0, 0) },
 			ClaimJitter:         time.Nanosecond,
 			ClaimInitialDivisor: 1,

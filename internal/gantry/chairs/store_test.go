@@ -332,7 +332,7 @@ func occupiedSnapshotWithCount(epoch int64, count int) chairs.Snapshot {
 			ID:              chairs.ID(index),
 			AssignmentEpoch: epoch,
 			Holder: chairs.Holder{
-				PeerID:       ifaces.NodeID(fmt.Sprintf("peer-%d", index)),
+				PeerID:       ifaces.PeerID(fmt.Sprintf("peer-%d", index)),
 				P2PAddrs:     []string{fmt.Sprintf("/ip4/10.0.0.%d/tcp/4001/p2p/peer-%d", index+1, index)},
 				TransferAddr: fmt.Sprintf("10.0.0.%d:5001", index+1),
 			},

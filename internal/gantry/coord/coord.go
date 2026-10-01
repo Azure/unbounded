@@ -206,7 +206,7 @@ func (s *Server) dispatch(ctx context.Context, remote peer.ID, in *coordv1.Envel
 		resp := &coordv1.ChairOfferResponse{}
 
 		if s.chairSuccessor != nil && m.ChairOfferRequest.GetAssignment() != nil {
-			endpoint, accepted := s.chairSuccessor.AcceptChair(ctx, ifaces.NodeID(remote.String()), chairAssignmentFromProto(m.ChairOfferRequest.GetAssignment()))
+			endpoint, accepted := s.chairSuccessor.AcceptChair(ctx, ifaces.PeerID(remote.String()), chairAssignmentFromProto(m.ChairOfferRequest.GetAssignment()))
 
 			resp.Accepted = accepted
 			if accepted {
@@ -349,7 +349,7 @@ func NewClient(h host.Host, opts ...ClientOption) *Client {
 	return c
 }
 
-func (c *Client) OfferChair(ctx context.Context, target ifaces.NodeID, assignment ifaces.ChairAssignment) (ifaces.PeerEndpoint, bool, error) {
+func (c *Client) OfferChair(ctx context.Context, target ifaces.PeerID, assignment ifaces.ChairAssignment) (ifaces.PeerEndpoint, bool, error) {
 	in := &coordv1.Envelope{Msg: &coordv1.Envelope_ChairOfferRequest{ChairOfferRequest: &coordv1.ChairOfferRequest{Assignment: chairAssignmentToProto(assignment)}}}
 
 	out, err := c.roundTrip(ctx, target, in)
@@ -366,10 +366,10 @@ func (c *Client) OfferChair(ctx context.Context, target ifaces.NodeID, assignmen
 		return ifaces.PeerEndpoint{}, false, nil
 	}
 
-	return ifaces.PeerEndpoint{PeerID: ifaces.NodeID(response.GetPeerId()), P2PAddrs: append([]string(nil), response.GetP2PAddrs()...), TransferAddr: response.GetTransferAddr()}, true, nil
+	return ifaces.PeerEndpoint{PeerID: ifaces.PeerID(response.GetPeerId()), P2PAddrs: append([]string(nil), response.GetP2PAddrs()...), TransferAddr: response.GetTransferAddr()}, true, nil
 }
 
-func (c *Client) roundTrip(ctx context.Context, target ifaces.NodeID, env *coordv1.Envelope) (*coordv1.Envelope, error) {
+func (c *Client) roundTrip(ctx context.Context, target ifaces.PeerID, env *coordv1.Envelope) (*coordv1.Envelope, error) {
 	pid, err := peer.Decode(string(target))
 	if err != nil {
 		return nil, fmt.Errorf("coord: invalid peer ID: %w", err)

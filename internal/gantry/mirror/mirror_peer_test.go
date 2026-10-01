@@ -201,7 +201,7 @@ func TestMirror_PeerFallback_ServesFromPeerNotOrigin(t *testing.T) {
 	srv, _, dht, originHits, peerFetches := newMirrorWithPeer(
 		t,
 		map[digest.Digest][]byte{d: body},
-		map[digest.Digest][]ifaces.Provider{d: {{NodeID: "peer-a", Addr: peerAddr}}},
+		map[digest.Digest][]ifaces.Provider{d: {{PeerID: "peer-a", Addr: peerAddr}}},
 	)
 
 	resp, err := http.Get(srv.URL + "/v2/r/blobs/" + d.String())
@@ -239,8 +239,8 @@ func TestMirror_PeerFallback_LiveStreamResumesFromAnotherPeer(t *testing.T) {
 	dialer := &resumingPeerDialer{body: body}
 	dht := fakes.NewDHT()
 	dht.Inject(d,
-		ifaces.Provider{NodeID: "peer-a", Addr: "10.0.0.1:5001"},
-		ifaces.Provider{NodeID: "peer-b", Addr: "10.0.0.2:5001"},
+		ifaces.Provider{PeerID: "peer-a", Addr: "10.0.0.1:5001"},
+		ifaces.Provider{PeerID: "peer-b", Addr: "10.0.0.2:5001"},
 	)
 
 	cfg, originSrc := newMirrorOriginNotFound(t)
@@ -337,7 +337,7 @@ func TestMirror_PeerFallback_PeerNotFoundExhaustsWarmPath(t *testing.T) {
 	srv, _, _, originHits, peerFetches := newMirrorWithPeer(
 		t,
 		map[digest.Digest][]byte{d: body},
-		map[digest.Digest][]ifaces.Provider{d: {{NodeID: "peer-stale", Addr: peerAddr}}},
+		map[digest.Digest][]ifaces.Provider{d: {{PeerID: "peer-stale", Addr: peerAddr}}},
 	)
 
 	resp, err := http.Get(srv.URL + "/v2/r/blobs/" + d.String())
@@ -370,7 +370,7 @@ func TestMirror_PeerFallback_StaleProviderFilteredOnNextRequest(t *testing.T) {
 	srv, _, _, originHits, _ := newMirrorWithPeer(
 		t,
 		map[digest.Digest][]byte{d: body},
-		map[digest.Digest][]ifaces.Provider{d: {{NodeID: "peer-stale", Addr: peerAddr}}},
+		map[digest.Digest][]ifaces.Provider{d: {{PeerID: "peer-stale", Addr: peerAddr}}},
 	)
 
 	resp1, err := http.Get(srv.URL + "/v2/r/blobs/" + d.String())
@@ -427,16 +427,15 @@ func TestMirror_PeerFallback_FiltersSelfProviderAfterLocalMiss(t *testing.T) {
 
 	dht := fakes.NewDHT()
 	dht.Inject(d,
-		ifaces.Provider{NodeID: "self-node", Addr: "127.0.0.1:1"},
-		ifaces.Provider{NodeID: "self-peer-id", Addr: "127.0.0.1:2"},
-		ifaces.Provider{NodeID: "peer-good", Addr: peerAddr},
+		ifaces.Provider{PeerID: "self-peer-id", Addr: "127.0.0.1:1"},
+		ifaces.Provider{PeerID: "self-peer-id", Addr: "127.0.0.1:2"},
+		ifaces.Provider{PeerID: "peer-good", Addr: peerAddr},
 	)
 
 	var peerHits int32
 
 	m := mirror.New(cfg, c, oc,
 		mirror.WithDiscovery(dht, transfer.NewClient()),
-		mirror.WithSelfNodeID("self-node"),
 		mirror.WithSelfPeerID("self-peer-id"),
 		mirror.WithPeerBudgets(time.Second, 2*time.Second, 1),
 		mirror.WithPeerMetrics(func(outcome string) {
@@ -481,7 +480,7 @@ func TestMirror_PeerFallback_DialFailureExhaustsWarmPath(t *testing.T) {
 
 	// Provide an unreachable peer addr (port 1 is reliably refused).
 	dht := fakes.NewDHT()
-	dht.Inject(d, ifaces.Provider{NodeID: "peer-dead", Addr: "127.0.0.1:1"})
+	dht.Inject(d, ifaces.Provider{PeerID: "peer-dead", Addr: "127.0.0.1:1"})
 
 	var originHits int32
 
@@ -585,7 +584,7 @@ func TestMirror_PeerFallback_LiveStreamDigestMismatchQuarantines(t *testing.T) {
 	cfg, oc := newMirrorOriginNotFound(t)
 
 	dht := fakes.NewDHT()
-	dht.Inject(d, ifaces.Provider{NodeID: "poison-peer", Addr: peerAddr})
+	dht.Inject(d, ifaces.Provider{PeerID: "poison-peer", Addr: peerAddr})
 
 	var digestMismatches int32
 
@@ -627,7 +626,7 @@ func TestMirror_PeerFallback_NonLiveCommitDigestMismatchQuarantines(t *testing.T
 	cfg, oc := newMirrorOriginNotFound(t)
 
 	dht := fakes.NewDHT()
-	dht.Inject(d, ifaces.Provider{NodeID: "poison-peer", Addr: peerAddr})
+	dht.Inject(d, ifaces.Provider{PeerID: "poison-peer", Addr: peerAddr})
 
 	var digestMismatches int32
 

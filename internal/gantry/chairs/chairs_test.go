@@ -23,7 +23,7 @@ func TestRankIsDeterministicAndUsesOccupiedBackups(t *testing.T) {
 
 		snapshot.Chairs = append(snapshot.Chairs, chairs.Chair{
 			ID:              chairs.ID(index),
-			Holder:          testHolder(ifaces.NodeID("peer-" + chairs.ID(index).Name())),
+			Holder:          testHolder(ifaces.PeerID("peer-" + chairs.ID(index).Name())),
 			AssignmentEpoch: 7,
 		})
 	}
@@ -56,7 +56,7 @@ func TestRankChangesAcrossDigests(t *testing.T) {
 	for index := range chairs.Count {
 		snapshot.Chairs = append(snapshot.Chairs, chairs.Chair{
 			ID:     chairs.ID(index),
-			Holder: testHolder(ifaces.NodeID(chairs.ID(index).Name())),
+			Holder: testHolder(ifaces.PeerID(chairs.ID(index).Name())),
 		})
 	}
 
@@ -79,7 +79,7 @@ func TestRankIncludesPreviousEpochDuringRollover(t *testing.T) {
 
 		snapshot.Chairs = append(snapshot.Chairs, chairs.Chair{
 			ID:              chairs.ID(index),
-			Holder:          testHolder(ifaces.NodeID(chairs.ID(index).Name())),
+			Holder:          testHolder(ifaces.PeerID(chairs.ID(index).Name())),
 			AssignmentEpoch: epoch,
 		})
 	}
@@ -94,7 +94,7 @@ func TestRankSkipsIncompleteHolderEndpoint(t *testing.T) {
 	snapshot := chairs.Snapshot{Epoch: 3}
 
 	for index := range chairs.SeedCount + 1 {
-		holder := testHolder(ifaces.NodeID(chairs.ID(index).Name()))
+		holder := testHolder(ifaces.PeerID(chairs.ID(index).Name()))
 		if index == 0 {
 			holder.P2PAddrs = nil
 		}
@@ -110,7 +110,7 @@ func TestRankSkipsIncompleteHolderEndpoint(t *testing.T) {
 	}
 }
 
-func testHolder(peerID ifaces.NodeID) chairs.Holder {
+func testHolder(peerID ifaces.PeerID) chairs.Holder {
 	return chairs.Holder{
 		PeerID:       peerID,
 		P2PAddrs:     []string{"/ip4/10.0.0.1/tcp/4001/p2p/" + string(peerID)},
