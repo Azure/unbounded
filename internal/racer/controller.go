@@ -400,11 +400,10 @@ func (c Config) validateReplication() error {
 }
 
 // Lifecycle owns process serving, independently of the leader-owned publishers.
-// The historical leader field and LeaderContext method bind process cancellation.
 type Lifecycle struct {
 	mu               sync.Mutex
 	started          bool
-	leader           context.Context
+	process          context.Context
 	synced           bool
 	issuer           bool
 	serving          bool
@@ -418,9 +417,9 @@ func newLifecycle(p *Publications) *Lifecycle {
 
 func (*Lifecycle) NeedLeaderElection() bool { return false }
 
-// LeaderContext is the legacy name for binding a request to the serving process.
+// ProcessContext binds a request to the serving process lifetime.
 // Missing or canceled process lifetime returns an already-canceled child.
-func (l *Lifecycle) LeaderContext(parent context.Context) (context.Context, context.CancelFunc) {
+func (l *Lifecycle) ProcessContext(parent context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(parent)
 	if l == nil {
 		cancel()
@@ -428,16 +427,16 @@ func (l *Lifecycle) LeaderContext(parent context.Context) (context.Context, cont
 	}
 
 	l.mu.Lock()
-	leader := l.leader
+	process := l.process
 	l.mu.Unlock()
 
-	if leader == nil {
+	if process == nil {
 		cancel()
 		return ctx, cancel
 	}
 
-	stop := context.AfterFunc(leader, cancel)
-	if leader.Err() != nil {
+	stop := context.AfterFunc(process, cancel)
+	if process.Err() != nil {
 		cancel()
 	}
 
@@ -451,7 +450,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		return wire.Conflict
 	}
 
-	l.started, l.leader = true, ctx
+	l.started, l.process = true, ctx
 	l.publications.bindProcess(ctx)
 	l.mu.Unlock()
 
@@ -495,7 +494,7 @@ func (l *Lifecycle) Ready(_ *http.Request) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if l.leader == nil || l.leader.Err() != nil || !l.synced || !l.issuer || !l.serving {
+	if l.process == nil || l.process.Err() != nil || !l.synced || !l.issuer || !l.serving {
 		return wire.Unavailable
 	}
 
@@ -550,10 +549,8 @@ func nodeChanges() predicate.Predicate {
 			return false
 		}
 
-		for _, key := range []string{machinav1.MachineSiteLabelKey, deprecatedSiteLabel} {
-			if a.GetLabels()[key] != b.GetLabels()[key] {
-				return false
-			}
+		if a.GetLabels()[machinav1.MachineSiteLabelKey] != b.GetLabels()[machinav1.MachineSiteLabelKey] {
+			return false
 		}
 
 		for _, key := range []string{wire.SharesAnnotation, wire.RailsAnnotation, wire.AlignmentAnnotation, enrolledSharesAnnotation} {

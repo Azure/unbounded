@@ -27,10 +27,10 @@ func TestMemberSiteLabelsOverrideHistory(t *testing.T) {
 	}{
 		{"unlabeled", nil, ""},
 		{"canonical", map[string]string{machinav1.MachineSiteLabelKey: "site-a"}, "site-a"},
-		{"deprecated", map[string]string{deprecatedSiteLabel: "site-b"}, "site-b"},
-		{"precedence", map[string]string{machinav1.MachineSiteLabelKey: "site-a", deprecatedSiteLabel: "site-b"}, "site-a"},
-		{"empty canonical fallback", map[string]string{machinav1.MachineSiteLabelKey: "", deprecatedSiteLabel: "site-b"}, "site-b"},
-		{"empty labels", map[string]string{machinav1.MachineSiteLabelKey: "", deprecatedSiteLabel: ""}, ""},
+		{"deprecated ignored", map[string]string{"net.unbounded-cloud.io/site": "site-b"}, ""},
+		{"canonical only", map[string]string{machinav1.MachineSiteLabelKey: "site-a", "net.unbounded-cloud.io/site": "site-b"}, "site-a"},
+		{"empty canonical no fallback", map[string]string{machinav1.MachineSiteLabelKey: "", "net.unbounded-cloud.io/site": "site-b"}, ""},
+		{"empty labels", map[string]string{machinav1.MachineSiteLabelKey: ""}, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, mode := range []string{"cold", "memory", "restart"} {
@@ -57,7 +57,7 @@ func TestMemberSiteLabelsOverrideHistory(t *testing.T) {
 						}
 					}
 
-					got, diagnostics, err := ReconcileMembers([]corev1.Node{node}, pods, testDaemonSetUID, accepted, 7443)
+					got, diagnostics, err := reconcileMembers([]corev1.Node{node}, pods, memberOwnership(t, testDaemonSetUID), accepted, 7443)
 					require.NoError(t, err)
 					require.Len(t, got, 1)
 					require.Equal(t, tc.want, got[testNodeUID].Site)
@@ -77,7 +77,7 @@ func TestMemberSiteLabelsOverrideHistory(t *testing.T) {
 }
 
 func TestNodeChangesSiteLabels(t *testing.T) {
-	for _, key := range []string{machinav1.MachineSiteLabelKey, deprecatedSiteLabel} {
+	for _, key := range []string{machinav1.MachineSiteLabelKey, "net.unbounded-cloud.io/site"} {
 		for _, values := range [][2]string{{"", "site-a"}, {"site-a", "site-b"}, {"site-a", ""}} {
 			old, next := memberNode(), memberNode()
 			if values[0] != "" {
@@ -88,7 +88,7 @@ func TestNodeChangesSiteLabels(t *testing.T) {
 				next.Labels = map[string]string{key: values[1]}
 			}
 
-			require.True(t, nodeChanges().Update(event.UpdateEvent{ObjectOld: &old, ObjectNew: &next}), "%s %v", key, values)
+			require.Equal(t, key == machinav1.MachineSiteLabelKey, nodeChanges().Update(event.UpdateEvent{ObjectOld: &old, ObjectNew: &next}), "%s %v", key, values)
 		}
 	}
 

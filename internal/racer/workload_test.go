@@ -39,6 +39,11 @@ func TestWorkloadProjectionAndStorage(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	wantSelector := map[string]string{"app.kubernetes.io/name": "racer-dataplane", "app.kubernetes.io/instance": cfg.DaemonSetName}
+	if !reflect.DeepEqual(ds.Spec.Selector.MatchLabels, wantSelector) || !reflect.DeepEqual(ds.Spec.Template.Labels, wantSelector) {
+		t.Fatalf("unexpected fresh workload selector: %v", ds.Spec.Selector)
+	}
+
 	pod := ds.Spec.Template.Spec
 	if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken || pod.ServiceAccountName != cfg.DataplaneServiceAccount {
 		t.Fatal("automatic API token or wrong service account")
@@ -242,7 +247,7 @@ func assertWorkloadPeerMembership(t *testing.T, ds *appsv1.DaemonSet, peerPort u
 			t.Fatalf("peer listener must bind the exact Pod IP and peer port: %q", listen)
 		}
 
-		members, diagnostics, err := ReconcileMembers([]corev1.Node{memberNode()}, map[string][]corev1.Pod{pod.Spec.NodeName: {pod}}, testDaemonSetUID, nil, peerPort)
+		members, diagnostics, err := reconcileMembers([]corev1.Node{memberNode()}, map[string][]corev1.Pod{pod.Spec.NodeName: {pod}}, memberOwnership(t, testDaemonSetUID), nil, peerPort)
 		if err != nil || len(diagnostics) != 0 || len(members) != 1 {
 			t.Fatalf("unready Pod with IPs %v must be published: %v, %v", ips, diagnostics, err)
 		}

@@ -199,6 +199,41 @@ func TestServerReadinessTracksCachedServingCertificate(t *testing.T) {
 	})
 }
 
+func TestServerReadinessUsesUsableChainPrefix(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newServingFixture(t)
+		now := time.Now()
+		old := servingTestCertificate(t, 1, now.Add(-time.Hour), now.Add(time.Second), nil, true)
+		current := servingTestCertificate(t, 2, now.Add(-time.Hour), now.Add(time.Hour), nil, true)
+		leaf := servingTestCertificate(t, 3, now.Add(-time.Minute), now.Add(time.Minute), &current, false)
+		bridge := *current.Leaf
+		bridge.NotAfter = old.Leaf.NotAfter
+
+		der, err := x509.CreateCertificate(rand.Reader, &bridge, old.Leaf, current.Leaf.PublicKey, old.PrivateKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		leaf.Certificate = [][]byte{leaf.Certificate[0], der, old.Certificate[0]}
+
+		r := f.a.Server.installTestServingCertificate(leaf)
+		if err := f.a.Server.Ready(nil); err != nil {
+			t.Fatal(err)
+		}
+
+		time.Sleep(time.Second)
+
+		if err := f.a.Server.Ready(nil); err != nil {
+			t.Fatal("optional suffix expiration withdrew readiness", err)
+		}
+
+		selected, err := r.getCertificate(nil)
+		if err != nil || len(selected.Certificate) != 1 {
+			t.Fatal("handshake did not select usable prefix", err)
+		}
+	})
+}
+
 func TestServingCertificateProjectionAndRecovery(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now()

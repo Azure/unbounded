@@ -292,9 +292,6 @@ type DataplaneWorkloadIdentities struct {
 	namespace string
 	names     [2]string
 	uids      [2]types.UID
-	// Only the legacy SelectEndpoint/ReconcileMembers APIs use UID-only ownership.
-	// Their callers supply namespace-scoped Pods and the current workload UID.
-	legacyUID types.UID
 }
 
 // ReadDataplaneWorkloadIdentities requires at most two exact-name reads. Missing
@@ -339,10 +336,6 @@ func (ids DataplaneWorkloadIdentities) Owns(pod *corev1.Pod) bool {
 		return false
 	}
 
-	if ids.legacyUID != "" {
-		return owner.UID == ids.legacyUID
-	}
-
 	if pod.Namespace != ids.namespace {
 		return false
 	}
@@ -359,18 +352,13 @@ func (ids DataplaneWorkloadIdentities) Owns(pod *corev1.Pod) bool {
 const (
 	enrolledSharesAnnotation = "racer.unbounded-cloud.io/enrolled-shares"
 	admittedMemberAnnotation = "racer.unbounded-cloud.io/last-admitted-member"
-	deprecatedSiteLabel      = "net.unbounded-cloud.io/site"
 )
 
-// nodeSite follows net's canonical-first, nonempty deprecated-label fallback.
+// nodeSite uses only the canonical Machine Site label.
 // Read current labels independently of retained annotations: removal must revoke
 // the old RDMA boundary even when hardware annotations are malformed.
 func nodeSite(node *corev1.Node) string {
-	if site := node.Labels[machinav1.MachineSiteLabelKey]; site != "" {
-		return site
-	}
-
-	return node.Labels[deprecatedSiteLabel]
+	return node.Labels[machinav1.MachineSiteLabelKey]
 }
 
 // AcceptedMembers is backed by per-Node UID-bound last-admitted annotations.
@@ -453,15 +441,8 @@ func equalNUMA(a, b *uint32) bool {
 	return a == nil && b == nil || a != nil && b != nil && *a == *b
 }
 
-// SelectEndpoint verifies workload ownership, ignores terminating/IP-less Pods,
+// selectEndpoint verifies workload ownership, ignores terminating/IP-less Pods,
 // and chooses the newest creation time, breaking ties by UID. Readiness is ignored.
-// An empty DaemonSet UID represents a missing workload and returns Unavailable.
-// The caller supplies Pods from the installation namespace and the current
-// managed DaemonSet UID; labels alone never establish ownership.
-func SelectEndpoint(pods []corev1.Pod, daemonSetUID types.UID, nodeName string, port uint16) (string, error) {
-	return selectEndpoint(pods, DataplaneWorkloadIdentities{legacyUID: daemonSetUID}, nodeName, port)
-}
-
 func selectEndpoint(pods []corev1.Pod, ownership DataplaneWorkloadIdentities, nodeName string, port uint16) (string, error) {
 	if nodeName == "" || port == 0 {
 		return "", wire.InvalidRequest
@@ -500,7 +481,7 @@ func selectEndpoint(pods []corev1.Pod, ownership DataplaneWorkloadIdentities, no
 	return netip.AddrPortFrom(address, port).String(), nil
 }
 
-// ReconcileMembers preserves admitted values across gaps using UID-bound Node
+// reconcileMembers preserves admitted values across gaps using UID-bound Node
 // annotations on restart. Never-admitted nodes with unavailable or malformed
 // required inputs are omitted. Deletion and exclusion remove membership.
 // Annotations are accepted as one unit, independently of the endpoint. Site is
@@ -511,10 +492,6 @@ func selectEndpoint(pods []corev1.Pod, ownership DataplaneWorkloadIdentities, no
 // Accepted must contain only previously committed results from this function.
 // The caller supplies installation-namespace Pods grouped by assigned node name.
 // Each group is still checked for node assignment and DaemonSet ownership.
-func ReconcileMembers(nodes []corev1.Node, podsByNode map[string][]corev1.Pod, daemonSetUID types.UID, accepted AcceptedMembers, port uint16) (AcceptedMembers, []Diagnostic, error) {
-	return reconcileMembers(nodes, podsByNode, DataplaneWorkloadIdentities{legacyUID: daemonSetUID}, accepted, port)
-}
-
 func reconcileMembers(nodes []corev1.Node, podsByNode map[string][]corev1.Pod, ownership DataplaneWorkloadIdentities, accepted AcceptedMembers, port uint16) (AcceptedMembers, []Diagnostic, error) {
 	if port == 0 {
 		return nil, nil, wire.InvalidRequest

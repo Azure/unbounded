@@ -177,9 +177,7 @@ func replicatedServingSmoke(t *testing.T, count int) {
 		r := &replicationSmokeReplica{a: a, ctx: process, cancel: stop, endpoint: "https://" + listener.Addr().String(), listener: &replicationSmokeListener{Listener: listener}, done: make(chan error, 1)}
 		replicas = append(replicas, r)
 
-		config := a.Server.tlsConfigWithCertificate(process, func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-			return &f.serverCertificate, nil
-		})
+		config := a.Server.tlsConfig(process, f.serverCertificate)
 
 		go func() {
 			r.done <- a.Server.serve(process, r.listener, config)
@@ -512,7 +510,7 @@ func replicatedServingSmoke(t *testing.T, count int) {
 }
 
 func replicationSmokeLifecycle(l *Lifecycle, ctx context.Context) {
-	l.leader, l.synced = ctx, true
+	l.process, l.synced = ctx, true
 }
 
 func replicationSmokePublish(t *testing.T, ctx context.Context, r *TopologyReconciler, members AcceptedMembers) *CommittedPublication {

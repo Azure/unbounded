@@ -427,10 +427,9 @@ func (b *Bootstrap) Authenticate(ctx context.Context, r *http.Request) (NodeIden
 	if !authorizedNode(&node) {
 		return NodeIdentity{}, wire.Forbidden
 	}
-	// Newer API servers return node binding extras. When present they must
-	// agree, but older servers' Pod-bound TokenReviews need not include them.
+	// Require unambiguous current node bindings as well as the live Pod binding.
 	for key, want := range map[string]string{"node-name": node.Name, "node-uid": string(node.UID)} {
-		if _, present := status.User.Extra["authentication.kubernetes.io/"+key]; present && singleExtra(status.User, key) != want {
+		if singleExtra(status.User, key) != want {
 			return NodeIdentity{}, wire.Forbidden
 		}
 	}

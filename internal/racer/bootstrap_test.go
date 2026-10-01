@@ -36,7 +36,7 @@ func authFixture(t *testing.T) (*Application, authv1.TokenReviewStatus, string) 
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "racer", Name: "worker-pod", UID: "pod-uid", OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "DaemonSet", Name: ds.Name, UID: ds.UID, Controller: &controller}}}, Spec: corev1.PodSpec{NodeName: node.Name, ServiceAccountName: sa.Name}, Status: corev1.PodStatus{PodIP: "192.0.2.1"}}
 	r := initializedTopology(t, ds, sa, node, pod)
 	a := Assemble(r.Config, r.Client, r.APIReader)
-	status := authv1.TokenReviewStatus{Authenticated: true, Audiences: []string{wire.TokenAudience}, User: authv1.UserInfo{Username: "system:serviceaccount:racer:racer-dataplane", UID: string(sa.UID), Extra: map[string]authv1.ExtraValue{"authentication.kubernetes.io/pod-name": {pod.Name}, "authentication.kubernetes.io/pod-uid": {string(pod.UID)}}}}
+	status := authv1.TokenReviewStatus{Authenticated: true, Audiences: []string{wire.TokenAudience}, User: authv1.UserInfo{Username: "system:serviceaccount:racer:racer-dataplane", UID: string(sa.UID), Extra: map[string]authv1.ExtraValue{"authentication.kubernetes.io/pod-name": {pod.Name}, "authentication.kubernetes.io/pod-uid": {string(pod.UID)}, "authentication.kubernetes.io/node-name": {node.Name}, "authentication.kubernetes.io/node-uid": {string(node.UID)}}}}
 	token := "header." + base64.RawURLEncoding.EncodeToString(fmt.Appendf(nil, `{"exp":%d}`, time.Now().Add(time.Hour).Unix())) + ".signature"
 
 	return a, status, token
@@ -61,14 +61,40 @@ func installReview(t *testing.T, a *Application, status authv1.TokenReviewStatus
 	}})
 }
 
+func TestBootstrapRequiresUnambiguousNodeBindings(t *testing.T) {
+	for _, key := range []string{"node-name", "node-uid"} {
+		for _, values := range []authv1.ExtraValue{nil, {}, {""}, {"wrong"}, {"worker", "worker"}, {testNodeUID, testNodeUID}} {
+			t.Run(fmt.Sprintf("%s/%v", key, values), func(t *testing.T) {
+				a, status, token := authFixture(t)
+				fullKey := "authentication.kubernetes.io/" + key
+				delete(status.User.Extra, fullKey)
+
+				if values != nil {
+					status.User.Extra[fullKey] = values
+				}
+
+				installReview(t, a, status, token)
+
+				r := httptest.NewRequest(http.MethodGet, wire.KeyringPath, nil)
+				r.Header.Set("Authorization", "Bearer "+token)
+
+				if _, err := a.Server.Bootstrap.Authenticate(t.Context(), r); err == nil {
+					t.Fatal("accepted missing or ambiguous node binding")
+				}
+			})
+		}
+	}
+}
+
 func TestBootstrapAuthoritativeBindings(t *testing.T) {
 	for _, scenario := range []string{"success", "audience", "not authenticated", "review error", "username", "sa uid", "pod uid", "missing bound pod", "ambiguous bound pod", "node extra", "node extra uid", "recreated pod", "recreated sa", "recreated ds", "owner name", "owner kind", "owner not controller", "pod sa", "unscheduled", "terminal pod", "excluded node", "deleted node", "api failure", "canceled", "expired token", "duplicate bearer"} {
 		t.Run(scenario, func(t *testing.T) {
 			a, status, token := authFixture(t)
 			runKeys(t, a.Keyring)
 			reconcileTopology(t, a.Topology, t.Context())
-			a.Lifecycle.leader, a.Lifecycle.synced = t.Context(), true
+			a.Lifecycle.process, a.Lifecycle.synced = t.Context(), true
 			a.Lifecycle.SetServingReady(true)
+			a.Server.tlsConfig(t.Context(), servingTestCertificate(t, 1, time.Now().Add(-time.Minute), time.Now().Add(time.Hour), nil, false))
 			_, enrollment, _ := issuanceRequest(t, a.Keyring)
 
 			ctx, cancel := context.WithCancel(context.Background())

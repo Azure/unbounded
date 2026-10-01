@@ -148,9 +148,8 @@ func DesiredDaemonSet(c WorkloadConfig) (*appsv1.DaemonSet, error) {
 		return nil, fmt.Errorf("mixed networking requires the drain-aware two-workload planner: %w", wire.InvalidRequest)
 	}
 
-	// The legacy managed-by label is part of the immutable selector. Preserve it
-	// for in-place adoption; SSA's field manager records the actual workload owner.
-	labels := map[string]string{"app.kubernetes.io/name": "racer-dataplane", "app.kubernetes.io/managed-by": "racer-controller"}
+	// Use workload identity, not the manager's identity, for the Pod selector.
+	labels := map[string]string{"app.kubernetes.io/name": "racer-dataplane", "app.kubernetes.io/instance": c.DaemonSetName}
 	// Preserve the automatic port for existing installations; explicit ports
 	// are validated rather than silently moved on collision.
 	diagnosticsPort := int32(c.DiagnosticsPort)

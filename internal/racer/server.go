@@ -359,7 +359,7 @@ func (s *Server) Handler() http.Handler {
 			return
 		}
 
-		ctx, cancel := s.Lifecycle.LeaderContext(r.Context())
+		ctx, cancel := s.Lifecycle.ProcessContext(r.Context())
 		defer cancel()
 
 		stop := context.AfterFunc(ctx, func() {

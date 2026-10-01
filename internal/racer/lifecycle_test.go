@@ -21,12 +21,12 @@ import (
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
 
-func TestLifecycleLeaderContext(t *testing.T) {
-	for _, source := range []string{"parent", "leader", "child"} {
+func TestLifecycleProcessContext(t *testing.T) {
+	for _, source := range []string{"parent", "process", "child"} {
 		t.Run(source, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				leader, loseLeadership := context.WithCancel(t.Context())
-				defer loseLeadership()
+				process, stopProcess := context.WithCancel(t.Context())
+				defer stopProcess()
 
 				parent, stopParent := context.WithTimeout(t.Context(), time.Minute)
 				defer stopParent()
@@ -34,9 +34,9 @@ func TestLifecycleLeaderContext(t *testing.T) {
 				key := connectionKey{}
 				parent = context.WithValue(parent, key, source)
 				l := newLifecycle(NewPublications())
-				l.leader = leader
+				l.process = process
 
-				child, cancel := l.LeaderContext(parent)
+				child, cancel := l.ProcessContext(parent)
 				defer cancel()
 
 				deadline, ok := child.Deadline()
@@ -49,8 +49,8 @@ func TestLifecycleLeaderContext(t *testing.T) {
 				switch source {
 				case "parent":
 					stopParent()
-				case "leader":
-					loseLeadership()
+				case "process":
+					stopProcess()
 				case "child":
 					cancel()
 				}
@@ -61,20 +61,20 @@ func TestLifecycleLeaderContext(t *testing.T) {
 					t.Fatalf("child ignored %s cancellation: %v", source, child.Err())
 				}
 
-				if source != "leader" && leader.Err() != nil || source != "parent" && parent.Err() != nil {
+				if source != "process" && process.Err() != nil || source != "parent" && parent.Err() != nil {
 					t.Fatal("child cancellation propagated to an independent parent")
 				}
 			})
 		})
 	}
 
-	leader, cancel := context.WithCancel(t.Context())
+	process, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	for _, l := range []*Lifecycle{nil, newLifecycle(NewPublications()), {leader: leader}} {
-		child, stop := l.LeaderContext(t.Context())
+	for _, l := range []*Lifecycle{nil, newLifecycle(NewPublications()), {process: process}} {
+		child, stop := l.ProcessContext(t.Context())
 		if !errors.Is(child.Err(), context.Canceled) {
-			t.Fatal("absent or canceled leadership did not immediately cancel child")
+			t.Fatal("absent or canceled process did not immediately cancel child")
 		}
 
 		stop()
@@ -136,7 +136,7 @@ func TestLifecycleFollowerWithValidatedPublicationIsReady(t *testing.T) {
 	}
 
 	l := newLifecycle(r.Publications)
-	l.leader, l.synced = t.Context(), true
+	l.process, l.synced = t.Context(), true
 	l.SetIssuerReady(true)
 	l.SetServingReady(true)
 
@@ -208,10 +208,10 @@ func TestLifecycleGatesAndCancellation(t *testing.T) {
 		l.SetServingReady(true)
 
 		if l.Ready(nil) == nil {
-			t.Fatal("old leadership resurrected")
+			t.Fatal("old process resurrected")
 		}
 
-		request, stop := l.LeaderContext(t.Context())
+		request, stop := l.ProcessContext(t.Context())
 		defer stop()
 
 		if !errors.Is(request.Err(), context.Canceled) {
@@ -219,7 +219,7 @@ func TestLifecycleGatesAndCancellation(t *testing.T) {
 		}
 
 		if err := l.Start(context.Background()); !errors.Is(err, wire.Conflict) {
-			t.Fatalf("leadership restarted: %v", err)
+			t.Fatalf("process restarted: %v", err)
 		}
 	})
 }
@@ -244,7 +244,7 @@ func TestLifecycleRequiresPublicationAndHonorsRequestCancellation(t *testing.T) 
 		requestCtx, stop := context.WithCancel(context.Background())
 		stop()
 
-		request, stopRequest := l.LeaderContext(requestCtx)
+		request, stopRequest := l.ProcessContext(requestCtx)
 		defer stopRequest()
 
 		if !errors.Is(request.Err(), context.Canceled) {

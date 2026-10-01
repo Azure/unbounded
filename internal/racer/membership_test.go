@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -28,6 +29,18 @@ const (
 
 func memberNode() corev1.Node {
 	return corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", UID: testNodeUID}}
+}
+
+func memberOwnership(t *testing.T, uid types.UID) DataplaneWorkloadIdentities {
+	t.Helper()
+	r := initializedTopology(t, &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: DataplaneDaemonSetName, Namespace: "racer", UID: uid}})
+
+	ids, err := ReadDataplaneWorkloadIdentities(t.Context(), r.APIReader, "racer")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return ids
 }
 
 func memberPod(uid types.UID, created int64, ip string) corev1.Pod {
@@ -134,7 +147,7 @@ func TestSelectEndpoint(t *testing.T) {
 	// The newest Pod need not be Ready; a ready older Pod is not preferred.
 	pods[0].Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
 	for range 2 {
-		got, err := SelectEndpoint(pods, testDaemonSetUID, "node-a", 7443)
+		got, err := selectEndpoint(pods, memberOwnership(t, testDaemonSetUID), "node-a", 7443)
 		if err != nil || got != "[2001:db8::1]:7443" {
 			t.Fatalf("got %q, %v", got, err)
 		}
@@ -153,6 +166,8 @@ func TestSelectEndpoint(t *testing.T) {
 		"false controller": func(p *corev1.Pod) { *p.OwnerReferences[0].Controller = false },
 		"wrong kind":       func(p *corev1.Pod) { p.OwnerReferences[0].Kind = "ReplicaSet" },
 		"wrong api":        func(p *corev1.Pod) { p.OwnerReferences[0].APIVersion = "other/v1" },
+		"wrong namespace":  func(p *corev1.Pod) { p.Namespace = "other" },
+		"wrong owner name": func(p *corev1.Pod) { p.OwnerReferences[0].Name = "other" },
 		"no ip":            func(p *corev1.Pod) { p.Status.PodIP = "" },
 		"hostname":         func(p *corev1.Pod) { p.Status.PodIP = "example.com" },
 		"ip with port":     func(p *corev1.Pod) { p.Status.PodIP = "192.0.2.9:7443" },
@@ -162,11 +177,11 @@ func TestSelectEndpoint(t *testing.T) {
 			ineligible := memberPod("new", 10, "192.0.2.9")
 			mutate(&ineligible)
 
-			if _, err := SelectEndpoint([]corev1.Pod{ineligible}, testDaemonSetUID, "node-a", 7443); !errors.Is(err, wire.Unavailable) {
+			if _, err := selectEndpoint([]corev1.Pod{ineligible}, memberOwnership(t, testDaemonSetUID), "node-a", 7443); !errors.Is(err, wire.Unavailable) {
 				t.Fatalf("ineligible Pod admitted: %v", err)
 			}
 
-			got, err := SelectEndpoint([]corev1.Pod{ineligible, memberPod("old", 1, "192.0.2.1")}, testDaemonSetUID, "node-a", 7443)
+			got, err := selectEndpoint([]corev1.Pod{ineligible, memberPod("old", 1, "192.0.2.1")}, memberOwnership(t, testDaemonSetUID), "node-a", 7443)
 			if err != nil || got != "192.0.2.1:7443" {
 				t.Fatalf("eligible older Pod lost: %q, %v", got, err)
 			}
@@ -180,12 +195,12 @@ func TestSelectEndpoint(t *testing.T) {
 	}{
 		{testDaemonSetUID, "", 7443}, {testDaemonSetUID, "node-a", 0},
 	} {
-		if _, err := SelectEndpoint(pods, tc.uid, tc.node, tc.port); !errors.Is(err, wire.InvalidRequest) {
+		if _, err := selectEndpoint(pods, memberOwnership(t, tc.uid), tc.node, tc.port); !errors.Is(err, wire.InvalidRequest) {
 			t.Fatalf("invalid endpoint configuration: %v", err)
 		}
 	}
 
-	if _, err := SelectEndpoint(pods, "", "node-a", 7443); !errors.Is(err, wire.Unavailable) {
+	if _, err := selectEndpoint(pods, DataplaneWorkloadIdentities{}, "node-a", 7443); !errors.Is(err, wire.Unavailable) {
 		t.Fatalf("missing workload must have no eligible endpoint: %v", err)
 	}
 }
@@ -193,7 +208,7 @@ func TestSelectEndpoint(t *testing.T) {
 func TestReconcileMembersColdStartAndRetention(t *testing.T) {
 	node := memberNode()
 	pod := memberPod("a", 1, "192.0.2.1")
-	initial, diagnostics, err := ReconcileMembers([]corev1.Node{node}, map[string][]corev1.Pod{node.Name: {pod}}, testDaemonSetUID, nil, 7443)
+	initial, diagnostics, err := reconcileMembers([]corev1.Node{node}, map[string][]corev1.Pod{node.Name: {pod}}, memberOwnership(t, testDaemonSetUID), nil, 7443)
 
 	want := wire.Member{Node: testNodeUID, Shares: 4, Rails: []wire.Rail{}, AlignmentEnabled: true, PeerEndpoint: "192.0.2.1:7443"}
 	if err != nil || len(diagnostics) != 0 || !reflect.DeepEqual(initial[testNodeUID], want) {
@@ -217,7 +232,7 @@ func TestReconcileMembersColdStartAndRetention(t *testing.T) {
 			node := node.DeepCopy()
 			node.Annotations = tc.annotations
 
-			got, diagnostics, err := ReconcileMembers([]corev1.Node{*node}, map[string][]corev1.Pod{node.Name: tc.pods}, testDaemonSetUID, initial, 7443)
+			got, diagnostics, err := reconcileMembers([]corev1.Node{*node}, map[string][]corev1.Pod{node.Name: tc.pods}, memberOwnership(t, testDaemonSetUID), initial, 7443)
 			if err != nil || len(diagnostics) != tc.diagnostics || got[testNodeUID].Shares != tc.shares || got[testNodeUID].PeerEndpoint != tc.endpoint {
 				t.Fatalf("warm reconcile: %#v, %v, %v", got, diagnostics, err)
 			}
@@ -226,7 +241,7 @@ func TestReconcileMembersColdStartAndRetention(t *testing.T) {
 				t.Fatal("mutated accepted input")
 			}
 
-			cold, diagnostics, err := ReconcileMembers([]corev1.Node{*node}, map[string][]corev1.Pod{node.Name: tc.pods}, testDaemonSetUID, nil, 7443)
+			cold, diagnostics, err := reconcileMembers([]corev1.Node{*node}, map[string][]corev1.Pod{node.Name: tc.pods}, memberOwnership(t, testDaemonSetUID), nil, 7443)
 			if err != nil || len(cold) != 0 || len(diagnostics) != tc.diagnostics {
 				t.Fatalf("cold reconcile: %#v, %v, %v", cold, diagnostics, err)
 			}
@@ -246,7 +261,7 @@ func TestReconcileMembersIdentityAndRemoval(t *testing.T) {
 
 	pods := map[string][]corev1.Pod{node.Name: {pod}}
 
-	accepted, _, err := ReconcileMembers([]corev1.Node{node}, pods, testDaemonSetUID, nil, 7443)
+	accepted, _, err := reconcileMembers([]corev1.Node{node}, pods, memberOwnership(t, testDaemonSetUID), nil, 7443)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,32 +269,32 @@ func TestReconcileMembersIdentityAndRemoval(t *testing.T) {
 	for _, label := range []string{"", "false", "true"} {
 		node.Labels = map[string]string{wire.ExclusionLabel: label}
 
-		got, diagnostics, err := ReconcileMembers([]corev1.Node{node}, pods, testDaemonSetUID, accepted, 7443)
+		got, diagnostics, err := reconcileMembers([]corev1.Node{node}, pods, memberOwnership(t, testDaemonSetUID), accepted, 7443)
 		if err != nil || len(got) != 0 || len(diagnostics) != 0 {
 			t.Fatalf("exclusion: %v, %v, %v", got, diagnostics, err)
 		}
 
 		node.Labels = nil
 
-		got, _, err = ReconcileMembers([]corev1.Node{node}, nil, testDaemonSetUID, got, 7443)
+		got, _, err = reconcileMembers([]corev1.Node{node}, nil, memberOwnership(t, testDaemonSetUID), got, 7443)
 		if err != nil || len(got) != 0 {
 			t.Fatalf("exclusion history survived: %v, %v", got, err)
 		}
 	}
 
-	got, _, err := ReconcileMembers(nil, nil, testDaemonSetUID, accepted, 7443)
+	got, _, err := reconcileMembers(nil, nil, memberOwnership(t, testDaemonSetUID), accepted, 7443)
 	if err != nil || got == nil || len(got) != 0 {
 		t.Fatalf("deletion: %v, %v", got, err)
 	}
 
 	node.UID = testOtherUID
 
-	got, _, err = ReconcileMembers([]corev1.Node{node}, nil, testDaemonSetUID, accepted, 7443)
+	got, _, err = reconcileMembers([]corev1.Node{node}, nil, memberOwnership(t, testDaemonSetUID), accepted, 7443)
 	if err != nil || len(got) != 0 {
 		t.Fatalf("same-name recreation inherited history: %v, %v", got, err)
 	}
 
-	got, _, err = ReconcileMembers([]corev1.Node{node}, pods, testDaemonSetUID, accepted, 7443)
+	got, _, err = reconcileMembers([]corev1.Node{node}, pods, memberOwnership(t, testDaemonSetUID), accepted, 7443)
 	if err != nil || len(got) != 1 || got[testOtherUID].Node != testOtherUID {
 		t.Fatalf("new UID not admitted: %v, %v", got, err)
 	}
@@ -288,7 +303,7 @@ func TestReconcileMembersIdentityAndRemoval(t *testing.T) {
 	node.DeletionTimestamp = &metav1.Time{}
 	node.Status.Conditions = []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionFalse}}
 
-	got, _, err = ReconcileMembers([]corev1.Node{node}, pods, testDaemonSetUID, got, 7443)
+	got, _, err = reconcileMembers([]corev1.Node{node}, pods, memberOwnership(t, testDaemonSetUID), got, 7443)
 	if err != nil || len(got) != 1 {
 		t.Fatalf("readiness removed ownership: %v, %v", got, err)
 	}
@@ -301,7 +316,7 @@ func TestReconcileMembersDefaultsAndIsolation(t *testing.T) {
 
 	pods := map[string][]corev1.Pod{node.Name: {pod}}
 
-	accepted, _, err := ReconcileMembers([]corev1.Node{node}, pods, testDaemonSetUID, nil, 7443)
+	accepted, _, err := reconcileMembers([]corev1.Node{node}, pods, memberOwnership(t, testDaemonSetUID), nil, 7443)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,7 +330,7 @@ func TestReconcileMembersDefaultsAndIsolation(t *testing.T) {
 		t.Fatal("candidate aliases Kubernetes inputs")
 	}
 
-	got, _, err := ReconcileMembers([]corev1.Node{node}, nil, testDaemonSetUID, accepted, 7443)
+	got, _, err := reconcileMembers([]corev1.Node{node}, nil, memberOwnership(t, testDaemonSetUID), accepted, 7443)
 	if err != nil || !reflect.DeepEqual(got, accepted) {
 		t.Fatalf("retention: %v, %v", got, err)
 	}
@@ -328,7 +343,7 @@ func TestReconcileMembersDefaultsAndIsolation(t *testing.T) {
 		t.Fatal("retention aliases accepted state")
 	}
 
-	got, _, err = ReconcileMembers([]corev1.Node{node}, nil, testDaemonSetUID, accepted, 7443)
+	got, _, err = reconcileMembers([]corev1.Node{node}, nil, memberOwnership(t, testDaemonSetUID), accepted, 7443)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,7 +357,7 @@ func TestReconcileMembersDefaultsAndIsolation(t *testing.T) {
 
 	node.Annotations = nil
 
-	got, _, err = ReconcileMembers([]corev1.Node{node}, nil, testDaemonSetUID, accepted, 7443)
+	got, _, err = reconcileMembers([]corev1.Node{node}, nil, memberOwnership(t, testDaemonSetUID), accepted, 7443)
 	if err != nil || got[testNodeUID].Shares != 4 || !got[testNodeUID].AlignmentEnabled || len(got[testNodeUID].Rails) != 0 {
 		t.Fatalf("removed annotations did not default: %v, %v", got, err)
 	}
@@ -363,7 +378,7 @@ func TestReconcileMembersRejectsInvalidInput(t *testing.T) {
 		{"duplicate name", []corev1.Node{memberNode(), {ObjectMeta: metav1.ObjectMeta{Name: "node-a", UID: testOtherUID}}}, testDaemonSetUID, 7443},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, _, err := ReconcileMembers(tc.nodes, nil, tc.uid, nil, tc.port)
+			got, _, err := reconcileMembers(tc.nodes, nil, memberOwnership(t, tc.uid), nil, tc.port)
 			if !errors.Is(err, wire.InvalidRequest) || got != nil {
 				t.Fatalf("invalid inputs accepted: %v, %v", got, err)
 			}
@@ -397,7 +412,7 @@ func TestReconcileMembersGroupedPods(t *testing.T) {
 	var firstDiagnostics []Diagnostic
 
 	for range 2 {
-		members, diagnostics, err := ReconcileMembers(nodes, pods, testDaemonSetUID, nil, 7443)
+		members, diagnostics, err := reconcileMembers(nodes, pods, memberOwnership(t, testDaemonSetUID), nil, 7443)
 		if err != nil || len(members) != 1 || members[testNodeUID].PeerEndpoint != "192.0.2.1:7443" {
 			t.Fatalf("grouped endpoint checks: %v, %v", members, err)
 		}
@@ -424,7 +439,7 @@ func TestReconcileMembersGroupedPods(t *testing.T) {
 	// Multiple rejected nodes must report in UID order, not input or map order.
 	nodeA.Annotations = nodeB.Annotations
 	for _, nodes := range [][]corev1.Node{{nodeB, nodeA}, {nodeA, nodeB}} {
-		_, diagnostics, err := ReconcileMembers(nodes, nil, testDaemonSetUID, nil, 7443)
+		_, diagnostics, err := reconcileMembers(nodes, nil, memberOwnership(t, testDaemonSetUID), nil, 7443)
 		if err != nil || len(diagnostics) != 4 || diagnostics[0].Object != nodeA.Name || diagnostics[1].Object != nodeA.Name || diagnostics[2].Object != nodeB.Name || diagnostics[3].Object != nodeB.Name {
 			t.Fatalf("node diagnostic order: %v, %v", diagnostics, err)
 		}
@@ -442,7 +457,7 @@ func TestReconcileCandidateHashesAndOrdering(t *testing.T) {
 	nodesBefore := []corev1.Node{*nodeB.DeepCopy(), *nodeA.DeepCopy()}
 	podsBefore := map[string][]corev1.Pod{nodeA.Name: {*podA.DeepCopy()}, nodeB.Name: {*podB.DeepCopy()}}
 
-	members, diagnostics, err := ReconcileMembers(nodes, pods, testDaemonSetUID, nil, 7443)
+	members, diagnostics, err := reconcileMembers(nodes, pods, memberOwnership(t, testDaemonSetUID), nil, 7443)
 	if err != nil || len(diagnostics) != 0 || !reflect.DeepEqual(nodes, nodesBefore) || !reflect.DeepEqual(pods, podsBefore) {
 		t.Fatalf("candidate failed or mutated inputs: %v, %v", diagnostics, err)
 	}
@@ -460,7 +475,7 @@ func TestReconcileCandidateHashesAndOrdering(t *testing.T) {
 
 	nodes[0].Annotations[wire.RailsAnnotation] = `[{"rail":1,"fabric":"a"},{"rail":2,"fabric":"b"}]`
 
-	members, _, err = ReconcileMembers(nodes, pods, testDaemonSetUID, nil, 7443)
+	members, _, err = reconcileMembers(nodes, pods, memberOwnership(t, testDaemonSetUID), nil, 7443)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -500,21 +515,21 @@ func TestReconcileMembersLimit(t *testing.T) {
 		accepted[wire.NodeID(id)] = wire.Member{Node: wire.NodeID(id), Shares: 4, PeerEndpoint: "192.0.2.1:7443", Rails: []wire.Rail{}, AlignmentEnabled: true}
 	}
 
-	got, _, err := ReconcileMembers(nodes, nil, testDaemonSetUID, accepted, 7443)
+	got, _, err := reconcileMembers(nodes, nil, memberOwnership(t, testDaemonSetUID), accepted, 7443)
 	if !errors.Is(err, wire.TooLarge) || got != nil {
 		t.Fatalf("oversized membership: %d, %v", len(got), err)
 	}
 	// The bound is on admitted members, not all observed Nodes.
 	nodes[0].Labels = map[string]string{wire.ExclusionLabel: ""}
 
-	got, _, err = ReconcileMembers(nodes, nil, testDaemonSetUID, accepted, 7443)
+	got, _, err = reconcileMembers(nodes, nil, memberOwnership(t, testDaemonSetUID), accepted, 7443)
 	if err != nil || len(got) != wire.MaxMembers {
 		t.Fatalf("membership at bound: %d, %v", len(got), err)
 	}
 }
 
 func TestReconcileMembersMissingWorkloadAndRecovery(t *testing.T) {
-	empty, diagnostics, err := ReconcileMembers(nil, nil, "", nil, 7443)
+	empty, diagnostics, err := reconcileMembers(nil, nil, DataplaneWorkloadIdentities{}, nil, 7443)
 	if err != nil || empty == nil || len(empty) != 0 || len(diagnostics) != 0 {
 		t.Fatalf("empty initial reconcile: %#v, %v, %v", empty, diagnostics, err)
 	}
@@ -522,19 +537,19 @@ func TestReconcileMembersMissingWorkloadAndRecovery(t *testing.T) {
 	node := memberNode()
 	pods := map[string][]corev1.Pod{node.Name: {memberPod("a", 1, "192.0.2.1")}}
 
-	accepted, _, err := ReconcileMembers([]corev1.Node{node}, pods, testDaemonSetUID, nil, 7443)
+	accepted, _, err := reconcileMembers([]corev1.Node{node}, pods, memberOwnership(t, testDaemonSetUID), nil, 7443)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	var got AcceptedMembers
 	for _, uid := range []types.UID{"", "replacement-daemonset"} {
-		got, diagnostics, err = ReconcileMembers([]corev1.Node{node}, pods, uid, accepted, 7443)
+		got, diagnostics, err = reconcileMembers([]corev1.Node{node}, pods, memberOwnership(t, uid), accepted, 7443)
 		if err != nil || !reflect.DeepEqual(got, accepted) || len(diagnostics) != 1 {
 			t.Fatalf("workload gap: %v, %v, %v", got, diagnostics, err)
 		}
 
-		got, diagnostics, err = ReconcileMembers([]corev1.Node{node}, pods, uid, nil, 7443)
+		got, diagnostics, err = reconcileMembers([]corev1.Node{node}, pods, memberOwnership(t, uid), nil, 7443)
 		if err != nil || len(got) != 0 || len(diagnostics) != 1 {
 			t.Fatalf("cold workload gap: %v, %v, %v", got, diagnostics, err)
 		}
@@ -542,14 +557,14 @@ func TestReconcileMembersMissingWorkloadAndRecovery(t *testing.T) {
 
 	node.Annotations = map[string]string{wire.SharesAnnotation: "invalid-sensitive-input"}
 
-	cold, diagnostics, err := ReconcileMembers([]corev1.Node{node}, pods, testDaemonSetUID, nil, 7443)
+	cold, diagnostics, err := reconcileMembers([]corev1.Node{node}, pods, memberOwnership(t, testDaemonSetUID), nil, 7443)
 	if err != nil || len(cold) != 0 || len(diagnostics) != 1 || strings.Contains(diagnostics[0].Reason, "invalid-sensitive-input") {
 		t.Fatalf("cold invalid annotations: %v, %v, %v", cold, diagnostics, err)
 	}
 
 	node.Annotations[wire.SharesAnnotation] = "16"
 
-	got, diagnostics, err = ReconcileMembers([]corev1.Node{node}, pods, testDaemonSetUID, cold, 7443)
+	got, diagnostics, err = reconcileMembers([]corev1.Node{node}, pods, memberOwnership(t, testDaemonSetUID), cold, 7443)
 	if err != nil || got[testNodeUID].Shares != 16 || len(diagnostics) != 0 {
 		t.Fatalf("corrected inputs not admitted: %v, %v, %v", got, diagnostics, err)
 	}
