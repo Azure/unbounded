@@ -275,30 +275,8 @@ fn hedged_plaintext_validates_aead_and_preserves_singleflight_and_original_credi
             (ordered[0].clone(), Reply::Copy(good.clone())),
             (ordered[1].clone(), Reply::Copy(alternative)),
         ]);
-        peers.hedge.set(true);
         peers.primary_polls.set(40);
-        let metrics = crate::telemetry::metrics::Metrics::default();
-        let hedges = super::super::super::hedge::Hedges::new(
-            super::super::super::hedge::Config {
-                delay: Duration::from_nanos(1),
-                slots: 1,
-                bytes: super::super::super::hedge::DUPLICATE_BYTES,
-            },
-            metrics.clone(),
-        )
-        .unwrap();
-        let mut deps = f.fill.dependencies.clone();
-        deps.candidates = Rc::new(
-            CandidatePolicy::new(
-                node(peers.local),
-                Rc::new(Placement::new(16)),
-                peers.clone(),
-                deps.credentials.clone(),
-                Arc::new(Default::default()),
-            )
-            .with_hedges(hedges),
-        );
-        f.fill = Fill::new(deps);
+        let metrics = enable_hedge(&mut f, &peers);
         let mut first_budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
         let mut second_budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
         let (first, second) = drive(
@@ -681,19 +659,7 @@ fn hedge_default_budget_never_sends_underfunded_second_cold_fallback() {
 fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_original_budget() {
     let queue = Rc::new(crate::read::drivers::DriverQueue::default());
     let _owner = queue.enter();
-    use crate::{
-        control::{
-            state::{PublishedState, SnapshotStore},
-            wire::{Publication, PublicationSequence, SCHEMA_VERSION},
-        },
-        memory::{delivery::Delivery, pipe::PipePool},
-        peer::server::LocalPageService,
-        read::{
-            Coordinator,
-            metadata::{MetadataDependencies, MetadataService},
-            range_stream::RangeStreams,
-        },
-    };
+    use crate::{peer::server::LocalPageService, read::Coordinator};
     struct Mesh {
         signing: Vec<Forwarding>,
         nodes: RefCell<Vec<Rc<Coordinator>>>,
@@ -840,57 +806,19 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
             let mut deps = f.fill.dependencies.clone();
             deps.candidates = Rc::new(policy);
             f.fill = Fill::new(deps);
-            let fill = Rc::new(f.fill.clone());
-            let published = Arc::new(PublishedState::default());
-            let availability = Rc::new(crate::control::state::Availability::new(
-                published.clone(),
-                f.keys.clone(),
-            ));
-            let snapshots = Rc::new(SnapshotStore::new(f.keys.cluster().clone(), published, 4));
-            snapshots
-                .publish(Publication {
-                    schema_version: SCHEMA_VERSION,
-                    cluster: f.keys.cluster().clone(),
-                    sequence: PublicationSequence(1),
-                    membership_version: membership.version,
-                    members: membership.members().to_vec(),
-                    caches: vec![crate::control::state::CacheDefinition {
-                        id: f.context.object.cache.clone(),
-                        name: "cold".into(),
-                        client_socket: "/run/racer/cold/client/socket".into(),
-                        origin_socket: "/run/racer/cold/origin/socket".into(),
-                    }],
-                })
-                .unwrap();
-            let owners = fill.dependencies.metadata_owner.clone();
-            let metadata = Rc::new(MetadataService::new(
-                fill.dependencies.candidates.clone(),
-                f.origin.clone(),
-                fill.dependencies.credentials.clone(),
-                16,
-                MetadataDependencies {
-                    index: Rc::new(Index::new(WorkerId(0), 16, availability.clone())),
-                    owners: owners.clone(),
-                    fill: fill.clone(),
+            let (coordinator, endpoint, _) = f.read_graph(
+                Rc::new(f.fill.clone()),
+                &membership,
+                ReadGraphSettings {
+                    name: "cold",
+                    snapshots: 4,
+                    metadata: 16,
+                    window: 1,
+                    stall: Duration::from_secs(10),
+                    seed: None,
                 },
-            ));
-            let delivery = Rc::new(Delivery::new(
-                Rc::new(PipePool::new(
-                    fill.dependencies.admission.clone(),
-                    f.reactor.clone(),
-                )),
-                Duration::from_secs(10),
-            ));
-            let streams = Rc::new(RangeStreams::new(owners.clone(), delivery, 1));
-            let coordinator = Rc::new(Coordinator::new(
-                snapshots,
-                metadata,
-                fill.clone(),
-                streams,
-                fill.dependencies.credentials.clone(),
-                availability,
-            ));
-            endpoints.push(owners.install(WorkerId(0), coordinator.clone()).unwrap());
+            );
+            endpoints.push(endpoint);
             mesh.nodes.borrow_mut().push(coordinator);
         }
         let (attempts, links) = if target_rank == 1 { (8, 16) } else { (10, 18) };
@@ -1313,20 +1241,6 @@ fn corrupt_disk_decrypt_is_counted_without_publishing_plaintext() {
     assert_eq!(f.fill.metrics.count(Event::FillDecryptPeerCorrupt), 0);
     assert_unpublished(&f);
     assert_eq!(f.origin.calls.get(), 0);
-}
-
-fn acquire(f: &mut Fixture, budget: &mut AcquisitionBudget) -> Result<PageResult> {
-    drive(
-        f.fill.acquire(
-            f.page.clone(),
-            f.membership.clone(),
-            &f.context,
-            &f.scope,
-            budget,
-        ),
-        &mut f.engine,
-        &f.crypto,
-    )
 }
 
 fn assert_published(f: &Fixture, result: &PageResult, persist: bool) {

@@ -16,20 +16,7 @@ mod duplex_release {
             let signers = network(1);
             let mut f = fixture();
             f.reactor.init().unwrap();
-            let membership = Arc::new(
-                Membership::validate(
-                    MembershipVersion(1),
-                    vec![Member {
-                        node: signers[0].node().clone(),
-                        shares: NonZeroU32::new(1).unwrap(),
-                        peer_endpoint: "127.0.0.1:8000".into(),
-                        rails: vec![],
-                        alignment_enabled: false,
-                        site: String::new(),
-                    }],
-                )
-                .unwrap(),
-            );
+            let membership = local_membership(&signers[0]);
             let (local, mut endpoint, _publication) =
                 coordinator(&f, &signers[0], &membership, Rc::new(NoPeer));
             let response = futures::executor::block_on(local.read(
@@ -203,20 +190,7 @@ mod duplex_release {
         let signers = network(1);
         let mut f = fixture_with(2 * PAGE_BYTES + 7, None);
         f.reactor.init().unwrap();
-        let membership = Arc::new(
-            Membership::validate(
-                MembershipVersion(1),
-                vec![Member {
-                    node: signers[0].node().clone(),
-                    shares: NonZeroU32::new(1).unwrap(),
-                    peer_endpoint: "127.0.0.1:8000".into(),
-                    rails: vec![],
-                    alignment_enabled: false,
-                    site: String::new(),
-                }],
-            )
-            .unwrap(),
-        );
+        let membership = local_membership(&signers[0]);
         let (local, mut endpoint, _publication) =
             coordinator(&f, &signers[0], &membership, Rc::new(NoPeer));
         let scope = RequestScope::new(
@@ -559,10 +533,7 @@ mod duplex_release {
 use super::*;
 use crate::{
     client::{ClientRequest, ReadKind},
-    control::{
-        state::{PublishedState, SnapshotStore},
-        wire::*,
-    },
+    control::state::PublishedState,
     http::{Codec, connection::HttpIo},
     memory::{delivery::Delivery, pipe::PipePool},
     model::{ByteRange, MembershipVersion},
@@ -571,11 +542,7 @@ use crate::{
         protocol::{PeerRequest, SignedRequest, SignedResponse, VerifiedResponse},
         server::{LocalPageService, PeerServer},
     },
-    read::{
-        Coordinator, ReadService,
-        metadata::{MetadataDependencies, MetadataService},
-        range_stream::RangeStreams,
-    },
+    read::{Coordinator, ReadService},
     security::{
         connection::{
             Signatures,
@@ -663,6 +630,23 @@ impl LocalPageService for Gate {
         })
     }
 }
+fn local_membership(signer: &Signatures) -> MembershipLease {
+    Arc::new(
+        Membership::validate(
+            MembershipVersion(1),
+            vec![Member {
+                node: signer.node().clone(),
+                shares: NonZeroU32::new(1).unwrap(),
+                peer_endpoint: "127.0.0.1:8000".into(),
+                rails: vec![],
+                alignment_enabled: false,
+                site: String::new(),
+            }],
+        )
+        .unwrap(),
+    )
+}
+
 pub(super) fn coordinator(
     f: &Fixture,
     signer: &Rc<Signatures>,
@@ -673,33 +657,6 @@ pub(super) fn coordinator(
     crate::read::dispatch::WorkerEndpoint,
     Arc<PublishedState>,
 ) {
-    let published = Arc::new(PublishedState::default());
-    let availability = Rc::new(crate::control::state::Availability::new(
-        published.clone(),
-        f.keys.clone(),
-    ));
-    let snapshots = Rc::new(SnapshotStore::new(
-        f.keys.cluster().clone(),
-        published.clone(),
-        2,
-    ));
-    let (client_socket, origin_socket) =
-        crate::control::state::canonical_socket_paths("hot-read").unwrap();
-    snapshots
-        .publish(Publication {
-            schema_version: SCHEMA_VERSION,
-            cluster: f.keys.cluster().clone(),
-            sequence: PublicationSequence(1),
-            membership_version: membership.version,
-            members: membership.members().to_vec(),
-            caches: vec![crate::control::state::CacheDefinition {
-                id: f.context.object.cache.clone(),
-                name: "hot-read".into(),
-                client_socket,
-                origin_socket,
-            }],
-        })
-        .unwrap();
     let mut deps = f.fill.dependencies.clone();
     deps.candidates = Rc::new(CandidatePolicy::new(
         signer.node().clone(),
@@ -708,40 +665,18 @@ pub(super) fn coordinator(
         deps.credentials.clone(),
         Arc::new(Default::default()),
     ));
-    let owners = deps.metadata_owner.clone();
-    let fill = Rc::new(Fill::new(deps));
-    let metadata = Rc::new(MetadataService::new(
-        fill.dependencies.candidates.clone(),
-        f.origin.clone(),
-        fill.dependencies.credentials.clone(),
-        32,
-        MetadataDependencies {
-            index: Rc::new(Index::new(WorkerId(0), 32, availability.clone())),
-            owners: owners.clone(),
-            fill: fill.clone(),
+    f.read_graph(
+        Rc::new(Fill::new(deps)),
+        membership,
+        ReadGraphSettings {
+            name: "hot-read",
+            snapshots: 2,
+            metadata: 32,
+            window: 2,
+            stall: Duration::from_secs(30),
+            seed: Some(f.origin.metadata.immutable()),
         },
-    ));
-    metadata
-        .publish_version(f.origin.metadata.immutable())
-        .unwrap();
-    let delivery = Rc::new(Delivery::new(
-        Rc::new(PipePool::new(
-            fill.dependencies.admission.clone(),
-            f.reactor.clone(),
-        )),
-        Duration::from_secs(30),
-    ));
-    let streams = Rc::new(RangeStreams::new(owners.clone(), delivery, 2));
-    let local = Rc::new(Coordinator::new(
-        snapshots,
-        metadata,
-        fill.clone(),
-        streams,
-        fill.dependencies.credentials.clone(),
-        availability,
-    ));
-    let endpoint = owners.install(WorkerId(0), local.clone()).unwrap();
-    (local, endpoint, published)
+    )
 }
 
 #[test]
@@ -751,20 +686,7 @@ fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
     let signers = network(1);
     let mut f = fixture_with(3 * PAGE_BYTES + 7, None);
     f.reactor.init().unwrap();
-    let membership = Arc::new(
-        Membership::validate(
-            MembershipVersion(1),
-            vec![Member {
-                node: signers[0].node().clone(),
-                shares: NonZeroU32::new(1).unwrap(),
-                peer_endpoint: "127.0.0.1:8000".into(),
-                rails: vec![],
-                alignment_enabled: false,
-                site: String::new(),
-            }],
-        )
-        .unwrap(),
-    );
+    let membership = local_membership(&signers[0]);
     let (local, mut endpoint, _publication) =
         coordinator(&f, &signers[0], &membership, Rc::new(NoPeer));
     let open = |ordered, credits, start| {
@@ -890,20 +812,7 @@ fn ordered_acquisition_window_is_not_an_unreleased_credit_ceiling() {
         let signers = network(1);
         let mut f = fixture_with(5 * PAGE_BYTES + 7, None);
         f.reactor.init().unwrap();
-        let membership = Arc::new(
-            Membership::validate(
-                MembershipVersion(1),
-                vec![Member {
-                    node: signers[0].node().clone(),
-                    shares: NonZeroU32::new(1).unwrap(),
-                    peer_endpoint: "127.0.0.1:8000".into(),
-                    rails: vec![],
-                    alignment_enabled: false,
-                    site: String::new(),
-                }],
-            )
-            .unwrap(),
-        );
+        let membership = local_membership(&signers[0]);
         let (local, mut endpoint, _publication) =
             coordinator(&f, &signers[0], &membership, Rc::new(NoPeer));
         let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
@@ -1005,20 +914,7 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
         let signers = network(1);
         let mut f = fixture_with(2 * PAGE_BYTES + 7, None);
         f.reactor.init().unwrap();
-        let membership = Arc::new(
-            Membership::validate(
-                MembershipVersion(1),
-                vec![Member {
-                    node: signers[0].node().clone(),
-                    shares: NonZeroU32::new(1).unwrap(),
-                    peer_endpoint: "127.0.0.1:8000".into(),
-                    rails: vec![],
-                    alignment_enabled: false,
-                    site: String::new(),
-                }],
-            )
-            .unwrap(),
-        );
+        let membership = local_membership(&signers[0]);
         let (local, mut endpoint, _publication) =
             coordinator(&f, &signers[0], &membership, Rc::new(NoPeer));
         let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
@@ -1595,18 +1491,7 @@ fn origin_fill_preserves_ciphertext_for_memory_and_pending_candidate_copy() {
     let _owner = queue.enter();
     let mut f = fixture();
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
-    let result = drive(
-        f.fill.acquire(
-            f.page.clone(),
-            f.membership.clone(),
-            &f.context,
-            &f.scope,
-            &mut budget,
-        ),
-        &mut f.engine,
-        &f.crypto,
-    )
-    .unwrap();
+    let result = acquire(&mut f, &mut budget).unwrap();
     assert_eq!(result.plaintext.bytes(), b"abc");
     assert_eq!(f.origin.calls.get(), 1);
     assert_eq!(budget.remaining_attempts(), 7);
@@ -1623,18 +1508,7 @@ fn origin_fill_preserves_ciphertext_for_memory_and_pending_candidate_copy() {
         .unwrap()
         .unwrap();
     assert_eq!(pending.ciphertext.bytes(), result.ciphertext.bytes());
-    let second = drive(
-        f.fill.acquire(
-            f.page.clone(),
-            f.membership.clone(),
-            &f.context,
-            &f.scope,
-            &mut budget,
-        ),
-        &mut f.engine,
-        &f.crypto,
-    )
-    .unwrap();
+    let second = acquire(&mut f, &mut budget).unwrap();
     assert_eq!(second.ciphertext.bytes(), result.ciphertext.bytes());
     assert_eq!(f.origin.calls.get(), 1);
     assert_eq!(f.fill.metrics.count(Event::OriginFill), 1);
@@ -1656,18 +1530,7 @@ fn origin_fill_preserves_ciphertext_for_memory_and_pending_candidate_copy() {
     .unwrap()
     .unwrap();
     assert_eq!(disk_copy.0.version, f.page.version);
-    let disk_result = drive(
-        f.fill.acquire(
-            f.page.clone(),
-            f.membership.clone(),
-            &f.context,
-            &f.scope,
-            &mut budget,
-        ),
-        &mut f.engine,
-        &f.crypto,
-    )
-    .unwrap();
+    let disk_result = acquire(&mut f, &mut budget).unwrap();
     assert_eq!(disk_result.plaintext.bytes(), b"abc");
     // CopyOnly retains the disk ciphertext, so plaintext acquisition promotes
     // that same allocation instead of reading the disk again.

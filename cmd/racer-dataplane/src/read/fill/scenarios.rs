@@ -16,7 +16,6 @@ mod metadata {
     fn metadata_cohorts_refresh_zero_ttl_and_do_not_negative_cache_adapter_failure() {
         use crate::{
             model::MetadataSelector,
-            read::metadata::{MetadataDependencies, MetadataService},
             test_support::origin::{AdapterOrigin, RequestKind},
         };
         for failure in [None, Some(502)] {
@@ -35,24 +34,8 @@ mod metadata {
             if let Some(status) = failure {
                 adapter.reject_next(RequestKind::Head, status);
             }
-            let service = MetadataService::new(
-                f.fill.dependencies.candidates.clone(),
-                adapter_client(&f, &adapter),
-                f.fill.dependencies.credentials.clone(),
-                1,
-                MetadataDependencies {
-                    index: Rc::new(Index::new(
-                        WorkerId(0),
-                        8,
-                        crate::control::state::for_caches(
-                            f.keys.clone(),
-                            vec![f.context.object.cache.clone()],
-                        ),
-                    )),
-                    fill: Rc::new(Fill::new(f.fill.dependencies.clone())),
-                    owners: f.fill.dependencies.metadata_owner.clone(),
-                },
-            );
+            let service =
+                f.metadata_service_with_index(adapter_client(&f, &adapter), 1, f.metadata_index(8));
             let mut first = service.resolve(
                 MetadataSelector::Fresh,
                 f.membership.clone(),
@@ -131,31 +114,13 @@ mod metadata {
     fn bootstrap_rejection_re_elects_and_version_changes_never_mix_pages() {
         let queue = Rc::new(drivers::DriverQueue::default());
         let _owner = queue.enter();
-        use crate::read::metadata::{MetadataDependencies, MetadataService};
         let mut f = fixture();
         use crate::test_support::origin::{AdapterOrigin, RequestKind};
         let adapter = AdapterOrigin::new("fixture", f.origin.metadata.clone());
         adapter.set_body(vec![1; 3]);
         adapter.reject_next(RequestKind::InitialGet, 403);
         let origin = adapter_client(&f, &adapter);
-        let service = MetadataService::new(
-            f.fill.dependencies.candidates.clone(),
-            origin.clone(),
-            f.fill.dependencies.credentials.clone(),
-            8,
-            MetadataDependencies {
-                index: Rc::new(Index::new(
-                    WorkerId(0),
-                    8,
-                    crate::control::state::for_caches(
-                        f.keys.clone(),
-                        vec![f.context.object.cache.clone()],
-                    ),
-                )),
-                fill: Rc::new(Fill::new(f.fill.dependencies.clone())),
-                owners: f.fill.dependencies.metadata_owner.clone(),
-            },
-        );
+        let service = f.metadata_service_with_index(origin, 8, f.metadata_index(8));
         let second_scope = RequestScope::new(RequestId([93; 16]), f.scope.deadline.0).unwrap();
         let second_context = OriginContext {
             object: f.context.object.clone(),
@@ -312,10 +277,7 @@ mod metadata {
     fn bootstrap_after_catalog_eviction_checks_cached_content_type_and_preserves_fresh_expiry() {
         let queue = Rc::new(drivers::DriverQueue::default());
         let _owner = queue.enter();
-        use crate::{
-            model::ContentType,
-            read::metadata::{MetadataDependencies, MetadataService},
-        };
+        use crate::model::ContentType;
         for with_origin_page in [false, true] {
             for (cached_type, fresh_type, conflict) in [
                 (Some("text/plain"), Some("text/html"), true),
@@ -327,18 +289,7 @@ mod metadata {
             ] {
                 let mut f = fixture();
                 let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
-                let mut cached = drive(
-                    f.fill.acquire(
-                        f.page.clone(),
-                        f.membership.clone(),
-                        &f.context,
-                        &f.scope,
-                        &mut budget,
-                    ),
-                    &mut f.engine,
-                    &f.crypto,
-                )
-                .unwrap();
+                let mut cached = acquire(&mut f, &mut budget).unwrap();
                 // Retain real authenticated buffers with a historical descriptor in
                 // memory, independently of the evictable page-zero catalog.
                 cached.metadata.content_type =
@@ -349,14 +300,7 @@ mod metadata {
                     .remove_cache(&f.context.object.cache)
                     .unwrap();
                 f.fill.dependencies.memory.publish(cached.clone()).unwrap();
-                let index = Rc::new(Index::new(
-                    WorkerId(0),
-                    4,
-                    crate::control::state::for_caches(
-                        f.keys.clone(),
-                        vec![f.context.object.cache.clone()],
-                    ),
-                ));
+                let index = f.metadata_index(4);
                 index.publish_version(cached.metadata.immutable()).unwrap();
                 assert_eq!(index.evict_metadata(1).unwrap(), 1);
                 assert!(index.version(&f.page.version).unwrap().is_none());
@@ -386,17 +330,7 @@ mod metadata {
                     receive: RefCell::new(Some(receive)),
                     calls: Cell::new(0),
                 });
-                let service = MetadataService::new(
-                    f.fill.dependencies.candidates.clone(),
-                    origin.clone(),
-                    f.fill.dependencies.credentials.clone(),
-                    4,
-                    MetadataDependencies {
-                        index: index.clone(),
-                        owners: f.fill.dependencies.metadata_owner.clone(),
-                        fill: Rc::new(Fill::new(f.fill.dependencies.clone())),
-                    },
-                );
+                let service = f.metadata_service_with_index(origin.clone(), 4, index.clone());
                 send.send(MetadataReply {
                     metadata: fresh.clone(),
                     page_zero,
@@ -812,32 +746,13 @@ mod pressure {
         let dependencies = &f.fill.dependencies;
         assert_eq!(dependencies.writer.queued_count(), 1);
         assert_eq!(dependencies.memory.evict_idle(usize::MAX), Ok(0));
-        use crate::{
-            read::metadata::{MetadataDependencies, MetadataService},
-            test_support::origin::{AdapterOrigin, RequestKind},
-        };
+        use crate::test_support::origin::{AdapterOrigin, RequestKind};
         let mut metadata = f.origin.metadata.clone();
         metadata.version.etag = StrongEtag::test_value("empty");
         metadata.length = 0;
         let adapter = AdapterOrigin::new("fixture", metadata.clone());
-        let service = MetadataService::new(
-            dependencies.candidates.clone(),
-            adapter_client(&f, &adapter),
-            dependencies.credentials.clone(),
-            8,
-            MetadataDependencies {
-                index: Rc::new(Index::new(
-                    WorkerId(0),
-                    8,
-                    crate::control::state::for_caches(
-                        f.keys.clone(),
-                        vec![f.context.object.cache.clone()],
-                    ),
-                )),
-                fill: Rc::new(Fill::new(dependencies.clone())),
-                owners: dependencies.metadata_owner.clone(),
-            },
-        );
+        let service =
+            f.metadata_service_with_index(adapter_client(&f, &adapter), 8, f.metadata_index(8));
         let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
         let response = drive_io(
             service.bootstrap_peer(f.membership.clone(), &f.context, &f.scope, &mut budget),
@@ -1303,10 +1218,30 @@ impl Drop for Fixture {
     }
 }
 impl Fixture {
+    fn metadata_index(&self, capacity: usize) -> Rc<Index> {
+        Rc::new(Index::new(
+            WorkerId(0),
+            capacity,
+            crate::control::state::for_caches(
+                self.keys.clone(),
+                vec![self.context.object.cache.clone()],
+            ),
+        ))
+    }
+
     fn metadata_service(
         &self,
         origin: Rc<dyn Origin>,
         capacity: usize,
+    ) -> super::super::metadata::MetadataService {
+        self.metadata_service_with_index(origin, capacity, self.metadata_index(4))
+    }
+
+    fn metadata_service_with_index(
+        &self,
+        origin: Rc<dyn Origin>,
+        capacity: usize,
+        index: Rc<Index>,
     ) -> super::super::metadata::MetadataService {
         use super::super::metadata::{MetadataDependencies, MetadataService};
         MetadataService::new(
@@ -1315,19 +1250,108 @@ impl Fixture {
             self.fill.dependencies.credentials.clone(),
             capacity,
             MetadataDependencies {
-                index: Rc::new(Index::new(
-                    WorkerId(0),
-                    4,
-                    crate::control::state::for_caches(
-                        self.keys.clone(),
-                        vec![self.context.object.cache.clone()],
-                    ),
-                )),
+                index,
                 owners: self.fill.dependencies.metadata_owner.clone(),
                 fill: Rc::new(self.fill.clone()),
             },
         )
     }
+
+    // Keep graph sizing explicit: cold-copy and hot-range scenarios deliberately
+    // use different catalog, delivery, and acquisition bounds.
+    fn read_graph(
+        &self,
+        fill: Rc<Fill>,
+        membership: &MembershipLease,
+        settings: ReadGraphSettings,
+    ) -> (
+        Rc<crate::read::Coordinator>,
+        crate::read::dispatch::WorkerEndpoint,
+        Arc<crate::control::state::PublishedState>,
+    ) {
+        use crate::{
+            control::{
+                state::{Availability, CacheDefinition, PublishedState, SnapshotStore},
+                wire::*,
+            },
+            memory::{delivery::Delivery, pipe::PipePool},
+            read::{
+                Coordinator,
+                metadata::{MetadataDependencies, MetadataService},
+                range_stream::RangeStreams,
+            },
+        };
+        let published = Arc::new(PublishedState::default());
+        let availability = Rc::new(Availability::new(published.clone(), self.keys.clone()));
+        let snapshots = Rc::new(SnapshotStore::new(
+            self.keys.cluster().clone(),
+            published.clone(),
+            settings.snapshots,
+        ));
+        let (client_socket, origin_socket) =
+            crate::control::state::canonical_socket_paths(settings.name).unwrap();
+        snapshots
+            .publish(Publication {
+                schema_version: SCHEMA_VERSION,
+                cluster: self.keys.cluster().clone(),
+                sequence: PublicationSequence(1),
+                membership_version: membership.version,
+                members: membership.members().to_vec(),
+                caches: vec![CacheDefinition {
+                    id: self.context.object.cache.clone(),
+                    name: settings.name.into(),
+                    client_socket,
+                    origin_socket,
+                }],
+            })
+            .unwrap();
+        let owners = fill.dependencies.metadata_owner.clone();
+        let metadata = Rc::new(MetadataService::new(
+            fill.dependencies.candidates.clone(),
+            self.origin.clone(),
+            fill.dependencies.credentials.clone(),
+            settings.metadata,
+            MetadataDependencies {
+                index: Rc::new(Index::new(
+                    WorkerId(0),
+                    settings.metadata,
+                    availability.clone(),
+                )),
+                owners: owners.clone(),
+                fill: fill.clone(),
+            },
+        ));
+        if let Some(version) = settings.seed {
+            metadata.publish_version(version).unwrap();
+        }
+        let delivery = Rc::new(Delivery::new(
+            Rc::new(PipePool::new(
+                fill.dependencies.admission.clone(),
+                self.reactor.clone(),
+            )),
+            settings.stall,
+        ));
+        let streams = Rc::new(RangeStreams::new(owners.clone(), delivery, settings.window));
+        let local = Rc::new(Coordinator::new(
+            snapshots,
+            metadata,
+            fill.clone(),
+            streams,
+            fill.dependencies.credentials.clone(),
+            availability,
+        ));
+        let endpoint = owners.install(WorkerId(0), local.clone()).unwrap();
+        (local, endpoint, published)
+    }
+}
+
+struct ReadGraphSettings {
+    name: &'static str,
+    snapshots: usize,
+    metadata: usize,
+    window: usize,
+    stall: Duration,
+    seed: Option<crate::model::VersionMetadata>,
 }
 fn pump_worker(
     endpoint: &mut crate::read::dispatch::WorkerEndpoint,
@@ -1344,6 +1368,20 @@ fn pump_worker(
 }
 fn fixture() -> Fixture {
     fixture_with(3, None)
+}
+
+fn acquire(f: &mut Fixture, budget: &mut AcquisitionBudget) -> Result<PageResult> {
+    drive(
+        f.fill.acquire(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            budget,
+        ),
+        &mut f.engine,
+        &f.crypto,
+    )
 }
 fn fixture_with(length: u64, limits: Option<crate::model::Limits>) -> Fixture {
     fixture_with_caches(
@@ -1646,18 +1684,7 @@ fn abandoned_acquisition_preserves_peer_scope(metadata: bool) {
         );
         assert_eq!(queue.pending(), 0);
         let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
-        let result = drive(
-            f.fill.acquire(
-                f.page.clone(),
-                f.membership.clone(),
-                &f.context,
-                &f.scope,
-                &mut budget,
-            ),
-            &mut f.engine,
-            &f.crypto,
-        )
-        .unwrap();
+        let result = acquire(&mut f, &mut budget).unwrap();
         assert_eq!(result.plaintext.bytes(), b"abc");
     }
 }
@@ -1833,18 +1860,7 @@ fn ordinary_publication_rejects_foreign_worker_charges() {
     let mut source = fixture();
     let target = fixture();
     let mut budget = AcquisitionBudget::new(source.scope.deadline.0, 8, 16);
-    let page = drive(
-        source.fill.acquire(
-            source.page.clone(),
-            source.membership.clone(),
-            &source.context,
-            &source.scope,
-            &mut budget,
-        ),
-        &mut source.engine,
-        &source.crypto,
-    )
-    .unwrap();
+    let page = acquire(&mut source, &mut budget).unwrap();
     assert!(matches!(
         target.fill.dependencies.memory.publish(page.clone()),
         Err(Error::InvalidConfiguration)
@@ -1882,18 +1898,7 @@ fn cached_corrupt_ciphertext_falls_back_without_exposing_plaintext() {
     let _owner = queue.enter();
     let mut f = fixture();
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
-    let result = drive(
-        f.fill.acquire(
-            f.page.clone(),
-            f.membership.clone(),
-            &f.context,
-            &f.scope,
-            &mut budget,
-        ),
-        &mut f.engine,
-        &f.crypto,
-    )
-    .unwrap();
+    let result = acquire(&mut f, &mut budget).unwrap();
     let mut bytes = result.ciphertext.bytes().to_vec();
     bytes[0] ^= 1;
     let copy = crate::memory::page::CiphertextCopy {
@@ -1934,18 +1939,7 @@ fn cached_corrupt_ciphertext_falls_back_without_exposing_plaintext() {
     let metrics = Metrics::default();
     f.fill.metrics = metrics.clone();
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
-    let result = drive(
-        f.fill.acquire(
-            f.page.clone(),
-            f.membership.clone(),
-            &f.context,
-            &f.scope,
-            &mut budget,
-        ),
-        &mut f.engine,
-        &f.crypto,
-    )
-    .unwrap();
+    let result = acquire(&mut f, &mut budget).unwrap();
     assert_eq!(result.plaintext.bytes(), b"abc");
     assert_eq!(
         metrics.count(Event::PageDecrypt),
@@ -1966,18 +1960,7 @@ fn ciphertext_ready_promotes_once_for_concurrent_plaintext_readers() {
     let metrics = Metrics::default();
     f.fill.metrics = metrics.clone();
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
-    let original = drive(
-        f.fill.acquire(
-            f.page.clone(),
-            f.membership.clone(),
-            &f.context,
-            &f.scope,
-            &mut budget,
-        ),
-        &mut f.engine,
-        &f.crypto,
-    )
-    .unwrap();
+    let original = acquire(&mut f, &mut budget).unwrap();
     assert_eq!(f.origin.calls.get(), 1);
     let copy = original.copy();
     drop(original);
@@ -2082,6 +2065,7 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
         panic!("expected copy registration")
     };
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
+    // The retained waiter borrows context/scope, so drive only the engine mutably.
     let original = drive(
         f.fill.acquire(
             f.page.clone(),
@@ -2178,74 +2162,21 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
     {
         use crate::{
             client::{ClientRequest, ReadKind},
-            control::{
-                state::CacheDefinition,
-                state::{PublishedState, SnapshotStore},
-                wire::*,
-            },
-            memory::{delivery::Delivery, pipe::PipePool},
             model::ByteRange,
-            read::{
-                Coordinator, ReadService,
-                metadata::{MetadataDependencies, MetadataService},
-                range_stream::RangeStreams,
-            },
+            read::ReadService,
         };
-        let published = Arc::new(PublishedState::default());
-        let availability = Rc::new(crate::control::state::Availability::new(
-            published.clone(),
-            f.keys.clone(),
-        ));
-        let snapshots = Rc::new(SnapshotStore::new(f.keys.cluster().clone(), published, 2));
-        let (client_socket, origin_socket) =
-            crate::control::state::canonical_socket_paths("rotation").unwrap();
-        snapshots
-            .publish(Publication {
-                schema_version: SCHEMA_VERSION,
-                cluster: f.keys.cluster().clone(),
-                sequence: PublicationSequence(1),
-                membership_version: f.membership.version,
-                members: f.membership.members().to_vec(),
-                caches: vec![CacheDefinition {
-                    id: f.context.object.cache.clone(),
-                    name: "rotation".into(),
-                    client_socket,
-                    origin_socket,
-                }],
-            })
-            .unwrap();
-        let fill = Rc::new(Fill::new(f.fill.dependencies.clone()));
-        let owners = fill.dependencies.metadata_owner.clone();
-        let metadata = Rc::new(MetadataService::new(
-            fill.dependencies.candidates.clone(),
-            f.origin.clone(),
-            fill.dependencies.credentials.clone(),
-            16,
-            MetadataDependencies {
-                index: Rc::new(Index::new(WorkerId(0), 16, availability.clone())),
-                owners: owners.clone(),
-                fill: fill.clone(),
+        let (coordinator, mut endpoint, _) = f.read_graph(
+            Rc::new(Fill::new(f.fill.dependencies.clone())),
+            &f.membership,
+            ReadGraphSettings {
+                name: "rotation",
+                snapshots: 2,
+                metadata: 16,
+                window: 1,
+                stall: Duration::from_secs(10),
+                seed: Some(original.metadata.immutable()),
             },
-        ));
-        metadata
-            .publish_version(original.metadata.immutable())
-            .unwrap();
-        let admission = fill.dependencies.admission.clone();
-        let reactor = Rc::new(Reactor::new(admission.clone()));
-        let delivery = Rc::new(Delivery::new(
-            Rc::new(PipePool::new(admission, reactor)),
-            Duration::from_secs(10),
-        ));
-        let streams = Rc::new(RangeStreams::new(owners.clone(), delivery, 1));
-        let coordinator = Rc::new(Coordinator::new(
-            snapshots,
-            metadata,
-            fill.clone(),
-            streams,
-            fill.dependencies.credentials.clone(),
-            availability,
-        ));
-        let mut endpoint = owners.install(WorkerId(0), coordinator.clone()).unwrap();
+        );
         for ordered in [false, true] {
             let kind = ReadKind::Subscription {
                 pin: Some(f.page.version.etag.clone()),
@@ -2527,18 +2458,7 @@ fn cold_disk_fixture() -> Fixture {
     f.reactor.init().unwrap();
     futures::executor::block_on(f.fill.dependencies.writer.open()).unwrap();
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
-    let original = drive(
-        f.fill.acquire(
-            f.page.clone(),
-            f.membership.clone(),
-            &f.context,
-            &f.scope,
-            &mut budget,
-        ),
-        &mut f.engine,
-        &f.crypto,
-    )
-    .unwrap();
+    let original = acquire(&mut f, &mut budget).unwrap();
     assert_eq!(
         drive_disk(&f, f.fill.dependencies.writer.progress(1, &f.scope)).unwrap(),
         1
@@ -2949,18 +2869,7 @@ fn lookup_plaintext_and_pending_hits_do_not_probe_disk() {
     let mut f = fixture();
     assert!(f.fill.cached_page(&f.page, &f.scope).unwrap().is_none());
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
-    let page = drive(
-        f.fill.acquire(
-            f.page.clone(),
-            f.membership.clone(),
-            &f.context,
-            &f.scope,
-            &mut budget,
-        ),
-        &mut f.engine,
-        &f.crypto,
-    )
-    .unwrap();
+    let page = acquire(&mut f, &mut budget).unwrap();
     assert!(f.fill.cached_page(&f.page, &f.scope).unwrap().is_some());
     assert_eq!(f.fill.metrics.count(Event::PlaintextLookupHit), 1);
     assert_eq!(f.fill.metrics.count(Event::PlaintextLookupMiss), 2);
@@ -3068,18 +2977,7 @@ fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
     f.reactor.init().unwrap();
     futures::executor::block_on(f.fill.dependencies.writer.open()).unwrap();
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
-    let original = drive(
-        f.fill.acquire(
-            f.page.clone(),
-            f.membership.clone(),
-            &f.context,
-            &f.scope,
-            &mut budget,
-        ),
-        &mut f.engine,
-        &f.crypto,
-    )
-    .unwrap();
+    let original = acquire(&mut f, &mut budget).unwrap();
     let expected = original.ciphertext.bytes().to_vec();
     let envelope = original.ciphertext.envelope().clone();
     let metadata = original.metadata.clone();
@@ -3113,12 +3011,7 @@ fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
     );
     let failures = crate::telemetry::failures::Failures::default();
     deps.admission.set_observer(failures.observer(WorkerId(0)));
-    use crate::read::metadata::{MetadataDependencies, MetadataService};
-    let index = Rc::new(Index::new(
-        WorkerId(0),
-        64,
-        crate::control::state::for_caches(f.keys.clone(), vec![f.context.object.cache.clone()]),
-    ));
+    let index = f.metadata_index(64);
     let mut fresh = metadata.clone();
     fresh.expires_at = ExpiresAt::from_unix_millis(
         std::time::SystemTime::now()
@@ -3129,17 +3022,7 @@ fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
     )
     .unwrap();
     index.publish_current(fresh).unwrap();
-    let service = MetadataService::new(
-        deps.candidates.clone(),
-        deps.origin.clone(),
-        deps.credentials.clone(),
-        64,
-        MetadataDependencies {
-            index,
-            owners: deps.metadata_owner.clone(),
-            fill: Rc::new(Fill::new(deps.clone())),
-        },
-    );
+    let service = f.metadata_service_with_index(deps.origin.clone(), 64, index);
     let read_copy = || -> crate::error::Operation<'_, (ObjectMetadata, CiphertextPage)> {
         Box::pin(async {
             if bootstrap {
@@ -3266,17 +3149,7 @@ fn copy_only_miss_has_no_origin_side_effect_and_wrong_context_never_joins() {
     f.context.object.key = CacheKey([1; 32]);
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
     assert!(matches!(
-        drive(
-            f.fill.acquire(
-                f.page.clone(),
-                f.membership.clone(),
-                &f.context,
-                &f.scope,
-                &mut budget
-            ),
-            &mut f.engine,
-            &f.crypto
-        ),
+        acquire(&mut f, &mut budget),
         Err(Error::InvalidRequest)
     ));
     assert_eq!(budget.remaining_attempts(), 4);
