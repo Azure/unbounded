@@ -98,10 +98,10 @@ func TestHTTPServer_ServeFiles(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-serve"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:01", IPv4: "10.0.1.50", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
@@ -236,11 +236,11 @@ func TestHTTPServer_HTTPBootLoaderRequiresActiveInstallOperation(t *testing.T) {
 			node := &v1alpha3.Machine{
 				ObjectMeta: metav1.ObjectMeta{Name: "node-http"},
 				Spec: v1alpha3.MachineSpec{
-					PXE: &v1alpha3.PXESpec{
+					Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 						Image:        "ghcr.io/test/image:v1",
 						BootProtocol: v1alpha3.PXEBootProtocolHTTP,
 						DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:10", IPv4: "10.0.1.60", SubnetMask: "255.255.255.0"}},
-					},
+					}},
 				},
 			}
 
@@ -313,11 +313,11 @@ func TestHTTPServer_MissingOptionalShimRevocationsFilesHTTPBoot(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-revocations"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:        "ghcr.io/test/image:v1",
 				BootProtocol: v1alpha3.PXEBootProtocolHTTP,
 				DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:11", IPv4: "10.0.1.61", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
@@ -382,10 +382,10 @@ func TestHTTPServer_MissingShimRevocationsFilePXEStill404(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-pxe-revocations"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:12", IPv4: "10.0.1.62", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
@@ -420,7 +420,7 @@ func TestHTTPServer_MissingShimRevocationsFilePXEStill404(t *testing.T) {
 func TestHTTPServer_TemplateRendered(t *testing.T) {
 	bootTemplate := `set default=0
 menuentry "Install" {
-  linux /vmlinuz hostname={{ .Machine.Name }} ip={{ (index .Machine.Spec.PXE.DHCPLeases 0).IPv4 }}
+  linux /vmlinuz hostname={{ .Machine.Name }} ip={{ (index .Machine.Spec.Host.Netboot.DHCPLeases 0).IPv4 }}
 }`
 
 	cache := setupOCICache(t, "ghcr.io/test/image:v1", "tmpl123", map[string][]byte{
@@ -430,10 +430,10 @@ menuentry "Install" {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-01"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f0", IPv4: "10.0.1.10", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
@@ -497,10 +497,10 @@ func TestHTTPServer_TemplateVerbatim(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-verbatim"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:02", IPv4: "10.0.1.51", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
@@ -555,10 +555,10 @@ func TestHTTPServer_StaticFile(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-static"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:03", IPv4: "10.0.1.52", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
@@ -651,7 +651,7 @@ func TestTFTPServerRecordsOnlyInitialBootLoader(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "machine-1"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{},
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{}},
 		},
 	}
 	server := &TFTPServer{
@@ -683,7 +683,7 @@ func TestTFTPServerRecordsInitialBootLoaderForTargetArchitecture(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "machine-arm"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{Architecture: v1alpha3.PXEArchitectureARM64},
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{Architecture: v1alpha3.PXEArchitectureARM64}},
 		},
 	}
 	server := &TFTPServer{
@@ -708,10 +708,10 @@ func TestHTTPServerDoesNotRecordBootImageWriteOnFileDownload(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-serve"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:01", IPv4: "10.0.1.50", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
@@ -777,10 +777,10 @@ func TestHTTPServer_UsesMachineImageForBootFilesWhenNetbootImageUnset(t *testing
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-serve"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:01", IPv4: "10.0.1.50", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
@@ -1033,7 +1033,7 @@ func TestGrubTemplate_NoInstallRequested(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-no-operations", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				TargetDisk: "/dev/disk/by-id/test-os-disk",
 				DHCPLeases: []v1alpha3.DHCPLease{{
 					IPv4:       "10.0.1.20",
@@ -1042,7 +1042,7 @@ func TestGrubTemplate_NoInstallRequested(t *testing.T) {
 					SubnetMask: "255.255.255.0",
 					DNS:        []string{"10.0.1.53", "10.0.1.54"},
 				}},
-			},
+			}},
 		},
 	}
 
@@ -1084,7 +1084,7 @@ func TestNetworkConfigTemplate_SelectsBootLease(t *testing.T) {
 
 	node := &v1alpha3.Machine{
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				DHCPLeases: []v1alpha3.DHCPLease{
 					{IPv4: "10.0.1.20", MAC: "aa:bb:cc:dd:ee:20", Gateway: "10.0.1.1", SubnetMask: "255.255.255.0"},
 					{
@@ -1095,7 +1095,7 @@ func TestNetworkConfigTemplate_SelectsBootLease(t *testing.T) {
 						DNS:        []string{"10.0.2.53", "2001:db8::53"},
 					},
 				},
-			},
+			}},
 		},
 	}
 
@@ -1127,9 +1127,9 @@ func TestNetworkConfigTemplate_InvalidSubnetMask(t *testing.T) {
 	networkTmpl, err := os.ReadFile(filepath.Join("..", "..", "..", "images", "netboot", "assets", "network-config.tmpl"))
 	require.NoError(t, err)
 
-	node := &v1alpha3.Machine{Spec: v1alpha3.MachineSpec{PXE: &v1alpha3.PXESpec{DHCPLeases: []v1alpha3.DHCPLease{{
+	node := &v1alpha3.Machine{Spec: v1alpha3.MachineSpec{Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{DHCPLeases: []v1alpha3.DHCPLease{{
 		IPv4: "10.0.1.20", MAC: "aa:bb:cc:dd:ee:20", Gateway: "10.0.1.1", SubnetMask: "255.0.255.0",
-	}}}}}
+	}}}}}}
 
 	_, err = renderTemplate(string(networkTmpl), newTemplateData(node, ClusterInfo{}, "", "", "10.0.1.20", true))
 	require.ErrorContains(t, err, "non-contiguous IPv4 subnet mask")
@@ -1146,10 +1146,10 @@ func TestHTTPServer_NetworkConfigOmitsGatewayAndInvalidDNS(t *testing.T) {
 	})
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-on-link"},
-		Spec: v1alpha3.MachineSpec{PXE: &v1alpha3.PXESpec{DHCPLeases: []v1alpha3.DHCPLease{{
+		Spec: v1alpha3.MachineSpec{Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{DHCPLeases: []v1alpha3.DHCPLease{{
 			IPv4: "10.0.1.20", MAC: "aa:bb:cc:dd:ee:20", SubnetMask: "255.255.255.0",
 			DNS: []string{"not-an-address", "10.0.1.53"},
-		}}}},
+		}}}}},
 	}
 	fc := fake.NewClientBuilder().
 		WithScheme(newScheme(t)).
@@ -1200,12 +1200,12 @@ func TestGrubTemplate_SelectsBootLeaseByRequestIP(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-multi-lease", Namespace: "default"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				DHCPLeases: []v1alpha3.DHCPLease{
 					{IPv4: "10.0.1.20", MAC: "aa:bb:cc:dd:ee:20", Gateway: "10.0.1.1", SubnetMask: "255.255.255.0"},
 					{IPv4: "10.0.1.21", MAC: "aa:bb:cc:dd:ee:21", Gateway: "10.0.1.1", SubnetMask: "255.255.255.0"},
 				},
-			},
+			}},
 		},
 	}
 
@@ -1504,7 +1504,7 @@ func TestResolveFileByPath_UserDataFromConfigMap(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-cm-ud"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:40", IPv4: "10.0.8.10", SubnetMask: "255.255.255.0"}},
 				CloudInit: &v1alpha3.CloudInitSpec{
@@ -1514,7 +1514,7 @@ func TestResolveFileByPath_UserDataFromConfigMap(t *testing.T) {
 						Key:       "user-data",
 					},
 				},
-			},
+			}},
 		},
 	}
 
@@ -1553,10 +1553,10 @@ func TestResolveFileByPath_UserDataFallsBackToDefault(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-no-cm"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:41", IPv4: "10.0.8.11", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
@@ -1610,7 +1610,7 @@ func TestResolveFileByPath_UserDataConfigMapCustomKey(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-custom-key"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:42", IPv4: "10.0.8.12", SubnetMask: "255.255.255.0"}},
 				CloudInit: &v1alpha3.CloudInitSpec{
@@ -1620,7 +1620,7 @@ func TestResolveFileByPath_UserDataConfigMapCustomKey(t *testing.T) {
 						Key:       "my-custom-key",
 					},
 				},
-			},
+			}},
 		},
 	}
 
@@ -1659,7 +1659,7 @@ func TestResolveFileByPath_UserDataConfigMapMissing(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-cm-missing"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:43", IPv4: "10.0.8.13", SubnetMask: "255.255.255.0"}},
 				CloudInit: &v1alpha3.CloudInitSpec{
@@ -1668,7 +1668,7 @@ func TestResolveFileByPath_UserDataConfigMapMissing(t *testing.T) {
 						Namespace: "default",
 					},
 				},
-			},
+			}},
 		},
 	}
 
@@ -1703,7 +1703,7 @@ func TestResolveFileByPath_UserDataConfigMapGetError(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-cm-err"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:45", IPv4: "10.0.8.15", SubnetMask: "255.255.255.0"}},
 				CloudInit: &v1alpha3.CloudInitSpec{
@@ -1712,7 +1712,7 @@ func TestResolveFileByPath_UserDataConfigMapGetError(t *testing.T) {
 						Namespace: "default",
 					},
 				},
-			},
+			}},
 		},
 	}
 
@@ -1766,7 +1766,7 @@ func TestResolveFileByPath_UserDataConfigMapMissingKey(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-cm-nokey"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:44", IPv4: "10.0.8.14", SubnetMask: "255.255.255.0"}},
 				CloudInit: &v1alpha3.CloudInitSpec{
@@ -1776,7 +1776,7 @@ func TestResolveFileByPath_UserDataConfigMapMissingKey(t *testing.T) {
 						Key:       "user-data",
 					},
 				},
-			},
+			}},
 		},
 	}
 
@@ -1822,7 +1822,7 @@ func TestResolveFileByPath_UserDataFromBinaryData(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-bindata"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:60", IPv4: "10.0.10.10", SubnetMask: "255.255.255.0"}},
 				CloudInit: &v1alpha3.CloudInitSpec{
@@ -1831,7 +1831,7 @@ func TestResolveFileByPath_UserDataFromBinaryData(t *testing.T) {
 						Namespace: "default",
 					},
 				},
-			},
+			}},
 		},
 	}
 
@@ -1866,7 +1866,7 @@ func TestHTTPServer_UserDataConfigMapMissing(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-http-cm-miss"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:51", IPv4: "10.0.9.11", SubnetMask: "255.255.255.0"}},
 				CloudInit: &v1alpha3.CloudInitSpec{
@@ -1875,7 +1875,7 @@ func TestHTTPServer_UserDataConfigMapMissing(t *testing.T) {
 						Namespace: "default",
 					},
 				},
-			},
+			}},
 		},
 	}
 
@@ -1942,7 +1942,7 @@ func TestHTTPServer_UserDataFromConfigMap(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-http-ud"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:50", IPv4: "10.0.9.10", SubnetMask: "255.255.255.0"}},
 				CloudInit: &v1alpha3.CloudInitSpec{
@@ -1952,7 +1952,7 @@ func TestHTTPServer_UserDataFromConfigMap(t *testing.T) {
 						Key:       "user-data",
 					},
 				},
-			},
+			}},
 		},
 	}
 
@@ -2269,10 +2269,10 @@ menuentry "Install {{ .Machine.Name }}" {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "e2e-node"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/e2e:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:00:11:22", IPv4: "10.0.3.10", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
@@ -2368,11 +2368,11 @@ func TestHTTPServer_RoutesDiskFromMachineImageAndBootFromNetbootImage(t *testing
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "split-node"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:        "ghcr.io/test/machine:v1",
 				NetbootImage: "ghcr.io/test/netboot:v1",
 				DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:80", IPv4: "10.0.30.10", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
@@ -2434,21 +2434,21 @@ func TestHTTPServer_CrossImageIsolation(t *testing.T) {
 	alphaNode := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "alpha-node"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:        "ghcr.io/test/alpha:v1",
 				NetbootImage: "ghcr.io/test/alpha:v1",
 				DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "aa:aa:aa:aa:aa:aa", IPv4: "10.0.10.1", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 	betaNode := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "beta-node"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:        "ghcr.io/test/beta:v1",
 				NetbootImage: "ghcr.io/test/beta:v1",
 				DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "bb:bb:bb:bb:bb:bb", IPv4: "10.0.10.2", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
@@ -2528,23 +2528,23 @@ func TestHTTPServer_UsesMachineArchitectureForSameImageRef(t *testing.T) {
 	amd64Node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "amd64-node"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:        imageRef,
 				NetbootImage: imageRef,
 				Architecture: v1alpha3.PXEArchitectureAMD64,
 				DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "aa:aa:aa:aa:aa:01", IPv4: "10.0.20.1", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 	arm64Node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "arm64-node"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:        imageRef,
 				NetbootImage: imageRef,
 				Architecture: v1alpha3.PXEArchitectureARM64,
 				DHCPLeases:   []v1alpha3.DHCPLease{{MAC: "aa:aa:aa:aa:aa:02", IPv4: "10.0.20.2", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
@@ -2597,10 +2597,10 @@ func TestHTTPServer_503WhenFileNotDownloaded(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "pending-node"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/pending:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:10", IPv4: "10.0.5.10", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
@@ -2663,10 +2663,10 @@ func TestHTTPServer_DisablePXE(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "pxe-node"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:20", IPv4: "10.0.6.10", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
@@ -2733,10 +2733,10 @@ func TestHTTPServer_DisablePXE_RecordFailure(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "pxe-node"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:21", IPv4: "10.0.6.11", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
@@ -2849,7 +2849,7 @@ func TestFileResolverHTTPBootURL(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-http-url"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{Image: "ghcr.io/test/image:v1"},
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{Image: "ghcr.io/test/image:v1"}},
 		},
 	}
 
@@ -2867,7 +2867,7 @@ func TestFileResolverHTTPBootURLFallsBackToDHCPBootImageName(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-http-url"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{Image: "ghcr.io/test/image:v1"},
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{Image: "ghcr.io/test/image:v1"}},
 		},
 	}
 
@@ -3280,10 +3280,10 @@ func TestInstallLogEndpointAcceptsPlainTextWithoutRecordingCondition(t *testing.
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "install-log-node"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:78", IPv4: "10.0.20.18", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
@@ -3325,10 +3325,10 @@ func TestCloudInitCondition_StageStartSetsRunning(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "ci-start-node"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:70", IPv4: "10.0.20.10", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
@@ -3387,10 +3387,10 @@ func TestCloudInitCondition_FinalStageSuccessSetsTrue(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "ci-done-node"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:71", IPv4: "10.0.20.11", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
@@ -3453,10 +3453,10 @@ func TestCloudInitCondition_StageFailureSetsFailedWithDetails(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "ci-fail-node"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:72", IPv4: "10.0.20.12", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
@@ -3590,10 +3590,10 @@ func TestCloudInitCondition_StatusUpdateError(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "ci-update-err-node"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:75", IPv4: "10.0.20.15", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
@@ -3643,10 +3643,10 @@ func TestCloudInitCondition_FullLifecycle(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "ci-lifecycle-node"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:73", IPv4: "10.0.20.13", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
@@ -3740,10 +3740,10 @@ func TestHTTPServerRecordsCloudInitDoneOnlyOnFinalSuccess(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "ci-operation-node"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:76", IPv4: "10.0.20.16", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
@@ -3799,10 +3799,10 @@ func TestHTTPServerDoesNotRecordCloudInitDoneOnFailure(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "ci-operation-fail-node"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Image:      "ghcr.io/test/image:v1",
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:77", IPv4: "10.0.20.17", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 

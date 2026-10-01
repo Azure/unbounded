@@ -28,13 +28,13 @@ func TestDHCPHandler(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-01"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{DHCPLeases: []v1alpha3.DHCPLease{{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{DHCPLeases: []v1alpha3.DHCPLease{{
 				MAC:        "aa:bb:cc:dd:ee:f0",
 				IPv4:       "10.0.1.10",
 				SubnetMask: "255.255.255.0",
 				Gateway:    "10.0.1.1",
 				DNS:        []string{"1.1.1.1", "8.8.8.8"},
-			}}},
+			}}}},
 		},
 	}
 
@@ -113,11 +113,11 @@ func TestDHCPHandlerPXE(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-02"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{Image: machineImageRef, NetbootImage: netbootImageRef, DHCPLeases: []v1alpha3.DHCPLease{{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{Image: machineImageRef, NetbootImage: netbootImageRef, DHCPLeases: []v1alpha3.DHCPLease{{
 				MAC:        "aa:bb:cc:dd:ee:f1",
 				IPv4:       "10.0.1.11",
 				SubnetMask: "255.255.255.0",
-			}}},
+			}}}},
 		},
 	}
 
@@ -196,14 +196,14 @@ func TestDHCPHandlerPXEUsesDefaultNetbootImage(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-default-netboot"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				Architecture: v1alpha3.PXEArchitectureARM64,
 				DHCPLeases: []v1alpha3.DHCPLease{{
 					MAC:        "aa:bb:cc:dd:ee:f2",
 					IPv4:       "10.0.1.12",
 					SubnetMask: "255.255.255.0",
 				}},
-			},
+			}},
 		},
 	}
 
@@ -264,7 +264,7 @@ func TestDHCPHandlerHTTPBootSuppressesPXEBootOptions(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-http-boot"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				NetbootImage: netbootImageRef,
 				BootProtocol: v1alpha3.PXEBootProtocolHTTP,
 				DHCPLeases: []v1alpha3.DHCPLease{{
@@ -272,7 +272,7 @@ func TestDHCPHandlerHTTPBootSuppressesPXEBootOptions(t *testing.T) {
 					IPv4:       "10.0.1.13",
 					SubnetMask: "255.255.255.0",
 				}},
-			},
+			}},
 		},
 	}
 
@@ -339,7 +339,7 @@ func TestDHCPHandlerHTTPBootClientGetsHTTPBootURL(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-http-client-boot"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				NetbootImage: netbootImageRef,
 				BootProtocol: v1alpha3.PXEBootProtocolHTTP,
 				DHCPLeases: []v1alpha3.DHCPLease{{
@@ -347,7 +347,7 @@ func TestDHCPHandlerHTTPBootClientGetsHTTPBootURL(t *testing.T) {
 					IPv4:       "10.0.1.14",
 					SubnetMask: "255.255.255.0",
 				}},
-			},
+			}},
 		},
 	}
 
@@ -446,11 +446,11 @@ func TestDHCPHandlerRequest(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-01"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{DHCPLeases: []v1alpha3.DHCPLease{{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{DHCPLeases: []v1alpha3.DHCPLease{{
 				MAC:        "aa:bb:cc:dd:ee:f0",
 				IPv4:       "10.0.1.10",
 				SubnetMask: "255.255.255.0",
-			}}},
+			}}}},
 		},
 	}
 
@@ -509,11 +509,11 @@ func TestDHCPHandlerNoImageAllowsPXEDiscover(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-01"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{DHCPLeases: []v1alpha3.DHCPLease{{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{DHCPLeases: []v1alpha3.DHCPLease{{
 				MAC:        "aa:bb:cc:dd:ee:f0",
 				IPv4:       "10.0.1.10",
 				SubnetMask: "255.255.255.0",
-			}}},
+			}}}},
 		},
 	}
 
@@ -564,11 +564,11 @@ func TestDHCPHandlerNoImageAllowsHTTPBootDiscover(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-01"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{DHCPLeases: []v1alpha3.DHCPLease{{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{DHCPLeases: []v1alpha3.DHCPLease{{
 				MAC:        "aa:bb:cc:dd:ee:f0",
 				IPv4:       "10.0.1.10",
 				SubnetMask: "255.255.255.0",
-			}}},
+			}}}},
 		},
 	}
 
@@ -619,11 +619,11 @@ func TestDHCPHandlerPXEDisabledAllowsNonPXEDiscover(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-01"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{DHCPLeases: []v1alpha3.DHCPLease{{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{DHCPLeases: []v1alpha3.DHCPLease{{
 				MAC:        "aa:bb:cc:dd:ee:f0",
 				IPv4:       "10.0.1.10",
 				SubnetMask: "255.255.255.0",
-			}}},
+			}}}},
 		},
 	}
 
@@ -665,11 +665,11 @@ func TestDHCPHandlerRelayOnlyRejectsDirectPacket(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-01"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{DHCPLeases: []v1alpha3.DHCPLease{{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{DHCPLeases: []v1alpha3.DHCPLease{{
 				MAC:        "aa:bb:cc:dd:ee:f0",
 				IPv4:       "10.0.1.10",
 				SubnetMask: "255.255.255.0",
-			}}},
+			}}}},
 		},
 	}
 
@@ -703,11 +703,11 @@ func TestDHCPHandlerRelayAgent(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-01"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{DHCPLeases: []v1alpha3.DHCPLease{{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{DHCPLeases: []v1alpha3.DHCPLease{{
 				MAC:        "aa:bb:cc:dd:ee:f0",
 				IPv4:       "10.0.1.10",
 				SubnetMask: "255.255.255.0",
-			}}},
+			}}}},
 		},
 	}
 

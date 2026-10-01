@@ -138,11 +138,11 @@ func testLookupByIP(c client.Client) func(ctx context.Context, ip string) (*v1al
 		}
 
 		for i := range list.Items {
-			if list.Items[i].Spec.PXE == nil {
+			if list.Items[i].Spec.Netboot() == nil {
 				continue
 			}
 
-			for _, lease := range list.Items[i].Spec.PXE.DHCPLeases {
+			for _, lease := range list.Items[i].Spec.Host.Netboot.DHCPLeases {
 				if lease.IPv4 == ip {
 					return &list.Items[i], nil
 				}
@@ -297,9 +297,9 @@ func TestAttestTOFUStoresKey(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-01"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f0", IPv4: "10.0.1.10", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
@@ -349,9 +349,9 @@ func TestAttestTOFURejectsNewKey(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-tofu-reject"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f1", IPv4: "10.0.1.11", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
@@ -398,9 +398,9 @@ func TestAttestEKMismatch(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-03"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f2", IPv4: "10.0.1.12", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 		Status: v1alpha3.MachineStatus{
 			TPM: &v1alpha3.TPMStatus{EKPublicKey: otherPubPEM},
@@ -431,9 +431,9 @@ func TestAttestE2E(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-e2e"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:f3", IPv4: "10.0.1.13", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
@@ -491,9 +491,9 @@ func TestAttestMissingFields(t *testing.T) {
 	node := &v1alpha3.Machine{
 		ObjectMeta: metav1.ObjectMeta{Name: "node-badreq"},
 		Spec: v1alpha3.MachineSpec{
-			PXE: &v1alpha3.PXESpec{
+			Host: &v1alpha3.HostSpec{Netboot: &v1alpha3.PXESpec{
 				DHCPLeases: []v1alpha3.DHCPLease{{MAC: "aa:bb:cc:dd:ee:d0", IPv4: "10.0.1.60", SubnetMask: "255.255.255.0"}},
-			},
+			}},
 		},
 	}
 
