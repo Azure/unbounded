@@ -10,15 +10,7 @@ use std::{
 #[test]
 fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill() {
     let mut fixture = ControlFixture::new();
-    let mut config = fixture.config.take().unwrap();
-    let node = Arc::new(NodeState::new(vec![WorkerId(0), WorkerId(1)], 64).unwrap());
-    config.node = bootstrap(
-        &config,
-        &node,
-        &config.limits,
-        &scope(Duration::from_secs(15)).unwrap(),
-    )
-    .unwrap();
+    let (config, node) = fixture.bootstrap_node(2, Duration::from_secs(15));
     let (mut first, rt0, mut crypto0) = local_worker(&config, &node, 0);
     let (mut second, rt1, mut crypto1) = local_worker(&config, &node, 1);
     first
@@ -163,15 +155,7 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
 #[test]
 fn two_workers_start_from_real_control_and_checkpoint_one_complete_cut() {
     let mut fixture = ControlFixture::new();
-    let mut config = fixture.config.take().unwrap();
-    let node = Arc::new(NodeState::new(vec![WorkerId(0), WorkerId(1)], 64).unwrap());
-    config.node = bootstrap(
-        &config,
-        &node,
-        &config.limits,
-        &scope(Duration::from_secs(15)).unwrap(),
-    )
-    .unwrap();
+    let (config, node) = fixture.bootstrap_node(2, Duration::from_secs(15));
     let ready = std::sync::Barrier::new(2);
     thread::scope(|threads| {
         for id in 0..2 {
@@ -207,16 +191,8 @@ fn two_workers_start_from_real_control_and_checkpoint_one_complete_cut() {
 #[test]
 fn startup_finishes_local_snapshot_installation_while_next_long_poll_is_held() {
     let mut fixture = ControlFixture::new();
-    let mut config = fixture.config.take().unwrap();
     fixture.hold_long_poll.store(true, Ordering::Release);
-    let node = Arc::new(NodeState::new(vec![WorkerId(0), WorkerId(1)], 64).unwrap());
-    config.node = bootstrap(
-        &config,
-        &node,
-        &config.limits,
-        &scope(Duration::from_secs(5)).unwrap(),
-    )
-    .unwrap();
+    let (config, node) = fixture.bootstrap_node(2, Duration::from_secs(5));
     let finished = std::sync::Barrier::new(2);
     let results = thread::scope(|threads| {
         let mut handles = Vec::new();
@@ -305,15 +281,7 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
     }
 
     let mut fixture = ControlFixture::new();
-    let mut config = fixture.config.take().unwrap();
-    let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
-    config.node = bootstrap(
-        &config,
-        &node,
-        &config.limits,
-        &scope(Duration::from_secs(15)).unwrap(),
-    )
-    .unwrap();
+    let (config, node) = fixture.bootstrap_node(1, Duration::from_secs(15));
     // An already renewal-due, still valid certificate avoids advancing the TLS
     // server's host clock. A fresh 24-hour certificate covers the later virtual
     // expiry of this old certificate, and is also valid for real TLS handshakes.
@@ -676,16 +644,8 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
 #[test]
 fn startup_retries_tls_internal_error_before_enrollment_and_worker_snapshot() {
     let mut fixture = ControlFixture::new();
-    let mut config = fixture.config.take().unwrap();
-    let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
     fixture.handshake_alerts.lock().unwrap().push_back(80);
-    config.node = bootstrap(
-        &config,
-        &node,
-        &config.limits,
-        &scope(Duration::from_secs(15)).unwrap(),
-    )
-    .unwrap();
+    let (config, node) = fixture.bootstrap_node(1, Duration::from_secs(15));
     assert_eq!(fixture.enrollments.load(Ordering::Acquire), 1);
     assert_eq!(fixture.polls.load(Ordering::Acquire), 0);
     fixture.handshake_alerts.lock().unwrap().push_back(80);
@@ -785,15 +745,7 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
     use crate::runtime::affinity::{EffectiveTopology, WorkerPair};
     for renewal_due in [false, true] {
         let mut fixture = ControlFixture::new();
-        let mut config = fixture.config.take().unwrap();
-        let node = Arc::new(NodeState::new(vec![WorkerId(0), WorkerId(1)], 64).unwrap());
-        config.node = bootstrap(
-            &config,
-            &node,
-            &config.limits,
-            &scope(Duration::from_secs(15)).unwrap(),
-        )
-        .unwrap();
+        let (config, node) = fixture.bootstrap_node(2, Duration::from_secs(15));
         if renewal_due {
             fixture
                 .certificate_age
@@ -896,15 +848,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
         store::checkpoint,
     };
     let mut fixture = ControlFixture::new();
-    let mut config = fixture.config.take().unwrap();
-    let node = Arc::new(NodeState::new(vec![WorkerId(0), WorkerId(1)], 64).unwrap());
-    config.node = bootstrap(
-        &config,
-        &node,
-        &config.limits,
-        &scope(Duration::from_secs(15)).unwrap(),
-    )
-    .unwrap();
+    let (config, node) = fixture.bootstrap_node(2, Duration::from_secs(15));
     let keys = Keyring::new(
         config.cluster.clone(),
         config.node.clone(),
@@ -1034,15 +978,7 @@ fn drive<T>(
 #[test]
 fn blocked_publication_is_superseded_while_projection_rotates() {
     let mut fixture = ControlFixture::new();
-    let mut config = fixture.config.take().unwrap();
-    let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
-    config.node = bootstrap(
-        &config,
-        &node,
-        &config.limits,
-        &scope(Duration::from_secs(15)).unwrap(),
-    )
-    .unwrap();
+    let (config, node) = fixture.bootstrap_node(1, Duration::from_secs(15));
     let (mut worker, runtime, mut engine) = local_worker(&config, &node, 0);
     drive(
         &runtime,
@@ -1285,21 +1221,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     let startup = scope(Duration::from_secs(15)).unwrap();
     config.node = bootstrap(&config, &node, &config.limits, &startup).unwrap();
     assert_eq!(fixture.enrollments.load(Ordering::Acquire), 1);
-    let admission = Rc::new(Admission::new(config.limits.clone()));
-    let (io, engine) = crate::runtime::crypto::pair(WorkerId(0), 0, config.limits.queue_entries);
-    let runtime = WorkerRuntime {
-        reactor: Rc::new(Reactor::new(admission.clone())),
-        admission,
-        crypto: Rc::new(crate::runtime::crypto::CryptoClient::new(io)),
-    };
-    let mut engine = PageCryptoEngine::new(CryptoRuntime { port: engine });
-    let local = WorkerRuntime {
-        reactor: runtime.reactor.clone(),
-        admission: runtime.admission.clone(),
-        crypto: runtime.crypto.clone(),
-    };
-    let mut worker =
-        WorkerApplication::assemble(&config, node.clone(), WorkerId(0), local, Vec::new()).unwrap();
+    let (mut worker, runtime, mut engine) = local_worker(&config, &node, 0);
     let startup = scope(Duration::from_secs(15)).unwrap();
     drive(&runtime, &mut engine, worker.start(&startup)).unwrap();
     assert!(node.observations.health.ready());

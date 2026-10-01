@@ -215,6 +215,19 @@ impl ControlHandlers {
 }
 
 impl ControlFixture {
+    /// Enroll a normal node; failure and retained-identity scenarios call bootstrap
+    /// directly so their result and on-disk identity assertions stay independent.
+    pub(super) fn bootstrap_node(
+        &mut self,
+        workers: u16,
+        timeout: Duration,
+    ) -> (Config, Arc<NodeState>) {
+        let mut config = self.config.take().unwrap();
+        let node = Arc::new(NodeState::new((0..workers).map(WorkerId).collect(), 64).unwrap());
+        config.node = bootstrap(&config, &node, &config.limits, &scope(timeout).unwrap()).unwrap();
+        (config, node)
+    }
+
     pub(super) fn new() -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
