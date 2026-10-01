@@ -1,6 +1,7 @@
 //! Bounded node-local handoffs. Only owned commands and immutable results cross
 //! threads; the coordinator, futures, delivery leases, and streams stay local.
-use super::{Coordinator, fill::PageResult, flight::AcquisitionBudget};
+use super::{Coordinator, flight::AcquisitionBudget};
+use crate::memory::page::PageResult;
 use crate::runtime::collections::HashMap;
 use crate::{
     error::{Error, Operation, Result},

@@ -15,7 +15,7 @@ use crate::{
     error::{Error, Operation, Result},
     memory::{
         cache::MemoryCache,
-        page::{AcquiredPage, UnverifiedPage},
+        page::{AcquiredPage, PageResult, UnverifiedPage},
         pool::{BufferPool, CiphertextPage},
     },
     model::{ObjectMetadata, OriginContext, PAGE_BYTES, PageId, ResourceClass, VersionMetadata},
@@ -32,7 +32,6 @@ use crate::{
 };
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
 
-pub use crate::memory::page::PageResult;
 #[derive(Clone)]
 pub struct FillDependencies {
     pub memory: Rc<MemoryCache>,

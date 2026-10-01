@@ -1,7 +1,8 @@
 //! Shared compact subscription demand with independently leased page slices.
 //! A stream pins its version and length once. A late error terminates that stream;
 //! it cannot replace headers or reopen against a newer version.
-use super::{dispatch::WorkerDirectory, fill::PageResult, flight::AcquisitionBudget};
+use super::{dispatch::WorkerDirectory, flight::AcquisitionBudget};
+use crate::memory::page::PageResult;
 use crate::telemetry::failures::{Detail, Failure, Observer, Stage};
 use crate::{
     error::{Error, Operation, Result},

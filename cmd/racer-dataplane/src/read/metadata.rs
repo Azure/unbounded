@@ -35,8 +35,6 @@ use std::{
 
 const MAX_WAITERS: usize = 64;
 const MAX_REFRESH_ATTEMPTS: usize = 8;
-#[cfg(test)]
-const MAX_BOOTSTRAP_ATTEMPTS: usize = 3;
 const DEFAULT_ATTEMPTS: u32 = 32;
 const DEFAULT_LINKS: u8 = 96;
 
@@ -346,12 +344,6 @@ fn caller_budget_failure(error: Error, budget: &AcquisitionBudget) -> bool {
         error,
         Error::Cancelled | Error::DeadlineExceeded | Error::HopBudgetExhausted
     ) || (error == Error::Unavailable && budget.remaining_attempts() == 0)
-}
-/// An empty bootstrap is metadata-only: it never constructs an encrypted page.
-#[cfg(test)]
-pub(crate) enum BootstrapResult {
-    Empty(ObjectMetadata),
-    Page(super::fill::PageResult),
 }
 #[derive(Clone)]
 pub struct MetadataDependencies {
@@ -794,7 +786,7 @@ impl MetadataService {
         {
             return Ok(response);
         }
-        let output = self
+        let mut output = self
             .resolve_inner(
                 MetadataSelector::Fresh,
                 membership.clone(),
@@ -814,7 +806,8 @@ impl MetadataService {
         let ciphertext = match output.page {
             Some(page) => page.copy().ciphertext,
             None => {
-                self.storage
+                let copy = self
+                    .storage
                     .fill
                     .acquire_ciphertext(
                         PageId {
@@ -826,8 +819,12 @@ impl MetadataService {
                         scope,
                         budget,
                     )
-                    .await?
-                    .ciphertext
+                    .await?;
+                validate_bootstrap_metadata(&output.metadata, &copy.metadata)?;
+                if output.metadata.content_type.is_none() {
+                    output.metadata.content_type = copy.metadata.content_type;
+                }
+                copy.ciphertext
             }
         };
         output
@@ -886,116 +883,6 @@ impl MetadataService {
                     }
                 }
             }
-        })
-    }
-    /// Regression helper retaining plaintext bootstrap checks; production peers use
-    /// bootstrap_peer. Resolve metadata, then acquire page zero via
-    /// the same Fill as pinned reads. Require identical version AND total length;
-    /// bounded version-change retries happen before any response headers escape.
-    /// Missing pinned descriptors may use owners.retained_metadata before probing
-    /// peers/origin; fresh admission must still revalidate an absent/expired pointer.
-    #[cfg(test)]
-    pub(crate) fn bootstrap<'a>(
-        &'a self,
-        selector: MetadataSelector,
-        membership: MembershipLease,
-        context: &'a OriginContext,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, BootstrapResult> {
-        Box::pin(async move {
-            let mut budget =
-                AcquisitionBudget::new(scope.deadline.0, DEFAULT_ATTEMPTS, DEFAULT_LINKS);
-            self.bootstrap_with_budget(selector, membership, context, scope, &mut budget)
-                .await
-        })
-    }
-
-    #[cfg(test)]
-    fn bootstrap_with_budget<'a>(
-        &'a self,
-        selector: MetadataSelector,
-        membership: MembershipLease,
-        context: &'a OriginContext,
-        scope: &'a RequestScope,
-        budget: &'a mut AcquisitionBudget,
-    ) -> Operation<'a, BootstrapResult> {
-        Box::pin(async move {
-            let mut bounded_scope = scope.clone();
-            bounded_scope.deadline.0 = scope.deadline.0.min(budget.deadline());
-            let scope = &bounded_scope;
-            for attempt in 0..MAX_BOOTSTRAP_ATTEMPTS {
-                scope.check()?;
-                let resolved = match self
-                    .resolve_inner(
-                        selector.clone(),
-                        membership.clone(),
-                        context,
-                        scope,
-                        budget,
-                        attempt != 0,
-                        true,
-                    )
-                    .await
-                {
-                    Err(Error::VersionUnavailable)
-                        if matches!(selector, MetadataSelector::Fresh) =>
-                    {
-                        continue;
-                    }
-                    result => result?,
-                };
-                let mut metadata = resolved.metadata;
-                if metadata.length == 0 {
-                    return Ok(BootstrapResult::Empty(metadata));
-                }
-                let page = PageId {
-                    version: metadata.version.clone(),
-                    number: PageNumber(0),
-                };
-                let result = match resolved.page {
-                    Some(crate::memory::page::AcquiredPage::Plaintext(page)) => Ok(page),
-                    Some(crate::memory::page::AcquiredPage::Ciphertext(copy)) => {
-                        self.storage
-                            .fill
-                            .accept_ciphertext(
-                                copy.copy,
-                                membership.clone(),
-                                context,
-                                scope,
-                                budget,
-                            )
-                            .await
-                    }
-                    None => {
-                        self.storage
-                            .fill
-                            .acquire(page.clone(), membership.clone(), context, scope, budget)
-                            .await
-                    }
-                };
-                scope.check()?;
-                let result = result.and_then(|mut result| {
-                    validate_bootstrap_metadata(&metadata, &result.metadata)?;
-                    result.validate_for(&page)?;
-                    if metadata.content_type.is_none() {
-                        metadata.content_type = result.metadata.content_type.clone();
-                    }
-                    // Preserve the fresh admission's expiry, not a page copy's
-                    // historical expiry, and any known compatible content type.
-                    result.metadata = metadata;
-                    Ok(result)
-                });
-                match result {
-                    Ok(page) => return Ok(BootstrapResult::Page(page)),
-                    Err(Error::VersionUnavailable)
-                        if matches!(selector, MetadataSelector::Fresh) =>
-                    {
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            Err(Error::VersionUnavailable)
         })
     }
 }

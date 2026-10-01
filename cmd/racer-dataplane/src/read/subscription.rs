@@ -9,7 +9,7 @@ use std::{
 };
 
 struct Demand {
-    results: VecDeque<super::fill::PageResult>,
+    results: VecDeque<crate::memory::page::PageResult>,
     waker: Option<std::task::Waker>,
     version: ObjectVersion,
     range: ResolvedRange,
@@ -158,7 +158,7 @@ pub(crate) struct DemandLease {
 }
 
 pub(crate) enum Next {
-    Page(super::fill::PageResult),
+    Page(crate::memory::page::PageResult),
     Select(Selection),
     End,
 }
@@ -172,7 +172,7 @@ pub(crate) struct Selection {
     pub(crate) demand: crate::peer::subscriptions::Demand,
 }
 impl Selection {
-    pub(crate) fn complete(self, page: super::fill::PageResult) -> Result<()> {
+    pub(crate) fn complete(self, page: crate::memory::page::PageResult) -> Result<()> {
         let number = page.plaintext.page().number;
         if page.metadata.version != self.version || !self.demand.contains(number.0) {
             return Err(Error::CorruptRecord);

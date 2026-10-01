@@ -1180,8 +1180,7 @@ impl Origin for BootstrapOrigin {
 
 #[test]
 fn bootstrap_rejection_re_elects_and_version_changes_never_mix_pages() {
-    use crate::model::MetadataSelector;
-    use crate::read::metadata::{BootstrapResult, MetadataDependencies, MetadataService};
+    use crate::read::metadata::{MetadataDependencies, MetadataService};
     let mut f = fixture();
     let origin = Rc::new(BootstrapOrigin {
         buffers: f.fill.dependencies.buffers.clone(),
@@ -1209,18 +1208,20 @@ fn bootstrap_rejection_re_elects_and_version_changes_never_mix_pages() {
     };
     let (a, b) = drive(
         async {
+            let mut first_budget = AcquisitionBudget::new(f.scope.deadline.0, 32, 96);
+            let mut second_budget = AcquisitionBudget::new(f.scope.deadline.0, 32, 96);
             futures::join!(
-                service.bootstrap(
-                    MetadataSelector::Fresh,
+                service.bootstrap_peer(
                     f.membership.clone(),
                     &f.context,
-                    &f.scope
+                    &f.scope,
+                    &mut first_budget,
                 ),
-                service.bootstrap(
-                    MetadataSelector::Fresh,
+                service.bootstrap_peer(
                     f.membership.clone(),
                     &second_context,
-                    &second_scope
+                    &second_scope,
+                    &mut second_budget,
                 )
             )
         },
@@ -1228,30 +1229,55 @@ fn bootstrap_rejection_re_elects_and_version_changes_never_mix_pages() {
         &f.crypto,
     );
     assert!(matches!(a, Err(Error::OriginForbidden)));
-    let BootstrapResult::Page(first) = b.unwrap() else {
+    let PeerResponse::Bootstrap {
+        metadata: first_metadata,
+        page_zero: Some(first),
+    } = b.unwrap()
+    else {
         panic!("page")
     };
-    assert_eq!(first.plaintext.bytes(), &[1; 3]);
+    assert_eq!(first.envelope().page.version, first_metadata.version);
+    let first_bytes = f
+        .fill
+        .dependencies
+        .memory
+        .get(&first.envelope().page)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_bytes.plaintext.bytes(), &[1; 3]);
     assert_eq!(origin.calls.get(), 2);
     origin.version.set(2);
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 32, 96);
     let result = drive(
-        service.bootstrap(
-            MetadataSelector::Fresh,
+        service.bootstrap_peer(
             f.membership.clone(),
             &second_context,
             &second_scope,
+            &mut budget,
         ),
         &mut f.engine,
         &f.crypto,
     )
     .unwrap();
-    let BootstrapResult::Page(second) = result else {
+    let PeerResponse::Bootstrap {
+        metadata: second_metadata,
+        page_zero: Some(second),
+    } = result
+    else {
         panic!("page")
     };
-    assert_eq!(second.plaintext.bytes(), &[2; 3]);
-    assert_eq!(second.metadata.version.etag, StrongEtag::test_value("v2"));
-    assert_eq!(first.plaintext.bytes(), &[1; 3]);
-    assert_eq!(first.metadata.version.etag, StrongEtag::test_value("v1"));
+    assert_eq!(second.envelope().page.version, second_metadata.version);
+    let second_bytes = f
+        .fill
+        .dependencies
+        .memory
+        .get(&second.envelope().page)
+        .unwrap()
+        .unwrap();
+    assert_eq!(second_bytes.plaintext.bytes(), &[2; 3]);
+    assert_eq!(second_metadata.version.etag, StrongEtag::test_value("v2"));
+    assert_eq!(first_bytes.plaintext.bytes(), &[1; 3]);
+    assert_eq!(first_metadata.version.etag, StrongEtag::test_value("v1"));
     assert_eq!(origin.calls.get(), 3, "rejection was not negative-cached");
 }
 impl Origin for GatedMetadataOrigin {
@@ -1280,8 +1306,8 @@ impl Origin for GatedMetadataOrigin {
 #[test]
 fn bootstrap_after_catalog_eviction_checks_cached_content_type_and_preserves_fresh_expiry() {
     use crate::{
-        model::{ContentType, MetadataSelector},
-        read::metadata::{BootstrapResult, MetadataDependencies, MetadataService},
+        model::ContentType,
+        read::metadata::{MetadataDependencies, MetadataService},
     };
     for with_origin_page in [false, true] {
         for (cached_type, fresh_type, conflict) in [
@@ -1363,13 +1389,9 @@ fn bootstrap_after_catalog_eviction_checks_cached_content_type_and_preserves_fre
             })
             .ok()
             .unwrap();
+            let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 32, 96);
             let result = drive(
-                service.bootstrap(
-                    MetadataSelector::Fresh,
-                    f.membership.clone(),
-                    &f.context,
-                    &f.scope,
-                ),
+                service.bootstrap_peer(f.membership.clone(), &f.context, &f.scope, &mut budget),
                 &mut f.engine,
                 &f.crypto,
             );
@@ -1385,24 +1407,21 @@ fn bootstrap_after_catalog_eviction_checks_cached_content_type_and_preserves_fre
                     );
                 }
             } else {
-                let BootstrapResult::Page(result) = result.unwrap() else {
+                let PeerResponse::Bootstrap {
+                    metadata,
+                    page_zero: Some(ciphertext),
+                } = result.unwrap()
+                else {
                     panic!("nonempty bootstrap")
                 };
                 let expected = fresh
                     .content_type
                     .clone()
                     .or_else(|| cached.metadata.content_type.clone());
-                assert_eq!(result.metadata.content_type, expected);
-                assert_eq!(result.metadata.expires_at, fresh.expires_at);
-                assert!(Arc::ptr_eq(
-                    &result.plaintext.inner,
-                    &cached.plaintext.inner
-                ));
-                assert!(Arc::ptr_eq(
-                    &result.ciphertext.inner,
-                    &cached.ciphertext.inner
-                ));
-                assert_eq!(result.plaintext.bytes(), b"abc");
+                assert_eq!(metadata.content_type, expected);
+                assert_eq!(metadata.expires_at, fresh.expires_at);
+                assert_eq!(ciphertext.envelope().page.version, metadata.version);
+                assert_eq!(cached.plaintext.bytes(), b"abc");
                 if with_origin_page {
                     assert_eq!(
                         index
