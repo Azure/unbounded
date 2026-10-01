@@ -28,7 +28,7 @@ impl Availability {
     pub(crate) fn permissive_for_tests() -> Rc<Self> {
         Rc::new(Self {
             publications: Arc::new(PublishedState::default()),
-            keys: Rc::new(crate::security::keyring::tests::keys()),
+            keys: Rc::new(crate::security::identity::keyring_tests::keys()),
             permissive: true,
         })
     }
