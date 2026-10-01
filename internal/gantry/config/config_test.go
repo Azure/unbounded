@@ -125,10 +125,10 @@ func TestChairCapacityConfig(t *testing.T) {
 		}
 	})
 
-	t.Run("legacy percentage is ignored", func(t *testing.T) {
+	t.Run("legacy percentage is rejected", func(t *testing.T) {
 		c := NewDefault()
-		if err := c.LoadYAML(strings.NewReader("chair_seed_percentage: 10\n")); err != nil {
-			t.Fatalf("LoadYAML: %v", err)
+		if err := c.LoadYAML(strings.NewReader("chair_seed_percentage: 10\n")); err == nil {
+			t.Fatal("removed chair percentage accepted")
 		}
 
 		if c.ChairHolderCount != 64 || c.ChairSeedCount != 8 {
@@ -708,36 +708,19 @@ func TestLoadYAML_KnownFieldsOnly(t *testing.T) {
 	}
 }
 
-func TestLoadYAML_RetiredMembershipKeysStillParse(t *testing.T) {
-	c := NewDefault()
+func TestLoadYAML_RetiredMembershipKeysRejected(t *testing.T) {
+	for _, key := range []string{"pod_name", "members_namespace", "members_label_selector", "members_sync_timeout", "cache_dir", "cache_budget_bytes", "cache_forced_eviction_headroom_pct", "eviction_provider_count_threshold", "chair_seed_percentage"} {
+		c := NewDefault()
+		if err := c.LoadYAML(strings.NewReader(key + ": 1\n")); err == nil {
+			t.Errorf("removed YAML key %s accepted", key)
+		}
 
-	// LoadYAML runs with KnownFields(true), so a ConfigMap written for the
-	// informer-based agent would fail outright if these keys were deleted
-	// rather than retired onto LegacyDeprecated. The agent is upgraded in
-	// place against an existing ConfigMap, so parsing must survive.
-	in := []byte(`
-pod_name: gantry-abc12
-members_namespace: unbounded-system
-members_label_selector: app.kubernetes.io/name=gantry
-members_sync_timeout: 30s
-upstream_registries:
-  - name: registry.example.com
-    endpoint: https://registry.example.com
-`)
-	if err := c.LoadYAML(bytes.NewReader(in)); err != nil {
-		t.Fatalf("LoadYAML with retired membership keys: %v", err)
-	}
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		c.BindFlags(fs)
 
-	if c.LegacyDeprecated.PodName != "gantry-abc12" {
-		t.Errorf("LegacyDeprecated.PodName = %q, want gantry-abc12", c.LegacyDeprecated.PodName)
-	}
-
-	if c.LegacyDeprecated.MembersNamespace != "unbounded-system" {
-		t.Errorf("LegacyDeprecated.MembersNamespace = %q, want unbounded-system", c.LegacyDeprecated.MembersNamespace)
-	}
-
-	if err := c.Validate(); err != nil {
-		t.Errorf("Validate after retired keys: %v", err)
+		if fs.Lookup(strings.ReplaceAll(key, "_", "-")) != nil {
+			t.Errorf("removed flag %s registered", key)
+		}
 	}
 }
 
@@ -745,8 +728,6 @@ func TestLoadYAML_Roundtrip(t *testing.T) {
 	c := NewDefault()
 
 	in := []byte(`
-cache_dir: /tmp/gantry-cache
-cache_budget_bytes: 12345
 upstream_registries:
   - name: registry.example.com
     endpoint: https://registry.example.com
@@ -762,12 +743,6 @@ log_level: debug
 `)
 	if err := c.LoadYAML(bytes.NewReader(in)); err != nil {
 		t.Fatalf("LoadYAML: %v", err)
-	}
-	// cache_dir / cache_budget_bytes are accepted as legacy YAML
-	// keys only (no Go consumer reads them); they land on
-	// LegacyDeprecated so existing ConfigMaps continue to parse.
-	if c.LegacyDeprecated.CacheDir != "/tmp/gantry-cache" || c.LegacyDeprecated.CacheBudgetBytes != 12345 {
-		t.Errorf("legacy YAML overlay failed: %+v", c.LegacyDeprecated)
 	}
 
 	if len(c.UpstreamRegistries) != 1 || c.UpstreamRegistries[0].Name != "registry.example.com" {
@@ -825,14 +800,6 @@ func TestLoadEnv(t *testing.T) {
 	getenv := func(k string) string { return env[k] }
 	if err := c.LoadEnv(getenv); err != nil {
 		t.Fatalf("LoadEnv: %v", err)
-	}
-
-	if c.LegacyDeprecated.CacheDir != "" {
-		t.Errorf("LegacyDeprecated.CacheDir = %q; deprecated env should not write to it", c.LegacyDeprecated.CacheDir)
-	}
-
-	if c.LegacyDeprecated.CacheBudgetBytes != 0 {
-		t.Errorf("LegacyDeprecated.CacheBudgetBytes = %d; deprecated env should not write to it", c.LegacyDeprecated.CacheBudgetBytes)
 	}
 
 	if c.HRWK != 9 {

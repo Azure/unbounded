@@ -204,11 +204,8 @@ type Config struct {
 	// ChairHolderCount caps the number of agents holding fixed chair Leases.
 	ChairHolderCount int `yaml:"chair_holder_count"`
 	// ChairSeedCount is the per-digest replica count at a full holder pool.
-	ChairSeedCount int `yaml:"chair_seed_count"`
-	// ChairSeedPercentage is accepted for compatibility with the short-lived
-	// capacity-coupled configuration. Holder and seed sizing ignore it.
-	ChairSeedPercentage int           `yaml:"chair_seed_percentage,omitempty"`
-	ChairAPITimeout     time.Duration `yaml:"chair_api_timeout"`
+	ChairSeedCount  int           `yaml:"chair_seed_count"`
+	ChairAPITimeout time.Duration `yaml:"chair_api_timeout"`
 
 	// ---------- Storage backend ----------
 
@@ -224,14 +221,6 @@ type Config struct {
 	// Default is "containerd". Exposed via the
 	// gantry_storage_mode_info metric for observability.
 	StorageMode string `yaml:"storage_mode"`
-
-	// LegacyDeprecated captures YAML fields that used to live on
-	// Config but are no longer consumed by any code path. They are
-	// kept here purely so existing ConfigMaps that still set
-	// `cache_dir`, `cache_budget_bytes`, etc. continue to parse
-	// (LoadYAML uses KnownFields=true). New deployments should not
-	// set them. A future major version will remove the struct.
-	LegacyDeprecated LegacyDeprecatedConfig `yaml:",inline"`
 
 	// ---------- containerd integration (cdsub) ----------
 
@@ -469,30 +458,6 @@ type UpstreamRegistry struct {
 	NSAlias string `yaml:"ns_alias"`
 }
 
-// LegacyDeprecatedConfig captures YAML field names that used to live
-// on Config but no longer have any effect. They are accepted here
-// purely so existing ConfigMaps that still set them parse without
-// error under KnownFields=true. None of these fields are exposed via
-// CLI flags or environment variables - setting them via env/flag is
-// not supported, only YAML round-trips for back-compat. A future
-// major version will remove this struct entirely.
-//
-// Removal trail :
-// - cache_dir / cache_budget_bytes / cache_forced_eviction_headroom_pct
-// / eviction_provider_count_threshold:
-// the hostPath cache backend was deleted; containerd's own GC owns
-// blob lifetime now.
-type LegacyDeprecatedConfig struct {
-	CacheDir                       string        `yaml:"cache_dir,omitempty"`
-	CacheBudgetBytes               int64         `yaml:"cache_budget_bytes,omitempty"`
-	CacheForcedEvictionHeadroomPct int           `yaml:"cache_forced_eviction_headroom_pct,omitempty"`
-	EvictionProviderCountThreshold int           `yaml:"eviction_provider_count_threshold,omitempty"`
-	PodName                        string        `yaml:"pod_name,omitempty"`
-	MembersNamespace               string        `yaml:"members_namespace,omitempty"`
-	MembersLabelSelector           string        `yaml:"members_label_selector,omitempty"`
-	MembersSyncTimeout             time.Duration `yaml:"members_sync_timeout,omitempty"`
-}
-
 // NewDefault returns a Config populated with the design-doc defaults.
 // All fields are set; Validate against this MUST pass.
 func NewDefault() *Config {
@@ -710,17 +675,7 @@ func (c *Config) LoadEnv(env func(string) string) error {
 	setStr("CHAIR_CAPACITY_DAEMONSET", &c.ChairCapacityDaemonSet)
 	setInt("CHAIR_HOLDER_COUNT", &c.ChairHolderCount)
 	setInt("CHAIR_SEED_COUNT", &c.ChairSeedCount)
-	setInt("CHAIR_SEED_PERCENTAGE", &c.ChairSeedPercentage)
 	setDur("CHAIR_API_TIMEOUT", &c.ChairAPITimeout)
-
-	// Deprecated env vars (GANTRY_CACHE_DIR, GANTRY_CACHE_BUDGET_BYTES,
-	// GANTRY_CACHE_FORCED_EVICTION_HEADROOM_PCT,
-	// GANTRY_EVICTION_PROVIDER_COUNT_THRESHOLD, GANTRY_STORAGE_MODE)
-	// are no longer read. The fields they used to write to are either
-	// removed (cache_*) or no longer operator-tunable (storage_mode is
-	// fixed to "containerd" - see Validate). Existing ConfigMaps that
-	// still set them in YAML continue to parse via
-	// LegacyDeprecatedConfig.
 
 	setStr("CONTAINERD_SOCKET", &c.ContainerdSocket)
 	setStr("CONTAINERD_NAMESPACE", &c.ContainerdNamespace)
@@ -813,17 +768,7 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 	fs.StringVar(&c.ChairCapacityDaemonSet, "chair-capacity-daemonset", c.ChairCapacityDaemonSet, "DaemonSet whose desired scheduled count bounds the holder pool")
 	fs.IntVar(&c.ChairHolderCount, "chair-holder-count", c.ChairHolderCount, "maximum number of agents holding fixed chair Leases")
 	fs.IntVar(&c.ChairSeedCount, "chair-seed-count", c.ChairSeedCount, "per-digest seed replicas at a full holder pool")
-	fs.IntVar(&c.ChairSeedPercentage, "chair-seed-percentage", c.ChairSeedPercentage, "deprecated and ignored")
 	fs.DurationVar(&c.ChairAPITimeout, "chair-api-timeout", c.ChairAPITimeout, "timeout for one Kubernetes chair Lease API operation")
-
-	// Deprecated cache flags (--cache-dir, --cache-budget-bytes,
-	// --cache-forced-eviction-headroom-pct,
-	// --eviction-provider-count-threshold) and --storage-mode were
-	// removed in plan . The cache fields are no-ops under
-	// containerd-only storage; storage_mode itself is no longer an
-	// operator knob because "containerd" is the only accepted value
-	// (Validate enforces it). YAML-only back-compat for these names
-	// lives in Config.StorageMode and Config.LegacyDeprecated.
 
 	fs.StringVar(&c.ContainerdSocket, "containerd-socket", c.ContainerdSocket, "containerd gRPC socket path (required in legacy mode; unused with GANTRY_RACER_ENABLED=true)")
 	fs.StringVar(&c.ContainerdNamespace, "containerd-namespace", c.ContainerdNamespace, "containerd namespace cdsub watches (default k8s.io)")
