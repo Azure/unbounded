@@ -1,7 +1,16 @@
 # notice
 
 Generates and verifies the project's `NOTICE` file from direct dependencies in
-`go.mod` and `frontend/package.json`.
+`go.mod`, `frontend/package.json`, and `cmd/racer-dataplane/Cargo.toml`.
+
+Before generation, install frontend dependencies with `npm ci` in `frontend/`
+and fetch the locked Rust sources with
+`cargo fetch --locked --manifest-path cmd/racer-dataplane/Cargo.toml`.
+Use Rust 1.96.0, matching the Racer builder. Cargo notices include all direct
+production and build dependencies, including optional heap-profiling crates and
+target-specific dependencies. Only dev-only dependencies are excluded. Versions
+come from the root package's `Cargo.lock` entry; its name comes from the manifest.
+License text is read from the Cargo registry source cache, not fetched by the tool.
 
 ## Usage
 
@@ -42,6 +51,7 @@ hack/cmd/notice/
     gomod/                 # Collector for go.mod direct deps; Go vanity-domain
                            # repo-base heuristics.
     npm/                   # Collector for frontend/package.json direct deps.
+    cargo/                 # Collector for locked Racer production/build crates.
     testutil/              # WriteTree + canonical license-text fixtures.
 ```
 
