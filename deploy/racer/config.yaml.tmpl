@@ -24,6 +24,10 @@ data:
   RACER_TLS_PRIVATE_KEY_FILE: "/etc/racer/tls/tls.key"
   RACER_CONTROLLER_SERVICE_ACCOUNT: "racer-controller"
   RACER_REPLICATION_TOKEN_FILE: "/var/run/secrets/racer-controller/token"
+  # The mounted ca.crt is Secret key ca-bundle.crt, not the single signing root.
+  # It contains the current CA plus retained roots (up to 14 days after rotation,
+  # bounded by certificate expiry). Cross-signed serving chains support the
+  # reverse projection order: an old follower verifying a newly rotated leader.
   RACER_REPLICATION_TRUST_FILE: "/etc/racer/tls/ca.crt"
   RACER_REPLICATION_SERVER_NAME: {{ printf "racer-controller.%s.svc" (.Namespace | default "unbounded-system") | quote }}
   RACER_REPLICATION_PORT: "8443"

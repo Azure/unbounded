@@ -70,6 +70,8 @@ func TestRetainedTLSWeeklyMaintenance(t *testing.T) {
 		}
 
 		require.NoError(t, verifyServing(t, secret, old.Data["ca.crt"], at))
+		require.NoError(t, verifyServing(t, old, secret.Data[caBundleKey], at))
+		require.Equal(t, string(secret.Data["ca.crt"])+string(secret.Data[previousCAKey]), string(secret.Data[caBundleKey]))
 
 		trust := &corev1.ConfigMap{}
 		require.NoError(t, env.Client.Get(t.Context(), objectKey(env, trustName), trust))

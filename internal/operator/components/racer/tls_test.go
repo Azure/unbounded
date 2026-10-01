@@ -61,6 +61,134 @@ func stateOf(t *testing.T, secret *corev1.Secret) tlsState {
 	return state
 }
 
+func TestTLSReplicationProjectionOrders(t *testing.T) {
+	now := tlsEpoch()
+	old, err := newTLS("custom-system", now)
+	require.NoError(t, err)
+
+	at := now.Add(caRotationInterval)
+	rotated, err := renewTLS(old, "custom-system", at)
+	require.NoError(t, err)
+	unrelated, err := newTLS("custom-system", at)
+	require.NoError(t, err)
+
+	// Reproduce the failure with current-only trust before checking the bundle.
+	require.Error(t, verifyServing(t, old, rotated.Data["ca.crt"], at))
+
+	for _, scenario := range []struct {
+		name     string
+		leader   *corev1.Secret
+		follower *corev1.Secret
+	}{
+		{"neither-projected", old, old},
+		{"follower-first", old, rotated},
+		{"leader-first", rotated, old},
+		{"both-projected", rotated, rotated},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			require.NoError(t, verifyServing(t, scenario.leader, scenario.follower.Data[caBundleKey], at))
+			require.Error(t, verifyServing(t, unrelated, scenario.follower.Data[caBundleKey], at))
+		})
+	}
+}
+
+func TestTLSReplicationBundleRepair(t *testing.T) {
+	now := tlsEpoch()
+	fresh, err := newTLS("custom-system", now)
+	require.NoError(t, err)
+	rotated, err := renewTLS(fresh, "custom-system", now.Add(caRotationInterval))
+	require.NoError(t, err)
+	unrelated, err := newTLS("custom-system", now)
+	require.NoError(t, err)
+
+	for _, original := range []*corev1.Secret{fresh, rotated} {
+		for _, scenario := range []string{"missing", "empty", "stale", "foreign"} {
+			t.Run(stateOf(t, original).CreatedAt.Format("2006-01-02")+"/"+scenario, func(t *testing.T) {
+				secret := original.DeepCopy()
+
+				switch scenario {
+				case "missing":
+					delete(secret.Data, caBundleKey)
+				case "empty":
+					secret.Data[caBundleKey] = []byte{}
+				case "stale":
+					secret.Data[caBundleKey] = []byte("invalid PEM")
+				case "foreign":
+					secret.Data[caBundleKey] = unrelated.Data["ca.crt"]
+				}
+
+				secret.Annotations["unrelated"] = "preserved"
+				secret.Data["unrelated"] = []byte("preserved")
+				env := testEnv(t, secret)
+				at := stateOf(t, original).CreatedAt.Add(time.Hour)
+				plan := component.NewPlan()
+				result, err := planTLSAt(t.Context(), env, plan, false, at)
+				require.NoError(t, err)
+				require.Nil(t, result, "do not publish workloads before bundle persistence")
+				require.Len(t, plan.Operations, 1)
+				require.Equal(t, component.OpMergePatch, plan.Operations[0].Kind)
+
+				stored := &corev1.Secret{}
+				require.NoError(t, env.Client.Get(t.Context(), objectKey(env, tlsName), stored))
+				require.Equal(t, secret.Data, stored.Data, "planning must not mutate credentials")
+				persist(t, env, plan)
+
+				restart := component.NewPlan()
+				result, err = planTLSAt(t.Context(), env, restart, false, at)
+				require.NoError(t, err)
+				require.Zero(t, restart.Len())
+
+				want := secret.DeepCopy()
+				want.Data[caBundleKey] = original.Data[caBundleKey]
+				require.Equal(t, want.Data, result.Data, "only the derived bundle changes")
+				require.Equal(t, want.Annotations, result.Annotations)
+				require.Equal(t, string(original.Data["ca.crt"])+string(original.Data[previousCAKey]), string(result.Data[caBundleKey]))
+				require.NoError(t, verifyServing(t, fresh, result.Data[caBundleKey], at))
+				require.Error(t, verifyServing(t, unrelated, result.Data[caBundleKey], at))
+			})
+		}
+	}
+}
+
+func TestTLSReplicationBundleUpgradeBeforeWorkloads(t *testing.T) {
+	for _, retained := range []bool{false, true} {
+		t.Run(map[bool]string{false: "active", true: "retained"}[retained], func(t *testing.T) {
+			env := testEnv(t, cache("cache"))
+			initialize(t, env)
+			persist(t, env, planPass(t, env))
+
+			if retained {
+				require.NoError(t, env.Client.Delete(t.Context(), cache("cache")))
+			}
+
+			secret := &corev1.Secret{}
+			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, tlsName), secret))
+			delete(secret.Data, caBundleKey)
+			require.NoError(t, env.Client.Update(t.Context(), secret))
+			at := stateOf(t, secret).CreatedAt.Add(time.Hour)
+			plan, _, err := planAt(t.Context(), env, at)
+			require.NoError(t, err)
+			require.Len(t, plan.Operations, 1, "persist bundle before updating projected workload")
+			require.Equal(t, component.OpMergePatch, plan.Operations[0].Kind)
+			require.Equal(t, tlsName, plan.Operations[0].Object.GetName())
+			persist(t, env, plan)
+
+			stored := &corev1.Secret{}
+			require.NoError(t, env.Client.Get(t.Context(), objectKey(env, tlsName), stored))
+			require.Equal(t, secret.Data["ca.crt"], stored.Data[caBundleKey])
+			require.Equal(t, secret.Data[corev1.TLSPrivateKeyKey], stored.Data[corev1.TLSPrivateKeyKey])
+			plan, _, err = planAt(t.Context(), env, at)
+			require.NoError(t, err)
+
+			if retained {
+				require.Zero(t, plan.Len(), "retained mode must not repair workloads")
+			} else {
+				require.NotZero(t, plan.Len(), "active mode resumes runtime reconciliation")
+			}
+		})
+	}
+}
+
 func TestTLSWeeklyGenerations(t *testing.T) {
 	now := tlsEpoch()
 	secret, err := newTLS("custom-system", now)
@@ -95,6 +223,23 @@ func TestTLSWeeklyGenerations(t *testing.T) {
 		roots = append(roots, next.Data["ca.crt"])
 		require.Len(t, stateOf(t, next).Previous, min(generation, maxPreviousCAs))
 		require.NoError(t, verifyServing(t, next, next.Data["ca.crt"], at))
+		require.Equal(t, string(next.Data["ca.crt"])+string(next.Data[previousCAKey]), string(next.Data[caBundleKey]))
+
+		bundle := x509.NewCertPool()
+		require.True(t, bundle.AppendCertsFromPEM(next.Data[caBundleKey]))
+
+		for i, root := range roots {
+			ca, err := singleCertificate(root)
+			require.NoError(t, err)
+
+			_, err = ca.Verify(x509.VerifyOptions{Roots: bundle, CurrentTime: at})
+			if i >= generation-maxPreviousCAs {
+				require.NoError(t, err, "retained root %d", i)
+			} else {
+				require.NotContains(t, string(next.Data[caBundleKey]), string(root))
+				require.Error(t, err, "retired root %d", i)
+			}
+		}
 
 		for i, root := range roots[:generation] {
 			err := verifyServing(t, next, root, at)
@@ -146,6 +291,8 @@ func TestTLSLeafRenewalAndDelayedRotation(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, stateOf(t, pruned).Previous)
 	require.Empty(t, pruned.Data[previousCAKey])
+	require.Equal(t, pruned.Data["ca.crt"], pruned.Data[caBundleKey])
+	require.NotContains(t, string(pruned.Data[caBundleKey]), string(secret.Data["ca.crt"]))
 	require.Equal(t, next.Data[corev1.TLSPrivateKeyKey], pruned.Data[corev1.TLSPrivateKeyKey])
 	require.NoError(t, verifyServing(t, pruned, pruned.Data["ca.crt"], now.Add(28*day)))
 	// Persist the empty previous-root value through real merge-patch encoding.
@@ -283,6 +430,10 @@ func TestTLSCorruptionFailsClosed(t *testing.T) {
 
 	for name, damage := range map[string]func(*corev1.Secret){
 		"missing-state": func(s *corev1.Secret) { delete(s.Data, tlsStateKey) },
+		"missing-bundle-and-state": func(s *corev1.Secret) {
+			delete(s.Data, caBundleKey)
+			delete(s.Data, tlsStateKey)
+		},
 		"all-metadata-missing": func(s *corev1.Secret) {
 			delete(s.Data, tlsStateKey)
 			delete(s.Data, previousCAKey)

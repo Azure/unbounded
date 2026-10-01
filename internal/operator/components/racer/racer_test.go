@@ -162,7 +162,7 @@ func TestLifecycleWithoutSites(t *testing.T) {
 		require.Contains(t, controller.Env, corev1.EnvVar{Name: name, ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: field}}})
 	}
 
-	require.Equal(t, []corev1.KeyToPath{{Key: "tls.crt", Path: "tls.crt"}, {Key: "tls.key", Path: "tls.key"}, {Key: "ca.crt", Path: "ca.crt"}}, pod.Volumes[0].Secret.Items)
+	require.Equal(t, []corev1.KeyToPath{{Key: "tls.crt", Path: "tls.crt"}, {Key: "tls.key", Path: "tls.key"}, {Key: caBundleKey, Path: "ca.crt"}}, pod.Volumes[0].Secret.Items)
 	require.Equal(t, cfg.ReplicationTrustFile, controller.VolumeMounts[0].MountPath+"/ca.crt")
 	require.Equal(t, controllerName, cfg.ControllerServiceAccount)
 	require.Equal(t, controllerName+"."+env.Namespace+".svc", cfg.ReplicationServerName)

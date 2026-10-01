@@ -76,7 +76,12 @@ spec:
                 path: tls.crt
               - key: tls.key
                 path: tls.key
-              - key: ca.crt
+              # Keep the runtime path stable, but trust current and retained roots
+              # so a follower can verify a leader whose projection is still old.
+              # The operator backfills this derived key before updating workloads.
+              # Standalone ServingTLSSecret inputs must supply this public bundle;
+              # do not mount ca.key or the private rotation state.
+              - key: ca-bundle.crt
                 path: ca.crt
         - name: replication-token
           projected:

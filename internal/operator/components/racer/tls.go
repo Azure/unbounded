@@ -36,6 +36,7 @@ const (
 	trustOverlap       = 14 * day
 	tlsStateKey        = "rotation.json"
 	previousCAKey      = "previous-ca.crt"
+	caBundleKey        = "ca-bundle.crt"
 	tlsStateAnnotation = "racer.unbounded-cloud.io/serving-tls-state"
 	maxPreviousCAs     = 2
 )
@@ -271,7 +272,9 @@ func renewTLS(secret *corev1.Secret, namespace string, now time.Time) (*corev1.S
 	}
 
 	updated := secret.DeepCopy()
-	changed := false
+	// This derived field was absent in earlier version-1 Secrets. Repair it
+	// only after validating the authoritative credentials and rotation state.
+	changed := !bytes.Equal(secret.Data[caBundleKey], servingRoots(secret))
 	// Older generations are a suffix. If an intermediate has expired, no
 	// earlier root can verify through it, so retire that entire suffix.
 	for i, previous := range state.Previous {
@@ -475,6 +478,10 @@ func previousRoots(state tlsState) []byte {
 	return roots
 }
 
+func servingRoots(secret *corev1.Secret) []byte {
+	return append(bytes.Clone(secret.Data["ca.crt"]), secret.Data[previousCAKey]...)
+}
+
 func writeTLSState(secret *corev1.Secret, state tlsState) error {
 	if len(state.Previous) > maxPreviousCAs {
 		return fmt.Errorf("too many Racer serving CA generations")
@@ -494,6 +501,8 @@ func writeTLSState(secret *corev1.Secret, state tlsState) error {
 	secret.Data[tlsStateKey] = encoded
 
 	secret.Data[previousCAKey] = previousRoots(state)
+
+	secret.Data[caBundleKey] = servingRoots(secret)
 	if secret.Annotations == nil {
 		secret.Annotations = map[string]string{}
 	}

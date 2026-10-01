@@ -153,8 +153,8 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 				t.Fatal("serving TLS not wired")
 			}
 
-			if !slices.Equal(pod.Volumes[0].Secret.Items, []corev1.KeyToPath{{Key: "tls.crt", Path: "tls.crt"}, {Key: "tls.key", Path: "tls.key"}, {Key: "ca.crt", Path: "ca.crt"}}) || pod.Containers[0].VolumeMounts[0].MountPath+"/ca.crt" != cfg.ReplicationTrustFile {
-				t.Fatal("replication requires the serving CA, never its private key")
+			if !slices.Equal(pod.Volumes[0].Secret.Items, []corev1.KeyToPath{{Key: "tls.crt", Path: "tls.crt"}, {Key: "tls.key", Path: "tls.key"}, {Key: "ca-bundle.crt", Path: "ca.crt"}}) || pod.Containers[0].VolumeMounts[0].MountPath+"/ca.crt" != cfg.ReplicationTrustFile {
+				t.Fatal("replication requires current and retained serving CAs, never their private keys")
 			}
 
 			if cfg.ControllerServiceAccount != pod.ServiceAccountName || cfg.ReplicationServerName != service.Name+"."+namespace+".svc" || cfg.ReplicationPort != 8443 || cfg.SnapshotMaxAge != 30*time.Second {
