@@ -2,6 +2,7 @@
 use super::*;
 use std::time::Instant;
 mod acquisition;
+mod directory;
 mod recovery;
 
 #[test]

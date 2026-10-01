@@ -146,7 +146,19 @@ fn endpoint_ownership_rejects_unsafe_locks_and_foreign_sockets() {
             }
         }
         let before = fs::symlink_metadata(fixture.socket()).ok().map(|m| m.ino());
-        assert_eq!(fixture.reconcile(&[definition()]), Err(Error::Io), "{kind}");
+        if kind == "writable-directory" {
+            // Startup prepares permissions first, but acquire itself stays strict.
+            let dir = File::open(&directory).unwrap();
+            assert!(EndpointOwner::acquire(&dir).is_err());
+            assert_eq!(dir.metadata().unwrap().mode() & 0o7777, 0o777);
+            assert!(!lock.exists());
+        } else {
+            for mode in [0o755, 0o777] {
+                fs::set_permissions(&directory, fs::Permissions::from_mode(mode)).unwrap();
+                assert_eq!(fixture.reconcile(&[definition()]), Err(Error::Io), "{kind}");
+                assert_eq!(fs::metadata(&directory).unwrap().mode() & 0o7777, 0o755);
+            }
+        }
         assert_eq!(
             fs::symlink_metadata(fixture.socket()).ok().map(|m| m.ino()),
             before

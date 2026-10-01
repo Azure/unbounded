@@ -1124,6 +1124,34 @@ fn child_directory(parent: &File, name: &[u8]) -> Result<File> {
     }
 }
 
+fn prepare_client_directory(directory: &File) -> Result<()> {
+    let before = directory.metadata().map_err(|_| Error::Io)?;
+    // Only harden directories we own, even when running with CAP_FOWNER.
+    // SAFETY: geteuid has no preconditions.
+    if !before.is_dir() || before.uid() != unsafe { libc::geteuid() } {
+        return Err(Error::Io);
+    }
+    let mode = before.mode() & 0o7777 & !0o022;
+    if before.mode() & 0o022 != 0 {
+        // The O_NOFOLLOW directory descriptor pins the inode across path swaps.
+        // Never chmod ancestors or broaden existing read/search permissions.
+        // SAFETY: directory owns the descriptor for the duration of fchmod.
+        if unsafe { libc::fchmod(directory.as_raw_fd(), mode) } != 0 {
+            return Err(Error::Io);
+        }
+    }
+    let after = directory.metadata().map_err(|_| Error::Io)?;
+    if !after.is_dir()
+        || after.uid() != before.uid()
+        || after.gid() != before.gid()
+        || !same_inode(&before, &after)
+        || after.mode() & 0o7777 != mode
+    {
+        return Err(Error::Io);
+    }
+    Ok(())
+}
+
 fn bind(
     root: &Path,
     definition: CacheDefinition,
@@ -1159,6 +1187,7 @@ fn bind(
     let root = open_directory(root)?;
     let cache = child_directory(&root, definition.name.as_bytes())?;
     let directory = child_directory(&cache, b"client")?;
+    prepare_client_directory(&directory)?;
     let owner = match previous.and_then(|listener| listener.owner.as_ref()) {
         Some(owner) => {
             owner.validate(&directory)?;
