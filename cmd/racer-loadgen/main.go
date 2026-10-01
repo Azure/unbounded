@@ -63,6 +63,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	f.DurationVar(&opts.pull.RetryDelay, "retry-delay", time.Second, "Per-worker delay after failed pulls")
 	f.DurationVar(&opts.pull.Interval, "interval", 0, "Per-worker delay after successful pulls")
 	f.BoolVar(&opts.pull.Verify, "verify", true, "Verify SHA-256 for every downloaded object")
+	f.BoolVar(&opts.pull.DiagnoseIntegrity, "diagnose-integrity", false, "Compare deterministic bytes and retain bounded page hashes on integrity failure (requires verify)")
 	f.DurationVar(&opts.startDelay, "start-delay", 10*time.Second, "Delay after origin readiness before starting workers")
 	f.DurationVar(&opts.duration, "duration", 0, "Load phase duration; zero runs until signaled")
 
@@ -209,6 +210,10 @@ func run(parent context.Context, opts options) error {
 
 	if err == nil {
 		p.img = catalog.images[0]
+		if err := p.configureDiagnostics(catalog); err != nil {
+			return err
+		}
+
 		p.images = catalog.images
 		ready.Store(catalog)
 		slog.Info("origin ready", "images", len(catalog.images), "digest", p.img.Manifest.Digest, "repository", opts.image.Repository, "target", opts.pull.Target, "concurrency", opts.pull.Concurrency)

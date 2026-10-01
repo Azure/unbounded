@@ -78,12 +78,7 @@ func newCatalog(ctx context.Context, opts imageOptions, count int) (*imageCatalo
 
 	images := make([]*syntheticImage, 0, count)
 	for index := range count {
-		imageOpts := opts
-		// Image zero preserves the original content and latest tag. Derivation
-		// depends only on the shared seed and index, never on the origin node.
-		if index > 0 {
-			imageOpts.Seed = fmt.Sprintf("racer-loadgen/catalog/v1/%d/%s", index, opts.Seed)
-		}
+		imageOpts := catalogImageOptions(opts, index)
 
 		img, err := newImage(ctx, imageOpts)
 		if err != nil {
@@ -120,6 +115,15 @@ func catalogFromImages(images []*syntheticImage) *imageCatalog {
 	}
 
 	return c
+}
+
+func catalogImageOptions(opts imageOptions, index int) imageOptions {
+	// Image zero preserves the original content and latest tag.
+	if index > 0 {
+		opts.Seed = fmt.Sprintf("racer-loadgen/catalog/v1/%d/%s", index, opts.Seed)
+	}
+
+	return opts
 }
 
 // The zero value independently shuffles a complete pass, preserving the baseline.

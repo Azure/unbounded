@@ -67,6 +67,7 @@ type integrityEvidence struct {
 	actualDigest   string
 	expectedSize   int64
 	receivedSize   int64
+	pages          *pageEvidence
 }
 
 // Validate at the logging boundary, including a length bound before parsing.
@@ -162,6 +163,7 @@ func (p *puller) reportPullFailure(err error, now time.Time, logger *slog.Logger
 	if reason == failureDigest && failure != nil && failure.integrity != nil {
 		evidence := failure.integrity
 		expected := safeSHA256(evidence.expectedDigest)
+
 		attrs = append(attrs, slog.Group("integrity",
 			slog.String("content_digest", expected),
 			slog.String("expected_digest", expected),
@@ -169,6 +171,9 @@ func (p *puller) reportPullFailure(err error, now time.Time, logger *slog.Logger
 			slog.Int64("expected_size", evidence.expectedSize),
 			slog.Int64("received_size", evidence.receivedSize),
 		))
+		if evidence.pages != nil {
+			attrs = append(attrs, slog.Any("pages", evidence.pages))
+		}
 	}
 
 	logger.Warn("image pull failed", attrs...)

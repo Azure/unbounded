@@ -18,24 +18,26 @@ import (
 	"sync"
 	"time"
 
+	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"golang.org/x/sync/errgroup"
 )
 
 type pullOptions struct {
-	Profile          string
-	ZipfExponent     float64
-	Target           string
-	Namespace        string
-	Concurrency      int
-	ConcurrencyFile  string
-	NodeCapsFile     string
-	NodeName         string
-	LayerConcurrency int
-	Timeout          time.Duration
-	RetryDelay       time.Duration
-	Interval         time.Duration
-	Verify           bool
+	Profile           string
+	ZipfExponent      float64
+	Target            string
+	Namespace         string
+	Concurrency       int
+	ConcurrencyFile   string
+	NodeCapsFile      string
+	NodeName          string
+	LayerConcurrency  int
+	Timeout           time.Duration
+	RetryDelay        time.Duration
+	Interval          time.Duration
+	Verify            bool
+	DiagnoseIntegrity bool
 }
 
 type puller struct {
@@ -48,11 +50,16 @@ type puller struct {
 	transport   *http.Transport
 	buffers     sync.Pool
 	failureLogs failureLogs
+	expected    map[digest.Digest]imageBlob
 	// Shared by workers; production uses the concurrency-safe package RNG.
 	randomFloat64 func() float64
 }
 
 func newPuller(img *syntheticImage, opts pullOptions, metrics *loadMetrics) (*puller, error) {
+	if opts.DiagnoseIntegrity && !opts.Verify {
+		return nil, errors.New("diagnose-integrity requires verify")
+	}
+
 	if img == nil || metrics == nil {
 		return nil, errors.New("image and metrics are required")
 	}
@@ -309,7 +316,27 @@ func (p *puller) fetch(ctx context.Context, kind string, desc ocispec.Descriptor
 		}
 	}()
 
-	n, actual, err := p.readBody(response.Body)
+	var (
+		n      int64
+		actual string
+		pages  *pageEvidence
+	)
+
+	if p.opts.DiagnoseIntegrity && status == http.StatusOK {
+		expected, ok := p.expected[desc.Digest]
+		if !ok || expected.descriptor.Size != desc.Size {
+			reason = failureOther
+			return errors.New("diagnostic expected object missing or inconsistent")
+		}
+
+		n, actual, pages, err = p.readBodyDiagnostic(response.Body, expected)
+		if errors.Is(err, errDiagnosticOracle) {
+			reason = failureOther
+		}
+	} else {
+		n, actual, err = p.readBody(response.Body)
+	}
+
 	if err != nil {
 		return fmt.Errorf("read %s %s: %w", kind, desc.Digest, err)
 	}
@@ -333,6 +360,7 @@ func (p *puller) fetch(ctx context.Context, kind string, desc ocispec.Descriptor
 		integrity = &integrityEvidence{
 			expectedDigest: desc.Digest.String(), actualDigest: actual,
 			expectedSize: desc.Size, receivedSize: n,
+			pages: pages,
 		}
 
 		return fmt.Errorf("%s %s: digest mismatch (received %s)", kind, desc.Digest, actual)
