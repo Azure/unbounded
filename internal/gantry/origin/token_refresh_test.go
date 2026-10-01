@@ -52,6 +52,8 @@ func TestTokenRefreshLeaderCancellationPreservesLiveWaiter(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 
+	var releaseOnce sync.Once
+
 	var calls atomic.Int32
 
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -66,7 +68,7 @@ func TestTokenRefreshLeaderCancellationPreservesLiveWaiter(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	defer close(release)
+	defer releaseOnce.Do(func() { close(release) })
 
 	r := &registry{hc: server.Client()}
 	challenge := `Bearer realm="` + server.URL + `"`
@@ -107,10 +109,7 @@ func TestTokenRefreshLeaderCancellationPreservesLiveWaiter(t *testing.T) {
 	go func() {
 		select {
 		case <-waiterCtx.waiting:
-			select {
-			case release <- struct{}{}:
-			case <-ctx.Done():
-			}
+			releaseOnce.Do(func() { close(release) })
 		case <-ctx.Done():
 		}
 	}()

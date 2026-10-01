@@ -13,35 +13,8 @@ import (
 	"github.com/Azure/unbounded/internal/gantry/origin"
 )
 
-// TestDefaultConfigMap_StartsCleanWithoutSecret is the regression
-// test for 's main finding:
-//
-//	The shipped deploy/gantry/configmap.yaml declared
-//	`credentials_path: "/etc/gantry/registry/registry.example.com"`
-//	on its sole upstream-registry entry, while the matching
-//	registry-creds volume in deploy/gantry/daemonset.yaml is `optional: true`
-//	and the harness does NOT apply deploy/gantry/examples/registry-secret.example.yaml.
-//	Kubernetes therefore happily starts the pod with no Secret
-//	mounted, but origin.New eagerly opens credentials_path at
-//	startup, returns a hard error, and the agent crashloops before
-//	/readyz can ever turn green. The e2e smoke test could never
-//	reach rollout.
-//
-// This test guards the post-fix invariant: loading the shipped
-// default ConfigMap into a Config and constructing an origin.Client
-// from it succeeds WITHOUT any credentials file being present.
-//
-// If a future revision re-introduces a credentials_path on an
-// uncommented entry, origin.New(cfg) will hit
-// `read credentials %q: no such file or directory` and the test
-// trips - exactly the failure mode the reviewer caught in
-// production manifests.
-//
-// Why this lives in internal/origin: origin.New is the chokepoint
-// that crashloops the pod. Putting the test next to it keeps the
-// failure mode and its regression guard adjacent. It also runs in
-// the default `go test ./...` suite (no `e2e` build tag) so every
-// validation gate enforces it.
+// TestDefaultConfigMap_StartsCleanWithoutSecret verifies that the chart's
+// default configuration constructs an origin client without shared credentials.
 func TestDefaultConfigMap_StartsCleanWithoutSecret(t *testing.T) {
 	repoRoot, err := filepath.Abs(filepath.Join("..", "..", ".."))
 	if err != nil {
@@ -80,22 +53,12 @@ func TestDefaultConfigMap_StartsCleanWithoutSecret(t *testing.T) {
 		t.Fatalf("LoadYAML on default ConfigMap: %v", err)
 	}
 
-	// The actual regression check: every UpstreamRegistry whose
-	// credentials_path is non-empty must reference a file that
-	// either (a) exists or (b) is explicitly created by the apply
-	// flow. The simplest defensible invariant - and the one the
-	// a prior review demands - is that the SHIPPED default has
-	// no required credentials_path, so the pod starts cleanly on
-	// any cluster regardless of whether deploy/gantry/examples/registry-secret.example.yaml
-	// has been applied.
+	// Shared identity file configuration must not return through chart rendering.
 	if strings.Contains(cfgYAML, "credentials_path") {
 		t.Error("removed credentials-file configuration rendered")
 	}
 
-	// And the load-bearing assertion: origin.New must succeed on
-	// the default ConfigMap. This catches the original bug exactly
-	// - even with no credentials_path set today, a future entry
-	// that references an absent file would trip this.
+	// Construction does not depend on mounted registry secrets.
 	c, err := origin.New(cfg)
 	if err != nil {
 		t.Fatalf("origin.New on default ConfigMap: %v (the shipped default ConfigMap must start without any Secret being applied; see deploy/gantry/configmap.yaml and deploy/gantry/README.md 'Apply order')", err)

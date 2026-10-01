@@ -161,6 +161,25 @@ Gantry does not mount shared registry identities or read credential files.
 Public registries that require an anonymous Bearer token remain supported.
 Private pulls use the requester's delegated credentials without identity fallback.
 
+#### Configuration Contract
+
+The default backend remains containerd; `GANTRY_RACER_ENABLED` selects Racer.
+There is no `storage_mode` selector. The default backend requires a containerd
+socket and positive lease TTL and cleanup intervals.
+
+Chair API access uses `chair_kubeconfig`, `GANTRY_CHAIR_KUBECONFIG`, or
+`--chair-kubeconfig`; an empty value selects in-cluster credentials. The former
+membership-named kubeconfig setting has no alias. `node_name` remains supported
+and identifies the node in layer-completion metrics, not chair selection.
+
+Removed cache, membership, HRW, prefetch, chair-percentage, and coordination
+compatibility settings are not accepted in YAML or as flags. Use
+`chair_holder_count` and `chair_seed_count` to size the chair pool and replicas.
+
+The Racer origin adapter requires bounded range reads. Resumed mirror responses
+must match the selected size, digest, and exact MIME type, including whether the
+MIME type is absent. A metadata mismatch fails before serving the response body.
+
 ### 5. Verify Distribution
 
 First verify one agent directly. Select a pod and forward its health and
