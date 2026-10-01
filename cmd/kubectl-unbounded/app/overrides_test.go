@@ -843,6 +843,7 @@ func TestDescribeAppliedRequiresState(t *testing.T) {
 			t.Fatalf("describeApplied(%+v) = %q", workload, got)
 		}
 	}
+
 	for state, want := range map[string]string{
 		v1alpha3.OverrideStateApplied: "yes", v1alpha3.OverrideStatePending: "pending",
 		v1alpha3.OverrideStateFailed: "failed", v1alpha3.OverrideStateWithheld: "withheld",

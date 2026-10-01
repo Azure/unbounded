@@ -276,12 +276,12 @@ func TestInstallDropsLiveReaperConfig(t *testing.T) {
 			strategyType, found, err := unstructured.NestedString(captured.deployment.Object, "spec", "strategy", "type")
 			require.NoError(t, err)
 			require.True(t, found)
-			require.Equal(t, "Recreate", strategyType)
+			require.Equal(t, "RollingUpdate", strategyType)
 
 			rollingUpdate, found, err := unstructured.NestedFieldNoCopy(captured.deployment.Object, "spec", "strategy", "rollingUpdate")
 			require.NoError(t, err)
-			require.True(t, found, "rollingUpdate must remain explicit through manifest apply conversion")
-			require.Nil(t, rollingUpdate)
+			require.True(t, found)
+			require.Equal(t, map[string]any{"maxSurge": int64(0), "maxUnavailable": int64(1)}, rollingUpdate)
 		})
 	}
 }
