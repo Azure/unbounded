@@ -251,3 +251,116 @@ func TestResolveTunnelProtocolsOnPeers_GatewayMeshSGPAScope(t *testing.T) {
 		}
 	})
 }
+
+// TestResolveTunnelProtocolsOnPeers_CrossCloudPrivateUnderlay covers the
+// managed-interconnect topology: two sites in different clouds joined by a
+// private, provider-managed L3 path (for example Azure Multicloud Interconnect,
+// a DIY ExpressRoute plus Direct Connect stitch, or a site-to-site VPN).
+//
+// Unbounded never provisions that underlay. A SitePeering naming both sites is
+// the operator's assertion that it exists, and the only thing the node agent
+// derives from it is that the link is not an internet link: usesExternal is
+// false, so Auto stops forcing WireGuard and the peering's tunnelProtocol is
+// honored. That is what makes every underlying transport interchangeable here.
+func TestResolveTunnelProtocolsOnPeers_CrossCloudPrivateUnderlay(t *testing.T) {
+	const (
+		localSite  = "azure-eastus"
+		remoteSite = "aws-us-east-1"
+	)
+
+	tests := []struct {
+		name string
+		// meshNodes true puts the remote site in peeredSites as well as
+		// networkPeeredSites; false puts it only in networkPeeredSites.
+		meshNodes bool
+		// peeringTunnel is SitePeering.spec.tunnelProtocol, "" meaning unset.
+		peeringTunnel string
+		wantProtocol  string
+	}{
+		{
+			// The recommended configuration: the interconnect already applies
+			// MACsec at the link layer, so IPIP avoids paying for WireGuard
+			// encryption a second time.
+			name:          "meshNodes with explicit IPIP is honored",
+			meshNodes:     true,
+			peeringTunnel: "IPIP",
+			wantProtocol:  "IPIP",
+		},
+		{
+			// Unset means Auto, and Auto over a private underlay resolves to
+			// preferredPrivateNetworkEncapsulation rather than WireGuard.
+			name:          "meshNodes unset peering falls back to the private default",
+			meshNodes:     true,
+			peeringTunnel: "",
+			wantProtocol:  "GENEVE",
+		},
+		{
+			// Security-wins is still available: an operator who does not trust
+			// the provider's encryption can demand WireGuard explicitly.
+			name:          "meshNodes explicit WireGuard still wins",
+			meshNodes:     true,
+			peeringTunnel: "WireGuard",
+			wantProtocol:  "WireGuard",
+		},
+		{
+			// With meshNodes false the sites are network-peered but nodes do
+			// not mesh, so no SitePeering scope applies to this mesh peer and
+			// it resolves through Auto. It must not become WireGuard: the site
+			// is still reachable on internal IPs across the interconnect.
+			name:          "network-peered without node mesh is not treated as an internet link",
+			meshNodes:     false,
+			peeringTunnel: "IPIP",
+			wantProtocol:  "GENEVE",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mesh := []meshPeerInfo{{Name: "aws-node-1", SiteName: remoteSite}}
+
+			peeredSites := map[string]bool{localSite: true}
+			networkPeeredSites := map[string]bool{localSite: true, remoteSite: true}
+
+			peeringSiteTunnelProtos := map[string]string{}
+
+			if tt.meshNodes {
+				peeredSites[remoteSite] = true
+
+				if tt.peeringTunnel != "" {
+					peeringSiteTunnelProtos[remoteSite] = tt.peeringTunnel
+				}
+			}
+
+			resolveTunnelProtocolsOnPeers(
+				mesh, nil, localSite,
+				peeredSites, networkPeeredSites,
+				false, false, nil,
+				"GENEVE", "WireGuard",
+				nil, peeringSiteTunnelProtos, nil, nil,
+			)
+
+			if mesh[0].TunnelProtocol != tt.wantProtocol {
+				t.Errorf("cross-cloud mesh peer: got %q, want %q", mesh[0].TunnelProtocol, tt.wantProtocol)
+			}
+		})
+	}
+
+	// Control: without any SitePeering the same cross-cloud peer is an internet
+	// link and Auto must force WireGuard. This is the line the SitePeering
+	// moves, and it is the whole reason declaring one is required.
+	t.Run("no SitePeering means the cross-cloud link forces WireGuard", func(t *testing.T) {
+		mesh := []meshPeerInfo{{Name: "aws-node-1", SiteName: remoteSite}}
+
+		resolveTunnelProtocolsOnPeers(
+			mesh, nil, localSite,
+			map[string]bool{localSite: true}, map[string]bool{localSite: true},
+			false, false, nil,
+			"GENEVE", "WireGuard",
+			nil, nil, nil, nil,
+		)
+
+		if mesh[0].TunnelProtocol != "WireGuard" {
+			t.Errorf("unpeered cross-cloud peer: got %q, want WireGuard", mesh[0].TunnelProtocol)
+		}
+	})
+}
