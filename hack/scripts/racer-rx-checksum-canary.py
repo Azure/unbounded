@@ -258,7 +258,7 @@ def stop(signum, frame):
 
 
 def remote_shell(mutate):
-    script = f'test "$(hostname)" = {NODE} || exit 41\n'
+    script = hostname_guard()
     if mutate:
         # This shell's timer does not depend on Python polling or HTTP progress.
         script += '''cleanup() {
@@ -288,6 +288,25 @@ exit "$rc"
     else:
         script += 'python3 -u -B -c "$@"\n'
     return script
+
+
+def hostname_guard():
+    # Azure hostnames can preserve an uppercase VMSS suffix; Kubernetes node
+    # names are lowercase. Compare DNS names case-insensitively in both paths.
+    return (f'test "$(hostname | LC_ALL=C tr A-Z a-z)" = {NODE} || '
+            '{ printf "rx-canary: hostname mismatch\\n" >&2; exit 41; }\n')
+
+
+def safe_stderr(line):
+    """Retain exact allowlisted diagnostics, never arbitrary remote output."""
+    text = line.decode("utf-8", errors="replace").strip()
+    if re.fullmatch(r"command terminated with exit code \d{1,3}", text):
+        return text
+    if text == "rx-canary: hostname mismatch":
+        return text
+    if re.fullmatch(r"(?:sh: \d+: )?(?:python3|timeout|ethtool|nsenter): (?:not found|Permission denied)", text):
+        return text
+    return None
 
 
 def preflight(concurrency):
@@ -323,6 +342,7 @@ def stream(argv, seconds):
     proc = subprocess.Popen(["timeout", "--signal=TERM", "--kill-after=10s", f"{seconds}s", *argv],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
     rows, pending = [], b""
+    suppressed = 0
     deadline = time.monotonic() + seconds + 10
     try:
         with selectors.DefaultSelector() as selector:
@@ -343,12 +363,26 @@ def stream(argv, seconds):
                     try:
                         row = json.loads(line)
                     except ValueError:
-                        # Never export arbitrary remote stderr, config or source.
+                        diagnostic = safe_stderr(line)
+                        if diagnostic:
+                            emit("remote_stderr", diagnostic=diagnostic)
+                        else:
+                            suppressed += 1
                         continue
                     rows.append(row)
                     emit("remote", record=row)
-            if proc.wait(timeout=1) != 0 or pending:
-                raise RuntimeError("remote failed or incomplete output")
+            status = proc.wait(timeout=1)
+            if pending:
+                diagnostic = safe_stderr(pending)
+                if diagnostic:
+                    emit("remote_stderr", diagnostic=diagnostic)
+                else:
+                    suppressed += 1
+            if status != 0 or pending:
+                emit("remote_exit", status=status, incomplete=bool(pending),
+                     suppressed_stderr_lines=suppressed)
+                raise RuntimeError(f"remote failed or incomplete output: exit={status}; "
+                                   f"suppressed_stderr_lines={suppressed}")
         return rows
     finally:
         with cleanup_signals():
@@ -365,7 +399,7 @@ def stream(argv, seconds):
 def independent_restore(original):
     # A failed journal must not suppress the independent write.
     command(host_exec("timeout", "--signal=TERM", "--kill-after=10s", "5s", "sh", "-c",
-                      f'test "$(hostname)" = {NODE} && ethtool -K eth0 rx on'), 7)
+                      hostname_guard() + 'ethtool -K eth0 rx on'), 7)
     current = {dev: features(command(host_exec("ethtool", "-k", dev), 5)) for dev in ("eth0", VF)}
     check_features(original, current, "on")
     emit("independent_restored", error=None)
@@ -418,18 +452,34 @@ def main():
     if len(sys.argv) == 3 and sys.argv[1] == "--remote":
         config = json.loads(sys.argv[2])
         host = Host(config)
-        if config["mode"] == "baseline":
-            original = host.features()
-            if any(original[d]["rx-checksumming"] != ("on", False) for d in original):
-                raise RuntimeError("original RX must be on and mutable")
-            emit("original", original=original)
-            stage(host, "baseline", 45, original, "on", config["concurrency"])
-        elif config["mode"] == "restored":
-            stage(host, "restored", 45, config["original"], "on", config["concurrency"], state=config["state"])
-        else:
-            if config.get("authorize") != AUTH:
-                raise RuntimeError("remote mutation not authorized")
-            changed(host, config)
+        try:
+            if config["mode"] == "baseline":
+                original = host.features()
+                if any(original[d]["rx-checksumming"] != ("on", False) for d in original):
+                    raise RuntimeError("original RX must be on and mutable")
+                emit("original", original=original)
+                stage(host, "baseline", 45, original, "on", config["concurrency"])
+            elif config["mode"] == "restored":
+                stage(host, "restored", 45, config["original"], "on", config["concurrency"], state=config["state"])
+            elif config["mode"] == "changed":
+                if config.get("authorize") != AUTH:
+                    raise RuntimeError("remote mutation not authorized")
+                changed(host, config)
+            else:
+                raise RuntimeError("invalid remote mode")
+        except Exception as error:
+            # Never stringify CalledProcessError: it embeds argv (source/config).
+            fields = dict(kind=type(error).__name__)
+            if isinstance(error, RuntimeError):
+                fields["diagnostic"] = str(error)[:256]
+            if isinstance(error, subprocess.CalledProcessError):
+                fields["exit"] = error.returncode
+                safe = [safe_stderr(line.encode()) for line in (error.stderr or "").splitlines()]
+                fields["stderr"] = [line for line in safe if line]
+            if isinstance(error, OSError):
+                fields["errno"] = error.errno
+            emit("remote_error", **fields)
+            raise SystemExit(1) from None
         return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--authorize", required=True)

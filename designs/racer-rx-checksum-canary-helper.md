@@ -56,7 +56,11 @@ Concurrency is the applied loadgen concurrency, not client/server credits.
 No credentials, payloads, object keys or environment are collected. Diagnostic
 page hashes are pseudonyms. Remote samples stream as JSON lines and are flushed
 to the local checkpoint. Source travels as a Python `-c` argument, not an
-asynchronous stdin pipe. Non-JSON remote stderr is not exported. Collection
+asynchronous stdin pipe. Non-JSON stderr is retained only for exact allowlisted
+diagnostics (hostname mismatch, kubectl exit status, missing required tools).
+Other lines are counted but suppressed. Remote Python failures emit structured
+error kind/status/errno and controlled RuntimeError messages; command argv,
+source/config and arbitrary subprocess stderr are never stringified. Collection
 failure preserves already-streamed evidence. An inconclusive baseline exits zero
 with an explicit `inconclusive` event, not a success verdict.
 
@@ -109,6 +113,13 @@ Offline tests (all host commands mocked):
 ```sh
 timeout --signal=TERM --kill-after=10s 30s python3 -B hack/scripts/racer-rx-checksum-canary_test.py
 ```
+
+Hostname comparisons normalize ASCII case in both entry and independent restore.
+The receiver's actual host name ends in uppercase `W`, while its Kubernetes node
+name ends in lowercase `w`. The first parent run on October 1 failed at this
+literal comparison with shell exit 41 before Python baseline startup; both RX
+features were subsequently observed on. Tests execute the real baseline entry
+through a real shell with this uppercase hostname and mocked host measurements.
 
 Development validation uses scoped Python syntax/indentation checks. `make fmt`
 is a Go-only target (Makefile:531-533); its earlier bounded invocation expired

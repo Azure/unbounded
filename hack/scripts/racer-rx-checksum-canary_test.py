@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import signal
 import os
+import json
 import unittest
 from unittest.mock import patch
 
@@ -161,7 +162,79 @@ python3() { ENDING; }
         with patch.object(rx, "emit") as emit:
             with self.assertRaisesRegex(RuntimeError, "remote failed"):
                 rx.stream(["python3", "-c", 'print(\'{"event":"checkpoint"}\',flush=True);exit(2)'], 3)
-        emit.assert_called_once_with("remote", record={"event": "checkpoint"})
+        self.assertEqual(emit.call_args_list[0].args, ("remote",))
+        self.assertEqual(emit.call_args_list[0].kwargs, dict(record={"event": "checkpoint"}))
+        self.assertEqual(emit.call_args_list[-1].kwargs["status"], 2)
+
+    def test_uppercase_hostname_runs_real_remote_baseline_entry(self):
+        # Real shell + Python + main entry; fake only host data and stage clock.
+        source = Path(rx.__file__).read_text().split('if __name__ == "__main__":')[0]
+        source += '''
+class FakeHost:
+    def __init__(self, config): pass
+    def features(self):
+        return {d: {"rx-checksumming": ("on", False)} for d in ("eth0", VF)}
+Host = FakeHost
+def stage(*args, **kwargs):
+    assert args[1:3] == ("baseline", 45)
+    emit("baseline_entry_verified")
+main()
+'''
+        prelude = 'hostname() { printf "%s\\n" aks-adsv5-13731677-vmss00000W; }\n'
+        output = rx.command(["sh", "-c", prelude + rx.remote_shell(False), "test", source,
+                             "--remote", json.dumps(dict(mode="baseline", concurrency=8, load_ip="127.0.0.1"))], 3)
+        records = [json.loads(line) for line in output.splitlines()]
+        self.assertEqual([r["event"] for r in records], ["original", "baseline_entry_verified"])
+
+    def test_wrong_hostname_reports_safe_error_before_python(self):
+        prelude = 'hostname() { printf "wrong-host\\n"; }\n'
+        with patch.object(rx, "emit") as emit:
+            with self.assertRaisesRegex(RuntimeError, "exit=41"):
+                rx.stream(["sh", "-c", prelude + rx.remote_shell(False), "test", 'print("UNREACHABLE")'], 3)
+        diagnostics = [c.kwargs for c in emit.call_args_list]
+        self.assertIn(dict(diagnostic="rx-canary: hostname mismatch"), diagnostics)
+        self.assertNotIn("UNREACHABLE", str(diagnostics))
+
+    def test_stderr_allowlist_does_not_export_secrets(self):
+        self.assertEqual(rx.safe_stderr(b"command terminated with exit code 41"),
+                         "command terminated with exit code 41")
+        for line in (b"Authorization: bearer SECRET", b"RuntimeError: SECRET", b"source token=SECRET"):
+            self.assertIsNone(rx.safe_stderr(line))
+
+    def test_unterminated_safe_stderr_is_preserved(self):
+        with patch.object(rx, "emit") as emit:
+            with self.assertRaisesRegex(RuntimeError, "exit=41"):
+                rx.stream(["python3", "-c", 'import sys; sys.stderr.write("command terminated with exit code 41"); sys.exit(41)'], 3)
+        self.assertEqual(emit.call_args_list[0].kwargs,
+                         dict(diagnostic="command terminated with exit code 41"))
+
+    def test_independent_restore_uses_same_case_normalization(self):
+        text = "Features for interface:\nrx-checksumming: on\ngeneric-receive-offload: on\n"
+        with patch.object(rx, "command", side_effect=["", text, text]) as command, patch.object(rx, "emit"):
+            rx.independent_restore(original())
+        script = command.call_args_list[0].args[0][-1]
+        self.assertTrue(script.startswith(rx.hostname_guard()))
+        prelude = '''hostname() { printf '%s\\n' aks-adsv5-13731677-vmss00000W; }
+ethtool() { printf 'MOCK_RESTORE\\n'; }
+'''
+        self.assertEqual(rx.command(["sh", "-c", prelude + script], 3).strip(), "MOCK_RESTORE")
+
+    def test_remote_exception_does_not_print_source_config(self):
+        source = Path(rx.__file__).read_text().split('if __name__ == "__main__":')[0]
+        source += '''
+class FakeHost:
+    def __init__(self, config): pass
+    def features(self):
+        raise subprocess.CalledProcessError(17, ["SECRET_ARG"], stderr="Authorization: SECRET")
+Host = FakeHost
+main()
+'''
+        with self.assertRaises(subprocess.CalledProcessError) as caught:
+            rx.command(["python3", "-B", "-c", source, "--remote", '{"mode":"baseline"}'], 3)
+        record = json.loads(caught.exception.stdout)
+        self.assertEqual(record["event"], "remote_error")
+        self.assertEqual(record["exit"], 17)
+        self.assertNotIn("SECRET", caught.exception.stdout + caught.exception.stderr)
 
     def test_real_shell_source_argument_and_watchdog_cleanup(self):
         # Real python, no stdin ambiguity; all host reads/writes are shell fakes.
