@@ -361,7 +361,7 @@ impl Transfers {
                 .ok_or(Error::Unauthorized)?;
             let verified = self.signatures.verify_historical(signed)?;
             if verified.node() != &path[index]
-                || crate::security::signing::receiver(&signed.head)? != path[index - 1]
+                || crate::security::connection::receiver(&signed.head)? != path[index - 1]
             {
                 return Err(Error::Unauthorized);
             }
