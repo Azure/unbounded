@@ -2,13 +2,7 @@
 //! All writable state lives beneath this crate's target/.
 #![cfg(target_os = "linux")]
 
-#[path = "process/control.rs"]
-mod control;
-#[path = "process/measurement.rs"]
-mod measurement;
-#[path = "process/sdk_connection_age.rs"]
-mod sdk_connection_age;
-#[path = "process/throughput.rs"]
+#[path = "process_restart/throughput.rs"]
 mod throughput;
 
 use racer_dataplane::{model::PAGE_BYTES, store::checkpoint_format};
@@ -43,6 +37,864 @@ const NAME: &str = "process-restart";
 const P: u64 = PAGE_BYTES;
 const LENGTH: u64 = 2 * P + 113;
 const TIMEOUT: Duration = Duration::from_secs(30);
+
+mod control {
+    //! Minimal real TLS controller fixture: bearer enrollment, then mTLS publication.
+    use super::*;
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use racer_dataplane::{
+        control::{
+            caches::{CacheDefinition, canonical_socket_paths},
+            wire,
+        },
+        model::{CacheId, ClusterId, MembershipVersion, NodeId},
+        topology::membership::Member,
+    };
+    use std::{num::NonZeroU32, time::SystemTime};
+
+    pub struct Control {
+        pub endpoint: String,
+        pub bundle: Vec<u8>,
+        pub enrollments: Arc<AtomicUsize>,
+        pub polls: Arc<AtomicUsize>,
+        pub blocked: Arc<AtomicBool>,
+        pub publication: Arc<Mutex<wire::Publication>>,
+        stop: Arc<AtomicBool>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+    impl Control {
+        pub fn start(root: &Path) -> Self {
+            Self::start_with(root, vec![(CACHE.into(), NAME.into())])
+        }
+        pub fn start_with(root: &Path, caches: Vec<(String, String)>) -> Self {
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params.key_usages = vec![
+                rcgen::KeyUsagePurpose::KeyCertSign,
+                rcgen::KeyUsagePurpose::CrlSign,
+            ];
+            let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+            let ca = params.self_signed(&ca_key).unwrap();
+            let server_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+            let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
+            params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+            let cert = params.signed_by(&server_key, &ca, &ca_key).unwrap();
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(ca.der().clone()).unwrap();
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(roots),
+                provider.clone(),
+            )
+            .allow_unauthenticated()
+            .build()
+            .unwrap();
+            let tls = Arc::new(
+                rustls::ServerConfig::builder_with_provider(provider)
+                    .with_safe_default_protocol_versions()
+                    .unwrap()
+                    .with_client_cert_verifier(verifier)
+                    .with_single_cert(
+                        vec![cert.der().clone()],
+                        rustls::pki_types::PrivatePkcs8KeyDer::from(server_key.serialize_der())
+                            .into(),
+                    )
+                    .unwrap(),
+            );
+            fs::write(root.join("trust.pem"), ca.pem()).unwrap();
+            fs::write(root.join("token"), "fixture.token").unwrap();
+            // Runtime-generated test material, distinct for the two encryption purposes.
+            let keys: Vec<_> = caches.iter().flat_map(|(cache, _)| [("page", 7u8), ("origin_credentials", 8u8)].into_iter().map(move |(purpose, id)| {
+                let mut material = [0; 32];
+                getrandom::getrandom(&mut material).unwrap();
+                serde_json::json!({"cache": cache, "id": STANDARD.encode([id; 16]), "purpose": purpose, "state": "active", "material": STANDARD.encode(material)})
+            })).collect();
+            let bundle = serde_json::json!({"schema_version": 1, "cluster": CLUSTER, "generation": "1", "peer_trust_roots": [STANDARD.encode(ca.der())], "cache_keys": keys});
+            let bundle_bytes = serde_json::to_vec(&bundle).unwrap();
+            let publication = Arc::new(Mutex::new(wire::Publication {
+                schema_version: 1,
+                cluster: ClusterId(CLUSTER.into()),
+                sequence: wire::PublicationSequence(1),
+                membership_version: MembershipVersion(1),
+                members: vec![Member {
+                    node: NodeId(NODE.into()),
+                    shares: NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: "127.0.0.1:7443".into(),
+                    rails: vec![],
+                    alignment_enabled: false,
+                }],
+                caches: caches
+                    .into_iter()
+                    .map(|(id, name)| {
+                        let (client_socket, origin_socket) = canonical_socket_paths(&name).unwrap();
+                        CacheDefinition {
+                            id: CacheId(id),
+                            name,
+                            client_socket,
+                            origin_socket,
+                        }
+                    })
+                    .collect(),
+            }));
+            let published = publication.clone();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("https://{}", listener.local_addr().unwrap());
+            listener.set_nonblocking(true).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let enrollments = Arc::new(AtomicUsize::new(0));
+            let polls = Arc::new(AtomicUsize::new(0));
+            let blocked = Arc::new(AtomicBool::new(false));
+            let (observed, paused) = (polls.clone(), blocked.clone());
+            let (stopping, issued) = (stop.clone(), enrollments.clone());
+            let ca = Arc::new(ca);
+            let ca_key = Arc::new(ca_key);
+            let thread = thread::spawn(move || {
+                let mut handlers = Vec::new();
+                while !stopping.load(Ordering::Acquire) {
+                    let (socket, _) = match listener.accept() {
+                        Ok(pair) => pair,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(2));
+                            continue;
+                        }
+                        Err(error) => panic!("control accept: {error}"),
+                    };
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    socket
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let (tls, published, observed, paused, stopping, issued) = (
+                        tls.clone(),
+                        published.clone(),
+                        observed.clone(),
+                        paused.clone(),
+                        stopping.clone(),
+                        issued.clone(),
+                    );
+                    let (ca, ca_key, bundle) = (ca.clone(), ca_key.clone(), bundle.clone());
+                    handlers.push(thread::spawn(move || {
+                    let mut stream = rustls::StreamOwned::new(
+                        rustls::ServerConnection::new(tls.clone()).unwrap(),
+                        socket,
+                    );
+                    let Ok(head) = read_head(&mut stream) else {
+                        return;
+                    };
+                    let fields = fields(&head);
+                    let length = fields
+                        .get("content-length")
+                        .map_or(0, |n| n.parse::<usize>().unwrap());
+                    assert!(length <= wire::MAX_ENROLLMENT_BYTES);
+                    let mut body = vec![0; length];
+                    if stream.read_exact(&mut body).is_err() {
+                        return;
+                    }
+                    let (status, body) = if head.starts_with("GET /v1/keyring") {
+                        assert!(stream.conn.peer_certificates().is_some() || fields["authorization"].starts_with("Bearer fixture.token"));
+                        if head.starts_with("GET /v1/keyring?after=1 ") {
+                            (204, Vec::new())
+                        } else {
+                            (200, serde_json::to_vec(&bundle).unwrap())
+                        }
+                    } else if head.starts_with("POST /v1/bootstrap ") {
+                        let binding = fields["authorization"]
+                            .strip_prefix("Bearer fixture.token")
+                            .unwrap();
+                        let node = if binding.is_empty() {
+                            NODE
+                        } else {
+                            binding.strip_prefix('.').unwrap()
+                        };
+                        assert!(
+                            published
+                                .lock()
+                                .unwrap()
+                                .members
+                                .iter()
+                                .any(|member| member.node.0 == node)
+                        );
+                        assert!(stream.conn.peer_certificates().is_none());
+                        let request = wire::decode_enrollment_request(&body).unwrap();
+                        assert_eq!(request.cluster.0, CLUSTER);
+                        let der =
+                            rustls::pki_types::CertificateSigningRequestDer::from(request.csr_der);
+                        let mut csr = rcgen::CertificateSigningRequestParams::from_der(&der).unwrap();
+                        csr.params.not_before = (SystemTime::now() - Duration::from_secs(1)).into();
+                        csr.params.not_after = (SystemTime::now() + Duration::from_secs(86399)).into();
+                        csr.params.subject_alt_names = vec![rcgen::SanType::URI(
+                            format!("spiffe://{CLUSTER}/node/{node}")
+                                .try_into()
+                                .unwrap(),
+                        )];
+                        csr.params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+                        csr.params.extended_key_usages =
+                            vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+                        let certificate = csr.signed_by(&ca, &ca_key).unwrap();
+                        issued.fetch_add(1, Ordering::Release);
+                        (
+                            200,
+                            wire::encode_enrollment_response(&wire::EnrollmentResponse {
+                                schema_version: 1,
+                                cluster: request.cluster,
+                                node: NodeId(node.into()),
+                                enrollment: request.enrollment,
+                                certificate_chain: vec![certificate.der().to_vec()],
+                            })
+                            .unwrap(),
+                        )
+                    } else {
+                        assert!(head.starts_with("GET /v1/snapshot"));
+                        assert!(stream.conn.peer_certificates().is_some());
+                        observed.fetch_add(1, Ordering::Release);
+                        while paused.load(Ordering::Acquire) && !stopping.load(Ordering::Acquire) {
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        let publication = published.lock().unwrap();
+                        if head
+                            .lines()
+                            .next()
+                            .unwrap()
+                            .contains(&format!("?after={} ", publication.sequence.0))
+                        {
+                            thread::sleep(Duration::from_millis(20));
+                            (204, Vec::new())
+                        } else {
+                            (200, wire::encode_publication(&publication).unwrap())
+                        }
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream
+                        .write_all(response.as_bytes())
+                        .and_then(|()| stream.write_all(&body))
+                        .and_then(|()| stream.flush());
+                    }));
+                    let mut i = 0;
+                    while i < handlers.len() {
+                        if handlers[i].is_finished() {
+                            handlers.swap_remove(i).join().unwrap();
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+                for handler in handlers {
+                    handler.join().unwrap();
+                }
+            });
+            Self {
+                bundle: bundle_bytes,
+                endpoint,
+                enrollments,
+                polls,
+                blocked,
+                publication,
+                stop,
+                thread: Some(thread),
+            }
+        }
+    }
+    impl Drop for Control {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+}
+
+mod measurement {
+    //! Client-side completion oracle. Partial bodies never contribute to goodput.
+    use serde::Serialize;
+    use std::{
+        collections::BTreeMap,
+        io::{self, BufReader, Read, Write},
+        time::Duration,
+    };
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum Failure {
+        Http(u16),
+        Truncated,
+        Transport(io::ErrorKind),
+        Invalid,
+        Corrupt,
+    }
+    impl From<io::Error> for Failure {
+        fn from(error: io::Error) -> Self {
+            if error.kind() == io::ErrorKind::UnexpectedEof {
+                Self::Truncated
+            } else {
+                Self::Transport(error.kind())
+            }
+        }
+    }
+
+    pub struct Expected {
+        pub start: u64,
+        pub end: u64,
+        pub length: u64,
+    }
+
+    pub fn response<S: Read + Write>(
+        stream: &mut BufReader<S>,
+        expected: &Expected,
+        byte: impl FnMut(u64) -> u8,
+        pause: Duration,
+    ) -> Result<u64, Failure> {
+        response_fields(stream, expected, byte, pause).map(|(length, _)| length)
+    }
+
+    pub fn response_fields<S: Read + Write>(
+        stream: &mut BufReader<S>,
+        expected: &Expected,
+        mut byte: impl FnMut(u64) -> u8,
+        pause: Duration,
+    ) -> Result<(u64, BTreeMap<String, String>), Failure> {
+        let mut head = Vec::new();
+        // Bounded even for an unterminated malicious header.
+        while !head.ends_with(b"\r\n\r\n") {
+            if head.len() == 32768 {
+                return Err(Failure::Invalid);
+            }
+            let mut b = [0];
+            stream.read_exact(&mut b)?;
+            head.push(b[0]);
+        }
+        let head = std::str::from_utf8(&head).map_err(|_| Failure::Invalid)?;
+        let mut lines = head.split("\r\n");
+        let mut status = lines.next().ok_or(Failure::Invalid)?.split_whitespace();
+        if status.next() != Some("HTTP/1.1") {
+            return Err(Failure::Invalid);
+        }
+        let status: u16 = status
+            .next()
+            .ok_or(Failure::Invalid)?
+            .parse()
+            .map_err(|_| Failure::Invalid)?;
+        let mut fields = BTreeMap::new();
+        for line in lines.filter(|line| !line.is_empty()) {
+            let (name, value) = line.split_once(':').ok_or(Failure::Invalid)?;
+            if fields
+                .insert(name.to_ascii_lowercase(), value.trim().to_owned())
+                .is_some()
+            {
+                return Err(Failure::Invalid);
+            }
+        }
+        if status != 200 {
+            return Err(Failure::Http(status));
+        }
+        let length = expected
+            .end
+            .checked_sub(expected.start)
+            .ok_or(Failure::Invalid)?;
+        let pages = if length == 0 {
+            0
+        } else {
+            (expected.end - 1) / super::P - expected.start / super::P + 1
+        };
+        if expected.end > expected.length
+            || fields
+                .get("content-length")
+                .and_then(|s| s.parse::<u64>().ok())
+                != Some(length + 21 * (pages + 1))
+            || fields.get("etag").map(String::as_str) != Some("\"restart-v1\"")
+            || fields.get("racer-object-length") != Some(&expected.length.to_string())
+            || fields.get("racer-range-start") != Some(&expected.start.to_string())
+            || fields.get("racer-range-end") != Some(&expected.end.to_string())
+            || fields.get("racer-expires-at") != Some(&"0".to_owned())
+            || fields.get("content-type").map(String::as_str) != Some("application/octet-stream")
+            || fields.get("connection").map(String::as_str) != Some("close")
+            || fields.contains_key("content-range")
+            || fields.contains_key("transfer-encoding")
+        {
+            return Err(Failure::Invalid);
+        }
+        let mut scratch = [0; 64 << 10];
+        let mut offset = expected.start;
+        while offset < expected.end {
+            let number = offset / super::P;
+            let end = expected.end.min((number + 1) * super::P);
+            let length = (end - offset) as u32;
+            let mut frame = [0; 21];
+            stream.read_exact(&mut frame)?;
+            if frame[0] != 1
+                || u64::from_be_bytes(frame[1..9].try_into().unwrap()) != number
+                || u64::from_be_bytes(frame[9..17].try_into().unwrap()) != offset
+                || u32::from_be_bytes(frame[17..].try_into().unwrap()) != length
+            {
+                return Err(Failure::Invalid);
+            }
+            while offset < end {
+                let n = scratch.len().min((end - offset) as usize);
+                stream.read_exact(&mut scratch[..n])?;
+                if scratch[..n]
+                    .iter()
+                    .enumerate()
+                    .any(|(i, actual)| *actual != byte(offset + i as u64))
+                {
+                    return Err(Failure::Corrupt);
+                }
+                offset += n as u64;
+                if !pause.is_zero() {
+                    std::thread::sleep(pause);
+                }
+            }
+            // Completion releases the final lease; earlier pages return exact credit.
+            if offset < expected.end {
+                stream.get_mut().write_all(&number.to_be_bytes())?;
+                stream.get_mut().write_all(&length.to_be_bytes())?;
+            }
+        }
+        let mut complete = [0; 21];
+        stream.read_exact(&mut complete)?;
+        if complete[0] != 2
+            || u64::from_be_bytes(complete[1..9].try_into().unwrap()) != pages
+            || u64::from_be_bytes(complete[9..17].try_into().unwrap()) != length
+            || u32::from_be_bytes(complete[17..].try_into().unwrap()) != 0
+        {
+            return Err(Failure::Invalid);
+        }
+        let mut extra = [0];
+        if stream.read(&mut extra)? != 0 {
+            return Err(Failure::Invalid);
+        }
+        Ok((length, fields))
+    }
+
+    #[derive(Default, Debug, Serialize)]
+    pub struct Measurements {
+        pub attempted: usize,
+        pub completed: usize,
+        pub completed_bytes: u64,
+        pub failures: BTreeMap<String, usize>,
+        pub elapsed_seconds: f64,
+        pub goodput_bytes_per_second: f64,
+        pub completed_p50_ms: Option<f64>,
+        pub completed_p99_ms: Option<f64>,
+        #[serde(skip)]
+        latencies: Vec<Duration>,
+    }
+    impl Measurements {
+        pub fn record(&mut self, result: Result<u64, Failure>, latency: Duration) {
+            self.attempted += 1;
+            match result {
+                Ok(bytes) => {
+                    self.completed += 1;
+                    self.completed_bytes += bytes;
+                    self.latencies.push(latency);
+                }
+                Err(error) => *self.failures.entry(format!("{error:?}")).or_default() += 1,
+            }
+        }
+        pub fn finish(&mut self, elapsed: Duration) {
+            self.elapsed_seconds = elapsed.as_secs_f64();
+            self.goodput_bytes_per_second = if elapsed.is_zero() {
+                0.
+            } else {
+                self.completed_bytes as f64 / self.elapsed_seconds
+            };
+            self.latencies.sort_unstable();
+            let percentile = |p: usize| {
+                self.latencies
+                    .get((self.latencies.len() * p).div_ceil(100).saturating_sub(1))
+                    .map(|d| d.as_secs_f64() * 1000.)
+            };
+            self.completed_p50_ms = percentile(50);
+            self.completed_p99_ms = percentile(99);
+        }
+        pub fn accept(&self, scheduled: usize) -> bool {
+            scheduled > 0
+                && self.attempted == scheduled
+                && self.completed == scheduled
+                && self.completed_bytes > 0
+                && self.failures.is_empty()
+                && self.elapsed_seconds > 0.
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        fn check(bytes: &[u8]) -> Result<u64, Failure> {
+            response(
+                &mut BufReader::new(io::Cursor::new(bytes.to_vec())),
+                &Expected {
+                    start: 0,
+                    end: 3,
+                    length: 3,
+                },
+                |i| i as u8,
+                Duration::ZERO,
+            )
+        }
+        #[test]
+        fn complete_error_truncated_malformed_and_corrupt_responses() {
+            let head = b"HTTP/1.1 200 OK\r\nContent-Length: 45\r\nETag: \"restart-v1\"\r\nRacer-Object-Length: 3\r\nRacer-Range-Start: 0\r\nRacer-Range-End: 3\r\nRacer-Expires-At: 0\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n";
+            let page = frame(1, 0, 0, 3);
+            let complete = frame(2, 1, 3, 0);
+            let valid = [head.as_slice(), &page, &[0, 1, 2], &complete].concat();
+            assert_eq!(check(&valid), Ok(3));
+            assert_eq!(
+                check(&[head.as_slice(), &page, &[0, 1]].concat()),
+                Err(Failure::Truncated)
+            );
+            assert_eq!(
+                check(&[head.as_slice(), &page, &[0, 1, 7], &complete].concat()),
+                Err(Failure::Corrupt)
+            );
+            assert_eq!(
+                check(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\n\r\n"),
+                Err(Failure::Http(503))
+            );
+            assert_eq!(check(b""), Err(Failure::Truncated));
+            assert_eq!(check(&valid[..valid.len() - 1]), Err(Failure::Truncated));
+            assert_eq!(
+                check(&[valid.as_slice(), &[0]].concat()),
+                Err(Failure::Invalid)
+            );
+            assert_eq!(
+                check(&[head.as_slice(), &frame(1, 1, 0, 3), &[0, 1, 2], &complete].concat()),
+                Err(Failure::Invalid)
+            );
+            assert_eq!(
+                check(&[head.as_slice(), &page, &[0, 1, 2], &frame(2, 2, 3, 0)].concat()),
+                Err(Failure::Invalid)
+            );
+            assert_eq!(check(&vec![b'x'; 32769]), Err(Failure::Invalid));
+            assert_eq!(
+                check(b"HTTP/1.1 206 OK\r\nContent-Length: 3\r\ncontent-length: 3\r\n\r\n"),
+                Err(Failure::Invalid)
+            );
+        }
+        fn frame(kind: u8, number: u64, offset: u64, length: u32) -> [u8; 21] {
+            let mut frame = [0; 21];
+            frame[0] = kind;
+            frame[1..9].copy_from_slice(&number.to_be_bytes());
+            frame[9..17].copy_from_slice(&offset.to_be_bytes());
+            frame[17..].copy_from_slice(&length.to_be_bytes());
+            frame
+        }
+
+        #[test]
+        fn partial_pages_return_exact_credit_and_empty_requires_completion() {
+            let (mut client, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            server
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let worker = std::thread::spawn(move || {
+                write!(server, "HTTP/1.1 200 OK\r\nContent-Length: 65\r\nETag: \"restart-v1\"\r\nRacer-Object-Length: {}\r\nRacer-Range-Start: {}\r\nRacer-Range-End: {}\r\nRacer-Expires-At: 0\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n", super::super::P + 1, super::super::P - 1, super::super::P + 1).unwrap();
+                server
+                    .write_all(&frame(1, 0, super::super::P - 1, 1))
+                    .unwrap();
+                server.write_all(&[7]).unwrap();
+                let mut release = [0; 12];
+                server.read_exact(&mut release).unwrap();
+                assert_eq!(&release[..8], &0u64.to_be_bytes());
+                assert_eq!(&release[8..], &1u32.to_be_bytes());
+                server.write_all(&frame(1, 1, super::super::P, 1)).unwrap();
+                server.write_all(&[7]).unwrap();
+                server.write_all(&frame(2, 2, 2, 0)).unwrap();
+            });
+            assert_eq!(
+                response(
+                    &mut BufReader::new(&mut client),
+                    &Expected {
+                        start: super::super::P - 1,
+                        end: super::super::P + 1,
+                        length: super::super::P + 1
+                    },
+                    |_| 7,
+                    Duration::ZERO
+                ),
+                Ok(2)
+            );
+            worker.join().unwrap();
+            let head = b"HTTP/1.1 200 OK\r\nContent-Length: 21\r\nETag: \"restart-v1\"\r\nRacer-Object-Length: 0\r\nRacer-Range-Start: 0\r\nRacer-Range-End: 0\r\nRacer-Expires-At: 0\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n";
+            for complete in [true, false] {
+                let mut raw = head.to_vec();
+                if complete {
+                    raw.extend_from_slice(&frame(2, 0, 0, 0));
+                }
+                assert_eq!(
+                    response(
+                        &mut BufReader::new(io::Cursor::new(raw)),
+                        &Expected {
+                            start: 0,
+                            end: 0,
+                            length: 0
+                        },
+                        |_| panic!("empty payload"),
+                        Duration::ZERO
+                    ),
+                    if complete {
+                        Ok(0)
+                    } else {
+                        Err(Failure::Truncated)
+                    }
+                );
+            }
+        }
+        #[test]
+        fn strict_gate_rejects_partial_success_empty_and_unfinished_runs() {
+            let mut m = Measurements::default();
+            m.finish(Duration::from_secs(1));
+            assert!(!m.accept(0));
+            m.record(Ok(3), Duration::from_millis(10));
+            m.finish(Duration::from_secs(1));
+            assert!(m.accept(1));
+            assert!(!m.accept(2));
+            m.record(Err(Failure::Truncated), Duration::from_millis(20));
+            m.finish(Duration::from_secs(2));
+            assert!(!m.accept(2));
+            assert_eq!(m.completed_bytes, 3);
+            assert_eq!(m.goodput_bytes_per_second, 1.5);
+            assert_eq!(m.completed_p99_ms, Some(10.));
+            m.finish(Duration::ZERO);
+            assert!(!m.accept(1));
+        }
+    }
+}
+
+// Opt-in real Application + Go SDK sustained connection rotation gate.
+// The flag records normal completion observed by the load loop. Drop must not
+// probe/reap an unobserved exited supervisor before signaling its whole group.
+struct SDKProcess(Child, bool);
+impl Drop for SDKProcess {
+    fn drop(&mut self) {
+        // A normally completed timeout has already waited for its SDK child.
+        if self.1 {
+            return;
+        }
+        // Keep the supervisor alive during the grace period. Do not reap it
+        // before escalation: its unreaped PID also pins the process-group ID.
+        let group = -(self.0.id() as i32);
+        unsafe {
+            libc::kill(group, libc::SIGTERM);
+        }
+        thread::sleep(Duration::from_millis(200));
+        unsafe {
+            libc::kill(group, libc::SIGKILL);
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match self.0.try_wait() {
+                Ok(Some(_)) => break,
+                Err(error) => {
+                    eprintln!("SDK supervisor reap failed: {error}");
+                    break;
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    eprintln!("SDK supervisor did not exit after process-group SIGKILL");
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn sdk_process_cleanup_terminates_term_ignoring_child() {
+    use std::os::fd::AsRawFd;
+
+    let mut sdk = SDKProcess(
+        Command::new("timeout")
+            .process_group(0)
+            .args([
+                "--signal=TERM",
+                "--kill-after=10s",
+                "60s",
+                "sh",
+                "-c",
+                "trap '' TERM; printf '%s\\n' \"$$\"; exec sleep 300",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        false,
+    );
+    let supervisor = sdk.0.id();
+    let mut output = sdk.0.stdout.take().unwrap();
+    // Bound the readiness handshake too; the child must install SIG_IGN before
+    // cleanup begins, otherwise a passing test would not prove escalation.
+    let flags = unsafe { libc::fcntl(output.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(output.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut ready = Vec::new();
+    loop {
+        let mut byte = [0];
+        match output.read(&mut byte) {
+            Ok(1) if byte[0] == b'\n' => break,
+            Ok(1) => ready.push(byte[0]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(5))
+            }
+            other => panic!("child readiness failed: {other:?}"),
+        }
+        assert!(Instant::now() < deadline, "child readiness timed out");
+    }
+    let child: u32 = std::str::from_utf8(&ready).unwrap().parse().unwrap();
+    assert_ne!(child, supervisor);
+    let started = Instant::now();
+    drop(sdk);
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(
+        !Path::new(&format!("/proc/{supervisor}")).exists(),
+        "supervisor was not reaped"
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        // An orphan may briefly be a zombie until init reaps it. It must no
+        // longer execute; kill(pid, 0) alone cannot distinguish this state.
+        match fs::read_to_string(format!("/proc/{child}/stat")) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Ok(stat) if stat.rsplit_once(") ").unwrap().1.starts_with('Z') => break,
+            _ => assert!(
+                Instant::now() < deadline,
+                "TERM-ignoring child survived cleanup"
+            ),
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn cpu(pid: u32) -> BTreeMap<String, u64> {
+    fs::read_dir(format!("/proc/{pid}/task"))
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let name = fs::read_to_string(path.join("comm")).unwrap();
+            let stat = fs::read_to_string(path.join("schedstat")).unwrap();
+            (
+                format!(
+                    "{}:{}",
+                    name.trim(),
+                    path.file_name().unwrap().to_string_lossy()
+                ),
+                stat.split_whitespace().next().unwrap().parse().unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "requires root, mount namespaces, io_uring, O_DIRECT and RACER_SDK_AGE_BINARY"]
+fn real_sdk_connection_age_sustained() {
+    let binary = std::env::var_os("RACER_SDK_AGE_BINARY").expect("prebuild the Go SDK test binary");
+    let report_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+    fs::create_dir_all(&report_directory).unwrap();
+    let scratch = Scratch::new();
+    let profile = throughput::Profile {
+        pairs: 4,
+        length: P + 113,
+        caches: vec![
+            (CACHE.into(), "age-bulk".into()),
+            (
+                "44444444-4444-4444-8444-444444444445".into(),
+                "age-small".into(),
+            ),
+        ],
+        peer: None,
+        key_base: 0,
+    };
+    let control = control::Control::start_with(&scratch.0, profile.caches.clone());
+    let (mut process, mut origins) = Process::start_profile(&scratch, &control, 0, Some(&profile));
+    // Give the second cache genuinely small objects, not small ranges of bulk objects.
+    drop(origins.remove(1));
+    let small_origin = format!(
+        "/proc/self/fd/{}/origin/socket",
+        process.cache_directories[1].as_raw_fd()
+    );
+    fs::remove_file(&small_origin).unwrap();
+    origins.push(Origin::start_with(Path::new(&small_origin), 113, true));
+    for age in ["1h", "500ms"] {
+        let output = report_directory.join(format!("sdk-age-{age}.log"));
+        let log = fs::File::create(&output).unwrap();
+        let mut sdk = SDKProcess(
+            Command::new("timeout")
+                .process_group(0)
+                .args(["--signal=TERM", "--kill-after=10s", "60s"])
+                .arg(&binary)
+                .args([
+                    "-test.run=^TestRealRuntimeConnectionAgeLoad$",
+                    "-test.timeout=5m",
+                    "-test.v",
+                ])
+                .env("RACER_SDK_AGE", age)
+                .env(
+                    "RACER_SDK_AGE_SOCKET",
+                    format!(
+                        "/proc/{}/fd/{}/client/socket",
+                        std::process::id(),
+                        process.cache_directories[0].as_raw_fd()
+                    ),
+                )
+                .env(
+                    "RACER_SDK_AGE_SMALL_SOCKET",
+                    format!(
+                        "/proc/{}/fd/{}/client/socket",
+                        std::process::id(),
+                        process.cache_directories[1].as_raw_fd()
+                    ),
+                )
+                .stdout(log.try_clone().unwrap())
+                .stderr(log)
+                .spawn()
+                .unwrap(),
+            false,
+        );
+        let started = Instant::now();
+        let before = cpu(process.child.id());
+        let mut samples = Vec::new();
+        let status = loop {
+            process.assert_running();
+            if let Some(status) = sdk.0.try_wait().unwrap() {
+                sdk.1 = true;
+                break status;
+            }
+            if started.elapsed() > Duration::from_secs(75) {
+                // Allow timeout's full 60s + 10s escalation window. On a
+                // stalled supervisor, Drop still escalates the entire group.
+                panic!("SDK timed out");
+            }
+            let metrics = process.diagnostic("/metrics").unwrap();
+            samples.push(serde_json::json!({"seconds": started.elapsed().as_secs_f64(), "cpu_ns": cpu(process.child.id()), "metrics": String::from_utf8(metrics.body).unwrap()}));
+            thread::sleep(Duration::from_millis(500));
+        };
+        let after = cpu(process.child.id());
+        let report = serde_json::json!({"age": age, "pairs": 4, "elapsed_seconds": started.elapsed().as_secs_f64(), "cpu_before_ns": before, "cpu_after_ns": after, "samples": samples,
+            "limitations": ["thread CPU is a worker activity proxy, not request attribution", "server exports aggregate metrics, not per-worker requests or queue residence"]});
+        fs::write(
+            report_directory.join(format!("sdk-age-{age}.json")),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .unwrap();
+        println!(
+            "SDK_AGE_LOG {}\n{}",
+            output.display(),
+            fs::read_to_string(&output).unwrap()
+        );
+        assert!(status.success(), "SDK load failed");
+    }
+    assert!(process.stop(libc::SIGTERM).success());
+    drop(origins);
+}
 
 // Historical profiles call I/O shard counts "pairs". Preserve their 1/2/4-shard
 // workloads, but budget shared crypto rather than doubling every shard count.
@@ -223,7 +1075,8 @@ impl Process {
                 ("RACER_SEGMENT_BYTES", "67108864"),
                 ("RACER_FREE_SEGMENT_RESERVE", "1"),
                 ("RACER_QUEUE_ENTRIES", "16"),
-                ("RACER_CLIENT_CONNECTIONS", "8"),
+                // Three independent control slots require twelve total connections.
+                ("RACER_CLIENT_CONNECTIONS", "12"),
                 ("RACER_ORIGIN_CONNECTIONS_PER_CACHE", "2"),
                 ("RACER_METADATA_ENTRIES", "32"),
                 ("RACER_FLIGHTS", "8"),
@@ -316,9 +1169,14 @@ impl Process {
                 "caller owns worker zero; progress floors must fund requested I/O shards: {names:?}"
             );
             assert_eq!(
-                names.len(),
+                // Linux can expose io_uring's kernel workers in the task list.
+                // They are not application threads selected by AffinityPlan.
+                names
+                    .iter()
+                    .filter(|name| !name.starts_with("iou-wrk-"))
+                    .count(),
                 plan.pairs.len() + plan.crypto_groups().len(),
-                "whole-process thread count must match the capped plan: {names:?}"
+                "application thread count must match the capped plan: {names:?}"
             );
         }
         (process, origins)
