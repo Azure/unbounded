@@ -3,7 +3,7 @@ use super::*;
 use crate::{
     memory::page::CiphertextCopy,
     model::NodeId,
-    peer::wire::{PeerRequest, VerifiedResponse},
+    peer::protocol::{PeerRequest, VerifiedResponse},
     security::{
         forwarding::Forwarding,
         signing::tests::{network, node},

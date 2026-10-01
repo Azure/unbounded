@@ -24,7 +24,7 @@ struct Never;
 impl server::LocalPageService for Never {
     fn serve_peer<'a>(
         &'a self,
-        _: wire::VerifiedRequest,
+        _: protocol::VerifiedRequest,
         _: crate::topology::membership::MembershipLease,
         _: &'a RequestScope,
     ) -> crate::error::Operation<'a, PeerResponse> {
@@ -88,7 +88,7 @@ fn exchange(
         .map(|(r, a)| {
             Rc::new(HttpIo::with_admission(
                 r.clone(),
-                Codec::new(wire::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
+                Codec::new(protocol::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
                 a.clone(),
             ))
         })
@@ -234,7 +234,7 @@ fn exchange(
                 vec![5; 32]
             );
             let response = match request.request().operation {
-                wire::Operation::Bootstrap { .. } => PeerResponse::Bootstrap {
+                protocol::Operation::Bootstrap { .. } => PeerResponse::Bootstrap {
                     metadata: metadata.clone(),
                     page_zero: Some(page.clone()),
                 },
@@ -257,7 +257,7 @@ fn exchange(
             if fragmented {
                 let head = conn.session.as_mut().unwrap().sign(head)?;
                 let mut encoded =
-                    Codec::new(wire::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16)
+                    Codec::new(protocol::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16)
                         .encode_head(&head)?;
                 encoded.extend_from_slice(&body[..173]);
                 for chunk in encoded.chunks(997) {
@@ -320,14 +320,14 @@ fn exchange(
         for i in 0..rounds {
             let mut request = request(&admissions[0], i as u8);
             request.operation = if i % 2 == 0 {
-                wire::Operation::Bootstrap {
+                protocol::Operation::Bootstrap {
                     object: metadata.version.object.clone(),
-                    mode: wire::FetchMode::CopyOnly,
+                    mode: protocol::FetchMode::CopyOnly,
                 }
             } else {
-                wire::Operation::Page {
+                protocol::Operation::Page {
                     page: page.envelope().page.clone(),
-                    mode: wire::FetchMode::CopyOnly,
+                    mode: protocol::FetchMode::CopyOnly,
                 }
             };
             let auth = Forwarding::new(signers[0].clone());
@@ -462,7 +462,10 @@ fn opaque_relay_benchmark() {
 fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution() {
     use crate::security::{forwarding::ForwardedHead, protocol};
     fn copy(head: &crate::http::MessageHead) -> crate::http::MessageHead {
-        let codec = Codec::new(wire::MAX_SIGNED_HEAD, crate::model::PAGE_BYTES + 16);
+        let codec = Codec::new(
+            crate::peer::protocol::MAX_SIGNED_HEAD,
+            crate::model::PAGE_BYTES + 16,
+        );
         let mut head = codec
             .decode_head(&codec.encode_head(head).unwrap())
             .unwrap()

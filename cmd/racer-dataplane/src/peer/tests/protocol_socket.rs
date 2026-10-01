@@ -158,7 +158,7 @@ fn not_found_is_authenticated_through_relay_and_restricted_to_fresh_acquire() {
         )
         .unwrap();
         p::push(&mut head, "racer-receiver", &signers[signer - 1].node().0);
-        let response = wire::SignedResponse {
+        let response = protocol::SignedResponse {
             authentication: crate::security::forwarding::ForwardedHead {
                 original: Arc::new(signers[signer].sign(head).unwrap()),
                 hops: vec![],
@@ -332,10 +332,10 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
     impl PeerTransport for NeverTransport {
         fn exchange<'a>(
             &'a self,
-            _: wire::SignedRequest,
+            _: protocol::SignedRequest,
             _: crate::topology::membership::MembershipLease,
             _: &'a RequestScope,
-        ) -> crate::error::Operation<'a, wire::SignedResponse> {
+        ) -> crate::error::Operation<'a, protocol::SignedResponse> {
             Box::pin(async { panic!("local service must not relay") })
         }
     }
@@ -343,7 +343,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
     impl server::LocalPageService for Service {
         fn serve_peer<'a>(
             &'a self,
-            request: wire::VerifiedRequest,
+            request: protocol::VerifiedRequest,
             _: crate::topology::membership::MembershipLease,
             _: &'a RequestScope,
         ) -> crate::error::Operation<'a, PeerResponse> {
@@ -478,7 +478,7 @@ fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
     };
     p::push(&mut head, "content-length", 0);
     p::push(&mut head, "racer-kind", "handshake");
-    p::push(&mut head, "racer-wire-version", wire::VERSION);
+    p::push(&mut head, "racer-wire-version", protocol::VERSION);
     p::push(&mut head, "racer-membership", 1);
     p::push(&mut head, "racer-receiver", C);
     let signed = signers[0].sign(head).unwrap();
@@ -541,10 +541,10 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
     impl PeerTransport for Destination {
         fn exchange<'a>(
             &'a self,
-            request: wire::SignedRequest,
+            request: protocol::SignedRequest,
             _: crate::topology::membership::MembershipLease,
             scope: &'a RequestScope,
-        ) -> crate::error::Operation<'a, wire::SignedResponse> {
+        ) -> crate::error::Operation<'a, protocol::SignedResponse> {
             Box::pin(async move {
                 scope.check()?;
                 if self.fail {
@@ -780,7 +780,7 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let io = Rc::new(HttpIo::with_admission(
         reactor.clone(),
-        Codec::new(wire::MAX_ENVELOPE_HEAD, 0),
+        Codec::new(protocol::MAX_ENVELOPE_HEAD, 0),
         admission.clone(),
     ));
     let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2));
@@ -929,10 +929,10 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
     impl PeerTransport for NeverTransport {
         fn exchange<'a>(
             &'a self,
-            _: wire::SignedRequest,
+            _: protocol::SignedRequest,
             _: crate::topology::membership::MembershipLease,
             _: &'a RequestScope,
-        ) -> crate::error::Operation<'a, wire::SignedResponse> {
+        ) -> crate::error::Operation<'a, protocol::SignedResponse> {
             Box::pin(async { panic!("direct request must not relay") })
         }
     }
@@ -940,7 +940,7 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
     impl server::LocalPageService for Local {
         fn serve_peer<'a>(
             &'a self,
-            request: wire::VerifiedRequest,
+            request: protocol::VerifiedRequest,
             _: crate::topology::membership::MembershipLease,
             scope: &'a RequestScope,
         ) -> crate::error::Operation<'a, PeerResponse> {
@@ -970,7 +970,7 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let io = Rc::new(HttpIo::with_admission(
         reactor.clone(),
-        Codec::new(wire::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
+        Codec::new(protocol::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
         admission.clone(),
     ));
     let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2));
@@ -1109,17 +1109,17 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
     impl PeerTransport for Never {
         fn exchange<'a>(
             &'a self,
-            _: wire::SignedRequest,
+            _: protocol::SignedRequest,
             _: crate::topology::membership::MembershipLease,
             _: &'a RequestScope,
-        ) -> crate::error::Operation<'a, wire::SignedResponse> {
+        ) -> crate::error::Operation<'a, protocol::SignedResponse> {
             Box::pin(async { panic!("incomplete headers must not relay") })
         }
     }
     impl server::LocalPageService for Never {
         fn serve_peer<'a>(
             &'a self,
-            _: wire::VerifiedRequest,
+            _: protocol::VerifiedRequest,
             _: crate::topology::membership::MembershipLease,
             _: &'a RequestScope,
         ) -> crate::error::Operation<'a, PeerResponse> {
@@ -1154,7 +1154,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
         let baseline = admission.used(ResourceClass::RequestContext);
         let io = Rc::new(HttpIo::with_admission(
             reactor.clone(),
-            Codec::new(wire::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
+            Codec::new(protocol::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
             admission.clone(),
         ));
         let (signers, _) = identities();
@@ -1568,7 +1568,7 @@ mod established_sessions {
     impl server::LocalPageService for CountedService {
         fn serve_peer<'a>(
             &'a self,
-            _: wire::VerifiedRequest,
+            _: protocol::VerifiedRequest,
             _: crate::topology::membership::MembershipLease,
             _: &'a RequestScope,
         ) -> crate::error::Operation<'a, PeerResponse> {
@@ -1581,10 +1581,10 @@ mod established_sessions {
     impl PeerTransport for CountedService {
         fn exchange<'a>(
             &'a self,
-            _: wire::SignedRequest,
+            _: protocol::SignedRequest,
             _: crate::topology::membership::MembershipLease,
             _: &'a RequestScope,
-        ) -> crate::error::Operation<'a, wire::SignedResponse> {
+        ) -> crate::error::Operation<'a, protocol::SignedResponse> {
             Box::pin(async { panic!("direct request must not relay") })
         }
     }
@@ -1606,7 +1606,7 @@ mod established_sessions {
             reactor.init().unwrap();
             let io = Rc::new(HttpIo::with_admission(
                 reactor.clone(),
-                Codec::new(wire::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
+                Codec::new(protocol::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
                 admission.clone(),
             ));
             let signers = signers();
@@ -1769,7 +1769,7 @@ mod established_sessions {
                     .value;
                 signature[8] = if signature[8] == b'A' { b'B' } else { b'A' };
             }
-            let bytes = Codec::new(wire::MAX_ENVELOPE_HEAD, 0)
+            let bytes = Codec::new(protocol::MAX_ENVELOPE_HEAD, 0)
                 .encode_head(&head)
                 .unwrap();
             let mut buffer = f.io.buffer(bytes.len()).unwrap();

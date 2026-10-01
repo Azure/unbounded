@@ -202,7 +202,7 @@ fn real_uds_root_remapping_keeps_public_authority_and_http_validation() {
     use crate::{
         peer::{
             PeerClient,
-            wire::{FetchMode, Operation as PeerOperation, PeerRequest, VerifiedResponse},
+            protocol::{FetchMode, Operation as PeerOperation, PeerRequest, VerifiedResponse},
         },
         read::candidates::{CandidatePolicy, CandidateResolution},
         topology::placement::Placement,
@@ -809,7 +809,7 @@ fn public_operations_reject_wrong_authority_before_io() {
         model::{MembershipVersion, NodeId},
         peer::{
             PeerClient,
-            wire::{FetchMode, Operation as PeerOperation, PeerRequest, VerifiedResponse},
+            protocol::{FetchMode, Operation as PeerOperation, PeerRequest, VerifiedResponse},
         },
         read::candidates::{CandidatePolicy, CandidateResolution},
         topology::{

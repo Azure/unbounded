@@ -115,10 +115,10 @@ struct NoPeer;
 impl peer::PeerClient for NoPeer {
     fn request<'a>(
         &'a self,
-        _: peer::wire::PeerRequest,
+        _: peer::protocol::PeerRequest,
         _: topology::membership::MembershipLease,
         _: &'a RequestScope,
-    ) -> Operation<'a, peer::wire::VerifiedResponse> {
+    ) -> Operation<'a, peer::protocol::VerifiedResponse> {
         Box::pin(async { panic!("single-node fixture contacted peer") })
     }
 }

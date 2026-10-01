@@ -1,18 +1,17 @@
 //! Correlated logical requests with monotonic budgets, attempts, and cancellation.
 pub mod adaptive;
-pub(crate) mod decode;
 mod native;
 mod native_io;
+pub mod protocol;
 pub mod server;
 pub mod subscriptions;
 #[cfg(test)]
 mod tests;
 pub mod transfer;
-pub mod wire;
 
 use self::{
+    protocol::{PeerRequest, SignedRequest, SignedResponse, VerifiedRequest, VerifiedResponse},
     transfer::Transfers,
-    wire::{PeerRequest, SignedRequest, SignedResponse, VerifiedRequest, VerifiedResponse},
 };
 use crate::telemetry::failures::{Observer, Stage};
 use crate::{
@@ -85,7 +84,7 @@ impl PeerNetwork {
 /// Narrow a caller's scope to the signed route without creating a new cancellation
 /// domain or extending the original deadline.
 pub(crate) fn request_scope(
-    request: &wire::PeerRequest,
+    request: &protocol::PeerRequest,
     scope: &RequestScope,
 ) -> Result<RequestScope> {
     scope.check()?;
@@ -106,7 +105,7 @@ pub(crate) fn request_scope(
 }
 
 pub(crate) fn check_membership(
-    request: &wire::PeerRequest,
+    request: &protocol::PeerRequest,
     membership: &MembershipLease,
 ) -> Result<()> {
     if request.route.membership != membership.version {
@@ -163,7 +162,7 @@ impl Relay {
     /// binding before appending a reverse hop. Never re-sign the original response.
     ///
     /// ```compile_fail
-    /// use racer_dataplane::{peer::{Relay, wire::SignedRequest},
+    /// use racer_dataplane::{peer::{Relay, protocol::SignedRequest},
     ///     runtime::deadline::RequestScope, topology::membership::MembershipLease};
     /// fn unverified(relay: &Relay, request: SignedRequest,
     ///     membership: MembershipLease, scope: &RequestScope) {
@@ -309,7 +308,7 @@ pub trait PeerClient {
 /// ```no_run
 /// use racer_dataplane::{error::Result, peer::{PeerClient, PeerTransport,
 ///     Relay, server::PeerServer,
-///     wire::{PeerRequest, SignedRequest, SignedResponse, VerifiedResponse}},
+///     protocol::{PeerRequest, SignedRequest, SignedResponse, VerifiedResponse}},
 ///     runtime::deadline::RequestScope, security::forwarding::Forwarding,
 ///     topology::membership::MembershipLease};
 /// async fn interfaces(
@@ -513,8 +512,8 @@ impl Requester {
             // The sender validates the actual selected page against that rail and
             // falls back to HTTP before exporting a window when they disagree.
             let rail_hint = match &request.request.operation {
-                wire::Operation::Page { page, .. } => Some(page.clone()),
-                wire::Operation::Subscribe { subscription, .. } => subscription
+                protocol::Operation::Page { page, .. } => Some(page.clone()),
+                protocol::Operation::Subscribe { subscription, .. } => subscription
                     .demand
                     .intervals()
                     .first()

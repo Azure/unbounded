@@ -3,7 +3,7 @@ use super::*;
 use crate::{
     http::{Codec, Header, MessageHead, StartLine, pool::ConnectionLease},
     model::{ExpiresAt, MetadataSelector, ObjectMetadata, ResourceClass, *},
-    peer::wire::{
+    peer::protocol::{
         self, FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse, WireCodec,
     },
     security::{
@@ -39,7 +39,7 @@ fn application() -> (WorkerApplication, WorkerRuntime, PageCryptoEngine) {
     config.limits.range_window_pages = NonZeroUsize::new(1).unwrap();
     // Use the exact worker progress floor rather than the generous fixture budget.
     config.limits.request_context_bytes =
-        NonZeroUsize::new(wire::MIN_REQUEST_CONTEXT_BYTES + 4 * 32 * 1024).unwrap();
+        NonZeroUsize::new(protocol::MIN_REQUEST_CONTEXT_BYTES + 4 * 32 * 1024).unwrap();
     partition_limits(&config.limits, 1, false).unwrap();
     integration_tests::local_worker(&config, &Arc::new(NodeState::default()), 0)
 }
@@ -52,9 +52,9 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
     let reactor = &runtime.reactor;
     reactor.init().unwrap();
     let baseline = admission.used(ResourceClass::RequestContext);
-    let signers = network(wire::MAX_HOPS + 1);
+    let signers = network(protocol::MAX_HOPS + 1);
     let forwarding: Vec<_> = signers.iter().map(|s| Forwarding::new(s.clone())).collect();
-    let codec = wire::SecurityCodec::new(
+    let codec = protocol::SecurityCodec::new(
         admission.clone(),
         Rc::new(BufferPool::new(admission.clone())),
     );
@@ -116,9 +116,9 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
             membership: MembershipVersion(1),
             request: scope.request,
             attempt,
-            destination: node(wire::MAX_HOPS),
+            destination: node(protocol::MAX_HOPS),
             visited: vec![node(0)],
-            remaining_links: wire::MAX_HOPS as u8,
+            remaining_links: protocol::MAX_HOPS as u8,
             remaining_attempts: 1,
             deadline: scope.deadline,
         },
@@ -136,7 +136,7 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
     let mut bindings = vec![binding];
     let mut sockets = Vec::new();
     let mut destination = None;
-    for index in 1..=wire::MAX_HOPS {
+    for index in 1..=protocol::MAX_HOPS {
         let (left, right) = UnixStream::pair().unwrap();
         let left = ConnectionLease::from_accepted(left.into(), admission).unwrap();
         let right = ConnectionLease::from_accepted(right.into(), admission).unwrap();
@@ -174,7 +174,7 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
         let verified = forwarding[index].verify_request(decoded).unwrap();
         bindings.push(verified.binding().clone());
         drop(request);
-        if index == wire::MAX_HOPS {
+        if index == protocol::MAX_HOPS {
             destination = Some(verified);
             break;
         }
@@ -186,7 +186,7 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
             .unwrap();
     }
     let destination = destination.unwrap();
-    let mut response = forwarding[wire::MAX_HOPS]
+    let mut response = forwarding[protocol::MAX_HOPS]
         .sign_response(
             destination.binding(),
             PeerResponse::Metadata(ObjectMetadata {
@@ -210,7 +210,7 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
         authorization
     );
     drop(opened);
-    for index in (1..=wire::MAX_HOPS).rev() {
+    for index in (1..=protocol::MAX_HOPS).rev() {
         let (left, right) = sockets.pop().unwrap();
         let head = WireCodec::encode(&response.authentication, true, 0).unwrap();
         let (sent, received) = drive(reactor, async {
@@ -229,7 +229,7 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
             .unwrap();
         assert_eq!(
             verified.signed().authentication.hops.len(),
-            wire::MAX_HOPS - index
+            protocol::MAX_HOPS - index
         );
         let PeerResponse::Metadata(result) = verified.response() else {
             panic!("expected metadata")
@@ -261,7 +261,7 @@ fn peer_worker_partition_rejects_underfunding_and_reduces_worker_count() {
     // Fund control progress on all three planned shards so only context bytes
     // determine which worker counts pass the boundary assertions below.
     config.limits.client_connections = NonZeroUsize::new(36).unwrap();
-    let floor = wire::MIN_REQUEST_CONTEXT_BYTES + 4 * config.limits.header_bytes.get();
+    let floor = protocol::MIN_REQUEST_CONTEXT_BYTES + 4 * config.limits.header_bytes.get();
     for budget in [128 * 1024, floor - 1, floor, 2 * floor - 1, 2 * floor] {
         config.limits.request_context_bytes = NonZeroUsize::new(budget).unwrap();
         assert_eq!(
@@ -314,11 +314,11 @@ fn assembled_peer_io_rejects_oversize_and_admission_pressure_before_submission()
     let head = || MessageHead {
         start: StartLine::Request {
             method: "POST".into(),
-            target: wire::REQUEST_TARGET.into(),
+            target: protocol::REQUEST_TARGET.into(),
         },
         headers: vec![Header {
             name: "x".into(),
-            value: vec![b'x'; wire::MAX_ENVELOPE_HEAD],
+            value: vec![b'x'; protocol::MAX_ENVELOPE_HEAD],
         }],
     };
     let (socket, _other) = UnixStream::pair().unwrap();
@@ -330,7 +330,7 @@ fn assembled_peer_io_rejects_oversize_and_admission_pressure_before_submission()
     let (socket, mut other) = UnixStream::pair().unwrap();
     let conn = ConnectionLease::from_accepted(socket.into(), admission).unwrap();
     let writer = std::thread::spawn(move || {
-        let _ = other.write_all(&vec![b'x'; wire::MAX_ENVELOPE_HEAD + 1]);
+        let _ = other.write_all(&vec![b'x'; protocol::MAX_ENVELOPE_HEAD + 1]);
     });
     assert!(matches!(
         drive(reactor, io.receive_head(conn, &scope)),
@@ -346,15 +346,15 @@ fn assembled_peer_io_rejects_oversize_and_admission_pressure_before_submission()
             value: b"0".to_vec(),
         }],
     };
-    let encoded = Codec::new(wire::MAX_ENVELOPE_HEAD, 0)
+    let encoded = Codec::new(protocol::MAX_ENVELOPE_HEAD, 0)
         .encode_head(&response())
         .unwrap();
-    let send_budget = wire::MAX_ENVELOPE_HEAD + encoded.len();
+    let send_budget = protocol::MAX_ENVELOPE_HEAD + encoded.len();
     // Send scratch uses the head cap, but staging uses the actual encoded size.
     // Insufficient receive staging, send scratch, or send staging rejects before I/O.
     for (send, available, succeeds) in [
         (false, 4096 - 1, false),
-        (true, wire::MAX_ENVELOPE_HEAD - 1, false),
+        (true, protocol::MAX_ENVELOPE_HEAD - 1, false),
         (true, send_budget - 1, false),
         (true, send_budget, true),
     ] {

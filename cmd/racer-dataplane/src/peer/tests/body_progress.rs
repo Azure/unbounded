@@ -62,7 +62,7 @@ fn body_cases(cases: &[&str]) {
         let reactor = Rc::new(Reactor::new(admission.clone()));
         let io = Rc::new(HttpIo::with_admission(
             reactor.clone(),
-            Codec::new(wire::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
+            Codec::new(protocol::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
             admission.clone(),
         ));
         let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 1));

@@ -751,7 +751,7 @@ mod tests {
     fn small_peer_send_stages_actual_head_under_context_pressure() {
         let (admission, reactor, _, scope) = setup();
         reactor.init().unwrap();
-        let limit = crate::peer::wire::MAX_ENVELOPE_HEAD;
+        let limit = crate::peer::protocol::MAX_ENVELOPE_HEAD;
         let io = HttpIo::with_admission(reactor.clone(), Codec::new(limit, 16), admission.clone());
         let baseline = admission.used(ResourceClass::RequestContext);
         let held = admission
@@ -1035,7 +1035,7 @@ mod tests {
         let (admission, reactor, _, scope) = setup();
         let peer = HttpIo::with_admission(
             reactor.clone(),
-            Codec::new(crate::peer::wire::MAX_ENVELOPE_HEAD, 16),
+            Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD, 16),
             admission.clone(),
         );
         let client = HttpIo::for_clients(reactor.clone(), admission.clone());
@@ -1043,7 +1043,7 @@ mod tests {
         for (io, limit) in [
             (&client, admission.limits().header_bytes.get()),
             (&origin, super::super::MAX_HEAD_BYTES),
-            (&peer, crate::peer::wire::MAX_ENVELOPE_HEAD),
+            (&peer, crate::peer::protocol::MAX_ENVELOPE_HEAD),
         ] {
             for extra in [0, 1] {
                 let mut head = request("GET");

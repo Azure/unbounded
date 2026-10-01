@@ -1,7 +1,7 @@
 //! Authenticate, replay-check, authorize, and admit before local dispatch or relay.
 use super::{
     Relay,
-    wire::{PeerResponse, SignedRequest, SignedResponse, VerifiedRequest},
+    protocol::{PeerResponse, SignedRequest, SignedResponse, VerifiedRequest},
 };
 use crate::{
     error::{Error, Operation},
@@ -19,7 +19,7 @@ use std::{
 /// it with a retained clone of the request binding.
 ///
 /// ```compile_fail
-/// use racer_dataplane::{peer::{server::LocalPageService, wire::PeerRequest},
+/// use racer_dataplane::{peer::{server::LocalPageService, protocol::PeerRequest},
 ///     runtime::deadline::RequestScope, topology::membership::MembershipLease};
 /// fn unverified(service: &dyn LocalPageService, request: PeerRequest,
 ///     membership: MembershipLease, scope: &RequestScope) {
@@ -44,7 +44,7 @@ pub struct PeerServer {
     admission: Rc<Admission>,
     local: Rc<dyn LocalPageService>,
     relay: Rc<Relay>,
-    wire: Rc<super::wire::SecurityCodec>,
+    wire: Rc<super::protocol::SecurityCodec>,
     signatures: Rc<crate::security::signing::Signatures>,
     transfers: Option<Rc<super::transfer::Transfers>>,
     request_timeout: Duration,
@@ -165,7 +165,7 @@ impl PeerServer {
         admission: Rc<Admission>,
         local: Rc<dyn LocalPageService>,
         relay: Rc<Relay>,
-        wire: Rc<super::wire::SecurityCodec>,
+        wire: Rc<super::protocol::SecurityCodec>,
         signatures: Rc<crate::security::signing::Signatures>,
     ) -> Self {
         Self {
@@ -221,7 +221,7 @@ impl PeerServer {
         scope: &'a RequestScope,
     ) -> Operation<'a, crate::http::pool::ConnectionLease> {
         Box::pin(async move {
-            use super::wire::WireCodec;
+            use super::protocol::WireCodec;
             scope.check()?;
             let codec = &self.wire;
             // One fixed budget for handshake reads, verification, signing, writes,
@@ -563,7 +563,7 @@ impl PeerServer {
         Box::pin(async move {
             use super::subscriptions::Selection;
             use crate::security::protocol::{encode_deadline, millis};
-            let super::wire::Operation::Subscribe { subscription, mode } =
+            let super::protocol::Operation::Subscribe { subscription, mode } =
                 &request.request().operation
             else {
                 return self.local.serve_peer(request, membership, scope).await;
@@ -578,7 +578,7 @@ impl PeerServer {
                 encode_deadline(scope.deadline)?,
                 millis(crate::runtime::environment::wall_now())?,
                 |number| {
-                    if matches!(mode, super::wire::FetchMode::CopyOnly) {
+                    if matches!(mode, super::protocol::FetchMode::CopyOnly) {
                         return true;
                     }
                     placement
@@ -1268,7 +1268,7 @@ mod tests {
         use crate::{
             http::{Codec, io::HttpIo, pool::ConnectionLease},
             memory::pool::BufferPool,
-            peer::{PeerTransport, wire::SecurityCodec},
+            peer::{PeerTransport, protocol::SecurityCodec},
             runtime::{environment::SimulationClock, reactor::Reactor},
             security::connection::tests::{finish, hello},
             topology::{health::LinkHealth, paths::Paths},
@@ -1358,7 +1358,7 @@ mod tests {
                 let baseline = admission.used(ResourceClass::RequestContext);
                 let io = Rc::new(HttpIo::with_admission(
                     reactor.clone(),
-                    Codec::new(super::super::wire::MAX_ENVELOPE_HEAD, 0),
+                    Codec::new(super::super::protocol::MAX_ENVELOPE_HEAD, 0),
                     admission.clone(),
                 ));
                 let forwarding = Rc::new(Forwarding::new(signers[1].clone()));

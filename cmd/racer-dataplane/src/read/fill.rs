@@ -20,7 +20,7 @@ use crate::{
     },
     model::{ObjectMetadata, OriginContext, PAGE_BYTES, PageId, ResourceClass, VersionMetadata},
     origin::Origin,
-    peer::wire::{FetchMode, Operation as PeerOperation, PeerResponse},
+    peer::protocol::{FetchMode, Operation as PeerOperation, PeerResponse},
     runtime::{
         admission::{Admission, Reservation},
         deadline::RequestScope,
@@ -1131,7 +1131,7 @@ impl Fill {
     async fn decrypt_response(
         &self,
         page: &PageId,
-        response: crate::peer::wire::VerifiedResponse,
+        response: crate::peer::protocol::VerifiedResponse,
         reservation: Option<Reservation>,
         scope: &RequestScope,
     ) -> Result<PageResult> {
@@ -1346,10 +1346,10 @@ mod tests {
     impl PeerClient for NeverPeer {
         fn request<'a>(
             &'a self,
-            _: crate::peer::wire::PeerRequest,
+            _: crate::peer::protocol::PeerRequest,
             _: crate::topology::membership::MembershipLease,
             _: &'a RequestScope,
-        ) -> Operation<'a, crate::peer::wire::VerifiedResponse> {
+        ) -> Operation<'a, crate::peer::protocol::VerifiedResponse> {
             Box::pin(async { panic!("local owner must not contact a peer") })
         }
     }

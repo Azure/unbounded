@@ -93,7 +93,7 @@ impl Signatures {
             "signature",
             format!("racer=:{}:", protocol::binary(&signature)),
         );
-        Codec::new(crate::peer::wire::MAX_ENVELOPE_HEAD, u64::MAX).encode_head(&head)?;
+        Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD, u64::MAX).encode_head(&head)?;
         Ok(SignedHead { head, signature })
     }
     /// Verify identity and retained provenance, without replay admission. Network
@@ -206,7 +206,7 @@ pub fn receiver(head: &MessageHead) -> Result<NodeId> {
     node_field(head, "racer-receiver")
 }
 fn components(head: &MessageHead) -> Result<Vec<String>> {
-    Codec::new(crate::peer::wire::MAX_ENVELOPE_HEAD, u64::MAX).encode_head(head)?;
+    Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD, u64::MAX).encode_head(head)?;
     let mut names = BTreeSet::new();
     for h in &head.headers {
         let name = h.name.to_ascii_lowercase();
@@ -490,7 +490,7 @@ pub(crate) mod tests {
                             "coverage" => ("signature-input", b"racer=()".to_vec()),
                             "oversized" => (
                                 "x-fixture-00",
-                                vec![b'a'; crate::peer::wire::MAX_ENVELOPE_HEAD],
+                                vec![b'a'; crate::peer::protocol::MAX_ENVELOPE_HEAD],
                             ),
                             "bad-name" => ("x-fixture-00", b"valid".to_vec()),
                             _ => unreachable!(),

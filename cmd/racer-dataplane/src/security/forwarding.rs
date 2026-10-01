@@ -8,7 +8,7 @@
 //! use racer_dataplane::{
 //!     error::Result,
 //!     model::NodeId,
-//!     peer::{server::LocalPageService, wire::{PeerRequest, VerifiedResponse}},
+//!     peer::{server::LocalPageService, protocol::{PeerRequest, VerifiedResponse}},
 //!     runtime::deadline::RequestScope,
 //!     security::forwarding::Forwarding,
 //!     topology::{membership::MembershipLease, paths::RouteBudget},
@@ -49,7 +49,7 @@ use crate::{
     error::{Error, Result},
     http::{MessageHead, StartLine},
     model::NodeId,
-    peer::wire::{PeerRequest, PeerResponse, SignedRequest, SignedResponse},
+    peer::protocol::{PeerRequest, PeerResponse, SignedRequest, SignedResponse},
     topology::paths::RouteBudget,
 };
 use std::{rc::Rc, sync::Arc};
@@ -86,14 +86,14 @@ pub struct RequestBinding {
 /// from modifying signed fields after verification.
 ///
 /// ```compile_fail
-/// use racer_dataplane::peer::wire::{SignedRequest, VerifiedRequest};
+/// use racer_dataplane::peer::protocol::{SignedRequest, VerifiedRequest};
 /// fn bypass_verification(request: SignedRequest) -> VerifiedRequest {
 ///     request.into()
 /// }
 /// ```
 ///
 /// ```compile_fail
-/// use racer_dataplane::peer::wire::VerifiedRequest;
+/// use racer_dataplane::peer::protocol::VerifiedRequest;
 /// fn change_verified_route(request: VerifiedRequest) {
 ///     request.request().route.remaining_links = 255;
 /// }
@@ -109,7 +109,7 @@ impl VerifiedRequest {
     /// page for the existing Fill implementation. This value must never be relayed
     /// or reverified: its immutable binding still names the full subscription.
     pub(crate) fn select_page(mut self, page: crate::model::PageId) -> Result<Self> {
-        use crate::peer::wire::{FetchMode, Operation};
+        use crate::peer::protocol::{FetchMode, Operation};
         let Operation::Subscribe { subscription, mode } = &self.signed.request.operation else {
             return Err(Error::InvalidRequest);
         };
@@ -147,14 +147,14 @@ impl VerifiedRequest {
 /// This is distinct from both an unsigned local result and unverified wire input.
 ///
 /// ```compile_fail
-/// use racer_dataplane::peer::wire::{SignedResponse, VerifiedResponse};
+/// use racer_dataplane::peer::protocol::{SignedResponse, VerifiedResponse};
 /// fn bypass_verification(response: SignedResponse) -> VerifiedResponse {
 ///     response.into()
 /// }
 /// ```
 ///
 /// ```compile_fail
-/// use racer_dataplane::peer::wire::{PeerResponse, VerifiedResponse};
+/// use racer_dataplane::peer::protocol::{PeerResponse, VerifiedResponse};
 /// fn replace_verified_result(mut response: VerifiedResponse) {
 ///     *response.response() = PeerResponse::Miss;
 /// }
@@ -350,7 +350,7 @@ impl Forwarding {
     /// operation, membership, attempt, and freshness without hashing page bytes.
     ///
     /// ```compile_fail
-    /// use racer_dataplane::{peer::wire::SignedResponse, security::forwarding::Forwarding};
+    /// use racer_dataplane::{peer::protocol::SignedResponse, security::forwarding::Forwarding};
     /// fn unbound_response(auth: &Forwarding, response: SignedResponse) {
     ///     auth.verify_response(response);
     /// }
@@ -460,7 +460,7 @@ impl Forwarding {
         request: &RequestBinding,
         previous: &NodeId,
     ) -> Result<ForwardedHead> {
-        let expected = crate::peer::decode::opaque_response_head(&auth.original.head, length)?;
+        let expected = crate::peer::protocol::opaque_response_head(&auth.original.head, length)?;
         self.verify_response_head(&auth, &expected, request)?;
         self.append_response_head(&mut auth, request, previous)?;
         Ok(auth)
@@ -680,7 +680,7 @@ fn response_matches(response: &MessageHead, request: &MessageHead) -> Result<()>
             }
         }
         let receivers = protocol::decode_nodes(field(request, "racer-route-visited")?.as_bytes())?;
-        if !crate::peer::decode::demand(request)?.contains(number(response, "racer-page")?)
+        if !crate::peer::protocol::demand(request)?.contains(number(response, "racer-page")?)
             || number(response, "racer-grant-membership")?
                 != number(request, "racer-route-membership")?
             || receivers.first() != Some(&node_field(response, "racer-grant-receiver")?)
@@ -774,7 +774,7 @@ mod tests {
             EncryptedAuthorization, KeyId, Limits, MetadataSelector, Nonce, OpaqueMetadata,
             PeerOriginContext, ResourceClass, *,
         },
-        peer::wire::{FetchMode, Operation},
+        peer::protocol::{FetchMode, Operation},
         runtime::{admission::Admission, deadline::RequestScope},
         security::signing::tests::{clone_head, network, node},
     };
@@ -1135,7 +1135,7 @@ mod tests {
 
         // Real wire framing and canonical logical decode retain the effective
         // balance independently of the immutable original signed ceiling.
-        use crate::peer::wire::{SecurityCodec, WireCodec};
+        use crate::peer::protocol::{SecurityCodec, WireCodec};
         let scope = forwarded.request.origin.scope().clone();
         let admission = Rc::new(Admission::new(
             crate::test_support::cluster::config(false).limits,

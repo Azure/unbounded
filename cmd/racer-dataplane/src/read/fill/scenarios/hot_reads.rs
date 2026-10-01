@@ -11,8 +11,8 @@ use crate::{
     model::{ByteRange, MembershipVersion},
     peer::{
         PeerNetwork, PeerTransport,
+        protocol::{PeerRequest, SignedRequest, SignedResponse, VerifiedResponse},
         server::{LocalPageService, PeerServer},
-        wire::{PeerRequest, SignedRequest, SignedResponse, VerifiedResponse},
     },
     read::{
         Coordinator, ReadService,
@@ -69,7 +69,7 @@ struct Gate {
 impl LocalPageService for Gate {
     fn serve_peer<'a>(
         &'a self,
-        request: crate::peer::wire::VerifiedRequest,
+        request: crate::peer::protocol::VerifiedRequest,
         membership: MembershipLease,
         scope: &'a RequestScope,
     ) -> Operation<'a, PeerResponse> {
@@ -572,13 +572,13 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
         } else {
             let admission = fixtures[i].fill.dependencies.admission.clone();
             let reactor = fixtures[i].reactor.clone();
-            let codec = Rc::new(crate::peer::wire::SecurityCodec::new(
+            let codec = Rc::new(crate::peer::protocol::SecurityCodec::new(
                 admission.clone(),
                 Rc::new(BufferPool::new(admission.clone())),
             ));
             let io = Rc::new(HttpIo::with_admission(
                 reactor.clone(),
-                Codec::new(crate::peer::wire::MAX_ENVELOPE_HEAD, PAGE_BYTES + 16),
+                Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD, PAGE_BYTES + 16),
                 admission.clone(),
             ));
             let transfers = Rc::new(crate::peer::transfer::Transfers::new(
@@ -628,14 +628,14 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
         admission.clone(),
         network.clone(),
     ));
-    let codec = Rc::new(crate::peer::wire::SecurityCodec::new(
+    let codec = Rc::new(crate::peer::protocol::SecurityCodec::new(
         admission.clone(),
         Rc::new(BufferPool::new(admission.clone())),
     ));
     let server = PeerServer::new(
         Rc::new(HttpIo::with_admission(
             fixtures[2].reactor.clone(),
-            Codec::new(crate::peer::wire::MAX_ENVELOPE_HEAD, PAGE_BYTES + 16),
+            Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD, PAGE_BYTES + 16),
             admission.clone(),
         )),
         auth,

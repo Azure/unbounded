@@ -10,8 +10,8 @@ use crate::{
         PageId, PeerOriginContext, VersionMetadata, WorkerId,
     },
     peer::{
+        protocol::{PeerResponse, VerifiedRequest},
         server::LocalPageService,
-        wire::{PeerResponse, VerifiedRequest},
     },
     runtime::{
         deadline::{Cancellation, RequestScope},
@@ -691,14 +691,14 @@ impl WorkerDirectory {
         Box::pin(async move {
             let owner = match &request.request().operation {
                 // PeerServer must authenticate and project a provider selection.
-                crate::peer::wire::Operation::Subscribe { .. } => {
+                crate::peer::protocol::Operation::Subscribe { .. } => {
                     return Err(Error::InvalidRequest);
                 }
-                crate::peer::wire::Operation::Bootstrap { object, .. } => {
+                crate::peer::protocol::Operation::Bootstrap { object, .. } => {
                     self.metadata_owner(object)?
                 }
-                crate::peer::wire::Operation::Page { page, .. } => self.page_owner(page)?,
-                crate::peer::wire::Operation::Metadata { object, .. } => {
+                crate::peer::protocol::Operation::Page { page, .. } => self.page_owner(page)?,
+                crate::peer::protocol::Operation::Metadata { object, .. } => {
                     self.metadata_owner(object)?
                 }
             };

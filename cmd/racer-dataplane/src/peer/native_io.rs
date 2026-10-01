@@ -1,8 +1,8 @@
 //! Automatic native payload exchange on the same exclusive HTTP connection.
 use super::{
     native::{self, Binding, Phase, extension},
+    protocol::{PeerResponse, SignedRequest, SignedResponse, WireCodec},
     transfer::{Transfers, WireBuffer},
-    wire::{PeerResponse, SignedRequest, SignedResponse, WireCodec},
 };
 use crate::{
     error::{Error, Result},
@@ -66,7 +66,7 @@ mod tests {
         let io = Rc::new(HttpIo::with_admission(
             reactor.clone(),
             Codec::new(
-                super::super::wire::MAX_ENVELOPE_HEAD,
+                super::super::protocol::MAX_ENVELOPE_HEAD,
                 crate::model::PAGE_BYTES + 16,
             ),
             admission.clone(),
@@ -76,7 +76,7 @@ mod tests {
             io,
             Some(rdma),
             admission.clone(),
-            Rc::new(super::super::wire::SecurityCodec::new(
+            Rc::new(super::super::protocol::SecurityCodec::new(
                 admission.clone(),
                 Rc::new(BufferPool::new(admission.clone())),
             )),
@@ -424,7 +424,7 @@ mod tests {
             let http = Rc::new(HttpIo::with_admission(
                 reactor.clone(),
                 Codec::new(
-                    super::super::wire::MAX_ENVELOPE_HEAD,
+                    super::super::protocol::MAX_ENVELOPE_HEAD,
                     crate::model::PAGE_BYTES + 16,
                 ),
                 admission.clone(),
@@ -434,7 +434,7 @@ mod tests {
                 http,
                 Some(rdma),
                 admission.clone(),
-                Rc::new(super::super::wire::SecurityCodec::new(
+                Rc::new(super::super::protocol::SecurityCodec::new(
                     admission.clone(),
                     Rc::new(BufferPool::new(admission.clone())),
                 )),
@@ -540,7 +540,7 @@ mod tests {
                 vec![],
             )
             .unwrap();
-        let accept_wire = super::super::wire::encode_signed(&accept).unwrap();
+        let accept_wire = super::super::protocol::encode_signed(&accept).unwrap();
         let membership = Arc::new(
             Membership::validate(
                 MembershipVersion(1),
@@ -600,7 +600,7 @@ mod tests {
             let (verified, _) = binding.verify(
                 &signers[2],
                 signers[0].node(),
-                super::super::wire::decode_signed(&accept_wire)?,
+                super::super::protocol::decode_signed(&accept_wire)?,
                 &[Phase::Accept],
                 &[0; 32],
                 0,
@@ -1045,7 +1045,7 @@ impl Transfers {
             0,
             scope,
         )?;
-        let (metadata, envelope) = super::decode::page_descriptor(&authentication.original.head)?;
+        let (metadata, envelope) = super::protocol::page_descriptor(&authentication.original.head)?;
         let remote = SetupParameters::from_verified(&offer, binding.rail)?;
         let mut previous = signed_digest(&offer.signed)?;
         connection.next_round()?;
@@ -1220,7 +1220,7 @@ impl Transfers {
                 PeerResponse::Selected {
                     metadata,
                     ciphertext: page,
-                    grant: super::decode::grant(&authentication.original.head)?,
+                    grant: super::protocol::grant(&authentication.original.head)?,
                 }
             } else {
                 PeerResponse::Page {

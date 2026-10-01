@@ -27,8 +27,8 @@ use crate::{
         ResolvedRange,
     },
     peer::{
+        protocol::{FetchMode, Operation as PeerOperation, PeerResponse, VerifiedRequest},
         server::LocalPageService,
-        wire::{FetchMode, Operation as PeerOperation, PeerResponse, VerifiedRequest},
     },
     runtime::deadline::RequestScope,
     security::credentials::{ChargedOriginContext, CredentialCrypto},

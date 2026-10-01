@@ -5,7 +5,7 @@ use crate::{
     error::{Error, Result},
     http::{Header, MessageHead, StartLine},
     model::{NodeId, ObjectId, ObjectMetadata, ObjectVersion, PAGE_BYTES},
-    peer::wire::{FetchMode, Operation, PeerRequest, PeerResponse},
+    peer::protocol::{FetchMode, Operation, PeerRequest, PeerResponse},
     runtime::deadline::Deadline,
     topology::paths::RouteBudget,
 };
@@ -595,6 +595,6 @@ mod tests {
         let decoded = decode_deadline(encoded).unwrap();
         assert_eq!(encode_deadline(decoded).unwrap(), encoded);
         assert!(decoded.0 <= deadline.0);
-        assert_eq!(MAX_HEAD, crate::peer::wire::MAX_SIGNED_HEAD);
+        assert_eq!(MAX_HEAD, crate::peer::protocol::MAX_SIGNED_HEAD);
     }
 }

@@ -7,7 +7,7 @@ use crate::{
     model::{AttemptId, MetadataSelector, NodeId, ObjectId, OriginContext, PageNumber},
     peer::{
         PeerClient,
-        wire::{
+        protocol::{
             FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse, VerifiedResponse,
         },
     },

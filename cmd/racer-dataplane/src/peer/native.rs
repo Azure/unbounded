@@ -231,7 +231,7 @@ pub(crate) fn envelope_digest(auth: &ForwardedHead) -> Result<[u8; 32]> {
 pub(crate) fn attach(head: &mut MessageHead, signed: &SignedHead) -> Result<()> {
     head.headers.push(Header {
         name: HEADER.into(),
-        value: super::wire::encode_signed(signed)?,
+        value: super::protocol::encode_signed(signed)?,
     });
     Ok(())
 }
@@ -239,11 +239,13 @@ pub(crate) fn detach(head: &mut MessageHead) -> Result<Option<SignedHead>> {
     let value = head.unique(HEADER)?.map(|v| v.to_vec());
     head.headers
         .retain(|h| !h.name.eq_ignore_ascii_case(HEADER));
-    value.map(|v| super::wire::decode_signed(&v)).transpose()
+    value
+        .map(|v| super::protocol::decode_signed(&v))
+        .transpose()
 }
 pub(crate) fn frame(signed: SignedHead) -> Result<MessageHead> {
     let response = matches!(signed.head.start, StartLine::Response { .. });
-    super::wire::WireCodec::encode(
+    super::protocol::WireCodec::encode(
         &ForwardedHead {
             original: Arc::new(signed),
             hops: vec![],
@@ -253,7 +255,7 @@ pub(crate) fn frame(signed: SignedHead) -> Result<MessageHead> {
     )
 }
 pub(crate) fn unframe(head: MessageHead, response: bool) -> Result<SignedHead> {
-    let (auth, len) = super::wire::WireCodec::decode(head, response)?;
+    let (auth, len) = super::protocol::WireCodec::decode(head, response)?;
     if len != 0 || !auth.hops.is_empty() {
         return Err(Error::InvalidRequest);
     }
@@ -303,8 +305,8 @@ mod tests {
             let admitted = receiver.admit(signed).unwrap();
             let control = unframe(admitted, phase.response()).unwrap();
             let copy = || {
-                super::super::wire::decode_signed(
-                    &super::super::wire::encode_signed(&control).unwrap(),
+                super::super::protocol::decode_signed(
+                    &super::super::protocol::encode_signed(&control).unwrap(),
                 )
                 .unwrap()
             };
@@ -416,9 +418,10 @@ mod tests {
                 vec![],
             )
             .unwrap();
-        let copy =
-            super::super::wire::decode_signed(&super::super::wire::encode_signed(&signed).unwrap())
-                .unwrap();
+        let copy = super::super::protocol::decode_signed(
+            &super::super::protocol::encode_signed(&signed).unwrap(),
+        )
+        .unwrap();
         original
             .verify(
                 &nodes[1],

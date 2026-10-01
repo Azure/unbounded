@@ -6,8 +6,8 @@ use super::*;
 use racer_dataplane::{
     model::{Authorization, OpaqueMetadata, OriginContext},
     peer::{
+        protocol::{FetchMode, Operation, PeerRequest, PeerResponse},
         server::LocalPageService,
-        wire::{FetchMode, Operation, PeerRequest, PeerResponse},
     },
     security::identity::PendingIdentity,
     topology::{membership::MembershipLease, paths::RouteBudget},

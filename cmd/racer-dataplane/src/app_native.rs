@@ -275,7 +275,7 @@ mod tests {
             (ResourceClass::DirtyCiphertext, page + 16),
             (
                 ResourceClass::RequestContext,
-                crate::peer::wire::MIN_REQUEST_CONTEXT_BYTES
+                crate::peer::protocol::MIN_REQUEST_CONTEXT_BYTES
                     + 4 * limits.header_bytes.get().max(crate::model::MAX_FIELD_BYTES),
             ),
         ] {

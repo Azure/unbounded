@@ -80,13 +80,13 @@ impl Session {
         // A peer may carry historical proofs, but cannot present another node's
         // head as its own immediate hop, including on native controls.
         let mut last = head.unique("racer-original")?;
-        for i in 0..crate::peer::wire::MAX_HOPS {
+        for i in 0..crate::peer::protocol::MAX_HOPS {
             if let Some(hop) = head.unique(&format!("racer-hop-{i}"))? {
                 last = Some(hop);
             }
         }
         if let Some(proof) = last {
-            let proof = crate::peer::wire::decode_signed(proof)?;
+            let proof = crate::peer::protocol::decode_signed(proof)?;
             if node_field(&proof.head, "racer-signer")? != self.peer
                 || super::signing::receiver(&proof.head)? != *self.signatures.node()
             {
@@ -330,7 +330,7 @@ pub(crate) mod tests {
         MessageHead {
             start: StartLine::Request {
                 method: "POST".into(),
-                target: crate::peer::wire::REQUEST_TARGET.into(),
+                target: crate::peer::protocol::REQUEST_TARGET.into(),
             },
             headers: vec![crate::http::Header {
                 name: "content-length".into(),
@@ -339,7 +339,7 @@ pub(crate) mod tests {
         }
     }
     fn clone_head(head: &MessageHead) -> MessageHead {
-        let codec = Codec::new(crate::peer::wire::MAX_ENVELOPE_HEAD, u64::MAX);
+        let codec = Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD, u64::MAX);
         codec
             .decode_head(&codec.encode_head(head).unwrap())
             .unwrap()
@@ -382,11 +382,11 @@ pub(crate) mod tests {
         let mut previous = None;
         for sequence in 1..=2 {
             let wire = a
-                .sign(crate::peer::wire::WireCodec::encode(&auth, false, 0).unwrap())
+                .sign(crate::peer::protocol::WireCodec::encode(&auth, false, 0).unwrap())
                 .unwrap();
             let copy = clone_head(&wire);
             let decoded = b.admit(wire).unwrap();
-            let (retained, _) = crate::peer::wire::WireCodec::decode(decoded, false).unwrap();
+            let (retained, _) = crate::peer::protocol::WireCodec::decode(decoded, false).unwrap();
             assert_eq!(retained.original.signature, proof.signature);
             assert_eq!(b.rx, sequence);
             if let Some(old) = previous {
@@ -548,7 +548,7 @@ pub(crate) mod tests {
         let reactor = Rc::new(Reactor::new(admission.clone()));
         let io = HttpIo::with_admission(
             reactor.clone(),
-            Codec::new(crate::peer::wire::MAX_ENVELOPE_HEAD, u64::MAX),
+            Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD, u64::MAX),
             admission.clone(),
         );
         let pool = HttpPool::new(reactor.clone(), admission.clone(), 2);

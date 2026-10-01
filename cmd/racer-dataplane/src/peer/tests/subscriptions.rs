@@ -87,10 +87,10 @@ fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failure
     impl PeerTransport for Never {
         fn exchange<'a>(
             &'a self,
-            _: wire::SignedRequest,
+            _: protocol::SignedRequest,
             _: crate::topology::membership::MembershipLease,
             _: &'a RequestScope,
-        ) -> crate::error::Operation<'a, wire::SignedResponse> {
+        ) -> crate::error::Operation<'a, protocol::SignedResponse> {
             Box::pin(async { panic!("destination must not relay") })
         }
     }
@@ -103,7 +103,7 @@ fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failure
     impl server::LocalPageService for Service {
         fn serve_peer<'a>(
             &'a self,
-            request: wire::VerifiedRequest,
+            request: protocol::VerifiedRequest,
             _: crate::topology::membership::MembershipLease,
             _: &'a RequestScope,
         ) -> crate::error::Operation<'a, PeerResponse> {
@@ -181,7 +181,7 @@ fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failure
         let server = server::PeerServer::new(
             Rc::new(HttpIo::with_admission(
                 Rc::new(Reactor::new(admission.clone())),
-                Codec::new(wire::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
+                Codec::new(protocol::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
                 admission.clone(),
             )),
             destination,
@@ -303,7 +303,7 @@ fn subscription_selection_is_canonical_signed_and_bound_to_exact_grant() {
         )
         .unwrap();
         crate::security::protocol::push(&mut head, "racer-receiver", A);
-        let signed = wire::SignedResponse {
+        let signed = protocol::SignedResponse {
             authentication: crate::security::forwarding::ForwardedHead {
                 original: Arc::new(signers[2].sign(head).unwrap()),
                 hops: vec![],
@@ -347,7 +347,7 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
     impl server::LocalPageService for Local {
         fn serve_peer<'a>(
             &'a self,
-            request: wire::VerifiedRequest,
+            request: protocol::VerifiedRequest,
             _: crate::topology::membership::MembershipLease,
             _: &'a RequestScope,
         ) -> crate::error::Operation<'a, PeerResponse> {
@@ -372,10 +372,10 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
     impl PeerTransport for Local {
         fn exchange<'a>(
             &'a self,
-            _: wire::SignedRequest,
+            _: protocol::SignedRequest,
             _: crate::topology::membership::MembershipLease,
             _: &'a RequestScope,
-        ) -> crate::error::Operation<'a, wire::SignedResponse> {
+        ) -> crate::error::Operation<'a, protocol::SignedResponse> {
             Box::pin(async { panic!("no relay or speculative backup") })
         }
     }
@@ -386,7 +386,7 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let io = Rc::new(HttpIo::with_admission(
         reactor.clone(),
-        Codec::new(wire::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
+        Codec::new(protocol::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
         admission.clone(),
     ));
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

@@ -16,7 +16,7 @@ use crate::{
         PageNumber, StrongEtag,
     },
     origin::Origin,
-    peer::wire::{FetchMode, Operation as PeerOperation, PeerResponse},
+    peer::protocol::{FetchMode, Operation as PeerOperation, PeerResponse},
     runtime::deadline::RequestScope,
     security::credentials::CredentialCrypto,
     store::index::Index,

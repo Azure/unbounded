@@ -1,21 +1,392 @@
-//! Decode the security owner's canonical fields, then compare its encoding exactly.
-use super::wire::*;
+//! Signed peer operations and canonical security decoding with charged ownership.
 use crate::{
     error::{Error, Result},
-    http::MessageHead,
-    memory::pool::BufferPool,
+    http::{Codec, Header, MessageHead, StartLine},
+    memory::pool::{BufferPool, CiphertextPage},
     model::{
         EncryptedAuthorization, ExpiresAt, KeyId, MetadataSelector, Nonce, ObjectMetadata,
         OpaqueMetadata, PageEnvelope, PeerOriginContext, ResourceClass, *,
     },
     runtime::{admission::Admission, deadline::RequestScope},
-    security::{forwarding::ForwardedHead, protocol as p},
+    security::{forwarding::ForwardedHead, protocol as p, signing::SignedHead},
     topology::paths::RouteBudget,
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use std::{
     rc::Rc,
+    sync::Arc,
     time::{Duration, UNIX_EPOCH},
 };
+
+pub use crate::security::forwarding::{RequestBinding, VerifiedRequest, VerifiedResponse};
+
+pub enum FetchMode {
+    CopyOnly,
+    Acquire,
+}
+pub enum Operation {
+    Subscribe {
+        subscription: super::subscriptions::Subscription,
+        mode: FetchMode,
+    },
+    Bootstrap {
+        object: ObjectId,
+        mode: FetchMode,
+    },
+    Page {
+        page: PageId,
+        mode: FetchMode,
+    },
+    Metadata {
+        object: ObjectId,
+        selector: MetadataSelector,
+        mode: FetchMode,
+    },
+}
+/// Locally constructed operation, not evidence of authenticated ingress.
+pub struct PeerRequest {
+    pub operation: Operation,
+    pub origin: PeerOriginContext,
+    pub route: RouteBudget,
+}
+/// Unsigned local result. Transport must sign it against the admitted request.
+pub enum PeerResponse {
+    Selected {
+        metadata: ObjectMetadata,
+        ciphertext: CiphertextPage,
+        grant: super::subscriptions::TransferGrant,
+    },
+    Bootstrap {
+        metadata: ObjectMetadata,
+        page_zero: Option<CiphertextPage>,
+    },
+    Page {
+        metadata: ObjectMetadata,
+        ciphertext: CiphertextPage,
+    },
+    Metadata(ObjectMetadata),
+    Miss,
+    /// Authoritative origin absence, only for fresh metadata Acquire.
+    NotFound,
+    VersionUnavailable,
+    Unavailable,
+    Overloaded,
+    OriginRejected,
+    OriginForbidden,
+    /// Authenticated peer no longer retains the requested routing epoch.
+    StaleMembership,
+}
+/// Owned, unverified wire input/output. The original and all forwarding signatures
+/// travel with the operation, including opaque encrypted origin credentials.
+/// Verification must check that the operation and effective route agree with the
+/// original signed fields and the complete forwarding chain before admitting work.
+pub struct SignedRequest {
+    pub authentication: ForwardedHead,
+    pub request: PeerRequest,
+}
+/// Owned, unverified wire response, including signed misses and errors. A relay
+/// preserves both the original head and ciphertext; it never decrypts the body.
+/// Verification checks logical response fields against the signed head and binds
+/// them to the outstanding request. Page bodies are neither signed nor hashed.
+pub struct SignedResponse {
+    pub authentication: ForwardedHead,
+    pub response: PeerResponse,
+}
+pub const VERSION: &str = "5";
+pub const REQUEST_TARGET: &str = "/racer/peer/v5/exchange";
+pub const MAX_HOPS: usize = 8;
+pub const MAX_SIGNED_HEAD: usize = crate::security::protocol::MAX_HEAD;
+pub const MAX_ENVELOPE_HEAD: usize = (MAX_HOPS + 1) * (MAX_SIGNED_HEAD * 2);
+/// Per-worker progress floor: retained inbound/outbound envelopes, decoded context,
+/// signing/encoding scratch and simultaneous receive/send staging during a relay.
+/// Runtime admission still rejects concurrent work when this shared budget is full.
+pub const MIN_REQUEST_CONTEXT_BYTES: usize = 8 * MAX_ENVELOPE_HEAD;
+
+/// Versioned HTTP envelope. Signed header values and signatures are preserved using
+/// the HTTP codec; this wrapper is framing only and is never a signing authority.
+pub struct WireCodec;
+impl WireCodec {
+    pub fn encode(
+        authentication: &ForwardedHead,
+        response: bool,
+        body_length: usize,
+    ) -> Result<MessageHead> {
+        if authentication.hops.len() > MAX_HOPS
+            || body_length > crate::model::PAGE_BYTES as usize + 16
+            || (!response && body_length != 0)
+        {
+            return Err(Error::InvalidRequest);
+        }
+        let mut headers = vec![
+            Header {
+                name: "racer-peer-version".into(),
+                value: VERSION.as_bytes().to_vec(),
+            },
+            Header {
+                name: "content-length".into(),
+                value: body_length.to_string().into_bytes(),
+            },
+            Header {
+                name: "racer-original".into(),
+                value: encode_signed(&authentication.original)?,
+            },
+        ];
+        for (index, head) in authentication.hops.iter().enumerate() {
+            headers.push(Header {
+                name: format!("racer-hop-{index}"),
+                value: encode_signed(head)?,
+            });
+        }
+        let head = MessageHead {
+            start: if response {
+                StartLine::Response { status: 200 }
+            } else {
+                StartLine::Request {
+                    method: "POST".into(),
+                    target: REQUEST_TARGET.into(),
+                }
+            },
+            headers,
+        };
+        Codec::new(MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16).encode_head(&head)?;
+        Ok(head)
+    }
+    pub fn decode(head: MessageHead, response: bool) -> Result<(ForwardedHead, usize)> {
+        match (&head.start, response) {
+            (StartLine::Request { method, target }, false)
+                if method == "POST" && target == REQUEST_TARGET => {}
+            (StartLine::Response { status: 200 }, true) => {}
+            _ => return Err(Error::InvalidRequest),
+        }
+        let mut original = None;
+        let mut version = false;
+        let mut length = None;
+        let mut hops = std::collections::BTreeMap::new();
+        let mut seen = crate::runtime::collections::HashSet::default();
+        let mut total = 0usize;
+        for header in head.headers {
+            total = total
+                .checked_add(header.name.len())
+                .and_then(|n| n.checked_add(header.value.len()))
+                .ok_or(Error::InvalidRequest)?;
+            if total > MAX_ENVELOPE_HEAD {
+                return Err(Error::InvalidRequest);
+            }
+            let name = header.name.to_ascii_lowercase();
+            if !seen.insert(name.clone()) {
+                return Err(Error::InvalidRequest);
+            }
+            match name.as_str() {
+                "racer-peer-version" => {
+                    if header.value != VERSION.as_bytes() {
+                        return Err(Error::InvalidRequest);
+                    }
+                    version = true;
+                }
+                "content-length" => {
+                    let text =
+                        std::str::from_utf8(&header.value).map_err(|_| Error::InvalidRequest)?;
+                    let parsed = text.parse::<usize>().map_err(|_| Error::InvalidRequest)?;
+                    if text != parsed.to_string() {
+                        return Err(Error::InvalidRequest);
+                    }
+                    length = Some(parsed);
+                }
+                "racer-original" => original = Some(Arc::new(decode_signed(&header.value)?)),
+                "connection" | "host" => {}
+                _ => {
+                    let suffix = name
+                        .strip_prefix("racer-hop-")
+                        .ok_or(Error::InvalidRequest)?;
+                    let index = suffix.parse::<usize>().map_err(|_| Error::InvalidRequest)?;
+                    if index >= MAX_HOPS || suffix != index.to_string() {
+                        return Err(Error::InvalidRequest);
+                    }
+                    hops.insert(index, decode_signed(&header.value)?);
+                }
+            }
+        }
+        let length = length.ok_or(Error::InvalidRequest)?;
+        if !version || length > crate::model::PAGE_BYTES as usize + 16 || (!response && length != 0)
+        {
+            return Err(Error::InvalidRequest);
+        }
+        if hops.keys().copied().ne(0..hops.len()) {
+            return Err(Error::InvalidRequest);
+        }
+        Ok((
+            ForwardedHead {
+                original: original.ok_or(Error::InvalidRequest)?,
+                hops: hops.into_values().collect(),
+            },
+            length,
+        ))
+    }
+}
+pub(crate) fn encode_signed(head: &SignedHead) -> Result<Vec<u8>> {
+    if head.signature.len() != 64 {
+        return Err(Error::InvalidRequest);
+    }
+    let bytes =
+        Codec::new(MAX_SIGNED_HEAD, crate::model::PAGE_BYTES + 16).encode_head(&head.head)?;
+    let mut framed = Vec::with_capacity(bytes.len() + 64);
+    framed.extend_from_slice(&head.signature);
+    framed.extend_from_slice(&bytes);
+    Ok(STANDARD.encode(framed).into_bytes())
+}
+pub(crate) fn decode_signed(bytes: &[u8]) -> Result<SignedHead> {
+    if bytes.len() > (MAX_SIGNED_HEAD + 64).div_ceil(3) * 4 {
+        return Err(Error::InvalidRequest);
+    }
+    let decoded = STANDARD.decode(bytes).map_err(|_| Error::InvalidRequest)?;
+    if STANDARD.encode(&decoded).as_bytes() != bytes || decoded.len() <= 64 {
+        return Err(Error::InvalidRequest);
+    }
+    let (head, consumed) = Codec::new(MAX_SIGNED_HEAD, crate::model::PAGE_BYTES + 16)
+        .decode_head(&decoded[64..])?
+        .ok_or(Error::InvalidRequest)?;
+    if consumed != decoded.len() - 64 {
+        return Err(Error::InvalidRequest);
+    }
+    Ok(SignedHead {
+        head,
+        signature: decoded[..64].to_vec(),
+    })
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+    fn envelope() -> ForwardedHead {
+        ForwardedHead {
+            original: Arc::new(SignedHead {
+                head: MessageHead {
+                    start: StartLine::Response { status: 404 },
+                    headers: vec![Header {
+                        name: "racer-opaque".into(),
+                        value: b"AAEC/w==".to_vec(),
+                    }],
+                },
+                signature: vec![7; 64],
+            }),
+            hops: vec![],
+        }
+    }
+    #[test]
+    fn envelope_preserves_signature_and_opaque_headers() {
+        let original = envelope();
+        let (decoded, length) =
+            WireCodec::decode(WireCodec::encode(&original, true, 27).unwrap(), true).unwrap();
+        assert_eq!(length, 27);
+        assert_eq!(decoded.original.signature, original.original.signature);
+        assert_eq!(decoded.original.head.headers[0].value, b"AAEC/w==");
+    }
+    #[test]
+    fn rejects_versions_duplicates_holes_and_request_bodies() {
+        for version in ["1", "2", "3", "4", "6"] {
+            let mut head = WireCodec::encode(&envelope(), false, 0).unwrap();
+            head.headers[0].value = version.as_bytes().to_vec();
+            assert!(WireCodec::decode(head, false).is_err());
+        }
+        let mut legacy = WireCodec::encode(&envelope(), false, 0).unwrap();
+        legacy.start = StartLine::Request {
+            method: "POST".into(),
+            target: "/racer/peer/v2/exchange".into(),
+        };
+        assert!(WireCodec::decode(legacy, false).is_err());
+        let mut head = WireCodec::encode(&envelope(), false, 0).unwrap();
+        head.headers[0].value = b"1".to_vec();
+        assert!(WireCodec::decode(head, false).is_err());
+        let mut head = WireCodec::encode(&envelope(), false, 0).unwrap();
+        head.headers.push(Header {
+            name: "Content-Length".into(),
+            value: b"0".to_vec(),
+        });
+        assert!(WireCodec::decode(head, false).is_err());
+        let mut head = WireCodec::encode(&envelope(), false, 0).unwrap();
+        head.headers.push(Header {
+            name: "racer-hop-1".into(),
+            value: encode_signed(&envelope().original).unwrap(),
+        });
+        assert!(WireCodec::decode(head, false).is_err());
+        assert!(WireCodec::encode(&envelope(), false, 1).is_err());
+        assert!(WireCodec::encode(&envelope(), true, usize::MAX).is_err());
+    }
+    #[test]
+    fn rejects_trailing_or_oversized_embedded_head() {
+        let mut encoded = STANDARD
+            .decode(encode_signed(&envelope().original).unwrap())
+            .unwrap();
+        encoded.extend_from_slice(b"extra");
+        assert!(decode_signed(STANDARD.encode(encoded).as_bytes()).is_err());
+        assert!(decode_signed(&vec![b'A'; MAX_SIGNED_HEAD * 2]).is_err());
+    }
+    #[test]
+    fn maximum_signed_heads_and_hop_count_fit_outer_signature_profile() {
+        let signers = crate::security::signing::tests::network(2);
+        let mut head = MessageHead {
+            start: StartLine::Response { status: 200 },
+            headers: vec![
+                Header {
+                    name: "racer-receiver".into(),
+                    value: signers[1].node().0.as_bytes().to_vec(),
+                },
+                Header {
+                    name: "padding".into(),
+                    value: b"x".to_vec(),
+                },
+            ],
+        };
+        let small = signers[0].sign(head).unwrap();
+        let codec = Codec::new(MAX_SIGNED_HEAD, u64::MAX);
+        let length = codec.encode_head(&small.head).unwrap().len();
+        head = small.head;
+        head.headers.retain(|h| {
+            !crate::security::signing::is_auth_field(&h.name) || h.name == "racer-receiver"
+        });
+        head.headers
+            .iter_mut()
+            .find(|h| h.name == "padding")
+            .unwrap()
+            .value
+            .resize(1 + MAX_SIGNED_HEAD - length, b'x');
+        let maximum = signers[0].sign(head).unwrap();
+        assert_eq!(
+            codec.encode_head(&maximum.head).unwrap().len(),
+            MAX_SIGNED_HEAD
+        );
+        let encoded = encode_signed(&maximum).unwrap();
+        assert!(encoded.len() > MAX_SIGNED_HEAD);
+        let mut envelope = ForwardedHead {
+            original: Arc::new(maximum),
+            hops: (0..MAX_HOPS)
+                .map(|_| decode_signed(&encoded).unwrap())
+                .collect(),
+        };
+        let mut outer = WireCodec::encode(&envelope, true, 0).unwrap();
+        crate::security::protocol::push(&mut outer, "racer-receiver", &signers[1].node().0);
+        let outer = signers[0].sign_fields(outer).unwrap();
+        signers[1].verify_proof(outer).unwrap();
+        envelope.hops.push(decode_signed(&encoded).unwrap());
+        assert!(WireCodec::encode(&envelope, true, 0).is_err());
+        let mut too_large = decode_signed(&encoded).unwrap();
+        too_large
+            .head
+            .headers
+            .iter_mut()
+            .find(|h| h.name == "padding")
+            .unwrap()
+            .value
+            .push(b'x');
+        assert!(matches!(
+            encode_signed(&too_large),
+            Err(Error::HeaderTooLarge)
+        ));
+        let mut decoded = STANDARD.decode(&encoded).unwrap();
+        decoded.insert(decoded.len() - 4, b'x');
+        assert!(decode_signed(STANDARD.encode(decoded).as_bytes()).is_err());
+    }
+}
 
 /// Decode the canonical security profile while retaining charged body ownership.
 pub struct SecurityCodec {

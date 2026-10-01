@@ -369,7 +369,7 @@ mod tests {
     use super::*;
     #[test]
     fn maximum_wire_heads_and_maximum_field_count_have_checked_decoded_bounds() {
-        for limit in [MAX_HEAD_BYTES, crate::peer::wire::MAX_ENVELOPE_HEAD] {
+        for limit in [MAX_HEAD_BYTES, crate::peer::protocol::MAX_ENVELOPE_HEAD] {
             let codec = Codec::new(limit, 16);
             let mut bytes = b"GET / HTTP/1.1\r\nX: ".to_vec();
             bytes.resize(limit - 4, b'a');

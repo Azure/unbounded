@@ -1726,7 +1726,7 @@ impl Harness {
     fn peer_security(&mut self) {
         use crate::{
             http::{Codec, MessageHead, StartLine},
-            peer::wire::WireCodec,
+            peer::protocol::WireCodec,
             security::protocol as p,
         };
         let receiver = self.rng.pick(self.nodes.len());
@@ -1747,7 +1747,11 @@ impl Harness {
         };
         p::push(&mut head, "content-length", 0);
         p::push(&mut head, "racer-kind", "handshake");
-        p::push(&mut head, "racer-wire-version", crate::peer::wire::VERSION);
+        p::push(
+            &mut head,
+            "racer-wire-version",
+            crate::peer::protocol::VERSION,
+        );
         p::push(&mut head, "racer-membership", self.generation);
         p::push(&mut head, "racer-receiver", &peer.0);
         let signed = signatures.sign(head).unwrap();
@@ -2675,7 +2679,7 @@ fn dst_coverage_policy_and_aggregation() {
 #[test]
 fn completed_peer_dispatches_do_not_exhaust_worker_cancellation() {
     use crate::model::{MetadataSelector, OriginContext};
-    use crate::peer::wire::{FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse};
+    use crate::peer::protocol::{FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse};
     use crate::topology::paths::RouteBudget;
     use futures::{Stream, stream::FuturesUnordered};
 

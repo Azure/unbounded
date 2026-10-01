@@ -288,7 +288,7 @@ fn partition_limits_with_cause(
         (
             "request_context_bytes",
             limits.request_context_bytes.get()
-                < crate::peer::wire::MIN_REQUEST_CONTEXT_BYTES
+                < crate::peer::protocol::MIN_REQUEST_CONTEXT_BYTES
                     + 4 * limits.header_bytes.get().max(crate::model::MAX_FIELD_BYTES),
         ),
         ("queue_entries", limits.queue_entries.get() < 2),
@@ -673,7 +673,7 @@ impl WorkerApplication {
         let io = Rc::new(HttpIo::with_admission(
             reactor.clone(),
             crate::http::Codec::new(
-                crate::peer::wire::MAX_ENVELOPE_HEAD,
+                crate::peer::protocol::MAX_ENVELOPE_HEAD,
                 crate::model::PAGE_BYTES + 16,
             ),
             admission.clone(),
@@ -767,7 +767,7 @@ impl WorkerApplication {
             node.publications.clone(),
             config.routing_algorithm,
         )?);
-        let wire = Rc::new(crate::peer::wire::SecurityCodec::new(
+        let wire = Rc::new(crate::peer::protocol::SecurityCodec::new(
             admission.clone(),
             buffers.clone(),
         ));

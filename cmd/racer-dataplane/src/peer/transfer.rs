@@ -1,5 +1,5 @@
 //! Transport-neutral ciphertext lifecycle, selecting HTTP or authenticated RDMA.
-use super::wire::{PeerResponse, SecurityCodec, SignedRequest, SignedResponse, WireCodec};
+use super::protocol::{PeerResponse, SecurityCodec, SignedRequest, SignedResponse, WireCodec};
 use crate::telemetry::failures::{BodyProgress, Detail, Failure, Stage, timestamp};
 use crate::{
     error::{Error, Operation, Result},

@@ -528,7 +528,7 @@ impl Rig {
             io.clone(),
             None,
             admission.clone(),
-            Rc::new(racer_dataplane::peer::wire::SecurityCodec::new(
+            Rc::new(racer_dataplane::peer::protocol::SecurityCodec::new(
                 admission.clone(),
                 buffers.clone(),
             )),

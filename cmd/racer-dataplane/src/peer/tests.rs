@@ -12,7 +12,7 @@ use crate::{
     model::{
         EncryptedAuthorization, KeyId, MetadataSelector, Nonce, PeerOriginContext, ResourceClass, *,
     },
-    peer::wire::{FetchMode, Operation, PeerRequest, PeerResponse, SecurityCodec, WireCodec},
+    peer::protocol::{FetchMode, Operation, PeerRequest, PeerResponse, SecurityCodec, WireCodec},
     runtime::{
         admission::Admission,
         deadline::{Deadline, RequestScope},

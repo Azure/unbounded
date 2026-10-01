@@ -13,9 +13,9 @@ use crate::{
     model::{ExpiresAt, MetadataSelector, ObjectMetadata, OriginContext, *},
     peer::{
         PeerNetwork, PeerTransport, Relay, Requester,
+        protocol::{self, FetchMode, PeerResponse, SignedRequest, SignedResponse, VerifiedRequest},
         server::{LocalPageService, PeerServer},
         transfer::Transfers,
-        wire::{self, FetchMode, PeerResponse, SignedRequest, SignedResponse, VerifiedRequest},
     },
     runtime::{admission::Admission, deadline::RequestScope, reactor::Reactor},
     security::{
@@ -140,10 +140,10 @@ impl LocalPageService for CandidateService {
             assert!(logical.route.remaining_attempts > 0);
             assert!(matches!(
                 logical.operation,
-                wire::Operation::Metadata {
+                protocol::Operation::Metadata {
                     mode: FetchMode::Acquire,
                     ..
-                } | wire::Operation::Bootstrap {
+                } | protocol::Operation::Bootstrap {
                     mode: FetchMode::Acquire,
                     ..
                 }
@@ -199,10 +199,10 @@ fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
     impl PeerClient for NoPeers {
         fn request<'a>(
             &'a self,
-            _: wire::PeerRequest,
+            _: protocol::PeerRequest,
             _: crate::topology::membership::MembershipLease,
             _: &'a RequestScope,
-        ) -> Operation<'a, wire::VerifiedResponse> {
+        ) -> Operation<'a, protocol::VerifiedResponse> {
             Box::pin(async { panic!("single candidate must not probe peers") })
         }
     }
@@ -265,8 +265,8 @@ fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
             authorization: None,
         };
         let attempt = AttemptId([index as u8; 16]);
-        let request = wire::PeerRequest {
-            operation: wire::Operation::Metadata {
+        let request = protocol::PeerRequest {
+            operation: protocol::Operation::Metadata {
                 object: context.object.clone(),
                 selector,
                 mode: if acquire {
@@ -397,10 +397,10 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let io = Rc::new(HttpIo::with_admission(
         reactor.clone(),
-        Codec::new(wire::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
+        Codec::new(protocol::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
         admission.clone(),
     ));
-    let codec = Rc::new(wire::SecurityCodec::new(
+    let codec = Rc::new(protocol::SecurityCodec::new(
         admission.clone(),
         Rc::new(BufferPool::new(admission.clone())),
     ));
@@ -546,7 +546,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     let scope =
         RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(30)).unwrap();
     let mut budget = AcquisitionBudget::new(scope.deadline.0, 16, 24);
-    let operation = wire::Operation::Metadata {
+    let operation = protocol::Operation::Metadata {
         object,
         selector: if matches!(absence, Some(Absence::Pinned | Absence::CachedPin)) {
             MetadataSelector::Pinned(metadata.version.etag.clone())
@@ -756,10 +756,10 @@ struct PinnedFallback {
 impl crate::peer::PeerClient for PinnedFallback {
     fn request<'a>(
         &'a self,
-        request: wire::PeerRequest,
+        request: protocol::PeerRequest,
         membership: crate::topology::membership::MembershipLease,
         scope: &'a RequestScope,
-    ) -> Operation<'a, wire::VerifiedResponse> {
+    ) -> Operation<'a, protocol::VerifiedResponse> {
         Box::pin(async move {
             if request.route.destination == self.destination {
                 return crate::peer::PeerClient::request(
@@ -844,14 +844,14 @@ struct CachedCopies {
 impl crate::peer::PeerClient for CachedCopies {
     fn request<'a>(
         &'a self,
-        request: wire::PeerRequest,
+        request: protocol::PeerRequest,
         _: crate::topology::membership::MembershipLease,
         _: &'a RequestScope,
-    ) -> Operation<'a, wire::VerifiedResponse> {
+    ) -> Operation<'a, protocol::VerifiedResponse> {
         Box::pin(async move {
             assert!(matches!(
                 request.operation,
-                wire::Operation::Metadata {
+                protocol::Operation::Metadata {
                     mode: FetchMode::CopyOnly,
                     ..
                 }
