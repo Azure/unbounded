@@ -938,7 +938,7 @@ mod tests {
     }
     #[test]
     fn lagging_replica_retries_preserve_state_without_enrollment() {
-        use super::transport::tests::{FixtureIo, scripted_server};
+        use super::transport::scenarios::{FixtureIo, scripted_server};
         use futures::executor::block_on;
         for pending in [false, true] {
             let d = testing::Directory::new();
