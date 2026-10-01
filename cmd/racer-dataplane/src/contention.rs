@@ -745,7 +745,6 @@ impl Simulator {
 }
 
 mod fidelity;
-mod global_admission;
 mod queues;
 mod scenarios;
 mod waiter_detach;
