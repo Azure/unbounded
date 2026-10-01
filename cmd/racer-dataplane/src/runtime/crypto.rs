@@ -73,6 +73,8 @@ impl PartialOrd for CryptoId {
 /// Output capacity was admitted on I/O. The engine cannot reach Admission,
 /// flights, metadata catalogs, storage, credentials, or any Rc service graph.
 pub enum CryptoInput {
+    /// Check a stored CRC without allocating plaintext or running AEAD.
+    Checksum { ciphertext: CiphertextPage },
     Decrypt {
         ciphertext: CiphertextPage,
         plaintext: Reservation,
@@ -85,6 +87,7 @@ pub enum CryptoInput {
 }
 
 pub enum CryptoOutput {
+    Checksummed(CiphertextPage),
     /// Retain original ciphertext through completion too; I/O decides whether to
     /// retain it for peer copies/persistence after consuming the completion.
     Decrypted(VerifiedPage, CiphertextPage),
@@ -120,6 +123,7 @@ pub struct CryptoPermit {
 
 #[derive(Default)]
 struct Measurement {
+    checksum_only: bool,
     // Benchmark control only. No production field, configuration, or runtime knob.
     #[cfg(test)]
     disabled: bool,
@@ -173,6 +177,10 @@ impl CryptoCompletion {
     fn record(&self, metrics: &crate::telemetry::metrics::Metrics) {
         use crate::telemetry::metrics::Event::*;
         let m = &self.permit.measurement;
+        // CRC-only relay work is not an AEAD encrypt/decrypt operation.
+        if m.checksum_only {
+            return;
+        }
         let Some(execution) = m.execution_ns else {
             return;
         };
@@ -242,12 +250,13 @@ impl CryptoPermit {
     pub fn job(mut self, input: CryptoInput, key: KeyLease, scope: RequestScope) -> CryptoJob {
         use super::reactor::IoBuffer;
         if self.measurement_enabled() {
+            self.measurement.checksum_only = matches!(input, CryptoInput::Checksum { .. });
             self.measurement.decrypt = matches!(input, CryptoInput::Decrypt { .. });
             self.measurement.bytes = match &input {
                 CryptoInput::Encrypt { plaintext, .. } => {
                     plaintext.bytes().map_or(0, |b| b.len() as u64)
                 }
-                CryptoInput::Decrypt { ciphertext, .. } => {
+                CryptoInput::Decrypt { ciphertext, .. } | CryptoInput::Checksum { ciphertext } => {
                     u64::from(ciphertext.envelope().plaintext_length)
                 }
             };

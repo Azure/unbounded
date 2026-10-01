@@ -1377,6 +1377,199 @@ fn cold_disk_fixture() -> Fixture {
 }
 
 #[test]
+fn copy_only_rejects_disk_payload_and_tag_corruption_before_retention() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
+    for acquire in [false, true] {
+        for corrupt_tag in [false, true] {
+            let mut f = cold_disk_fixture();
+            let writer = &f.fill.dependencies.writer;
+            let location = writer.index().lookup(&f.page).unwrap().unwrap().location;
+            let staging = writer
+                .slabs()
+                .allocate(location.location.extent.length(), None)
+                .unwrap();
+            let lease = writer.lease(&location).unwrap();
+            let mut stored = drive_disk(
+                &f,
+                writer
+                    .slabs()
+                    .read(location.location, staging, lease, &f.scope),
+            )
+            .unwrap();
+            let parsed = crate::store::format::parse(&stored, location.location.extent).unwrap();
+            let offset = if corrupt_tag {
+                parsed.ciphertext.end - 1
+            } else {
+                parsed.ciphertext.start
+            };
+            stored.bytes_mut().unwrap()[offset] ^= 1;
+            let lease = writer.lease(&location).unwrap();
+            drive_disk(
+                &f,
+                writer
+                    .slabs()
+                    .write(location.location, stored, lease, &f.scope),
+            )
+            .unwrap();
+            if acquire {
+                assert!(
+                    drive_io(
+                        f.fill.acquire_local_copy(&f.page, &f.scope, false),
+                        &f.reactor,
+                        &mut f.engine,
+                        &f.crypto
+                    )
+                    .unwrap()
+                    .is_none()
+                );
+            } else {
+                assert!(
+                    drive_io(
+                        f.fill.copy_only(&f.page, &f.scope),
+                        &f.reactor,
+                        &mut f.engine,
+                        &f.crypto
+                    )
+                    .unwrap()
+                    .is_none()
+                );
+            }
+            assert!(
+                drive_io(
+                    f.fill.copy_only(&f.page, &f.scope),
+                    &f.reactor,
+                    &mut f.engine,
+                    &f.crypto
+                )
+                .unwrap()
+                .is_none()
+            );
+            assert!(writer.index().lookup(&f.page).unwrap().is_none());
+            assert!(
+                f.fill
+                    .dependencies
+                    .memory
+                    .unverified(&f.page)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(f.fill.metrics.count(Event::CorruptMiss), 1);
+            assert_eq!(f.fill.metrics.count(Event::PageDecrypt), 0);
+            assert_eq!(f.origin.calls.get(), 0);
+            assert_eq!(f.reactor.in_flight(), 0);
+            assert!(f.fill.local_copies.borrow().is_empty());
+            assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Flight), 0);
+            assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Waiter), 0);
+            if acquire {
+                // A full ciphertext-only Acquire must fall through to origin, not
+                // publish the rejected disk copy through its flight.
+                f.origin.version_unavailable.set(true);
+                let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+                assert!(matches!(
+                    drive_io(
+                        f.fill.acquire_ciphertext(
+                            f.page.clone(),
+                            f.membership.clone(),
+                            &f.context,
+                            &f.scope,
+                            &mut budget
+                        ),
+                        &f.reactor,
+                        &mut f.engine,
+                        &f.crypto
+                    ),
+                    Err(Error::VersionUnavailable)
+                ));
+                assert_eq!(f.origin.calls.get(), 1);
+                assert!(
+                    f.fill
+                        .dependencies
+                        .memory
+                        .unverified(&f.page)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn disk_crc_validation_preserves_replacement_and_intact_acquire() {
+    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let _owner = queue.enter();
+    let mut f = cold_disk_fixture();
+    let (mut stale, token) = drive_disk(
+        &f,
+        f.fill.dependencies.disk.read_with_token(&f.page, &f.scope),
+    )
+    .unwrap()
+    .unwrap();
+    let (replacement, _) = drive_disk(
+        &f,
+        f.fill.dependencies.disk.read_with_token(&f.page, &f.scope),
+    )
+    .unwrap()
+    .unwrap();
+    // Hold an old read across a same-page replacement publication.
+    Arc::get_mut(&mut stale.ciphertext.inner).unwrap().bytes[0] ^= 1;
+    let writer = &f.fill.dependencies.writer;
+    let old = writer.index().lookup(&f.page).unwrap().unwrap().location;
+    let dirty = f
+        .fill
+        .dependencies
+        .admission
+        .reserve(
+            Some(&f.page.version.object.cache),
+            ResourceClass::DirtyCiphertext,
+            replacement.ciphertext.bytes().len(),
+        )
+        .unwrap();
+    writer.enqueue(replacement, dirty).unwrap();
+    drive_disk(&f, writer.progress(1, &f.scope)).unwrap();
+    let new = writer.index().lookup(&f.page).unwrap().unwrap().location;
+    assert_ne!(old, new);
+    assert_eq!(
+        drive(
+            f.fill.validate_disk_copy(&stale, &f.page, &token, &f.scope),
+            &mut f.engine,
+            &f.crypto
+        ),
+        Err(Error::CorruptRecord)
+    );
+    assert_eq!(
+        writer.index().lookup(&f.page).unwrap().unwrap().location,
+        new
+    );
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+    let intact = drive_io(
+        f.fill.acquire_ciphertext(
+            f.page.clone(),
+            f.membership.clone(),
+            &f.context,
+            &f.scope,
+            &mut budget,
+        ),
+        &f.reactor,
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    assert_eq!(intact.ciphertext.verify_checksum(), Ok(()));
+    assert_eq!(f.fill.metrics.count(Event::PageDecrypt), 0);
+    assert_eq!(f.origin.calls.get(), 0);
+    assert!(
+        f.fill
+            .dependencies
+            .memory
+            .unverified(&f.page)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
 fn concurrent_cold_disk_copy_only_shares_io_and_retains_original_ciphertext() {
     let queue = Rc::new(crate::read::drivers::DriverQueue::default());
     let _owner = queue.enter();
@@ -1396,7 +1589,12 @@ fn concurrent_cold_disk_copy_only_shares_io_and_retains_original_ciphertext() {
     assert!(second.as_mut().poll(&mut cx).is_pending());
     assert_eq!(f.reactor.in_flight(), 1, "one cold disk submission");
     assert_eq!(f.fill.local_copies.borrow().len(), 1);
-    let (first, second) = drive_disk(&f, futures::future::join(first, second));
+    let (first, second) = drive_io(
+        futures::future::join(first, second),
+        &f.reactor,
+        &mut f.engine,
+        &f.crypto,
+    );
     let (first, second) = (first.unwrap().unwrap(), second.unwrap().unwrap());
     assert!(Arc::ptr_eq(&first.1.inner, &second.1.inner));
     let retained = f
@@ -1466,7 +1664,7 @@ fn concurrent_cold_disk_copy_only_shares_io_and_retains_original_ciphertext() {
 fn detached_copy_only_keeps_disk_fence_and_independent_waiters() {
     let queue = Rc::new(crate::read::drivers::DriverQueue::default());
     let _owner = queue.enter();
-    let f = cold_disk_fixture();
+    let mut f = cold_disk_fixture();
     let caller = RequestScope::new(RequestId([9; 16]), f.scope.deadline.0).unwrap();
     let mut first = f.fill.copy_only(&f.page, &caller);
     let mut second = f.fill.copy_only(&f.page, &f.scope);
@@ -1487,7 +1685,11 @@ fn detached_copy_only_keeps_disk_fence_and_independent_waiters() {
     let mut replacement = f.fill.copy_only(&f.page, &f.scope);
     assert!(replacement.as_mut().poll(&mut cx).is_pending());
     assert_eq!(f.reactor.in_flight(), 1);
-    assert!(drive_disk(&f, replacement).unwrap().is_some());
+    assert!(
+        drive_io(replacement, &f.reactor, &mut f.engine, &f.crypto)
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Flight), 0);
     assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Waiter), 0);
     assert!(f.fill.local_copies.borrow().is_empty());
@@ -1824,6 +2026,8 @@ fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
     let mut read = read_copy();
     let copy = loop {
         f.scope.check().unwrap();
+        f.engine.poll_budgeted(64).unwrap();
+        f.crypto.poll_budgeted(64).unwrap();
         if let Poll::Ready(result) = read.as_mut().poll(&mut cx) {
             break result.expect("idle cached ciphertext must not reject a disk copy");
         }

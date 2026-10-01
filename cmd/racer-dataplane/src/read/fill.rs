@@ -798,7 +798,8 @@ impl Fill {
                     else {
                         return Ok(None);
                     };
-                    validate_copy(&copy, &page)?;
+                    fill.validate_disk_copy(&copy, &page, &token, &owned_scope)
+                        .await?;
                     let copy = UnverifiedPage {
                         copy,
                         disk_token: Some(token),
@@ -869,6 +870,19 @@ impl Fill {
             },
         };
         if let Some(copy) = local {
+            if !want_plaintext {
+                if let Some(token) = &token {
+                    match self.validate_disk_copy(&copy, page, token, scope).await {
+                        Ok(()) => {}
+                        Err(Error::CorruptRecord) => {
+                            self.metrics.record(Event::CorruptMiss, 1)?;
+                            return Ok(None);
+                        }
+                        Err(Error::MissingKey) => return Ok(None),
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
             if !want_plaintext && validate_copy(&copy, page).is_ok() {
                 self.metrics.record(
                     if token.is_some() {
@@ -919,6 +933,28 @@ impl Fill {
             drop(plaintext);
         }
         Ok(None)
+    }
+
+    async fn validate_disk_copy(
+        &self,
+        copy: &crate::memory::page::CiphertextCopy,
+        page: &PageId,
+        token: &crate::store::ReadToken,
+        scope: &RequestScope,
+    ) -> Result<()> {
+        let result = match validate_copy(copy, page) {
+            Ok(()) => {
+                self.dependencies
+                    .crypto
+                    .verify_checksum(copy.ciphertext.clone(), scope)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        if matches!(result, Err(Error::CorruptRecord | Error::MissingKey)) {
+            self.dependencies.disk.invalidate(token)?;
+        }
+        result
     }
 
     async fn acquire_once(

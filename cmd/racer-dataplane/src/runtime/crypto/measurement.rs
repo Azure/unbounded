@@ -93,7 +93,10 @@ fn envelope(size: usize) -> PageEnvelope {
 fn validate(result: &CryptoCompletion, size: usize) {
     if let CryptoOutcome::Completed(output) = &result.outcome {
         let (CryptoOutput::Encrypted(plain, ciphertext)
-        | CryptoOutput::Decrypted(plain, ciphertext)) = output;
+        | CryptoOutput::Decrypted(plain, ciphertext)) = output
+        else {
+            panic!("AEAD measurement received checksum-only output");
+        };
         assert_eq!(plain.bytes().len(), size);
         assert_eq!(ciphertext.bytes().len(), size + 16);
         assert_eq!(plain.bytes()[0], 7);
@@ -404,7 +407,10 @@ fn accounting_sample(size: usize, decrypt: bool, enabled: bool, iterations: usiz
                 .await
                 .unwrap();
             let (CryptoOutput::Encrypted(plain, cipher) | CryptoOutput::Decrypted(plain, cipher)) =
-                &output;
+                &output
+            else {
+                panic!("AEAD measurement received checksum-only output");
+            };
             assert_eq!(plain.bytes().len(), size);
             assert_eq!((plain.bytes()[0], plain.bytes()[size - 1]), (7, 7));
             assert_eq!(cipher.bytes().len(), size + 16);

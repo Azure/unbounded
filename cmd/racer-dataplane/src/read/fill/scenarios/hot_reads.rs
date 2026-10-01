@@ -1102,9 +1102,14 @@ fn origin_fill_preserves_ciphertext_for_memory_and_pending_candidate_copy() {
     drive_disk(&f, f.fill.dependencies.writer.progress(1, &f.scope)).unwrap();
     drop((result, second, copy, pending));
     assert!(f.fill.dependencies.memory.evict_idle(usize::MAX).unwrap() > 0);
-    let disk_copy = drive_disk(&f, f.fill.copy_only(&f.page, &f.scope))
-        .unwrap()
-        .unwrap();
+    let disk_copy = drive_io(
+        f.fill.copy_only(&f.page, &f.scope),
+        &f.reactor,
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(disk_copy.0.version, f.page.version);
     let disk_result = drive(
         f.fill.acquire(

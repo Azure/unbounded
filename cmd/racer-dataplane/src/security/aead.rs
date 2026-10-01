@@ -68,6 +68,30 @@ pub struct PageCrypto {
     client: Rc<CryptoClient>,
 }
 impl PageCrypto {
+    /// Verify persisted ciphertext integrity on the bounded crypto worker queue.
+    /// This does not authenticate a peer copy or produce publishable plaintext.
+    pub fn verify_checksum<'a>(
+        &'a self,
+        ciphertext: CiphertextPage,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, ()> {
+        Box::pin(async move {
+            let envelope = ciphertext.envelope();
+            let key = self.keys.lease(
+                Some(&envelope.page.version.object.cache),
+                envelope.key_id,
+                KeyPurpose::Page,
+            )?;
+            match self
+                .client
+                .execute(CryptoInput::Checksum { ciphertext }, key, scope)
+                .await?
+            {
+                CryptoOutput::Checksummed(_) => Ok(()),
+                _ => Err(Error::CorruptRecord),
+            }
+        })
+    }
     /// I/O-local facade. Only owned page inputs and an immutable key lease cross
     /// to the engine; this Rc graph and its futures stay on I/O.
     pub fn new(keys: Rc<Keyring>, client: Rc<CryptoClient>) -> Self {
@@ -111,7 +135,9 @@ impl PageCrypto {
                 .await?
             {
                 CryptoOutput::Decrypted(page, _original_ciphertext) => Ok(page),
-                CryptoOutput::Encrypted(..) => Err(Error::CorruptRecord),
+                CryptoOutput::Encrypted(..) | CryptoOutput::Checksummed(_) => {
+                    Err(Error::CorruptRecord)
+                }
             }
         })
     }
@@ -141,7 +167,9 @@ impl PageCrypto {
                 .await?
             {
                 CryptoOutput::Encrypted(plaintext, ciphertext) => Ok((plaintext, ciphertext)),
-                CryptoOutput::Decrypted(..) => Err(Error::CorruptRecord),
+                CryptoOutput::Decrypted(..) | CryptoOutput::Checksummed(_) => {
+                    Err(Error::CorruptRecord)
+                }
             }
         })
     }
@@ -197,8 +225,14 @@ impl PageCryptoEngine {
         permit: &mut CryptoPermit,
     ) -> Result<(PageEnvelope, Zeroizing<Vec<u8>>)> {
         scope.check()?;
+        if let CryptoInput::Checksum { ciphertext } = input {
+            ciphertext.verify_checksum()?;
+            scope.check()?;
+            return Ok((ciphertext.envelope().clone(), Zeroizing::new(Vec::new())));
+        }
         let cipher = XChaCha20Poly1305::new(key.material(KeyPurpose::Page)?.into());
         let (envelope, mut bytes) = match input {
+            CryptoInput::Checksum { .. } => unreachable!("checksum handled above"),
             CryptoInput::Encrypt {
                 page,
                 plaintext,
@@ -297,6 +331,9 @@ impl PageCryptoEngine {
         mut bytes: Zeroizing<Vec<u8>>,
     ) -> CryptoOutcome {
         match input {
+            CryptoInput::Checksum { ciphertext } => {
+                CryptoOutcome::Completed(CryptoOutput::Checksummed(ciphertext))
+            }
             CryptoInput::Encrypt {
                 page,
                 plaintext,
