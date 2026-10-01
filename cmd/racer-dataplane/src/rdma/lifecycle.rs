@@ -351,7 +351,7 @@ impl NativeService {
             .try_reserve_exact(activation.bytes)
             .map_err(|_| Error::Overloaded)?;
         mailbox.bytes.resize(activation.bytes, 0);
-        let region = ffi::Region::new(device.clone(), activation.bytes, Box::new(quota))?;
+        let region = ffi::Region::new(device.clone(), activation.bytes, quota)?;
         self.resources[i] = Some(Resource {
             device: device.clone(),
             region,
@@ -711,7 +711,7 @@ mod tests {
     pub(super) fn provision_test(
         service: &mut NativeService,
         index: usize,
-    ) -> Rc<std::cell::Cell<usize>> {
+    ) -> ffi::lifetime_tests::QuotaObserver {
         let (qp, region, charged) = ffi::lifetime_tests::fresh_fixture();
         let device = qp.device().clone();
         let slot = &service.port.shared.slots[index];

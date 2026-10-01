@@ -1,13 +1,16 @@
 //! Native RDMA unsafe boundary. Used exclusively by the paired native service.
 //! Provider layouts stay in native/rdma.c. Failed teardown retains DMA ownership.
-use crate::error::{Error, Result};
+use crate::{
+    error::{Error, Result},
+    runtime::admission::Reservation,
+};
 use std::{
-    any::Any,
     cell::{Cell, RefCell},
     collections::BTreeMap,
     ffi::{CStr, c_char, c_int, c_void},
     ptr::NonNull,
     rc::Rc,
+    sync::Arc,
 };
 
 pub struct Verbs;
@@ -305,14 +308,14 @@ pub(crate) struct Region {
     raw: NonNull<c_void>,
     length: usize,
     used: Cell<usize>,
-    quota: Option<Box<dyn Any>>,
+    quota: Option<Arc<Reservation>>,
     busy: Cell<bool>,
 }
 impl Region {
     pub(crate) fn new(
         device: Rc<DeviceHandle>,
         length: usize,
-        quota: Box<dyn Any>,
+        quota: Arc<Reservation>,
     ) -> Result<Rc<Self>> {
         if length == 0 || length > u32::MAX as usize {
             return Err(Error::InvalidRange);

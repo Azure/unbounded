@@ -856,8 +856,8 @@ mod tests {
         let receiver = QueuePairHandle::new(device.clone()).unwrap();
         sender.connect(receiver.endpoint).unwrap();
         receiver.connect(sender.endpoint).unwrap();
-        let source = Region::new(device.clone(), 32, Box::new(())).unwrap();
-        let target = Region::new(device, 32, Box::new(())).unwrap();
+        let source = Region::new(device.clone(), 32, lifetime_tests::quota().0).unwrap();
+        let target = Region::new(device, 32, lifetime_tests::quota().0).unwrap();
         source.resize(17).unwrap();
         target.resize(17).unwrap();
         source.copy_from(&[0xa5; 17]).unwrap();
@@ -898,20 +898,12 @@ mod tests {
 
     #[test]
     fn fallback_cannot_reuse_quarantined_region_in_either_completion_order() {
-        struct Probe(Rc<Cell<usize>>);
-        impl Drop for Probe {
-            fn drop(&mut self) {
-                self.0.set(self.0.get() + 1);
-            }
-        }
         for remote_first in [false, true] {
             let sim = Simulation::new();
-            let drops = Rc::new(Cell::new(0));
+            let (quota, charged) = lifetime_tests::quota();
             {
                 let (sender, receiver, source, _) = connected(&sim);
-                let target =
-                    Region::new(sender.device().clone(), 32, Box::new(Probe(drops.clone())))
-                        .unwrap();
+                let target = Region::new(sender.device().clone(), 32, quota).unwrap();
                 target.resize(17).unwrap();
                 let (window, bind) = receiver.bind(target.clone()).unwrap();
                 assert_eq!(receiver.progress(), Ok(1));
@@ -946,7 +938,7 @@ mod tests {
                     assert_eq!(source.copy_to().unwrap(), [0xa5; 17]);
                     assert_eq!(invalidation.result(), None);
                 }
-                assert_eq!(drops.get(), 0);
+                assert_eq!(charged.get(), 1);
                 assert_eq!(target.copy_to(), Err(Error::Unavailable));
                 assert!(matches!(
                     fallback_receiver.bind(target.clone()),
@@ -979,9 +971,9 @@ mod tests {
                     expected,
                     "old key cannot modify the reused destination"
                 );
-                assert_eq!(drops.get(), 0);
+                assert_eq!(charged.get(), 1);
             }
-            assert_eq!(drops.get(), 1);
+            assert_eq!(charged.get(), 0);
             assert_eq!(sim.live_resources(), 0);
         }
     }
@@ -1192,7 +1184,7 @@ mod tests {
                 assert!(Verbs.discover().unwrap().is_empty());
             }
             assert_eq!(Verbs.discover().unwrap().len(), 1);
-            let region = Region::new(device, 32, Box::new(())).unwrap();
+            let region = Region::new(device, 32, lifetime_tests::quota().0).unwrap();
             let address = region.address();
             drop(scope);
             drop(region);

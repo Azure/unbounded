@@ -123,14 +123,23 @@ unsafe extern "C" fn poll(_: *mut c_void, out: *mut Completion, cap: u32) -> c_i
         n as c_int
     })
 }
-struct Quota(Rc<Cell<usize>>);
-impl Drop for Quota {
-    fn drop(&mut self) {
-        self.0.set(self.0.get() - 1);
-        event("quota");
+/// Observe the real admission charge without retaining the reservation itself.
+pub(crate) struct QuotaObserver(crate::runtime::admission::Admission);
+impl QuotaObserver {
+    pub(crate) fn get(&self) -> usize {
+        self.0.used(crate::model::ResourceClass::Registered)
     }
 }
-pub(crate) fn fixture() -> (Rc<QueuePairHandle>, Rc<Region>, Rc<Cell<usize>>) {
+pub(crate) fn quota() -> (Arc<Reservation>, QuotaObserver) {
+    let admission = crate::runtime::admission::Admission::new(
+        crate::test_support::cluster::config(false).limits,
+    );
+    let reservation = admission
+        .reserve(None, crate::model::ResourceClass::Registered, 1)
+        .unwrap();
+    (Arc::new(reservation), QuotaObserver(admission))
+}
+pub(crate) fn fixture() -> (Rc<QueuePairHandle>, Rc<Region>, QuotaObserver) {
     FAULTS.with_borrow_mut(|f| *f = Faults::default());
     let api = Rc::new(Api {
         library: None,
@@ -167,8 +176,8 @@ pub(crate) fn fixture() -> (Rc<QueuePairHandle>, Rc<Region>, Rc<Cell<usize>>) {
     });
     let qp = QueuePairHandle::new(device.clone()).unwrap();
     qp.connect(qp.endpoint).unwrap();
-    let charged = Rc::new(Cell::new(1));
-    let region = Region::new(device, 32, Box::new(Quota(charged.clone()))).unwrap();
+    let (quota, charged) = quota();
+    let region = Region::new(device, 32, quota).unwrap();
     (qp, region, charged)
 }
 pub(crate) fn complete(id: u64, status: u32, opcode: u32) {
@@ -177,7 +186,7 @@ pub(crate) fn complete(id: u64, status: u32, opcode: u32) {
 pub(crate) fn fail_stop(fail: bool) {
     FAULTS.with_borrow_mut(|f| f.stop_fails = fail);
 }
-pub(crate) fn fresh_fixture() -> (Rc<QueuePairHandle>, Rc<Region>, Rc<Cell<usize>>) {
+pub(crate) fn fresh_fixture() -> (Rc<QueuePairHandle>, Rc<Region>, QuotaObserver) {
     let (qp, region, charged) = fixture();
     let fresh = QueuePairHandle::new(qp.device.clone()).unwrap();
     (fresh, region, charged)
@@ -195,7 +204,7 @@ fn cancelled_waiter_retains_source_and_quota_until_terminal_fence() {
     qp.stop().unwrap();
     assert_eq!(charged.get(), 0);
     drop(qp);
-    FAULTS.with_borrow(|f| assert_eq!(f.events, ["stop", "mr", "quota", "cq", "pd-context"]));
+    FAULTS.with_borrow(|f| assert_eq!(f.events, ["stop", "mr", "cq", "pd-context"]));
 }
 
 #[test]
@@ -274,13 +283,8 @@ fn write_success_and_post_rejection_have_distinct_release_paths() {
 #[test]
 fn reversed_completions_release_only_their_own_allocation() {
     let (qp, first, first_charge) = fixture();
-    let second_charge = Rc::new(Cell::new(1));
-    let second = Region::new(
-        qp.device.clone(),
-        32,
-        Box::new(Quota(second_charge.clone())),
-    )
-    .unwrap();
+    let (quota, second_charge) = quota();
+    let second = Region::new(qp.device.clone(), 32, quota).unwrap();
     let one = qp.write(first.clone(), 4096, 7).unwrap();
     let two = qp.write(second.clone(), 8192, 8).unwrap();
     drop(first);
@@ -381,8 +385,8 @@ fn native_available_provider_write_bind_invalidate_and_fence() {
     let sender = QueuePairHandle::new(device.clone()).unwrap();
     receiver.connect(sender.endpoint).unwrap();
     sender.connect(receiver.endpoint).unwrap();
-    let destination = Region::new(device.clone(), 4096, Box::new(())).unwrap();
-    let source = Region::new(device.clone(), 4096, Box::new(())).unwrap();
+    let destination = Region::new(device.clone(), 4096, quota().0).unwrap();
+    let source = Region::new(device.clone(), 4096, quota().0).unwrap();
     source.copy_from(&vec![0xa5; 4096]).unwrap();
     let (window, bind) = receiver.bind(destination.clone()).unwrap();
     fn wait(qp: &QueuePairHandle, ticket: &Ticket) {
@@ -405,7 +409,7 @@ fn native_available_provider_write_bind_invalidate_and_fence() {
     // A completed local invalidation must reject a subsequent write using the
     // old capability. It still does not authorize CPU access before the fence.
     assert_eq!(destination.copy_to(), Err(Error::Unavailable));
-    let stale = Region::new(device, 4096, Box::new(())).unwrap();
+    let stale = Region::new(device, 4096, quota().0).unwrap();
     stale.copy_from(&vec![0xff; 4096]).unwrap();
     let rejected = sender
         .write(stale, destination.address(), stale_key)
