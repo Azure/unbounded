@@ -5,7 +5,7 @@
 #[path = "process_restart/throughput.rs"]
 mod throughput;
 
-use racer_dataplane::{model::PAGE_BYTES, store::checkpoint_format};
+use racer_dataplane::{model::PAGE_BYTES, store::checkpoint};
 use std::{
     collections::BTreeMap,
     ffi::CString,
@@ -1541,7 +1541,7 @@ fn graceful_process_restart_recovers_encrypted_multipage_pin_without_origin() {
         "graceful shutdown must unlink its listener"
     );
     let checkpoint = fs::read(scratch.0.join("slabs/checkpoint.0")).unwrap();
-    let image = checkpoint_format::decode(&checkpoint).unwrap();
+    let image = checkpoint::decode(&checkpoint).unwrap();
     assert_eq!(image.shards.len(), 1);
     assert_eq!(
         image.shards[0].index.entries.len(),

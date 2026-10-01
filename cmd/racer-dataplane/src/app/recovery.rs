@@ -5,7 +5,7 @@
 //! gating and shutdown drain predicates remain in app.rs.
 use super::*;
 use crate::runtime::collections::{HashMap, HashSet};
-use crate::store::checkpoint_format::CheckpointImage;
+use crate::store::checkpoint::CheckpointImage;
 
 #[derive(Default)]
 pub(super) struct RecoveryCut {
@@ -245,7 +245,7 @@ impl WorkerApplication {
         })
         .await?;
         if self.worker == node.control_worker {
-            let candidates = crate::store::recovery::read_candidates(&self.slab_directory);
+            let candidates = crate::store::checkpoint::read_candidates(&self.slab_directory);
             let mut cut = node.recovery.lock().map_err(|_| Error::Unavailable)?;
             match candidates {
                 Ok(candidates) => {
@@ -369,7 +369,7 @@ fn select(
 mod tests {
     use super::*;
     use crate::store::{
-        catalog::IndexSnapshot, checkpoint_format::CHECKPOINT_VERSION, disk::DirectAlignment,
+        catalog::IndexSnapshot, checkpoint::CHECKPOINT_VERSION, disk::DirectAlignment,
     };
     fn geometry() -> CheckpointGeometry {
         CheckpointGeometry::new(
@@ -485,7 +485,7 @@ mod tests {
         use crate::model::{VersionMetadata, *};
         use crate::store::{
             catalog::{IndexedPage, RecordLocation, Segments},
-            checkpoint_format,
+            checkpoint,
         };
         let node = NodeState::new(vec![WorkerId(0)], 16).unwrap();
         let keys = crate::security::identity::keyring_tests::keys();
@@ -537,8 +537,8 @@ mod tests {
         standalone.length = 0;
         old.shards[0].index.metadata.push(standalone.clone());
         // Both historical slots survive. Decode their exact bytes, as restart does.
-        let bytes = checkpoint_format::encode(&old).unwrap();
-        let decoded = || checkpoint_format::decode(&bytes).unwrap();
+        let bytes = checkpoint::encode(&old).unwrap();
+        let decoded = || checkpoint::decode(&bytes).unwrap();
         let removed = select(
             vec![decoded(), decoded()],
             &geometry,

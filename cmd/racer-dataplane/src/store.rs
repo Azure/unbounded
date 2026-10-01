@@ -1,10 +1,8 @@
 //! Worker-local encrypted slab storage. No HTTP, plaintext, or origin credentials.
 pub mod catalog;
 pub mod checkpoint;
-pub mod checkpoint_format;
 pub mod disk;
 pub mod format;
-pub mod recovery;
 pub mod writer;
 
 use self::{
@@ -23,7 +21,7 @@ pub struct Store {
     pub reader: Rc<StoreReader>,
     pub writer: Rc<writer::StoreWriter>,
     pub checkpoint: Rc<checkpoint::Checkpointer>,
-    pub recovery: recovery::Recovery,
+    pub recovery: checkpoint::Recovery,
     pub eviction: Rc<catalog::SegmentClock>,
 }
 
@@ -48,7 +46,7 @@ impl Store {
         Box::pin(async move {
             let alignment = self.writer.open().await?;
             let slabs = self.writer.slabs();
-            let geometry = checkpoint_format::CheckpointGeometry::new(
+            let geometry = checkpoint::CheckpointGeometry::new(
                 slabs.slab_bytes(),
                 slabs.segment_bytes(),
                 slabs.slab_bytes() / slabs.segment_bytes(),

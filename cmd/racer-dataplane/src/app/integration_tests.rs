@@ -210,7 +210,7 @@ fn two_workers_start_from_real_control_and_checkpoint_one_complete_cut() {
             });
         }
     });
-    let images = crate::store::recovery::read_candidates(&config.slab_directory).unwrap();
+    let images = crate::store::checkpoint::read_candidates(&config.slab_directory).unwrap();
     assert_eq!(images.len(), 1);
     assert_eq!(images[0].1.shards.len(), 2);
     assert_eq!(fixture.enrollments.load(Ordering::Acquire), 2);
@@ -873,7 +873,7 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
             old_keys.signing_identity().unwrap().node(),
             &app.config.node
         );
-        let images = crate::store::recovery::read_candidates(&app.config.slab_directory).unwrap();
+        let images = crate::store::checkpoint::read_candidates(&app.config.slab_directory).unwrap();
         assert_eq!(images[0].1.shards.len(), 2);
         fixture.poll_status.store(200, Ordering::Release);
         fixture.certificate_age.store(1, Ordering::Release);
@@ -929,7 +929,7 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
 fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
     use crate::{
         runtime::affinity::{EffectiveTopology, WorkerPair},
-        store::checkpoint_format,
+        store::checkpoint,
     };
     let mut fixture = ControlFixture::new();
     let mut config = fixture.config.take().unwrap();
@@ -1017,7 +1017,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
     group.shutdown(&shutdown).unwrap();
     group.join().unwrap();
     let bytes = std::fs::read(fixture.directory.join("slabs/checkpoint.0")).unwrap();
-    let image = checkpoint_format::decode(&bytes).unwrap();
+    let image = checkpoint::decode(&bytes).unwrap();
     let mut workers: Vec<_> = image.shards.iter().map(|shard| shard.worker.0).collect();
     workers.sort_unstable();
     assert_eq!(workers, vec![0, 1]);

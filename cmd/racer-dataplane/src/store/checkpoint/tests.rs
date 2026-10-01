@@ -1,12 +1,7 @@
 use super::*;
-use crate::store::{catalog::Index, checkpoint::Checkpointer, recovery::Recovery};
+use crate::store::tests::Directory;
 use futures::executor::block_on;
-use std::{
-    fs,
-    path::PathBuf,
-    rc::Rc,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::{fs, rc::Rc};
 
 const SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -132,28 +127,6 @@ fn async_retirement_invalidation_fences_both_slots_and_preserves_failure() {
     );
     assert_eq!(reactor.in_flight(), 0);
 }
-static DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-struct Directory(PathBuf);
-impl Directory {
-    fn new() -> Self {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join(format!(
-                "checkpoint-test-{}-{}",
-                std::process::id(),
-                DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-            ));
-        fs::create_dir_all(&path).unwrap();
-        Self(path)
-    }
-}
-impl Drop for Directory {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.0).unwrap();
-    }
-}
-
 fn geometry() -> CheckpointGeometry {
     CheckpointGeometry::new(
         SEGMENT_BYTES * 2,
@@ -685,4 +658,4 @@ fn outstanding_lease_and_wrong_worker_cannot_partially_install() {
             .is_some()
     );
 }
-use crate::store::checkpoint_format;
+use crate::store::checkpoint as checkpoint_format;

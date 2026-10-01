@@ -97,7 +97,7 @@ impl Fixture {
                 index.clone(),
                 segments.clone(),
             )),
-            recovery: recovery::Recovery::new(directory.0.clone(), index, segments.clone()),
+            recovery: checkpoint::Recovery::new(directory.0.clone(), index, segments.clone()),
             eviction,
         };
         store.configure(admission.clone(), 2, 16).unwrap();
@@ -287,10 +287,10 @@ fn incremental_checkpoint_budget_thaws_and_async_publication_roundtrips() {
     drive(&f.reactor, task).unwrap();
     f.store.checkpoint.finish_snapshot();
     let bytes = std::fs::read(f._directory.0.join("checkpoint.1")).unwrap();
-    let image = checkpoint_format::decode(&bytes).unwrap();
+    let image = checkpoint::decode(&bytes).unwrap();
     assert_eq!(image.sequence, 7);
     assert_eq!(image.shards[0].index.entries.len(), 1);
-    let geometry = checkpoint_format::CheckpointGeometry::new(
+    let geometry = checkpoint::CheckpointGeometry::new(
         1024 * 1024 * 1024,
         64 * 1024 * 1024,
         16,

@@ -60,10 +60,8 @@ use crate::{
     store::{
         Store, StoreReader,
         catalog::{Index, SegmentClock, Segments},
-        checkpoint::Checkpointer,
-        checkpoint_format::{CheckpointGeometry, ShardImage},
+        checkpoint::{CheckpointGeometry, Checkpointer, Recovery, ShardImage},
         disk::Slabs,
-        recovery::Recovery,
         writer::StoreWriter,
     },
     telemetry::Telemetry,
