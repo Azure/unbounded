@@ -140,10 +140,13 @@ fn exchange(
         transfers.clone(),
         network.clone(),
     ));
-    let relay = Rc::new(
-        Relay::new(paths, auth.clone(), requester, admissions[1].clone())
-            .with_network(network.clone()),
-    );
+    let relay = Rc::new(Relay::new(
+        paths,
+        auth.clone(),
+        requester,
+        admissions[1].clone(),
+        network.clone(),
+    ));
     let server = server::PeerServer::new(
         ios[1].clone(),
         auth,

@@ -538,15 +538,13 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
         .unwrap(),
     );
     let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4));
-    let relay = Rc::new(
-        Relay::new(
-            paths,
-            destination.clone(),
-            Rc::new(NeverTransport),
-            admission.clone(),
-        )
-        .with_network(network.clone()),
-    );
+    let relay = Rc::new(Relay::new(
+        paths,
+        destination.clone(),
+        Rc::new(NeverTransport),
+        admission.clone(),
+        network.clone(),
+    ));
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let io = Rc::new(HttpIo::with_admission(
         reactor,
@@ -774,8 +772,8 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
                 fail,
             }),
             admission.clone(),
-        )
-        .with_network(network);
+            network,
+        );
         let local = request(&admission, 9);
         let scope = local.origin.scope().clone();
         let (signed, binding) = origin.sign_request_to(local, signers[1].node()).unwrap();
@@ -1202,15 +1200,13 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
     let adaptive =
         super::adaptive::AdaptivePeers::new(Default::default(), metrics.clone()).unwrap();
     let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4).with_peer_admission(adaptive));
-    let relay = Rc::new(
-        Relay::new(
-            paths.clone(),
-            destination_auth.clone(),
-            Rc::new(NeverTransport),
-            admission.clone(),
-        )
-        .with_network(destination_network.clone()),
-    );
+    let relay = Rc::new(Relay::new(
+        paths.clone(),
+        destination_auth.clone(),
+        Rc::new(NeverTransport),
+        admission.clone(),
+        destination_network.clone(),
+    ));
     let server = server::PeerServer::new(
         io,
         destination_auth,
@@ -1351,6 +1347,9 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
             forwarding.clone(),
             Rc::new(Never),
             admission.clone(),
+            Rc::new(
+                PeerNetwork::new(signers[2].node().clone(), Arc::new(Default::default())).unwrap(),
+            ),
         ));
         let mut server = server::PeerServer::new(
             io.clone(),
@@ -1816,15 +1815,13 @@ mod established_sessions {
                 )
                 .unwrap(),
             );
-            let relay = Rc::new(
-                Relay::new(
-                    Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
-                    forwarding.clone(),
-                    service.clone(),
-                    admission.clone(),
-                )
-                .with_network(network.clone()),
-            );
+            let relay = Rc::new(Relay::new(
+                Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
+                forwarding.clone(),
+                service.clone(),
+                admission.clone(),
+                network.clone(),
+            ));
             let server =
                 server::PeerServer::new(io.clone(), forwarding, admission.clone(), service, relay)
                     .with_network(network)

@@ -1396,6 +1396,13 @@ mod tests {
                     forwarding.clone(),
                     Rc::new(Never),
                     admission.clone(),
+                    Rc::new(
+                        super::super::PeerNetwork::new(
+                            signers[1].node().clone(),
+                            std::sync::Arc::new(Default::default()),
+                        )
+                        .unwrap(),
+                    ),
                 ));
                 let server =
                     PeerServer::new(io, forwarding, admission.clone(), Rc::new(Never), relay)

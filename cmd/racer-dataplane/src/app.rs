@@ -878,15 +878,13 @@ impl WorkerApplication {
             )
             .with_availability(availability),
         );
-        let relay = Rc::new(
-            Relay::new(
-                paths,
-                forwarding.clone(),
-                requester.clone(),
-                admission.clone(),
-            )
-            .with_network(network.clone()),
-        );
+        let relay = Rc::new(Relay::new(
+            paths,
+            forwarding.clone(),
+            requester.clone(),
+            admission.clone(),
+            network.clone(),
+        ));
         let dispatcher = Rc::new(Dispatcher::new(node.workers.clone()));
         let peers = PeerServer::new(
             io.clone(),

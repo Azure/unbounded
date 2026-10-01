@@ -138,7 +138,7 @@ pub struct Relay {
     forwarding: Rc<Forwarding>,
     transport: Rc<dyn PeerTransport>,
     admission: Rc<Admission>,
-    network: Option<Rc<PeerNetwork>>,
+    network: Rc<PeerNetwork>,
 }
 
 impl Relay {
@@ -147,19 +147,15 @@ impl Relay {
         forwarding: Rc<Forwarding>,
         transport: Rc<dyn PeerTransport>,
         admission: Rc<Admission>,
+        network: Rc<PeerNetwork>,
     ) -> Self {
         Self {
             paths,
             forwarding,
             transport,
             admission,
-            network: None,
+            network,
         }
-    }
-
-    pub fn with_network(mut self, network: Rc<PeerNetwork>) -> Self {
-        self.network = Some(network);
-        self
     }
 
     /// Retain ingress binding and reverse path, append a signed request hop, and
@@ -198,7 +194,7 @@ impl Relay {
         Box::pin(async move {
             let scope = request_scope(request.request(), scope)?;
             check_membership(request.request(), &membership)?;
-            let network = self.network.as_ref().ok_or(Error::InvalidConfiguration)?;
+            let network = &self.network;
             let budget = &request.request().route;
             if budget.destination == network.local || budget.visited.contains(&network.local) {
                 return Err(Error::InvalidRequest);

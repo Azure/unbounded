@@ -425,15 +425,13 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     );
     let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 8));
     let auth = Rc::new(Forwarding::new(b.signatures.clone()));
-    let relay = Rc::new(
-        Relay::new(
-            paths.clone(),
-            auth.clone(),
-            Rc::new(NeverRelay),
-            admission.clone(),
-        )
-        .with_network(destination_network.clone()),
-    );
+    let relay = Rc::new(Relay::new(
+        paths.clone(),
+        auth.clone(),
+        Rc::new(NeverRelay),
+        admission.clone(),
+        destination_network.clone(),
+    ));
     let calls = Rc::new(Cell::new(0));
     let metadata = ObjectMetadata {
         content_type: Some(

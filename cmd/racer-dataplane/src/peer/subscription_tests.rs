@@ -165,15 +165,13 @@ fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failure
             .unwrap(),
         );
         let destination = Rc::new(Forwarding::new(signers[2].clone()));
-        let relay = Rc::new(
-            Relay::new(
-                Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
-                destination.clone(),
-                Rc::new(Never),
-                admission.clone(),
-            )
-            .with_network(network.clone()),
-        );
+        let relay = Rc::new(Relay::new(
+            Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
+            destination.clone(),
+            Rc::new(Never),
+            admission.clone(),
+            network.clone(),
+        ));
         let service = Rc::new(Service {
             admission: admission.clone(),
             ready: Cell::new(false),
@@ -427,15 +425,13 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
     let destination = Rc::new(Forwarding::new(signers[2].clone()));
     let local = Rc::new(Local(admission.clone()));
     let codec = Rc::new(codec(&admission));
-    let relay = Rc::new(
-        Relay::new(
-            paths.clone(),
-            destination.clone(),
-            local.clone(),
-            admission.clone(),
-        )
-        .with_network(network(C)),
-    );
+    let relay = Rc::new(Relay::new(
+        paths.clone(),
+        destination.clone(),
+        local.clone(),
+        admission.clone(),
+        network(C),
+    ));
     let server = server::PeerServer::new(io.clone(), destination, admission.clone(), local, relay)
         .with_network(network(C))
         .with_wire(codec.clone())

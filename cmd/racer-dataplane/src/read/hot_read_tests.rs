@@ -622,15 +622,13 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
     let admission = fixtures[2].fill.dependencies.admission.clone();
     let auth = Rc::new(Forwarding::new(signers[2].clone()));
     let network = Rc::new(PeerNetwork::new(node(2), publications[2].clone()).unwrap());
-    let relay = Rc::new(
-        crate::peer::Relay::new(
-            Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
-            auth.clone(),
-            Rc::new(NoPeer),
-            admission.clone(),
-        )
-        .with_network(network.clone()),
-    );
+    let relay = Rc::new(crate::peer::Relay::new(
+        Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
+        auth.clone(),
+        Rc::new(NoPeer),
+        admission.clone(),
+        network.clone(),
+    ));
     let codec = Rc::new(crate::peer::wire::SecurityCodec::new(
         admission.clone(),
         Rc::new(BufferPool::new(admission.clone())),
