@@ -25,6 +25,9 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
 };
+/// OriginClient is the shipping adapter implementation. Scripted implementations
+/// remain for poll-exact cancellation, wake ordering, and reservation-fence tests;
+/// ordinary adapter scenarios should use the shared test_support UDS fixture.
 pub trait Origin {
     /// Consume the read owner's reclaimed and admitted bootstrap plaintext budget.
     fn bootstrap_reserved<'a>(

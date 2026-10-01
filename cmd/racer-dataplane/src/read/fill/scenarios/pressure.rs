@@ -109,7 +109,38 @@ fn bootstrap_admission_discards_queued_copy_before_evicting_idle_bundle() {
     let dependencies = &f.fill.dependencies;
     assert_eq!(dependencies.writer.queued_count(), 1);
     assert_eq!(dependencies.memory.evict_idle(usize::MAX), Ok(0));
-    let reservation = f.fill.reserve_bootstrap(&f.context.object.cache).unwrap();
+    use crate::{
+        read::metadata::{MetadataDependencies, MetadataService},
+        test_support::origin::{AdapterOrigin, RequestKind},
+    };
+    let mut metadata = f.origin.metadata.clone();
+    metadata.version.etag = StrongEtag::test_value("empty");
+    metadata.length = 0;
+    let adapter = AdapterOrigin::new("fixture", metadata.clone());
+    let service = MetadataService::new(
+        dependencies.candidates.clone(),
+        adapter_client(&f, &adapter),
+        dependencies.credentials.clone(),
+        8,
+        MetadataDependencies {
+            index: Rc::new(Index::new(WorkerId(0), 8)),
+            fill: Rc::new(Fill::new(dependencies.clone())),
+            owners: dependencies.metadata_owner.clone(),
+        },
+    );
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
+    let response = drive_io(
+        service.bootstrap_peer(f.membership.clone(), &f.context, &f.scope, &mut budget),
+        &f.reactor,
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    assert!(
+        matches!(response, PeerResponse::Bootstrap { metadata: actual, page_zero: None } if actual == metadata)
+    );
+    assert_eq!(adapter.count(RequestKind::InitialGet), 1);
+    assert_eq!(adapter.count(RequestKind::Head), 0);
     assert_eq!(dependencies.writer.discarded_count(), 1);
     assert_eq!(dependencies.writer.pending_count(), 0);
     assert!(dependencies.memory.get(&f.page).unwrap().is_none());
@@ -118,11 +149,7 @@ fn bootstrap_admission_discards_queued_copy_before_evicting_idle_bundle() {
         dependencies.admission.used(ResourceClass::DirtyCiphertext),
         0
     );
-    assert_eq!(
-        dependencies.admission.used(ResourceClass::Plaintext),
-        reservation.amount()
-    );
-    drop(reservation);
+    // The empty reply releases the bootstrap plaintext reservation after I/O.
     assert_eq!(dependencies.admission.used(ResourceClass::Plaintext), 0);
 }
 
