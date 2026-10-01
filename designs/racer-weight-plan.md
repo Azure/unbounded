@@ -97,6 +97,9 @@ impaired resource/error behavior from observations during any authorized trial.
    The version ConfigMap alone is not the member map. Check controller replicas
    serve the same final publication after replication. Prepare/commit/install are
    distinct (`internal/racer/topology.go:148-175`).
+   Alternatively, for committed membership application only, use the bounded
+   Kubernetes-metadata helper below. It does not claim controller replica serving
+   health or attest cache-catalog contents; preserve those separate gates.
 6. On dataplanes supporting `GET /debug/membership`, collect a direct response
    from every expected process, binding each response to its Node UID, Pod UID,
    container identity and restart count. Older images return 404 and cannot attest.
@@ -124,7 +127,48 @@ Focused tests (artifacts optional, no cluster access):
 
 ```
 timeout --signal=TERM --kill-after=10s 30s env RACER_WEIGHT_ARTIFACTS=/path/to/artifacts python3 -B hack/scripts/racer-weight-plan_test.py
+timeout --signal=TERM --kill-after=10s 30s python3 -B hack/scripts/racer-membership-attest_test.py
 ```
+
+### Read-only Kubernetes membership attestation alternative
+
+After the parent finishes rollout and drain, with the controller map held stable:
+
+```
+timeout --signal=TERM --kill-after=10s 280s python3 -B hack/scripts/racer-membership-attest.py --context joolshev-scale-test --expected-image ghcr.io/azure/racer-dataplane:EXACT_COMMIT --expected-count 1500 --output NEW_ATTESTATION.json
+```
+
+Add `--candidate-plan plan.json` after a shares trial to require its exact Node
+UID/name/annotation/shares map and verify its map hash. Without it, the helper
+attests the current committed map, not the desired optimizer candidate. Output is
+optional (stdout otherwise), exclusive-create, with an already existing parent.
+Do not interpret output from a nonzero exit as success.
+
+The helper GETs only the installation/version ConfigMaps, Nodes, relevant Pods and
+DaemonSets through the explicit authenticated Kubernetes context. It reconstructs
+the full canonical membership document from last-admitted records and requires its
+SHA-256 to equal the durable membership hash. Canonical field order, omitted site
+and NUMA fields, Unicode escaping and no trailing newline match the wire codec.
+Installation UID binding and positive monotonic-counter shape are checked.
+Annotations alone or version counters alone are never sufficient.
+
+It verifies exactly one ready, running, expected-image dataplane per admitted Node,
+current DaemonSet ownership, and admitted peer endpoint matching the Pod IP/port.
+One existing net-node host session performs 32 concurrent read-only curls against
+the identified diagnostic endpoints. Each curl has a two-second request ceiling,
+four-second external TERM bound, and 1 KiB response limit. The remote process has
+its own timeout; the operation has a 265-second alarm plus cleanup headroom within
+the required external 280-second bound. Progress is reported every 30 seconds
+while a command runs. No retries, pod creation, private identity reads or Secrets.
+
+Both inventory brackets must match, including durable data and installation/CM
+UIDs, Node mapping, Pod/container/image/restart identities, endpoints, and selected
+net-node access identity. ResourceVersion alone may change on unchanged controller
+CAS confirmations and is not compared. Missing, pending, stale-worker, hash/version
+mismatch, HTTP error, rollout or restart fails closed. A fresh attempt requires
+new complete brackets, not reuse of previous successful rows. Each process was
+observed within the collection interval; the report is not simultaneous fleet
+state, a future lease, or authorization to resume load.
 
 Captured operational JSON remains outside git. Before later execution the parent
 must persist candidate, rollback, input hashes, and progress in its approved
