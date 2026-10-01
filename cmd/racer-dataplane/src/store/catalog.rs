@@ -373,6 +373,12 @@ impl Index {
         Ok(())
     }
     pub fn validate_snapshot(&self, snapshot: &IndexSnapshot) -> Result<()> {
+        // Reject downsized cuts before allocating descriptor/duplicate tables.
+        if snapshot.entries.len() > self.page_capacity.get()
+            || snapshot.metadata.len() > self.metadata_capacity
+        {
+            return Err(Error::CorruptRecord);
+        }
         snapshot.validate_metadata()?;
         for m in snapshot
             .metadata
@@ -380,11 +386,6 @@ impl Index {
             .chain(snapshot.entries.iter().map(|(_, e)| &e.metadata))
         {
             Self::validate_descriptor(m)?;
-        }
-        if snapshot.entries.len() > self.page_capacity.get()
-            || snapshot.metadata.len() > self.metadata_capacity
-        {
-            return Err(Error::CorruptRecord);
         }
         let mut pages = HashSet::default();
         let mut versions = HashSet::default();

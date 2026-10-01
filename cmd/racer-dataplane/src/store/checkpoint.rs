@@ -879,6 +879,14 @@ pub async fn encode_incremental(image: &CheckpointImage) -> Result<Vec<u8>> {
 /// Reject truncation, trailing data, unknown versions, and malformed allocations.
 /// No payload files are read and no live shard is modified by decoding.
 pub fn decode(bytes: &[u8]) -> Result<CheckpointImage> {
+    decode_with_budget(bytes, MAX_CHECKPOINT_BYTES)
+}
+
+/// The budget includes the encoded buffer, decoded vectors/strings and concurrent
+/// validation scratch. Preflight walks borrowed bytes only, before any allocation.
+/// A downsized budget rejects the disposable cut rather than partially restoring it.
+pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage> {
+    recovery_memory(bytes, budget)?;
     if bytes.len() < HEADER_BYTES + 4 + DIGEST_BYTES || bytes.len() > MAX_CHECKPOINT_BYTES {
         return Err(Error::CorruptRecord);
     }
@@ -899,7 +907,7 @@ pub fn decode(bytes: &[u8]) -> Result<CheckpointImage> {
         return Err(Error::CorruptRecord);
     }
     let count = input.count(MAX_SHARDS, 62)?;
-    let mut shards = Vec::new();
+    let mut shards = Vec::with_capacity(count);
     for _ in 0..count {
         let worker = WorkerId(u16::from_le_bytes(input.array()?));
         let geometry = CheckpointGeometry {
@@ -912,7 +920,7 @@ pub fn decode(bytes: &[u8]) -> Result<CheckpointImage> {
         };
         geometry.validate()?;
         let count = input.count(MAX_ITEMS, 25)?;
-        let mut segments = Vec::new();
+        let mut segments = Vec::with_capacity(count);
         for _ in 0..count {
             segments.push(SegmentSnapshot {
                 id: SegmentId(input.u64()?),
@@ -928,7 +936,7 @@ pub fn decode(bytes: &[u8]) -> Result<CheckpointImage> {
             });
         }
         let count = input.count(MAX_ITEMS, 112)?;
-        let mut entries = Vec::new();
+        let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
             let metadata = input.descriptor(version)?;
             let page = PageId {
@@ -956,7 +964,7 @@ pub fn decode(bytes: &[u8]) -> Result<CheckpointImage> {
             ));
         }
         let count = input.count(MAX_ITEMS, 48)?;
-        let mut metadata = Vec::new();
+        let mut metadata = Vec::with_capacity(count);
         for _ in 0..count {
             metadata.push(input.descriptor(version)?);
         }
@@ -977,6 +985,71 @@ pub fn decode(bytes: &[u8]) -> Result<CheckpointImage> {
     };
     validate_image(&image)?;
     Ok(image)
+}
+
+/// Conservative accounting, not serialized size: per-item scratch covers growing
+/// reference hash tables (including old buckets during growth), extent sorting,
+/// isolated segment slots, lease Rc allocations and free-tree nodes. String copies
+/// include page identity duplication and descriptor parsing during validation.
+/// Live restored index storage has its own page/catalog capacities.
+fn recovery_memory(bytes: &[u8], budget: usize) -> Result<usize> {
+    if bytes.len() < HEADER_BYTES + 4 + DIGEST_BYTES || bytes.len() > MAX_CHECKPOINT_BYTES {
+        return Err(Error::CorruptRecord);
+    }
+    sequence_hint(bytes)?;
+    let mut used = bytes.len();
+    let mut charge = |count: usize, size: usize| -> Result<()> {
+        used = count
+            .checked_mul(size)
+            .and_then(|n| used.checked_add(n))
+            .filter(|n| *n <= budget)
+            .ok_or(Error::Overloaded)?;
+        Ok(())
+    };
+    charge(1, std::mem::size_of::<CheckpointImage>())?;
+    let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    let mut input = Decoder(&bytes[HEADER_BYTES..bytes.len() - DIGEST_BYTES]);
+    let shards = input.count(MAX_SHARDS, 62)?;
+    charge(shards, std::mem::size_of::<ShardImage>() + 512)?;
+    for _ in 0..shards {
+        input.take(2)?;
+        input.take(16)?;
+        let segment_count = input.u64()?;
+        input.take(24)?;
+        let segments = input.count(MAX_ITEMS, 25)?;
+        if segment_count != segments as u64 {
+            return Err(Error::CorruptRecord);
+        }
+        charge(segments, std::mem::size_of::<SegmentSnapshot>() + 512)?;
+        input.take(segments * 25)?;
+        let pages = input.count(MAX_ITEMS, 112)?;
+        charge(pages, std::mem::size_of::<(PageId, IndexedPage)>() + 512)?;
+        for _ in 0..pages {
+            charge(input.descriptor_bytes(version)?, 4)?;
+            input.take(64)?;
+        }
+        let metadata = input.count(MAX_ITEMS, 48)?;
+        charge(metadata, std::mem::size_of::<VersionMetadata>() + 512)?;
+        for _ in 0..metadata {
+            charge(input.descriptor_bytes(version)?, 4)?;
+        }
+    }
+    if !input.0.is_empty() {
+        return Err(Error::CorruptRecord);
+    }
+    Ok(used)
+}
+
+/// Untrusted ordering hint only. Full length, digest and structure are checked
+/// after reading the selected slot, never used to authorize installation.
+pub(crate) fn sequence_hint(bytes: &[u8]) -> Result<u64> {
+    if bytes.len() < HEADER_BYTES
+        || &bytes[..8] != MAGIC
+        || !matches!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 1 | 2)
+    {
+        return Err(Error::CorruptRecord);
+    }
+    Ok(u64::from_le_bytes(bytes[16..24].try_into().unwrap()))
 }
 
 fn validate_descriptor(metadata: &VersionMetadata) -> Result<()> {
@@ -1078,6 +1151,18 @@ impl Encoder {
 }
 struct Decoder<'a>(&'a [u8]);
 impl<'a> Decoder<'a> {
+    fn descriptor_bytes(&mut self, version: u32) -> Result<usize> {
+        let cache = self.string()?.len();
+        self.take(32)?;
+        let etag = self.string()?.len();
+        self.take(8)?;
+        let mime = if version >= 2 {
+            self.string()?.len()
+        } else {
+            0
+        };
+        Ok(cache + etag + mime)
+    }
     fn take(&mut self, length: usize) -> Result<&'a [u8]> {
         if length > self.0.len() {
             return Err(Error::CorruptRecord);
