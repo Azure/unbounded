@@ -292,13 +292,12 @@ kubectl -n unbounded-system logs <gateway-node-agent-pod>
 **Check:**
 ```bash
 kubectl -n unbounded-system get endpointslices -l kubernetes.io/service-name=unbounded-net-controller
-kubectl -n unbounded-system get endpoints unbounded-net-controller 2>&1
 ```
 
 **Common causes:**
-- Stale `v1/Endpoints` from a previous controller version. The controller
-  cleans these on leader election, but during upgrades it may be needed:
-  `kubectl -n unbounded-system delete endpoints unbounded-net-controller`
+- Missing or stale EndpointSlice addresses or Pod target references. Check the
+  leader's readiness and API write permissions; the leader periodically repairs
+  its slice. v1 Endpoints and pre-release layout migrations are not supported.
 
 > **Note:** The controller Service has **no selector**. The leader manages its
 > own EndpointSlice. Do not add a selector.
