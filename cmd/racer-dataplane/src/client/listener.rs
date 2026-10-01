@@ -270,7 +270,7 @@ impl ClientListeners {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "subscription-interop"))]
     pub(crate) fn set_root(&mut self, root: PathBuf) {
         self.root = root;
     }

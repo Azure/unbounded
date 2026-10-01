@@ -26,6 +26,10 @@ pub mod store;
 pub mod telemetry;
 pub mod topology;
 
+#[cfg(feature = "subscription-interop")]
+#[doc(hidden)]
+pub mod subscription_interop;
+
 #[cfg(test)]
 mod contention;
 

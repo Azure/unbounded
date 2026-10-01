@@ -1,29 +1,11 @@
-// Opt-in Go SDK interoperability using the production client and read graph.
-// Compile source modules in this test crate to use crate-private fixture hooks
-// without exporting test APIs or modifying production modules.
-mod app;
-mod client;
-mod config;
-mod control;
-mod error;
-mod http;
-mod memory;
-mod model;
-mod origin;
-mod peer;
-mod rdma;
-mod read;
-mod runtime;
-mod security;
-mod store;
-mod telemetry;
-mod test_support;
-mod topology;
+//! Opt-in Go SDK fixture using the production library, not a second crate root.
+use crate::{
+    client, control, error, http, memory, model, origin, peer, read, runtime, security, store,
+    topology,
+};
 
 use error::Operation;
-use model::{
-    OriginContext, *, ResourceClass, *, PAGE_BYTES,
-};
+use model::{OriginContext, PAGE_BYTES, ResourceClass, *};
 use runtime::{
     admission::{Admission, Reservation},
     deadline::RequestScope,
@@ -123,10 +105,8 @@ impl peer::PeerClient for NoPeer {
     }
 }
 
-#[test]
-#[ignore = "run RACER_SUBSCRIPTION_INTEROP=1 go test ./pkg/racersdk -run '^TestRustSubscriptionInterop$' -timeout=5m under external timeout"]
-fn go_sdk_subscription_server() {
-    use client::{listener::ClientListeners, RequestParser, response::Responses};
+pub fn go_sdk_subscription_server() {
+    use client::{RequestParser, listener::ClientListeners, response::Responses};
     use control::{
         caches::CacheDefinition,
         snapshot::{PublishedState, SnapshotStore},
@@ -134,27 +114,27 @@ fn go_sdk_subscription_server() {
     };
     use memory::{cache::MemoryCache, delivery::Delivery, pipe::PipePool, pool::BufferPool};
     use read::{
+        Coordinator,
         candidates::CandidatePolicy,
         dispatch::WorkerDirectory,
         fill::{Fill, FillDependencies},
         flight::Flights,
         metadata::{MetadataDependencies, MetadataService},
         range_stream::RangeStreams,
-        Coordinator,
     };
     use security::{
         aead::{PageCrypto, PageCryptoEngine},
         credentials::CredentialCrypto,
     };
     use store::{
-        eviction::SegmentClock, index::Index, StoreReader, segment::Segments, slab::Slabs,
+        StoreReader, eviction::SegmentClock, index::Index, segment::Segments, slab::Slabs,
         writer::StoreWriter,
     };
 
     let root = PathBuf::from(
         std::env::var_os("RACER_SUBSCRIPTION_INTEROP_DIR").expect("Go fixture directory"),
     );
-    let mut limits = test_support::cluster::config(false).limits;
+    let mut limits = interop_limits();
     // Independent of the 512 MiB logical object: at most four plaintext pages.
     limits.plaintext_bytes = NonZeroUsize::new(4 * PAGE_BYTES as usize).unwrap();
     limits.ciphertext_bytes = NonZeroUsize::new(4 * (PAGE_BYTES as usize + 16)).unwrap();
@@ -163,7 +143,7 @@ fn go_sdk_subscription_server() {
     let reactor = Rc::new(Reactor::new(admission.clone()));
     reactor.init().unwrap();
     let buffers = Rc::new(BufferPool::new(admission.clone()));
-    let keys = Rc::new(security::keyring::tests::keys());
+    let keys = Rc::new(interop_keys());
     let snapshots = Rc::new(SnapshotStore::new(
         keys.cluster().clone(),
         Arc::new(PublishedState::default()),
@@ -264,11 +244,7 @@ fn go_sdk_subscription_server() {
         Rc::new(PipePool::new(admission.clone(), reactor.clone())),
         Duration::from_secs(10),
     ));
-    let streams = Rc::new(RangeStreams::new(
-        directory.clone(),
-        delivery.clone(),
-        2,
-    ));
+    let streams = Rc::new(RangeStreams::new(directory.clone(), delivery.clone(), 2));
     let coordinator = Rc::new(Coordinator::new(
         snapshots,
         metadata,
@@ -353,4 +329,67 @@ fn go_sdk_subscription_server() {
         "Rust subscription interop: peak plaintext={peak}, limit={}, final plaintext/flight/waiter=0",
         4 * PAGE_BYTES
     );
+}
+
+fn interop_limits() -> Limits {
+    let count = NonZeroUsize::new(16).unwrap();
+    let bytes = NonZeroUsize::new(128 * 1024 * 1024).unwrap();
+    Limits {
+        plaintext_bytes: bytes,
+        ciphertext_bytes: bytes,
+        dirty_bytes: bytes,
+        registered_bytes: bytes,
+        request_context_bytes: bytes,
+        flights: count,
+        waiters_per_flight: count,
+        queue_entries: count,
+        connections_per_neighbor: count,
+        client_connections: count,
+        pipes: count,
+        range_window_pages: count,
+        header_bytes: NonZeroUsize::new(16 * 1024).unwrap(),
+        cached_rankings: count,
+        cached_paths: count,
+        retained_snapshots: count,
+        metadata_entries: count,
+        relay_transfers: count,
+    }
+}
+
+fn interop_keys() -> security::keyring::Keyring {
+    use control::wire::*;
+    use security::keyring::{KeyEpochs, Keyring};
+
+    let cluster = ClusterId("11111111-1111-4111-8111-111111111111".into());
+    let keys = Keyring::new(
+        cluster.clone(),
+        NodeId("22222222-2222-4222-8222-222222222222".into()),
+        Arc::new(KeyEpochs::default()),
+    );
+    let mut ca = rcgen::CertificateParams::new(vec![]).unwrap();
+    ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca = ca
+        .self_signed(&rcgen::KeyPair::generate().unwrap())
+        .unwrap();
+    keys.install(KeyringBundle {
+        schema_version: SCHEMA_VERSION,
+        cluster,
+        generation: BundleGeneration(1),
+        peer_trust_roots: vec![ca.der().to_vec()],
+        cache_keys: [CacheKeyPurpose::Page, CacheKeyPurpose::OriginCredentials]
+            .into_iter()
+            .enumerate()
+            .map(|(i, purpose)| CacheEncryptionKey {
+                key: CacheKeyRef {
+                    cache: CacheId("33333333-3333-4333-8333-333333333333".into()),
+                    id: KeyId([i as u8 + 1; 16]),
+                    purpose,
+                },
+                state: CacheKeyState::Active,
+                material: [i as u8 + 7; 32],
+            })
+            .collect(),
+    })
+    .unwrap();
+    keys
 }

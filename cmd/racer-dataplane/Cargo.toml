@@ -9,7 +9,7 @@ description = "Racer node-local read-through cache dataplane"
 default = []
 # Enables the separately loaded native verbs adapter; unavailable hardware uses HTTP.
 rdma = []
-# Opt-in standalone client interoperability fixture with crate-private test hooks.
+# Opt-in Go SDK interoperability fixture using the production library.
 subscription-interop = []
 # Binary-only jemalloc allocator and dedicated, opt-in pprof HTTP listener.
 heap-profiling = ["dep:jemalloc_pprof", "dep:tikv-jemallocator"]

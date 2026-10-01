@@ -1,4 +1,6 @@
-//! Standalone fixture crate using the production modules and private test hooks.
-#![allow(dead_code, unused_imports)]
-#![deny(unsafe_op_in_unsafe_fn)]
-include!("../src/subscription_interop.rs");
+//! Go launches this exact test selector and drives the production library over UDS.
+#[test]
+#[ignore = "run RACER_SUBSCRIPTION_INTEROP=1 go test ./pkg/racersdk -run '^TestRustSubscriptionInterop$' -timeout=5m under external timeout"]
+fn go_sdk_subscription_server() {
+    racer_dataplane::subscription_interop::go_sdk_subscription_server();
+}
