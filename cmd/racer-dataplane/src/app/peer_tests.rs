@@ -4,12 +4,46 @@ use super::*;
 
 #[test]
 fn assembly_applies_configured_client_request_timeout() {
+    use crate::{
+        http::connection::ConnectionLease, model::ResourceClass, runtime::ingress::Retired,
+    };
     for timeout in [Duration::from_millis(250), Duration::from_secs(45)] {
+        let clock = crate::runtime::environment::SimulationClock::new(908);
+        let _environment = clock.environment(0).enter();
         let mut config = crate::test_support::cluster::config(false);
         config.request_timeout = timeout;
         config.reader_stall_timeout = timeout;
-        let (app, _, _) = local_worker(&config, &Arc::new(NodeState::default()), 0);
-        assert_eq!(app.clients.request_timeout(), timeout);
+        let (app, runtime, _) = local_worker(&config, &Arc::new(NodeState::default()), 0);
+        let (server, mut client) = std::os::unix::net::UnixStream::pair().unwrap();
+        client.set_nonblocking(true).unwrap();
+        let reservation = runtime
+            .admission
+            .reserve_connection(ResourceClass::IngressConnection)
+            .unwrap();
+        let connection = ConnectionLease::from_reserved(server.into(), reservation).unwrap();
+        app.clients
+            .install_connection(
+                connection,
+                test_support::definition().id,
+                Arc::new(Retired::default()),
+            )
+            .unwrap();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        app.clients.poll_budgeted(&mut cx, 64).unwrap();
+        clock.advance(timeout - Duration::from_millis(1));
+        app.clients.poll_budgeted(&mut cx, 64).unwrap();
+        assert_eq!(app.clients.active_connections(), 1);
+        clock.advance(Duration::from_millis(2));
+        for _ in 0..64 {
+            runtime.reactor.poll_budgeted(64).unwrap();
+            app.clients.poll_budgeted(&mut cx, 64).unwrap();
+            if app.clients.active_connections() == 0 {
+                break;
+            }
+        }
+        assert_eq!(app.clients.active_connections(), 0);
+        let mut byte = [0];
+        assert_eq!(std::io::Read::read(&mut client, &mut byte).unwrap(), 0);
     }
 }
 

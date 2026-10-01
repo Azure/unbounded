@@ -235,170 +235,179 @@ impl Harness {
                 self.seed,
                 self.nodes.len()
             );
-            match action {
-                Action::AddNode if self.nodes.len() < MAX_NODES => self.add(None),
-                Action::RemoveNode if self.nodes.len() > 1 => {
-                    let index = self.rng.pick(self.nodes.len());
-                    self.remove(index);
-                }
-                Action::Update => {
-                    let object = self.rng.pick(8);
-                    self.update(object);
-                }
-                Action::Evict => {
-                    self.settle();
-                    for worker in self.nodes.iter().flat_map(|n| &n.workers) {
-                        worker.app.memory.evict_idle(usize::MAX).unwrap();
-                    }
-                    self.coverage.action("evict");
-                    self.traffic(1, false);
-                }
-                Action::Restart => {
-                    let index = self.rng.pick(self.nodes.len());
-                    let id = self.remove(index);
-                    self.add(Some(id));
-                }
-                Action::ShortIo => {
-                    let operation = if self.rng.pick(2) == 0 {
-                        "send"
-                    } else {
-                        "recv"
-                    };
-                    self.sim
-                        .inject(operation, Fault::Short(1 + self.rng.pick(128)));
-                    *self.coverage.injected.entry(operation.into()).or_default() += 1;
-                    self.coverage.action("short-io");
-                    self.traffic(1, false);
-                }
-                Action::ConnectFailure => {
-                    self.sim.inject("connect", Fault::Errno(libc::ECONNREFUSED));
-                    *self.coverage.injected.entry("connect".into()).or_default() += 1;
-                    // A fresh unpinned object requires an origin connection even
-                    // when every peer already has a cached copy of the old version.
-                    self.update(2);
-                    let client = self.request(2, false, false);
-                    self.exchange(client, true);
-                    self.coverage.action("connect-failure");
-                    self.recover_origin();
-                }
-                Action::DelayedWrite => {
-                    self.sim.inject("write", Fault::Delay(3 + self.rng.pick(8)));
-                    *self.coverage.injected.entry("write".into()).or_default() += 1;
-                    self.update(3);
-                    let client = self.request(3, false, false);
-                    self.exchange(client, false);
-                    self.coverage.action("delayed-write");
-                }
-                Action::ClientCancel => {
-                    let mut client = self.request(1, false, false);
-                    // Send the request without consuming the response, ensuring
-                    // real socket backpressure regardless of the generated path.
-                    for _ in 0..MAX_TURNS {
-                        if client.sent == client.request.len() {
-                            break;
-                        }
-                        if let Ok(n) =
-                            handle(client.fd.as_ref().unwrap()).send(&client.request[client.sent..])
-                        {
-                            client.sent += n;
-                        }
-                        self.tick();
-                    }
-                    for _ in 0..256 {
-                        self.tick();
-                    }
-                    for _ in 0..1 + self.rng.pick(32) {
-                        self.tick();
-                        if client.poll() {
-                            break;
-                        }
-                    }
-                    self.sim.disconnect(client.fd.as_ref().unwrap()).unwrap();
-                    client.fd.take();
-                    self.settle();
-                    self.coverage.action("client-cancel");
-                }
-                Action::PeerOutage => self.peer_outage(),
-                Action::InflightCrash => {
-                    self.crash_inflight();
-                }
-                Action::OldPin => {
-                    // Warm the ingress before mutation. This old pin is provably
-                    // retained, so unavailability cannot excuse a failed read.
-                    let object = 2 + self.rng.pick(6);
-                    let node = self.rng.pick(self.nodes.len());
-                    let warm = self.request_on(object, false, false, node);
-                    self.exchange(warm, false);
-                    let client = self.request_on(object, true, false, node);
-                    self.update(object);
-                    self.exchange(client, false);
-                    self.coverage.action("old-pin");
-                }
-                Action::FailedDirtyWrite => {
-                    self.sim.inject("write", Fault::Errno(libc::EIO));
-                    *self.coverage.injected.entry("write".into()).or_default() += 1;
-                    self.update(4);
-                    let client = self.request(4, false, false);
-                    self.exchange(client, false);
-                    self.coverage.action("failed-dirty-write");
-                }
-                Action::InflightMembership if self.nodes.len() < MAX_NODES => {
-                    let mut client = self.request(1, false, false);
-                    self.tick();
-                    let complete = client.poll();
-                    self.add(None);
-                    if complete {
-                        self.check(&client, false);
-                        client.fd.take();
-                        self.settle();
-                    } else {
-                        self.exchange(client, false);
-                    }
-                    self.coverage.action("inflight-membership");
-                }
-                Action::Partition if self.nodes.len() > 1 => self.partition_traffic(),
-                Action::WallJump => {
-                    let wall = crate::runtime::environment::wall_now();
-                    let amount = Duration::from_secs(1 + self.rng.pick(120) as u64);
-                    self.clock.set_wall_time(if self.rng.pick(2) == 0 {
-                        wall + amount
-                    } else {
-                        wall - amount
-                    });
-                    self.traffic(1, true);
-                    // Replay admission retains a wall high-water mark. Recovery
-                    // advances past it; rolling back again is not a healthy clock.
-                    self.clock.advance(Duration::from_secs(121));
-                    let (anchor, wall_anchor) = crate::runtime::environment::clock_anchor();
-                    self.clock.set_wall_time(
-                        wall_anchor + crate::runtime::environment::now().duration_since(anchor),
-                    );
-                    self.coverage.action("wall-jump");
-                }
-                Action::OriginFault => self.origin_fault(),
-                Action::MalformedClient => self.malformed_client(),
-                Action::KeyRetirement => self.key_retirement(),
-                Action::CacheRecreate => self.cache_recreate(),
-                Action::NativeFault if self.native => self.native_fault(),
-                Action::PeerSecurity if self.nodes.len() > 1 => self.peer_security(),
-                Action::DiskCorruption => self.disk_corruption(),
-                Action::PendingWriteCrash => self.crash_pending_write(),
-                // Gated actions keep their slot and use ordinary traffic instead
-                // of resampling, preserving both weights and random draws.
-                Action::Traffic
-                | Action::AddNode
-                | Action::RemoveNode
-                | Action::InflightMembership
-                | Action::Partition
-                | Action::NativeFault
-                | Action::PeerSecurity => {
-                    let count = 1 + self.rng.pick(4);
-                    self.coverage.action("traffic");
-                    self.traffic(count, false);
-                }
-            }
+            self.run_action(action);
             self.coverage.trace.checkpoint();
         }
+        self.verify_recovery();
+        self.teardown_generated();
+    }
+
+    fn run_action(&mut self, action: Action) {
+        match action {
+            Action::AddNode if self.nodes.len() < MAX_NODES => self.add(None),
+            Action::RemoveNode if self.nodes.len() > 1 => {
+                let index = self.rng.pick(self.nodes.len());
+                self.remove(index);
+            }
+            Action::Update => {
+                let object = self.rng.pick(8);
+                self.update(object);
+            }
+            Action::Evict => {
+                self.settle();
+                for worker in self.nodes.iter().flat_map(|n| &n.workers) {
+                    worker.app.memory.evict_idle(usize::MAX).unwrap();
+                }
+                self.coverage.action("evict");
+                self.traffic(1, false);
+            }
+            Action::Restart => {
+                let index = self.rng.pick(self.nodes.len());
+                let id = self.remove(index);
+                self.add(Some(id));
+            }
+            Action::ShortIo => {
+                let operation = if self.rng.pick(2) == 0 {
+                    "send"
+                } else {
+                    "recv"
+                };
+                self.sim
+                    .inject(operation, Fault::Short(1 + self.rng.pick(128)));
+                *self.coverage.injected.entry(operation.into()).or_default() += 1;
+                self.coverage.action("short-io");
+                self.traffic(1, false);
+            }
+            Action::ConnectFailure => {
+                self.sim.inject("connect", Fault::Errno(libc::ECONNREFUSED));
+                *self.coverage.injected.entry("connect".into()).or_default() += 1;
+                // A fresh unpinned object requires an origin connection even
+                // when every peer already has a cached copy of the old version.
+                self.update(2);
+                let client = self.request(2, false, false);
+                self.exchange(client, true);
+                self.coverage.action("connect-failure");
+                self.recover_origin();
+            }
+            Action::DelayedWrite => {
+                self.sim.inject("write", Fault::Delay(3 + self.rng.pick(8)));
+                *self.coverage.injected.entry("write".into()).or_default() += 1;
+                self.update(3);
+                let client = self.request(3, false, false);
+                self.exchange(client, false);
+                self.coverage.action("delayed-write");
+            }
+            Action::ClientCancel => {
+                let mut client = self.request(1, false, false);
+                // Send the request without consuming the response, ensuring
+                // real socket backpressure regardless of the generated path.
+                for _ in 0..MAX_TURNS {
+                    if client.sent == client.request.len() {
+                        break;
+                    }
+                    if let Ok(n) =
+                        handle(client.fd.as_ref().unwrap()).send(&client.request[client.sent..])
+                    {
+                        client.sent += n;
+                    }
+                    self.tick();
+                }
+                for _ in 0..256 {
+                    self.tick();
+                }
+                for _ in 0..1 + self.rng.pick(32) {
+                    self.tick();
+                    if client.poll() {
+                        break;
+                    }
+                }
+                self.sim.disconnect(client.fd.as_ref().unwrap()).unwrap();
+                client.fd.take();
+                self.settle();
+                self.coverage.action("client-cancel");
+            }
+            Action::PeerOutage => self.peer_outage(),
+            Action::InflightCrash => {
+                self.crash_inflight();
+            }
+            Action::OldPin => {
+                // Warm the ingress before mutation. This old pin is provably
+                // retained, so unavailability cannot excuse a failed read.
+                let object = 2 + self.rng.pick(6);
+                let node = self.rng.pick(self.nodes.len());
+                let warm = self.request_on(object, false, false, node);
+                self.exchange(warm, false);
+                let client = self.request_on(object, true, false, node);
+                self.update(object);
+                self.exchange(client, false);
+                self.coverage.action("old-pin");
+            }
+            Action::FailedDirtyWrite => {
+                self.sim.inject("write", Fault::Errno(libc::EIO));
+                *self.coverage.injected.entry("write".into()).or_default() += 1;
+                self.update(4);
+                let client = self.request(4, false, false);
+                self.exchange(client, false);
+                self.coverage.action("failed-dirty-write");
+            }
+            Action::InflightMembership if self.nodes.len() < MAX_NODES => {
+                let mut client = self.request(1, false, false);
+                self.tick();
+                let complete = client.poll();
+                self.add(None);
+                if complete {
+                    self.check(&client, false);
+                    client.fd.take();
+                    self.settle();
+                } else {
+                    self.exchange(client, false);
+                }
+                self.coverage.action("inflight-membership");
+            }
+            Action::Partition if self.nodes.len() > 1 => self.partition_traffic(),
+            Action::WallJump => {
+                let wall = crate::runtime::environment::wall_now();
+                let amount = Duration::from_secs(1 + self.rng.pick(120) as u64);
+                self.clock.set_wall_time(if self.rng.pick(2) == 0 {
+                    wall + amount
+                } else {
+                    wall - amount
+                });
+                self.traffic(1, true);
+                // Replay admission retains a wall high-water mark. Recovery
+                // advances past it; rolling back again is not a healthy clock.
+                self.clock.advance(Duration::from_secs(121));
+                let (anchor, wall_anchor) = crate::runtime::environment::clock_anchor();
+                self.clock.set_wall_time(
+                    wall_anchor + crate::runtime::environment::now().duration_since(anchor),
+                );
+                self.coverage.action("wall-jump");
+            }
+            Action::OriginFault => self.origin_fault(),
+            Action::MalformedClient => self.malformed_client(),
+            Action::KeyRetirement => self.key_retirement(),
+            Action::CacheRecreate => self.cache_recreate(),
+            Action::NativeFault if self.native => self.native_fault(),
+            Action::PeerSecurity if self.nodes.len() > 1 => self.peer_security(),
+            Action::DiskCorruption => self.disk_corruption(),
+            Action::PendingWriteCrash => self.crash_pending_write(),
+            // Gated actions keep their slot and use ordinary traffic instead
+            // of resampling, preserving both weights and random draws.
+            Action::Traffic
+            | Action::AddNode
+            | Action::RemoveNode
+            | Action::InflightMembership
+            | Action::Partition
+            | Action::NativeFault
+            | Action::PeerSecurity => {
+                let count = 1 + self.rng.pick(4);
+                self.coverage.action("traffic");
+                self.traffic(count, false);
+            }
+        }
+    }
+
+    fn verify_recovery(&mut self) {
         // Recovery liveness is a mandatory oracle obligation, independent of the
         // generator's action mix: every current object must still be readable.
         for object in 0..8 {
@@ -422,6 +431,9 @@ impl Harness {
                 "injected OS fault was not consumed"
             );
         }
+    }
+
+    fn teardown_generated(&mut self) {
         while !self.nodes.is_empty() {
             self.remove(0);
         }

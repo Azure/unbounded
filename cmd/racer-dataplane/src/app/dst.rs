@@ -684,9 +684,12 @@ impl Harness {
                 .clock
                 .environment(1 + id as u64 + (self.generation << 32) + ((worker as u64) << 48));
             let _role = role.enter();
-            let (mut app, runtime, engine) =
-                test_support::local_worker(&config, &node, worker as u16);
-            app.fabric_ports = workers[0].app.fabric_ports.clone();
+            let (app, runtime, engine) = test_support::local_worker_with_fabric(
+                &config,
+                &node,
+                worker as u16,
+                workers[0].app.fabric_ports.clone(),
+            );
             let crypto = node.native.crypto(WorkerId(worker as u16), engine).unwrap();
             workers.push(LocalWorker {
                 app,
@@ -695,26 +698,7 @@ impl Harness {
             });
         }
         lifecycle(&mut workers, &startup, Lifecycle::Start);
-        // Persist provisioning, not cached page writes. Every ancestor binding is
-        // explicit so a power loss cannot erase the fixture's whole node directory.
-        for path in [
-            std::path::PathBuf::from("/"),
-            "/dst".into(),
-            format!("/dst/node-{id}").into(),
-            config.slab_directory.clone(),
-        ] {
-            self.sim.disk().sync(&path).unwrap();
-        }
-        for worker in &workers {
-            self.sim
-                .disk()
-                .sync(
-                    &config
-                        .slab_directory
-                        .join(format!("worker-{}-slab-0.dat", worker.app.worker.0)),
-                )
-                .unwrap();
-        }
+        self.persist_provisioning(id, &config, &workers);
         if self.native {
             assert!(
                 workers.iter().all(|w| !w.app.actual_rails.is_empty()),
@@ -724,25 +708,7 @@ impl Harness {
         if worker_count > 1 {
             self.coverage.action("multi-worker");
         }
-        let LocalWorker {
-            app,
-            runtime,
-            crypto,
-        } = &mut workers[0];
-        drive_local(
-            runtime,
-            &mut **crypto,
-            app.clients.reconcile(&[self.definition(id)], &startup),
-        )
-        .unwrap();
-        let peers = app.peers.clone();
-        let address = config.peer_listen;
-        let listener_scope = scope(Duration::from_secs(365 * 24 * 3600)).unwrap();
-        let peer_scope = listener_scope.clone();
-        app.listener_scope = Some(listener_scope);
-        app.peer_task = Some(Box::pin(
-            async move { peers.listen(address, &peer_scope).await },
-        ));
+        self.start_node_listeners(id, &config, &mut workers[0], &startup);
         let adapter = Adapter::new(&self.sim, id);
         self.nodes.push(Node {
             id,
@@ -755,6 +721,57 @@ impl Harness {
         self.tick();
         self.coverage
             .action(if restart.is_some() { "restart" } else { "add" });
+    }
+
+    fn persist_provisioning(&self, id: usize, config: &Config, workers: &[LocalWorker]) {
+        // Persist provisioning, not cached page writes. Every ancestor binding is
+        // explicit so a power loss cannot erase the fixture's whole node directory.
+        for path in [
+            std::path::PathBuf::from("/"),
+            "/dst".into(),
+            format!("/dst/node-{id}").into(),
+            config.slab_directory.clone(),
+        ] {
+            self.sim.disk().sync(&path).unwrap();
+        }
+        for worker in workers {
+            self.sim
+                .disk()
+                .sync(
+                    &config
+                        .slab_directory
+                        .join(format!("worker-{}-slab-0.dat", worker.app.worker.0)),
+                )
+                .unwrap();
+        }
+    }
+
+    fn start_node_listeners(
+        &self,
+        id: usize,
+        config: &Config,
+        worker: &mut LocalWorker,
+        startup: &RequestScope,
+    ) {
+        let LocalWorker {
+            app,
+            runtime,
+            crypto,
+        } = worker;
+        drive_local(
+            runtime,
+            &mut **crypto,
+            app.clients.reconcile(&[self.definition(id)], startup),
+        )
+        .unwrap();
+        let peers = app.peers.clone();
+        let address = config.peer_listen;
+        let listener_scope = scope(Duration::from_secs(365 * 24 * 3600)).unwrap();
+        let peer_scope = listener_scope.clone();
+        app.listener_scope = Some(listener_scope);
+        app.peer_task = Some(Box::pin(
+            async move { peers.listen(address, &peer_scope).await },
+        ));
     }
     fn members(&self) -> Vec<crate::topology::membership::Member> {
         self.nodes.iter().map(|n| member(&n.config)).collect()

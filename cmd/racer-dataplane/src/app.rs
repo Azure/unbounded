@@ -1114,6 +1114,29 @@ impl WorkerApplication {
             }
         }
         self.poll_checkpoint(cx)?;
+        self.poll_ingress(cx, budget)?;
+        self.http.poll_waiters(budget);
+        // Expire metadata before advancing peer/listener tasks.
+        self.metadata
+            .poll_deadlines(crate::runtime::environment::now(), budget);
+        if !self.stopping {
+            self.poll_cache_preparation(cx)?;
+        }
+        self.poll_listeners(cx, budget)?;
+        self.poll_writer(cx)?;
+        if !self.stopping {
+            self.poll_control(cx)?;
+            self.refresh_snapshot(&scope(self.timeout)?)?;
+        }
+        let now = crate::runtime::environment::now();
+        if now >= self.next_health {
+            self.observe_health()?;
+            self.next_health = now + Duration::from_millis(100);
+        }
+        Ok(())
+    }
+
+    fn poll_ingress(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
         {
             for accepted in self
                 .node
@@ -1156,12 +1179,10 @@ impl WorkerApplication {
                 break;
             }
         }
-        self.http.poll_waiters(budget);
-        self.metadata
-            .poll_deadlines(crate::runtime::environment::now(), budget);
-        if !self.stopping {
-            self.poll_cache_preparation(cx)?;
-        }
+        Ok(())
+    }
+
+    fn poll_listeners(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
         if let Some(result) = poll_task(&mut self.diagnostic_task, cx) {
             if let Err(error) = &result
                 && !self.stopping
@@ -1222,6 +1243,10 @@ impl WorkerApplication {
                 result?;
             }
         }
+        Ok(())
+    }
+
+    fn poll_writer(&mut self, cx: &mut Context<'_>) -> Result<()> {
         if let Some(result) = poll_task(&mut self.writer_task, cx)
             && !matches!(
                 result,
@@ -1249,15 +1274,6 @@ impl WorkerApplication {
             self.writer_task = Some(Box::pin(async move {
                 writer.progress(8, &write_scope).await.map(|_| ())
             }));
-        }
-        if !self.stopping {
-            self.poll_control(cx)?;
-            self.refresh_snapshot(&scope(self.timeout)?)?;
-        }
-        let now = crate::runtime::environment::now();
-        if now >= self.next_health {
-            self.observe_health()?;
-            self.next_health = now + Duration::from_millis(100);
         }
         Ok(())
     }
