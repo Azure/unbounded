@@ -203,20 +203,21 @@ Gateway nodes must ensure that reply packets take the same WireGuard tunnel as
 the original request. Without this, asymmetric routing would cause connection
 failures (the reply arrives from a different source, or rp_filter drops it).
 
-#### Per-Interface FORWARD ACCEPT Rules (default)
+#### Tunnel-to-Tunnel FORWARD Rules
 
-The current default approach uses per-interface iptables FORWARD ACCEPT rules
-instead of policy-based routing. When a tunnel or WireGuard gateway interface is
-created, the node agent inserts:
+For each managed tunnel or WireGuard gateway interface, the node agent installs
+a source-interface jump and a destination-interface accept rule. Omitting the
+rule comments, their shape is:
 
 ```
-iptables -I FORWARD 1 -i <iface> -j ACCEPT
+iptables -I FORWARD 1 -i <iface> -j UNBOUNDED-FORWARD
+iptables -A UNBOUNDED-FORWARD -o <iface> -j ACCEPT
 ```
 
-on both the tunnel interface (e.g., `geneve0`, `vxlan0`) and the WireGuard
-gateway interfaces (e.g., `wg51821`). This allows the kernel to forward
-decapsulated overlay traffic between tunnel and WireGuard interfaces without
-connmark/fwmark bookkeeping.
+Both the incoming and outgoing interfaces must be managed tunnels for this
+chain to accept the packet. This permits overlay transit without granting a
+blanket ACCEPT to all traffic arriving on a tunnel. The managed route table
+selects the next hop; these filter rules do not choose the return route.
 
 Rules are removed when the interface is deleted. This approach is simpler
 than PBR and avoids the complexity of per-interface routing tables and fwmark

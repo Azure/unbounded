@@ -81,10 +81,11 @@ even when invalid rail annotations cause the last accepted rail configuration
 to be retained. In-flight operations can retain an older membership snapshot;
 a label change is not an immediate revocation mechanism.
 
-Upgrade all Racer dataplanes before relying on this boundary. Older dataplanes
-do not enforce Site restrictions, so mixed-version deployments must not be
-treated as enforcing them. Upgraded dataplanes use HTTP for publications that
-do not contain Site membership.
+Deploy matching first-release controllers and dataplanes. Racer control JSON
+rejects unknown fields and requires explicit member `site` and positive `shares`
+values. An explicit `"site":""` means HTTP-only; an omitted `site` is invalid,
+not an HTTP fallback. Pre-release publications and mixed pre-release peers are
+not supported. Owned Racer TLS connections require TLS 1.3.
 
 ### Gateway Pools
 

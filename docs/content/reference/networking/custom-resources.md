@@ -45,7 +45,7 @@ spec:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `spec.nodeCidrs` | `[]string` | Yes | CIDR blocks containing internal IPs of nodes at this site. |
-| `spec.podCidrAssignments` | `[]PodCidrAssignment` | No | Pod CIDR allocation rules for this site. |
+| `spec.podCidrAssignments` | `[]PodCidrAssignment` | Yes | At least one pod CIDR pool/assignment rule, including when an external CNI allocates pod addresses. |
 | `spec.manageCniPlugin` | `*bool` | No | Controls CNI and WireGuard behavior (default: `true`). |
 | `spec.nonMasqueradeCIDRs` | `[]string` | No | CIDRs that should NOT be masqueraded when traffic leaves via the default gateway. |
 | `spec.localCidrs` | `[]string` | No | CIDRs considered local; traffic to these is never routed via gateway pools. |
@@ -58,7 +58,7 @@ spec:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `assignmentEnabled` | `*bool` | No | Enables this assignment (default: `true`). |
-| `cidrBlocks` | `[]string` | No | CIDR pools to allocate from (IPv4 and/or IPv6). |
+| `cidrBlocks` | `[]string` | Yes | At least one CIDR pool (IPv4 and/or IPv6). |
 | `nodeBlockSizes.ipv4` | `int` | No | IPv4 subnet size for node allocations (default: `/24`). |
 | `nodeBlockSizes.ipv6` | `int` | No | IPv6 subnet size for node allocations (default: pool prefix + 16). |
 | `nodeRegex` | `[]string` | No | Regex patterns to match node names. Empty means no filtering. |

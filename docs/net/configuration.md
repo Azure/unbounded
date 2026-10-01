@@ -46,7 +46,7 @@ restart of the affected controller or node-agent pods.
 | `controller.statusDetailRequestTimeout` | `--status-detail-request-timeout` | `120s` | Strictly positive duration |
 
 The cache lifetime starts when actual details arrive, not on summary updates or
-reads. Continuous legacy full publications refresh it; on-demand duplicate or
+reads. Continuous full-mode publications refresh it; on-demand duplicate or
 late replies do not. The request timeout covers all delivery attempts together.
 
 Requests are coalesced per node, but simultaneous requests for different nodes
@@ -465,7 +465,7 @@ logging both the kept and ignored peering/profile details.
 
 The node agent uses configurable API server mode for websocket and push behavior:
 
-1. WebSocket transport (`/status/nodews` and aggregated API path) with protobuf full+delta messages and compression. The controller also accepts JSON messages for compatibility.
+1. WebSocket transport (`/status/nodews` and aggregated API path) with protobuf full+delta messages and compression. JSON envelopes are also supported; bare top-level full-status JSON is not.
 2. Periodic HTTP push (`/status/push` and aggregated API path) when websocket is unavailable or configured for periodic reconciliation.
 3. Controller pull fallback when push data is stale/unavailable.
 
@@ -480,9 +480,11 @@ When critical changes are published, existing peers retain their last published 
 Statistics updates include a timestamp even when measurements are unchanged, so the controller continues to see fresh status.
 Periodic full synchronization and full resynchronization after a rejected delta remain in place.
 
-New nodes use compact protobuf peer-measurement deltas only after the controller positively advertises `peer_measurements` in a successful WebSocket ACK with a nonzero revision.
+Nodes use compact protobuf peer-measurement deltas only after the controller positively advertises `peer_measurements` in a successful WebSocket ACK with a nonzero revision.
 The capability and revision are reset on every connection; the first message and any resynchronization are full snapshots.
-Old controllers receive full peer replacements, and new controllers continue to accept legacy protobuf and JSON full/top-level deltas.
+Without that negotiated capability, nodes send full peer replacements. Explicit
+protobuf and JSON full/delta envelopes remain supported; this is a current
+publication mode, not a pre-release compatibility promise.
 HTTP fallback uses typed top-level deltas without compact measurements and does not rely on a capability learned on a different connection.
 
 Compact measurements carry packed RX/TX/handshake columns and RTT/uptime string columns instead of repeated static peer metadata and nested health objects.

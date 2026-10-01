@@ -2,7 +2,9 @@
 
 # Custom Resource Definitions
 
-unbounded-net uses seven Custom Resource Definitions (CRDs) to manage network configuration.
+unbounded-net uses the shared `Site` CRD in `unbounded-cloud.io/v1alpha3` and six
+network CRDs in `net.unbounded-cloud.io/v1alpha1`. The former net-group Site is
+not served or migrated.
 
 ## Site
 
@@ -21,7 +23,7 @@ spec:
     - "10.0.0.0/16"
     - "10.1.0.0/16"
 
-  # Optional: Pod CIDR assignment rules for this site
+  # Required: Pod CIDR pools and assignment rules for this site
   podCidrAssignments:
     - assignmentEnabled: true
       cidrBlocks:
@@ -51,7 +53,7 @@ status:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `spec.nodeCidrs` | `[]string` | Yes | CIDR blocks containing internal IPs of nodes at this site. At least one required. |
-| `spec.podCidrAssignments` | `[]PodCidrAssignment` | No | Pod CIDR allocation rules for this site. |
+| `spec.podCidrAssignments` | `[]PodCidrAssignment` | Yes | At least one pod CIDR pool/assignment rule, including when an external CNI allocates pod addresses. |
 | `spec.manageCniPlugin` | `*bool` | No | Controls CNI and WireGuard behavior. Defaults to `true`. See below. |
 | `spec.nonMasqueradeCIDRs` | `[]string` | No | CIDRs that should NOT be masqueraded when traffic leaves via the default gateway. See below. |
 | `spec.localCidrs` | `[]string` | No | CIDR blocks considered local to this site. Traffic to these CIDRs is never routed via gateway pools. |
@@ -66,7 +68,7 @@ status:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `assignmentEnabled` | `*bool` | No | Enables this assignment (default: `true`). Disabled assignments are ignored. |
-| `cidrBlocks` | `[]string` | No | CIDR pools to allocate from (IPv4 and/or IPv6). |
+| `cidrBlocks` | `[]string` | Yes | At least one CIDR pool (IPv4 and/or IPv6). |
 | `nodeBlockSizes.ipv4` | `int` | No | IPv4 subnet size for node allocations (default: `/24` when IPv4 pools exist). |
 | `nodeBlockSizes.ipv6` | `int` | No | IPv6 subnet size for node allocations (default: first IPv6 pool prefix + 16). |
 | `nodeRegex` | `[]string` | No | Regex patterns to match node names. If empty, no regex filtering is applied. |
@@ -168,6 +170,9 @@ metadata:
 spec:
   nodeCidrs:
     - "192.168.1.0/24"
+  podCidrAssignments:
+    - cidrBlocks:
+        - "100.64.0.0/16"
 ```
 
 **Multi-Region Site with Pod CIDR Assignments:**
@@ -184,7 +189,7 @@ spec:
     - assignmentEnabled: true
       cidrBlocks:
         - "100.64.0.0/14"
-        - "fdde:east::/48"
+        - "fdde:ea57::/48"
       nodeBlockSizes:
         ipv4: 24
         ipv6: 80

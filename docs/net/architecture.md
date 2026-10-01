@@ -499,7 +499,7 @@ sequenceDiagram
 Node agents publish summaries by default. The controller separates observed
 overview facts from expiring, explicitly requested diagnostic payloads.
 Routine cluster APIs and broadcasts contain only summaries, including when
-legacy agents publish full status. The diagram illustrates the HTTP path;
+agents are configured to publish full status. The diagram illustrates the HTTP path;
 agents can also publish over authenticated WebSockets.
 
 ```mermaid
@@ -597,7 +597,7 @@ graph TD
         D1[Overview Cache<br/>node -> metadata and counts]
         D2[Pod Informer<br/>unbounded-net-node pods]
         D3[WebSocket Broadcaster<br/>summary updates and history]
-        D4[Detail Cache<br/>UID-bound payload and legacy base with TTL]
+        D4[Detail Cache<br/>UID-bound payload and full-publication base with TTL]
         D5[Detail Requests<br/>IDs, deadlines, and lifecycle metadata]
     end
 
@@ -681,7 +681,6 @@ graph TD
         CR7[EndpointSlices: get, create, update, delete]
         CR8[Pods: get, list, watch]
         CR9[TokenReviews: create]
-        CR10[Endpoints: delete - cleanup stale v1 resources]
         CR11[SitePeerings: get, list, watch + status]
         CR12[SiteGatewayPoolAssignments: get, list, watch]
         CR13[GatewayPoolPeerings: get, list, watch]

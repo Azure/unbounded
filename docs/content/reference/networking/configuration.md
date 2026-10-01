@@ -82,7 +82,7 @@ requires restarting the affected controller or node-agent pods.
 | `controller.statusDetailRequestTimeout` | `--status-detail-request-timeout` | `120s` | Strictly positive duration |
 
 The cache lifetime starts when actual details arrive, not on summary updates or
-reads. Continuous legacy full publications refresh it; on-demand duplicate or
+reads. Continuous full-mode publications refresh it; on-demand duplicate or
 late replies do not. The request timeout covers all delivery attempts together.
 
 Requests are coalesced per node, but simultaneous requests for different nodes

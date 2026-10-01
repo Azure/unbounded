@@ -8,7 +8,7 @@ This guide covers deployment, monitoring, troubleshooting, and operational proce
 
 ### Prerequisites
 
-1. **Kubernetes cluster** (1.24+)
+1. **Kubernetes cluster** (1.34+)
 2. **eBPF/TC** kernel support on all nodes
 3. **WireGuard** kernel module on nodes that use encrypted tunnels
 4. **Container runtime** with CNI support
