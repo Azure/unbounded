@@ -12,6 +12,22 @@ use crate::{
 };
 use std::rc::Rc;
 pub trait PeerClient {
+    /// Conservative hedge capability: the destination must itself be the first hop.
+    fn direct_hedge_available(
+        &self,
+        _membership: &MembershipLease,
+        _destination: &crate::model::identity::NodeId,
+    ) -> bool {
+        false
+    }
+    fn request_direct<'a>(
+        &'a self,
+        _request: PeerRequest,
+        _membership: MembershipLease,
+        _scope: &'a RequestScope,
+    ) -> Operation<'a, VerifiedResponse> {
+        Box::pin(async { Err(Error::Unavailable) })
+    }
     /// Carry the originating operation's lease through routing and completion.
     /// Cancellation does not release accepted transport work before its fence.
     fn request<'a>(
@@ -104,6 +120,47 @@ impl Requester {
     }
 }
 impl PeerClient for Requester {
+    fn direct_hedge_available(
+        &self,
+        membership: &MembershipLease,
+        destination: &crate::model::identity::NodeId,
+    ) -> bool {
+        self.network
+            .as_ref()
+            .is_some_and(|n| n.endpoint(membership, destination).is_ok())
+            && self.health.available(destination).unwrap_or(false)
+            && self
+                .paths
+                .peer_admission
+                .as_ref()
+                .is_some_and(|a| a.hedge_available(destination))
+    }
+    fn request_direct<'a>(
+        &'a self,
+        request: PeerRequest,
+        membership: MembershipLease,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, VerifiedResponse> {
+        Box::pin(async move {
+            if !matches!(request.operation, super::wire::Operation::Page { .. }) {
+                return Err(Error::InvalidRequest);
+            }
+            let scope = super::request_scope(&request, scope)?;
+            let next = request.route.destination.clone();
+            if !self.direct_hedge_available(&membership, &next) {
+                return Err(Error::Overloaded);
+            }
+            let (signed, binding) = self.forwarding.sign_request_to(request, &next)?;
+            let response = self
+                .exchange_inner_mode(signed, membership, None, &scope, true)
+                .await?;
+            let super::transfer::RelayResponse::Complete(response) = response else {
+                return Err(Error::Internal);
+            };
+            scope.check()?;
+            self.forwarding.verify_response(response, &binding)
+        })
+    }
     /// Sign a fresh attempt, exchange the full envelope, then verify the response
     /// using the binding retained from signing. Logical callers retain the proof.
     fn request<'a>(
@@ -171,6 +228,16 @@ impl Requester {
         relay: Option<Rc<crate::runtime::admission::Reservation>>,
         scope: &'a RequestScope,
     ) -> Operation<'a, super::transfer::RelayResponse> {
+        self.exchange_inner_mode(request, membership, relay, scope, false)
+    }
+    fn exchange_inner_mode<'a>(
+        &'a self,
+        request: SignedRequest,
+        membership: MembershipLease,
+        relay: Option<Rc<crate::runtime::admission::Reservation>>,
+        scope: &'a RequestScope,
+        direct_http: bool,
+    ) -> Operation<'a, super::transfer::RelayResponse> {
         Box::pin(async move {
             let scope = super::request_scope(&request.request, scope)?;
             super::check_membership(&request.request, &membership)?;
@@ -200,7 +267,12 @@ impl Requester {
                     }),
                 _ => None,
             };
-            let plan = if let Some(page) = rail_hint {
+            let plan = if direct_http {
+                if next != budget.destination {
+                    return Err(Error::InvalidRequest);
+                }
+                crate::topology::rails::TransportPlan::Http
+            } else if let Some(page) = rail_hint {
                 let search = super::search_budget(budget, &network.local)?;
                 let route = self
                     .paths

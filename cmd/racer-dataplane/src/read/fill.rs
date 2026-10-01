@@ -991,6 +991,28 @@ impl Fill {
             page: page.clone(),
             mode: FetchMode::Acquire,
         };
+        if want_plaintext {
+            if let Some(result) = self
+                .dependencies
+                .candidates
+                .hedge_page(
+                    &candidates,
+                    context,
+                    &operation,
+                    scope,
+                    budget,
+                    &self.dependencies.admission,
+                    |response| Box::pin(self.decrypt_response(page, response, None, scope)),
+                )
+                .await?
+            {
+                result.validate_for(page)?;
+                scope.check()?;
+                self.publish(result.clone(), dirty, scope).await?;
+                self.metrics.record(Event::PeerHit, 1)?;
+                return Ok(result.into());
+            }
+        }
         // Keep the accepted ranking to probe later cached copies on an origin 412.
         let resolution = self
             .dependencies

@@ -91,6 +91,35 @@ fn worker_requesters_share_configured_admission_and_production_metrics() {
     drop(permit);
     assert_eq!(node.metrics[1].1.gauge(Gauge::PeerExchanges), 0);
 }
+#[test]
+fn workers_share_configured_page_hedge_slots_and_bytes() {
+    let clock = crate::runtime::environment::SimulationClock::new(907);
+    let _environment = clock.environment(0).enter();
+    let mut config = crate::test_support::cluster::config(false);
+    config.page_hedge.slots = 1;
+    let node = Arc::new(NodeState::default());
+    let (_first, _, _) = local_worker(&config, &node, 0);
+    let owner = node.hedges.get().unwrap().clone();
+    let (mut second, _, _) = local_worker(&config, &node, 1);
+    assert!(Arc::ptr_eq(&owner, node.hedges.get().unwrap()));
+    let permit = owner.acquire().unwrap();
+    let wake = Arc::new(crate::test_support::WakeCounter::default());
+    let waker = std::task::Waker::from(wake.clone());
+    let mut cx = Context::from_waker(&waker);
+    assert!(permit.delay(&mut cx).is_pending());
+    clock.advance(config.page_hedge.delay);
+    // No listener/checkpoint startup in this composition-only fixture. Alarms
+    // must still wake before unrelated unstarted services report unavailable.
+    assert_eq!(second.poll_services(&mut cx, 1), Err(Error::Unavailable));
+    assert!(wake.count() > 0);
+    assert!(permit.delay(&mut cx).is_ready());
+    assert!(matches!(
+        node.hedges.get().unwrap().acquire(),
+        Err(Error::Overloaded)
+    ));
+    drop(permit);
+    assert!(owner.acquire().is_ok());
+}
 
 #[test]
 fn distributed_peer_listener_recovers_from_queue_pressure() {

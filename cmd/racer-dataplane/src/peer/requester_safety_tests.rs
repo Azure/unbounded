@@ -38,6 +38,65 @@ fn attached_requester_verification_and_opaque_outcome_gate_real_probe_recovery()
     }
 }
 
+#[test]
+fn direct_page_hedge_transport_pins_receiver_and_uses_shared_admission() {
+    probe_exchange(false, "direct");
+}
+
+#[test]
+fn page_hedge_does_not_treat_multihop_destination_as_independent_first_hop() {
+    let members = Arc::new(
+        Membership::validate(
+            MembershipVersion(1),
+            (0..1500)
+                .map(|i| Member {
+                    node: crate::model::identity::NodeId(format!(
+                        "{i:08x}-1111-4111-8111-111111111111"
+                    )),
+                    shares: std::num::NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
+                    rails: vec![],
+                    alignment_enabled: false,
+                })
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let local = members.members()[0].node.clone();
+    let network = Rc::new(
+        crate::peer::PeerNetwork::new(
+            local.clone(),
+            crate::control::snapshot::PublishedState::for_membership(members.clone()),
+        )
+        .unwrap(),
+    );
+    let nonneighbor = members
+        .members()
+        .iter()
+        .find(|m| m.node != local && network.endpoint(&members, &m.node).is_err())
+        .unwrap();
+    let admission = Rc::new(Admission::new(
+        crate::test_support::cluster::config(false).limits,
+    ));
+    let reactor = Rc::new(Reactor::new(admission.clone()));
+    let io = Rc::new(HttpIo::with_admission(
+        reactor.clone(),
+        Codec::new(crate::peer::wire::MAX_ENVELOPE_HEAD, 0),
+        admission.clone(),
+    ));
+    let pool = Rc::new(HttpPool::new(reactor, admission, 2));
+    let adaptive = AdaptivePeers::new(Default::default(), Metrics::default()).unwrap();
+    let signers = crate::peer::tests::signers();
+    let requester = Requester::new(
+        Rc::new(Paths::new(Rc::new(LinkHealth), 4).with_peer_admission(adaptive)),
+        Rc::new(Rails),
+        Rc::new(Forwarding::new(signers[0].clone())),
+        Rc::new(Transfers::new(pool, io, None)),
+    )
+    .with_network(network);
+    assert!(!requester.direct_hedge_available(&members, &nonneighbor.node));
+}
+
 fn probe_exchange(opaque: bool, case: &str) {
     let signers = crate::peer::tests::signers();
     let admission = Rc::new(Admission::new(
@@ -80,17 +139,19 @@ fn probe_exchange(opaque: bool, case: &str) {
     let metrics = Metrics::default();
     let adaptive = AdaptivePeers::new(
         crate::peer::adaptive::Config {
-            total: 1,
+            total: 4,
             per_peer: 1,
         },
         metrics.clone(),
     )
     .unwrap();
     let node = signers[2].node().clone();
-    let failed = adaptive.acquire(&node).unwrap();
-    failed.observe(Outcome::PeerFailure);
-    drop(failed);
-    std::thread::sleep(Duration::from_millis(260));
+    if case != "direct" {
+        let failed = adaptive.acquire(&node).unwrap();
+        failed.observe(Outcome::PeerFailure);
+        drop(failed);
+        std::thread::sleep(Duration::from_millis(260));
+    }
     let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4).with_peer_admission(adaptive.clone()));
     let forwarding = Rc::new(Forwarding::new(signers[0].clone()));
     let requester = Requester::new(paths, Rc::new(Rails), forwarding.clone(), transfers)
@@ -110,7 +171,24 @@ fn probe_exchange(opaque: bool, case: &str) {
     .unwrap();
     request.route.deadline = scope.deadline;
     request.origin.scope = scope.clone();
-    let (signed, _) = forwarding.sign_request(request).unwrap();
+    if case == "direct" {
+        request.operation = crate::peer::wire::Operation::Page {
+            page: crate::model::identity::PageId {
+                version: crate::model::identity::ObjectVersion {
+                    object: request.origin.object.clone(),
+                    etag: crate::model::identity::StrongEtag::test_value("hedge"),
+                },
+                number: crate::model::identity::PageNumber(0),
+            },
+            mode: crate::peer::wire::FetchMode::CopyOnly,
+        };
+        assert!(requester.direct_hedge_available(&membership, &node));
+    }
+    let (direct, signed) = if case == "direct" {
+        (Some(request), None)
+    } else {
+        (None, Some(forwarding.sign_request(request).unwrap().0))
+    };
     let server = async {
         let fd = reactor
             .accept(Rc::new(Descriptor::from(listener)), &scope)
@@ -146,10 +224,15 @@ fn probe_exchange(opaque: bool, case: &str) {
         Ok::<_, Error>(())
     };
     let client = async {
-        if opaque {
+        if let Some(request) = direct {
+            requester
+                .request_direct(request, membership, &scope)
+                .await
+                .map(|r| RelayResponse::Complete(r.into_signed()))
+        } else if opaque {
             requester
                 .exchange_relay(
-                    signed,
+                    signed.unwrap(),
                     membership,
                     Rc::new(admission.reserve(None, ResourceClass::Relay, 1)?),
                     &scope,
@@ -157,7 +240,7 @@ fn probe_exchange(opaque: bool, case: &str) {
                 .await
         } else {
             requester
-                .exchange(signed, membership, &scope)
+                .exchange(signed.unwrap(), membership, &scope)
                 .await
                 .map(RelayResponse::Complete)
         }
@@ -202,11 +285,14 @@ fn probe_exchange(opaque: bool, case: &str) {
             ),
         }
     }
-    assert_eq!(metrics.count(Event::PeerProbe), 1);
+    assert_eq!(metrics.count(Event::PeerProbe), u64::from(case != "direct"));
     assert_eq!(
         metrics.count(Event::PeerVerified),
-        u64::from(case == "miss")
+        u64::from(case == "miss" || case == "direct")
     );
-    assert_eq!(adaptive.available(&node), case == "miss");
+    assert_eq!(
+        adaptive.available(&node),
+        case == "miss" || case == "direct"
+    );
     assert_eq!(metrics.gauge(Gauge::PeerExchanges), 0);
 }

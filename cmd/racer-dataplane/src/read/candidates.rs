@@ -41,6 +41,7 @@ pub enum ProbeOutcome {
     UnusableCopy,
 }
 pub struct CandidatePolicy {
+    hedge: Option<std::sync::Arc<super::hedge::Hedges>>,
     attempt_timeout: std::time::Duration,
     observer: Observer,
     node: NodeId,
@@ -50,6 +51,151 @@ pub struct CandidatePolicy {
     published: RefCell<Option<std::sync::Arc<crate::control::snapshot::PublishedState>>>,
 }
 impl CandidatePolicy {
+    /// Only Fill's plaintext fixed-page path calls this. Direct HTTP destinations
+    /// prove independent first hops. Drain both attempts before releasing escrow.
+    pub(crate) async fn hedge_page<'a, T: 'a>(
+        &'a self,
+        candidates: &Candidates,
+        context: &'a OriginContext,
+        operation: &PeerOperation,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+        admission: &Rc<crate::runtime::admission::Admission>,
+        validate: impl Fn(VerifiedResponse) -> Operation<'a, T>,
+    ) -> Result<Option<T>> {
+        let Some(hedges) = self.hedge.as_ref().filter(|h| h.enabled()) else {
+            return Ok(None);
+        };
+        let eligible = matches!(operation, PeerOperation::Page { .. })
+            && !self.is_candidate(candidates)
+            && candidates.ordered.len() >= 2
+            && candidates.ordered[0] != candidates.ordered[1]
+            && budget.remaining_attempts() >= 4
+            && budget.remaining_links() >= 8
+            && candidates.ordered[..2]
+                .iter()
+                .all(|n| self.peers.direct_hedge_available(&candidates.membership, n));
+        if !eligible {
+            hedges.suppressed();
+            return Ok(None);
+        }
+        check_budget(scope, budget)?;
+        let reservation = (|| {
+            let slot = hedges.acquire()?;
+            let plain = admission.reserve(
+                Some(&context.object.cache),
+                crate::model::limits::ResourceClass::Plaintext,
+                crate::model::range::PAGE_BYTES as usize,
+            )?;
+            let cipher = admission.reserve(
+                Some(&context.object.cache),
+                crate::model::limits::ResourceClass::Ciphertext,
+                crate::model::range::PAGE_BYTES as usize + 16,
+            )?;
+            Ok::<_, Error>((slot, plain, cipher))
+        })();
+        let Ok((slot, _plain, _cipher)) = reservation else {
+            hedges.suppressed();
+            return Ok(None);
+        };
+        let mut secondary_budget = budget.partition(1, 4)?;
+        let mut primary_budget = budget.partition(budget.remaining_attempts() / 2, 4)?;
+        let primary_scope =
+            RequestScope::new(scope.request, scope.deadline.0.min(budget.deadline()))?;
+        let secondary_scope = RequestScope::new(scope.request, primary_scope.deadline.0)?;
+        let primary = async {
+            let response = self
+                .request_mode(
+                    &candidates.membership,
+                    &candidates.ordered[0],
+                    context,
+                    operation,
+                    FetchMode::Acquire,
+                    &primary_scope,
+                    &mut primary_budget,
+                    1,
+                    true,
+                )
+                .await?;
+            match classify(response.response(), operation, true)? {
+                Some(_) => Err(Error::Unavailable),
+                None => validate(response).await,
+            }
+        };
+        let secondary = async {
+            if !self
+                .peers
+                .direct_hedge_available(&candidates.membership, &candidates.ordered[1])
+            {
+                hedges.suppressed();
+                return Err(Error::Overloaded);
+            }
+            // Recheck local headroom after the delay. The escrow remains held;
+            // these trial reservations do not replace actual receive/crypto quota.
+            let capacity = (|| {
+                let plain = admission.reserve(
+                    Some(&context.object.cache),
+                    crate::model::limits::ResourceClass::Plaintext,
+                    crate::model::range::PAGE_BYTES as usize,
+                )?;
+                let cipher = admission.reserve(
+                    Some(&context.object.cache),
+                    crate::model::limits::ResourceClass::Ciphertext,
+                    crate::model::range::PAGE_BYTES as usize + 16,
+                )?;
+                Ok::<_, Error>((plain, cipher))
+            })();
+            let Ok(capacity) = capacity else {
+                hedges.suppressed();
+                return Err(Error::Overloaded);
+            };
+            drop(capacity);
+            slot.started();
+            let response = self
+                .request_mode(
+                    &candidates.membership,
+                    &candidates.ordered[1],
+                    context,
+                    operation,
+                    FetchMode::CopyOnly,
+                    &secondary_scope,
+                    &mut secondary_budget,
+                    1,
+                    true,
+                )
+                .await?;
+            match classify(response.response(), operation, false)? {
+                Some(_) => Err(Error::Unavailable),
+                None => validate(response).await,
+            }
+        };
+        let result = super::hedge::race(
+            primary,
+            secondary,
+            &primary_scope,
+            &secondary_scope,
+            scope,
+            &slot,
+        )
+        .await;
+        budget.reunite(primary_budget)?;
+        budget.reunite(secondary_budget)?;
+        check_budget(scope, budget)?;
+        match result {
+            Ok(result) => Ok(Some(result)),
+            Err(
+                Error::Unavailable
+                | Error::Io
+                | Error::Overloaded
+                | Error::CorruptRecord
+                | Error::MissingKey,
+            ) => {
+                budget.note_route_failure();
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
     /// One admitted selection, one transfer grant. Routing chooses the primary of
     /// the oldest demanded page; the provider can choose any demanded page for
     /// which it is also primary. Backups are not speculatively contacted.
@@ -136,6 +282,7 @@ impl CandidatePolicy {
     }
     pub fn new(node: NodeId, placement: Rc<Placement>, peers: Rc<dyn PeerClient>) -> Self {
         Self {
+            hedge: None,
             attempt_timeout: std::time::Duration::from_secs(30),
             observer: Observer::default(),
             node,
@@ -148,6 +295,10 @@ impl CandidatePolicy {
 
     pub(crate) fn with_observer(mut self, observer: Observer) -> Self {
         self.observer = observer;
+        self
+    }
+    pub(crate) fn with_hedges(mut self, hedges: std::sync::Arc<super::hedge::Hedges>) -> Self {
+        self.hedge = Some(hedges);
         self
     }
 
@@ -472,6 +623,31 @@ impl CandidatePolicy {
         budget: &mut AcquisitionBudget,
         remaining_opportunities: u32,
     ) -> Result<VerifiedResponse> {
+        self.request_mode(
+            membership,
+            destination,
+            context,
+            operation,
+            mode,
+            scope,
+            budget,
+            remaining_opportunities,
+            false,
+        )
+        .await
+    }
+    async fn request_mode(
+        &self,
+        membership: &MembershipLease,
+        destination: &NodeId,
+        context: &OriginContext,
+        operation: &PeerOperation,
+        mode: FetchMode,
+        scope: &RequestScope,
+        budget: &mut AcquisitionBudget,
+        remaining_opportunities: u32,
+        direct: bool,
+    ) -> Result<VerifiedResponse> {
         check_budget(scope, budget)?;
         // Reserve the complete permitted route before sending. Lost responses cannot
         // refund an unknown number of forwarded links. No retry gets fresh credits.
@@ -551,9 +727,13 @@ impl CandidatePolicy {
             },
         };
         let registration = scope.cancellation.subscribe()?;
-        let mut exchange = self
-            .peers
-            .request(request, membership.clone(), &attempt_scope);
+        let mut exchange = if direct {
+            self.peers
+                .request_direct(request, membership.clone(), &attempt_scope)
+        } else {
+            self.peers
+                .request(request, membership.clone(), &attempt_scope)
+        };
         let mut stopped = None;
         let response = std::future::poll_fn(|cx| {
             registration.register(cx.waker());

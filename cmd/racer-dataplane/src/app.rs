@@ -106,6 +106,7 @@ pub struct Application {
 /// Shared immutable-publication and partitioned-admission roots. No Rc worker
 /// graph crosses a thread. Worker zero alone drives enrollment/control reloads.
 pub struct NodeState {
+    hedges: std::sync::OnceLock<Arc<crate::read::hedge::Hedges>>,
     peer_admission: Arc<crate::peer::adaptive::AdaptivePeers>,
     subscriptions: Arc<crate::peer::subscriptions::Subscriptions>,
     ingress: Arc<crate::runtime::ingress::Ingress>,
@@ -156,6 +157,7 @@ impl NodeState {
             crate::peer::adaptive::AdaptivePeers::new(peer_config, metrics[0].clone())?;
         Ok(Self {
             peer_admission,
+            hedges: std::sync::OnceLock::new(),
             ingress: Arc::new(crate::runtime::ingress::Ingress::new(&workers)),
             subscriptions: Arc::new(crate::peer::subscriptions::Subscriptions::new(
                 Default::default(),
@@ -598,6 +600,14 @@ impl WorkerApplication {
         let drivers = Rc::new(crate::read::drivers::DriverQueue::default());
         let _queue = drivers.enter();
         let admission = runtime.admission.clone();
+        config.page_hedge.validate()?;
+        let hedges = node
+            .hedges
+            .get_or_init(|| {
+                crate::read::hedge::Hedges::new(config.page_hedge, node.metrics[0].1.clone())
+                    .expect("validated hedge config")
+            })
+            .clone();
         admission.set_observer(node.failures.observer(worker));
         node.ingress.install(worker, &admission)?;
         let reactor = runtime.reactor.clone();
@@ -800,6 +810,7 @@ impl WorkerApplication {
         );
         let candidates = Rc::new(
             CandidatePolicy::new(config.node.clone(), placement.clone(), requester.clone())
+                .with_hedges(hedges)
                 .with_attempt_timeout(config.peer_attempt_timeout)
                 .with_observer(admission.observer()),
         );
@@ -1208,6 +1219,9 @@ impl WorkerApplication {
         let _queue = self.drivers.enter();
         if work_budget == 0 {
             return Ok(());
+        }
+        if let Some(hedges) = self.node.as_ref().and_then(|n| n.hedges.get()) {
+            hedges.poll();
         }
         let budget = work_budget.min(64);
         self.poll_native(cx)?;

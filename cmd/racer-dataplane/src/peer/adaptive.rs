@@ -74,6 +74,18 @@ pub(crate) struct Permit {
     probe: bool,
 }
 impl AdaptivePeers {
+    pub(crate) fn hedge_available(&self, node: &NodeId) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            state.limit == self.config.total
+                && state.active + 1 < state.limit
+                && state.peers.get(node).is_none_or(|p| {
+                    p.retry.is_none()
+                        && !p.probe
+                        && p.limit == self.config.per_peer
+                        && p.active < p.limit
+                })
+        })
+    }
     pub(crate) fn new(config: Config, metrics: Metrics) -> Result<Arc<Self>> {
         config.validate()?;
         metrics.set_gauge(Gauge::PeerAdmissionLimit, config.total as u64);
@@ -251,6 +263,37 @@ impl Drop for Permit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hedges_require_spare_capacity_and_no_local_or_peer_pressure() {
+        let clock = crate::runtime::environment::SimulationClock::new(905);
+        let _env = clock.environment(0).enter();
+        let owner = AdaptivePeers::new(
+            Config {
+                total: 4,
+                per_peer: 2,
+            },
+            Metrics::default(),
+        )
+        .unwrap();
+        let node = NodeId("a".into());
+        assert!(owner.hedge_available(&node));
+        let permit = owner.acquire(&node).unwrap();
+        clock.advance(BACKOFF);
+        permit.observe(Outcome::LocalPressure);
+        assert!(!owner.hedge_available(&node));
+        drop(permit);
+        let owner = AdaptivePeers::new(
+            Config {
+                total: 4,
+                per_peer: 2,
+            },
+            Metrics::default(),
+        )
+        .unwrap();
+        let permit = owner.acquire(&node).unwrap();
+        permit.observe(Outcome::PeerFailure);
+        assert!(!owner.hedge_available(&node));
+    }
     #[test]
     fn churn_cannot_evict_neutral_probe_backoff_with_old_update_time() {
         let clock = crate::runtime::environment::SimulationClock::new(783);

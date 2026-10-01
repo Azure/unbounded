@@ -17,6 +17,9 @@ enum Reply {
     Unauthorized,
 }
 struct ScriptedPeers {
+    hedge: Cell<bool>,
+    primary_polls: Cell<usize>,
+    canceled_primary: Cell<bool>,
     local: usize,
     signing: Vec<Forwarding>,
     replies: RefCell<VecDeque<(NodeId, Reply)>>,
@@ -24,6 +27,21 @@ struct ScriptedPeers {
     local_deadlines: RefCell<Vec<(Instant, Instant)>>,
 }
 impl PeerClient for ScriptedPeers {
+    fn direct_hedge_available(
+        &self,
+        _: &crate::topology::membership::MembershipLease,
+        _: &NodeId,
+    ) -> bool {
+        self.hedge.get()
+    }
+    fn request_direct<'a>(
+        &'a self,
+        request: PeerRequest,
+        membership: crate::topology::membership::MembershipLease,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, VerifiedResponse> {
+        self.request(request, membership, scope)
+    }
     fn request<'a>(
         &'a self,
         request: PeerRequest,
@@ -56,6 +74,22 @@ impl PeerClient for ScriptedPeers {
                 .pop_front()
                 .expect("no repeated source");
             assert_eq!(destination, expected);
+            if self.hedge.get() && self.calls.borrow().len() == 1 {
+                std::future::poll_fn(|cx| {
+                    if scope.check().is_err() {
+                        self.canceled_primary.set(true);
+                        return std::task::Poll::Ready(());
+                    }
+                    if self.primary_polls.get() == 0 {
+                        return std::task::Poll::Ready(());
+                    }
+                    self.primary_polls.set(self.primary_polls.get() - 1);
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                })
+                .await;
+                scope.check()?;
+            }
             let response = match reply {
                 Reply::Copy(copy) => PeerResponse::Page {
                     metadata: copy.metadata,
@@ -98,6 +132,9 @@ fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Ve
         .map(|rank| ordered[rank].clone())
         .unwrap_or_else(|| (0..4).map(node).find(|n| !ordered.contains(n)).unwrap());
     let peers = Rc::new(ScriptedPeers {
+        hedge: Cell::new(false),
+        primary_polls: Cell::new(0),
+        canceled_primary: Cell::new(false),
         local: (0..4).find(|i| node(*i) == local).unwrap(),
         signing: network(4).into_iter().map(Forwarding::new).collect(),
         replies: RefCell::new(VecDeque::new()),
@@ -109,6 +146,176 @@ fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Ve
     dependencies.candidates = Rc::new(CandidatePolicy::new(local, placement, peers.clone()));
     f.fill = Fill::new(dependencies);
     (peers, ordered)
+}
+
+#[test]
+fn hedged_plaintext_validates_aead_and_preserves_singleflight_and_original_credits() {
+    for corrupt in [false, true] {
+        let mut f = fixture();
+        let (peers, ordered) = install_peers(&mut f, None);
+        let good = encrypted_copy(&mut f);
+        let alternative = if corrupt {
+            unusable_copy(&f, &good, false)
+        } else {
+            good.clone()
+        };
+        peers.replies.borrow_mut().extend([
+            (ordered[0].clone(), Reply::Copy(good.clone())),
+            (ordered[1].clone(), Reply::Copy(alternative)),
+        ]);
+        peers.hedge.set(true);
+        peers.primary_polls.set(40);
+        let metrics = crate::telemetry::metrics::Metrics::default();
+        let hedges = super::super::super::hedge::Hedges::new(
+            super::super::super::hedge::Config {
+                delay: Duration::from_nanos(1),
+                slots: 1,
+                bytes: super::super::super::hedge::DUPLICATE_BYTES,
+            },
+            metrics.clone(),
+        )
+        .unwrap();
+        let mut deps = f.fill.dependencies.clone();
+        deps.candidates = Rc::new(
+            CandidatePolicy::new(
+                node(peers.local),
+                Rc::new(Placement::new(16)),
+                peers.clone(),
+            )
+            .with_hedges(hedges),
+        );
+        f.fill = Fill::new(deps);
+        let mut first_budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+        let mut second_budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+        let (first, second) = drive(
+            async {
+                futures::join!(
+                    f.fill.acquire(
+                        f.page.clone(),
+                        f.membership.clone(),
+                        &f.context,
+                        &f.scope,
+                        &mut first_budget
+                    ),
+                    f.fill.acquire(
+                        f.page.clone(),
+                        f.membership.clone(),
+                        &f.context,
+                        &f.scope,
+                        &mut second_budget
+                    )
+                )
+            },
+            &mut f.engine,
+            &f.crypto,
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.plaintext.bytes(), b"abc");
+        assert_eq!(second.plaintext.bytes(), b"abc");
+        assert_eq!(peers.calls.borrow().len(), 2);
+        assert!(!peers.calls.borrow()[0].1);
+        assert!(peers.calls.borrow()[1].1);
+        assert_eq!(metrics.count(Event::PageHedgeStarted), 1);
+        assert_eq!(metrics.count(Event::PageHedgeWon), u64::from(!corrupt));
+        assert_eq!(peers.canceled_primary.get(), !corrupt);
+        assert_eq!(first_budget.deadline(), f.scope.deadline.0);
+        assert_eq!(
+            first_budget.remaining_attempts() + second_budget.remaining_attempts(),
+            12
+        );
+        assert_eq!(
+            first_budget.remaining_links() + second_budget.remaining_links(),
+            24
+        );
+        assert!(
+            peers
+                .calls
+                .borrow()
+                .iter()
+                .all(|call| call.4 == f.scope.deadline.0)
+        );
+        assert_published(&f, &first, false);
+    }
+}
+
+#[test]
+fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
+    for reason in ["route", "credits", "memory", "slots"] {
+        let mut f = fixture();
+        let (peers, ordered) = install_peers(&mut f, None);
+        peers.hedge.set(reason != "route");
+        let metrics = crate::telemetry::metrics::Metrics::default();
+        let hedges = super::super::super::hedge::Hedges::new(
+            super::super::super::hedge::Config {
+                delay: Duration::from_millis(1),
+                slots: 1,
+                bytes: super::super::super::hedge::DUPLICATE_BYTES,
+            },
+            metrics.clone(),
+        )
+        .unwrap();
+        let _slot = (reason == "slots").then(|| hedges.acquire().unwrap());
+        let mut deps = f.fill.dependencies.clone();
+        deps.candidates = Rc::new(
+            CandidatePolicy::new(
+                node(peers.local),
+                Rc::new(Placement::new(16)),
+                peers.clone(),
+            )
+            .with_hedges(hedges),
+        );
+        f.fill = Fill::new(deps);
+        let admission = &f.fill.dependencies.admission;
+        let _pressure = (reason == "memory").then(|| {
+            admission
+                .reserve(
+                    None,
+                    ResourceClass::Plaintext,
+                    admission.limit(ResourceClass::Plaintext),
+                )
+                .unwrap()
+        });
+        let mut budget = AcquisitionBudget::new(
+            f.scope.deadline.0,
+            if reason == "credits" { 1 } else { 8 },
+            16,
+        );
+        let before = (
+            budget.remaining_attempts(),
+            budget.remaining_links(),
+            budget.deadline(),
+        );
+        let candidates = crate::topology::placement::Candidates {
+            membership: f.membership.clone(),
+            ordered,
+        };
+        let operation = PeerOperation::Page {
+            page: f.page.clone(),
+            mode: FetchMode::Acquire,
+        };
+        let result = futures::executor::block_on(f.fill.dependencies.candidates.hedge_page(
+            &candidates,
+            &f.context,
+            &operation,
+            &f.scope,
+            &mut budget,
+            admission,
+            |_| Box::pin(async { panic!("suppressed hedge validation") }),
+        )) as Result<Option<()>>;
+        assert!(matches!(result, Ok(None)));
+        assert_eq!(
+            before,
+            (
+                budget.remaining_attempts(),
+                budget.remaining_links(),
+                budget.deadline()
+            )
+        );
+        assert!(peers.calls.borrow().is_empty());
+        assert_eq!(metrics.count(Event::PageHedgeSuppressed), 1);
+        assert_eq!(metrics.count(Event::PageHedgeStarted), 0);
+    }
 }
 
 fn encrypted_copy(f: &mut Fixture) -> CiphertextCopy {
