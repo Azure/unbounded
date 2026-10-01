@@ -3,7 +3,7 @@ use super::*;
 use crate::{error::Result, memory::pool::CiphertextPage};
 use std::net::Shutdown;
 
-async fn until(condition: impl Fn() -> bool) {
+pub(super) async fn until(condition: impl Fn() -> bool) {
     std::future::poll_fn(|cx| {
         if condition() {
             Poll::Ready(())

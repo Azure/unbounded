@@ -1,5 +1,6 @@
 use super::*;
 mod materialized_pairing;
+mod safety;
 use crate::{
     http::{
         Codec,
