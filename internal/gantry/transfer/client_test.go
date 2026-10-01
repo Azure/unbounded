@@ -13,8 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/http2"
-
 	"github.com/Azure/unbounded/internal/gantry/digest"
 	"github.com/Azure/unbounded/internal/gantry/ifaces"
 	"github.com/Azure/unbounded/internal/gantry/ifaces/fakes"
@@ -93,16 +91,24 @@ func TestClientDefaultRequestTimeout(t *testing.T) {
 	}
 }
 
-func TestClientAdvertisesLargePeerFrames(t *testing.T) {
+func TestClientConfiguresHTTP2Transport(t *testing.T) {
 	client := NewClient()
 
-	transport, ok := client.hc.Transport.(*http2.Transport)
+	transport, ok := client.hc.Transport.(*http.Transport)
 	if !ok {
-		t.Fatalf("transport = %T, want *http2.Transport", client.hc.Transport)
+		t.Fatalf("transport = %T, want *http.Transport", client.hc.Transport)
 	}
 
-	if transport.MaxReadFrameSize != peerMaxReadFrameSize {
-		t.Fatalf("MaxReadFrameSize = %d, want %d", transport.MaxReadFrameSize, peerMaxReadFrameSize)
+	if transport.HTTP2.MaxReadFrameSize != peerMaxReadFrameSize {
+		t.Fatalf("MaxReadFrameSize = %d, want %d", transport.HTTP2.MaxReadFrameSize, peerMaxReadFrameSize)
+	}
+
+	if transport.HTTP2.SendPingTimeout != 10*time.Second {
+		t.Fatalf("SendPingTimeout = %v, want 10s", transport.HTTP2.SendPingTimeout)
+	}
+
+	if !transport.Protocols.UnencryptedHTTP2() || transport.Protocols.HTTP1() || transport.Protocols.HTTP2() {
+		t.Fatalf("protocols = %s, want unencrypted HTTP/2 only", transport.Protocols)
 	}
 }
 
