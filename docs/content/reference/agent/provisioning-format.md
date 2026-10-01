@@ -31,18 +31,21 @@ Resolution follows these rules:
 2. An explicit Machine provisioning format wins. When inheriting the template
    image, its declared format is used if the Machine has no format declaration.
    A Machine image override does not inherit a different template image's format.
-3. Otherwise the installed observation is used. A known Ignition installation
-   selecting an explicit replacement image must declare the target format.
-4. With neither a declaration nor an observation, CloudInit is the legacy fallback.
+3. When preserving the current image, the installed observation may supply the
+   format. An explicit replacement image always requires a declared target format,
+   even if the current installation uses CloudInit.
+4. With neither a declaration nor an applicable observation, replacement fails.
+   There is no implicit CloudInit default.
 
 The controller currently generates **cloud-init only**. A resolved Ignition
 HostReplace fails before the destructive provider call. Declaring Ignition does
 not add controller-driven Ignition delivery. If an image changes provisioning
 format, declare the new target format explicitly rather than editing observations.
 
-Operation snapshots created before the format field existed fall back to current
-Machine declarations/observations using their snapshotted image. They do not have
-the full frozen-format guarantee of newly initialized operations.
+Replacement operation snapshots must include the frozen provisioning format.
+Snapshots without it fail before replacement bootstrap data is generated; they
+are not repaired from mutable Machine declarations or observations. Create a new
+operation after declaring the intended image and format.
 
 ## Installed observations
 
@@ -52,7 +55,7 @@ the values `cloud-init` or `ignition`. Explicit values are reported through
 Status reporting preserves desired spec and uses the existing Machine status RBAC.
 
 Omitted installation format remains unobserved. The agent does not infer it from
-the host OS and does not manufacture a CloudInit observation for a legacy host.
+the host OS and does not manufacture a CloudInit observation for an unknown host.
 Existing script/cloud-init renderers continue to leave that observation unset.
 
 Deploy the updated CRDs and controller before agents that report explicit format
