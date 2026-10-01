@@ -135,9 +135,11 @@ fn assert_outcomes(report: &Report, completed: usize, failed: usize, canceled: u
         completed + failed + canceled,
         "{report:?}"
     );
-    assert_eq!(report.completed, completed, "{report:?}");
-    assert_eq!(report.failed, failed, "{report:?}");
-    assert_eq!(report.canceled, canceled, "{report:?}");
+    assert_eq!(
+        report.outcomes(),
+        (completed, failed, canceled),
+        "{report:?}"
+    );
     assert_eq!(report.delivered_bytes, completed as u64 * PAGE_BYTES);
     assert_eq!(report.latency_ticks.len(), completed);
     assert_eq!(report.final_used, [0; 11]);

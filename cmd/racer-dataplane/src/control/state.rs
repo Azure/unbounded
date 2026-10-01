@@ -501,4 +501,182 @@ mod cache_tests {
     }
 }
 #[cfg(test)]
-mod publication_tests;
+mod publication_tests {
+    use super::*;
+    fn publication(sequence: u64) -> Publication {
+        let mut p =
+            crate::control::wire::decode_publication(include_bytes!("testdata/publication.json"))
+                .unwrap();
+        p.sequence.0 = sequence;
+        p.membership_version.0 = 1;
+        // Lifecycle cases use ASCII fabric IDs; wire parity has separate coverage.
+        for member in &mut p.members {
+            for rail in &mut member.rails {
+                rail.fabric = "fabric-a".into();
+            }
+        }
+        p
+    }
+    fn store(retained: usize) -> SnapshotStore {
+        SnapshotStore::new(
+            publication(1).cluster,
+            Arc::new(PublishedState::default()),
+            retained,
+        )
+    }
+    fn membership(sequence: u64, version: u64) -> Publication {
+        let mut next = publication(sequence);
+        next.membership_version.0 = version;
+        next
+    }
+    #[test]
+    fn default_two_old_generations_resolve_without_local_request_pins() {
+        let store = store(2);
+        for version in 1..20 {
+            store.publish(membership(version, version)).unwrap();
+            for old in version.saturating_sub(2).max(1)..=version {
+                assert_eq!(
+                    store
+                        .published
+                        .membership(MembershipVersion(old))
+                        .unwrap()
+                        .version
+                        .0,
+                    old
+                );
+            }
+            assert!(store.published.state.lock().unwrap().memberships.len() <= 3);
+        }
+    }
+    #[test]
+    fn cache_only_history_uses_one_slot_and_weak_registry_stays_bounded() {
+        let store = store(0);
+        let first = store.publish(publication(1)).unwrap();
+        let mut history = vec![first.clone()];
+        for sequence in 2..40 {
+            let mut next = publication(sequence);
+            next.caches.clear();
+            let snapshot = store.publish(next).unwrap();
+            assert!(Arc::ptr_eq(&first.membership, &snapshot.membership));
+            history.push(snapshot);
+            assert_eq!(store.published.state.lock().unwrap().memberships.len(), 1);
+        }
+        let next = membership(40, 2);
+        assert!(matches!(
+            store.publish(next.clone()),
+            Err(Error::Overloaded)
+        ));
+        let weak = Arc::downgrade(&first.membership);
+        drop(first);
+        drop(history);
+        store.publish(next).unwrap();
+        assert!(weak.upgrade().is_none());
+        for version in 3..100 {
+            store.publish(membership(version + 40, version)).unwrap();
+            assert_eq!(store.published.state.lock().unwrap().memberships.len(), 1);
+            assert!(matches!(
+                store.published.membership(MembershipVersion(version - 1)),
+                Err(Error::IncompatibleMembership)
+            ));
+        }
+    }
+    #[test]
+    fn delayed_thread_lease_blocks_admission_until_release() {
+        let store = store(1);
+        let published = store.published.clone();
+        store.publish(publication(1)).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let snapshot = published.current().unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            let incoming = published.membership(MembershipVersion(1)).unwrap();
+            assert!(Arc::ptr_eq(&snapshot.membership, &incoming));
+        });
+        ready_rx.recv().unwrap();
+        let current = store.publish(membership(2, 2)).unwrap();
+        assert!(matches!(
+            store.publish(membership(3, 3)),
+            Err(Error::Overloaded)
+        ));
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        store.publish(membership(3, 3)).unwrap();
+        assert_eq!(current.membership.version, MembershipVersion(2));
+    }
+    #[test]
+    fn atomic_replay_rollback_and_leased_history() {
+        let store = store(1);
+        let first = store.publish(publication(1)).unwrap();
+        assert!(Arc::ptr_eq(&first, &store.publish(publication(1)).unwrap()));
+        let mut changed = publication(1);
+        changed.caches[0].id = CacheId("66666666-6666-4666-8666-666666666666".into());
+        assert!(matches!(store.publish(changed), Err(Error::Replay)));
+        let second = store.publish(membership(2, 2)).unwrap();
+        assert!(matches!(store.publish(publication(1)), Err(Error::Replay)));
+        assert!(matches!(
+            store.publish(membership(3, 3)),
+            Err(Error::Overloaded)
+        ));
+        assert_eq!(store.cursor().unwrap(), Some(PublicationSequence(2)));
+        drop(first);
+        assert!(store.publish(membership(3, 3)).is_ok());
+        drop(second);
+        let mut changed = membership(4, 3);
+        changed.members[0].peer_endpoint = "192.0.2.7:7443".into();
+        assert!(matches!(
+            store.publish(changed.clone()),
+            Err(Error::IncompatibleMembership)
+        ));
+        changed.membership_version.0 += 1;
+        assert!(store.publish(changed).is_ok());
+    }
+    #[test]
+    fn site_changes_require_new_membership_and_preserve_leased_history() {
+        let store = store(3);
+        let old = store.publish(publication(1)).unwrap();
+        let mut next = publication(2);
+        next.members[0].site = "site1".into();
+        assert!(matches!(
+            store.publish(next.clone()),
+            Err(Error::IncompatibleMembership)
+        ));
+        next.membership_version.0 = 2;
+        let current = store.publish(next).unwrap();
+        assert!(old.membership.members()[0].site.is_empty());
+        assert_eq!(current.membership.members()[0].site, "site1");
+        assert_eq!(
+            old.membership.placement_identity(),
+            current.membership.placement_identity()
+        );
+        assert!(
+            store
+                .publish(membership(3, 3))
+                .unwrap()
+                .membership
+                .members()[0]
+                .site
+                .is_empty()
+        );
+    }
+    #[test]
+    fn staged_resources_commit_only_on_accepted_replacement() {
+        struct Transition(Rc<std::cell::Cell<usize>>);
+        impl CacheTransition for Transition {
+            fn commit(self: Box<Self>) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let committed = Rc::new(std::cell::Cell::new(0));
+        let store = store(0);
+        let publish = |p| store.publish_staged(p, Some(Box::new(Transition(committed.clone()))));
+        let first = publish(publication(1)).unwrap();
+        assert_eq!(committed.get(), 1);
+        assert!(matches!(publish(membership(2, 2)), Err(Error::Overloaded)));
+        assert_eq!(committed.get(), 1);
+        drop(first);
+        publish(membership(2, 2)).unwrap();
+        assert_eq!(committed.get(), 2);
+    }
+}

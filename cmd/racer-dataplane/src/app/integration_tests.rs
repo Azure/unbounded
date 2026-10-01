@@ -194,19 +194,7 @@ fn two_workers_start_from_real_control_and_checkpoint_one_complete_cut() {
                 assert_eq!(app.telemetry.metrics.count(Event::MemoryHit), 3);
                 assert_eq!(app.peer_task.is_some(), id == 0);
                 ready.wait();
-                drive(
-                    &runtime,
-                    &mut engine,
-                    app.drain(&scope(Duration::from_secs(5)).unwrap()),
-                )
-                .unwrap();
-                drive(&runtime, &mut engine, runtime.reactor.drain()).unwrap();
-                drive(
-                    &runtime,
-                    &mut engine,
-                    app.shutdown(&scope(Duration::from_secs(5)).unwrap()),
-                )
-                .unwrap();
+                stop_worker(&mut app, &runtime, &mut engine);
             });
         }
     });
@@ -511,19 +499,7 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
     );
 
     drop(_clock);
-    drive(
-        &runtime,
-        &mut engine,
-        worker.drain(&scope(Duration::from_secs(5)).unwrap()),
-    )
-    .unwrap();
-    drive(&runtime, &mut engine, runtime.reactor.drain()).unwrap();
-    drive(
-        &runtime,
-        &mut engine,
-        worker.shutdown(&scope(Duration::from_secs(5)).unwrap()),
-    )
-    .unwrap();
+    stop_worker(&mut worker, &runtime, &mut engine);
 }
 
 #[test]
@@ -909,19 +885,7 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
                 .node,
             new
         );
-        drive(
-            &runtime,
-            &mut engine,
-            worker.drain(&scope(Duration::from_secs(5)).unwrap()),
-        )
-        .unwrap();
-        drive(&runtime, &mut engine, runtime.reactor.drain()).unwrap();
-        drive(
-            &runtime,
-            &mut engine,
-            worker.shutdown(&scope(Duration::from_secs(5)).unwrap()),
-        )
-        .unwrap();
+        stop_worker(&mut worker, &runtime, &mut engine);
     }
 }
 
@@ -1023,6 +987,26 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
     assert_eq!(workers, vec![0, 1]);
     assert!(!node.observations.health.ready());
 }
+fn stop_worker(
+    worker: &mut WorkerApplication,
+    runtime: &WorkerRuntime,
+    engine: &mut dyn CryptoService,
+) {
+    drive(
+        runtime,
+        engine,
+        worker.drain(&scope(Duration::from_secs(5)).unwrap()),
+    )
+    .unwrap();
+    drive(runtime, engine, runtime.reactor.drain()).unwrap();
+    drive(
+        runtime,
+        engine,
+        worker.shutdown(&scope(Duration::from_secs(5)).unwrap()),
+    )
+    .unwrap();
+}
+
 fn drive<T>(
     runtime: &WorkerRuntime,
     engine: &mut dyn CryptoService,
@@ -1125,19 +1109,7 @@ fn blocked_publication_is_superseded_while_projection_rotates() {
         engine.poll_budgeted(64).unwrap();
     }
     assert!(worker.snapshots.current().unwrap().caches.is_empty());
-    drive(
-        &runtime,
-        &mut engine,
-        worker.drain(&scope(Duration::from_secs(5)).unwrap()),
-    )
-    .unwrap();
-    drive(&runtime, &mut engine, runtime.reactor.drain()).unwrap();
-    drive(
-        &runtime,
-        &mut engine,
-        worker.shutdown(&scope(Duration::from_secs(5)).unwrap()),
-    )
-    .unwrap();
+    stop_worker(&mut worker, &runtime, &mut engine);
 }
 
 #[test]

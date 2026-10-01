@@ -62,6 +62,14 @@ fn assert_success(config: &Config, requests: &[Request], report: &Report) {
     assert_eq!(report.latency_ticks.len(), requests.len(), "{report:?}");
 }
 
+fn compare_success(configs: [&Config; 2], requests: &[Request]) -> [Report; 2] {
+    configs.map(|config| {
+        let report = run(config, requests);
+        assert_success(config, requests, &report);
+        report
+    })
+}
+
 fn run(config: &Config, requests: &[Request]) -> Report {
     let mut sim = Simulator::new(config.clone());
     sim.run(requests.to_vec())
@@ -153,11 +161,7 @@ fn larger_request_window_overlaps_fill_and_reader_service() {
     let mut request = Request::new(0, 0);
     request.pages = 12;
     let requests = vec![request];
-    let narrow = run(&narrow_config, &requests);
-    let wide = run(&wide_config, &requests);
-
-    assert_success(&narrow_config, &requests, &narrow);
-    assert_success(&wide_config, &requests, &wide);
+    let [narrow, wide] = compare_success([&narrow_config, &wide_config], &requests);
     assert_eq!(wide.fills, narrow.fills, "window changed page identity");
     assert!(
         total_latency(&wide) < total_latency(&narrow),
@@ -183,11 +187,7 @@ fn slow_disk_sheds_persistence_without_losing_reader_progress() {
     let mut request = Request::new(0, 0);
     request.pages = 24;
     let requests = vec![request];
-    let fast = run(&fast_config, &requests);
-    let slow = run(&slow_config, &requests);
-
-    assert_success(&fast_config, &requests, &fast);
-    assert_success(&slow_config, &requests, &slow);
+    let [fast, slow] = compare_success([&fast_config, &slow_config], &requests);
     assert!(slow.disk_bytes > 0, "disk path was not exercised: {slow:?}");
     assert!(
         slow.persistence_skips > fast.persistence_skips,
@@ -255,11 +255,7 @@ fn workers_share_node_network_bandwidth() {
             request
         })
         .collect();
-    let fast = run(&fast_config, &requests);
-    let slow = run(&slow_config, &requests);
-
-    assert_success(&fast_config, &requests, &fast);
-    assert_success(&slow_config, &requests, &slow);
+    let [fast, slow] = compare_success([&fast_config, &slow_config], &requests);
     assert!(total_latency(&slow) > total_latency(&fast), "{slow:?}");
     // Each object maps to a different worker, but all four inbound pages must
     // cross the same node NIC. Independent worker NICs violate this floor.
@@ -292,11 +288,7 @@ fn cold_nodes_contend_for_one_global_origin_queue() {
             request
         })
         .collect();
-    let fast = run(&fast_config, &requests);
-    let slow = run(&slow_config, &requests);
-
-    assert_success(&fast_config, &requests, &fast);
-    assert_success(&slow_config, &requests, &slow);
+    let [fast, slow] = compare_success([&fast_config, &slow_config], &requests);
     assert!(slow.origin_bytes >= requested_bytes(&requests), "{slow:?}");
     assert!(total_latency(&slow) > total_latency(&fast), "{slow:?}");
     let origin_ticks = requested_bytes(&requests).div_ceil(slow_config.origin_bytes_per_tick);

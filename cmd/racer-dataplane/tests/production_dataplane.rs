@@ -832,11 +832,7 @@ fn fixture_keys() -> (Rc<Keyring>, Rc<Keyring>) {
 }
 
 fn identities(bundle: &mut serde_json::Value, keys: &Keyring) -> Rc<Keyring> {
-    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
-    let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
-    let ca = params.self_signed(&ca_key).unwrap();
+    let (ca, ca_key) = fixture_io::ca();
     let roots = vec![ca.der().to_vec()];
     bundle["peer_trust_roots"] =
         serde_json::json!([base64::engine::general_purpose::STANDARD.encode(&roots[0])]);
@@ -849,32 +845,13 @@ fn identities(bundle: &mut serde_json::Value, keys: &Keyring) -> Rc<Keyring> {
         keyring
             .install(wire::decode_bundle(&serde_json::to_vec(bundle).unwrap()).unwrap())
             .unwrap();
-        let pending = PendingIdentity::generate().unwrap();
-        let secret = pending.export_pkcs8_for_persistence().unwrap();
-        let key = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
-            &rustls::pki_types::PrivatePkcs8KeyDer::from(secret.as_slice()),
-            &rcgen::PKCS_ED25519,
-        )
-        .unwrap();
-        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-        params.subject_alt_names = vec![rcgen::SanType::URI(
-            format!("spiffe://{CLUSTER}/node/{}", keyring.node().0)
-                .try_into()
-                .unwrap(),
-        )];
-        params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
-        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-        let certificate = params.signed_by(&key, &ca, &ca_key).unwrap();
         keyring
-            .install_signing_identity(Arc::new(
-                pending
-                    .accept(
-                        ClusterId(CLUSTER.into()),
-                        keyring.node().clone(),
-                        vec![certificate.der().to_vec()],
-                        &roots,
-                    )
-                    .unwrap(),
+            .install_signing_identity(fixture_io::signing_identity(
+                PendingIdentity::generate().unwrap(),
+                &ca,
+                &ca_key,
+                ClusterId(CLUSTER.into()),
+                keyring.node().clone(),
             ))
             .unwrap();
     }

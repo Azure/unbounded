@@ -3,10 +3,243 @@
 pub(crate) mod async_files;
 mod dns;
 pub mod enrollment;
-pub mod secrets;
+pub mod secrets {
+    use super::{
+        wire::{self, BundleGeneration, KeyringBundle},
+        *,
+    };
+    use sha2::{Digest, Sha256};
+
+    pub struct BundleInstaller {
+        keys: RefCell<Rc<Keyring>>,
+        accepted: RefCell<Option<(BundleGeneration, [u8; 32], Vec<Vec<u8>>)>>,
+    }
+    impl BundleInstaller {
+        pub fn new(keys: Rc<Keyring>) -> Self {
+            Self {
+                keys: RefCell::new(keys),
+                accepted: RefCell::new(None),
+            }
+        }
+        pub fn generation(&self) -> Option<BundleGeneration> {
+            self.accepted
+                .borrow()
+                .as_ref()
+                .map(|(generation, _, _)| *generation)
+        }
+        pub fn bind_keyring(&self, keys: Rc<Keyring>) {
+            *self.keys.borrow_mut() = keys;
+            *self.accepted.borrow_mut() = None;
+        }
+        pub fn install(
+            &self,
+            mut bundle: KeyringBundle,
+        ) -> Result<(BundleGeneration, Vec<Vec<u8>>)> {
+            bundle.peer_trust_roots.sort();
+            bundle.cache_keys.sort_by(|a, b| {
+                (&a.key.cache, a.key.purpose as u8, a.key.id.0).cmp(&(
+                    &b.key.cache,
+                    b.key.purpose as u8,
+                    b.key.id.0,
+                ))
+            });
+            let encoded = zeroize::Zeroizing::new(wire::encode_bundle(&bundle)?);
+            let hash: [u8; 32] = Sha256::digest(&*encoded).into();
+            if let Some((generation, old, roots)) = self.accepted.borrow().as_ref() {
+                if bundle.generation < *generation
+                    || bundle.generation == *generation && hash != *old
+                {
+                    return Err(Error::Replay);
+                }
+                if bundle.generation == *generation {
+                    return Ok((*generation, roots.clone()));
+                }
+            }
+            let roots = bundle.peer_trust_roots.clone();
+            let generation = self.keys.borrow().install(bundle)?;
+            *self.accepted.borrow_mut() = Some((generation, hash, roots.clone()));
+            Ok((generation, roots))
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::{os::unix::fs::symlink, sync::Arc};
+        #[test]
+        fn bundle_installation_is_idempotent_and_rejects_rollback() {
+            use crate::security::identity::{KeyEpochs, KeyPurpose};
+            let publication =
+                wire::decode_publication(include_bytes!("control/testdata/publication.json"))
+                    .unwrap();
+            let keys = Rc::new(Keyring::new(
+                publication.cluster,
+                publication.members[0].node.clone(),
+                Arc::new(KeyEpochs::default()),
+            ));
+            let installer = BundleInstaller::new(keys.clone());
+            let (ca, _) = testing::ca();
+            let mut bundle =
+                wire::decode_bundle(include_bytes!("control/testdata/bundle.json")).unwrap();
+            bundle.generation = BundleGeneration(2);
+            bundle.peer_trust_roots = vec![ca.der().to_vec()];
+            // Retain page keys only: the wire vector repeats material across purposes.
+            bundle.cache_keys.truncate(2);
+            let cache = bundle.cache_keys[0].key.cache.clone();
+            for _ in 0..2 {
+                assert_eq!(
+                    installer.install(bundle.clone()).unwrap().0,
+                    BundleGeneration(2)
+                );
+                assert!(keys.active(&cache, KeyPurpose::Page).is_ok());
+            }
+            assert!(wire::decode_bundle(b"{}").is_err());
+            bundle.generation = BundleGeneration(0);
+            assert!(installer.install(bundle).is_err());
+            assert_eq!(installer.generation(), Some(BundleGeneration(2)));
+            assert!(keys.active(&cache, KeyPurpose::Page).is_ok());
+        }
+        #[test]
+        fn coherent_projection_rejects_partial_and_escaping_links() {
+            let Some(reactor) = testing::reactor() else {
+                return;
+            };
+            let d = testing::Directory::new();
+            let scope = testing::scope();
+            let read = || {
+                testing::drive(
+                    &reactor,
+                    Box::pin(async_files::projected_file(
+                        &reactor,
+                        &d.0,
+                        "bundle.json",
+                        wire::MAX_BUNDLE_BYTES,
+                        &scope,
+                    )),
+                )
+            };
+            std::fs::create_dir(d.0.join("epoch-a")).unwrap();
+            std::fs::write(
+                d.0.join("epoch-a/bundle.json"),
+                include_bytes!("control/testdata/bundle.json"),
+            )
+            .unwrap();
+            symlink("epoch-a", d.0.join("..data")).unwrap();
+            symlink("/dev/null", d.0.join("bundle.json")).unwrap();
+            assert!(wire::decode_bundle(&read().unwrap()).is_ok());
+            std::fs::create_dir(d.0.join("epoch-b")).unwrap();
+            symlink("epoch-b", d.0.join("..next")).unwrap();
+            std::fs::rename(d.0.join("..next"), d.0.join("..data")).unwrap();
+            assert!(read().is_err());
+            std::fs::write(d.0.join("epoch-b/bundle.json"), b"{\"generation\":null}").unwrap();
+            assert!(wire::decode_bundle(&read().unwrap()).is_err());
+            std::fs::remove_file(d.0.join("..data")).unwrap();
+            symlink("../", d.0.join("..data")).unwrap();
+            assert!(read().is_err());
+        }
+    }
+}
 pub mod state;
 #[cfg(test)]
-pub(crate) mod testing;
+pub(crate) mod testing {
+    use crate as dataplane;
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+    #[allow(dead_code)]
+    mod io {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/enrollment.rs"
+        ));
+    }
+    pub(super) use io::drive;
+    pub(crate) use io::{ca, signing_identity};
+    pub(super) struct Directory(pub PathBuf);
+    impl Directory {
+        pub fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target/control-tests")
+                .join(format!(
+                    "{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    pub(super) fn scope() -> crate::runtime::deadline::RequestScope {
+        crate::runtime::deadline::RequestScope::new(
+            crate::model::RequestId([7; 16]),
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .unwrap()
+    }
+    pub(super) fn reactor() -> Option<std::rc::Rc<crate::runtime::reactor::Reactor>> {
+        match io_uring::IoUring::new(2) {
+            Ok(ring) => drop(ring),
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(libc::ENOSYS | libc::EPERM | libc::EACCES)
+                ) =>
+            {
+                eprintln!("control io_uring unavailable: {e}");
+                return None;
+            }
+            Err(e) => panic!("io_uring setup: {e}"),
+        }
+        Some(io::reactor())
+    }
+    pub(super) fn issue(
+        request: &super::wire::EnrollmentRequest,
+        ca: &rcgen::Certificate,
+        key: &rcgen::KeyPair,
+        node: &str,
+    ) -> super::wire::EnrollmentResponse {
+        issue_at(
+            request,
+            ca,
+            key,
+            node,
+            crate::runtime::environment::wall_now() - std::time::Duration::from_secs(1),
+        )
+    }
+    pub(crate) fn issue_at(
+        request: &super::wire::EnrollmentRequest,
+        ca: &rcgen::Certificate,
+        key: &rcgen::KeyPair,
+        node: &str,
+        not_before: std::time::SystemTime,
+    ) -> super::wire::EnrollmentResponse {
+        let der = rustls::pki_types::CertificateSigningRequestDer::from(request.csr_der.clone());
+        let mut csr = rcgen::CertificateSigningRequestParams::from_der(&der).unwrap();
+        csr.params.not_before = not_before.into();
+        csr.params.not_after = (not_before + std::time::Duration::from_secs(86400)).into();
+        csr.params.subject_alt_names = vec![rcgen::SanType::URI(
+            format!("spiffe://{}/node/{node}", request.cluster.0)
+                .try_into()
+                .unwrap(),
+        )];
+        csr.params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        csr.params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        let cert = csr.signed_by(ca, key).unwrap();
+        super::wire::EnrollmentResponse {
+            schema_version: 1,
+            cluster: request.cluster.clone(),
+            node: crate::model::NodeId(node.into()),
+            enrollment: request.enrollment.clone(),
+            certificate_chain: vec![cert.der().to_vec()],
+        }
+    }
+}
 pub mod transport;
 pub mod wire;
 

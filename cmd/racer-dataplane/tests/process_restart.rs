@@ -8,6 +8,7 @@ mod throughput;
 use racer_dataplane as dataplane;
 use racer_dataplane::{model::PAGE_BYTES, store::checkpoint};
 #[path = "support/enrollment.rs"]
+#[allow(dead_code)]
 mod enrollment_io;
 use enrollment_io::{fields, read_head};
 use std::{
