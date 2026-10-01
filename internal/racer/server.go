@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -23,19 +24,20 @@ import (
 )
 
 type Server struct {
-	Config         Config
-	Trust          *Trust
-	Bootstrap      *Bootstrap
-	Publications   *Publications
-	Lifecycle      *Lifecycle
-	Replication    *Replication
-	once           sync.Once
-	admission      sync.Mutex
-	polls          map[wire.NodeID]struct{}
-	keyringPolls   map[wire.NodeID]struct{}
-	authSlots      chan struct{}
-	bootstrapSlots chan struct{}
-	writes         chan struct{}
+	Config             Config
+	Trust              *Trust
+	Bootstrap          *Bootstrap
+	Publications       *Publications
+	Lifecycle          *Lifecycle
+	Replication        *Replication
+	once               sync.Once
+	admission          sync.Mutex
+	polls              map[wire.NodeID]struct{}
+	keyringPolls       map[wire.NodeID]struct{}
+	authSlots          chan struct{}
+	bootstrapSlots     chan struct{}
+	writes             chan struct{}
+	servingCertificate atomic.Pointer[servingCertificateReloader]
 }
 
 var (
@@ -73,6 +75,8 @@ func (s *Server) TLSConfig(ctx context.Context) (*tls.Config, error) {
 	}
 
 	go reloader.run(ctx, servingCertificatePollInterval)
+
+	s.servingCertificate.Store(reloader)
 
 	return s.tlsConfigWithCertificate(ctx, reloader.getCertificate), nil
 }
@@ -279,6 +283,15 @@ func release(slots chan struct{}) { <-slots }
 func (s *Server) Ready(r *http.Request) error {
 	if s.Lifecycle == nil {
 		return wire.Unavailable
+	}
+
+	reloader := s.servingCertificate.Load()
+	if reloader == nil {
+		return wire.Unavailable
+	}
+
+	if _, err := reloader.getCertificate(nil); err != nil {
+		return err
 	}
 
 	if _, err := s.Trust.pool(); err != nil {

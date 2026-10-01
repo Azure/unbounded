@@ -137,6 +137,68 @@ func TestServingCertificateValidation(t *testing.T) {
 
 func certificatePointer(c tls.Certificate) *tls.Certificate { return &c }
 
+func TestServerReadinessTracksCachedServingCertificate(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newServingFixture(t)
+		s := f.a.Server
+		s.servingCertificate.Store(nil)
+
+		if s.Ready(nil) == nil {
+			t.Fatal("ready without serving certificate initialization")
+		}
+
+		r := &servingCertificateReloader{}
+		s.servingCertificate.Store(r)
+
+		if s.Ready(nil) == nil {
+			t.Fatal("ready with empty certificate cache")
+		}
+
+		dir := t.TempDir()
+		now := time.Now()
+		first := servingTestCertificate(t, 1, now.Add(-time.Minute), now.Add(2*time.Second), nil, false)
+		writeServingTestPair(t, dir, first)
+
+		r.certificateFile, r.keyFile = filepath.Join(dir, "tls.crt"), filepath.Join(dir, "tls.key")
+		if err := r.reload(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := s.Ready(nil); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := os.WriteFile(r.certificateFile, []byte("broken projection"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		if r.reload() == nil {
+			t.Fatal("accepted invalid reload")
+		}
+
+		if err := s.Ready(nil); err != nil {
+			t.Fatal("lost valid last-good certificate", err)
+		}
+
+		time.Sleep(2 * time.Second)
+
+		if s.Ready(nil) == nil {
+			t.Fatal("ready with expired cached certificate")
+		}
+
+		second := servingTestCertificate(t, 2, now.Add(-time.Minute), now.Add(time.Hour), nil, false)
+		writeServingTestPair(t, dir, second)
+
+		if err := r.reload(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := s.Ready(nil); err != nil {
+			t.Fatal("reload did not restore readiness", err)
+		}
+	})
+}
+
 func TestServingCertificateProjectionAndRecovery(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now()

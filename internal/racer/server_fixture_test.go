@@ -36,7 +36,16 @@ type servingFixture struct {
 
 // Fixed-certificate adapter for socket tests; production always uses the reloader.
 func (s *Server) tlsConfig(ctx context.Context, certificate tls.Certificate) *tls.Config {
-	return s.tlsConfigWithCertificate(ctx, func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return &certificate, nil })
+	validated, err := validateServingCertificate(certificate, time.Now())
+	if err != nil {
+		panic(err)
+	}
+
+	r := &servingCertificateReloader{}
+	r.current.Store(validated)
+	s.servingCertificate.Store(r)
+
+	return s.tlsConfigWithCertificate(ctx, r.getCertificate)
 }
 
 func newServingFixture(t *testing.T) *servingFixture {
@@ -86,6 +95,7 @@ func newServingFixture(t *testing.T) *servingFixture {
 
 	roots := x509.NewCertPool()
 	roots.AddCert(cert)
+	a.Server.tlsConfig(ctx, tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key})
 
 	return &servingFixture{a: a, token: token, key: key, request: request, certificate: tls.Certificate{Certificate: response.CertificateChain, PrivateKey: key}, serverCertificate: tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, roots: roots, ctx: ctx, cancel: cancel}
 }

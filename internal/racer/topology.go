@@ -45,13 +45,6 @@ type TopologyReconciler struct {
 // authoritatively, commits counters/hashes with CAS, then installs the result.
 // Conflicts requeue from fresh inputs; missing established counters fail closed.
 func (r *TopologyReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
-	if r.CatalogGate != nil {
-		if err := r.CatalogGate.Acquire(ctx); err != nil {
-			return ctrl.Result{}, reconcile.TerminalError(err)
-		}
-		defer r.CatalogGate.Release()
-	}
-
 	if err := ctx.Err(); err != nil {
 		return ctrl.Result{}, reconcile.TerminalError(err)
 	}
@@ -79,6 +72,33 @@ func (r *TopologyReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctr
 }
 
 func (r *TopologyReconciler) reconcile(ctx context.Context) error {
+	var update topologyUpdate
+	if err := r.publish(ctx, &update); err != nil {
+		return err
+	}
+
+	return r.annotate(ctx, update)
+}
+
+type topologyUpdate struct {
+	nodes   corev1.NodeList
+	members AcceptedMembers
+}
+
+// publish protects authoritative reads, CAS, and local installation. Annotation
+// writes are recovery hints, not authority, and must not block trust observation.
+func (r *TopologyReconciler) publish(ctx context.Context, update *topologyUpdate) error {
+	if r.CatalogGate != nil {
+		if err := r.CatalogGate.Acquire(ctx); err != nil {
+			return err
+		}
+		defer r.CatalogGate.Release()
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	cm, previous, err := readVersion(ctx, r.APIReader, r.Config)
 	if err != nil {
 		r.suspendInvalidAuthority(err)
@@ -173,11 +193,16 @@ func (r *TopologyReconciler) reconcile(ctx context.Context) error {
 	}
 
 	r.Accepted = candidate
+	*update = topologyUpdate{nodes: nodes, members: candidate}
 
-	for i := range nodes.Items {
-		node := &nodes.Items[i]
+	return nil
+}
 
-		member, ok := candidate[wire.NodeID(node.UID)]
+func (r *TopologyReconciler) annotate(ctx context.Context, update topologyUpdate) error {
+	for i := range update.nodes.Items {
+		node := &update.nodes.Items[i]
+
+		member, ok := update.members[wire.NodeID(node.UID)]
 		if !ok {
 			if _, excluded := node.Labels[wire.ExclusionLabel]; excluded && node.Annotations[admittedMemberAnnotation] != "" {
 				before := node.DeepCopy()
