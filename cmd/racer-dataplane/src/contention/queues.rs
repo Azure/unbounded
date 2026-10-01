@@ -1,4 +1,10 @@
-//! Independent queue bounds, cancellation, and scheduled-owner edge cases.
+//! Model mechanics: queue bounds, cancellation, and scheduled-owner edge cases.
+//!
+//! These tests drive Simulator events and inspect its accounting, not production
+//! I/O or completion fences. Allocation-backed comparisons live in fidelity.rs;
+//! production queue behavior belongs to the memory/runtime and app scenarios.
+//! Keep event ordering and terminal accounting here even when fidelity tests
+//! compare the same resource owners: those comparisons do not run this scheduler.
 use super::*;
 
 fn global_capacity_config() -> Config {
@@ -14,13 +20,10 @@ fn global_capacity_config() -> Config {
 }
 
 #[test]
-fn two_live_caches_can_use_global_pipe_capacity_until_exhaustion() {
-    assert_global_capacity(ResourceClass::Pipe);
-}
-
-#[test]
-fn two_live_caches_can_use_global_connection_capacity_until_exhaustion() {
-    assert_global_capacity(ResourceClass::Connection);
+fn two_live_caches_can_use_global_transport_capacity_until_exhaustion() {
+    for class in [ResourceClass::Pipe, ResourceClass::Connection] {
+        assert_global_capacity(class);
+    }
 }
 
 fn assert_global_capacity(class: ResourceClass) {
@@ -268,7 +271,7 @@ fn one_pipe_drains_a_full_bounded_queue_sequentially() {
     }
     assert_eq!(sim.workers[0].pipe_queue, VecDeque::from([1, 2, 3]));
 
-    // A fresh run exercises the real dispatcher and terminal accounting.
+    // A fresh run exercises the model event dispatcher and terminal accounting.
     let report = Simulator::new(config.clone()).run(vec![request(); count]);
     assert_outcomes(&report, count, 0, 0);
     assert_eq!(report.peak_requests, count);

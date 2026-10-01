@@ -459,78 +459,23 @@ impl Rig {
         let http = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 8));
         let buffers = Rc::new(BufferPool::new(admission.clone()));
         let memory = Rc::new(MemoryCache::new(buffers.clone()));
-        let index = Rc::new(Index::new(worker, entries));
-        let segments = Rc::new(Segments::new(worker, 64 * 1024 * 1024));
-        let slabs = Rc::new(Slabs::new(
+        let (index, disk, writer) = open_fixture_storage(
             worker,
             scratch.path.join("slabs"),
-            reactor.clone(),
-            admission.clone(),
             slab_bytes,
-            64 * 1024 * 1024,
-        ));
-        let eviction = Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1));
-        let disk = Rc::new(StoreReader::new(
-            eviction.clone(),
-            index.clone(),
-            segments.clone(),
-            slabs.clone(),
+            entries,
+            &reactor,
+            &admission,
             buffers.clone(),
-        ));
-        let writer = Rc::new(StoreWriter::new(index.clone(), segments, slabs));
-        writer
-            .configure(admission.clone(), eviction, 64, entries)
-            .unwrap();
-        futures::executor::block_on(writer.open()).expect("real O_DIRECT slab must open");
-        let keys = Rc::new(Keyring::new(
-            ClusterId(CLUSTER.into()),
-            NodeId(NODE.into()),
-            Arc::new(KeyEpochs::default()),
-        ));
-        // The wire fixture reuses material across purposes; the real keyring
-        // requires distinct material. These are deterministic test-only keys.
-        let mut bundle: serde_json::Value =
-            serde_json::from_slice(include_bytes!("../src/control/testdata/bundle.json")).unwrap();
-        for (i, key) in bundle["cache_keys"]
-            .as_array_mut()
-            .unwrap()
-            .iter_mut()
-            .enumerate()
-        {
-            key["material"] = base64::engine::general_purpose::STANDARD
-                .encode([i as u8 + 7; 32])
-                .into();
-        }
-        let sender_keys = identities(&mut bundle, &keys);
+        );
+        let (keys, sender_keys) = fixture_keys();
         let published = Arc::new(PublishedState::default());
         let snapshots = Rc::new(SnapshotStore::new(
             ClusterId(CLUSTER.into()),
             published.clone(),
             4,
         ));
-        let (client_socket, origin_socket) = canonical_socket_paths("production-fixture").unwrap();
-        let snapshot = snapshots
-            .publish(Publication {
-                schema_version: 1,
-                cluster: ClusterId(CLUSTER.into()),
-                sequence: PublicationSequence(1),
-                membership_version: MembershipVersion(1),
-                members: vec![Member {
-                    node: NodeId(NODE.into()),
-                    shares: NonZeroU32::new(4).unwrap(),
-                    peer_endpoint: "127.0.0.1:8000".into(),
-                    rails: vec![],
-                    alignment_enabled: false,
-                    site: String::new(),
-                }],
-                caches: vec![CacheDefinition {
-                    id: CacheId(CACHE.into()),
-                    name: "production-fixture".into(),
-                    client_socket,
-                    origin_socket,
-                }],
-            })
-            .unwrap();
+        let snapshot = snapshots.publish(fixture_publication()).unwrap();
         let network = Rc::new(PeerNetwork::new(NodeId(NODE.into()), published).unwrap());
         let certificates = Rc::new(Certificates::new(ClusterId(CLUSTER.into()), keys.clone()));
         let signatures = Rc::new(Signatures::new(keys.clone(), certificates));
@@ -791,6 +736,89 @@ struct Bootstrap {
     credentials: CredentialCrypto,
     coordinator: Rc<Coordinator>,
     membership: MembershipLease,
+}
+
+fn open_fixture_storage(
+    worker: WorkerId,
+    path: PathBuf,
+    slab_bytes: u64,
+    entries: usize,
+    reactor: &Rc<Reactor>,
+    admission: &Rc<Admission>,
+    buffers: Rc<BufferPool>,
+) -> (Rc<Index>, Rc<StoreReader>, Rc<StoreWriter>) {
+    let index = Rc::new(Index::new(worker, entries));
+    let segments = Rc::new(Segments::new(worker, 64 * 1024 * 1024));
+    let slabs = Rc::new(Slabs::new(
+        worker,
+        path,
+        reactor.clone(),
+        admission.clone(),
+        slab_bytes,
+        64 * 1024 * 1024,
+    ));
+    let eviction = Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1));
+    let disk = Rc::new(StoreReader::new(
+        eviction.clone(),
+        index.clone(),
+        segments.clone(),
+        slabs.clone(),
+        buffers,
+    ));
+    let writer = Rc::new(StoreWriter::new(index.clone(), segments, slabs));
+    writer
+        .configure(admission.clone(), eviction, 64, entries)
+        .unwrap();
+    futures::executor::block_on(writer.open()).expect("real O_DIRECT slab must open");
+    (index, disk, writer)
+}
+
+fn fixture_publication() -> Publication {
+    let (client_socket, origin_socket) = canonical_socket_paths("production-fixture").unwrap();
+    Publication {
+        schema_version: 1,
+        cluster: ClusterId(CLUSTER.into()),
+        sequence: PublicationSequence(1),
+        membership_version: MembershipVersion(1),
+        members: vec![Member {
+            node: NodeId(NODE.into()),
+            shares: NonZeroU32::new(4).unwrap(),
+            peer_endpoint: "127.0.0.1:8000".into(),
+            rails: vec![],
+            alignment_enabled: false,
+            site: String::new(),
+        }],
+        caches: vec![CacheDefinition {
+            id: CacheId(CACHE.into()),
+            name: "production-fixture".into(),
+            client_socket,
+            origin_socket,
+        }],
+    }
+}
+
+fn fixture_keys() -> (Rc<Keyring>, Rc<Keyring>) {
+    let keys = Rc::new(Keyring::new(
+        ClusterId(CLUSTER.into()),
+        NodeId(NODE.into()),
+        Arc::new(KeyEpochs::default()),
+    ));
+    // The wire fixture reuses material across purposes; the real keyring
+    // requires distinct material. These are deterministic test-only keys.
+    let mut bundle: serde_json::Value =
+        serde_json::from_slice(include_bytes!("../src/control/testdata/bundle.json")).unwrap();
+    for (i, key) in bundle["cache_keys"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .enumerate()
+    {
+        key["material"] = base64::engine::general_purpose::STANDARD
+            .encode([i as u8 + 7; 32])
+            .into();
+    }
+    let sender = identities(&mut bundle, &keys);
+    (keys, sender)
 }
 
 fn identities(bundle: &mut serde_json::Value, keys: &Keyring) -> Rc<Keyring> {
