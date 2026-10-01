@@ -3,77 +3,18 @@
 //! Only readiness and trust-file reads use a test adapter; TLS, HTTP, enrollment,
 //! and wire decoding are production implementations.
 use racer_dataplane as dataplane;
+#[path = "support/enrollment.rs"]
+#[allow(dead_code)]
+mod enrollment_io;
 use racer_dataplane::{
     control::{ControlEndpoint, enrollment::Enrollment, transport::*, wire},
-    error::{Error, Operation},
     model::{ClusterId, RequestId},
-    runtime::{deadline::RequestScope, reactor::Descriptor},
+    runtime::deadline::RequestScope,
 };
 use std::{
-    os::fd::AsRawFd,
-    path::Path,
     rc::Rc,
     time::{Duration, Instant},
 };
-
-struct Io;
-impl ControlIo for Io {
-    fn read_file<'a>(
-        &'a self,
-        path: &'a Path,
-        limit: usize,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, zeroize::Zeroizing<Vec<u8>>> {
-        Box::pin(async move {
-            scope.check()?;
-            let bytes = std::fs::read(path).map_err(|_| Error::Io)?;
-            if bytes.len() > limit {
-                return Err(Error::Overloaded);
-            }
-            Ok(zeroize::Zeroizing::new(bytes))
-        })
-    }
-    fn resolve<'a>(
-        &'a self,
-        host: &'a str,
-        port: u16,
-        _: &'a RequestScope,
-    ) -> Operation<'a, Vec<std::net::SocketAddr>> {
-        Box::pin(async move {
-            assert_eq!(host, "127.0.0.1");
-            Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))])
-        })
-    }
-    fn ready<'a>(
-        &'a self,
-        fd: Rc<Descriptor>,
-        read: bool,
-        write: bool,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, ()> {
-        Box::pin(async move {
-            loop {
-                scope.check()?;
-                let mut poll = libc::pollfd {
-                    fd: fd.as_raw_fd(),
-                    events: (if read { libc::POLLIN } else { 0 })
-                        | (if write { libc::POLLOUT } else { 0 }),
-                    revents: 0,
-                };
-                let result = unsafe { libc::poll(&mut poll, 1, 10) };
-                if result > 0 {
-                    return Ok(());
-                }
-                if result < 0 {
-                    return Err(Error::Io);
-                }
-            }
-        })
-    }
-    fn sleep<'a>(&'a self, _: Instant, _: &'a RequestScope) -> Operation<'a, ()> {
-        Box::pin(async { Err(Error::InvalidConfiguration) })
-    }
-}
 
 #[test]
 #[ignore = "run RACER_RUST_INTEROP=1 go test ./internal/racer -run '^TestRustKeyringInterop$' -timeout=5m under the required external timeout"]
@@ -96,7 +37,8 @@ fn go_controller_keyring_bootstrap_mtls_and_rotation() {
         url: config["endpoint"].clone(),
         trust_bundle: directory.join("trust.pem"),
     });
-    transport.attach_io(Rc::new(Io));
+    assert!(config["endpoint"].starts_with("https://127.0.0.1:"));
+    transport.attach_io(Rc::new(enrollment_io::ControlIo));
     let scope =
         RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(90)).unwrap();
 
@@ -142,9 +84,6 @@ fn go_controller_keyring_bootstrap_mtls_and_rotation() {
         enrollment
             .set_peer_trust_roots(initial.peer_trust_roots.clone())
             .unwrap();
-        #[path = "support/enrollment.rs"]
-        #[allow(dead_code)]
-        mod enrollment_io;
         let reactor = enrollment_io::reactor();
         enrollment.attach_reactor(reactor.clone());
         let request = enrollment_io::drive(&reactor, enrollment.prepare(&scope)).unwrap();

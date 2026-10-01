@@ -174,75 +174,7 @@ fn request_heads_validate_and_bound_credentials_before_copying() {
     );
 }
 
-/// Test-only synchronous driver. Production uses ReactorControlIo and never
-/// calls poll from within a future; this drives real loopback TLS fixtures.
-pub(in crate::control) struct FixtureIo;
-impl ControlIo for FixtureIo {
-    fn read_file<'a>(
-        &'a self,
-        path: &'a std::path::Path,
-        limit: usize,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, zeroize::Zeroizing<Vec<u8>>> {
-        Box::pin(async move {
-            use std::os::unix::fs::OpenOptionsExt;
-            scope.check()?;
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-                .open(path)
-                .map_err(|_| Error::Io)?;
-            if !file.metadata().map_err(|_| Error::Io)?.is_file() {
-                return Err(Error::InvalidRequest);
-            }
-            let mut bytes = zeroize::Zeroizing::new(Vec::new());
-            file.take(limit as u64 + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|_| Error::Io)?;
-            if bytes.len() > limit {
-                return Err(Error::Overloaded);
-            }
-            Ok(bytes)
-        })
-    }
-    fn resolve<'a>(
-        &'a self,
-        _: &'a str,
-        port: u16,
-        _: &'a RequestScope,
-    ) -> Operation<'a, Vec<SocketAddr>> {
-        Box::pin(async move { Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))]) })
-    }
-    fn ready<'a>(
-        &'a self,
-        fd: Rc<Descriptor>,
-        read: bool,
-        write: bool,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, ()> {
-        Box::pin(async move {
-            loop {
-                scope.check()?;
-                let mut poll = libc::pollfd {
-                    fd: fd.as_raw_fd(),
-                    events: (if read { libc::POLLIN } else { 0 })
-                        | (if write { libc::POLLOUT } else { 0 }),
-                    revents: 0,
-                };
-                let n = unsafe { libc::poll(&mut poll, 1, 10) };
-                if n > 0 {
-                    return Ok(());
-                }
-                if n < 0 {
-                    return Err(Error::Io);
-                }
-            }
-        })
-    }
-    fn sleep<'a>(&'a self, _: Instant, _: &'a RequestScope) -> Operation<'a, ()> {
-        Box::pin(async { Ok(()) })
-    }
-}
+pub(in crate::control) use testing::FixtureIo;
 
 /// Each group must use exactly one TLS connection. EOF after each group
 /// proves that failure/retirement closes the socket rather than just hiding it.

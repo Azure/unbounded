@@ -154,7 +154,7 @@ pub(crate) mod testing {
         ));
     }
     pub(super) use io::drive;
-    pub(crate) use io::{ca, signing_identity};
+    pub(crate) use io::{ControlIo as FixtureIo, ca, signing_identity};
     pub(super) struct Directory(pub PathBuf);
     impl Directory {
         pub fn new() -> Self {
