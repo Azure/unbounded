@@ -35,7 +35,7 @@ use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
 #[derive(Clone)]
 pub struct FillDependencies {
     pub memory: Rc<MemoryCache>,
-    pub buffers: Rc<BufferPool>,
+    pub buffers: BufferPool,
     pub disk: Rc<StoreReader>,
     pub writer: Rc<StoreWriter>,
     pub origin: Rc<dyn Origin>,

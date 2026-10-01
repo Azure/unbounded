@@ -236,10 +236,7 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
     let baseline = admission.used(ResourceClass::RequestContext);
     let signers = network(protocol::MAX_HOPS + 1);
     let forwarding: Vec<_> = signers.iter().map(|s| Forwarding::new(s.clone())).collect();
-    let codec = protocol::SecurityCodec::new(
-        admission.clone(),
-        Rc::new(BufferPool::new(admission.clone())),
-    );
+    let codec = protocol::SecurityCodec::new(admission.clone(), BufferPool::new(admission.clone()));
     let crypto = CredentialCrypto::new(
         Rc::new(crate::security::identity::keyring_tests::keys()),
         admission.clone(),

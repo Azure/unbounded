@@ -1142,7 +1142,7 @@ mod tests {
         ));
         let codec = SecurityCodec::new(
             admission.clone(),
-            Rc::new(crate::memory::pool::BufferPool::new(admission)),
+            crate::memory::pool::BufferPool::new(admission),
         );
         let (auth, _) = WireCodec::decode(
             WireCodec::encode(&forwarded.authentication, false, 0).unwrap(),

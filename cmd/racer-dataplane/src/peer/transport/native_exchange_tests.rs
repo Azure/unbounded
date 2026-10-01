@@ -42,7 +42,7 @@ fn transfers(
         admission.clone(),
         Rc::new(super::super::protocol::SecurityCodec::new(
             admission.clone(),
-            Rc::new(BufferPool::new(admission.clone())),
+            BufferPool::new(admission.clone()),
         )),
         signatures.clone(),
     )
@@ -504,7 +504,7 @@ fn native_roundtrip(simulated: bool, reverse: bool, rejected_site: Option<&str>,
             admission.clone(),
             Rc::new(super::super::protocol::SecurityCodec::new(
                 admission.clone(),
-                Rc::new(BufferPool::new(admission.clone())),
+                BufferPool::new(admission.clone()),
             )),
             signatures.clone(),
         )

@@ -174,7 +174,7 @@ fn duplicate_owners_match_full_page_occupancy_until_each_last_owner() {
     let model = admission(2);
     let real = admission(2);
     let cache = CacheId("owners".into());
-    let memory = MemoryCache::new(Rc::new(BufferPool::new(real.clone())));
+    let memory = MemoryCache::new(BufferPool::new(real.clone()));
     let retained = MetadataOwners::reserve(&model, &cache);
     let page = allocated_page(&real, &cache, "v1", PLAIN);
     let id = page.plaintext.page().clone();
@@ -252,7 +252,7 @@ fn fair_reclamation_matches_metadata_trace_and_keeps_other_cache() {
             ..Config::default()
         });
         let real = admission(4);
-        let memory = MemoryCache::new(Rc::new(BufferPool::new(real.clone())));
+        let memory = MemoryCache::new(BufferPool::new(real.clone()));
         // reserve_page uses numeric cache IDs, including for fair-share scope.
         let a = CacheId("0".into());
         let b = CacheId("1".into());
@@ -490,7 +490,7 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
     let real_dirty = real
         .reserve(Some(&cache), ResourceClass::DirtyCiphertext, CIPHER)
         .unwrap();
-    let buffers = Rc::new(BufferPool::new(real.clone()));
+    let buffers = BufferPool::new(real.clone());
     let memory = Rc::new(MemoryCache::new(buffers.clone()));
     let mut old_model = MetadataOwners::reserve(&model, &cache);
     Arc::get_mut(&mut old_model.bundle.plain)

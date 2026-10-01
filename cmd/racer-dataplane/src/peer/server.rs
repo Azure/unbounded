@@ -1440,7 +1440,7 @@ mod tests {
                     relay,
                     Rc::new(SecurityCodec::new(
                         admission.clone(),
-                        Rc::new(BufferPool::new(admission.clone())),
+                        BufferPool::new(admission.clone()),
                     )),
                     signers[1].clone(),
                 )

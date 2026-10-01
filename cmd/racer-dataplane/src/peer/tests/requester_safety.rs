@@ -115,7 +115,7 @@ fn probe_exchange(opaque: bool, case: &str) {
     let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2));
     let codec = Rc::new(SecurityCodec::new(
         admission.clone(),
-        Rc::new(crate::memory::pool::BufferPool::new(admission.clone())),
+        crate::memory::pool::BufferPool::new(admission.clone()),
     ));
     let transfers = Rc::new(Transfers::new(
         pool,

@@ -3,7 +3,7 @@ use super::*;
 use crate::read::{candidates::OriginAuthority, drivers};
 
 pub(super) struct GatedMetadataOrigin {
-    pub(super) buffers: Rc<BufferPool>,
+    pub(super) buffers: BufferPool,
     pub(super) receive: RefCell<Option<futures::channel::oneshot::Receiver<MetadataReply>>>,
     pub(super) calls: Cell<usize>,
 }

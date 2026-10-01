@@ -391,10 +391,10 @@ mod envelope_tests {
 /// Decode the canonical security profile while retaining charged body ownership.
 pub struct SecurityCodec {
     admission: Rc<Admission>,
-    buffers: Rc<BufferPool>,
+    buffers: BufferPool,
 }
 impl SecurityCodec {
-    pub fn new(admission: Rc<Admission>, buffers: Rc<BufferPool>) -> Self {
+    pub fn new(admission: Rc<Admission>, buffers: BufferPool) -> Self {
         Self { admission, buffers }
     }
 }
@@ -513,7 +513,7 @@ mod metadata_tests {
         limits.ciphertext_bytes = std::num::NonZeroUsize::new(19).unwrap();
         let admission = Rc::new(Admission::new(limits.clone()));
         let foreign = Admission::new(limits);
-        let buffers = Rc::new(BufferPool::new(admission.clone()));
+        let buffers = BufferPool::new(admission.clone());
         let codec = SecurityCodec::new(admission.clone(), buffers.clone());
         let metadata = ObjectMetadata {
             content_type: None,

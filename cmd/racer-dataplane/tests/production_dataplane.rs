@@ -457,7 +457,7 @@ impl Rig {
             admission.clone(),
         ));
         let http = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 8));
-        let buffers = Rc::new(BufferPool::new(admission.clone()));
+        let buffers = BufferPool::new(admission.clone());
         let memory = Rc::new(MemoryCache::new(buffers.clone()));
         let (index, disk, writer) = open_fixture_storage(
             worker,

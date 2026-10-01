@@ -87,7 +87,7 @@ fn client() -> (OriginClient, Rc<Admission>, Rc<Reactor>) {
         Arc::new(PublishedState::default()),
         2,
     ));
-    let buffers = Rc::new(BufferPool::new(admission.clone()));
+    let buffers = BufferPool::new(admission.clone());
     (
         OriginClient::new(
             snapshots,

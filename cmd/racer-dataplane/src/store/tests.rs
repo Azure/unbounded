@@ -45,7 +45,7 @@ struct Fixture {
     store: Store,
     admission: Rc<Admission>,
     reactor: Rc<Reactor>,
-    pool: Rc<BufferPool>,
+    pool: BufferPool,
     segments: Rc<catalog::Segments>,
     _directory: Directory,
 }
@@ -59,7 +59,7 @@ impl Fixture {
             crate::test_support::cluster::config(false).limits,
         ));
         let reactor = Rc::new(Reactor::new(admission.clone()));
-        let pool = Rc::new(BufferPool::new(admission.clone()));
+        let pool = BufferPool::new(admission.clone());
         let index = Rc::new(catalog::Index::new(WorkerId(0), 16));
         let segments = Rc::new(catalog::Segments::new(WorkerId(0), 32 * 1024 * 1024));
         let eviction = Rc::new(catalog::SegmentClock::new(

@@ -76,7 +76,7 @@ pub struct OriginClient {
     pool: Rc<HttpPool>,
     io: Rc<HttpIo>,
     admission: Rc<Admission>,
-    buffers: Rc<BufferPool>,
+    buffers: BufferPool,
     socket_root: PathBuf,
 }
 impl OriginClient {
@@ -91,7 +91,7 @@ impl OriginClient {
         pool: Rc<HttpPool>,
         io: Rc<HttpIo>,
         admission: Rc<Admission>,
-        buffers: Rc<BufferPool>,
+        buffers: BufferPool,
         root: impl Into<PathBuf>,
     ) -> Result<Self> {
         let root = root.into();

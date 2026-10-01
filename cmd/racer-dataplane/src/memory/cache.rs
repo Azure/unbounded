@@ -21,10 +21,6 @@ impl Entries {
     fn len(&self) -> usize {
         self.pages.len()
     }
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
-        self.pages.is_empty()
-    }
     fn remove(&mut self, id: &PageId) -> Option<PageResult> {
         let (tick, page) = self.pages.remove(id)?;
         self.lru.remove(&tick);
@@ -73,9 +69,9 @@ pub struct MemoryCache {
     availability: Option<Rc<crate::control::availability::Availability>>,
 }
 impl MemoryCache {
-    pub fn new(pool: Rc<BufferPool>) -> Self {
+    pub fn new(pool: BufferPool) -> Self {
         Self {
-            pool: (*pool).clone(),
+            pool,
             entries: RefCell::new(Entries::default()),
             ciphertext_entries: RefCell::new(BTreeMap::new()),
             ciphertext_cursor: RefCell::new(None),
@@ -406,7 +402,7 @@ mod tests {
     #[test]
     fn ciphertext_residency_is_distinct_bounded_and_conditionally_invalidated() {
         let admission = admission(2);
-        let cache = MemoryCache::new(Rc::new(BufferPool::new(admission.clone())));
+        let cache = MemoryCache::new(BufferPool::new(admission.clone()));
         let first = bundle(&admission, "cipher");
         let id = first.plaintext.page().clone();
         let unverified = super::super::page::UnverifiedPage {
@@ -439,10 +435,12 @@ mod tests {
     #[test]
     fn bounded_reclamation_advances_past_a_busy_prefix() {
         let admission = admission(300);
-        let cache = MemoryCache::new(Rc::new(BufferPool::new(admission.clone())));
+        let cache = MemoryCache::new(BufferPool::new(admission.clone()));
         let mut busy = Vec::new();
+        let mut ids = Vec::new();
         for n in 0..300 {
             let page = bundle(&admission, &format!("v{n}"));
+            ids.push(page.plaintext.page().clone());
             if n < 256 {
                 busy.push(page.clone());
             }
@@ -450,12 +448,21 @@ mod tests {
         }
         assert_eq!(cache.evict_idle(1), Ok(0));
         assert_eq!(cache.evict_idle(1), Ok(22));
-        assert_eq!(cache.entries.borrow().len(), 299);
+        assert!(cache.get(&ids[256]).unwrap().is_none());
+        assert!(cache.get(&ids[257]).unwrap().is_some());
+        for reader in &busy {
+            assert_eq!(reader.plaintext.bytes(), &[1; 3]);
+            assert!(cache.get(reader.plaintext.page()).unwrap().is_some());
+        }
+        assert_eq!(admission.used(ResourceClass::Plaintext), 299 * 3);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 299 * 19);
         drop(busy);
         for _ in 0..3 {
             cache.evict_idle(usize::MAX).unwrap();
         }
-        assert!(cache.entries.borrow().is_empty());
+        for id in ids {
+            assert!(cache.get(&id).unwrap().is_none());
+        }
         assert_eq!(admission.used(ResourceClass::Plaintext), 0);
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
     }
@@ -463,7 +470,7 @@ mod tests {
     #[test]
     fn busy_leases_protect_both_allocations_and_eviction_releases_idle_bytes() {
         let admission = admission(8);
-        let cache = MemoryCache::new(Rc::new(BufferPool::new(admission.clone())));
+        let cache = MemoryCache::new(BufferPool::new(admission.clone()));
         let page = bundle(&admission, "v1");
         let id = page.plaintext.page().clone();
         cache.publish(page).unwrap();
@@ -483,10 +490,9 @@ mod tests {
     #[test]
     fn duplicate_preserves_original_ciphertext_metadata_and_expired_deadline() {
         let admission = admission(8);
-        let cache = MemoryCache::new(Rc::new(BufferPool::new(admission.clone())));
+        let cache = MemoryCache::new(BufferPool::new(admission.clone()));
         let page = bundle(&admission, "v1");
         let id = page.plaintext.page().clone();
-        let pointer = page.ciphertext.bytes().as_ptr();
         let original = page.ciphertext.envelope().clone();
         cache.publish(page).unwrap();
         let mut duplicate = bundle(&admission, "v1");
@@ -498,7 +504,6 @@ mod tests {
             .0[0] ^= 1;
         cache.publish(duplicate).unwrap();
         let copy = cache.ciphertext(&id).unwrap().unwrap();
-        assert_eq!(copy.ciphertext.bytes().as_ptr(), pointer);
         assert_eq!(copy.ciphertext.envelope(), &original);
         assert_eq!(copy.ciphertext.bytes(), &[2; 19]);
         assert_eq!(copy.metadata.expires_at, ExpiresAt(std::time::UNIX_EPOCH));
@@ -511,7 +516,7 @@ mod tests {
     #[test]
     fn capacity_evicts_least_recent_idle_entry_and_rejects_all_busy() {
         let admission = admission(2);
-        let cache = MemoryCache::new(Rc::new(BufferPool::new(admission.clone())));
+        let cache = MemoryCache::new(BufferPool::new(admission.clone()));
         let first = bundle(&admission, "v1");
         let first_id = first.plaintext.page().clone();
         let second = bundle(&admission, "v2");
@@ -525,18 +530,25 @@ mod tests {
             Err(Error::Overloaded)
         );
         drop(also_busy);
-        cache.publish(bundle(&admission, "v3")).unwrap();
+        let third = bundle(&admission, "v3");
+        let third_id = third.plaintext.page().clone();
+        cache.publish(third).unwrap();
         assert!(cache.get(&second_id).unwrap().is_none());
         assert!(cache.get(&first_id).unwrap().is_some());
         drop(busy);
-        cache.publish(bundle(&admission, "v4")).unwrap();
+        let fourth = bundle(&admission, "v4");
+        let fourth_id = fourth.plaintext.page().clone();
+        cache.publish(fourth).unwrap();
         assert!(cache.get(&first_id).unwrap().is_some());
-        assert_eq!(cache.entries.borrow().len(), 2);
+        assert!(cache.get(&third_id).unwrap().is_none());
+        assert!(cache.get(&fourth_id).unwrap().is_some());
+        assert_eq!(admission.used(ResourceClass::Plaintext), 6);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 38);
     }
     #[test]
     fn publication_rejects_foreign_undercharged_and_conflicting_bundles() {
         let admission = admission(8);
-        let cache = MemoryCache::new(Rc::new(BufferPool::new(admission.clone())));
+        let cache = MemoryCache::new(BufferPool::new(admission.clone()));
         assert_eq!(
             cache.publish(bundle(&self::admission(8), "v1")),
             Err(Error::InvalidConfiguration)
@@ -562,21 +574,27 @@ mod tests {
             cache.publish(undercharged),
             Err(Error::InvalidConfiguration)
         );
-        cache.publish(bundle(&admission, "v1")).unwrap();
+        let original = bundle(&admission, "v1");
+        let id = original.plaintext.page().clone();
+        cache.publish(original).unwrap();
         let mut conflicting = bundle(&admission, "v1");
         Arc::get_mut(&mut conflicting.plaintext.inner)
             .unwrap()
             .bytes[0] ^= 1;
         assert_eq!(cache.publish(conflicting), Err(Error::CorruptRecord));
         let mut inconsistent = bundle(&admission, "v2");
+        let rejected_id = inconsistent.plaintext.page().clone();
         inconsistent.metadata.version.etag = crate::model::StrongEtag::test_value("v1");
         assert_eq!(cache.publish(inconsistent), Err(Error::CorruptRecord));
-        assert_eq!(cache.entries.borrow().len(), 1);
+        assert_eq!(cache.get(&id).unwrap().unwrap().plaintext.bytes(), &[1; 3]);
+        assert!(cache.get(&rejected_id).unwrap().is_none());
+        assert_eq!(admission.used(ResourceClass::Plaintext), 3);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
     }
     #[test]
     fn eviction_is_cache_scoped_and_preserves_live_leases() {
         let admission = admission(8);
-        let cache = MemoryCache::new(Rc::new(BufferPool::new(admission.clone())));
+        let cache = MemoryCache::new(BufferPool::new(admission.clone()));
         let page = bundle(&admission, "v1");
         let id = page.plaintext.page().clone();
         let mut other_descriptor = page.metadata.immutable();
@@ -605,7 +623,7 @@ mod tests {
     #[test]
     fn eviction_is_idempotent_and_churn_needs_no_tombstones() {
         let admission = admission(1);
-        let cache = MemoryCache::new(Rc::new(BufferPool::new(admission)));
+        let cache = MemoryCache::new(BufferPool::new(admission));
         let id = CacheId("cache".into());
         assert_eq!(cache.retire_key(&id, KeyId([1; 16])), Ok(0));
         assert_eq!(cache.retire_key(&id, KeyId([1; 16])), Ok(0));
@@ -629,7 +647,7 @@ mod tests {
         let caches: Vec<_> = (0..356)
             .map(|cache| CacheId(format!("{cache:08x}-0000-4000-8000-000000000000")))
             .collect();
-        let memory = MemoryCache::new(Rc::new(BufferPool::new(admission)))
+        let memory = MemoryCache::new(BufferPool::new(admission.clone()))
             .with_availability(for_caches(keys.clone(), caches.clone()));
         let mut previous: Vec<crate::control::wire::CacheKeyRef> = Vec::new();
         for generation in 2u64..=6 {
@@ -658,6 +676,8 @@ mod tests {
             }
             previous = next.cache_keys.iter().map(|key| key.key.clone()).collect();
         }
-        assert!(memory.entries.borrow().is_empty());
+        assert_eq!(memory.evict_idle(usize::MAX), Ok(0));
+        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
     }
 }

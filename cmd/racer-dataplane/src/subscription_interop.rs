@@ -23,7 +23,7 @@ use std::{
 
 // Only origin content is generated. No client wire framing, scheduling, credit
 // accounting, page validation, encryption, or delivery is implemented here.
-struct GeneratedOrigin(Rc<memory::pool::BufferPool>);
+struct GeneratedOrigin(memory::pool::BufferPool);
 fn metadata(context: &OriginContext) -> ObjectMetadata {
     let length = match context.object.key.0[0] {
         0 => 0,
@@ -199,7 +199,7 @@ impl SubscriptionFixture {
         let admission = Rc::new(Admission::new(limits.clone()));
         let reactor = Rc::new(Reactor::new(admission.clone()));
         reactor.init().unwrap();
-        let buffers = Rc::new(BufferPool::new(admission.clone()));
+        let buffers = BufferPool::new(admission.clone());
         let keys = Rc::new(interop_keys());
         let snapshots = Rc::new(SnapshotStore::new(
             keys.cluster().clone(),

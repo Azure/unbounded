@@ -133,7 +133,7 @@ impl AdapterOrigin {
         snapshots: Rc<SnapshotStore>,
         admission: Rc<Admission>,
         reactor: Rc<Reactor>,
-        buffers: Rc<BufferPool>,
+        buffers: BufferPool,
     ) -> Rc<OriginClient> {
         Rc::new(
             OriginClient::new(

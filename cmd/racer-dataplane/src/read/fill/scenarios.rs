@@ -37,7 +37,7 @@ use std::{
 
 use crate::test_support::NoPeers as NoPeer;
 struct TestOrigin {
-    buffers: Rc<BufferPool>,
+    buffers: BufferPool,
     calls: Cell<usize>,
     metadata: ObjectMetadata,
     reject_once: Cell<bool>,
@@ -167,7 +167,7 @@ fn fixture_with_availability(
         keys.clone(),
         vec![CacheId(crate::security::identity::tests::CACHE.into())],
     );
-    let buffers = Rc::new(BufferPool::new(admission.clone()));
+    let buffers = BufferPool::new(admission.clone());
     let memory = MemoryCache::new(buffers.clone());
     let memory = Rc::new(if check_availability {
         memory.with_availability(availability.clone())

@@ -531,7 +531,7 @@ impl WorkerApplication {
             ),
             admission.clone(),
         ));
-        let buffers = Rc::new(BufferPool::new(admission.clone()));
+        let buffers = BufferPool::new(admission.clone());
         let memory =
             Rc::new(MemoryCache::new(buffers.clone()).with_availability(availability.clone()));
         let pipes = Rc::new(PipePool::new(admission.clone(), reactor.clone()));
@@ -879,7 +879,7 @@ impl WorkerApplication {
         node: &NodeState,
         worker: WorkerId,
         runtime: &WorkerRuntime,
-        buffers: Rc<BufferPool>,
+        buffers: BufferPool,
         availability: Rc<crate::control::availability::Availability>,
         metrics: &crate::telemetry::metrics::Metrics,
     ) -> Result<Store> {

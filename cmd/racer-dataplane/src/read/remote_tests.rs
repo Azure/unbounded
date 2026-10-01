@@ -339,7 +339,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     ));
     let codec = Rc::new(protocol::SecurityCodec::new(
         admission.clone(),
-        Rc::new(BufferPool::new(admission.clone())),
+        BufferPool::new(admission.clone()),
     ));
     let transfers = Rc::new(Transfers::new(
         Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2)),
@@ -916,7 +916,7 @@ fn metadata_coordinator_with_newer_publication(
         // Peer acquisition must use the ingress lease, even when current
         // membership has advanced and no longer includes this candidate.
     }
-    let buffers = Rc::new(BufferPool::new(admission.clone()));
+    let buffers = BufferPool::new(admission.clone());
     let index = Rc::new(Index::new(WorkerId(0), 16));
     let segments = Rc::new(Segments::new(WorkerId(0), 64 * 1024 * 1024));
     let slabs = Rc::new(Slabs::new(

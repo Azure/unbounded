@@ -70,7 +70,7 @@ pub struct StoreReader {
     index: Rc<Index>,
     segments: Rc<Segments>,
     slabs: Rc<Slabs>,
-    buffers: Rc<BufferPool>,
+    buffers: BufferPool,
 }
 #[derive(Clone)]
 /// Permits conditional invalidation without removing a replacement mapping.
@@ -90,7 +90,7 @@ impl StoreReader {
         index: Rc<Index>,
         segments: Rc<Segments>,
         slabs: Rc<Slabs>,
-        buffers: Rc<BufferPool>,
+        buffers: BufferPool,
     ) -> Self {
         Self {
             metrics: crate::telemetry::metrics::Metrics::default(),
