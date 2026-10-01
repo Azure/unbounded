@@ -306,3 +306,99 @@ func TestAssignPodCIDRsLiveGetError(t *testing.T) {
 		t.Fatal("CIDR was allocated after failed live read")
 	}
 }
+
+// failFirstPatchWithConflict makes the first patch fail with a conflict. If
+// concurrentCIDR is non-empty, it is written to the live node before the
+// conflict is returned, simulating another writer assigning pod CIDRs.
+func (h *podCIDRTestHarness) failFirstPatchWithConflict(t *testing.T, concurrentCIDR string) {
+	t.Helper()
+
+	attempts := 0
+
+	h.client.PrependReactor("patch", "nodes", func(clienttesting.Action) (bool, runtime.Object, error) {
+		attempts++
+		if attempts > 1 {
+			return false, nil, nil
+		}
+
+		node, err := h.client.Tracker().Get(schema.GroupVersionResource{Version: "v1", Resource: "nodes"}, "", podCIDRTestNode)
+		if err != nil {
+			t.Errorf("get node from tracker: %v", err)
+			return true, nil, err
+		}
+
+		updated := node.(*corev1.Node).DeepCopy()
+		updated.ResourceVersion = "9"
+
+		if concurrentCIDR != "" {
+			updated.Spec.PodCIDR = concurrentCIDR
+			updated.Spec.PodCIDRs = []string{concurrentCIDR}
+		}
+
+		if err := h.client.Tracker().Update(schema.GroupVersionResource{Version: "v1", Resource: "nodes"}, updated, ""); err != nil {
+			t.Errorf("update node in tracker: %v", err)
+			return true, nil, err
+		}
+
+		return true, nil, apierrors.NewConflict(schema.GroupResource{Resource: "nodes"}, podCIDRTestNode, errors.New("resourceVersion changed"))
+	})
+}
+
+func TestAssignPodCIDRsRetriesOnConflict(t *testing.T) {
+	h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
+	h.failFirstPatchWithConflict(t, "")
+
+	if err := h.sc.assignPodCIDRsForNodeWithLabel(context.Background(), h.cached, h.sites, "site-a"); err != nil {
+		t.Fatalf("expected conflict to be retried, got %v", err)
+	}
+
+	if len(h.patches) != 2 {
+		t.Fatalf("expected two patch attempts, got %d", len(h.patches))
+	}
+
+	if got := decodePatch(t, h.patches[0])["metadata"]["resourceVersion"]; got != "4" {
+		t.Fatalf("first patch resourceVersion = %v, want 4", got)
+	}
+
+	if got := decodePatch(t, h.patches[1])["metadata"]["resourceVersion"]; got != "9" {
+		t.Fatalf("retry patch resourceVersion = %v, want re-read resourceVersion 9", got)
+	}
+
+	if got := decodePatch(t, h.patches[1])["spec"]["podCIDR"]; got != "10.244.0.0/24" {
+		t.Fatalf("retry patch podCIDR = %v, want released CIDR 10.244.0.0/24 reused", got)
+	}
+
+	if h.state.allocator.IsAllocated("10.244.1.0/24") {
+		t.Fatal("conflict retry leaked an extra CIDR allocation")
+	}
+
+	node, err := h.client.CoreV1().Nodes().Get(context.Background(), podCIDRTestNode, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+
+	if node.Spec.PodCIDR != "10.244.0.0/24" {
+		t.Fatalf("node podCIDR = %q, want 10.244.0.0/24", node.Spec.PodCIDR)
+	}
+}
+
+func TestAssignPodCIDRsConflictRetryAdoptsConcurrentAssignment(t *testing.T) {
+	h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
+	h.failFirstPatchWithConflict(t, "10.244.5.0/24")
+
+	if err := h.sc.assignPodCIDRsForNode(context.Background(), h.cached, h.sites, "site-a"); err != nil {
+		t.Fatalf("expected conflict retry to succeed, got %v", err)
+	}
+
+	if len(h.patches) != 1 {
+		t.Fatalf("expected no patch after concurrent assignment, got %d patches", len(h.patches))
+	}
+
+	if h.state.allocator.IsAllocated("10.244.0.0/24") {
+		t.Fatal("CIDR from the conflicted attempt was not released")
+	}
+
+	if !h.state.allocator.IsAllocated("10.244.5.0/24") {
+		t.Fatal("concurrently assigned CIDR was not marked allocated")
+	}
+}

@@ -32,6 +32,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
@@ -2118,7 +2119,20 @@ func (sc *SiteController) computePodCIDRsForNode(state *assignmentAllocator) (st
 // Reading the stale cached node would allocate a second CIDR and attempt an
 // illegal podCIDR change. The patch also carries the observed resourceVersion
 // so a concurrent writer causes a conflict instead of an invalid update.
+//
+// Conflicts are expected while a node is starting up because kubelet and
+// other agents update it frequently, so they are retried here with a fresh
+// read rather than surfacing as sync errors. Each failed attempt releases its
+// CIDRs before the next attempt allocates again.
 func (sc *SiteController) allocateAndPatchNodePodCIDRs(ctx context.Context, nodeName string, state *assignmentAllocator, siteName string) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		return sc.tryAllocateAndPatchNodePodCIDRs(ctx, nodeName, state, siteName)
+	})
+}
+
+// tryAllocateAndPatchNodePodCIDRs performs a single read-allocate-patch attempt
+// for allocateAndPatchNodePodCIDRs.
+func (sc *SiteController) tryAllocateAndPatchNodePodCIDRs(ctx context.Context, nodeName string, state *assignmentAllocator, siteName string) error {
 	liveNode, err := sc.clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
