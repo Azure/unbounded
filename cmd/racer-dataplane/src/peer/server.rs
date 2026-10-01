@@ -49,6 +49,7 @@ pub(crate) struct Settings {
 
 pub struct PeerServer {
     subscriptions: std::sync::Arc<super::subscriptions::Subscriptions>,
+    placement: crate::topology::placement::Placement,
     opaque_relay: bool,
     pipes: Rc<crate::memory::pipe::PipePool>,
     accept: AcceptMode,
@@ -214,6 +215,7 @@ impl PeerServer {
     ) -> Self {
         Self {
             subscriptions,
+            placement: crate::topology::placement::Placement::new(64),
             opaque_relay: settings.opaque_relay,
             pipes,
             accept: settings.accept,
@@ -616,27 +618,27 @@ impl PeerServer {
                 return self.local.serve_peer(request, membership, scope).await;
             };
             membership.member(request.origin().node())?;
-            let placement = crate::topology::placement::Placement::new(64);
             let local = &self.relay.network.local;
-            let selection = self.subscriptions.schedule_eligible(
-                subscription.clone(),
-                membership.version,
-                request.origin().node().clone(),
-                encode_deadline(scope.deadline)?,
-                millis(crate::runtime::environment::wall_now())?,
-                |number| {
-                    if matches!(mode, super::protocol::FetchMode::CopyOnly) {
-                        return true;
-                    }
-                    placement
-                        .rank(
-                            membership.clone(),
-                            &subscription.version.object,
-                            crate::model::PageNumber(number),
-                        )
-                        .is_ok_and(|rank| rank.ordered.first() == Some(local))
-                },
-            )?;
+            let selection = if matches!(mode, super::protocol::FetchMode::CopyOnly) {
+                self.subscriptions.schedule(
+                    subscription.clone(),
+                    membership.version,
+                    request.origin().node().clone(),
+                    encode_deadline(scope.deadline)?,
+                    millis(crate::runtime::environment::wall_now())?,
+                )?
+            } else {
+                self.subscriptions
+                    .schedule_scoped(
+                        subscription.clone(),
+                        membership.clone(),
+                        request.origin().node().clone(),
+                        local,
+                        &self.placement,
+                        scope,
+                    )
+                    .await?
+            };
             let (mut work, mut waiter) = match selection {
                 Selection::Leader { work, waiter } => (Some(work), waiter),
                 Selection::Follower(waiter) => (None, waiter),

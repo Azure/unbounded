@@ -235,6 +235,82 @@ impl Subscriptions {
         now_ms: u64,
         eligible: impl Fn(u64) -> bool,
     ) -> Result<Selection> {
+        let key = self.admit(subscription, membership, receiver, deadline, now_ms)?;
+        self.select(&key, now_ms, |page| Some(eligible(page)))?
+            .map_err(|_| Error::Internal)
+    }
+
+    /// Retain the accepted sequence before yielding, but spend no credits until
+    /// selection commits. Every retry sweeps current demand and checks the exact
+    /// sequence, capacity, expiry and pending owner under the scheduler mutex.
+    pub(crate) async fn schedule_scoped(
+        self: &Arc<Self>,
+        subscription: Subscription,
+        membership: crate::topology::membership::MembershipLease,
+        receiver: NodeId,
+        local: &NodeId,
+        placement: &crate::topology::placement::Placement,
+        scope: &crate::runtime::deadline::RequestScope,
+    ) -> Result<Selection> {
+        use crate::security::protocol::{encode_deadline, millis};
+        let now = || millis(crate::runtime::environment::wall_now());
+        scope.check()?;
+        let object = subscription.version.object.clone();
+        let key = self.admit(
+            subscription,
+            membership.version,
+            receiver,
+            encode_deadline(scope.deadline)?,
+            now()?,
+        )?;
+        let mut eligible = HashMap::new();
+        // Bound retained endpoint decisions even if concurrent demand continually
+        // changes. This is the maximum size of one compact scheduler sweep.
+        let maximum = self
+            .limits
+            .max_entries
+            .saturating_mul(MAX_DEMAND_INTERVALS)
+            .saturating_add(self.limits.max_completed_intervals)
+            .saturating_mul(2);
+        loop {
+            scope.check()?;
+            match self.select(&key, now()?, |page| eligible.get(&page).copied())? {
+                Ok(selection) => return Ok(selection),
+                Err(page) => {
+                    if eligible.len() >= maximum {
+                        return Err(Error::Overloaded);
+                    }
+                    let rank = placement
+                        .rank_scoped(membership.clone(), &object, PageNumber(page), Some(scope))
+                        .await?;
+                    eligible.insert(page, rank.ordered.first() == Some(local));
+                    // A ready/hot rank must not chain arbitrary endpoint work in
+                    // one poll. Also separate the final cold quantum from the
+                    // next rank, preserving the per-poll member hash bound.
+                    let mut yielded = false;
+                    std::future::poll_fn(|cx| {
+                        if yielded {
+                            Poll::Ready(())
+                        } else {
+                            yielded = true;
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                    })
+                    .await;
+                }
+            }
+        }
+    }
+
+    fn admit(
+        &self,
+        subscription: Subscription,
+        membership: MembershipVersion,
+        receiver: NodeId,
+        deadline: u64,
+        now_ms: u64,
+    ) -> Result<(EntryKey, u64)> {
         if membership.0 == 0
             || receiver.0.is_empty()
             || receiver.0.len() > MAX_FIELD_BYTES
@@ -252,6 +328,7 @@ impl Subscriptions {
                 receiver: receiver.clone(),
                 id: subscription.id,
             };
+            let sequence = subscription.sequence;
             if let Some(entry) = state.entries.get_mut(&key) {
                 if subscription.sequence <= entry.subscription.sequence {
                     return Err(Error::Replay);
@@ -292,20 +369,46 @@ impl Subscriptions {
                     },
                 );
             }
-            let entry = &state.entries[&key];
+            Ok((key, sequence))
+        })
+    }
+
+    /// An unknown eligibility endpoint is returned without reserving a flight.
+    /// The caller computes it outside the lock, then repeats this transaction.
+    fn select(
+        self: &Arc<Self>,
+        (key, sequence): &(EntryKey, u64),
+        now_ms: u64,
+        eligible: impl Fn(u64) -> Option<bool>,
+    ) -> Result<std::result::Result<Selection, u64>> {
+        self.with_state(Some(now_ms), |state| {
+            let entry = state.entries.get(key).ok_or(Error::DeadlineExceeded)?;
+            if entry.deadline <= state.now {
+                return Err(Error::DeadlineExceeded);
+            }
+            if entry.subscription.sequence != *sequence {
+                return Err(Error::Replay);
+            }
+            if entry.pending.is_some() {
+                return Err(Error::Overloaded);
+            }
             if entry.subscription.page_budget == 0 || entry.subscription.byte_budget == 0 {
                 return Err(Error::Unavailable);
             }
             if state.pending.len() >= self.limits.max_pending {
                 return Err(Error::Overloaded);
             }
-            let number = state.select(&key, &eligible).ok_or(Error::Unavailable)?;
+            let number = match state.select(key, &eligible) {
+                Ok(number) => number.ok_or(Error::Unavailable)?,
+                Err(page) => return Ok(Err(page)),
+            };
+            let deadline = entry.deadline;
             let page = PageId {
                 version: entry.subscription.version.clone(),
                 number: PageNumber(number),
             };
             let flight_key = FlightKey {
-                membership,
+                membership: key.membership,
                 page: page.clone(),
             };
             let existing = state.flights.iter().find_map(|(&token, candidate)| {
@@ -327,13 +430,13 @@ impl Subscriptions {
             if existing.is_none() {
                 state.flights.insert(flight, flight_key);
             }
-            let entry = state.entries.get_mut(&key).expect("admitted entry");
+            let entry = state.entries.get_mut(key).expect("admitted entry");
             entry.subscription.page_budget -= 1;
             entry.pending = Some(token);
             state.pending.insert(
                 token,
                 Pending {
-                    entry: key,
+                    entry: key.clone(),
                     flight,
                     deadline,
                     result: None,
@@ -345,7 +448,7 @@ impl Subscriptions {
                 scheduler: self.clone(),
                 token: Some(token),
             };
-            Ok(if existing.is_some() {
+            Ok(Ok(if existing.is_some() {
                 Selection::Follower(waiter)
             } else {
                 Selection::Leader {
@@ -356,7 +459,7 @@ impl Subscriptions {
                     },
                     waiter,
                 }
-            })
+            }))
         })
     }
 }
@@ -385,7 +488,11 @@ impl State {
         // Never release acquisition capacity while the owner can still run Fill.
     }
 
-    fn select(&self, target: &EntryKey, eligible: &impl Fn(u64) -> bool) -> Option<u64> {
+    fn select(
+        &self,
+        target: &EntryKey,
+        eligible: &impl Fn(u64) -> Option<bool>,
+    ) -> std::result::Result<Option<u64>, u64> {
         let version = &self.entries[target].subscription.version;
         // Sweep endpoints, not pages. Count distinct receivers, not subscription
         // IDs, so one receiver cannot boost its priority by issuing duplicate IDs.
@@ -427,12 +534,12 @@ impl State {
                 }
                 cursor += 1;
             }
-            if active && receivers.len() > score && eligible(point) {
+            if active && receivers.len() > score && eligible(point).ok_or(point)? {
                 best = Some(point);
                 score = receivers.len();
             }
         }
-        best
+        Ok(best)
     }
 
     fn remove_pending(&mut self, token: u64) -> Option<Pending> {
@@ -761,6 +868,97 @@ mod tests {
         assert_eq!(demand.page_count(), u64::MAX);
         assert!(demand.contains(u64::MAX - 1));
         assert!(!demand.contains(u64::MAX));
+    }
+    #[test]
+    fn deferred_selection_rechecks_fairness_sequence_expiry_capacity_and_credits() {
+        let scheduler = Arc::new(Subscriptions::new(Default::default()).unwrap());
+        let key = scheduler
+            .admit(
+                subscription(1, 0, 20),
+                MembershipVersion(1),
+                NodeId("a".into()),
+                1000,
+                1,
+            )
+            .unwrap();
+        assert!(matches!(scheduler.select(&key, 1, |_| None), Ok(Err(0))));
+        // Demand arriving while rank is suspended changes the winner. A cached
+        // answer for page zero must not commit the obsolete candidate.
+        let Selection::Leader { work, waiter } =
+            schedule(&scheduler, subscription(2, 8, 9), "b").unwrap()
+        else {
+            panic!()
+        };
+        assert!(matches!(
+            scheduler.select(&key, 1, |p| (p == 0).then_some(true)),
+            Ok(Err(8))
+        ));
+        let Ok(Selection::Follower(follower)) = scheduler.select(&key, 1, |_| Some(true)).unwrap()
+        else {
+            panic!("must join current hot page")
+        };
+        assert!(matches!(
+            scheduler.select(&key, 1, |_| Some(true)),
+            Err(Error::Overloaded)
+        ));
+        assert_eq!(
+            scheduler.state.lock().unwrap().entries[&key.0]
+                .subscription
+                .page_budget,
+            9
+        );
+        drop((work, waiter, follower));
+        // Accepted updates invalidate suspended older work, without another debit.
+        let mut update = subscription(1, 0, 20);
+        update.sequence = 1;
+        update.page_budget = 9;
+        let latest = scheduler
+            .admit(update, MembershipVersion(1), NodeId("a".into()), 1000, 1)
+            .unwrap();
+        assert!(matches!(
+            scheduler.select(&key, 1, |_| Some(true)),
+            Err(Error::Replay)
+        ));
+        assert!(matches!(
+            scheduler.select(&latest, 1000, |_| Some(true)),
+            Err(Error::DeadlineExceeded)
+        ));
+        assert_eq!(
+            scheduler.state.lock().unwrap().entries[&key.0]
+                .subscription
+                .page_budget,
+            9
+        );
+
+        let scheduler = Arc::new(
+            Subscriptions::new(SubscriptionLimits {
+                max_pending: 1,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let key = scheduler
+            .admit(
+                subscription(1, 0, 20),
+                MembershipVersion(1),
+                NodeId("a".into()),
+                1000,
+                1,
+            )
+            .unwrap();
+        assert!(matches!(scheduler.select(&key, 1, |_| None), Ok(Err(0))));
+        let held = schedule(&scheduler, subscription(2, 8, 9), "b").unwrap();
+        assert!(matches!(
+            scheduler.select(&key, 1, |_| Some(true)),
+            Err(Error::Overloaded)
+        ));
+        assert_eq!(
+            scheduler.state.lock().unwrap().entries[&key.0]
+                .subscription
+                .page_budget,
+            10
+        );
+        drop(held);
     }
     #[test]
     fn provider_chooses_from_whole_demand_and_joins_one_completed_flight() {

@@ -20,6 +20,14 @@ use std::{
 
 pub const SLOT_COUNT: u32 = 1 << 20;
 const WORK_QUANTUM: usize = 256;
+#[cfg(test)]
+thread_local! {
+    static SCORED_MEMBERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(crate) fn scored_members() -> usize {
+    SCORED_MEMBERS.get()
+}
 /// Conservative allocation charge: ranking, four scores, Rc/RefCell, BTree
 /// entry and FIFO key, including container slack and allocator overhead.
 pub const RANKING_BYTES: usize = 512;
@@ -99,6 +107,8 @@ fn exponential_cost(sample: u64) -> u64 {
 
 impl Ranking {
     fn score(membership: &Membership, slot: u32, index: usize) -> Score {
+        #[cfg(test)]
+        SCORED_MEMBERS.set(SCORED_MEMBERS.get() + 1);
         let member = &membership.members()[index];
         let mut digest = hash::domain(b"racer/hrw/v1\0");
         digest.update(slot.to_be_bytes());

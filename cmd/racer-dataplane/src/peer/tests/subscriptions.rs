@@ -205,11 +205,16 @@ fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failure
         let mut first = server.dispatch(codec.request(first, &first_scope).unwrap(), &first_scope);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(first.as_mut().poll(&mut cx).is_pending());
+        assert!(first.as_mut().poll(&mut cx).is_pending());
         let second = subscribe(&admission, B, 2, 0, FetchMode::Acquire);
         let second_scope = second.origin.scope().clone();
         let (second, second_binding) = senders[1].sign_request(second).unwrap();
         let mut second = server.dispatch(second, &second_scope);
-        assert!(second.as_mut().poll(&mut cx).is_pending());
+        // Both compact endpoints may need independent cooperative eligibility
+        // checks before the follower joins the held leader.
+        for _ in 0..4 {
+            assert!(second.as_mut().poll(&mut cx).is_pending());
+        }
         assert_eq!(service.calls.get(), 1);
         service.ready.set(true);
         let Poll::Ready(Ok(first)) = first.as_mut().poll(&mut cx) else {
@@ -244,6 +249,252 @@ fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failure
             .unwrap();
         assert!(matches!(verified.response(), PeerResponse::Selected { .. }));
     }
+}
+
+#[test]
+fn signed_ingress_cold_selection_is_bounded_cancellable_and_does_not_block_other_workers() {
+    use crate::peer::subscriptions::Selection;
+    use crate::topology::placement::scored_members;
+
+    struct Never;
+    impl PeerTransport for Never {
+        fn exchange<'a>(
+            &'a self,
+            _: protocol::SignedRequest,
+            _: crate::topology::membership::MembershipLease,
+            _: &'a RequestScope,
+        ) -> crate::error::Operation<'a, protocol::SignedResponse> {
+            Box::pin(async { panic!("destination must not relay") })
+        }
+    }
+    impl server::LocalPageService for Never {
+        fn serve_peer<'a>(
+            &'a self,
+            _: protocol::VerifiedRequest,
+            _: crate::topology::membership::MembershipLease,
+            _: &'a RequestScope,
+        ) -> crate::error::Operation<'a, PeerResponse> {
+            Box::pin(async { panic!("all demand endpoints must be ineligible") })
+        }
+    }
+    let signers = signers();
+    let sender = Forwarding::new(signers[0].clone());
+    let admission = Rc::new(Admission::new(
+        crate::test_support::cluster::config(false).limits,
+    ));
+    // Full protocol membership; the local provider has negligible weight. The
+    // signed unavailable response below proves all 64 endpoints were ineligible.
+    let membership = Arc::new(
+        Membership::validate(
+            MembershipVersion(1),
+            (0..100_000)
+                .map(|i| Member {
+                    node: NodeId(match i {
+                        0 => A.into(),
+                        1 => C.into(),
+                        _ => format!("member-{i:06}"),
+                    }),
+                    shares: std::num::NonZeroU32::new(if i == 1 { 1 } else { u32::MAX }).unwrap(),
+                    peer_endpoint: "127.0.0.1:8000".into(),
+                    rails: vec![],
+                    alignment_enabled: false,
+                })
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let destination = Rc::new(Forwarding::new(signers[2].clone()));
+    let network = Rc::new(
+        PeerNetwork::new(
+            NodeId(C.into()),
+            crate::control::snapshot::PublishedState::for_membership(membership),
+        )
+        .unwrap(),
+    );
+    let relay = Rc::new(Relay::new(
+        Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
+        destination.clone(),
+        Rc::new(Never),
+        admission.clone(),
+        network,
+    ));
+    let server = server::PeerServer::for_test(
+        Rc::new(HttpIo::with_admission(
+            Rc::new(Reactor::new(admission.clone())),
+            Codec::new(protocol::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
+            admission.clone(),
+        )),
+        destination,
+        admission.clone(),
+        Rc::new(Never),
+        relay,
+        Rc::new(codec(&admission)),
+        signers[2].clone(),
+    );
+    let mut request = subscribe(&admission, A, 70, 0, FetchMode::Acquire);
+    let scope = RequestScope::new(
+        RequestId([70; 16]),
+        Instant::now() + Duration::from_secs(240),
+    )
+    .unwrap();
+    request.origin.scope = scope.clone();
+    request.origin.request = scope.request;
+    request.route.request = scope.request;
+    request.route.deadline = scope.deadline;
+    let Operation::Subscribe { subscription, .. } = &mut request.operation else {
+        panic!()
+    };
+    subscription.demand = Demand::new(
+        (0..64)
+            .map(|i| PageInterval {
+                start: i * 2,
+                end: i * 2 + 1,
+            })
+            .collect(),
+    )
+    .unwrap();
+    let contract = subscription.clone();
+    let (signed, _) = sender.sign_request(request).unwrap();
+    let (wire, _) = WireCodec::decode(
+        WireCodec::encode(&signed.authentication, false, 0).unwrap(),
+        false,
+    )
+    .unwrap();
+    let mut work = server.dispatch(codec(&admission).request(wire, &scope).unwrap(), &scope);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    let before = scored_members();
+    assert!(work.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(scored_members() - before, 256);
+
+    // Another OS worker must acquire the same node-wide scheduler while ingress
+    // ranking is suspended. A bounded channel receive diagnoses lock retention.
+    let scheduler = server.subscription_owner().clone();
+    let mut other = contract.clone();
+    other.id = [71; 16];
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let now = crate::security::protocol::millis(std::time::SystemTime::now()).unwrap();
+        let Selection::Leader { work, mut waiter } = scheduler
+            .schedule(
+                other,
+                MembershipVersion(1),
+                NodeId(B.into()),
+                now + 30_000,
+                now,
+            )
+            .unwrap()
+        else {
+            panic!("independent flight")
+        };
+        work.fail(Error::Unavailable);
+        assert!(matches!(waiter.try_result(now), Err(Error::Unavailable)));
+        send.send(()).unwrap();
+    });
+    receive.recv_timeout(Duration::from_secs(2)).unwrap();
+    worker.join().unwrap();
+    scope.cancel().unwrap();
+    let before = scored_members();
+    assert!(matches!(
+        work.as_mut().poll(&mut cx),
+        Poll::Ready(Err(Error::Cancelled))
+    ));
+    assert_eq!(
+        scored_members(),
+        before,
+        "cancellation must hash no more members"
+    );
+    drop(work);
+    assert_eq!(admission.used(ResourceClass::Waiter), 0);
+
+    // Resume the accepted contract with a new signed sequence and the original
+    // deadline, then traverse every ineligible interval. Every poll is measured,
+    // including rank completion and transition to the next endpoint.
+    let mut request = subscribe(&admission, A, 72, 0, FetchMode::Acquire);
+    let resume_scope = RequestScope::new(scope.request, scope.deadline.0).unwrap();
+    request.origin.scope = resume_scope.clone();
+    request.origin.request = resume_scope.request;
+    request.route.request = resume_scope.request;
+    request.route.deadline = resume_scope.deadline;
+    let mut resume = contract.clone();
+    resume.sequence = 1;
+    request.operation = Operation::Subscribe {
+        subscription: resume,
+        mode: FetchMode::Acquire,
+    };
+    let (signed, binding) = sender.sign_request(request).unwrap();
+    let (wire, _) = WireCodec::decode(
+        WireCodec::encode(&signed.authentication, false, 0).unwrap(),
+        false,
+    )
+    .unwrap();
+    let mut work = server.dispatch(
+        codec(&admission).request(wire, &resume_scope).unwrap(),
+        &resume_scope,
+    );
+    let start = scored_members();
+    let mut polls = 0;
+    let response = loop {
+        let before = scored_members();
+        let result = work.as_mut().poll(&mut cx);
+        assert!(
+            scored_members() - before <= 256,
+            "poll {polls} exceeded rank quantum"
+        );
+        polls += 1;
+        assert!(polls < 30_000, "bounded interval set must finish");
+        if let Poll::Ready(result) = result {
+            break result.unwrap();
+        }
+    };
+    assert!(
+        polls > 20_000,
+        "must actually traverse large cold membership"
+    );
+    assert_eq!(
+        scored_members() - start,
+        64 * 100_000 - 256,
+        "canceled partial ranking is reused"
+    );
+    assert!(matches!(
+        sender
+            .verify_response(response, &binding)
+            .unwrap()
+            .response(),
+        PeerResponse::Unavailable
+    ));
+    // Persistent cache avoids another full membership traversal for later updates.
+    drop(work);
+    let mut request = subscribe(&admission, A, 73, 0, FetchMode::Acquire);
+    request.origin.scope = resume_scope.clone();
+    request.origin.request = resume_scope.request;
+    request.route.request = resume_scope.request;
+    request.route.deadline = resume_scope.deadline;
+    let mut resume = contract;
+    resume.sequence = 2;
+    request.operation = Operation::Subscribe {
+        subscription: resume,
+        mode: FetchMode::Acquire,
+    };
+    let (signed, binding) = sender.sign_request(request).unwrap();
+    let mut work = server.dispatch(signed, &resume_scope);
+    let before = scored_members();
+    for _ in 0..64 {
+        assert!(
+            work.as_mut().poll(&mut cx).is_pending(),
+            "even hot endpoints yield"
+        );
+    }
+    let Poll::Ready(Ok(response)) = work.as_mut().poll(&mut cx) else {
+        panic!("hot sweep finishes")
+    };
+    assert_eq!(scored_members(), before);
+    assert!(matches!(
+        sender
+            .verify_response(response, &binding)
+            .unwrap()
+            .response(),
+        PeerResponse::Unavailable
+    ));
 }
 
 #[test]
