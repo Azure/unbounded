@@ -1096,7 +1096,18 @@ fn enrolled_identity(
         .unwrap();
     // Verify the persisted certificate's chain, SAN, validity, request correlation,
     // and local key pairing rather than comparing opaque identity.json bytes.
-    let identity = enrollment.load_identity().unwrap().unwrap();
+    #[path = "support/enrollment.rs"]
+    mod enrollment_io;
+    let reactor = enrollment_io::reactor();
+    enrollment.attach_reactor(reactor.clone());
+    let scope = racer_dataplane::runtime::deadline::RequestScope::new(
+        racer_dataplane::model::RequestId([9; 16]),
+        Instant::now() + Duration::from_secs(15),
+    )
+    .unwrap();
+    let identity = enrollment_io::drive(&reactor, enrollment.load_identity_async(&scope))
+        .unwrap()
+        .unwrap();
     assert_eq!(identity.cluster().0, CLUSTER);
     assert_eq!(identity.node().0, NODE);
     assert!(identity.valid_now());

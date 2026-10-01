@@ -1,6 +1,6 @@
 //! Generate node-private Ed25519 keys locally and enroll/rotate with node-bound SA identity.
+use super::wire;
 use super::wire::{EnrollmentId, EnrollmentRequest, EnrollmentResponse};
-use super::{files, wire};
 use crate::{
     error::{Error, Operation, Result},
     model::{ClusterId, NodeId},
@@ -301,39 +301,6 @@ impl Enrollment {
         *self.roots.borrow_mut() = roots;
         Ok(())
     }
-    /// Non-reactor compatibility for enrollment tools and interoperability fixtures.
-    /// Runtime callers attach a reactor and use the fenced async methods instead.
-    /// Reread the projected token on every attempt; never retain it in a DTO.
-    pub fn read_token(&self) -> Result<Zeroizing<String>> {
-        if self.reactor.borrow().is_some() {
-            return Err(Error::InvalidConfiguration);
-        }
-        // Kubernetes token paths normally pass through a projection symlink. Opening
-        // once pins one complete token file across atomic directory replacement.
-        let b = Zeroizing::new(files::read_path(
-            &self.token_path,
-            wire::MAX_ENROLLMENT_BYTES,
-        )?);
-        token(&b)
-    }
-    pub fn prepare_now(&self) -> Result<EnrollmentRequest> {
-        if self.reactor.borrow().is_some() {
-            return Err(Error::InvalidConfiguration);
-        }
-        if !wire::valid_uuid(&self.cluster.0) {
-            return Err(Error::InvalidConfiguration);
-        }
-        let dir = files::directory(&self.identity_directory, true, true)?;
-        match files::read_at(&dir, "pending.json", wire::MAX_ENROLLMENT_BYTES, true) {
-            Ok(b) => return self.request(&decode_pending(&Zeroizing::new(b))?),
-            Err(Error::MissingKey) => (),
-            Err(e) => return Err(e),
-        }
-        let pending = self.generate()?;
-        let encoded = Zeroizing::new(serde_json::to_vec(&pending).map_err(|_| Error::Io)?);
-        files::atomic_write(&dir, "pending.json", &encoded)?;
-        self.request(&pending)
-    }
     fn generate(&self) -> Result<PendingIdentity> {
         if !wire::valid_uuid(&self.cluster.0) {
             return Err(Error::InvalidConfiguration);
@@ -402,71 +369,7 @@ impl Enrollment {
         csr.verify_signature().map_err(|_| Error::Unauthorized)?;
         Ok(r)
     }
-    /// Verify server-authenticated response correlation, chain/SAN/validity, and
-    /// local key pairing, then persist the node identity. Never trust CSR SANs.
-    /// A token-authenticated response may replace a Node UID within the pinned
-    /// cluster. Callers with a live node-bound graph must restart before activation.
-    pub fn accept_response(&self, response: EnrollmentResponse) -> Result<LocalSigningIdentity> {
-        if self.reactor.borrow().is_some() {
-            return Err(Error::InvalidConfiguration);
-        }
-        let dir = files::directory(&self.identity_directory, false, true)?;
-        match files::read_at(&dir, "identity.json", wire::MAX_ENROLLMENT_BYTES * 3, true) {
-            Ok(bytes) => {
-                let bytes = Zeroizing::new(bytes);
-                let old = PersistedIdentity::decode(&bytes)?.response()?;
-                if old.cluster != response.cluster {
-                    return Err(Error::Unauthorized);
-                }
-            }
-            Err(Error::MissingKey) => (),
-            Err(e) => return Err(e),
-        }
-        let bytes = Zeroizing::new(files::read_at(
-            &dir,
-            "pending.json",
-            wire::MAX_ENROLLMENT_BYTES,
-            true,
-        )?);
-        let (identity, b) = self.accept_pending(&bytes, &response)?;
-        files::atomic_write(&dir, "identity.json", &b)?;
-        files::remove(&dir, "pending.json")?;
-        Ok(identity)
-    }
-    pub fn load_identity(&self) -> Result<Option<LocalSigningIdentity>> {
-        if self.reactor.borrow().is_some() {
-            return Err(Error::InvalidConfiguration);
-        }
-        let dir = match files::directory(&self.identity_directory, false, true) {
-            Ok(d) => d,
-            Err(Error::MissingKey) => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        let b = match files::read_at(&dir, "identity.json", wire::MAX_ENROLLMENT_BYTES * 3, true) {
-            Ok(b) => Zeroizing::new(b),
-            Err(Error::MissingKey) => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        let p = PersistedIdentity::decode(&b)?;
-        let response = p.response()?;
-        match self.validate(&p.pending, &response) {
-            Ok(identity) => {
-                // Complete a crash between identity rename and pending removal.
-                if let Ok(b) =
-                    files::read_at(&dir, "pending.json", wire::MAX_ENROLLMENT_BYTES, true)
-                {
-                    if decode_pending(&b)?.enrollment == identity.enrollment.0 {
-                        files::remove(&dir, "pending.json")?;
-                    }
-                }
-                Ok(Some(identity))
-            }
-            Err(Error::Unauthorized) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-    /// Shared identity parsing and validation; only persistence differs between
-    /// reactor transactions and the non-reactor compatibility entry points.
+    /// Validate identity correlation and key pairing before fenced persistence.
     fn accept_pending(
         &self,
         bytes: &[u8],
@@ -704,7 +607,8 @@ mod tests {
             let (rogue_ca, rogue_key) = testing::ca();
             let rogue = testing::issue(&request, &rogue_ca, &rogue_key, NEW_NODE);
             let other = Enrollment::new(e.cluster.clone(), d.0.join("token"), d.0.join("other"));
-            let mut other_request = other.prepare_now().unwrap();
+            other.attach_reactor(r.clone());
+            let mut other_request = testing::drive(&r, other.prepare(&scope)).unwrap();
             other_request.enrollment = request.enrollment.clone();
             let wrong_key = testing::issue(&other_request, &ca, &key, NEW_NODE);
             for bad in [wrong_san, wrong_id, foreign, rogue, wrong_key] {
@@ -740,9 +644,16 @@ mod tests {
             foreign
                 .set_peer_trust_roots(vec![ca.der().to_vec()])
                 .unwrap();
-            let request = foreign.prepare_now().unwrap();
+            foreign.attach_reactor(r.clone());
+            let request = testing::drive(&r, foreign.prepare(&scope)).unwrap();
             assert!(matches!(
-                foreign.accept_response(testing::issue(&request, &ca, &key, NEW_NODE)),
+                testing::drive(
+                    &r,
+                    foreign.accept_response_async(
+                        testing::issue(&request, &ca, &key, NEW_NODE),
+                        &scope
+                    )
+                ),
                 Err(Error::Unauthorized)
             ));
         }
@@ -819,6 +730,8 @@ mod tests {
 
     #[test]
     fn durable_retry_key_pairing_identity_and_rotation() {
+        let Some(r) = testing::reactor() else { return };
+        let scope = testing::scope();
         let directory = testing::Directory::new();
         let token = directory.0.join("token");
         std::fs::write(&token, "first.token").unwrap();
@@ -826,41 +739,64 @@ mod tests {
         let enrollment =
             Enrollment::new(cluster.clone(), token.clone(), directory.0.join("identity"));
         assert!(!directory.0.join("identity").exists());
-        let request = enrollment.prepare_now().unwrap();
+        enrollment.attach_reactor(r.clone());
+        let request = testing::drive(&r, enrollment.prepare(&scope)).unwrap();
         let again = Enrollment::new(cluster, token.clone(), directory.0.join("identity"));
-        assert_eq!(request.csr_der, again.prepare_now().unwrap().csr_der);
-        assert_eq!(request.enrollment, again.prepare_now().unwrap().enrollment);
-        assert_eq!(&*again.read_token().unwrap(), "first.token");
+        again.attach_reactor(r.clone());
+        assert_eq!(
+            request.csr_der,
+            testing::drive(&r, again.prepare(&scope)).unwrap().csr_der
+        );
+        assert_eq!(
+            request.enrollment,
+            testing::drive(&r, again.prepare(&scope))
+                .unwrap()
+                .enrollment
+        );
+        assert_eq!(
+            &*testing::drive(&r, again.read_token_async(&scope)).unwrap(),
+            "first.token"
+        );
         std::fs::write(&token, "rotated.token").unwrap();
-        assert_eq!(&*again.read_token().unwrap(), "rotated.token");
+        assert_eq!(
+            &*testing::drive(&r, again.read_token_async(&scope)).unwrap(),
+            "rotated.token"
+        );
         let (ca, key) = testing::ca();
         again.set_peer_trust_roots(vec![ca.der().to_vec()]).unwrap();
         let response = testing::issue(&request, &ca, &key, "22222222-2222-4222-8222-222222222222");
         let mut wrong = response.clone();
         wrong.node.0 = "33333333-3333-4333-8333-333333333333".into();
-        assert!(again.accept_response(wrong).is_err());
+        assert!(testing::drive(&r, again.accept_response_async(wrong, &scope)).is_err());
         assert!(directory.0.join("identity/pending.json").exists());
-        let identity = again.accept_response(response).unwrap();
+        let identity = testing::drive(&r, again.accept_response_async(response, &scope)).unwrap();
         assert!(identity.valid_now());
         assert!(!identity.renewal_due());
         assert_eq!(
-            again.load_identity().unwrap().unwrap().node(),
+            testing::drive(&r, again.load_identity_async(&scope))
+                .unwrap()
+                .unwrap()
+                .node(),
             identity.node()
         );
         assert!(!directory.0.join("identity/pending.json").exists());
-        let fresh = again.prepare_now().unwrap();
+        let fresh = testing::drive(&r, again.prepare(&scope)).unwrap();
         assert_ne!(fresh.enrollment, request.enrollment);
         assert_ne!(fresh.csr_der, request.csr_der);
         assert_eq!(
-            again.load_identity().unwrap().unwrap().node(),
+            testing::drive(&r, again.load_identity_async(&scope))
+                .unwrap()
+                .unwrap()
+                .node(),
             identity.node()
         );
-        let dir = files::directory(&directory.0.join("identity"), false, true).unwrap();
-        files::atomic_write(&dir, "pending.json", b"{broken").unwrap();
-        assert!(again.prepare_now().is_err());
+        std::fs::write(directory.0.join("identity/pending.json"), b"{broken").unwrap();
+        assert!(testing::drive(&r, again.prepare(&scope)).is_err());
     }
     #[test]
     fn rejects_symlinked_identity_and_insecure_modes() {
+        let Some(r) = testing::reactor() else { return };
+        let scope = testing::scope();
         use std::os::unix::fs::{PermissionsExt, symlink};
         let directory = testing::Directory::new();
         std::fs::create_dir(directory.0.join("real")).unwrap();
@@ -870,12 +806,19 @@ mod tests {
             directory.0.join("token"),
             directory.0.join("link"),
         );
-        assert!(enrollment.prepare_now().is_err());
+        enrollment.attach_reactor(r.clone());
+        assert!(testing::drive(&r, enrollment.prepare(&scope)).is_err());
         std::fs::set_permissions(
             directory.0.join("real"),
             std::fs::Permissions::from_mode(0o755),
         )
         .unwrap();
-        assert!(files::directory(&directory.0.join("real"), false, true).is_err());
+        let insecure = Enrollment::new(
+            enrollment.cluster.clone(),
+            directory.0.join("token"),
+            directory.0.join("real"),
+        );
+        insecure.attach_reactor(r.clone());
+        assert!(testing::drive(&r, insecure.prepare(&scope)).is_err());
     }
 }

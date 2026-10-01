@@ -141,7 +141,11 @@ fn go_controller_keyring_bootstrap_mtls_and_rotation() {
         enrollment
             .set_peer_trust_roots(initial.peer_trust_roots.clone())
             .unwrap();
-        let request = enrollment.prepare_now().unwrap();
+        #[path = "support/enrollment.rs"]
+        mod enrollment_io;
+        let reactor = enrollment_io::reactor();
+        enrollment.attach_reactor(reactor.clone());
+        let request = enrollment_io::drive(&reactor, enrollment.prepare(&scope)).unwrap();
         let body = wire::encode_enrollment_request(&request).unwrap();
         let response = transport
             .bootstrap(&scope)
@@ -158,9 +162,14 @@ fn go_controller_keyring_bootstrap_mtls_and_rotation() {
             .await
             .unwrap();
         assert_eq!(response.status, 200);
-        let identity = enrollment
-            .accept_response(wire::decode_enrollment_response(response.body.as_slice()).unwrap())
-            .unwrap();
+        let identity = enrollment_io::drive(
+            &reactor,
+            enrollment.accept_response_async(
+                wire::decode_enrollment_response(response.body.as_slice()).unwrap(),
+                &scope,
+            ),
+        )
+        .unwrap();
         assert_eq!(identity.node().0, config["node"]);
 
         let response = transport
