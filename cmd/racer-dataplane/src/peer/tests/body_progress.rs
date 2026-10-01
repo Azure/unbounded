@@ -37,6 +37,34 @@ fn local_total_cap_bounds_progress_and_pending_body_without_shortening_wire_auth
 
 fn body_cases(cases: &[&str]) {
     for &case in cases {
+        BodyFixture::new(case).run(case);
+    }
+}
+
+struct BodyFixture {
+    idle: bool,
+    telemetry: Telemetry,
+    before_metrics: String,
+    admission: Rc<Admission>,
+    reactor: Rc<Reactor>,
+    io: Rc<HttpIo>,
+    pool: Rc<HttpPool>,
+    signers: Vec<Rc<Signatures>>,
+    transfers: transport::Transfers,
+    listener: TcpListener,
+    start: Instant,
+    original: Instant,
+    share: Instant,
+    signed_deadline: Instant,
+    scope: RequestScope,
+    server_scope: RequestScope,
+    auth: Forwarding,
+    signed: protocol::SignedRequest,
+    binding: crate::security::forwarding::RequestBinding,
+}
+
+impl BodyFixture {
+    fn new(case: &str) -> Self {
         let idle = matches!(
             case,
             "progress"
@@ -76,7 +104,6 @@ fn body_cases(cases: &[&str]) {
             signers[0].clone(),
         );
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
         let start = Instant::now();
         let original = start
             + if case == "hard" {
@@ -84,7 +111,6 @@ fn body_cases(cases: &[&str]) {
             } else {
                 Duration::from_secs(3)
             };
-        let fixture_end = start + Duration::from_secs(5);
         let share = start + Duration::from_millis(250);
         let mut local = request(&admission, 9);
         let signed_deadline = if idle { original } else { share };
@@ -120,6 +146,53 @@ fn body_cases(cases: &[&str]) {
         let auth = Forwarding::new(signers[0].clone());
         let (signed, binding) = auth.sign_request(local).unwrap();
         let server_scope = RequestScope::new(scope.request, original).unwrap();
+        Self {
+            idle,
+            telemetry,
+            before_metrics,
+            admission,
+            reactor,
+            io,
+            pool,
+            signers,
+            transfers,
+            listener,
+            start,
+            original,
+            share,
+            signed_deadline,
+            scope,
+            server_scope,
+            auth,
+            signed,
+            binding,
+        }
+    }
+
+    fn run(self, case: &str) {
+        let Self {
+            idle,
+            telemetry,
+            before_metrics,
+            admission,
+            reactor,
+            io,
+            pool,
+            signers,
+            transfers,
+            listener,
+            start,
+            original,
+            share,
+            signed_deadline,
+            scope,
+            server_scope,
+            auth,
+            signed,
+            binding,
+        } = self;
+        let address = listener.local_addr().unwrap();
+        let fixture_end = start + Duration::from_secs(5);
         let sent = Cell::new(0usize);
         let server = async {
             let fd = reactor
