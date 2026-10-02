@@ -89,26 +89,43 @@ fn reopen_snapshot_reads_old_record_and_appends_without_overwriting_it() {
         .configure(slab.capacity_bytes(), 2, alignment)
         .unwrap();
     // Restore validates the entire image before changing any slot or free list.
-    for invalid in 0..6 {
+    for (invalid, label) in [
+        "duplicate segment ID",
+        "zero generation",
+        "oversized sealed segment",
+        "misaligned sealed segment",
+        "nonempty free segment",
+        "missing segment",
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let mut damaged = snapshot.clone();
         match invalid {
             0 => damaged[1].id = SegmentId(0),
             1 => damaged[1].generation = Generation(0),
-            2 => damaged[1].used_bytes = slab.segment_bytes() + alignment.length() as u64,
-            3 => damaged[1].used_bytes = 513,
+            2 => {
+                damaged[1].state = SegmentState::Sealed;
+                damaged[1].used_bytes = slab.segment_bytes() + alignment.length() as u64;
+            }
+            3 => {
+                damaged[1].state = SegmentState::Sealed;
+                damaged[1].used_bytes = 513;
+            }
             4 => damaged[1].used_bytes = alignment.length() as u64,
             _ => {
                 damaged.pop();
             }
         }
-        assert_eq!(segments.restore(damaged), Err(Error::Corrupt));
-        assert_eq!(segments.free_count(), 2);
+        assert_eq!(segments.restore(damaged), Err(Error::Corrupt), "{label}");
+        assert_eq!(segments.free_count(), 2, "{label}");
         assert!(
             segments
                 .snapshot()
                 .unwrap()
                 .iter()
-                .all(|s| s.state == SegmentState::Free && s.used_bytes == 0)
+                .all(|s| s.state == SegmentState::Free && s.used_bytes == 0),
+            "{label}"
         );
     }
     segments.validate_restore(&snapshot).unwrap();

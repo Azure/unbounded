@@ -236,6 +236,34 @@ impl Drop for CountingCharge {
     }
 }
 
+// The simulation build covers these assertions through the public Slab workflow.
+#[cfg(not(feature = "simulation"))]
+#[test]
+fn aligned_pool_reuses_only_fenced_zeroed_admitted_storage() {
+    let used = Rc::new(Cell::new(0));
+    let pool = Rc::new(RefCell::new(None));
+    let alignment = Alignment::new(512, 512, 512).unwrap();
+    let charge = || CountingCharge::new(&used, 512);
+    let mut buffer = alignment.allocate(512, charge()).unwrap().pooled(&pool);
+    let pointer = buffer.bytes().unwrap().as_ptr();
+    buffer.bytes_mut().unwrap().fill(42);
+    let extra = Rc::new(charge());
+    let weak = Rc::downgrade(&extra);
+    buffer.retain(extra);
+    assert_eq!(used.get(), 1024);
+    drop(buffer);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(used.get(), 512);
+    let mut reused = pool.borrow_mut().take().unwrap();
+    assert_eq!(reused.bytes().unwrap().as_ptr(), pointer);
+    assert!(reused.bytes().unwrap().iter().all(|b| *b == 0));
+    reused.rebind(charge()).unwrap();
+    assert_eq!(used.get(), 512);
+    drop(reused.pooled(&pool));
+    drop(pool);
+    assert_eq!(used.get(), 0);
+}
+
 #[test]
 fn geometry_rounds_without_assuming_page_size() {
     let a = Alignment::new(512, 512, 1024).unwrap();
