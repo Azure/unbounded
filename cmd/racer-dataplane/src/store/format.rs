@@ -1,9 +1,6 @@
 //! Versioned little-endian encrypted records. Header SHA-256 is framing integrity;
 //! payload integrity remains AEAD at the fill boundary. Padding is never returned.
-use super::{
-    catalog::Generation,
-    disk::{AlignedBuffer, DirectAlignment, DirectExtent},
-};
+use crate::runtime::admission::Reservation;
 use crate::{
     error::{Error, Result},
     memory::page::CiphertextCopy,
@@ -11,8 +8,8 @@ use crate::{
         CacheId, CacheKey, KeyId, Nonce, ObjectId, ObjectVersion, PageEnvelope, PageId, PageNumber,
         StrongEtag, VersionMetadata,
     },
-    runtime::reactor::IoBuffer,
 };
+use page_alloc::{AlignedBuffer, Alignment, Extent, Generation};
 use sha2::{Digest, Sha256};
 // Version 4 is the sole format: mandatory CRC-64/XZ plus optional content type.
 pub const FORMAT_VERSION: u32 = 4;
@@ -29,11 +26,11 @@ pub struct RecordHeader {
     pub envelope: PageEnvelope,
     pub metadata: VersionMetadata,
     pub logical_bytes: u64,
-    pub extent: DirectExtent,
+    pub extent: Extent,
 }
 pub struct EncodedRecord {
     pub header: RecordHeader,
-    pub buffer: AlignedBuffer,
+    pub buffer: AlignedBuffer<Reservation>,
 }
 pub struct DecodedRecord {
     pub header: RecordHeader,
@@ -127,17 +124,17 @@ pub fn logical_length(page: &CiphertextCopy) -> Result<usize> {
 pub fn encode(
     page: &CiphertextCopy,
     generation: Generation,
-    alignment: DirectAlignment,
-    buffer: AlignedBuffer,
+    alignment: Alignment,
+    buffer: AlignedBuffer<Reservation>,
 ) -> Result<EncodedRecord> {
     encode_at(page, generation, alignment, 0, buffer)
 }
 pub fn encode_at(
     page: &CiphertextCopy,
     generation: Generation,
-    alignment: DirectAlignment,
+    alignment: Alignment,
     offset: u64,
-    mut buffer: AlignedBuffer,
+    mut buffer: AlignedBuffer<Reservation>,
 ) -> Result<EncodedRecord> {
     let layout = layout(page, generation)?;
     let logical_bytes = layout.logical_bytes;
@@ -160,10 +157,10 @@ pub fn encode_at(
         buffer,
     })
 }
-pub fn parse(buffer: &AlignedBuffer, extent: DirectExtent) -> Result<DecodedRecord> {
+pub fn parse(buffer: &AlignedBuffer<Reservation>, extent: Extent) -> Result<DecodedRecord> {
     parse_bytes(buffer.bytes()?, extent)
 }
-pub fn parse_bytes(bytes: &[u8], extent: DirectExtent) -> Result<DecodedRecord> {
+pub fn parse_bytes(bytes: &[u8], extent: Extent) -> Result<DecodedRecord> {
     if bytes.len() != extent.length() {
         return Err(Error::CorruptRecord);
     }
@@ -252,7 +249,10 @@ pub fn parse_bytes(bytes: &[u8], extent: DirectExtent) -> Result<DecodedRecord> 
         checksum,
     })
 }
-pub fn decode(buffer: &AlignedBuffer, expected: &RecordHeader) -> Result<PageEnvelope> {
+pub fn decode(
+    buffer: &AlignedBuffer<Reservation>,
+    expected: &RecordHeader,
+) -> Result<PageEnvelope> {
     let actual = parse(buffer, expected.extent)?.header;
     if actual.format_version != expected.format_version
         || actual.generation != expected.generation
@@ -338,7 +338,11 @@ mod tests {
         }
     }
 
-    fn buffer(admission: &Admission, alignment: DirectAlignment, length: usize) -> AlignedBuffer {
+    fn buffer(
+        admission: &Admission,
+        alignment: Alignment,
+        length: usize,
+    ) -> AlignedBuffer<Reservation> {
         alignment
             .allocate(
                 length,
@@ -398,7 +402,7 @@ mod tests {
                 "v1".into()
             };
             let mut page = page(&admission, length, number, &cache, &etag);
-            let alignment = DirectAlignment::validate(geometry.0, geometry.1, geometry.2).unwrap();
+            let alignment = Alignment::new(geometry.0, geometry.1, geometry.2).unwrap();
             let logical = logical_length(&page).unwrap();
             assert_eq!(
                 logical,
@@ -456,7 +460,7 @@ mod tests {
     #[test]
     fn malformed_inputs_reject_record_errors_before_geometry_checks() {
         let admission = admission();
-        let alignment = DirectAlignment::validate(512, 512, 512).unwrap();
+        let alignment = Alignment::new(512, 512, 512).unwrap();
         let mutations: &[fn(&mut CiphertextCopy)] = &[
             |p| p.metadata.length = 0,
             |p| p.metadata.length = 4,
@@ -546,7 +550,7 @@ mod tests {
     fn sizing_uses_generation_one_and_ignores_historical_freshness() {
         let admission = admission();
         let mut page = page(&admission, 3, 0, "cache", "v1");
-        let alignment = DirectAlignment::validate(512, 512, 512).unwrap();
+        let alignment = Alignment::new(512, 512, 512).unwrap();
         for expiry in [
             UNIX_EPOCH,
             UNIX_EPOCH + std::time::Duration::from_secs(1),
@@ -593,19 +597,19 @@ mod tests {
         let admission = admission();
         let page = page(&admission, 3, 0, "cache", "v1");
         let baseline = admission.used(ResourceClass::Ciphertext);
-        let normal = DirectAlignment::validate(512, 512, 512).unwrap();
+        let normal = Alignment::new(512, 512, 512).unwrap();
         for (alignment, offset, length, expected) in [
             (normal, 1, 512, Error::InvalidConfiguration),
             (normal, 0, 1024, Error::InvalidConfiguration),
             (normal, u64::MAX - 511, 512, Error::CorruptRecord),
             (
-                DirectAlignment::validate(512, 512, usize::MAX).unwrap(),
+                Alignment::new(512, 512, usize::MAX).unwrap(),
                 0,
                 512,
                 Error::InvalidConfiguration,
             ),
             (
-                DirectAlignment::validate(512, 1, usize::MAX).unwrap(),
+                Alignment::new(512, 1, usize::MAX).unwrap(),
                 0,
                 512,
                 Error::InvalidConfiguration,
@@ -613,7 +617,7 @@ mod tests {
         ] {
             let mut staging = buffer(&admission, normal, length);
             staging.bytes_mut().unwrap().fill(0xa5);
-            staging.retain_charge(std::rc::Rc::new(
+            staging.retain(std::rc::Rc::new(
                 admission
                     .reserve(None, ResourceClass::Ciphertext, 17)
                     .unwrap(),
@@ -634,7 +638,7 @@ mod tests {
         use std::{hint::black_box, time::Instant};
         assert!(!cfg!(debug_assertions), "run with --release");
         let admission = admission();
-        let alignment = DirectAlignment::validate(4096, 4096, 4096).unwrap();
+        let alignment = Alignment::new(4096, 4096, 4096).unwrap();
         println!(
             "memory-only; 5 samples; median [min,max] ns/record; GiB/s uses logical record bytes (sizing does not touch payload)"
         );
@@ -710,7 +714,7 @@ mod tests {
             unhex(GOLDEN_RECORD_SHA256)
         );
         assert!(matches!(
-            parse_bytes(&expected, DirectExtent::checked(0, 512).unwrap()),
+            parse_bytes(&expected, Extent::new(0, 512).unwrap()),
             Err(Error::CorruptRecord)
         ));
     }
@@ -720,7 +724,7 @@ mod tests {
         let admission = admission();
         let mut page = page(&admission, 3, 0, "cache", "v1");
         page.metadata.content_type = Some(crate::model::ContentType::parse(b"text/plain").unwrap());
-        let alignment = DirectAlignment::validate(512, 512, 512).unwrap();
+        let alignment = Alignment::new(512, 512, 512).unwrap();
         let encoded = encode(
             &page,
             Generation(7),
@@ -764,7 +768,7 @@ mod tests {
     fn only_current_version_is_accepted_even_with_valid_header_digest() {
         let admission = admission();
         let page = page(&admission, 3, 0, "cache", "v1");
-        let alignment = DirectAlignment::validate(512, 512, 512).unwrap();
+        let alignment = Alignment::new(512, 512, 512).unwrap();
         let encoded = encode(
             &page,
             Generation(7),
@@ -839,12 +843,12 @@ mod tests {
     fn malformed_frames_are_rejected_without_unbounded_allocations() {
         for len in [1, 16, 512] {
             let bytes = vec![0; len];
-            assert!(parse_bytes(&bytes, DirectExtent::checked(0, len).unwrap()).is_err());
+            assert!(parse_bytes(&bytes, Extent::new(0, len).unwrap()).is_err());
         }
         let mut bytes = vec![0; 512];
         bytes[..8].copy_from_slice(MAGIC);
         bytes[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
         bytes[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert!(parse_bytes(&bytes, DirectExtent::checked(0, 512).unwrap()).is_err());
+        assert!(parse_bytes(&bytes, Extent::new(0, 512).unwrap()).is_err());
     }
 }

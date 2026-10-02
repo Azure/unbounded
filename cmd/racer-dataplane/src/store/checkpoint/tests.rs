@@ -9,15 +9,12 @@ const SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
 // filter, but do not create an application worker directory. No legacy loader is
 // compiled into the dataplane.
 impl Recovery {
-    pub(crate) fn load(
-        &self,
-        alignment: DirectAlignment,
-    ) -> Operation<'_, Option<CheckpointImage>> {
+    pub(crate) fn load(&self, alignment: Alignment) -> Operation<'_, Option<CheckpointImage>> {
         self.load_filtered(alignment, |_, _| true)
     }
     fn load_filtered(
         &self,
-        alignment: DirectAlignment,
+        alignment: Alignment,
         available: impl Fn(&CacheId, KeyId) -> bool,
     ) -> Operation<'_, Option<CheckpointImage>> {
         let result = candidates(&self.directory, MAX_CHECKPOINT_BYTES).map(|mut cuts| {
@@ -148,7 +145,7 @@ fn geometry() -> CheckpointGeometry {
         SEGMENT_BYTES * 2,
         SEGMENT_BYTES,
         2,
-        DirectAlignment::validate(4096, 4096, 4096).unwrap(),
+        Alignment::new(4096, 4096, 4096).unwrap(),
     )
     .unwrap()
 }
@@ -174,7 +171,7 @@ fn state(capacity: usize) -> (Rc<Index>, Rc<Segments>) {
         capacity,
         crate::test_support::availability(),
     ));
-    let segments = Rc::new(Segments::new(WorkerId(0), g.segment_bytes));
+    let segments = Rc::new(Segments::new(g.segment_bytes));
     segments
         .configure(
             g.slab_bytes,
@@ -206,7 +203,7 @@ fn shard() -> ShardImage {
                 location: RecordLocation {
                     segment: allocation.id,
                     generation: allocation.generation,
-                    location: lease.location,
+                    extent: lease.1,
                 },
                 metadata,
                 key_id: KeyId::from_generation(1, 1).unwrap(),
@@ -367,7 +364,7 @@ fn binary_round_trip_retains_locations_keys_metadata_and_is_send() {
     let (_, entry) = &shard.index.entries[0];
     assert_eq!(entry.metadata, descriptor("v1", 17));
     assert_eq!(entry.key_id, KeyId::from_generation(1, 1).unwrap());
-    assert_eq!(entry.location.location.extent.length(), 4096);
+    assert_eq!(entry.location.extent.length(), 4096);
     assert!(
         shard
             .index
@@ -438,6 +435,47 @@ fn empty_cut_has_stable_current_binary_vector() {
         digest,
         "088cec30ebf4ca46e9ae669e335ebad64dde2d3a98fe39a4d1be15b4cc7a5b75"
     );
+}
+
+#[test]
+fn populated_cut_preserves_legacy_slab_wire_field_and_rejects_nonzero() {
+    let bytes = checkpoint_format::encode(&image(7)).unwrap();
+    // Literal version-2 image(7) layout, independent of Encoder/Decoder:
+    // header 32 + shard count 4 + worker 2 + geometry 48 + segment count 4
+    // + two segments 50 + page count 4 + descriptor 92 (36-byte cache,
+    // 32-byte key, 4-byte quoted ETag, length 8, three string lengths 12)
+    // + page number 8 + key ID 16 + segment 8 + generation 8 = 276.
+    const SLAB_OFFSET: usize = 276;
+    assert_eq!(bytes.len(), 431);
+    assert_eq!(&bytes[SLAB_OFFSET..SLAB_OFFSET + 8], &[0; 8]);
+    // Independently packed legacy single-slab fixture, including its zero slab
+    // u64, extent (0, 4096), and standalone "empty" descriptor, has 399 body bytes.
+    let digest: String = bytes[399..]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(
+        digest,
+        "39535d258c76e81ba92d01122d23943bb45de093e98c72d09a77ce692d3b531d"
+    );
+    let decoded = checkpoint_format::decode(&bytes).unwrap();
+    assert_eq!(decoded.shards[0].index.entries.len(), 1);
+    assert_eq!(
+        decoded.shards[0].index.entries[0].1.metadata,
+        descriptor("v1", 17)
+    );
+
+    // Exercise low and high bits of the whole legacy u64, not just its first byte.
+    for slab in [1u64, 1 << 63, u64::MAX] {
+        let mut malformed = bytes.clone();
+        malformed[SLAB_OFFSET..SLAB_OFFSET + 8].copy_from_slice(&slab.to_le_bytes());
+        resign(&mut malformed);
+        assert_eq!(&Sha256::digest(&malformed[..399])[..], &malformed[399..]);
+        assert!(matches!(
+            checkpoint_format::decode(&malformed),
+            Err(Error::CorruptRecord)
+        ));
+    }
 }
 
 #[test]
@@ -581,8 +619,7 @@ fn invalid_generation_bounds_duplicates_and_descriptor_conflicts_are_rejected() 
     bad.shards[0].index.entries[0].1.location.generation.0 += 1;
     assert!(checkpoint_format::encode(&bad).is_err());
     let mut bad = image(1);
-    bad.shards[0].index.entries[0].1.location.location.extent =
-        DirectExtent::checked(SEGMENT_BYTES, 4096).unwrap();
+    bad.shards[0].index.entries[0].1.location.extent = Extent::new(SEGMENT_BYTES, 4096).unwrap();
     assert!(checkpoint_format::encode(&bad).is_err());
     let mut bad = image(1);
     let duplicate = bad.shards[0].index.entries[0].clone();

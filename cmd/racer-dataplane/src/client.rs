@@ -663,8 +663,7 @@ pub(crate) mod test_support {
         },
         store::{
             StoreReader,
-            catalog::{Index, SegmentClock, Segments},
-            disk::Slabs,
+            catalog::{Index, SegmentClock},
             writer::StoreWriter,
         },
         test_support::origin::AdapterOrigin,
@@ -730,20 +729,20 @@ pub(crate) mod test_support {
             );
             let buffers = BufferPool::new(admission.clone());
             let index = Rc::new(Index::new(WorkerId(0), 16, availability.clone()));
-            let segments = Rc::new(Segments::new(WorkerId(0), 64 * 1024 * 1024));
+            let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
             // Reads use an empty disk index. No slabs need to be opened or written.
-            let slabs = Rc::new(Slabs::new(
-                WorkerId(0),
-                origin.root.join("slabs"),
-                reactor.clone(),
-                admission.clone(),
+            let slabs = Rc::new(page_alloc::Slab::new(
+                origin.root.join("slabs/worker-0-slab-0.dat"),
                 256 * 1024 * 1024,
                 64 * 1024 * 1024,
+                crate::model::PAGE_BYTES as usize + crate::store::format::MAX_HEADER_BYTES + 16,
             ));
             let writer = Rc::new(StoreWriter::new(
                 index.clone(),
                 segments.clone(),
                 slabs.clone(),
+                admission.clone(),
+                reactor.clone(),
                 availability.clone(),
             ));
             let disk = Rc::new(StoreReader::new(
@@ -751,6 +750,8 @@ pub(crate) mod test_support {
                 index.clone(),
                 segments,
                 slabs,
+                admission.clone(),
+                reactor.clone(),
                 buffers.clone(),
             ));
             let (port, engine) =

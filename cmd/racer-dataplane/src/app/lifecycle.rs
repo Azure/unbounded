@@ -192,9 +192,9 @@ impl WorkerApplication {
         let alignment = self.store.writer.open().await?;
         let slabs = self.store.writer.slabs();
         let geometry = CheckpointGeometry::new(
-            slabs.slab_bytes(),
+            slabs.capacity_bytes(),
             slabs.segment_bytes(),
-            slabs.slab_bytes() / slabs.segment_bytes(),
+            slabs.capacity_bytes() / slabs.segment_bytes(),
             alignment,
         )?;
         self.store.recovery.configure_geometry(geometry)?;

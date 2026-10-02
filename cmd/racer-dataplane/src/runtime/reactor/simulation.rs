@@ -43,12 +43,10 @@ fn simulated_pipe_splice_preserves_suffix_under_backpressure() {
 }
 #[test]
 fn direct_io_faults_check_address_offset_and_length_independently() {
-    use crate::{
-        runtime::reactor::IoBuffer,
-        store::disk::{AlignedBuffer, DirectAlignment},
-    };
+    use crate::runtime::{admission::Reservation, reactor::IoBuffer};
+    use page_alloc::{AlignedBuffer, Alignment};
     struct View {
-        buffer: AlignedBuffer,
+        buffer: AlignedBuffer<Reservation>,
         start: usize,
         length: usize,
     }
@@ -64,10 +62,10 @@ fn direct_io_faults_check_address_offset_and_length_independently() {
     }
     let (sim, _environment, r, scope) = setup();
     assert_eq!(
-        DirectAlignment::validate(0, 4096, 4096),
+        Alignment::new(0, 4096, 4096).map_err(Error::from),
         Err(Error::DirectIoUnsupported)
     );
-    let alignment = DirectAlignment::validate(4096, 4096, 4096).unwrap();
+    let alignment = Alignment::new(4096, 4096, 4096).unwrap();
     let path = Path::new("/direct");
     let fd = Rc::new(
         sim.open(None, path, libc::O_CREAT | libc::O_RDWR | libc::O_DIRECT)
@@ -248,29 +246,32 @@ fn immutable_ciphertext_send_shares_backing_and_retains_it_through_cancel_fences
 }
 #[test]
 fn real_slab_open_is_sparse_exclusive_and_checks_direct_geometry() {
-    use crate::{model::WorkerId, store::disk::Slabs};
+    use crate::runtime::admission::Reservation;
+    use page_alloc::Slab;
     let sim = Simulation::new();
     let _environment = sim.enter();
     let r = Rc::new(reactor());
-    let slabs = Slabs::new(
-        WorkerId(0),
-        "/slabs".into(),
-        r.clone(),
-        r.admission.clone(),
+    let slabs = Slab::<Reservation>::new(
+        "/slabs/worker-0-slab-0.dat".into(),
         64 * 1024 * 1024,
         32 * 1024 * 1024,
+        crate::model::PAGE_BYTES as usize + crate::store::format::MAX_HEADER_BYTES + 16,
     );
     assert!(slabs.open_now().is_ok());
-    let other = Slabs::new(
-        WorkerId(0),
-        "/slabs".into(),
-        r.clone(),
-        r.admission.clone(),
+    let other = Slab::<Reservation>::new(
+        "/slabs/worker-0-slab-0.dat".into(),
         64 * 1024 * 1024,
         32 * 1024 * 1024,
+        crate::model::PAGE_BYTES as usize + crate::store::format::MAX_HEADER_BYTES + 16,
     );
-    assert_eq!(other.open_now(), Err(Error::Unavailable));
-    assert_eq!(other.open_now(), Err(Error::Unavailable));
+    assert_eq!(
+        other.open_now().map_err(Error::from),
+        Err(Error::Unavailable)
+    );
+    assert_eq!(
+        other.open_now().map_err(Error::from),
+        Err(Error::Unavailable)
+    );
     drop(slabs);
     assert!(other.open_now().is_ok());
     let path = Path::new("/slabs/worker-0-slab-0.dat");

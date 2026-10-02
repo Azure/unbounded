@@ -3,11 +3,7 @@
 //! The coordinator keeps every owner frozen through publication, then explicitly
 //! finishes each snapshot even on failure. Write/rename provides no fsync durability.
 use super::{
-    catalog::{
-        Generation, Index, IndexSnapshot, IndexedPage, RecordLocation, SegmentId, SegmentSnapshot,
-        SegmentState, Segments,
-    },
-    disk::{DirectAlignment, DirectExtent, SlabId, SlabLocation},
+    catalog::{Index, IndexSnapshot, IndexedPage, RecordLocation},
     format::Decoder,
 };
 use crate::error::{Error, Operation, Result, cooperative_turn};
@@ -17,6 +13,9 @@ use crate::{
         VersionMetadata, WorkerId,
     },
     runtime::collections::{HashMap, HashSet},
+};
+use page_alloc::{
+    Alignment, Extent, Generation, SegmentId, SegmentSnapshot, SegmentState, Segments,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -53,7 +52,7 @@ impl Checkpointer {
 
     /// Call after slab opening discovers actual geometry, before taking snapshots.
     pub fn configure_geometry(&self, geometry: CheckpointGeometry) -> Result<()> {
-        geometry.validate_live(self.index.worker(), &self.segments)?;
+        geometry.validate_live(&self.segments)?;
         if self.frozen.get() {
             return Err(Error::Overloaded);
         }
@@ -375,7 +374,7 @@ impl Recovery {
 
     /// Configure actual opened slab geometry before installation. No I/O is done.
     pub fn configure_geometry(&self, geometry: CheckpointGeometry) -> Result<()> {
-        geometry.validate_live(self.index.worker(), &self.segments)?;
+        geometry.validate_live(&self.segments)?;
         self.geometry.set(Some(geometry));
         Ok(())
     }
@@ -388,7 +387,7 @@ impl Recovery {
             let image = match image {
                 Some(image) => image,
                 None => {
-                    let empty = Segments::new(self.index.worker(), geometry.segment_bytes);
+                    let empty = Segments::new(geometry.segment_bytes);
                     empty.configure(
                         geometry.slab_bytes,
                         geometry.segment_count as usize,
@@ -618,7 +617,7 @@ impl CheckpointGeometry {
         slab_bytes: u64,
         segment_bytes: u64,
         segment_count: u64,
-        alignment: DirectAlignment,
+        alignment: Alignment,
     ) -> Result<Self> {
         let geometry = Self {
             slab_bytes,
@@ -631,12 +630,12 @@ impl CheckpointGeometry {
         geometry.validate()?;
         Ok(geometry)
     }
-    pub fn alignment(&self) -> Result<DirectAlignment> {
-        DirectAlignment::validate(
+    pub fn alignment(&self) -> Result<Alignment> {
+        Ok(Alignment::new(
             usize::try_from(self.memory_alignment).map_err(|_| Error::CorruptRecord)?,
             self.offset_alignment,
             usize::try_from(self.length_alignment).map_err(|_| Error::CorruptRecord)?,
-        )
+        )?)
     }
     pub fn validate(&self) -> Result<()> {
         self.alignment()?;
@@ -654,15 +653,14 @@ impl CheckpointGeometry {
         }
         Ok(())
     }
-    pub fn matches_alignment(&self, alignment: DirectAlignment) -> bool {
+    pub fn matches_alignment(&self, alignment: Alignment) -> bool {
         self.memory_alignment == alignment.memory() as u64
             && self.offset_alignment == alignment.offset()
             && self.length_alignment == alignment.length() as u64
     }
-    pub(crate) fn validate_live(&self, worker: WorkerId, segments: &Segments) -> Result<()> {
+    pub(crate) fn validate_live(&self, segments: &Segments) -> Result<()> {
         self.validate()?;
-        if segments.worker() != worker
-            || segments.slab_bytes() != self.slab_bytes
+        if segments.capacity_bytes() != self.slab_bytes
             || segments.segment_bytes() != self.segment_bytes
             || segments.snapshot()?.len() as u64 != self.segment_count
         {
@@ -690,7 +688,7 @@ impl ShardImage {
         {
             return Err(Error::CorruptRecord);
         }
-        let segments = Segments::new(self.worker, self.geometry.segment_bytes);
+        let segments = Segments::new(self.geometry.segment_bytes);
         segments.configure(
             self.geometry.slab_bytes,
             self.geometry.segment_count as usize,
@@ -713,8 +711,12 @@ impl ShardImage {
             if !pages.insert(page) {
                 return Err(Error::CorruptRecord);
             }
-            segments.validate_location(&entry.location)?;
-            let extent = entry.location.location.extent;
+            segments.validate(
+                entry.location.segment,
+                entry.location.generation,
+                &entry.location.extent,
+            )?;
+            let extent = entry.location.extent;
             extents.push((
                 extent.offset(),
                 extent
@@ -804,9 +806,9 @@ pub async fn encode_incremental(image: &CheckpointImage) -> Result<Vec<u8>> {
             out.bytes(&entry.key_id.0)?;
             out.u64(entry.location.segment.0)?;
             out.u64(entry.location.generation.0)?;
-            out.u64(entry.location.location.slab.0)?;
-            out.u64(entry.location.location.extent.offset())?;
-            out.u64(entry.location.location.extent.length() as u64)?;
+            out.u64(0)?; // Reserved single-slab field preserves checkpoint encoding.
+            out.u64(entry.location.extent.offset())?;
+            out.u64(entry.location.extent.length() as u64)?;
         }
         out.count(shard.index.metadata.len())?;
         let mut metadata: Vec<_> = shard.index.metadata.iter().collect();
@@ -899,10 +901,12 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
             let key_id = KeyId(input.array()?);
             let segment = SegmentId(input.u64()?);
             let generation = Generation(input.u64()?);
-            let slab = SlabId(input.u64()?);
+            if input.u64()? != 0 {
+                return Err(Error::CorruptRecord);
+            }
             let offset = input.u64()?;
             let length = usize::try_from(input.u64()?).map_err(|_| Error::CorruptRecord)?;
-            let extent = DirectExtent::checked(offset, length)?;
+            let extent = Extent::new(offset, length)?;
             entries.push((
                 page,
                 IndexedPage {
@@ -911,7 +915,7 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
                     location: RecordLocation {
                         segment,
                         generation,
-                        location: SlabLocation { slab, extent },
+                        extent,
                     },
                 },
             ));

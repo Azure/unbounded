@@ -298,7 +298,7 @@ impl Harness {
             .slab_directory
             .join(format!("worker-{worker}-slab-0.dat"));
         self.sim.disk().sync_all().unwrap();
-        let offset = entry.location.location.extent.offset();
+        let offset = entry.location.extent.offset();
         let original = self
             .sim
             .disk()

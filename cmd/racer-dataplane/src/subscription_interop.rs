@@ -191,8 +191,7 @@ impl SubscriptionFixture {
         };
         use store::{
             StoreReader,
-            catalog::{Index, SegmentClock, Segments},
-            disk::Slabs,
+            catalog::{Index, SegmentClock},
             writer::StoreWriter,
         };
 
@@ -246,20 +245,20 @@ impl SubscriptionFixture {
             .unwrap(),
         );
         let index = Rc::new(Index::new(WorkerId(0), 16, availability.clone()));
-        let segments = Rc::new(Segments::new(WorkerId(0), 64 * 1024 * 1024));
-        let slabs = Rc::new(Slabs::new(
-            WorkerId(0),
-            root.join("slabs"),
-            reactor.clone(),
-            admission.clone(),
+        let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
+        let slabs = Rc::new(page_alloc::Slab::new(
+            root.join("slabs/worker-0-slab-0.dat"),
             256 * 1024 * 1024,
             64 * 1024 * 1024,
+            crate::model::PAGE_BYTES as usize + crate::store::format::MAX_HEADER_BYTES + 16,
         ));
         slabs.open_now().unwrap();
         let writer = Rc::new(StoreWriter::new(
             index.clone(),
             segments.clone(),
             slabs.clone(),
+            admission.clone(),
+            reactor.clone(),
             availability.clone(),
         ));
         let disk = Rc::new(StoreReader::new(
@@ -267,6 +266,8 @@ impl SubscriptionFixture {
             index.clone(),
             segments,
             slabs,
+            admission.clone(),
+            reactor.clone(),
             buffers.clone(),
         ));
         let (port, engine) = runtime::crypto::pair(WorkerId(0), 0, limits.queue_entries);

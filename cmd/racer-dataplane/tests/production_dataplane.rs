@@ -49,8 +49,7 @@ use racer_dataplane::{
     },
     store::{
         StoreReader,
-        catalog::{Index, SegmentClock, Segments},
-        disk::Slabs,
+        catalog::{Index, SegmentClock},
         writer::StoreWriter,
     },
     topology::{
@@ -746,14 +745,14 @@ fn open_fixture_storage(
     availability: Rc<racer_dataplane::control::state::Availability>,
 ) -> (Rc<Index>, Rc<StoreReader>, Rc<StoreWriter>) {
     let index = Rc::new(Index::new(worker, entries, availability.clone()));
-    let segments = Rc::new(Segments::new(worker, 64 * 1024 * 1024));
-    let slabs = Rc::new(Slabs::new(
-        worker,
-        path,
-        reactor.clone(),
-        admission.clone(),
+    let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
+    let slabs = Rc::new(page_alloc::Slab::new(
+        path.join(format!("worker-{}-slab-0.dat", worker.0)),
         slab_bytes,
         64 * 1024 * 1024,
+        racer_dataplane::model::PAGE_BYTES as usize
+            + racer_dataplane::store::format::MAX_HEADER_BYTES
+            + 16,
     ));
     let eviction = Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1));
     let disk = Rc::new(StoreReader::new(
@@ -761,12 +760,16 @@ fn open_fixture_storage(
         index.clone(),
         segments.clone(),
         slabs.clone(),
+        admission.clone(),
+        reactor.clone(),
         buffers,
     ));
     let writer = Rc::new(StoreWriter::new(
         index.clone(),
         segments,
         slabs,
+        admission.clone(),
+        reactor.clone(),
         availability,
     ));
     writer

@@ -32,8 +32,7 @@ use crate::{
     },
     store::{
         StoreReader,
-        catalog::{Index, SegmentClock, Segments},
-        disk::Slabs,
+        catalog::{Index, SegmentClock},
         writer::StoreWriter,
     },
     topology::{
@@ -512,28 +511,31 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
 
     let worker = WorkerId(0);
     let index = Rc::new(Index::new(worker, 16, availability.clone()));
-    let segments = Rc::new(Segments::new(worker, 64 * 1024 * 1024));
+    let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
     // Never opened: dirty saturation must bypass writer enqueue and all disk I/O.
-    let slabs = Rc::new(Slabs::new(
-        worker,
+    let reactor = Rc::new(Reactor::new(real.clone()));
+    let slabs = Rc::new(page_alloc::Slab::new(
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target/contention-fidelity-unopened"),
-        Rc::new(Reactor::new(real.clone())),
-        real.clone(),
+            .join("target/contention-fidelity-unopened/worker-0-slab-0.dat"),
         128 * 1024 * 1024,
         64 * 1024 * 1024,
+        crate::model::PAGE_BYTES as usize + crate::store::format::MAX_HEADER_BYTES + 16,
     ));
     let disk = Rc::new(StoreReader::new(
         Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1)),
         index.clone(),
         segments.clone(),
         slabs.clone(),
+        real.clone(),
+        reactor.clone(),
         buffers.clone(),
     ));
     let writer = Rc::new(StoreWriter::new(
         index,
         segments,
         slabs,
+        real.clone(),
+        reactor,
         availability.clone(),
     ));
     let (port, engine_port) = crypto::pair(worker, 0, NonZeroUsize::new(4).unwrap());

@@ -1098,10 +1098,7 @@ use crate::{
         worker::{CryptoRuntime, CryptoService, WorkerMap},
     },
     security::aead::PageCryptoEngine,
-    store::{
-        catalog::{Index, SegmentClock, Segments},
-        disk::Slabs,
-    },
+    store::catalog::{Index, SegmentClock},
     topology::{
         membership::{Member, Membership},
         placement::Placement,
@@ -1407,7 +1404,7 @@ fn fixture_with_caches(
     let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let index = Rc::new(Index::new(worker, 16, availability.clone()));
-    let segments = Rc::new(Segments::new(worker, 64 * 1024 * 1024));
+    let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
@@ -1416,13 +1413,11 @@ fn fixture_with_caches(
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-    let slabs = Rc::new(Slabs::new(
-        worker,
-        directory.clone(),
-        reactor.clone(),
-        admission.clone(),
+    let slabs = Rc::new(page_alloc::Slab::new(
+        directory.join(format!("worker-{}-slab-0.dat", worker.0)),
         1024 * 1024 * 1024,
         64 * 1024 * 1024,
+        crate::model::PAGE_BYTES as usize + crate::store::format::MAX_HEADER_BYTES + 16,
     ));
     slabs
         .open_now()
@@ -1435,6 +1430,8 @@ fn fixture_with_caches(
             index.clone(),
             segments.clone(),
             slabs.clone(),
+            admission.clone(),
+            reactor.clone(),
             buffers.clone(),
         )
         .with_metrics(metrics.clone()),
@@ -1443,6 +1440,8 @@ fn fixture_with_caches(
         index,
         segments,
         slabs,
+        admission.clone(),
+        reactor.clone(),
         availability.clone(),
     ));
     let context = OriginContext {
@@ -2496,17 +2495,24 @@ fn copy_only_rejects_disk_payload_and_tag_corruption_before_retention() {
             let location = writer.index().lookup(&f.page).unwrap().unwrap().location;
             let staging = writer
                 .slabs()
-                .allocate(location.location.extent.length(), None)
+                .allocate(
+                    location.extent.length(),
+                    f.fill
+                        .dependencies
+                        .admission
+                        .reserve(None, ResourceClass::Ciphertext, location.extent.length())
+                        .unwrap(),
+                )
                 .unwrap();
             let lease = writer.lease(&location).unwrap();
             let mut stored = drive_disk(
                 &f,
                 writer
                     .slabs()
-                    .read(location.location, staging, lease, &f.scope),
+                    .read(&f.reactor, location.extent, staging, lease, &f.scope),
             )
             .unwrap();
-            let parsed = crate::store::format::parse(&stored, location.location.extent).unwrap();
+            let parsed = crate::store::format::parse(&stored, location.extent).unwrap();
             let offset = if corrupt_tag {
                 parsed.ciphertext.end - 1
             } else {
@@ -2518,7 +2524,7 @@ fn copy_only_rejects_disk_payload_and_tag_corruption_before_retention() {
                 &f,
                 writer
                     .slabs()
-                    .write(location.location, stored, lease, &f.scope),
+                    .write(&f.reactor, location.extent, stored, lease, &f.scope),
             )
             .unwrap();
             if acquire {
@@ -3125,7 +3131,7 @@ fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
     assert!(diagnostics.contains("requested: 33554960"), "{diagnostics}");
     drop((read, copy, busy));
     deps.memory.evict_idle(usize::MAX).unwrap();
-    deps.writer.slabs().reclaim_buffer();
+    deps.writer.slabs().reclaim_idle();
     deps.admission.reclaim_buffers();
     assert_eq!(deps.admission.used(ResourceClass::Ciphertext), 0);
     assert_eq!(f.reactor.in_flight(), 0);

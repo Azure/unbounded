@@ -64,6 +64,19 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl From<page_alloc::Error> for Error {
+    fn from(error: page_alloc::Error) -> Self {
+        match error {
+            page_alloc::Error::Unsupported => Self::DirectIoUnsupported,
+            page_alloc::Error::InvalidConfiguration => Self::InvalidConfiguration,
+            page_alloc::Error::Busy => Self::Overloaded,
+            page_alloc::Error::Corrupt => Self::CorruptRecord,
+            page_alloc::Error::Unavailable => Self::Unavailable,
+            page_alloc::Error::Io => Self::Io,
+        }
+    }
+}
+
 impl From<uring_runtime::Error> for Error {
     fn from(error: uring_runtime::Error) -> Self {
         match error {
@@ -83,6 +96,24 @@ impl From<uring_runtime::Error> for Error {
 #[cfg(test)]
 mod tests {
     use super::Error;
+
+    #[test]
+    fn allocator_errors_keep_racer_boundary_meanings() {
+        use page_alloc::Error as AllocError;
+        for (allocator, racer) in [
+            (AllocError::Unsupported, Error::DirectIoUnsupported),
+            (
+                AllocError::InvalidConfiguration,
+                Error::InvalidConfiguration,
+            ),
+            (AllocError::Busy, Error::Overloaded),
+            (AllocError::Corrupt, Error::CorruptRecord),
+            (AllocError::Unavailable, Error::Unavailable),
+            (AllocError::Io, Error::Io),
+        ] {
+            assert_eq!(Error::from(allocator), racer);
+        }
+    }
 
     #[test]
     fn runtime_errors_keep_racer_boundary_meanings() {

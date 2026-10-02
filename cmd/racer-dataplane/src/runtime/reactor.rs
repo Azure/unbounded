@@ -23,11 +23,12 @@
 //! Audited production buffers own independent storage:
 //! ```
 //! use racer_dataplane::{memory::pool::PlaintextBuffer,
-//!     runtime::reactor::IoBuffer, store::disk::AlignedBuffer};
+//!     runtime::{reactor::IoBuffer, admission::Reservation}};
+//! use page_alloc::AlignedBuffer;
 //! fn independent<T: 'static>() {}
 //! fn completion_safe<B: IoBuffer>() { independent::<B>(); }
 //! completion_safe::<PlaintextBuffer>();
-//! completion_safe::<AlignedBuffer>();
+//! completion_safe::<AlignedBuffer<Reservation>>();
 //! ```
 //! Immutable ciphertext cannot be used for receive:
 //! ```compile_fail

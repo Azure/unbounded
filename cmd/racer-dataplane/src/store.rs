@@ -1,20 +1,21 @@
 //! Worker-local encrypted slab storage. No HTTP, plaintext, or origin credentials.
 pub mod catalog;
 pub mod checkpoint;
-pub mod disk;
 pub mod format;
 pub mod writer;
 
-use self::{
-    catalog::{Index, RecordLocation, Segments},
-    disk::Slabs,
+use self::catalog::{Index, RecordLocation};
+use crate::runtime::{
+    admission::{Admission, Reservation},
+    reactor::Reactor,
 };
 use crate::{
     error::{Error, Operation, Result},
     memory::{page::CiphertextCopy, pool::BufferPool},
     model::{PageId, ResourceClass},
-    runtime::{deadline::RequestScope, reactor::IoBuffer},
+    runtime::deadline::RequestScope,
 };
+use page_alloc::{Alignment, Segments, Slab};
 use std::rc::Rc;
 
 pub struct Store {
@@ -42,14 +43,14 @@ impl Store {
     }
 
     /// Open slabs and configure the actual live shard and checkpoint geometry.
-    pub fn open(&self) -> Operation<'_, disk::DirectAlignment> {
+    pub fn open(&self) -> Operation<'_, Alignment> {
         Box::pin(async move {
             let alignment = self.writer.open().await?;
             let slabs = self.writer.slabs();
             let geometry = checkpoint::CheckpointGeometry::new(
-                slabs.slab_bytes(),
+                slabs.capacity_bytes(),
                 slabs.segment_bytes(),
-                slabs.slab_bytes() / slabs.segment_bytes(),
+                slabs.capacity_bytes() / slabs.segment_bytes(),
                 alignment,
             )?;
             self.checkpoint.configure_geometry(geometry)?;
@@ -66,7 +67,9 @@ pub struct StoreReader {
     clock: Rc<catalog::SegmentClock>,
     index: Rc<Index>,
     segments: Rc<Segments>,
-    slabs: Rc<Slabs>,
+    slabs: Rc<Slab<Reservation>>,
+    admission: Rc<Admission>,
+    reactor: Rc<Reactor>,
     buffers: BufferPool,
 }
 #[derive(Clone)]
@@ -86,7 +89,9 @@ impl StoreReader {
         clock: Rc<catalog::SegmentClock>,
         index: Rc<Index>,
         segments: Rc<Segments>,
-        slabs: Rc<Slabs>,
+        slabs: Rc<Slab<Reservation>>,
+        admission: Rc<Admission>,
+        reactor: Rc<Reactor>,
         buffers: BufferPool,
     ) -> Self {
         Self {
@@ -95,6 +100,8 @@ impl StoreReader {
             index,
             segments,
             slabs,
+            admission,
+            reactor,
             buffers,
         }
     }
@@ -117,7 +124,7 @@ impl StoreReader {
         scope: &'a RequestScope,
     ) -> Operation<'a, Option<(CiphertextCopy, ReadToken)>> {
         self.read_with_token_reclaim(page, scope, |amount| {
-            self.slabs.reserve(
+            self.admission.reserve(
                 Some(&page.version.object.cache),
                 ResourceClass::Ciphertext,
                 amount,
@@ -145,7 +152,15 @@ impl StoreReader {
                 location: entry.location.clone(),
             };
             // Both checks happen without yielding, so eviction cannot interleave.
-            if self.segments.validate_location(&entry.location).is_err() {
+            if self
+                .segments
+                .validate(
+                    entry.location.segment,
+                    entry.location.generation,
+                    &entry.location.extent,
+                )
+                .is_err()
+            {
                 self.invalidate(&token)?;
                 return Ok(None);
             }
@@ -159,22 +174,28 @@ impl StoreReader {
                     return Ok(None);
                 }
             };
-            let length = entry.location.location.extent.length();
+            let length = entry.location.extent.length();
             let decoded_length = entry.metadata.page_length(page)? as usize + 16;
             let amount = length
                 .checked_add(decoded_length)
                 .ok_or(Error::Overloaded)?;
             let mut reserved = reserve(amount);
             if matches!(reserved, Err(Error::Overloaded)) {
-                self.slabs.reclaim_buffer();
+                self.slabs.reclaim_idle();
                 reserved = reserve(amount);
             }
             let mut decoded_reservation = reserved?;
+            decoded_reservation.validate(ResourceClass::Ciphertext, amount)?;
+            if !self.admission.owns(&decoded_reservation)
+                || decoded_reservation.cache() != Some(&page.version.object.cache)
+            {
+                return Err(Error::InvalidConfiguration);
+            }
             let staging = decoded_reservation.split(length)?;
-            let buffer = self.slabs.allocate_reserved(length, staging)?;
+            let buffer = self.slabs.allocate(length, staging)?;
             let buffer = match self
                 .slabs
-                .read(entry.location.location, buffer, lease, scope)
+                .read(&self.reactor, entry.location.extent, buffer, lease, scope)
                 .await
             {
                 Ok(b) => b,
@@ -187,7 +208,7 @@ impl StoreReader {
                 }
                 Err(e) => return Err(e),
             };
-            let decoded = match format::parse(&buffer, entry.location.location.extent) {
+            let decoded = match format::parse(&buffer, entry.location.extent) {
                 Ok(d) => d,
                 Err(_) => {
                     self.corrupt_miss();

@@ -98,6 +98,12 @@ pub struct Reservation {
     stopped: Arc<AtomicBool>,
 }
 
+impl page_alloc::Charge for Reservation {
+    fn covers(&self, bytes: usize) -> bool {
+        matches!(self.class(), ResourceClass::Ciphertext) && self.amount() >= bytes
+    }
+}
+
 /// Wipe every allocated payload byte, including truncated and uninitialized tails.
 /// Leave the length empty so rejection can deallocate without exposing spare bytes.
 fn wipe_payload(bytes: &mut Vec<u8>) {

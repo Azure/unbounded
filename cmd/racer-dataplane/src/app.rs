@@ -58,9 +58,8 @@ use crate::{
     },
     store::{
         Store, StoreReader,
-        catalog::{Index, SegmentClock, Segments},
+        catalog::{Index, SegmentClock},
         checkpoint::{CheckpointGeometry, Checkpointer, Recovery, ShardImage},
-        disk::Slabs,
         writer::StoreWriter,
     },
     telemetry::Telemetry,
@@ -1252,19 +1251,19 @@ impl WorkerApplication {
             limits.metadata_entries.get(),
             availability.clone(),
         ));
-        let segments = Rc::new(Segments::new(worker, config.segment_bytes));
+        let segments = Rc::new(page_alloc::Segments::new(config.segment_bytes));
         let eviction = Rc::new(SegmentClock::new(
             index.clone(),
             segments.clone(),
             config.free_segment_reserve,
         ));
-        let slabs = Rc::new(Slabs::new(
-            worker,
-            config.slab_directory.clone(),
-            runtime.reactor.clone(),
-            runtime.admission.clone(),
+        let slabs = Rc::new(page_alloc::Slab::new(
+            config
+                .slab_directory
+                .join(format!("worker-{}-slab-0.dat", worker.0)),
             config.slab_bytes,
             config.segment_bytes,
+            crate::model::PAGE_BYTES as usize + crate::store::format::MAX_HEADER_BYTES + 16,
         ));
         let reader = Rc::new(
             StoreReader::new(
@@ -1272,13 +1271,22 @@ impl WorkerApplication {
                 index.clone(),
                 segments.clone(),
                 slabs.clone(),
+                runtime.admission.clone(),
+                runtime.reactor.clone(),
                 buffers,
             )
             .with_metrics(metrics.clone()),
         );
         let writer = Rc::new(
-            StoreWriter::new(index.clone(), segments.clone(), slabs, availability)
-                .with_metrics(metrics.clone()),
+            StoreWriter::new(
+                index.clone(),
+                segments.clone(),
+                slabs,
+                runtime.admission.clone(),
+                runtime.reactor.clone(),
+                availability,
+            )
+            .with_metrics(metrics.clone()),
         );
         writer.configure(
             runtime.admission.clone(),

@@ -403,17 +403,10 @@ fn validate_candidate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{
-        catalog::IndexSnapshot, checkpoint::CHECKPOINT_VERSION, disk::DirectAlignment,
-    };
+    use crate::store::{catalog::IndexSnapshot, checkpoint::CHECKPOINT_VERSION};
+    use page_alloc::{Alignment, Segments};
     fn geometry() -> CheckpointGeometry {
-        CheckpointGeometry::new(
-            8192,
-            4096,
-            2,
-            DirectAlignment::validate(4096, 4096, 4096).unwrap(),
-        )
-        .unwrap()
+        CheckpointGeometry::new(8192, 4096, 2, Alignment::new(4096, 4096, 4096).unwrap()).unwrap()
     }
     fn caches() -> Vec<crate::control::state::CacheDefinition> {
         let mut cache = super::super::test_support::definition();
@@ -428,7 +421,7 @@ mod tests {
                 .iter()
                 .map(|worker| {
                     let g = geometry();
-                    let segments = Segments::new(*worker, g.segment_bytes);
+                    let segments = Segments::new(g.segment_bytes);
                     segments
                         .configure(
                             g.slab_bytes,
@@ -526,7 +519,7 @@ mod tests {
     {
         use crate::model::{VersionMetadata, *};
         use crate::store::{
-            catalog::{IndexedPage, RecordLocation, Segments},
+            catalog::{IndexedPage, RecordLocation},
             checkpoint,
         };
         let node = NodeState::new(vec![WorkerId(0)], 16).unwrap();
@@ -536,7 +529,7 @@ mod tests {
         let g = geometry();
         let geometry = [(WorkerId(0), g)].into_iter().collect();
         let mut old = image(8, &[WorkerId(0)]);
-        let segments = Segments::new(WorkerId(0), g.segment_bytes);
+        let segments = Segments::new(g.segment_bytes);
         segments
             .configure(
                 g.slab_bytes,
@@ -564,9 +557,9 @@ mod tests {
             page.clone(),
             IndexedPage {
                 location: RecordLocation {
-                    segment: append.segment.id(),
-                    generation: append.segment.generation(),
-                    location: append.location,
+                    segment: append.0.id(),
+                    generation: append.0.generation(),
+                    extent: append.1,
                 },
                 metadata: metadata.clone(),
                 key_id: crate::model::KeyId::from_generation(1, 1).unwrap(),
@@ -640,7 +633,7 @@ mod tests {
             16,
             crate::test_support::availability(),
         ));
-        let segments = Rc::new(Segments::new(WorkerId(0), g.segment_bytes));
+        let segments = Rc::new(Segments::new(g.segment_bytes));
         segments
             .configure(
                 g.slab_bytes,

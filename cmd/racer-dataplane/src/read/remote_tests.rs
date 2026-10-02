@@ -897,8 +897,7 @@ fn metadata_coordinator_with_newer_publication(
         security::aead::PageCrypto,
         store::{
             StoreReader,
-            catalog::{Index, SegmentClock, Segments},
-            disk::Slabs,
+            catalog::{Index, SegmentClock},
             writer::StoreWriter,
         },
     };
@@ -932,26 +931,28 @@ fn metadata_coordinator_with_newer_publication(
     }
     let buffers = BufferPool::new(admission.clone());
     let index = Rc::new(Index::new(WorkerId(0), 16, availability.clone()));
-    let segments = Rc::new(Segments::new(WorkerId(0), 64 * 1024 * 1024));
-    let slabs = Rc::new(Slabs::new(
-        WorkerId(0),
-        "unused/absence-slabs".into(),
-        reactor.clone(),
-        admission.clone(),
+    let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
+    let slabs = Rc::new(page_alloc::Slab::new(
+        "unused/absence-slabs/worker-0-slab-0.dat".into(),
         1024 * 1024 * 1024,
         64 * 1024 * 1024,
+        crate::model::PAGE_BYTES as usize + crate::store::format::MAX_HEADER_BYTES + 16,
     ));
     let disk = Rc::new(StoreReader::new(
         Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1)),
         index.clone(),
         segments.clone(),
         slabs.clone(),
+        admission.clone(),
+        reactor.clone(),
         buffers.clone(),
     ));
     let writer = Rc::new(StoreWriter::new(
         index.clone(),
         segments,
         slabs,
+        admission.clone(),
+        reactor.clone(),
         availability.clone(),
     ));
     let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));

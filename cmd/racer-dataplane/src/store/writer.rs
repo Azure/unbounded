@@ -1,10 +1,10 @@
 //! Bounded dirty copies persist asynchronously, with publication after full I/O.
 use super::{
-    catalog::{Index, IndexedPage, RecordLocation, SegmentClock, Segments},
-    disk::Slabs,
+    catalog::{Index, IndexedPage, RecordLocation, SegmentClock},
     format,
 };
 use crate::runtime::collections::HashMap;
+use crate::runtime::reactor::Reactor;
 use crate::{
     error::{Error, Operation, Result},
     memory::page::CiphertextCopy,
@@ -14,6 +14,7 @@ use crate::{
         deadline::RequestScope,
     },
 };
+use page_alloc::{Alignment, SegmentLease, Segments, Slab};
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
@@ -30,7 +31,9 @@ pub struct StoreWriter {
     metrics: crate::telemetry::metrics::Metrics,
     index: Rc<Index>,
     segments: Rc<Segments>,
-    slabs: Rc<Slabs>,
+    slabs: Rc<Slab<Reservation>>,
+    admission: Rc<Admission>,
+    reactor: Rc<Reactor>,
     clock: RefCell<Option<Rc<SegmentClock>>>,
     pending: RefCell<HashMap<PageId, Dirty>>,
     queue: RefCell<VecDeque<PageId>>,
@@ -46,7 +49,9 @@ impl StoreWriter {
     pub fn new(
         index: Rc<Index>,
         segments: Rc<Segments>,
-        slabs: Rc<Slabs>,
+        slabs: Rc<Slab<Reservation>>,
+        admission: Rc<Admission>,
+        reactor: Rc<Reactor>,
         availability: Rc<crate::control::state::Availability>,
     ) -> Self {
         Self {
@@ -54,6 +59,8 @@ impl StoreWriter {
             index,
             segments,
             slabs,
+            admission,
+            reactor,
             clock: RefCell::new(None),
             pending: RefCell::new(HashMap::default()),
             queue: RefCell::new(VecDeque::new()),
@@ -80,19 +87,21 @@ impl StoreWriter {
         if queue_entries == 0 || self.busy.get() || !self.pending.borrow().is_empty() {
             return Err(Error::InvalidConfiguration);
         }
-        self.slabs.validate_admission(&admission)?;
+        if !Rc::ptr_eq(&self.admission, &admission) {
+            return Err(Error::InvalidConfiguration);
+        }
         self.index.set_page_capacity(page_entries)?;
         *self.clock.borrow_mut() = Some(clock);
         self.capacity.set(queue_entries);
         Ok(())
     }
-    pub fn open(&self) -> Operation<'_, super::disk::DirectAlignment> {
+    pub fn open(&self) -> Operation<'_, Alignment> {
         Box::pin(async move {
             let alignment = self.slabs.open().await?;
             if self.segments.snapshot()?.is_empty() {
                 self.segments.configure(
-                    self.slabs.slab_bytes(),
-                    usize::try_from(self.slabs.slab_bytes() / self.slabs.segment_bytes())
+                    self.slabs.capacity_bytes(),
+                    usize::try_from(self.slabs.capacity_bytes() / self.slabs.segment_bytes())
                         .map_err(|_| Error::InvalidConfiguration)?,
                     alignment,
                 )?;
@@ -100,15 +109,16 @@ impl StoreWriter {
             Ok(alignment)
         })
     }
-    pub fn slabs(&self) -> &Rc<Slabs> {
+    pub fn slabs(&self) -> &Rc<Slab<Reservation>> {
         &self.slabs
     }
     pub fn index(&self) -> &Rc<Index> {
         &self.index
     }
-    pub fn lease(&self, location: &RecordLocation) -> Result<super::catalog::SegmentLease> {
-        self.segments.validate_location(location)?;
-        self.segments.lease(location.segment, location.generation)
+    pub fn lease(&self, location: &RecordLocation) -> Result<SegmentLease> {
+        self.segments
+            .validate(location.segment, location.generation, &location.extent)?;
+        Ok(self.segments.lease(location.segment, location.generation)?)
     }
     fn allowed(&self, page: &CiphertextCopy) -> bool {
         let e = page.ciphertext.envelope();
@@ -117,9 +127,20 @@ impl StoreWriter {
     }
     pub fn enqueue(&self, page: CiphertextCopy, dirty: Reservation) -> Result<u64> {
         let cache = page.metadata.version.object.cache.clone();
-        self.enqueue_reclaiming(page, dirty, |length| {
-            self.slabs.reserve_staging(length, &cache)
-        })
+        self.enqueue_reclaiming(page, dirty, |length| self.reserve_staging(length, &cache))
+    }
+    /// Accepted fills may complete after request admission closes, within quota.
+    fn reserve_staging(&self, length: usize, cache: &CacheId) -> Result<Reservation> {
+        let reserve = || {
+            self.admission
+                .reserve_completion(Some(cache), ResourceClass::Ciphertext, length)
+        };
+        let result = reserve();
+        if matches!(result, Err(Error::Overloaded)) {
+            self.slabs.reclaim_idle();
+            return reserve();
+        }
+        result
     }
     /// The fill owner may reclaim idle cached bytes for exact aligned staging.
     /// Reclamation is synchronous and happens before queue acceptance; no writer
@@ -141,7 +162,7 @@ impl StoreWriter {
         }
         let logical = format::logical_length(&page)?;
         if !matches!(dirty.class(), ResourceClass::DirtyCiphertext)
-            || !self.slabs.owns_reservation(&dirty)
+            || !self.admission.owns(&dirty)
             || dirty.cache() != Some(&page.metadata.version.object.cache)
             || dirty.amount() < page.ciphertext.bytes().len()
             || logical > crate::model::PAGE_BYTES as usize + super::format::MAX_HEADER_BYTES + 16
@@ -175,9 +196,7 @@ impl StoreWriter {
         let disk_bytes = self.slabs.alignment()?.extent(0, logical)?.length();
         let staging = reserve_staging(disk_bytes)?;
         staging.validate(ResourceClass::Ciphertext, disk_bytes)?;
-        if !self.slabs.owns_reservation(&staging)
-            || staging.cache() != Some(&id.version.object.cache)
-        {
+        if !self.admission.owns(&staging) || staging.cache() != Some(&id.version.object.cache) {
             return Err(Error::InvalidConfiguration);
         }
         let ticket = self.next.get();
@@ -281,7 +300,7 @@ impl StoreWriter {
     /// Release only enough queued ciphertext/staging charges to cover a deficit.
     /// Submitted writes are absent from queue and keep all completion-owned charges.
     pub(crate) fn reclaim_ciphertext(&self, cache: Option<&CacheId>, bytes: usize) -> usize {
-        let pooled = self.slabs.reclaim_buffer();
+        let pooled = self.slabs.reclaim_idle();
         if pooled >= bytes {
             return pooled;
         }
@@ -399,9 +418,12 @@ impl StoreWriter {
                 entry.ticket,
             )
         };
-        let mut buffer = self.slabs.allocate_reserved(disk_bytes, staging)?;
-        buffer.retain_charge(dirty);
-        let append = match self.segments.append(disk_bytes) {
+        if !self.admission.owns(&staging) {
+            return Err(Error::InvalidConfiguration);
+        }
+        let mut buffer = self.slabs.allocate(disk_bytes, staging)?;
+        buffer.retain(dirty);
+        let (segment, extent) = match self.segments.append(disk_bytes).map_err(Error::from) {
             Ok(append) => append,
             Err(Error::Overloaded) => {
                 if let Some(clock) = self.clock.borrow().clone() {
@@ -412,20 +434,20 @@ impl StoreWriter {
             Err(error) => return Err(error),
         };
         let location = RecordLocation {
-            segment: append.segment.id(),
-            generation: append.segment.generation(),
-            location: append.location,
+            segment: segment.id(),
+            generation: segment.generation(),
+            extent,
         };
         let _publication_lease = self.segments.lease(location.segment, location.generation)?;
         let encoded = format::encode_at(
             page,
             location.generation,
             alignment,
-            location.location.extent.offset(),
+            location.extent.offset(),
             buffer,
         )?;
         self.slabs
-            .write(append.location, encoded.buffer, append.segment, scope)
+            .write(&self.reactor, extent, encoded.buffer, segment, scope)
             .await?;
         if self.allowed(page)
             && self
@@ -433,7 +455,10 @@ impl StoreWriter {
                 .borrow()
                 .get(id)
                 .is_some_and(|d| d.ticket == ticket)
-            && self.segments.validate_location(&location).is_ok()
+            && self
+                .segments
+                .validate(location.segment, location.generation, &location.extent)
+                .is_ok()
         {
             index_ticket.publish(
                 id.clone(),
@@ -475,7 +500,7 @@ impl StoreWriter {
                 self.progress(8, scope).await?;
             }
             self.slabs.fence_writes().await?;
-            self.slabs.reclaim_buffer();
+            self.slabs.reclaim_idle();
             Ok(())
         })
     }
@@ -495,11 +520,11 @@ impl StoreWriter {
     }
     /// Idle, zeroized staging remains charged until reuse, pressure, or drain.
     pub fn retained_staging_bytes(&self) -> usize {
-        self.slabs.retained_staging_bytes()
+        self.slabs.idle_bytes()
     }
     #[cfg(test)]
     pub(super) fn reclaim_idle_buffer(&self) -> usize {
-        self.slabs.reclaim_buffer()
+        self.slabs.reclaim_idle()
     }
 }
 struct Busy<'a>(&'a StoreWriter);
