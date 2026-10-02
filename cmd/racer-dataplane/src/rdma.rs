@@ -4,8 +4,17 @@
 //! Public contracts always compile; native FFI is gated by `rdma`. Attach bounded
 //! lifecycle endpoints, activate devices against publication, and run `WithNative`
 //! on the crypto role. I/O turns consume mailboxes and drive session progress.
-mod ffi;
+#[cfg(test)]
+mod activation_tests;
 pub mod lifecycle;
+#[cfg(test)]
+mod lifecycle_tests;
+#[cfg(test)]
+mod mailbox_tests;
+#[cfg(test)]
+mod receive_tests;
+#[cfg(test)]
+mod test_support;
 
 use self::lifecycle::{
     DeviceHandle, Endpoint, IoPort, QueuePairHandle, Region, Ticket, Window, wait,
@@ -208,7 +217,7 @@ impl Sessions {
         }
         let qp = std::task::ready!(QueuePairHandle::poll_new_admitted(
             self.devices.select(rail)?.handle,
-            permit
+            permit.map(|p| p as rdma_verbs::Guard)
         ))?;
         // Bound a peer that opens setup but never completes the exchange. A
         // transfer subsequently replaces this with its original request deadline.
@@ -363,7 +372,7 @@ impl SessionLease {
                     let _ = self.qp.stop();
                     return Poll::Ready(Err(error));
                 }
-                self.qp.poll_connected(cx)
+                self.qp.poll_connected(cx).map_err(Into::into)
             })
             .await
         })
@@ -378,7 +387,7 @@ impl SessionLease {
         self.binding
     }
     pub fn progress(&self) -> Result<usize> {
-        self.qp.progress()
+        self.qp.progress().map_err(Into::into)
     }
     pub fn ready(&self) -> bool {
         self.qp.ready() && !self.claimed.get()
@@ -390,7 +399,7 @@ impl SessionLease {
         Ok(())
     }
     pub fn abort(&self) -> Result<()> {
-        self.qp.stop()
+        self.qp.stop().map_err(Into::into)
     }
 }
 #[cfg(test)]
@@ -657,9 +666,9 @@ impl Grant {
         let buffer = self.buffer.as_ref().ok_or(Error::InvalidRequest)?;
         Ok(RemoteDescriptor {
             transfer: self.transfer,
-            address: self.window.address.get(),
+            address: self.window.address(),
             length: buffer.len() as u64,
-            scoped_key: self.window.key.get(),
+            scoped_key: self.window.key(),
         })
     }
     pub fn header_value(&self) -> Result<Vec<u8>> {
@@ -681,9 +690,9 @@ impl Grant {
                     return Poll::Ready(Err(Error::DeadlineExceeded));
                 }
                 if let Err(error) = self.qp.progress() {
-                    return Poll::Ready(Err(error));
+                    return Poll::Ready(Err(error.into()));
                 }
-                self.bound.poll(cx)
+                self.bound.poll(cx).map_err(Into::into)
             })
             .await
         })
@@ -718,16 +727,16 @@ impl Grant {
                     return Poll::Ready(Err(Error::DeadlineExceeded));
                 }
                 if let Err(error) = self.qp.progress() {
-                    return Poll::Ready(Err(error));
+                    return Poll::Ready(Err(error.into()));
                 }
                 if invalidated.is_none() {
                     match self.qp.poll_invalidate(self.window.clone(), cx) {
                         Poll::Pending => return Poll::Pending,
-                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
                         Poll::Ready(Ok(ticket)) => invalidated = Some(ticket),
                     }
                 }
-                invalidated.as_ref().unwrap().poll(cx)
+                invalidated.as_ref().unwrap().poll(cx).map_err(Into::into)
             })
             .await?;
             // Cancellation/expiry returns no buffer. Grant Drop requests stop;
@@ -738,7 +747,7 @@ impl Grant {
                 if crate::runtime::environment::now() >= self.deadline.0 {
                     return Poll::Ready(Err(Error::DeadlineExceeded));
                 }
-                self.qp.poll_stopped(cx)
+                self.qp.poll_stopped(cx).map_err(Into::into)
             })
             .await?;
             self.buffer.take().ok_or(Error::InvalidRequest)
@@ -870,7 +879,7 @@ impl RdmaTransfer {
                 if let Err(error) = session.progress() {
                     return Poll::Ready(Err(error));
                 }
-                ticket.poll(cx)
+                ticket.poll(cx).map_err(Into::into)
             })
             .await?;
             // Source buffer is safe after its write CQE. Stop this single-use QP
@@ -996,6 +1005,13 @@ fn registered_charge(length: usize) -> Result<usize> {
         .map(|n| n & !4095)
         .ok_or(Error::Overloaded)
 }
+fn validate_native_page_size(page_size: libc::c_long) -> Result<()> {
+    if page_size == 4096 {
+        Ok(())
+    } else {
+        Err(Error::Unavailable)
+    }
+}
 /// A native slot owns both a registered buffer and bounded handoff staging.
 pub(crate) fn native_slot_charge(length: usize) -> Result<usize> {
     registered_charge(length)?
@@ -1006,6 +1022,16 @@ pub(crate) fn native_slot_charge(length: usize) -> Result<usize> {
 #[cfg(test)]
 mod registered_tests {
     use super::*;
+    #[test]
+    fn native_page_policy_preserves_unavailable_for_unsupported_hosts() {
+        assert_eq!(validate_native_page_size(4096), Ok(()));
+        for page_size in [-1, 0, 1024, 8192, 65536] {
+            assert_eq!(
+                validate_native_page_size(page_size),
+                Err(Error::Unavailable)
+            );
+        }
+    }
     #[test]
     fn registered_quota_accounts_for_short_and_final_physical_pages() {
         assert_eq!(registered_charge(1), Ok(4096));
@@ -1053,21 +1079,7 @@ pub struct FabricPort {
     pub port: u8,
     pub gid: Option<[u8; 16]>,
 }
-#[derive(Clone, Debug)]
-pub struct DiscoveredPort {
-    pub device: String,
-    pub port: u8,
-    pub gid: [u8; 16],
-    pub numa_node: Option<usize>,
-}
-pub(crate) fn discovered_port(device: &ffi::NativeDevice) -> Result<DiscoveredPort> {
-    Ok(DiscoveredPort {
-        device: device.name.clone(),
-        port: device.endpoint.port,
-        gid: device.endpoint.gid,
-        numa_node: device.numa_node(),
-    })
-}
+pub use rdma_verbs::PortInfo as DiscoveredPort;
 /// Pure deterministic matching used by native activation. An absent association,
 /// duplicate candidate, reused physical port or mismatched NUMA fails closed.
 pub fn match_publication(
@@ -1124,14 +1136,7 @@ impl Devices {
     pub(crate) fn test(port: std::rc::Rc<IoPort>) -> Self {
         let devices = Self::new();
         devices.selected.borrow_mut().push(Device {
-            handle: std::rc::Rc::new(DeviceHandle {
-                port: port.clone(),
-                rail: RailId(0),
-                generation: port
-                    .shared
-                    .generation
-                    .load(std::sync::atomic::Ordering::Acquire),
-            }),
+            handle: port.device(0),
             rail: RailId(0),
         });
         *devices.port.borrow_mut() = Some(port);
@@ -1166,16 +1171,45 @@ impl Devices {
             if bytes_per_slot == 0 || bytes_per_slot > MAX_CIPHERTEXT {
                 return Err(Error::InvalidConfiguration);
             }
+            // Racer's quota profile charges 4 KiB physical pages. This policy
+            // does not belong in the generic native ABI.
+            validate_native_page_size(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })?;
             let port = self.port.borrow().clone().ok_or(Error::Unavailable)?;
             port.reopen()?;
             let charge = native_slot_charge(bytes_per_slot)?;
             // One native registered allocation plus one bounded handoff staging
             // allocation per slot. Both remain charged through native quarantine.
             let quotas = (0..port.capacity())
-                .map(|_| admission.reserve(None, ResourceClass::Registered, charge))
+                .map(|_| {
+                    admission
+                        .reserve(None, ResourceClass::Registered, charge)
+                        .map(|q| std::sync::Arc::new(q) as rdma_verbs::Guard)
+                })
                 .collect::<Result<Vec<_>>>()?;
-            port.configure(publication, associations, quotas, bytes_per_slot, scope)
-                .await?;
+            let requested = publication.clone();
+            let mut configure = std::pin::pin!(port.configure(rdma_verbs::Configuration {
+                discover: !publication.is_empty(),
+                guards: quotas,
+                bytes: bytes_per_slot,
+                selector: Box::new(move |ports| {
+                    match_publication(&requested, &associations, ports)
+                        .map(|selected| {
+                            selected
+                                .into_iter()
+                                .map(|(r, i)| (u32::from(r.rail.0), i))
+                                .collect()
+                        })
+                        .map_err(|e| match e {
+                            Error::InvalidConfiguration => rdma_verbs::Error::InvalidConfiguration,
+                            Error::Overloaded => rdma_verbs::Error::Overloaded,
+                            _ => rdma_verbs::Error::Unavailable,
+                        })
+                }),
+            }));
+            wait(scope, |cx| {
+                std::future::Future::poll(configure.as_mut(), cx)
+            })
+            .await?;
             struct ActivationGuard<'a> {
                 port: &'a IoPort,
                 completed: bool,
@@ -1195,11 +1229,7 @@ impl Devices {
             let mappings = futures::future::poll_fn(|cx| {
                 port.register_driver(cx.waker());
                 cancel.register(cx.waker());
-                if port
-                    .shared
-                    .closed
-                    .load(std::sync::atomic::Ordering::Acquire)
-                {
+                if port.closed() {
                     return std::task::Poll::Ready(Err(Error::Unavailable));
                 }
                 if let Err(error) = scope.check() {
@@ -1207,21 +1237,27 @@ impl Devices {
                     return std::task::Poll::Ready(Err(error));
                 }
                 port.activation()
+                    .map(|r| r.map_err(Error::from))
                     .map_or(std::task::Poll::Pending, std::task::Poll::Ready)
             })
             .await?;
             guard.completed = true;
+            let mappings: Vec<_> = mappings
+                .into_iter()
+                .map(|selected| {
+                    let mut mapping = publication
+                        .iter()
+                        .find(|m| u32::from(m.rail.0) == selected.tag)
+                        .expect("selector only returns published tags")
+                        .clone();
+                    mapping.numa_node = selected.port.numa_node;
+                    mapping
+                })
+                .collect();
             *self.selected.borrow_mut() = mappings
                 .iter()
                 .map(|mapping| Device {
-                    handle: Rc::new(DeviceHandle {
-                        port: port.clone(),
-                        rail: mapping.rail,
-                        generation: port
-                            .shared
-                            .generation
-                            .load(std::sync::atomic::Ordering::Acquire),
-                    }),
+                    handle: port.device(u32::from(mapping.rail.0)),
                     rail: mapping.rail,
                 })
                 .collect();
@@ -1239,12 +1275,11 @@ impl Devices {
     }
     pub fn ready(&self, rail: RailId) -> bool {
         self.select(rail).is_ok()
-            && self.port.borrow().as_ref().is_some_and(|port| {
-                !port
-                    .shared
-                    .closed
-                    .load(std::sync::atomic::Ordering::Acquire)
-            })
+            && self
+                .port
+                .borrow()
+                .as_ref()
+                .is_some_and(|port| !port.closed())
     }
     pub fn close(&self) {
         if let Some(port) = self.port.borrow().as_ref() {

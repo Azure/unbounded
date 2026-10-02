@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "runtime", "alloc", "crypto"]
+members = [".", "runtime", "alloc", "crypto", "verbs"]
 resolver = "3"
 
 [package]
@@ -12,7 +12,7 @@ description = "Racer node-local read-through cache dataplane"
 [features]
 default = []
 # Enables the separately loaded native verbs adapter; unavailable hardware uses HTTP.
-rdma = []
+rdma = ["rdma-verbs/native"]
 # Opt-in Go SDK interoperability fixture using the production library.
 subscription-interop = []
 
@@ -23,6 +23,7 @@ required-features = ["subscription-interop"]
 
 [dependencies]
 racer-crypto = { path = "crypto" }
+rdma-verbs = { path = "verbs" }
 page-alloc = { path = "alloc" }
 uring-runtime = { path = "runtime" }
 base64 = "0.22"
@@ -41,6 +42,7 @@ x509-parser = { version = "0.16", features = ["verify"] }
 zeroize = "1"
 
 [dev-dependencies]
+rdma-verbs = { path = "verbs", features = ["simulation"] }
 page-alloc = { path = "alloc", features = ["simulation"] }
 uring-runtime = { path = "runtime", features = ["simulation"] }
 

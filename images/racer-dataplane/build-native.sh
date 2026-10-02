@@ -15,5 +15,5 @@ mkdir -p "$(dirname "$2")"
 # shellcheck disable=SC2046
 "${CC:-cc}" $(pkg-config --cflags libibverbs) \
     -O2 -g -std=gnu11 -Wall -Wextra -Werror -fPIC -shared \
-    -Wl,-soname,libracer_rdma.so.1 -Wl,-z,defs \
+    -Wl,-soname,librdma_verbs.so.1 -Wl,-z,defs \
     -o "$2" "$1" $(pkg-config --libs libibverbs)

@@ -1284,7 +1284,7 @@ async fn fence(session: &crate::rdma::SessionLease, scope: &RequestScope) -> Res
         cancellation.register(cx.waker());
         session.abort()?;
         scope.check()?;
-        session.qp.poll_stopped(cx)
+        session.qp.poll_stopped(cx).map_err(Into::into)
     })
     .await
 }

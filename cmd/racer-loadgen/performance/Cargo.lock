@@ -661,6 +661,7 @@ dependencies = [
  "page-alloc",
  "racer-crypto",
  "rcgen",
+ "rdma-verbs",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -704,6 +705,15 @@ dependencies = [
  "time",
  "x509-parser",
  "yasna",
+]
+
+[[package]]
+name = "rdma-verbs"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "libc",
+ "uring-runtime",
 ]
 
 [[package]]

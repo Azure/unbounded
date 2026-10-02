@@ -1324,7 +1324,7 @@ mod shared_tests {
         group.join().unwrap();
         for io in observed.native.lock().unwrap().iter() {
             assert_eq!(
-                io.reopen(),
+                io.reopen().map_err(Error::from),
                 Err(Error::Unavailable),
                 "native owner was destroyed"
             );

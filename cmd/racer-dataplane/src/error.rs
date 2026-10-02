@@ -64,6 +64,21 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl From<rdma_verbs::Error> for Error {
+    fn from(error: rdma_verbs::Error) -> Self {
+        match error {
+            rdma_verbs::Error::InvalidConfiguration => Self::InvalidConfiguration,
+            rdma_verbs::Error::InvalidRequest => Self::InvalidRequest,
+            rdma_verbs::Error::InvalidRange => Self::InvalidRange,
+            rdma_verbs::Error::Unavailable => Self::Unavailable,
+            rdma_verbs::Error::Overloaded => Self::Overloaded,
+            rdma_verbs::Error::DeadlineExceeded => Self::DeadlineExceeded,
+            rdma_verbs::Error::Cancelled => Self::Cancelled,
+            rdma_verbs::Error::Io => Self::Io,
+        }
+    }
+}
+
 impl From<page_alloc::Error> for Error {
     fn from(error: page_alloc::Error) -> Self {
         match error {
@@ -96,6 +111,23 @@ impl From<uring_runtime::Error> for Error {
 #[cfg(test)]
 mod tests {
     use super::Error;
+
+    #[test]
+    fn verbs_errors_keep_racer_boundary_meanings() {
+        use rdma_verbs::Error as Verbs;
+        for (verbs, racer) in [
+            (Verbs::InvalidConfiguration, Error::InvalidConfiguration),
+            (Verbs::InvalidRequest, Error::InvalidRequest),
+            (Verbs::InvalidRange, Error::InvalidRange),
+            (Verbs::Unavailable, Error::Unavailable),
+            (Verbs::Overloaded, Error::Overloaded),
+            (Verbs::DeadlineExceeded, Error::DeadlineExceeded),
+            (Verbs::Cancelled, Error::Cancelled),
+            (Verbs::Io, Error::Io),
+        ] {
+            assert_eq!(Error::from(verbs), racer);
+        }
+    }
 
     #[test]
     fn allocator_errors_keep_racer_boundary_meanings() {

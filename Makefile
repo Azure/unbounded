@@ -20,7 +20,7 @@ ENVTEST_K8S_VERSION ?= 1.37.0
 SETUP_ENVTEST_VERSION ?= v0.25.2-0.20260923145615-d837464d41be
 SETUP_ENVTEST = $(CURDIR)/bin/setup-envtest-$(SETUP_ENVTEST_VERSION)
 RACER_NATIVE_RDMA ?= false
-RACER_NATIVE_LIB ?= bin/libracer_rdma.so.1
+RACER_NATIVE_LIB ?= bin/librdma_verbs.so.1
 RACER_PREFIX ?= /usr/local
 RACER_LIBDIR ?= $(RACER_PREFIX)/lib
 RACER_RUST_IMAGE ?= docker.io/library/rust:1.96.0-bookworm
@@ -624,10 +624,10 @@ racer-dataplane-build: ## Build the locked Rust release binary; optionally enabl
 
 racer-dataplane-native-build: ## Compile against installed libibverbs headers and libraries
 	CC="$(CC)" sh images/racer-dataplane/build-native.sh \
-		cmd/racer-dataplane/native/rdma.c "$(RACER_NATIVE_LIB)"
+		cmd/racer-dataplane/verbs/native/verbs.c "$(RACER_NATIVE_LIB)"
 
 racer-dataplane-native-install: racer-dataplane-native-build ## Stage or install the optional native library
-	install -D -m 0755 "$(RACER_NATIVE_LIB)" "$(DESTDIR)$(RACER_LIBDIR)/libracer_rdma.so.1"
+	install -D -m 0755 "$(RACER_NATIVE_LIB)" "$(DESTDIR)$(RACER_LIBDIR)/librdma_verbs.so.1"
 
 image-racer-dataplane-local: ## Build the Racer dataplane image locally (single-arch)
 	@case "$(RACER_NATIVE_RDMA)" in true|false) ;; *) echo "RACER_NATIVE_RDMA must be true or false" >&2; exit 1 ;; esac

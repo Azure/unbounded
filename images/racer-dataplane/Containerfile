@@ -24,14 +24,16 @@ COPY cmd/racer-dataplane/alloc/Cargo.toml ./alloc/Cargo.toml
 COPY cmd/racer-dataplane/alloc/src ./alloc/src
 COPY cmd/racer-dataplane/crypto/Cargo.toml ./crypto/Cargo.toml
 COPY cmd/racer-dataplane/crypto/src ./crypto/src
-COPY cmd/racer-dataplane/native/rdma.c ./native/rdma.c
+COPY cmd/racer-dataplane/verbs/Cargo.toml ./verbs/Cargo.toml
+COPY cmd/racer-dataplane/verbs/src ./verbs/src
+COPY cmd/racer-dataplane/verbs/native/verbs.c ./verbs/native/verbs.c
 COPY images/racer-dataplane/build-native.sh ./build-native.sh
 COPY images/racer-dataplane/check-debug-info.sh ./check-debug-info.sh
 RUN set -eu; \
     mkdir -p /out/usr/local/bin /out/usr/local/lib; \
     if [ "$RACER_NATIVE_RDMA" = true ]; then \
         cargo build --locked --release --bin racer-dataplane --no-default-features --features rdma; \
-        sh ./build-native.sh native/rdma.c /out/usr/local/lib/libracer_rdma.so.1; \
+        sh ./build-native.sh verbs/native/verbs.c /out/usr/local/lib/librdma_verbs.so.1; \
     else \
         cargo build --locked --release --bin racer-dataplane --no-default-features; \
     fi; \
