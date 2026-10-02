@@ -383,7 +383,7 @@ mod codec {
         }
         let mut canonical = zeroize::Zeroizing::new([0; 44]);
         STANDARD
-            .encode_slice(&*decoded, &mut *canonical)
+            .encode_slice(decoded.as_slice(), &mut *canonical)
             .map_err(|_| Error::InvalidRequest)?;
         if canonical.as_slice() != s.as_bytes() {
             return Err(Error::InvalidRequest);
