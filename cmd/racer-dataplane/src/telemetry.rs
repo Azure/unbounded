@@ -633,8 +633,9 @@ impl Drop for Buffer {
         self.resources.active.set(self.resources.active.get() - 1);
     }
 }
-impl crate::runtime::reactor::sealed::Sealed for Buffer {}
-impl IoBuffer for Buffer {
+// SAFETY: private fixed Vec retains its reservation and is not aliased.
+unsafe impl IoBuffer for Buffer {
+    type Error = Error;
     fn bytes(&self) -> Result<&[u8]> {
         Ok(&self.bytes[self.start..self.end])
     }

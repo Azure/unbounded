@@ -174,8 +174,9 @@ impl Drop for AlignedBuffer {
         unsafe { dealloc(self.allocation.as_ptr(), self.layout) };
     }
 }
-impl crate::runtime::reactor::sealed::Sealed for AlignedBuffer {}
-impl IoBuffer for AlignedBuffer {
+// SAFETY: explicitly allocated aligned backing remains owned and stable.
+unsafe impl IoBuffer for AlignedBuffer {
+    type Error = Error;
     fn bytes(&self) -> Result<&[u8]> {
         // SAFETY: initialized allocation remains live for this borrow.
         Ok(unsafe { std::slice::from_raw_parts(self.allocation.as_ptr(), self.length) })
@@ -327,7 +328,7 @@ impl Slabs {
             let file = sim
                 .open(None, &path, libc::O_CREAT | libc::O_RDWR | libc::O_DIRECT)
                 .map_err(|_| Error::Io)?;
-            let Descriptor::Sim(handle) = &file else {
+            let Some(handle) = file.as_sim() else {
                 unreachable!()
             };
             handle.lock().map_err(|_| Error::Unavailable)?;

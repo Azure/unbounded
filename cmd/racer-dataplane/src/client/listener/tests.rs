@@ -627,7 +627,7 @@ fn queued_handoffs_reject_retired_generations_and_stopped_receivers() {
 
 #[test]
 fn simulated_listener_preparation_rollback_and_real_http_exchange() {
-    use crate::runtime::reactor::{Descriptor, SocketAddress, simulation::Simulation};
+    use crate::runtime::reactor::{SocketAddress, simulation::Simulation};
     let sim = Simulation::new();
     let _environment = sim.enter();
     let admission = Rc::new(Admission::new(limits()));
@@ -665,9 +665,7 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
     assert_eq!(sim.metadata(&path).unwrap().0, inode);
     assert_eq!(sim.metadata(&path).unwrap().1 & 0o777, 0o666);
     let client = sim.connect(SocketAddress::Unix(path)).unwrap();
-    let Descriptor::Sim(client) = client else {
-        unreachable!()
-    };
+    let client = client.into_sim().unwrap();
     client.send(&request("HEAD", "")).unwrap();
     let mut response = Vec::new();
     let mut bytes = [0; 4096];

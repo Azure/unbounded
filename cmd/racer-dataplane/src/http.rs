@@ -95,8 +95,9 @@ pub mod connection {
             Ok(buffer)
         }
     }
-    impl crate::runtime::reactor::sealed::Sealed for OwnedBuffer {}
-    impl IoBuffer for OwnedBuffer {
+    // SAFETY: private fixed Vec and quota remain owned until completion.
+    unsafe impl IoBuffer for OwnedBuffer {
+        type Error = Error;
         fn bytes(&self) -> Result<&[u8]> {
             Ok(&self.bytes)
         }
@@ -110,7 +111,10 @@ pub mod connection {
         buffer: B,
         range: Range<usize>,
     }
-    impl<B: IoBuffer> BufferRange<B> {
+    impl<B: IoBuffer> BufferRange<B>
+    where
+        Error: From<B::Error>,
+    {
         pub fn new(buffer: B, range: Range<usize>) -> Result<Self> {
             if range.start > range.end || range.end > buffer.bytes()?.len() {
                 return Err(Error::InvalidRequest);
@@ -121,12 +125,13 @@ pub mod connection {
             self.buffer
         }
     }
-    impl<B: IoBuffer> crate::runtime::reactor::sealed::Sealed for BufferRange<B> {}
-    impl<B: IoBuffer> IoBuffer for BufferRange<B> {
-        fn bytes(&self) -> Result<&[u8]> {
+    // SAFETY: a fixed subrange retains its complete stable backing owner.
+    unsafe impl<B: IoBuffer> IoBuffer for BufferRange<B> {
+        type Error = B::Error;
+        fn bytes(&self) -> std::result::Result<&[u8], B::Error> {
             Ok(&self.buffer.bytes()?[self.range.clone()])
         }
-        fn bytes_mut(&mut self) -> Result<&mut [u8]> {
+        fn bytes_mut(&mut self) -> std::result::Result<&mut [u8], B::Error> {
             Ok(&mut self.buffer.bytes_mut()?[self.range.clone()])
         }
     }
@@ -144,9 +149,10 @@ pub mod connection {
         buffer: B,
         range: Range<usize>,
     }
-    impl<B: SendBuffer> crate::runtime::reactor::sealed::Sealed for SendRange<B> {}
-    impl<B: SendBuffer> SendBuffer for SendRange<B> {
-        fn send_bytes(&self) -> Result<&[u8]> {
+    // SAFETY: a fixed immutable subrange retains its complete send owner.
+    unsafe impl<B: SendBuffer> SendBuffer for SendRange<B> {
+        type Error = B::Error;
+        fn send_bytes(&self) -> std::result::Result<&[u8], B::Error> {
             Ok(&self.buffer.send_bytes()?[self.range.clone()])
         }
     }
@@ -516,7 +522,10 @@ pub mod connection {
             connection: ConnectionLease,
             buffer: B,
             scope: &'a RequestScope,
-        ) -> Operation<'a, Completion<B, ConnectionLease>> {
+        ) -> Operation<'a, Completion<B, ConnectionLease>>
+        where
+            Error: From<B::Error>,
+        {
             Box::pin(async move {
                 let length = buffer.bytes()?.len();
                 self.read_body_range(connection, buffer, 0..length, scope)
@@ -537,7 +546,10 @@ pub mod connection {
             connection: ConnectionLease,
             buffer: B,
             scope: &'a RequestScope,
-        ) -> Operation<'a, Completion<B, ConnectionLease>> {
+        ) -> Operation<'a, Completion<B, ConnectionLease>>
+        where
+            Error: From<B::Error>,
+        {
             Box::pin(async move {
                 let length = buffer.send_bytes()?.len();
                 self.write_body_range(connection, buffer, 0..length, scope)
@@ -552,7 +564,10 @@ pub mod connection {
             mut buffer: B,
             range: Range<usize>,
             scope: &'a RequestScope,
-        ) -> Operation<'a, Completion<B, ConnectionLease>> {
+        ) -> Operation<'a, Completion<B, ConnectionLease>>
+        where
+            Error: From<B::Error>,
+        {
             Box::pin(async move {
                 scope.check()?;
                 connection.begin_io();
@@ -617,7 +632,10 @@ pub mod connection {
             mut buffer: B,
             range: Range<usize>,
             scope: &'a RequestScope,
-        ) -> Operation<'a, Completion<B, ConnectionLease>> {
+        ) -> Operation<'a, Completion<B, ConnectionLease>>
+        where
+            Error: From<B::Error>,
+        {
             Box::pin(async move {
                 scope.check()?;
                 connection.begin_io();
@@ -1753,7 +1771,7 @@ pub mod connection {
     }
 
     fn set_nonblocking(fd: &Descriptor) -> Result<()> {
-        fd.set_nonblocking()
+        fd.set_nonblocking().map_err(Into::into)
     }
 
     // Runtime's owned address type is used so connect never borrows sockaddr bytes

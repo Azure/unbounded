@@ -663,10 +663,7 @@ impl PartialEq for ReplayTrace {
 impl Eq for ReplayTrace {}
 
 fn handle(fd: &Descriptor) -> &crate::runtime::reactor::simulation::Handle {
-    match fd {
-        Descriptor::Sim(h) => h,
-        _ => panic!("DST escaped into host I/O"),
-    }
+    fd.as_sim().expect("DST escaped into host I/O")
 }
 fn would_block(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::WouldBlock

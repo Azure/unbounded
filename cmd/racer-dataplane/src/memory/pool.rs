@@ -34,8 +34,9 @@ impl Drop for PlaintextBuffer {
         }
     }
 }
-impl crate::runtime::reactor::sealed::Sealed for PlaintextBuffer {}
-impl crate::runtime::reactor::IoBuffer for PlaintextBuffer {
+// SAFETY: private fixed backing and reservation remain exclusively owned.
+unsafe impl crate::runtime::reactor::IoBuffer for PlaintextBuffer {
+    type Error = Error;
     fn bytes(&self) -> Result<&[u8]> {
         Ok(&self.bytes)
     }
@@ -241,8 +242,9 @@ impl CiphertextPage {
         &self.inner.bytes
     }
 }
-impl crate::runtime::reactor::sealed::Sealed for CiphertextPage {}
-impl crate::runtime::reactor::SendBuffer for CiphertextPage {
+// SAFETY: shared ciphertext backing is immutable and retained by the owner.
+unsafe impl crate::runtime::reactor::SendBuffer for CiphertextPage {
+    type Error = Error;
     fn send_bytes(&self) -> Result<&[u8]> {
         Ok(self.bytes())
     }

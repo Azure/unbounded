@@ -1077,7 +1077,7 @@ impl Flights {
                 .ok_or(Error::StaleFlight)
         })?;
         drop(resources);
-        self.update(|table, wakes| {
+        self.update(|table, wakes| -> Result<()> {
             let entry = table
                 .entries
                 .get_mut(&fence.page)

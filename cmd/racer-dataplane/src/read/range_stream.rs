@@ -405,7 +405,7 @@ impl RangeStream {
     async fn next_ordered_slice(&mut self) -> Result<Option<ReaderLease>> {
         let scope = self.operation_scope();
         let cancellation = scope.cancellation.subscribe()?;
-        poll_fn(|cx| {
+        poll_fn(|cx| -> Poll<Result<()>> {
             cancellation.register(cx.waker());
             std::task::ready!(self.poll_ordered(cx))?;
             if self.ready.is_empty() && self.next_page.is_some() {

@@ -31,7 +31,7 @@ impl Datagram {
                     .unwrap(),
                 )
                 .map_err(|_| Error::Io)?;
-            let Descriptor::Sim(handle) = &fd else {
+            let Some(handle) = fd.as_sim() else {
                 unreachable!()
             };
             handle.connect_datagram(server).map_err(|_| Error::Io)?;
@@ -54,9 +54,7 @@ impl Datagram {
             Self::Real(socket) => socket.send(bytes),
             #[cfg(test)]
             Self::Sim(fd) => {
-                let Descriptor::Sim(h) = &**fd else {
-                    unreachable!()
-                };
+                let Some(h) = fd.as_sim() else { unreachable!() };
                 h.send_datagram(bytes)
             }
         }
@@ -66,9 +64,7 @@ impl Datagram {
             Self::Real(socket) => socket.recv(bytes),
             #[cfg(test)]
             Self::Sim(fd) => {
-                let Descriptor::Sim(h) = &**fd else {
-                    unreachable!()
-                };
+                let Some(h) = fd.as_sim() else { unreachable!() };
                 h.recv_from(bytes).map(|(n, _)| n)
             }
         }

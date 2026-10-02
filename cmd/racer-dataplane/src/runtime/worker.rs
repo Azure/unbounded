@@ -12,7 +12,7 @@
 
 use super::{
     admission::Admission,
-    affinity::{AffinityPlan, WorkerPair, current_cpus, pin_cpu, set_cpus},
+    affinity::AffinityPlan,
     crypto::{self, CryptoClient, CryptoPort, IoCryptoPort},
     deadline::{Cancellation, Deadline, RequestScope},
     reactor::{Reactor, ReactorWake},
@@ -29,17 +29,13 @@ use std::{
     marker::PhantomData,
     num::NonZeroUsize,
     rc::Rc,
-    sync::{Arc, Condvar, Mutex, MutexGuard},
+    sync::{Arc, Mutex},
     task::{Context, Poll, Wake, Waker},
-    thread::{self, JoinHandle},
+    thread,
     time::Duration,
 };
 
 const WORK_BUDGET: usize = 64;
-// A large page is synchronous work. Yield to sibling shards after each job.
-const CRYPTO_QUANTUM: usize = 1;
-// Deadline checks, nonblocking accepts, and bounded round-robin passes still need
-// a tick when no registered completion or cooperative continuation wakes us.
 const IDLE_WAIT: Duration = Duration::from_millis(1);
 
 /// Constructed on I/O; never move the local graph to the crypto thread.
@@ -58,15 +54,15 @@ pub struct WorkerRuntime {
 pub struct CryptoRuntime {
     pub port: CryptoPort,
 }
-type IoShard = (usize, WorkerPair, IoCryptoPort);
-type CryptoShard = (usize, WorkerId, CryptoPort);
+#[cfg(test)]
+use super::affinity::{WorkerPair, current_cpus};
+use uring_runtime::group::{Factory, FailureReporter, Group, Helper, Lane, Plan, Service};
 pub struct WorkerMap {
     workers: Vec<WorkerId>,
 }
 pub struct WorkerGroup<'a> {
     plan: AffinityPlan,
-    control: Arc<Control>,
-    threads: Vec<JoinHandle<()>>,
+    runtime: Group<RequestScope>,
     generation: u64,
     borrowed: PhantomData<&'a dyn WorkerFactory>,
 }
@@ -187,9 +183,8 @@ impl WorkerMap {
 impl<'a> WorkerGroup<'a> {
     pub fn new(plan: AffinityPlan) -> Self {
         Self {
+            runtime: Group::new(runtime_plan(&plan)),
             plan,
-            control: Arc::new(Control::new(0, 0, false)),
-            threads: Vec::new(),
             generation: 0,
             borrowed: PhantomData,
         }
@@ -209,72 +204,28 @@ impl<'a> WorkerGroup<'a> {
         &mut self,
         factory: Arc<dyn WorkerFactory + Send>,
         scope: &RequestScope,
-        allocate: impl FnMut(WorkerId, u64, NonZeroUsize) -> Result<(IoCryptoPort, CryptoPort)>
-        + Send
-        + 'static,
+        allocate: impl FnMut(WorkerId, u64, NonZeroUsize) -> Result<(IoCryptoPort, CryptoPort)>,
     ) -> Result<()> {
         self.prepare(false)?;
-        let plan = AffinityPlan {
-            pairs: self.plan.pairs.clone(),
-            max_threads: self.plan.max_threads,
-        };
-        let control = self.control.clone();
-        let startup = scope.clone();
-        let generation = self.generation;
-        let handle = thread::Builder::new()
-            .name(format!("racer-io-{}", plan.pairs[0].worker.0))
-            .spawn(move || {
-                let mut group = WorkerGroup::new(plan);
-                group.control = control.clone();
-                group.generation = generation;
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    group.run_prepared(&*factory, &startup, false, allocate)
-                })) {
-                    Ok(Ok(())) => (),
-                    Ok(Err(error)) => control.fail(error),
-                    Err(_) => control.fail(Error::Io),
-                }
-            })
-            .map_err(|_| Error::Io)?;
-        self.threads.push(handle);
-        let result = self
-            .control
-            .wait_for(scope, |state| state.ready == state.total);
-        if let Err(error) = result {
-            self.control.fail(error);
-            self.control.set_phase(Phase::Shutdown);
-            let _ = self.join();
-            return Err(error);
-        }
-        Ok(())
+        let resources = self.allocate(&*factory, allocate)?;
+        self.runtime
+            .start(Arc::new(Adapter { factory, resources }), scope)
     }
     /// Stop I/O admission first. Drive both roles during I/O drain, then close
     /// crypto submissions and reap all completions. Deadline expiry requests
     /// cancellation but does not release resources before completion fences.
     pub fn drain(&mut self, scope: &RequestScope) -> Result<()> {
-        self.control.set_phase(Phase::Drain);
-        // Timeout reports cancellation to the caller; live threads retain their
-        // resources and continue fencing. join/Drop still wait for those fences.
-        self.control
-            .wait_for(scope, |state| state.drained == state.total)
+        self.runtime.drain(scope)
     }
     /// After drain, shut down both services and fence kernel/NIC references.
     /// Never terminate crypto with an outstanding job or unconsumed completion.
     pub fn shutdown(&mut self, scope: &RequestScope) -> Result<()> {
-        self.control.set_phase(Phase::Shutdown);
-        self.control
-            .wait_for(scope, |state| state.done == state.total)
+        self.runtime.shutdown(scope)
     }
     /// Join every I/O and unique crypto OS thread, including partial startup.
     /// Cannot succeed while a service can still access its retained resources.
     pub fn join(&mut self) -> Result<()> {
-        self.control.set_phase(Phase::Shutdown);
-        for handle in self.threads.drain(..) {
-            if handle.join().is_err() {
-                self.control.fail(Error::Io);
-            }
-        }
-        self.control.result()
+        self.runtime.join()
     }
     /// Ordered start, budgeted drive, drain, shutdown, and join (also on failure).
     pub fn run(&mut self, factory: &'a dyn WorkerFactory) -> Result<()> {
@@ -293,27 +244,13 @@ impl<'a> WorkerGroup<'a> {
     }
 
     fn prepare(&mut self, caller_is_worker: bool) -> Result<()> {
-        if !self.threads.is_empty() || self.plan.pairs.is_empty() {
+        if self.runtime.stats().coordinators != 0 || self.plan.pairs.is_empty() {
             return Err(Error::InvalidConfiguration);
         }
-        let threads = self
-            .plan
-            .pairs
-            .len()
-            .checked_add(self.plan.crypto_groups().len())
-            .and_then(|n| n.checked_add(usize::from(!caller_is_worker)))
-            .ok_or(Error::InvalidConfiguration)?;
-        if threads > self.plan.max_threads {
-            return Err(Error::InvalidConfiguration);
-        }
-        let allowed = current_cpus()?;
         let mut workers = HashSet::new();
         let mut crypto_locations = HashMap::new();
         for pair in &self.plan.pairs {
-            if !workers.insert(pair.worker)
-                || !allowed.contains(&pair.io.cpu)
-                || !allowed.contains(&pair.crypto.cpu)
-            {
+            if !workers.insert(pair.worker) {
                 return Err(Error::InvalidConfiguration);
             }
             if matches!((pair.io.numa_node, pair.crypto.numa_node), (Some(io), Some(crypto)) if io != crypto)
@@ -330,55 +267,36 @@ impl<'a> WorkerGroup<'a> {
                 return Err(Error::InvalidConfiguration);
             }
         }
+        self.runtime = Group::new(runtime_plan(&self.plan));
+        self.runtime.validate(caller_is_worker)?;
         self.generation = self
             .generation
             .checked_add(1)
             .ok_or(Error::InvalidConfiguration)?;
-        self.control = Arc::new(Control::new(
-            self.plan.pairs.len(),
-            self.plan.crypto_groups().len(),
-            caller_is_worker,
-        ));
         Ok(())
     }
 
-    fn allocate_group(
+    fn allocate(
         &self,
-        indices: &[usize],
-        capacity: NonZeroUsize,
-        allocate: &mut impl FnMut(WorkerId, u64, NonZeroUsize) -> Result<(IoCryptoPort, CryptoPort)>,
-    ) -> (Vec<IoShard>, Vec<CryptoShard>) {
-        let mut ios = Vec::new();
-        let mut engines = Vec::new();
-        for &index in indices {
-            let pair = self.plan.pairs[index].clone();
-            // Report allocation panics before the scoped join so already-started
-            // siblings see Drain rather than waiting forever for missing I/O.
-            let allocated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                allocate(pair.worker, self.generation, capacity)
-            }))
-            .unwrap_or(Err(Error::Io));
-            match allocated {
-                Ok((io, engine)) => {
-                    engines.push((index, pair.worker, engine));
-                    ios.push((index, pair, io));
-                }
-                Err(error) => {
-                    self.control.fail(error);
-                    break;
-                }
+        factory: &dyn WorkerFactory,
+        mut allocate: impl FnMut(WorkerId, u64, NonZeroUsize) -> Result<(IoCryptoPort, CryptoPort)>,
+    ) -> Result<Resources> {
+        // Allocate every endpoint before spawning even the coordinator. Panics
+        // in caller policy and fallible queue allocation have identical rollback.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let limits = factory.limits();
+            let mut ports = Vec::new();
+            for pair in &self.plan.pairs {
+                let (io, crypto) = allocate(pair.worker, self.generation, limits.queue_entries)?;
+                ports.push(Mutex::new((Some(io), Some(crypto))));
             }
-        }
-        (ios, engines)
-    }
-
-    fn close_unlaunched(&self, launched: &[bool]) {
-        for (index, launched) in launched.iter().enumerate() {
-            if !launched {
-                self.control.close_io(index);
-                self.control.fence_io(index);
-            }
-        }
+            Ok(Resources {
+                limits,
+                workers: self.plan.pairs.iter().map(|p| p.worker).collect(),
+                ports,
+            })
+        }))
+        .unwrap_or(Err(Error::Io))
     }
 
     fn run_inner(
@@ -398,235 +316,19 @@ impl<'a> WorkerGroup<'a> {
         allocate: impl FnMut(WorkerId, u64, NonZeroUsize) -> Result<(IoCryptoPort, CryptoPort)>,
     ) -> Result<()> {
         self.prepare(true)?;
-        self.run_prepared(factory, scope, check_scope, allocate)
-    }
-
-    fn run_prepared(
-        &mut self,
-        factory: &dyn WorkerFactory,
-        scope: &RequestScope,
-        check_scope: bool,
-        mut allocate: impl FnMut(WorkerId, u64, NonZeroUsize) -> Result<(IoCryptoPort, CryptoPort)>,
-    ) -> Result<()> {
-        let original_affinity = current_cpus()?;
-        let limits = factory.limits();
-        self.control.lock().check_scope = check_scope;
-        thread::scope(|threads| {
-            let mut handles = Vec::new();
-            let mut first_io = None;
-            let mut launched = vec![false; self.plan.pairs.len()];
-            for indices in self.plan.crypto_groups() {
-                let (ios, engines) =
-                    self.allocate_group(&indices, limits.queue_entries, &mut allocate);
-                if engines.is_empty() {
-                    break;
-                }
-                let control = self.control.clone();
-                let startup = scope.clone();
-                let cpu = self.plan.pairs[indices[0]].crypto.cpu;
-                match thread::Builder::new()
-                    .name(format!("racer-crypto-{cpu}"))
-                    .spawn_scoped(threads, move || {
-                        crypto_thread(factory, cpu, engines, startup, control)
-                    }) {
-                    Ok(handle) => handles.push(handle),
-                    Err(_) => {
-                        self.control.fail(Error::Io);
-                        break;
-                    }
-                }
-                for (index, pair, io) in ios {
-                    if index == 0 {
-                        first_io = Some((pair, io));
-                        launched[index] = true;
-                        continue;
-                    }
-                    let control = self.control.clone();
-                    let startup = scope.clone();
-                    let limits = limits.clone();
-                    match thread::Builder::new()
-                        .name(format!("racer-io-{}", pair.worker.0))
-                        .spawn_scoped(threads, move || {
-                            io_thread(factory, pair, io, limits, startup, control, index)
-                        }) {
-                        Ok(handle) => {
-                            handles.push(handle);
-                            launched[index] = true;
-                        }
-                        Err(_) => {
-                            self.control.close_io(index);
-                            self.control.fence_io(index);
-                            self.control.fail(Error::Io);
-                            break;
-                        }
-                    }
-                }
-                if self.control.result().is_err() {
-                    break;
-                }
-            }
-            self.close_unlaunched(&launched);
-            if let Some((pair, io)) = first_io {
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    io_thread(
-                        factory,
-                        pair,
-                        io,
-                        limits,
-                        scope.clone(),
-                        self.control.clone(),
-                        0,
-                    )
-                }))
-                .is_err()
-                {
-                    self.control.fail(Error::Io);
-                }
-            }
-            for handle in handles {
-                if handle.join().is_err() {
-                    self.control.fail(Error::Io);
-                }
-            }
-        });
-        let restore = set_cpus(&original_affinity);
-        self.control.result().and(restore)
+        let resources = self.allocate(factory, allocate)?;
+        let adapter = Adapter { factory, resources };
+        if check_scope {
+            self.runtime.run_with_scope(&adapter, scope)
+        } else {
+            self.runtime.run(&adapter, scope)
+        }
     }
 }
 
 impl Drop for WorkerGroup<'_> {
     fn drop(&mut self) {
         let _ = self.join();
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Phase {
-    Running,
-    Drain,
-    Shutdown,
-}
-
-struct State {
-    phase: Phase,
-    // Lifecycle counters count actual execution threads, not service instances.
-    total: usize,
-    ready: usize,
-    drained: usize,
-    done: usize,
-    error: Option<Error>,
-    // Handshake/fence state remains indexed by I/O shard.
-    crypto_ready: Vec<bool>,
-    io_closed: Vec<bool>,
-    io_fenced: Vec<bool>,
-    auto_shutdown: bool,
-    check_scope: bool,
-}
-
-struct Control {
-    state: Mutex<State>,
-    changed: Condvar,
-}
-
-impl Control {
-    fn new(io_count: usize, crypto_count: usize, auto_shutdown: bool) -> Self {
-        Self {
-            state: Mutex::new(State {
-                phase: Phase::Running,
-                total: io_count + crypto_count,
-                ready: 0,
-                drained: 0,
-                done: 0,
-                error: None,
-                crypto_ready: vec![false; io_count],
-                io_closed: vec![false; io_count],
-                io_fenced: vec![false; io_count],
-                auto_shutdown,
-                check_scope: false,
-            }),
-            changed: Condvar::new(),
-        }
-    }
-    fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|error| error.into_inner())
-    }
-    fn result(&self) -> Result<()> {
-        self.lock().error.map_or(Ok(()), Err)
-    }
-    fn set_phase(&self, phase: Phase) {
-        let mut state = self.lock();
-        state.phase = state.phase.max(phase);
-        self.changed.notify_all();
-    }
-    fn fail(&self, error: Error) {
-        let mut state = self.lock();
-        state.error.get_or_insert(error);
-        state.phase = state.phase.max(Phase::Drain);
-        self.changed.notify_all();
-    }
-    fn close_io(&self, index: usize) {
-        self.lock().io_closed[index] = true;
-        self.changed.notify_all();
-    }
-    fn fence_io(&self, index: usize) {
-        self.lock().io_fenced[index] = true;
-        self.changed.notify_all();
-    }
-    fn wait_for(&self, scope: &RequestScope, done: impl Fn(&State) -> bool) -> Result<()> {
-        let mut state = self.lock();
-        loop {
-            if let Some(error) = state.error {
-                return Err(error);
-            }
-            if done(&state) {
-                return Ok(());
-            }
-            scope.check()?;
-            state = self
-                .changed
-                .wait_timeout(state, IDLE_WAIT)
-                .unwrap_or_else(|error| error.into_inner())
-                .0;
-        }
-    }
-    fn stopping(&self, scope: &RequestScope) -> bool {
-        let check = self.lock().check_scope;
-        if check {
-            if let Err(error) = scope.check() {
-                self.fail(error);
-            }
-        }
-        self.lock().phase != Phase::Running
-    }
-    fn drained(&self) {
-        let mut state = self.lock();
-        state.drained += 1;
-        self.changed.notify_all();
-        while state.phase != Phase::Shutdown && !state.auto_shutdown && state.error.is_none() {
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(|error| error.into_inner());
-        }
-    }
-}
-
-// Even on unwinding, wake the other role and make partial startup observable.
-struct ThreadExit {
-    control: Arc<Control>,
-    io: Option<usize>,
-}
-impl Drop for ThreadExit {
-    fn drop(&mut self) {
-        if let Some(index) = self.io {
-            self.control.close_io(index);
-            self.control.fence_io(index);
-        }
-        if thread::panicking() {
-            self.control.fail(Error::Io);
-        }
-        self.control.lock().done += 1;
-        self.control.changed.notify_all();
     }
 }
 
@@ -651,52 +353,52 @@ fn driver_waker(runtime: Option<&WorkerRuntime>) -> Result<Waker> {
     ))))
 }
 
-/// Start may be interrupted; teardown may not. During an I/O service future,
-/// independently drive reactor CQEs and crypto completions. A CryptoService's
-/// async lifecycle methods must drive their own engine: &mut self prevents the
-/// group from also calling poll_budgeted until that future completes.
-fn drive(
-    mut operation: Operation<'_, ()>,
-    runtime: Option<&WorkerRuntime>,
-    scope: &RequestScope,
-    control: &Control,
-    startup: bool,
-    waker: &Waker,
-) -> Result<()> {
-    let mut cx = Context::from_waker(waker);
-    let cancellation = startup
-        .then(|| scope.cancellation.subscribe())
-        .transpose()?;
-    if let Some(cancellation) = &cancellation {
-        cancellation.register(waker);
-    }
-    let mut error = None;
-    loop {
-        if startup {
-            scope.check()?;
-            if control.lock().phase != Phase::Running {
-                return Err(Error::Cancelled);
-            }
-        }
-        if let Some(runtime) = runtime {
+/// Independently drive resource completions while a service future borrows its
+/// graph. The generic group owns scheduling, cancellation, and lifecycle phases.
+fn drive_local<'a>(
+    operation: Operation<'a, ()>,
+    runtime: &'a WorkerRuntime,
+    reporter: Option<&'a FailureReporter<Error>>,
+) -> Operation<'a, ()> {
+    drive_local_with(
+        operation,
+        reporter,
+        move |waker| {
             runtime.crypto.register_driver(waker);
-            if let Err(failure) = poll_runtime(runtime) {
-                control.fail(failure);
-                error.get_or_insert(failure);
+            poll_runtime(runtime)
+        },
+        move || runtime.reactor.wait(IDLE_WAIT),
+    )
+}
+
+fn drive_local_with<'a>(
+    mut operation: Operation<'a, ()>,
+    reporter: Option<&'a FailureReporter<Error>>,
+    mut poll: impl FnMut(&Waker) -> Result<()> + 'a,
+    mut wait: impl FnMut() -> Result<()> + 'a,
+) -> Operation<'a, ()> {
+    let mut error = None;
+    Box::pin(std::future::poll_fn(move |cx| {
+        if let Err(failure) = poll(cx.waker()) {
+            if let Some(reporter) = reporter {
+                reporter.report(failure);
             }
+            error.get_or_insert(failure);
         }
-        if let Poll::Ready(result) = operation.as_mut().poll(&mut cx) {
-            return error.map_or(result, Err);
+        if let Poll::Ready(result) = operation.as_mut().poll(cx) {
+            return Poll::Ready(error.map_or(result, Err));
         }
-        if let Some(runtime) = runtime {
-            if let Err(failure) = runtime.reactor.wait(IDLE_WAIT) {
-                control.fail(failure);
-                error.get_or_insert(failure);
+        if let Err(failure) = wait() {
+            if let Some(reporter) = reporter {
+                reporter.report(failure);
             }
-        } else {
-            thread::park_timeout(IDLE_WAIT);
+            error.get_or_insert(failure);
         }
-    }
+        // The reactor already performed the bounded wait. Do not add a second
+        // generic executor sleep before consuming its newly available CQEs.
+        thread::current().unpark();
+        Poll::Pending
+    }))
 }
 
 fn lifecycle_scope() -> Result<RequestScope> {
@@ -714,339 +416,228 @@ fn poll_runtime(runtime: &WorkerRuntime) -> Result<()> {
     crypto.and(reactor.map(|_| ()))
 }
 
-fn fence_runtime(runtime: &WorkerRuntime, control: &Control, scope: &RequestScope, waker: &Waker) {
+fn fence_runtime<'a>(
+    runtime: &'a WorkerRuntime,
+    scope: &'a RequestScope,
+    reporter: Option<&'a FailureReporter<Error>>,
+) -> Operation<'a, ()> {
     // Service drain has ended: detach any delivery waiters it left behind, while
     // still retaining every accepted job until the engine returns its completion.
-    let fence_scope = lifecycle_scope().unwrap_or_else(|_| scope.clone());
-    record(control, fence_scope.cancel());
-    record(
-        control,
-        drive(
+    Box::pin(async move {
+        let fence_scope = lifecycle_scope().unwrap_or_else(|_| scope.clone());
+        let cancelled = fence_scope.cancel();
+        let drained = drive_local(
             Box::pin(async {
                 let (crypto, reactor) =
                     futures::join!(runtime.crypto.drain(&fence_scope), runtime.reactor.drain());
                 crypto.and(reactor)
             }),
-            Some(runtime),
-            &fence_scope,
-            control,
-            false,
-            waker,
-        ),
-    );
-    // Backend failures do not relax ownership fences. A permanently failed
-    // backend can therefore prevent join; leaking live owners is not success.
-    let waker = Waker::from(Arc::new(ThreadWake(thread::current(), None)));
-    while runtime.crypto.outstanding() != 0 || runtime.reactor.in_flight() != 0 {
-        runtime.crypto.register_driver(&waker);
-        record(control, poll_runtime(runtime));
-        thread::park_timeout(IDLE_WAIT);
-    }
-}
-
-fn record(control: &Control, result: Result<()>) {
-    if let Err(error) = result {
-        control.fail(error);
-    }
-}
-
-fn io_thread(
-    factory: &dyn WorkerFactory,
-    pair: WorkerPair,
-    port: IoCryptoPort,
-    limits: Limits,
-    startup: RequestScope,
-    control: Arc<Control>,
-    index: usize,
-) {
-    let _exit = ThreadExit {
-        control: control.clone(),
-        io: Some(index),
-    };
-    if let Err(error) = pin_cpu(pair.io.cpu) {
-        control.fail(error);
-        return;
-    }
-    let admission = Rc::new(Admission::new(limits));
-    let runtime = WorkerRuntime {
-        reactor: Rc::new(Reactor::new(admission.clone())),
-        admission,
-        crypto: Rc::new(CryptoClient::new(port)),
-    };
-    // Acquire once while the reactor is live. Its wake descriptor remains valid
-    // during shutdown; asking for a new driver after drain would reinitialize a
-    // stopped reactor and skip the service's shutdown future.
-    let waker = match driver_waker(Some(&runtime)) {
-        Ok(waker) => waker,
-        Err(error) => {
-            control.fail(error);
-            runtime.admission.stop();
-            record(&control, runtime.crypto.close_submissions());
-            return;
-        }
-    };
-    // No application graph is constructed until the crypto role is operational.
-    let ready = control.wait_for(&startup, |state| state.crypto_ready[index]);
-    let mut service = match ready.and_then(|()| {
-        factory.build(
-            pair.worker,
-            WorkerRuntime {
-                reactor: runtime.reactor.clone(),
-                admission: runtime.admission.clone(),
-                crypto: runtime.crypto.clone(),
-            },
+            runtime,
+            reporter,
         )
-    }) {
-        Ok(service) => service,
-        Err(error) => {
-            control.fail(error);
-            runtime.admission.stop();
-            record(&control, runtime.crypto.close_submissions());
-            control.close_io(index);
-            fence_runtime(&runtime, &control, &startup, &waker);
-            return;
-        }
-    };
-    let started = drive(
-        service.start(&startup),
-        Some(&runtime),
-        &startup,
-        &control,
-        true,
-        &waker,
-    );
-    if started.is_ok() {
-        control.lock().ready += 1;
-        control.changed.notify_all();
-        let check_scope = control.lock().check_scope;
-        let _cancellation = if check_scope {
-            match startup.cancellation.subscribe() {
-                Ok(registration) => {
-                    registration.register(&waker);
-                    Some(registration)
+        .await;
+        // Backend failures do not relax ownership fences. A permanently failed
+        // backend can therefore prevent join; leaking live owners is not success.
+        let mut error = None;
+        std::future::poll_fn(|cx| {
+            runtime.crypto.register_driver(cx.waker());
+            if let Err(failure) = poll_runtime(runtime) {
+                if let Some(reporter) = reporter {
+                    reporter.report(failure);
                 }
-                Err(error) => {
-                    control.fail(error);
-                    None
-                }
+                error.get_or_insert(failure);
             }
-        } else {
-            None
-        };
-        let mut cx = Context::from_waker(&waker);
-        while !control.stopping(&startup) {
-            runtime.crypto.register_driver(&waker);
-            if let Err(error) =
-                poll_runtime(&runtime).and_then(|()| service.poll_budgeted(&mut cx, WORK_BUDGET))
-            {
-                control.fail(error);
-                break;
-            }
-            // Real wakes interrupt this fallback for deadlines and nonblocking accepts.
-            if let Err(error) = runtime.reactor.wait(IDLE_WAIT) {
-                control.fail(error);
-                break;
-            }
-        }
-    } else {
-        record(&control, started);
-    }
-    runtime.admission.stop();
-    record(&control, service.stop_admission());
-    let teardown = lifecycle_scope().unwrap_or_else(|_| startup.clone());
-    record(
-        &control,
-        drive(
-            service.drain(&teardown),
-            Some(&runtime),
-            &teardown,
-            &control,
-            false,
-            &waker,
-        ),
-    );
-    record(&control, runtime.crypto.close_submissions());
-    control.close_io(index);
-    // Do not let a canceled service future authorize dropping accepted work.
-    fence_runtime(&runtime, &control, &teardown, &waker);
-    control.fence_io(index);
-    control.drained();
-    record(
-        &control,
-        drive(
-            service.shutdown(&teardown),
-            Some(&runtime),
-            &teardown,
-            &control,
-            false,
-            &waker,
-        ),
-    );
-    fence_runtime(&runtime, &control, &teardown, &waker);
-}
-
-fn crypto_thread(
-    factory: &dyn WorkerFactory,
-    cpu: usize,
-    ports: Vec<CryptoShard>,
-    startup: RequestScope,
-    control: Arc<Control>,
-) {
-    let _exit = ThreadExit {
-        control: control.clone(),
-        io: None,
-    };
-    if let Err(error) = pin_cpu(cpu) {
-        control.fail(error);
-        return;
-    }
-    let waker = Waker::from(Arc::new(ThreadWake(thread::current(), None)));
-    let mut services = Vec::new();
-    // Native contexts and other !Send service state are constructed and destroyed
-    // here, never on the spawning thread. A later build failure must still tear
-    // down every already-built service.
-    for (index, worker, port) in ports {
-        port.register_driver(&waker);
-        match factory.build_crypto(worker, CryptoRuntime { port }) {
-            Ok(service) => services.push((index, service)),
-            Err(error) => {
-                control.fail(error);
-                break;
-            }
-        }
-    }
-    let _cancellation = match startup.cancellation.subscribe() {
-        Ok(registration) => {
-            registration.register(&waker);
-            Some(registration)
-        }
-        Err(error) => {
-            control.fail(error);
-            None
-        }
-    };
-    let mut ready = false;
-    let indices = services.iter().map(|(index, _)| *index).collect::<Vec<_>>();
-    {
-        let operations = services
-            .iter_mut()
-            .map(|(index, service)| {
-                crypto_shard(*index, &mut **service, &startup, &control, &waker)
-            })
-            .collect();
-        drive_crypto_group(operations, &control, &waker, || {
-            let mut state = control.lock();
-            if !ready
-                && !indices.is_empty()
-                && indices.iter().all(|index| state.crypto_ready[*index])
-            {
-                state.ready += 1;
-                ready = true;
-                control.changed.notify_all();
-            }
-        });
-    }
-    control.drained();
-    let teardown = lifecycle_scope().unwrap_or_else(|_| startup.clone());
-    let operations = services
-        .iter_mut()
-        .map(|(_, service)| {
-            service.register_driver(&waker);
-            service.shutdown(&teardown)
-        })
-        .collect();
-    drive_crypto_group(operations, &control, &waker, || {});
-}
-
-fn crypto_shard<'a>(
-    index: usize,
-    service: &'a mut dyn CryptoService,
-    startup: &'a RequestScope,
-    control: &'a Control,
-    waker: &'a Waker,
-) -> Operation<'a, ()> {
-    Box::pin(async move {
-        service.register_driver(waker);
-        let started = {
-            let mut operation = service.start(startup);
-            std::future::poll_fn(|cx| {
-                startup.check()?;
-                if control.lock().phase != Phase::Running {
-                    return Poll::Ready(Err(Error::Cancelled));
-                }
-                operation.as_mut().poll(cx)
-            })
-            .await
-        };
-        if started.is_ok() {
-            control.lock().crypto_ready[index] = true;
-            control.changed.notify_all();
-        } else {
-            record(control, started);
-        }
-        // One page per poll, including during I/O drain and after errors. Once
-        // submissions close, the service's cooperative drain flushes any backend
-        // work. Sibling shards remain runnable while that future is pending.
-        std::future::poll_fn(|_| {
-            service.register_driver(waker);
-            record(control, service.poll_budgeted(CRYPTO_QUANTUM));
-            if control.lock().io_closed[index] {
+            if runtime.crypto.outstanding() == 0 && runtime.reactor.in_flight() == 0 {
                 Poll::Ready(())
             } else {
                 Poll::Pending
             }
         })
         .await;
-        let teardown = lifecycle_scope().unwrap_or_else(|_| startup.clone());
-        service.register_driver(waker);
-        record(control, service.drain(&teardown).await);
-        // Publication is not consumption. Keep native state alive until I/O has
-        // reaped every completion, including abandoned/canceled jobs.
-        std::future::poll_fn(|_| {
-            service.register_driver(waker);
-            record(control, service.poll_budgeted(CRYPTO_QUANTUM));
-            if control.lock().io_fenced[index] {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
-            }
-        })
-        .await;
-        Ok(())
+        cancelled.and(drained).and(error.map_or(Ok(()), Err))
     })
 }
 
-/// Poll every shard once per pass, rotating the first shard. Never block on one
-/// shard's start/drain/shutdown future while another shard needs engine progress.
-fn drive_crypto_group(
-    operations: Vec<Operation<'_, ()>>,
-    control: &Control,
-    waker: &Waker,
-    mut after_pass: impl FnMut(),
-) {
-    let mut operations = operations.into_iter().map(Some).collect::<Vec<_>>();
-    let mut remaining = operations.len();
-    let mut first = 0;
-    let mut passes = 0;
-    let mut cx = Context::from_waker(waker);
-    while remaining != 0 {
-        for offset in 0..operations.len() {
-            let index = (first + offset) % operations.len();
-            if let Some(operation) = &mut operations[index] {
-                if let Poll::Ready(result) = operation.as_mut().poll(&mut cx) {
-                    record(control, result);
-                    operations[index] = None;
-                    remaining -= 1;
+fn runtime_plan(plan: &AffinityPlan) -> Plan {
+    Plan {
+        lanes: plan
+            .pairs
+            .iter()
+            .map(|pair| Lane {
+                name: format!("racer-io-{}", pair.worker.0),
+                cpu: pair.io.cpu,
+            })
+            .collect(),
+        helpers: plan
+            .crypto_groups()
+            .into_iter()
+            .map(|lanes| {
+                let cpu = plan.pairs[lanes[0]].crypto.cpu;
+                Helper {
+                    name: format!("racer-crypto-{cpu}"),
+                    cpu,
+                    lanes,
                 }
+            })
+            .collect(),
+        max_threads: plan.max_threads,
+    }
+}
+struct Resources {
+    limits: Limits,
+    workers: Vec<WorkerId>,
+    ports: Vec<Mutex<(Option<IoCryptoPort>, Option<CryptoPort>)>>,
+}
+struct Adapter<F> {
+    factory: F,
+    resources: Resources,
+}
+trait FactoryRef: Sync {
+    fn factory(&self) -> &dyn WorkerFactory;
+}
+impl FactoryRef for Arc<dyn WorkerFactory + Send> {
+    fn factory(&self) -> &dyn WorkerFactory {
+        &**self
+    }
+}
+impl FactoryRef for &dyn WorkerFactory {
+    fn factory(&self) -> &dyn WorkerFactory {
+        *self
+    }
+}
+impl<F: FactoryRef> Factory<RequestScope> for Adapter<F> {
+    fn abandon_lane(&self, lane: usize) -> Result<()> {
+        if let Some(port) = self.resources.ports[lane].lock().unwrap().0.take() {
+            port.close_submissions()?;
+        }
+        Ok(())
+    }
+    fn build_lane(&self, lane: usize) -> Result<Box<dyn Service<RequestScope>>> {
+        let port = self.resources.ports[lane]
+            .lock()
+            .unwrap()
+            .0
+            .take()
+            .ok_or(Error::Io)?;
+        let admission = Rc::new(Admission::new(self.resources.limits.clone()));
+        let runtime = WorkerRuntime {
+            reactor: Rc::new(Reactor::new(admission.clone())),
+            admission,
+            crypto: Rc::new(CryptoClient::new(port)),
+        };
+        // Retain the runtime even if user construction fails or panics. Returning
+        // a failed-start adapter lets the group execute the same close and fence.
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.factory.factory().build(
+                self.resources.workers[lane],
+                WorkerRuntime {
+                    reactor: runtime.reactor.clone(),
+                    admission: runtime.admission.clone(),
+                    crypto: runtime.crypto.clone(),
+                },
+            )
+        }))
+        .unwrap_or(Err(Error::Io));
+        Ok(Box::new(IoService {
+            runtime,
+            built,
+            reporter: None,
+        }))
+    }
+    fn build_helper(&self, lane: usize) -> Result<Box<dyn Service<RequestScope>>> {
+        let port = self.resources.ports[lane]
+            .lock()
+            .unwrap()
+            .1
+            .take()
+            .ok_or(Error::Io)?;
+        let service = self
+            .factory
+            .factory()
+            .build_crypto(self.resources.workers[lane], CryptoRuntime { port })?;
+        Ok(Box::new(HelperService(service)))
+    }
+    fn teardown_scope(&self, startup: &RequestScope) -> RequestScope {
+        lifecycle_scope().unwrap_or_else(|_| startup.clone())
+    }
+}
+struct IoService {
+    runtime: WorkerRuntime,
+    built: Result<Box<dyn WorkerService>>,
+    reporter: Option<FailureReporter<Error>>,
+}
+impl Service<RequestScope> for IoService {
+    fn set_failure_reporter(&mut self, reporter: FailureReporter<Error>) {
+        self.reporter = Some(reporter);
+    }
+    fn waker(&self) -> Result<Waker> {
+        driver_waker(Some(&self.runtime))
+    }
+    fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
+        match &mut self.built {
+            Ok(service) => drive_local(service.start(scope), &self.runtime, self.reporter.as_ref()),
+            Err(error) => {
+                let error = *error;
+                Box::pin(async move { Err(error) })
             }
         }
-        after_pass();
-        first = (first + 1) % operations.len();
-        passes += 1;
-        if remaining != 0 && passes == WORK_BUDGET {
-            thread::park_timeout(IDLE_WAIT);
-            passes = 0;
+    }
+    fn poll_budgeted(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
+        self.runtime.crypto.register_driver(cx.waker());
+        poll_runtime(&self.runtime)?;
+        if let Ok(service) = &mut self.built {
+            service.poll_budgeted(cx, budget)?;
         }
+        self.runtime.reactor.wait(IDLE_WAIT)?;
+        thread::current().unpark();
+        Ok(())
+    }
+    fn stop_admission(&mut self) -> Result<()> {
+        self.runtime.admission.stop();
+        match &mut self.built {
+            Ok(service) => service.stop_admission(),
+            Err(_) => Ok(()),
+        }
+    }
+    fn drain<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
+        match &mut self.built {
+            Ok(service) => drive_local(service.drain(scope), &self.runtime, self.reporter.as_ref()),
+            Err(_) => Box::pin(async { Ok(()) }),
+        }
+    }
+    fn close(&mut self) -> Result<()> {
+        self.runtime.crypto.close_submissions()
+    }
+    fn fence<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
+        fence_runtime(&self.runtime, scope, self.reporter.as_ref())
+    }
+    fn shutdown<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
+        match &mut self.built {
+            Ok(service) => drive_local(
+                service.shutdown(scope),
+                &self.runtime,
+                self.reporter.as_ref(),
+            ),
+            Err(_) => Box::pin(async { Ok(()) }),
+        }
+    }
+}
+struct HelperService(Box<dyn CryptoService>);
+impl Service<RequestScope> for HelperService {
+    fn register_driver(&self, waker: &Waker) {
+        self.0.register_driver(waker);
+    }
+    fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
+        self.0.start(scope)
+    }
+    fn poll_budgeted(&mut self, _: &mut Context<'_>, budget: usize) -> Result<()> {
+        self.0.poll_budgeted(budget)
+    }
+    fn drain<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
+        self.0.drain(scope)
+    }
+    fn shutdown<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
+        self.0.shutdown(scope)
     }
 }
 
@@ -1463,18 +1054,18 @@ mod shared_tests {
         let scope = scope();
         group.start(Arc::new(factory), &scope).unwrap();
         assert_eq!(
-            group.threads.len(),
+            group.runtime.stats().coordinators,
             1,
             "one coordinator owns the scoped workers"
         );
-        assert_eq!(group.control.lock().total, 3);
-        assert_eq!(group.control.lock().ready, 3);
+        assert_eq!(group.runtime.stats().total, 3);
+        assert_eq!(group.runtime.stats().ready, 3);
         assert_eq!(observed.submitted.load(Ordering::SeqCst), 8);
         group.drain(&scope).unwrap();
-        assert_eq!(group.control.lock().drained, 3);
+        assert_eq!(group.runtime.stats().drained, 3);
         group.shutdown(&scope).unwrap();
         group.join().unwrap();
-        assert_eq!(group.control.lock().done, 3);
+        assert_eq!(group.runtime.stats().done, 3);
         let events = observed.events.lock().unwrap();
         let thread_for = |worker, name| {
             events
@@ -1522,7 +1113,7 @@ mod shared_tests {
             Err(Error::DeadlineExceeded)
         );
         assert_eq!(current_cpus().unwrap(), before);
-        assert_eq!(group.control.lock().done, 3);
+        assert_eq!(group.runtime.stats().done, 3);
         assert_eq!(factory.observed.submitted.load(Ordering::SeqCst), 8);
         let (plan, factory) = fixture(3, Failure::None, false);
         assert_eq!(
@@ -1559,7 +1150,7 @@ mod shared_tests {
                     group.start(Arc::new(factory), &scope)
                 };
                 assert_eq!(result, Err(expected));
-                assert_eq!(group.control.lock().done, 3);
+                assert_eq!(group.runtime.stats().done, 3);
                 let events = observed.events.lock().unwrap();
                 for id in 0..if failure == Failure::BuildCrypto {
                     1
@@ -1602,7 +1193,7 @@ mod shared_tests {
             let _ = group.drain(&scope);
             let _ = group.shutdown(&scope);
             assert_eq!(group.join(), Err(Error::Io));
-            assert_eq!(group.control.lock().done, 3);
+            assert_eq!(group.runtime.stats().done, 3);
             assert_eq!(observed.shutdown.load(Ordering::SeqCst), 2);
         }
     }
@@ -1634,7 +1225,7 @@ mod shared_tests {
         let drained = group.drain(&scope);
         assert!(drained == Err(Error::Cancelled) || drained == Ok(()));
         group.join().unwrap();
-        assert_eq!(group.control.lock().done, 3);
+        assert_eq!(group.runtime.stats().done, 3);
     }
 
     #[test]
@@ -1651,7 +1242,7 @@ mod shared_tests {
             Err(Error::DeadlineExceeded)
         );
         assert_eq!(observed.completed.load(Ordering::SeqCst), 1);
-        assert_eq!(group.control.lock().done, 3);
+        assert_eq!(group.runtime.stats().done, 3);
     }
 
     #[test]
@@ -1661,8 +1252,8 @@ mod shared_tests {
             return;
         };
         for borrowed in [false, true] {
-            // Only the first group is constructed, so its teardown must not wait for
-            // the deliberately absent second service in this test fixture.
+            // Allocation is transactional across every helper group: neither
+            // owned nor borrowed entry points may build even the first service.
             let (mut plan, mut factory) =
                 fixture(if borrowed { 4 } else { 5 }, Failure::BuildCrypto, false);
             plan.pairs[1].crypto.cpu = second_cpu;
@@ -1671,21 +1262,10 @@ mod shared_tests {
             let mut group = WorkerGroup::new(plan);
             let scope = scope();
             let allocator_observed = observed.clone();
-            let allocator_scope = scope.clone();
             let allocate = move |worker, generation, capacity| {
+                assert!(allocator_observed.events.lock().unwrap().is_empty());
                 if worker == WorkerId(0) {
                     return crypto::try_pair(worker, generation, capacity);
-                }
-                let event = "crypto-start";
-                while !allocator_observed
-                    .events
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|(_, name, _)| *name == event)
-                {
-                    allocator_scope.check()?;
-                    thread::sleep(IDLE_WAIT);
                 }
                 Err(Error::Overloaded)
             };
@@ -1695,15 +1275,11 @@ mod shared_tests {
                 group.start_with_allocator(Arc::new(factory), &scope, allocate)
             };
             assert_eq!(result, Err(Error::Overloaded));
-            assert_eq!(group.control.lock().done, 2);
+            assert_eq!(group.runtime.stats().done, 0);
+            assert_eq!(group.runtime.stats().coordinators, 0);
             assert_eq!(current_cpus().unwrap(), allowed);
             let events = observed.events.lock().unwrap();
-            assert!(
-                events
-                    .iter()
-                    .any(|(_, event, _)| *event == "crypto-shutdown")
-            );
-            // Both entry points allocate all groups before starting the caller's I/O.
+            assert!(events.is_empty());
         }
     }
 
@@ -1720,8 +1296,8 @@ mod shared_tests {
         let mut group = WorkerGroup::new(plan);
         let scope = scope();
         group.start(Arc::new(factory), &scope).unwrap();
-        assert_eq!(group.threads.len(), 1);
-        assert_eq!(group.control.lock().ready, 4);
+        assert_eq!(group.runtime.stats().coordinators, 1);
+        assert_eq!(group.runtime.stats().ready, 4);
         group.drain(&scope).unwrap();
         group.shutdown(&scope).unwrap();
         group.join().unwrap();
@@ -1754,7 +1330,7 @@ mod shared_tests {
             );
         }
         assert_eq!(observed.shutdown.load(Ordering::SeqCst), 2);
-        assert_eq!(group.control.lock().done, 3);
+        assert_eq!(group.runtime.stats().done, 3);
     }
 }
 
@@ -1997,7 +1573,10 @@ mod tests {
             second.worker = WorkerId(1);
             group.plan.pairs.push(second);
             group.prepare(false).unwrap();
-            assert_eq!(group.control.lock().total, 3);
+            assert_eq!(
+                runtime_plan(&group.plan).lanes.len() + runtime_plan(&group.plan).helpers.len(),
+                3
+            );
         }
     }
 
@@ -2017,7 +1596,7 @@ mod tests {
         assert!(position("io-drain") < position("crypto-drain"));
         assert!(position("crypto-drain") < position("crypto-shutdown"));
         assert!(events.contains(&"io-shutdown"));
-        assert_eq!(group.control.lock().done, 2);
+        assert_eq!(group.runtime.stats().done, 2);
         // Completed workers cannot retain cancellation slots in the caller's scope.
         let registrations = (0..1024)
             .map(|_| scope.cancellation.subscribe().unwrap())
@@ -2041,8 +1620,8 @@ mod tests {
             group.start(Arc::new(factory), &scope),
             Err(Error::Overloaded)
         );
-        assert!(group.threads.is_empty());
-        assert_eq!(group.control.lock().done, 2);
+        assert_eq!(group.runtime.stats().coordinators, 0);
+        assert_eq!(group.runtime.stats().done, 2);
         assert!(events.lock().unwrap().contains(&"crypto-shutdown"));
     }
 
@@ -2064,8 +1643,8 @@ mod tests {
                 Error::InvalidRequest
             };
             assert_eq!(group.start(Arc::new(factory), &scope), Err(expected));
-            assert!(group.threads.is_empty());
-            assert_eq!(group.control.lock().done, 2);
+            assert_eq!(group.runtime.stats().coordinators, 0);
+            assert_eq!(group.runtime.stats().done, 2);
         }
     }
 
@@ -2082,7 +1661,7 @@ mod tests {
         let mut group = WorkerGroup::new(plan);
         assert_eq!(group.run(&factory), Err(Error::Cancelled));
         assert_eq!(current_cpus().unwrap(), before);
-        assert_eq!(group.control.lock().done, 2);
+        assert_eq!(group.runtime.stats().done, 2);
         assert!(factory.events.lock().unwrap().contains(&"crypto-shutdown"));
     }
 
@@ -2099,7 +1678,7 @@ mod tests {
             scoped.run_with_scope(&factory, &scope),
             Err(Error::DeadlineExceeded)
         );
-        assert_eq!(scoped.control.lock().done, 2);
+        assert_eq!(scoped.runtime.stats().done, 2);
     }
 
     #[test]
@@ -2138,7 +1717,259 @@ mod tests {
             }),
             Err(Error::Io)
         );
-        assert!(group.threads.is_empty());
+        assert_eq!(group.runtime.stats().coordinators, 0);
+        assert_eq!(group.runtime.stats().done, 0);
+        let factory = fixture(3).1;
+        let mut borrowed = WorkerGroup::new(colocated_plan(2, 1));
+        let before = current_cpus().unwrap();
+        assert_eq!(
+            borrowed.run_with_allocator(&factory, &scope, false, |_, _, _| {
+                panic!("injected borrowed allocation panic")
+            }),
+            Err(Error::Io)
+        );
+        assert_eq!(borrowed.runtime.stats().done, 0);
+        assert_eq!(current_cpus().unwrap(), before);
+    }
+
+    #[test]
+    fn limits_panic_starts_no_owned_or_borrowed_threads() {
+        struct PanicLimits;
+        impl WorkerFactory for PanicLimits {
+            fn limits(&self) -> Limits {
+                panic!("injected limits panic")
+            }
+            fn build(&self, _: WorkerId, _: WorkerRuntime) -> Result<Box<dyn WorkerService>> {
+                panic!("must not build")
+            }
+            fn build_crypto(
+                &self,
+                _: WorkerId,
+                _: CryptoRuntime,
+            ) -> Result<Box<dyn CryptoService>> {
+                panic!("must not build")
+            }
+        }
+        let before = current_cpus().unwrap();
+        let scope = lifecycle_scope().unwrap();
+        let mut group = WorkerGroup::new(colocated_plan(3, 1));
+        assert_eq!(group.start(Arc::new(PanicLimits), &scope), Err(Error::Io));
+        assert_eq!(group.runtime.stats().done, 0);
+        assert_eq!(group.runtime.stats().coordinators, 0);
+        assert_eq!(group.run_with_scope(&PanicLimits, &scope), Err(Error::Io));
+        assert_eq!(group.runtime.stats().done, 0);
+        assert_eq!(current_cpus().unwrap(), before);
+    }
+
+    #[test]
+    fn pending_start_backend_failure_notifies_group_before_deadline() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct BackendFactory {
+            sibling_started: Arc<AtomicBool>,
+            sibling_drained: Arc<AtomicBool>,
+            fences: Arc<AtomicUsize>,
+            fail_wait: bool,
+        }
+        struct BackendService {
+            sibling_started: Arc<AtomicBool>,
+            lane: usize,
+            reporter: Option<FailureReporter<Error>>,
+            sibling_drained: Arc<AtomicBool>,
+            fences: Arc<AtomicUsize>,
+            fail_wait: bool,
+        }
+        impl Factory<RequestScope> for BackendFactory {
+            fn build_lane(&self, lane: usize) -> Result<Box<dyn Service<RequestScope>>> {
+                Ok(Box::new(BackendService {
+                    sibling_started: self.sibling_started.clone(),
+                    lane,
+                    reporter: None,
+                    sibling_drained: self.sibling_drained.clone(),
+                    fences: self.fences.clone(),
+                    fail_wait: self.fail_wait,
+                }))
+            }
+        }
+        impl Service<RequestScope> for BackendService {
+            fn set_failure_reporter(&mut self, reporter: FailureReporter<Error>) {
+                self.reporter = Some(reporter);
+            }
+            fn start<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
+                if self.lane != 0 {
+                    self.sibling_started.store(true, Ordering::SeqCst);
+                    return Box::pin(async { Ok(()) });
+                }
+                let fail_wait = self.fail_wait;
+                let poll_ready = self.sibling_started.clone();
+                let wait_ready = self.sibling_started.clone();
+                // Exercise the exact resource-driver wrapper with a permanently
+                // pending application future and either backend failure site.
+                drive_local_with(
+                    Box::pin(std::future::pending()),
+                    self.reporter.as_ref(),
+                    move |_| {
+                        if !fail_wait && poll_ready.load(Ordering::SeqCst) {
+                            Err(Error::Io)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    move || {
+                        if fail_wait && wait_ready.load(Ordering::SeqCst) {
+                            Err(Error::Io)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
+            }
+            fn poll_budgeted(&mut self, _: &mut Context<'_>, _: usize) -> Result<()> {
+                Ok(())
+            }
+            fn drain<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
+                Box::pin(std::future::poll_fn(move |_| {
+                    if self.lane == 1 {
+                        self.sibling_drained.store(true, Ordering::SeqCst);
+                    }
+                    if self.sibling_drained.load(Ordering::SeqCst) {
+                        Poll::Ready(Ok(()))
+                    } else {
+                        Poll::Pending
+                    }
+                }))
+            }
+            fn fence<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
+                Box::pin(async move {
+                    assert!(self.sibling_drained.load(Ordering::SeqCst));
+                    self.fences.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+            fn shutdown<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+        for fail_wait in [false, true] {
+            let cpu = *current_cpus().unwrap().first().unwrap();
+            let factory = Arc::new(BackendFactory {
+                sibling_started: Arc::default(),
+                sibling_drained: Arc::default(),
+                fences: Arc::default(),
+                fail_wait,
+            });
+            let mut group = Group::new(Plan {
+                lanes: (0..2)
+                    .map(|i| Lane {
+                        name: format!("failure-lane-{i}"),
+                        cpu,
+                    })
+                    .collect(),
+                helpers: Vec::new(),
+                max_threads: 3,
+            });
+            let scope =
+                RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(3))
+                    .unwrap();
+            let started = Instant::now();
+            assert_eq!(group.start(factory.clone(), &scope), Err(Error::Io));
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "backend failure must not wait for the startup deadline"
+            );
+            assert_eq!(group.stats().done, 2);
+            assert_eq!(factory.fences.load(Ordering::SeqCst), 4);
+        }
+    }
+
+    #[test]
+    fn pending_drain_backend_failure_notifies_without_releasing_ownership() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct PendingFactory {
+            release: Arc<AtomicBool>,
+            fences: Arc<AtomicUsize>,
+        }
+        struct PendingDrain {
+            release: Arc<AtomicBool>,
+            fences: Arc<AtomicUsize>,
+            reporter: Option<FailureReporter<Error>>,
+        }
+        impl Factory<RequestScope> for PendingFactory {
+            fn build_lane(&self, _: usize) -> Result<Box<dyn Service<RequestScope>>> {
+                Ok(Box::new(PendingDrain {
+                    release: self.release.clone(),
+                    fences: self.fences.clone(),
+                    reporter: None,
+                }))
+            }
+        }
+        impl Service<RequestScope> for PendingDrain {
+            fn set_failure_reporter(&mut self, reporter: FailureReporter<Error>) {
+                self.reporter = Some(reporter);
+            }
+            fn start<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+            fn poll_budgeted(&mut self, _: &mut Context<'_>, _: usize) -> Result<()> {
+                Ok(())
+            }
+            fn drain<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
+                let release = self.release.clone();
+                drive_local_with(
+                    Box::pin(std::future::poll_fn(move |_| {
+                        if release.load(Ordering::SeqCst) {
+                            Poll::Ready(Ok(()))
+                        } else {
+                            Poll::Pending
+                        }
+                    })),
+                    self.reporter.as_ref(),
+                    |_| Err(Error::Io),
+                    || Ok(()),
+                )
+            }
+            fn fence<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
+                Box::pin(async move {
+                    assert!(self.release.load(Ordering::SeqCst));
+                    self.fences.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+            fn shutdown<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+        let cpu = *current_cpus().unwrap().first().unwrap();
+        let factory = Arc::new(PendingFactory {
+            release: Arc::default(),
+            fences: Arc::default(),
+        });
+        let mut group = Group::new(Plan {
+            lanes: vec![Lane {
+                name: "pending-drain".into(),
+                cpu,
+            }],
+            helpers: Vec::new(),
+            max_threads: 2,
+        });
+        let scope =
+            RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(3)).unwrap();
+        group.start(factory.clone(), &scope).unwrap();
+        let started = Instant::now();
+        let result = group.drain(&scope);
+        let elapsed = started.elapsed();
+        let before = group.stats();
+        let fences_before = factory.fences.load(Ordering::SeqCst);
+        // Release before assertions so a failed regression cannot hang Drop.
+        factory.release.store(true, Ordering::SeqCst);
+        let joined = group.join();
+        assert_eq!(result, Err(Error::Io));
+        assert!(elapsed < Duration::from_secs(1));
+        assert_eq!(before.drained, 0);
+        assert_eq!(before.done, 0);
+        assert_eq!(fences_before, 0);
+        assert_eq!(joined, Err(Error::Io));
+        assert_eq!(factory.fences.load(Ordering::SeqCst), 2);
+        assert_eq!(group.stats().done, 1);
     }
 
     #[test]
@@ -2156,16 +1987,15 @@ mod tests {
                 if worker == WorkerId(0) {
                     return crypto::try_pair(worker, generation, capacity);
                 }
-                // Group endpoints are allocated before its owning thread starts.
+                // All endpoints are allocated before any owning thread starts.
                 Err(Error::Overloaded)
             },
         );
         assert_eq!(result, Err(Error::Overloaded));
-        assert!(group.threads.is_empty());
-        assert_eq!(group.control.lock().done, 2);
+        assert_eq!(group.runtime.stats().coordinators, 0);
+        assert_eq!(group.runtime.stats().done, 0);
         let events = events.lock().unwrap();
-        assert!(!events.contains(&"io-build"));
-        assert!(events.contains(&"crypto-shutdown"));
+        assert!(events.is_empty());
     }
 
     #[test]
@@ -2190,9 +2020,9 @@ mod tests {
             });
         assert_eq!(result, Err(Error::Overloaded));
         assert_eq!(current_cpus().unwrap(), before);
-        assert_eq!(scoped.control.lock().done, 2);
+        assert_eq!(scoped.runtime.stats().done, 0);
+        assert_eq!(scoped.runtime.stats().coordinators, 0);
         let events = factory.events.lock().unwrap();
-        assert!(!events.contains(&"io-build"));
-        assert!(events.contains(&"crypto-shutdown"));
+        assert!(events.is_empty());
     }
 }

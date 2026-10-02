@@ -64,8 +64,9 @@ impl PageSendRange {
     }
 }
 
-impl crate::runtime::reactor::sealed::Sealed for PageSendRange {}
-impl SendBuffer for PageSendRange {
+// SAFETY: fixed immutable view retains the complete ciphertext page owner.
+unsafe impl SendBuffer for PageSendRange {
+    type Error = Error;
     fn send_bytes(&self) -> Result<&[u8]> {
         Ok(&self.page.bytes()[self.range.clone()])
     }
@@ -76,8 +77,9 @@ enum DeliveryBuffer {
     Page(PageSendRange),
 }
 
-impl crate::runtime::reactor::sealed::Sealed for DeliveryBuffer {}
-impl SendBuffer for DeliveryBuffer {
+// SAFETY: both variants retain stable immutable backing through completion.
+unsafe impl SendBuffer for DeliveryBuffer {
+    type Error = Error;
     fn send_bytes(&self) -> Result<&[u8]> {
         match self {
             Self::Pipe(buffer) => buffer.send_bytes(),
@@ -367,7 +369,7 @@ fn splice_unsupported(error: &io::Error) -> bool {
 }
 
 fn validate_socket(connection: &Descriptor) -> Result<()> {
-    connection.validate_socket()
+    connection.validate_socket().map_err(Into::into)
 }
 
 use crate::error::cooperative_turn as yield_once;

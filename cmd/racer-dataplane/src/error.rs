@@ -63,3 +63,45 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<uring_runtime::Error> for Error {
+    fn from(error: uring_runtime::Error) -> Self {
+        match error {
+            uring_runtime::Error::Cancelled => Self::Cancelled,
+            uring_runtime::Error::DeadlineExceeded => Self::DeadlineExceeded,
+            uring_runtime::Error::Overloaded => Self::Overloaded,
+            uring_runtime::Error::Unavailable => Self::Unavailable,
+            uring_runtime::Error::InvalidConfiguration => Self::InvalidConfiguration,
+            uring_runtime::Error::InvalidInput => Self::InvalidRequest,
+            uring_runtime::Error::NotFound => Self::MissingKey,
+            uring_runtime::Error::AlreadyExists => Self::Replay,
+            uring_runtime::Error::Io => Self::Io,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    #[test]
+    fn runtime_errors_keep_racer_boundary_meanings() {
+        use uring_runtime::Error as RuntimeError;
+        for (runtime, racer) in [
+            (RuntimeError::Cancelled, Error::Cancelled),
+            (RuntimeError::DeadlineExceeded, Error::DeadlineExceeded),
+            (RuntimeError::Overloaded, Error::Overloaded),
+            (RuntimeError::Unavailable, Error::Unavailable),
+            (
+                RuntimeError::InvalidConfiguration,
+                Error::InvalidConfiguration,
+            ),
+            (RuntimeError::InvalidInput, Error::InvalidRequest),
+            (RuntimeError::NotFound, Error::MissingKey),
+            (RuntimeError::AlreadyExists, Error::Replay),
+            (RuntimeError::Io, Error::Io),
+        ] {
+            assert_eq!(Error::from(runtime), racer);
+        }
+    }
+}

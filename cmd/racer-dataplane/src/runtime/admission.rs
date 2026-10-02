@@ -270,7 +270,7 @@ impl ConnectionAdmission {
         if self.stopped.load(Ordering::Acquire) {
             return Err(Error::Unavailable);
         }
-        let charge = |class, limit| {
+        let charge = |class, limit| -> Result<Reservation> {
             self.totals.used[index(class)]
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                     used.checked_add(1).filter(|next| *next <= limit)

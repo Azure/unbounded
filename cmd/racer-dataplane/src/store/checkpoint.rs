@@ -512,11 +512,10 @@ impl CandidateFile {
             libc::O_NOFOLLOW | libc::O_NONBLOCK | if directory { libc::O_DIRECTORY } else { 0 };
         #[cfg(test)]
         if let Some(sim) = crate::runtime::reactor::simulation::Simulation::current() {
-            let crate::runtime::reactor::Descriptor::Sim(handle) =
-                sim.open(None, path, libc::O_RDONLY | flags)?
-            else {
-                unreachable!()
-            };
+            let handle = sim
+                .open(None, path, libc::O_RDONLY | flags)?
+                .into_sim()
+                .expect("simulated file");
             return Ok(Self::Sim(handle, 0));
         }
         OpenOptions::new()

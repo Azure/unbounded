@@ -4,25 +4,21 @@ use crate::{
     model::RequestId,
 };
 use std::{
-    sync::{
-        Arc, Mutex, OnceLock, Weak,
-        atomic::{AtomicBool, Ordering},
-    },
-    task::Waker,
+    sync::{Arc, Mutex, OnceLock},
     time::Instant,
 };
-#[derive(Clone, Copy, Debug)]
-pub struct Deadline(pub Instant);
+pub use uring_runtime::deadline::{CancellationRegistration, Deadline};
+
+/// Racer candidate policy shares the cancellation lifetime, but is not runtime policy.
 #[derive(Clone)]
 pub struct Cancellation {
+    inner: uring_runtime::deadline::Cancellation,
     state: Arc<State>,
 }
 struct State {
-    canceled: AtomicBool,
     candidate_total: OnceLock<Instant>,
     candidate_idle: OnceLock<Mutex<(std::time::Duration, Instant)>>,
     candidate_body: OnceLock<Mutex<CandidateBody>>,
-    registrations: Mutex<Vec<Weak<futures::task::AtomicWaker>>>,
 }
 struct CandidateBody {
     observation: std::time::Duration,
@@ -30,77 +26,27 @@ struct CandidateBody {
     first: Option<(Instant, usize)>,
     expired: bool,
 }
-/// Operation-owned cancellation wake registration. Drop removes its live entry;
-/// independent operations may safely register the same executor waker.
-pub struct CancellationRegistration {
-    cancellation: Cancellation,
-    wake: Arc<futures::task::AtomicWaker>,
-}
-impl CancellationRegistration {
-    pub fn register(&self, waker: &Waker) {
-        self.wake.register(waker);
-        if self.cancellation.is_cancelled() {
-            self.wake.wake();
-        }
-    }
-}
-impl Drop for CancellationRegistration {
-    fn drop(&mut self) {
-        if let Ok(mut entries) = self.cancellation.state.registrations.lock() {
-            entries.retain(|entry| {
-                !std::ptr::eq(entry.as_ptr(), Arc::as_ptr(&self.wake)) && entry.strong_count() != 0
-            });
-        }
-    }
-}
 impl Cancellation {
     pub fn new() -> Result<Self> {
         Ok(Self {
+            inner: uring_runtime::deadline::Cancellation::new()?,
             state: Arc::new(State {
-                canceled: AtomicBool::new(false),
                 candidate_total: OnceLock::new(),
                 candidate_idle: OnceLock::new(),
                 candidate_body: OnceLock::new(),
-                registrations: Mutex::new(Vec::new()),
             }),
         })
     }
     pub fn is_cancelled(&self) -> bool {
-        self.state.canceled.load(Ordering::Acquire)
+        self.inner.is_cancelled()
     }
     /// Subscribe for one operation's lifetime, even when several operations share
     /// an executor waker. Dropping the subscription reclaims its capacity and wake.
     pub fn subscribe(&self) -> Result<CancellationRegistration> {
-        let wake = Arc::new(futures::task::AtomicWaker::new());
-        let mut entries = self
-            .state
-            .registrations
-            .lock()
-            .map_err(|_| Error::Unavailable)?;
-        entries.retain(|entry| entry.strong_count() != 0);
-        if entries.len() >= 1024 {
-            return Err(Error::Overloaded);
-        }
-        entries.push(Arc::downgrade(&wake));
-        Ok(CancellationRegistration {
-            cancellation: self.clone(),
-            wake,
-        })
+        self.inner.subscribe().map_err(Into::into)
     }
     pub fn cancel(&self) -> Result<()> {
-        self.state.canceled.store(true, Ordering::Release);
-        let registrations: Vec<_> = self
-            .state
-            .registrations
-            .lock()
-            .map_err(|_| Error::Unavailable)?
-            .iter()
-            .filter_map(Weak::upgrade)
-            .collect();
-        for registration in registrations {
-            registration.wake();
-        }
-        Ok(())
+        self.inner.cancel().map_err(Into::into)
     }
 }
 #[derive(Clone)]
@@ -247,10 +193,25 @@ impl RequestScope {
         self.cancellation.cancel()
     }
 }
+impl uring_runtime::Scope for RequestScope {
+    type Error = Error;
+
+    fn check(&self) -> Result<()> {
+        RequestScope::check(self)
+    }
+
+    fn cancellation(&self) -> Option<&uring_runtime::deadline::Cancellation> {
+        Some(&self.cancellation.inner)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{sync::atomic::AtomicUsize, task::Wake, time::Duration};
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Wake, Waker},
+        time::Duration,
+    };
     #[test]
     fn candidate_total_survives_body_completion_and_never_changes_authority() {
         let clock = crate::runtime::environment::SimulationClock::new(97);
@@ -440,42 +401,30 @@ mod tests {
         }
     }
     #[test]
-    fn operation_registrations_reclaim_capacity_and_do_not_remove_shared_wakes() {
-        let cancellation = Cancellation::new().unwrap();
+    fn runtime_scope_retains_candidate_policy_and_shared_cancellation() {
+        let clock = crate::runtime::environment::SimulationClock::new(101);
+        let _env = clock.environment(0).enter();
+        let start = crate::runtime::environment::now();
+        let scope =
+            RequestScope::new(RequestId([101; 16]), start + Duration::from_secs(30)).unwrap();
+        scope
+            .set_candidate_total(start + Duration::from_secs(10))
+            .unwrap();
+        let clone = scope.clone();
+        clock.advance(Duration::from_secs(10));
+        assert_eq!(
+            uring_runtime::Scope::check(&clone),
+            Err(Error::DeadlineExceeded)
+        );
         let count = Arc::new(Count(AtomicUsize::new(0)));
-        let waker = Waker::from(count.clone());
-        for _ in 0..2048 {
-            let registration = cancellation.subscribe().unwrap();
-            registration.register(&waker);
-        }
-        assert!(cancellation.state.registrations.lock().unwrap().is_empty());
-        let first = cancellation.subscribe().unwrap();
-        let second = cancellation.subscribe().unwrap();
-        first.register(&waker);
-        second.register(&waker);
-        drop(first);
-        cancellation.cancel().unwrap();
+        let registration = uring_runtime::Scope::cancellation(&clone)
+            .unwrap()
+            .subscribe()
+            .unwrap();
+        registration.register(&Waker::from(count.clone()));
+        scope.cancel().unwrap();
+        assert_eq!(uring_runtime::Scope::check(&clone), Err(Error::Cancelled));
         assert_eq!(count.0.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn dropping_subscription_releases_executor_resources_before_scope_ends() {
-        let cancellation = Cancellation::new().unwrap();
-        let executor = Arc::new(Count(AtomicUsize::new(0)));
-        let weak = Arc::downgrade(&executor);
-        let registration = cancellation.subscribe().unwrap();
-        registration.register(&Waker::from(executor));
-        assert!(weak.upgrade().is_some());
-        drop(registration);
-        assert!(weak.upgrade().is_none());
-        assert!(!cancellation.is_cancelled());
-
-        // A worker that subscribes after cancellation must still be notified.
-        cancellation.cancel().unwrap();
-        let executor = Arc::new(Count(AtomicUsize::new(0)));
-        let registration = cancellation.subscribe().unwrap();
-        registration.register(&Waker::from(executor.clone()));
-        assert_eq!(executor.0.load(Ordering::Relaxed), 1);
     }
     #[test]
     fn clones_preserve_deadline_and_wake_independent_waiters() {

@@ -2075,8 +2075,9 @@ impl WireBuffer {
         (self.bytes, self._reservation)
     }
 }
-impl crate::runtime::reactor::sealed::Sealed for WireBuffer {}
-impl IoBuffer for WireBuffer {
+// SAFETY: private fixed Vec retains its reservation and is not aliased.
+unsafe impl IoBuffer for WireBuffer {
+    type Error = Error;
     fn bytes(&self) -> Result<&[u8]> {
         Ok(&self.bytes)
     }

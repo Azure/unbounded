@@ -43,11 +43,11 @@ impl Listener {
         match self {
             Self::Real(listener) => listener.accept().map(|(socket, _)| (socket.into(), ())),
             #[cfg(test)]
-            Self::Sim(crate::runtime::reactor::Descriptor::Sim(handle)) => {
-                handle.accept().map(|fd| (fd, ()))
-            }
-            #[cfg(test)]
-            Self::Sim(_) => unreachable!(),
+            Self::Sim(fd) => fd
+                .as_sim()
+                .expect("simulated listener")
+                .accept()
+                .map(|fd| (fd, ())),
         }
     }
     fn set_nonblocking(&self, value: bool) -> std::io::Result<()> {

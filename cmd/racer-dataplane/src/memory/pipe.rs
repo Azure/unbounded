@@ -254,7 +254,7 @@ impl PipeLease {
     pub(crate) fn prepare_transit(&mut self) {
         let pipe = self.resources.as_mut().unwrap();
         #[cfg(test)]
-        if matches!(pipe.write, Descriptor::Sim(_)) {
+        if pipe.write.as_sim().is_some() {
             return;
         }
         if pipe.capacity < MAX_PIPE_BYTES && pipe.buffered == 0 {
@@ -279,7 +279,7 @@ impl PipeLease {
         count: usize,
     ) -> io::Result<usize> {
         #[cfg(test)]
-        if matches!(socket, Descriptor::Sim(_)) {
+        if socket.as_sim().is_some() {
             return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
         }
         let pipe = self.resources.as_mut().unwrap();
@@ -312,7 +312,7 @@ impl PipeLease {
     pub fn try_write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let pipe = self.resources.as_mut().unwrap();
         #[cfg(test)]
-        if let Descriptor::Sim(handle) = &pipe.write {
+        if let Some(handle) = pipe.write.as_sim() {
             let written = handle.pipe_write(bytes)?;
             pipe.buffered += written;
             return Ok(written);
@@ -335,7 +335,7 @@ impl PipeLease {
     pub fn try_read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         let pipe = self.resources.as_mut().unwrap();
         #[cfg(test)]
-        if let Descriptor::Sim(handle) = &pipe.read {
+        if let Some(handle) = pipe.read.as_sim() {
             let read = handle.pipe_read(bytes)?;
             pipe.buffered -= read;
             return Ok(read);
@@ -359,9 +359,10 @@ impl PipeLease {
         count: usize,
     ) -> io::Result<usize> {
         #[cfg(test)]
-        if let (Descriptor::Sim(pipe), Descriptor::Sim(socket)) =
-            (&self.resources.as_ref().unwrap().read, socket)
-        {
+        if let (Some(pipe), Some(socket)) = (
+            self.resources.as_ref().unwrap().read.as_sim(),
+            socket.as_sim(),
+        ) {
             let sent = pipe.splice(socket, count.min(self.buffered()))?;
             self.resources.as_mut().unwrap().buffered -= sent;
             return Ok(sent);
@@ -413,7 +414,7 @@ impl PipeLease {
         socket: &crate::http::connection::ConnectionLease,
     ) -> io::Result<usize> {
         #[cfg(test)]
-        if matches!(&*socket.fd, Descriptor::Sim(_)) {
+        if socket.fd.as_sim().is_some() {
             return self.try_splice_descriptor(&socket.fd, self.buffered());
         }
         self.splice_to_fd(socket.fd.as_raw_fd(), self.buffered())

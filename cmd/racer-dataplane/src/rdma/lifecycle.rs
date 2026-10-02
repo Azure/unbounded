@@ -1083,7 +1083,7 @@ impl<S: CryptoService> CryptoService for WithNative<S> {
     fn drain<'a>(&'a mut self, scope: &'a RequestScope) -> crate::error::Operation<'a, ()> {
         Box::pin(async move {
             self.native.close();
-            futures::future::poll_fn(|cx| {
+            futures::future::poll_fn(|cx| -> std::task::Poll<Result<()>> {
                 self.native.register_driver(cx.waker());
                 self.native.poll_budgeted(1)?;
                 if self.native.drained() {
