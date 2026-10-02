@@ -204,6 +204,17 @@ impl uring_runtime::Scope for RequestScope {
         Some(&self.cancellation.inner)
     }
 }
+impl rest_client::Scope for RequestScope {
+    fn deadline(&self) -> Instant {
+        self.deadline.0
+    }
+
+    fn narrowed(&self, until: Instant) -> Self {
+        let mut scope = self.clone();
+        scope.deadline.0 = scope.deadline.0.min(until);
+        scope
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +223,27 @@ mod tests {
         task::{Wake, Waker},
         time::Duration,
     };
+    #[test]
+    fn rest_narrowing_preserves_policy_cancellation_and_parent_deadline() {
+        use rest_client::Scope;
+        let clock = crate::runtime::environment::SimulationClock::new(102);
+        let _env = clock.environment(0).enter();
+        let start = crate::runtime::environment::now();
+        let end = start + Duration::from_secs(30);
+        let scope = RequestScope::new(RequestId([102; 16]), end).unwrap();
+        scope
+            .set_candidate_total(start + Duration::from_secs(10))
+            .unwrap();
+        let narrowed = scope.narrowed(start + Duration::from_secs(20));
+        assert_eq!(scope.deadline(), end);
+        assert_eq!(narrowed.deadline(), start + Duration::from_secs(20));
+        assert_eq!(narrowed.narrowed(end).deadline(), narrowed.deadline());
+        clock.advance(Duration::from_secs(10));
+        assert_eq!(narrowed.check(), Err(Error::DeadlineExceeded));
+        scope.cancel().unwrap();
+        assert_eq!(narrowed.check(), Err(Error::Cancelled));
+    }
+
     #[test]
     fn candidate_total_survives_body_completion_and_never_changes_authority() {
         let clock = crate::runtime::environment::SimulationClock::new(97);

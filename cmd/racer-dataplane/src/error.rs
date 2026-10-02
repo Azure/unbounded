@@ -75,6 +75,20 @@ impl From<flow_control::Error> for Error {
     }
 }
 
+impl From<rest_client::Error> for Error {
+    fn from(error: rest_client::Error) -> Self {
+        match error {
+            rest_client::Error::InvalidConfiguration => Self::InvalidConfiguration,
+            rest_client::Error::InvalidRequest => Self::InvalidRequest,
+            rest_client::Error::Unauthorized => Self::Unauthorized,
+            rest_client::Error::Unavailable => Self::Unavailable,
+            rest_client::Error::Overloaded => Self::Overloaded,
+            rest_client::Error::Io => Self::Io,
+            rest_client::Error::Internal => Self::Internal,
+        }
+    }
+}
+
 impl From<rdma_verbs::Error> for Error {
     fn from(error: rdma_verbs::Error) -> Self {
         match error {

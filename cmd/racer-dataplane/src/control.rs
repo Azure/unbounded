@@ -1,7 +1,6 @@
 //! HTTPS enrollment, snapshot polling, and independent network keyring delivery.
 //! Bounded long polls, accepted cursors, jittered retry; no node/status reporting.
 pub(crate) mod async_files;
-mod dns;
 pub mod enrollment;
 pub mod secrets {
     use super::{

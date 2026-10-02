@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "runtime", "alloc", "crypto", "verbs", "http", "topology", "telemetry", "flow"]
+members = [".", "runtime", "alloc", "crypto", "verbs", "http", "topology", "telemetry", "flow", "rest"]
 resolver = "3"
 
 [package]
@@ -23,6 +23,7 @@ required-features = ["subscription-interop"]
 
 [dependencies]
 flow-control = { path = "flow" }
+rest-client = { path = "rest" }
 topology = { path = "topology" }
 telemetry = { path = "telemetry" }
 http1 = { path = "http" }
@@ -33,12 +34,10 @@ uring-runtime = { path = "runtime" }
 base64 = "0.22"
 futures = "0.3"
 getrandom = "0.2"
-httparse = "1"
 io-uring = "0.7"
 libc = "0.2"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -47,6 +46,7 @@ zeroize = "1"
 
 [dev-dependencies]
 flow-control = { path = "flow", features = ["simulation"] }
+rest-client = { path = "rest", features = ["simulation"] }
 rdma-verbs = { path = "verbs", features = ["simulation"] }
 http1 = { path = "http", features = ["test-util"] }
 page-alloc = { path = "alloc", features = ["simulation"] }

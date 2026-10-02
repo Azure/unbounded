@@ -1,22 +1,19 @@
-//! Nonblocking rustls over reactor-owned readiness. No executor or helper thread.
+//! Racer policy and health around the generic worker-local REST transport.
 use super::{ControlEndpoint, enrollment::LocalSigningIdentity, wire};
-use crate::runtime::reactor::Descriptor;
 use crate::{
     error::{Error, Operation, Result},
-    runtime::deadline::RequestScope,
+    runtime::{deadline::RequestScope, reactor::Descriptor},
 };
 use std::{
-    cell::RefCell,
-    io::{Read, Write},
-    net::{SocketAddr, TcpStream},
+    net::SocketAddr,
     os::fd::{AsRawFd, FromRawFd},
     rc::Rc,
-    sync::Arc,
-    time::{Duration, Instant, SystemTime},
+    time::Instant,
 };
 
-/// Runtime adapter: readiness registration must retain the FD until deregistration.
-/// Dropping a wait cancels its registration. Timers and DNS run on the sole owner.
+pub use rest_client::Response as HttpResponse;
+
+/// Racer's owner-local filesystem, timer, admission, and readiness adapter.
 pub trait ControlIo {
     fn ready_charged<'a>(
         &'a self,
@@ -39,7 +36,6 @@ pub trait ControlIo {
             }
         })
     }
-    /// Production supplies the same owner-local reactor for filesystem and TLS.
     fn reactor(&self) -> Option<Rc<crate::runtime::reactor::Reactor>> {
         None
     }
@@ -69,8 +65,50 @@ pub trait ControlIo {
     ) -> Operation<'a, ()>;
     fn sleep<'a>(&'a self, until: Instant, scope: &'a RequestScope) -> Operation<'a, ()>;
 }
-/// Concrete owner-local io_uring readiness/timer adapter. DNS is independently
-/// injectable; the default implementation uses bounded nonblocking UDP queries.
+
+// Keep the existing object-safe Racer adapter API while supplying the generic
+// crate's associated types. Fixtures and production share this exact bridge.
+impl rest_client::Io for dyn ControlIo {
+    type Error = Error;
+    type Scope = RequestScope;
+    type Lease = crate::runtime::admission::ConnectionReservation;
+
+    fn lease(&self) -> Result<Option<Rc<Self::Lease>>> {
+        self.reactor()
+            .map(|r| {
+                r.reserve_connection(crate::model::ResourceClass::ControlConnection)
+                    .map(Rc::new)
+            })
+            .transpose()
+    }
+    fn ready<'a>(
+        &'a self,
+        fd: Rc<Descriptor>,
+        read: bool,
+        write: bool,
+        lease: Option<Rc<Self::Lease>>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, ()> {
+        self.ready_charged(fd, read, write, lease, scope)
+    }
+    fn resolve<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, Vec<SocketAddr>> {
+        ControlIo::resolve(self, host, port, scope)
+    }
+    fn read_file<'a>(
+        &'a self,
+        path: &'a std::path::Path,
+        limit: usize,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, zeroize::Zeroizing<Vec<u8>>> {
+        ControlIo::read_file(self, path, limit, scope)
+    }
+}
+
 pub struct ReactorControlIo {
     reactor: Rc<crate::runtime::reactor::Reactor>,
 }
@@ -89,7 +127,9 @@ impl ControlIo for ReactorControlIo {
         port: u16,
         scope: &'a RequestScope,
     ) -> Operation<'a, Vec<SocketAddr>> {
-        Box::pin(async move { super::dns::resolve(self, host, port, scope).await })
+        Box::pin(async move {
+            rest_client::dns::resolve(self as &dyn ControlIo, host, port, scope).await
+        })
     }
     fn ready<'a>(
         &'a self,
@@ -157,141 +197,38 @@ impl ControlIo for ReactorControlIo {
         })
     }
 }
+
 pub struct ControlTransport {
     health: Rc<crate::topology::health::LinkHealth>,
-    endpoint: ControlEndpoint,
-    io: RefCell<Option<Rc<dyn ControlIo>>>,
-    idle: Rc<RefCell<Option<ControlConnection>>>,
+    endpoint: crate::model::NodeId,
+    inner: rest_client::Transport<dyn ControlIo>,
 }
 pub struct ControlConnection {
     health: Rc<crate::topology::health::LinkHealth>,
     endpoint: crate::model::NodeId,
-    charge: Option<Rc<crate::runtime::admission::ConnectionReservation>>,
-    stream: ControlStream,
-    fd: Rc<Descriptor>,
-    tls: rustls::ClientConnection,
-    io: Rc<dyn ControlIo>,
-    host: String,
-    expires: Option<SystemTime>,
-    epoch: [u8; 32],
-    idle: std::rc::Weak<RefCell<Option<ControlConnection>>>,
-    idle_since: Instant,
-    // Redistribution is checked only between requests, never during a long poll.
-    retire_at: Option<Instant>,
-}
-const AUTHENTICATED_AGE_MIN: Duration = Duration::from_secs(240);
-const AUTHENTICATED_AGE_JITTER_MS: u64 = 60_000;
-
-fn authenticated_age(random: u64) -> Duration {
-    AUTHENTICATED_AGE_MIN + Duration::from_millis(random % (AUTHENTICATED_AGE_JITTER_MS + 1))
-}
-enum ControlStream {
-    Real(TcpStream),
-    #[cfg(test)]
-    Sim(Rc<Descriptor>),
-}
-impl Read for ControlStream {
-    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            Self::Real(stream) => stream.read(bytes),
-            #[cfg(test)]
-            Self::Sim(fd) => fd.try_recv(bytes),
-        }
-    }
-}
-impl Write for ControlStream {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        match self {
-            Self::Real(stream) => stream.write(bytes),
-            #[cfg(test)]
-            Self::Sim(fd) => fd.try_send(bytes),
-        }
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            Self::Real(stream) => stream.flush(),
-            #[cfg(test)]
-            Self::Sim(_) => Ok(()),
-        }
-    }
-}
-pub struct HttpResponse {
-    pub status: u16,
-    pub body: Vec<u8>,
-    pub retry_after: Option<Duration>,
-}
-impl Drop for HttpResponse {
-    fn drop(&mut self) {
-        use zeroize::Zeroize;
-        self.body.zeroize();
-    }
-}
-struct Endpoint {
-    host: String,
-    authority: String,
-    port: u16,
-}
-fn endpoint(url: &str) -> Result<Endpoint> {
-    let authority = url
-        .strip_prefix("https://")
-        .ok_or(Error::InvalidConfiguration)?
-        .trim_end_matches('/');
-    if authority.is_empty()
-        || authority.contains(['/', '?', '#', '@', '\r', '\n', '\\'])
-        || !authority.is_ascii()
-    {
-        return Err(Error::InvalidConfiguration);
-    }
-    let (host, port) = if let Some(s) = authority.strip_prefix('[') {
-        let (host, rest) = s.split_once(']').ok_or(Error::InvalidConfiguration)?;
-        host.parse::<std::net::Ipv6Addr>()
-            .map_err(|_| Error::InvalidConfiguration)?;
-        (
-            host,
-            if rest.is_empty() {
-                443
-            } else {
-                rest.strip_prefix(':')
-                    .ok_or(Error::InvalidConfiguration)?
-                    .parse()
-                    .map_err(|_| Error::InvalidConfiguration)?
-            },
-        )
-    } else {
-        match authority.split_once(':') {
-            Some((host, port)) => (host, port.parse().map_err(|_| Error::InvalidConfiguration)?),
-            None => (authority, 443),
-        }
-    };
-    rustls::pki_types::ServerName::try_from(host.to_owned())
-        .map_err(|_| Error::InvalidConfiguration)?;
-    if port == 0 {
-        return Err(Error::InvalidConfiguration);
-    }
-    Ok(Endpoint {
-        host: host.into(),
-        authority: authority.into(),
-        port,
-    })
+    inner: rest_client::Connection<dyn ControlIo>,
 }
 impl ControlTransport {
     pub fn new(endpoint: ControlEndpoint) -> Self {
         Self {
             health: Rc::new(crate::topology::health::LinkHealth::new(1)),
-            endpoint,
-            io: RefCell::new(None),
-            idle: Rc::new(RefCell::new(None)),
+            endpoint: crate::model::NodeId(endpoint.url.clone()),
+            inner: rest_client::Transport::new(rest_client::Config {
+                url: endpoint.url,
+                trust_bundle: endpoint.trust_bundle,
+                max_trust_bundle: wire::MAX_BUNDLE_BYTES,
+                max_error_body: wire::MAX_ENROLLMENT_BYTES,
+            }),
         }
     }
     pub fn attach_io(&self, io: Rc<dyn ControlIo>) {
-        self.idle.borrow_mut().take();
-        *self.io.borrow_mut() = Some(io);
+        self.inner.attach_io(io);
     }
     pub fn io(&self) -> Result<Rc<dyn ControlIo>> {
-        self.io.borrow().clone().ok_or(Error::InvalidConfiguration)
+        self.inner.io()
     }
     pub fn close_idle(&self) {
-        self.idle.borrow_mut().take();
+        self.inner.close_idle();
     }
     pub fn bootstrap<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, ControlConnection> {
         self.connect(None, scope)
@@ -311,319 +248,30 @@ impl ControlTransport {
         Box::pin(async move {
             self.health
                 .run(
-                    &crate::model::NodeId(self.endpoint.url.clone()),
-                    self.connect_inner(identity, scope),
+                    &self.endpoint,
+                    Box::pin(async move {
+                        scope.check()?;
+                        if identity.is_some_and(|i| !i.valid_now()) {
+                            return Err(Error::Unauthorized);
+                        }
+                        let identity = identity.map(|i| rest_client::Identity {
+                            certificate_chain: i.certificate_chain(),
+                            private_key: i.private_key_der(),
+                            expires: i.expires_at(),
+                        });
+                        let inner = self.inner.connect(identity, scope).await?;
+                        Ok(ControlConnection {
+                            health: self.health.clone(),
+                            endpoint: self.endpoint.clone(),
+                            inner,
+                        })
+                    }),
                 )
                 .await
         })
     }
-    fn connect_inner<'a>(
-        &'a self,
-        identity: Option<&'a LocalSigningIdentity>,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, ControlConnection> {
-        Box::pin(async move {
-            scope.check()?;
-            if identity.is_some_and(|i| !i.valid_now()) {
-                return Err(Error::Unauthorized);
-            }
-            let endpoint = endpoint(&self.endpoint.url)?;
-            let io = self.io()?;
-            let trust = io
-                .read_file(&self.endpoint.trust_bundle, wire::MAX_BUNDLE_BYTES, scope)
-                .await?;
-            use sha2::Digest;
-            let mut epoch = sha2::Sha256::new();
-            epoch.update(&*trust);
-            if let Some(identity) = identity {
-                for certificate in identity.certificate_chain() {
-                    epoch.update((certificate.len() as u64).to_be_bytes());
-                    epoch.update(certificate);
-                }
-            }
-            let epoch: [u8; 32] = epoch.finalize().into();
-            if let Some(connection) = self.idle.borrow_mut().take() {
-                if identity.is_some()
-                    && connection.epoch == epoch
-                    && connection.within_max_age()
-                    && crate::runtime::environment::now()
-                        .saturating_duration_since(connection.idle_since)
-                        < Duration::from_secs(20)
-                    && connection.check(scope).is_ok()
-                {
-                    return Ok(connection);
-                }
-            }
-            let mut roots = rustls::RootCertStore::empty();
-            for cert in rustls_pemfile::certs(&mut trust.as_slice()) {
-                roots
-                    .add(cert.map_err(|_| Error::Unauthorized)?)
-                    .map_err(|_| Error::Unauthorized)?;
-            }
-            if roots.is_empty() {
-                return Err(Error::Unauthorized);
-            }
-            let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(|_| Error::Unauthorized)?
-            .with_root_certificates(roots);
-            let mut config = if let Some(i) = identity {
-                builder
-                    .with_client_auth_cert(
-                        i.certificate_chain()
-                            .iter()
-                            .cloned()
-                            .map(rustls::pki_types::CertificateDer::from)
-                            .collect(),
-                        rustls::pki_types::PrivatePkcs8KeyDer::from(i.private_key_der().to_vec())
-                            .into(),
-                    )
-                    .map_err(|_| Error::Unauthorized)?
-            } else {
-                builder.with_no_client_auth()
-            };
-            config.alpn_protocols = vec![b"http/1.1".to_vec()];
-            config.resumption = rustls::client::Resumption::disabled();
-            let addresses = if let Ok(ip) = endpoint.host.parse() {
-                vec![SocketAddr::new(ip, endpoint.port)]
-            } else {
-                io.resolve(&endpoint.host, endpoint.port, scope).await?
-            };
-            if addresses.is_empty() || addresses.len() > 64 {
-                return Err(Error::Unavailable);
-            }
-            let (stream, fd, charge) = connect_addresses(io.as_ref(), &addresses, scope).await?;
-            let server = rustls::pki_types::ServerName::try_from(endpoint.host)
-                .map_err(|_| Error::InvalidConfiguration)?;
-            let mut tls = rustls::ClientConnection::new(Arc::new(config), server)
-                .map_err(|_| Error::Unauthorized)?;
-            tls.set_buffer_limit(Some(64 * 1024));
-            let retire_at = if identity.is_some() {
-                let mut random = [0; 8];
-                crate::runtime::environment::fill_random(&mut random).map_err(|_| Error::Io)?;
-                Some(
-                    crate::runtime::environment::now()
-                        + authenticated_age(u64::from_ne_bytes(random)),
-                )
-            } else {
-                None
-            };
-            let mut connection = ControlConnection {
-                health: self.health.clone(),
-                endpoint: crate::model::NodeId(self.endpoint.url.clone()),
-                charge,
-                stream,
-                fd,
-                tls,
-                io,
-                host: endpoint.authority,
-                expires: identity.map(|i| i.expires_at()),
-                epoch,
-                idle: if identity.is_some() {
-                    Rc::downgrade(&self.idle)
-                } else {
-                    std::rc::Weak::new()
-                },
-                idle_since: crate::runtime::environment::now(),
-                retire_at,
-            };
-            while connection.tls.is_handshaking() {
-                connection.step(scope).await?;
-            }
-            Ok(connection)
-        })
-    }
-}
-type Connected = (
-    ControlStream,
-    Rc<Descriptor>,
-    Option<Rc<crate::runtime::admission::ConnectionReservation>>,
-);
-
-async fn connect_addresses(
-    io: &dyn ControlIo,
-    addresses: &[SocketAddr],
-    scope: &RequestScope,
-) -> Result<Connected> {
-    for (index, address) in addresses.iter().enumerate() {
-        scope.check()?;
-        // Reserve a share for every remaining address and one for TLS. A local
-        // blackhole must not consume the parent's entire connection deadline.
-        let now = crate::runtime::environment::now();
-        let share =
-            scope.deadline.0.saturating_duration_since(now) / (addresses.len() - index + 1) as u32;
-        let mut attempt = scope.clone();
-        attempt.deadline.0 = now + share.min(Duration::from_secs(5));
-        let charge = io
-            .reactor()
-            .map(|r| {
-                r.reserve_connection(crate::model::ResourceClass::ControlConnection)
-                    .map(Rc::new)
-            })
-            .transpose()?;
-        #[cfg(test)]
-        if let Some(sim) = crate::runtime::reactor::simulation::Simulation::current() {
-            if let Ok(fd) = sim.connect(crate::runtime::reactor::SocketAddress::Inet(*address)) {
-                let fd = Rc::new(fd);
-                return Ok((ControlStream::Sim(fd.clone()), fd, charge));
-            }
-            continue;
-        }
-        if let Ok(stream) = connect_socket(*address) {
-            let fd = Rc::new(Descriptor::from(stream.try_clone().map_err(|_| Error::Io)?));
-            let ready = io
-                .ready_charged(fd.clone(), false, true, charge.clone(), &attempt)
-                .await;
-            // Cancellation and overall expiry always win over local retry.
-            scope.check()?;
-            match ready {
-                Ok(()) => {}
-                Err(Error::DeadlineExceeded | Error::Io | Error::Unavailable) => continue,
-                Err(error) => return Err(error),
-            }
-            if stream.take_error().map_err(|_| Error::Io)?.is_none() {
-                return Ok((ControlStream::Real(stream), fd, charge));
-            }
-        }
-    }
-    scope.check()?;
-    Err(Error::Unavailable)
-}
-
-fn connect_socket(address: SocketAddr) -> Result<TcpStream> {
-    let domain = if address.is_ipv4() {
-        libc::AF_INET
-    } else {
-        libc::AF_INET6
-    };
-    let raw = unsafe {
-        libc::socket(
-            domain,
-            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
-    if raw < 0 {
-        return Err(Error::Io);
-    }
-    let stream = unsafe { TcpStream::from_raw_fd(raw) };
-    let result = match address {
-        SocketAddr::V4(a) => {
-            let addr = libc::sockaddr_in {
-                sin_family: libc::AF_INET as _,
-                sin_port: a.port().to_be(),
-                sin_addr: libc::in_addr {
-                    s_addr: u32::from_ne_bytes(a.ip().octets()),
-                },
-                sin_zero: [0; 8],
-            };
-            unsafe {
-                libc::connect(
-                    raw,
-                    (&addr as *const libc::sockaddr_in).cast(),
-                    std::mem::size_of_val(&addr) as _,
-                )
-            }
-        }
-        SocketAddr::V6(a) => {
-            let addr = libc::sockaddr_in6 {
-                sin6_family: libc::AF_INET6 as _,
-                sin6_port: a.port().to_be(),
-                sin6_flowinfo: a.flowinfo(),
-                sin6_addr: libc::in6_addr {
-                    s6_addr: a.ip().octets(),
-                },
-                sin6_scope_id: a.scope_id(),
-            };
-            unsafe {
-                libc::connect(
-                    raw,
-                    (&addr as *const libc::sockaddr_in6).cast(),
-                    std::mem::size_of_val(&addr) as _,
-                )
-            }
-        }
-    };
-    if result < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINPROGRESS) {
-        return Err(Error::Io);
-    }
-    Ok(stream)
 }
 impl ControlConnection {
-    fn within_max_age(&self) -> bool {
-        self.retire_at
-            .is_none_or(|at| crate::runtime::environment::now() < at)
-    }
-    fn check(&self, scope: &RequestScope) -> Result<()> {
-        scope.check()?;
-        if self
-            .expires
-            .is_some_and(|e| crate::runtime::environment::wall_now() >= e)
-        {
-            return Err(Error::Unauthorized);
-        }
-        Ok(())
-    }
-    async fn step(&mut self, scope: &RequestScope) -> Result<()> {
-        self.check(scope)?;
-        // Even a continuously readable peer must yield to other owner work.
-        let mut yielded = false;
-        std::future::poll_fn(|cx| {
-            if yielded {
-                std::task::Poll::Ready(())
-            } else {
-                yielded = true;
-                cx.waker().wake_by_ref();
-                std::task::Poll::Pending
-            }
-        })
-        .await;
-        let mut progress = false;
-        if self.tls.wants_write() {
-            match self.tls.write_tls(&mut self.stream) {
-                Ok(0) => return Err(Error::Io),
-                Ok(_) => progress = true,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
-                Err(_) => return Err(Error::Io),
-            }
-        }
-        if self.tls.wants_read() {
-            match self.tls.read_tls(&mut self.stream) {
-                Ok(0) => return Err(Error::Io),
-                Ok(_) => {
-                    self.tls.process_new_packets().map_err(tls_failure)?;
-                    progress = true;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
-                Err(_) => return Err(Error::Io),
-            }
-        }
-        if !progress {
-            let mut bounded = scope.clone();
-            if let Some(expiry) = self.expires {
-                let remaining = expiry
-                    .duration_since(crate::runtime::environment::wall_now())
-                    .map_err(|_| Error::Unauthorized)?;
-                bounded.deadline.0 = bounded
-                    .deadline
-                    .0
-                    .min(crate::runtime::environment::now() + remaining);
-            }
-            self.io
-                .ready_charged(
-                    self.fd.clone(),
-                    self.tls.wants_read(),
-                    self.tls.wants_write(),
-                    self.charge.clone(),
-                    &bounded,
-                )
-                .await?;
-        }
-        Ok(())
-    }
-    /// Successful framed requests recycle one connection within its trust/identity epoch.
     pub fn request<'a>(
         self,
         method: &'a str,
@@ -646,424 +294,38 @@ impl ControlConnection {
         scope: &'a RequestScope,
     ) -> Operation<'a, HttpResponse> {
         Box::pin(async move {
-            let health = self.health.clone();
-            let endpoint = self.endpoint.clone();
-            health
+            self.health
                 .run(
-                    &endpoint,
-                    self.request_inner(method, path, token, body, limit, base, scope),
+                    &self.endpoint,
+                    Box::pin(async move {
+                        let method = match method {
+                            "GET" => rest_client::Method::Get,
+                            "POST" => rest_client::Method::Post,
+                            _ => return Err(Error::InvalidRequest),
+                        };
+                        if base.is_some_and(|b| {
+                            b.len() != 64 || !b.bytes().all(|b| b.is_ascii_hexdigit())
+                        }) {
+                            return Err(Error::InvalidRequest);
+                        }
+                        self.inner
+                            .request(
+                                rest_client::Request {
+                                    method,
+                                    path,
+                                    bearer: token,
+                                    header: base.map(|base| ("X-Racer-Delta-Base", base)),
+                                    body,
+                                    limit,
+                                },
+                                scope,
+                            )
+                            .await
+                    }),
                 )
                 .await
         })
     }
-    fn request_inner<'a>(
-        mut self,
-        method: &'a str,
-        path: &'a str,
-        token: Option<&'a str>,
-        body: &'a [u8],
-        limit: usize,
-        base: Option<&'a str>,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, HttpResponse> {
-        Box::pin(async move {
-            let request = request_head(&self.host, method, path, token, body.len(), base)?;
-            for bytes in [request.as_bytes(), body] {
-                let mut offset = 0;
-                while offset < bytes.len() {
-                    self.check(scope)?;
-                    match self.tls.writer().write(&bytes[offset..]) {
-                        Ok(n) if n != 0 => offset += n,
-                        Ok(_) => (),
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
-                        Err(_) => return Err(Error::Io),
-                    }
-                    self.step(scope).await?;
-                }
-            }
-            while self.tls.wants_write() {
-                self.step(scope).await?;
-            }
-            let mut received = zeroize::Zeroizing::new(Vec::new());
-            let mut scratch = zeroize::Zeroizing::new([0; 16384]);
-            let (status, header_len, framing, retry_after) = loop {
-                if let Some(head) = parse_head(&received, limit)? {
-                    break head;
-                }
-                if received.len() >= 16384 {
-                    return Err(Error::Overloaded);
-                }
-                self.receive(&mut received, &mut scratch[..], scope).await?;
-            };
-            let close = std::str::from_utf8(&received[..header_len])
-                .map_err(|_| Error::InvalidRequest)?
-                .lines()
-                .any(|line| {
-                    line.split_once(':').is_some_and(|(name, value)| {
-                        name.eq_ignore_ascii_case("connection")
-                            && value
-                                .split(',')
-                                .any(|token| token.trim().eq_ignore_ascii_case("close"))
-                    })
-                });
-            let body = match framing {
-                Framing::Length(length) => {
-                    if received.len() > header_len + length {
-                        return Err(Error::InvalidRequest);
-                    }
-                    while received.len() < header_len + length {
-                        self.receive(&mut received, &mut scratch[..], scope).await?;
-                        if received.len() > header_len + length {
-                            return Err(Error::InvalidRequest);
-                        }
-                    }
-                    zeroize::Zeroizing::new(received[header_len..].to_vec())
-                }
-                Framing::Chunked => {
-                    let bound = if status == 200 {
-                        limit
-                    } else {
-                        wire::MAX_ENROLLMENT_BYTES
-                    };
-                    self.receive_chunked(&received[header_len..], bound, &mut scratch[..], scope)
-                        .await?
-                }
-            };
-            self.check(scope)?;
-            // A TLS record can contain more plaintext than the last bounded
-            // receive consumed. Never recycle a connection with trailing bytes.
-            let reusable = match self.tls.reader().read(&mut scratch[..1]) {
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => true,
-                Ok(0) => false,
-                Ok(_) => return Err(Error::InvalidRequest),
-                Err(_) => false,
-            };
-            // Failed requests (including 429/503) must reselect a Service backend.
-            // An aged connection finishes its in-flight response, then retires.
-            if reusable && !close && matches!(status, 200 | 204) && self.within_max_age() {
-                if let Some(idle) = self.idle.upgrade() {
-                    self.idle_since = crate::runtime::environment::now();
-                    *idle.borrow_mut() = Some(self);
-                }
-            }
-            Ok(HttpResponse {
-                status,
-                body: body.to_vec(),
-                retry_after,
-            })
-        })
-    }
-    async fn receive_chunked(
-        &mut self,
-        initial: &[u8],
-        bound: usize,
-        scratch: &mut [u8],
-        scope: &RequestScope,
-    ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
-        let mut raw = zeroize::Zeroizing::new(initial.to_vec());
-        let mut body = zeroize::Zeroizing::new(Vec::new());
-        loop {
-            let line_end = loop {
-                if let Some(n) = raw.windows(2).position(|w| w == b"\r\n") {
-                    break n;
-                }
-                if raw.len() > 128 {
-                    return Err(Error::InvalidRequest);
-                }
-                self.receive(&mut raw, scratch, scope).await?;
-            };
-            if line_end == 0 || line_end > 16 || !raw[..line_end].iter().all(u8::is_ascii_hexdigit)
-            {
-                return Err(Error::InvalidRequest);
-            }
-            let length = usize::from_str_radix(
-                std::str::from_utf8(&raw[..line_end]).map_err(|_| Error::InvalidRequest)?,
-                16,
-            )
-            .map_err(|_| Error::Overloaded)?;
-            raw.drain(..line_end + 2);
-            if length > bound - body.len() {
-                return Err(Error::Overloaded);
-            }
-            let mut remaining = length;
-            while remaining != 0 {
-                if raw.is_empty() {
-                    self.receive(&mut raw, scratch, scope).await?;
-                }
-                let n = remaining.min(raw.len());
-                append_sensitive(&mut body, &raw[..n]);
-                raw.drain(..n);
-                remaining -= n;
-            }
-            while raw.len() < 2 {
-                self.receive(&mut raw, scratch, scope).await?;
-            }
-            if &raw[..2] != b"\r\n" {
-                return Err(Error::InvalidRequest);
-            }
-            raw.drain(..2);
-            if length == 0 {
-                if !raw.is_empty() {
-                    return Err(Error::InvalidRequest);
-                }
-                return Ok(body);
-            }
-        }
-    }
-
-    async fn receive(
-        &mut self,
-        into: &mut zeroize::Zeroizing<Vec<u8>>,
-        scratch: &mut [u8],
-        scope: &RequestScope,
-    ) -> Result<()> {
-        loop {
-            self.check(scope)?;
-            match self.tls.reader().read(scratch) {
-                Ok(0) => return Err(Error::Io),
-                Ok(n) => {
-                    append_sensitive(into, &scratch[..n]);
-                    return Ok(());
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => self.step(scope).await?,
-                Err(_) => return Err(Error::Io),
-            }
-        }
-    }
-}
-fn request_head(
-    host: &str,
-    method: &str,
-    path: &str,
-    token: Option<&str>,
-    body_length: usize,
-    base: Option<&str>,
-) -> Result<zeroize::Zeroizing<String>> {
-    const MAX_HEAD: usize = 16384;
-    if !matches!(method, "GET" | "POST")
-        || !path.starts_with('/')
-        || path.bytes().any(|b| b <= 32 || b >= 127)
-        || host.bytes().any(|b| b <= 32 || b >= 127)
-        || token.is_some_and(|t| t.bytes().any(|b| b <= 32 || b >= 127))
-        || base.is_some_and(|b| b.len() != 64 || !b.bytes().all(|b| b.is_ascii_hexdigit()))
-    {
-        return Err(Error::InvalidRequest);
-    }
-    // Bound allocation before copying bearer credentials. Reserve once, so a
-    // String growth cannot free an allocation still containing a token.
-    let capacity = [
-        host.len(),
-        path.len(),
-        token.map_or(0, str::len),
-        base.map_or(0, str::len),
-    ]
-    .into_iter()
-    .try_fold(256usize, |total, len| total.checked_add(len))
-    .filter(|size| *size <= MAX_HEAD)
-    .ok_or(Error::Overloaded)?;
-    let mut request = zeroize::Zeroizing::new(String::with_capacity(capacity));
-    use std::fmt::Write;
-    write!(request, "{method} {path} HTTP/1.1\r\nHost: {host}\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {body_length}\r\nConnection: keep-alive\r\n")
-        .map_err(|_| Error::Internal)?;
-    if let Some(token) = token {
-        request.push_str("Authorization: Bearer ");
-        request.push_str(token);
-        request.push_str("\r\n");
-    }
-    if let Some(base) = base {
-        request.push_str("X-Racer-Delta-Base: ");
-        request.push_str(base);
-        request.push_str("\r\n");
-    }
-    request.push_str("\r\n");
-    Ok(request)
-}
-
-// Grow without freeing an allocation containing plaintext key material.
-fn append_sensitive(into: &mut zeroize::Zeroizing<Vec<u8>>, bytes: &[u8]) {
-    if into.capacity() - into.len() < bytes.len() {
-        let capacity = (into.len() + bytes.len()).max(into.capacity().saturating_mul(2));
-        let mut next = zeroize::Zeroizing::new(Vec::with_capacity(capacity));
-        next.extend_from_slice(into);
-        std::mem::swap(into, &mut next);
-    }
-    into.extend_from_slice(bytes);
-}
-// Go's TLS server sends internal_error when bounded ClientHello admission is
-// saturated. Retry that transport failure without accepting an unauthenticated
-// connection; certificate and protocol failures remain terminal.
-fn tls_failure(error: rustls::Error) -> Error {
-    match error {
-        rustls::Error::AlertReceived(rustls::AlertDescription::InternalError) => Error::Unavailable,
-        _ => Error::Unauthorized,
-    }
-}
-
-enum Framing {
-    Length(usize),
-    Chunked,
-}
-fn parse_head(
-    bytes: &[u8],
-    limit: usize,
-) -> Result<Option<(u16, usize, Framing, Option<Duration>)>> {
-    let mut headers = [httparse::EMPTY_HEADER; 64];
-    let mut response = httparse::Response::new(&mut headers);
-    let length = match response.parse(bytes).map_err(|_| Error::InvalidRequest)? {
-        httparse::Status::Partial => return Ok(None),
-        httparse::Status::Complete(n) => n,
-    };
-    if length > 16384 || response.version != Some(1) {
-        return Err(Error::InvalidRequest);
-    }
-    let status = response.code.ok_or(Error::InvalidRequest)?;
-    let mut content_length = None;
-    let mut retry = None;
-    let mut content_type = false;
-    let mut chunked = false;
-    for h in response.headers {
-        if h.name.eq_ignore_ascii_case("content-encoding") {
-            return Err(Error::InvalidRequest);
-        }
-        if h.name.eq_ignore_ascii_case("transfer-encoding") {
-            if chunked || !h.value.eq_ignore_ascii_case(b"chunked") {
-                return Err(Error::InvalidRequest);
-            }
-            chunked = true;
-        }
-        if h.name.eq_ignore_ascii_case("content-length") {
-            if content_length.is_some() {
-                return Err(Error::InvalidRequest);
-            }
-            let s = std::str::from_utf8(h.value).map_err(|_| Error::InvalidRequest)?;
-            if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(Error::InvalidRequest);
-            }
-            content_length = Some(s.parse::<usize>().map_err(|_| Error::Overloaded)?);
-        }
-        if h.name.eq_ignore_ascii_case("content-type") {
-            if content_type
-                || !std::str::from_utf8(h.value)
-                    .map_err(|_| Error::InvalidRequest)?
-                    .split(';')
-                    .next()
-                    .is_some_and(|s| s.trim().eq_ignore_ascii_case("application/json"))
-            {
-                return Err(Error::InvalidRequest);
-            }
-            content_type = true;
-        }
-        if h.name.eq_ignore_ascii_case("retry-after") {
-            if retry.is_some() {
-                return Err(Error::InvalidRequest);
-            }
-            retry = Some(retry_delay(h.value)?);
-        }
-    }
-    if chunked && (content_length.is_some() || status == 204) {
-        return Err(Error::InvalidRequest);
-    }
-    let size = if status == 204 {
-        if content_length.is_some_and(|n| n != 0) {
-            return Err(Error::InvalidRequest);
-        }
-        0
-    } else {
-        if !content_type {
-            return Err(Error::InvalidRequest);
-        }
-        if chunked {
-            0
-        } else {
-            content_length.ok_or(Error::InvalidRequest)?
-        }
-    };
-    let bound = if status == 200 {
-        limit
-    } else {
-        wire::MAX_ENROLLMENT_BYTES
-    };
-    if size > bound {
-        return Err(Error::Overloaded);
-    }
-    Ok(Some((
-        status,
-        length,
-        if chunked {
-            Framing::Chunked
-        } else {
-            Framing::Length(size)
-        },
-        retry,
-    )))
-}
-fn retry_delay(bytes: &[u8]) -> Result<Duration> {
-    let text = std::str::from_utf8(bytes).map_err(|_| Error::InvalidRequest)?;
-    if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
-        return text
-            .parse::<u64>()
-            .map(Duration::from_secs)
-            .map_err(|_| Error::InvalidRequest);
-    }
-    // IMF-fixdate, the preferred HTTP-date form. No locale or time-zone globals.
-    let parts: Vec<_> = text.split(' ').collect();
-    if parts.len() != 6
-        || !["Mon,", "Tue,", "Wed,", "Thu,", "Fri,", "Sat,", "Sun,"].contains(&parts[0])
-        || parts[5] != "GMT"
-    {
-        return Err(Error::InvalidRequest);
-    }
-    let number = |s: &str| -> Result<i64> {
-        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(Error::InvalidRequest);
-        }
-        s.parse().map_err(|_| Error::InvalidRequest)
-    };
-    let day = number(parts[1])?;
-    let year = number(parts[3])?;
-    let month = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ]
-    .iter()
-    .position(|s| *s == parts[2])
-    .ok_or(Error::InvalidRequest)? as i64
-        + 1;
-    let time: Vec<_> = parts[4].split(':').collect();
-    if time.len() != 3 || year < 1970 || year > 9999 {
-        return Err(Error::InvalidRequest);
-    }
-    let hour = number(time[0])?;
-    let minute = number(time[1])?;
-    let second = number(time[2])?;
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let days = [
-        31,
-        if leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    if day < 1 || day > days[month as usize - 1] || hour > 23 || minute > 59 || second > 59 {
-        return Err(Error::InvalidRequest);
-    }
-    let y = year - i64::from(month <= 2);
-    let era = y / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
-    let days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
-    let seconds = days * 86400 + hour * 3600 + minute * 60 + second;
-    let target = std::time::UNIX_EPOCH
-        + Duration::from_secs(seconds.try_into().map_err(|_| Error::InvalidRequest)?);
-    Ok(target
-        .duration_since(crate::runtime::environment::wall_now())
-        .unwrap_or_default())
 }
 
 #[cfg(test)]

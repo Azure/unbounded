@@ -678,15 +678,14 @@ dependencies = [
  "futures",
  "getrandom",
  "http1",
- "httparse",
  "io-uring",
  "libc",
  "page-alloc",
  "racer-crypto",
  "rcgen",
  "rdma-verbs",
+ "rest-client",
  "rustls",
- "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2",
@@ -727,6 +726,21 @@ dependencies = [
  "futures",
  "libc",
  "uring-runtime",
+]
+
+[[package]]
+name = "rest-client"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "httparse",
+ "libc",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "sha2",
+ "uring-runtime",
+ "zeroize",
 ]
 
 [[package]]

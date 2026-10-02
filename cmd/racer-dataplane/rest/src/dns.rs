@@ -1,25 +1,21 @@
-//! Bounded UDP DNS on the control reactor. TLS, never DNS, authenticates the host.
-use super::transport::ControlIo;
-use crate::runtime::reactor::Descriptor;
-use crate::{
-    error::{Error, Result},
-    runtime::deadline::RequestScope,
-};
+//! Bounded UDP DNS on caller-owned readiness. TLS, never DNS, authenticates the host.
+use crate::{Error, Io, Result, Scope};
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
     rc::Rc,
     time::Duration,
 };
+use uring_runtime::{Scope as _, reactor::Descriptor};
 
 enum Datagram {
     Real(UdpSocket),
-    #[cfg(test)]
+    #[cfg(feature = "simulation")]
     Sim(Rc<Descriptor>),
 }
 impl Datagram {
     fn connect(server: SocketAddr) -> Result<(Self, Rc<Descriptor>)> {
-        #[cfg(test)]
-        if let Some(sim) = crate::runtime::reactor::simulation::Simulation::current() {
+        #[cfg(feature = "simulation")]
+        if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
             let fd = sim
                 .bind_datagram(
                     if server.is_ipv4() {
@@ -52,7 +48,7 @@ impl Datagram {
     fn send(&self, bytes: &[u8]) -> std::io::Result<usize> {
         match self {
             Self::Real(socket) => socket.send(bytes),
-            #[cfg(test)]
+            #[cfg(feature = "simulation")]
             Self::Sim(fd) => {
                 let Some(h) = fd.as_sim() else { unreachable!() };
                 h.send_datagram(bytes)
@@ -62,7 +58,7 @@ impl Datagram {
     fn recv(&self, bytes: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::Real(socket) => socket.recv(bytes),
-            #[cfg(test)]
+            #[cfg(feature = "simulation")]
             Self::Sim(fd) => {
                 let Some(h) = fd.as_sim() else { unreachable!() };
                 h.recv_from(bytes).map(|(n, _)| n)
@@ -71,12 +67,12 @@ impl Datagram {
     }
 }
 
-pub(super) async fn resolve(
-    io: &dyn ControlIo,
+pub async fn resolve<I: Io + ?Sized>(
+    io: &I,
     host: &str,
     port: u16,
-    scope: &RequestScope,
-) -> Result<Vec<SocketAddr>> {
+    scope: &I::Scope,
+) -> Result<Vec<SocketAddr>, I::Error> {
     scope.check()?;
     // Configuration and network I/O both use the owner-local reactor.
     let config = io
@@ -114,7 +110,7 @@ pub(super) async fn resolve(
     }
     servers.truncate(3);
     if servers.is_empty() {
-        return Err(Error::Unavailable);
+        return Err(Error::Unavailable.into());
     }
     let mut names = Vec::new();
     let absolute_first =
@@ -134,16 +130,15 @@ pub(super) async fn resolve(
         for server in &servers {
             let mut addresses = Vec::new();
             for kind in [1u16, 28] {
-                let mut attempt = scope.clone();
-                attempt.deadline.0 = attempt
-                    .deadline
-                    .0
-                    .min(crate::runtime::environment::now() + Duration::from_secs(2));
+                let attempt =
+                    scope.narrowed(uring_runtime::environment::now() + Duration::from_secs(2));
                 match query(io, *server, &name, kind, &attempt).await {
                     Ok(ips) => {
                         addresses.extend(ips.into_iter().map(|ip| SocketAddr::new(ip, port)))
                     }
-                    Err(Error::Cancelled) => return Err(Error::Cancelled),
+                    Err(error) if error == uring_runtime::Error::Cancelled.into() => {
+                        return Err(error);
+                    }
                     Err(_) => {
                         scope.check()?;
                     }
@@ -155,24 +150,24 @@ pub(super) async fn resolve(
             }
         }
     }
-    Err(Error::Unavailable)
+    Err(Error::Unavailable.into())
 }
-async fn query(
-    io: &dyn ControlIo,
+async fn query<I: Io + ?Sized>(
+    io: &I,
     server: SocketAddr,
     name: &str,
     kind: u16,
-    scope: &RequestScope,
-) -> Result<Vec<IpAddr>> {
+    scope: &I::Scope,
+) -> Result<Vec<IpAddr>, I::Error> {
     let mut id = [0; 2];
-    crate::runtime::environment::fill_random(&mut id).map_err(|_| Error::Io)?;
+    uring_runtime::environment::fill_random(&mut id).map_err(|_| Error::Io)?;
     let mut request = vec![id[0], id[1], 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
     if name.len() > 253 {
-        return Err(Error::InvalidConfiguration);
+        return Err(Error::InvalidConfiguration.into());
     }
     for label in name.split('.') {
         if label.is_empty() || label.len() > 63 || !label.is_ascii() {
-            return Err(Error::InvalidConfiguration);
+            return Err(Error::InvalidConfiguration.into());
         }
         request.push(label.len() as u8);
         request.extend_from_slice(label.as_bytes());
@@ -186,20 +181,20 @@ async fn query(
         match socket.send(&request) {
             Ok(n) if n == request.len() => break,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                io.ready(fd.clone(), false, true, scope).await?
+                io.ready(fd.clone(), false, true, None, scope).await?
             }
-            _ => return Err(Error::Io),
+            _ => return Err(Error::Io.into()),
         }
     }
     let mut response = [0; 4096];
     loop {
         scope.check()?;
         match socket.recv(&mut response) {
-            Ok(n) => return parse(&response[..n], &request, kind),
+            Ok(n) => return parse(&response[..n], &request, kind).map_err(Into::into),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                io.ready(fd.clone(), true, false, scope).await?
+                io.ready(fd.clone(), true, false, None, scope).await?
             }
-            _ => return Err(Error::Io),
+            _ => return Err(Error::Io.into()),
         }
     }
 }
