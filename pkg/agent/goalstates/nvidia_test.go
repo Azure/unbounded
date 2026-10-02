@@ -157,18 +157,43 @@ func TestDiscoverNVIDIADriverVersionFallsBackToKernelModule(t *testing.T) {
 	libDir := t.TempDir()
 	moduleVersionPath := filepath.Join(t.TempDir(), "version")
 	require.NoError(t, os.WriteFile(filepath.Join(libDir, "libcuda.so.1"), []byte("driver"), 0o644))
-	require.NoError(t, os.WriteFile(moduleVersionPath, []byte("580.167.08\n"), 0o644))
+	require.NoError(t, os.WriteFile(moduleVersionPath, []byte("580.142\n"), 0o644))
 
 	libs := []NvidiaLibMapping{{HostPath: filepath.Join(libDir, "libcuda.so.1")}}
-	require.Equal(t, "580.167.08", discoverNVIDIADriverVersion(libs, moduleVersionPath))
+	require.Equal(t, "580.142", discoverNVIDIADriverVersion(libs, moduleVersionPath))
+}
+
+func TestIsNVIDIADriverVersion(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		version string
+		valid   bool
+	}{
+		{version: "580.142", valid: true},
+		{version: "580.142.01", valid: true},
+		{version: "580", valid: false},
+		{version: "580.", valid: false},
+		{version: ".142", valid: false},
+		{version: "580..142", valid: false},
+		{version: "580.142.", valid: false},
+		{version: "580.142.01.2", valid: false},
+		{version: "580.142-beta", valid: false},
+	} {
+		t.Run(test.version, func(t *testing.T) {
+			t.Parallel()
+
+			require.Equal(t, test.valid, isNVIDIADriverVersion(test.version))
+		})
+	}
 }
 
 func TestParseNVIDIALibraries_ARM64(t *testing.T) {
 	ldconfigOutput := []byte(`	linux-vdso.so.1 (LINUX_VDSO) => linux-vdso.so.1
-	libcuda.so.1 (libc6,aarch64) => /usr/lib/aarch64-linux-gnu/libcuda.so.1
+	libcuda.so.1 (libc6,AArch64) => /usr/lib/aarch64-linux-gnu/libcuda.so.1
 	libcuda.so.1 (libc6,x86-64) => /usr/lib/x86_64-linux-gnu/libcuda.so.1
-	libnvidia-ml.so.1 (libc6,aarch64) => /usr/lib/aarch64-linux-gnu/libnvidia-ml.so.1
-	libpthread.so.0 (libc6,aarch64) => /lib/aarch64-linux-gnu/libpthread.so.0
+	libnvidia-ml.so.1 (libc6,AArch64) => /usr/lib/aarch64-linux-gnu/libnvidia-ml.so.1
+	libpthread.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libpthread.so.0
 `)
 
 	libs := parseNVIDIALibraries(ldconfigOutput, "aarch64")
