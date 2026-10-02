@@ -26,8 +26,12 @@ Racer-specific request IDs, candidate deadlines, admission classes, crypto
 queues, page ownership hashing, TLS time conversion, and placement policy stay
 in the parent crate's `runtime` adapters.
 
-From the dataplane directory, run `cargo test --workspace --all-features` to test
-both crates. Build the production binary with:
+From the dataplane directory, run `cargo test -p uring-runtime --features simulation`
+to test this crate, including the public reserved-capacity lifecycle scenario and
+the simulated short-write request/reply workflow. Simulation scenarios need no
+io_uring permissions; real-kernel regression tests remain separate and may require
+io_uring support. Run `cargo test --workspace --all-features` for workspace coverage.
+Build the production binary with:
 
 ```sh
 cargo build --release --bin racer-dataplane --no-default-features

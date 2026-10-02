@@ -1101,13 +1101,14 @@ mod io_tests {
         drive(&r, r.connect(client.clone(), address, &scope)).unwrap();
         let server = Rc::new(drive(&r, r.accept(listener.clone(), &scope)).unwrap());
         sim.set_stream_capacity(3);
-        let sent = drive(
+        let mut sent = drive(
             &r,
             r.send(client.clone(), r.file_bytes(b"abcdef").unwrap(), (), &scope),
         )
         .unwrap();
         assert_eq!(sent.bytes, 3);
-        drop(sent);
+        sent.buffer.advance(sent.bytes).unwrap();
+        assert_eq!(sent.buffer.remaining(), 3);
         let mut writable = r.readiness(client.clone(), libc::POLLOUT as u32, &scope);
         assert!(poll(&mut writable).is_pending());
         r.poll_budgeted(8).unwrap();
@@ -1121,6 +1122,33 @@ mod io_tests {
         assert_eq!(read.buffer.prefix(3).unwrap(), b"abc");
         drop(read);
         assert_eq!(drive(&r, writable).unwrap(), libc::POLLOUT as u32);
+        // Reuse the returned owner to finish the request, then send a reply.
+        let mut sent = drive(&r, r.send(client.clone(), sent.buffer, (), &scope)).unwrap();
+        assert_eq!(sent.bytes, 3);
+        sent.buffer.advance(sent.bytes).unwrap();
+        assert_eq!(sent.buffer.remaining(), 0);
+        drop(sent);
+        let read = drive(
+            &r,
+            r.recv(server.clone(), r.file_buffer(8).unwrap(), (), &scope),
+        )
+        .unwrap();
+        assert_eq!(read.buffer.prefix(read.bytes).unwrap(), b"def");
+        drop(read);
+        let sent = drive(
+            &r,
+            r.send(server.clone(), r.file_bytes(b"ok").unwrap(), (), &scope),
+        )
+        .unwrap();
+        assert_eq!(sent.bytes, 2);
+        drop(sent);
+        let reply = drive(
+            &r,
+            r.recv(client.clone(), r.file_buffer(8).unwrap(), (), &scope),
+        )
+        .unwrap();
+        assert_eq!(reply.buffer.prefix(reply.bytes).unwrap(), b"ok");
+        drop(reply);
         drop(client);
         assert_eq!(
             drive(
@@ -1131,6 +1159,16 @@ mod io_tests {
             .bytes,
             0
         );
+        assert!(matches!(
+            drive(
+                &r,
+                r.send(server.clone(), r.file_bytes(b"late").unwrap(), (), &scope)
+            ),
+            Err(Error::Io)
+        ));
+        drive(&r, r.drain()).unwrap();
+        assert_eq!(r.in_flight(), 0);
+        assert_eq!(r.init(), Err(Error::Unavailable));
         drop((server, listener));
         assert_eq!(sim.live_handles(), 0);
         assert_eq!(r.admission.used(ResourceClass::RequestContext), baseline);
