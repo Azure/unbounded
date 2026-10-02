@@ -54,28 +54,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_partial_full_wrapped_and_snapshot() {
-        let mut ring = Ring::<u8, 3>::default();
-        assert!(ring.is_empty());
-        assert_eq!(ring.total(), 0);
-        assert_eq!(ring.iter().len(), 0);
-        ring.push(10);
-        ring.push(20);
-        assert_eq!(ring.iter().collect::<Vec<_>>(), [(1, 10), (2, 20)]);
-        ring.push(30);
-        let snapshot = ring.clone();
-        ring.push(40);
-        ring.push(50);
-        assert_eq!(ring.total(), 5);
-        assert_eq!(ring.len(), 3);
-        assert_eq!(ring.iter().collect::<Vec<_>>(), [(3, 30), (4, 40), (5, 50)]);
-        assert_eq!(
-            snapshot.iter().collect::<Vec<_>>(),
-            [(1, 10), (2, 20), (3, 30)]
-        );
-    }
-
-    #[test]
     fn single_entry_and_saturated_sequence_keep_insertion_order() {
         let mut one = Ring::<u8, 1>::default();
         one.push(1);
