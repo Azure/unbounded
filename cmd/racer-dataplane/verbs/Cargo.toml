@@ -1,0 +1,19 @@
+[package]
+name = "rdma-verbs"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Bounded paired-thread RDMA verbs ownership and simulated fabric"
+
+[features]
+default = []
+native = []
+simulation = ["uring-runtime/simulation"]
+
+[dependencies]
+futures = "0.3"
+libc = "0.2"
+uring-runtime = { path = "../runtime" }
+
+[dev-dependencies]
+uring-runtime = { path = "../runtime", features = ["simulation"] }

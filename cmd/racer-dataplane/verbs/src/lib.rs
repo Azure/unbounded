@@ -1,0 +1,73 @@
+//! Bounded paired-thread RDMA operations. Native owners never cross threads.
+mod ffi;
+mod lifecycle;
+
+pub use ffi::Endpoint;
+#[cfg(any(test, feature = "simulation"))]
+pub use ffi::simulation;
+pub use lifecycle::QueuePairHandle as QueuePair;
+#[cfg(feature = "simulation")]
+pub use lifecycle::testing;
+pub use lifecycle::{
+    Configuration, DeviceHandle, IoPort, NativePort, NativeService, PortInfo, QueuePairHandle,
+    Region, Selection, Ticket, Window, pair,
+};
+
+use std::sync::Arc;
+
+/// Opaque caller-owned lifetime charge. The crate never inspects its contents.
+pub type Guard = Arc<dyn Send + Sync>;
+
+// This unique wrapper, not the caller's Arc, is counted to detect native leaks.
+// A caller may retain any number of references without preventing pool reopen.
+struct GuardOwner {
+    _guard: Guard,
+}
+impl GuardOwner {
+    fn new(guard: Guard) -> Arc<Self> {
+        Arc::new(Self { _guard: guard })
+    }
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Error {
+    InvalidConfiguration,
+    InvalidRequest,
+    InvalidRange,
+    Unavailable,
+    Overloaded,
+    DeadlineExceeded,
+    Cancelled,
+    Io,
+}
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod test_guard {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub struct Observer(Arc<AtomicUsize>);
+    impl Observer {
+        pub fn get(&self) -> usize {
+            self.0.load(Ordering::Acquire)
+        }
+    }
+    struct Charge(Arc<AtomicUsize>);
+    impl Drop for Charge {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+    pub fn guard() -> (Guard, Observer) {
+        let count = Arc::new(AtomicUsize::new(1));
+        (Arc::new(Charge(count.clone())), Observer(count))
+    }
+}
