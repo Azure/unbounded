@@ -91,8 +91,8 @@ controller:
     image: ""
   leaderElection:
     enabled: true
-    leaseDuration: 15s
-    renewDeadline: 5s
+    leaseDuration: 30s
+    renewDeadline: 15s
     retryPeriod: 10s
     resourceNamespace: unbounded-system
     resourceName: unbounded-net-controller
@@ -174,8 +174,8 @@ Pod CIDR allocation is configured per Site using `spec.podCidrAssignments`.
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--leader-elect` | bool | `false` | Enable leader election for HA. |
-| `--leader-elect-lease-duration` | duration | `15s` | Duration of the leader lease. |
-| `--leader-elect-renew-deadline` | duration | `5s` | Deadline for renewing leadership. |
+| `--leader-elect-lease-duration` | duration | `30s` | Duration of the leader lease. |
+| `--leader-elect-renew-deadline` | duration | `15s` | Deadline for renewing leadership. |
 | `--leader-elect-retry-period` | duration | `10s` | Retry period for acquiring leadership. |
 
 With leader election enabled, the controller allocates pod CIDRs (during node sync
@@ -911,8 +911,8 @@ replicas: 2  # Or 3 for larger clusters
 
 args:
   - --leader-elect=true
-  - --leader-elect-lease-duration=15s
-  - --leader-elect-renew-deadline=5s
+  - --leader-elect-lease-duration=30s
+  - --leader-elect-renew-deadline=15s
   - --leader-elect-retry-period=10s
 ```
 

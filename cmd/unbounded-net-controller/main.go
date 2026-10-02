@@ -146,8 +146,8 @@ on site configuration, and maintain SiteNodeSlice and GatewayPool status.`,
 
 	// Leader election flags
 	flags.BoolVar(&cfg.LeaderElection.Enabled, "leader-elect", true, "Enable leader election for controller manager")
-	flags.DurationVar(&cfg.LeaderElection.LeaseDuration, "leader-elect-lease-duration", 15*time.Second, "Duration that non-leader candidates will wait to force acquire leadership")
-	flags.DurationVar(&cfg.LeaderElection.RenewDeadline, "leader-elect-renew-deadline", 5*time.Second, "Duration that the acting leader will retry refreshing leadership before giving up")
+	flags.DurationVar(&cfg.LeaderElection.LeaseDuration, "leader-elect-lease-duration", 30*time.Second, "Duration that non-leader candidates will wait to force acquire leadership")
+	flags.DurationVar(&cfg.LeaderElection.RenewDeadline, "leader-elect-renew-deadline", 15*time.Second, "Duration that the acting leader will retry refreshing leadership before giving up")
 	flags.DurationVar(&cfg.LeaderElection.RetryPeriod, "leader-elect-retry-period", 10*time.Second, "Duration the LeaderElector clients should wait between tries of actions")
 	flags.StringVar(&cfg.LeaderElection.ResourceNamespace, "leader-elect-resource-namespace", unbounded.SystemNamespace(), "Namespace for leader election lease")
 	flags.StringVar(&cfg.LeaderElection.ResourceName, "leader-elect-resource-name", "unbounded-net-controller", "Name of leader election lease")
@@ -353,11 +353,11 @@ General Flags:
 
 Leader Election Flags:
       --leader-elect                             Enable leader election for controller manager (default true)
-      --leader-elect-lease-duration duration     Duration that non-leader candidates will wait to force acquire leadership (default 15s)
-      --leader-elect-renew-deadline duration     Duration that the acting leader will retry refreshing leadership before giving up (default 10s)
+      --leader-elect-lease-duration duration     Duration that non-leader candidates will wait to force acquire leadership (default 30s)
+      --leader-elect-renew-deadline duration     Duration that the acting leader will retry refreshing leadership before giving up (default 15s)
       --leader-elect-resource-name string        Name of leader election lease (default "unbounded-net-controller")
       --leader-elect-resource-namespace string   Namespace for leader election lease (default "unbounded-system")
-      --leader-elect-retry-period duration       Duration the LeaderElector clients should wait between tries of actions (default 2s)
+      --leader-elect-retry-period duration       Duration the LeaderElector clients should wait between tries of actions (default 10s)
 
 Utility Flags:
   -h, --help                                     help for {{.Name}}

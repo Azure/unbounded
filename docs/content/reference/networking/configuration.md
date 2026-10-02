@@ -76,8 +76,8 @@ controller:
     image: ""
   leaderElection:
     enabled: true
-    leaseDuration: 15s
-    renewDeadline: 5s
+    leaseDuration: 30s
+    renewDeadline: 15s
     retryPeriod: 10s
 
 node:
@@ -127,8 +127,8 @@ to disable their creation.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--leader-elect` | `false` | Enable leader election for HA. |
-| `--leader-elect-lease-duration` | `15s` | Duration of the leader lease. |
-| `--leader-elect-renew-deadline` | `5s` | Deadline for renewing leadership. |
+| `--leader-elect-lease-duration` | `30s` | Duration of the leader lease. |
+| `--leader-elect-renew-deadline` | `15s` | Deadline for renewing leadership. |
 | `--leader-elect-retry-period` | `10s` | Retry period for acquiring leadership. |
 
 With leader election enabled, the controller allocates pod CIDRs (during node sync
@@ -380,8 +380,8 @@ resources:
 replicas: 2
 args:
   - --leader-elect=true
-  - --leader-elect-lease-duration=15s
-  - --leader-elect-renew-deadline=5s
+  - --leader-elect-lease-duration=30s
+  - --leader-elect-renew-deadline=15s
 ```
 
 ### Large Clusters (1000+ nodes)

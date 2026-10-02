@@ -17,15 +17,15 @@ func TestDefaultLeaderElectionConfig(t *testing.T) {
 		t.Fatalf("expected leader election enabled by default")
 	}
 
-	if cfg.LeaseDuration != 15*time.Second {
+	if cfg.LeaseDuration != 30*time.Second {
 		t.Fatalf("unexpected lease duration: %v", cfg.LeaseDuration)
 	}
 
-	if cfg.RenewDeadline != 10*time.Second {
+	if cfg.RenewDeadline != 15*time.Second {
 		t.Fatalf("unexpected renew deadline: %v", cfg.RenewDeadline)
 	}
 
-	if cfg.RetryPeriod != 2*time.Second {
+	if cfg.RetryPeriod != 10*time.Second {
 		t.Fatalf("unexpected retry period: %v", cfg.RetryPeriod)
 	}
 
