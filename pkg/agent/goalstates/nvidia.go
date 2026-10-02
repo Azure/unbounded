@@ -525,7 +525,18 @@ func nvidiaDriverVersionFromName(name string) string {
 }
 
 func isNVIDIADriverVersion(version string) bool {
-	return strings.Count(version, ".") >= 2 && strings.Trim(version, "0123456789.") == ""
+	parts := strings.Split(version, ".")
+	if len(parts) != 2 && len(parts) != 3 {
+		return false
+	}
+
+	for _, part := range parts {
+		if part == "" || strings.Trim(part, "0123456789") != "" {
+			return false
+		}
+	}
+
+	return true
 }
 
 func nvidiaI386LibraryDirs(i386LibDir string) []string {
@@ -699,7 +710,7 @@ func parseNVIDIALibraries(ldconfigOutput []byte, archTag string) []NvidiaLibMapp
 		}
 
 		// Filter to the target architecture only when an architecture was given.
-		if archTag != "" && !strings.Contains(line, archTag) {
+		if archTag != "" && !strings.Contains(strings.ToLower(line), strings.ToLower(archTag)) {
 			continue
 		}
 
