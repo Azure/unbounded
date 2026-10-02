@@ -1,7 +1,7 @@
 use super::{lifecycle::*, test_support::*, *};
 use crate::{
     model::*,
-    runtime::admission::Admission,
+    runtime::admission::AdmissionPolicy,
     telemetry::metrics::{Gauge, Metrics},
 };
 use rdma_verbs::testing::State;
@@ -184,7 +184,9 @@ fn dropped_activation_does_not_publish_readiness_or_release_accepted_quota_early
     let (io, port) = pair(1).unwrap();
     let devices = Devices::new();
     devices.attach(io).unwrap();
-    let admission = Admission::new(crate::test_support::cluster::config(true).limits);
+    let admission = flow_control::Quotas::new(AdmissionPolicy::new(
+        crate::test_support::cluster::config(true).limits,
+    ));
     let scope = scope();
     let mut operation = devices.activate(Vec::new(), &admission, 4096, &scope);
     assert!(

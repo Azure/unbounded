@@ -9,7 +9,7 @@ use crate::{
     model::{CacheId, RequestId},
     read::ReadService,
     runtime::{
-        admission::Admission,
+        admission::{AdmissionExt, AdmissionPolicy},
         deadline::{Cancellation, RequestScope},
         reactor::Descriptor,
     },
@@ -159,7 +159,7 @@ pub struct ClientListeners {
     parser: RequestParser,
     responses: Rc<Responses>,
     io: Rc<HttpIo>,
-    admission: Rc<Admission>,
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     listeners: Rc<RefCell<BTreeMap<CacheId, Rc<BoundListener>>>>,
     preparing: Rc<Cell<bool>>,
     cleanup: Rc<RefCell<VecDeque<Rc<BoundListener>>>>,
@@ -175,7 +175,7 @@ impl ClientListeners {
         parser: RequestParser,
         responses: Rc<Responses>,
         io: Rc<HttpIo>,
-        admission: Rc<Admission>,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     ) -> Self {
         Self {
             generation: Rc::new(Cell::new(0)),
@@ -659,7 +659,7 @@ async fn serve_connection(
     reads: &dyn ReadService,
     responses: &Responses,
     io: &HttpIo,
-    admission: &Admission,
+    admission: &flow_control::Quotas<AdmissionPolicy>,
     cancellation: Cancellation,
     retired: Arc<crate::runtime::ingress::Retired>,
     idle: Rc<Cell<bool>>,

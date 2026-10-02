@@ -17,7 +17,7 @@ use crate::{
     },
     runtime::deadline::RequestScope,
     runtime::{
-        admission::{Admission, Reservation},
+        admission::{AdmissionExt, AdmissionPolicy},
         reactor::IoBuffer,
     },
     security::{
@@ -227,7 +227,7 @@ mod native_exchange_tests {
         memory::pool::BufferPool,
         model::{ExpiresAt, KeyId, Nonce, ObjectMetadata, PageEnvelope, ResourceClass, *},
         rdma::{Devices, RdmaTransfer, Sessions},
-        runtime::{admission::Admission, reactor::Reactor},
+        runtime::reactor::Reactor,
         security::{connection::Signatures, protocol as p},
     };
     use std::{
@@ -240,7 +240,7 @@ mod native_exchange_tests {
 
     fn transfers(
         signatures: Rc<Signatures>,
-        admission: &Rc<Admission>,
+        admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
         reactor: &Rc<Reactor>,
     ) -> Transfers {
         let devices = Rc::new(Devices::new());
@@ -337,9 +337,9 @@ mod native_exchange_tests {
             &[0, 2],
             &rejected_sites.unwrap_or(["site1", "site1"]),
         );
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let reactor = Rc::new(Reactor::new(admission.clone()));
         let receiver = transfers(signers[0].clone(), &admission, &reactor);
         let sender = transfers(signers[2].clone(), &admission, &reactor);
@@ -686,9 +686,9 @@ mod native_exchange_tests {
         if reverse {
             signers.swap(0, 2);
         }
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(true).limits,
-        ));
+        )));
         let reactor = Rc::new(Reactor::new(admission.clone()));
         let mappings = vec![RailMapping {
             rail: RailId(7),
@@ -2025,10 +2025,13 @@ impl Transfers {
 /// stays fixed while ownership moves through reactor completion closures.
 pub(crate) struct WireBuffer {
     bytes: Vec<u8>,
-    _reservation: Reservation,
+    _reservation: flow_control::Charge<AdmissionPolicy>,
 }
 impl WireBuffer {
-    pub(crate) fn new(admission: &Admission, length: usize) -> Result<Self> {
+    pub(crate) fn new(
+        admission: &flow_control::Quotas<AdmissionPolicy>,
+        length: usize,
+    ) -> Result<Self> {
         if length > crate::model::PAGE_BYTES as usize + 16 {
             return Err(Error::InvalidRequest);
         }
@@ -2038,7 +2041,10 @@ impl WireBuffer {
             _reservation: reservation,
         })
     }
-    pub(crate) fn reserved(reservation: Reservation, length: usize) -> Result<Self> {
+    pub(crate) fn reserved(
+        reservation: flow_control::Charge<AdmissionPolicy>,
+        length: usize,
+    ) -> Result<Self> {
         reservation.validate(ResourceClass::Ciphertext, length)?;
         if length > crate::model::PAGE_BYTES as usize + 16 {
             return Err(Error::InvalidRequest);
@@ -2048,7 +2054,7 @@ impl WireBuffer {
             _reservation: reservation,
         })
     }
-    pub(crate) fn into_parts(self) -> (Vec<u8>, Reservation) {
+    pub(crate) fn into_parts(self) -> (Vec<u8>, flow_control::Charge<AdmissionPolicy>) {
         (self.bytes, self._reservation)
     }
 }
@@ -2143,7 +2149,7 @@ pub struct Transfers {
     pub(super) http: Rc<HttpPool>,
     pub(super) io: Rc<HttpIo>,
     pub(super) rdma: Option<Rc<RdmaTransfer>>,
-    pub(super) wire: (Rc<Admission>, Rc<SecurityCodec>),
+    pub(super) wire: (Rc<flow_control::Quotas<AdmissionPolicy>>, Rc<SecurityCodec>),
     pub(super) native: Option<Rc<crate::rdma::Sessions>>,
 }
 impl Transfers {
@@ -2160,7 +2166,7 @@ impl Transfers {
         http: Rc<HttpPool>,
         io: Rc<HttpIo>,
         rdma: Option<Rc<RdmaTransfer>>,
-        admission: Rc<Admission>,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         codec: Rc<SecurityCodec>,
         signatures: Rc<crate::security::connection::Signatures>,
     ) -> Self {
@@ -2199,7 +2205,7 @@ impl Transfers {
         request: SignedRequest,
         plan: TransportPlan,
         membership: Option<crate::topology::membership::MembershipLease>,
-        relay: Option<Rc<Reservation>>,
+        relay: Option<Rc<flow_control::Charge<AdmissionPolicy>>>,
         peer_admission: Option<std::sync::Arc<super::adaptive::Permit>>,
         failure: Rc<std::cell::Cell<bool>>,
         mut timing: Option<&'a mut super::timing::PageTiming<'_>>,
@@ -2387,19 +2393,27 @@ impl Transfers {
         peer_admission: &Option<std::sync::Arc<super::adaptive::Permit>>,
         failure: &Rc<std::cell::Cell<bool>>,
         scope: &RequestScope,
-    ) -> Result<(ConnectionLease, Vec<u8>, Option<Reservation>)> {
+    ) -> Result<(
+        ConnectionLease,
+        Vec<u8>,
+        Option<flow_control::Charge<AdmissionPolicy>>,
+    )> {
         let (admission, _) = &self.wire;
         let observer = admission.observer();
         let (body, staging_reservation) = if length == 0 {
             (Vec::new(), None)
         } else {
             let cache = &request.request.origin.object.cache;
-            let mut reservation = admission.reserve(Some(cache), ResourceClass::Ciphertext, length);
+            let mut reservation = admission
+                .reserve(Some(cache), ResourceClass::Ciphertext, length)
+                .map_err(Error::from);
             if matches!(reservation, Err(Error::Overloaded))
                 && let Some(reclaim) = &self.reclaim
             {
                 reclaim(cache, length);
-                reservation = admission.reserve(Some(cache), ResourceClass::Ciphertext, length);
+                reservation = admission
+                    .reserve(Some(cache), ResourceClass::Ciphertext, length)
+                    .map_err(Error::from);
             }
             let mut buffer = WireBuffer::reserved(
                 observer.result(Stage::PeerReceiveAdmission, scope, reservation)?,
@@ -2509,7 +2523,9 @@ mod tests {
     #[test]
     fn wire_checkout_reuses_zeroed_payload_without_moving_or_releasing_its_charge() {
         use crate::model::CacheId;
-        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
+        let admission = flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
         let first = CacheId("first".into());
         let second = CacheId("second".into());
         let length = 1 << 20;
@@ -2544,7 +2560,7 @@ mod tests {
             let (bytes, mut reservation) = buffer.into_parts();
             assert_eq!(bytes.as_ptr(), pointer);
             assert_eq!(&bytes[..3], b"abc");
-            assert_eq!(reservation.cache(), reserved.then_some(&second));
+            assert_eq!(reservation.key(), reserved.then_some(&second));
             assert_eq!(reservation.amount(), length);
             assert_eq!(admission.used(ResourceClass::Ciphertext), length);
             reservation.recycle(bytes);
@@ -2556,7 +2572,9 @@ mod tests {
 
     #[test]
     fn wire_checkout_validates_bounds_class_and_admission_before_reuse() {
-        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
+        let admission = flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
         let length = 1 << 20;
         let mut old = admission
             .reserve(None, ResourceClass::Ciphertext, length)
@@ -2601,7 +2619,9 @@ mod tests {
         const ITERATIONS: usize = 128;
         for length in [1 << 20, 16 << 20, (16 << 20) + 16] {
             for reserved in [false, true] {
-                let admission = Admission::new(crate::test_support::cluster::config(false).limits);
+                let admission = flow_control::Quotas::new(AdmissionPolicy::new(
+                    crate::test_support::cluster::config(false).limits,
+                ));
                 for sample in 0..6 {
                     let start = Instant::now();
                     for _ in 0..ITERATIONS {

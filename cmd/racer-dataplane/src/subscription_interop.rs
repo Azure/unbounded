@@ -7,7 +7,7 @@ use crate::{
 use error::Operation;
 use model::{OriginContext, PAGE_BYTES, ResourceClass, *};
 use runtime::{
-    admission::{Admission, Reservation},
+    admission::AdmissionPolicy,
     deadline::RequestScope,
     reactor::{IoBuffer, Reactor},
     worker::{CryptoRuntime, CryptoService, WorkerMap},
@@ -48,7 +48,7 @@ impl origin::Origin for GeneratedOrigin {
         &'a self,
         authority: &'a read::candidates::OriginAuthority,
         context: &'a OriginContext,
-        reservation: Reservation,
+        reservation: flow_control::Charge<AdmissionPolicy>,
         scope: &'a RequestScope,
     ) -> Operation<'a, origin::metadata::MetadataReply> {
         Box::pin(async move {
@@ -93,7 +93,7 @@ impl origin::Origin for GeneratedOrigin {
         authority: &'a read::candidates::OriginAuthority,
         context: &'a OriginContext,
         page: &'a PageId,
-        reservation: Reservation,
+        reservation: flow_control::Charge<AdmissionPolicy>,
         scope: &'a RequestScope,
     ) -> Operation<'a, origin::page::OriginPage> {
         Box::pin(async move {
@@ -163,7 +163,7 @@ struct SubscriptionFixture {
     reactor: Rc<Reactor>,
     writer: Rc<store::writer::StoreWriter>,
     memory: Rc<memory::cache::MemoryCache>,
-    admission: Rc<Admission>,
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     cache: control::state::CacheDefinition,
     scope: RequestScope,
 }
@@ -175,7 +175,9 @@ impl SubscriptionFixture {
             state::{CacheDefinition, PublishedState, SnapshotStore},
             wire::*,
         };
-        use memory::{cache::MemoryCache, delivery::Delivery, pipe::PipePool, pool::BufferPool};
+        use memory::{
+            cache::MemoryCache, delivery::Delivery, pipe::new_pipe_pool, pool::BufferPool,
+        };
         use read::{
             Coordinator,
             candidates::CandidatePolicy,
@@ -200,7 +202,9 @@ impl SubscriptionFixture {
         limits.plaintext_bytes = NonZeroUsize::new(4 * PAGE_BYTES as usize).unwrap();
         limits.ciphertext_bytes = NonZeroUsize::new(4 * (PAGE_BYTES as usize + 16)).unwrap();
         limits.range_window_pages = NonZeroUsize::new(2).unwrap();
-        let admission = Rc::new(Admission::new(limits.clone()));
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+            limits.clone(),
+        )));
         let reactor = Rc::new(Reactor::new(admission.clone()));
         reactor.init().unwrap();
         let buffers = BufferPool::new(admission.clone());
@@ -308,7 +312,8 @@ impl SubscriptionFixture {
             },
         ));
         let delivery = Rc::new(Delivery::new(
-            Rc::new(PipePool::new(admission.clone(), reactor.clone())),
+            Rc::new(new_pipe_pool(admission.clone())),
+            reactor.clone(),
             Duration::from_secs(10),
         ));
         let streams = Rc::new(RangeStreams::new(directory.clone(), delivery.clone(), 2));

@@ -26,12 +26,12 @@ use std::time::Instant;
 use std::{rc::Rc, sync::Arc};
 
 fn reserve_hedge_pages(
-    admission: &crate::runtime::admission::Admission,
+    admission: &flow_control::Quotas<crate::runtime::admission::AdmissionPolicy>,
     cache: &crate::model::CacheId,
     pages: usize,
 ) -> Result<(
-    crate::runtime::admission::Reservation,
-    crate::runtime::admission::Reservation,
+    flow_control::Charge<crate::runtime::admission::AdmissionPolicy>,
+    flow_control::Charge<crate::runtime::admission::AdmissionPolicy>,
 )> {
     use crate::model::{PAGE_BYTES, ResourceClass};
     let plaintext = admission.reserve(
@@ -102,7 +102,7 @@ impl CandidatePolicy {
         operation: &PeerOperation,
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
-        admission: &Rc<crate::runtime::admission::Admission>,
+        admission: &Rc<flow_control::Quotas<crate::runtime::admission::AdmissionPolicy>>,
         continuation: &mut HedgeContinuation,
         validate: impl Fn(VerifiedResponse, RequestScope) -> Operation<'a, T>,
     ) -> Result<Option<T>> {
@@ -1267,7 +1267,7 @@ mod tests {
         use crate::{
             model::ClusterId,
             model::{MembershipVersion, RequestId},
-            runtime::admission::Admission,
+            runtime::admission::AdmissionPolicy,
             security::identity::{KeyEpochs, Keyring},
             topology::membership::{Member, Membership},
         };
@@ -1296,9 +1296,9 @@ mod tests {
             Instant::now() + std::time::Duration::from_secs(60),
         )
         .unwrap();
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let keys = Rc::new(Keyring::new(
             ClusterId("cluster".into()),
             NodeId("local".into()),
@@ -1572,7 +1572,9 @@ mod tests {
     fn policy(node: NodeId, peers: Rc<RecordedPeer>) -> CandidatePolicy {
         use crate::security::identity::{KeyEpochs, Keyring};
         let config = crate::test_support::cluster::config(false);
-        let admission = Rc::new(crate::runtime::admission::Admission::new(config.limits));
+        let admission = Rc::new(flow_control::Quotas::new(
+            crate::runtime::admission::AdmissionPolicy::new(config.limits),
+        ));
         let keys = Rc::new(Keyring::new(
             config.cluster,
             node.clone(),

@@ -7,7 +7,7 @@ use crate::{
         EncryptedAuthorization, ExpiresAt, KeyId, MetadataSelector, Nonce, ObjectMetadata,
         OpaqueMetadata, PageEnvelope, PeerOriginContext, ResourceClass, *,
     },
-    runtime::{admission::Admission, deadline::RequestScope},
+    runtime::{admission::AdmissionPolicy, deadline::RequestScope},
     security::{connection::SignedHead, forwarding::ForwardedHead, protocol as p},
     topology::routing::RouteBudget,
 };
@@ -381,11 +381,11 @@ mod envelope_tests {
 
 /// Decode the canonical security profile while retaining charged body ownership.
 pub struct SecurityCodec {
-    admission: Rc<Admission>,
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     buffers: BufferPool,
 }
 impl SecurityCodec {
-    pub fn new(admission: Rc<Admission>, buffers: BufferPool) -> Self {
+    pub fn new(admission: Rc<flow_control::Quotas<AdmissionPolicy>>, buffers: BufferPool) -> Self {
         Self { admission, buffers }
     }
 }
@@ -493,8 +493,10 @@ mod metadata_tests {
         let cache = CacheId("cccccccc-1111-4111-8111-111111111111".into());
         let mut limits = crate::test_support::cluster::config(false).limits;
         limits.ciphertext_bytes = std::num::NonZeroUsize::new(19).unwrap();
-        let admission = Rc::new(Admission::new(limits.clone()));
-        let foreign = Admission::new(limits);
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+            limits.clone(),
+        )));
+        let foreign = flow_control::Quotas::new(AdmissionPolicy::new(limits));
         let buffers = BufferPool::new(admission.clone());
         let codec = SecurityCodec::new(admission.clone(), buffers.clone());
         let metadata = ObjectMetadata {
@@ -872,7 +874,7 @@ impl SecurityCodec {
         &self,
         authentication: ForwardedHead,
         body: Vec<u8>,
-        reservation: Option<crate::runtime::admission::Reservation>,
+        reservation: Option<flow_control::Charge<AdmissionPolicy>>,
         scope: &RequestScope,
     ) -> Result<SignedResponse> {
         scope.check()?;
@@ -890,7 +892,7 @@ impl SecurityCodec {
                     Some(reservation) => {
                         reservation.validate(ResourceClass::Ciphertext, body.capacity())?;
                         if !self.admission.owns(&reservation)
-                            || reservation.cache() != Some(&metadata.version.object.cache)
+                            || reservation.key() != Some(&metadata.version.object.cache)
                         {
                             return Err(Error::InvalidRequest);
                         }

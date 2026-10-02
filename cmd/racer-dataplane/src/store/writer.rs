@@ -9,10 +9,7 @@ use crate::{
     error::{Error, Operation, Result},
     memory::page::CiphertextCopy,
     model::{CacheId, ObjectVersion, PageId, ResourceClass, VersionMetadata},
-    runtime::{
-        admission::{Admission, Reservation},
-        deadline::RequestScope,
-    },
+    runtime::{admission::AdmissionPolicy, deadline::RequestScope},
 };
 use page_alloc::{Alignment, SegmentLease, Segments, Slab};
 use std::{
@@ -24,15 +21,15 @@ struct Dirty {
     _metric: crate::telemetry::metrics::GaugeLease,
     ticket: u64,
     page: CiphertextCopy,
-    _reservation: Rc<Reservation>,
-    staging: Option<Reservation>,
+    _reservation: Rc<flow_control::Charge<AdmissionPolicy>>,
+    staging: Option<flow_control::Charge<AdmissionPolicy>>,
 }
 pub struct StoreWriter {
     metrics: crate::telemetry::metrics::Metrics,
     index: Rc<Index>,
     segments: Rc<Segments>,
-    slabs: Rc<Slab<Reservation>>,
-    admission: Rc<Admission>,
+    slabs: Rc<Slab<flow_control::Charge<AdmissionPolicy>>>,
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     reactor: Rc<Reactor>,
     clock: RefCell<Option<Rc<SegmentClock>>>,
     pending: RefCell<HashMap<PageId, Dirty>>,
@@ -49,8 +46,8 @@ impl StoreWriter {
     pub fn new(
         index: Rc<Index>,
         segments: Rc<Segments>,
-        slabs: Rc<Slab<Reservation>>,
-        admission: Rc<Admission>,
+        slabs: Rc<Slab<flow_control::Charge<AdmissionPolicy>>>,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         reactor: Rc<Reactor>,
         availability: Rc<crate::control::state::Availability>,
     ) -> Self {
@@ -79,7 +76,7 @@ impl StoreWriter {
     }
     pub fn configure(
         &self,
-        admission: Rc<Admission>,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         clock: Rc<SegmentClock>,
         queue_entries: usize,
         page_entries: usize,
@@ -109,7 +106,7 @@ impl StoreWriter {
             Ok(alignment)
         })
     }
-    pub fn slabs(&self) -> &Rc<Slab<Reservation>> {
+    pub fn slabs(&self) -> &Rc<Slab<flow_control::Charge<AdmissionPolicy>>> {
         &self.slabs
     }
     pub fn index(&self) -> &Rc<Index> {
@@ -125,15 +122,24 @@ impl StoreWriter {
         self.availability
             .page(&e.page.version.object.cache, e.key_id)
     }
-    pub fn enqueue(&self, page: CiphertextCopy, dirty: Reservation) -> Result<u64> {
+    pub fn enqueue(
+        &self,
+        page: CiphertextCopy,
+        dirty: flow_control::Charge<AdmissionPolicy>,
+    ) -> Result<u64> {
         let cache = page.metadata.version.object.cache.clone();
         self.enqueue_reclaiming(page, dirty, |length| self.reserve_staging(length, &cache))
     }
     /// Accepted fills may complete after request admission closes, within quota.
-    fn reserve_staging(&self, length: usize, cache: &CacheId) -> Result<Reservation> {
+    fn reserve_staging(
+        &self,
+        length: usize,
+        cache: &CacheId,
+    ) -> Result<flow_control::Charge<AdmissionPolicy>> {
         let reserve = || {
             self.admission
                 .reserve_completion(Some(cache), ResourceClass::Ciphertext, length)
+                .map_err(Error::from)
         };
         let result = reserve();
         if matches!(result, Err(Error::Overloaded)) {
@@ -148,8 +154,8 @@ impl StoreWriter {
     pub(crate) fn enqueue_reclaiming(
         &self,
         page: CiphertextCopy,
-        dirty: Reservation,
-        reserve_staging: impl FnOnce(usize) -> Result<Reservation>,
+        dirty: flow_control::Charge<AdmissionPolicy>,
+        reserve_staging: impl FnOnce(usize) -> Result<flow_control::Charge<AdmissionPolicy>>,
     ) -> Result<u64> {
         if self.closed.get() {
             return Err(Error::Unavailable);
@@ -163,7 +169,7 @@ impl StoreWriter {
         let logical = format::logical_length(&page)?;
         if !matches!(dirty.class(), ResourceClass::DirtyCiphertext)
             || !self.admission.owns(&dirty)
-            || dirty.cache() != Some(&page.metadata.version.object.cache)
+            || dirty.key() != Some(&page.metadata.version.object.cache)
             || dirty.amount() < page.ciphertext.bytes().len()
             || logical > crate::model::PAGE_BYTES as usize + super::format::MAX_HEADER_BYTES + 16
         {
@@ -196,7 +202,7 @@ impl StoreWriter {
         let disk_bytes = self.slabs.alignment()?.extent(0, logical)?.length();
         let staging = reserve_staging(disk_bytes)?;
         staging.validate(ResourceClass::Ciphertext, disk_bytes)?;
-        if !self.admission.owns(&staging) || staging.cache() != Some(&id.version.object.cache) {
+        if !self.admission.owns(&staging) || staging.key() != Some(&id.version.object.cache) {
             return Err(Error::InvalidConfiguration);
         }
         let ticket = self.next.get();
@@ -293,7 +299,10 @@ impl StoreWriter {
             queue.remove(position);
             let dirty = pending.remove(id).expect("located queued copy");
             self.note_discard(1);
-            return dirty.staging.as_ref().map_or(0, Reservation::amount);
+            return dirty
+                .staging
+                .as_ref()
+                .map_or(0, flow_control::Charge::amount);
         }
         0
     }
@@ -312,8 +321,12 @@ impl StoreWriter {
                 return true;
             }
             if let Some(dirty) = pending.remove(id) {
-                released =
-                    released.saturating_add(dirty.staging.as_ref().map_or(0, Reservation::amount));
+                released = released.saturating_add(
+                    dirty
+                        .staging
+                        .as_ref()
+                        .map_or(0, flow_control::Charge::amount),
+                );
                 if std::sync::Arc::strong_count(&dirty.page.ciphertext.inner) == 1 {
                     released =
                         released.saturating_add(dirty.page.ciphertext.inner.reservation.amount());

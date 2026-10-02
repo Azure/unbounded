@@ -428,7 +428,9 @@ pub(super) fn local_worker_with_fabric(
     discovered_nics: Vec<crate::topology::rails::RailMapping>,
 ) -> (WorkerApplication, WorkerRuntime, PageCryptoEngine) {
     let worker = WorkerId(id);
-    let admission = Rc::new(Admission::new(config.limits.clone()));
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+        config.limits.clone(),
+    )));
     let (io, engine) = crate::runtime::crypto::pair(worker, 0, config.limits.queue_entries);
     let runtime = WorkerRuntime {
         reactor: Rc::new(Reactor::new(admission.clone())),

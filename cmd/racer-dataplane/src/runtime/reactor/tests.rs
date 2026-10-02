@@ -25,8 +25,8 @@ fn movable_production_buffers_preserve_subrange_through_completion() {
         let buffer = finish();
         assert_eq!(buffer.bytes().unwrap(), &[0, 7, 0]);
     }
-    let admission = Rc::new(Admission::new(limits(4)));
-    check(OwnedBuffer::new(&admission, 3).unwrap());
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits(4))));
+    check(OwnedBuffer::new(&crate::http::connection::HttpContext(admission.clone()), 3).unwrap());
     check(WireBuffer::new(&admission, 3).unwrap());
     let pool = BufferPool::new(admission.clone());
     check(
@@ -88,7 +88,9 @@ pub(super) fn kernel_reactor(capacity: usize) -> Option<Reactor> {
         }
         Err(error) => panic!("unexpected io_uring setup failure: {error}"),
     }
-    let reactor = Reactor::new(Rc::new(Admission::new(limits(capacity))));
+    let reactor = Reactor::new(Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+        limits(capacity),
+    ))));
     reactor.init().unwrap();
     Some(reactor)
 }
@@ -110,7 +112,9 @@ fn buffer(bytes: &[u8]) -> Buffer {
 fn file_fence_selects_only_the_matching_racer_request() {
     let sim = simulation::Simulation::new();
     let _environment = sim.enter();
-    let reactor = Reactor::new(Rc::new(Admission::new(limits(4))));
+    let reactor = Reactor::new(Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+        limits(4),
+    ))));
     sim.write_file(std::path::Path::new("/one"), b"one")
         .unwrap();
     sim.write_file(std::path::Path::new("/two"), b"two")
@@ -147,7 +151,9 @@ fn file_fence_selects_only_the_matching_racer_request() {
 fn listener_retry_preserves_racer_policy_after_capacity_recovery() {
     let sim = simulation::Simulation::new();
     let _environment = sim.enter();
-    let reactor = Reactor::new(Rc::new(Admission::new(limits(1))));
+    let reactor = Reactor::new(Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+        limits(1),
+    ))));
     let request = scope();
     let (fd, _peer) = sim.socket_pair();
     let mut busy = reactor.readiness(Rc::new(fd), libc::POLLIN as u32, &request);
@@ -203,7 +209,12 @@ fn real_drain_io_preserves_control_capacity_after_admission_stop() {
 
 mod reserved_submission_tests {
     use super::*;
-    fn reserve(admission: &Admission) -> (Reservation, Reservation) {
+    fn reserve(
+        admission: &flow_control::Quotas<AdmissionPolicy>,
+    ) -> (
+        flow_control::Charge<AdmissionPolicy>,
+        flow_control::Charge<AdmissionPolicy>,
+    ) {
         (
             admission
                 .reserve(None, ResourceClass::ControlProgress, 1)
@@ -217,7 +228,7 @@ mod reserved_submission_tests {
     fn provenance_capacity_and_completion_ownership() {
         let reactor = kernel_reactor(2).expect("real io_uring reserved submissions");
         let request = scope();
-        let foreign = Admission::new(limits(2));
+        let foreign = flow_control::Quotas::new(AdmissionPolicy::new(limits(2)));
         let (slots, memory) = reserve(&foreign);
         assert!(matches!(
             reactor.reserve_submissions(slots, memory),

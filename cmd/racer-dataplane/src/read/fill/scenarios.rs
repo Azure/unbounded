@@ -225,7 +225,7 @@ mod metadata {
             &'a self,
             authority: &'a OriginAuthority,
             context: &'a OriginContext,
-            reservation: Reservation,
+            reservation: flow_control::Charge<AdmissionPolicy>,
             scope: &'a RequestScope,
         ) -> Operation<'a, MetadataReply> {
             Box::pin(async move {
@@ -255,7 +255,7 @@ mod metadata {
             _: &'a OriginAuthority,
             _: &'a OriginContext,
             _: &'a PageId,
-            _: Reservation,
+            _: flow_control::Charge<AdmissionPolicy>,
             _: &'a RequestScope,
         ) -> Operation<'a, OriginPage> {
             Box::pin(async { panic!("metadata-only refresh") })
@@ -881,7 +881,9 @@ mod pressure {
                 let attempts = Cell::new(0);
                 let result = f.fill.reserve_reclaiming(cache, class, amount, || {
                     attempts.set(attempts.get() + 1);
-                    deps.admission.reserve(Some(cache), class, amount)
+                    deps.admission
+                        .reserve(Some(cache), class, amount)
+                        .map_err(Into::into)
                 });
                 if busy_count == 256 && idle_tail {
                     assert!(
@@ -1128,7 +1130,7 @@ impl Origin for TestOrigin {
         &'a self,
         _: &'a super::super::candidates::OriginAuthority,
         _: &'a OriginContext,
-        _: Reservation,
+        _: flow_control::Charge<AdmissionPolicy>,
         _: &'a RequestScope,
     ) -> Operation<'a, MetadataReply> {
         Box::pin(async { panic!("pinned page fill must not bootstrap metadata") })
@@ -1147,7 +1149,7 @@ impl Origin for TestOrigin {
         authority: &'a super::super::candidates::OriginAuthority,
         context: &'a OriginContext,
         page: &'a PageId,
-        reservation: Reservation,
+        reservation: flow_control::Charge<AdmissionPolicy>,
         scope: &'a RequestScope,
     ) -> Operation<'a, OriginPage> {
         Box::pin(async move {
@@ -1271,7 +1273,7 @@ impl Fixture {
                 state::{Availability, CacheDefinition, PublishedState, SnapshotStore},
                 wire::*,
             },
-            memory::{delivery::Delivery, pipe::PipePool},
+            memory::{delivery::Delivery, pipe::new_pipe_pool},
             read::{
                 Coordinator,
                 metadata::{MetadataDependencies, MetadataService},
@@ -1322,10 +1324,8 @@ impl Fixture {
             metadata.publish_version(version).unwrap();
         }
         let delivery = Rc::new(Delivery::new(
-            Rc::new(PipePool::new(
-                fill.dependencies.admission.clone(),
-                self.reactor.clone(),
-            )),
+            Rc::new(new_pipe_pool(fill.dependencies.admission.clone())),
+            self.reactor.clone(),
             settings.stall,
         ));
         let streams = Rc::new(RangeStreams::new(owners.clone(), delivery, settings.window));
@@ -1397,7 +1397,9 @@ fn fixture_with_caches(
         config.limits = limits;
     }
     let worker = WorkerId(0);
-    let admission = Rc::new(Admission::new(config.limits.clone()));
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+        config.limits.clone(),
+    )));
     let keys = Rc::new(crate::security::identity::keyring_tests::keys_for(&caches));
     let availability = crate::control::state::for_caches(keys.clone(), caches);
     let buffers = BufferPool::new(admission.clone());

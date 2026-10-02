@@ -7,7 +7,7 @@ use crate::{
     error::{Error, Operation, Result},
     memory::delivery::{Delivery, ReaderLease},
     model::{ObjectMetadata, OriginContext, PageId, PageNumber, ResolvedRange},
-    runtime::deadline::RequestScope,
+    runtime::{admission::AdmissionPolicy, deadline::RequestScope},
     topology::membership::MembershipLease,
 };
 use std::{
@@ -88,7 +88,7 @@ pub struct RangeStreams {
 /// send::<RangeStream>();
 /// ```
 pub struct RangeStream {
-    pipe_admission: Option<Operation<'static, crate::memory::pipe::PipeLease>>,
+    pipe_admission: Option<Operation<'static, flow_control::pipe::PipeLease<AdmissionPolicy>>>,
     prefetch_error: Option<Error>,
     selected_ready: Option<PageResult>,
     selection: Option<Operation<'static, (Result<PageResult>, AcquisitionBudget)>>,
@@ -391,7 +391,10 @@ impl RangeStream {
     // Duplex delivery drops next_slice between polls to process release_page.
     // Keep the FIFO guard, cancellation registration, and original admission
     // deadline in the stream instead of in that temporary borrowing future.
-    async fn admit_pipe(&mut self, scope: &RequestScope) -> Result<crate::memory::pipe::PipeLease> {
+    async fn admit_pipe(
+        &mut self,
+        scope: &RequestScope,
+    ) -> Result<flow_control::pipe::PipeLease<AdmissionPolicy>> {
         let admission = self.pipe_admission.get_or_insert_with(|| {
             let delivery = self.delivery.clone();
             let scope = scope.clone();
@@ -524,23 +527,23 @@ pub(super) mod tests {
         ByteRange, CacheId, CacheKey, ExpiresAt, ObjectId, ObjectVersion, PAGE_BYTES, StrongEtag,
     };
     use crate::{
-        memory::pipe::PipePool,
+        memory::pipe::new_pipe_pool,
         model::{MembershipVersion, RequestId, ResourceClass, WorkerId},
-        runtime::{admission::Admission, reactor::Reactor, worker::WorkerMap},
+        runtime::{admission::AdmissionPolicy, reactor::Reactor, worker::WorkerMap},
         topology::membership::Membership,
     };
 
     struct Fixture {
-        admission: Rc<Admission>,
-        pipes: Rc<PipePool>,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+        pipes: Rc<flow_control::pipe::PipePool<AdmissionPolicy>>,
         streams: RangeStreams,
     }
 
     impl Fixture {
         fn new(limits: crate::model::Limits, capacity: usize) -> Self {
-            let admission = Rc::new(Admission::new(limits));
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
             let reactor = Rc::new(Reactor::new(admission.clone()));
-            let pipes = Rc::new(PipePool::new(admission.clone(), reactor));
+            let pipes = Rc::new(new_pipe_pool(admission.clone()));
             let directory = Arc::new(
                 WorkerDirectory::new(
                     Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
@@ -551,7 +554,11 @@ pub(super) mod tests {
             );
             let streams = RangeStreams::new(
                 directory,
-                Rc::new(Delivery::new(pipes.clone(), Duration::from_secs(30))),
+                Rc::new(Delivery::new(
+                    pipes.clone(),
+                    reactor,
+                    Duration::from_secs(30),
+                )),
                 capacity,
             );
             Self {
@@ -589,7 +596,7 @@ pub(super) mod tests {
         (budget.remaining_attempts(), budget.remaining_links())
     }
     pub(crate) fn page_result(
-        admission: &crate::runtime::admission::Admission,
+        admission: &flow_control::Quotas<AdmissionPolicy>,
         metadata: &ObjectMetadata,
         number: u64,
     ) -> PageResult {
@@ -1151,10 +1158,10 @@ pub(super) mod tests {
         use crate::{
             client::response::Responses,
             http::{Codec, connection::HttpIo},
-            memory::pipe::PipePool,
+            memory::pipe::new_pipe_pool,
             model::{RequestId, ResourceClass},
             read::ReadResponse,
-            runtime::{admission::Admission, reactor::Reactor},
+            runtime::reactor::Reactor,
         };
         use std::{
             io::{Read, Write},
@@ -1167,9 +1174,9 @@ pub(super) mod tests {
             let clock = crate::runtime::environment::SimulationClock::new(55);
             let environment = clock.environment(0);
             let _clock = environment.enter();
-            let admission = Rc::new(Admission::new(
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
-            ));
+            )));
             let reactor = Rc::new(Reactor::new(admission.clone()));
             let io = Rc::new(HttpIo::with_admission(
                 reactor.clone(),
@@ -1182,7 +1189,8 @@ pub(super) mod tests {
                 },
             ));
             let delivery = Rc::new(Delivery::new(
-                Rc::new(PipePool::new(admission.clone(), reactor.clone())),
+                Rc::new(new_pipe_pool(admission.clone())),
+                reactor.clone(),
                 Duration::from_secs(30),
             ));
             let mut metadata = metadata();

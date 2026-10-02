@@ -166,7 +166,7 @@ mod listener_tests {
     #[test]
     fn submitted_listener_cancellation_waits_for_cqe_fence() {
         use crate::runtime::{
-            admission::Admission,
+            admission::AdmissionPolicy,
             reactor::{Reactor, simulation::Simulation},
         };
         use std::rc::Rc;
@@ -175,9 +175,9 @@ mod listener_tests {
         let clock = SimulationClock::new(3);
         let environment = clock.environment(0);
         let _time = environment.enter();
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let reactor = Reactor::new(admission);
         let scope = RequestScope::new(
             RequestId([0; 16]),

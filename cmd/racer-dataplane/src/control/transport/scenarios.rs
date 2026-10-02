@@ -59,8 +59,10 @@ fn real_connect_readiness_blackhole_yields_to_next_address_and_cleans_fds() {
         }
     }
     for mode in ["local", "cancel", "parent"] {
-        let admission = Rc::new(crate::runtime::admission::Admission::new(
-            crate::test_support::cluster::config(false).limits,
+        let admission = Rc::new(flow_control::Quotas::new(
+            crate::runtime::admission::AdmissionPolicy::new(
+                crate::test_support::cluster::config(false).limits,
+            ),
         ));
         let reactor = Rc::new(crate::runtime::reactor::Reactor::new(admission));
         reactor.init().unwrap();

@@ -2,10 +2,11 @@
 use super::*;
 use crate::{
     http::{Codec, Header, MessageHead, StartLine},
-    memory::pipe::PipePool,
+    memory::pipe::{acquire_wait, new_pipe_pool},
     model::{RequestId, ResourceClass},
-    runtime::{admission::Admission, reactor::Reactor},
+    runtime::{admission::AdmissionPolicy, reactor::Reactor},
 };
+use flow_control::pipe::PipePool;
 use std::{
     future::Future,
     io::{Read, Write},
@@ -55,10 +56,10 @@ fn drive_worker<T>(reactor: &Reactor, work: impl Future<Output = T>) -> T {
     }
 }
 struct Fixture {
-    admission: Rc<Admission>,
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     reactor: Rc<Reactor>,
     io: HttpIo,
-    pipes: PipePool,
+    pipes: PipePool<AdmissionPolicy>,
     scope: RequestScope,
 }
 impl Fixture {
@@ -66,7 +67,7 @@ impl Fixture {
         let mut limits = crate::test_support::cluster::config(false).limits;
         limits.pipes = std::num::NonZeroUsize::new(1).unwrap();
         limits.relay_transfers = std::num::NonZeroUsize::new(1).unwrap();
-        let admission = Rc::new(Admission::new(limits));
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
         let reactor = Rc::new(Reactor::new(admission.clone()));
         reactor.init().unwrap();
         Self {
@@ -76,7 +77,7 @@ impl Fixture {
                 admission.clone(),
                 crate::model::PAGE_BYTES + 16,
             ),
-            pipes: PipePool::new(admission.clone(), reactor.clone()),
+            pipes: new_pipe_pool(admission.clone()),
             admission,
             reactor,
             scope: RequestScope::new(RequestId([3; 16]), Instant::now() + Duration::from_secs(8))
@@ -176,10 +177,13 @@ fn stalled_transit_retains_both_connections_pipe_and_relay_until_cancel_fence() 
             assert_eq!(f.admission.used(ResourceClass::Connection), 2);
             assert_eq!(f.admission.used(ResourceClass::Relay), 1);
             assert_eq!(f.admission.used(ResourceClass::Pipe), 1);
-            assert!(matches!(f.pipes.acquire(), Err(Error::Overloaded)));
+            assert!(matches!(
+                f.pipes.acquire(),
+                Err(flow_control::Error::Overloaded)
+            ));
             assert!(matches!(
                 f.admission.reserve(None, ResourceClass::Relay, 1),
-                Err(Error::Overloaded)
+                Err(flow_control::Error::Overloaded)
             ));
             let mut reader = Some(reader);
             if end == "disconnect" {
@@ -277,7 +281,7 @@ fn tcp_backpressure_recovers_and_wakes_queued_pipe_owner_without_losing_frame() 
     let mut pipe = f.pipes.acquire().unwrap();
     pipe.prepare_transit();
     let mut relay = Box::pin(f.io.relay_body(source, destination, Some(pipe), &f.scope));
-    let mut waiting = f.pipes.acquire_wait(&f.scope);
+    let mut waiting = acquire_wait(&f.pipes, &f.scope);
     assert!(poll(waiting.as_mut()).is_pending());
     // The reader is deliberately not running. A page cannot fit in the bounded
     // send/receive buffers, so transit must retain its owners under backpressure.

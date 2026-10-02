@@ -29,9 +29,9 @@ fn adaptive_checkout_attributes_actual_connect_completion_errno() {
     ] {
         let simulation = Simulation::new();
         let _env = simulation.enter();
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let reactor = Rc::new(Reactor::new(admission.clone()));
         let pool = HttpPool::new(reactor.clone(), admission, 1);
         let metrics = Metrics::default();

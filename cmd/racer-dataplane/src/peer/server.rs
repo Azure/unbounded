@@ -6,7 +6,10 @@ use super::{
 use crate::{
     error::{Error, Operation},
     model::ResourceClass,
-    runtime::{admission::Admission, deadline::RequestScope},
+    runtime::{
+        admission::{AdmissionExt, AdmissionPolicy},
+        deadline::RequestScope,
+    },
     security::forwarding::Forwarding,
     topology::membership::MembershipLease,
 };
@@ -59,11 +62,11 @@ pub struct PeerServer {
     subscriptions: std::sync::Arc<super::subscriptions::Subscriptions>,
     placement: crate::topology::placement::Placement,
     opaque_relay: bool,
-    pipes: Rc<crate::memory::pipe::PipePool>,
+    pipes: Rc<flow_control::pipe::PipePool<AdmissionPolicy>>,
     accept: AcceptMode,
     io: Rc<crate::http::connection::HttpIo>,
     forwarding: Rc<Forwarding>,
-    admission: Rc<Admission>,
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     local: Rc<dyn LocalPageService>,
     relay: Rc<Relay>,
     wire: Rc<super::protocol::SecurityCodec>,
@@ -143,16 +146,13 @@ impl PeerServer {
     pub(crate) fn for_test(
         io: Rc<crate::http::connection::HttpIo>,
         forwarding: Rc<Forwarding>,
-        admission: Rc<Admission>,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         local: Rc<dyn LocalPageService>,
         relay: Rc<Relay>,
         wire: Rc<super::protocol::SecurityCodec>,
         signatures: Rc<crate::security::connection::Signatures>,
     ) -> Self {
-        let pipes = Rc::new(crate::memory::pipe::PipePool::new(
-            admission.clone(),
-            io.reactor().clone(),
-        ));
+        let pipes = Rc::new(crate::memory::pipe::new_pipe_pool(admission.clone()));
         let transfers = Rc::new(super::transport::Transfers::new(
             Rc::new(crate::http::connection::HttpPool::new(
                 io.reactor().clone(),
@@ -285,13 +285,13 @@ impl PeerServer {
     pub(crate) fn new(
         io: Rc<crate::http::connection::HttpIo>,
         forwarding: Rc<Forwarding>,
-        admission: Rc<Admission>,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         local: Rc<dyn LocalPageService>,
         relay: Rc<Relay>,
         wire: Rc<super::protocol::SecurityCodec>,
         signatures: Rc<crate::security::connection::Signatures>,
         subscriptions: std::sync::Arc<super::subscriptions::Subscriptions>,
-        pipes: Rc<crate::memory::pipe::PipePool>,
+        pipes: Rc<flow_control::pipe::PipePool<AdmissionPolicy>>,
         transfers: Rc<super::transport::Transfers>,
         settings: Settings,
     ) -> Self {
@@ -403,7 +403,11 @@ impl PeerServer {
                         .node();
                     network.endpoint(membership, previous)?;
                     let binding = request.binding().clone();
-                    let result = match self.admission.reserve(None, ResourceClass::Relay, 1) {
+                    let result = match self
+                        .admission
+                        .reserve(None, ResourceClass::Relay, 1)
+                        .map_err(Error::from)
+                    {
                         Ok(reservation) => {
                             let reservation = Rc::new(reservation);
                             received.connection.state_mut().relay_reservation =
@@ -682,7 +686,10 @@ impl PeerServer {
                 };
             }
             let binding = request.binding().clone();
-            let reservation = self.admission.reserve(None, ResourceClass::Waiter, 1);
+            let reservation = self
+                .admission
+                .reserve(None, ResourceClass::Waiter, 1)
+                .map_err(Error::from);
             let _reservation = match reservation {
                 Ok(reservation) => reservation,
                 Err(Error::Overloaded) => {
@@ -999,9 +1006,9 @@ mod tests {
 
         for body in [false, true] {
             for cancel_parent in [false, true] {
-                let admission = Rc::new(Admission::new(
+                let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
-                ));
+                )));
                 let reactor = Rc::new(Reactor::new(admission.clone()));
                 reactor.init().unwrap();
                 let io = HttpIo::with_admission(
@@ -1111,9 +1118,9 @@ mod tests {
             http::{Codec, connection::HttpIo},
             runtime::reactor::Reactor,
         };
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let reactor = Rc::new(Reactor::new(admission.clone()));
         reactor.init().unwrap();
         let io = HttpIo::with_admission(reactor.clone(), Codec::new(4096), admission.clone(), 4096);
@@ -1296,9 +1303,9 @@ mod tests {
 
         for ready in [false, true] {
             for end in ["consume", "cancel", "drop"] {
-                let admission = Rc::new(Admission::new(
+                let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
-                ));
+                )));
                 let reactor = Reactor::new(admission.clone());
                 reactor.init().unwrap();
                 let baseline = admission.used(ResourceClass::RequestContext);
@@ -1508,7 +1515,7 @@ mod tests {
                 let signers = crate::security::connection::signature_tests::network(2);
                 let mut limits = crate::test_support::cluster::config(false).limits;
                 limits.client_connections = std::num::NonZeroUsize::new(1).unwrap();
-                let admission = Rc::new(Admission::new(limits));
+                let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
                 let reactor = Rc::new(Reactor::new(admission.clone()));
                 reactor.init().unwrap();
                 let baseline = admission.used(ResourceClass::RequestContext);
@@ -1613,7 +1620,7 @@ mod tests {
                 assert!(admission.used(ResourceClass::RequestContext) > baseline);
                 assert!(matches!(
                     admission.reserve(None, ResourceClass::Connection, 1),
-                    Err(Error::Overloaded)
+                    Err(flow_control::Error::Overloaded)
                 ));
 
                 if end == "resume" {

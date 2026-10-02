@@ -116,7 +116,7 @@ use crate::telemetry::failures::{Observer, Stage};
 use crate::{
     error::{Error, Operation, Result},
     model::{MembershipVersion, NodeId, ResourceClass},
-    runtime::admission::Admission,
+    runtime::admission::AdmissionPolicy,
     runtime::deadline::RequestScope,
     security::forwarding::Forwarding,
     topology::{membership::MembershipLease, rails, routing::Paths},
@@ -218,7 +218,7 @@ pub struct Relay {
     paths: Rc<Paths>,
     forwarding: Rc<Forwarding>,
     transport: Rc<dyn PeerTransport>,
-    admission: Rc<Admission>,
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     network: Rc<PeerNetwork>,
 }
 
@@ -227,7 +227,7 @@ impl Relay {
         paths: Rc<Paths>,
         forwarding: Rc<Forwarding>,
         transport: Rc<dyn PeerTransport>,
-        admission: Rc<Admission>,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         network: Rc<PeerNetwork>,
     ) -> Self {
         Self {
@@ -269,7 +269,7 @@ impl Relay {
         &'a self,
         request: VerifiedRequest,
         membership: MembershipLease,
-        relay: Option<Rc<crate::runtime::admission::Reservation>>,
+        relay: Option<Rc<flow_control::Charge<AdmissionPolicy>>>,
         scope: &'a RequestScope,
     ) -> Operation<'a, transport::RelayResponse> {
         Box::pin(async move {
@@ -418,7 +418,7 @@ pub trait PeerTransport {
         &'a self,
         request: SignedRequest,
         membership: MembershipLease,
-        reservation: Rc<crate::runtime::admission::Reservation>,
+        reservation: Rc<flow_control::Charge<AdmissionPolicy>>,
         scope: &'a RequestScope,
     ) -> Operation<'a, transport::RelayResponse> {
         Box::pin(async move {
@@ -562,7 +562,7 @@ impl PeerTransport for Requester {
         &'a self,
         request: SignedRequest,
         membership: MembershipLease,
-        reservation: Rc<crate::runtime::admission::Reservation>,
+        reservation: Rc<flow_control::Charge<AdmissionPolicy>>,
         scope: &'a RequestScope,
     ) -> Operation<'a, transport::RelayResponse> {
         self.exchange_inner(request, membership, Some(reservation), scope)
@@ -589,7 +589,7 @@ impl Requester {
         &'a self,
         request: SignedRequest,
         membership: MembershipLease,
-        relay: Option<Rc<crate::runtime::admission::Reservation>>,
+        relay: Option<Rc<flow_control::Charge<AdmissionPolicy>>>,
         scope: &'a RequestScope,
     ) -> Operation<'a, transport::RelayResponse> {
         self.exchange_inner_mode(request, membership, relay, scope, false, None)
@@ -598,7 +598,7 @@ impl Requester {
         &'a self,
         request: SignedRequest,
         membership: MembershipLease,
-        relay: Option<Rc<crate::runtime::admission::Reservation>>,
+        relay: Option<Rc<flow_control::Charge<AdmissionPolicy>>>,
         scope: &'a RequestScope,
         direct_http: bool,
         timing: Option<&'a mut timing::PageTiming<'_>>,

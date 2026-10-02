@@ -8,7 +8,7 @@ use racer_dataplane::{
         Codec, Header, MessageHead, StartLine,
         connection::{ConnectionLease, HttpIo},
     },
-    memory::{delivery::Delivery, pipe::PipePool},
+    memory::{delivery::Delivery, pipe::new_pipe_pool},
     model::{
         ByteRange, CacheId, CacheKey, ExpiresAt, Limits, ObjectId, ObjectMetadata, ObjectVersion,
         PageId, PageNumber, RequestId, StrongEtag,
@@ -16,7 +16,7 @@ use racer_dataplane::{
     origin::{metadata, page},
     read::ReadResponse,
     runtime::{
-        admission::Admission,
+        admission::AdmissionPolicy,
         deadline::RequestScope,
         reactor::{IoBuffer, Reactor},
     },
@@ -37,7 +37,7 @@ const P: u64 = 16777216;
 const MAX: u64 = 9223372036854775807;
 
 struct Rig {
-    admission: Rc<Admission>,
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     reactor: Rc<Reactor>,
     io: Rc<HttpIo>,
 }
@@ -45,7 +45,7 @@ impl Rig {
     fn new() -> Self {
         let n = NonZeroUsize::new(32).unwrap();
         let bytes = NonZeroUsize::new(4 * P as usize).unwrap();
-        let admission = Rc::new(Admission::new(Limits {
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(Limits {
             plaintext_bytes: bytes,
             ciphertext_bytes: bytes,
             dirty_bytes: bytes,
@@ -64,7 +64,7 @@ impl Rig {
             retained_snapshots: n,
             metadata_entries: n,
             relay_transfers: n,
-        }));
+        })));
         let reactor = Rc::new(Reactor::new(admission.clone()));
         let io = Rc::new(HttpIo::with_admission(
             reactor.clone(),
@@ -98,7 +98,8 @@ impl Rig {
         Responses::new(
             self.io.clone(),
             Rc::new(Delivery::new(
-                Rc::new(PipePool::new(self.admission.clone(), self.reactor.clone())),
+                Rc::new(new_pipe_pool(self.admission.clone())),
+                self.reactor.clone(),
                 Duration::from_secs(5),
             )),
         )

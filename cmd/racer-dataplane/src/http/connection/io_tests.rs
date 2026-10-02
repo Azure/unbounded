@@ -13,10 +13,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn setup() -> (Rc<Admission>, Rc<Reactor>, HttpIo, RequestScope) {
-    let admission = Rc::new(Admission::new(
+fn setup() -> (
+    Rc<flow_control::Quotas<AdmissionPolicy>>,
+    Rc<Reactor>,
+    HttpIo,
+    RequestScope,
+) {
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
-    ));
+    )));
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let io = HttpIo::with_admission(
         reactor.clone(),

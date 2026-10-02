@@ -18,7 +18,7 @@ use std::{
 };
 
 fn subscribe(
-    admission: &Admission,
+    admission: &flow_control::Quotas<AdmissionPolicy>,
     sender: &str,
     id: u8,
     start: u64,
@@ -49,7 +49,7 @@ fn subscribe(
     request
 }
 
-fn copy(admission: &Rc<Admission>, page: PageId) -> CiphertextCopy {
+fn copy(admission: &Rc<flow_control::Quotas<AdmissionPolicy>>, page: PageId) -> CiphertextCopy {
     let length = (page.number.0 + 1) * crate::model::PAGE_BYTES - crate::model::PAGE_BYTES + 3;
     let ciphertext = BufferPool::new(admission.clone())
         .ciphertext(
@@ -95,7 +95,7 @@ fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failure
         }
     }
     struct Service {
-        admission: Rc<Admission>,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         ready: Cell<bool>,
         calls: Cell<usize>,
         reject: bool,
@@ -137,9 +137,9 @@ fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failure
     for reject in [false, true] {
         let signers = signers();
         let senders: Vec<_> = signers.iter().map(|s| Forwarding::new(s.clone())).collect();
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let membership = Arc::new(
             Membership::validate(
                 MembershipVersion(1),
@@ -288,9 +288,9 @@ fn signed_ingress_cold_selection_is_bounded_cancellable_and_does_not_block_other
     }
     let signers = signers();
     let sender = Forwarding::new(signers[0].clone());
-    let admission = Rc::new(Admission::new(
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
-    ));
+    )));
     // Full protocol membership; the local provider has negligible weight. The
     // signed unavailable response below proves all 64 endpoints were ineligible.
     let membership = Arc::new(
@@ -512,9 +512,9 @@ fn subscription_selection_is_canonical_signed_and_bound_to_exact_grant() {
     let signers = signers();
     let sender = Forwarding::new(signers[0].clone());
     let destination = Forwarding::new(signers[2].clone());
-    let admission = Rc::new(Admission::new(
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
-    ));
+    )));
     let local = subscribe(&admission, A, 1, 0, FetchMode::CopyOnly);
     let (signed, binding) = sender.sign_request(local).unwrap();
     let admitted = destination.verify_request(signed).unwrap();
@@ -602,7 +602,7 @@ fn subscription_selection_is_canonical_signed_and_bound_to_exact_grant() {
 #[test]
 fn subscription_runs_through_real_tcp_requester_session_and_provider() {
     use crate::peer::PeerClient;
-    struct Local(Rc<Admission>);
+    struct Local(Rc<flow_control::Quotas<AdmissionPolicy>>);
     impl server::LocalPageService for Local {
         fn serve_peer<'a>(
             &'a self,
@@ -754,9 +754,9 @@ fn retained_subscription_cannot_complete_after_request_mac_key_retirement() {
     let (signers, discovery) = identities();
     let sender = Forwarding::new(signers[0].clone());
     let destination = Forwarding::new(signers[2].clone());
-    let admission = Rc::new(Admission::new(
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
-    ));
+    )));
     let (request, _) = sender
         .sign_request(subscribe(&admission, A, 1, 0, FetchMode::CopyOnly))
         .unwrap();

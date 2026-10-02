@@ -37,14 +37,14 @@ impl Recovery {
 
 #[test]
 fn canceled_async_publication_preserves_existing_slots_without_submission() {
-    use crate::runtime::{admission::Admission, deadline::RequestScope, reactor::Reactor};
+    use crate::runtime::{admission::AdmissionPolicy, deadline::RequestScope, reactor::Reactor};
     use std::time::{Duration, Instant};
     let directory = Directory::new();
     let (index, segments) = state(8);
     let checkpoint = Checkpointer::new(directory.0.clone(), index, segments);
     checkpoint.configure_geometry(geometry()).unwrap();
-    let reactor = Rc::new(Reactor::new(Rc::new(Admission::new(
-        crate::test_support::cluster::config(false).limits,
+    let reactor = Rc::new(Reactor::new(Rc::new(flow_control::Quotas::new(
+        AdmissionPolicy::new(crate::test_support::cluster::config(false).limits),
     ))));
     let scope = RequestScope::new(
         crate::model::RequestId([202; 16]),
@@ -71,7 +71,7 @@ fn canceled_async_publication_preserves_existing_slots_without_submission() {
 
 #[test]
 fn abandoned_async_publication_fences_io_and_preserves_existing_slots() {
-    use crate::runtime::{admission::Admission, deadline::RequestScope, reactor::Reactor};
+    use crate::runtime::{admission::AdmissionPolicy, deadline::RequestScope, reactor::Reactor};
     use std::{
         task::{Context, Poll},
         time::{Duration, Instant},
@@ -79,8 +79,8 @@ fn abandoned_async_publication_fences_io_and_preserves_existing_slots() {
     let directory = Directory::new();
     let (index, segments) = state(8);
     let checkpoint = Checkpointer::new(directory.0.clone(), index, segments);
-    let reactor = Rc::new(Reactor::new(Rc::new(Admission::new(
-        crate::test_support::cluster::config(false).limits,
+    let reactor = Rc::new(Reactor::new(Rc::new(flow_control::Quotas::new(
+        AdmissionPolicy::new(crate::test_support::cluster::config(false).limits),
     ))));
     reactor.init().unwrap();
     let scope = || {

@@ -4,7 +4,7 @@ use super::test_support::*;
 use super::*;
 use crate::{
     model::{ResourceClass, TransferId},
-    runtime::{admission::Admission, environment},
+    runtime::{admission::AdmissionPolicy, environment},
     security::connection::signature_tests::network,
 };
 use rdma_verbs::testing::{Contention, State};
@@ -70,9 +70,9 @@ fn receive_case(readback: bool, terminal: Option<Error>, failed_fence: bool) {
     let session = SessionLease::test(qp.clone(), signers[0].node().clone());
     let devices = Rc::new(Devices::new());
     let sessions = Rc::new(Sessions::new(devices, 1));
-    let admission = Rc::new(Admission::new(
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(true).limits,
-    ));
+    )));
     let transfer = RdmaTransfer::new(sessions);
     let envelope = envelope();
     let mut scope = scope();

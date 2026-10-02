@@ -8,9 +8,9 @@ fn signed_opaque_relay_roundtrip_and_exact_attempt_binding() {
         .iter()
         .map(|s| Forwarding::new(s.clone()))
         .collect::<Vec<_>>();
-    let admission = Rc::new(Admission::new(
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
-    ));
+    )));
     let codec = codec(&admission);
     let local = request(&admission, 7);
     let scope = local.origin.scope().clone();
@@ -25,7 +25,7 @@ fn signed_opaque_relay_roundtrip_and_exact_attempt_binding() {
         .verify_request(codec.request(envelope, &scope).unwrap())
         .unwrap();
     assert_eq!(
-        verified.request().origin.reservation.cache(),
+        verified.request().origin.reservation.key(),
         Some(&CacheId(CACHE.into()))
     );
     let reverse = verified.binding().clone();
@@ -87,9 +87,9 @@ fn not_found_is_authenticated_through_relay_and_restricted_to_fresh_acquire() {
     use crate::{http::StartLine, security::protocol as p};
     let signers = signers();
     let auth: Vec<_> = signers.iter().map(|s| Forwarding::new(s.clone())).collect();
-    let admission = Rc::new(Admission::new(
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
-    ));
+    )));
     let codec = codec(&admission);
     for role in ["fresh", "copy", "pinned", "page", "relay"] {
         let mut local = request(&admission, 20);
@@ -264,9 +264,9 @@ fn changed_operation_credentials_replay_and_deadlines_fail() {
     let signers = signers();
     let sender = Forwarding::new(signers[0].clone());
     let receiver = Forwarding::new(signers[2].clone());
-    let admission = Rc::new(Admission::new(
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
-    ));
+    )));
     let codec = codec(&admission);
     let local = request(&admission, 1);
     let scope = local.origin.scope().clone();
@@ -304,7 +304,9 @@ fn changed_operation_credentials_replay_and_deadlines_fail() {
 
 #[test]
 fn search_view_consumes_ingress_without_changing_signed_route() {
-    let admission = Admission::new(crate::test_support::cluster::config(false).limits);
+    let admission = flow_control::Quotas::new(AdmissionPolicy::new(
+        crate::test_support::cluster::config(false).limits,
+    ));
     let request = request(&admission, 1);
     let initial = search_budget(&request.route, &NodeId(A.into())).unwrap();
     assert!(initial.visited.is_empty());
@@ -363,9 +365,9 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
     let signers = signers();
     let sender = Forwarding::new(signers[0].clone());
     let destination = Rc::new(Forwarding::new(signers[2].clone()));
-    let admission = Rc::new(Admission::new(
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
-    ));
+    )));
     let membership = Arc::new(
         Membership::validate(
             MembershipVersion(1),
@@ -572,9 +574,9 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
         let signers = signers();
         let origin = Forwarding::new(signers[0].clone());
         let forwarding = Rc::new(Forwarding::new(signers[1].clone()));
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let membership = Arc::new(
             Membership::validate(
                 MembershipVersion(1),
@@ -639,9 +641,9 @@ fn v5_equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
         routing::Paths,
     };
     let signers = signers();
-    let admission = Rc::new(Admission::new(
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
-    ));
+    )));
     let nodes = std::iter::once(A.to_owned())
         .chain((0..1498).map(|i| format!("00000002-1111-4111-8111-{i:012x}")))
         .chain(std::iter::once(C.to_owned()));
@@ -746,9 +748,9 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
     };
     use std::task::{Context, Poll};
     let (signers, _) = identities();
-    let admission = Rc::new(Admission::new(
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
-    ));
+    )));
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let io = Rc::new(HttpIo::with_admission(
         reactor.clone(),
@@ -1143,9 +1145,9 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
     for case in [
         "silent", "partial", "trickle", "idle", "listener", "cancel", "drop",
     ] {
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let reactor = Rc::new(Reactor::new(admission.clone()));
         reactor.init().unwrap();
         let baseline = admission.used(ResourceClass::RequestContext);
@@ -1313,9 +1315,9 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
         net::TcpListener,
         task::{Context, Poll},
     };
-    let admission = Rc::new(Admission::new(
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
-    ));
+    )));
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let io = Rc::new(HttpIo::with_admission(
         reactor.clone(),
@@ -1571,9 +1573,9 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
             assert!(matches!(endpoint, Err(Error::InvalidRequest)));
         }
     }
-    let admission = crate::runtime::admission::Admission::new(
+    let admission = flow_control::Quotas::new(crate::runtime::admission::AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
-    );
+    ));
     let mut request = request(&admission, 1);
     assert_eq!(
         super::check_membership(&request, &membership),
@@ -1630,7 +1632,7 @@ mod established_sessions {
         }
     }
     struct Fixture {
-        admission: Rc<Admission>,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         reactor: Rc<Reactor>,
         io: Rc<HttpIo>,
         server: server::PeerServer,
@@ -1640,9 +1642,9 @@ mod established_sessions {
     }
     impl Fixture {
         fn new() -> Self {
-            let admission = Rc::new(Admission::new(
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
-            ));
+            )));
             let reactor = Rc::new(Reactor::new(admission.clone()));
             reactor.init().unwrap();
             let io = Rc::new(HttpIo::with_admission(

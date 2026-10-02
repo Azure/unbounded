@@ -21,7 +21,7 @@ use crate::{
     memory::page::{AcquiredPage, PageResult, UnverifiedPage},
     model::{OriginContext, PageId, ResourceClass},
     runtime::{
-        admission::{Admission, Reservation},
+        admission::{AdmissionExt, AdmissionPolicy},
         deadline::RequestScope,
     },
     topology::membership::MembershipLease,
@@ -37,7 +37,7 @@ use std::{
 };
 
 pub struct Flights {
-    admission: Rc<Admission>,
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     availability: Rc<crate::control::state::Availability>,
     owner: Rc<()>,
     limits: FlightLimits,
@@ -83,7 +83,7 @@ struct Entry {
     waiter_cursor: u64,
     operations: HashMap<u64, Option<Retained>>,
     ciphertext: Option<UnverifiedPage>,
-    _reservation: Reservation,
+    _reservation: flow_control::Charge<AdmissionPolicy>,
 }
 struct WaiterRecord {
     scope: RequestScope,
@@ -93,11 +93,11 @@ struct WaiterRecord {
     issued: bool,
     error: Option<Error>,
     waker: Option<Waker>,
-    _reservation: Reservation,
+    _reservation: flow_control::Charge<AdmissionPolicy>,
 }
 struct Retained {
     _resources: Box<dyn Any>,
-    _reservation: Reservation,
+    _reservation: flow_control::Charge<AdmissionPolicy>,
 }
 enum Outcome {
     Published(AcquiredPage),
@@ -572,7 +572,7 @@ impl CopyWaiter<'_> {
 
 impl Flights {
     pub fn new(
-        admission: Rc<Admission>,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         availability: Rc<crate::control::state::Availability>,
     ) -> Self {
         let limits = FlightLimits {
@@ -591,7 +591,7 @@ impl Flights {
     }
 
     pub fn with_limits(
-        admission: Rc<Admission>,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         availability: Rc<crate::control::state::Availability>,
         limits: FlightLimits,
     ) -> Result<Self> {

@@ -23,12 +23,13 @@
 //! Audited production buffers own independent storage:
 //! ```
 //! use racer_dataplane::{memory::pool::PlaintextBuffer,
-//!     runtime::{reactor::IoBuffer, admission::Reservation}};
+//!     runtime::{reactor::IoBuffer, admission::AdmissionPolicy}};
+//! use flow_control::Charge;
 //! use page_alloc::AlignedBuffer;
 //! fn independent<T: 'static>() {}
 //! fn completion_safe<B: IoBuffer>() { independent::<B>(); }
 //! completion_safe::<PlaintextBuffer>();
-//! completion_safe::<AlignedBuffer<Reservation>>();
+//! completion_safe::<AlignedBuffer<Charge<AdmissionPolicy>>>();
 //! ```
 //! Immutable ciphertext cannot be used for receive:
 //! ```compile_fail
@@ -40,7 +41,7 @@
 //! }
 //! ```
 use super::{
-    admission::{Admission, ConnectionReservation, Reservation},
+    admission::{AdmissionExt, AdmissionPolicy, ConnectionReservation},
     deadline::RequestScope,
 };
 use crate::{
@@ -56,15 +57,15 @@ pub mod filesystem;
 #[cfg(test)]
 pub mod simulation;
 
-pub struct AdmissionBudget(Rc<Admission>);
+pub struct AdmissionBudget(Rc<flow_control::Quotas<AdmissionPolicy>>);
 impl uring_runtime::Budget for AdmissionBudget {
-    type Charge = Reservation;
-    fn charge(&self, bytes: usize) -> uring_runtime::Result<Reservation> {
+    type Charge = flow_control::Charge<AdmissionPolicy>;
+    fn charge(&self, bytes: usize) -> uring_runtime::Result<flow_control::Charge<AdmissionPolicy>> {
         self.0
             .reserve_completion(None, ResourceClass::RequestContext, bytes)
             .map_err(|error| match error {
-                Error::InvalidConfiguration => uring_runtime::Error::InvalidConfiguration,
-                Error::Unavailable => uring_runtime::Error::Unavailable,
+                flow_control::Error::InvalidInput => uring_runtime::Error::InvalidConfiguration,
+                flow_control::Error::Unavailable => uring_runtime::Error::Unavailable,
                 _ => uring_runtime::Error::Overloaded,
             })
     }
@@ -72,7 +73,7 @@ impl uring_runtime::Budget for AdmissionBudget {
 
 pub struct Reactor {
     core: uring_runtime::reactor::Reactor<RequestScope, AdmissionBudget>,
-    admission: Rc<Admission>,
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
 }
 impl Deref for Reactor {
     type Target = uring_runtime::reactor::Reactor<RequestScope, AdmissionBudget>;
@@ -81,7 +82,7 @@ impl Deref for Reactor {
     }
 }
 impl Reactor {
-    pub fn new(admission: Rc<Admission>) -> Self {
+    pub fn new(admission: Rc<flow_control::Quotas<AdmissionPolicy>>) -> Self {
         Self {
             core: uring_runtime::reactor::Reactor::new(
                 admission.limits().queue_entries.get(),
@@ -125,8 +126,8 @@ impl Reactor {
     }
     pub(crate) fn reserve_submissions(
         &self,
-        slots: Reservation,
-        memory: Reservation,
+        slots: flow_control::Charge<AdmissionPolicy>,
+        memory: flow_control::Charge<AdmissionPolicy>,
     ) -> Result<Rc<SubmissionCapacity>> {
         let capacity = slots.amount();
         slots.validate(ResourceClass::ControlProgress, capacity)?;

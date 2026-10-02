@@ -8,20 +8,19 @@
 //! through abandonment and the final completion fence. After backpressure, the
 //! rest of that page uses direct sends instead of repeating pipe drain round trips.
 //! Backpressured direct sends own immutable page views, not copied staging bytes.
-use super::{
-    pipe::{PipeLease, PipePool},
-    pool::VerifiedPage,
-};
+use super::pool::VerifiedPage;
 use crate::runtime::reactor::Descriptor;
 use crate::{
     error::{Error, Operation, Result},
-    http::connection::{ConnectionLease, OwnedBuffer},
+    http::connection::{ConnectionLease, HttpContext, OwnedBuffer},
     model::PageSlice,
     runtime::{
+        admission::AdmissionPolicy,
         deadline::RequestScope,
-        reactor::{IoBuffer, SendBuffer},
+        reactor::{IoBuffer, Reactor, SendBuffer},
     },
 };
+use flow_control::pipe::{PipeLease, PipePool};
 #[cfg(test)]
 use std::os::fd::AsRawFd;
 #[cfg(test)]
@@ -90,7 +89,8 @@ unsafe impl SendBuffer for DeliveryBuffer {
 
 pub struct Delivery {
     metrics: crate::telemetry::metrics::Metrics,
-    pipes: Rc<PipePool>,
+    pipes: Rc<PipePool<AdmissionPolicy>>,
+    reactor: Rc<Reactor>,
     stall_timeout: Duration,
 }
 
@@ -99,7 +99,7 @@ pub struct Delivery {
 pub struct ReaderLease {
     _active: crate::telemetry::metrics::GaugeLease,
     page: VerifiedPage,
-    pipe: PipeLease,
+    pipe: PipeLease<AdmissionPolicy>,
     slice: PageSlice,
     sent: usize,
 }
@@ -133,10 +133,15 @@ impl ReaderLease {
 }
 
 impl Delivery {
-    pub fn new(pipes: Rc<PipePool>, stall_timeout: Duration) -> Self {
+    pub fn new(
+        pipes: Rc<PipePool<AdmissionPolicy>>,
+        reactor: Rc<Reactor>,
+        stall_timeout: Duration,
+    ) -> Self {
         Self {
             metrics: crate::telemetry::metrics::Metrics::default(),
             pipes,
+            reactor,
             stall_timeout,
         }
     }
@@ -150,15 +155,18 @@ impl Delivery {
         self.attach_reserved(page, slice, self.pipes.acquire()?)
     }
 
-    pub(crate) fn admit<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, PipeLease> {
-        self.pipes.acquire_wait(scope)
+    pub(crate) fn admit<'a>(
+        &'a self,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, PipeLease<AdmissionPolicy>> {
+        super::pipe::acquire_wait(&self.pipes, scope)
     }
 
     pub(crate) fn attach_reserved(
         &self,
         page: VerifiedPage,
         slice: PageSlice,
-        pipe: PipeLease,
+        pipe: PipeLease<AdmissionPolicy>,
     ) -> Result<ReaderLease> {
         validate_slice(&page, slice)?;
         Ok(ReaderLease {
@@ -280,7 +288,8 @@ impl Delivery {
                             )?)
                         } else {
                             let count = reader.pipe.buffered();
-                            let mut buffer = OwnedBuffer::new(self.pipes.admission(), count)?;
+                            let mut buffer =
+                                OwnedBuffer::new(&HttpContext(self.pipes.quotas().clone()), count)?;
                             match reader.pipe.try_read(buffer.bytes_mut()?) {
                                 Ok(read) if read == count && count != 0 => {}
                                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {
@@ -299,8 +308,7 @@ impl Delivery {
                             state.0.set((count == reader.remaining()).then_some(false));
                         }
                         let completion = self
-                            .pipes
-                            .reactor()
+                            .reactor
                             .send(
                                 connection.socket(),
                                 buffer,
@@ -384,18 +392,29 @@ mod tests {
             ResourceClass, StrongEtag,
         },
         runtime::{
-            admission::Admission,
+            admission::AdmissionPolicy,
             deadline::{Cancellation, Deadline},
             reactor::Reactor,
         },
     };
     use std::{io::Read, os::unix::net::UnixStream, sync::Arc, task::Context};
 
-    fn setup(pipes: usize, stall: Duration) -> (Rc<Admission>, Rc<Reactor>, Delivery) {
+    fn setup(
+        pipes: usize,
+        stall: Duration,
+    ) -> (
+        Rc<flow_control::Quotas<AdmissionPolicy>>,
+        Rc<Reactor>,
+        Delivery,
+    ) {
         let admission = admission(pipes);
         let reactor = Rc::new(Reactor::new(admission.clone()));
-        let pool = Rc::new(PipePool::new(admission.clone(), reactor.clone()));
-        (admission, reactor, Delivery::new(pool, stall))
+        let pool = Rc::new(super::super::pipe::new_pipe_pool(admission.clone()));
+        (
+            admission,
+            reactor.clone(),
+            Delivery::new(pool, reactor, stall),
+        )
     }
 
     fn scope() -> RequestScope {
@@ -407,7 +426,7 @@ mod tests {
         }
     }
 
-    fn page(admission: &Admission, bytes: Vec<u8>) -> VerifiedPage {
+    fn page(admission: &flow_control::Quotas<AdmissionPolicy>, bytes: Vec<u8>) -> VerifiedPage {
         VerifiedPage {
             inner: Arc::new(VerifiedBytes {
                 page: PageId {
@@ -436,14 +455,18 @@ mod tests {
         }
     }
 
-    fn connection(socket: Descriptor, admission: &Admission, length: u64) -> ConnectionLease {
+    fn connection(
+        socket: Descriptor,
+        admission: &flow_control::Quotas<AdmissionPolicy>,
+        length: u64,
+    ) -> ConnectionLease {
         let mut connection = crate::http::connection::from_accepted(socket, admission).unwrap();
         connection.set_framing(None, Some(length), false);
         connection
     }
 
     fn blocked_reader(
-        admission: &Admission,
+        admission: &flow_control::Quotas<AdmissionPolicy>,
         delivery: &Delivery,
     ) -> (
         ReaderLease,
@@ -584,14 +607,20 @@ mod tests {
             assert_eq!(reactor.in_flight(), 1);
             assert_eq!(admission.used(ResourceClass::Plaintext), 512 * 1024);
             assert_eq!(admission.used(ResourceClass::Connection), 1);
-            assert!(matches!(delivery.pipes.acquire(), Err(Error::Overloaded)));
+            assert!(matches!(
+                delivery.pipes.acquire(),
+                Err(flow_control::Error::Overloaded)
+            ));
             match failure {
                 "abandon" => {
                     drop(operation);
                     assert_eq!(weak.strong_count(), 2);
                     assert_eq!(admission.used(ResourceClass::Plaintext), 512 * 1024);
                     assert_eq!(admission.used(ResourceClass::Connection), 1);
-                    assert!(matches!(delivery.pipes.acquire(), Err(Error::Overloaded)));
+                    assert!(matches!(
+                        delivery.pipes.acquire(),
+                        Err(flow_control::Error::Overloaded)
+                    ));
                     drive(&reactor, reactor.drain()).unwrap();
                 }
                 "drain" => {
@@ -1011,7 +1040,10 @@ mod tests {
             let mut operation = delivery.finish_to(reader, connection, &scope);
             assert_pending(&mut operation);
             assert!(weak.upgrade().is_some());
-            assert!(matches!(delivery.pipes.acquire(), Err(Error::Overloaded)));
+            assert!(matches!(
+                delivery.pipes.acquire(),
+                Err(flow_control::Error::Overloaded)
+            ));
             if cancel {
                 scope.cancel().unwrap();
                 assert!(matches!(drive(&reactor, operation), Err(Error::Cancelled)));
@@ -1088,7 +1120,10 @@ mod tests {
         let operation =
             delivery.finish_to(reader, connection(socket.into(), &admission, 3), &scope);
         assert!(weak.upgrade().is_some());
-        assert!(matches!(delivery.pipes.acquire(), Err(Error::Overloaded)));
+        assert!(matches!(
+            delivery.pipes.acquire(),
+            Err(flow_control::Error::Overloaded)
+        ));
         drop(operation);
         assert!(weak.upgrade().is_none());
         assert!(delivery.pipes.acquire().is_ok());
@@ -1166,7 +1201,10 @@ mod tests {
         assert_eq!(reactor.in_flight(), 1);
         drop(operation);
         assert!(weak.upgrade().is_some());
-        assert!(matches!(delivery.pipes.acquire(), Err(Error::Overloaded)));
+        assert!(matches!(
+            delivery.pipes.acquire(),
+            Err(flow_control::Error::Overloaded)
+        ));
         assert_eq!(admission.used(ResourceClass::Connection), 1);
         let start = Instant::now();
         while reactor.in_flight() != 0 {

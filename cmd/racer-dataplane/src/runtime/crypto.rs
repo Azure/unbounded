@@ -31,7 +31,7 @@ mod measurement {
     use crate::{
         memory::pool::BufferPool,
         model::{KeyId, Nonce, PageEnvelope, ResourceClass, *},
-        runtime::{admission::Admission, reactor::IoBuffer},
+        runtime::reactor::IoBuffer,
         security::aead::{PageCryptoEngine, page_aad},
     };
     use racer_crypto::aead;
@@ -274,9 +274,9 @@ mod measurement {
         let env = clock.environment(0);
         let _env = env.enter();
         let _strict = environment::require_simulated();
-        let admission = std::rc::Rc::new(crate::runtime::admission::Admission::new(
+        let admission = std::rc::Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let keys = keyring();
         for decrypt in [false, true] {
             for mode in [
@@ -436,9 +436,9 @@ mod measurement {
             security::aead::PageCryptoEngine,
             telemetry::send_crc::{Pair, Samples},
         };
-        let admission = std::rc::Rc::new(crate::runtime::admission::Admission::new(
+        let admission = std::rc::Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let keys = keyring();
         let cache = crate::model::CacheId("00000000-0000-4000-8000-000000000003".into());
         let lease = || {
@@ -521,9 +521,9 @@ mod measurement {
             security::aead::{PageCrypto, PageCryptoEngine},
             telemetry::send_crc::{Pair, Samples},
         };
-        let admission = std::rc::Rc::new(crate::runtime::admission::Admission::new(
+        let admission = std::rc::Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let keys = std::rc::Rc::new(keyring());
         let filter = Pair::parse(
             "8816d91d-e896-49bf-ba8a-da97ede93818,11111111-1111-4111-8111-111111111111",
@@ -668,9 +668,9 @@ mod measurement {
         let env = clock.environment(0);
         let _env = env.enter();
         let _strict = environment::require_simulated();
-        let admission = std::rc::Rc::new(crate::runtime::admission::Admission::new(
+        let admission = std::rc::Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let keys = keyring();
         let cache = crate::model::CacheId("00000000-0000-4000-8000-000000000003".into());
         let lease = || {
@@ -843,7 +843,7 @@ mod measurement {
     }
 
     fn measurement_input(
-        admission: &Rc<Admission>,
+        admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
         cache: &CacheId,
         key: KeyLease,
         scope: &RequestScope,
@@ -936,7 +936,7 @@ mod measurement {
     }
 
     struct MeasurementInputs {
-        admission: Rc<Admission>,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         pool: BufferPool,
         page: PageId,
         source: Vec<u8>,
@@ -950,7 +950,7 @@ mod measurement {
             let mut limits = crate::test_support::cluster::config(false).limits;
             limits.plaintext_bytes = NonZeroUsize::new(512 * 1024 * 1024).unwrap();
             limits.ciphertext_bytes = limits.plaintext_bytes;
-            let admission = Rc::new(Admission::new(limits));
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
             let pool = BufferPool::new(admission.clone());
             let page = page();
             let source = vec![7u8; size];
@@ -1031,7 +1031,7 @@ mod measurement {
 }
 
 use super::{
-    admission::Reservation,
+    admission::AdmissionPolicy,
     channel::{self, Receiver, SendFailure, Sender},
     deadline::RequestScope,
 };
@@ -1082,12 +1082,12 @@ pub enum CryptoInput {
     Checksum { ciphertext: CiphertextPage },
     Decrypt {
         ciphertext: CiphertextPage,
-        plaintext: Reservation,
+        plaintext: flow_control::Charge<AdmissionPolicy>,
     },
     Encrypt {
         page: PageId,
         plaintext: PlaintextBuffer,
-        ciphertext: Reservation,
+        ciphertext: flow_control::Charge<AdmissionPolicy>,
     },
 }
 
@@ -1843,7 +1843,7 @@ mod tests {
     use crate::test_support::WakeCounter;
 
     struct Fixture {
-        admission: std::rc::Rc<crate::runtime::admission::Admission>,
+        admission: std::rc::Rc<flow_control::Quotas<AdmissionPolicy>>,
         client: CryptoClient,
         engine: CryptoPort,
         scope: RequestScope,
@@ -1851,9 +1851,9 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let admission = std::rc::Rc::new(crate::runtime::admission::Admission::new(
+            let admission = std::rc::Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
-            ));
+            )));
             let (io, engine) = pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
             Self {
                 admission,
@@ -1869,7 +1869,7 @@ mod tests {
     }
 
     pub(super) fn input(
-        admission: &std::rc::Rc<crate::runtime::admission::Admission>,
+        admission: &std::rc::Rc<flow_control::Quotas<AdmissionPolicy>>,
     ) -> CryptoInput {
         use crate::{
             memory::pool::BufferPool,
@@ -2201,15 +2201,14 @@ mod tests {
         use crate::{
             memory::pool::BufferPool,
             model::{ResourceClass, *},
-            runtime::admission::Admission,
         };
         use std::{
             rc::Rc,
             time::{Duration, Instant},
         };
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let cache = CacheId("cache".into());
         let pool = BufferPool::new(admission.clone());
         let plaintext = pool
@@ -2294,15 +2293,14 @@ mod tests {
         use crate::{
             memory::pool::BufferPool,
             model::{ResourceClass, *},
-            runtime::admission::Admission,
         };
         use std::{
             rc::Rc,
             time::{Duration, Instant},
         };
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let cache = CacheId("cache".into());
         let plaintext = BufferPool::new(admission.clone())
             .plaintext(
@@ -2357,12 +2355,11 @@ mod tests {
         use crate::{
             memory::pool::BufferPool,
             model::{ResourceClass, *},
-            runtime::admission::Admission,
         };
         use std::{rc::Rc, time::Instant};
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let cache = CacheId("cache".into());
         let plaintext = BufferPool::new(admission.clone())
             .plaintext(

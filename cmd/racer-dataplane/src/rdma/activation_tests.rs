@@ -3,7 +3,7 @@ use super::{lifecycle::*, *};
 use crate::{
     model::*,
     runtime::{
-        admission::Admission,
+        admission::AdmissionPolicy,
         crypto,
         worker::{CryptoRuntime, CryptoService},
     },
@@ -19,7 +19,7 @@ fn fixture(
     simulation::Simulation,
     Devices,
     NativeService,
-    Admission,
+    flow_control::Quotas<AdmissionPolicy>,
     RequestScope,
 ) {
     let sim = simulation::Simulation::new()
@@ -32,7 +32,9 @@ fn fixture(
     };
     let devices = Devices::new();
     devices.attach(io).unwrap();
-    let admission = Admission::new(crate::test_support::cluster::config(true).limits);
+    let admission = flow_control::Quotas::new(AdmissionPolicy::new(
+        crate::test_support::cluster::config(true).limits,
+    ));
     let scope = RequestScope::new(
         RequestId([1; 16]),
         crate::runtime::environment::now() + std::time::Duration::from_secs(30),
@@ -42,7 +44,7 @@ fn fixture(
 }
 fn activate<'a>(
     devices: &'a Devices,
-    admission: &'a Admission,
+    admission: &'a flow_control::Quotas<AdmissionPolicy>,
     scope: &'a RequestScope,
 ) -> Operation<'a, Vec<RailMapping>> {
     devices.activate(
@@ -87,7 +89,9 @@ fn repeated_rail_selects_exact_physical_binding_and_revokes_changed_gid() {
     let selected = super::discovery::select_worker(&publication, &inventory, 1, None, 2);
     assert_eq!(selected.len(), 1);
     assert_eq!(selected[0].device, "b");
-    let admission = Admission::new(crate::test_support::cluster::config(true).limits);
+    let admission = flow_control::Quotas::new(AdmissionPolicy::new(
+        crate::test_support::cluster::config(true).limits,
+    ));
     let scope = RequestScope::new(
         RequestId([3; 16]),
         crate::runtime::environment::now() + std::time::Duration::from_secs(30),
@@ -150,9 +154,9 @@ fn configured_activation_spends_budget_and_yields_to_sibling_page_jobs() {
         number: PageNumber(0),
     };
     let cache = &page.version.object.cache;
-    let sibling_admission = Rc::new(Admission::new(
+    let sibling_admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
-    ));
+    )));
     let pool = BufferPool::new(sibling_admission.clone());
     let (io, port) = crypto::pair(WorkerId(1), 1, std::num::NonZeroUsize::new(1).unwrap());
     let mut sibling = PageCryptoEngine::new(CryptoRuntime { port });
@@ -333,7 +337,9 @@ fn configured_native_wrapper_drain_fences_one_slot_per_poll() {
     let (native_io, native_port) = pair(4).unwrap();
     let devices = Devices::new();
     devices.attach(native_io).unwrap();
-    let admission = Admission::new(crate::test_support::cluster::config(true).limits);
+    let admission = flow_control::Quotas::new(AdmissionPolicy::new(
+        crate::test_support::cluster::config(true).limits,
+    ));
     let scope = super::test_support::scope();
     let (io, port) = crypto::pair(WorkerId(0), 1, std::num::NonZeroUsize::new(1).unwrap());
     io.close_submissions().unwrap();

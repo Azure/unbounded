@@ -11,7 +11,7 @@
 //! must permit progress when both threads share one CPU.
 
 use super::{
-    admission::Admission,
+    admission::AdmissionPolicy,
     affinity::AffinityPlan,
     crypto::{self, CryptoClient, CryptoPort, IoCryptoPort},
     deadline::{Cancellation, Deadline, RequestScope},
@@ -46,7 +46,7 @@ const IDLE_WAIT: Duration = Duration::from_millis(1);
 /// ```
 pub struct WorkerRuntime {
     pub reactor: Rc<Reactor>,
-    pub admission: Rc<Admission>,
+    pub admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     pub crypto: Rc<CryptoClient>,
 }
 /// Send endpoint is moved before construction on the crypto thread. No I/O
@@ -519,7 +519,9 @@ impl<F: FactoryRef> Factory<RequestScope> for Adapter<F> {
             .0
             .take()
             .ok_or(Error::Io)?;
-        let admission = Rc::new(Admission::new(self.resources.limits.clone()));
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+            self.resources.limits.clone(),
+        )));
         let runtime = WorkerRuntime {
             reactor: Rc::new(Reactor::new(admission.clone())),
             admission,

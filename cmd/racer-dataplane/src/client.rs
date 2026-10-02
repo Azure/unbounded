@@ -652,7 +652,7 @@ pub(crate) mod test_support {
             range_stream::RangeStreams,
         },
         runtime::{
-            admission::Admission,
+            admission::AdmissionPolicy,
             crypto::{self, CryptoClient},
             reactor::Reactor,
             worker::{CryptoRuntime, CryptoService, WorkerMap},
@@ -689,7 +689,7 @@ pub(crate) mod test_support {
         pub fn new(
             cache: CacheDefinition,
             metadata: ObjectMetadata,
-            admission: Rc<Admission>,
+            admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
             reactor: Rc<Reactor>,
             delivery: Rc<Delivery>,
             window: usize,

@@ -989,8 +989,10 @@ mod tests {
     fn selected_owner_cancellation_waits_for_actual_completion() {
         let directory = directory(1);
         let scope = scope();
-        let admission = Rc::new(crate::runtime::admission::Admission::new(
-            crate::test_support::cluster::config(false).limits,
+        let admission = Rc::new(flow_control::Quotas::new(
+            crate::runtime::admission::AdmissionPolicy::new(
+                crate::test_support::cluster::config(false).limits,
+            ),
         ));
         let page = crate::memory::pool::tests::bundle_for(
             &admission,

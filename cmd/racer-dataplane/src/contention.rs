@@ -3,7 +3,7 @@
 
 use crate::{
     model::{CacheId, PAGE_BYTES, ResourceClass},
-    runtime::admission::{Admission, Reservation},
+    runtime::admission::{AdmissionExt, AdmissionPolicy},
 };
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -131,8 +131,8 @@ impl Report {
 type Key = (usize, u64, u64); // cache, object, page
 
 struct Bundle {
-    plain: Arc<Reservation>,
-    cipher: Arc<Reservation>,
+    plain: Arc<flow_control::Charge<AdmissionPolicy>>,
+    cipher: Arc<flow_control::Charge<AdmissionPolicy>>,
 }
 impl Bundle {
     fn idle(&self) -> bool {
@@ -141,13 +141,13 @@ impl Bundle {
 }
 struct Flight {
     bundle: Bundle,
-    dirty: Option<Reservation>,
-    _flight: Reservation,
-    _source: Option<Arc<Reservation>>,
-    waiters: Vec<(usize, u64, Reservation)>,
+    dirty: Option<flow_control::Charge<AdmissionPolicy>>,
+    _flight: flow_control::Charge<AdmissionPolicy>,
+    _source: Option<Arc<flow_control::Charge<AdmissionPolicy>>>,
+    waiters: Vec<(usize, u64, flow_control::Charge<AdmissionPolicy>)>,
 }
 struct Worker {
-    admission: Admission,
+    admission: flow_control::Quotas<AdmissionPolicy>,
     cache: BTreeMap<Key, Bundle>,
     lru: VecDeque<Key>,
     flights: BTreeMap<Key, Flight>,
@@ -160,10 +160,10 @@ struct Active {
     next: u64,
     send_next: u64,
     outstanding: usize,
-    ready: BTreeMap<u64, Arc<Reservation>>,
-    pipe: Option<Reservation>,
-    _context: Reservation,
-    _connection: Reservation,
+    ready: BTreeMap<u64, Arc<flow_control::Charge<AdmissionPolicy>>>,
+    pipe: Option<flow_control::Charge<AdmissionPolicy>>,
+    _context: flow_control::Charge<AdmissionPolicy>,
+    _connection: flow_control::Charge<AdmissionPolicy>,
     attempts: usize,
     sending_until: Option<u64>,
     queued: bool,
@@ -172,8 +172,12 @@ enum Event {
     Arrive(usize, Request),
     Pump(usize),
     Fill(usize, Key),
-    Sent(usize, Arc<Reservation>),
-    Disk(usize, Arc<Reservation>, Reservation),
+    Sent(usize, Arc<flow_control::Charge<AdmissionPolicy>>),
+    Disk(
+        usize,
+        Arc<flow_control::Charge<AdmissionPolicy>>,
+        flow_control::Charge<AdmissionPolicy>,
+    ),
     Terminate(usize, bool),
     Release(Active),
 }
@@ -227,7 +231,7 @@ impl Simulator {
                 limits.metadata_entries =
                     Nz::new(config.pages_per_worker.max(config.queue_entries)).unwrap();
                 Worker {
-                    admission: Admission::new(limits),
+                    admission: flow_control::Quotas::new(AdmissionPolicy::new(limits)),
                     cache: BTreeMap::new(),
                     lru: VecDeque::new(),
                     flights: BTreeMap::new(),
@@ -273,7 +277,7 @@ impl Simulator {
         cache: usize,
         class: ResourceClass,
         amount: usize,
-    ) -> Option<Reservation> {
+    ) -> Option<flow_control::Charge<AdmissionPolicy>> {
         self.touched.insert(w);
         // Match HttpPool/ConnectionLease and PipePool's global transport charges.
         let cache = match class {
@@ -306,7 +310,7 @@ impl Simulator {
         cache: usize,
         class: ResourceClass,
         amount: usize,
-    ) -> Option<Reservation> {
+    ) -> Option<flow_control::Charge<AdmissionPolicy>> {
         if let Some(r) = self.reserve(w, cache, class, amount) {
             return Some(r);
         }
@@ -811,7 +815,9 @@ mod waiter_detach {
                 sim.arrive(id, request());
                 sim.pump(id);
             }
-            let real = Rc::new(Admission::new(sim.workers[0].admission.limits().clone()));
+            let real = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+                sim.workers[0].admission.limits().clone(),
+            )));
             let flights = Rc::new(Flights::new(
                 real.clone(),
                 crate::test_support::availability(),

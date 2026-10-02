@@ -5,10 +5,7 @@ pub mod format;
 pub mod writer;
 
 use self::catalog::{Index, RecordLocation};
-use crate::runtime::{
-    admission::{Admission, Reservation},
-    reactor::Reactor,
-};
+use crate::runtime::{admission::AdmissionPolicy, reactor::Reactor};
 use crate::{
     error::{Error, Operation, Result},
     memory::{page::CiphertextCopy, pool::BufferPool},
@@ -30,7 +27,7 @@ impl Store {
     /// Side-effect-free resource wiring, before startup and request admission.
     pub fn configure(
         &self,
-        admission: Rc<crate::runtime::admission::Admission>,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         queue_entries: usize,
         page_entries: usize,
     ) -> Result<()> {
@@ -67,8 +64,8 @@ pub struct StoreReader {
     clock: Rc<catalog::SegmentClock>,
     index: Rc<Index>,
     segments: Rc<Segments>,
-    slabs: Rc<Slab<Reservation>>,
-    admission: Rc<Admission>,
+    slabs: Rc<Slab<flow_control::Charge<AdmissionPolicy>>>,
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     reactor: Rc<Reactor>,
     buffers: BufferPool,
 }
@@ -89,8 +86,8 @@ impl StoreReader {
         clock: Rc<catalog::SegmentClock>,
         index: Rc<Index>,
         segments: Rc<Segments>,
-        slabs: Rc<Slab<Reservation>>,
-        admission: Rc<Admission>,
+        slabs: Rc<Slab<flow_control::Charge<AdmissionPolicy>>>,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         reactor: Rc<Reactor>,
         buffers: BufferPool,
     ) -> Self {
@@ -124,11 +121,13 @@ impl StoreReader {
         scope: &'a RequestScope,
     ) -> Operation<'a, Option<(CiphertextCopy, ReadToken)>> {
         self.read_with_token_reclaim(page, scope, |amount| {
-            self.admission.reserve(
-                Some(&page.version.object.cache),
-                ResourceClass::Ciphertext,
-                amount,
-            )
+            self.admission
+                .reserve(
+                    Some(&page.version.object.cache),
+                    ResourceClass::Ciphertext,
+                    amount,
+                )
+                .map_err(Into::into)
         })
     }
     /// Admit staging and decoded ciphertext together before submitting disk I/O.
@@ -136,7 +135,7 @@ impl StoreReader {
         &'a self,
         page: &'a PageId,
         scope: &'a RequestScope,
-        reserve: impl Fn(usize) -> Result<crate::runtime::admission::Reservation> + 'a,
+        reserve: impl Fn(usize) -> Result<flow_control::Charge<AdmissionPolicy>> + 'a,
     ) -> Operation<'a, Option<(CiphertextCopy, ReadToken)>> {
         Box::pin(async move {
             scope.check()?;
@@ -187,7 +186,7 @@ impl StoreReader {
             let mut decoded_reservation = reserved?;
             decoded_reservation.validate(ResourceClass::Ciphertext, amount)?;
             if !self.admission.owns(&decoded_reservation)
-                || decoded_reservation.cache() != Some(&page.version.object.cache)
+                || decoded_reservation.key() != Some(&page.version.object.cache)
             {
                 return Err(Error::InvalidConfiguration);
             }

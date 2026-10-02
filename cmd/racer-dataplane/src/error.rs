@@ -64,6 +64,17 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl From<flow_control::Error> for Error {
+    fn from(error: flow_control::Error) -> Self {
+        match error {
+            flow_control::Error::InvalidInput => Self::InvalidConfiguration,
+            flow_control::Error::Overloaded => Self::Overloaded,
+            flow_control::Error::Unavailable => Self::Unavailable,
+            flow_control::Error::Io => Self::Io,
+        }
+    }
+}
+
 impl From<rdma_verbs::Error> for Error {
     fn from(error: rdma_verbs::Error) -> Self {
         match error {
@@ -120,6 +131,21 @@ impl From<uring_runtime::Error> for Error {
 #[cfg(test)]
 mod tests {
     use super::Error;
+
+    #[test]
+    fn quota_errors_keep_racer_boundary_meanings() {
+        for (flow, racer) in [
+            (
+                flow_control::Error::InvalidInput,
+                Error::InvalidConfiguration,
+            ),
+            (flow_control::Error::Overloaded, Error::Overloaded),
+            (flow_control::Error::Unavailable, Error::Unavailable),
+            (flow_control::Error::Io, Error::Io),
+        ] {
+            assert_eq!(Error::from(flow), racer);
+        }
+    }
 
     #[test]
     fn verbs_errors_keep_racer_boundary_meanings() {

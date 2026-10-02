@@ -13,7 +13,7 @@ use crate::{
         server::{LocalPageService, PeerServer},
         transport::Transfers,
     },
-    runtime::{admission::Admission, deadline::RequestScope, reactor::Reactor},
+    runtime::{admission::AdmissionPolicy, deadline::RequestScope, reactor::Reactor},
     security::{
         credentials::CredentialCrypto, forwarding::Forwarding, identity::Keyring,
         test_support::Identity,
@@ -160,9 +160,9 @@ fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
         )
         .unwrap(),
     );
-    let admission = Rc::new(Admission::new(
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
-    ));
+    )));
     let calls = missing_adapter();
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let (coordinator, _endpoint) = metadata_coordinator_with_newer_publication(
@@ -333,9 +333,9 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     let identities = identities(&nodes);
     let a = &identities[0];
     let b = &identities[1];
-    let admission = Rc::new(Admission::new(
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
-    ));
+    )));
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let io = Rc::new(HttpIo::with_admission(
         reactor.clone(),
@@ -634,10 +634,8 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         let responses = crate::client::response::Responses::new(
             Rc::new(HttpIo::for_clients(reactor.clone(), admission.clone())),
             Rc::new(crate::memory::delivery::Delivery::new(
-                Rc::new(crate::memory::pipe::PipePool::new(
-                    admission.clone(),
-                    reactor.clone(),
-                )),
+                Rc::new(crate::memory::pipe::new_pipe_pool(admission.clone())),
+                reactor.clone(),
                 Duration::from_secs(10),
             )),
         );
@@ -859,7 +857,7 @@ fn metadata_coordinator(
     node: &NodeId,
     membership: &Arc<Membership>,
     keys: Rc<Keyring>,
-    admission: Rc<Admission>,
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     reactor: Rc<Reactor>,
     peers: Rc<dyn crate::peer::PeerClient>,
     adapter: Rc<AdapterOrigin>,
@@ -873,7 +871,7 @@ fn metadata_coordinator_with_newer_publication(
     node: &NodeId,
     membership: &Arc<Membership>,
     keys: Rc<Keyring>,
-    admission: Rc<Admission>,
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     reactor: Rc<Reactor>,
     peers: Rc<dyn crate::peer::PeerClient>,
     adapter: Rc<AdapterOrigin>,
@@ -884,7 +882,7 @@ fn metadata_coordinator_with_newer_publication(
             state::{PublishedState, SnapshotStore},
             wire::{Publication, PublicationSequence},
         },
-        memory::{cache::MemoryCache, delivery::Delivery, pipe::PipePool},
+        memory::{cache::MemoryCache, delivery::Delivery, pipe::new_pipe_pool},
         runtime::{
             crypto::{self, CryptoClient},
             worker::WorkerMap,
@@ -1001,7 +999,8 @@ fn metadata_coordinator_with_newer_publication(
         },
     ));
     let delivery = Rc::new(Delivery::new(
-        Rc::new(PipePool::new(admission, reactor)),
+        Rc::new(new_pipe_pool(admission)),
+        reactor,
         Duration::from_secs(10),
     ));
     let streams = Rc::new(super::range_stream::RangeStreams::new(

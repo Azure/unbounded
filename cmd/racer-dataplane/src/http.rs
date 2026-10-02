@@ -22,43 +22,47 @@ pub mod connection {
     #[cfg(test)]
     use super::StartLine;
     use super::{Codec, MessageHead};
-    #[cfg(test)]
-    use crate::memory::pipe::MAX_PIPE_BYTES;
     use crate::{
         error::{Error, Operation, Result},
         model::ResourceClass,
         runtime::{
-            admission::{Admission, ConnectionReservation, Reservation},
+            admission::{AdmissionExt, AdmissionPolicy, ConnectionReservation},
             deadline::RequestScope,
             reactor::{Descriptor, IoBuffer, Reactor, SocketAddress},
         },
     };
+    #[cfg(test)]
+    use flow_control::pipe::MAX_PIPE_BYTES;
     pub use http1::connection::BufferRange;
     use std::{cell::RefCell, ops::Deref, path::PathBuf, rc::Rc, task::Poll, time::Duration};
     #[cfg(test)]
     use std::{task::Waker, time::Instant};
-    pub type ConnectionLease = http1::connection::ConnectionLease<Admission>;
-    pub type OwnedBuffer = http1::connection::OwnedBuffer<Admission>;
-    pub type HeadCompletion<T> = http1::connection::HeadCompletion<Admission, T>;
+    pub type ConnectionLease = http1::connection::ConnectionLease<HttpContext>;
+    pub type OwnedBuffer = http1::connection::OwnedBuffer<HttpContext>;
+    pub type HeadCompletion<T> = http1::connection::HeadCompletion<HttpContext, T>;
 
-    impl http1::connection::Context for Admission {
+    /// HTTP's application context, separate from the generic quota authority.
+    pub struct HttpContext(pub(crate) Rc<flow_control::Quotas<AdmissionPolicy>>);
+    impl http1::connection::Context for HttpContext {
         type Error = Error;
         type Scope = RequestScope;
         type Budget = crate::runtime::reactor::AdmissionBudget;
         type Reactor = Reactor;
-        type Charge = Reservation;
+        type Charge = flow_control::Charge<AdmissionPolicy>;
         type Slot = ConnectionReservation;
         type Opaque = super::RacerOpaque;
         type State = State;
         type Endpoint = Endpoint;
-        fn charge(&self, bytes: usize) -> Result<Reservation> {
-            self.reserve(None, ResourceClass::RequestContext, bytes)
+        fn charge(&self, bytes: usize) -> Result<flow_control::Charge<AdmissionPolicy>> {
+            self.0
+                .reserve(None, ResourceClass::RequestContext, bytes)
+                .map_err(Into::into)
         }
         fn outbound_slot(&self) -> Result<ConnectionReservation> {
-            self.reserve_connection(ResourceClass::OutboundConnection)
+            self.0.reserve_connection(ResourceClass::OutboundConnection)
         }
         fn stopped(&self) -> bool {
-            self.is_stopped()
+            self.0.is_stopped()
         }
     }
     #[derive(Default)]
@@ -71,11 +75,11 @@ pub mod connection {
         #[cfg(test)]
         pub(crate) relay_fallback_at: Option<usize>,
         pub(crate) relay_peer: Option<Box<ConnectionLease>>,
-        pub(crate) relay_pipe: Option<crate::memory::pipe::PipeLease>,
-        pub(crate) relay_context: Option<Reservation>,
-        pub(crate) relay_reservation: Option<Rc<Reservation>>,
+        pub(crate) relay_pipe: Option<flow_control::pipe::PipeLease<AdmissionPolicy>>,
+        pub(crate) relay_context: Option<flow_control::Charge<AdmissionPolicy>>,
+        pub(crate) relay_reservation: Option<Rc<flow_control::Charge<AdmissionPolicy>>>,
         pub(crate) session: Option<crate::security::connection::Session>,
-        pub(crate) control_reservation: Option<Reservation>,
+        pub(crate) control_reservation: Option<flow_control::Charge<AdmissionPolicy>>,
     }
     impl http1::connection::State<Error> for State {
         fn admit(&mut self, head: MessageHead) -> Result<MessageHead> {
@@ -120,7 +124,10 @@ pub mod connection {
             }
         }
     }
-    pub fn from_accepted(fd: Descriptor, admission: &Admission) -> Result<ConnectionLease> {
+    pub fn from_accepted(
+        fd: Descriptor,
+        admission: &flow_control::Quotas<AdmissionPolicy>,
+    ) -> Result<ConnectionLease> {
         from_reserved(
             fd,
             admission.reserve_connection(ResourceClass::IngressConnection)?,
@@ -143,9 +150,9 @@ pub mod connection {
         connection.begin_io();
         Ok(())
     }
-    pub struct HttpIo(http1::connection::HttpIo<Admission>);
+    pub struct HttpIo(http1::connection::HttpIo<HttpContext>);
     impl Deref for HttpIo {
-        type Target = http1::connection::HttpIo<Admission>;
+        type Target = http1::connection::HttpIo<HttpContext>;
         fn deref(&self) -> &Self::Target {
             &self.0
         }
@@ -154,14 +161,21 @@ pub mod connection {
         pub fn with_admission(
             reactor: Rc<Reactor>,
             codec: Codec,
-            admission: Rc<Admission>,
+            admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
             body_limit: u64,
         ) -> Self {
             Self(http1::connection::HttpIo::new(
-                reactor, codec, admission, body_limit, body_limit,
+                reactor,
+                codec,
+                Rc::new(HttpContext(admission)),
+                body_limit,
+                body_limit,
             ))
         }
-        pub fn for_clients(reactor: Rc<Reactor>, admission: Rc<Admission>) -> Self {
+        pub fn for_clients(
+            reactor: Rc<Reactor>,
+            admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+        ) -> Self {
             Self(http1::connection::HttpIo::new(
                 reactor,
                 Codec::new(
@@ -171,7 +185,7 @@ pub mod connection {
                         .get()
                         .min(super::MAX_HEAD_BYTES),
                 ),
-                admission,
+                Rc::new(HttpContext(admission)),
                 crate::model::PAGE_BYTES + 16,
                 i64::MAX as u64,
             ))
@@ -216,20 +230,24 @@ pub mod connection {
         }
     }
     pub struct HttpPool {
-        core: http1::connection::HttpPool<Admission>,
+        core: http1::connection::HttpPool<HttpContext>,
         #[cfg(test)]
         reactor: Rc<Reactor>,
         #[cfg(test)]
-        admission: Rc<Admission>,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     }
     impl Deref for HttpPool {
-        type Target = http1::connection::HttpPool<Admission>;
+        type Target = http1::connection::HttpPool<HttpContext>;
         fn deref(&self) -> &Self::Target {
             &self.core
         }
     }
     impl HttpPool {
-        pub fn new(reactor: Rc<Reactor>, admission: Rc<Admission>, per_endpoint: usize) -> Self {
+        pub fn new(
+            reactor: Rc<Reactor>,
+            admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+            per_endpoint: usize,
+        ) -> Self {
             Self::with_limits(
                 reactor,
                 admission,
@@ -240,7 +258,7 @@ pub mod connection {
         }
         pub fn with_limits(
             reactor: Rc<Reactor>,
-            admission: Rc<Admission>,
+            admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
             per_endpoint: usize,
             max_endpoints: usize,
             idle_timeout: Duration,
@@ -248,7 +266,7 @@ pub mod connection {
             Self {
                 core: http1::connection::HttpPool::new(
                     reactor.clone(),
-                    admission.clone(),
+                    Rc::new(HttpContext(admission.clone())),
                     http1::connection::PoolConfig {
                         per_endpoint,
                         secondary_cap: per_endpoint,
@@ -275,7 +293,7 @@ pub mod connection {
         pub(crate) fn checkout_peer<'a>(
             &'a self,
             endpoint: &'a Endpoint,
-            relay: Option<Rc<Reservation>>,
+            relay: Option<Rc<flow_control::Charge<AdmissionPolicy>>>,
             peer: Option<std::sync::Arc<crate::peer::adaptive::Permit>>,
             failure: Option<Rc<std::cell::Cell<bool>>>,
             scope: &'a RequestScope,

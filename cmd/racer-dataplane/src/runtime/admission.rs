@@ -1,393 +1,42 @@
-//! I/O-local admission authority with completion-safe cross-thread quota release.
-use crate::runtime::collections::HashMap;
+//! Racer resource policy and compound admission operations.
 use crate::{
     error::{Error, Result},
     model::{CacheId, Limits, PAGE_BYTES, ResourceClass},
+    telemetry::failures::{Detail, Failure, Observer, Stage},
 };
-use std::{
-    cell::RefCell,
-    sync::{
-        Arc, Mutex, Weak,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
-};
+use flow_control::{Charge, Policy, Quotas, Rejection, SharedQuotas};
+use std::sync::Mutex;
 
-const CLASSES: usize = 14;
-#[repr(align(64))]
-struct CacheLineCounter(AtomicUsize);
-impl std::ops::Deref for CacheLineCounter {
-    type Target = AtomicUsize;
-    fn deref(&self) -> &AtomicUsize {
-        &self.0
-    }
-}
-fn index(class: ResourceClass) -> usize {
-    class as usize
-}
-struct Counters {
-    active: Option<Arc<AtomicUsize>>,
-    retired: Option<(CacheId, Arc<Mutex<std::collections::VecDeque<CacheId>>>)>,
-    used: [CacheLineCounter; CLASSES],
-    wake: futures::task::AtomicWaker,
-}
-impl Counters {
-    fn new() -> Self {
-        Self {
-            active: None,
-            retired: None,
-            used: std::array::from_fn(|_| CacheLineCounter(AtomicUsize::new(0))),
-            wake: futures::task::AtomicWaker::new(),
-        }
-    }
-}
-impl Drop for Counters {
-    fn drop(&mut self) {
-        if let Some(active) = &self.active {
-            active.fetch_sub(1, Ordering::AcqRel);
-        }
-        if let Some((cache, queue)) = &self.retired {
-            queue
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push_back(cache.clone());
-        }
-    }
-}
-
-pub struct Admission {
-    observer: RefCell<crate::telemetry::failures::Observer>,
+pub struct AdmissionPolicy {
     limits: Limits,
-    totals: Arc<Counters>,
-    caches: RefCell<HashMap<CacheId, Weak<Counters>>>,
-    active_caches: Arc<AtomicUsize>,
-    retired_caches: Arc<Mutex<std::collections::VecDeque<CacheId>>>,
-    stopped: Arc<AtomicBool>,
-    buffers: Arc<Mutex<Vec<(Vec<u8>, Reservation)>>>,
+    observer: Mutex<Observer>,
 }
-
-/// Read-only worker quota counters, including reservations released on other threads.
-/// Retaining this handle does not retain reservations or pooled payload buffers.
-pub(crate) struct AdmissionUsage {
-    totals: Arc<Counters>,
-    relay_limit: usize,
-    ciphertext_limit: usize,
-}
-impl AdmissionUsage {
-    pub(crate) fn relay(&self) -> (usize, usize) {
-        (
-            self.totals.used[index(ResourceClass::Relay)].load(Ordering::Acquire),
-            self.relay_limit,
-        )
-    }
-    pub(crate) fn ciphertext(&self) -> (usize, usize) {
-        (
-            self.totals.used[index(ResourceClass::Ciphertext)].load(Ordering::Acquire),
-            self.ciphertext_limit,
-        )
-    }
-}
-
-/// Ownership of a charge, released only when its last containing allocation dies.
-pub struct Reservation {
-    class: ResourceClass,
-    amount: usize,
-    cache: Option<CacheId>,
-    totals: Arc<Counters>,
-    local: Option<Arc<Counters>>,
-    buffers: Weak<Mutex<Vec<(Vec<u8>, Reservation)>>>,
-    stopped: Arc<AtomicBool>,
-}
-
-impl page_alloc::Charge for Reservation {
-    fn covers(&self, bytes: usize) -> bool {
-        matches!(self.class(), ResourceClass::Ciphertext) && self.amount() >= bytes
-    }
-}
-
-/// Wipe every allocated payload byte, including truncated and uninitialized tails.
-/// Leave the length empty so rejection can deallocate without exposing spare bytes.
-fn wipe_payload(bytes: &mut Vec<u8>) {
-    bytes.clear();
-    #[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "musl")))]
-    if bytes.capacity() != 0 {
-        // SAFETY: this exclusive Vec<u8> owns capacity writable bytes. Passing the
-        // raw pointer does not construct a reference to uninitialized spare bytes.
-        // explicit_bzero initializes the entire range and cannot be elided even
-        // when the allocation is immediately freed. It uses libc's optimized wipe
-        // rather than a Rust memset that dead-store elimination could remove.
-        // GNU builds require glibc >= 2.25 (the Debian bookworm image has 2.36).
-        unsafe { libc::explicit_bzero(bytes.as_mut_ptr().cast(), bytes.capacity()) };
-    }
-    #[cfg(not(all(target_os = "linux", any(target_env = "gnu", target_env = "musl"))))]
-    {
-        use zeroize::Zeroize;
-        bytes.zeroize();
-    }
-}
-
-impl Reservation {
-    /// Return only the final exclusive payload owner. The retained reservation
-    /// accounts for idle capacity; at most two buffers survive per worker.
-    pub(crate) fn recycle(&mut self, mut bytes: Vec<u8>) {
-        // Wipe before every retention check, including non-pooling destruction.
-        wipe_payload(&mut bytes);
-        if self.stopped.load(Ordering::Acquire) {
-            return;
-        }
-        if bytes.capacity() < 1024 * 1024 || bytes.capacity() > self.amount {
-            return;
-        }
-        let Some(pool) = self.buffers.upgrade() else {
-            return;
-        };
-        let Ok(mut pool) = pool.try_lock() else {
-            return;
-        };
-        if self.stopped.load(Ordering::Acquire) {
-            return;
-        }
-        if pool.len() >= 2 {
-            return;
-        }
-        // SAFETY: wipe_payload above writes zero to the entire capacity,
-        // including previously uninitialized spare capacity. No allocation or
-        // byte mutation intervenes. Record that initialized length while idle
-        // so exact-capacity checkout needs no second zero-fill.
-        unsafe { bytes.set_len(bytes.capacity()) };
-        let reservation = Reservation {
-            class: self.class,
-            amount: std::mem::take(&mut self.amount),
-            cache: self.cache.clone(),
-            totals: self.totals.clone(),
-            local: self.local.clone(),
-            buffers: Weak::new(),
-            stopped: self.stopped.clone(),
-        };
-        pool.push((bytes, reservation));
-    }
-    pub(crate) fn buffer(&self, length: usize) -> Result<Vec<u8>> {
-        if length > self.amount {
-            return Err(Error::InvalidConfiguration);
-        }
-        if let Some(pool) = self.buffers.upgrade() {
-            let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(index) = pool
-                .iter()
-                .position(|(bytes, _)| bytes.capacity() == length)
-            {
-                let (bytes, old) = pool.swap_remove(index);
-                drop(old);
-                debug_assert_eq!(bytes.len(), length);
-                return Ok(bytes);
-            }
-        }
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(length)
-            .map_err(|_| Error::Overloaded)?;
-        bytes.resize(length, 0);
-        Ok(bytes)
-    }
-    /// Release unused capacity only while the allocation owner is exclusive.
-    /// Callers must retain at least the capacity of every live backing allocation.
-    pub fn shrink(&mut self, amount: usize) -> Result<()> {
-        if amount == 0 || amount > self.amount {
-            return Err(Error::InvalidConfiguration);
-        }
-        let released = self.amount - amount;
-        self.amount = amount;
-        self.totals.used[index(self.class)].fetch_sub(released, Ordering::AcqRel);
-        if let Some(local) = &self.local {
-            local.used[index(self.class)].fetch_sub(released, Ordering::AcqRel);
-        }
-        Ok(())
-    }
-    /// Divide an already admitted working set without changing its total charge.
-    pub fn split(&mut self, amount: usize) -> Result<Self> {
-        if amount == 0 || amount >= self.amount {
-            return Err(Error::InvalidConfiguration);
-        }
-        self.amount -= amount;
-        Ok(Self {
-            class: self.class,
-            amount,
-            cache: self.cache.clone(),
-            totals: self.totals.clone(),
-            local: self.local.clone(),
-            buffers: self.buffers.clone(),
-            stopped: self.stopped.clone(),
-        })
-    }
-    pub fn amount(&self) -> usize {
-        self.amount
-    }
-    pub fn class(&self) -> ResourceClass {
-        self.class
-    }
-    pub fn cache(&self) -> Option<&CacheId> {
-        self.cache.as_ref()
-    }
-    pub fn validate(&self, class: ResourceClass, amount: usize) -> Result<()> {
-        if index(self.class) != index(class) || amount > self.amount {
-            Err(Error::InvalidConfiguration)
-        } else {
-            Ok(())
+impl Clone for AdmissionPolicy {
+    fn clone(&self) -> Self {
+        Self {
+            limits: self.limits.clone(),
+            observer: Mutex::new(self.observer()),
         }
     }
 }
-impl Drop for Reservation {
-    fn drop(&mut self) {
-        self.totals.used[index(self.class)].fetch_sub(self.amount, Ordering::AcqRel);
-        if let Some(local) = &self.local {
-            local.used[index(self.class)].fetch_sub(self.amount, Ordering::AcqRel);
-        }
-        if matches!(
-            self.class,
-            ResourceClass::Connection | ResourceClass::IngressConnection
-        ) {
-            self.totals.wake.wake();
-        }
-    }
-}
-pub struct FillReservation {
-    pub plaintext: Reservation,
-    pub ciphertext: Reservation,
-    pub dirty: Option<Reservation>,
-}
-/// Socket role admission, retained by the connection through kernel completion.
-pub struct ConnectionReservation {
-    _total: Reservation,
-    _role: Reservation,
-}
-/// Only socket admission crosses workers; cache admission remains I/O-local.
-#[derive(Clone)]
-pub(crate) struct ConnectionAdmission {
-    observer: crate::telemetry::failures::Observer,
-    totals: Arc<Counters>,
-    stopped: Arc<AtomicBool>,
-    total: usize,
-    ingress: usize,
-}
-impl ConnectionAdmission {
-    pub(crate) fn register(&self, waker: &std::task::Waker) {
-        self.totals.wake.register(waker);
-    }
-    pub(crate) fn reserve(&self) -> Result<ConnectionReservation> {
-        if self.stopped.load(Ordering::Acquire) {
-            return Err(Error::Unavailable);
-        }
-        let charge = |class, limit| -> Result<Reservation> {
-            self.totals.used[index(class)]
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                    used.checked_add(1).filter(|next| *next <= limit)
-                })
-                .map_err(|_| {
-                    use crate::telemetry::failures::{Detail, Failure, Stage};
-                    self.observer
-                        .record(Failure::new(Stage::Admission, Error::Overloaded).detail(
-                            Detail::Resource {
-                                class,
-                                used: self.totals.used[index(class)].load(Ordering::Acquire),
-                                limit,
-                                requested: 1,
-                                cache_used: None,
-                                cache_limit: None,
-                            },
-                        ));
-                    Error::Overloaded
-                })?;
-            Ok(Reservation {
-                buffers: Weak::new(),
-                stopped: self.stopped.clone(),
-                class,
-                amount: 1,
-                cache: None,
-                totals: self.totals.clone(),
-                local: None,
-            })
-        };
-        let role = charge(ResourceClass::IngressConnection, self.ingress)?;
-        let total = charge(ResourceClass::Connection, self.total)?;
-        Ok(ConnectionReservation {
-            _total: total,
-            _role: role,
-        })
-    }
-}
-impl Admission {
-    pub(crate) fn usage(&self) -> AdmissionUsage {
-        AdmissionUsage {
-            totals: self.totals.clone(),
-            relay_limit: self.limit(ResourceClass::Relay),
-            ciphertext_limit: self.limit(ResourceClass::Ciphertext),
-        }
-    }
-    pub(crate) fn set_observer(&self, observer: crate::telemetry::failures::Observer) {
-        *self.observer.borrow_mut() = observer;
-    }
-    pub(crate) fn observer(&self) -> crate::telemetry::failures::Observer {
-        self.observer.borrow().clone()
-    }
-    pub(crate) fn connection_admission(&self) -> ConnectionAdmission {
-        ConnectionAdmission {
-            observer: self.observer(),
-            totals: self.totals.clone(),
-            stopped: self.stopped.clone(),
-            total: self.limit(ResourceClass::Connection),
-            ingress: self.limit(ResourceClass::IngressConnection),
-        }
-    }
-    /// Partition the existing socket ceiling. Ingress cannot consume outbound or
-    /// control progress slots; outbound traffic cannot consume control slots.
-    pub fn reserve_connection(&self, role: ResourceClass) -> Result<ConnectionReservation> {
-        if matches!(role, ResourceClass::IngressConnection) {
-            return self.connection_admission().reserve();
-        }
-        if !matches!(
-            role,
-            ResourceClass::IngressConnection
-                | ResourceClass::OutboundConnection
-                | ResourceClass::ControlConnection
-        ) {
-            return Err(Error::InvalidConfiguration);
-        }
-        let role_charge = self.reserve(None, role, 1)?;
-        let total = self.reserve(None, ResourceClass::Connection, 1)?;
-        Ok(ConnectionReservation {
-            _total: total,
-            _role: role_charge,
-        })
-    }
+impl AdmissionPolicy {
     pub fn new(limits: Limits) -> Self {
         Self {
-            observer: RefCell::default(),
             limits,
-            totals: Arc::new(Counters::new()),
-            caches: RefCell::new(HashMap::default()),
-            active_caches: Arc::new(AtomicUsize::new(0)),
-            retired_caches: Arc::new(Mutex::new(std::collections::VecDeque::new())),
-            stopped: Arc::new(AtomicBool::new(false)),
-            buffers: Arc::new(Mutex::new(Vec::new())),
+            observer: Mutex::default(),
         }
     }
-    pub fn limits(&self) -> &Limits {
-        &self.limits
+    fn observer(&self) -> Observer {
+        self.observer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
-    pub fn stop(&self) {
-        self.stopped.store(true, Ordering::Release);
-        self.reclaim_buffers();
-        self.totals.wake.wake();
-    }
-    pub fn is_stopped(&self) -> bool {
-        self.stopped.load(Ordering::Acquire)
-    }
-    pub fn used(&self, class: ResourceClass) -> usize {
-        self.totals.used[index(class)].load(Ordering::Acquire)
-    }
-    pub fn owns(&self, reservation: &Reservation) -> bool {
-        Arc::ptr_eq(&self.totals, &reservation.totals)
-    }
-    pub fn limit(&self, class: ResourceClass) -> usize {
+}
+impl Policy for AdmissionPolicy {
+    type Class = ResourceClass;
+    type Key = CacheId;
+    fn limit(&self, class: ResourceClass) -> usize {
         match class {
             ResourceClass::Plaintext => self.limits.plaintext_bytes.get(),
             ResourceClass::Ciphertext => self.limits.ciphertext_bytes.get(),
@@ -401,7 +50,7 @@ impl Admission {
                 .get()
                 .saturating_mul(self.limits.waiters_per_flight.get()),
             ResourceClass::Connection => self.limits.client_connections.get(),
-            // Snapshot, renewal, and keyring delivery must make independent progress.
+            // Snapshot, renewal, and keyring delivery make independent progress.
             ResourceClass::ControlConnection => (self.limits.client_connections.get() / 4).min(3),
             ResourceClass::OutboundConnection => self.limits.client_connections.get() / 4,
             ResourceClass::IngressConnection => {
@@ -415,235 +64,115 @@ impl Admission {
             ResourceClass::Relay => self.limits.relay_transfers.get(),
         }
     }
-    fn fair_limit(&self, class: ResourceClass, active: usize) -> usize {
-        let limit = self.limit(class);
-        let progress = match class {
+    fn floor(&self, class: ResourceClass) -> usize {
+        match class {
             ResourceClass::Plaintext => PAGE_BYTES as usize,
-            // A disk read owns padded staging and decoded ciphertext together.
-            // Global admission still bounds aggregate concurrent working sets.
+            // Disk reads own padded staging and decoded ciphertext together.
             ResourceClass::Ciphertext => {
                 2 * (PAGE_BYTES as usize + 16) + crate::store::format::MAX_HEADER_BYTES + 4096
             }
             ResourceClass::DirtyCiphertext | ResourceClass::Registered => PAGE_BYTES as usize + 16,
             _ => 1,
-        };
-        (limit / active.max(1)).max(progress).min(limit)
+        }
     }
-    /// Diagnose byte pressure after a failed reserve. A fair-share deficit must
-    /// be reclaimed from this cache; global pressure may use any idle cache.
-    /// Impossible allocations and cache-accounting saturation have no byte remedy.
-    pub(crate) fn reclamation(
-        &self,
-        cache: &CacheId,
-        class: ResourceClass,
-        amount: usize,
-    ) -> Option<(Option<CacheId>, usize)> {
-        let caches = self.caches.borrow();
-        let local = caches.get(cache).and_then(Weak::upgrade);
-        let fair = self.fair_limit(
+    fn max_keys(&self) -> usize {
+        self.limits.metadata_entries.get()
+    }
+    fn wakes(class: ResourceClass) -> bool {
+        matches!(
             class,
-            self.active_caches.load(Ordering::Acquire) + usize::from(local.is_none()),
-        );
-        if amount > fair {
-            return None;
-        }
-        let local_deficit = local
-            .as_ref()
-            .map_or(0, |local| local.used[index(class)].load(Ordering::Acquire))
-            .saturating_sub(fair - amount);
-        if local_deficit != 0 {
-            return Some((Some(cache.clone()), local_deficit));
-        }
-        let deficit = self.used(class).saturating_sub(self.limit(class) - amount);
-        (deficit != 0).then_some((None, deficit))
+            ResourceClass::Connection | ResourceClass::IngressConnection
+        )
     }
-    pub fn reserve(
-        &self,
-        cache: Option<&CacheId>,
-        class: ResourceClass,
-        amount: usize,
-    ) -> Result<Reservation> {
-        self.reserve_reclaiming(cache, class, amount, false)
+    fn allows_stopped(class: ResourceClass) -> bool {
+        matches!(class, ResourceClass::ControlProgress)
     }
-    /// Only for already-admitted work during drain. Does not bypass byte/count
-    /// bounds; callers must not use this entry point to accept new requests.
-    pub fn reserve_completion(
-        &self,
-        cache: Option<&CacheId>,
-        class: ResourceClass,
-        amount: usize,
-    ) -> Result<Reservation> {
-        self.reserve_reclaiming(cache, class, amount, true)
+    fn covers(class: ResourceClass) -> bool {
+        matches!(class, ResourceClass::Ciphertext)
     }
-    fn reserve_reclaiming(
-        &self,
-        cache: Option<&CacheId>,
-        class: ResourceClass,
-        amount: usize,
-        completion: bool,
-    ) -> Result<Reservation> {
-        let result = self.reserve_inner(cache, class, amount, completion);
-        if matches!(result, Err(Error::Overloaded)) {
-            self.reclaim_buffers_for(cache, class);
-            return self.reserve_inner(cache, class, amount, completion);
-        }
-        result
+    fn rejected(&self, rejection: Rejection<ResourceClass>) {
+        let detail = match rejection {
+            Rejection::Keys { used, limit } => Detail::CacheEntries { used, limit },
+            Rejection::Resource {
+                class,
+                used,
+                limit,
+                requested,
+                key_used,
+                key_limit,
+            } => Detail::Resource {
+                class,
+                used,
+                limit,
+                requested,
+                cache_used: key_used,
+                cache_limit: key_limit,
+            },
+        };
+        self.observer()
+            .record(Failure::new(Stage::Admission, Error::Overloaded).detail(detail));
     }
-    pub fn retained_buffer_bytes(&self) -> usize {
-        self.buffers
+}
+
+pub struct FillReservation {
+    pub plaintext: Charge<AdmissionPolicy>,
+    pub ciphertext: Charge<AdmissionPolicy>,
+    pub dirty: Option<Charge<AdmissionPolicy>>,
+}
+/// Compound socket role admission, retained through kernel completion.
+pub struct ConnectionReservation {
+    _total: Charge<AdmissionPolicy>,
+    _role: Charge<AdmissionPolicy>,
+}
+
+/// Racer operations on the generic local authority. No quota facade or alias.
+pub trait AdmissionExt {
+    fn limits(&self) -> &Limits;
+    fn observer(&self) -> Observer;
+    fn set_observer(&self, observer: Observer);
+    fn usage(&self) -> SharedQuotas<AdmissionPolicy>;
+    fn connection_admission(&self) -> SharedQuotas<AdmissionPolicy>;
+    fn reserve_connection(&self, role: ResourceClass) -> Result<ConnectionReservation>;
+    fn reserve_fill(&self, cache: &CacheId, persist: bool) -> Result<FillReservation>;
+}
+impl AdmissionExt for Quotas<AdmissionPolicy> {
+    fn limits(&self) -> &Limits {
+        &self.policy().limits
+    }
+    fn observer(&self) -> Observer {
+        self.policy().observer()
+    }
+    fn set_observer(&self, observer: Observer) {
+        *self
+            .policy()
+            .observer
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .map(|(_, reservation)| reservation.amount())
-            .sum()
+            .unwrap_or_else(|e| e.into_inner()) = observer;
     }
-    pub fn reclaim_buffers(&self) {
-        self.buffers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+    fn usage(&self) -> SharedQuotas<AdmissionPolicy> {
+        self.shared()
     }
-    fn reclaim_buffers_for(&self, cache: Option<&CacheId>, class: ResourceClass) {
-        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        // Cache-scoped admission can also exhaust cache records or fair shares;
-        // retain its existing aggregate reclamation. Without a cache, only this
-        // resource's counter can reject admission, so unrelated payload charges
-        // cannot help. Preserve the existing whole-pool release when relevant.
-        if cache.is_some()
-            || buffers
-                .iter()
-                .any(|(_, reservation)| index(reservation.class) == index(class))
-        {
-            buffers.clear();
+    fn connection_admission(&self) -> SharedQuotas<AdmissionPolicy> {
+        self.shared()
+    }
+    fn reserve_connection(&self, role: ResourceClass) -> Result<ConnectionReservation> {
+        if matches!(role, ResourceClass::IngressConnection) {
+            return self.connection_admission().reserve_ingress();
         }
-    }
-    fn reserve_inner(
-        &self,
-        cache: Option<&CacheId>,
-        class: ResourceClass,
-        amount: usize,
-        completing: bool,
-    ) -> Result<Reservation> {
-        if self.is_stopped() && !completing && !matches!(class, ResourceClass::ControlProgress) {
-            return Err(Error::Unavailable);
-        }
-        if amount == 0 {
+        if !matches!(
+            role,
+            ResourceClass::OutboundConnection | ResourceClass::ControlConnection
+        ) {
             return Err(Error::InvalidConfiguration);
         }
-        let limit = self.limit(class);
-        let local = if let Some(cache) = cache {
-            let mut caches = self.caches.borrow_mut();
-            // Completion-thread destructors enqueue only released cache records.
-            // Cleanup examines notifications, never every class of every cache.
-            let mut retired = self
-                .retired_caches
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            for _ in 0..256 {
-                let Some(id) = retired.pop_front() else {
-                    break;
-                };
-                if caches
-                    .get(&id)
-                    .is_some_and(|counts| counts.strong_count() == 0)
-                {
-                    caches.remove(&id);
-                }
-            }
-            drop(retired);
-            if !caches.contains_key(cache) && caches.len() >= self.limits.metadata_entries.get() {
-                use crate::telemetry::failures::{Detail, Failure, Stage};
-                self.observer.borrow().record(
-                    Failure::new(Stage::Admission, Error::Overloaded).detail(
-                        Detail::CacheEntries {
-                            used: caches.len(),
-                            limit: self.limits.metadata_entries.get(),
-                        },
-                    ),
-                );
-                return Err(Error::Overloaded);
-            }
-            Some(
-                if let Some(counts) = caches.get(cache).and_then(Weak::upgrade) {
-                    counts
-                } else {
-                    let mut counts = Counters::new();
-                    counts.active = Some(self.active_caches.clone());
-                    counts.retired = Some((cache.clone(), self.retired_caches.clone()));
-                    self.active_caches.fetch_add(1, Ordering::AcqRel);
-                    let counts = Arc::new(counts);
-                    caches.insert(cache.clone(), Arc::downgrade(&counts));
-                    counts
-                },
-            )
-        } else {
-            None
-        };
-        // Active cache accounting is bounded above. Fair-share admission prevents
-        // a busy cache from continuing to grow while other caches have live work.
-        // Existing leases are never revoked, so a newly active cache may have to
-        // wait for their natural release/idle eviction before its first admission.
-        if let Some(local) = local.as_ref().filter(|_| !completing) {
-            let active = self.active_caches.load(Ordering::Acquire).max(1);
-            let fair_limit = self.fair_limit(class, active);
-            if local.used[index(class)]
-                .load(Ordering::Acquire)
-                .checked_add(amount)
-                .is_none_or(|used| used > fair_limit)
-            {
-                self.rejected(
-                    class,
-                    amount,
-                    Some(local.used[index(class)].load(Ordering::Acquire)),
-                    Some(fair_limit),
-                );
-                return Err(Error::Overloaded);
-            }
-        }
-        self.totals.used[index(class)]
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(amount).filter(|next| *next <= limit)
-            })
-            .map_err(|_| {
-                self.rejected(class, amount, None, None);
-                Error::Overloaded
-            })?;
-        if let Some(local) = &local {
-            local.used[index(class)].fetch_add(amount, Ordering::AcqRel);
-        }
-        Ok(Reservation {
-            class,
-            amount,
-            cache: cache.cloned(),
-            totals: self.totals.clone(),
-            local,
-            buffers: Arc::downgrade(&self.buffers),
-            stopped: self.stopped.clone(),
+        let role_charge = self.reserve(None, role, 1)?;
+        let total = self.reserve(None, ResourceClass::Connection, 1)?;
+        Ok(ConnectionReservation {
+            _total: total,
+            _role: role_charge,
         })
     }
-    fn rejected(
-        &self,
-        class: ResourceClass,
-        amount: usize,
-        cache_used: Option<usize>,
-        cache_limit: Option<usize>,
-    ) {
-        use crate::telemetry::failures::{Detail, Failure, Stage};
-        self.observer
-            .borrow()
-            .record(
-                Failure::new(Stage::Admission, Error::Overloaded).detail(Detail::Resource {
-                    class,
-                    used: self.used(class),
-                    limit: self.limit(class),
-                    requested: amount,
-                    cache_used,
-                    cache_limit,
-                }),
-            );
-    }
-    /// All allocation dimensions are acquired together; failure rolls back every charge.
-    pub fn reserve_fill(&self, cache: &CacheId, persist: bool) -> Result<FillReservation> {
+    fn reserve_fill(&self, cache: &CacheId, persist: bool) -> Result<FillReservation> {
         let plaintext = self.reserve(Some(cache), ResourceClass::Plaintext, PAGE_BYTES as usize)?;
         let ciphertext = self.reserve(
             Some(cache),
@@ -666,456 +195,36 @@ impl Admission {
         })
     }
 }
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn secure_payload_wipe_initializes_spare_capacity_and_preserves_geometry() {
-        for capacity in [0, 1, 15, 16, 17, 63, 64, 65, 4095, 4096, 4097] {
-            for initialized in [false, true] {
-                let mut bytes = Vec::with_capacity(capacity);
-                if initialized {
-                    bytes.resize(bytes.capacity(), 0xa7);
-                    bytes.truncate(capacity / 2);
-                }
-                let pointer = bytes.as_ptr();
-                let allocated = bytes.capacity();
-                super::wipe_payload(&mut bytes);
-                assert!(bytes.is_empty());
-                assert_eq!(bytes.capacity(), allocated);
-                assert_eq!(bytes.as_ptr(), pointer);
-                // SAFETY: wipe_payload initializes every byte of this allocation,
-                // including capacity that has never been part of the live length.
-                unsafe { bytes.set_len(allocated) };
-                assert!(bytes.iter().all(|byte| *byte == 0));
-                super::wipe_payload(&mut bytes);
-                assert!(bytes.is_empty());
-            }
-        }
-    }
 
-    #[test]
-    #[ignore = "release-only alternating full-capacity secure wipe comparison"]
-    fn secure_payload_wipe_benchmark() {
-        use std::{hint::black_box, time::Instant};
-        use zeroize::Zeroize;
-        assert!(!cfg!(debug_assertions), "run with --release");
-        const ITERATIONS: usize = 128;
-        for length in [1 << 20, 16 << 20, (16 << 20) + 16] {
-            let mut bytes = vec![0u8; length];
-            for sample in 0..6 {
-                for optimized in if sample % 2 == 0 {
-                    [false, true]
-                } else {
-                    [true, false]
-                } {
-                    let start = Instant::now();
-                    for _ in 0..ITERATIONS {
-                        bytes.fill(black_box(0xa7));
-                        black_box(&bytes);
-                        if optimized {
-                            super::wipe_payload(&mut bytes);
-                        } else {
-                            bytes.clear();
-                            bytes.zeroize();
-                        }
-                        // SAFETY: both primitives initialize the full capacity.
-                        unsafe { bytes.set_len(length) };
-                        black_box(&bytes);
-                    }
-                    let elapsed = start.elapsed();
-                    assert!(bytes.iter().all(|byte| *byte == 0));
-                    if sample != 0 {
-                        println!(
-                            "secure_wipe length={length} optimized={optimized} sample={sample} iterations={ITERATIONS} ns_per_op={:.0}",
-                            elapsed.as_nanos() as f64 / ITERATIONS as f64,
-                        );
-                    }
-                }
-            }
-        }
+/// Compound ingress admission and Racer-specific usage views on the direct
+/// generic shared handle. No cache authority or payload pool crosses workers.
+pub trait SharedAdmissionExt {
+    fn reserve_ingress(&self) -> Result<ConnectionReservation>;
+    fn relay(&self) -> (usize, usize);
+    fn ciphertext(&self) -> (usize, usize);
+}
+impl SharedAdmissionExt for SharedQuotas<AdmissionPolicy> {
+    fn reserve_ingress(&self) -> Result<ConnectionReservation> {
+        let role = self.reserve(ResourceClass::IngressConnection, 1)?;
+        let total = self.reserve(ResourceClass::Connection, 1)?;
+        Ok(ConnectionReservation {
+            _total: total,
+            _role: role,
+        })
     }
-
-    #[test]
-    fn recycled_truncated_capacity_is_zero_before_cross_cache_and_class_reuse() {
-        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
-        let first = CacheId("first".into());
-        let second = CacheId("second".into());
-        let capacity = 1024 * 1024;
-        for length in [0, 1, capacity - 16, capacity] {
-            let mut reservation = admission
-                .reserve(Some(&first), ResourceClass::Ciphertext, capacity)
-                .unwrap();
-            let mut bytes = reservation.buffer(capacity).unwrap();
-            bytes.fill(0xa7);
-            bytes.truncate(length);
-            let pointer = bytes.as_ptr();
-            reservation.recycle(bytes);
-            drop(reservation);
-            assert_eq!(admission.used(ResourceClass::Ciphertext), capacity);
-            {
-                let pool = admission.buffers.lock().unwrap();
-                let bytes = &pool[0].0;
-                assert_eq!(bytes.len(), capacity);
-                assert!(bytes.iter().all(|byte| *byte == 0));
-            }
-            let mut reservation = admission
-                .reserve(Some(&second), ResourceClass::Plaintext, capacity)
-                .unwrap();
-            let bytes = reservation.buffer(capacity).unwrap();
-            assert_eq!(bytes.as_ptr(), pointer);
-            assert!(bytes.iter().all(|byte| *byte == 0));
-            assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
-            assert_eq!(admission.used(ResourceClass::Plaintext), capacity);
-            reservation.recycle(bytes);
-            drop(reservation);
-            admission.reclaim_buffers();
-            assert_eq!(admission.used(ResourceClass::Plaintext), 0);
-        }
+    fn relay(&self) -> (usize, usize) {
+        (
+            self.used(ResourceClass::Relay),
+            self.limit(ResourceClass::Relay),
+        )
     }
-    #[test]
-    fn recycled_spare_capacity_is_initialized_and_checkout_is_exact_and_admitted() {
-        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
-        let mut bytes = Vec::with_capacity(1 << 20);
-        bytes.push(0xa7);
-        let capacity = bytes.capacity();
-        let pointer = bytes.as_ptr();
-        let mut reservation = admission
-            .reserve(None, ResourceClass::Ciphertext, capacity)
-            .unwrap();
-        reservation.recycle(bytes);
-        drop(reservation);
-        let reservation = admission
-            .reserve(None, ResourceClass::Plaintext, capacity)
-            .unwrap();
-        assert!(matches!(
-            reservation.buffer(capacity + 1),
-            Err(Error::InvalidConfiguration)
-        ));
-        let different = reservation.buffer(capacity - 1).unwrap();
-        assert_ne!(different.as_ptr(), pointer);
-        assert_eq!(different.len(), capacity - 1);
-        assert!(different.iter().all(|byte| *byte == 0));
-        drop(different);
-        assert_eq!(admission.retained_buffer_bytes(), capacity);
-        let bytes = reservation.buffer(capacity).unwrap();
-        assert_eq!(bytes.as_ptr(), pointer);
-        assert_eq!(bytes.len(), capacity);
-        assert!(bytes.iter().all(|byte| *byte == 0));
-        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
-        assert_eq!(admission.used(ResourceClass::Plaintext), capacity);
-        drop((bytes, reservation));
-        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
-    }
-    #[test]
-    fn recycled_pool_keeps_two_slots_and_pressure_releases_idle_charges() {
-        let capacity = 1 << 20;
-        let mut limits = crate::test_support::cluster::config(false).limits;
-        limits.ciphertext_bytes = std::num::NonZeroUsize::new(3 * capacity).unwrap();
-        let admission = Admission::new(limits);
-        let buffers: Vec<_> = (0..3)
-            .map(|_| {
-                let reservation = admission
-                    .reserve(None, ResourceClass::Ciphertext, capacity)
-                    .unwrap();
-                let mut bytes = reservation.buffer(capacity).unwrap();
-                bytes.fill(0xa7);
-                (bytes, reservation)
-            })
-            .collect();
-        for (bytes, mut reservation) in buffers {
-            reservation.recycle(bytes);
-        }
-        assert_eq!(admission.buffers.lock().unwrap().len(), 2);
-        assert_eq!(admission.retained_buffer_bytes(), 2 * capacity);
-        assert_eq!(admission.used(ResourceClass::Ciphertext), 2 * capacity);
-        let reservation = admission
-            .reserve(None, ResourceClass::Ciphertext, 3 * capacity)
-            .unwrap();
-        assert_eq!(admission.retained_buffer_bytes(), 0);
-        assert_eq!(admission.used(ResourceClass::Ciphertext), 3 * capacity);
-        drop(reservation);
-        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
-    }
-    #[test]
-    fn unrelated_quota_failure_preserves_recycled_payload() {
-        for completing in [false, true] {
-            for class in [ResourceClass::Plaintext, ResourceClass::Ciphertext] {
-                let admission = Admission::new(crate::test_support::cluster::config(false).limits);
-                let length = PAGE_BYTES as usize
-                    + usize::from(matches!(class, ResourceClass::Ciphertext)) * 16;
-                let mut old = admission.reserve(None, class, length).unwrap();
-                let mut bytes = old.buffer(length).unwrap();
-                bytes.fill(0xa7);
-                let pointer = bytes.as_ptr();
-                old.recycle(bytes);
-                drop(old);
-                let limit = admission.limit(ResourceClass::RequestContext);
-                let held = admission
-                    .reserve(None, ResourceClass::RequestContext, limit)
-                    .unwrap();
-                let result = if completing {
-                    admission.reserve_completion(None, ResourceClass::RequestContext, 1)
-                } else {
-                    admission.reserve(None, ResourceClass::RequestContext, 1)
-                };
-                assert!(matches!(result, Err(Error::Overloaded)));
-                assert_eq!(admission.used(ResourceClass::RequestContext), limit);
-                assert_eq!(admission.retained_buffer_bytes(), length);
-                assert_eq!(admission.used(class), length);
-                drop(held);
-                let next = admission.reserve(None, class, length).unwrap();
-                let bytes = next.buffer(length).unwrap();
-                assert_eq!(bytes.as_ptr(), pointer);
-                assert!(bytes.iter().all(|byte| *byte == 0));
-                assert_eq!(admission.retained_buffer_bytes(), 0);
-                assert_eq!(admission.used(class), length);
-                drop((bytes, next));
-                assert_eq!(admission.used(class), 0);
-            }
-        }
-    }
-    #[test]
-    fn relevant_quota_failure_still_reclaims_recycled_payload() {
-        for completing in [false, true] {
-            for cache_records in [false, true] {
-                let length = 1 << 20;
-                let mut limits = crate::test_support::cluster::config(false).limits;
-                limits.ciphertext_bytes = std::num::NonZeroUsize::new(length).unwrap();
-                limits.metadata_entries = std::num::NonZeroUsize::new(1).unwrap();
-                let admission = Admission::new(limits);
-                let first = CacheId("first".into());
-                let second = CacheId("second".into());
-                let mut old = admission
-                    .reserve(Some(&first), ResourceClass::Ciphertext, length)
-                    .unwrap();
-                let bytes = old.buffer(length).unwrap();
-                old.recycle(bytes);
-                drop(old);
-                assert_eq!(admission.retained_buffer_bytes(), length);
-                let (cache, class, amount) = if cache_records {
-                    (Some(&second), ResourceClass::RequestContext, 1)
-                } else {
-                    (None, ResourceClass::Ciphertext, length)
-                };
-                let reservation = if completing {
-                    admission.reserve_completion(cache, class, amount)
-                } else {
-                    admission.reserve(cache, class, amount)
-                }
-                .unwrap();
-                assert_eq!(admission.retained_buffer_bytes(), 0);
-                assert_eq!(admission.used(class), amount);
-                if cache_records {
-                    assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
-                    assert!(!admission.caches.borrow().contains_key(&first));
-                }
-                drop(reservation);
-                assert_eq!(admission.used(class), 0);
-            }
-        }
-    }
-    #[test]
-    #[ignore = "opt-in same-workload payload recycle benchmark"]
-    fn payload_recycle_benchmark() {
-        use std::{hint::black_box, time::Instant};
-        const ITERATIONS: usize = 128;
-        for length in [1 << 20, 16 << 20, (16 << 20) + 16] {
-            for retain in [true, false] {
-                let admission = Admission::new(crate::test_support::cluster::config(false).limits);
-                // Keep geometry, allocation, writes, admission, and destructor work
-                // identical between revisions. Stop forces the non-pooling path.
-                if !retain {
-                    admission.stop();
-                }
-                for sample in 0..6 {
-                    let start = Instant::now();
-                    for _ in 0..ITERATIONS {
-                        let mut reservation = admission
-                            .reserve_completion(None, ResourceClass::Ciphertext, length)
-                            .unwrap();
-                        let mut bytes = reservation.buffer(length).unwrap();
-                        bytes.fill(black_box(0xa7));
-                        black_box(&bytes);
-                        reservation.recycle(bytes);
-                        drop(reservation);
-                    }
-                    let elapsed = start.elapsed();
-                    // First sample warms allocator and retained buffers.
-                    if sample != 0 {
-                        println!(
-                            "payload_recycle length={length} retain={retain} sample={sample} iterations={ITERATIONS} ns_per_op={:.0}",
-                            elapsed.as_nanos() as f64 / ITERATIONS as f64,
-                        );
-                    }
-                }
-                admission.reclaim_buffers();
-                assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
-            }
-        }
-    }
-    #[test]
-    fn recycled_payload_capacity_stays_admitted_zeroed_and_reclaimable() {
-        use super::*;
-        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
-        let cache = CacheId("pool".into());
-        let mut reservation = admission
-            .reserve(Some(&cache), ResourceClass::Plaintext, 1024 * 1024)
-            .unwrap();
-        let mut bytes = reservation.buffer(1024 * 1024).unwrap();
-        let pointer = bytes.as_ptr();
-        bytes.fill(87);
-        reservation.recycle(bytes);
-        drop(reservation);
-        assert_eq!(admission.used(ResourceClass::Plaintext), 1024 * 1024);
-        let reservation = admission
-            .reserve(Some(&cache), ResourceClass::Plaintext, 1024 * 1024)
-            .unwrap();
-        let bytes = reservation.buffer(1024 * 1024).unwrap();
-        assert_eq!(bytes.as_ptr(), pointer);
-        assert!(bytes.iter().all(|b| *b == 0));
-        assert_eq!(admission.used(ResourceClass::Plaintext), 1024 * 1024);
-        drop((bytes, reservation));
-        assert_eq!(admission.retained_buffer_bytes(), 0);
-        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
-    }
-    use super::*;
-    #[test]
-    fn ingress_saturation_preserves_outbound_and_control_without_raising_total() {
-        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
-        let ingress: Vec<_> = (0..admission.limit(ResourceClass::IngressConnection))
-            .map(|_| {
-                admission
-                    .reserve_connection(ResourceClass::IngressConnection)
-                    .unwrap()
-            })
-            .collect();
-        assert!(
-            admission
-                .reserve_connection(ResourceClass::IngressConnection)
-                .is_err()
-        );
-        let outbound: Vec<_> = (0..admission.limit(ResourceClass::OutboundConnection))
-            .map(|_| {
-                admission
-                    .reserve_connection(ResourceClass::OutboundConnection)
-                    .unwrap()
-            })
-            .collect();
-        assert!(
-            admission
-                .reserve_connection(ResourceClass::OutboundConnection)
-                .is_err()
-        );
-        let control: Vec<_> = (0..admission.limit(ResourceClass::ControlConnection))
-            .map(|_| {
-                admission
-                    .reserve_connection(ResourceClass::ControlConnection)
-                    .unwrap()
-            })
-            .collect();
-        assert_eq!(
-            control.len(),
-            3,
-            "snapshot, enrollment, and key delivery slots"
-        );
-        assert_eq!(
-            admission.used(ResourceClass::Connection),
-            admission.limit(ResourceClass::Connection)
-        );
-        drop((ingress, outbound, control));
-        assert_eq!(admission.used(ResourceClass::Connection), 0);
-    }
-    #[test]
-    fn split_and_shrink_preserve_live_ownership_and_reject_growth() {
-        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
-        let cache = CacheId("cache".into());
-        let mut bundle = admission
-            .reserve(Some(&cache), ResourceClass::Ciphertext, 100)
-            .unwrap();
-        assert!(bundle.split(100).is_err());
-        assert!(bundle.shrink(101).is_err());
-        assert!(bundle.shrink(0).is_err());
-        let staging = bundle.split(60).unwrap();
-        assert_eq!(admission.used(ResourceClass::Ciphertext), 100);
-        bundle.shrink(19).unwrap();
-        assert_eq!(admission.used(ResourceClass::Ciphertext), 79);
-        std::thread::spawn(move || drop(staging)).join().unwrap();
-        assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
-        drop(bundle);
-        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
-    }
-    #[test]
-    fn rollback_and_cross_thread_release() {
-        let mut limits = crate::test_support::cluster::config(false).limits;
-        limits.ciphertext_bytes = std::num::NonZeroUsize::new(1).unwrap();
-        let admission = Admission::new(limits);
-        assert!(matches!(
-            admission.reserve_fill(&CacheId("c".into()), false),
-            Err(Error::Overloaded)
-        ));
-        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
-        let reservation = admission
-            .reserve(None, ResourceClass::Plaintext, 7)
-            .unwrap();
-        assert!(admission.owns(&reservation));
-        assert!(reservation.validate(ResourceClass::Ciphertext, 7).is_err());
-        std::thread::spawn(move || drop(reservation))
-            .join()
-            .unwrap();
-        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
-    }
-    #[test]
-    fn stop_preserves_completion_progress_and_rejects_overflow() {
-        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
-        assert!(matches!(
-            admission.reserve(None, ResourceClass::Plaintext, usize::MAX),
-            Err(Error::Overloaded)
-        ));
-        admission.stop();
-        assert!(matches!(
-            admission.reserve(None, ResourceClass::Plaintext, 1),
-            Err(Error::Unavailable)
-        ));
-        assert!(
-            admission
-                .reserve(None, ResourceClass::ControlProgress, 1)
-                .is_ok()
-        );
-        let completion = admission
-            .reserve_completion(None, ResourceClass::RequestContext, 1)
-            .unwrap();
-        assert_eq!(completion.amount(), 1);
-        assert!(
-            admission
-                .reserve_completion(None, ResourceClass::RequestContext, usize::MAX)
-                .is_err()
-        );
-    }
-    #[test]
-    fn active_caches_share_admission_and_released_counters_are_reclaimed() {
-        let mut limits = crate::test_support::cluster::config(false).limits;
-        limits.request_context_bytes = std::num::NonZeroUsize::new(100).unwrap();
-        let admission = Admission::new(limits);
-        let a = CacheId("a".into());
-        let b = CacheId("b".into());
-        let first = admission
-            .reserve(Some(&a), ResourceClass::RequestContext, 40)
-            .unwrap();
-        let second = admission
-            .reserve(Some(&b), ResourceClass::RequestContext, 40)
-            .unwrap();
-        assert!(matches!(
-            admission.reserve(Some(&a), ResourceClass::RequestContext, 11),
-            Err(Error::Overloaded)
-        ));
-        drop(second);
-        let third = admission
-            .reserve(Some(&a), ResourceClass::RequestContext, 60)
-            .unwrap();
-        assert_eq!(admission.active_caches.load(Ordering::Acquire), 1);
-        assert!(!admission.caches.borrow().contains_key(&b));
-        assert_eq!(admission.used(ResourceClass::RequestContext), 100);
-        drop((first, third));
-        assert_eq!(admission.used(ResourceClass::RequestContext), 0);
+    fn ciphertext(&self) -> (usize, usize) {
+        (
+            self.used(ResourceClass::Ciphertext),
+            self.limit(ResourceClass::Ciphertext),
+        )
     }
 }
+
+#[cfg(test)]
+mod tests;

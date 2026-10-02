@@ -43,7 +43,7 @@ fn assert_global_capacity(class: ResourceClass) {
             panic!("{class:?} falsely rejected at {slot}/{limit} global usage")
         }));
     }
-    assert!(leases.iter().all(|lease| lease.cache().is_none()));
+    assert!(leases.iter().all(|lease| lease.key().is_none()));
     assert_eq!(sim.report.rejections[class as usize], 0);
     assert_eq!(sim.workers[0].admission.used(class), limit);
     for cache in [0, 1] {
@@ -96,8 +96,8 @@ fn cache_scoped_resources_still_enforce_fairness_with_global_room() {
         let limit = sim.workers[0].admission.limit(class);
         let first = sim.reserve(0, 0, class, limit / 2).unwrap();
         let second = sim.reserve(0, 1, class, amount).unwrap();
-        assert_eq!(first.cache(), Some(&CacheId("0".into())));
-        assert_eq!(second.cache(), Some(&CacheId("1".into())));
+        assert_eq!(first.key(), Some(&CacheId("0".into())));
+        assert_eq!(second.key(), Some(&CacheId("1".into())));
         assert!(sim.workers[0].admission.used(class) + amount <= limit);
         assert!(sim.reserve(0, 0, class, amount).is_none(), "{class:?}");
         assert_eq!(sim.report.rejections[class as usize], 1);

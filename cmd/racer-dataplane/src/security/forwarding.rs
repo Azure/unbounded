@@ -825,7 +825,7 @@ mod tests {
             PeerOriginContext, ResourceClass, *,
         },
         peer::protocol::{FetchMode, Operation},
-        runtime::{admission::Admission, deadline::RequestScope},
+        runtime::{admission::AdmissionPolicy, deadline::RequestScope},
         security::connection::signature_tests::{clone_head, network, node},
     };
     use std::time::{Duration, Instant};
@@ -845,7 +845,7 @@ mod tests {
     }
     fn request(id: u8) -> PeerRequest {
         let n = std::num::NonZeroUsize::new(1024 * 1024).unwrap();
-        let admission = Admission::new(Limits {
+        let admission = flow_control::Quotas::new(AdmissionPolicy::new(Limits {
             plaintext_bytes: n,
             ciphertext_bytes: n,
             dirty_bytes: n,
@@ -864,7 +864,7 @@ mod tests {
             retained_snapshots: n,
             metadata_entries: n,
             relay_transfers: n,
-        });
+        }));
         let object = ObjectId {
             cache: CacheId(node(88).0),
             key: CacheKey([7; 32]),
@@ -1048,9 +1048,9 @@ mod tests {
         );
         assert_eq!(response_authority(&empty, &head, &node(2)), Ok(()));
         metadata.length = 3;
-        let admission = std::rc::Rc::new(Admission::new(
+        let admission = std::rc::Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let page = bundle_for(&admission, metadata.immutable());
         let response = protocol::response_head(
             &PeerResponse::Bootstrap {
@@ -1277,9 +1277,9 @@ mod tests {
         // balance independently of the immutable original signed ceiling.
         use crate::peer::protocol::{SecurityCodec, decode_envelope, encode_envelope};
         let scope = forwarded.request.origin.scope().clone();
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let codec = SecurityCodec::new(
             admission.clone(),
             crate::memory::pool::BufferPool::new(admission),

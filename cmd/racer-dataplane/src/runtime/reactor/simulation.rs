@@ -6,23 +6,22 @@ use super::tests::{drive, poll, scope};
 use crate::model::ResourceClass;
 use crate::{
     error::{Error, Result},
-    runtime::{admission::Admission, deadline::RequestScope},
+    runtime::{admission::AdmissionPolicy, deadline::RequestScope},
 };
 use std::{cell::Cell, ffi::CString, path::Path, rc::Rc, time::Duration};
 fn reactor() -> Reactor {
-    Reactor::new(Rc::new(Admission::new(
+    Reactor::new(Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
-    )))
+    ))))
 }
 #[test]
 fn simulated_pipe_splice_preserves_suffix_under_backpressure() {
     let sim = Simulation::new();
     let _environment = sim.enter();
-    let admission = Rc::new(Admission::new(
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
-    ));
-    let pool =
-        crate::memory::pipe::PipePool::new(admission.clone(), Rc::new(Reactor::new(admission)));
+    )));
+    let pool = crate::memory::pipe::new_pipe_pool(admission);
     let mut pipe = pool.acquire().unwrap();
     let (a, b) = sim.socket_pair();
     sim.set_stream_capacity(2);
@@ -43,10 +42,10 @@ fn simulated_pipe_splice_preserves_suffix_under_backpressure() {
 }
 #[test]
 fn direct_io_faults_check_address_offset_and_length_independently() {
-    use crate::runtime::{admission::Reservation, reactor::IoBuffer};
+    use crate::runtime::reactor::IoBuffer;
     use page_alloc::{AlignedBuffer, Alignment};
     struct View {
-        buffer: AlignedBuffer<Reservation>,
+        buffer: AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
         start: usize,
         length: usize,
     }
@@ -246,19 +245,18 @@ fn immutable_ciphertext_send_shares_backing_and_retains_it_through_cancel_fences
 }
 #[test]
 fn real_slab_open_is_sparse_exclusive_and_checks_direct_geometry() {
-    use crate::runtime::admission::Reservation;
     use page_alloc::Slab;
     let sim = Simulation::new();
     let _environment = sim.enter();
     let r = Rc::new(reactor());
-    let slabs = Slab::<Reservation>::new(
+    let slabs = Slab::<flow_control::Charge<AdmissionPolicy>>::new(
         "/slabs/worker-0-slab-0.dat".into(),
         64 * 1024 * 1024,
         32 * 1024 * 1024,
         crate::model::PAGE_BYTES as usize + crate::store::format::MAX_HEADER_BYTES + 16,
     );
     assert!(slabs.open_now().is_ok());
-    let other = Slab::<Reservation>::new(
+    let other = Slab::<flow_control::Charge<AdmissionPolicy>>::new(
         "/slabs/worker-0-slab-0.dat".into(),
         64 * 1024 * 1024,
         32 * 1024 * 1024,

@@ -2,7 +2,7 @@
 
 use crate::{
     error::{Error, Result},
-    runtime::{admission::Reservation, deadline::RequestScope},
+    runtime::{admission::AdmissionPolicy, deadline::RequestScope},
 };
 use std::{
     fmt,
@@ -758,7 +758,7 @@ pub struct PeerOriginContext {
     pub authorization: Option<EncryptedAuthorization>,
     /// Charge all owned field allocations, including ciphertext/tag and metadata.
     /// Transport retains this owner until all I/O using those fields is fenced.
-    pub(crate) reservation: Reservation,
+    pub(crate) reservation: flow_control::Charge<AdmissionPolicy>,
     pub(crate) scope: RequestScope,
 }
 
@@ -812,6 +812,13 @@ pub enum ResourceClass {
     IngressConnection,
     OutboundConnection,
     ControlConnection,
+}
+
+impl flow_control::Class for ResourceClass {
+    const COUNT: usize = 14;
+    fn index(self) -> usize {
+        self as usize
+    }
 }
 
 #[cfg(test)]

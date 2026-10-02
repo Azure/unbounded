@@ -220,7 +220,11 @@ use crate::{
         CacheId, CacheKey, ExpiresAt, KeyId, Nonce, ObjectId, ObjectMetadata, ObjectVersion,
         PageEnvelope, PageId, PageNumber, RequestId, ResourceClass, StrongEtag, WorkerId,
     },
-    runtime::{admission::Admission, deadline::RequestScope, reactor::Reactor},
+    runtime::{
+        admission::{AdmissionExt, AdmissionPolicy},
+        deadline::RequestScope,
+        reactor::Reactor,
+    },
 };
 use std::{
     future::Future,
@@ -252,7 +256,7 @@ impl Drop for Directory {
 struct Fixture {
     metrics: crate::telemetry::metrics::Metrics,
     store: Store,
-    admission: Rc<Admission>,
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     reactor: Rc<Reactor>,
     pool: BufferPool,
     segments: Rc<Segments>,
@@ -270,9 +274,9 @@ impl Fixture {
         availability: Rc<crate::control::state::Availability>,
     ) -> Self {
         let metrics = crate::telemetry::metrics::Metrics::default();
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let reactor = Rc::new(Reactor::new(admission.clone()));
         let pool = BufferPool::new(admission.clone());
         let index = Rc::new(catalog::Index::new(WorkerId(0), 16, availability.clone()));
@@ -323,7 +327,9 @@ impl Fixture {
             eviction,
         };
         store.configure(admission.clone(), 2, 16).unwrap();
-        let foreign = Rc::new(Admission::new(admission.limits().clone()));
+        let foreign = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+            admission.limits().clone(),
+        )));
         assert_eq!(
             store.configure(foreign, 2, 16),
             Err(Error::InvalidConfiguration)
@@ -671,7 +677,7 @@ fn dirty_queue_is_bounded_and_cache_removal_discards_without_io() {
 fn allocator_integration_rejects_foreign_and_mismatched_writer_charges() {
     let f = Fixture::new();
     futures::executor::block_on(f.store.open()).unwrap();
-    let foreign = Admission::new(f.admission.limits().clone());
+    let foreign = flow_control::Quotas::new(AdmissionPolicy::new(f.admission.limits().clone()));
     let page = f.copy(1, 64);
     let cache = &page.metadata.version.object.cache;
     let other_cache = CacheId("other".into());
@@ -713,7 +719,9 @@ fn allocator_integration_rejects_foreign_and_mismatched_writer_charges() {
                     ResourceClass::Ciphertext
                 };
                 let cache = if variant == 2 { &other_cache } else { cache };
-                owner.reserve(Some(cache), class, length - usize::from(variant == 3))
+                owner
+                    .reserve(Some(cache), class, length - usize::from(variant == 3))
+                    .map_err(Into::into)
             });
         assert_eq!(result, Err(Error::InvalidConfiguration));
         assert_eq!(f.store.writer.pending_count(), 0);
@@ -732,7 +740,7 @@ fn allocator_integration_validates_reader_charges_before_submission() {
     let page = f.copy(1, 64);
     let id = page.ciphertext.envelope().page.clone();
     let cache = &id.version.object.cache;
-    let foreign = Admission::new(f.admission.limits().clone());
+    let foreign = flow_control::Quotas::new(AdmissionPolicy::new(f.admission.limits().clone()));
     let other_cache = CacheId("other".into());
     let length = f
         .store
@@ -778,7 +786,9 @@ fn allocator_integration_validates_reader_charges_before_submission() {
                     ResourceClass::Ciphertext
                 };
                 let cache = if variant == 2 { &other_cache } else { cache };
-                owner.reserve(Some(cache), class, amount - usize::from(variant == 3))
+                owner
+                    .reserve(Some(cache), class, amount - usize::from(variant == 3))
+                    .map_err(Into::into)
             },
         ));
         assert!(matches!(result, Err(Error::InvalidConfiguration)));
@@ -1678,11 +1688,15 @@ fn disk_read_reclaims_exact_staging_and_decode_charges_without_flushing_queue() 
             .reader
             .read_with_token_reclaim(&id, &request, |amount| {
                 allocations.borrow_mut().push(amount);
-                match f.admission.reserve(
-                    Some(&id.version.object.cache),
-                    ResourceClass::Ciphertext,
-                    amount,
-                ) {
+                match f
+                    .admission
+                    .reserve(
+                        Some(&id.version.object.cache),
+                        ResourceClass::Ciphertext,
+                        amount,
+                    )
+                    .map_err(Error::from)
+                {
                     Err(Error::Overloaded) => {
                         let (cache, bytes) = f
                             .admission
@@ -1693,11 +1707,13 @@ fn disk_read_reclaims_exact_staging_and_decode_charges_without_flushing_queue() 
                             )
                             .unwrap();
                         f.store.writer.reclaim_ciphertext(cache.as_ref(), bytes);
-                        f.admission.reserve(
-                            Some(&id.version.object.cache),
-                            ResourceClass::Ciphertext,
-                            amount,
-                        )
+                        f.admission
+                            .reserve(
+                                Some(&id.version.object.cache),
+                                ResourceClass::Ciphertext,
+                                amount,
+                            )
+                            .map_err(Into::into)
                     }
                     result => result,
                 }

@@ -16,7 +16,7 @@ use crate::{
     model::{MetadataSelector, OriginContext, PAGE_BYTES, PageId, PageNumber, ResourceClass},
     read::candidates::OriginAuthority,
     runtime::{
-        admission::{Admission, Reservation},
+        admission::AdmissionPolicy,
         deadline::RequestScope,
         reactor::{Completion, IoBuffer},
     },
@@ -34,7 +34,7 @@ pub trait Origin {
         &'a self,
         authority: &'a OriginAuthority,
         context: &'a OriginContext,
-        reservation: Reservation,
+        reservation: flow_control::Charge<AdmissionPolicy>,
         scope: &'a RequestScope,
     ) -> Operation<'a, MetadataReply>;
     /// Consume the fill's atomically admitted plaintext budget.
@@ -43,7 +43,7 @@ pub trait Origin {
         authority: &'a OriginAuthority,
         context: &'a OriginContext,
         page: &'a PageId,
-        reservation: Reservation,
+        reservation: flow_control::Charge<AdmissionPolicy>,
         scope: &'a RequestScope,
     ) -> Operation<'a, OriginPage>;
     fn metadata<'a>(
@@ -59,7 +59,7 @@ pub struct OriginClient {
     snapshots: Rc<SnapshotStore>,
     pool: Rc<HttpPool>,
     io: Rc<HttpIo>,
-    admission: Rc<Admission>,
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     buffers: BufferPool,
     socket_root: PathBuf,
 }
@@ -74,7 +74,7 @@ impl OriginClient {
         snapshots: Rc<SnapshotStore>,
         pool: Rc<HttpPool>,
         io: Rc<HttpIo>,
-        admission: Rc<Admission>,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         buffers: BufferPool,
         root: impl Into<PathBuf>,
     ) -> Result<Self> {
@@ -105,13 +105,13 @@ impl OriginClient {
         &self,
         endpoint: &Endpoint,
         context: &OriginContext,
-        reservation: Reservation,
+        reservation: flow_control::Charge<AdmissionPolicy>,
         scope: &RequestScope,
     ) -> Result<MetadataReply> {
         scope.check()?;
         let (admission, buffers) = (&self.admission, &self.buffers);
         reservation.validate(ResourceClass::Plaintext, PAGE_BYTES as usize)?;
-        if !admission.owns(&reservation) || reservation.cache() != Some(&context.object.cache) {
+        if !admission.owns(&reservation) || reservation.key() != Some(&context.object.cache) {
             return Err(Error::InvalidConfiguration);
         }
         let mut head = request(context, "GET")?;
@@ -232,7 +232,7 @@ impl OriginClient {
         endpoint: &Endpoint,
         context: &OriginContext,
         page: &PageId,
-        reservation: Reservation,
+        reservation: flow_control::Charge<AdmissionPolicy>,
         scope: &RequestScope,
     ) -> Result<OriginPage> {
         scope.check()?;
@@ -255,7 +255,7 @@ impl OriginClient {
             .push(header("If-Match", page.version.etag.as_bytes()));
         let (admission, buffers) = (&self.admission, &self.buffers);
         reservation.validate(ResourceClass::Plaintext, PAGE_BYTES as usize)?;
-        if !admission.owns(&reservation) || reservation.cache() != Some(&context.object.cache) {
+        if !admission.owns(&reservation) || reservation.key() != Some(&context.object.cache) {
             return Err(Error::InvalidConfiguration);
         }
         let connection = self
@@ -336,7 +336,7 @@ impl Origin for OriginClient {
         &'a self,
         authority: &'a OriginAuthority,
         context: &'a OriginContext,
-        reservation: Reservation,
+        reservation: flow_control::Charge<AdmissionPolicy>,
         scope: &'a RequestScope,
     ) -> Operation<'a, MetadataReply> {
         Box::pin(async move {
@@ -356,7 +356,7 @@ impl Origin for OriginClient {
         authority: &'a OriginAuthority,
         context: &'a OriginContext,
         page: &'a PageId,
-        reservation: Reservation,
+        reservation: flow_control::Charge<AdmissionPolicy>,
         scope: &'a RequestScope,
     ) -> Operation<'a, OriginPage> {
         Box::pin(async move {

@@ -3,6 +3,7 @@ use crate::{
     error::{Error, Result},
     model::{ObjectVersion, PAGE_BYTES, PageId, PageNumber, ResolvedRange},
 };
+use flow_control::Window;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Mutex},
@@ -16,7 +17,8 @@ struct Demand {
     next: u64,
     end: u64,
     selected: BTreeSet<u64>,
-    credits: Credits,
+    credits: Window<PageNumber>,
+    ordered: bool,
     turn: bool,
     gate_ticket: Option<u64>,
 }
@@ -103,7 +105,10 @@ impl Scheduler {
         bytes: u64,
         ordered: bool,
     ) -> Result<DemandLease> {
-        let credits = Credits::new(pages, bytes, ordered)?;
+        if !(1..=64).contains(&pages) || !(PAGE_BYTES..=64 * PAGE_BYTES).contains(&bytes) {
+            return Err(Error::InvalidRequest);
+        }
+        let credits = Window::new(pages, bytes, PAGE_BYTES).map_err(window_error)?;
         let mut state = self.state.lock().unwrap();
         if state.demands.len() >= self.capacity {
             return Err(Error::Overloaded);
@@ -121,6 +126,7 @@ impl Scheduler {
                 end: range.last_page().0 + 1,
                 selected: BTreeSet::new(),
                 credits,
+                ordered,
                 turn: false,
                 gate_ticket: None,
             },
@@ -162,10 +168,7 @@ impl Selection {
         })?;
         let mut state = self.scheduler.state.lock().unwrap();
         for demand in state.demands.values_mut() {
-            if demand.credits.ordered
-                || demand.version != self.version
-                || !demand.eligible(number.0)
-            {
+            if demand.ordered || demand.version != self.version || !demand.eligible(number.0) {
                 continue;
             }
             let length = demand
@@ -173,7 +176,10 @@ impl Selection {
                 .slice_at(number)?
                 .ok_or(Error::InvalidRange)?
                 .length;
-            demand.credits.reserve(number, length)?;
+            demand
+                .credits
+                .reserve(number, u64::from(length))
+                .map_err(window_error)?;
             demand.turn = !demand.turn;
             demand.selected.insert(number.0);
             while demand.selected.remove(&demand.next) {
@@ -233,7 +239,10 @@ impl DemandLease {
             .slice_at(number)?
             .ok_or(Error::InvalidRange)?
             .length;
-        demand.credits.reserve(number, length)?;
+        demand
+            .credits
+            .reserve(number, u64::from(length))
+            .map_err(window_error)?;
         demand.gate_ticket = None;
         demand.next += 1;
         *state.fixed.entry(version.clone()).or_default() += 1;
@@ -276,7 +285,7 @@ impl DemandLease {
             let demand = &state.demands[&self.id];
             if !demand.turn
                 || demand.selected.len() >= 63
-                || !demand.credits.can_reserve(PAGE_BYTES as u32)
+                || !demand.credits.can_reserve(PAGE_BYTES)
             {
                 intervals.push(PageInterval {
                     start: demand.next,
@@ -340,6 +349,7 @@ impl DemandLease {
             .ok_or(Error::Cancelled)?
             .credits
             .issued(number)
+            .map_err(window_error)
     }
     pub(crate) fn release(&mut self, number: PageNumber, length: u32) -> Result<()> {
         self.scheduler
@@ -350,12 +360,11 @@ impl DemandLease {
             .get_mut(&self.id)
             .ok_or(Error::Cancelled)?
             .credits
-            .release(number, length)
+            .release(number, u64::from(length))
+            .map_err(window_error)
     }
     pub(crate) fn ordered(&self) -> bool {
-        self.scheduler.state.lock().unwrap().demands[&self.id]
-            .credits
-            .ordered
+        self.scheduler.state.lock().unwrap().demands[&self.id].ordered
     }
     pub(crate) fn exhausted(&self) -> bool {
         let state = self.scheduler.state.lock().unwrap();
@@ -381,7 +390,7 @@ impl State {
     fn earlier_turn(&self, version: &ObjectVersion, ticket: u64, ordered: bool) -> bool {
         self.demands.values().any(|demand| {
             &demand.version == version
-                && (!ordered || !demand.credits.ordered)
+                && (!ordered || !demand.ordered)
                 && demand.gate_ticket.is_some_and(|other| other < ticket)
                 && demand.results.is_empty()
                 && demand.eligible(demand.next)
@@ -421,8 +430,7 @@ impl Demand {
         if number < self.next
             || number >= self.end
             || self.selected.contains(&number)
-            || (number != self.next
-                && (self.credits.ordered || !self.turn || self.selected.len() >= 64))
+            || (number != self.next && (self.ordered || !self.turn || self.selected.len() >= 64))
         {
             return false;
         }
@@ -430,7 +438,7 @@ impl Demand {
             .slice_at(PageNumber(number))
             .ok()
             .flatten()
-            .is_some_and(|slice| self.credits.can_reserve(slice.length))
+            .is_some_and(|slice| self.credits.can_reserve(u64::from(slice.length)))
     }
 }
 impl Drop for DemandLease {
@@ -453,65 +461,22 @@ impl Drop for DemandLease {
     }
 }
 
-pub(crate) struct Credits {
-    pages: usize,
-    bytes: u64,
-    used: u64,
-    outstanding: BTreeMap<PageNumber, (u32, bool)>,
-    pub(crate) ordered: bool,
-}
-impl Credits {
-    pub(crate) fn new(pages: usize, bytes: u64, ordered: bool) -> Result<Self> {
-        if !(1..=64).contains(&pages) || !(PAGE_BYTES..=64 * PAGE_BYTES).contains(&bytes) {
-            return Err(Error::InvalidRequest);
-        }
-        Ok(Self {
-            pages,
-            bytes,
-            used: 0,
-            outstanding: BTreeMap::new(),
-            ordered,
-        })
-    }
-    fn can_reserve(&self, length: u32) -> bool {
-        self.outstanding.len() < self.pages && u64::from(length) <= self.bytes - self.used
-    }
-    pub(crate) fn reserve(&mut self, page: PageNumber, length: u32) -> Result<()> {
-        if length == 0 || u64::from(length) > PAGE_BYTES {
-            return Err(Error::InvalidRequest);
-        }
-        if !self.can_reserve(length) || self.outstanding.contains_key(&page) {
-            return Err(Error::Overloaded);
-        }
-        self.outstanding.insert(page, (length, false));
-        self.used += u64::from(length);
-        Ok(())
-    }
-    pub(crate) fn issued(&mut self, page: PageNumber) -> Result<()> {
-        let entry = self
-            .outstanding
-            .get_mut(&page)
-            .ok_or(Error::InvalidRequest)?;
-        if entry.1 {
-            return Err(Error::InvalidRequest);
-        }
-        entry.1 = true;
-        Ok(())
-    }
-    pub(crate) fn release(&mut self, page: PageNumber, length: u32) -> Result<()> {
-        if self.outstanding.get(&page) != Some(&(length, true)) {
-            return Err(Error::InvalidRequest);
-        }
-        self.outstanding.remove(&page);
-        self.used -= u64::from(length);
-        Ok(())
+// Invalid credit transitions are client request errors, not configuration errors.
+fn window_error(error: flow_control::Error) -> Error {
+    match error {
+        flow_control::Error::InvalidInput => Error::InvalidRequest,
+        other => other.into(),
     }
 }
 
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::model::{ByteRange, CacheId, CacheKey, ObjectId, StrongEtag};
+    use crate::{
+        model::{ByteRange, CacheId, CacheKey, ObjectId, StrongEtag},
+        runtime::admission::AdmissionPolicy,
+    };
+    use flow_control::Quotas;
     use std::task::{Context, Poll};
     fn version() -> ObjectVersion {
         ObjectVersion {
@@ -556,9 +521,9 @@ pub(super) mod tests {
             content_type: None,
             expires_at: crate::model::ExpiresAt::from_system_time(std::time::UNIX_EPOCH).unwrap(),
         };
-        let admission = crate::runtime::admission::Admission::new(
+        let admission: Quotas<AdmissionPolicy> = Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        );
+        ));
         selection
             .complete(super::super::range_stream::tests::page_result(
                 &admission, &metadata, number,
@@ -714,12 +679,12 @@ pub(super) mod tests {
             panic!()
         };
         assert_eq!(number, PageNumber(0));
-        assert_eq!(
-            scheduler.state.lock().unwrap().demands[&ordered.id]
-                .credits
-                .used,
-            3
-        );
+        {
+            let state = scheduler.state.lock().unwrap();
+            let credits = &state.demands[&ordered.id].credits;
+            assert!(credits.can_reserve(PAGE_BYTES - 3));
+            assert!(!credits.can_reserve(PAGE_BYTES - 2));
+        }
         assert!(
             ordered.poll_ordered(&mut cx).is_pending(),
             "byte credit reserved before work"
@@ -874,7 +839,7 @@ pub(super) mod tests {
             demand.turn = true;
             demand
                 .credits
-                .reserve(PageNumber(99), PAGE_BYTES as u32 - 2)
+                .reserve(PageNumber(99), PAGE_BYTES - 2)
                 .unwrap();
         }
         let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
@@ -889,26 +854,29 @@ pub(super) mod tests {
 
     #[test]
     fn pending_and_delivered_share_exact_once_credit() {
-        let mut credits = Credits::new(2, 2 * PAGE_BYTES, false).unwrap();
-        credits.reserve(PageNumber(0), PAGE_BYTES as u32).unwrap();
+        let mut credits = Window::new(2, 2 * PAGE_BYTES, PAGE_BYTES).unwrap();
+        credits.reserve(PageNumber(0), PAGE_BYTES).unwrap();
         assert_eq!(
-            credits.release(PageNumber(0), PAGE_BYTES as u32),
-            Err(Error::InvalidRequest)
+            credits.release(PageNumber(0), PAGE_BYTES),
+            Err(flow_control::Error::InvalidInput)
         );
-        credits.reserve(PageNumber(1), PAGE_BYTES as u32).unwrap();
-        assert!(!credits.can_reserve(PAGE_BYTES as u32));
-        assert_eq!(credits.reserve(PageNumber(2), 1), Err(Error::Overloaded));
+        credits.reserve(PageNumber(1), PAGE_BYTES).unwrap();
+        assert!(!credits.can_reserve(PAGE_BYTES));
+        assert_eq!(
+            credits.reserve(PageNumber(2), 1),
+            Err(flow_control::Error::Overloaded)
+        );
         credits.issued(PageNumber(0)).unwrap();
         assert_eq!(
             credits.release(PageNumber(0), 1),
-            Err(Error::InvalidRequest)
+            Err(flow_control::Error::InvalidInput)
         );
-        credits.release(PageNumber(0), PAGE_BYTES as u32).unwrap();
+        credits.release(PageNumber(0), PAGE_BYTES).unwrap();
         assert_eq!(
-            credits.release(PageNumber(0), PAGE_BYTES as u32),
-            Err(Error::InvalidRequest)
+            credits.release(PageNumber(0), PAGE_BYTES),
+            Err(flow_control::Error::InvalidInput)
         );
-        assert!(credits.can_reserve(PAGE_BYTES as u32));
+        assert!(credits.can_reserve(PAGE_BYTES));
     }
     #[test]
     fn scheduler_is_compact_bounded_and_preserves_ordered_head() {
@@ -1036,7 +1004,7 @@ pub(super) mod tests {
             let demand = &state.demands[&reader.id];
             assert!(demand.selected.len() <= 64);
             assert!(demand.results.is_empty());
-            assert!(demand.credits.outstanding.is_empty());
+            assert!(demand.credits.is_empty());
             assert!(state.selecting.is_empty());
         }
         assert!(scheduler.state.lock().unwrap().demands[&reader.id].next >= 500);
@@ -1055,16 +1023,23 @@ pub(super) mod tests {
         assert_eq!(ordered(&mut reader), Some(PageNumber(1)));
         assert!(reader.exhausted());
         assert_eq!(ordered(&mut reader), None);
-        assert_eq!(
-            scheduler.state.lock().unwrap().demands[&reader.id]
+        assert!(
+            !scheduler.state.lock().unwrap().demands[&reader.id]
                 .credits
-                .used,
-            8
+                .is_empty()
         );
         reader.issued(PageNumber(0)).unwrap();
         assert_eq!(reader.release(PageNumber(0), 5), Err(Error::InvalidRequest));
         reader.release(PageNumber(0), 3).unwrap();
         assert_eq!(reader.release(PageNumber(0), 3), Err(Error::InvalidRequest));
+        reader.issued(PageNumber(1)).unwrap();
+        assert_eq!(reader.release(PageNumber(1), 3), Err(Error::InvalidRequest));
+        reader.release(PageNumber(1), 5).unwrap();
+        assert!(
+            scheduler.state.lock().unwrap().demands[&reader.id]
+                .credits
+                .is_empty()
+        );
         drop(reader);
         assert!(scheduler.state.lock().unwrap().demands.is_empty());
     }
@@ -1110,6 +1085,31 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn credit_boundaries_and_invalid_transitions_preserve_request_errors() {
+        let scheduler = Scheduler::new(1);
+        let range = ByteRange::From(0).resolve(PAGE_BYTES).unwrap();
+        for (pages, bytes) in [(1, PAGE_BYTES), (64, 64 * PAGE_BYTES)] {
+            let mut reader = scheduler
+                .register(version(), range, pages, bytes, true)
+                .unwrap();
+            assert!(reader.ordered());
+            assert_eq!(reader.issued(PageNumber(0)), Err(Error::InvalidRequest));
+            assert_eq!(ordered(&mut reader), Some(PageNumber(0)));
+            assert_eq!(
+                reader.release(PageNumber(0), PAGE_BYTES as u32),
+                Err(Error::InvalidRequest)
+            );
+            reader.issued(PageNumber(0)).unwrap();
+            assert_eq!(reader.issued(PageNumber(0)), Err(Error::InvalidRequest));
+            reader.release(PageNumber(0), PAGE_BYTES as u32).unwrap();
+            assert_eq!(
+                reader.release(PageNumber(0), PAGE_BYTES as u32),
+                Err(Error::InvalidRequest)
+            );
+        }
+    }
+
+    #[test]
     fn invalid_credit_contracts_never_admit_demand() {
         let scheduler = Scheduler::new(1);
         let range = ByteRange::From(0).resolve(1).unwrap();
@@ -1117,6 +1117,8 @@ pub(super) mod tests {
             (0, PAGE_BYTES),
             (65, PAGE_BYTES),
             (1, 0),
+            (1, PAGE_BYTES - 1),
+            (1, 64 * PAGE_BYTES + 1),
             (1, 65 * PAGE_BYTES),
         ] {
             assert!(matches!(
@@ -1125,15 +1127,18 @@ pub(super) mod tests {
             ));
         }
         assert!(scheduler.state.lock().unwrap().demands.is_empty());
-        let mut credits = Credits::new(1, PAGE_BYTES, false).unwrap();
+        let mut credits = Window::new(1, PAGE_BYTES, PAGE_BYTES).unwrap();
         assert_eq!(
             credits.reserve(PageNumber(0), 0),
-            Err(Error::InvalidRequest)
+            Err(flow_control::Error::InvalidInput)
         );
         assert_eq!(
-            credits.reserve(PageNumber(0), PAGE_BYTES as u32 + 1),
-            Err(Error::InvalidRequest)
+            credits.reserve(PageNumber(0), PAGE_BYTES + 1),
+            Err(flow_control::Error::InvalidInput)
         );
-        assert_eq!(credits.issued(PageNumber(0)), Err(Error::InvalidRequest));
+        assert_eq!(
+            credits.issued(PageNumber(0)),
+            Err(flow_control::Error::InvalidInput)
+        );
     }
 }

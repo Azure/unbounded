@@ -1,5 +1,5 @@
 //! Bounded pre-session socket handoff. No submitted operation crosses reactors.
-use super::admission::{Admission, ConnectionAdmission, ConnectionReservation};
+use super::admission::{AdmissionExt, AdmissionPolicy, ConnectionReservation, SharedAdmissionExt};
 use crate::{
     error::{Error, Result},
     model::{CacheId, WorkerId},
@@ -34,7 +34,7 @@ pub(crate) struct Accepted {
     pub kind: Kind,
 }
 struct Target {
-    admission: Option<ConnectionAdmission>,
+    admission: Option<flow_control::SharedQuotas<AdmissionPolicy>>,
     queue: VecDeque<Accepted>,
     waker: Option<Waker>,
     closed: bool,
@@ -69,7 +69,11 @@ impl Ingress {
             cursor: 0,
         }))
     }
-    pub fn install(&self, worker: WorkerId, admission: &Admission) -> Result<()> {
+    pub fn install(
+        &self,
+        worker: WorkerId,
+        admission: &flow_control::Quotas<AdmissionPolicy>,
+    ) -> Result<()> {
         let mut state = self.0.lock().map_err(|_| Error::Unavailable)?;
         let target = &mut state
             .targets
@@ -95,7 +99,7 @@ impl Ingress {
                 continue;
             };
             admission.register(waker);
-            if let Ok(reservation) = admission.reserve() {
+            if let Ok(reservation) = admission.reserve_ingress() {
                 state.cursor = (index + 1) % state.targets.len();
                 return Ok(Offer {
                     ingress: self.clone(),
@@ -174,7 +178,9 @@ mod tests {
     use crate::model::ResourceClass;
     #[test]
     fn batch_pop_respects_budget_and_releases_unconsumed_entries() {
-        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
+        let admission = flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
         let ingress = Arc::new(Ingress::new(&[WorkerId(7)]));
         ingress.install(WorkerId(7), &admission).unwrap();
         let waker = futures::task::noop_waker();
@@ -211,7 +217,9 @@ mod tests {
     fn target_charge_follows_queued_socket_and_closed_offer_rolls_back() {
         let mut limits = crate::test_support::cluster::config(false).limits;
         limits.client_connections = std::num::NonZeroUsize::new(32).unwrap();
-        let admissions: Vec<_> = (0..4).map(|_| Admission::new(limits.clone())).collect();
+        let admissions: Vec<_> = (0..4)
+            .map(|_| flow_control::Quotas::new(AdmissionPolicy::new(limits.clone())))
+            .collect();
         let ingress = Arc::new(Ingress::new(&[
             WorkerId(0),
             WorkerId(1),

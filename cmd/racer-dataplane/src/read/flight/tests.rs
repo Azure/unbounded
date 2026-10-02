@@ -485,9 +485,9 @@ use std::time::Duration;
 fn flights(limits: FlightLimits) -> Rc<Flights> {
     Rc::new(
         Flights::with_limits(
-            Rc::new(Admission::new(
+            Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
-            )),
+            ))),
             crate::test_support::availability(),
             limits,
         )

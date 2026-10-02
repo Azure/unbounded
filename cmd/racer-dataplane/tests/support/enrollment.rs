@@ -2,7 +2,7 @@ use super::dataplane;
 use dataplane::{
     error::{Error, Operation},
     model::Limits,
-    runtime::{admission::Admission, reactor::Reactor},
+    runtime::{admission::AdmissionPolicy, reactor::Reactor},
 };
 
 /// Blocking readiness for loopback TLS fixtures only, never the serving graph.
@@ -85,26 +85,28 @@ use std::{
 
 pub fn reactor() -> Rc<Reactor> {
     let n = NonZeroUsize::new(1024 * 1024).unwrap();
-    let reactor = Rc::new(Reactor::new(Rc::new(Admission::new(Limits {
-        plaintext_bytes: n,
-        ciphertext_bytes: n,
-        dirty_bytes: n,
-        registered_bytes: n,
-        request_context_bytes: n,
-        flights: n,
-        waiters_per_flight: n,
-        queue_entries: NonZeroUsize::new(32).unwrap(),
-        connections_per_neighbor: n,
-        client_connections: n,
-        pipes: n,
-        range_window_pages: n,
-        header_bytes: n,
-        cached_rankings: n,
-        cached_paths: n,
-        retained_snapshots: n,
-        metadata_entries: n,
-        relay_transfers: n,
-    }))));
+    let reactor = Rc::new(Reactor::new(Rc::new(flow_control::Quotas::new(
+        AdmissionPolicy::new(Limits {
+            plaintext_bytes: n,
+            ciphertext_bytes: n,
+            dirty_bytes: n,
+            registered_bytes: n,
+            request_context_bytes: n,
+            flights: n,
+            waiters_per_flight: n,
+            queue_entries: NonZeroUsize::new(32).unwrap(),
+            connections_per_neighbor: n,
+            client_connections: n,
+            pipes: n,
+            range_window_pages: n,
+            header_bytes: n,
+            cached_rankings: n,
+            cached_paths: n,
+            retained_snapshots: n,
+            metadata_entries: n,
+            relay_transfers: n,
+        }),
+    ))));
     reactor.init().unwrap();
     reactor
 }

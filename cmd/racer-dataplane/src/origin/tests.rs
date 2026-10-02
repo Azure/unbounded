@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime::admission::AdmissionExt;
 use crate::{
     control::state::PublishedState,
     http::Codec,
@@ -85,7 +86,9 @@ impl OriginClient {
             .await
     }
 }
-fn credentials(admission: Rc<Admission>) -> Rc<crate::security::credentials::CredentialCrypto> {
+fn credentials(
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+) -> Rc<crate::security::credentials::CredentialCrypto> {
     use crate::security::{
         credentials::CredentialCrypto,
         identity::{KeyEpochs, Keyring},
@@ -99,7 +102,11 @@ fn credentials(admission: Rc<Admission>) -> Rc<crate::security::credentials::Cre
         admission,
     ))
 }
-fn client() -> (OriginClient, Rc<Admission>, Rc<Reactor>) {
+fn client() -> (
+    OriginClient,
+    Rc<flow_control::Quotas<AdmissionPolicy>>,
+    Rc<Reactor>,
+) {
     let n = NonZeroUsize::new(32).unwrap();
     let bytes = NonZeroUsize::new(4 * PAGE_BYTES as usize).unwrap();
     let limits = Limits {
@@ -122,7 +129,7 @@ fn client() -> (OriginClient, Rc<Admission>, Rc<Reactor>) {
         metadata_entries: n,
         relay_transfers: n,
     };
-    let admission = Rc::new(Admission::new(limits));
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2));
     let io = Rc::new(HttpIo::with_admission(
@@ -154,7 +161,7 @@ fn client() -> (OriginClient, Rc<Admission>, Rc<Reactor>) {
 
 fn published_client() -> (
     OriginClient,
-    Rc<Admission>,
+    Rc<flow_control::Quotas<AdmissionPolicy>>,
     Rc<Reactor>,
     crate::control::state::SnapshotLease,
 ) {
@@ -1053,7 +1060,7 @@ fn real_uds_final_page_consumes_supplied_budget_without_second_charge() {
         .unwrap();
     assert!(matches!(
         admission.reserve(Some(&context.object.cache), ResourceClass::Plaintext, 1),
-        Err(Error::Overloaded)
+        Err(flow_control::Error::Overloaded)
     ));
     let page = PageId {
         version: crate::model::ObjectVersion {

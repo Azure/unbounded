@@ -22,7 +22,7 @@ use crate::{
     origin::Origin,
     peer::protocol::{FetchMode, Operation as PeerOperation, PeerResponse},
     runtime::{
-        admission::{Admission, Reservation},
+        admission::{AdmissionExt, AdmissionPolicy},
         deadline::RequestScope,
     },
     security::{aead::PageCrypto, credentials::CredentialCrypto},
@@ -43,7 +43,7 @@ pub struct FillDependencies {
     pub flights: Rc<Flights>,
     pub crypto: Rc<PageCrypto>,
     pub credentials: Rc<CredentialCrypto>,
-    pub admission: Rc<Admission>,
+    pub admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     /// Publish immutable descriptors to the page-zero owner over bounded commands.
     /// Page workers keep their own page-attached descriptor even if that catalog evicts it.
     pub metadata_owner: Arc<super::dispatch::WorkerDirectory>,
@@ -241,11 +241,12 @@ impl Fill {
         cache: &crate::model::CacheId,
         class: ResourceClass,
         amount: usize,
-    ) -> Result<Reservation> {
+    ) -> Result<flow_control::Charge<AdmissionPolicy>> {
         self.reserve_reclaiming(cache, class, amount, || {
             self.dependencies
                 .admission
                 .reserve(Some(cache), class, amount)
+                .map_err(Into::into)
         })
     }
 
@@ -254,8 +255,8 @@ impl Fill {
         cache: &crate::model::CacheId,
         class: ResourceClass,
         amount: usize,
-        reserve: impl Fn() -> Result<Reservation>,
-    ) -> Result<Reservation> {
+        reserve: impl Fn() -> Result<flow_control::Charge<AdmissionPolicy>>,
+    ) -> Result<flow_control::Charge<AdmissionPolicy>> {
         let mut result = reserve();
         // At most two bounded scans, rechecking cache/global pressure each time.
         // Zero released bytes does not mean exhaustion: the memory cursor may
@@ -290,7 +291,10 @@ impl Fill {
 
     /// Fresh metadata has no page identity yet. Admit its page-zero plaintext
     /// before origin I/O using the same bounded reclamation as ordinary fills.
-    pub(crate) fn reserve_bootstrap(&self, cache: &crate::model::CacheId) -> Result<Reservation> {
+    pub(crate) fn reserve_bootstrap(
+        &self,
+        cache: &crate::model::CacheId,
+    ) -> Result<flow_control::Charge<AdmissionPolicy>> {
         self.reserve_with_reclamation(cache, ResourceClass::Plaintext, PAGE_BYTES as usize)
     }
     pub fn new(dependencies: FillDependencies) -> Self {
@@ -677,8 +681,8 @@ impl Fill {
             PAGE_BYTES as usize + 16,
         ) {
             Ok(reservation) => Some(reservation),
-            Err(Error::Overloaded) => None,
-            Err(error) => return Err(error),
+            Err(flow_control::Error::Overloaded) => None,
+            Err(error) => return Err(error.into()),
         };
         let (plaintext, ciphertext) = self
             .dependencies
@@ -998,8 +1002,8 @@ impl Fill {
                 PAGE_BYTES as usize + 16,
             ) {
                 Ok(reservation) => Some(reservation),
-                Err(Error::Overloaded) => None,
-                Err(error) => return Err(error),
+                Err(flow_control::Error::Overloaded) => None,
+                Err(error) => return Err(error.into()),
             }
         } else {
             None
@@ -1168,7 +1172,7 @@ impl Fill {
         &self,
         page: &PageId,
         origin: crate::origin::page::OriginPage,
-        ciphertext: Reservation,
+        ciphertext: flow_control::Charge<AdmissionPolicy>,
         scope: &RequestScope,
     ) -> Result<PageResult> {
         use crate::runtime::reactor::IoBuffer;
@@ -1195,7 +1199,7 @@ impl Fill {
         &self,
         page: &PageId,
         response: crate::peer::protocol::VerifiedResponse,
-        reservation: Option<Reservation>,
+        reservation: Option<flow_control::Charge<AdmissionPolicy>>,
         scope: &RequestScope,
     ) -> Result<PageResult> {
         scope.check()?;
@@ -1221,7 +1225,7 @@ impl Fill {
         &self,
         page: &PageId,
         copy: crate::memory::page::CiphertextCopy,
-        reservation: Reservation,
+        reservation: flow_control::Charge<AdmissionPolicy>,
         scope: &RequestScope,
         source: DecryptSource,
     ) -> Result<PageResult> {
@@ -1252,7 +1256,7 @@ impl Fill {
     async fn publish(
         &self,
         result: PageResult,
-        dirty: Option<Reservation>,
+        dirty: Option<flow_control::Charge<AdmissionPolicy>>,
         scope: &RequestScope,
     ) -> Result<()> {
         result.validate_metadata()?;
@@ -1286,11 +1290,10 @@ impl Fill {
                 .enqueue_reclaiming(result.copy(), dirty, |amount| {
                     let cache = &result.metadata.version.object.cache;
                     self.reserve_reclaiming(cache, ResourceClass::Ciphertext, amount, || {
-                        self.dependencies.admission.reserve_completion(
-                            Some(cache),
-                            ResourceClass::Ciphertext,
-                            amount,
-                        )
+                        self.dependencies
+                            .admission
+                            .reserve_completion(Some(cache), ResourceClass::Ciphertext, amount)
+                            .map_err(Into::into)
                     })
                 }) {
                 Ok(_)

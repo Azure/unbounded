@@ -1,5 +1,6 @@
 use super::*;
 use crate::model::RequestId;
+use crate::runtime::admission::AdmissionExt;
 use std::{
     io::{Read, Write as IoWrite},
     net::TcpStream,
@@ -9,10 +10,14 @@ use std::{
 fn scope() -> RequestScope {
     RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(15)).unwrap()
 }
-fn setup() -> (Rc<Admission>, Rc<Reactor>, Rc<DiagnosticIo>) {
-    let admission = Rc::new(Admission::new(
+fn setup() -> (
+    Rc<flow_control::Quotas<AdmissionPolicy>>,
+    Rc<Reactor>,
+    Rc<DiagnosticIo>,
+) {
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
-    ));
+    )));
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let io = Rc::new(
         DiagnosticIo::attach(reactor.clone(), admission.clone())
@@ -265,7 +270,7 @@ fn resource_and_lifecycle_changes_are_observable_at_both_health_endpoints() {
 fn diagnostic_probe_and_monitors_progress_under_sustained_queue_pressure() {
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.queue_entries = std::num::NonZeroUsize::new(8).unwrap();
-    let admission = Rc::new(Admission::new(limits));
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let io = Rc::new(DiagnosticIo::attach(reactor.clone(), admission.clone()).unwrap());
     let telemetry = Telemetry::default();
@@ -378,7 +383,7 @@ fn diagnostic_probe_and_monitors_progress_under_sustained_queue_pressure() {
 fn diagnostic_accept_recovers_after_full_entry_table() {
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.queue_entries = std::num::NonZeroUsize::new(8).unwrap();
-    let admission = Rc::new(Admission::new(limits));
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let io = Rc::new(DiagnosticIo::attach(reactor.clone(), admission.clone()).unwrap());
     let telemetry = Telemetry::default();
@@ -734,7 +739,7 @@ fn metrics_http_response_exports_worker_quotas_with_bounded_output() {
             let mut limits = crate::test_support::cluster::config(false).limits;
             limits.relay_transfers = std::num::NonZeroUsize::new(usize::MAX).unwrap();
             limits.ciphertext_bytes = std::num::NonZeroUsize::new(usize::MAX).unwrap();
-            let admission = Admission::new(limits);
+            let admission = flow_control::Quotas::new(AdmissionPolicy::new(limits));
             metrics
                 .observe_admission(WorkerId(u16::MAX - index as u16), admission.usage())
                 .unwrap();
@@ -814,7 +819,7 @@ fn unattached_serving_fails_closed_and_attachment_capacity_rolls_back() {
     ));
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.request_context_bytes = std::num::NonZeroUsize::new(1).unwrap();
-    let admission = Rc::new(Admission::new(limits));
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
     let reactor = Rc::new(Reactor::new(admission.clone()));
     assert!(matches!(
         telemetry.attach_io(reactor, admission.clone()),
@@ -865,9 +870,9 @@ fn raw_slow_clients_are_bounded_and_timeout_releases_capacity() {
 
 #[test]
 fn attach_is_explicit_and_bind_failure_is_reported_on_first_poll() {
-    let admission = Rc::new(Admission::new(
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
-    ));
+    )));
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let telemetry = Telemetry::default();
     assert_eq!(admission.used(ResourceClass::ControlProgress), 0);

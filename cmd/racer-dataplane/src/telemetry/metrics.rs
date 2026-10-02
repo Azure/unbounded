@@ -11,7 +11,11 @@
 //! These counters count attempts, not unique records or corrupt client deliveries,
 //! and identify rejection/check location, not where corruption originated. Source
 //! totals need not equal crypto totals, especially with abandoned fill waiters.
-use crate::{error::Result, model::WorkerId, runtime::admission::AdmissionUsage};
+use crate::{
+    error::Result,
+    model::WorkerId,
+    runtime::admission::{AdmissionPolicy, SharedAdmissionExt},
+};
 use ::telemetry::metrics;
 use std::sync::{Arc, OnceLock};
 
@@ -26,7 +30,7 @@ pub(crate) enum LookupTier {
 #[derive(Clone)]
 pub struct Metrics {
     core: ::telemetry::Metrics<Event, Gauge>,
-    admission: Arc<[OnceLock<(WorkerId, AdmissionUsage)>]>,
+    admission: Arc<[OnceLock<(WorkerId, flow_control::SharedQuotas<AdmissionPolicy>)>]>,
     shard: usize,
 }
 
@@ -198,7 +202,11 @@ impl Metrics {
         })
     }
     /// Install once during worker assembly, not on the admission hot path.
-    pub(crate) fn observe_admission(&self, worker: WorkerId, usage: AdmissionUsage) -> Result<()> {
+    pub(crate) fn observe_admission(
+        &self,
+        worker: WorkerId,
+        usage: flow_control::SharedQuotas<AdmissionPolicy>,
+    ) -> Result<()> {
         self.admission[self.shard]
             .set((worker, usage))
             .map_err(|_| crate::error::Error::InvalidConfiguration)
@@ -327,7 +335,7 @@ impl Metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{model::ResourceClass, runtime::admission::Admission};
+    use crate::{model::ResourceClass, runtime::admission::AdmissionExt};
 
     #[test]
     fn request_lease_overflow_preserves_counters_and_error() {
@@ -398,8 +406,12 @@ mod tests {
     #[test]
     fn worker_quota_gauges_follow_authoritative_reservations() {
         let workers = Metrics::for_workers(2).unwrap();
-        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
-        let other = Admission::new(crate::test_support::cluster::config(false).limits);
+        let admission = flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let other = flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
         workers[0]
             .observe_admission(WorkerId(7), admission.usage())
             .unwrap();
@@ -447,7 +459,7 @@ mod tests {
         for class in [ResourceClass::Relay, ResourceClass::Ciphertext] {
             assert!(matches!(
                 admission.reserve(None, class, 1),
-                Err(crate::error::Error::Overloaded)
+                Err(flow_control::Error::Overloaded)
             ));
         }
         assert_eq!(scrape(), full, "rejection must not change quota gauges");
@@ -479,7 +491,9 @@ mod tests {
     #[test]
     fn worker_quota_gauges_include_recycled_ciphertext_capacity() {
         let metrics = Metrics::default();
-        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
+        let admission = flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
         metrics
             .observe_admission(WorkerId(0), admission.usage())
             .unwrap();

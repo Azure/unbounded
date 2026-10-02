@@ -39,7 +39,8 @@ mod duplex_release {
             .unwrap();
             let admission = f.fill.dependencies.admission.clone();
             let delivery = Rc::new(Delivery::new(
-                Rc::new(PipePool::new(admission.clone(), f.reactor.clone())),
+                Rc::new(new_pipe_pool(admission.clone())),
+                f.reactor.clone(),
                 Duration::from_secs(30),
             ));
             let io = Rc::new(HttpIo::with_admission(
@@ -216,7 +217,8 @@ mod duplex_release {
         let response = futures::executor::block_on(local.read(request, &scope)).unwrap();
         let admission = f.fill.dependencies.admission.clone();
         let delivery = Rc::new(Delivery::new(
-            Rc::new(PipePool::new(admission.clone(), f.reactor.clone())),
+            Rc::new(new_pipe_pool(admission.clone())),
+            f.reactor.clone(),
             Duration::from_secs(30),
         ));
         let io = Rc::new(HttpIo::with_admission(
@@ -538,7 +540,7 @@ use crate::{
     client::{ClientRequest, ReadKind},
     control::state::PublishedState,
     http::{Codec, connection::HttpIo},
-    memory::{delivery::Delivery, pipe::PipePool},
+    memory::{delivery::Delivery, pipe::new_pipe_pool},
     model::{ByteRange, MembershipVersion},
     peer::{
         PeerNetwork, PeerTransport,
@@ -1068,10 +1070,8 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
             };
             drop(selection);
             let delivery = Delivery::new(
-                Rc::new(PipePool::new(
-                    f.fill.dependencies.admission.clone(),
-                    f.reactor.clone(),
-                )),
+                Rc::new(new_pipe_pool(f.fill.dependencies.admission.clone())),
+                f.reactor.clone(),
                 Duration::from_secs(30),
             );
             let (socket, _stalled_client) = std::os::unix::net::UnixStream::pair().unwrap();

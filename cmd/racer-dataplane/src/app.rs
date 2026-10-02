@@ -24,7 +24,7 @@ use crate::{
     },
     error::{Error, Operation, Result},
     http::connection::{HttpIo, HttpPool},
-    memory::{cache::MemoryCache, delivery::Delivery, pipe::PipePool, pool::BufferPool},
+    memory::{cache::MemoryCache, delivery::Delivery, pipe::new_pipe_pool, pool::BufferPool},
     model::{Limits, NodeId, RequestId, WorkerId},
     origin::{Origin, OriginClient},
     peer::{Relay, Requester, server::PeerServer, transport::Transfers},
@@ -39,7 +39,7 @@ use crate::{
         range_stream::RangeStreams,
     },
     runtime::{
-        admission::Admission,
+        admission::{AdmissionExt, AdmissionPolicy},
         affinity::AffinityPlan,
         deadline::RequestScope,
         reactor::Reactor,
@@ -395,7 +395,7 @@ mod sizing {
             }
         }
         // Snapshot polling, renewal, and key delivery need independent control slots.
-        let admission = Admission::new(limits.clone());
+        let admission = flow_control::Quotas::new(AdmissionPolicy::new(limits.clone()));
         if admission.limit(crate::model::ResourceClass::ControlConnection) < 3 {
             return Err(invalid("control_connections"));
         }
@@ -620,7 +620,9 @@ fn bootstrap(
     limits: &Limits,
     startup: &RequestScope,
 ) -> Result<NodeId> {
-    let admission = Rc::new(Admission::new(limits.clone()));
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+        limits.clone(),
+    )));
     let reactor = Rc::new(Reactor::new(admission));
     let unresolved = Rc::new(Keyring::new(
         config.cluster.clone(),
@@ -900,9 +902,10 @@ impl WorkerApplication {
         ));
         let buffers = BufferPool::new(admission.clone());
         let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
-        let pipes = Rc::new(PipePool::new(admission.clone(), reactor.clone()));
+        let pipes = Rc::new(new_pipe_pool(admission.clone()));
         let delivery = Rc::new(
-            Delivery::new(pipes.clone(), config.reader_stall_timeout).with_metrics(metrics.clone()),
+            Delivery::new(pipes.clone(), reactor.clone(), config.reader_stall_timeout)
+                .with_metrics(metrics.clone()),
         );
 
         let store = Self::assemble_storage(
@@ -1318,7 +1321,7 @@ impl WorkerApplication {
     }
 
     fn ciphertext_reclaimer(
-        admission: Rc<Admission>,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         memory: Rc<MemoryCache>,
         writer: Rc<StoreWriter>,
     ) -> impl Fn(&crate::model::CacheId, usize) {
@@ -1970,7 +1973,7 @@ mod lifetime_tests {
 pub(crate) mod tests {
     use super::*;
     use crate::runtime::{
-        admission::Admission,
+        admission::{AdmissionExt, AdmissionPolicy},
         crypto::{self, CryptoClient},
         reactor::Reactor,
     };
@@ -2096,7 +2099,7 @@ pub(crate) mod tests {
                 ));
                 continue;
             }
-            let admission = Admission::new(result.unwrap());
+            let admission = flow_control::Quotas::new(AdmissionPolicy::new(result.unwrap()));
             let control = (0..3)
                 .map(|_| {
                     admission
@@ -2127,7 +2130,9 @@ pub(crate) mod tests {
 
     pub(crate) fn wake_test_worker() -> WorkerApplication {
         let config = crate::test_support::cluster::config(false);
-        let admission = Rc::new(Admission::new(config.limits.clone()));
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+            config.limits.clone(),
+        )));
         let (io, _engine) = crypto::pair(WorkerId(0), 0, config.limits.queue_entries);
         WorkerApplication::assemble(
             &config,
@@ -2278,7 +2283,9 @@ pub(crate) mod tests {
     fn composes_http_and_optional_rdma_without_operational_side_effects() {
         for enable_rdma in [false, true] {
             let config = crate::test_support::cluster::config(enable_rdma);
-            let admission = Rc::new(Admission::new(config.limits.clone()));
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+                config.limits.clone(),
+            )));
             let (io, engine) = crypto::pair(WorkerId(0), 0, config.limits.queue_entries);
             let crypto = Rc::new(CryptoClient::new(io));
             let runtime = WorkerRuntime {
@@ -2312,7 +2319,9 @@ pub(crate) mod tests {
                 3,
                 "runtime and page facade share one local crypto client"
             );
-            let second_admission = Rc::new(Admission::new(config.limits.clone()));
+            let second_admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+                config.limits.clone(),
+            )));
             let (second_io, second_engine) =
                 crypto::pair(WorkerId(1), 0, config.limits.queue_entries);
             let second_runtime = WorkerRuntime {

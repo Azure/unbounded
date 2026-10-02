@@ -9,7 +9,7 @@ use crate::{
     memory::pool::BufferPool,
     model::{ObjectMetadata, PAGE_BYTES},
     origin::OriginClient,
-    runtime::{admission::Admission, reactor::Reactor},
+    runtime::{admission::AdmissionPolicy, reactor::Reactor},
 };
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -133,7 +133,7 @@ impl AdapterOrigin {
     pub fn client(
         &self,
         snapshots: Rc<SnapshotStore>,
-        admission: Rc<Admission>,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         reactor: Rc<Reactor>,
         buffers: BufferPool,
     ) -> Rc<OriginClient> {

@@ -5,7 +5,7 @@ use crate::{
     memory::pool::{CiphertextBytes, CiphertextPage, PlaintextBuffer, VerifiedBytes, VerifiedPage},
     model::{Nonce, PageEnvelope, PageId, ResourceClass},
     runtime::{
-        admission::Reservation,
+        admission::AdmissionPolicy,
         crypto::{
             CryptoClient, CryptoCompletion, CryptoInput, CryptoJob, CryptoOutcome, CryptoOutput,
             CryptoPermit, IntegrityRejection,
@@ -121,17 +121,17 @@ impl PageCrypto {
     /// ```compile_fail
     /// use racer_dataplane::{security::aead::PageCrypto,
     ///     memory::pool::CiphertextPage,
-    ///     runtime::{admission::Reservation, deadline::RequestScope}};
+    ///     runtime::{admission::AdmissionPolicy, deadline::RequestScope}};
     /// fn require_send<T: Send>(_: T) {}
     /// fn move_future(crypto: &PageCrypto, page: CiphertextPage,
-    ///     output: Reservation, scope: &RequestScope) {
+    ///     output: flow_control::Charge<AdmissionPolicy>, scope: &RequestScope) {
     ///     require_send(crypto.decrypt(page, output, scope));
     /// }
     /// ```
     pub fn decrypt<'a>(
         &'a self,
         ciphertext: CiphertextPage,
-        plaintext: Reservation,
+        plaintext: flow_control::Charge<AdmissionPolicy>,
         scope: &'a RequestScope,
     ) -> Operation<'a, VerifiedPage> {
         Box::pin(async move {
@@ -165,7 +165,7 @@ impl PageCrypto {
         &'a self,
         page: PageId,
         plaintext: PlaintextBuffer,
-        ciphertext: Reservation,
+        ciphertext: flow_control::Charge<AdmissionPolicy>,
         scope: &'a RequestScope,
     ) -> Operation<'a, (VerifiedPage, CiphertextPage)> {
         Box::pin(async move {
@@ -282,7 +282,7 @@ impl PageCryptoEngine {
                 plaintext
                     .reservation()
                     .validate(ResourceClass::Plaintext, raw.len())?;
-                if plaintext.reservation().cache() != Some(&page.version.object.cache) {
+                if plaintext.reservation().key() != Some(&page.version.object.cache) {
                     return Err(Error::InvalidConfiguration);
                 }
                 let length = u32::try_from(raw.len()).map_err(|_| Error::InvalidRequest)?;
@@ -298,7 +298,7 @@ impl PageCryptoEngine {
                     ResourceClass::Ciphertext,
                     envelope.ciphertext_length as usize,
                 )?;
-                if ciphertext.cache() != Some(&page.version.object.cache) {
+                if ciphertext.key() != Some(&page.version.object.cache) {
                     return Err(Error::InvalidConfiguration);
                 }
                 let mut bytes =
@@ -329,7 +329,7 @@ impl PageCryptoEngine {
                     return Err(Error::CorruptRecord);
                 }
                 plaintext.validate(ResourceClass::Plaintext, envelope.plaintext_length as usize)?;
-                if plaintext.cache() != Some(&envelope.page.version.object.cache) {
+                if plaintext.key() != Some(&envelope.page.version.object.cache) {
                     return Err(Error::InvalidConfiguration);
                 }
                 // Decryption allocates only plaintext-length storage,
@@ -579,7 +579,7 @@ mod tests {
         use crate::{
             memory::pool::BufferPool,
             runtime::{
-                admission::Admission,
+                admission::AdmissionPolicy,
                 crypto::{CryptoId, pair},
             },
         };
@@ -639,9 +639,9 @@ mod tests {
             ),
         ];
         let keys = super::super::identity::keyring_tests::keys();
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let pool = BufferPool::new(admission.clone());
         let (io, _port) = pair(WorkerId(0), 1, std::num::NonZeroUsize::new(1).unwrap());
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -776,14 +776,14 @@ mod tests {
         use crate::{
             memory::pool::BufferPool,
             runtime::{
-                admission::Admission,
+                admission::AdmissionPolicy,
                 crypto::{CryptoId, pair},
             },
         };
         let keys = super::super::identity::keyring_tests::keys();
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let pool = BufferPool::new(admission.clone());
         let descriptor = envelope();
         let cache = &descriptor.page.version.object.cache;
@@ -902,14 +902,14 @@ mod tests {
         use crate::{
             memory::pool::BufferPool,
             runtime::{
-                admission::Admission,
+                admission::AdmissionPolicy,
                 crypto::{CryptoId, pair},
             },
         };
         let keys = super::super::identity::keyring_tests::keys();
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let pool = BufferPool::new(admission.clone());
         let page = envelope().page;
         let cache = &page.version.object.cache;
@@ -1026,14 +1026,14 @@ mod tests {
         use crate::{
             memory::pool::BufferPool,
             runtime::{
-                admission::Admission,
+                admission::AdmissionPolicy,
                 crypto::{CryptoId, pair},
             },
         };
         let keys = super::super::identity::keyring_tests::keys();
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let pool = BufferPool::new(admission.clone());
         let descriptor = envelope();
         let cache = &descriptor.page.version.object.cache;
@@ -1150,7 +1150,7 @@ mod tests {
     #[test]
     fn drain_reschedules_after_a_full_quantum() {
         use crate::runtime::{
-            admission::Admission,
+            admission::AdmissionPolicy,
             crypto::{CryptoId, pair},
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1164,7 +1164,9 @@ mod tests {
             }
         }
         let keys = super::super::identity::keyring_tests::keys();
-        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
+        let admission = flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
         let descriptor = envelope();
         let cache = &descriptor.page.version.object.cache;
         let scope = RequestScope::new(

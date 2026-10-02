@@ -56,10 +56,14 @@ fn scope() -> RequestScope {
     )
     .unwrap()
 }
-fn setup() -> (Rc<Admission>, Rc<Reactor>, HttpPool) {
+fn setup() -> (
+    Rc<flow_control::Quotas<AdmissionPolicy>>,
+    Rc<Reactor>,
+    HttpPool,
+) {
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.queue_entries = std::num::NonZeroUsize::new(2).unwrap();
-    let admission = Rc::new(Admission::new(limits));
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
     let reactor = Rc::new(Reactor::new(admission.clone()));
     reactor.init().unwrap();
     let pool = HttpPool::new(reactor.clone(), admission.clone(), 1).with_origin_limit(2);
@@ -533,9 +537,9 @@ fn invalidated_active_generation_cannot_reenter_idle_and_expiry_releases_quota()
 }
 #[test]
 fn opaque_staging_and_connection_reservations_survive_reactor_abandonment() {
-    let admission = Rc::new(Admission::new(
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
-    ));
+    )));
     let reactor = Rc::new(Reactor::new(admission.clone()));
     reactor.init().unwrap();
     let baseline = admission.used(ResourceClass::RequestContext);
@@ -544,7 +548,7 @@ fn opaque_staging_and_connection_reservations_survive_reactor_abandonment() {
     let (connection, peer) = held(&pool, &endpoint, &listener);
     let scope =
         RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(5)).unwrap();
-    let staging = OwnedBuffer::new(&admission, 4096).unwrap();
+    let staging = OwnedBuffer::new(&HttpContext(admission.clone()), 4096).unwrap();
     let mut receive = reactor.recv(connection.socket(), staging, connection, &scope);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(matches!(receive.as_mut().poll(&mut cx), Poll::Pending));

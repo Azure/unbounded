@@ -47,7 +47,7 @@ mod body_progress {
     struct BodyFixture {
         idle: bool,
         telemetry: Telemetry,
-        admission: Rc<Admission>,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         reactor: Rc<Reactor>,
         io: Rc<HttpIo>,
         pool: Rc<HttpPool>,
@@ -80,9 +80,9 @@ mod body_progress {
                     | "capped_stall"
             );
             let telemetry = Telemetry::default();
-            let admission = Rc::new(Admission::new(
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
-            ));
+            )));
             admission.set_observer(telemetry.failures.observer(WorkerId(2)));
             let reactor = Rc::new(Reactor::new(admission.clone()));
             let io = Rc::new(HttpIo::with_admission(
@@ -582,7 +582,10 @@ mod destination_disconnect {
         SuccessAfterFin,
     }
 
-    fn page_result(admission: &Admission, page: &PageId) -> crate::memory::page::PageResult {
+    fn page_result(
+        admission: &flow_control::Quotas<AdmissionPolicy>,
+        page: &PageId,
+    ) -> crate::memory::page::PageResult {
         use crate::{
             memory::pool::{CiphertextBytes, CiphertextPage, VerifiedBytes, VerifiedPage},
             model::{ExpiresAt, ObjectMetadata, PageEnvelope},
@@ -628,7 +631,7 @@ mod destination_disconnect {
     }
 
     struct DestinationFixture {
-        admission: Rc<Admission>,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         reactor: Rc<Reactor>,
         io: Rc<HttpIo>,
         signers: Vec<Rc<Signatures>>,
@@ -642,9 +645,9 @@ mod destination_disconnect {
 
     impl DestinationFixture {
         fn new() -> Self {
-            let admission = Rc::new(Admission::new(
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
-            ));
+            )));
             let reactor = Rc::new(Reactor::new(admission.clone()));
             reactor.init().unwrap();
             let io = Rc::new(HttpIo::with_admission(
@@ -1046,9 +1049,9 @@ mod encrypted_http {
         assert!(!Rc::ptr_eq(&identities[0].keys, &identities[1].keys));
         let admissions: Vec<_> = (0..2)
             .map(|_| {
-                Rc::new(Admission::new(
+                Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
-                ))
+                )))
             })
             .collect();
         let reactor = Rc::new(Reactor::new(admissions[0].clone()));
@@ -1352,7 +1355,7 @@ mod requester_safety {
             transport::RelayResponse,
         },
         runtime::{
-            admission::Admission,
+            admission::AdmissionPolicy,
             reactor::{Descriptor, Reactor},
         },
         security::connection,
@@ -1412,9 +1415,9 @@ mod requester_safety {
             .iter()
             .find(|m| m.node != local && network.endpoint(&members, &m.node).is_err())
             .unwrap();
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let reactor = Rc::new(Reactor::new(admission.clone()));
         let io = Rc::new(HttpIo::with_admission(
             reactor.clone(),
@@ -1648,7 +1651,7 @@ mod timing {
         topology::rails::{RailId, TransportPlan},
     };
 
-    fn page_request(admission: &Admission, attempt: u8) -> PeerRequest {
+    fn page_request(admission: &flow_control::Quotas<AdmissionPolicy>, attempt: u8) -> PeerRequest {
         let mut local = request(admission, attempt);
         local.operation = Operation::Page {
             page: PageId {
@@ -1663,7 +1666,10 @@ mod timing {
         local
     }
 
-    fn page_response(admission: &Rc<Admission>, request: &PeerRequest) -> PeerResponse {
+    fn page_response(
+        admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
+        request: &PeerRequest,
+    ) -> PeerResponse {
         let Operation::Page { page, .. } = &request.operation else {
             panic!()
         };
@@ -1702,9 +1708,9 @@ mod timing {
     #[test]
     fn page_timing_deterministic_delays_publish_once_only_after_verified_page() {
         let signers = signers();
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let sender = Forwarding::new(signers[0].clone());
         let receiver = Forwarding::new(signers[2].clone());
         let local = page_request(&admission, 1);
@@ -1745,7 +1751,9 @@ mod timing {
 
     #[test]
     fn page_timing_excludes_metadata_transit_native_and_opaque() {
-        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
+        let admission = flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
         let metrics = Metrics::default();
         for case in ["metadata", "bootstrap", "transit", "native", "opaque"] {
             let mut local = page_request(&admission, 1);
@@ -1784,7 +1792,9 @@ mod timing {
     #[test]
     fn page_timing_pending_future_drop_counts_once_without_partial_samples() {
         use std::task::{Context, Poll};
-        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
+        let admission = flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
         let metrics = Metrics::default();
         let local = page_request(&admission, 1);
         let clock = SimulationClock::new_at(8, Instant::now(), std::time::SystemTime::now());
@@ -1813,9 +1823,9 @@ mod timing {
     #[test]
     fn page_timing_invalid_signature_miss_and_drop_censor_without_partial_success() {
         let signers = signers();
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let sender = Forwarding::new(signers[0].clone());
         let receiver = Forwarding::new(signers[2].clone());
         let metrics = Metrics::default();
@@ -2024,7 +2034,7 @@ use crate::{
         encode_envelope,
     },
     runtime::{
-        admission::Admission,
+        admission::{AdmissionExt, AdmissionPolicy},
         deadline::{Deadline, RequestScope},
     },
     security::{
@@ -2060,7 +2070,10 @@ pub(super) fn signers() -> Vec<Rc<Signatures>> {
     let (signers, _) = identities();
     signers
 }
-pub(super) fn request(admission: &Admission, attempt: u8) -> PeerRequest {
+pub(super) fn request(
+    admission: &flow_control::Quotas<AdmissionPolicy>,
+    attempt: u8,
+) -> PeerRequest {
     let scope =
         RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(30)).unwrap();
     let object = ObjectId {
@@ -2102,13 +2115,13 @@ pub(super) fn request(admission: &Admission, attempt: u8) -> PeerRequest {
         route,
     }
 }
-pub(super) fn codec(admission: &Rc<Admission>) -> SecurityCodec {
+pub(super) fn codec(admission: &Rc<flow_control::Quotas<AdmissionPolicy>>) -> SecurityCodec {
     SecurityCodec::new(admission.clone(), BufferPool::new(admission.clone()))
 }
 
 /// Common signed HTTP plumbing. Scenarios retain their own membership and service.
 pub(crate) struct SocketFixture {
-    pub admission: Rc<Admission>,
+    pub admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     pub reactor: Rc<crate::runtime::reactor::Reactor>,
     pub io: Rc<crate::http::connection::HttpIo>,
     pub codec: Rc<SecurityCodec>,
@@ -2120,9 +2133,9 @@ impl SocketFixture {
         Self::with_body_limit(pool_limit, PAGE_BYTES + 16)
     }
     pub fn with_body_limit(pool_limit: usize, body_limit: u64) -> Self {
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let reactor = Rc::new(crate::runtime::reactor::Reactor::new(admission.clone()));
         let io = Rc::new(crate::http::connection::HttpIo::with_admission(
             reactor.clone(),

@@ -44,7 +44,7 @@ use crate::{
         AttemptId, Authorization, EncryptedAuthorization, KeyId, ObjectId, OpaqueMetadata,
         OriginContext, PeerOriginContext, RequestId, ResourceClass,
     },
-    runtime::{admission::Admission, deadline::RequestScope},
+    runtime::{admission::AdmissionPolicy, deadline::RequestScope},
 };
 use racer_crypto::aead;
 use std::{ops::Deref, rc::Rc};
@@ -52,7 +52,7 @@ use zeroize::Zeroizing;
 /// Decrypted context remains charged for the complete local origin operation.
 pub struct ChargedOriginContext {
     context: OriginContext,
-    _reservation: crate::runtime::admission::Reservation,
+    _reservation: flow_control::Charge<AdmissionPolicy>,
 }
 impl Deref for ChargedOriginContext {
     type Target = OriginContext;
@@ -101,7 +101,7 @@ fn bounds(object: &ObjectId, metadata: Option<&[u8]>, credential_length: usize) 
 }
 pub struct CredentialCrypto {
     keys: Rc<Keyring>,
-    admission: Rc<Admission>,
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
 }
 impl CredentialCrypto {
     /// Independently admitted same-worker context. No trust boundary is crossed;
@@ -134,7 +134,7 @@ impl CredentialCrypto {
             _reservation: reservation,
         })
     }
-    pub fn new(keys: Rc<Keyring>, admission: Rc<Admission>) -> Self {
+    pub fn new(keys: Rc<Keyring>, admission: Rc<flow_control::Quotas<AdmissionPolicy>>) -> Self {
         Self { keys, admission }
     }
     /// Borrow only for this bounded synchronous call; never retain, clone, enqueue,
@@ -245,7 +245,7 @@ impl CredentialCrypto {
         context
             .reservation
             .validate(ResourceClass::RequestContext, size)?;
-        if context.reservation.cache() != Some(&context.object.cache) {
+        if context.reservation.key() != Some(&context.object.cache) {
             return Err(Error::Unauthorized);
         }
         let output = self.admission.reserve(
@@ -297,9 +297,9 @@ mod tests {
     #[test]
     fn local_context_is_independently_charged_and_keeps_exact_sensitive_fields() {
         let keys = std::rc::Rc::new(crate::security::identity::keyring_tests::keys());
-        let admission = std::rc::Rc::new(crate::runtime::admission::Admission::new(
+        let admission = std::rc::Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let crypto = super::CredentialCrypto::new(keys, admission.clone());
         let scope = crate::runtime::deadline::RequestScope::new(
             crate::model::RequestId([4; 16]),
@@ -359,9 +359,9 @@ mod tests {
     }
     #[test]
     fn exact_roundtrip_nonce_freshness_admission_and_cancellation() {
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let crypto = CredentialCrypto::new(
             Rc::new(super::super::identity::keyring_tests::keys()),
             admission.clone(),
@@ -398,7 +398,7 @@ mod tests {
         limits.request_context_bytes = std::num::NonZeroUsize::new(1).unwrap();
         let crypto = CredentialCrypto::new(
             Rc::new(super::super::identity::keyring_tests::keys()),
-            Rc::new(Admission::new(limits)),
+            Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits))),
         );
         assert!(matches!(
             crypto.seal(&original, attempt, &self::scope()),
@@ -407,9 +407,9 @@ mod tests {
     }
     #[test]
     fn absent_authorization_is_charged_and_expired_context_is_rejected() {
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let crypto = CredentialCrypto::new(
             Rc::new(super::super::identity::keyring_tests::keys()),
             admission.clone(),
@@ -441,9 +441,9 @@ mod tests {
     fn rejects_substitution_and_distinguishes_absent_from_empty() {
         let crypto = CredentialCrypto::new(
             Rc::new(super::super::identity::keyring_tests::keys()),
-            Rc::new(Admission::new(
+            Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
-            )),
+            ))),
         );
         let original = origin();
         let scope = scope();

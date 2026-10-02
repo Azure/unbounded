@@ -1115,7 +1115,7 @@ mod tests {
         use crate::{
             memory::pool::BufferPool,
             model::{ExpiresAt, KeyId, Nonce, PageEnvelope, ResourceClass},
-            runtime::admission::Admission,
+            runtime::admission::AdmissionPolicy,
         };
         use std::{rc::Rc, time::UNIX_EPOCH};
         let scheduler = Arc::new(Subscriptions::new(Default::default()).unwrap());
@@ -1131,9 +1131,9 @@ mod tests {
         else {
             panic!()
         };
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let pool = BufferPool::new(admission.clone());
         let page = work.page().clone();
         let ciphertext = pool

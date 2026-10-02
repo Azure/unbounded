@@ -3,7 +3,7 @@
 //! Bundle owner traces, not the simulator's event scheduling or completion timing.
 use super::*;
 use crate::{
-    error::{Error, Operation},
+    error::Operation,
     memory::{
         cache::MemoryCache,
         page::PageResult,
@@ -54,7 +54,7 @@ struct MetadataOwners {
 }
 
 impl MetadataOwners {
-    fn reserve(admission: &Admission, cache: &CacheId) -> Self {
+    fn reserve(admission: &flow_control::Quotas<AdmissionPolicy>, cache: &CacheId) -> Self {
         let reserved = admission.reserve_fill(cache, false).unwrap();
         Self {
             bundle: super::Bundle {
@@ -76,13 +76,13 @@ impl Clone for MetadataOwners {
     }
 }
 
-fn admission(pages: usize) -> Rc<Admission> {
+fn admission(pages: usize) -> Rc<flow_control::Quotas<AdmissionPolicy>> {
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.plaintext_bytes = NonZeroUsize::new(pages * PLAIN).unwrap();
     limits.ciphertext_bytes = NonZeroUsize::new(pages * CIPHER).unwrap();
     limits.dirty_bytes = NonZeroUsize::new(CIPHER).unwrap();
     limits.metadata_entries = NonZeroUsize::new(16).unwrap();
-    Rc::new(Admission::new(limits))
+    Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)))
 }
 
 fn descriptor(cache: &CacheId, version: &str, length: usize) -> VersionMetadata {
@@ -107,7 +107,7 @@ fn page_id(metadata: &VersionMetadata) -> PageId {
 }
 
 fn allocated_page(
-    admission: &Rc<Admission>,
+    admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
     cache: &CacheId,
     version: &str,
     length: usize,
@@ -148,7 +148,7 @@ fn allocated_page(
     }
 }
 
-fn occupancy(admission: &Admission) -> [usize; 3] {
+fn occupancy(admission: &flow_control::Quotas<AdmissionPolicy>) -> [usize; 3] {
     admission.reclaim_buffers();
     [
         ResourceClass::Plaintext,
@@ -158,7 +158,12 @@ fn occupancy(admission: &Admission) -> [usize; 3] {
     .map(|class| admission.used(class))
 }
 
-fn checkpoint(label: &str, model: &Admission, real: &Admission, expected: [usize; 3]) {
+fn checkpoint(
+    label: &str,
+    model: &flow_control::Quotas<AdmissionPolicy>,
+    real: &flow_control::Quotas<AdmissionPolicy>,
+    expected: [usize; 3],
+) {
     assert_eq!(occupancy(model), expected, "abstract: {label}");
     assert_eq!(occupancy(real), expected, "production: {label}");
 }
@@ -304,7 +309,7 @@ fn fair_reclamation_matches_metadata_trace_and_keeps_other_cache() {
         ] {
             assert!(matches!(
                 admission.reserve(Some(a), class, amount),
-                Err(Error::Overloaded)
+                Err(flow_control::Error::Overloaded)
             ));
             // Local deficit takes precedence over global spare room,
             // runtime/admission.rs:149-156. Evicting B cannot remedy A's share.
@@ -428,7 +433,7 @@ impl Origin for NoTransport {
         &'a self,
         _: &'a OriginAuthority,
         _: &'a OriginContext,
-        _: crate::runtime::admission::Reservation,
+        _: flow_control::Charge<AdmissionPolicy>,
         _: &'a RequestScope,
     ) -> Operation<'a, MetadataReply> {
         Box::pin(async { panic!("bootstrap fixture already owns origin metadata") })
@@ -438,7 +443,7 @@ impl Origin for NoTransport {
         _: &'a OriginAuthority,
         _: &'a OriginContext,
         _: &'a PageId,
-        _: crate::runtime::admission::Reservation,
+        _: flow_control::Charge<AdmissionPolicy>,
         _: &'a RequestScope,
     ) -> Operation<'a, OriginPage> {
         Box::pin(async { panic!("bootstrap fixture already owns origin bytes") })
@@ -504,7 +509,7 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
     assert!(next_model.bundle.idle());
     assert!(matches!(
         model.reserve(Some(&cache), ResourceClass::DirtyCiphertext, CIPHER),
-        Err(Error::Overloaded)
+        Err(flow_control::Error::Overloaded)
     ));
     assert!(old_model.bundle.idle());
     assert!(next_model.bundle.idle());

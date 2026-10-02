@@ -630,7 +630,7 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
     use crate::runtime::reactor::{SocketAddress, simulation::Simulation};
     let sim = Simulation::new();
     let _environment = sim.enter();
-    let admission = Rc::new(Admission::new(limits()));
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits())));
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let io = Rc::new(HttpIo::with_admission(
         reactor.clone(),
@@ -639,7 +639,8 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
         i64::MAX as u64,
     ));
     let delivery = Rc::new(Delivery::new(
-        Rc::new(PipePool::new(admission.clone(), reactor.clone())),
+        Rc::new(new_pipe_pool(admission.clone())),
+        reactor.clone(),
         Duration::from_secs(2),
     ));
     let reads = Rc::new(Heads {
@@ -698,7 +699,7 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
 use crate::{
     client::ClientRequest,
     http::Codec,
-    memory::{delivery::Delivery, pipe::PipePool},
+    memory::{delivery::Delivery, pipe::new_pipe_pool},
     model::{ExpiresAt, Limits, ObjectMetadata, ObjectVersion, StrongEtag},
     read::ReadResponse,
     runtime::reactor::Reactor,
@@ -826,7 +827,7 @@ impl Fixture {
     }
     fn with_limits(limits: Limits) -> Self {
         let root = Root::new();
-        let admission = Rc::new(Admission::new(limits));
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
         let reactor = Rc::new(Reactor::new(admission.clone()));
         let io = Rc::new(HttpIo::with_admission(
             reactor.clone(),
@@ -835,7 +836,8 @@ impl Fixture {
             i64::MAX as u64,
         ));
         let delivery = Rc::new(Delivery::new(
-            Rc::new(PipePool::new(admission.clone(), reactor.clone())),
+            Rc::new(new_pipe_pool(admission.clone())),
+            reactor.clone(),
             Duration::from_secs(2),
         ));
         let reads = Rc::new(Heads {
@@ -1289,7 +1291,8 @@ fn actual_uds_nonempty_range_and_late_failure_truncates() {
         let failures = crate::telemetry::failures::Failures::default();
         let observer = failures.observer(WorkerId(0));
         let delivery = Rc::new(Delivery::new(
-            Rc::new(PipePool::new(admission.clone(), fixture.reactor.clone())),
+            Rc::new(new_pipe_pool(admission.clone())),
+            fixture.reactor.clone(),
             Duration::from_secs(2),
         ));
         fixture.listeners.responses = Rc::new(
@@ -1419,7 +1422,10 @@ fn subscription_retains_delivered_page_until_release_and_rejects_invalid_release
     }
 }
 
-fn body_fixture(queue: usize, fail_first: bool) -> (Fixture, Rc<PipePool>) {
+fn body_fixture(
+    queue: usize,
+    fail_first: bool,
+) -> (Fixture, Rc<flow_control::pipe::PipePool<AdmissionPolicy>>) {
     body_fixture_with_large_page(queue, fail_first, false)
 }
 
@@ -1427,14 +1433,18 @@ fn body_fixture_with_large_page(
     queue: usize,
     fail_first: bool,
     large_page: bool,
-) -> (Fixture, Rc<PipePool>) {
+) -> (Fixture, Rc<flow_control::pipe::PipePool<AdmissionPolicy>>) {
     let mut limits = limits();
     limits.pipes = NonZeroUsize::new(1).unwrap();
     limits.queue_entries = NonZeroUsize::new(queue).unwrap();
     let mut fixture = Fixture::with_limits(limits);
     let admission = fixture.listeners.admission.clone();
-    let pipes = Rc::new(PipePool::new(admission.clone(), fixture.reactor.clone()));
-    let delivery = Rc::new(Delivery::new(pipes.clone(), Duration::from_secs(2)));
+    let pipes = Rc::new(new_pipe_pool(admission.clone()));
+    let delivery = Rc::new(Delivery::new(
+        pipes.clone(),
+        fixture.reactor.clone(),
+        Duration::from_secs(2),
+    ));
     fixture.listeners.responses = Rc::new(Responses::new(
         fixture.listeners.io.clone(),
         delivery.clone(),
@@ -1478,7 +1488,10 @@ fn assert_no_body_leases(fixture: &Fixture) {
     }
 }
 
-fn assert_only_idle_pipes(fixture: &Fixture, pipes: &crate::memory::pipe::PipePool) {
+fn assert_only_idle_pipes(
+    fixture: &Fixture,
+    pipes: &flow_control::pipe::PipePool<AdmissionPolicy>,
+) {
     fixture.listeners.admission.reclaim_buffers();
     use crate::model::ResourceClass;
     assert_eq!(fixture.listeners.active_connections(), 0);
@@ -1607,7 +1620,11 @@ fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
     fixture.listeners.responses = Rc::new(
         Responses::new(
             fixture.listeners.io.clone(),
-            Rc::new(Delivery::new(pipes.clone(), Duration::from_secs(2))),
+            Rc::new(Delivery::new(
+                pipes.clone(),
+                fixture.reactor.clone(),
+                Duration::from_secs(2),
+            )),
         )
         .with_observer(failures.observer(crate::model::WorkerId(0))),
     );
@@ -1642,7 +1659,11 @@ fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
 fn actual_uds_first_page_failure_is_complete_503() {
     let (mut fixture, _pipes) = body_fixture(16, true);
     let failures = crate::telemetry::failures::Failures::default();
-    let delivery = Rc::new(Delivery::new(_pipes.clone(), Duration::from_secs(2)));
+    let delivery = Rc::new(Delivery::new(
+        _pipes.clone(),
+        fixture.reactor.clone(),
+        Duration::from_secs(2),
+    ));
     fixture.listeners.responses = Rc::new(
         Responses::new(fixture.listeners.io.clone(), delivery)
             .with_observer(failures.observer(crate::model::WorkerId(0))),

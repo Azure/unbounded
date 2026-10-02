@@ -2,7 +2,7 @@
 use super::{lifecycle::*, test_support::*, *};
 use crate::{
     model::*,
-    runtime::{admission::Admission, environment},
+    runtime::{admission::AdmissionPolicy, environment},
     security::connection::signature_tests::network,
 };
 use rdma_verbs::testing::{Contention, State};
@@ -110,9 +110,9 @@ fn sender_case(terminal: Option<Error>) {
     let receive = SessionLease::test(receiver.clone(), signers[0].node().clone());
     let send = SessionLease::test(sender.clone(), signers[0].node().clone());
     let devices = Rc::new(Devices::test(io.clone()));
-    let admission = Rc::new(Admission::new(
+    let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(true).limits,
-    ));
+    )));
     let transfer = RdmaTransfer::new(Rc::new(Sessions::new(devices, 2)));
     let mut scope = scope();
     if terminal == Some(Error::DeadlineExceeded) {
@@ -323,7 +323,9 @@ fn activation_contention_retains_quota_and_cancellation_releases_unsubmitted_con
     for activation_lock in [false, true] {
         let (io, port) = pair(1).unwrap();
         let mut native = NativeService::new(port);
-        let admission = Admission::new(crate::test_support::cluster::config(true).limits);
+        let admission = flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(true).limits,
+        ));
         let scope = scope();
         let plan = || rdma_verbs::Configuration {
             discover: false,

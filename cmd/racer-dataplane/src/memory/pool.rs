@@ -2,28 +2,28 @@
 use crate::{
     error::{Error, Result},
     model::{CacheId, PAGE_BYTES, PageEnvelope, PageId, ResourceClass},
-    runtime::admission::{Admission, Reservation},
+    runtime::admission::{AdmissionExt, AdmissionPolicy},
 };
 use std::{rc::Rc, sync::Arc};
 
 #[derive(Clone)]
 pub struct BufferPool {
-    admission: Rc<Admission>,
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
 }
 /// Mutable staging buffer, not proof of authentication and not client-deliverable.
 /// Fixed-size owned backing stays at the same address when this owner moves.
 pub struct PlaintextBuffer {
     bytes: Vec<u8>,
-    reservation: Option<Reservation>,
+    reservation: Option<flow_control::Charge<AdmissionPolicy>>,
 }
 impl PlaintextBuffer {
-    pub(crate) fn into_parts(mut self) -> (Box<[u8]>, Reservation) {
+    pub(crate) fn into_parts(mut self) -> (Box<[u8]>, flow_control::Charge<AdmissionPolicy>) {
         (
             std::mem::take(&mut self.bytes).into_boxed_slice(),
             self.reservation.take().expect("owned reservation"),
         )
     }
-    pub(crate) fn reservation(&self) -> &Reservation {
+    pub(crate) fn reservation(&self) -> &flow_control::Charge<AdmissionPolicy> {
         self.reservation.as_ref().expect("owned reservation")
     }
 }
@@ -52,7 +52,7 @@ pub struct VerifiedPage {
 pub(crate) struct VerifiedBytes {
     pub page: PageId,
     pub bytes: Vec<u8>,
-    pub reservation: Reservation,
+    pub reservation: flow_control::Charge<AdmissionPolicy>,
 }
 impl Drop for VerifiedBytes {
     fn drop(&mut self) {
@@ -68,7 +68,7 @@ pub(crate) struct CiphertextBytes {
     pub checksum: std::sync::OnceLock<u64>,
     pub envelope: PageEnvelope,
     pub bytes: Vec<u8>,
-    pub reservation: Reservation,
+    pub reservation: flow_control::Charge<AdmissionPolicy>,
 }
 impl Drop for CiphertextBytes {
     fn drop(&mut self) {
@@ -76,12 +76,12 @@ impl Drop for CiphertextBytes {
     }
 }
 impl BufferPool {
-    pub fn new(admission: Rc<Admission>) -> Self {
+    pub fn new(admission: Rc<flow_control::Quotas<AdmissionPolicy>>) -> Self {
         Self { admission }
     }
     pub fn plaintext(
         &self,
-        mut reservation: Reservation,
+        mut reservation: flow_control::Charge<AdmissionPolicy>,
         length: usize,
     ) -> Result<PlaintextBuffer> {
         if length == 0 || length > PAGE_BYTES as usize {
@@ -91,7 +91,7 @@ impl BufferPool {
             &reservation,
             ResourceClass::Plaintext,
             length,
-            reservation.cache(),
+            reservation.key(),
         )?;
         let bytes = reservation.buffer(length)?;
         // Keep exact charged capacity, but no Box while reactor pointers are live.
@@ -104,7 +104,7 @@ impl BufferPool {
     }
     pub fn ciphertext(
         &self,
-        mut reservation: Reservation,
+        mut reservation: flow_control::Charge<AdmissionPolicy>,
         envelope: PageEnvelope,
         bytes: Vec<u8>,
     ) -> Result<CiphertextPage> {
@@ -137,15 +137,15 @@ impl BufferPool {
     }
     fn validate_reservation(
         &self,
-        reservation: &Reservation,
+        reservation: &flow_control::Charge<AdmissionPolicy>,
         class: ResourceClass,
         capacity: usize,
         cache: Option<&CacheId>,
     ) -> Result<()> {
-        if !self.admission.owns(reservation) || cache.is_none() || reservation.cache() != cache {
+        if !self.admission.owns(reservation) || cache.is_none() || reservation.key() != cache {
             return Err(Error::InvalidConfiguration);
         }
-        reservation.validate(class, capacity)
+        reservation.validate(class, capacity).map_err(Into::into)
     }
     pub(super) fn validate_page(&self, page: &super::page::PageResult) -> Result<()> {
         page.validate_metadata()?;
@@ -185,9 +185,12 @@ impl CiphertextPage {
     /// Rehome a completed receive before retaining it in another worker's cache.
     /// Admit the new charge first. Shared transport owners keep their original
     /// allocation and charge until fenced; only exclusive bytes can move in place.
-    pub(crate) fn rehome(mut self, reservation: Reservation) -> Result<Self> {
+    pub(crate) fn rehome(
+        mut self,
+        reservation: flow_control::Charge<AdmissionPolicy>,
+    ) -> Result<Self> {
         reservation.validate(ResourceClass::Ciphertext, self.inner.bytes.capacity())?;
-        if reservation.cache() != Some(&self.envelope().page.version.object.cache) {
+        if reservation.key() != Some(&self.envelope().page.version.object.cache) {
             return Err(Error::InvalidConfiguration);
         }
         if let Some(inner) = Arc::get_mut(&mut self.inner) {
@@ -257,13 +260,15 @@ pub(crate) mod tests {
         runtime::reactor::IoBuffer,
     };
 
-    pub(in crate::memory) fn admission(entries: usize) -> Rc<Admission> {
+    pub(in crate::memory) fn admission(
+        entries: usize,
+    ) -> Rc<flow_control::Quotas<AdmissionPolicy>> {
         let mut limits = crate::test_support::cluster::config(false).limits;
         limits.metadata_entries = std::num::NonZeroUsize::new(entries).unwrap();
-        Rc::new(Admission::new(limits))
+        Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)))
     }
     pub(in crate::memory) fn bundle(
-        admission: &Rc<Admission>,
+        admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
         version: &str,
     ) -> super::super::page::PageResult {
         use crate::model::{CacheKey, ObjectId, ObjectVersion, StrongEtag};
@@ -283,7 +288,7 @@ pub(crate) mod tests {
         )
     }
     pub(crate) fn bundle_for(
-        admission: &Rc<Admission>,
+        admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
         metadata: VersionMetadata,
     ) -> super::super::page::PageResult {
         let page = PageId {

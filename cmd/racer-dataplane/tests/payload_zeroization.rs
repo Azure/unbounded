@@ -6,7 +6,7 @@ use racer_dataplane::{
         CacheId, CacheKey, KeyId, Nonce, ObjectId, ObjectVersion, PageEnvelope, PageId, PageNumber,
         ResourceClass, StrongEtag,
     },
-    runtime::{admission::Admission, reactor::IoBuffer},
+    runtime::{admission::AdmissionPolicy, reactor::IoBuffer},
 };
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -79,7 +79,9 @@ fn final_payload_owner_scrubs_full_allocation_on_reclaim_and_rejection() {
     let cache = CacheId("44444444-4444-4444-8444-444444444444".into());
     for ciphertext in [false, true] {
         for scenario in ["retained", "small", "full", "stopped", "destroyed"] {
-            let admission = Rc::new(Admission::new(config.limits.clone()));
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+                config.limits.clone(),
+            )));
             let pool = BufferPool::new(admission.clone());
             let capacity = if scenario == "small" { 4096 } else { 1 << 20 };
             let class = if ciphertext {
@@ -225,7 +227,9 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
         "cancel-decrypt",
         "cancel-encrypt",
     ] {
-        let admission = Rc::new(Admission::new(config.limits.clone()));
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+            config.limits.clone(),
+        )));
         let pool = BufferPool::new(admission.clone());
         let key = keys.active(&cache, KeyPurpose::Page).unwrap();
         let mut descriptor = PageEnvelope {

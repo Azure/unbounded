@@ -9,7 +9,7 @@ use racer_dataplane::{
     },
     error::{Error, Operation, Result},
     http::{Codec, connection::HttpIo, connection::HttpPool},
-    memory::{cache::MemoryCache, delivery::Delivery, pipe::PipePool, pool::BufferPool},
+    memory::{cache::MemoryCache, delivery::Delivery, pipe::new_pipe_pool, pool::BufferPool},
     model::{Limits, PAGE_BYTES, ResourceClass, *},
     origin::OriginClient,
     peer::{
@@ -28,7 +28,7 @@ use racer_dataplane::{
         range_stream::RangeStreams,
     },
     runtime::{
-        admission::Admission,
+        admission::AdmissionPolicy,
         crypto::{self, CryptoClient},
         deadline::RequestScope,
         reactor::Reactor,
@@ -352,7 +352,7 @@ fn adapter_connection(
 struct Rig {
     bootstrap: Bootstrap,
     drivers: Rc<racer_dataplane::read::drivers::DriverQueue>,
-    admission: Rc<Admission>,
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     reactor: Rc<Reactor>,
     crypto: Rc<CryptoClient>,
     engine: Option<RefCell<PageCryptoEngine>>,
@@ -363,7 +363,7 @@ struct Rig {
     coordinator: Rc<Coordinator>,
     io: Rc<HttpIo>,
     responses: Rc<Responses>,
-    pipes: Rc<PipePool>,
+    pipes: Rc<flow_control::pipe::PipePool<AdmissionPolicy>>,
     writer_task: RefCell<Option<Operation<'static, ()>>>,
     adapter: Adapter,
     _scratch: Scratch,
@@ -427,7 +427,7 @@ impl Rig {
         let (admission, reactor) = match &runtime {
             Some(runtime) => (runtime.admission.clone(), runtime.reactor.clone()),
             None => {
-                let admission = Rc::new(Admission::new(budget));
+                let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(budget)));
                 let reactor = Rc::new(Reactor::new(admission.clone()));
                 (admission, reactor)
             }
@@ -549,9 +549,10 @@ impl Rig {
                 owners: directory.clone(),
             },
         ));
-        let pipes = Rc::new(PipePool::new(admission.clone(), reactor.clone()));
+        let pipes = Rc::new(new_pipe_pool(admission.clone()));
         let delivery = Rc::new(Delivery::new(
             pipes.clone(),
+            reactor.clone(),
             // This fixture polls real crypto inline rather than on its paired
             // production thread. Debug-build page crypto must not count as a
             // two-second client stall while the fixture executor is occupied.
@@ -738,7 +739,7 @@ fn open_fixture_storage(
     slab_bytes: u64,
     entries: usize,
     reactor: &Rc<Reactor>,
-    admission: &Rc<Admission>,
+    admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
     buffers: BufferPool,
     availability: Rc<racer_dataplane::control::state::Availability>,
 ) -> (Rc<Index>, Rc<StoreReader>, Rc<StoreWriter>) {
@@ -865,7 +866,7 @@ impl Bootstrap {
     fn new(
         sender: Rc<Keyring>,
         receiver: Rc<Forwarding>,
-        admission: Rc<Admission>,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         coordinator: Rc<Coordinator>,
         membership: MembershipLease,
     ) -> Self {

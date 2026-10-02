@@ -349,7 +349,7 @@ mod tests {
         let mut plan = four_pair_plan(&config);
         let limits = size_workers(&config.limits, &mut plan, config.enable_rdma).unwrap();
         assert_eq!(plan.pairs.len(), 5);
-        let admission = Admission::new(limits.clone());
+        let admission = flow_control::Quotas::new(AdmissionPolicy::new(limits.clone()));
         let page = crate::model::PAGE_BYTES as usize;
         for (class, floor) in [
             (ResourceClass::Plaintext, 3 * page),
@@ -610,7 +610,7 @@ mod tests {
             assert_eq!(port.capacity(), 1);
             let devices = Devices::new();
             devices.attach(port).unwrap();
-            let admission = Admission::new(limits.clone());
+            let admission = flow_control::Quotas::new(AdmissionPolicy::new(limits.clone()));
             let startup = scope(Duration::from_secs(10)).unwrap();
             let mut activation =
                 devices.activate(vec![], &admission, crate::rdma::MAX_CIPHERTEXT, &startup);
@@ -727,7 +727,7 @@ mod tests {
         assert_eq!(port.capacity(), 2);
         let devices = Devices::new();
         devices.attach(port).unwrap();
-        let admission = Admission::new(limits);
+        let admission = flow_control::Quotas::new(AdmissionPolicy::new(limits));
         let held = admission
             .reserve(None, ResourceClass::Registered, 1)
             .unwrap();
@@ -780,7 +780,9 @@ mod tests {
             .native
             .prepare(std::iter::once(WorkerId(0)), &app.limits)
             .unwrap();
-        let admission = Rc::new(Admission::new(app.limits.clone()));
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+            app.limits.clone(),
+        )));
         let (io, engine) = crypto::pair(WorkerId(0), 0, app.limits.queue_entries);
         let runtime = WorkerRuntime {
             reactor: Rc::new(Reactor::new(admission.clone())),

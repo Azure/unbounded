@@ -841,7 +841,7 @@ fn exchange(
 
 struct RelayFixture {
     signers: Vec<Rc<Signatures>>,
-    admissions: Vec<Rc<Admission>>,
+    admissions: Vec<Rc<flow_control::Quotas<AdmissionPolicy>>>,
     reactors: Vec<Rc<Reactor>>,
     ios: Vec<Rc<HttpIo>>,
     listener: TcpListener,
@@ -1010,9 +1010,9 @@ impl RelayFixture {
         let signers = signers();
         let admissions: Vec<_> = (0..3)
             .map(|_| {
-                Rc::new(Admission::new(
+                Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                     crate::test_support::cluster::config(false).limits,
-                ))
+                )))
             })
             .collect();
         let reactors: Vec<_> = admissions
@@ -1474,9 +1474,9 @@ fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution()
         let a = Forwarding::new(signers[0].clone());
         let b = Forwarding::new(signers[1].clone());
         let c = Forwarding::new(signers[2].clone());
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let local = request(&admission, 1);
         let (signed, _) = a.sign_request_to(local, signers[1].node()).unwrap();
         let verified = b.verify_request(signed).unwrap();

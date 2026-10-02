@@ -1,10 +1,10 @@
 //! Racer-specific opaque relay. Both connections remain completion-owned.
 use super::*;
-use crate::memory::pipe::{MAX_PIPE_BYTES, PipeLease};
+use flow_control::pipe::{MAX_PIPE_BYTES, PipeLease};
 struct Transit {
     source: ConnectionLease,
     destination: ConnectionLease,
-    pipe: PipeLease,
+    pipe: PipeLease<AdmissionPolicy>,
     fallback: Option<OwnedBuffer>,
     pending: std::ops::Range<usize>,
     copied: bool,
@@ -22,7 +22,7 @@ impl HttpIo {
         &self,
         source: ConnectionLease,
         destination: ConnectionLease,
-        pipe: Option<PipeLease>,
+        pipe: Option<PipeLease<AdmissionPolicy>>,
         scope: &RequestScope,
     ) -> Result<ConnectionLease> {
         if source.receive_remaining() != destination.send_remaining()

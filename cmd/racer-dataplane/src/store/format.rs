@@ -1,6 +1,6 @@
 //! Versioned little-endian encrypted records. Header SHA-256 is framing integrity;
 //! payload integrity remains AEAD at the fill boundary. Padding is never returned.
-use crate::runtime::admission::Reservation;
+use crate::runtime::admission::AdmissionPolicy;
 use crate::{
     error::{Error, Result},
     memory::page::CiphertextCopy,
@@ -30,7 +30,7 @@ pub struct RecordHeader {
 }
 pub struct EncodedRecord {
     pub header: RecordHeader,
-    pub buffer: AlignedBuffer<Reservation>,
+    pub buffer: AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
 }
 pub struct DecodedRecord {
     pub header: RecordHeader,
@@ -125,7 +125,7 @@ pub fn encode(
     page: &CiphertextCopy,
     generation: Generation,
     alignment: Alignment,
-    buffer: AlignedBuffer<Reservation>,
+    buffer: AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
 ) -> Result<EncodedRecord> {
     encode_at(page, generation, alignment, 0, buffer)
 }
@@ -134,7 +134,7 @@ pub fn encode_at(
     generation: Generation,
     alignment: Alignment,
     offset: u64,
-    mut buffer: AlignedBuffer<Reservation>,
+    mut buffer: AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
 ) -> Result<EncodedRecord> {
     let layout = layout(page, generation)?;
     let logical_bytes = layout.logical_bytes;
@@ -157,7 +157,10 @@ pub fn encode_at(
         buffer,
     })
 }
-pub fn parse(buffer: &AlignedBuffer<Reservation>, extent: Extent) -> Result<DecodedRecord> {
+pub fn parse(
+    buffer: &AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
+    extent: Extent,
+) -> Result<DecodedRecord> {
     parse_bytes(buffer.bytes()?, extent)
 }
 pub fn parse_bytes(bytes: &[u8], extent: Extent) -> Result<DecodedRecord> {
@@ -250,7 +253,7 @@ pub fn parse_bytes(bytes: &[u8], extent: Extent) -> Result<DecodedRecord> {
     })
 }
 pub fn decode(
-    buffer: &AlignedBuffer<Reservation>,
+    buffer: &AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
     expected: &RecordHeader,
 ) -> Result<PageEnvelope> {
     let actual = parse(buffer, expected.extent)?.header;
@@ -287,16 +290,17 @@ mod tests {
     use crate::{
         memory::pool::{CiphertextBytes, CiphertextPage},
         model::{ExpiresAt, PAGE_BYTES, ResourceClass},
-        runtime::admission::Admission,
     };
     use std::{sync::Arc, time::UNIX_EPOCH};
 
-    fn admission() -> Admission {
-        Admission::new(crate::test_support::cluster::config(false).limits)
+    fn admission() -> flow_control::Quotas<AdmissionPolicy> {
+        flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        ))
     }
 
     fn page(
-        admission: &Admission,
+        admission: &flow_control::Quotas<AdmissionPolicy>,
         length: usize,
         number: u64,
         cache: &str,
@@ -339,10 +343,10 @@ mod tests {
     }
 
     fn buffer(
-        admission: &Admission,
+        admission: &flow_control::Quotas<AdmissionPolicy>,
         alignment: Alignment,
         length: usize,
-    ) -> AlignedBuffer<Reservation> {
+    ) -> AlignedBuffer<flow_control::Charge<AdmissionPolicy>> {
         alignment
             .allocate(
                 length,

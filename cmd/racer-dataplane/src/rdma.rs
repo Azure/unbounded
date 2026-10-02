@@ -24,7 +24,7 @@ use crate::{
     memory::pool::{BufferPool, CiphertextPage},
     model::{NodeId, PageEnvelope, ResourceClass, TransferId},
     runtime::{
-        admission::Admission,
+        admission::AdmissionPolicy,
         deadline::{Deadline, RequestScope},
     },
     security::{connection::VerifiedHead, identity::VerifiedPeer},
@@ -916,7 +916,7 @@ impl RdmaTransfer {
         grant: Grant,
         head: &'a VerifiedHead,
         envelope: PageEnvelope,
-        admission: &'a Rc<Admission>,
+        admission: &'a Rc<flow_control::Quotas<AdmissionPolicy>>,
         scope: &'a RequestScope,
     ) -> Operation<'a, CiphertextPage> {
         Box::pin(async move {
@@ -1141,7 +1141,7 @@ impl Devices {
     pub fn activate<'a>(
         &'a self,
         publication: Vec<RailMapping>,
-        admission: &'a Admission,
+        admission: &'a flow_control::Quotas<AdmissionPolicy>,
         bytes_per_slot: usize,
         scope: &'a RequestScope,
     ) -> Operation<'a, Vec<RailMapping>> {
@@ -1169,6 +1169,7 @@ impl Devices {
                     admission
                         .reserve(None, ResourceClass::Registered, charge)
                         .map(|q| std::sync::Arc::new(q) as rdma_verbs::Guard)
+                        .map_err(Error::from)
                 })
                 .collect::<Result<Vec<_>>>()?;
             let requested = publication.clone();

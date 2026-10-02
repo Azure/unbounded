@@ -1,530 +1,50 @@
-//! Bounded, nonblocking, per-reader kernel pipes.
-//!
-//! Each lease owns both descriptors and its admission charge. Idle empty pipes
-//! retain that charge in the worker-local pool. No descriptor or backing page is
-//! recycled while a reader owns the lease. Writes copy into kernel
-//! pipe pages before splice: socket acceptance is not a userspace page reuse fence.
-use crate::runtime::reactor::Descriptor;
+//! Racer policy and request-scope wiring for the generic pipe pool.
 use crate::{
-    error::{Error, Operation, Result},
+    error::Operation,
     model::ResourceClass,
     runtime::{
-        admission::{Admission, Reservation},
+        admission::{AdmissionExt, AdmissionPolicy},
         deadline::RequestScope,
-        reactor::Reactor,
     },
 };
-use std::{
-    cell::RefCell,
-    collections::VecDeque,
-    future::poll_fn,
-    io,
-    os::fd::{AsFd, AsRawFd, FromRawFd},
-    rc::{Rc, Weak},
-    task::{Poll, Waker},
+use flow_control::{
+    Quotas,
+    pipe::{PipeLease, PipePool},
 };
+use std::{rc::Rc, task::Waker};
 
-/// Maximum kernel buffer capacity per admitted reader. Pipe admission is in pipe
-/// units, so total pipe capacity is bounded by Limits::pipes * MAX_PIPE_BYTES.
-/// Spliced bytes retained by sockets are subject to socket buffer limits instead.
-pub const MAX_PIPE_BYTES: usize = 64 * 1024;
-
-pub struct PipePool {
-    admission: Rc<Admission>,
-    reactor: Rc<Reactor>,
-    waiting: Waiters,
-    idle: Rc<RefCell<Vec<PipeResources>>>,
+pub fn new_pipe_pool(admission: Rc<Quotas<AdmissionPolicy>>) -> PipePool<AdmissionPolicy> {
+    let waiter_limit = admission.limits().queue_entries.get();
+    PipePool::new(
+        admission,
+        ResourceClass::Pipe,
+        ResourceClass::RequestContext,
+        waiter_limit,
+    )
 }
 
-type Waiters = Rc<RefCell<VecDeque<Rc<RefCell<Option<Waker>>>>>>;
-
-// Contains no reactor reference: a pending send can own this through its fence.
-struct Notify(Waiters);
-impl Drop for Notify {
-    fn drop(&mut self) {
-        wake_front(&self.0);
-    }
-}
-fn wake_front(waiters: &Waiters) {
-    let wake = waiters
-        .borrow()
-        .front()
-        .and_then(|entry| entry.borrow().clone());
-    if let Some(wake) = wake {
-        wake.wake();
-    }
-}
-struct Waiting {
-    queue: Waiters,
-    entry: Rc<RefCell<Option<Waker>>>,
-    _reservation: Reservation,
-}
-impl Drop for Waiting {
-    fn drop(&mut self) {
-        {
-            let mut queue = self.queue.borrow_mut();
-            queue.retain(|entry| !Rc::ptr_eq(entry, &self.entry));
-            if queue.is_empty() {
-                // Do not retain queue storage after its admission charges leave.
-                *queue = VecDeque::new();
-            }
-        }
-        wake_front(&self.queue);
-    }
-}
-
-pub struct PipeLease {
-    resources: Option<PipeResources>,
-    pool: Weak<RefCell<Vec<PipeResources>>>,
-    admission: Weak<Admission>,
-    _notify: Notify,
-}
-
-struct PipeResources {
-    read: Descriptor,
-    write: Descriptor,
-    capacity: usize,
-    buffered: usize,
-    // Declared after the descriptors so capacity is returned only after closing.
-    _reservation: Reservation,
-}
-
-impl Drop for PipeLease {
-    fn drop(&mut self) {
-        // Reactor ownership keeps the lease alive through every accepted CQE.
-        // Never recycle canceled/partially drained payloads: close those pipes.
-        if let Some(resources) = self.resources.take() {
-            if resources.buffered == 0 && self.admission.upgrade().is_some_and(|a| !a.is_stopped())
-            {
-                if let Some(pool) = self.pool.upgrade() {
-                    pool.borrow_mut().push(resources);
-                }
-            }
-        }
-        // Notify drops after the pipe has been recycled or its charge released.
-    }
-}
-
-impl PipePool {
-    pub fn new(admission: Rc<Admission>, reactor: Rc<Reactor>) -> Self {
-        Self {
-            admission,
-            reactor,
-            waiting: Rc::default(),
-            idle: Rc::default(),
-        }
-    }
-
-    pub(crate) fn admission(&self) -> &Admission {
-        &self.admission
-    }
-
-    pub(crate) fn reactor(&self) -> &Reactor {
-        &self.reactor
-    }
-
-    /// Empty retained pipes, still charged to the worker's fixed pipe budget.
-    pub fn idle_count(&self) -> usize {
-        self.idle.borrow().len()
-    }
-
-    /// FIFO scheduling above immediate raw admission. At most queue_entries wait
-    /// without pipes or new page acquisitions; each entry charges context bytes
-    /// for its guard, queue slot, wake cell, and cancellation registration.
-    /// The owning worker's bounded tick checks deadlines and stopped admission.
-    pub(crate) fn acquire_wait<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, PipeLease> {
-        Box::pin(async move {
-            scope.check()?;
-            if self.waiting.borrow().is_empty() {
-                match self.acquire() {
-                    Err(Error::Overloaded) => {}
-                    result => return result,
-                }
-            }
-            if self.waiting.borrow().len() >= self.admission.limits().queue_entries.get() {
-                return Err(Error::Overloaded);
-            }
-            let reservation = self.admission.reserve(
-                None,
-                ResourceClass::RequestContext,
-                std::mem::size_of::<Waiting>() + 128,
-            )?;
+pub(crate) fn acquire_wait<'a>(
+    pool: &'a PipePool<AdmissionPolicy>,
+    scope: &'a RequestScope,
+) -> Operation<'a, PipeLease<AdmissionPolicy>> {
+    Box::pin(pool.acquire_wait(
+        || scope.check(),
+        || {
             let cancellation = scope.cancellation.subscribe()?;
-            let entry = Rc::new(RefCell::new(None));
-            self.waiting.borrow_mut().push_back(entry.clone());
-            let waiting = Waiting {
-                queue: self.waiting.clone(),
-                entry,
-                _reservation: reservation,
-            };
-            poll_fn(|cx| {
-                cancellation.register(cx.waker());
-                scope.check()?;
-                if self.admission.is_stopped() {
-                    return Poll::Ready(Err(Error::Unavailable));
-                }
-                *waiting.entry.borrow_mut() = Some(cx.waker().clone());
-                if self
-                    .waiting
-                    .borrow()
-                    .front()
-                    .is_some_and(|entry| Rc::ptr_eq(entry, &waiting.entry))
-                {
-                    match self.acquire() {
-                        Err(Error::Overloaded) => {}
-                        result => return Poll::Ready(result),
-                    }
-                }
-                Poll::Pending
-            })
-            .await
-        })
-    }
-
-    /// Reserve before creating descriptors. Exhaustion never waits for a reader.
-    pub fn acquire(&self) -> Result<PipeLease> {
-        if self.admission.is_stopped() {
-            return Err(Error::Unavailable);
-        }
-        if let Some(resources) = self.idle.borrow_mut().pop() {
-            return Ok(self.lease(resources));
-        }
-        let reservation = self.admission.reserve(None, ResourceClass::Pipe, 1)?;
-        reservation.validate(ResourceClass::Pipe, 1)?;
-        #[cfg(test)]
-        if let Some(sim) = crate::runtime::reactor::simulation::Simulation::current() {
-            let (read, write) = sim.pipe(MAX_PIPE_BYTES);
-            return Ok(self.lease(PipeResources {
-                read,
-                write,
-                capacity: MAX_PIPE_BYTES,
-                buffered: 0,
-                _reservation: reservation,
-            }));
-        }
-        let mut fds = [-1; 2];
-        // SAFETY: pipe2 initializes exactly two descriptors on success.
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } < 0 {
-            return Err(Error::Io);
-        }
-        // SAFETY: both descriptors were newly created and have unique owners.
-        let read = unsafe { Descriptor::from_raw_fd(fds[0]) };
-        let write = unsafe { Descriptor::from_raw_fd(fds[1]) };
-        // SAFETY: fcntl operates on a live descriptor and requires no pointer.
-        let mut capacity = unsafe { libc::fcntl(write.as_raw_fd(), libc::F_GETPIPE_SZ) };
-        if capacity < 0 {
-            return Err(Error::Io);
-        }
-        if capacity as usize != MAX_PIPE_BYTES {
-            // Request one bounded chunk once at creation, before pooling. Under
-            // UID pipe pressure growth may fail; retain the smaller actual size.
-            // SAFETY: the empty pipe can be resized without borrowing user memory.
-            let resized = unsafe {
-                libc::fcntl(write.as_raw_fd(), libc::F_SETPIPE_SZ, MAX_PIPE_BYTES as i32)
-            };
-            if resized > 0 {
-                capacity = resized;
-            }
-        }
-        if capacity <= 0 || capacity as usize > MAX_PIPE_BYTES {
-            return Err(Error::Io);
-        }
-        Ok(self.lease(PipeResources {
-            read,
-            write,
-            capacity: capacity as usize,
-            buffered: 0,
-            _reservation: reservation,
-        }))
-    }
-
-    fn lease(&self, resources: PipeResources) -> PipeLease {
-        PipeLease {
-            resources: Some(resources),
-            pool: Rc::downgrade(&self.idle),
-            admission: Rc::downgrade(&self.admission),
-            _notify: Notify(self.waiting.clone()),
-        }
-    }
-}
-
-impl PipeLease {
-    /// Transit benefits from a full bounded chunk even when the UID's default
-    /// pipe size has shrunk. Failure to grow is harmless: use the actual capacity.
-    pub(crate) fn prepare_transit(&mut self) {
-        let pipe = self.resources.as_mut().unwrap();
-        #[cfg(test)]
-        if pipe.write.as_sim().is_some() {
-            return;
-        }
-        if pipe.capacity < MAX_PIPE_BYTES && pipe.buffered == 0 {
-            // SAFETY: live, empty pipe, bounded integer capacity, no user pointer.
-            let capacity = unsafe {
-                libc::fcntl(
-                    pipe.write.as_raw_fd(),
-                    libc::F_SETPIPE_SZ,
-                    MAX_PIPE_BYTES as i32,
-                )
-            };
-            if capacity > 0 {
-                pipe.capacity = capacity as usize;
-            }
-        }
-    }
-    /// Receive opaque socket pages directly into an empty bounded pipe. No user
-    /// buffer is borrowed or retained by this synchronous nonblocking syscall.
-    pub(crate) fn try_splice_from(
-        &mut self,
-        socket: &Descriptor,
-        count: usize,
-    ) -> io::Result<usize> {
-        #[cfg(test)]
-        if socket.as_sim().is_some() {
-            return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
-        }
-        let pipe = self.resources.as_mut().unwrap();
-        let count = count.min(pipe.capacity - pipe.buffered);
-        // SAFETY: the caller owns a nonblocking ConnectionLease; this pipe owns
-        // both ends, offsets are null, and no userspace pointer enters the kernel.
-        let received = syscall_count(unsafe {
-            libc::splice(
-                socket.as_raw_fd(),
-                std::ptr::null_mut(),
-                pipe.write.as_raw_fd(),
-                std::ptr::null_mut(),
-                count,
-                libc::SPLICE_F_NONBLOCK | libc::SPLICE_F_MOVE,
-            )
-        })?;
-        pipe.buffered += received;
-        Ok(received)
-    }
-    pub fn capacity(&self) -> usize {
-        self.resources.as_ref().unwrap().capacity
-    }
-
-    pub fn buffered(&self) -> usize {
-        self.resources.as_ref().unwrap().buffered
-    }
-
-    /// Copy at most the available capacity. WouldBlock and Interrupted are exposed
-    /// to the caller; this method never waits or retains a borrowed buffer.
-    pub fn try_write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let pipe = self.resources.as_mut().unwrap();
-        #[cfg(test)]
-        if let Some(handle) = pipe.write.as_sim() {
-            let written = handle.pipe_write(bytes)?;
-            pipe.buffered += written;
-            return Ok(written);
-        }
-        // SAFETY: the initialized slice stays live for this nonblocking syscall.
-        // The read end is owned by this lease, so this cannot generate SIGPIPE.
-        let written = unsafe {
-            libc::write(
-                pipe.write.as_raw_fd(),
-                bytes.as_ptr().cast(),
-                bytes.len().min(pipe.capacity),
-            )
-        };
-        let written = syscall_count(written)?;
-        pipe.buffered += written;
-        Ok(written)
-    }
-
-    /// Read currently buffered bytes, or return WouldBlock for an empty pipe.
-    pub fn try_read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        let pipe = self.resources.as_mut().unwrap();
-        #[cfg(test)]
-        if let Some(handle) = pipe.read.as_sim() {
-            let read = handle.pipe_read(bytes)?;
-            pipe.buffered -= read;
-            return Ok(read);
-        }
-        // SAFETY: the destination is exclusively borrowed until read returns.
-        let read = unsafe {
-            libc::read(
-                pipe.read.as_raw_fd(),
-                bytes.as_mut_ptr().cast(),
-                bytes.len(),
-            )
-        };
-        let read = syscall_count(read)?;
-        pipe.buffered -= read;
-        Ok(read)
-    }
-
-    pub fn try_splice_descriptor(
-        &mut self,
-        socket: &Descriptor,
-        count: usize,
-    ) -> io::Result<usize> {
-        #[cfg(test)]
-        if let (Some(pipe), Some(socket)) = (
-            self.resources.as_ref().unwrap().read.as_sim(),
-            socket.as_sim(),
-        ) {
-            let sent = pipe.splice(socket, count.min(self.buffered()))?;
-            self.resources.as_mut().unwrap().buffered -= sent;
-            return Ok(sent);
-        }
-        self.try_splice_to(socket, count)
-    }
-
-    /// Transfer copied kernel pipe bytes to a nonblocking stream socket. The
-    /// caller retains both owners through this synchronous syscall. Unsupported
-    /// splice errors leave the bytes in the pipe for an independent copy fallback.
-    pub fn try_splice_to(&mut self, socket: &impl AsFd, count: usize) -> io::Result<usize> {
-        let fd = socket.as_fd().as_raw_fd();
-        // SPLICE_F_NONBLOCK controls the pipe side; the socket must also be
-        // nonblocking. Never risk a blocking call for an arbitrary caller's FD.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if flags & libc::O_NONBLOCK == 0 {
-            return Err(io::Error::from_raw_os_error(libc::EINVAL));
-        }
-        // O_NONBLOCK does not prevent regular-file I/O from blocking. Restrict
-        // this public API to stream sockets before entering splice.
-        let mut kind: libc::c_int = 0;
-        let mut length = std::mem::size_of_val(&kind) as libc::socklen_t;
-        // SAFETY: both output pointers reference correctly sized local values.
-        if unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_TYPE,
-                (&mut kind as *mut libc::c_int).cast(),
-                &mut length,
-            )
-        } < 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        if kind != libc::SOCK_STREAM {
-            return Err(io::Error::from_raw_os_error(libc::EINVAL));
-        }
-        self.splice_to_fd(fd, count)
-    }
-
-    /// Crate-only fast path for a descriptor whose lease guarantees a
-    /// nonblocking stream socket. The public arbitrary-FD API still validates it.
-    pub(crate) fn try_splice_connection(&mut self, socket: &Descriptor) -> io::Result<usize> {
-        #[cfg(test)]
-        if socket.as_sim().is_some() {
-            return self.try_splice_descriptor(socket, self.buffered());
-        }
-        self.splice_to_fd(socket.as_raw_fd(), self.buffered())
-    }
-
-    fn splice_to_fd(&mut self, fd: libc::c_int, count: usize) -> io::Result<usize> {
-        let pipe = self.resources.as_mut().unwrap();
-        if count == 0 || pipe.buffered == 0 {
-            return Ok(0);
-        }
-        // Unlike send, splice has no MSG_NOSIGNAL. Mask only on this worker and
-        // only across the syscall, consuming our own EPIPE signal before restore.
-        let signal = SigpipeGuard::block()?;
-        // SAFETY: owned live FDs, null offsets for pipe/socket, no userspace page
-        // pointers, and both ends are nonblocking. No vmsplice/GIFT is involved.
-        let result = syscall_count(unsafe {
-            libc::splice(
-                pipe.read.as_raw_fd(),
-                std::ptr::null_mut(),
-                fd,
-                std::ptr::null_mut(),
-                count.min(pipe.buffered),
-                libc::SPLICE_F_NONBLOCK,
-            )
-        });
-        if result
-            .as_ref()
-            .is_err_and(|e| e.raw_os_error() == Some(libc::EPIPE))
-        {
-            signal.consume_generated();
-        }
-        drop(signal);
-        if let Ok(sent) = result {
-            pipe.buffered -= sent;
-        }
-        result
-    }
-}
-
-struct SigpipeGuard {
-    previous: libc::sigset_t,
-    set: libc::sigset_t,
-    was_pending: bool,
-}
-
-impl SigpipeGuard {
-    fn block() -> io::Result<Self> {
-        // SAFETY: all signal set pointers refer to initialized local storage.
-        unsafe {
-            let mut guard = Self {
-                previous: std::mem::zeroed(),
-                set: std::mem::zeroed(),
-                was_pending: true,
-            };
-            libc::sigemptyset(&mut guard.set);
-            libc::sigaddset(&mut guard.set, libc::SIGPIPE);
-            let error = libc::pthread_sigmask(libc::SIG_BLOCK, &guard.set, &mut guard.previous);
-            if error != 0 {
-                // No mask was installed; do not run the restoring destructor.
-                std::mem::forget(guard);
-                return Err(io::Error::from_raw_os_error(error));
-            }
-            let mut pending = std::mem::zeroed();
-            if libc::sigpending(&mut pending) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            guard.was_pending = libc::sigismember(&pending, libc::SIGPIPE) == 1;
-            Ok(guard)
-        }
-    }
-
-    fn consume_generated(&self) {
-        if self.was_pending {
-            return;
-        }
-        let timeout = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: zero timeout never waits; only our thread's blocked SIGPIPE is
-        // consumed. Preserve a signal that was pending before entering the guard.
-        while unsafe { libc::sigtimedwait(&self.set, std::ptr::null_mut(), &timeout) } < 0 {
-            if io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                break;
-            }
-        }
-    }
-}
-
-impl Drop for SigpipeGuard {
-    fn drop(&mut self) {
-        // SAFETY: restore the exact thread mask saved by successful pthread_sigmask.
-        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut()) };
-    }
-}
-
-fn syscall_count(value: isize) -> io::Result<usize> {
-    if value < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(value as usize)
-    }
+            Ok(move |waker: &Waker| cancellation.register(waker))
+        },
+    ))
 }
 
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::model::Limits;
+    use crate::{error::Error, model::Limits};
 
-    pub(in crate::memory) fn admission(pipes: usize) -> Rc<Admission> {
+    pub(in crate::memory) fn admission(pipes: usize) -> Rc<Quotas<AdmissionPolicy>> {
         let small = std::num::NonZeroUsize::new(8).unwrap();
         let bytes = std::num::NonZeroUsize::new(32 * 1024 * 1024).unwrap();
-        Rc::new(Admission::new(Limits {
+        Rc::new(Quotas::new(AdmissionPolicy::new(Limits {
             plaintext_bytes: bytes,
             ciphertext_bytes: bytes,
             dirty_bytes: bytes,
@@ -543,106 +63,45 @@ pub(super) mod tests {
             retained_snapshots: small,
             metadata_entries: small,
             relay_transfers: small,
-        }))
+        })))
     }
 
     #[test]
-    fn empty_pipe_reuses_descriptors_and_partial_pipe_is_closed() {
-        let admission = admission(1);
-        let pool = PipePool::new(admission.clone(), Rc::new(Reactor::new(admission.clone())));
-        let mut pipe = pool.acquire().unwrap();
-        let read = pipe.resources.as_ref().unwrap().read.as_raw_fd();
-        let write = pipe.resources.as_ref().unwrap().write.as_raw_fd();
-        pipe.try_write(b"secret").unwrap();
-        let mut bytes = [0; 6];
-        assert_eq!(pipe.try_read(&mut bytes).unwrap(), 6);
-        drop(pipe);
-        assert_eq!(admission.used(ResourceClass::Pipe), 1);
-        let mut pipe = pool.acquire().unwrap();
-        assert_eq!(pipe.resources.as_ref().unwrap().read.as_raw_fd(), read);
-        assert_eq!(pipe.resources.as_ref().unwrap().write.as_raw_fd(), write);
-        assert_eq!(
-            pipe.try_read(&mut bytes).unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
-        );
-        pipe.try_write(b"discard").unwrap();
-        drop(pipe);
-        assert!(pool.idle.borrow().is_empty());
-        assert_eq!(admission.used(ResourceClass::Pipe), 0);
-        // SAFETY: only query the closed descriptor numbers, without reusing them.
-        assert_eq!(unsafe { libc::fcntl(read, libc::F_GETFD) }, -1);
-        assert_eq!(unsafe { libc::fcntl(write, libc::F_GETFD) }, -1);
-    }
-
-    #[test]
-    fn exhaustion_and_drop_return_capacity_even_after_pool_drop() {
-        let admission = admission(1);
-        let reactor = Rc::new(Reactor::new(admission.clone()));
-        let pool = PipePool::new(admission.clone(), reactor.clone());
-        let lease = pool.acquire().unwrap();
-        assert!(matches!(pool.acquire(), Err(Error::Overloaded)));
-        drop(pool);
-        let pool = PipePool::new(admission, reactor);
-        assert!(matches!(pool.acquire(), Err(Error::Overloaded)));
-        drop(lease);
-        assert!(pool.acquire().is_ok());
-    }
-
-    #[test]
-    fn scheduled_acquisition_is_bounded_fifo_and_wakes_only_for_progress() {
-        use crate::{model::RequestId, test_support::WakeCounter};
+    fn immediate_acquisition_does_not_subscribe_to_cancellation() {
+        use crate::model::RequestId;
         use std::{
-            sync::Arc,
-            task::Context,
+            task::{Context, Poll},
             time::{Duration, Instant},
         };
-        let admission = admission(2);
-        let pool = PipePool::new(admission.clone(), Rc::new(Reactor::new(admission.clone())));
-        let held = [pool.acquire().unwrap(), pool.acquire().unwrap()];
+        let admission = admission(1);
+        let pool = new_pipe_pool(admission.clone());
         let scope =
             RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(5)).unwrap();
-        let count = Arc::new(WakeCounter::default());
-        let waker = Waker::from(count.clone());
-        let mut cx = Context::from_waker(&waker);
-        let mut waiting: Vec<_> = (0..8).map(|_| pool.acquire_wait(&scope)).collect();
-        for wait in &mut waiting {
-            assert!(wait.as_mut().poll(&mut cx).is_pending());
+        let mut registrations = Vec::new();
+        loop {
+            match scope.cancellation.subscribe() {
+                Ok(registration) => registrations.push(registration),
+                Err(Error::Overloaded) => break,
+                Err(error) => panic!("unexpected registration failure: {error:?}"),
+            }
+            assert!(registrations.len() <= 1024);
         }
-        assert_eq!(count.count(), 0, "waiting does not spin/self-wake");
+        let mut cx = Context::from_waker(Waker::noop());
+        let Poll::Ready(Ok(held)) = acquire_wait(&pool, &scope).as_mut().poll(&mut cx) else {
+            panic!("immediate acquisition unnecessarily subscribed")
+        };
         assert!(matches!(
-            pool.acquire_wait(&scope).as_mut().poll(&mut cx),
+            acquire_wait(&pool, &scope).as_mut().poll(&mut cx),
             Poll::Ready(Err(Error::Overloaded))
         ));
-        assert_eq!(pool.waiting.borrow().len(), 8);
-        assert_eq!(admission.used(ResourceClass::Pipe), 2);
-        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
-        drop(held);
-        assert!(count.count() > 0);
-        // Reverse polling cannot let new arrivals jump the queue.
-        for wait in waiting.iter_mut().skip(1).rev() {
-            assert!(wait.as_mut().poll(&mut cx).is_pending());
-        }
-        let mut leases = VecDeque::new();
-        for mut wait in waiting {
-            if leases.len() == 2 {
-                leases.pop_front();
-            }
-            let Poll::Ready(Ok(pipe)) = wait.as_mut().poll(&mut cx) else {
-                panic!("FIFO waiter did not progress")
-            };
-            leases.push_back(pipe);
-            assert!(admission.used(ResourceClass::Pipe) <= 2);
-        }
-        assert!(pool.waiting.borrow().is_empty());
         assert_eq!(admission.used(ResourceClass::RequestContext), 0);
-        drop(leases);
-        assert_eq!(
-            admission.used(ResourceClass::Pipe),
-            2,
-            "idle pipes remain admitted"
-        );
-        drop(pool);
-        assert_eq!(admission.used(ResourceClass::Pipe), 0);
+        assert_eq!(admission.used(ResourceClass::Pipe), 1);
+        drop(registrations);
+        let mut wait = acquire_wait(&pool, &scope);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        drop(held);
+        assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+        assert_eq!(admission.used(ResourceClass::RequestContext), 0);
     }
 
     #[test]
@@ -650,7 +109,7 @@ pub(super) mod tests {
         use crate::{model::RequestId, test_support::WakeCounter};
         use std::{
             sync::Arc,
-            task::Context,
+            task::{Context, Poll},
             time::{Duration, Instant},
         };
         for failure in [
@@ -660,7 +119,7 @@ pub(super) mod tests {
             None,
         ] {
             let admission = admission(1);
-            let pool = PipePool::new(admission.clone(), Rc::new(Reactor::new(admission.clone())));
+            let pool = new_pipe_pool(admission.clone());
             let held = pool.acquire().unwrap();
             let scope = RequestScope::new(
                 RequestId([0; 16]),
@@ -675,9 +134,12 @@ pub(super) mod tests {
             let count = Arc::new(WakeCounter::default());
             let waker = Waker::from(count.clone());
             let mut cx = Context::from_waker(&waker);
-            let mut wait = pool.acquire_wait(&scope);
+            let mut wait = acquire_wait(&pool, &scope);
             assert!(wait.as_mut().poll(&mut cx).is_pending());
-            assert!(admission.used(ResourceClass::RequestContext) > 0);
+            assert_eq!(
+                admission.used(ResourceClass::RequestContext),
+                pool.waiter_bytes()
+            );
             match failure {
                 Some(Error::Cancelled) => {
                     scope.cancel().unwrap();
@@ -693,161 +155,21 @@ pub(super) mod tests {
                 );
             }
             drop(wait);
-            assert!(pool.waiting.borrow().is_empty());
             assert_eq!(admission.used(ResourceClass::RequestContext), 0);
             assert_eq!(admission.used(ResourceClass::Pipe), 1);
             drop(held);
+            if failure != Some(Error::Unavailable) {
+                // No stale FIFO entry may prevent the next caller's progress.
+                let fresh =
+                    RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(5))
+                        .unwrap();
+                assert!(matches!(
+                    acquire_wait(&pool, &fresh).as_mut().poll(&mut cx),
+                    Poll::Ready(Ok(_))
+                ));
+            }
             drop(pool);
             assert_eq!(admission.used(ResourceClass::Pipe), 0);
         }
-    }
-
-    #[test]
-    fn pipes_are_nonblocking_bounded_cloexec_and_independent() {
-        let admission = admission(2);
-        let reactor = Rc::new(Reactor::new(admission.clone()));
-        let pool = PipePool::new(admission, reactor);
-        let mut first = pool.acquire().unwrap();
-        let mut second = pool.acquire().unwrap();
-        let resources = first.resources.as_ref().unwrap();
-        for fd in [&resources.read, &resources.write] {
-            // SAFETY: these descriptors are owned for the duration of the query.
-            assert_ne!(
-                unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
-                0
-            );
-            assert_ne!(
-                unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
-                0
-            );
-        }
-        assert!(first.capacity() <= MAX_PIPE_BYTES);
-        assert!(first.capacity() > 0);
-        // Account the actual kernel capacity, including denied best-effort growth.
-        assert_eq!(first.capacity(), unsafe {
-            libc::fcntl(
-                first.resources.as_ref().unwrap().write.as_raw_fd(),
-                libc::F_GETPIPE_SZ,
-            )
-        } as usize);
-        let bytes = vec![0x5a; first.capacity()];
-        assert_eq!(first.try_write(&bytes).unwrap(), bytes.len());
-        assert_eq!(
-            first.try_write(b"x").unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
-        );
-        let mut out = vec![0; bytes.len()];
-        assert_eq!(
-            second.try_read(&mut out).unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
-        );
-        assert_eq!(first.try_read(&mut out).unwrap(), bytes.len());
-        assert_eq!(out, bytes);
-        assert_eq!(
-            first.try_read(&mut out).unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
-        );
-        assert_eq!(second.try_write(b"second").unwrap(), 6);
-        assert_eq!(second.try_read(&mut out).unwrap(), 6);
-        assert_eq!(&out[..6], b"second");
-    }
-
-    #[test]
-    fn copied_splice_survives_source_reuse_and_partial_drain() {
-        use std::{io::Read, os::unix::net::UnixStream};
-        let admission = admission(1);
-        let reactor = Rc::new(Reactor::new(admission.clone()));
-        let pool = PipePool::new(admission, reactor);
-        let mut pipe = pool.acquire().unwrap();
-        let (socket, mut peer) = UnixStream::pair().unwrap();
-        socket.set_nonblocking(true).unwrap();
-        let mut source = b"copied kernel pages".to_vec();
-        assert_eq!(pipe.try_write(&source).unwrap(), source.len());
-        source.fill(0);
-        assert_eq!(pipe.try_splice_to(&socket, 6).unwrap(), 6);
-        assert_eq!(pipe.buffered(), 13);
-        assert_eq!(pipe.try_splice_to(&socket, usize::MAX).unwrap(), 13);
-        assert_eq!(pipe.buffered(), 0);
-        // Socket-owned kernel pages survive both pipe closure and quota reuse.
-        drop(pipe);
-        let mut reused = pool.acquire().unwrap();
-        reused.try_write(b"replacement data").unwrap();
-        let mut received = [0; 19];
-        peer.read_exact(&mut received).unwrap();
-        assert_eq!(&received, b"copied kernel pages");
-    }
-
-    #[test]
-    fn splice_rejects_blocking_socket_and_handles_disconnect_without_losing_bytes() {
-        use std::os::unix::net::UnixStream;
-        let admission = admission(1);
-        let reactor = Rc::new(Reactor::new(admission.clone()));
-        let pool = PipePool::new(admission, reactor);
-        let mut pipe = pool.acquire().unwrap();
-        pipe.try_write(b"abc").unwrap();
-        let (socket, peer) = UnixStream::pair().unwrap();
-        assert_eq!(
-            pipe.try_splice_to(&socket, 3).unwrap_err().raw_os_error(),
-            Some(libc::EINVAL)
-        );
-        assert_eq!(pipe.buffered(), 3);
-        socket.set_nonblocking(true).unwrap();
-        drop(peer);
-        assert_eq!(
-            pipe.try_splice_to(&socket, 3).unwrap_err().raw_os_error(),
-            Some(libc::EPIPE)
-        );
-        assert_eq!(pipe.buffered(), 3);
-        let mut bytes = [0; 3];
-        assert_eq!(pipe.try_read(&mut bytes).unwrap(), 3);
-        assert_eq!(&bytes, b"abc");
-    }
-
-    #[test]
-    fn splice_backpressure_preserves_buffered_bytes_and_socket_validation() {
-        use std::{io::Write, os::unix::net::UnixStream};
-        let admission = admission(1);
-        let reactor = Rc::new(Reactor::new(admission.clone()));
-        let pool = PipePool::new(admission, reactor);
-        let mut pipe = pool.acquire().unwrap();
-        pipe.try_write(b"pending").unwrap();
-        let (mut socket, _peer) = UnixStream::pair().unwrap();
-        socket.set_nonblocking(true).unwrap();
-        let start = std::time::Instant::now();
-        loop {
-            assert!(start.elapsed() < std::time::Duration::from_secs(5));
-            match socket.write(&[1; 8192]) {
-                Ok(count) => assert_ne!(count, 0),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) => panic!("{error}"),
-            }
-        }
-        assert_eq!(
-            pipe.try_splice_to(&socket, 7).unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
-        );
-        assert_eq!(pipe.buffered(), 7);
-        let (datagram, _peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
-        datagram.set_nonblocking(true).unwrap();
-        assert_eq!(
-            pipe.try_splice_to(&datagram, 7).unwrap_err().raw_os_error(),
-            Some(libc::EINVAL)
-        );
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open("/dev/null")
-            .unwrap();
-        // SAFETY: change flags on this exclusively owned test descriptor.
-        assert_eq!(
-            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
-            0
-        );
-        assert_eq!(
-            pipe.try_splice_to(&file, 7).unwrap_err().raw_os_error(),
-            Some(libc::ENOTSOCK)
-        );
-        let mut bytes = [0; 7];
-        assert_eq!(pipe.try_read(&mut bytes).unwrap(), 7);
-        assert_eq!(&bytes, b"pending");
     }
 }

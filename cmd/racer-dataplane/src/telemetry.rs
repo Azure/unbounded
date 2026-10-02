@@ -443,7 +443,7 @@ use crate::{
     error::{Error, Operation, Result},
     model::ResourceClass,
     runtime::{
-        admission::Admission,
+        admission::AdmissionPolicy,
         deadline::{Deadline, RequestScope},
         reactor::Reactor,
     },
@@ -510,7 +510,11 @@ impl MembershipDiagnostic {
 impl Telemetry {
     /// Reserve diagnostic memory/control slots before data admission. Does not
     /// bind a listener or spawn work. Duplicate attachment is rejected.
-    pub fn attach_io(&self, reactor: Rc<Reactor>, admission: Rc<Admission>) -> Result<()> {
+    pub fn attach_io(
+        &self,
+        reactor: Rc<Reactor>,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+    ) -> Result<()> {
         if self.io.get().is_some() {
             return Err(Error::InvalidConfiguration);
         }
@@ -570,13 +574,16 @@ impl server::Scope for RequestScope {
 /// abandoned connection futures because the reactor retains their buffers.
 pub struct DiagnosticIo {
     reactor: Rc<Reactor>,
-    admission: Rc<Admission>,
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     server: Server,
 }
 impl DiagnosticIo {
     /// Explicit startup acquisition, using the worker's already-budgeted reactor.
     /// Must run before ordinary request admission fills the memory quota.
-    pub fn attach(reactor: Rc<Reactor>, admission: Rc<Admission>) -> Result<Self> {
+    pub fn attach(
+        reactor: Rc<Reactor>,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+    ) -> Result<Self> {
         let control = admission.reserve(None, ResourceClass::ControlProgress, CONTROL_SLOTS)?;
         let mut memory = admission.reserve(None, ResourceClass::RequestContext, RESERVED_BYTES)?;
         let bookkeeping =
@@ -609,7 +616,7 @@ fn serve<'a>(
 
 struct DiagnosticHandler<'a> {
     telemetry: &'a Telemetry,
-    admission: &'a Admission,
+    admission: &'a flow_control::Quotas<AdmissionPolicy>,
 }
 impl Handler for DiagnosticHandler<'_> {
     type Connection = GaugeLease;

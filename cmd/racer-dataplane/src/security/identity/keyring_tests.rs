@@ -324,8 +324,10 @@ fn active_crypto_operation_completes_after_rotation_with_its_original_key_lease(
     let keys = keys();
     let cache = CacheId(CACHE.into());
     use crate::runtime::reactor::IoBuffer;
-    let admission = std::rc::Rc::new(crate::runtime::admission::Admission::new(
-        crate::test_support::cluster::config(false).limits,
+    let admission = std::rc::Rc::new(flow_control::Quotas::new(
+        crate::runtime::admission::AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        ),
     ));
     let pool = BufferPool::new(admission.clone());
     let (io, engine) = crypto::pair(WorkerId(0), 0, std::num::NonZeroUsize::new(8).unwrap());

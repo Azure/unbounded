@@ -651,7 +651,7 @@ pub(crate) mod tests {
             connection::{Endpoint, HttpPool},
         },
         model::{RequestId, ResourceClass},
-        runtime::{admission::Admission, reactor::Reactor},
+        runtime::{admission::AdmissionPolicy, reactor::Reactor},
     };
     use std::{
         future::Future,
@@ -727,7 +727,9 @@ pub(crate) mod tests {
             }
             previous = Some(copy);
         }
-        let admission = Admission::new(crate::test_support::cluster::config(false).limits);
+        let admission = flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
         let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
         let mut conn = crate::http::connection::from_accepted(socket.into(), &admission).unwrap();
         crate::http::connection::install_session(&mut conn, a).unwrap();
@@ -874,9 +876,9 @@ pub(crate) mod tests {
     #[test]
     fn loopback_mutual_authentication_pool_reuse_and_fresh_reconnect() {
         let n = super::signature_tests::network(2);
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let reactor = Rc::new(Reactor::new(admission.clone()));
         let io = HttpIo::with_admission(
             reactor.clone(),
@@ -1020,9 +1022,9 @@ pub(crate) mod tests {
     fn socket_admission_rejects_replay_before_dispatch_and_closes_pool_slot() {
         use crate::runtime::reactor::IoBuffer;
         let n = super::signature_tests::network(2);
-        let admission = Rc::new(Admission::new(
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
-        ));
+        )));
         let reactor = Rc::new(Reactor::new(admission.clone()));
         let io = HttpIo::with_admission(reactor.clone(), Codec::new(65536), admission.clone(), 0);
         let scope = RequestScope::new(RequestId([2; 16]), Instant::now() + Duration::from_secs(10))
@@ -1068,9 +1070,9 @@ pub(crate) mod tests {
     fn handshake_cancel_expiry_and_abandonment_retain_only_fenced_admissions() {
         let n = super::signature_tests::network(2);
         for end in ["cancel", "expiry", "drop"] {
-            let admission = Rc::new(Admission::new(
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
-            ));
+            )));
             let reactor = Rc::new(Reactor::new(admission.clone()));
             reactor.init().unwrap();
             let io =
