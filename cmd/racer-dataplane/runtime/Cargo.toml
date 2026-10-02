@@ -1,0 +1,18 @@
+[package]
+name = "uring-runtime"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Explicitly driven worker-local io_uring runtime"
+
+[features]
+default = []
+simulation = ["dep:sha2"]
+
+[dependencies]
+futures = "0.3"
+getrandom = "0.2"
+io-uring = "0.7"
+libc = "0.2"
+zeroize = "1"
+sha2 = { version = "0.10", optional = true }
