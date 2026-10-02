@@ -4,6 +4,10 @@
 package cargo
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -58,7 +62,7 @@ dependencies = [
 ]
 `,
 	})
-	writePerformanceFixture(t, root, "1.2.3")
+	writeCollectorFixtures(t, root, "1.2.3")
 
 	for _, crate := range []string{"foo-1.2.3", "build-helper-2.0.1", "linux-only-3.4.5"} {
 		testutil.WriteTree(t, cargoHome, map[string]string{
@@ -140,7 +144,7 @@ func TestCollectorPrecheckReportsMissingCache(t *testing.T) {
 		"cmd/racer-dataplane/Cargo.toml": "[package]\nname = \"racer-dataplane\"\n[dependencies]\n",
 		"cmd/racer-dataplane/Cargo.lock": "version = 4\n",
 	})
-	writePerformanceFixture(t, root, "1.2.3")
+	writeCollectorFixtures(t, root, "1.2.3")
 
 	err := New(t.TempDir()).Precheck(root)
 	if err == nil || !strings.Contains(err.Error(), "cargo fetch") {
@@ -167,7 +171,7 @@ dependencies = [
 ]
 `,
 	})
-	writePerformanceFixture(t, root, "1.2.3")
+	writeCollectorFixtures(t, root, "1.2.3")
 
 	for _, registry := range []string{"first", "second"} {
 		testutil.WriteTree(t, cargoHome, map[string]string{
@@ -200,7 +204,7 @@ dependencies = [
 ]
 `,
 	})
-	writePerformanceFixture(t, root, "1.2.3")
+	writeCollectorFixtures(t, root, "1.2.3")
 	testutil.WriteTree(t, cargoHome, map[string]string{
 		"registry/src/index/foo-1.2.3/LICENSE":        "Choose either LICENSE-APACHE or LICENSE-MIT, included alongside this index.\n",
 		"registry/src/index/foo-1.2.3/LICENSE-APACHE": testutil.Apache2License(),
@@ -252,7 +256,7 @@ dependencies = [
 ]
 `,
 	})
-	writePerformanceFixture(t, root, "1.2.3")
+	writeCollectorFixtures(t, root, "1.2.3")
 	testutil.WriteTree(t, cargoHome, map[string]string{
 		"registry/src/index/foo-1.2.3/Cargo.toml.orig": "[package]\nlicense = \"MIT OR Apache-2.0\"\n",
 	})
@@ -271,9 +275,23 @@ dependencies = [
 	}
 }
 
-func writePerformanceFixture(t *testing.T, root, version string) {
+func writeCollectorFixtures(t *testing.T, root, version string) {
 	t.Helper()
+
+	lock, err := os.ReadFile(filepath.Join(root, "cmd/racer-dataplane/Cargo.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, member := range []string{"runtime", "alloc", "crypto"} {
+		testutil.WriteTree(t, root, map[string]string{
+			"cmd/racer-dataplane/" + member + "/Cargo.toml": "[package]\nname = \"racer-" + member + "\"\n",
+		})
+		lock = append(lock, []byte("\n[[package]]\nname = \"racer-"+member+"\"\nversion = \"0.1.0\"\n")...)
+	}
+
 	testutil.WriteTree(t, root, map[string]string{
+		"cmd/racer-dataplane/Cargo.lock": string(lock),
 		"cmd/racer-loadgen/performance/Cargo.toml": `[package]
 name = "racer-performance-control"
 [dependencies]
@@ -309,7 +327,7 @@ dependencies = [
 ]
 `,
 	})
-	writePerformanceFixture(t, root, "1.2.4")
+	writeCollectorFixtures(t, root, "1.2.4")
 
 	_, err := New(t.TempDir()).Collect(root)
 	if err == nil || !strings.Contains(err.Error(), "conflicting direct versions") {
@@ -349,5 +367,122 @@ func TestCollectorPrecheckRequiresEveryManifest(t *testing.T) {
 	err := New(t.TempDir()).Precheck(root)
 	if err == nil || !strings.Contains(err.Error(), "cmd/racer-loadgen/performance/Cargo.toml") {
 		t.Fatalf("Precheck error = %v", err)
+	}
+}
+
+func TestCollectorCollectWorkspaceMembers(t *testing.T) {
+	root := t.TempDir()
+	cargoHome := t.TempDir()
+	testutil.WriteTree(t, root, map[string]string{
+		"cmd/racer-dataplane/Cargo.toml": `[package]
+name = "racer-dataplane"
+[dependencies]
+racer-runtime = { path = "runtime" }
+racer-alloc = { path = "alloc" }
+racer-crypto = { path = "crypto" }
+`,
+		"cmd/racer-dataplane/Cargo.lock": "[[package]]\nname = \"racer-dataplane\"\nversion = \"0.1.0\"\n",
+	})
+	writeCollectorFixtures(t, root, "1.2.3")
+
+	// Only the members depend directly on these registry packages. Each member
+	// selects an exact version from a workspace lock containing two versions.
+	lock := "[[package]]\nname = \"racer-dataplane\"\nversion = \"0.1.0\"\n"
+	want := map[string]string{"foo": "1.2.3"}
+
+	for _, member := range []string{"runtime", "alloc", "crypto"} {
+		name := member + "-dep"
+		want[name] = "1.2.3"
+		testutil.WriteTree(t, root, map[string]string{
+			"cmd/racer-dataplane/" + member + "/Cargo.toml": fmt.Sprintf("[package]\nname = %q\n[dependencies]\n%s = \"1\"\n", "racer-"+member, name),
+		})
+		lock += fmt.Sprintf(`
+[[package]]
+name = %q
+version = "0.1.0"
+dependencies = [
+ %q,
+]
+[[package]]
+name = %q
+version = "1.2.3"
+[[package]]
+name = %q
+version = "2.0.0"
+`, "racer-"+member, name+" 1.2.3", name, name)
+	}
+
+	testutil.WriteTree(t, root, map[string]string{"cmd/racer-dataplane/Cargo.lock": lock})
+
+	for name, version := range want {
+		testutil.WriteTree(t, cargoHome, map[string]string{
+			"registry/src/index/" + name + "-" + version + "/LICENSE": testutil.MITLicense("Copyright (c) 2026 Example"),
+		})
+	}
+
+	c := New(cargoHome)
+	if err := c.Precheck(root); err != nil {
+		t.Fatalf("Precheck without member locks: %v", err)
+	}
+
+	// A stale adjacent member lock must not override the workspace lock.
+	for _, member := range []string{"runtime", "alloc", "crypto"} {
+		testutil.WriteTree(t, root, map[string]string{
+			"cmd/racer-dataplane/" + member + "/Cargo.lock": "invalid stale member lock\n",
+		})
+	}
+
+	entries, err := c.Collect(root)
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+
+	got := map[string]string{}
+
+	for _, entry := range entries {
+		if len(entry.License) != 1 {
+			t.Fatalf("licenses for %s = %#v", entry.Dependency, entry.License)
+		}
+
+		got[entry.Dependency] = entry.License[0].Link
+	}
+
+	for name, version := range want {
+		want[name] = fmt.Sprintf("https://docs.rs/crate/%s/%s/source/LICENSE", name, version)
+	}
+
+	if !reflect.DeepEqual(got, want) || len(entries) != len(want) {
+		t.Fatalf("entries = %#v, want links %v", entries, want)
+	}
+}
+
+func TestCollectorRequiresWorkspaceInputs(t *testing.T) {
+	for _, missing := range []string{
+		"cmd/racer-dataplane/runtime/Cargo.toml",
+		"cmd/racer-dataplane/alloc/Cargo.toml",
+		"cmd/racer-dataplane/crypto/Cargo.toml",
+		"cmd/racer-dataplane/Cargo.lock",
+	} {
+		t.Run(missing, func(t *testing.T) {
+			root := t.TempDir()
+			testutil.WriteTree(t, root, map[string]string{
+				"cmd/racer-dataplane/Cargo.toml": "[package]\nname = \"racer-dataplane\"\n",
+				"cmd/racer-dataplane/Cargo.lock": "[[package]]\nname = \"racer-dataplane\"\nversion = \"0.1.0\"\n",
+			})
+			writeCollectorFixtures(t, root, "1.2.3")
+
+			if err := os.Remove(filepath.Join(root, missing)); err != nil {
+				t.Fatal(err)
+			}
+
+			c := New(t.TempDir())
+			if err := c.Precheck(root); err == nil || !strings.Contains(err.Error(), missing) {
+				t.Fatalf("Precheck error = %v, want missing %s", err, missing)
+			}
+
+			if _, err := c.Collect(root); err == nil || !strings.Contains(err.Error(), missing) {
+				t.Fatalf("Collect error = %v, want missing %s", err, missing)
+			}
+		})
 	}
 }

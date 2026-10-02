@@ -1,7 +1,8 @@
 # notice
 
 Generates and verifies the project's `NOTICE` file from direct dependencies in
-`go.mod`, `frontend/package.json`, `cmd/racer-dataplane/Cargo.toml`, and
+`go.mod`, `frontend/package.json`, `cmd/racer-dataplane/Cargo.toml`, its
+`runtime`, `alloc`, and `crypto` workspace members, and
 `cmd/racer-loadgen/performance/Cargo.toml` plus
 any paired libfabric and OpenSSL source pins in `Makefile` (currently absent).
 
@@ -90,8 +91,9 @@ To add a new ecosystem (e.g. PyPI, Cargo):
   Always materialize fixtures dynamically in tests via `testutil.WriteTree`.
 - Cargo collection reads `Cargo.toml` and exact versions from `Cargo.lock`, then
   reads license files from the local Cargo registry source cache. Populate it
-  with `cargo fetch --manifest-path <crate>/Cargo.toml --locked` for each Racer
-  crate listed above. Root package names come from the manifests; shared registry
+  with `cargo fetch --manifest-path <crate>/Cargo.toml --locked` for the dataplane
+  and performance roots listed above. Workspace members use the dataplane root's
+  lockfile. Root package names come from the manifests; shared registry
   dependencies are deduplicated. Conflicting direct versions fail collection.
   Development dependencies are excluded; normal, target, build, and optional
   direct dependencies are included. Local first-party path dependencies are excluded.

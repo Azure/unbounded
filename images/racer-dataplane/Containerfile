@@ -22,6 +22,8 @@ COPY cmd/racer-dataplane/runtime/Cargo.toml ./runtime/Cargo.toml
 COPY cmd/racer-dataplane/runtime/src ./runtime/src
 COPY cmd/racer-dataplane/alloc/Cargo.toml ./alloc/Cargo.toml
 COPY cmd/racer-dataplane/alloc/src ./alloc/src
+COPY cmd/racer-dataplane/crypto/Cargo.toml ./crypto/Cargo.toml
+COPY cmd/racer-dataplane/crypto/src ./crypto/src
 COPY cmd/racer-dataplane/native/rdma.c ./native/rdma.c
 COPY images/racer-dataplane/build-native.sh ./build-native.sh
 COPY images/racer-dataplane/check-debug-info.sh ./check-debug-info.sh

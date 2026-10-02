@@ -18,7 +18,19 @@ import (
 	"github.com/Azure/unbounded/hack/cmd/notice/internal/notice"
 )
 
-var cratePaths = []string{"cmd/racer-dataplane", "cmd/racer-loadgen/performance"}
+type crateInput struct {
+	manifestPath string
+	lockPath     string
+}
+
+// Workspace members share the dataplane lock, not an adjacent Cargo.lock.
+var crateInputs = []crateInput{
+	{"cmd/racer-dataplane/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
+	{"cmd/racer-loadgen/performance/Cargo.toml", "cmd/racer-loadgen/performance/Cargo.lock"},
+	{"cmd/racer-dataplane/runtime/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
+	{"cmd/racer-dataplane/alloc/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
+	{"cmd/racer-dataplane/crypto/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
+}
 
 // Collector reads Cargo.toml and Cargo.lock locally and obtains license text
 // from Cargo's populated registry source cache.
@@ -46,10 +58,10 @@ func (c *Collector) Name() string { return "cargo" }
 
 // Precheck implements notice.Collector.
 func (c *Collector) Precheck(root string) error {
-	for _, cratePath := range cratePaths {
-		for _, name := range []string{"Cargo.toml", "Cargo.lock"} {
-			if _, err := os.Stat(filepath.Join(root, cratePath, name)); err != nil {
-				return fmt.Errorf("stat %s: %w", filepath.Join(cratePath, name), err)
+	for _, input := range crateInputs {
+		for _, path := range []string{input.manifestPath, input.lockPath} {
+			if _, err := os.Stat(filepath.Join(root, path)); err != nil {
+				return fmt.Errorf("stat %s: %w", path, err)
 			}
 		}
 	}
@@ -60,7 +72,7 @@ func (c *Collector) Precheck(root string) error {
 	}
 
 	if _, err := os.Stat(filepath.Join(home, "registry", "src")); err != nil {
-		return fmt.Errorf("cargo registry source cache not found; run 'cargo fetch --manifest-path <crate>/Cargo.toml --locked' for each of %v first (%w)", cratePaths, err)
+		return fmt.Errorf("cargo registry source cache not found; run 'cargo fetch --manifest-path <crate>/Cargo.toml --locked' for cmd/racer-dataplane and cmd/racer-loadgen/performance first (%w)", err)
 	}
 
 	return nil
@@ -69,8 +81,9 @@ func (c *Collector) Precheck(root string) error {
 // Collect implements notice.Collector.
 func (c *Collector) Collect(root string) ([]notice.Entry, error) {
 	versions := map[string]string{}
-	for _, cratePath := range cratePaths {
-		locked, err := collectVersions(root, cratePath)
+
+	for _, input := range crateInputs {
+		locked, err := collectVersions(root, input)
 		if err != nil {
 			return nil, err
 		}
@@ -97,8 +110,8 @@ func (c *Collector) Collect(root string) ([]notice.Entry, error) {
 	return entries, nil
 }
 
-func collectVersions(root, cratePath string) (map[string]string, error) {
-	manifestPath := filepath.Join(root, cratePath, "Cargo.toml")
+func collectVersions(root string, input crateInput) (map[string]string, error) {
+	manifestPath := filepath.Join(root, input.manifestPath)
 
 	manifest, err := os.ReadFile(manifestPath)
 	if err != nil {
@@ -110,7 +123,7 @@ func collectVersions(root, cratePath string) (map[string]string, error) {
 		return nil, fmt.Errorf("parsing %s: %w", manifestPath, err)
 	}
 
-	lockPath := filepath.Join(root, cratePath, "Cargo.lock")
+	lockPath := filepath.Join(root, input.lockPath)
 
 	lock, err := os.ReadFile(lockPath)
 	if err != nil {
