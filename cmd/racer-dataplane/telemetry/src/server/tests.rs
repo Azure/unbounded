@@ -193,10 +193,14 @@ impl Drop for Charge {
 struct Tracked {
     routes: Routes,
     connections: Rc<Cell<usize>>,
+    deny_next: Cell<bool>,
 }
 impl Handler for Tracked {
     type Connection = Charge;
     fn connect(&self) -> Option<Charge> {
+        if self.deny_next.replace(false) {
+            return None;
+        }
         Some(Charge::new(&self.connections))
     }
     fn get(&self, path: &str, out: &mut dyn Write) -> Result<Response, fmt::Error> {
@@ -225,6 +229,7 @@ fn independent_server_dispatch_guard_and_abandoned_buffer_fence() {
     let handler = Tracked {
         routes: Routes::default(),
         connections: connections.clone(),
+        deny_next: Cell::new(false),
     };
     let scope = TestScope {
         deadline: environment::now() + Duration::from_secs(10),
@@ -298,4 +303,114 @@ fn independent_server_dispatch_guard_and_abandoned_buffer_fence() {
     assert_eq!(control.get(), 0);
     assert_eq!(connections.get(), 0);
     assert_eq!(*handler.routes.0.borrow(), vec![Event::Accepted; 2]);
+}
+
+#[test]
+fn refused_connection_preserves_listener_existing_exchange_and_capacity() {
+    use std::{
+        io::{Read, Write as _},
+        net::{TcpListener, TcpStream},
+        task::{Context, Waker},
+    };
+    let reactor = Reactor::<TestScope, ()>::new(8, ());
+    let memory = Rc::new(Cell::new(0));
+    let control = Rc::new(Cell::new(0));
+    let connections = Rc::new(Cell::new(0));
+    let submissions = reactor
+        .reserve_submissions(CONTROL_SLOTS, Charge::new(&control))
+        .unwrap();
+    let owner = Server::new(submissions, Charge::new(&memory));
+    let handler = Tracked {
+        routes: Routes::default(),
+        connections: connections.clone(),
+        deny_next: Cell::new(false),
+    };
+    let scope = TestScope {
+        deadline: environment::now() + Duration::from_secs(10),
+        cancellation: uring_runtime::deadline::Cancellation::new().unwrap(),
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut server = owner.serve(&reactor, listener.into(), &handler, &scope);
+    let mut cx = Context::from_waker(Waker::noop());
+    let until = Instant::now() + Duration::from_secs(1);
+    let mut tick = || {
+        assert!(Instant::now() < until);
+        assert!(server.as_mut().poll(&mut cx).is_pending());
+        reactor.poll_budgeted(32).unwrap();
+        reactor.wait(Duration::from_millis(1)).unwrap();
+    };
+
+    let existing = TcpStream::connect(address).unwrap();
+    while connections.get() != 1 {
+        tick();
+    }
+    // Submit the existing exchange's receive before refusing another socket.
+    tick();
+    handler.deny_next.set(true);
+    let mut refused = TcpStream::connect(address).unwrap();
+    refused.set_nonblocking(true).unwrap();
+    while !handler.routes.0.borrow().contains(&Event::Rejected) {
+        tick();
+    }
+    assert_eq!(refused.read(&mut [0; 1]).unwrap(), 0);
+    assert!(!handler.deny_next.get());
+    assert!(owner.serving.get());
+    assert_eq!(owner.resources.active.get(), 1);
+    assert_eq!(connections.get(), 1);
+
+    // Fill every connection slot after the refusal to detect leaked capacity.
+    let mut sockets = vec![existing];
+    for _ in 1..MAX_CONNECTIONS {
+        sockets.push(TcpStream::connect(address).unwrap());
+    }
+    while connections.get() != MAX_CONNECTIONS {
+        tick();
+    }
+    assert_eq!(owner.resources.active.get(), MAX_CONNECTIONS);
+    for socket in &mut sockets {
+        socket
+            .write_all(b"GET /live HTTP/1.1\r\nHost: local\r\n\r\n")
+            .unwrap();
+        socket.set_nonblocking(true).unwrap();
+    }
+    for mut socket in sockets {
+        let mut response = Vec::new();
+        loop {
+            tick();
+            let mut bytes = [0; 1024];
+            match socket.read(&mut bytes) {
+                Ok(0) => break,
+                Ok(n) => response.extend_from_slice(&bytes[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert_eq!(
+            std::str::from_utf8(&response).unwrap(),
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 3\r\nConnection: close\r\nCache-Control: no-store\r\n\r\nok\n"
+        );
+    }
+    assert_eq!(connections.get(), 0);
+    assert_eq!(owner.resources.active.get(), 0);
+    let mut expected = vec![Event::Accepted, Event::Accepted, Event::Rejected];
+    expected.extend([Event::Accepted; MAX_CONNECTIONS - 1]);
+    assert_eq!(*handler.routes.0.borrow(), expected);
+    drop(server);
+    assert!(!owner.serving.get());
+    drop(owner);
+    let mut drain = reactor.drain();
+    let until = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Poll::Ready(result) = drain.as_mut().poll(&mut cx) {
+            result.unwrap();
+            break;
+        }
+        assert!(Instant::now() < until);
+        reactor.poll_budgeted(32).unwrap();
+        reactor.wait(Duration::from_millis(1)).unwrap();
+    }
+    assert_eq!(memory.get(), 0);
+    assert_eq!(control.get(), 0);
+    assert_eq!(connections.get(), 0);
 }

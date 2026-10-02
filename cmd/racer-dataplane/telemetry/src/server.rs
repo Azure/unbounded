@@ -44,6 +44,7 @@ pub enum Event {
 pub trait Handler {
     /// Retained in reactor-owned buffers until the completion fence.
     type Connection: 'static;
+    /// Returning None rejects only this connection, not the listener.
     fn connect(&self) -> Option<Self::Connection>;
     /// Write only trusted output. NotFound discards output and uses a fixed body.
     fn get(&self, path: &str, out: &mut dyn Write) -> Result<Response, fmt::Error>;
@@ -148,14 +149,18 @@ impl Server {
                             accepting = None;
                             let fd = result?;
                             handler.observe(Event::Accepted);
-                            let buffer = self.buffer(handler).ok_or(Error::Overloaded)?;
-                            connections.push(self.exchange(
-                                reactor,
-                                handler,
-                                Rc::new(fd),
-                                buffer,
-                                scope,
-                            ));
+                            if let Some(buffer) = self.buffer(handler) {
+                                connections.push(self.exchange(
+                                    reactor,
+                                    handler,
+                                    Rc::new(fd),
+                                    buffer,
+                                    scope,
+                                ));
+                            } else {
+                                drop(fd);
+                                handler.observe(Event::Rejected);
+                            }
                             cx.waker().wake_by_ref();
                         }
                     }
