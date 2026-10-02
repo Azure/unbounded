@@ -34,7 +34,7 @@ mod measurement {
         runtime::{admission::Admission, reactor::IoBuffer},
         security::aead::{PageCryptoEngine, page_aad},
     };
-    use chacha20poly1305::{KeyInit, XChaCha20Poly1305, aead::AeadInOut};
+    use racer_crypto::aead;
     use std::{
         rc::Rc,
         time::{Duration, Instant},
@@ -286,10 +286,15 @@ mod measurement {
                 "abandon",
                 "aead",
                 "malformed",
+                "short_body",
                 "abandon_crc",
                 "abandon_aead",
             ] {
-                if !decrypt && matches!(mode, "aead" | "malformed" | "abandon_crc" | "abandon_aead")
+                if !decrypt
+                    && matches!(
+                        mode,
+                        "aead" | "malformed" | "short_body" | "abandon_crc" | "abandon_aead"
+                    )
                 {
                     continue;
                 }
@@ -329,6 +334,13 @@ mod measurement {
                             .unwrap()
                             .envelope
                             .ciphertext_length += 1;
+                    }
+                    if mode == "short_body" {
+                        // A valid descriptor with a mismatched body is malformed,
+                        // not an authentication rejection from the primitive.
+                        let inner = Arc::get_mut(&mut ciphertext.inner).unwrap();
+                        inner.checksum = std::sync::OnceLock::new();
+                        inner.bytes.pop();
                     }
                 }
                 // Admission delay must not leak into residence.
@@ -459,7 +471,7 @@ mod measurement {
         };
         drop(plain);
         Arc::get_mut(&mut ciphertext.inner).unwrap().checksum = std::sync::OnceLock::new();
-        let expected = crate::security::crc64::checksum(ciphertext.bytes());
+        let expected = racer_crypto::crc64(ciphertext.bytes());
         let retained = ciphertext.clone();
         let samples = Samples::default();
         let filter = Pair::parse(
@@ -942,16 +954,16 @@ mod measurement {
             let pool = BufferPool::new(admission.clone());
             let page = page();
             let source = vec![7u8; size];
-            let cipher = XChaCha20Poly1305::new((&[7; 32]).into());
             let descriptor = envelope(size);
-            let mut encrypted = vec![7; size];
-            cipher
-                .encrypt_in_place(
-                    (&descriptor.nonce.0).into(),
-                    &page_aad(&descriptor).unwrap(),
-                    &mut encrypted,
-                )
-                .unwrap();
+            let mut encrypted = vec![0; size + aead::TAG_LEN];
+            aead::seal(
+                &[7; 32],
+                &descriptor.nonce.0,
+                &page_aad(&descriptor).unwrap(),
+                &source,
+                &mut encrypted,
+            )
+            .unwrap();
             if operation == "bad_tag" {
                 encrypted[size] ^= 1;
             }

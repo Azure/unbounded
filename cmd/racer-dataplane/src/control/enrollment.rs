@@ -344,15 +344,14 @@ impl Enrollment {
         };
         wire::encode_enrollment_request(&r)?;
         // A corrupt pending key must never be submitted, even if its CSR parses.
-        use ed25519_dalek::pkcs8::DecodePrivateKey;
         use x509_parser::prelude::FromDer;
         let secret = Zeroizing::new(
             STANDARD
                 .decode(&p.private_key)
                 .map_err(|_| Error::CorruptRecord)?,
         );
-        let key =
-            ed25519_dalek::SigningKey::from_pkcs8_der(&secret).map_err(|_| Error::CorruptRecord)?;
+        let key = racer_crypto::ed25519::SigningKey::from_pkcs8_der(&secret)
+            .map_err(|_| Error::CorruptRecord)?;
         let (_, csr) =
             x509_parser::certification_request::X509CertificationRequest::from_der(&r.csr_der)
                 .map_err(|_| Error::CorruptRecord)?;
@@ -436,13 +435,12 @@ impl Enrollment {
         if !usage.value.digital_signature() || !extended.value.client_auth {
             return Err(Error::Unauthorized);
         }
-        use ed25519_dalek::pkcs8::DecodePrivateKey;
         let private_material = Zeroizing::new(
             STANDARD
                 .decode(&p.private_key)
                 .map_err(|_| Error::CorruptRecord)?,
         );
-        let key = ed25519_dalek::SigningKey::from_pkcs8_der(&private_material)
+        let key = racer_crypto::ed25519::SigningKey::from_pkcs8_der(&private_material)
             .map_err(|_| Error::CorruptRecord)?;
         if cert.public_key().subject_public_key.data.as_ref() != key.verifying_key().as_bytes() {
             return Err(Error::Unauthorized);

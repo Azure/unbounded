@@ -210,14 +210,14 @@ impl CiphertextPage {
         *self
             .inner
             .checksum
-            .get_or_init(|| crate::security::crc64::checksum(self.bytes()))
+            .get_or_init(|| racer_crypto::crc64(self.bytes()))
     }
     /// Never initializes a checksum or scans bytes on the I/O thread.
     pub(crate) fn cached_checksum(&self) -> Option<u64> {
         self.inner.checksum.get().copied()
     }
     pub(crate) fn verify_checksum(&self) -> Result<()> {
-        let actual = crate::security::crc64::checksum(self.bytes());
+        let actual = racer_crypto::crc64(self.bytes());
         if self
             .inner
             .checksum

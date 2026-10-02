@@ -82,7 +82,7 @@ impl Signatures {
                 .keys
                 .active(&cache, super::identity::KeyPurpose::OriginCredentials)?;
             push_binary(&mut head, "racer-mac-key", &key.id().0);
-            let tag = super::hmac(&*super::request_key(&key)?, &mac_base(&head)?);
+            let tag = racer_crypto::hmac_sha256(&*super::request_key(&key)?, &mac_base(&head)?);
             push_binary(&mut head, "racer-request-mac", &tag);
         }
         let input = signature_input(&head)?;
@@ -140,8 +140,8 @@ impl Signatures {
                 crate::model::KeyId(id),
                 super::identity::KeyPurpose::OriginCredentials,
             )?;
-            let expected = super::hmac(&*super::request_key(&key)?, &mac_base(head)?);
-            if !super::equal(
+            let expected = racer_crypto::hmac_sha256(&*super::request_key(&key)?, &mac_base(head)?);
+            if !racer_crypto::ct_eq(
                 &p::decode_binary(field(head, "racer-request-mac")?.as_bytes())?,
                 &expected,
             ) {

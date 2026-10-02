@@ -927,17 +927,17 @@ impl Bootstrap {
             } => {
                 let mut body = Vec::new();
                 if let Some(page) = page_zero {
-                    use chacha20poly1305::{KeyInit, XChaCha20Poly1305, aead::AeadInOut};
                     metadata.immutable().validate_page(page.envelope())?;
                     assert_eq!(page.envelope().page.number, PageNumber(0));
-                    body = page.bytes().to_vec();
-                    XChaCha20Poly1305::new((&[7; 32]).into())
-                        .decrypt_in_place(
-                            (&page.envelope().nonce.0).into(),
-                            &racer_dataplane::security::aead::page_aad(page.envelope())?,
-                            &mut body,
-                        )
-                        .expect("authenticate actual bootstrap ciphertext");
+                    body = vec![0; page.envelope().plaintext_length as usize];
+                    racer_crypto::aead::open(
+                        &[7; 32],
+                        &page.envelope().nonce.0,
+                        &racer_dataplane::security::aead::page_aad(page.envelope())?,
+                        page.bytes(),
+                        &mut body,
+                    )
+                    .expect("authenticate actual bootstrap ciphertext");
                 } else {
                     assert_eq!(metadata.length, 0);
                 }

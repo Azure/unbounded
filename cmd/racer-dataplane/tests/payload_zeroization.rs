@@ -173,7 +173,7 @@ fn final_payload_owner_scrubs_full_allocation_on_reclaim_and_rejection() {
 
 fn failed_crypto_output_is_scrubbed(config: &Config) {
     use base64::Engine;
-    use chacha20poly1305::{KeyInit, XChaCha20Poly1305, aead::AeadInOut};
+    use racer_crypto::aead;
     use racer_dataplane::{
         control::wire,
         model::{ClusterId, NodeId, RequestId, WorkerId},
@@ -265,14 +265,16 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
                     .unwrap(),
             }
         } else {
-            let mut bytes = vec![0xa7; length];
-            XChaCha20Poly1305::new((&[7; 32]).into())
-                .encrypt_in_place(
-                    (&descriptor.nonce.0).into(),
-                    &page_aad(&descriptor).unwrap(),
-                    &mut bytes,
-                )
-                .unwrap();
+            let plaintext = vec![0xa7; length];
+            let mut bytes = vec![0; length + aead::TAG_LEN];
+            aead::seal(
+                &[7; 32],
+                &descriptor.nonce.0,
+                &page_aad(&descriptor).unwrap(),
+                &plaintext,
+                &mut bytes,
+            )
+            .unwrap();
             match fault {
                 "nonce" => descriptor.nonce.0[0] ^= 1,
                 "aad" => descriptor.page.number.0 += 1,
@@ -280,7 +282,7 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
                 "tag" => bytes[length] ^= 1,
                 _ => {}
             }
-            // In-place fixture growth may overallocate; charge its full capacity.
+            // Charge the complete fixture allocation, including the tag.
             let ciphertext = pool
                 .ciphertext(
                     admission

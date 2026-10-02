@@ -6,10 +6,7 @@ use crate::{
     error::{Error, Result},
     model::{CacheId, ClusterId, KeyId, NodeId},
 };
-use ed25519_dalek::{
-    Signature, Signer, SigningKey, VerifyingKey,
-    pkcs8::{DecodePrivateKey, EncodePrivateKey},
-};
+use racer_crypto::ed25519::{SigningKey, VerifyingKey};
 use rustls::{
     RootCertStore,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
@@ -40,7 +37,7 @@ impl PendingIdentity {
         let mut seed = Zeroizing::new([0u8; 32]);
         crate::runtime::environment::fill_random(&mut *seed).map_err(|_| Error::Unavailable)?;
         Ok(Self {
-            key: SigningKey::from_bytes(&seed),
+            key: SigningKey::from_seed(&seed),
         })
     }
     pub fn recover(pkcs8: &[u8]) -> Result<Self> {
@@ -52,13 +49,7 @@ impl PendingIdentity {
         })
     }
     pub fn export_pkcs8_for_persistence(&self) -> Result<Zeroizing<Vec<u8>>> {
-        Ok(Zeroizing::new(
-            self.key
-                .to_pkcs8_der()
-                .map_err(|_| Error::Unavailable)?
-                .as_bytes()
-                .to_vec(),
-        ))
+        self.key.to_pkcs8_der().map_err(|_| Error::Unavailable)
     }
     /// The control server assigns the node SAN from authenticated enrollment.
     pub fn csr_der(&self) -> Result<Vec<u8>> {
@@ -123,16 +114,10 @@ impl SigningIdentity {
         if now < self.valid_from || now >= self.expires {
             return Err(Error::Unauthorized);
         }
-        Ok(self.key.sign(message).to_bytes().to_vec())
+        Ok(self.key.sign(message).to_vec())
     }
     pub fn export_pkcs8_for_persistence(&self) -> Result<Zeroizing<Vec<u8>>> {
-        Ok(Zeroizing::new(
-            self.key
-                .to_pkcs8_der()
-                .map_err(|_| Error::Unavailable)?
-                .as_bytes()
-                .to_vec(),
-        ))
+        self.key.to_pkcs8_der().map_err(|_| Error::Unavailable)
     }
     pub fn tls_certified_key(&self) -> Result<rustls::sign::CertifiedKey> {
         let bytes = self.export_pkcs8_for_persistence()?;
@@ -233,8 +218,7 @@ impl Certificates {
             return Err(Error::Unauthorized);
         }
         let key = self.key(chain, expected)?;
-        let signature = Signature::from_slice(signature).map_err(|_| Error::Unauthorized)?;
-        key.verify_strict(message, &signature)
+        key.verify_strict(message, signature)
             .map_err(|_| Error::Unauthorized)?;
         Ok(VerifiedPeer {
             node: expected.clone(),
@@ -795,9 +779,13 @@ mod certificate_tests {
         let identity = pending
             .accept(cluster.clone(), node.clone(), chain.clone(), &roots)
             .unwrap();
-        let signature = Signature::from_slice(&identity.sign(b"message").unwrap()).unwrap();
+        let signature = identity.sign(b"message").unwrap();
         assert!(key.verify_strict(b"message", &signature).is_ok());
         assert!(key.verify_strict(b"changed", &signature).is_err());
+        assert!(key.verify_strict(b"message", &signature[..63]).is_err());
+        let mut oversized = signature.clone();
+        oversized.push(0);
+        assert!(key.verify_strict(b"message", &oversized).is_err());
         assert!(verify_chain(&roots, &chain, &cluster, &NodeId("other".into())).is_err());
         assert!(verify_chain(&roots, &chain, &ClusterId("other".into()), &node).is_err());
         let (_, _, foreign_roots) = issued();

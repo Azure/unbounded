@@ -46,7 +46,7 @@ use crate::{
     },
     runtime::{admission::Admission, deadline::RequestScope},
 };
-use chacha20poly1305::{KeyInit, XChaCha20Poly1305, aead::AeadInOut};
+use racer_crypto::aead;
 use std::{ops::Deref, rc::Rc};
 use zeroize::Zeroizing;
 /// Decrypted context remains charged for the complete local origin operation.
@@ -191,13 +191,15 @@ impl CredentialCrypto {
                 .active(&context.object.cache, KeyPurpose::OriginCredentials)?;
             let nonce = fresh_nonce()?;
             let aad = aad(key.id(), &context.object, scope.request, attempt, metadata)?;
-            let cipher =
-                XChaCha20Poly1305::new(key.material(KeyPurpose::OriginCredentials)?.into());
-            let mut bytes = Zeroizing::new(Vec::with_capacity(raw.len() + 16));
-            bytes.extend_from_slice(raw);
-            cipher
-                .encrypt_in_place((&nonce.0).into(), &aad, &mut *bytes)
-                .map_err(|_| Error::Unauthorized)?;
+            let mut bytes = Zeroizing::new(vec![0; raw.len() + aead::TAG_LEN]);
+            aead::seal(
+                key.material(KeyPurpose::OriginCredentials)?,
+                &nonce.0,
+                &aad,
+                raw,
+                &mut bytes,
+            )
+            .map_err(|_| Error::Unauthorized)?;
             Some(EncryptedAuthorization {
                 key_id: key.id(),
                 nonce,
@@ -266,10 +268,15 @@ impl CredentialCrypto {
                 KeyPurpose::OriginCredentials,
             )?;
             let aad = aad(key.id(), &context.object, request, attempt, metadata)?;
-            let mut bytes = Zeroizing::new(encrypted.ciphertext.clone());
-            XChaCha20Poly1305::new(key.material(KeyPurpose::OriginCredentials)?.into())
-                .decrypt_in_place((&encrypted.nonce.0).into(), &aad, &mut *bytes)
-                .map_err(|_| Error::Unauthorized)?;
+            let mut bytes = Zeroizing::new(vec![0; encrypted.ciphertext.len() - aead::TAG_LEN]);
+            aead::open(
+                key.material(KeyPurpose::OriginCredentials)?,
+                &encrypted.nonce.0,
+                &aad,
+                &encrypted.ciphertext,
+                &mut bytes,
+            )
+            .map_err(|_| Error::Unauthorized)?;
             Some(Authorization::from_header(&bytes)?)
         } else {
             None
@@ -441,7 +448,7 @@ mod tests {
         let original = origin();
         let scope = scope();
         let attempt = AttemptId([4; 16]);
-        for index in 0..6 {
+        for index in 0..8 {
             let mut sealed = crypto.seal(&original, attempt, &scope).unwrap();
             match index {
                 0 => sealed.object.key.0[0] ^= 1,
@@ -449,7 +456,19 @@ mod tests {
                 2 => sealed.authorization.as_mut().unwrap().ciphertext[0] ^= 1,
                 3 => sealed.authorization.as_mut().unwrap().nonce.0[0] ^= 1,
                 4 => sealed.request.0[0] ^= 1,
-                _ => sealed.attempt.0[0] ^= 1,
+                5 => sealed.attempt.0[0] ^= 1,
+                6 => sealed
+                    .authorization
+                    .as_mut()
+                    .unwrap()
+                    .ciphertext
+                    .truncate(aead::TAG_LEN - 1),
+                _ => sealed
+                    .authorization
+                    .as_mut()
+                    .unwrap()
+                    .ciphertext
+                    .truncate(aead::TAG_LEN),
             }
             assert!(crypto.open_charged(sealed, scope.request, attempt).is_err());
         }

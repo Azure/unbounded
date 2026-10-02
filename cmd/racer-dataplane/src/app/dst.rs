@@ -13,7 +13,6 @@ use crate::{
     },
     security::identity::{PendingIdentity, SigningIdentity},
 };
-use ed25519_dalek::pkcs8::EncodePrivateKey;
 use sha2::{Digest, Sha256};
 use std::{cell::RefCell, collections::BTreeMap};
 
@@ -935,11 +934,11 @@ struct Harness {
 }
 impl Harness {
     fn new(seed: u64, sim: Simulation, clock: SimulationClock, native: bool) -> Self {
-        let key = ed25519_dalek::SigningKey::from_bytes(&[91; 32])
+        let key = racer_crypto::ed25519::SigningKey::from_seed(&[91; 32])
             .to_pkcs8_der()
             .unwrap();
         let ca_key = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
-            &rustls::pki_types::PrivatePkcs8KeyDer::from(key.as_bytes()),
+            &rustls::pki_types::PrivatePkcs8KeyDer::from(key.as_slice()),
             &rcgen::PKCS_ED25519,
         )
         .unwrap();
@@ -1004,10 +1003,10 @@ impl Harness {
     fn identity(&self, config: &Config, id: usize) -> Arc<SigningIdentity> {
         let mut random = Random(self.seed ^ id as u64);
         let seed = std::array::from_fn(|_| random.next() as u8);
-        let key = ed25519_dalek::SigningKey::from_bytes(&seed)
+        let key = racer_crypto::ed25519::SigningKey::from_seed(&seed)
             .to_pkcs8_der()
             .unwrap();
-        let pending = PendingIdentity::recover(key.as_bytes()).unwrap();
+        let pending = PendingIdentity::recover(&key).unwrap();
         crate::control::testing::signing_identity(
             pending,
             &self.ca,

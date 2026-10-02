@@ -68,7 +68,6 @@ mod materialized_pairing {
             pool,
             server,
             scope,
-            cipher,
             mut metadata,
             ..
         } = RelayFixture::with_pool_limit(true, 2);
@@ -96,9 +95,7 @@ mod materialized_pairing {
             .enumerate()
             .map(|(number, plaintext)| {
                 let nonce = Nonce([number as u8 + 21; 24]);
-                let body = cipher
-                    .encrypt((&nonce.0).into(), plaintext.as_slice())
-                    .unwrap();
+                let body = seal_fixture(&nonce.0, plaintext);
                 BufferPool::new(admissions[2].clone())
                     .ciphertext(
                         admissions[2]
@@ -128,12 +125,7 @@ mod materialized_pairing {
                 assert_eq!(pages[left].bytes().len(), pages[right].bytes().len());
                 assert_ne!(pages[left].bytes(), pages[right].bytes());
                 assert!(
-                    cipher
-                        .decrypt(
-                            (&pages[left].envelope().nonce.0).into(),
-                            pages[right].bytes()
-                        )
-                        .is_err()
+                    open_fixture(&pages[left].envelope().nonce.0, pages[right].bytes()).is_err()
                 );
             }
         }
@@ -322,9 +314,7 @@ mod materialized_pairing {
                     "body must match this signed envelope, not another equal-length page"
                 );
                 assert_eq!(
-                    cipher
-                        .decrypt((&ciphertext.envelope().nonce.0).into(), ciphertext.bytes())
-                        .unwrap(),
+                    open_fixture(&ciphertext.envelope().nonce.0, ciphertext.bytes()).unwrap(),
                     plaintexts[number]
                 );
                 conn.finish_exchange()?;
@@ -763,15 +753,28 @@ use crate::{
         routing::Paths,
     },
 };
-use chacha20poly1305::{
-    XChaCha20Poly1305,
-    aead::{Aead, KeyInit},
-};
+use racer_crypto::aead;
 use std::{
     cell::Cell,
     net::{TcpListener, TcpStream},
     task::{Context, Poll},
 };
+
+// These opaque-transport fixtures intentionally use empty AAD, not page AAD.
+fn seal_fixture(nonce: &[u8; 24], plaintext: &[u8]) -> Vec<u8> {
+    let mut output = vec![0; plaintext.len() + aead::TAG_LEN];
+    aead::seal(&[7; 32], nonce, &[], plaintext, &mut output).unwrap();
+    output
+}
+
+fn open_fixture(
+    nonce: &[u8; 24],
+    sealed: &[u8],
+) -> std::result::Result<Vec<u8>, racer_crypto::Error> {
+    let mut output = vec![0; sealed.len().saturating_sub(aead::TAG_LEN)];
+    aead::open(&[7; 32], nonce, &[], sealed, &mut output)?;
+    Ok(output)
+}
 
 struct Never;
 impl server::LocalPageService for Never {
@@ -834,7 +837,6 @@ struct RelayFixture {
     server: server::PeerServer,
     scope: RequestScope,
     plaintext: Vec<u8>,
-    cipher: XChaCha20Poly1305,
     body: Vec<u8>,
     metadata: ObjectMetadata,
     page: crate::memory::pool::CiphertextPage,
@@ -1090,10 +1092,7 @@ impl RelayFixture {
         let plaintext: Vec<_> = (0..crate::model::PAGE_BYTES as usize)
             .map(|i| (i % 251) as u8)
             .collect();
-        let cipher = XChaCha20Poly1305::new((&[7; 32]).into());
-        let body = cipher
-            .encrypt((&[8; 24]).into(), plaintext.as_slice())
-            .unwrap();
+        let body = seal_fixture(&[8; 24], &plaintext);
         assert_eq!(body.len(), 16 * 1024 * 1024 + 16);
         let metadata = ObjectMetadata {
             content_type: None,
@@ -1144,7 +1143,6 @@ impl RelayFixture {
             server,
             scope,
             plaintext,
-            cipher,
             body,
             metadata,
             page,
@@ -1171,7 +1169,6 @@ impl RelayFixture {
             server,
             scope,
             plaintext,
-            cipher,
             body,
             metadata,
             page,
@@ -1347,9 +1344,7 @@ impl RelayFixture {
                     _ => panic!("page required"),
                 };
                 assert_eq!(
-                    cipher
-                        .decrypt((&[8; 24]).into(), ciphertext.bytes())
-                        .unwrap(),
+                    open_fixture(&[8; 24], ciphertext.bytes()).unwrap(),
                     plaintext
                 );
                 conn.finish_exchange()?;

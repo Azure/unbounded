@@ -313,7 +313,6 @@ checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
- "rand_core",
  "serde",
  "sha2",
  "subtle",
@@ -637,21 +636,30 @@ dependencies = [
 ]
 
 [[package]]
-name = "racer-dataplane"
+name = "racer-crypto"
 version = "0.1.0"
 dependencies = [
- "base64",
  "chacha20poly1305",
  "cipher",
  "crc64fast",
  "ed25519-dalek",
+ "poly1305",
+ "sha2",
+ "zeroize",
+]
+
+[[package]]
+name = "racer-dataplane"
+version = "0.1.0"
+dependencies = [
+ "base64",
  "futures",
  "getrandom",
  "httparse",
  "io-uring",
  "libc",
  "page-alloc",
- "poly1305",
+ "racer-crypto",
  "rcgen",
  "rustls",
  "rustls-pemfile",
