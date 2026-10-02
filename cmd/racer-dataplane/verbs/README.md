@@ -58,6 +58,14 @@ contention closures and scalar lifecycle snapshots for integration assertions.
 It does not expose mutex guards, mailbox contents, or native handles. Successful
 integration transfers use the connected fabric's DMA effects, not fabricated CQEs.
 
+Run `cargo test -p rdma-verbs --locked --offline --features simulation` from the
+workspace to exercise the public API without RDMA hardware. The integration suite
+covers tagged multi-port activation and bounded claims, close/reopen with stale
+device rejection, and connect/bind/write/invalidate/fence readback, including
+invalid inputs, delayed completion, and rejected stale keys. Native ABI and
+quarantine regressions remain separate; simulated DMA does not validate a real
+provider or the C adapter. Operator-selected native tests remain ignored by default.
+
 ## Limitations
 
 This is a bounded RC/type-2B memory-window pool, not a general verbs binding.
