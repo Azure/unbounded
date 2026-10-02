@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "runtime", "alloc", "crypto", "verbs"]
+members = [".", "runtime", "alloc", "crypto", "verbs", "http"]
 resolver = "3"
 
 [package]
@@ -22,6 +22,7 @@ path = "tests/subscription_interop.rs"
 required-features = ["subscription-interop"]
 
 [dependencies]
+http1 = { path = "http" }
 racer-crypto = { path = "crypto" }
 rdma-verbs = { path = "verbs" }
 page-alloc = { path = "alloc" }
@@ -43,6 +44,7 @@ zeroize = "1"
 
 [dev-dependencies]
 rdma-verbs = { path = "verbs", features = ["simulation"] }
+http1 = { path = "http", features = ["test-util"] }
 page-alloc = { path = "alloc", features = ["simulation"] }
 uring-runtime = { path = "runtime", features = ["simulation"] }
 

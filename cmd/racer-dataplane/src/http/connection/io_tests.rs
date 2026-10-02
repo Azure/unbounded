@@ -20,8 +20,9 @@ fn setup() -> (Rc<Admission>, Rc<Reactor>, HttpIo, RequestScope) {
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let io = HttpIo::with_admission(
         reactor.clone(),
-        Codec::new(4096, 8 * 1024 * 1024),
+        Codec::new(4096),
         admission.clone(),
+        8 * 1024 * 1024,
     );
     let scope =
         RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(10)).unwrap();
@@ -76,7 +77,7 @@ fn small_peer_send_stages_actual_head_under_context_pressure() {
     let (admission, reactor, _, scope) = setup();
     reactor.init().unwrap();
     let limit = crate::peer::protocol::MAX_ENVELOPE_HEAD;
-    let io = HttpIo::with_admission(reactor.clone(), Codec::new(limit, 16), admission.clone());
+    let io = HttpIo::with_admission(reactor.clone(), Codec::new(limit), admission.clone(), 16);
     let baseline = admission.used(ResourceClass::RequestContext);
     let held = admission
         .reserve(
@@ -86,9 +87,9 @@ fn small_peer_send_stages_actual_head_under_context_pressure() {
         )
         .unwrap();
     let head = response(0);
-    let expected = io.codec.encode_head(&head).unwrap();
+    let expected = Codec::new(limit).encode_head(&head).unwrap();
     let (socket, mut peer) = UnixStream::pair().unwrap();
-    let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+    let connection = from_accepted(socket.into(), &admission).unwrap();
     let result = drive(&reactor, io.send_head(connection, head, &scope)).unwrap();
     let mut received = vec![0; expected.len()];
     peer.read_exact(&mut received).unwrap();
@@ -133,7 +134,7 @@ fn decoded_field_storage_is_admitted_before_parser_allocations() {
         )
         .unwrap();
     let (socket, mut peer) = UnixStream::pair().unwrap();
-    let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+    let connection = from_accepted(socket.into(), &admission).unwrap();
     let mut head = b"GET / HTTP/1.1\r\n".to_vec();
     for _ in 0..500 {
         head.extend_from_slice(b"X:\r\n");
@@ -159,7 +160,7 @@ fn client_constructor_streams_beyond_page_cap_with_bounded_staging() {
     reactor.init().unwrap();
     let baseline = admission.used(ResourceClass::RequestContext);
     let (socket, mut peer) = UnixStream::pair().unwrap();
-    let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+    let connection = from_accepted(socket.into(), &admission).unwrap();
     peer.write_all(b"GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .unwrap();
     let received = drive(&reactor, io.receive_head(connection, &scope)).unwrap();
@@ -237,8 +238,9 @@ fn client_send_limit_does_not_relax_receive_or_page_transport_limits() {
     let page_limit = crate::model::PAGE_BYTES + 16;
     let page_io = HttpIo::with_admission(
         reactor.clone(),
-        Codec::new(4096, page_limit),
+        Codec::new(4096),
         admission.clone(),
+        page_limit,
     );
     let client_io = HttpIo::for_clients(reactor.clone(), admission.clone()).capped(4096);
     for io in [&page_io, &client_io] {
@@ -248,7 +250,7 @@ fn client_send_limit_does_not_relax_receive_or_page_transport_limits() {
         );
         for start in ["HTTP/1.1 200 OK", "GET /test HTTP/1.1"] {
             let (socket, mut peer) = UnixStream::pair().unwrap();
-            let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+            let connection = from_accepted(socket.into(), &admission).unwrap();
             write!(
                 peer,
                 "{start}\r\nContent-Length: {}\r\n\r\n",
@@ -266,7 +268,7 @@ fn client_send_limit_does_not_relax_receive_or_page_transport_limits() {
         (&client_io, i64::MAX as u64 + 1),
     ] {
         let (socket, _peer) = UnixStream::pair().unwrap();
-        let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+        let connection = from_accepted(socket.into(), &admission).unwrap();
         assert!(matches!(
             drive(
                 &reactor,
@@ -283,8 +285,9 @@ fn endpoint_caps_accept_exact_boundary_and_reject_one_extra_byte() {
     let (admission, reactor, _, scope) = setup();
     let peer = HttpIo::with_admission(
         reactor.clone(),
-        Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD, 16),
+        Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD),
         admission.clone(),
+        16,
     );
     let client = HttpIo::for_clients(reactor.clone(), admission.clone());
     let origin = peer.capped(crate::http::MAX_HEAD_BYTES);
@@ -295,13 +298,13 @@ fn endpoint_caps_accept_exact_boundary_and_reject_one_extra_byte() {
     ] {
         for extra in [0, 1] {
             let mut head = request("GET");
-            let overhead = Codec::new(usize::MAX, 16).encode_head(&head).unwrap().len();
+            let overhead = Codec::new(usize::MAX).encode_head(&head).unwrap().len();
             let value_length = head.headers[0].value.len() + limit - overhead + extra;
             head.headers[0].value.resize(value_length, b'x');
-            let raw = Codec::new(limit + 1, 16).encode_head(&head).unwrap();
+            let raw = Codec::new(limit + 1).encode_head(&head).unwrap();
             assert_eq!(raw.len(), limit + extra);
             let (socket, mut other) = UnixStream::pair().unwrap();
-            let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+            let connection = from_accepted(socket.into(), &admission).unwrap();
             let writer = std::thread::spawn(move || {
                 let _ = other.write_all(&raw);
             });
@@ -314,7 +317,7 @@ fn endpoint_caps_accept_exact_boundary_and_reject_one_extra_byte() {
             drop(result);
             writer.join().unwrap();
             let (socket, mut other) = UnixStream::pair().unwrap();
-            let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+            let connection = from_accepted(socket.into(), &admission).unwrap();
             let reader = std::thread::spawn(move || {
                 let mut received = Vec::new();
                 other.read_to_end(&mut received).unwrap();
@@ -339,7 +342,7 @@ fn real_socket_fragmentation_read_ahead_and_owned_ranges() {
     reactor.init().unwrap();
     let baseline = admission.used(ResourceClass::RequestContext);
     let (socket, mut peer) = UnixStream::pair().unwrap();
-    let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+    let connection = from_accepted(socket.into(), &admission).unwrap();
     let thread = std::thread::spawn(move || {
         peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Len").unwrap();
         std::thread::sleep(Duration::from_millis(5));
@@ -393,7 +396,7 @@ fn real_partial_sends_preserve_owned_subrange() {
         },
         0
     );
-    let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+    let connection = from_accepted(socket.into(), &admission).unwrap();
     let length = 1024 * 1024;
     let thread = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(10));
@@ -463,7 +466,7 @@ fn tcp_pool_reuses_only_finished_exchanges_and_enforces_capacity() {
 fn head_has_no_body_even_with_large_representation_length() {
     let (admission, reactor, io, scope) = setup();
     let (socket, mut peer) = UnixStream::pair().unwrap();
-    let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+    let connection = from_accepted(socket.into(), &admission).unwrap();
     let thread = std::thread::spawn(move || {
         let mut request = Vec::new();
         while !request.ends_with(b"\r\n\r\n") {
@@ -489,7 +492,7 @@ fn truncation_and_future_drop_do_not_recycle_live_buffers() {
     reactor.init().unwrap();
     let baseline = admission.used(ResourceClass::RequestContext);
     let (socket, mut peer) = UnixStream::pair().unwrap();
-    let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+    let connection = from_accepted(socket.into(), &admission).unwrap();
     peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort")
         .unwrap();
     drop(peer);
@@ -501,7 +504,7 @@ fn truncation_and_future_drop_do_not_recycle_live_buffers() {
     drop(received.value);
     drop(received._decoded);
     let (socket, _peer) = UnixStream::pair().unwrap();
-    let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+    let connection = from_accepted(socket.into(), &admission).unwrap();
     let mut future = io.receive_head(connection, &scope);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(future.as_mut().poll(&mut cx).is_pending());
@@ -523,7 +526,7 @@ fn deadline_expires_without_peer_traffic() {
     )
     .unwrap();
     let (socket, _peer) = UnixStream::pair().unwrap();
-    let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+    let connection = from_accepted(socket.into(), &admission).unwrap();
     assert!(matches!(
         drive(&reactor, io.receive_head(connection, &scope)),
         Err(Error::DeadlineExceeded)
@@ -582,20 +585,23 @@ fn unix_pool_reconnects_after_unread_response_and_bounds_endpoints() {
 fn read_ahead_erases_credentials_and_endpoint_limit_is_enforced() {
     let (admission, reactor, io, scope) = setup();
     let (socket, mut peer) = UnixStream::pair().unwrap();
-    let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+    let connection = from_accepted(socket.into(), &admission).unwrap();
     peer.write_all(b"POST / HTTP/1.1\r\nAuthorization: secret\r\nContent-Length: 4\r\n\r\nbody")
         .unwrap();
-    let received = drive(&reactor, io.receive_head(connection, &scope)).unwrap();
+    let mut received = drive(&reactor, io.receive_head(connection, &scope)).unwrap();
     let (ahead, range) = received
         .connection
-        .read_ahead
-        .as_ref()
+        .take_read_ahead()
         .expect("socket supplied head and body together");
-    assert!(ahead.bytes[..range.start].iter().all(|b| *b == 0));
-    assert_eq!(&ahead.bytes[range.clone()], b"body");
+    assert!(
+        ahead.bytes().unwrap()[..range.start]
+            .iter()
+            .all(|b| *b == 0)
+    );
+    assert_eq!(&ahead.bytes().unwrap()[range.clone()], b"body");
     drop(received);
     let (socket, mut peer) = UnixStream::pair().unwrap();
-    let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+    let connection = from_accepted(socket.into(), &admission).unwrap();
     peer.write_all(b"GET / HTTP/1.1\r\nAuthorization: too-large\r\n\r\n")
         .unwrap();
     assert!(matches!(
@@ -701,7 +707,7 @@ fn canceled_receive_retains_resources_until_completion_and_reports_canceled() {
     reactor.init().unwrap();
     let baseline = admission.used(ResourceClass::RequestContext);
     let (socket, _peer) = UnixStream::pair().unwrap();
-    let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+    let connection = from_accepted(socket.into(), &admission).unwrap();
     let mut future = io.receive_head(connection, &scope);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(future.as_mut().poll(&mut cx).is_pending());
@@ -720,14 +726,15 @@ fn raw_request_head_errors_return_fenced_socket_for_empty_400_and_431() {
         let (admission, reactor, _, scope) = setup();
         let io = HttpIo::with_admission(
             reactor.clone(),
-            Codec::new(32 * 1024, 1024),
+            Codec::new(32 * 1024),
             admission.clone(),
+            1024,
         );
         reactor.init().unwrap();
         let baseline = admission.used(ResourceClass::RequestContext);
         let (socket, mut peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+        let connection = from_accepted(socket.into(), &admission).unwrap();
         let raw = if oversized {
             let mut raw = b"GET / HTTP/1.1\r\nAuthorization: ".to_vec();
             raw.resize(crate::http::MAX_HEAD_BYTES, b'x');
@@ -752,7 +759,7 @@ fn raw_request_head_errors_return_fenced_socket_for_empty_400_and_431() {
             admission.used(ResourceClass::RequestContext),
             baseline + io.retained_buffer_bytes()
         );
-        assert!(outcome.connection.read_ahead.is_none());
+        assert!(outcome.connection.take_read_ahead().is_none());
         assert!(!outcome.connection.is_reusable());
         assert_eq!(
             outcome.connection.finish_exchange(),

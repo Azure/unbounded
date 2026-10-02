@@ -184,7 +184,10 @@ impl Service {
                     let failures = self.failures.clone();
                     let requests = self.requests.clone();
                     self.clients.push_back(Box::pin(async move {
-                        let lease = ConnectionLease::from_accepted(socket.into(), &rig.admission)?;
+                        let lease = racer_dataplane::http::connection::from_accepted(
+                            socket.into(),
+                            &rig.admission,
+                        )?;
                         let scope = scope();
                         let received = rig.io.receive_head(lease, &scope).await?;
                         let request = RequestParser::new(32768)

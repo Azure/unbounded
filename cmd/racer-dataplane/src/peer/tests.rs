@@ -6,7 +6,7 @@ mod body_progress {
         http::{
             Codec,
             connection::HttpIo,
-            connection::{ConnectionLease, Endpoint, HttpPool},
+            connection::{Endpoint, HttpPool},
         },
         model::{ExpiresAt, ObjectMetadata, PageEnvelope},
         runtime::reactor::Reactor,
@@ -87,8 +87,9 @@ mod body_progress {
             let reactor = Rc::new(Reactor::new(admission.clone()));
             let io = Rc::new(HttpIo::with_admission(
                 reactor.clone(),
-                Codec::new(protocol::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
+                Codec::new(protocol::MAX_ENVELOPE_HEAD),
                 admission.clone(),
+                crate::model::PAGE_BYTES + 16,
             ));
             let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 1));
             let signers = signers();
@@ -194,7 +195,7 @@ mod body_progress {
                 let fd = reactor
                     .accept(Rc::new(listener.into()), &server_scope)
                     .await?;
-                let conn = ConnectionLease::from_accepted(fd, &admission)?;
+                let conn = crate::http::connection::from_accepted(fd, &admission)?;
                 let conn = crate::security::connection::accept(
                     &io,
                     conn,
@@ -473,10 +474,7 @@ mod destination_disconnect {
     //! Real destination HTTP ingress with an independently owned, pending page flight.
     use super::*;
     use crate::{
-        http::{
-            Codec,
-            connection::{ConnectionLease, HttpIo},
-        },
+        http::{Codec, connection::HttpIo},
         model::OriginContext,
         read::flight::{
             AcquisitionBudget, AcquisitionEvent, AcquisitionFailure, Flights, JoinedCopy,
@@ -651,8 +649,9 @@ mod destination_disconnect {
             reactor.init().unwrap();
             let io = Rc::new(HttpIo::with_admission(
                 reactor.clone(),
-                Codec::new(protocol::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
+                Codec::new(protocol::MAX_ENVELOPE_HEAD),
                 admission.clone(),
+                crate::model::PAGE_BYTES + 16,
             ));
             let signers = signers();
             let forwarding = Rc::new(Forwarding::new(signers[2].clone()));
@@ -772,10 +771,13 @@ mod destination_disconnect {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let upstream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let (socket, _) = listener.accept().unwrap();
-            let client =
-                ConnectionLease::from_accepted(upstream.try_clone().unwrap().into(), &admission)
-                    .unwrap();
-            let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+            let client = crate::http::connection::from_accepted(
+                upstream.try_clone().unwrap().into(),
+                &admission,
+            )
+            .unwrap();
+            let connection =
+                crate::http::connection::from_accepted(socket.into(), &admission).unwrap();
             let mut work = server.serve_connection(connection, &parent);
             let sender = Forwarding::new(signers[0].clone());
             let mut request = request(&admission, 41);
@@ -977,7 +979,7 @@ mod encrypted_http {
         control::wire::{CacheEncryptionKey, CacheKeyPurpose, CacheKeyRef, CacheKeyState},
         http::{
             Codec,
-            connection::{ConnectionLease, Endpoint, HttpIo, HttpPool},
+            connection::{Endpoint, HttpIo, HttpPool},
         },
         memory::pool::CiphertextPage,
         runtime::{
@@ -1074,8 +1076,9 @@ mod encrypted_http {
             .map(|admission| {
                 Rc::new(HttpIo::with_admission(
                     reactor.clone(),
-                    Codec::new(protocol::MAX_ENVELOPE_HEAD, PAGE_BYTES + 16),
+                    Codec::new(protocol::MAX_ENVELOPE_HEAD),
                     admission.clone(),
+                    PAGE_BYTES + 16,
                 ))
             })
             .collect();
@@ -1153,7 +1156,7 @@ mod encrypted_http {
                     None => {
                         accepts.set(accepts.get() + 1);
                         let fd = reactor.accept(listener.clone(), &scope).await?;
-                        let conn = ConnectionLease::from_accepted(fd, &admissions[1])?;
+                        let conn = crate::http::connection::from_accepted(fd, &admissions[1])?;
                         crate::security::connection::accept(
                             &ios[1],
                             conn,
@@ -1341,7 +1344,7 @@ mod requester_safety {
     use crate::{
         http::{
             Codec,
-            connection::{ConnectionLease, HttpIo, HttpPool},
+            connection::{HttpIo, HttpPool},
         },
         model::{MembershipVersion, ResourceClass},
         peer::{
@@ -1417,8 +1420,9 @@ mod requester_safety {
         let reactor = Rc::new(Reactor::new(admission.clone()));
         let io = Rc::new(HttpIo::with_admission(
             reactor.clone(),
-            Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD, 0),
+            Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD),
             admission.clone(),
+            0,
         ));
         let pool = Rc::new(HttpPool::new(reactor, admission.clone(), 2));
         let adaptive = AdaptivePeers::new(Default::default(), Metrics::default()).unwrap();
@@ -1533,7 +1537,7 @@ mod requester_safety {
             let fd = reactor
                 .accept(Rc::new(Descriptor::from(listener)), &scope)
                 .await?;
-            let conn = ConnectionLease::from_accepted(fd, &admission)?;
+            let conn = crate::http::connection::from_accepted(fd, &admission)?;
             let conn = connection::accept(&io, conn, signers[2].clone(), &scope).await?;
             let received = io.receive_head(conn, &scope).await?;
             let (head, length) = decode_envelope(received.value, false)?;
@@ -1856,7 +1860,6 @@ mod timing {
     #[test]
     fn page_timing_requester_reuses_authenticated_session_and_rejects_bad_signature() {
         use crate::{
-            http::connection::ConnectionLease,
             peer::PeerClient,
             topology::{
                 health::LinkHealth,
@@ -1944,7 +1947,7 @@ mod timing {
         let server = async {
             // Only one accept and handshake: all three exchanges must reuse this session.
             let fd = reactor.accept(Rc::new(listener.into()), &scope).await?;
-            let connection = ConnectionLease::from_accepted(fd, &admission)?;
+            let connection = crate::http::connection::from_accepted(fd, &admission)?;
             let mut connection =
                 crate::security::connection::accept(&io, connection, signers[2].clone(), &scope)
                     .await?;
@@ -2127,8 +2130,9 @@ impl SocketFixture {
         let reactor = Rc::new(crate::runtime::reactor::Reactor::new(admission.clone()));
         let io = Rc::new(crate::http::connection::HttpIo::with_admission(
             reactor.clone(),
-            crate::http::Codec::new(protocol::MAX_ENVELOPE_HEAD, body_limit),
+            crate::http::Codec::new(protocol::MAX_ENVELOPE_HEAD),
             admission.clone(),
+            body_limit,
         ));
         Self {
             codec: Rc::new(codec(&admission)),

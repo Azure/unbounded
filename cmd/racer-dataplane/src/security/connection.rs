@@ -53,7 +53,7 @@ impl Signatures {
         }
         receiver(&head)?;
         let signed = self.sign_fields(head)?;
-        Codec::new(p::MAX_HEAD, u64::MAX).encode_head(&signed.head)?;
+        Codec::new(p::MAX_HEAD).encode_head(&signed.head)?;
         Ok(signed)
     }
     pub(crate) fn sign_fields(&self, mut head: MessageHead) -> Result<SignedHead> {
@@ -96,7 +96,7 @@ impl Signatures {
             "signature",
             format!("racer=:{}:", p::binary(&signature)),
         );
-        Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD, u64::MAX).encode_head(&head)?;
+        Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD).encode_head(&head)?;
         Ok(SignedHead { head, signature })
     }
     /// Verify identity and retained provenance, without replay admission. Network
@@ -220,7 +220,7 @@ pub fn receiver(head: &MessageHead) -> Result<NodeId> {
     node_field(head, "racer-receiver")
 }
 fn components(head: &MessageHead) -> Result<Vec<String>> {
-    Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD, u64::MAX).encode_head(head)?;
+    Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD).encode_head(head)?;
     let mut names = BTreeSet::new();
     for h in &head.headers {
         let name = h.name.to_ascii_lowercase();
@@ -536,7 +536,7 @@ pub async fn connect(
     parent: &RequestScope,
 ) -> Result<ConnectionLease> {
     parent.check()?;
-    if let Some(session) = connection.session.as_ref() {
+    if let Some(session) = connection.state().session.as_ref() {
         session.check()?;
         if session.peer() != peer {
             return Err(Error::Unauthorized);
@@ -573,12 +573,15 @@ pub async fn connect(
     scope.check()?;
     connection = response.connection;
     connection.next_round()?;
-    connection.install_session(Session::new(
-        signatures.clone(),
-        peer.clone(),
-        transcript(signatures.node(), peer, &a, &b),
-        0,
-    ))?;
+    crate::http::connection::install_session(
+        &mut connection,
+        Session::new(
+            signatures.clone(),
+            peer.clone(),
+            transcript(signatures.node(), peer, &a, &b),
+            0,
+        ),
+    )?;
     Ok(connection)
 }
 pub async fn accept(
@@ -588,7 +591,7 @@ pub async fn accept(
     parent: &RequestScope,
 ) -> Result<ConnectionLease> {
     parent.check()?;
-    if let Some(session) = connection.session.as_ref() {
+    if let Some(session) = connection.state().session.as_ref() {
         session.check()?;
         return Ok(connection);
     }
@@ -629,7 +632,10 @@ pub async fn accept(
     scope.check()?;
     connection.next_round()?;
     let id = transcript(&peer, signatures.node(), &a, &b);
-    connection.install_session(Session::new(signatures, peer, id, 1))?;
+    crate::http::connection::install_session(
+        &mut connection,
+        Session::new(signatures, peer, id, 1),
+    )?;
     Ok(connection)
 }
 
@@ -666,7 +672,7 @@ pub(crate) mod tests {
         }
     }
     fn clone_head(head: &MessageHead) -> MessageHead {
-        let codec = Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD, u64::MAX);
+        let codec = Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD);
         codec
             .decode_head(&codec.encode_head(head).unwrap())
             .unwrap()
@@ -723,14 +729,13 @@ pub(crate) mod tests {
         }
         let admission = Admission::new(crate::test_support::cluster::config(false).limits);
         let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
-        let mut conn = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
-        conn.install_session(a).unwrap();
-        assert!(conn.install_session(b).is_err());
-        conn.rx_remaining = Some(0);
-        conn.tx_remaining = Some(0);
+        let mut conn = crate::http::connection::from_accepted(socket.into(), &admission).unwrap();
+        crate::http::connection::install_session(&mut conn, a).unwrap();
+        assert!(crate::http::connection::install_session(&mut conn, b).is_err());
+        conn.set_framing(Some(0), Some(0), false);
         conn.next_round().unwrap();
         assert!(!conn.is_reusable());
-        assert_eq!(conn.session.as_ref().unwrap().tx, 2);
+        assert_eq!(conn.state().session.as_ref().unwrap().tx, 2);
     }
     #[test]
     fn parallel_connections_isolate_counters_and_wall_rollback_cannot_resurrect_frames() {
@@ -875,8 +880,9 @@ pub(crate) mod tests {
         let reactor = Rc::new(Reactor::new(admission.clone()));
         let io = HttpIo::with_admission(
             reactor.clone(),
-            Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD, u64::MAX),
+            Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD),
             admission.clone(),
+            u64::MAX,
         );
         let pool = HttpPool::new(reactor.clone(), admission.clone(), 2);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -892,13 +898,13 @@ pub(crate) mod tests {
             };
             let server = async {
                 let fd = reactor.accept(listener.clone(), &scope).await?;
-                let conn = ConnectionLease::from_accepted(fd, &admission)?;
+                let conn = crate::http::connection::from_accepted(fd, &admission)?;
                 accept(&io, conn, n[1].clone(), &scope).await
             };
             let (mut client, mut server) =
                 drive(&reactor, async { futures::try_join!(client, server) }).unwrap();
-            let id = client.session.as_ref().unwrap().id;
-            assert_eq!(id, server.session.as_ref().unwrap().id);
+            let id = client.state().session.as_ref().unwrap().id;
+            assert_eq!(id, server.state().session.as_ref().unwrap().id);
             assert_ne!(Some(id), previous_id);
             previous_id = Some(id);
             for sequence in 1..=3 {
@@ -921,11 +927,11 @@ pub(crate) mod tests {
                 };
                 (client, server) =
                     drive(&reactor, async { futures::try_join!(exchange, respond) }).unwrap();
-                assert_eq!(client.session.as_ref().unwrap().rx, sequence);
+                assert_eq!(client.state().session.as_ref().unwrap().rx, sequence);
                 drop(client);
                 client = drive(&reactor, pool.checkout(&endpoint, &scope)).unwrap();
-                assert_eq!(client.session.as_ref().unwrap().id, id);
-                assert_eq!(client.session.as_ref().unwrap().tx, sequence);
+                assert_eq!(client.state().session.as_ref().unwrap().id, id);
+                assert_eq!(client.state().session.as_ref().unwrap().tx, sequence);
             }
             client.poison();
             drop(client);
@@ -992,7 +998,7 @@ pub(crate) mod tests {
             true,
         )
         .unwrap();
-        let codec = Codec::new(65536, 0);
+        let codec = Codec::new(65536);
         let bytes = codec.encode_head(&h).unwrap();
         for end in 0..bytes.len() {
             assert!(codec.decode_head(&bytes[..end]).unwrap().is_none());
@@ -1018,12 +1024,12 @@ pub(crate) mod tests {
             crate::test_support::cluster::config(false).limits,
         ));
         let reactor = Rc::new(Reactor::new(admission.clone()));
-        let io = HttpIo::with_admission(reactor.clone(), Codec::new(65536, 0), admission.clone());
+        let io = HttpIo::with_admission(reactor.clone(), Codec::new(65536), admission.clone(), 0);
         let scope = RequestScope::new(RequestId([2; 16]), Instant::now() + Duration::from_secs(10))
             .unwrap();
         let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
-        let a = ConnectionLease::from_accepted(a.into(), &admission).unwrap();
-        let b = ConnectionLease::from_accepted(b.into(), &admission).unwrap();
+        let a = crate::http::connection::from_accepted(a.into(), &admission).unwrap();
+        let b = crate::http::connection::from_accepted(b.into(), &admission).unwrap();
         let (mut a, mut b) = drive(&reactor, async {
             futures::try_join!(
                 connect(&io, a, n[0].clone(), n[1].node(), &scope),
@@ -1031,8 +1037,14 @@ pub(crate) mod tests {
             )
         })
         .unwrap();
-        let valid = a.session.as_mut().unwrap().sign(frame()).unwrap();
-        let bytes = Codec::new(65536, 0).encode_head(&valid).unwrap();
+        let valid = a
+            .state_mut()
+            .session
+            .as_mut()
+            .unwrap()
+            .sign(frame())
+            .unwrap();
+        let bytes = Codec::new(65536).encode_head(&valid).unwrap();
         let mut dispatches = 0;
         for replay in [false, true] {
             let mut buffer = io.buffer(bytes.len()).unwrap();
@@ -1062,7 +1074,7 @@ pub(crate) mod tests {
             let reactor = Rc::new(Reactor::new(admission.clone()));
             reactor.init().unwrap();
             let io =
-                HttpIo::with_admission(reactor.clone(), Codec::new(65536, 0), admission.clone());
+                HttpIo::with_admission(reactor.clone(), Codec::new(65536), admission.clone(), 0);
             let scope = RequestScope::new(
                 RequestId([3; 16]),
                 Instant::now()
@@ -1074,7 +1086,7 @@ pub(crate) mod tests {
             )
             .unwrap();
             let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
-            let conn = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+            let conn = crate::http::connection::from_accepted(socket.into(), &admission).unwrap();
             let mut work = Box::pin(accept(&io, conn, n[1].clone(), &scope));
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             assert!(work.as_mut().poll(&mut cx).is_pending());

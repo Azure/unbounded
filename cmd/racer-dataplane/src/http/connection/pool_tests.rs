@@ -74,8 +74,9 @@ fn held(
     let scope = scope();
     let io = HttpIo::with_admission(
         pool.reactor.clone(),
-        Codec::new(4096, 16),
+        Codec::new(4096),
         pool.admission.clone(),
+        16,
     );
     let client = async {
         let connection = pool.checkout_metadata(endpoint, &scope).await?;
@@ -107,7 +108,7 @@ fn held(
     let server = async {
         let socket =
             std::future::poll_fn(|_| listener.accept().map_or(Poll::Pending, Poll::Ready)).await;
-        let connection = ConnectionLease::from_accepted(socket, &pool.admission)?;
+        let connection = from_accepted(socket, &pool.admission)?;
         let received = io.receive_head(connection, &scope).await?;
         assert!(
             matches!(received.value.start, StartLine::Request { ref target, .. } if target == "/pool")
@@ -158,7 +159,7 @@ fn idle_expiration_runs_without_checkout_or_waiters_and_is_budgeted() {
     let clock = crate::runtime::environment::SimulationClock::new(91);
     let _environment = clock.environment(0).enter();
     let (admission, _, mut pool) = setup();
-    pool.idle_timeout = Duration::ZERO;
+    pool.core.config_mut().idle_timeout = Duration::ZERO;
     let mut peers = Vec::new();
     for _ in 1..=3 {
         let (listener, endpoint) = Listener::peer();
@@ -283,7 +284,7 @@ fn waiting_cancel_deadline_close_stop_and_drop_release_only_waiter_quota() {
             );
         }
         drop(wait);
-        assert!(pool.state.borrow().waiting.is_empty());
+        assert_eq!(pool.snapshot().waiting, 0);
         assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
         assert_eq!(admission.used(ResourceClass::OutboundConnection), 1);
         assert_eq!(reactor.in_flight(), 0);
@@ -332,7 +333,7 @@ fn worker_tick_wakes_bounded_round_robin_waiters_even_in_nested_executor() {
         ));
         std::thread::sleep(Duration::from_millis(2));
     }
-    assert!(pool.state.borrow().waiting.is_empty());
+    assert_eq!(pool.snapshot().waiting, 0);
 }
 #[test]
 fn waiting_connection_quota_releases_and_connect_abandonment_keeps_fence() {
@@ -354,17 +355,17 @@ fn waiting_connection_quota_releases_and_connect_abandonment_keeps_fence() {
     assert!(wait.as_mut().poll(&mut cx).is_pending());
     assert_eq!(reactor.in_flight(), 0);
     assert!(
-        pool.state.borrow().entries.is_empty(),
+        pool.snapshot().entries.is_empty(),
         "no slot held waiting for global quota"
     );
     drop(quota);
     pool.poll_waiters(1);
     assert!(wait.as_mut().poll(&mut cx).is_pending());
-    assert!(pool.state.borrow().waiting.is_empty());
+    assert_eq!(pool.snapshot().waiting, 0);
     assert_eq!(reactor.in_flight(), 1);
     drop(wait);
     assert_eq!(admission.used(ResourceClass::Connection), 1);
-    assert_eq!(pool.state.borrow().entries[&endpoint].active, 1);
+    assert_eq!(pool.snapshot().entries[&endpoint].0, 1);
     assert!(matches!(
         pool.checkout(&endpoint, &scope).as_mut().poll(&mut cx),
         Poll::Ready(Err(Error::Overloaded))
@@ -374,14 +375,14 @@ fn waiting_connection_quota_releases_and_connect_abandonment_keeps_fence() {
         reactor.poll_budgeted(32).unwrap();
         reactor.wait(Duration::from_millis(1)).unwrap();
     }
-    assert!(pool.state.borrow().entries.is_empty());
+    assert!(pool.snapshot().entries.is_empty());
     assert_eq!(admission.used(ResourceClass::Connection), 0);
     assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
 }
 #[test]
 fn waiting_endpoint_table_and_context_pressure_remain_bounded() {
     let (admission, reactor, mut pool) = setup();
-    pool.max_endpoints = 1;
+    pool.core.config_mut().max_endpoints = 1;
     let (listener, first) = Listener::peer();
     let (second_listener, second) = Listener::peer();
     let (held, peer) = held(&pool, &first, &listener);
@@ -399,18 +400,18 @@ fn waiting_endpoint_table_and_context_pressure_remain_bounded() {
         pool.checkout_wait(&second, &scope).as_mut().poll(&mut cx),
         Poll::Ready(Err(Error::Overloaded))
     ));
-    assert!(pool.state.borrow().waiting.is_empty());
-    assert_eq!(pool.state.borrow().entries.len(), 1);
+    assert_eq!(pool.snapshot().waiting, 0);
+    assert_eq!(pool.snapshot().entries.len(), 1);
     drop(context);
     let mut wait = pool.checkout_wait(&second, &scope);
     assert!(wait.as_mut().poll(&mut cx).is_pending());
-    assert_eq!(pool.state.borrow().entries.len(), 1);
+    assert_eq!(pool.snapshot().entries.len(), 1);
     drop(held);
     // Real checkout evicts the idle-only endpoint before its idle timeout.
     let connection = drive(&reactor, wait.as_mut()).unwrap();
     assert!(second_listener.accept().is_some());
-    assert_eq!(pool.state.borrow().entries.len(), 1);
-    assert!(!pool.state.borrow().entries.contains_key(&first));
+    assert_eq!(pool.snapshot().entries.len(), 1);
+    assert!(!pool.snapshot().entries.contains_key(&first));
     drop((connection, wait, peer));
     assert_eq!(admission.used(ResourceClass::RequestContext), baseline);
     assert_eq!(admission.used(ResourceClass::Connection), 0);
@@ -418,7 +419,7 @@ fn waiting_endpoint_table_and_context_pressure_remain_bounded() {
 #[test]
 fn origin_uid_churn_preserves_endpoint_and_connection_bounds() {
     let (admission, _, mut pool) = setup();
-    pool.max_endpoints = 1;
+    pool.core.config_mut().max_endpoints = 1;
     let (listener, endpoint) = Listener::origin();
     let Endpoint::Unix(path) = endpoint else {
         unreachable!()
@@ -432,11 +433,11 @@ fn origin_uid_churn_preserves_endpoint_and_connection_bounds() {
         pool.prepare_connection(&origin(1)),
         Err(Error::Overloaded)
     ));
-    assert_eq!(pool.state.borrow().entries.len(), 1);
+    assert_eq!(pool.snapshot().entries.len(), 1);
     drop((first, peer));
     for uid in 1..32 {
         let (connection, peer) = held(&pool, &origin(uid), &listener);
-        assert_eq!(pool.state.borrow().entries.len(), 1);
+        assert_eq!(pool.snapshot().entries.len(), 1);
         assert_eq!(admission.used(ResourceClass::OutboundConnection), 1);
         drop((connection, peer));
     }
@@ -476,7 +477,7 @@ fn origin_cap_is_independent_of_peer_cap_and_idle_quota_is_reclaimed() {
         .unwrap();
     let other = Endpoint::Peer("127.0.0.1:9".into());
     let (lease, _) = pool.prepare_connection(&other).unwrap();
-    assert_eq!(pool.state.borrow().entries[&origin].idle.len(), 0);
+    assert_eq!(pool.snapshot().entries[&origin].1, 0);
     drop((lease, quota));
     assert_eq!(admission.used(ResourceClass::Connection), 0);
 }
@@ -503,7 +504,7 @@ fn metadata_bypasses_queued_pages_within_existing_origin_cap() {
     let Poll::Ready(Ok(metadata)) = metadata.as_mut().poll(&mut cx) else {
         panic!("metadata queued behind page")
     };
-    assert_eq!(pool.state.borrow().entries[&endpoint].active, 2);
+    assert_eq!(pool.snapshot().entries[&endpoint].0, 2);
     assert!(page.as_mut().poll(&mut cx).is_pending());
     drop((metadata, first, page, a, b));
     pool.close();
@@ -513,7 +514,7 @@ fn metadata_bypasses_queued_pages_within_existing_origin_cap() {
 #[test]
 fn invalidated_active_generation_cannot_reenter_idle_and_expiry_releases_quota() {
     let (admission, _, mut pool) = setup();
-    pool.idle_timeout = Duration::ZERO;
+    pool.core.config_mut().idle_timeout = Duration::ZERO;
     let (listener, endpoint) = Listener::peer();
     for invalidate in [true, false] {
         let (connection, peer) = held(&pool, &endpoint, &listener);
@@ -527,7 +528,7 @@ fn invalidated_active_generation_cannot_reenter_idle_and_expiry_releases_quota()
         );
         pool.expire_idle();
         assert_eq!(admission.used(ResourceClass::Connection), 0);
-        assert!(pool.state.borrow().entries.is_empty());
+        assert!(pool.snapshot().entries.is_empty());
     }
 }
 #[test]

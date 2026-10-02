@@ -546,11 +546,12 @@ impl ClientListeners {
                         worked += 1;
                         continue;
                     }
-                    let connection = match ConnectionLease::from_accepted(socket, &self.admission) {
-                        Ok(connection) => connection,
-                        Err(Error::Overloaded) => break,
-                        Err(error) => return Err(error),
-                    };
+                    let connection =
+                        match crate::http::connection::from_accepted(socket, &self.admission) {
+                            Ok(connection) => connection,
+                            Err(Error::Overloaded) => break,
+                            Err(error) => return Err(error),
+                        };
                     self.install_connection(
                         connection,
                         listener.definition.id.clone(),

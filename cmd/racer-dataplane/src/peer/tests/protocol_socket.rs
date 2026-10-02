@@ -402,8 +402,9 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let io = Rc::new(HttpIo::with_admission(
         reactor,
-        Codec::new(65536, 16777232),
+        Codec::new(65536),
         admission.clone(),
+        16777232,
     ));
     let calls = Rc::new(Cell::new(0));
     let server = server::PeerServer::for_test(
@@ -755,8 +756,9 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let io = Rc::new(HttpIo::with_admission(
         reactor.clone(),
-        Codec::new(protocol::MAX_ENVELOPE_HEAD, 0),
+        Codec::new(protocol::MAX_ENVELOPE_HEAD),
         admission.clone(),
+        0,
     ));
     let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2));
     let transfers = Rc::new(transport::Transfers::new(
@@ -893,13 +895,10 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
 
 fn signed_tcp_case(case: &str) {
     use super::PeerClient;
-    use crate::{
-        http::connection::ConnectionLease,
-        topology::{
-            health::LinkHealth,
-            membership::{Member, Membership},
-            routing::Paths,
-        },
+    use crate::topology::{
+        health::LinkHealth,
+        membership::{Member, Membership},
+        routing::Paths,
     };
     use std::{
         net::TcpListener,
@@ -1060,7 +1059,7 @@ fn signed_tcp_case(case: &str) {
                 &scope,
             )
             .await?;
-        let connection = ConnectionLease::from_accepted(fd, &admission)?;
+        let connection = crate::http::connection::from_accepted(fd, &admission)?;
         server.serve_connection(connection, &listener_scope).await?;
         Ok::<(), Error>(())
     };
@@ -1098,10 +1097,7 @@ fn signed_tcp_case(case: &str) {
 #[test]
 fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
     use crate::{
-        http::{
-            Codec,
-            connection::{ConnectionLease, HttpIo},
-        },
+        http::{Codec, connection::HttpIo},
         runtime::reactor::Reactor,
         topology::{health::LinkHealth, routing::Paths},
     };
@@ -1161,8 +1157,9 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
         let baseline = admission.used(ResourceClass::RequestContext);
         let io = Rc::new(HttpIo::with_admission(
             reactor.clone(),
-            Codec::new(protocol::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
+            Codec::new(protocol::MAX_ENVELOPE_HEAD),
             admission.clone(),
+            crate::model::PAGE_BYTES + 16,
         ));
         let (signers, _) = identities();
         let forwarding = Rc::new(Forwarding::new(signers[2].clone()));
@@ -1204,11 +1201,14 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
         let (socket, mut peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
-        let mut connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+        let mut connection =
+            crate::http::connection::from_accepted(socket.into(), &admission).unwrap();
         if case == "idle" {
-            let client =
-                ConnectionLease::from_accepted(peer.try_clone().unwrap().into(), &admission)
-                    .unwrap();
+            let client = crate::http::connection::from_accepted(
+                peer.try_clone().unwrap().into(),
+                &admission,
+            )
+            .unwrap();
             let (client, accepted) = drive(&reactor, async {
                 futures::try_join!(
                     crate::security::connection::connect(
@@ -1325,8 +1325,9 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let io = Rc::new(HttpIo::with_admission(
         reactor.clone(),
-        Codec::new(64 * 1024, crate::model::PAGE_BYTES + 16),
+        Codec::new(64 * 1024),
         admission.clone(),
+        crate::model::PAGE_BYTES + 16,
     ));
     let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 1));
     let signers = signers();
@@ -1418,14 +1419,14 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     let scope =
         RequestScope::new(RequestId([7; 16]), Instant::now() + Duration::from_secs(30)).unwrap();
     let server = async {
-        use crate::{http::connection::ConnectionLease, runtime::reactor::IoBuffer};
+        use crate::runtime::reactor::IoBuffer;
         let fd = reactor
             .accept(
                 Rc::new(crate::runtime::reactor::Descriptor::from(listener)),
                 &scope,
             )
             .await?;
-        let conn = ConnectionLease::from_accepted(fd, &admission)?;
+        let conn = crate::http::connection::from_accepted(fd, &admission)?;
         let mut conn =
             crate::security::connection::accept(&io, conn, signers[2].clone(), &scope).await?;
         for attempt in 0..3 {
@@ -1652,8 +1653,9 @@ mod established_sessions {
             reactor.init().unwrap();
             let io = Rc::new(HttpIo::with_admission(
                 reactor.clone(),
-                Codec::new(protocol::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
+                Codec::new(protocol::MAX_ENVELOPE_HEAD),
                 admission.clone(),
+                crate::model::PAGE_BYTES + 16,
             ));
             let signers = signers();
             let forwarding = Rc::new(Forwarding::new(signers[2].clone()));
@@ -1729,8 +1731,8 @@ mod established_sessions {
         fn sockets(&self) -> (ConnectionLease, ConnectionLease) {
             let (a, b) = UnixStream::pair().unwrap();
             (
-                ConnectionLease::from_accepted(a.into(), &self.admission).unwrap(),
-                ConnectionLease::from_accepted(b.into(), &self.admission).unwrap(),
+                crate::http::connection::from_accepted(a.into(), &self.admission).unwrap(),
+                crate::http::connection::from_accepted(b.into(), &self.admission).unwrap(),
             )
         }
         fn frame(&self, large: bool) -> crate::http::MessageHead {
@@ -1780,7 +1782,13 @@ mod established_sessions {
             let baseline = f.admission.used(ResourceClass::RequestContext);
             let (mut a, b) = f.first();
             assert_eq!(f.calls.get(), 1);
-            let mut head = a.session.as_mut().unwrap().sign(f.frame(false)).unwrap();
+            let mut head = a
+                .state_mut()
+                .session
+                .as_mut()
+                .unwrap()
+                .sign(f.frame(false))
+                .unwrap();
             // Re-sign incorrect bindings with the real peer key. Rejection must
             // test ordering/session/direction rather than signature corruption.
             if attack != "signature" {
@@ -1816,7 +1824,7 @@ mod established_sessions {
                     .value;
                 signature[8] = if signature[8] == b'A' { b'B' } else { b'A' };
             }
-            let bytes = Codec::new(protocol::MAX_ENVELOPE_HEAD, 0)
+            let bytes = Codec::new(protocol::MAX_ENVELOPE_HEAD)
                 .encode_head(&head)
                 .unwrap();
             let mut buffer = f.io.buffer(bytes.len()).unwrap();

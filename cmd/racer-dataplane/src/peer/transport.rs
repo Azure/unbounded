@@ -248,11 +248,9 @@ mod native_exchange_tests {
         let rdma = Rc::new(RdmaTransfer::new(sessions.clone()));
         let io = Rc::new(HttpIo::with_admission(
             reactor.clone(),
-            Codec::new(
-                super::super::protocol::MAX_ENVELOPE_HEAD,
-                crate::model::PAGE_BYTES + 16,
-            ),
+            Codec::new(super::super::protocol::MAX_ENVELOPE_HEAD),
             admission.clone(),
+            crate::model::PAGE_BYTES + 16,
         ));
         Transfers::new(
             Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2)),
@@ -443,8 +441,8 @@ mod native_exchange_tests {
             response,
         };
         let (a, b) = UnixStream::pair().unwrap();
-        let a = ConnectionLease::from_accepted(a.into(), &admission).unwrap();
-        let b = ConnectionLease::from_accepted(b.into(), &admission).unwrap();
+        let a = crate::http::connection::from_accepted(a.into(), &admission).unwrap();
+        let b = crate::http::connection::from_accepted(b.into(), &admission).unwrap();
         let receive = async {
             let a = crate::security::connection::connect(
                 &receiver.io,
@@ -715,11 +713,9 @@ mod native_exchange_tests {
             let rdma = Rc::new(RdmaTransfer::new(sessions.clone()));
             let http = Rc::new(HttpIo::with_admission(
                 reactor.clone(),
-                Codec::new(
-                    super::super::protocol::MAX_ENVELOPE_HEAD,
-                    crate::model::PAGE_BYTES + 16,
-                ),
+                Codec::new(super::super::protocol::MAX_ENVELOPE_HEAD),
                 admission.clone(),
+                crate::model::PAGE_BYTES + 16,
             ));
             let transfer = Transfers::new(
                 Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2)),
@@ -891,8 +887,8 @@ mod native_exchange_tests {
             .unwrap(),
         );
         let (a, b) = UnixStream::pair().unwrap();
-        let a = ConnectionLease::from_accepted(a.into(), &admission).unwrap();
-        let b = ConnectionLease::from_accepted(b.into(), &admission).unwrap();
+        let a = crate::http::connection::from_accepted(a.into(), &admission).unwrap();
+        let b = crate::http::connection::from_accepted(b.into(), &admission).unwrap();
         let receive = async {
             let a = crate::security::connection::connect(
                 &receiver.io,
@@ -976,8 +972,8 @@ mod native_exchange_tests {
             } else {
                 assert!(sent);
             }
-            assert_eq!(conn.tx_remaining, Some(0));
-            assert_eq!(conn.rx_remaining, Some(0));
+            assert_eq!(conn.send_remaining(), Some(0));
+            assert_eq!(conn.receive_remaining(), Some(0));
             conn.finish_exchange()?;
             Ok::<(), Error>(())
         };
@@ -1301,7 +1297,7 @@ impl Transfers {
         peer: &NodeId,
         sending: bool,
     ) -> Result<TransportPlan> {
-        if connection.session.as_ref().map(|s| s.peer()) != Some(peer) {
+        if connection.state().session.as_ref().map(|s| s.peer()) != Some(peer) {
             return Err(Error::Unauthorized);
         }
         let path = crate::security::protocol::decode_nodes(
@@ -1778,7 +1774,7 @@ impl Transfers {
             .prepare_admitted(
                 &offer.peer,
                 binding.rail,
-                connection.peer_admission.clone(),
+                connection.state().peer_admission.clone(),
                 scope,
             )
             .await
@@ -2274,11 +2270,11 @@ impl Transfers {
                     )
                     .await,
             )?;
-            connection.peer_admission = peer_admission.clone();
+            connection.state_mut().peer_admission = peer_admission.clone();
             if let Some(timing) = timing.as_deref_mut() {
                 timing.end(0);
             }
-            connection.relay_reservation = relay.clone();
+            connection.state_mut().relay_reservation = relay.clone();
             // Connection and handshake get separate bounded idle allowances.
             // No header byte can renew the request/head allowance.
             scope.candidate_progress()?;
@@ -2287,6 +2283,7 @@ impl Transfers {
                     timing.begin();
                 }
                 let _permit = connection
+                    .state()
                     .session
                     .is_none()
                     .then(|| admission.reserve(None, ResourceClass::ControlProgress, 1))
@@ -2364,7 +2361,7 @@ impl Transfers {
                     .map(RelayResponse::Complete);
             }
             if relay.is_some() {
-                received.connection.relay_context = relay_context;
+                received.connection.state_mut().relay_context = relay_context;
                 return Ok(RelayResponse::Http {
                     authentication,
                     connection: Box::new(received.connection),

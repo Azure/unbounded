@@ -143,8 +143,9 @@ impl AdapterOrigin {
                 Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 8)),
                 Rc::new(HttpIo::with_admission(
                     reactor,
-                    Codec::new(32768, PAGE_BYTES),
+                    Codec::new(32768),
                     admission.clone(),
+                    PAGE_BYTES,
                 )),
                 admission,
                 buffers,
@@ -239,11 +240,7 @@ fn serve(mut stream: UnixStream, state: &Mutex<State>, stop: &AtomicBool) {
         }
         assert!(request.len() <= 32768, "oversized adapter request");
     }
-    let request = Codec::new(32768, PAGE_BYTES)
-        .decode_head(&request)
-        .unwrap()
-        .unwrap()
-        .0;
+    let request = Codec::new(32768).decode_head(&request).unwrap().unwrap().0;
     let head = matches!(&request.start, crate::http::StartLine::Request { method, .. } if method == "HEAD");
     let if_match = request.unique("If-Match").unwrap().map(<[u8]>::to_vec);
     let first = request

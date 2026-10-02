@@ -72,8 +72,9 @@ impl Fixture {
         Self {
             io: HttpIo::with_admission(
                 reactor.clone(),
-                Codec::new(4096, crate::model::PAGE_BYTES + 16),
+                Codec::new(4096),
                 admission.clone(),
+                crate::model::PAGE_BYTES + 16,
             ),
             pipes: PipePool::new(admission.clone(), reactor.clone()),
             admission,
@@ -88,20 +89,17 @@ impl Fixture {
     ) -> (ConnectionLease, ConnectionLease, TcpStream, TcpStream) {
         let (source, writer) = pair();
         let (destination, reader) = pair();
-        let mut source = ConnectionLease::from_accepted(source.into(), &self.admission).unwrap();
-        let mut destination =
-            ConnectionLease::from_accepted(destination.into(), &self.admission).unwrap();
+        let mut source = from_accepted(source.into(), &self.admission).unwrap();
+        let mut destination = from_accepted(destination.into(), &self.admission).unwrap();
         let reservation = Rc::new(
             self.admission
                 .reserve(None, ResourceClass::Relay, 1)
                 .unwrap(),
         );
-        source.relay_reservation = Some(reservation.clone());
-        destination.relay_reservation = Some(reservation);
-        source.rx_remaining = Some(length as u64);
-        source.tx_remaining = Some(0);
-        destination.rx_remaining = Some(0);
-        destination.tx_remaining = Some(length as u64);
+        source.state_mut().relay_reservation = Some(reservation.clone());
+        destination.state_mut().relay_reservation = Some(reservation);
+        source.set_framing(Some(length as u64), Some(0), false);
+        destination.set_framing(Some(0), Some(length as u64), false);
         (source, destination, writer, reader)
     }
     fn drain(&self) {
@@ -112,7 +110,7 @@ impl Fixture {
 fn truncation_after_success_closes_both_without_error_suffix_or_pool_reuse() {
     let f = Fixture::new();
     let (source, mut destination, mut writer, mut reader) = f.connections(1024);
-    destination.tx_remaining = None;
+    destination.set_framing(destination.receive_remaining(), None, false);
     destination = drive(
         &f.reactor,
         f.io.send_head(
@@ -225,7 +223,7 @@ fn unsupported_splice_with_buffered_pipe_drains_suffix_and_keeps_exact_frame() {
     let f = Fixture::new();
     let length = 1024 * 1024 + 16;
     let (source, mut destination, mut writer, mut reader) = f.connections(length);
-    destination.relay_fallback_at = Some(length / 2);
+    destination.state_mut().relay_fallback_at = Some(length / 2);
     let producer = std::thread::spawn(move || {
         writer.write_all(&vec![83; length]).unwrap();
         writer
@@ -263,7 +261,7 @@ fn tcp_backpressure_recovers_and_wakes_queued_pipe_owner_without_losing_frame() 
     assert_eq!(
         unsafe {
             libc::setsockopt(
-                destination.fd.as_raw_fd(),
+                destination.socket().as_raw_fd(),
                 libc::SOL_SOCKET,
                 libc::SO_SNDBUF,
                 (&size as *const libc::c_int).cast(),
@@ -314,8 +312,7 @@ fn tcp_backpressure_recovers_and_wakes_queued_pipe_owner_without_losing_frame() 
     drop(pipe);
     drop(producer.join().unwrap());
     let mut reader = consumer.join().unwrap();
-    connection.rx_remaining = Some(0);
-    connection.tx_remaining = Some(4);
+    connection.set_framing(Some(0), Some(4), false);
     let mut suffix = f.io.buffer(4).unwrap();
     suffix.bytes_mut().unwrap().copy_from_slice(b"next");
     drop(drive_worker(&f.reactor, f.io.write_body(connection, suffix, &f.scope)).unwrap());

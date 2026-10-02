@@ -4,11 +4,7 @@ use super::flight::AcquisitionBudget;
 use crate::{
     control::wire::SCHEMA_VERSION,
     error::{Error, Operation},
-    http::{
-        Codec,
-        connection::HttpIo,
-        connection::{ConnectionLease, HttpPool},
-    },
+    http::{Codec, connection::HttpIo, connection::HttpPool},
     memory::pool::BufferPool,
     model::{ExpiresAt, MetadataSelector, ObjectMetadata, OriginContext, *},
     peer::{
@@ -345,8 +341,9 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let io = Rc::new(HttpIo::with_admission(
         reactor.clone(),
-        Codec::new(protocol::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
+        Codec::new(protocol::MAX_ENVELOPE_HEAD),
         admission.clone(),
+        crate::model::PAGE_BYTES + 16,
     ));
     let codec = Rc::new(protocol::SecurityCodec::new(
         admission.clone(),
@@ -512,7 +509,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
                 &scope,
             )
             .await?;
-        let connection = ConnectionLease::from_accepted(fd, &admission)?;
+        let connection = crate::http::connection::from_accepted(fd, &admission)?;
         server.serve_connection(connection, &scope).await?;
         Ok::<(), Error>(())
     };

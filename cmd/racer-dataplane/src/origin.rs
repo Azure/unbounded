@@ -623,7 +623,7 @@ pub mod metadata {
                 let raw = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"v\"\r\nRacer-Expires-At: {expiry}\r\n\r\n"
                 );
-                let (head, _) = Codec::new(32768, 0)
+                let (head, _) = Codec::new(32768)
                     .decode_head(raw.as_bytes())
                     .unwrap()
                     .unwrap();
@@ -1059,7 +1059,7 @@ mod protocol {
                         }
                     }
                     raw.push_str("\r\n");
-                    let result = Codec::new(32768, 1)
+                    let result = Codec::new(32768)
                         .decode_head(raw.as_bytes())
                         .map_err(|_| Error::BadGateway)
                         .and_then(|head| {

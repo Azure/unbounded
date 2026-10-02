@@ -17,7 +17,7 @@ fn movable_production_buffers_preserve_subrange_through_completion() {
         Error: From<B::Error>,
         B::Error: std::fmt::Debug,
     {
-        let mut range = BufferRange::new(buffer, 1..2).unwrap();
+        let mut range = BufferRange::new::<Error>(buffer, 1..2).unwrap();
         let ptr = range.bytes_mut().unwrap().as_mut_ptr();
         let finish: Box<dyn FnOnce() -> B> = Box::new(move || range.into_inner());
         // SAFETY: completion owns the fixed backing until after this write.

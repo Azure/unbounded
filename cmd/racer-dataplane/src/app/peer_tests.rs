@@ -116,9 +116,7 @@ fn peer_tcp_nodelay_accept_failure_closes_owned_socket_and_false_preserves_polic
 
 #[test]
 fn assembly_applies_configured_client_request_timeout() {
-    use crate::{
-        http::connection::ConnectionLease, model::ResourceClass, runtime::ingress::Retired,
-    };
+    use crate::{model::ResourceClass, runtime::ingress::Retired};
     for timeout in [Duration::from_millis(250), Duration::from_secs(45)] {
         let clock = crate::runtime::environment::SimulationClock::new(908);
         let _environment = clock.environment(0).enter();
@@ -132,7 +130,8 @@ fn assembly_applies_configured_client_request_timeout() {
             .admission
             .reserve_connection(ResourceClass::IngressConnection)
             .unwrap();
-        let connection = ConnectionLease::from_reserved(server.into(), reservation).unwrap();
+        let connection =
+            crate::http::connection::from_reserved(server.into(), reservation).unwrap();
         app.clients
             .install_connection(
                 connection,
@@ -295,7 +294,7 @@ fn assembly_uses_node_metrics_for_sparse_worker_ids() {
     assert_eq!(second.telemetry.metrics.gauge(Gauge::ActiveRequests), 0);
 }
 use crate::{
-    http::{Codec, Header, MessageHead, StartLine, connection::ConnectionLease},
+    http::{Codec, Header, MessageHead, StartLine},
     model::{ExpiresAt, MetadataSelector, ObjectMetadata, ResourceClass, *},
     peer::protocol::{
         self, FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse, decode_envelope,
@@ -383,7 +382,7 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
             },
         ],
     };
-    let client_codec = Codec::new(32 * 1024, 0);
+    let client_codec = Codec::new(32 * 1024);
     let raw = client_codec.encode_head(&head).unwrap();
     let parsed = RequestParser::new(32 * 1024)
         .parse(&cache, client_codec.decode_head(&raw).unwrap().unwrap().0)
@@ -430,8 +429,8 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
     let mut destination = None;
     for index in 1..=protocol::MAX_HOPS {
         let (left, right) = UnixStream::pair().unwrap();
-        let left = ConnectionLease::from_accepted(left.into(), admission).unwrap();
-        let right = ConnectionLease::from_accepted(right.into(), admission).unwrap();
+        let left = crate::http::connection::from_accepted(left.into(), admission).unwrap();
+        let right = crate::http::connection::from_accepted(right.into(), admission).unwrap();
         let next = node(index);
         let (left, right) = drive(reactor, async {
             futures::try_join!(
@@ -614,13 +613,13 @@ fn assembled_peer_io_rejects_oversize_and_admission_pressure_before_submission()
         }],
     };
     let (socket, _other) = UnixStream::pair().unwrap();
-    let conn = ConnectionLease::from_accepted(socket.into(), admission).unwrap();
+    let conn = crate::http::connection::from_accepted(socket.into(), admission).unwrap();
     assert!(matches!(
         drive(reactor, io.send_head(conn, head(), &scope)),
         Err(Error::HeaderTooLarge)
     ));
     let (socket, mut other) = UnixStream::pair().unwrap();
-    let conn = ConnectionLease::from_accepted(socket.into(), admission).unwrap();
+    let conn = crate::http::connection::from_accepted(socket.into(), admission).unwrap();
     let writer = std::thread::spawn(move || {
         let _ = other.write_all(&vec![b'x'; protocol::MAX_ENVELOPE_HEAD + 1]);
     });
@@ -638,7 +637,7 @@ fn assembled_peer_io_rejects_oversize_and_admission_pressure_before_submission()
             value: b"0".to_vec(),
         }],
     };
-    let encoded = Codec::new(protocol::MAX_ENVELOPE_HEAD, 0)
+    let encoded = Codec::new(protocol::MAX_ENVELOPE_HEAD)
         .encode_head(&response())
         .unwrap();
     let send_budget = protocol::MAX_ENVELOPE_HEAD + encoded.len();
@@ -662,7 +661,7 @@ fn assembled_peer_io_rejects_oversize_and_admission_pressure_before_submission()
         other
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
-        let conn = ConnectionLease::from_accepted(socket.into(), admission).unwrap();
+        let conn = crate::http::connection::from_accepted(socket.into(), admission).unwrap();
         let operation = async {
             if send {
                 io.send_head(conn, response(), &scope).await.map(|_| ())

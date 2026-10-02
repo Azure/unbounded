@@ -538,7 +538,7 @@ mod tests {
 
     #[test]
     fn head_rejects_legacy_endpoint() {
-        let codec = Codec::new(MAX_HEAD_BYTES, 0);
+        let codec = Codec::new(MAX_HEAD_BYTES);
         for endpoint in ["v1", "v2"] {
             let raw = format!(
                 "HEAD /{endpoint}/objects/{} HTTP/1.1\r\nHost: racer\r\n\r\n",
@@ -560,7 +560,7 @@ mod tests {
 
     #[test]
     fn sdk_raw_head_preserves_non_utf8_and_rejects_normalization() {
-        let codec = Codec::new(MAX_HEAD_BYTES, 0);
+        let codec = Codec::new(MAX_HEAD_BYTES);
         let mut raw = format!(
             "HEAD /v2/objects/{} HTTP/1.1\r\nHost: racer\r\nRacer-Metadata: opaque,",
             "0".repeat(64)
@@ -605,7 +605,7 @@ mod tests {
             for trailing in trailing_values {
                 for &limit in limits {
                     let parser = RequestParser::new(limit);
-                    let codec = Codec::new(parser.header_limit(), 0);
+                    let codec = Codec::new(parser.header_limit());
                     let prefix = format!(
                         "HEAD /v2/objects/{} HTTP/1.1\r\nHost: racer\r\nX:{separator}",
                         "0".repeat(64)
@@ -619,7 +619,7 @@ mod tests {
                         assert_eq!(raw.len(), length);
                         let decoded = codec.decode_head(raw.as_bytes());
                         if length > limit {
-                            assert!(matches!(decoded, Err(Error::HeaderTooLarge)));
+                            assert!(matches!(decoded, Err(http1::Error::HeadTooLarge)));
                         } else {
                             let (head, consumed) = decoded.unwrap().unwrap();
                             assert_eq!(consumed, length);

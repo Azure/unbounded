@@ -68,8 +68,9 @@ impl Rig {
         let reactor = Rc::new(Reactor::new(admission.clone()));
         let io = Rc::new(HttpIo::with_admission(
             reactor.clone(),
-            Codec::new(LIMIT, MAX),
+            Codec::new(LIMIT),
             admission.clone(),
+            MAX,
         ));
         Self {
             admission,
@@ -78,7 +79,7 @@ impl Rig {
         }
     }
     fn lease(&self, socket: UnixStream) -> ConnectionLease {
-        ConnectionLease::from_accepted(socket.into(), &self.admission).unwrap()
+        racer_dataplane::http::connection::from_accepted(socket.into(), &self.admission).unwrap()
     }
     fn drive<T>(&self, future: impl Future<Output = T>) -> T {
         let mut future = std::pin::pin!(future);
@@ -1343,10 +1344,7 @@ mod sdk {
             );
             stream.write_all(&raw).unwrap();
             let response = receive_all(stream);
-            let (head, used) = Codec::new(LIMIT, MAX)
-                .decode_head(&response)
-                .unwrap()
-                .unwrap();
+            let (head, used) = Codec::new(LIMIT).decode_head(&response).unwrap().unwrap();
             assert!(
                 matches!(head.start, StartLine::Response { status: actual } if actual == status),
                 "wrong SDK status for key {key}, {method}, {fields}"
@@ -1434,7 +1432,7 @@ fn raw_uds_fixed_body_is_not_scanned_for_heads_and_short_eof_is_failure() {
         });
         let result: Result<Vec<u8>> = rig.drive(async {
             let scope = scope();
-            let (head, _) = Codec::new(LIMIT, MAX)
+            let (head, _) = Codec::new(LIMIT)
                 .decode_head(&request("GET", b"Range: bytes=0-16777215\r\n"))
                 .unwrap()
                 .unwrap();

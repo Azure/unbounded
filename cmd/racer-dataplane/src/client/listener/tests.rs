@@ -634,8 +634,9 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
     let reactor = Rc::new(Reactor::new(admission.clone()));
     let io = Rc::new(HttpIo::with_admission(
         reactor.clone(),
-        Codec::new(32768, i64::MAX as u64),
+        Codec::new(32768),
         admission.clone(),
+        i64::MAX as u64,
     ));
     let delivery = Rc::new(Delivery::new(
         Rc::new(PipePool::new(admission.clone(), reactor.clone())),
@@ -813,7 +814,8 @@ impl Fixture {
             panic!("client endpoint delivered a peer socket");
         };
         let connection =
-            ConnectionLease::from_reserved(accepted.fd.into(), accepted.reservation).unwrap();
+            crate::http::connection::from_reserved(accepted.fd.into(), accepted.reservation)
+                .unwrap();
         self.listeners
             .install_connection(connection, cache, retired)
             .unwrap();
@@ -828,8 +830,9 @@ impl Fixture {
         let reactor = Rc::new(Reactor::new(admission.clone()));
         let io = Rc::new(HttpIo::with_admission(
             reactor.clone(),
-            Codec::new(32768, i64::MAX as u64),
+            Codec::new(32768),
             admission.clone(),
+            i64::MAX as u64,
         ));
         let delivery = Rc::new(Delivery::new(
             Rc::new(PipePool::new(admission.clone(), reactor.clone())),

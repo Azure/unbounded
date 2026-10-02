@@ -8,11 +8,7 @@ use racer_dataplane::{
         wire::{self, Publication, PublicationSequence},
     },
     error::{Error, Operation, Result},
-    http::{
-        Codec,
-        connection::HttpIo,
-        connection::{ConnectionLease, HttpPool},
-    },
+    http::{Codec, connection::HttpIo, connection::HttpPool},
     memory::{cache::MemoryCache, delivery::Delivery, pipe::PipePool, pool::BufferPool},
     model::{Limits, PAGE_BYTES, ResourceClass, *},
     origin::OriginClient,
@@ -439,8 +435,9 @@ impl Rig {
         let entries = if benchmarking { 512 } else { 64 };
         let io = Rc::new(HttpIo::with_admission(
             reactor.clone(),
-            Codec::new(32768, P + 16),
+            Codec::new(32768),
             admission.clone(),
+            P + 16,
         ));
         let http = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 8));
         let buffers = BufferPool::new(admission.clone());
@@ -639,7 +636,8 @@ impl Rig {
         }
     }
     async fn serve(&self, stream: UnixStream, scope: &RequestScope) -> Result<()> {
-        let lease = ConnectionLease::from_accepted(stream.into(), &self.admission)?;
+        let lease =
+            racer_dataplane::http::connection::from_accepted(stream.into(), &self.admission)?;
         let received = self.io.receive_head(lease, scope).await?;
         let request = RequestParser::new(32768).parse(&CacheId(CACHE.into()), received.value)?;
         let kind = request.kind.clone();

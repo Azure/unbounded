@@ -109,7 +109,7 @@ impl PeerServer {
             _ => return None,
         };
         ciphertext.provenance?;
-        let receiver = connection.session.as_ref()?.peer();
+        let receiver = connection.state().session.as_ref()?.peer();
         let (ticket, sample) = samples.begin(pair, self.signatures.node(), receiver)?;
         let permit = match crate::read::drivers::reserve() {
             Ok(p) => p,
@@ -262,7 +262,7 @@ impl PeerServer {
                     scope,
                 )
                 .await?;
-                let connection = match crate::http::connection::ConnectionLease::from_accepted(
+                let connection = match crate::http::connection::from_accepted(
                     self.configure_accepted(accepted)?,
                     &self.admission,
                 ) {
@@ -406,7 +406,8 @@ impl PeerServer {
                     let result = match self.admission.reserve(None, ResourceClass::Relay, 1) {
                         Ok(reservation) => {
                             let reservation = Rc::new(reservation);
-                            received.connection.relay_reservation = Some(reservation.clone());
+                            received.connection.state_mut().relay_reservation =
+                                Some(reservation.clone());
                             self.relay
                                 .forward_inner(
                                     request,
@@ -424,7 +425,7 @@ impl PeerServer {
                         if matches!(&response, super::transport::RelayResponse::Http { length, .. } if *length != 0) {
                             let mut pipe = self.pipes.acquire()?;
                             pipe.prepare_transit();
-                            received.connection.relay_pipe = Some(pipe);
+                            received.connection.state_mut().relay_pipe = Some(pipe);
                         }
                         Ok(response)
                     });
@@ -440,15 +441,18 @@ impl PeerServer {
                             length,
                         }) => {
                             let head = encode_envelope(&authentication, true, length)?;
-                            received.connection.relay_peer = Some(connection);
+                            received.connection.state_mut().relay_peer = Some(connection);
                             let mut connection = self
                                 .io
                                 .send_head(received.connection, head, &request_scope)
                                 .await?
                                 .connection;
-                            let downstream =
-                                *connection.relay_peer.take().ok_or(Error::Internal)?;
-                            let pipe = connection.relay_pipe.take();
+                            let downstream = *connection
+                                .state_mut()
+                                .relay_peer
+                                .take()
+                                .ok_or(Error::Internal)?;
+                            let pipe = connection.state_mut().relay_pipe.take();
                             // Once the success head is sent, any body failure closes
                             // both dirty connections. Never append an error envelope.
                             let mut observation = self.metrics.opaque_relay_body(length);
@@ -530,10 +534,10 @@ impl PeerServer {
         mut connection: crate::http::connection::ConnectionLease,
         scope: &RequestScope,
     ) -> crate::error::Result<crate::http::connection::ConnectionLease> {
-        if connection.session.is_some() {
+        if connection.state().session.is_some() {
             return Ok(connection);
         }
-        connection.control_reservation = Some(self.admission.reserve(
+        connection.state_mut().control_reservation = Some(self.admission.reserve(
             None,
             ResourceClass::ControlProgress,
             1,
@@ -547,7 +551,7 @@ impl PeerServer {
         .await?;
         // Successful accept has fenced every control operation. On error or
         // abandonment the reactor-owned connection retains this charge.
-        connection.control_reservation.take();
+        connection.state_mut().control_reservation.take();
         Ok(connection)
     }
 
@@ -605,7 +609,7 @@ impl PeerServer {
             connection = sent.lease;
         }
         connection.finish_exchange()?;
-        connection.relay_reservation = None;
+        connection.state_mut().relay_reservation = None;
         Ok(connection)
     }
     /// Verify the complete ingress envelope before service or relay. Sign a local
@@ -866,7 +870,7 @@ async fn materialized_exchange<T>(
     let mut watch = Some(io.reactor().readiness_with_lease(
         socket.clone(),
         events,
-        connection.reservation.clone(),
+        connection.slot().cloned(),
         &watch_scope,
     ));
     let mut work = std::pin::pin!(work);
@@ -988,10 +992,7 @@ mod tests {
     #[test]
     fn materialized_transit_fin_and_parent_cancel_fence_head_and_body() {
         use crate::{
-            http::{
-                Codec,
-                connection::{ConnectionLease, HttpIo},
-            },
+            http::{Codec, connection::HttpIo},
             runtime::reactor::Reactor,
         };
         use std::net::{Shutdown, TcpListener, TcpStream};
@@ -1005,8 +1006,9 @@ mod tests {
                 reactor.init().unwrap();
                 let io = HttpIo::with_admission(
                     reactor.clone(),
-                    Codec::new(4096, 4096),
+                    Codec::new(4096),
                     admission.clone(),
+                    4096,
                 );
                 let parent = listener_scope();
                 let exchange = RequestScope::new(
@@ -1017,10 +1019,11 @@ mod tests {
                 let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                 let upstream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
                 let (socket, _) = listener.accept().unwrap();
-                let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+                let connection =
+                    crate::http::connection::from_accepted(socket.into(), &admission).unwrap();
                 let (socket, mut downstream) = UnixStream::pair().unwrap();
                 let downstream_connection =
-                    ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+                    crate::http::connection::from_accepted(socket.into(), &admission).unwrap();
                 if body {
                     downstream
                         .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nx")
@@ -1093,7 +1096,7 @@ mod tests {
                     // A different connection on the same listener still makes progress.
                     let (socket, mut peer) = UnixStream::pair().unwrap();
                     let unrelated =
-                        ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+                        crate::http::connection::from_accepted(socket.into(), &admission).unwrap();
                     peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
                         .unwrap();
                     drive(&reactor, io.receive_head(unrelated, &parent)).unwrap();
@@ -1105,10 +1108,7 @@ mod tests {
     #[test]
     fn materialized_transit_success_fences_watch_before_keepalive() {
         use crate::{
-            http::{
-                Codec,
-                connection::{ConnectionLease, HttpIo},
-            },
+            http::{Codec, connection::HttpIo},
             runtime::reactor::Reactor,
         };
         let admission = Rc::new(Admission::new(
@@ -1116,10 +1116,11 @@ mod tests {
         ));
         let reactor = Rc::new(Reactor::new(admission.clone()));
         reactor.init().unwrap();
-        let io = HttpIo::with_admission(reactor.clone(), Codec::new(4096, 4096), admission.clone());
+        let io = HttpIo::with_admission(reactor.clone(), Codec::new(4096), admission.clone(), 4096);
         let parent = listener_scope();
         let (socket, mut peer) = UnixStream::pair().unwrap();
-        let mut connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+        let mut connection =
+            crate::http::connection::from_accepted(socket.into(), &admission).unwrap();
         for _ in 0..2 {
             peer.write_all(b"GET / HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
                 .unwrap();
@@ -1145,7 +1146,7 @@ mod tests {
             );
             assert_eq!(reactor.in_flight(), 0);
             assert_eq!(exchange.check(), Ok(()));
-            let head = Codec::new(4096, 4096)
+            let head = Codec::new(4096)
                 .decode_head(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
                 .unwrap()
                 .unwrap()
@@ -1513,8 +1514,9 @@ mod tests {
                 let baseline = admission.used(ResourceClass::RequestContext);
                 let io = Rc::new(HttpIo::with_admission(
                     reactor.clone(),
-                    Codec::new(super::super::protocol::MAX_ENVELOPE_HEAD, 0),
+                    Codec::new(super::super::protocol::MAX_ENVELOPE_HEAD),
                     admission.clone(),
+                    0,
                 ));
                 let forwarding = Rc::new(Forwarding::new(signers[1].clone()));
                 let relay = Rc::new(Relay::new(
@@ -1553,10 +1555,11 @@ mod tests {
                 let (socket, mut peer) = UnixStream::pair().unwrap();
                 let mut writer = socket.try_clone().unwrap();
                 peer.set_nonblocking(true).unwrap();
-                let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+                let connection =
+                    crate::http::connection::from_accepted(socket.into(), &admission).unwrap();
                 let mut work = server.serve_connection(connection, &scope);
                 assert!(poll(work.as_mut()).is_pending());
-                let codec = Codec::new(65536, 0);
+                let codec = Codec::new(65536);
                 let hello = codec
                     .encode_head(&hello(&signers[0], signers[1].node()))
                     .unwrap();
@@ -1689,7 +1692,8 @@ mod tests {
                     baseline + server.io.retained_buffer_bytes()
                 );
                 let (next, _peer) = UnixStream::pair().unwrap();
-                let admitted = ConnectionLease::from_accepted(next.into(), &admission).unwrap();
+                let admitted =
+                    crate::http::connection::from_accepted(next.into(), &admission).unwrap();
                 drop(admitted);
             }
         }

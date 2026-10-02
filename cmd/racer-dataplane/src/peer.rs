@@ -725,7 +725,7 @@ impl Requester {
                     .verify_opaque(&authentication, length, binding)?;
                 // All Racer outcomes use HTTP 200. Inspect the authenticated
                 // outcome, exactly as the materialized path does, not HTTP status.
-                connection.peer_response_verified = crate::security::protocol::field(
+                connection.state_mut().peer_response_verified = crate::security::protocol::field(
                     &authentication.original.head,
                     "racer-outcome",
                 )? != "overloaded";

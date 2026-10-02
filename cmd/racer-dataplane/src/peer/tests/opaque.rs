@@ -27,9 +27,8 @@ mod materialized_pairing {
         scope: &RequestScope,
     ) -> Result<ConnectionLease> {
         let head = encode_envelope(&response.authentication, true, page.bytes().len())?;
-        let head = conn.session.as_mut().unwrap().sign(head)?;
-        let mut encoded = Codec::new(protocol::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16)
-            .encode_head(&head)?;
+        let head = conn.state_mut().session.as_mut().unwrap().sign(head)?;
+        let mut encoded = Codec::new(protocol::MAX_ENVELOPE_HEAD).encode_head(&head)?;
         encoded.extend_from_slice(&page.bytes()[..173]);
         for chunk in encoded.chunks(997) {
             let mut buffer = io.buffer(chunk.len())?;
@@ -40,7 +39,7 @@ mod materialized_pairing {
                     .reactor()
                     .send(
                         conn.socket(),
-                        BufferRange::new(buffer, offset..chunk.len())?,
+                        BufferRange::new::<Error>(buffer, offset..chunk.len())?,
                         conn,
                         scope,
                     )
@@ -51,7 +50,11 @@ mod materialized_pairing {
                 conn = done.lease;
             }
         }
-        conn.tx_remaining = Some((page.bytes().len() - 173) as u64);
+        conn.set_framing(
+            conn.receive_remaining(),
+            Some((page.bytes().len() - 173) as u64),
+            false,
+        );
         Ok(conn)
     }
 
@@ -143,7 +146,7 @@ mod materialized_pairing {
         let destination = |listener: Rc<crate::runtime::reactor::Descriptor>| async {
             let fd = reactors[2].accept(listener, &scope).await?;
             accepted.set(accepted.get() + 1);
-            let conn = ConnectionLease::from_accepted(fd, &admissions[2])?;
+            let conn = crate::http::connection::from_accepted(fd, &admissions[2])?;
             let mut conn = connection::accept(&ios[2], conn, signers[2].clone(), &scope).await?;
             let auth = Forwarding::new(signers[2].clone());
             let mut previous = None;
@@ -215,7 +218,7 @@ mod materialized_pairing {
             }
         };
         let canceled_relay = async {
-            let conn = ConnectionLease::from_accepted(relay_socket.into(), &admissions[1])?;
+            let conn = crate::http::connection::from_accepted(relay_socket.into(), &admissions[1])?;
             assert!(matches!(
                 server.serve_connection(conn, &scope).await,
                 Err(Error::Cancelled)
@@ -224,7 +227,8 @@ mod materialized_pairing {
             Ok::<_, Error>(())
         };
         let healthy_relay = async {
-            let mut conn = ConnectionLease::from_accepted(healthy_relay.into(), &admissions[1])?;
+            let mut conn =
+                crate::http::connection::from_accepted(healthy_relay.into(), &admissions[1])?;
             for _ in 0..2 {
                 conn = server.serve_connection(conn, &scope).await?;
                 assert!(conn.is_reusable());
@@ -241,7 +245,8 @@ mod materialized_pairing {
         };
         let canceled_client = async {
             let shutdown = requester_socket.try_clone().unwrap();
-            let conn = ConnectionLease::from_accepted(requester_socket.into(), &admissions[0])?;
+            let conn =
+                crate::http::connection::from_accepted(requester_socket.into(), &admissions[0])?;
             let conn =
                 connection::connect(&ios[0], conn, signers[0].clone(), signers[1].node(), &scope)
                     .await?;
@@ -267,7 +272,8 @@ mod materialized_pairing {
             Ok::<_, Error>(())
         };
         let healthy_client = async {
-            let conn = ConnectionLease::from_accepted(healthy_socket.into(), &admissions[0])?;
+            let conn =
+                crate::http::connection::from_accepted(healthy_socket.into(), &admissions[0])?;
             let mut conn =
                 connection::connect(&ios[0], conn, signers[0].clone(), signers[1].node(), &scope)
                     .await?;
@@ -389,7 +395,7 @@ mod safety {
             let fd = f.reactors[2]
                 .accept(Rc::new(f.listener.into()), &f.scope)
                 .await?;
-            let conn = ConnectionLease::from_accepted(fd, &f.admissions[2])?;
+            let conn = crate::http::connection::from_accepted(fd, &f.admissions[2])?;
             let conn = connection::accept(&f.ios[2], conn, f.signers[2].clone(), &f.scope).await?;
             let received = f.ios[2].receive_head(conn, &f.scope).await?;
             let (head, length) = decode_envelope(received.value, false)?;
@@ -415,7 +421,8 @@ mod safety {
             Ok::<_, Error>(())
         };
         let relay = async {
-            let conn = ConnectionLease::from_accepted(f.relay_socket.into(), &f.admissions[1])?;
+            let conn =
+                crate::http::connection::from_accepted(f.relay_socket.into(), &f.admissions[1])?;
             let result = f.server.serve_connection(conn, &f.scope).await;
             assert!(matches!(
                 result,
@@ -426,7 +433,10 @@ mod safety {
             Ok::<_, Error>(())
         };
         let client = async {
-            let conn = ConnectionLease::from_accepted(f.requester_socket.into(), &f.admissions[0])?;
+            let conn = crate::http::connection::from_accepted(
+                f.requester_socket.into(),
+                &f.admissions[0],
+            )?;
             let conn = connection::connect(
                 &f.ios[0],
                 conn,
@@ -591,7 +601,7 @@ mod safety {
             let fd = f.reactors[2]
                 .accept(Rc::new(f.listener.into()), &f.scope)
                 .await?;
-            let conn = ConnectionLease::from_accepted(fd, &f.admissions[2])?;
+            let conn = crate::http::connection::from_accepted(fd, &f.admissions[2])?;
             let mut conn =
                 connection::accept(&f.ios[2], conn, f.signers[2].clone(), &f.scope).await?;
             for wrong in [true, false] {
@@ -628,7 +638,8 @@ mod safety {
             Ok::<_, Error>(())
         };
         let relay = async {
-            let mut conn = ConnectionLease::from_accepted(f.relay_socket.into(), &f.admissions[1])?;
+            let mut conn =
+                crate::http::connection::from_accepted(f.relay_socket.into(), &f.admissions[1])?;
             for _ in 0..2 {
                 conn = f.server.serve_connection(conn, &f.scope).await?;
                 assert!(conn.is_reusable());
@@ -636,7 +647,10 @@ mod safety {
             Ok::<_, Error>(())
         };
         let client = async {
-            let conn = ConnectionLease::from_accepted(f.requester_socket.into(), &f.admissions[0])?;
+            let conn = crate::http::connection::from_accepted(
+                f.requester_socket.into(),
+                &f.admissions[0],
+            )?;
             let mut conn = connection::connect(
                 &f.ios[0],
                 conn,
@@ -873,9 +887,11 @@ fn send_crc_http_success_failure_drop_do_not_wait_for_crypto() {
             crypto,
         );
         let client_conn =
-            ConnectionLease::from_accepted(f.requester_socket.into(), &f.admissions[0]).unwrap();
+            crate::http::connection::from_accepted(f.requester_socket.into(), &f.admissions[0])
+                .unwrap();
         let server_conn =
-            ConnectionLease::from_accepted(f.relay_socket.into(), &f.admissions[1]).unwrap();
+            crate::http::connection::from_accepted(f.relay_socket.into(), &f.admissions[1])
+                .unwrap();
         let (client_conn, mut server_conn) = drive(
             &f.reactors,
             async {
@@ -895,7 +911,7 @@ fn send_crc_http_success_failure_drop_do_not_wait_for_crypto() {
         .unwrap();
         // This test invokes the response sender directly after the handshake,
         // bypassing receive_head's completed bodyless-request framing.
-        server_conn.rx_remaining = Some(0);
+        server_conn.set_framing(Some(0), server_conn.send_remaining(), false);
         let a = Forwarding::new(f.signers[0].clone());
         let b = Forwarding::new(f.signers[1].clone());
         let mut local = request(&f.admissions[0], 9);
@@ -1009,8 +1025,9 @@ impl RelayFixture {
             .map(|(r, a)| {
                 Rc::new(HttpIo::with_admission(
                     r.clone(),
-                    Codec::new(protocol::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
+                    Codec::new(protocol::MAX_ENVELOPE_HEAD),
                     a.clone(),
+                    crate::model::PAGE_BYTES + 16,
                 ))
             })
             .collect();
@@ -1180,7 +1197,7 @@ impl RelayFixture {
         let destination = async {
             let fd = reactors[2].accept(Rc::new(listener.into()), &scope).await?;
             accepted.set(accepted.get() + 1);
-            let conn = ConnectionLease::from_accepted(fd, &admissions[2])?;
+            let conn = crate::http::connection::from_accepted(fd, &admissions[2])?;
             let mut conn = connection::accept(&ios[2], conn, signers[2].clone(), &scope).await?;
             for i in 0..rounds {
                 let received = ios[2].receive_head(conn, &scope).await?;
@@ -1247,8 +1264,9 @@ impl RelayFixture {
             Ok::<_, Error>(())
         };
         let relay = async {
-            let mut conn = ConnectionLease::from_accepted(relay_socket.into(), &admissions[1])?;
-            conn.relay_fallback = fallback;
+            let mut conn =
+                crate::http::connection::from_accepted(relay_socket.into(), &admissions[1])?;
+            conn.state_mut().relay_fallback = fallback;
             for i in 0..rounds {
                 let result = server.serve_connection(conn, &scope).await;
                 if truncated && i + 1 == rounds {
@@ -1277,7 +1295,8 @@ impl RelayFixture {
             Ok::<_, Error>(())
         };
         let client = async {
-            let conn = ConnectionLease::from_accepted(requester_socket.into(), &admissions[0])?;
+            let conn =
+                crate::http::connection::from_accepted(requester_socket.into(), &admissions[0])?;
             let mut conn =
                 connection::connect(&ios[0], conn, signers[0].clone(), signers[1].node(), &scope)
                     .await?;
@@ -1431,10 +1450,7 @@ fn opaque_relay_benchmark() {
 fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution() {
     use crate::security::{forwarding::ForwardedHead, protocol};
     fn copy(head: &crate::http::MessageHead) -> crate::http::MessageHead {
-        let codec = Codec::new(
-            crate::peer::protocol::MAX_SIGNED_HEAD,
-            crate::model::PAGE_BYTES + 16,
-        );
+        let codec = Codec::new(crate::peer::protocol::MAX_SIGNED_HEAD);
         let mut head = codec
             .decode_head(&codec.encode_head(head).unwrap())
             .unwrap()

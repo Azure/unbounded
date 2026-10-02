@@ -127,8 +127,9 @@ fn client() -> (OriginClient, Rc<Admission>, Rc<Reactor>) {
     let pool = Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 2));
     let io = Rc::new(HttpIo::with_admission(
         reactor.clone(),
-        Codec::new(32768, PAGE_BYTES),
+        Codec::new(32768),
         admission.clone(),
+        PAGE_BYTES,
     ));
     let snapshots = Rc::new(SnapshotStore::new(
         ClusterId("cluster".into()),
@@ -606,11 +607,7 @@ fn receive(stream: &mut UnixStream) -> MessageHead {
         stream.read_exact(&mut byte).unwrap();
         raw.push(byte[0]);
     }
-    Codec::new(32768, PAGE_BYTES)
-        .decode_head(&raw)
-        .unwrap()
-        .unwrap()
-        .0
+    Codec::new(32768).decode_head(&raw).unwrap().unwrap().0
 }
 fn check_request(
     head: &MessageHead,
@@ -1097,8 +1094,9 @@ fn real_uds_bounds_raw_heads_even_with_a_larger_shared_codec() {
     let (mut client, admission, reactor) = client();
     client.io = Rc::new(HttpIo::with_admission(
         reactor.clone(),
-        Codec::new(65536, PAGE_BYTES),
+        Codec::new(65536),
         admission.clone(),
+        PAGE_BYTES,
     ));
     reactor.init().unwrap();
     let infrastructure_bytes = admission.used(ResourceClass::RequestContext);

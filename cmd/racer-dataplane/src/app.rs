@@ -887,11 +887,9 @@ impl WorkerApplication {
         );
         let io = Rc::new(HttpIo::with_admission(
             reactor.clone(),
-            crate::http::Codec::new(
-                crate::peer::protocol::MAX_ENVELOPE_HEAD,
-                crate::model::PAGE_BYTES + 16,
-            ),
+            crate::http::Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD),
             admission.clone(),
+            crate::model::PAGE_BYTES + 16,
         ));
         let buffers = BufferPool::new(admission.clone());
         let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
@@ -1427,7 +1425,7 @@ impl WorkerApplication {
                 .into_iter()
                 .flatten()
             {
-                let connection = crate::http::connection::ConnectionLease::from_reserved(
+                let connection = crate::http::connection::from_reserved(
                     accepted.fd.into(),
                     accepted.reservation,
                 )?;

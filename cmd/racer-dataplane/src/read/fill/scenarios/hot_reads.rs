@@ -2,7 +2,7 @@
 mod duplex_release {
     //! Exercise release credit through the real duplex response, not release_page.
     use super::*;
-    use crate::{client::response::Responses, http::connection::ConnectionLease};
+    use crate::client::response::Responses;
     use std::io::{Read, Write};
 
     #[test]
@@ -44,12 +44,13 @@ mod duplex_release {
             ));
             let io = Rc::new(HttpIo::with_admission(
                 f.reactor.clone(),
-                Codec::new(32768, i64::MAX as u64),
+                Codec::new(32768),
                 admission.clone(),
+                i64::MAX as u64,
             ));
             let responses = Responses::new(io, delivery);
             let (socket, client) = sim.socket_pair();
-            let connection = ConnectionLease::from_accepted(socket, &admission).unwrap();
+            let connection = crate::http::connection::from_accepted(socket, &admission).unwrap();
             let mut send = responses.send_subscription_unobserved(
                 connection,
                 response,
@@ -220,13 +221,14 @@ mod duplex_release {
         ));
         let io = Rc::new(HttpIo::with_admission(
             f.reactor.clone(),
-            Codec::new(32768, i64::MAX as u64),
+            Codec::new(32768),
             admission.clone(),
+            i64::MAX as u64,
         ));
         let responses = Responses::new(io, delivery.clone());
         let (socket, mut client) = std::os::unix::net::UnixStream::pair().unwrap();
         client.set_nonblocking(true).unwrap();
-        let connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+        let connection = crate::http::connection::from_accepted(socket.into(), &admission).unwrap();
         let mut send = responses.send_subscription_unobserved(
             connection,
             response,
@@ -501,9 +503,10 @@ mod duplex_release {
         independent_client
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
-        let mut connection = ConnectionLease::from_accepted(socket.into(), &admission).unwrap();
+        let mut connection =
+            crate::http::connection::from_accepted(socket.into(), &admission).unwrap();
         // Model a sent one-byte response head for this independent delivery fixture.
-        connection.tx_remaining = Some(1);
+        connection.set_framing(None, Some(1), false);
         let mut finish = delivery.finish_to(other, connection, &other_scope);
         let mut finished = false;
         for _ in 0..1024 {
@@ -1073,12 +1076,12 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
                 Duration::from_secs(30),
             );
             let (socket, _stalled_client) = std::os::unix::net::UnixStream::pair().unwrap();
-            let mut connection = crate::http::connection::ConnectionLease::from_accepted(
+            let mut connection = crate::http::connection::from_accepted(
                 socket.into(),
                 &f.fill.dependencies.admission,
             )
             .unwrap();
-            connection.tx_remaining = Some(PAGE_BYTES);
+            connection.set_framing(None, Some(PAGE_BYTES), false);
             let mut write = delivery.finish_progressing(second, connection, &scope);
             // No call to next_slice: page two is acquired while the current
             // delivery lease (page one) is held, including its pipe and credit.
@@ -1174,8 +1177,9 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
             ));
             let io = Rc::new(HttpIo::with_admission(
                 reactor.clone(),
-                Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD, PAGE_BYTES + 16),
+                Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD),
                 admission.clone(),
+                PAGE_BYTES + 16,
             ));
             let transfers = Rc::new(crate::peer::transport::Transfers::new(
                 Rc::new(crate::http::connection::HttpPool::new(
@@ -1231,8 +1235,9 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
     let server = PeerServer::for_test(
         Rc::new(HttpIo::with_admission(
             fixtures[2].reactor.clone(),
-            Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD, PAGE_BYTES + 16),
+            Codec::new(crate::peer::protocol::MAX_ENVELOPE_HEAD),
             admission.clone(),
+            PAGE_BYTES + 16,
         )),
         auth,
         admission,

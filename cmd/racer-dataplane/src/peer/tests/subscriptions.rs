@@ -182,8 +182,9 @@ fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failure
         let server = server::PeerServer::for_test(
             Rc::new(HttpIo::with_admission(
                 Rc::new(Reactor::new(admission.clone())),
-                Codec::new(protocol::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
+                Codec::new(protocol::MAX_ENVELOPE_HEAD),
                 admission.clone(),
+                crate::model::PAGE_BYTES + 16,
             )),
             destination,
             admission.clone(),
@@ -331,8 +332,9 @@ fn signed_ingress_cold_selection_is_bounded_cancellable_and_does_not_block_other
     let server = server::PeerServer::for_test(
         Rc::new(HttpIo::with_admission(
             Rc::new(Reactor::new(admission.clone())),
-            Codec::new(protocol::MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16),
+            Codec::new(protocol::MAX_ENVELOPE_HEAD),
             admission.clone(),
+            crate::model::PAGE_BYTES + 16,
         )),
         destination,
         admission.clone(),
@@ -601,7 +603,7 @@ fn subscription_selection_is_canonical_signed_and_bound_to_exact_grant() {
 
 #[test]
 fn subscription_runs_through_real_tcp_requester_session_and_provider() {
-    use crate::{http::connection::ConnectionLease, peer::PeerClient};
+    use crate::peer::PeerClient;
     struct Local(Rc<Admission>);
     impl server::LocalPageService for Local {
         fn serve_peer<'a>(
@@ -717,7 +719,10 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
             )
             .await?;
         server
-            .serve_connection(ConnectionLease::from_accepted(fd, &admission)?, &scope)
+            .serve_connection(
+                crate::http::connection::from_accepted(fd, &admission)?,
+                &scope,
+            )
             .await?;
         Ok::<_, Error>(())
     };

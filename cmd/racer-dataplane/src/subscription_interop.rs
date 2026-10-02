@@ -324,8 +324,9 @@ impl SubscriptionFixture {
         let endpoint = directory.install(WorkerId(0), coordinator.clone()).unwrap();
         let io = Rc::new(http::connection::HttpIo::with_admission(
             reactor.clone(),
-            http::Codec::new(32768, i64::MAX as u64),
+            http::Codec::new(32768),
             admission.clone(),
+            i64::MAX as u64,
         ));
         let responses = Rc::new(Responses::new(io.clone(), delivery));
         let mut clients = ClientListeners::new(

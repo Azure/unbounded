@@ -142,7 +142,7 @@ pub fn encode_envelope(
         },
         headers,
     };
-    Codec::new(MAX_ENVELOPE_HEAD, crate::model::PAGE_BYTES + 16).encode_head(&head)?;
+    Codec::new(MAX_ENVELOPE_HEAD).encode_head(&head)?;
     Ok(head)
 }
 /// Decode framing only; proof verification and socket replay admission are separate.
@@ -219,8 +219,7 @@ pub(crate) fn encode_signed(head: &SignedHead) -> Result<Vec<u8>> {
     if head.signature.len() != 64 {
         return Err(Error::InvalidRequest);
     }
-    let bytes =
-        Codec::new(MAX_SIGNED_HEAD, crate::model::PAGE_BYTES + 16).encode_head(&head.head)?;
+    let bytes = Codec::new(MAX_SIGNED_HEAD).encode_head(&head.head)?;
     let mut framed = Vec::with_capacity(bytes.len() + 64);
     framed.extend_from_slice(&head.signature);
     framed.extend_from_slice(&bytes);
@@ -234,7 +233,7 @@ pub(crate) fn decode_signed(bytes: &[u8]) -> Result<SignedHead> {
     if STANDARD.encode(&decoded).as_bytes() != bytes || decoded.len() <= 64 {
         return Err(Error::InvalidRequest);
     }
-    let (head, consumed) = Codec::new(MAX_SIGNED_HEAD, crate::model::PAGE_BYTES + 16)
+    let (head, consumed) = Codec::new(MAX_SIGNED_HEAD)
         .decode_head(&decoded[64..])?
         .ok_or(Error::InvalidRequest)?;
     if consumed != decoded.len() - 64 {
@@ -330,7 +329,7 @@ mod envelope_tests {
             ],
         };
         let small = signers[0].sign(head).unwrap();
-        let codec = Codec::new(MAX_SIGNED_HEAD, u64::MAX);
+        let codec = Codec::new(MAX_SIGNED_HEAD);
         let length = codec.encode_head(&small.head).unwrap().len();
         head = small.head;
         head.headers.retain(|h| {

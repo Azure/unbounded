@@ -235,11 +235,11 @@ mod subscription {
                 connection.poison();
                 connection = self.io.send_head(connection, head, scope).await?.connection;
                 let socket = connection.socket();
-                let reservation = connection.reservation.clone();
+                let reservation = connection.slot().cloned();
                 let mut releases = Releases {
                     bytes: [0; 12],
                     used: 0,
-                    ahead: connection.read_ahead.take(),
+                    ahead: connection.take_read_ahead(),
                     provisional: false,
                 };
                 let mut outstanding = BTreeMap::new();

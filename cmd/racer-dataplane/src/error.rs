@@ -79,6 +79,15 @@ impl From<rdma_verbs::Error> for Error {
     }
 }
 
+impl From<http1::Error> for Error {
+    fn from(error: http1::Error) -> Self {
+        match error {
+            http1::Error::Malformed => Self::InvalidRequest,
+            http1::Error::HeadTooLarge => Self::HeaderTooLarge,
+        }
+    }
+}
+
 impl From<page_alloc::Error> for Error {
     fn from(error: page_alloc::Error) -> Self {
         match error {

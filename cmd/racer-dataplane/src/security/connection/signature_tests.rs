@@ -39,7 +39,7 @@ pub(crate) fn mac_test_key(cache: &str) -> Vec<crate::control::wire::CacheEncryp
     keys
 }
 pub(crate) fn clone_head(head: &SignedHead) -> SignedHead {
-    let codec = Codec::new(protocol::MAX_HEAD, u64::MAX);
+    let codec = Codec::new(protocol::MAX_HEAD);
     let encoded = codec.encode_head(&head.head).unwrap();
     SignedHead {
         head: codec.decode_head(&encoded).unwrap().unwrap().0,

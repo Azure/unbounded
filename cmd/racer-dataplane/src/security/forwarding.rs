@@ -1068,9 +1068,9 @@ mod tests {
             "racer-cache",
             "racer-key",
         ] {
-            let mut bad = crate::http::Codec::new(65536, 32)
+            let mut bad = crate::http::Codec::new(65536)
                 .decode_head(
-                    &crate::http::Codec::new(65536, 32)
+                    &crate::http::Codec::new(65536)
                         .encode_head(&response)
                         .unwrap(),
                 )

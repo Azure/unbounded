@@ -1150,10 +1150,7 @@ pub(super) mod tests {
     fn responses_stream_more_than_three_pages_only_with_client_sized_http_framing() {
         use crate::{
             client::response::Responses,
-            http::{
-                Codec,
-                connection::{ConnectionLease, HttpIo},
-            },
+            http::{Codec, connection::HttpIo},
             memory::pipe::PipePool,
             model::{RequestId, ResourceClass},
             read::ReadResponse,
@@ -1176,15 +1173,13 @@ pub(super) mod tests {
             let reactor = Rc::new(Reactor::new(admission.clone()));
             let io = Rc::new(HttpIo::with_admission(
                 reactor.clone(),
-                Codec::new(
-                    32768,
-                    if capped {
-                        PAGE_BYTES + 16
-                    } else {
-                        i64::MAX as u64
-                    },
-                ),
+                Codec::new(32768),
                 admission.clone(),
+                if capped {
+                    PAGE_BYTES + 16
+                } else {
+                    i64::MAX as u64
+                },
             ));
             let delivery = Rc::new(Delivery::new(
                 Rc::new(PipePool::new(admission.clone(), reactor.clone())),
@@ -1312,7 +1307,7 @@ pub(super) mod tests {
                 assert_eq!(client.read(&mut frame).unwrap(), 0);
             });
             let work = async {
-                let connection = ConnectionLease::from_accepted(server.into(), &admission)?;
+                let connection = crate::http::connection::from_accepted(server.into(), &admission)?;
                 let head = io.receive_head(connection, &scope).await?;
                 let metrics = crate::telemetry::metrics::Metrics::default();
                 let mut observation = metrics.request()?;

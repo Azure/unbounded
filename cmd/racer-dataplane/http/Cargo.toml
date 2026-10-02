@@ -1,0 +1,15 @@
+[package]
+name = "http1"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Strict fixed-length HTTP/1.1 over an explicitly driven uring runtime"
+
+[features]
+test-util = []
+
+[dependencies]
+uring-runtime = { path = "../runtime" }
+httparse = "1"
+zeroize = "1"
+libc = "0.2"

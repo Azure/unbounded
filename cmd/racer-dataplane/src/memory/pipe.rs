@@ -407,17 +407,14 @@ impl PipeLease {
         self.splice_to_fd(fd, count)
     }
 
-    /// Crate-only fast path for a ConnectionLease, which already guarantees a
+    /// Crate-only fast path for a descriptor whose lease guarantees a
     /// nonblocking stream socket. The public arbitrary-FD API still validates it.
-    pub(crate) fn try_splice_connection(
-        &mut self,
-        socket: &crate::http::connection::ConnectionLease,
-    ) -> io::Result<usize> {
+    pub(crate) fn try_splice_connection(&mut self, socket: &Descriptor) -> io::Result<usize> {
         #[cfg(test)]
-        if socket.fd.as_sim().is_some() {
-            return self.try_splice_descriptor(&socket.fd, self.buffered());
+        if socket.as_sim().is_some() {
+            return self.try_splice_descriptor(socket, self.buffered());
         }
-        self.splice_to_fd(socket.fd.as_raw_fd(), self.buffered())
+        self.splice_to_fd(socket.as_raw_fd(), self.buffered())
     }
 
     fn splice_to_fd(&mut self, fd: libc::c_int, count: usize) -> io::Result<usize> {

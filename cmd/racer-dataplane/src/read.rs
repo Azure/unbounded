@@ -658,8 +658,7 @@ pub mod hedge {
                             }
                         })
                         .await;
-                        let codec =
-                            crate::http::Codec::new(if kind == "large" { 8 } else { 4096 }, 0);
+                        let codec = crate::http::Codec::new(if kind == "large" { 8 } else { 4096 });
                         let bytes: &[u8] = if kind == "invalid" {
                             b"not-http\r\n\r\n"
                         } else {
@@ -667,7 +666,7 @@ pub mod hedge {
                         };
                         let parsed = codec.decode_head(bytes);
                         let error = match parsed {
-                            Err(e) => e,
+                            Err(e) => Error::from(e),
                             Ok(Some((head, _))) => {
                                 crate::peer::protocol::decode_envelope(head, true)
                                     .err()

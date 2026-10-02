@@ -176,7 +176,7 @@ impl Harness {
             hops: vec![],
         };
         let wire = encode_envelope(&envelope, false, 0).unwrap();
-        let bytes = Codec::new(32768, u64::MAX).encode_head(&wire).unwrap();
+        let bytes = Codec::new(32768).encode_head(&wire).unwrap();
         if self.security_faults.is_empty() {
             self.security_faults.extend([true, false]);
         }
@@ -222,7 +222,7 @@ impl Harness {
                 0,
             )
             .unwrap();
-            let bytes = Codec::new(32768, u64::MAX).encode_head(&wire).unwrap();
+            let bytes = Codec::new(32768).encode_head(&wire).unwrap();
             let response = self.raw_peer(receiver, bytes);
             assert!(
                 !response.starts_with(b"HTTP/1.1 200"),
