@@ -111,28 +111,28 @@ fn good_resources() -> health::Resources {
 }
 
 fn diagnostic_text(telemetry: &Telemetry, path: &str) -> String {
-    let mut bytes = vec![0; MAX_RESPONSE_BYTES];
+    let (_, reactor, io) = setup();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let scope = scope();
+    let mut server = telemetry.serve_listener_with_io(listener, io, &scope);
     let request =
         format!("GET {path} HTTP/1.1\r\nHost: local\r\nAuthorization: synthetic-secret\r\n\r\n");
-    let length = respond(telemetry, parse(request.as_bytes()), true, &mut bytes).unwrap();
-    assert_response(&bytes[..length], "200 OK", None);
-    assert!(length < MAX_RESPONSE_BYTES);
-    let text = std::str::from_utf8(&bytes[..length]).unwrap().to_owned();
+    let bytes = exchange_raw(address, request.as_bytes(), &mut server, &reactor);
+    assert_response(&bytes, "200 OK", None);
+    assert!(bytes.len() < MAX_RESPONSE_BYTES);
+    let text = std::str::from_utf8(&bytes).unwrap().to_owned();
     assert!(!text.contains("synthetic"));
+    finish(server, &scope, &reactor);
     text
 }
 
 #[test]
 fn membership_endpoint_is_bounded_and_not_a_readiness_alias() {
     let telemetry = Telemetry::default();
-    assert_eq!(
-        parse(b"GET /debug/membership HTTP/1.1\r\nHost: local\r\n\r\n"),
-        Route::Membership
-    );
-    let mut bytes = [0; MAX_RESPONSE_BYTES];
-    let length = respond(&telemetry, Route::Membership, true, &mut bytes).unwrap();
+    let text = diagnostic_text(&telemetry, "/debug/membership");
     assert_response(
-        &bytes[..length],
+        text.as_bytes(),
         "200 OK",
         Some("unavailable fully_applied=0\n"),
     );
@@ -149,13 +149,12 @@ fn membership_endpoint_is_bounded_and_not_a_readiness_alias() {
             })))
             .is_ok()
     );
-    let length = respond(&telemetry, Route::Membership, true, &mut bytes).unwrap();
-    let text = std::str::from_utf8(&bytes[..length]).unwrap();
+    let text = diagnostic_text(&telemetry, "/debug/membership");
     assert!(text.contains("accepted_sequence=18446744073709551615 accepted_membership=7"));
     assert!(text.contains(&format!("accepted_membership_hash={}", "ab".repeat(32))));
     assert!(text.ends_with("matching_workers=2 fully_applied=1\n"));
     assert!(!telemetry.health.ready());
-    assert!(length < 1024);
+    assert!(text.len() < 1024);
 }
 
 #[test]
@@ -630,6 +629,7 @@ fn raw_rejections_are_fixed_and_never_echo_untrusted_input() {
 #[test]
 fn slow_socket_does_not_block_probes_and_abandonment_keeps_quota_until_fenced() {
     let (admission, reactor, io) = setup();
+    let reserved_memory = admission.used(ResourceClass::RequestContext);
     let telemetry = Telemetry::default();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -655,6 +655,7 @@ fn slow_socket_does_not_block_probes_and_abandonment_keeps_quota_until_fenced() 
         admission.used(ResourceClass::ControlProgress),
         CONTROL_SLOTS
     );
+    assert!(admission.used(ResourceClass::RequestContext) >= reserved_memory);
     let mut drain = reactor.drain();
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -669,6 +670,26 @@ fn slow_socket_does_not_block_probes_and_abandonment_keeps_quota_until_fenced() 
     }
     assert_eq!(telemetry.metrics.gauge(Gauge::DiagnosticConnections), 0);
     assert_eq!(admission.used(ResourceClass::ControlProgress), 0);
+    assert!(admission.used(ResourceClass::RequestContext) < reserved_memory);
+}
+
+#[test]
+fn server_scope_preserves_metadata_cancellation_and_narrows_deadline() {
+    use server::Scope;
+    let mut parent = scope();
+    parent.body_deadlines = Some((Instant::now(), parent.deadline.0));
+    let shorter = parent.with_deadline(parent.deadline.0 - Duration::from_secs(1));
+    let longer = parent.with_deadline(parent.deadline.0 + Duration::from_secs(1));
+    assert_eq!(shorter.request, parent.request);
+    assert_eq!(shorter.body_deadlines, parent.body_deadlines);
+    assert_eq!(
+        shorter.deadline.0,
+        parent.deadline.0 - Duration::from_secs(1)
+    );
+    assert_eq!(longer.deadline.0, parent.deadline.0);
+    parent.cancel().unwrap();
+    assert_eq!(shorter.check(), Err(Error::Cancelled));
+    assert_eq!(longer.check(), Err(Error::Cancelled));
 }
 
 #[test]
@@ -677,21 +698,29 @@ fn fixed_parser_and_worst_case_response_bounds() {
     for event in metrics::EVENTS {
         telemetry.metrics.record(event, u64::MAX).unwrap();
     }
-    let mut bytes = [0; MAX_RESPONSE_BYTES];
-    let length = respond(&telemetry, Route::Metrics, true, &mut bytes).unwrap();
-    assert_response(&bytes[..length], "200 OK", None);
-    assert!(length < MAX_RESPONSE_BYTES);
+    let text = diagnostic_text(&telemetry, "/metrics");
+    assert!(text.len() < MAX_RESPONSE_BYTES);
+    let (_, reactor, io) = setup();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let scope = scope();
+    let mut server = telemetry.serve_listener_with_io(listener, io, &scope);
     for request in [
         b"GET /metrics HTTP/1.0\r\n\r\n".as_slice(),
         b"GET /metrics HTTP/1.1\r\n\r\n",
         b"GET /metrics HTTP/1.1\r\nHost: l\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
     ] {
-        assert_eq!(parse(request), Route::BadRequest);
+        let response = exchange_raw(address, request, &mut server, &reactor);
+        assert_response(&response, "400 Bad Request", Some("bad request\n"));
     }
-    assert_eq!(
-        parse(b"GET /metrics?secret HTTP/1.1\r\nHost: l\r\n\r\n"),
-        Route::NotFound
+    let response = exchange_raw(
+        address,
+        b"GET /metrics?secret HTTP/1.1\r\nHost: l\r\n\r\n",
+        &mut server,
+        &reactor,
     );
+    assert_response(&response, "404 Not Found", Some("not found\n"));
+    finish(server, &scope, &reactor);
 }
 
 #[test]
@@ -730,11 +759,8 @@ fn metrics_http_response_exports_worker_quotas_with_bounded_output() {
     for event in crate::telemetry::metrics::EVENTS {
         telemetry.metrics.record(event, u64::MAX).unwrap();
     }
-    let mut bytes = [0; MAX_RESPONSE_BYTES];
-    let length = respond(&telemetry, Route::Metrics, true, &mut bytes).unwrap();
-    assert_response(&bytes[..length], "200 OK", None);
-    let text = std::str::from_utf8(&bytes[..length]).unwrap();
-    assert!(length < MAX_RESPONSE_BYTES);
+    let text = diagnostic_text(&telemetry, "/metrics");
+    assert!(text.len() < MAX_RESPONSE_BYTES);
     for name in [
         "racer_opaque_relay_body_completed_total",
         "racer_opaque_relay_body_completed_bytes_total",
@@ -765,11 +791,14 @@ fn metrics_http_response_exports_worker_quotas_with_bounded_output() {
             .count(),
         4 * 64
     );
-    let mut small = [0; 512];
-    assert!(matches!(
-        respond(&telemetry, Route::Metrics, true, &mut small),
-        Err(Error::Internal)
-    ));
+    struct Small(usize);
+    impl std::fmt::Write for Small {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            self.0 = self.0.checked_sub(text.len()).ok_or(std::fmt::Error)?;
+            Ok(())
+        }
+    }
+    assert!(get(&telemetry, "/metrics", true, &mut Small(256)).is_err());
     drop(charges);
 }
 
