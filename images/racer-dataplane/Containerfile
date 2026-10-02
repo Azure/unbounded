@@ -31,6 +31,8 @@ COPY cmd/racer-dataplane/verbs/src ./verbs/src
 COPY cmd/racer-dataplane/verbs/native/verbs.c ./verbs/native/verbs.c
 COPY cmd/racer-dataplane/http/Cargo.toml ./http/Cargo.toml
 COPY cmd/racer-dataplane/http/src ./http/src
+COPY cmd/racer-dataplane/rest/Cargo.toml ./rest/Cargo.toml
+COPY cmd/racer-dataplane/rest/src ./rest/src
 COPY cmd/racer-dataplane/topology/Cargo.toml ./topology/Cargo.toml
 COPY cmd/racer-dataplane/topology/src ./topology/src
 COPY cmd/racer-dataplane/telemetry/Cargo.toml ./telemetry/Cargo.toml
