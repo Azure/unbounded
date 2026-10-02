@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -676,5 +677,128 @@ func TestAssignPodCIDRsConflictRetryAdoptsConcurrentAssignment(t *testing.T) {
 
 	if !h.state.allocator.IsAllocated("10.244.5.0/24") {
 		t.Fatal("concurrently assigned CIDR was not marked allocated")
+	}
+}
+
+type fakeLeaseFence struct {
+	validUntil time.Time
+}
+
+func (f *fakeLeaseFence) ValidUntil() time.Time {
+	return f.validUntil
+}
+
+func TestAssignPodCIDRsRefusedWithoutLease(t *testing.T) {
+	cases := map[string]time.Time{
+		"never-held": {},
+		"expired":    time.Now().Add(-time.Second),
+	}
+
+	for name, validUntil := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
+			h.sc.SetLeaseFence(&fakeLeaseFence{validUntil: validUntil})
+
+			err := h.sc.assignPodCIDRsForNodeWithLabel(context.Background(), h.cached, h.sites, "site-a")
+			if !errors.Is(err, errLeaseNotHeld) {
+				t.Fatalf("assign pod CIDRs error = %v, want errLeaseNotHeld", err)
+			}
+
+			if len(h.patches) != 0 {
+				t.Fatalf("patched node without the lease: %s", h.patches[0])
+			}
+
+			if h.state.allocator.IsAllocated("10.244.0.0/24") {
+				t.Fatal("allocated a CIDR without the lease")
+			}
+
+			if h.pending(podCIDRTestNode) != nil {
+				t.Fatal("recorded a pending assignment without the lease")
+			}
+		})
+	}
+}
+
+// TestAssignPodCIDRsKeepsPendingWhenLeaseLapses checks that losing the lease
+// between attempts leaves an earlier reservation in place: whether its patch
+// was applied is still unknown, so releasing it could hand it out twice.
+func TestAssignPodCIDRsKeepsPendingWhenLeaseLapses(t *testing.T) {
+	h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
+	fence := &fakeLeaseFence{validUntil: time.Now().Add(time.Minute)}
+	h.sc.SetLeaseFence(fence)
+	h.failPatches(apierrors.NewTimeoutError("request timed out", 1))
+
+	if err := h.sc.assignPodCIDRsForNode(context.Background(), h.cached, h.sites, "site-a"); err == nil {
+		t.Fatal("expected patch error")
+	}
+
+	fence.validUntil = time.Time{}
+	h.failPatches(nil)
+
+	if err := h.sc.assignPodCIDRsForNode(context.Background(), h.cached, h.sites, "site-a"); !errors.Is(err, errLeaseNotHeld) {
+		t.Fatalf("second sync error = %v, want errLeaseNotHeld", err)
+	}
+
+	if len(h.patches) != 1 {
+		t.Fatalf("expected only the first patch attempt, got %d patches", len(h.patches))
+	}
+
+	pending := h.pending(podCIDRTestNode)
+	if pending == nil || pending.podCIDR != "10.244.0.0/24" {
+		t.Fatalf("pending assignment = %+v, want 10.244.0.0/24", pending)
+	}
+
+	if !h.state.allocator.IsAllocated("10.244.0.0/24") {
+		t.Fatal("pending CIDR was released after the lease lapsed")
+	}
+}
+
+func TestAssignPodCIDRsAllowedWithLease(t *testing.T) {
+	h := newPodCIDRTestHarness(t, liveNodeWithRV("4"))
+	h.sc.SetLeaseFence(&fakeLeaseFence{validUntil: time.Now().Add(time.Minute)})
+
+	if err := h.sc.assignPodCIDRsForNode(context.Background(), h.cached, h.sites, "site-a"); err != nil {
+		t.Fatalf("assign pod CIDRs: %v", err)
+	}
+
+	if len(h.patches) != 1 {
+		t.Fatalf("expected one patch, got %d", len(h.patches))
+	}
+
+	if got := decodePatch(t, h.patches[0])["spec"]["podCIDR"]; got != "10.244.0.0/24" {
+		t.Fatalf("patch podCIDR = %v, want 10.244.0.0/24", got)
+	}
+}
+
+func TestTryAllocateForNodeLeaseFence(t *testing.T) {
+	cases := map[string]struct {
+		validUntil time.Time
+		wantOK     bool
+	}{
+		"held":       {validUntil: time.Now().Add(time.Minute), wantOK: true},
+		"never-held": {wantOK: false},
+		"expired":    {validUntil: time.Now().Add(-time.Second), wantOK: false},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := newPodCIDRTestHarness(t, liveNodeWithRV("1"))
+			h.sites[0].Spec.NodeCidrs = []string{"10.0.0.0/16"}
+			h.sc.sitesCache = h.sites
+			h.sc.SetLeaseFence(&fakeLeaseFence{validUntil: tc.validUntil})
+
+			podCIDR, _, siteName, ok := h.sc.TryAllocateForNode(podCIDRTestNode, []string{"10.0.0.5"})
+			if ok != tc.wantOK {
+				t.Fatalf("TryAllocateForNode ok = %v, want %v", ok, tc.wantOK)
+			}
+
+			if h.state.allocator.IsAllocated("10.244.0.0/24") != tc.wantOK {
+				t.Fatalf("allocator state for 10.244.0.0/24 = %v, want %v", !tc.wantOK, tc.wantOK)
+			}
+
+			if tc.wantOK && (podCIDR != "10.244.0.0/24" || siteName != "site-a") {
+				t.Fatalf("TryAllocateForNode = (%q, %q), want (10.244.0.0/24, site-a)", podCIDR, siteName)
+			}
+		})
 	}
 }

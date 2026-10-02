@@ -131,6 +131,13 @@ to disable their creation.
 | `--leader-elect-renew-deadline` | `5s` | Deadline for renewing leadership. |
 | `--leader-elect-retry-period` | `10s` | Retry period for acquiring leadership. |
 
+With leader election enabled, the controller allocates pod CIDRs (during node sync
+and in the mutating webhook) only while it has confirmed it holds the lease: until
+the renew deadline has elapsed since the start of its last successful lease write.
+A leader whose renewals stop succeeding stops allocating before another replica can
+acquire the lease. The webhook then admits new nodes without pod CIDRs, and the
+lease holder assigns them during node sync.
+
 ### Health and Monitoring
 
 | Flag | Default | Description |

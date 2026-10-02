@@ -534,6 +534,14 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 		klog.Warning("Dry-run mode is not supported for site-based pod CIDR assignment; running normally")
 	}
 
+	// With leader election enabled, pod CIDR allocation is fenced to the period
+	// in which this process has confirmed it holds the lease, so a deposed
+	// leader that has not yet noticed cannot allocate CIDRs.
+	var podCIDRFence *leaseFence
+	if cfg.LeaderElection.Enabled {
+		podCIDRFence = newLeaseFence(cfg.LeaderElection.RenewDeadline)
+	}
+
 	// runFunc creates and runs the controller - called only when becoming leader
 	// This ensures the allocator and informer are created fresh with current state
 	//
@@ -579,6 +587,10 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 		siteCtrl, err := controller.NewSiteController(clientset, dynamicClient, dynamicInformerFactory, informerFactory)
 		if err != nil {
 			klog.Fatalf("Failed to create site controller: %v", err)
+		}
+
+		if podCIDRFence != nil {
+			siteCtrl.SetLeaseFence(podCIDRFence)
 		}
 
 		// Wire the site controller as CIDR allocator for the mutating webhook
@@ -751,7 +763,7 @@ func run(cfg *config.Config, forceNotLeader bool) error {
 		}
 
 		klog.Info("Leader election enabled, waiting for leadership...")
-		runLeaderElection(ctx, cfg, clientset, healthState, runFunc)
+		runLeaderElection(ctx, cfg, clientset, healthState, podCIDRFence, runFunc)
 	} else {
 		klog.Info("Leader election disabled")
 		runAsLeader(ctx, healthState, runFunc)

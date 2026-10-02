@@ -177,6 +177,44 @@ type SiteController struct {
 	// holding CIDRs, is deleted, or can no longer receive the patch.
 	pendingPodCIDRs     map[string]*pendingPodCIDRAssignment
 	pendingPodCIDRsLock sync.Mutex
+
+	// leaseFence, when set, bounds pod CIDR allocation to the period in which
+	// this process is known to hold the leader lease. It is nil when leader
+	// election is disabled.
+	leaseFence LeaseFence
+}
+
+// LeaseFence reports how long the current process can rely on holding the
+// leader lease. ValidUntil returns the zero time when the lease is not held.
+type LeaseFence interface {
+	ValidUntil() time.Time
+}
+
+// errLeaseNotHeld is returned when pod CIDR allocation is refused because the
+// leader lease is not known to be held.
+var errLeaseNotHeld = errors.New("leader lease not held; refusing pod CIDR allocation")
+
+// SetLeaseFence makes pod CIDR allocation, from both node sync and the mutating
+// webhook, conditional on holding the leader lease. It must be called before
+// Run and before the controller is used as a webhook CIDR allocator.
+func (sc *SiteController) SetLeaseFence(fence LeaseFence) {
+	sc.leaseFence = fence
+}
+
+// leaseDeadline returns when this process stops being allowed to allocate pod
+// CIDRs, or errLeaseNotHeld if that time has passed. The zero time means no
+// fence is configured.
+func (sc *SiteController) leaseDeadline() (time.Time, error) {
+	if sc.leaseFence == nil {
+		return time.Time{}, nil
+	}
+
+	deadline := sc.leaseFence.ValidUntil()
+	if !time.Now().Before(deadline) {
+		return time.Time{}, errLeaseNotHeld
+	}
+
+	return deadline, nil
 }
 
 // pendingPodCIDRAssignment is an unconfirmed pod CIDR allocation for a node.
@@ -2183,12 +2221,29 @@ func (sc *SiteController) allocateAndPatchNodePodCIDRs(ctx context.Context, node
 			return nil
 		}
 
+		// Only the lease holder may allocate or write pod CIDRs. A deposed
+		// leader that has not yet noticed could otherwise hand out a CIDR the
+		// new leader also assigns.
+		deadline, err := sc.leaseDeadline()
+		if err != nil {
+			return err
+		}
+
 		podCIDR, podCIDRs, err := sc.pendingPodCIDRsForNode(liveNode, state)
 		if err != nil {
 			return err
 		}
 
-		if err := sc.patchNodePodCIDRs(ctx, nodeName, liveNode.ResourceVersion, siteName, podCIDR, podCIDRs); err != nil {
+		patchCtx := ctx
+
+		if !deadline.IsZero() {
+			var cancel context.CancelFunc
+
+			patchCtx, cancel = context.WithDeadline(ctx, deadline)
+			defer cancel()
+		}
+
+		if err := sc.patchNodePodCIDRs(patchCtx, nodeName, liveNode.ResourceVersion, siteName, podCIDR, podCIDRs); err != nil {
 			return err
 		}
 
@@ -2751,6 +2806,13 @@ func validateSiteCIDRsNoOverlap(sites []unboundedv1alpha3.Site) error {
 // ("", nil, false) if allocation is not possible.
 func (sc *SiteController) TryAllocateForNode(nodeName string, internalIPs []string) (string, []string, string, bool) {
 	if !sc.allocatorsReady.Load() {
+		return "", nil, "", false
+	}
+
+	// Admit the node without pod CIDRs when the lease is not held; the lease
+	// holder assigns them through node sync instead.
+	if _, err := sc.leaseDeadline(); err != nil {
+		klog.Warningf("Not allocating pod CIDRs for node %s at admission: %v", nodeName, err)
 		return "", nil, "", false
 	}
 
