@@ -332,6 +332,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 
 [[package]]
+name = "flow-control"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "libc",
+ "page-alloc",
+ "uring-runtime",
+ "zeroize",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -663,6 +674,7 @@ name = "racer-dataplane"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "flow-control",
  "futures",
  "getrandom",
  "http1",

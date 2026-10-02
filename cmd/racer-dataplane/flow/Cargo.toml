@@ -1,0 +1,16 @@
+[package]
+name = "flow-control"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Policy-driven quotas, payload recycling, credit windows, and bounded kernel pipes"
+
+[features]
+simulation = ["uring-runtime/simulation"]
+
+[dependencies]
+futures = "0.3"
+libc = "0.2"
+zeroize = "1"
+page-alloc = { path = "../alloc" }
+uring-runtime = { path = "../runtime" }
