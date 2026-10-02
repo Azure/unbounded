@@ -122,10 +122,3 @@ normal credentials. Confirm the selected namespace/node, populated overview and
 latency panels, optional loadgen activity, and node-resource labels. Check Grafana
 Query Inspector for errors; an absent optional metric should remain No data.
 The forward ends after five minutes; restart it only when still needed.
-
-Local structural/metric contract checks (stdlib only; not a PromQL parser or live
-Grafana validation):
-
-```sh
-timeout --signal=TERM --kill-after=10s 300s python3 -B -m unittest discover -s deploy/racer -p '*_test.py' -v
-```

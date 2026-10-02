@@ -31,6 +31,8 @@ COPY cmd/racer-dataplane/http/Cargo.toml ./http/Cargo.toml
 COPY cmd/racer-dataplane/http/src ./http/src
 COPY cmd/racer-dataplane/topology/Cargo.toml ./topology/Cargo.toml
 COPY cmd/racer-dataplane/topology/src ./topology/src
+COPY cmd/racer-dataplane/telemetry/Cargo.toml ./telemetry/Cargo.toml
+COPY cmd/racer-dataplane/telemetry/src ./telemetry/src
 COPY images/racer-dataplane/build-native.sh ./build-native.sh
 COPY images/racer-dataplane/check-debug-info.sh ./check-debug-info.sh
 RUN set -eu; \

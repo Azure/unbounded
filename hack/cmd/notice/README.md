@@ -2,7 +2,7 @@
 
 Generates and verifies the project's `NOTICE` file from direct dependencies in
 `go.mod`, `frontend/package.json`, `cmd/racer-dataplane/Cargo.toml`, its
-`runtime`, `alloc`, `crypto`, and `http` workspace members, and
+`runtime`, `alloc`, `crypto`, `http`, and `telemetry` workspace members, and
 `cmd/racer-loadgen/performance/Cargo.toml` plus
 any paired libfabric and OpenSSL source pins in `Makefile` (currently absent).
 

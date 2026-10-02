@@ -678,6 +678,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "telemetry",
  "topology",
  "uring-runtime",
  "x509-parser",
@@ -931,6 +932,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "telemetry"
+version = "0.1.0"
+dependencies = [
+ "httparse",
+ "uring-runtime",
+ "zeroize",
 ]
 
 [[package]]
