@@ -205,17 +205,21 @@ fn upload_then_fetch_on_one_connection_and_honor_server_close() {
         assert_eq!(downloaded.bytes, reply.len());
         assert_eq!(downloaded.buffer.bytes().unwrap(), reply);
         client = downloaded.lease;
-        for connection in [&mut client, &mut server] {
+        for connection in [&client, &server] {
             assert_eq!(connection.receive_remaining(), Some(0));
             assert_eq!(connection.send_remaining(), Some(0));
-            if close {
-                assert!(connection.closing());
-                connection.finish_exchange().unwrap();
-                assert!(!connection.is_reusable());
-            } else {
-                connection.next_round().unwrap();
-                assert!(!connection.is_reusable());
-            }
+            assert_eq!(connection.closing(), close);
+        }
+        client.finish_exchange().unwrap();
+        assert_eq!(client.is_reusable(), !close);
+        if close {
+            server.finish_exchange().unwrap();
+        } else {
+            // Advance the server's owned socket without returning it to a pool.
+            server.next_round().unwrap();
+        }
+        assert!(!server.is_reusable());
+        for connection in [&client, &server] {
             assert_eq!(connection.receive_remaining(), None);
             assert_eq!(connection.send_remaining(), None);
         }
