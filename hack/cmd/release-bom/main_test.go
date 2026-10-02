@@ -7,9 +7,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/Azure/unbounded/pkg/agent/goalstates"
@@ -95,6 +98,82 @@ func TestBuildBOM(t *testing.T) {
 
 	if !foundGantryChart {
 		t.Fatal("signed Gantry chart is missing from BOM artifacts")
+	}
+}
+
+func TestBuildBOMResolvesRacerReleaseImages(t *testing.T) {
+	opts := options{tag: "v1.2.3", registry: "registry.example.com/project/"}
+	resolved := make(map[string]int)
+	resolver := func(_ context.Context, name, ref string) (resolvedImage, error) {
+		resolved[ref]++
+
+		return resolvedImage{
+			Name: name, Reference: ref,
+			Digest:    fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(ref))),
+			MediaType: "application/vnd.oci.image.index.v1+json",
+			Platforms: []string{"linux/amd64", "linux/arm64"},
+		}, nil
+	}
+
+	bom, err := buildBOM(t.Context(), opts, resolver)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// These names are published by the release workflow, independently of the
+	// list under test. Native RDMA is a build option, not a separate image name.
+	for _, name := range []string{"racer-controller", "racer-dataplane"} {
+		ref := "registry.example.com/project/" + name + ":v1.2.3"
+		if resolved[ref] != 1 {
+			t.Fatalf("%s resolved %d times, want once", ref, resolved[ref])
+		}
+
+		want := resolvedImage{
+			Name: name, Reference: ref,
+			Digest:    fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(ref))),
+			MediaType: "application/vnd.oci.image.index.v1+json",
+			Platforms: []string{"linux/amd64", "linux/arm64"},
+		}
+
+		matches := 0
+
+		for _, image := range bom.Images {
+			if image.Name == name {
+				matches++
+
+				if !reflect.DeepEqual(image, want) {
+					t.Fatalf("resolved Racer image = %#v, want %#v", image, want)
+				}
+			}
+		}
+
+		if matches != 1 {
+			t.Fatalf("%s appears %d times in BOM images, want once", name, matches)
+		}
+	}
+}
+
+func TestBuildBOMRejectsUnresolvedRacerReleaseImage(t *testing.T) {
+	for _, name := range []string{"racer-controller", "racer-dataplane"} {
+		t.Run(name, func(t *testing.T) {
+			unavailable := errors.New("image unavailable")
+			resolver := func(_ context.Context, candidate, ref string) (resolvedImage, error) {
+				if candidate == name {
+					return resolvedImage{}, unavailable
+				}
+
+				return resolvedImage{Name: candidate, Reference: ref}, nil
+			}
+
+			bom, err := buildBOM(t.Context(), options{tag: "v1.2.3", registry: "registry.example.com/project"}, resolver)
+			if bom != nil || !errors.Is(err, unavailable) {
+				t.Fatalf("missing Racer image must fail BOM generation: bom=%#v err=%v", bom, err)
+			}
+
+			if !strings.Contains(err.Error(), "resolve release image "+name+":") {
+				t.Fatalf("error must identify unresolved Racer image: %v", err)
+			}
+		})
 	}
 }
 
