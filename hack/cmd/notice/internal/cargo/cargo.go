@@ -30,6 +30,7 @@ var crateInputs = []crateInput{
 	{"cmd/racer-dataplane/runtime/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
 	{"cmd/racer-dataplane/alloc/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
 	{"cmd/racer-dataplane/crypto/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
+	{"cmd/racer-dataplane/http/Cargo.toml", "cmd/racer-dataplane/Cargo.lock"},
 }
 
 // Collector reads Cargo.toml and Cargo.lock locally and obtains license text

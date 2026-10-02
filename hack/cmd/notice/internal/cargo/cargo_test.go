@@ -283,7 +283,7 @@ func writeCollectorFixtures(t *testing.T, root, version string) {
 		t.Fatal(err)
 	}
 
-	for _, member := range []string{"runtime", "alloc", "crypto"} {
+	for _, member := range []string{"runtime", "alloc", "crypto", "http"} {
 		testutil.WriteTree(t, root, map[string]string{
 			"cmd/racer-dataplane/" + member + "/Cargo.toml": "[package]\nname = \"racer-" + member + "\"\n",
 		})
@@ -380,6 +380,7 @@ name = "racer-dataplane"
 racer-runtime = { path = "runtime" }
 racer-alloc = { path = "alloc" }
 racer-crypto = { path = "crypto" }
+http1 = { path = "http" }
 `,
 		"cmd/racer-dataplane/Cargo.lock": "[[package]]\nname = \"racer-dataplane\"\nversion = \"0.1.0\"\n",
 	})
@@ -390,7 +391,7 @@ racer-crypto = { path = "crypto" }
 	lock := "[[package]]\nname = \"racer-dataplane\"\nversion = \"0.1.0\"\n"
 	want := map[string]string{"foo": "1.2.3"}
 
-	for _, member := range []string{"runtime", "alloc", "crypto"} {
+	for _, member := range []string{"runtime", "alloc", "crypto", "http"} {
 		name := member + "-dep"
 		want[name] = "1.2.3"
 		testutil.WriteTree(t, root, map[string]string{
@@ -426,7 +427,7 @@ version = "2.0.0"
 	}
 
 	// A stale adjacent member lock must not override the workspace lock.
-	for _, member := range []string{"runtime", "alloc", "crypto"} {
+	for _, member := range []string{"runtime", "alloc", "crypto", "http"} {
 		testutil.WriteTree(t, root, map[string]string{
 			"cmd/racer-dataplane/" + member + "/Cargo.lock": "invalid stale member lock\n",
 		})
@@ -461,6 +462,7 @@ func TestCollectorRequiresWorkspaceInputs(t *testing.T) {
 		"cmd/racer-dataplane/runtime/Cargo.toml",
 		"cmd/racer-dataplane/alloc/Cargo.toml",
 		"cmd/racer-dataplane/crypto/Cargo.toml",
+		"cmd/racer-dataplane/http/Cargo.toml",
 		"cmd/racer-dataplane/Cargo.lock",
 	} {
 		t.Run(missing, func(t *testing.T) {
