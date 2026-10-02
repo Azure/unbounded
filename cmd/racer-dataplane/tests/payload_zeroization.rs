@@ -68,7 +68,7 @@ fn watch(pointer: *const u8) {
 
 #[test]
 fn final_payload_owner_scrubs_full_allocation_on_reclaim_and_rejection() {
-    let (config, _) = Config::from_lookup_with_fabric_ports(|name| {
+    let config = Config::from_lookup(|name| {
         Ok(match name {
             "RACER_CLUSTER_ID" => Some("11111111-1111-4111-8111-111111111111".into()),
             "RACER_CONTROL_ENDPOINT" => Some("https://controller.invalid:443".into()),

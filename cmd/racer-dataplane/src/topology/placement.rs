@@ -506,7 +506,7 @@ mod tests {
         changed.reverse();
         for node in &mut changed {
             node.peer_endpoint = "[::1]:9090".into();
-            node.alignment_enabled = false;
+            node.rails.clear();
         }
         let changed = Arc::new(Membership::validate(MembershipVersion(2), changed).unwrap());
         for page in 0..100 {
@@ -609,7 +609,7 @@ mod tests {
         let mut nodes = old.members().to_vec();
         for node in &mut nodes {
             node.peer_endpoint = "[::1]:9090".into();
-            node.alignment_enabled = false;
+            node.rails.clear();
         }
         let current = Arc::new(Membership::validate(MembershipVersion(2), nodes).unwrap());
         assert_eq!(old.placement_identity(), current.placement_identity());

@@ -1075,9 +1075,10 @@ impl Harness {
                 .prepare(worker_ids.into_iter(), &config.limits)
                 .unwrap();
         }
-        let fabric_ports = if self.native {
-            vec![crate::rdma::FabricPort {
-                fabric: "dst-fabric".into(),
+        let discovered_nics = if self.native {
+            vec![crate::topology::rails::RailMapping {
+                rail: crate::topology::rails::RailId(0),
+                numa_node: None,
                 device,
                 port: 1,
                 gid: Some(gid),
@@ -1086,7 +1087,7 @@ impl Harness {
             Vec::new()
         };
         let (mut app, runtime, engine) =
-            test_support::local_worker_with_fabric(&config, &node, 0, fabric_ports);
+            test_support::local_worker_with_fabric(&config, &node, 0, discovered_nics);
         let crypto = node.native.crypto(WorkerId(0), engine).unwrap();
         app.keys
             .install(self.bundle(&config, u64::from(self.key_epoch) + 1))
@@ -1122,7 +1123,7 @@ impl Harness {
                 &config,
                 &node,
                 worker as u16,
-                workers[0].app.fabric_ports.clone(),
+                workers[0].app.discovered_nics.clone(),
             );
             let crypto = node.native.crypto(WorkerId(worker as u16), engine).unwrap();
             workers.push(LocalWorker {
@@ -2055,13 +2056,17 @@ fn member(config: &Config) -> crate::topology::membership::Member {
         rails: if config.enable_rdma {
             vec![crate::topology::rails::RailMapping {
                 rail: crate::topology::rails::RailId(0),
-                fabric: "dst-fabric".into(),
+                device: format!(
+                    "dst-rnic-{}",
+                    usize::from_str_radix(&config.node.0[..8], 16).unwrap()
+                ),
+                port: 1,
+                gid: None,
                 numa_node: None,
             }]
         } else {
             vec![]
         },
-        alignment_enabled: config.enable_rdma,
         site: "site1".into(),
     }
 }

@@ -713,7 +713,6 @@ pub(crate) mod test_support {
                         shares: NonZeroU32::new(1).unwrap(),
                         peer_endpoint: "127.0.0.1:1".into(),
                         rails: vec![],
-                        alignment_enabled: false,
                         site: String::new(),
                     }],
                     caches: vec![cache.clone()],

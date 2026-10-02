@@ -950,7 +950,6 @@ fn public_operations_reject_wrong_authority_before_io() {
                 shares: std::num::NonZeroU32::new(1).unwrap(),
                 peer_endpoint: "127.0.0.1:1234".into(),
                 rails: vec![],
-                alignment_enabled: false,
                 site: String::new(),
             }],
         )

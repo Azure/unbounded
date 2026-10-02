@@ -1,17 +1,14 @@
 //! Environment and deployment configuration, validated before startup.
 //!
 //! Default to all eligible physical cores, subject to CPU and resource budgets.
-//! Shares and rail alignment come exclusively from accepted controller membership.
+//! Shares and physical NIC bindings come from accepted controller membership.
 
-use crate::runtime::collections::HashSet;
 use crate::{
     error::{Error, Result},
     model::{ClusterId, Limits, NodeId, PAGE_BYTES},
-    rdma::FabricPort,
     store::format::MAX_HEADER_BYTES,
 };
 use std::{
-    io::Read,
     net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
     path::{Path, PathBuf},
@@ -24,7 +21,6 @@ pub const UNRESOLVED_NODE_ID: &str = "";
 const MIB: u64 = 1024 * 1024;
 const MAX_BYTES: u64 = 64 * 1024 * MIB;
 const MAX_ENTRIES: usize = 1_048_576;
-const MAX_FABRIC_FILE_BYTES: usize = 65_536;
 
 pub struct Config {
     pub send_crc_pair: Option<crate::telemetry::send_crc::Pair>,
@@ -70,72 +66,20 @@ pub struct Config {
 }
 
 impl Config {
-    /// Process configuration plus trusted operator-local physical associations.
-    /// Kept separate from Config so in-process callers must explicitly supply
-    /// their own associations rather than inheriting the process environment.
-    /// Reads a bounded projected file, when selected, before application startup.
-    pub fn from_env_with_fabric_ports() -> Result<(Self, Vec<FabricPort>)> {
-        Self::from_lookup_with_fabric_ports(env_value)
-    }
-
-    /// Injectable environment; a configured projection is read before startup.
-    pub fn from_lookup_with_fabric_ports(
-        lookup: impl FnMut(&str) -> Result<Option<String>>,
-    ) -> Result<(Self, Vec<FabricPort>)> {
-        Self::from_lookup_with_fabric_loader(lookup, load_fabric_ports)
-    }
-
-    /// Injectable environment and projected-file loader for side-effect-free tests.
-    pub fn from_lookup_with_fabric_loader(
-        mut lookup: impl FnMut(&str) -> Result<Option<String>>,
-        load: impl FnOnce(&Path) -> Result<Vec<FabricPort>>,
-    ) -> Result<(Self, Vec<FabricPort>)> {
-        let inline = lookup("RACER_FABRIC_PORTS")?;
-        let file = lookup("RACER_FABRIC_PORTS_FILE")?;
-        if inline.is_some() && file.is_some() {
-            return Err(Error::InvalidConfiguration);
-        }
-        let requested_rdma = lookup("RACER_ENABLE_RDMA")?;
-        let mut config = Self::from_lookup(|name| {
-            if name == "RACER_ENABLE_RDMA" {
-                Ok(match requested_rdma.as_deref() {
-                    None | Some("auto") => Some("false".into()),
-                    _ => requested_rdma.clone(),
-                })
-            } else {
-                lookup(name)
-            }
-        })?;
-        let ports = if let Some(file) = file {
-            let path = Path::new(&file);
-            validate_path(path)?;
-            for writable in [&config.identity_directory, &config.slab_directory] {
-                if path.starts_with(writable) || writable.starts_with(path) {
-                    return Err(Error::InvalidConfiguration);
-                }
-            }
-            load(path)?
-        } else {
-            parse_fabric_ports(inline.as_deref())?
-        };
-        validate_fabric_ports(&ports)?;
-        if requested_rdma
-            .as_deref()
-            .is_none_or(|value| value == "auto")
-        {
-            config.enable_rdma = cfg!(feature = "rdma") && !ports.is_empty();
-        }
-        Ok((config, ports))
+    pub fn from_env() -> Result<Self> {
+        Self::from_lookup(env_value)
     }
 
     /// Injectable lookup keeps parser tests independent of the process environment.
-    fn from_lookup(mut lookup: impl FnMut(&str) -> Result<Option<String>>) -> Result<Self> {
+    pub fn from_lookup(mut lookup: impl FnMut(&str) -> Result<Option<String>>) -> Result<Self> {
         // Fail closed on common obsolete authority overrides, even if empty.
         for name in [
             "RACER_NODE_UID",
             "RACER_NODE_ID",
             "RACER_RAILS",
             "RACER_ALIGNED_RAILS",
+            "RACER_FABRIC_PORTS",
+            "RACER_FABRIC_PORTS_FILE",
         ] {
             if lookup(name)?.is_some() {
                 return Err(Error::InvalidConfiguration);
@@ -156,12 +100,23 @@ impl Config {
         };
         let cluster = ClusterId(text("RACER_CLUSTER_ID", None)?);
         let control_endpoint = text("RACER_CONTROL_ENDPOINT", None)?;
+        let enable_rdma = match text("RACER_ENABLE_RDMA", Some("auto"))?.as_str() {
+            // Auto reserves native resources only with usable startup hardware.
+            // Explicit true reserves them even when absent, enabling hotplug
+            // recovery without resizing live workers or stealing HTTP budgets.
+            "auto" => {
+                cfg!(feature = "rdma")
+                    && rdma_verbs::inventory().is_ok_and(|ports| !ports.is_empty())
+            }
+            "true" => true,
+            "false" => false,
+            _ => return Err(Error::InvalidConfiguration),
+        };
         let mut boolean = |name| {
             text(name, Some("false"))?
                 .parse::<bool>()
                 .map_err(|_| Error::InvalidConfiguration)
         };
-        let enable_rdma = boolean("RACER_ENABLE_RDMA")?;
         let allow_smt = boolean("RACER_ALLOW_SMT")?;
         let opaque_relay = boolean("RACER_OPAQUE_RELAY")?;
         let peer_tcp_nodelay = boolean("RACER_PEER_TCP_NODELAY")?;
@@ -434,131 +389,12 @@ impl Config {
     }
 }
 
-/// Validate programmatic associations with the same rules as environment input.
-pub(crate) fn validate_fabric_ports(ports: &[FabricPort]) -> Result<()> {
-    if ports.len() > 64 {
-        return Err(Error::InvalidConfiguration);
-    }
-    let mut fabrics = HashSet::default();
-    let mut physical = HashSet::default();
-    for port in ports {
-        if port.fabric.is_empty()
-            || port.fabric.len() > 4096
-            || port.fabric.starts_with(' ')
-            || port.fabric.ends_with(' ')
-            || port.fabric.chars().any(char::is_control)
-            || port.device.is_empty()
-            || port.device.len() > 63
-            || !port.device.as_bytes()[0].is_ascii_alphanumeric()
-            || port.device == "."
-            || port.device.contains("..")
-            || !port
-                .device
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
-            || port.port == 0
-            || port.gid == Some([0; 16])
-            || port.gid.is_some_and(|gid| gid[0] == 0xff)
-            || !fabrics.insert(&port.fabric)
-            || !physical.insert((&port.device, port.port))
-        {
-            return Err(Error::InvalidConfiguration);
-        }
-    }
-    Ok(())
-}
-
-fn parse_fabric_ports(value: Option<&str>) -> Result<Vec<FabricPort>> {
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
-    if value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control) {
-        return Err(Error::InvalidConfiguration);
-    }
-    parse_fabric_document(value.as_bytes())
-}
-
 fn env_value(name: &str) -> Result<Option<String>> {
     match std::env::var(name) {
         Ok(value) => Ok(Some(value)),
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => Err(Error::InvalidConfiguration),
     }
-}
-
-fn load_fabric_ports(path: &Path) -> Result<Vec<FabricPort>> {
-    use std::os::unix::fs::OpenOptionsExt;
-    // Follow projection symlinks; O_NONBLOCK prevents a mistaken FIFO from hanging.
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|_| Error::InvalidConfiguration)?;
-    let metadata = file.metadata().map_err(|_| Error::InvalidConfiguration)?;
-    if !metadata.is_file() || metadata.len() > MAX_FABRIC_FILE_BYTES as u64 {
-        return Err(Error::InvalidConfiguration);
-    }
-    read_fabric_ports(file)
-}
-
-fn read_fabric_ports(reader: impl Read) -> Result<Vec<FabricPort>> {
-    let mut bytes = Vec::new();
-    reader
-        .take((MAX_FABRIC_FILE_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| Error::InvalidConfiguration)?;
-    parse_fabric_document(&bytes)
-}
-
-fn parse_fabric_document(value: &[u8]) -> Result<Vec<FabricPort>> {
-    if value.is_empty() || value.len() > MAX_FABRIC_FILE_BYTES {
-        return Err(Error::InvalidConfiguration);
-    }
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Association {
-        fabric: String,
-        device: String,
-        port: u8,
-        // Optional canonical 32-digit lowercase hex, in network byte order.
-        gid: Option<String>,
-    }
-    let entries: Vec<Association> =
-        serde_json::from_slice(value).map_err(|_| Error::InvalidConfiguration)?;
-    if entries.len() > 64 {
-        return Err(Error::InvalidConfiguration);
-    }
-    let ports = entries
-        .into_iter()
-        .map(|entry| {
-            let gid = entry
-                .gid
-                .map(|value| {
-                    if value.len() != 32
-                        || !value
-                            .bytes()
-                            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
-                    {
-                        return Err(Error::InvalidConfiguration);
-                    }
-                    let mut gid = [0; 16];
-                    for (index, byte) in gid.iter_mut().enumerate() {
-                        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-                            .map_err(|_| Error::InvalidConfiguration)?;
-                    }
-                    Ok(gid)
-                })
-                .transpose()?;
-            Ok(FabricPort {
-                fabric: entry.fabric,
-                device: entry.device,
-                port: entry.port,
-                gid,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    validate_fabric_ports(&ports)?;
-    Ok(ports)
 }
 
 fn to_usize(value: u64) -> Result<usize> {
@@ -673,8 +509,148 @@ fn validate_path(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
-    const ASSOCIATION: &str = r#"[{"fabric":"fabric-a","device":"mlx5_0","port":1,"gid":"fe800000000000000000000000001234"}]"#;
+    #[test]
+    fn configured_ports_do_not_override_membership_or_discovered_hardware() {
+        use crate::{
+            rdma::{DiscoveredPort, match_publication},
+            topology::rails::{RailId, RailMapping},
+        };
+        let nic = RailMapping {
+            device: "a".into(),
+            port: 1,
+            rail: RailId(7),
+            gid: Some([1; 16]),
+            numa_node: Some(9),
+        };
+        let live = DiscoveredPort {
+            device: "a".into(),
+            port: 1,
+            gid: [1; 16],
+            numa_node: Some(0),
+        };
+        assert_eq!(
+            match_publication(&[nic.clone()], &[live.clone()]).unwrap()[0]
+                .0
+                .numa_node,
+            Some(9)
+        );
+        for bad in [
+            DiscoveredPort {
+                device: "b".into(),
+                ..live.clone()
+            },
+            DiscoveredPort {
+                port: 2,
+                ..live.clone()
+            },
+            DiscoveredPort {
+                gid: [2; 16],
+                ..live.clone()
+            },
+        ] {
+            assert!(match_publication(&[nic.clone()], &[bad]).is_err());
+        }
+        assert!(match_publication(&[nic.clone()], &[live.clone(), live.clone()]).is_err());
+        assert!(match_publication(&[nic.clone(), nic.clone()], &[live]).is_err());
+        assert!(match_publication(&[nic], &[]).is_err());
+    }
+
+    // Retain the retired loader safety tests under their historical names. The
+    // contract now lives in authenticated wire NICs, not a second local parser.
+    fn nic_request(nics: &str) -> Vec<u8> {
+        String::from_utf8(
+            include_bytes!("../../../internal/racer/wire/testdata/bootstrap-request.json").to_vec(),
+        )
+        .unwrap()
+        .replace("\"rdma_nics\":[]", &format!("\"rdma_nics\":{nics}"))
+        .into_bytes()
+    }
+    #[test]
+    fn fabric_ports_reject_malformed_ambiguous_or_unsafe_configuration() {
+        for nics in [
+            "null",
+            "{}",
+            "[null]",
+            r#"[{"device":"a","port":0,"rail":0}]"#,
+            r#"[{"device":"a","port":1,"rail":0,"gid":""}]"#,
+            r#"[{"device":"a","port":1,"rail":0,"gid":null}]"#,
+            r#"[{"device":"a","port":1,"port":2,"rail":0}]"#,
+            r#"[{"device":"a","port":1,"rail":0,"fabric":"old"}]"#,
+            r#"[{"device":"a","port":1,"rail":0},{"device":"a","port":1,"rail":1}]"#,
+        ] {
+            assert!(
+                crate::control::wire::decode_enrollment_request(&nic_request(nics)).is_err(),
+                "{nics}"
+            );
+        }
+    }
+    #[test]
+    fn projected_fabric_configuration_is_bounded_and_errors_fail_closed() {
+        let entries: Vec<_> = (0..65)
+            .map(|i| format!(r#"{{"device":"d{i}","port":1,"rail":0}}"#))
+            .collect();
+        assert!(
+            crate::control::wire::decode_enrollment_request(&nic_request(&format!(
+                "[{}]",
+                entries[..64].join(",")
+            )))
+            .is_ok()
+        );
+        assert!(
+            crate::control::wire::decode_enrollment_request(&nic_request(&format!(
+                "[{}]",
+                entries.join(",")
+            )))
+            .is_err()
+        );
+        assert!(
+            crate::control::wire::decode_enrollment_request(&vec![
+                b' ';
+                crate::control::wire::MAX_ENROLLMENT_BYTES
+                    + 1
+            ])
+            .is_err()
+        );
+        for name in ["RACER_FABRIC_PORTS", "RACER_FABRIC_PORTS_FILE"] {
+            assert!(parse(&[(name, "[]")]).is_err());
+        }
+    }
+    #[test]
+    fn fabric_loader_is_selected_once_and_its_output_is_validated() {
+        assert!(Config::from_lookup(|_| Err(Error::InvalidConfiguration)).is_err());
+        for value in ["", "/missing", "[]", "not-json"] {
+            assert!(parse(&[("RACER_FABRIC_PORTS_FILE", value)]).is_err());
+            assert!(parse(&[("RACER_FABRIC_PORTS", value)]).is_err());
+        }
+        assert!(
+            crate::control::wire::decode_enrollment_request(&nic_request(
+                r#"[{"device":"a","port":1,"rail":0}]"#
+            ))
+            .is_ok()
+        );
+    }
+    #[test]
+    fn auto_without_ports_preserves_http_budget_explicit_true_reserves_hotplug() {
+        let sim = crate::rdma::lifecycle::simulation::Simulation::new()
+            .with_devices(vec![])
+            .unwrap();
+        let _environment = sim.enter();
+        assert!(
+            !parse(&[("RACER_REGISTERED_BYTES", "1")])
+                .unwrap()
+                .enable_rdma
+        );
+        assert!(
+            parse(&[
+                ("RACER_ENABLE_RDMA", "true"),
+                ("RACER_REGISTERED_BYTES", "1")
+            ])
+            .is_err()
+        );
+        assert!(parse(&[("RACER_ENABLE_RDMA", "true")]).unwrap().enable_rdma);
+    }
 
     fn lookup(name: &str) -> Result<Option<String>> {
         Ok(match name {
@@ -685,403 +661,37 @@ mod tests {
     }
 
     #[test]
-    fn fabric_configuration_preserves_explicit_labels_and_gid() {
-        let ports = parse_fabric_ports(Some(ASSOCIATION)).unwrap();
-        assert_eq!(ports[0].fabric, "fabric-a");
-        assert_eq!(ports[0].device, "mlx5_0");
-        assert_eq!(ports[0].port, 1);
-        assert_eq!(
-            ports[0].gid,
-            Some("fe80::1234".parse::<std::net::Ipv6Addr>().unwrap().octets())
-        );
-        let ports = parse_fabric_ports(Some(r#"[{"fabric":"β<&>","device":"mlx5_0","port":255}]"#))
-            .unwrap();
-        assert_eq!(ports[0].fabric, "β<&>");
-        assert_eq!(ports[0].gid, None);
-        let bytes = format!("\n{ASSOCIATION}\n");
-        assert_eq!(
-            read_fabric_ports(bytes.as_bytes()).unwrap()[0].fabric,
-            "fabric-a"
-        );
-    }
-
-    #[test]
-    fn fabric_configuration_rejects_duplicate_fabrics_and_reused_physical_ports() {
-        let entry = &ASSOCIATION[1..ASSOCIATION.len() - 1];
-        for second in [
-            entry.to_owned(),
-            entry.replace("mlx5_0", "mlx5_1"),
-            entry.replace("fabric-a", "fabric-b"),
+    fn obsolete_nic_authority_configuration_fails_even_when_disabled() {
+        for key in [
+            "RACER_FABRIC_PORTS",
+            "RACER_FABRIC_PORTS_FILE",
+            "RACER_RAILS",
+            "RACER_ALIGNED_RAILS",
         ] {
-            assert!(parse_fabric_ports(Some(&format!("[{entry},{second}]"))).is_err());
-        }
-        let second = entry
-            .replace("fabric-a", "fabric-b")
-            .replace("\"port\":1", "\"port\":2");
-        assert_eq!(
-            parse_fabric_ports(Some(&format!("[{entry},{second}]")))
-                .unwrap()
-                .len(),
-            2
-        );
-    }
-
-    #[test]
-    fn projected_fabric_configuration_is_bounded_and_errors_fail_closed() {
-        let entries = (0..65)
-            .map(|i| format!(r#"{{"fabric":"f{i}","device":"mlx5_{i}","port":1}}"#))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            parse_fabric_document(format!("[{}]", entries[..64].join(",")).as_bytes())
-                .unwrap()
-                .len(),
-            64
-        );
-        assert!(parse_fabric_document(format!("[{}]", entries.join(",")).as_bytes()).is_err());
-        let mut bytes = ASSOCIATION.as_bytes().to_vec();
-        bytes.resize(MAX_FABRIC_FILE_BYTES, b' ');
-        assert!(read_fabric_ports(bytes.as_slice()).is_ok());
-        bytes.push(b' ');
-        assert!(read_fabric_ports(bytes.as_slice()).is_err());
-        assert!(read_fabric_ports(std::io::repeat(b' ')).is_err());
-        struct Broken;
-        impl Read for Broken {
-            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::other("failed"))
+            for value in ["", "[]", "anything"] {
+                assert!(parse(&[(key, value), ("RACER_ENABLE_RDMA", "false")]).is_err());
             }
         }
-        assert!(read_fabric_ports(Broken).is_err());
-
-        for path in [
-            "",
-            "relative",
-            "/",
-            "/etc/../ports.json",
-            "/etc//ports.json",
-            "/etc/ports.json/",
-            "/var/lib/racer/slabs/ports.json",
-            "/var/lib/racer/identity/ports.json",
-        ] {
-            assert!(
-                Config::from_lookup_with_fabric_loader(
-                    |name| {
-                        if name == "RACER_FABRIC_PORTS_FILE" {
-                            Ok(Some(path.into()))
-                        } else {
-                            lookup(name)
-                        }
-                    },
-                    |_| panic!("invalid paths must fail before loading")
-                )
-                .is_err(),
-                "{path}"
-            );
-        }
-        assert!(
-            Config::from_lookup_with_fabric_loader(
-                |name| {
-                    if matches!(name, "RACER_FABRIC_PORTS" | "RACER_FABRIC_PORTS_FILE") {
-                        Ok(Some(String::new()))
-                    } else {
-                        lookup(name)
-                    }
-                },
-                |_| panic!("conflicting sources must fail before loading")
-            )
-            .is_err()
-        );
-        let file_lookup = |name: &str| {
-            if name == "RACER_FABRIC_PORTS_FILE" {
-                Ok(Some("/etc/racer/native/ports.json".into()))
-            } else {
-                lookup(name)
-            }
-        };
-        let (_, ports) = Config::from_lookup_with_fabric_loader(file_lookup, |path| {
-            assert_eq!(path, Path::new("/etc/racer/native/ports.json"));
-            read_fabric_ports(ASSOCIATION.as_bytes())
-        })
-        .unwrap();
-        assert_eq!(ports[0].device, "mlx5_0");
-        assert!(
-            Config::from_lookup_with_fabric_loader(file_lookup, |_| Err(
-                Error::InvalidConfiguration
-            ))
-            .is_err()
-        );
-        assert!(
-            Config::from_lookup_with_fabric_loader(
-                |_| Err(Error::InvalidConfiguration),
-                |_| panic!()
-            )
-            .is_err()
-        );
     }
 
     #[test]
-    fn projected_fabric_file_loads_symlinks_and_rejects_nonregular_or_invalid_files() {
-        use std::{ffi::CString, os::unix::fs::symlink};
-
-        struct Scratch(PathBuf);
-        impl Drop for Scratch {
-            fn drop(&mut self) {
-                std::fs::remove_dir_all(&self.0).unwrap();
-            }
-        }
-        let directory = Scratch(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("target")
-                .join(format!("fabric-file-test-{}", std::process::id())),
-        );
-        std::fs::create_dir_all(&directory.0).unwrap();
-        let file = directory.0.join("ports.json");
-        let projection = directory.0.join("projection.json");
-        std::fs::write(&file, format!("\n{ASSOCIATION}\n")).unwrap();
-        symlink("ports.json", &projection).unwrap();
-        let (_, ports) = Config::from_lookup_with_fabric_ports(|name| {
-            if name == "RACER_FABRIC_PORTS_FILE" {
-                Ok(Some(projection.to_str().unwrap().into()))
-            } else {
-                lookup(name)
-            }
-        })
-        .unwrap();
-        assert_eq!(ports[0].fabric, "fabric-a");
-        assert_eq!(ports[0].device, "mlx5_0");
-        assert!(load_fabric_ports(&directory.0).is_err());
-        assert!(load_fabric_ports(&directory.0.join("missing")).is_err());
-        for bytes in [vec![], vec![0xff], vec![b' '; MAX_FABRIC_FILE_BYTES + 1]] {
-            std::fs::write(&file, bytes).unwrap();
-            assert!(load_fabric_ports(&projection).is_err());
-        }
-        let fifo = directory.0.join("fifo");
-        let name = CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
-        assert!(load_fabric_ports(&fifo).is_err());
-    }
-
-    #[test]
-    fn fabric_loader_is_selected_once_and_its_output_is_validated() {
-        for inline in [None, Some("[]"), Some(ASSOCIATION)] {
-            let (_, ports) = Config::from_lookup_with_fabric_loader(
-                |name| {
-                    if name == "RACER_FABRIC_PORTS" {
-                        Ok(inline.map(str::to_owned))
-                    } else {
-                        lookup(name)
-                    }
-                },
-                |_| panic!("inline or absent configuration must not read a file"),
-            )
-            .unwrap();
-            assert_eq!(ports.len(), usize::from(inline == Some(ASSOCIATION)));
-        }
-        let mut invalid = parse_fabric_ports(Some(ASSOCIATION)).unwrap();
-        invalid[0].port = 0;
-        assert!(
-            Config::from_lookup_with_fabric_loader(
-                |name| {
-                    if name == "RACER_FABRIC_PORTS_FILE" {
-                        Ok(Some("/etc/racer/native/ports.json".into()))
-                    } else {
-                        lookup(name)
-                    }
-                },
-                |_| Ok(invalid),
-            )
-            .is_err()
-        );
-        for value in [
-            r#"[{"fabric":"f","device":"d","port":1,"gid":null}]"#,
-            r#"[{"fabric":"f","device":"d","port":1}]"#,
-        ] {
-            assert_eq!(parse_fabric_ports(Some(value)).unwrap()[0].gid, None);
-        }
-        assert!(
-            parse_fabric_ports(Some(
-                r#"[{"fabric":"f","device":"d","port":1,"gid":null,"gid":null}]"#,
-            ))
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn fabric_ports_are_bounded_explicit_and_preserve_exact_labels_and_gid() {
-        assert!(parse_fabric_ports(None).unwrap().is_empty());
-        assert!(parse_fabric_ports(Some("[]")).unwrap().is_empty());
-        let ports = parse_fabric_ports(Some(r#"[{"fabric":"β<&>\u2028","device":"mlx5_0","port":1,"gid":"fe800000000000000000000000000001"},{"fabric":"fabric-b","device":"mlx5_0","port":2}]"#)).unwrap();
-        assert_eq!(ports[0].fabric, "β<&>\u{2028}");
-        assert_eq!(ports[0].device, "mlx5_0");
-        assert_eq!(
-            ports[0].gid.unwrap(),
-            [254, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
-        );
-        assert_eq!(ports[1].port, 2);
-        assert_eq!(ports[1].gid, None);
-        let entries = (0..64)
-            .map(|i| format!(r#"{{"fabric":"f{i}","device":"d{i}","port":255}}"#))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            parse_fabric_ports(Some(&format!("[{}]", entries.join(","))))
-                .unwrap()
-                .len(),
-            64
-        );
-        let mut too_many = entries;
-        too_many.push(r#"{"fabric":"last","device":"last","port":1}"#.into());
-        assert!(parse_fabric_ports(Some(&format!("[{}]", too_many.join(",")))).is_err());
-    }
-
-    #[test]
-    fn fabric_ports_reject_malformed_ambiguous_or_unsafe_configuration() {
-        for value in [
-            "",
-            "null",
-            "{}",
-            "[",
-            "[] trailing",
-            "[{}]",
-            "[null]",
-            "[1]",
-            "[\n]",
-            "\n[]",
-            "[{},]",
-        ] {
-            assert!(parse_fabric_ports(Some(value)).is_err(), "{value:?}");
-        }
-        for entry in [
-            r#"{"fabric":"f","device":"d","port":0}"#,
-            r#"{"fabric":"f","device":"d","port":256}"#,
-            r#"{"fabric":"f","device":"d","port":-1}"#,
-            r#"{"fabric":"f","device":"d","port":1.0}"#,
-            r#"{"fabric":"f","device":"d","port":"1"}"#,
-            r#"{"fabric":"f","device":"d","port":1,"rail":0}"#,
-            r#"{"fabric":"f","fabric":"g","device":"d","port":1}"#,
-            r#"{"fabric":"f","device":"d","port":1,"port":2}"#,
-            r#"{"fabric":"f","device":"d","port":1,"gid":"::1"}"#,
-            r#"{"fabric":"f","device":"d","port":1,"gid":"FE800000000000000000000000000001"}"#,
-            r#"{"fabric":"f","device":"d","port":1,"gid":"00000000000000000000000000000000"}"#,
-            r#"{"fabric":"f","device":"d","port":1,"gid":[]}"#,
-            r#"{"fabric":"f","device":"d","port":1,"gid":"ff020000000000000000000000000001"}"#,
-            r#"{"fabric":"f","device":"d","port":1,"gid":"g0000000000000000000000000000000"}"#,
-        ] {
-            assert!(
-                parse_fabric_ports(Some(&format!("[{entry}]"))).is_err(),
-                "{entry}"
-            );
-        }
-        for device in [
-            "",
-            ".",
-            "..",
-            "../mlx5_0",
-            "mlx/0",
-            "mlx\\0",
-            "bad name",
-            "-mlx5",
-            "网卡",
-            "d\0",
-            "d\n",
-            "é",
-            &"x".repeat(64),
-        ] {
-            let value = serde_json::json!([{"fabric":"f","device":device,"port":1}]).to_string();
-            assert!(parse_fabric_ports(Some(&value)).is_err(), "{device:?}");
-        }
-        for fabric in ["", "bad\nlabel", "bad\0label", " fabric-a", "fabric-a "] {
-            let value = serde_json::json!([{"fabric":fabric,"device":"d","port":1}]).to_string();
-            assert!(parse_fabric_ports(Some(&value)).is_err());
-        }
-        for value in [
-            r#"[{"fabric":"f","device":"d","port":1},{"fabric":"f","device":"e","port":1}]"#,
-            r#"[{"fabric":"f","device":"d","port":1},{"fabric":"g","device":"d","port":1,"gid":"fe800000000000000000000000000001"}]"#,
-        ] {
-            assert!(parse_fabric_ports(Some(value)).is_err());
-        }
-        assert!(parse_fabric_ports(Some(&format!("[]{}", " ".repeat(4095)))).is_err());
-        assert!(parse_fabric_document(&[0xff]).is_err());
-        assert!(parse_fabric_ports(Some(&" ".repeat(4097))).is_err());
-    }
-
-    #[test]
-    fn configured_ports_do_not_override_membership_or_discovered_hardware() {
-        use crate::{
-            rdma::{DiscoveredPort, match_publication},
-            topology::rails::{RailId, RailMapping},
-        };
-        let ports = parse_fabric_ports(Some(r#"[{"fabric":"trusted","device":"mlx5_0","port":1,"gid":"01010101010101010101010101010101"}]"#)).unwrap();
-        let mut publication = vec![RailMapping {
-            rail: RailId(7),
-            fabric: "trusted".into(),
-            numa_node: Some(2),
-        }];
-        let mut discovered = vec![DiscoveredPort {
-            device: "mlx5_0".into(),
-            port: 1,
-            gid: [1; 16],
-            numa_node: Some(2),
-        }];
-        assert_eq!(
-            match_publication(&publication, &ports, &discovered).unwrap()[0].0,
-            publication[0]
-        );
-        publication[0].fabric = "peer-asserted".into();
-        assert!(match_publication(&publication, &ports, &discovered).is_err());
-        publication[0].fabric = "trusted".into();
-        discovered[0].numa_node = Some(3);
-        assert!(match_publication(&publication, &ports, &discovered).is_err());
-        discovered[0].numa_node = Some(2);
-        discovered[0].gid = [2; 16];
-        assert!(match_publication(&publication, &ports, &discovered).is_err());
-        discovered[0].gid = [1; 16];
-        discovered.push(discovered[0].clone());
-        assert!(match_publication(&publication, &ports, &discovered).is_err());
-        assert!(match_publication(&publication, &ports, &[]).is_err());
-    }
-
-    #[test]
-    fn process_configuration_validates_ports_even_when_rdma_is_disabled() {
-        let parse = |ports: &str| {
-            Config::from_lookup_with_fabric_ports(|name| {
+    fn native_auto_requires_build_and_available_library() {
+        for requested in [None, Some("auto"), Some("false")] {
+            let config = Config::from_lookup(|name| {
                 Ok(match name {
                     "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
                     "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
-                    "RACER_FABRIC_PORTS" => Some(ports.into()),
-                    "RACER_ENABLE_RDMA" => Some("false".into()),
+                    "RACER_ENABLE_RDMA" => requested.map(str::to_owned),
                     _ => None,
                 })
             })
-        };
-        let (config, ports) = parse(r#"[{"fabric":"f","device":"d","port":1}]"#).unwrap();
-        assert!(!config.enable_rdma);
-        assert_eq!(ports.len(), 1);
-        assert!(parse("bad json").is_err());
-        assert!(
-            Config::from_lookup_with_fabric_ports(|_| Err(Error::InvalidConfiguration)).is_err()
-        );
-    }
-
-    #[test]
-    fn native_auto_requires_build_and_trusted_associations() {
-        for requested in [None, Some("auto"), Some("false")] {
-            for mapped in [false, true] {
-                let (config, _) = Config::from_lookup_with_fabric_ports(|name| {
-                    Ok(match name {
-                        "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
-                        "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
-                        "RACER_ENABLE_RDMA" => requested.map(str::to_owned),
-                        "RACER_FABRIC_PORTS" if mapped => {
-                            Some(r#"[{"fabric":"f","device":"d","port":1}]"#.into())
-                        }
-                        _ => None,
-                    })
-                })
-                .unwrap();
-                assert_eq!(
-                    config.enable_rdma,
-                    requested != Some("false") && mapped && cfg!(feature = "rdma")
-                );
-            }
+            .unwrap();
+            assert_eq!(
+                config.enable_rdma,
+                requested != Some("false")
+                    && cfg!(feature = "rdma")
+                    && rdma_verbs::inventory().is_ok_and(|ports| !ports.is_empty())
+            );
         }
     }
 
@@ -1124,7 +734,10 @@ mod tests {
         assert_eq!(config.max_threads, usize::MAX);
         assert!(!config.allow_smt);
         assert_eq!(config.node.0, UNRESOLVED_NODE_ID);
-        assert!(!config.enable_rdma);
+        assert_eq!(
+            config.enable_rdma,
+            cfg!(feature = "rdma") && rdma_verbs::inventory().is_ok_and(|ports| !ports.is_empty())
+        );
         assert_eq!(config.slab_bytes / config.segment_bytes, 16);
         assert!(!config.opaque_relay);
         assert_eq!(config.free_segment_reserve, 2);
@@ -1172,11 +785,9 @@ mod tests {
     }
 
     fn exact_boolean(name: &str, field: fn(&Config) -> bool) {
-        assert!(!field(
-            &Config::from_lookup_with_fabric_ports(lookup).unwrap().0
-        ));
+        assert!(!field(&Config::from_lookup(lookup).unwrap()));
         for (value, expected) in [("true", true), ("false", false)] {
-            let (config, _) = Config::from_lookup_with_fabric_ports(|key| {
+            let config = Config::from_lookup(|key| {
                 if key == name {
                     Ok(Some(value.into()))
                 } else {
@@ -1196,7 +807,7 @@ mod tests {
             ));
         }
         assert!(
-            Config::from_lookup_with_fabric_ports(|key| {
+            Config::from_lookup(|key| {
                 if key == name {
                     Err(Error::InvalidConfiguration)
                 } else {

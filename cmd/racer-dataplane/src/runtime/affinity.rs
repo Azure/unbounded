@@ -111,8 +111,8 @@ impl AffinityPlan {
         }
         let mut nics = topology.nics;
         nics.sort_by(|a, b| a.device.cmp(&b.device));
-        // RailMapping carries a fabric label, not a local device identifier. NUMA
-        // compatibility is a placement hint only, never proof of RDMA eligibility.
+        // NUMA compatibility is a placement hint only, never proof of RDMA
+        // eligibility. Native activation separately matches physical bindings.
         nics.retain(|nic| {
             nic.numa_node.is_some()
                 && (rails.is_empty() || rails.iter().any(|rail| rail.numa_node == nic.numa_node))

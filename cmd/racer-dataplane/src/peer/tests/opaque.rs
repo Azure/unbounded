@@ -1051,7 +1051,6 @@ impl RelayFixture {
                             format!("127.0.0.1:{}", 8000 + i)
                         },
                         rails: vec![],
-                        alignment_enabled: false,
                         site: String::new(),
                     })
                     .collect(),

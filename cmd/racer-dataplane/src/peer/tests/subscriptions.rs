@@ -151,7 +151,6 @@ fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failure
                         shares: std::num::NonZeroU32::new(1).unwrap(),
                         peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
                         rails: vec![],
-                        alignment_enabled: false,
                         site: String::new(),
                     })
                     .collect(),
@@ -307,7 +306,6 @@ fn signed_ingress_cold_selection_is_bounded_cancellable_and_does_not_block_other
                     shares: std::num::NonZeroU32::new(if i == 1 { 1 } else { u32::MAX }).unwrap(),
                     peer_endpoint: "127.0.0.1:8000".into(),
                     rails: vec![],
-                    alignment_enabled: false,
                     site: String::new(),
                 })
                 .collect(),
@@ -668,7 +666,6 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
                         "127.0.0.1:9000".into()
                     },
                     rails: vec![],
-                    alignment_enabled: false,
                     site: String::new(),
                 })
                 .collect(),

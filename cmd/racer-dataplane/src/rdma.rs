@@ -1065,68 +1065,48 @@ pub struct Devices {
     selected: RefCell<Vec<Device>>,
     mappings: RefCell<Vec<RailMapping>>,
 }
+pub mod discovery;
 #[derive(Clone)]
 pub struct Device {
     pub(crate) handle: Rc<DeviceHandle>,
     pub rail: RailId,
 }
-/// Administrator-provided local association. Publication only contains an opaque
-/// fabric name and NUMA hint; it cannot identify a physical NIC by itself.
-#[derive(Clone, Debug)]
-pub struct FabricPort {
-    pub fabric: String,
-    pub device: String,
-    pub port: u8,
-    pub gid: Option<[u8; 16]>,
-}
 pub use rdma_verbs::PortInfo as DiscoveredPort;
-/// Pure deterministic matching used by native activation. An absent association,
-/// duplicate candidate, reused physical port or mismatched NUMA fails closed.
+/// Match authenticated physical bindings against live eligible verbs ports.
 pub fn match_publication(
     publication: &[RailMapping],
-    associations: &[FabricPort],
     discovered: &[DiscoveredPort],
 ) -> Result<Vec<(RailMapping, usize)>> {
-    if publication.len() > 64 || associations.len() > 64 || discovered.len() > 64 {
+    if publication.len() > 64 || discovered.len() > 64 {
         return Err(Error::InvalidConfiguration);
     }
     let mut result: Vec<(RailMapping, usize)> = Vec::new();
     for published in publication {
-        if published.fabric.is_empty() {
+        if published.device.is_empty() || published.port == 0 {
             return Err(Error::InvalidConfiguration);
         }
-        if result.iter().any(|(r, _)| r.rail == published.rail) {
-            return Err(Error::InvalidConfiguration);
-        }
-        let mappings: Vec<_> = associations
+        if result
             .iter()
-            .filter(|a| a.fabric == published.fabric)
-            .collect();
-        if mappings.len() != 1 {
-            return Err(Error::Unavailable);
-        }
-        let mapping = mappings[0];
-        if mapping.port == 0 || mapping.device.is_empty() {
+            .any(|(r, _)| r.device == published.device && r.port == published.port)
+        {
             return Err(Error::InvalidConfiguration);
         }
         let candidates: Vec<_> = discovered
             .iter()
             .enumerate()
             .filter(|(_, d)| {
-                d.device == mapping.device
-                    && d.port == mapping.port
+                d.device == published.device
+                    && d.port == published.port
                     && d.gid != [0; 16]
-                    && mapping.gid.is_none_or(|gid| d.gid == gid)
-                    && published
-                        .numa_node
-                        .is_none_or(|numa| d.numa_node == Some(numa))
+                    && published.gid.is_none_or(|gid| d.gid == gid)
             })
             .collect();
         if candidates.len() != 1 || result.iter().any(|(_, index)| *index == candidates[0].0) {
             return Err(Error::Unavailable);
         }
         let mut actual = published.clone();
-        actual.numa_node = candidates[0].1.numa_node;
+        actual.numa_node = published.numa_node.or(candidates[0].1.numa_node);
+        actual.gid = Some(candidates[0].1.gid);
         result.push((actual, candidates[0].0));
     }
     Ok(result)
@@ -1161,7 +1141,6 @@ impl Devices {
     pub fn activate<'a>(
         &'a self,
         publication: Vec<RailMapping>,
-        associations: Vec<FabricPort>,
         admission: &'a Admission,
         bytes_per_slot: usize,
         scope: &'a RequestScope,
@@ -1169,6 +1148,12 @@ impl Devices {
         Box::pin(async move {
             scope.check()?;
             if bytes_per_slot == 0 || bytes_per_slot > MAX_CIPHERTEXT {
+                return Err(Error::InvalidConfiguration);
+            }
+            // Worker selection must finish before binding native tags. Tags are
+            // rail IDs, so two physical ports with one tag would be ambiguous.
+            let mut rails = std::collections::BTreeSet::new();
+            if publication.iter().any(|nic| !rails.insert(nic.rail)) {
                 return Err(Error::InvalidConfiguration);
             }
             // Racer's quota profile charges 4 KiB physical pages. This policy
@@ -1192,7 +1177,7 @@ impl Devices {
                 guards: quotas,
                 bytes: bytes_per_slot,
                 selector: Box::new(move |ports| {
-                    match_publication(&requested, &associations, ports)
+                    match_publication(&requested, ports)
                         .map(|selected| {
                             selected
                                 .into_iter()
@@ -1247,10 +1232,15 @@ impl Devices {
                 .map(|selected| {
                     let mut mapping = publication
                         .iter()
-                        .find(|m| u32::from(m.rail.0) == selected.tag)
+                        .find(|m| {
+                            u32::from(m.rail.0) == selected.tag
+                                && m.device == selected.port.device
+                                && m.port == selected.port.port
+                        })
                         .expect("selector only returns published tags")
                         .clone();
-                    mapping.numa_node = selected.port.numa_node;
+                    mapping.numa_node = mapping.numa_node.or(selected.port.numa_node);
+                    mapping.gid = Some(selected.port.gid);
                     mapping
                 })
                 .collect();
@@ -1294,15 +1284,16 @@ impl Devices {
     }
     /// Call on every local membership publication. A mapping change revokes all
     /// old capabilities; drain the lifecycle generation before activating new rails.
-    pub fn revalidate(&self, published: &[RailMapping], alignment_enabled: bool) -> bool {
+    pub fn revalidate(&self, published: &[RailMapping]) -> bool {
         let actual = self.mappings.borrow();
-        let valid = alignment_enabled
-            && !actual.is_empty()
+        let valid = !actual.is_empty()
             && actual.len() == published.len()
             && actual.iter().all(|a| {
                 published.iter().any(|p| {
                     p.rail == a.rail
-                        && p.fabric == a.fabric
+                        && p.device == a.device
+                        && p.port == a.port
+                        && p.gid.is_none_or(|gid| a.gid == Some(gid))
                         && p.numa_node.is_none_or(|numa| a.numa_node == Some(numa))
                 })
             });
@@ -1328,54 +1319,41 @@ mod tests {
         assert!(devices.select(RailId(0)).is_err());
     }
     #[test]
-    fn discovery_never_invents_fabric_matches_and_rejects_ambiguity() {
+    fn discovery_matches_physical_ports_and_accepts_numa_override() {
         let publication = vec![RailMapping {
             rail: RailId(7),
-            fabric: "fabric-a".into(),
-            numa_node: Some(1),
-        }];
-        let mapping = FabricPort {
-            fabric: "fabric-a".into(),
             device: "mlx5_0".into(),
             port: 1,
-            gid: None,
-        };
+            gid: Some([1; 16]),
+            numa_node: Some(1),
+        }];
         let port = DiscoveredPort {
             device: "mlx5_0".into(),
             port: 1,
             gid: [1; 16],
             numa_node: Some(1),
         };
-        assert!(match_publication(&publication, &[], &[port.clone()]).is_err());
+        assert!(match_publication(&publication, &[]).is_err());
         assert!(
             match_publication(
-                &publication,
-                &[mapping.clone(), mapping.clone()],
+                &[publication[0].clone(), publication[0].clone()],
                 &[port.clone()]
             )
             .is_err()
         );
+        assert!(match_publication(&publication, &[port.clone(), port.clone()]).is_err());
         assert!(
             match_publication(
                 &publication,
-                &[mapping.clone()],
-                &[port.clone(), port.clone()]
-            )
-            .is_err()
-        );
-        assert!(
-            match_publication(
-                &publication,
-                &[mapping.clone()],
                 &[DiscoveredPort {
                     numa_node: Some(0),
                     ..port.clone()
                 }]
             )
-            .is_err()
+            .is_ok()
         );
         assert_eq!(
-            match_publication(&publication, &[mapping], &[port]).unwrap()[0].0,
+            match_publication(&publication, &[port]).unwrap()[0].0,
             publication[0]
         );
     }

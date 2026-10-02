@@ -377,7 +377,6 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
                     shares: NonZeroU32::new(1).unwrap(),
                     peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
                     rails: vec![],
-                    alignment_enabled: false,
                     site: String::new(),
                 })
                 .collect(),
@@ -455,7 +454,6 @@ fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
                     shares: std::num::NonZeroU32::new(1).unwrap(),
                     peer_endpoint: format!("127.0.0.1:{}", 9000 + index),
                     rails: vec![],
-                    alignment_enabled: false,
                     site: String::new(),
                 })
                 .collect(),
@@ -588,7 +586,6 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
                         shares: std::num::NonZeroU32::new(1).unwrap(),
                         peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
                         rails: vec![],
-                        alignment_enabled: false,
                         site: String::new(),
                     })
                     .collect(),
@@ -658,7 +655,6 @@ fn v5_equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
                     shares: std::num::NonZeroU32::new(if i % 3 == 0 { 1 } else { 4 }).unwrap(),
                     peer_endpoint: "127.0.0.1:7443".into(),
                     rails: vec![],
-                    alignment_enabled: false,
                     site: String::new(),
                 })
                 .collect(),
@@ -782,7 +778,6 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
                     shares: std::num::NonZeroU32::new(1).unwrap(),
                     peer_endpoint: address.clone(),
                     rails: vec![],
-                    alignment_enabled: false,
                     site: String::new(),
                 })
                 .collect(),
@@ -961,7 +956,6 @@ fn signed_tcp_case(case: &str) {
                         "127.0.0.1:9000".into()
                     },
                     rails: vec![],
-                    alignment_enabled: false,
                     site: String::new(),
                 })
                 .collect(),
@@ -1402,10 +1396,11 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
                     peer_endpoint: listener.local_addr().unwrap().to_string(),
                     rails: vec![RailMapping {
                         rail: RailId(0),
-                        fabric: "fabric".into(),
+                        device: "fabric".into(),
+                        port: 1,
+                        gid: None,
                         numa_node: None,
                     }],
-                    alignment_enabled: true,
                     site: "same-site".into(),
                 })
                 .collect(),
@@ -1533,7 +1528,6 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
                     shares: std::num::NonZeroU32::new(1).unwrap(),
                     peer_endpoint: format!("127.0.0.1:{}", 8000 + index),
                     rails: vec![],
-                    alignment_enabled: false,
                     site: String::new(),
                 })
                 .collect(),
@@ -1672,7 +1666,6 @@ mod established_sessions {
                             shares: std::num::NonZeroU32::new(1).unwrap(),
                             peer_endpoint: format!("127.0.0.1:{}", 9000 + i),
                             rails: vec![],
-                            alignment_enabled: false,
                             site: String::new(),
                         })
                         .collect(),

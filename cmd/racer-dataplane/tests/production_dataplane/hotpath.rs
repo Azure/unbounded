@@ -25,7 +25,7 @@ const MIB: u64 = 1 << 20;
 
 fn default_config() -> Config {
     // Parse real defaults without inheriting ambient RACER_* overrides or loading files.
-    let (config, _) = Config::from_lookup_with_fabric_ports(|name| {
+    let config = Config::from_lookup(|name| {
         Ok(match name {
             "RACER_CLUSTER_ID" => Some(CLUSTER.into()),
             "RACER_CONTROL_ENDPOINT" => Some("https://controller.invalid:443".into()),

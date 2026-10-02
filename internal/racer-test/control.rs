@@ -79,7 +79,6 @@ impl Control {
                 shares: NonZeroU32::new(1).unwrap(),
                 peer_endpoint: "127.0.0.1:7443".into(),
                 rails: vec![],
-                alignment_enabled: false,
                 site: String::new(),
             }],
             caches: caches

@@ -17,6 +17,8 @@ use std::{
 };
 use zeroize::{Zeroize, Zeroizing};
 pub struct Enrollment {
+    inventory: Arc<crate::rdma::discovery::Inventory>,
+    inventory_restored: Cell<bool>,
     shares: Cell<u32>,
     cluster: ClusterId,
     token_path: PathBuf,
@@ -104,6 +106,8 @@ fn token(b: &[u8]) -> Result<Zeroizing<String>> {
 impl Enrollment {
     pub fn new(cluster: ClusterId, token_path: PathBuf, identity_directory: PathBuf) -> Self {
         Self {
+            inventory: crate::rdma::discovery::Inventory::shared(),
+            inventory_restored: Cell::new(false),
             shares: Cell::new(4),
             cluster,
             token_path,
@@ -117,6 +121,10 @@ impl Enrollment {
     pub fn set_shares(&self, shares: std::num::NonZeroU32) {
         self.shares.set(shares.get());
     }
+    pub fn with_inventory(mut self, inventory: Arc<crate::rdma::discovery::Inventory>) -> Self {
+        self.inventory = inventory;
+        self
+    }
     /// Persist a fresh private key and retry-stable request before submission.
     /// All issuance uses the projected token, including lifetime-based renewal.
     pub fn prepare<'a>(&'a self, scope: &'a RequestScope) -> Operation<'a, EnrollmentRequest> {
@@ -126,6 +134,32 @@ impl Enrollment {
             let dir =
                 super::async_files::directory(&r, &self.identity_directory, true, true, &scope)
                     .await?;
+            if !self.inventory_restored.get() {
+                match super::async_files::read_at(
+                    &r,
+                    &dir,
+                    "rdma-rails.json",
+                    crate::rdma::discovery::MAX_JOURNAL_BYTES,
+                    true,
+                    &scope,
+                )
+                .await
+                {
+                    Ok(bytes) => self.inventory.restore(&bytes)?,
+                    Err(Error::MissingKey) => (),
+                    Err(error) => return Err(error),
+                }
+                self.inventory_restored.set(true);
+            }
+            self.inventory.refresh()?;
+            // Persist reservations before reporting. A crash can withdraw ports,
+            // but must never reuse an old physical port's automatic rail.
+            let reservations = self.inventory.reservations()?;
+            if reservations.len() > crate::rdma::discovery::MAX_JOURNAL_BYTES {
+                return Err(Error::Overloaded);
+            }
+            super::async_files::atomic_write(&r, &dir, "rdma-rails.json", &reservations, &scope)
+                .await?;
             match super::async_files::read_at(
                 &r,
                 &dir,
@@ -336,6 +370,7 @@ impl Enrollment {
             return Err(Error::Unauthorized);
         }
         let r = EnrollmentRequest {
+            rdma_nics: self.inventory.snapshot()?.nics,
             shares: self.shares.get(),
             schema_version: 1,
             cluster: self.cluster.clone(),
@@ -526,6 +561,40 @@ impl LocalSigningIdentity {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn enrollment_and_renewal_refresh_authenticated_physical_inventory() {
+        use crate::rdma::lifecycle::simulation::{Device, Simulation};
+        let enrollment = super::Enrollment::new(
+            crate::model::ClusterId("11111111-1111-4111-8111-111111111111".into()),
+            "/unused/token".into(),
+            "/unused/identity".into(),
+        );
+        let pending = enrollment.generate().unwrap();
+        let first = Simulation::new()
+            .with_devices(vec![Device::new("nic-a", [1; 16])])
+            .unwrap();
+        let request = {
+            let _environment = first.enter();
+            enrollment.inventory.refresh().unwrap();
+            enrollment.request(&pending).unwrap()
+        };
+        assert_eq!(request.rdma_nics.len(), 1);
+        assert_eq!(request.rdma_nics[0].device, "nic-a");
+        assert_eq!(request.rdma_nics[0].gid, Some([1; 16]));
+        let second = Simulation::new()
+            .with_devices(vec![Device::new("nic-b", [2; 16])])
+            .unwrap();
+        let _environment = second.enter();
+        enrollment.inventory.refresh().unwrap();
+        let renewed = enrollment.request(&pending).unwrap();
+        assert_eq!(renewed.enrollment, request.enrollment);
+        assert_eq!(renewed.csr_der, request.csr_der);
+        assert_eq!(renewed.rdma_nics[0].device, "nic-b");
+        let absent = Simulation::new().with_devices(vec![]).unwrap();
+        let _environment = absent.enter();
+        enrollment.inventory.refresh().unwrap();
+        assert!(enrollment.request(&pending).unwrap().rdma_nics.is_empty());
+    }
     use super::*;
     use crate::control::testing;
     const OLD_NODE: &str = "22222222-2222-4222-8222-222222222222";
@@ -790,6 +859,103 @@ mod tests {
         );
         std::fs::write(directory.0.join("identity/pending.json"), b"{broken").unwrap();
         assert!(testing::drive(&r, again.prepare(&scope)).is_err());
+    }
+    #[test]
+    fn durable_rail_journal_prevents_restart_renumbering_and_corruption_fails_closed() {
+        use crate::rdma::lifecycle::simulation::{Device, Simulation};
+        let Some(r) = testing::reactor() else { return };
+        let scope = testing::scope();
+        let directory = testing::Directory::new();
+        let make = || {
+            let e = Enrollment::new(
+                ClusterId("11111111-1111-4111-8111-111111111111".into()),
+                directory.0.join("token"),
+                directory.0.join("identity"),
+            );
+            e.attach_reactor(r.clone());
+            e
+        };
+        let all = Simulation::new()
+            .with_devices(vec![Device::new("a", [1; 16]), Device::new("b", [2; 16])])
+            .unwrap();
+        let first = {
+            let _environment = all.enter();
+            testing::drive(&r, make().prepare(&scope)).unwrap()
+        };
+        assert_eq!(first.rdma_nics[1].rail.0, 1);
+        let only_b = Simulation::new()
+            .with_devices(vec![Device::new("b", [3; 16])])
+            .unwrap();
+        let _environment = only_b.enter();
+        let restarted = testing::drive(&r, make().prepare(&scope)).unwrap();
+        assert_eq!(restarted.rdma_nics.len(), 1);
+        assert_eq!(restarted.rdma_nics[0].rail.0, 1);
+        assert_eq!(restarted.rdma_nics[0].gid, Some([3; 16]));
+        std::fs::write(directory.0.join("identity/rdma-rails.json"), b"broken").unwrap();
+        assert!(matches!(
+            testing::drive(&r, make().prepare(&scope)),
+            Err(Error::CorruptRecord)
+        ));
+    }
+    #[test]
+    fn saturated_rail_journal_still_persists_and_enrolls_known_ports() {
+        use crate::{
+            rdma::{
+                discovery::{Inventory, MAX_JOURNAL_BYTES},
+                lifecycle::simulation::{Device, Simulation},
+            },
+            topology::rails::{RailId, RailMapping},
+        };
+        let Some(r) = testing::reactor() else { return };
+        let scope = testing::scope();
+        let directory = testing::Directory::new();
+        let inventory = Inventory::shared();
+        let name = |i| format!("{i:04}{}", "x".repeat(59));
+        for batch in 0..20 {
+            inventory
+                .update(
+                    (batch * 64..(batch + 1) * 64)
+                        .map(|i| RailMapping {
+                            device: name(i),
+                            port: 1,
+                            rail: RailId(0),
+                            gid: Some([1; 16]),
+                            numa_node: None,
+                        })
+                        .collect(),
+                )
+                .unwrap();
+            assert!(inventory.reservations().unwrap().len() <= MAX_JOURNAL_BYTES);
+        }
+        let journal = inventory.reservations().unwrap();
+        let sim = Simulation::new()
+            .with_devices(vec![
+                Device::new(name(0), [2; 16]),
+                Device::new(name(2000), [3; 16]),
+            ])
+            .unwrap();
+        let _environment = sim.enter();
+        let make = || {
+            let e = Enrollment::new(
+                ClusterId("11111111-1111-4111-8111-111111111111".into()),
+                directory.0.join("token"),
+                directory.0.join("identity"),
+            )
+            .with_inventory(inventory.clone());
+            e.attach_reactor(r.clone());
+            e
+        };
+        for _ in 0..2 {
+            let request = testing::drive(&r, make().prepare(&scope)).unwrap();
+            assert_eq!(request.rdma_nics.len(), 1);
+            assert_eq!(request.rdma_nics[0].device, name(0));
+            assert_eq!(request.rdma_nics[0].rail, RailId(0));
+            assert_eq!(request.rdma_nics[0].gid, Some([2; 16]));
+            assert_eq!(
+                std::fs::read(directory.0.join("identity/rdma-rails.json")).unwrap(),
+                journal
+            );
+        }
     }
     #[test]
     fn rejects_symlinked_identity_and_insecure_modes() {

@@ -755,7 +755,7 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
             limits: config.limits.clone(),
             config: Arc::new(config),
             node: node.clone(),
-            fabric_ports: vec![],
+            discovered_nics: vec![],
         });
         let cpu = EffectiveTopology::discover().unwrap().cpus[0].clone();
         let mut group = WorkerGroup::new(AffinityPlan {
@@ -859,7 +859,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
         config: Arc::new(config),
         node: node.clone(),
         limits,
-        fabric_ports: vec![],
+        discovered_nics: vec![],
     });
     let cpu = EffectiveTopology::discover().unwrap().cpus[0].clone();
     let plan = AffinityPlan {

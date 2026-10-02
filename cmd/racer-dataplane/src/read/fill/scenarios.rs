@@ -1461,7 +1461,6 @@ fn fixture_with_caches(
                 shares: NonZeroU32::new(4).unwrap(),
                 peer_endpoint: "127.0.0.1:8000".into(),
                 rails: vec![],
-                alignment_enabled: false,
                 site: String::new(),
             }],
         )

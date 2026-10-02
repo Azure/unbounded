@@ -176,7 +176,6 @@ impl Fixture {
                         shares: std::num::NonZeroU32::new(4).unwrap(),
                         peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
                         rails: vec![],
-                        alignment_enabled: false,
                         site: String::new(),
                     })
                     .collect(),

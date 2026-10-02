@@ -917,7 +917,6 @@ fn production_peer_and_failed_neighbor_progress() {
                 shares: std::num::NonZeroU32::new(1).unwrap(),
                 peer_endpoint: socket.local_addr().unwrap().to_string(),
                 rails: vec![],
-                alignment_enabled: false,
                 site: String::new(),
             })
             .collect();
@@ -1049,7 +1048,6 @@ fn production_remote_bootstrap_one_get_and_empty() {
                 shares: std::num::NonZeroU32::new(1).unwrap(),
                 peer_endpoint: socket.local_addr().unwrap().to_string(),
                 rails: vec![],
-                alignment_enabled: false,
                 site: String::new(),
             })
             .collect();

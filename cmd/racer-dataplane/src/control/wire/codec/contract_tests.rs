@@ -151,8 +151,8 @@ fn site_wire_defaults_validation_and_hashes() {
     assert_eq!(encode_publication(&p).unwrap(), legacy);
     for value in ["null", "1", "true", "[]", "{}", "\"a\",\"site\":\"b\""] {
         let raw = String::from_utf8(legacy.clone()).unwrap().replacen(
-            "\"alignment_enabled\":true",
-            &format!("\"alignment_enabled\":true,\"site\":{value}"),
+            "\"site\":\"\"",
+            &format!("\"site\":{value}"),
             1,
         );
         assert!(decode_publication(raw.as_bytes()).is_err(), "{value}");
@@ -169,6 +169,31 @@ fn shared_bootstrap_and_bundle_vectors() {
         let b = fixture(name);
         assert_eq!(round_trip(name, &b).unwrap(), b, "{name}");
     }
+}
+
+#[test]
+fn physical_nic_bounds_repeated_rails_and_bootstrap_canonical_order() {
+    let mut p = decode_publication(&fixture("publication.json")).unwrap();
+    let nic = |device: String| RailMapping { device, port: 255, rail: RailId(65535), gid: Some([0xab; 16]), numa_node: Some(u32::MAX as usize) };
+    p.members[0].rails = (0..64).rev().map(|i| nic(format!("mlx5_{i:02}"))).collect();
+    let encoded = encode_publication(&p).unwrap();
+    let decoded = decode_publication(&encoded).unwrap();
+    assert_eq!(decoded.members[0].rails.len(), 64);
+    assert_eq!(decoded.members[0].rails[0].device, "mlx5_00");
+    assert_eq!(p.members[0].rails[0].device, "mlx5_63");
+    let mut request = decode_enrollment_request(&fixture("bootstrap-request.json")).unwrap();
+    request.rdma_nics = p.members[0].rails.clone();
+    let encoded = encode_enrollment_request(&request).unwrap();
+    assert_eq!(decode_enrollment_request(&encoded).unwrap().rdma_nics[0].device, "mlx5_00");
+    for (field, value) in [("gid", serde_json::json!("")), ("gid", Value::Null), ("gid", serde_json::json!("AB".repeat(16))), ("numa_node", Value::Null), ("port", serde_json::json!(0)), ("port", serde_json::json!(256))] {
+        let mut value_json: Value = serde_json::from_slice(&encoded).unwrap();
+        value_json["rdma_nics"][0][field] = value;
+        assert!(decode_enrollment_request(&serde_json::to_vec(&value_json).unwrap()).is_err());
+    }
+    p.members[0].rails.push(nic("extra".into()));
+    assert_eq!(encode_publication(&p), Err(Error::Overloaded));
+    request.rdma_nics.push(nic("extra".into()));
+    assert_eq!(encode_enrollment_request(&request), Err(Error::Overloaded));
 }
 
 #[test]
@@ -370,7 +395,6 @@ fn maximum_membership() {
             shares: NonZeroU32::new(1).unwrap(),
             peer_endpoint: "192.0.2.1:1".into(),
             rails: vec![],
-            alignment_enabled: false,
             site: String::new(),
         })
         .collect();

@@ -425,7 +425,7 @@ pub(super) fn local_worker_with_fabric(
     config: &Config,
     node: &Arc<NodeState>,
     id: u16,
-    fabric_ports: Vec<crate::rdma::FabricPort>,
+    discovered_nics: Vec<crate::topology::rails::RailMapping>,
 ) -> (WorkerApplication, WorkerRuntime, PageCryptoEngine) {
     let worker = WorkerId(id);
     let admission = Rc::new(Admission::new(config.limits.clone()));
@@ -441,7 +441,7 @@ pub(super) fn local_worker_with_fabric(
         crypto: runtime.crypto.clone(),
     };
     let app =
-        WorkerApplication::assemble(config, node.clone(), worker, local, fabric_ports).unwrap();
+        WorkerApplication::assemble(config, node.clone(), worker, local, discovered_nics).unwrap();
     (
         app,
         runtime,
@@ -475,7 +475,6 @@ pub(super) fn publication(
             shares: std::num::NonZeroU32::new(1).unwrap(),
             peer_endpoint: "127.0.0.1:7443".into(),
             rails: vec![],
-            alignment_enabled: false,
             site: String::new(),
         }],
         caches,

@@ -1,9 +1,6 @@
 //! Native lifecycle endpoints remain per I/O shard, even with shared crypto threads.
 use super::*;
-use crate::rdma::{
-    FabricPort,
-    lifecycle::{IoPort, NativePort, WithNative},
-};
+use crate::rdma::lifecycle::{IoPort, NativePort, WithNative};
 use crate::runtime::collections::HashMap;
 
 #[derive(Default)]
@@ -16,8 +13,7 @@ struct NativePair {
     crypto: Option<NativePort>,
 }
 
-/// Absence of a placement allows simulated endpoints. A planned crypto role
-/// must have known NUMA locality before it can advertise aligned native rails.
+/// NUMA locality of the crypto role that first-touches registered allocations.
 #[derive(Clone, Copy)]
 pub(super) struct NativePlacement {
     pub(super) numa_node: Option<usize>,
@@ -100,49 +96,45 @@ impl NativePairs {
     }
 }
 impl Application {
-    /// Trusted startup associations, not a report of activated hardware or rails.
-    pub fn fabric_ports(&self) -> &[FabricPort] {
-        &self.fabric_ports
-    }
-
-    /// Trusted physical associations only. Rail IDs and alignment remain exclusively
-    /// controller-owned. No I/O, native discovery, or extra threads are created.
-    pub fn with_fabric_ports(mut self, ports: Vec<FabricPort>) -> Result<Self> {
-        crate::config::validate_fabric_ports(&ports)?;
-        self.fabric_ports = ports;
-        Ok(self)
+    pub fn discovered_nics(&self) -> &[crate::topology::rails::RailMapping] {
+        &self.discovered_nics
     }
 }
 impl WorkerApplication {
+    /// Inventory withdrawal/GID changes invalidate in-progress activation before
+    /// it can publish readiness. Existing generations drain on their native owner.
+    pub(super) fn refresh_inventory(&mut self) -> Result<()> {
+        let snapshot = self.node.inventory.snapshot()?;
+        if snapshot.generation != self.inventory_generation {
+            self.native_task.take();
+            if let Some(devices) = &self.devices {
+                devices.close();
+            }
+            self.actual_rails.clear();
+            self.discovered_nics = snapshot.nics;
+            self.inventory_generation = snapshot.generation;
+            self.native_retry = crate::runtime::environment::now();
+        }
+        Ok(())
+    }
     pub(super) fn native_publication(&self) -> Result<Vec<crate::topology::rails::RailMapping>> {
         let snapshot = self.snapshots.current()?;
         let member = snapshot.membership.member(self.keys.node())?;
-        if !member.alignment_enabled || self.fabric_ports.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut rails = member.rails.clone();
-        if let Some(placement) = self.native_numa {
-            // Native allocations are first-touched by this pinned crypto role.
-            // Unknown topology cannot establish the aligned-locality contract.
-            let Some(numa) = placement.numa_node else {
-                return Ok(Vec::new());
-            };
-            rails.retain(|rail| rail.numa_node == Some(numa));
-        }
         let capacity = self.devices.as_ref().map_or(0, |d| d.capacity());
-        if !rails.is_empty() {
-            let offset = usize::from(self.worker.0) % rails.len();
-            rails.rotate_left(offset);
-            rails.truncate(capacity);
-            rails.sort_unstable_by_key(|r| r.rail);
-        }
-        Ok(rails)
+        Ok(crate::rdma::discovery::select_worker(
+            &member.rails,
+            &self.discovered_nics,
+            usize::from(self.worker.0),
+            self.native_numa.and_then(|p| p.numa_node),
+            capacity,
+        ))
     }
     pub(super) fn poll_native(&mut self, cx: &mut Context<'_>) -> Result<()> {
         if self.stopping {
             self.native_task.take();
             return Ok(());
         }
+        self.refresh_inventory()?;
         if let Some(task) = self.native_task.as_mut() {
             if let Poll::Ready(result) = task.as_mut().poll(cx) {
                 self.native_task = None;
@@ -171,24 +163,18 @@ impl WorkerApplication {
         if publication.is_empty() {
             return Ok(());
         }
-        let ports = self.fabric_ports.clone();
         let admission = self.runtime.admission.clone();
         let turn = scope(Duration::from_secs(5))?;
         self.native_task = Some(Box::pin(async move {
             devices
-                .activate(
-                    publication,
-                    ports,
-                    &admission,
-                    crate::rdma::MAX_CIPHERTEXT,
-                    &turn,
-                )
+                .activate(publication, &admission, crate::rdma::MAX_CIPHERTEXT, &turn)
                 .await
         }));
         cx.waker().wake_by_ref();
         Ok(())
     }
     pub(super) async fn activate_native(&mut self, startup: &RequestScope) -> Result<()> {
+        self.refresh_inventory()?;
         let Some(devices) = &self.devices else {
             return Ok(());
         };
@@ -199,7 +185,6 @@ impl WorkerApplication {
         match devices
             .activate(
                 publication,
-                self.fabric_ports.clone(),
                 &self.runtime.admission,
                 crate::rdma::MAX_CIPHERTEXT,
                 startup,
@@ -230,8 +215,83 @@ mod tests {
         topology::{membership::Member, rails::RailId},
     };
 
+    #[test]
+    fn shared_inventory_recovers_new_hardware_and_revokes_removed_or_changed_ports() {
+        use crate::rdma::lifecycle::simulation::{Device, Simulation};
+        let sim = Simulation::new()
+            .with_devices(vec![
+                Device::new("missing", [1; 16]),
+                Device::new("new", [2; 16]),
+            ])
+            .unwrap();
+        let _environment = sim.enter();
+        let app = configured();
+        let (mut worker, engine) = worker(&app, true, true);
+        let mut service = app.build_crypto(WorkerId(0), engine).unwrap();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut publication = crate::control::wire::Publication {
+            schema_version: 1,
+            cluster: app.config.cluster.clone(),
+            sequence: PublicationSequence(2),
+            membership_version: MembershipVersion(2),
+            members: vec![Member {
+                node: app.config.node.clone(),
+                shares: std::num::NonZeroU32::new(1).unwrap(),
+                peer_endpoint: "127.0.0.1:7443".into(),
+                rails: vec![crate::topology::rails::RailMapping {
+                    device: "new".into(),
+                    port: 1,
+                    gid: None,
+                    rail: RailId(7),
+                    numa_node: None,
+                }],
+                site: "site1".into(),
+            }],
+            caches: vec![],
+        };
+        worker.snapshots.publish(publication.clone()).unwrap();
+        app.node.inventory.update(vec![]).unwrap();
+        worker.poll_native(&mut cx).unwrap();
+        assert!(worker.native_publication().unwrap().is_empty());
+        let fresh = crate::rdma::discovery::inventory();
+        app.node.inventory.update(fresh.clone()).unwrap();
+        for _ in 0..20 {
+            worker.poll_native(&mut cx).unwrap();
+            service.poll_budgeted(8).unwrap();
+        }
+        assert_eq!(worker.actual_rails[0].device, "new");
+        assert!(worker.devices.as_ref().unwrap().ready(RailId(7)));
+        // No membership change is needed for local discovery withdrawal to revoke.
+        app.node.inventory.update(vec![]).unwrap();
+        worker.refresh_inventory().unwrap();
+        assert!(!worker.devices.as_ref().unwrap().ready(RailId(7)));
+        service.poll_budgeted(256).unwrap();
+        assert_eq!(worker.runtime.admission.used(ResourceClass::Registered), 0);
+        app.node.inventory.update(fresh.clone()).unwrap();
+        for _ in 0..20 {
+            worker.poll_native(&mut cx).unwrap();
+            service.poll_budgeted(8).unwrap();
+        }
+        assert!(worker.devices.as_ref().unwrap().ready(RailId(7)));
+        let mut changed = fresh;
+        changed.iter_mut().find(|n| n.device == "new").unwrap().gid = Some([3; 16]);
+        app.node.inventory.update(changed).unwrap();
+        worker.refresh_inventory().unwrap();
+        assert!(!worker.devices.as_ref().unwrap().ready(RailId(7)));
+        service.poll_budgeted(256).unwrap();
+        assert_eq!(worker.runtime.admission.used(ResourceClass::Registered), 0);
+        // Published GID must still match refreshed discovery, never bypass it.
+        publication.sequence.0 += 1;
+        publication.membership_version.0 += 1;
+        publication.members[0].rails[0].gid = Some([2; 16]);
+        worker.snapshots.publish(publication).unwrap();
+        assert!(worker.native_publication().unwrap().is_empty());
+        drop(service);
+        assert_eq!(sim.live_resources(), 0);
+    }
+
     fn default_config(rdma: bool) -> Config {
-        Config::from_lookup_with_fabric_ports(|name| {
+        Config::from_lookup(|name| {
             Ok(match name {
                 "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
                 "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
@@ -240,7 +300,6 @@ mod tests {
             })
         })
         .unwrap()
-        .0
     }
 
     #[test]
@@ -257,7 +316,7 @@ mod tests {
             values.len(),
             13 + usize::from(values.contains_key("RACER_MAX_THREADS"))
         );
-        let (config, _) = Config::from_lookup_with_fabric_ports(|name| {
+        let mut config = Config::from_lookup(|name| {
             Ok(values
                 .get(name)
                 .map(|v| (*v).to_owned())
@@ -268,7 +327,13 @@ mod tests {
                 }))
         })
         .unwrap();
-        assert!(!config.enable_rdma);
+        assert_eq!(
+            config.enable_rdma,
+            cfg!(feature = "rdma") && rdma_verbs::inventory().is_ok_and(|ports| !ports.is_empty())
+        );
+        // The following assertions exercise the HTTP budget profile independently
+        // of whether the host has the optional native adapter installed.
+        config.enable_rdma = false;
         assert_eq!(
             config.max_threads,
             values
@@ -343,7 +408,7 @@ mod tests {
     fn smt_startup_final_count_partitions_live_budgets_and_obeys_memory_floors() {
         use crate::runtime::affinity::{CpuLocation, EffectiveTopology};
         for (allow_smt, expected) in [(false, 3), (true, 5)] {
-            let (mut config, _) = Config::from_lookup_with_fabric_ports(|name| {
+            let mut config = Config::from_lookup(|name| {
                 Ok(match name {
                     "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
                     "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
@@ -547,13 +612,8 @@ mod tests {
             devices.attach(port).unwrap();
             let admission = Admission::new(limits.clone());
             let startup = scope(Duration::from_secs(10)).unwrap();
-            let mut activation = devices.activate(
-                vec![],
-                vec![],
-                &admission,
-                crate::rdma::MAX_CIPHERTEXT,
-                &startup,
-            );
+            let mut activation =
+                devices.activate(vec![], &admission, crate::rdma::MAX_CIPHERTEXT, &startup);
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             assert!(activation.as_mut().poll(&mut cx).is_pending());
             let used = admission.used(ResourceClass::Registered);
@@ -675,7 +735,6 @@ mod tests {
         assert!(matches!(
             futures::executor::block_on(devices.activate(
                 vec![],
-                vec![],
                 &admission,
                 crate::rdma::MAX_CIPHERTEXT,
                 &startup,
@@ -689,25 +748,27 @@ mod tests {
     }
 
     fn configured() -> Application {
-        let (mut config, ports) = Config::from_lookup_with_fabric_ports(|name| {
+        let mut config = Config::from_lookup(|name| {
             Ok(match name {
                 "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
                 "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
                 "RACER_ENABLE_RDMA" => Some("true".into()),
                 "RACER_MAX_THREADS" => Some("2".into()),
-                "RACER_FABRIC_PORTS" => {
-                    Some(r#"[{"fabric":"trusted","device":"missing","port":1}]"#.into())
-                }
                 _ => None,
             })
         })
         .unwrap();
         // Stand in only for the identity returned by authenticated enrollment.
         config.node = NodeId("00000000-0000-4000-8000-000000000002".into());
-        Application::assemble(config)
-            .unwrap()
-            .with_fabric_ports(ports)
-            .unwrap()
+        let mut app = Application::assemble(config).unwrap();
+        app.discovered_nics = vec![crate::topology::rails::RailMapping {
+            device: "missing".into(),
+            port: 1,
+            gid: Some([1; 16]),
+            rail: RailId(7),
+            numa_node: None,
+        }];
+        app
     }
 
     fn worker(
@@ -731,10 +792,10 @@ mod tests {
             app.node.clone(),
             WorkerId(0),
             runtime,
-            app.fabric_ports.clone(),
+            app.discovered_nics.clone(),
         )
         .unwrap();
-        worker.fabric_ports = app.fabric_ports.clone();
+        worker.discovered_nics = app.discovered_nics.clone();
         worker
             .snapshots
             .publish(Publication {
@@ -746,16 +807,11 @@ mod tests {
                     node: app.config.node.clone(),
                     shares: std::num::NonZeroU32::new(1).unwrap(),
                     peer_endpoint: "127.0.0.1:7443".into(),
-                    rails: if published_rails {
-                        vec![crate::topology::rails::RailMapping {
-                            rail: RailId(7),
-                            fabric: "trusted".into(),
-                            numa_node: None,
-                        }]
+                    rails: if published_rails && aligned {
+                        app.discovered_nics.clone()
                     } else {
                         vec![]
                     },
-                    alignment_enabled: aligned,
                     site: "site1".into(),
                 }],
                 caches: vec![],
@@ -773,11 +829,10 @@ mod tests {
             .unwrap();
         let _environment = simulated.enter();
         let mut app = configured();
-        app.fabric_ports[0].device = "test-device".into();
-        app.fabric_ports[0].gid = None;
+        app.discovered_nics[0].device = "test-device".into();
         let (mut worker, engine) = worker(&app, true, true);
         worker.native_numa = Some(NativePlacement { numa_node: None });
-        assert!(worker.native_publication().unwrap().is_empty());
+        assert_eq!(worker.native_publication().unwrap().len(), 1);
         worker.native_numa = None;
         assert_eq!(worker.native_publication().unwrap().len(), 1);
         let mut service = app.build_crypto(WorkerId(0), engine).unwrap();
@@ -803,20 +858,47 @@ mod tests {
             worker.runtime.admission.used(ResourceClass::Registered),
             charged
         );
-        worker.devices.as_ref().unwrap().close();
+        worker
+            .snapshots
+            .publish(Publication {
+                schema_version: 1,
+                cluster: app.config.cluster.clone(),
+                sequence: PublicationSequence(2),
+                membership_version: MembershipVersion(2),
+                members: vec![Member {
+                    node: app.config.node.clone(),
+                    shares: std::num::NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: "127.0.0.1:7443".into(),
+                    rails: vec![],
+                    site: "site1".into(),
+                }],
+                caches: vec![],
+            })
+            .unwrap();
+        worker
+            .refresh_snapshot(&scope(Duration::from_secs(1)).unwrap())
+            .unwrap();
+        assert!(worker.actual_rails.is_empty());
+        assert!(!worker.devices.as_ref().unwrap().ready(RailId(7)));
         service.poll_budgeted(256).unwrap();
         assert_eq!(worker.runtime.admission.used(ResourceClass::Registered), 0);
         drop(service);
         assert_eq!(sim.live_resources(), 0);
     }
     #[test]
-    fn programmatic_associations_share_config_validation() {
-        let mut ports = configured().fabric_ports.clone();
-        ports.push(ports[0].clone());
-        assert!(configured().with_fabric_ports(ports).is_err());
-        let mut ports = configured().fabric_ports.clone();
-        ports[0].device = "../device".into();
-        assert!(configured().with_fabric_ports(ports).is_err());
+    fn duplicate_discovery_cannot_activate_a_binding() {
+        let mut app = configured();
+        app.discovered_nics.push(app.discovered_nics[0].clone());
+        assert!(
+            crate::rdma::discovery::select_worker(
+                &app.discovered_nics[..1],
+                &app.discovered_nics,
+                0,
+                None,
+                1
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -828,7 +910,7 @@ mod tests {
         ] {
             let mut app = configured();
             if !mapped {
-                app.fabric_ports.clear();
+                app.discovered_nics.clear();
             }
             let (mut worker, _engine) = worker(&app, aligned, published_rails);
             futures::executor::block_on(
@@ -869,7 +951,7 @@ mod tests {
 
     fn activation_falls_back() {
         let app = configured();
-        assert_eq!(app.fabric_ports[0].fabric, "trusted");
+        assert_eq!(app.discovered_nics[0].device, "missing");
         let (mut worker, engine) = worker(&app, true, true);
         let admission = worker.runtime.admission.clone();
         let startup = scope(Duration::from_secs(10)).unwrap();

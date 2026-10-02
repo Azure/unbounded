@@ -2,7 +2,7 @@
 //!
 //! Readiness never changes ownership. Exclusions, weights, additions, and deletions
 //! do. Retain bounded old snapshots until their in-flight leases are released.
-//! Endpoint/rail/alignment/Site changes also advance membership version, but placement
+//! Endpoint/NIC/Site changes also advance membership version, but placement
 //! depends only on node IDs and shares. All inputs are controller-accepted values.
 use super::rails::RailMapping;
 use crate::{
@@ -19,7 +19,6 @@ pub struct Member {
     pub shares: NonZeroU32,
     pub peer_endpoint: String,
     pub rails: Vec<RailMapping>,
-    pub alignment_enabled: bool,
     pub site: String,
 }
 #[derive(Debug)]
@@ -56,16 +55,19 @@ impl Membership {
             if endpoint.port() == 0 || member.peer_endpoint.contains('%') {
                 return Err(Error::InvalidConfiguration);
             }
-            member.rails.sort_unstable_by_key(|mapping| mapping.rail.0);
-            if member.rails.iter().any(|mapping| {
-                !valid_fabric(&mapping.fabric)
-                    || mapping
-                        .numa_node
-                        .is_some_and(|numa| u32::try_from(numa).is_err())
-            }) || member
-                .rails
-                .windows(2)
-                .any(|pair| pair[0].rail == pair[1].rail)
+            member.rails.sort_unstable_by(|a, b| {
+                (a.rail, &a.device, a.port).cmp(&(b.rail, &b.device, b.port))
+            });
+            let mut physical = std::collections::BTreeSet::new();
+            if member.rails.len() > 64
+                || member.rails.iter().any(|mapping| {
+                    !valid_fabric(&mapping.device)
+                        || mapping.port == 0
+                        || !physical.insert((&mapping.device, mapping.port))
+                        || mapping
+                            .numa_node
+                            .is_some_and(|numa| u32::try_from(numa).is_err())
+                })
             {
                 return Err(Error::InvalidConfiguration);
             }
@@ -84,7 +86,6 @@ impl Membership {
         // A partially equipped hop must fall back rather than rehash the page.
         let rail_domain: Vec<_> = members
             .iter()
-            .filter(|m| m.alignment_enabled)
             .flat_map(|m| m.rails.iter().map(|r| r.rail))
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
@@ -99,7 +100,7 @@ impl Membership {
                         + m.peer_endpoint.capacity()
                         + m.site.capacity()
                         + m.rails.capacity() * std::mem::size_of::<RailMapping>()
-                        + m.rails.iter().map(|r| r.fabric.capacity()).sum::<usize>()
+                        + m.rails.iter().map(|r| r.device.capacity()).sum::<usize>()
                 })
                 .sum::<usize>();
         Ok(Self {
@@ -268,7 +269,9 @@ mod tests {
         node.rails = vec![
             RailMapping {
                 rail: RailId(0),
-                fabric: "a".into(),
+                device: "a".into(),
+                port: 1,
+                gid: None,
                 numa_node: None
             };
             2
@@ -292,12 +295,14 @@ mod tests {
             let mut node = member(0, 4);
             node.rails = vec![RailMapping {
                 rail: RailId(u16::MAX),
-                fabric: fabric.clone(),
+                device: fabric.clone(),
+                port: 1,
+                gid: None,
                 numa_node: Some(u32::MAX as usize),
             }];
             let accepted = Membership::validate(MembershipVersion(1), vec![node]).unwrap();
             assert_eq!(
-                accepted.members()[0].rails[0].fabric.as_bytes(),
+                accepted.members()[0].rails[0].device.as_bytes(),
                 fabric.as_bytes()
             );
             assert_eq!(
@@ -309,7 +314,9 @@ mod tests {
             let mut node = member(0, 4);
             node.rails = vec![RailMapping {
                 rail: RailId(0),
-                fabric: fabric.into(),
+                device: fabric.into(),
+                port: 1,
+                gid: None,
                 numa_node: None,
             }];
             assert_eq!(
@@ -342,7 +349,9 @@ mod tests {
             let mut node = member(0, 4);
             node.rails = vec![RailMapping {
                 rail: RailId(0),
-                fabric: format!("β{}fabric", char::from(byte)),
+                device: format!("β{}fabric", char::from(byte)),
+                port: 1,
+                gid: None,
                 numa_node: None,
             }];
             assert_eq!(
@@ -359,7 +368,9 @@ mod tests {
             let mut node = member(0, 4);
             node.rails = vec![RailMapping {
                 rail: RailId(0),
-                fabric: "fabric".into(),
+                device: "fabric".into(),
+                port: 1,
+                gid: None,
                 numa_node: Some(oversized),
             }];
             assert_eq!(

@@ -642,7 +642,6 @@ fn local_membership(signer: &Signatures) -> MembershipLease {
                 shares: NonZeroU32::new(1).unwrap(),
                 peer_endpoint: "127.0.0.1:8000".into(),
                 rails: vec![],
-                alignment_enabled: false,
                 site: String::new(),
             }],
         )
@@ -1150,7 +1149,6 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
                         format!("127.0.0.1:{}", 8100 + i)
                     },
                     rails: vec![],
-                    alignment_enabled: false,
                     site: String::new(),
                 })
                 .collect(),

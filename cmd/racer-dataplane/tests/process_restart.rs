@@ -643,7 +643,7 @@ fn profile_thread_cap(io_shards: usize) -> usize {
 
 fn profile_plan(io_shards: usize) -> racer_dataplane::runtime::affinity::AffinityPlan {
     use racer_dataplane::{config::Config, runtime::affinity::AffinityPlan};
-    let (config, _) = Config::from_lookup_with_fabric_ports(|name| {
+    let config = Config::from_lookup(|name| {
         Ok(match name {
             "RACER_CLUSTER_ID" => Some(CLUSTER.into()),
             "RACER_CONTROL_ENDPOINT" => Some("https://controller.invalid:443".into()),
@@ -667,7 +667,7 @@ fn capped_profiles_count_io_shards_and_unique_crypto_threads() {
         config::Config,
         runtime::affinity::{AffinityPlan, CpuLocation, EffectiveTopology},
     };
-    let (mut config, _) = Config::from_lookup_with_fabric_ports(|name| {
+    let mut config = Config::from_lookup(|name| {
         Ok(match name {
             "RACER_CLUSTER_ID" => Some(CLUSTER.into()),
             "RACER_CONTROL_ENDPOINT" => Some("https://controller.invalid:443".into()),

@@ -186,7 +186,7 @@ fn dropped_activation_does_not_publish_readiness_or_release_accepted_quota_early
     devices.attach(io).unwrap();
     let admission = Admission::new(crate::test_support::cluster::config(true).limits);
     let scope = scope();
-    let mut operation = devices.activate(Vec::new(), Vec::new(), &admission, 4096, &scope);
+    let mut operation = devices.activate(Vec::new(), &admission, 4096, &scope);
     assert!(
         operation
             .as_mut()

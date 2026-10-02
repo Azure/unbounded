@@ -54,6 +54,7 @@ pub struct Publication {
 #[derive(Clone)]
 pub struct EnrollmentRequest {
     pub shares: u32,
+    pub rdma_nics: Vec<crate::topology::rails::RailMapping>,
     pub schema_version: u32,
     pub cluster: ClusterId,
     pub enrollment: EnrollmentId,
@@ -350,6 +351,7 @@ mod codec {
     #[serde(deny_unknown_fields)]
     struct Request {
         shares: u32,
+        rdma_nics: Vec<Rail>,
         schema_version: u32,
         cluster: String,
         enrollment: String,
@@ -372,6 +374,7 @@ mod codec {
         }
         Ok(EnrollmentRequest {
             shares: r.shares,
+            rdma_nics: nics_from_dto(r.rdma_nics)?,
             schema_version: r.schema_version,
             cluster: ClusterId(r.cluster),
             enrollment: EnrollmentId(r.enrollment),
@@ -382,6 +385,7 @@ mod codec {
         let b = encode(
             &Request {
                 shares: r.shares,
+                rdma_nics: nics_to_dto(&r.rdma_nics)?,
                 schema_version: r.schema_version,
                 cluster: r.cluster.0.clone(),
                 enrollment: r.enrollment.0.clone(),
@@ -436,8 +440,15 @@ mod codec {
     #[derive(Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Rail {
+        device: String,
+        port: u8,
         rail: u16,
-        fabric: String,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "nonnull_gid"
+        )]
+        gid: Option<String>,
         #[serde(
             default,
             skip_serializing_if = "Option::is_none",
@@ -450,14 +461,83 @@ mod codec {
     ) -> std::result::Result<Option<u32>, D::Error> {
         u32::deserialize(d).map(Some)
     }
+    fn nonnull_gid<'de, D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> std::result::Result<Option<String>, D::Error> {
+        String::deserialize(d).map(Some)
+    }
+    fn nics_from_dto(nics: Vec<Rail>) -> Result<Vec<RailMapping>> {
+        if nics.len() > 64 {
+            return Err(Error::Overloaded);
+        }
+        let mut physical = HashSet::default();
+        let mut result = Vec::new();
+        for nic in nics {
+            if nic.device.is_empty()
+                || nic.device.contains(['\0', '\r', '\n'])
+                || nic.port == 0
+                || !physical.insert((nic.device.clone(), nic.port))
+            {
+                return Err(Error::InvalidRequest);
+            }
+            let gid = nic
+                .gid
+                .map(|value| {
+                    if value.len() != 32
+                        || !value
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+                    {
+                        return Err(Error::InvalidRequest);
+                    }
+                    let mut gid = [0; 16];
+                    for (i, byte) in gid.iter_mut().enumerate() {
+                        *byte = u8::from_str_radix(&value[i * 2..i * 2 + 2], 16)
+                            .map_err(|_| Error::InvalidRequest)?;
+                    }
+                    Ok(gid)
+                })
+                .transpose()?;
+            result.push(RailMapping {
+                device: nic.device,
+                port: nic.port,
+                rail: RailId(nic.rail),
+                gid,
+                numa_node: nic.numa_node.map(|n| n as usize),
+            });
+        }
+        result.sort_by(|a, b| (a.rail, &a.device, a.port).cmp(&(b.rail, &b.device, b.port)));
+        Ok(result)
+    }
+    fn nics_to_dto(nics: &[RailMapping]) -> Result<Vec<Rail>> {
+        let mut result = nics
+            .iter()
+            .map(|nic| {
+                Ok(Rail {
+                    device: nic.device.clone(),
+                    port: nic.port,
+                    rail: nic.rail.0,
+                    gid: nic
+                        .gid
+                        .map(|gid| gid.iter().map(|b| format!("{b:02x}")).collect()),
+                    numa_node: nic
+                        .numa_node
+                        .map(u32::try_from)
+                        .transpose()
+                        .map_err(|_| Error::InvalidRequest)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        result.sort_by(|a, b| (a.rail, &a.device, a.port).cmp(&(b.rail, &b.device, b.port)));
+        Ok(result)
+    }
     #[derive(Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct MemberDto {
         node: String,
         shares: u32,
         peer_endpoint: String,
-        rails: Vec<Rail>,
-        alignment_enabled: bool,
+        rdma_nics: Vec<Rail>,
         site: String,
     }
     #[derive(Clone, Serialize, Deserialize)]
@@ -514,28 +594,12 @@ mod codec {
             {
                 return Err(Error::InvalidRequest);
             }
-            let mut ids = HashSet::default();
-            let mut rails = Vec::new();
-            for r in m.rails {
-                if !ids.insert(r.rail)
-                    || r.fabric.is_empty()
-                    || r.fabric.contains(['\0', '\r', '\n'])
-                {
-                    return Err(Error::InvalidRequest);
-                }
-                rails.push(RailMapping {
-                    rail: RailId(r.rail),
-                    fabric: r.fabric,
-                    numa_node: r.numa_node.map(|n| n as usize),
-                });
-            }
-            rails.sort_by_key(|r| r.rail.0);
+            let rails = nics_from_dto(m.rdma_nics)?;
             members.push(Member {
                 node: NodeId(m.node),
                 shares: NonZeroU32::new(m.shares).ok_or(Error::InvalidRequest)?,
                 peer_endpoint: m.peer_endpoint,
                 rails,
-                alignment_enabled: m.alignment_enabled,
                 site: m.site,
             });
         }
@@ -564,25 +628,12 @@ mod codec {
     fn dto(p: &Publication) -> Result<PublicationDto> {
         let mut members = Vec::new();
         for m in &p.members {
-            let mut rails = Vec::new();
-            for r in &m.rails {
-                rails.push(Rail {
-                    rail: r.rail.0,
-                    fabric: r.fabric.clone(),
-                    numa_node: r
-                        .numa_node
-                        .map(u32::try_from)
-                        .transpose()
-                        .map_err(|_| Error::InvalidRequest)?,
-                });
-            }
-            rails.sort_by_key(|r| r.rail);
+            let rdma_nics = nics_to_dto(&m.rails)?;
             members.push(MemberDto {
                 node: m.node.0.clone(),
                 shares: m.shares.get(),
                 peer_endpoint: m.peer_endpoint.clone(),
-                rails,
-                alignment_enabled: m.alignment_enabled,
+                rdma_nics,
                 site: m.site.clone(),
             });
         }
@@ -1045,7 +1096,7 @@ mod codec {
         }
         #[test]
         fn go_delta_vector_applies_exactly_and_rejects_tampering() {
-            let base = decode_publication(br#"{"schema_version":1,"cluster":"11111111-1111-4111-8111-111111111111","sequence":"1","membership_version":"1","members":[{"node":"22222222-2222-4222-8222-222222222222","shares":4,"peer_endpoint":"127.0.0.1:7443","rails":[],"alignment_enabled":true,"site":""},{"node":"33333333-3333-4333-8333-333333333333","shares":4,"peer_endpoint":"127.0.0.2:7443","rails":[],"alignment_enabled":true,"site":""}],"caches":[]}"#).unwrap();
+            let base = decode_publication(br#"{"schema_version":1,"cluster":"11111111-1111-4111-8111-111111111111","sequence":"1","membership_version":"1","members":[{"node":"22222222-2222-4222-8222-222222222222","shares":4,"peer_endpoint":"127.0.0.1:7443","rdma_nics":[],"site":""},{"node":"33333333-3333-4333-8333-333333333333","shares":4,"peer_endpoint":"127.0.0.2:7443","rdma_nics":[],"site":""}],"caches":[]}"#).unwrap();
             let delta = include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../internal/racer/wire/testdata/delta.json"
@@ -1057,7 +1108,7 @@ mod codec {
             assert_eq!(next.members[1].shares.get(), 7);
             assert_eq!(
                 format!("{:x}", Sha256::digest(canonical_content(&next).unwrap().0)),
-                "8274c3baff472a8cd5a75b6925a54b0d1446722be397948d9e0a1c5228a3b166"
+                "0929db4d1b89c4fdb5c6c20d938a77b286318a830df0b1ac823ee62916af4e20"
             );
             assert!(apply_delta(&next, delta.as_bytes()).is_err());
             assert!(
@@ -1074,11 +1125,11 @@ mod codec {
             let (c, m) = canonical_content(&p).unwrap();
             assert_eq!(
                 format!("{:x}", Sha256::digest(c)),
-                "b8f2903edf26d15baaa665e733643e517060b8b309dff562d48162235de0d540"
+                "1f68b286bce90f488529367057850804d24be4dc5e81c811cc06ebfa376c0a0e"
             );
             assert_eq!(
                 format!("{:x}", Sha256::digest(m)),
-                "2348021c7385fc57f9726242344943c5cd5dd766574ceb31f8e10029126e9af0"
+                "c523f9a1b8f503628a8dbcef9fa0ef35553640b7c226515f5f5d70a9f3abe0ac"
             );
             let encoded = encode_publication(&p).unwrap();
             assert_eq!(

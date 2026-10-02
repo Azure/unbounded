@@ -666,7 +666,6 @@ mod destination_disconnect {
                             shares: std::num::NonZeroU32::new(1).unwrap(),
                             peer_endpoint: format!("127.0.0.1:{}", 9000 + i),
                             rails: vec![],
-                            alignment_enabled: false,
                             site: String::new(),
                         })
                         .collect(),
@@ -1394,7 +1393,6 @@ mod requester_safety {
                         shares: std::num::NonZeroU32::new(1).unwrap(),
                         peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
                         rails: vec![],
-                        alignment_enabled: false,
                         site: String::new(),
                     })
                     .collect(),
@@ -1466,7 +1464,6 @@ mod requester_safety {
                         shares: std::num::NonZeroU32::new(1).unwrap(),
                         peer_endpoint: address.clone(),
                         rails: vec![],
-                        alignment_enabled: false,
                         site: String::new(),
                     })
                     .collect(),
@@ -1893,7 +1890,6 @@ mod timing {
                         shares: std::num::NonZeroU32::new(1).unwrap(),
                         peer_endpoint: address.to_string(),
                         rails: vec![],
-                        alignment_enabled: false,
                         site: String::new(),
                     })
                     .collect(),

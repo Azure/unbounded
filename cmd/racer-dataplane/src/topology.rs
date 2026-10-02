@@ -338,7 +338,9 @@ pub mod rails {
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct RailMapping {
         pub rail: RailId,
-        pub fabric: String,
+        pub device: String,
+        pub port: u8,
+        pub gid: Option<[u8; 16]>,
         pub numa_node: Option<usize>,
     }
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -398,12 +400,10 @@ pub mod rails {
         members: &[&super::membership::Member],
         page: &PageId,
     ) -> Result<TransportPlan> {
-        if members.iter().any(|m| {
-            m.site.is_empty()
-                || m.site != members[0].site
-                || !m.alignment_enabled
-                || m.rails.is_empty()
-        }) {
+        if members
+            .iter()
+            .any(|m| m.site.is_empty() || m.site != members[0].site || m.rails.is_empty())
+        {
             return Ok(TransportPlan::Http);
         }
         // Site is an admission boundary, not a new rail domain or hash scheme.
@@ -416,14 +416,10 @@ pub mod rails {
         let digest = hash::finish(digest);
         let sample = u64::from_be_bytes(digest[..8].try_into().unwrap());
         let rail = domain[(sample % domain.len() as u64) as usize];
-        let Some(chosen) = members[0].rails.iter().find(|m| m.rail == rail) else {
-            return Ok(TransportPlan::Http);
-        };
-        if !members[1..].iter().all(|m| {
-            m.rails
-                .iter()
-                .any(|m| m.rail == rail && m.fabric == chosen.fabric)
-        }) {
+        if !members
+            .iter()
+            .all(|m| m.rails.iter().any(|m| m.rail == rail))
+        {
             return Ok(TransportPlan::Http);
         }
         Ok(TransportPlan::Rdma { rail })
@@ -443,12 +439,16 @@ pub mod rails {
             vec![
                 RailMapping {
                     rail: RailId(7),
-                    fabric: "a".into(),
+                    device: "a".into(),
+                    port: 1,
+                    gid: None,
                     numa_node: Some(0),
                 },
                 RailMapping {
                     rail: RailId(2),
-                    fabric: "b".into(),
+                    device: "b".into(),
+                    port: 1,
+                    gid: None,
                     numa_node: Some(1),
                 },
             ]
@@ -477,15 +477,13 @@ pub mod rails {
             let TransportPlan::Rdma { rail } = plan else {
                 return Ok(true);
             };
-            if !member.alignment_enabled {
-                return Ok(false);
-            }
             let Some(published) = member.rails.iter().find(|m| m.rail == *rail) else {
                 return Ok(false);
             };
             let mut matching = discovered.iter().filter(|m| m.rail == *rail);
             Ok(matching.next().is_some_and(|hardware| {
-                hardware.fabric == published.fabric
+                hardware.device == published.device
+                    && hardware.port == published.port
                     && published
                         .numa_node
                         .is_none_or(|numa| hardware.numa_node == Some(numa))
@@ -550,12 +548,12 @@ pub mod rails {
                 );
             }
             for changed in [
-                route(|m| m[1].alignment_enabled = false),
+                route(|m| m[1].site.clear()),
                 route(|m| m[1].rails.clear()),
                 route(|m| {
                     m[1].rails
                         .iter_mut()
-                        .for_each(|r| r.fabric = "wrong".into())
+                        .for_each(|r| r.rail = RailId(r.rail.0 + 1))
                 }),
             ] {
                 assert_eq!(
@@ -578,13 +576,35 @@ pub mod rails {
             }
         }
         #[test]
+        fn repeated_rails_and_different_physical_names_do_not_change_remote_eligibility() {
+            let original = route(|_| {});
+            let repeated = route(|members| {
+                for (i, member) in members.iter_mut().enumerate() {
+                    let mut extra = member.rails[0].clone();
+                    extra.device = format!("extra-{i}");
+                    member.rails.push(extra);
+                    member.rails[0].device = format!("local-{i}");
+                }
+            });
+            assert_eq!(
+                original.membership.rail_domain(),
+                repeated.membership.rail_domain()
+            );
+            for number in 0..100 {
+                assert_eq!(
+                    select(&original, &page(number)),
+                    select(&repeated, &page(number))
+                );
+            }
+        }
+        #[test]
         fn intersection_over_all_hops_and_http_fallback() {
             for route in [
-                route(|m| m[1].alignment_enabled = false),
+                route(|m| m[1].site.clear()),
                 route(|m| m[1].rails.clear()),
                 route(|m| {
                     for rail in &mut m[1].rails {
-                        rail.fabric = "wrong".into();
+                        rail.rail = RailId(rail.rail.0 + 1);
                     }
                 }),
             ] {
@@ -745,7 +765,6 @@ mod fixtures {
             shares: NonZeroU32::new(shares).unwrap(),
             peer_endpoint: "127.0.0.1:8080".into(),
             rails: vec![],
-            alignment_enabled: true,
             site: String::new(),
         }
     }

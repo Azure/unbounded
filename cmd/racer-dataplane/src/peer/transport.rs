@@ -287,10 +287,11 @@ mod native_exchange_tests {
                         peer_endpoint: format!("127.0.0.1:{}", 9000 + i),
                         rails: vec![RailMapping {
                             rail: RailId(7),
-                            fabric: "test-provider".into(),
+                            device: "test-provider".into(),
+                            port: 1,
+                            gid: None,
                             numa_node: None,
                         }],
-                        alignment_enabled: true,
                         site: (*site).into(),
                     })
                     .collect(),
@@ -646,10 +647,7 @@ mod native_exchange_tests {
         relayed: bool,
     ) {
         let reject_sender = rejected_site.is_some();
-        use crate::rdma::{
-            FabricPort,
-            lifecycle::{NativeService, pair},
-        };
+        use crate::rdma::lifecycle::{NativeService, pair};
         use crate::topology::{
             membership::{Member, Membership},
             rails::{RailId, RailMapping},
@@ -694,14 +692,10 @@ mod native_exchange_tests {
         let reactor = Rc::new(Reactor::new(admission.clone()));
         let mappings = vec![RailMapping {
             rail: RailId(7),
-            fabric: "test-provider".into(),
-            numa_node: None,
-        }];
-        let associations = vec![FabricPort {
-            fabric: "test-provider".into(),
             device,
             port,
             gid: Some(gid),
+            numa_node: None,
         }];
         let scope = RequestScope::new(RequestId([7; 16]), Instant::now() + Duration::from_secs(30))
             .unwrap();
@@ -735,20 +729,8 @@ mod native_exchange_tests {
         let (send_devices, mut send_engine, sender) = make(signers[2].clone());
         let mut activate = std::pin::pin!(async {
             futures::try_join!(
-                receive_devices.activate(
-                    mappings.clone(),
-                    associations.clone(),
-                    &admission,
-                    4096,
-                    &scope
-                ),
-                send_devices.activate(
-                    mappings.clone(),
-                    associations.clone(),
-                    &admission,
-                    4096,
-                    &scope
-                )
+                receive_devices.activate(mappings.clone(), &admission, 4096, &scope),
+                send_devices.activate(mappings.clone(), &admission, 4096, &scope)
             )
         });
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -872,7 +854,6 @@ mod native_exchange_tests {
                         shares: std::num::NonZeroU32::new(1).unwrap(),
                         peer_endpoint: format!("127.0.0.1:{}", 9000 + i),
                         rails: mappings.clone(),
-                        alignment_enabled: true,
                         site: if i == 1 {
                             "site2"
                         } else if i == 2 {

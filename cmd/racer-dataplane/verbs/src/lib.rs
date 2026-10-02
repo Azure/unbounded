@@ -13,6 +13,20 @@ pub use lifecycle::{
     Region, Selection, Ticket, Window, pair,
 };
 
+/// A synchronous pre-enrollment inventory. Native handles are dropped on this
+/// thread; only owned descriptions leave it. Missing providers return Unavailable.
+pub fn inventory() -> Result<Vec<PortInfo>> {
+    Ok(ffi::discover()?
+        .iter()
+        .map(|device| PortInfo {
+            device: device.name.clone(),
+            port: device.endpoint.port,
+            gid: device.endpoint.gid,
+            numa_node: None,
+        })
+        .collect())
+}
+
 use std::sync::Arc;
 
 /// Opaque caller-owned lifetime charge. The crate never inspects its contents.

@@ -48,14 +48,10 @@ fn activate<'a>(
     devices.activate(
         vec![RailMapping {
             rail: RailId(0),
-            fabric: "sim".into(),
-            numa_node: None,
-        }],
-        vec![FabricPort {
-            fabric: "sim".into(),
             device: "sim0".into(),
             port: 1,
             gid: None,
+            numa_node: None,
         }],
         admission,
         4096,
@@ -64,6 +60,68 @@ fn activate<'a>(
 }
 fn port(devices: &Devices) -> Rc<IoPort> {
     devices.port.borrow().as_ref().unwrap().clone()
+}
+
+#[test]
+fn repeated_rail_selects_exact_physical_binding_and_revokes_changed_gid() {
+    let sim = simulation::Simulation::new()
+        .with_devices(vec![
+            simulation::Device::new("a", [1; 16]),
+            simulation::Device::new("b", [2; 16]),
+        ])
+        .unwrap();
+    let _environment = sim.enter();
+    let (io, native) = pair(2).unwrap();
+    let mut service = NativeService::new(native);
+    let devices = Devices::new();
+    devices.attach(io).unwrap();
+    let inventory = super::discovery::inventory();
+    let publication: Vec<_> = inventory
+        .iter()
+        .cloned()
+        .map(|mut n| {
+            n.rail = RailId(7);
+            n
+        })
+        .collect();
+    let selected = super::discovery::select_worker(&publication, &inventory, 1, None, 2);
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].device, "b");
+    let admission = Admission::new(crate::test_support::cluster::config(true).limits);
+    let scope = RequestScope::new(
+        RequestId([3; 16]),
+        crate::runtime::environment::now() + std::time::Duration::from_secs(30),
+    )
+    .unwrap();
+    assert!(matches!(
+        futures::executor::block_on(devices.activate(publication, &admission, 4096, &scope)),
+        Err(Error::InvalidConfiguration)
+    ));
+    assert_eq!(admission.used(ResourceClass::Registered), 0);
+    let mut activation = devices.activate(selected.clone(), &admission, 4096, &scope);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(activation.as_mut().poll(&mut cx).is_pending());
+    for _ in 0..8 {
+        service.poll_budgeted(8).unwrap();
+    }
+    let Poll::Ready(Ok(actual)) = activation.as_mut().poll(&mut cx) else {
+        panic!("activation pending");
+    };
+    drop(activation);
+    assert_eq!(actual[0].device, "b");
+    assert_eq!(actual[0].gid, Some([2; 16]));
+    assert!(devices.ready(RailId(7)));
+    assert!(devices.revalidate(&selected));
+    let mut revoked = selected;
+    revoked[0].gid = Some([3; 16]);
+    assert!(!devices.revalidate(&revoked));
+    assert!(!devices.ready(RailId(7)));
+    for _ in 0..8 {
+        service.poll_budgeted(8).unwrap();
+    }
+    assert_eq!(admission.used(ResourceClass::Registered), 0);
+    drop(service);
+    assert_eq!(sim.live_resources(), 0);
 }
 
 #[test]

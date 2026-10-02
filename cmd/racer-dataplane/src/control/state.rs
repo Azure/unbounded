@@ -444,7 +444,6 @@ pub(crate) fn for_caches(keys: Rc<Keyring>, caches: Vec<CacheId>) -> Rc<Availabi
                 shares: std::num::NonZeroU32::new(1).unwrap(),
                 peer_endpoint: "127.0.0.1:7443".into(),
                 rails: vec![],
-                alignment_enabled: false,
                 site: String::new(),
             }],
             caches: caches
@@ -513,10 +512,10 @@ mod publication_tests {
         .unwrap();
         p.sequence.0 = sequence;
         p.membership_version.0 = 1;
-        // Lifecycle cases use ASCII fabric IDs; wire parity has separate coverage.
+        // Lifecycle cases use unique ASCII device IDs; wire parity is separate.
         for member in &mut p.members {
-            for rail in &mut member.rails {
-                rail.fabric = "fabric-a".into();
+            for (index, rail) in member.rails.iter_mut().enumerate() {
+                rail.device = format!("nic-{index}");
             }
         }
         p

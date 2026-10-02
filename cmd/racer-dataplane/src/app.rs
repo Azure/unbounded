@@ -468,12 +468,13 @@ pub struct Application {
     config: Arc<Config>,
     node: Arc<NodeState>,
     limits: Limits,
-    fabric_ports: Vec<crate::rdma::FabricPort>,
+    discovered_nics: Vec<crate::topology::rails::RailMapping>,
 }
 
 /// Shared immutable-publication and partitioned-admission roots. No Rc worker
 /// graph crosses a thread. Worker zero alone drives enrollment/control reloads.
 pub struct NodeState {
+    inventory: Arc<crate::rdma::discovery::Inventory>,
     send_crc: crate::telemetry::send_crc::Samples,
     hedges: std::sync::OnceLock<Arc<crate::read::hedge::Hedges>>,
     peer_admission: Arc<crate::peer::adaptive::AdaptivePeers>,
@@ -526,6 +527,7 @@ impl NodeState {
             crate::peer::adaptive::AdaptivePeers::new(peer_config, metrics[0].clone())?;
         Ok(Self {
             peer_admission,
+            inventory: crate::rdma::discovery::Inventory::shared(),
             send_crc: Default::default(),
             hedges: std::sync::OnceLock::new(),
             ingress: Arc::new(crate::runtime::ingress::Ingress::new(&workers)),
@@ -557,12 +559,13 @@ impl Application {
             limits: config.limits.clone(),
             config: Arc::new(config),
             node: Arc::new(NodeState::default()),
-            fabric_ports: Vec::new(),
+            discovered_nics: Vec::new(),
         })
     }
 
     pub fn run(mut self) -> Result<()> {
         self.config.validate()?;
+        self.discovered_nics = crate::rdma::discovery::inventory();
         let mut plan = AffinityPlan::discover(&self.config)?;
         log_worker_plan("planned", &plan);
         self.limits = size_workers(&self.config.limits, &mut plan, self.config.enable_rdma)?;
@@ -572,6 +575,7 @@ impl Application {
             self.limits.queue_entries.get(),
             self.config.peer_admission,
         )?);
+        self.node.inventory.update(self.discovered_nics.clone())?;
         if self.config.enable_rdma {
             self.node.native.place(&plan)?;
             self.node
@@ -632,6 +636,7 @@ fn bootstrap(
             node.publications.clone(),
             config.limits.retained_snapshots.get(),
         )),
+        node.inventory.clone(),
     );
     let mut operation = Box::pin(async {
         let identity = loop {
@@ -764,8 +769,9 @@ pub struct WorkerApplication {
     flights: Rc<Flights>,
     rdma: Option<Rc<RdmaTransfer>>,
     devices: Option<Rc<Devices>>,
-    fabric_ports: Vec<crate::rdma::FabricPort>,
+    discovered_nics: Vec<crate::topology::rails::RailMapping>,
     actual_rails: Vec<crate::topology::rails::RailMapping>,
+    inventory_generation: u64,
     native_numa: Option<native::NativePlacement>,
     native_task: Option<Operation<'static, Vec<crate::topology::rails::RailMapping>>>,
     native_retry: std::time::Instant,
@@ -812,7 +818,7 @@ impl WorkerApplication {
         node: Arc<NodeState>,
         worker: WorkerId,
         runtime: WorkerRuntime,
-        fabric_ports: Vec<crate::rdma::FabricPort>,
+        discovered_nics: Vec<crate::topology::rails::RailMapping>,
     ) -> Result<Self> {
         let environment = crate::runtime::environment::Environment::current();
         let metrics = node
@@ -866,6 +872,7 @@ impl WorkerApplication {
                 runtime.reactor.clone(),
                 keys.clone(),
                 snapshots.clone(),
+                node.inventory.clone(),
             ))
         } else {
             None
@@ -1091,8 +1098,9 @@ impl WorkerApplication {
             flights,
             rdma,
             devices,
-            fabric_ports,
+            discovered_nics,
             actual_rails: Vec::new(),
+            inventory_generation: 0,
             native_numa: node.native.numa(worker)?,
             native_task: None,
             native_retry: crate::runtime::environment::now(),
@@ -1212,12 +1220,16 @@ impl WorkerApplication {
         reactor: Rc<Reactor>,
         keys: Rc<Keyring>,
         snapshots: Rc<SnapshotStore>,
+        inventory: Arc<crate::rdma::discovery::Inventory>,
     ) -> Rc<ControlClient> {
-        let enrollment = Rc::new(Enrollment::new(
-            config.cluster.clone(),
-            config.service_account_token.clone(),
-            config.identity_directory.clone(),
-        ));
+        let enrollment = Rc::new(
+            Enrollment::new(
+                config.cluster.clone(),
+                config.service_account_token.clone(),
+                config.identity_directory.clone(),
+            )
+            .with_inventory(inventory),
+        );
         enrollment.set_shares(config.shares);
         let secrets = BundleInstaller::new(keys.clone());
         let control = Rc::new(ControlClient::new(
@@ -1328,6 +1340,7 @@ impl WorkerApplication {
     }
 
     fn refresh_snapshot(&mut self, current_scope: &RequestScope) -> Result<()> {
+        self.refresh_inventory()?;
         let snapshot = self.snapshots.current()?;
         if self
             .snapshot_sequence
@@ -1345,7 +1358,9 @@ impl WorkerApplication {
                     && self.actual_rails.iter().all(|actual| {
                         published_rails.iter().any(|published| {
                             published.rail == actual.rail
-                                && published.fabric == actual.fabric
+                                && published.device == actual.device
+                                && published.port == actual.port
+                                && published.gid.is_none_or(|gid| actual.gid == Some(gid))
                                 && published
                                     .numa_node
                                     .is_none_or(|numa| actual.numa_node == Some(numa))
@@ -1641,7 +1656,7 @@ impl WorkerFactory for Application {
             self.node.clone(),
             worker,
             runtime,
-            self.fabric_ports.clone(),
+            self.discovered_nics.clone(),
         )?;
         Ok(Box::new(application))
     }
@@ -1962,7 +1977,7 @@ pub(crate) mod tests {
 
     #[test]
     fn worker_sizing_reports_specific_resource_floor() {
-        let base = Config::from_lookup_with_fabric_ports(|name| {
+        let base = Config::from_lookup(|name| {
             Ok(match name {
                 "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
                 "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
@@ -1971,7 +1986,6 @@ pub(crate) mod tests {
             })
         })
         .unwrap()
-        .0
         .limits;
         assert!(partition_limits_with_cause(&base, 1, false).is_ok());
         assert_eq!(
@@ -2019,7 +2033,7 @@ pub(crate) mod tests {
             model::ResourceClass,
             runtime::affinity::{CpuLocation, EffectiveTopology},
         };
-        let config = Config::from_lookup_with_fabric_ports(|name| {
+        let config = Config::from_lookup(|name| {
             Ok(match name {
                 "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),
                 "RACER_CONTROL_ENDPOINT" => Some("https://control.example".into()),
@@ -2028,8 +2042,7 @@ pub(crate) mod tests {
                 _ => None,
             })
         })
-        .unwrap()
-        .0;
+        .unwrap();
         let make_plan = || {
             AffinityPlan::from_topology(
                 &config,
