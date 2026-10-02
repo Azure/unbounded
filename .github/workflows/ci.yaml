@@ -364,7 +364,9 @@ jobs:
         with:
           context: .
           file: images/racer-dataplane/Containerfile
-          build-args: VERSION=e2e
+          build-args: |
+            VERSION=e2e
+            RACER_NATIVE_RDMA=true
           tags: docker.io/library/racer-dataplane:e2e
           load: true
           provenance: false

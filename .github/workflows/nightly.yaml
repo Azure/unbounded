@@ -328,7 +328,8 @@ jobs:
         # it needs that arg (images/metalman/Containerfile declares it and feeds
         # it to make). REGISTRY is lowercased by the step above.
         #
-        # Nothing else needs one. Which component images the operator deploys is
+        # Racer release images always include native RDMA support.
+        # Which component images the operator deploys is
         # decided at reconcile time from its own compiled version, so VERSION,
         # passed to every build below, is what selects them.
         run: |
@@ -338,6 +339,9 @@ jobs:
             case "${{ matrix.component.name }}" in
               metalman)
                 echo "CONTAINER_REGISTRY=${REGISTRY}"
+                ;;
+              racer-dataplane)
+                echo "RACER_NATIVE_RDMA=true"
                 ;;
             esac
             echo 'EOF'

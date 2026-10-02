@@ -8,7 +8,10 @@ metadata:
 data:
   # Defaults match the Rust runtime. Existing administrator data is preserved.
   # Routing is V5 (radix32) only. RACER_ROUTING_ALGORITHM is not supported.
-  # Native builds activate only trusted, published, NUMA-local hardware mappings.
+  # Native RDMA is included in release images. Active MW2B-capable ports are
+  # reported at authenticated enrollment; published rdma-nics overrides win.
+  # RDMA requires the same nonempty Site and rail on both peers. NUMA is
+  # autodetected; same-rail candidates prefer local, then unknown, then remote.
   RACER_ENABLE_RDMA: "auto"
   # No thread cap by default: eligible physical cores, CPU quota, and resource budgets apply.
   # I/O shards share NUMA-local crypto threads at approximately 2:1, using leftovers:

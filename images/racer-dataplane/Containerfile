@@ -5,7 +5,7 @@ ARG RUST_IMAGE=docker.io/library/rust:1.96.0-bookworm
 ARG RUNTIME_IMAGE=docker.io/library/debian:bookworm-slim
 # Build on the target platform: both Rust and the verbs adapter use its ABI.
 FROM ${RUST_IMAGE} AS builder
-ARG RACER_NATIVE_RDMA=false
+ARG RACER_NATIVE_RDMA=true
 WORKDIR /src
 
 RUN case "$RACER_NATIVE_RDMA" in \
@@ -43,7 +43,7 @@ RUN set -eu; \
     install -m 0755 target/release/racer-dataplane /out/usr/local/bin/racer-dataplane
 
 FROM ${RUNTIME_IMAGE}
-ARG RACER_NATIVE_RDMA=false
+ARG RACER_NATIVE_RDMA=true
 ARG VERSION=dev
 ARG GIT_COMMIT=unknown
 LABEL org.opencontainers.image.title="racer-dataplane" \

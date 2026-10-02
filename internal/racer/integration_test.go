@@ -619,9 +619,11 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 		t.Fatal(err)
 	}
 
-	ds.Spec.Template.Spec.Containers[0].SecurityContext.Privileged = ptr.To(true)
+	if !ptr.Deref(ds.Spec.Template.Spec.Containers[0].SecurityContext.ReadOnlyRootFilesystem, false) {
+		t.Fatal("operator-owned workload must initially have a read-only root filesystem")
+	}
 
-	ds.Spec.Template.Spec.Containers[0].SecurityContext.AllowPrivilegeEscalation = ptr.To(true)
+	ds.Spec.Template.Spec.Containers[0].SecurityContext.ReadOnlyRootFilesystem = ptr.To(false)
 	if err := c.Update(t.Context(), ds); err != nil {
 		t.Fatal(err)
 	}
@@ -632,6 +634,10 @@ func integrationManagers(t *testing.T, rc *rest.Config, scheme *runtime.Scheme, 
 
 	if err := c.Get(t.Context(), client.ObjectKeyFromObject(ds), ds); err != nil || ds.ResourceVersion != rv {
 		t.Fatalf("Racer manager mutated an operator-owned workload: %v", err)
+	}
+
+	if ptr.Deref(ds.Spec.Template.Spec.Containers[0].SecurityContext.ReadOnlyRootFilesystem, true) {
+		t.Fatal("Racer manager reverted operator-owned security drift")
 	}
 
 	peer := integrationEnrollment(t, rc, c, apps[follower], ds, roots)

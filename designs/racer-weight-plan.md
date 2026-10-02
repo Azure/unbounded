@@ -147,8 +147,10 @@ Do not interpret output from a nonzero exit as success.
 The helper GETs only the installation/version ConfigMaps, Nodes, relevant Pods and
 DaemonSets through the explicit authenticated Kubernetes context. It reconstructs
 the full canonical membership document from last-admitted records and requires its
-SHA-256 to equal the durable membership hash. Canonical field order, omitted site
-and NUMA fields, Unicode escaping and no trailing newline match the wire codec.
+SHA-256 to equal the durable membership hash. Canonical field order, required
+explicit `site` and `rdma_nics`, omitted optional NIC GID/NUMA fields, Unicode
+escaping and no trailing newline must match the current wire codec. A helper
+using the former rails or omitted-Site format must be updated before use.
 Installation UID binding and positive monotonic-counter shape are checked.
 Annotations alone or version counters alone are never sufficient.
 

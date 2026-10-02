@@ -325,9 +325,11 @@ func DesiredDaemonSet(c WorkloadConfig) (*appsv1.DaemonSet, error) {
 							FailureThreshold: 1,
 						},
 						SecurityContext: &corev1.SecurityContext{
-							AllowPrivilegeEscalation: ptr.To(false),
+							// Native verbs require host device access. Privileged mode
+							// implies escalation and all capabilities; do not claim otherwise.
+							Privileged:               ptr.To(true),
+							AllowPrivilegeEscalation: ptr.To(true),
 							ReadOnlyRootFilesystem:   ptr.To(true),
-							Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 						},
 						VolumeMounts: []corev1.VolumeMount{
 							{
@@ -352,6 +354,13 @@ func DesiredDaemonSet(c WorkloadConfig) (*appsv1.DaemonSet, error) {
 								Name:      "sockets",
 								MountPath: "/run/racer",
 							},
+							{
+								Name:      "infiniband",
+								MountPath: "/dev/infiniband",
+								// Protect directory entries, not device I/O or the host
+								// from this privileged container.
+								ReadOnly: true,
+							},
 						},
 					}},
 					Volumes: projectedVolumes,
@@ -365,7 +374,9 @@ func DesiredDaemonSet(c WorkloadConfig) (*appsv1.DaemonSet, error) {
 		ds.Spec.Template.Spec.DNSPolicy = corev1.DNSClusterFirstWithHostNet
 	}
 
-	for _, mount := range []struct{ name, path string }{{"identity", "/var/lib/racer/identity"}, {"slabs", "/var/lib/racer/slabs"}, {"sockets", "/run/racer"}} {
+	// DirectoryOrCreate also permits HTTP-only nodes without RDMA hardware.
+	// Kubelet creates an empty /dev/infiniband; it does not create device nodes.
+	for _, mount := range []struct{ name, path string }{{"identity", "/var/lib/racer/identity"}, {"slabs", "/var/lib/racer/slabs"}, {"sockets", "/run/racer"}, {"infiniband", "/dev/infiniband"}} {
 		ds.Spec.Template.Spec.Volumes = append(ds.Spec.Template.Spec.Volumes, corev1.Volume{Name: mount.name, VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: mount.path, Type: ptr.To(corev1.HostPathDirectoryOrCreate)}}})
 	}
 

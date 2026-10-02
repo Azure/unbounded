@@ -16,6 +16,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 
 	"github.com/Azure/unbounded/internal/racer/wire"
 )
@@ -84,7 +85,7 @@ func TestWorkloadProjectionAndStorage(t *testing.T) {
 		t.Fatal("only controller CA trust may be projected as cryptographic material")
 	}
 
-	for _, name := range []string{"identity", "slabs", "sockets"} {
+	for _, name := range []string{"identity", "slabs", "sockets", "infiniband"} {
 		if volumes[name].HostPath == nil || *volumes[name].HostPath.Type != corev1.HostPathDirectoryOrCreate {
 			t.Fatalf("missing persistent host mount %s", name)
 		}
@@ -118,18 +119,65 @@ func TestWorkloadProjectionAndStorage(t *testing.T) {
 	}
 
 	wantMounts := map[string]corev1.VolumeMount{
-		"token":     {Name: "token", MountPath: "/var/run/racer-token", ReadOnly: true},
-		"bootstrap": {Name: "bootstrap", MountPath: "/etc/racer/bootstrap", ReadOnly: true},
-		"identity":  {Name: "identity", MountPath: "/var/lib/racer/identity"},
-		"slabs":     {Name: "slabs", MountPath: "/var/lib/racer/slabs"},
-		"sockets":   {Name: "sockets", MountPath: "/run/racer"},
+		"token":      {Name: "token", MountPath: "/var/run/racer-token", ReadOnly: true},
+		"bootstrap":  {Name: "bootstrap", MountPath: "/etc/racer/bootstrap", ReadOnly: true},
+		"identity":   {Name: "identity", MountPath: "/var/lib/racer/identity"},
+		"slabs":      {Name: "slabs", MountPath: "/var/lib/racer/slabs"},
+		"sockets":    {Name: "sockets", MountPath: "/run/racer"},
+		"infiniband": {Name: "infiniband", MountPath: "/dev/infiniband", ReadOnly: true},
 	}
 	if !reflect.DeepEqual(mounts, wantMounts) {
-		t.Fatal("mounts must retain token, controller trust, private identity, slabs and sockets only")
+		t.Fatal("mounts must retain token, controller trust, private identity, slabs, sockets and RDMA devices only")
 	}
 
 	if len(pod.Containers[0].Args) != 0 || len(pod.Containers[0].Command) != 0 {
 		t.Fatal("workload must use the image entrypoint")
+	}
+}
+
+func TestWorkloadNativeRDMAAccess(t *testing.T) {
+	for _, hostNetwork := range []bool{false, true} {
+		t.Run(strconv.FormatBool(hostNetwork), func(t *testing.T) {
+			cfg := workloadConfig(t)
+			cfg.HostNetwork = hostNetwork
+
+			ds, err := DesiredDaemonSet(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			pod := ds.Spec.Template.Spec
+			if pod.HostNetwork != hostNetwork || pod.HostPID || pod.HostIPC {
+				t.Fatal("RDMA access must not implicitly enable host namespaces")
+			}
+
+			wantSecurity := &corev1.SecurityContext{
+				Privileged: ptr.To(true), AllowPrivilegeEscalation: ptr.To(true), ReadOnlyRootFilesystem: ptr.To(true),
+			}
+			if !reflect.DeepEqual(pod.Containers[0].SecurityContext, wantSecurity) || !reflect.DeepEqual(pod.SecurityContext, &corev1.PodSecurityContext{RunAsUser: ptr.To(int64(0))}) {
+				t.Fatal("native dataplane must explicitly run privileged as root with a read-only rootfs")
+			}
+
+			wantVolume := corev1.Volume{Name: "infiniband", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
+				Path: "/dev/infiniband", Type: ptr.To(corev1.HostPathDirectoryOrCreate),
+			}}}
+
+			if len(pod.Volumes) != 6 {
+				t.Fatalf("unexpected volumes: %v", pod.Volumes)
+			}
+
+			found := false
+
+			for _, volume := range pod.Volumes {
+				if volume.Name == "infiniband" {
+					found = reflect.DeepEqual(volume, wantVolume)
+				}
+			}
+
+			if !found {
+				t.Fatal("RDMA hostPath must tolerate an absent directory on HTTP-only nodes")
+			}
+		})
 	}
 }
 

@@ -23,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -250,6 +251,12 @@ func TestLifecycleWithoutSites(t *testing.T) {
 	for _, name := range []string{"identity", "slabs", "sockets"} {
 		require.NotNil(t, volumes[name].HostPath)
 	}
+
+	require.Equal(t, &corev1.HostPathVolumeSource{Path: "/dev/infiniband", Type: ptr.To(corev1.HostPathDirectoryOrCreate)}, volumes["infiniband"].HostPath)
+	require.Contains(t, ds.Spec.Template.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{Name: "infiniband", MountPath: "/dev/infiniband", ReadOnly: true})
+	require.Equal(t, &corev1.SecurityContext{
+		Privileged: ptr.To(true), AllowPrivilegeEscalation: ptr.To(true), ReadOnlyRootFilesystem: ptr.To(true),
+	}, ds.Spec.Template.Spec.Containers[0].SecurityContext)
 
 	for _, name := range []string{"racer-credentials"} {
 		require.NoError(t, env.Client.Get(t.Context(), objectKey(env, name), &corev1.Secret{}))

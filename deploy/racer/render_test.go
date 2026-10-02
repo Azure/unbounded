@@ -72,6 +72,16 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 				t.Fatal("dataplane defaults must leave worker sizing automatic")
 			}
 
+			if dataplaneConfig.Data["RACER_ENABLE_RDMA"] != "auto" {
+				t.Fatal("native RDMA must default to automatic hardware discovery")
+			}
+
+			for _, legacy := range []string{"RACER_RAILS", "RACER_ALIGNED_RAILS"} {
+				if _, present := dataplaneConfig.Data[legacy]; present {
+					t.Fatalf("unsupported legacy setting: %s", legacy)
+				}
+			}
+
 			for key, value := range config.Data {
 				t.Setenv(key, value)
 			}
@@ -115,6 +125,11 @@ func TestRenderedDeploymentWorkloadContract(t *testing.T) {
 				if volumes[name].HostPath == nil {
 					t.Fatalf("node-local %s mount missing", name)
 				}
+			}
+
+			rdma := volumes["infiniband"].HostPath
+			if rdma == nil || rdma.Path != "/dev/infiniband" || rdma.Type == nil || *rdma.Type != corev1.HostPathDirectoryOrCreate {
+				t.Fatal("RDMA mount must tolerate nodes without device directories")
 			}
 
 			for _, variable := range ds.Spec.Template.Spec.Containers[0].Env {
