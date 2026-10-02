@@ -3,7 +3,6 @@ use super::wire::{Publication, PublicationSequence};
 use crate::{
     error::{Error, Result},
     model::{CacheId, ClusterId, KeyId, MembershipVersion},
-    runtime::collections::HashSet,
     security::identity::{KeyPurpose, Keyring},
     topology::membership::{Membership, MembershipLease},
 };
@@ -366,43 +365,11 @@ pub trait CacheTransition {
     fn commit(self: Box<Self>);
 }
 pub fn canonical_socket_paths(name: &str) -> Result<(PathBuf, PathBuf)> {
-    if name.is_empty()
-        || name.len() > 253
-        || !name.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && label.bytes().enumerate().all(|(i, b)| {
-                    b.is_ascii_lowercase()
-                        || b.is_ascii_digit()
-                        || b == b'-' && i != 0 && i + 1 != label.len()
-                })
-        })
-    {
-        return Err(Error::InvalidRequest);
-    }
-    let client = format!("/run/racer/{name}/client/socket");
-    let origin = format!("/run/racer/{name}/origin/socket");
-    if client.len() > 107 || origin.len() > 107 {
-        return Err(Error::InvalidRequest);
-    }
-    Ok((client.into(), origin.into()))
+    Ok(racer_control_wire::canonical_socket_paths(name)?)
 }
 pub fn validate_definitions(definitions: &[CacheDefinition]) -> Result<()> {
-    let mut ids = HashSet::default();
-    let mut names = HashSet::default();
-    for d in definitions {
-        if !super::wire::valid_uuid(&d.id.0) || !ids.insert(&d.id) || !names.insert(&d.name) {
-            return Err(Error::InvalidRequest);
-        }
-        let (client, origin) = canonical_socket_paths(&d.name)?;
-        // Path equality normalizes separators; the wire requires exact strings.
-        if d.client_socket.as_os_str() != client.as_os_str()
-            || d.origin_socket.as_os_str() != origin.as_os_str()
-        {
-            return Err(Error::InvalidRequest);
-        }
-    }
-    Ok(())
+    let definitions: Vec<_> = definitions.iter().cloned().map(Into::into).collect();
+    Ok(racer_control_wire::validate_definitions(&definitions)?)
 }
 
 /// Current positive admission set, shared by cache lookups and late publications.

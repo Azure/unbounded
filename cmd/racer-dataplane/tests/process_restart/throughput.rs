@@ -920,7 +920,8 @@ fn production_peer_and_failed_neighbor_progress() {
                 site: String::new(),
             })
             .collect();
-        control.publication.lock().unwrap().members = members.clone();
+        control.publication.lock().unwrap().members =
+            members.iter().cloned().map(Into::into).collect();
         let membership =
             Arc::new(Membership::validate(MembershipVersion(1), members.clone()).unwrap());
         let placement = Placement::new(128);
@@ -1051,7 +1052,8 @@ fn production_remote_bootstrap_one_get_and_empty() {
                 site: String::new(),
             })
             .collect();
-        control.publication.lock().unwrap().members = members.clone();
+        control.publication.lock().unwrap().members =
+            members.iter().cloned().map(Into::into).collect();
         let membership = Arc::new(Membership::validate(MembershipVersion(1), members).unwrap());
         let ranked = Placement::new(128)
             .rank(

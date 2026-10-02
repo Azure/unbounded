@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "runtime", "alloc", "crypto", "verbs", "http", "topology", "telemetry", "flow", "rest"]
+members = [".", "runtime", "alloc", "crypto", "verbs", "http", "topology", "telemetry", "flow", "rest", "control-wire"]
 resolver = "3"
 
 [package]
@@ -22,6 +22,7 @@ path = "tests/subscription_interop.rs"
 required-features = ["subscription-interop"]
 
 [dependencies]
+racer-control-wire = { path = "control-wire" }
 flow-control = { path = "flow" }
 rest-client = { path = "rest" }
 topology = { path = "topology" }

@@ -169,9 +169,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             bin/racer-cargo
-          key: racer-rust-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/Cargo.toml', 'cmd/racer-dataplane/runtime/Cargo.toml', 'cmd/racer-dataplane/alloc/Cargo.toml', 'cmd/racer-dataplane/flow/Cargo.toml', 'cmd/racer-dataplane/crypto/Cargo.toml', 'cmd/racer-dataplane/verbs/Cargo.toml', 'cmd/racer-dataplane/http/Cargo.toml', 'cmd/racer-dataplane/rest/Cargo.toml', 'cmd/racer-dataplane/telemetry/Cargo.toml') }}-${{ github.sha }}
+          key: racer-rust-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/Cargo.toml', 'cmd/racer-dataplane/runtime/Cargo.toml', 'cmd/racer-dataplane/alloc/Cargo.toml', 'cmd/racer-dataplane/flow/Cargo.toml', 'cmd/racer-dataplane/crypto/Cargo.toml', 'cmd/racer-dataplane/verbs/Cargo.toml', 'cmd/racer-dataplane/http/Cargo.toml', 'cmd/racer-dataplane/rest/Cargo.toml', 'cmd/racer-dataplane/telemetry/Cargo.toml', 'cmd/racer-dataplane/control-wire/Cargo.toml') }}-${{ github.sha }}
           restore-keys: |
-            racer-rust-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/Cargo.toml', 'cmd/racer-dataplane/runtime/Cargo.toml', 'cmd/racer-dataplane/alloc/Cargo.toml', 'cmd/racer-dataplane/flow/Cargo.toml', 'cmd/racer-dataplane/crypto/Cargo.toml', 'cmd/racer-dataplane/verbs/Cargo.toml', 'cmd/racer-dataplane/http/Cargo.toml', 'cmd/racer-dataplane/rest/Cargo.toml', 'cmd/racer-dataplane/telemetry/Cargo.toml') }}-
+            racer-rust-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/Cargo.toml', 'cmd/racer-dataplane/runtime/Cargo.toml', 'cmd/racer-dataplane/alloc/Cargo.toml', 'cmd/racer-dataplane/flow/Cargo.toml', 'cmd/racer-dataplane/crypto/Cargo.toml', 'cmd/racer-dataplane/verbs/Cargo.toml', 'cmd/racer-dataplane/http/Cargo.toml', 'cmd/racer-dataplane/rest/Cargo.toml', 'cmd/racer-dataplane/telemetry/Cargo.toml', 'cmd/racer-dataplane/control-wire/Cargo.toml') }}-
 
       - name: Check native adapter and complete Rust suite with bounded memory
         # A system service works without a user systemd manager on hosted runners.
@@ -253,9 +253,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             bin/racer-cargo
-          key: racer-rust-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/Cargo.toml', 'cmd/racer-dataplane/runtime/Cargo.toml', 'cmd/racer-dataplane/alloc/Cargo.toml', 'cmd/racer-dataplane/flow/Cargo.toml', 'cmd/racer-dataplane/crypto/Cargo.toml', 'cmd/racer-dataplane/verbs/Cargo.toml', 'cmd/racer-dataplane/http/Cargo.toml', 'cmd/racer-dataplane/rest/Cargo.toml', 'cmd/racer-dataplane/telemetry/Cargo.toml') }}-${{ github.sha }}
+          key: racer-rust-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/Cargo.toml', 'cmd/racer-dataplane/runtime/Cargo.toml', 'cmd/racer-dataplane/alloc/Cargo.toml', 'cmd/racer-dataplane/flow/Cargo.toml', 'cmd/racer-dataplane/crypto/Cargo.toml', 'cmd/racer-dataplane/verbs/Cargo.toml', 'cmd/racer-dataplane/http/Cargo.toml', 'cmd/racer-dataplane/rest/Cargo.toml', 'cmd/racer-dataplane/telemetry/Cargo.toml', 'cmd/racer-dataplane/control-wire/Cargo.toml') }}-${{ github.sha }}
           restore-keys: |
-            racer-rust-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/Cargo.toml', 'cmd/racer-dataplane/runtime/Cargo.toml', 'cmd/racer-dataplane/alloc/Cargo.toml', 'cmd/racer-dataplane/flow/Cargo.toml', 'cmd/racer-dataplane/crypto/Cargo.toml', 'cmd/racer-dataplane/verbs/Cargo.toml', 'cmd/racer-dataplane/http/Cargo.toml', 'cmd/racer-dataplane/rest/Cargo.toml', 'cmd/racer-dataplane/telemetry/Cargo.toml') }}-
+            racer-rust-${{ runner.os }}-${{ runner.arch }}-1.96.0-${{ hashFiles('cmd/racer-dataplane/Cargo.lock', 'cmd/racer-dataplane/Cargo.toml', 'cmd/racer-dataplane/runtime/Cargo.toml', 'cmd/racer-dataplane/alloc/Cargo.toml', 'cmd/racer-dataplane/flow/Cargo.toml', 'cmd/racer-dataplane/crypto/Cargo.toml', 'cmd/racer-dataplane/verbs/Cargo.toml', 'cmd/racer-dataplane/http/Cargo.toml', 'cmd/racer-dataplane/rest/Cargo.toml', 'cmd/racer-dataplane/telemetry/Cargo.toml', 'cmd/racer-dataplane/control-wire/Cargo.toml') }}-
 
       - name: Prebuild Go SDK fixture
         run: timeout --signal=TERM --kill-after=10s 300s make racer-sdk-age-build

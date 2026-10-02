@@ -657,6 +657,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "racer-control-wire"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "serde",
+ "serde_json",
+ "sha2",
+ "x509-parser",
+ "zeroize",
+]
+
+[[package]]
 name = "racer-crypto"
 version = "0.1.0"
 dependencies = [
@@ -681,6 +693,7 @@ dependencies = [
  "io-uring",
  "libc",
  "page-alloc",
+ "racer-control-wire",
  "racer-crypto",
  "rcgen",
  "rdma-verbs",

@@ -1,5 +1,5 @@
 use super::*;
-use crate::control::state::canonical_socket_paths;
+use crate::canonical_socket_paths;
 use sha2::{Digest, Sha256};
 
 fn content_hashes(p: &Publication) -> Result<(String, String)> {
@@ -12,7 +12,7 @@ fn content_hashes(p: &Publication) -> Result<(String, String)> {
 
 const ROOT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../internal/racer/wire/testdata/"
+    "/../../../internal/racer/wire/testdata/"
 );
 fn fixture(name: &str) -> Vec<u8> {
     let mut b = std::fs::read(format!("{ROOT}{name}")).unwrap();

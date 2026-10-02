@@ -147,13 +147,7 @@ impl Membership {
 }
 
 pub(crate) fn valid_site(value: &str) -> bool {
-    value.is_empty()
-        || (value.len() <= 63
-            && value.as_bytes()[0].is_ascii_alphanumeric()
-            && value.as_bytes()[value.len() - 1].is_ascii_alphanumeric()
-            && value
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')))
+    racer_control_wire::valid_site(value)
 }
 
 fn valid_identity(value: &str) -> bool {

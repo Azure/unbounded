@@ -43,11 +43,7 @@ pub(crate) fn parse_decimal(value: &[u8]) -> Result<u64> {
 // Keys are exactly 32 bytes. Strong ETags are opaque version identifiers, not
 // content hashes. Placement excludes ETag; page cache and flight identity include it.
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ClusterId(pub String);
-/// Kubernetes ClusterCache UID, not its reusable resource name.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct CacheId(pub String);
+pub use racer_control_wire::{CacheId, ClusterId, MembershipVersion, NodeId};
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CacheKey(pub [u8; 32]);
 
@@ -80,9 +76,6 @@ impl CacheKey {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-/// Kubernetes Node UID, not its reusable resource name.
-pub struct NodeId(pub String);
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct StrongEtag(String);
 
@@ -122,8 +115,6 @@ impl StrongEtag {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PageNumber(pub u64);
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct MembershipVersion(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RequestId(pub [u8; 16]);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

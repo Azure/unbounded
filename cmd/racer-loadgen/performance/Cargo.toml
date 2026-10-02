@@ -9,7 +9,7 @@ name = "racer-performance-control"
 path = "control.rs"
 
 [dependencies]
-racer-dataplane = { path = "../../racer-dataplane" }
+racer-control-wire = { path = "../../racer-dataplane/control-wire" }
 base64 = "0.22"
 getrandom = "0.2"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
