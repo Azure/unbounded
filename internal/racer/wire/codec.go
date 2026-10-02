@@ -25,6 +25,8 @@ func DecodeBootstrap(r io.Reader) (BootstrapRequest, error) {
 		return BootstrapRequest{}, err
 	}
 
+	v.RDMANICs = CanonicalRDMANICs(v.RDMANICs)
+
 	return v, nil
 }
 
@@ -40,6 +42,8 @@ func EncodeBootstrapRequest(v BootstrapRequest) ([]byte, error) {
 	if err := ValidateBootstrapRequest(v); err != nil {
 		return nil, err
 	}
+
+	v.RDMANICs = CanonicalRDMANICs(v.RDMANICs)
 
 	return encode(v, MaxBootstrapBytes)
 }
@@ -57,22 +61,71 @@ func DecodeBootstrapResponse(r io.Reader) (BootstrapResponse, error) {
 	return v, nil
 }
 
-// DecodeRails decodes a Node annotation using the strict JSON contract, bounded
-// by Kubernetes' total annotation size limit. Repeated rail IDs are preserved for
-// the membership reconciler to deduplicate or reject conflicting mappings.
-func DecodeRails(r io.Reader) ([]Rail, error) {
-	var rails []Rail
-	if err := decode(r, 256*1024, &rails); err != nil {
+// DecodeRDMANICs strictly decodes a bounded NIC annotation and canonicalizes it.
+func DecodeRDMANICs(r io.Reader) ([]RDMANIC, error) {
+	var nics []RDMANIC
+	if err := decode(r, 256*1024, &nics); err != nil {
 		return nil, err
 	}
 
-	for _, rail := range rails {
-		if !validRail(rail) {
-			return nil, InvalidRequest
-		}
+	if err := validateRDMANICs(nics); err != nil {
+		return nil, err
 	}
 
-	return rails, nil
+	return CanonicalRDMANICs(nics), nil
+}
+
+// DecodeAdmittedMember accepts pre-NIC persisted records only for restart
+// continuity. Legacy rails never become NICs. New records use the strict wire
+// shape, including required arrays and rejection of duplicate fields.
+func DecodeAdmittedMember(r io.Reader) (Member, error) {
+	b, err := io.ReadAll(io.LimitReader(r, MaxBootstrapBytes+1))
+	if err != nil {
+		return Member{}, InvalidRequest
+	}
+
+	if len(b) > MaxBootstrapBytes {
+		return Member{}, TooLarge
+	}
+
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(b, &fields) != nil {
+		return Member{}, InvalidRequest
+	}
+
+	var member Member
+	if _, present := fields["rdma_nics"]; present {
+		if err := decode(bytes.NewReader(b), MaxBootstrapBytes, &member); err != nil {
+			return Member{}, err
+		}
+	} else {
+		var legacy struct {
+			Node         NodeID `json:"node"`
+			Shares       uint32 `json:"shares"`
+			PeerEndpoint string `json:"peer_endpoint"`
+			Rails        []struct {
+				Rail     uint16  `json:"rail"`
+				Fabric   string  `json:"fabric"`
+				NUMANode *uint32 `json:"numa_node,omitempty"`
+			} `json:"rails"`
+			AlignmentEnabled bool   `json:"alignment_enabled"`
+			Site             string `json:"site,omitempty"`
+		}
+		if err := decode(bytes.NewReader(b), MaxBootstrapBytes, &legacy); err != nil {
+			return Member{}, err
+		}
+
+		member = Member{Node: legacy.Node, Shares: legacy.Shares, PeerEndpoint: legacy.PeerEndpoint, Site: legacy.Site, RDMANICs: []RDMANIC{}}
+	}
+
+	probe := Publication{SchemaVersion: SchemaVersion, Cluster: ClusterID(member.Node), Sequence: 1, MembershipVersion: 1, Members: []Member{member}}
+	if err := validatePublication(probe, true); err != nil {
+		return Member{}, err
+	}
+
+	member.RDMANICs = CanonicalRDMANICs(member.RDMANICs)
+
+	return member, nil
 }
 
 type bundleJSON struct {
@@ -375,6 +428,10 @@ func checkShape(v any, t reflect.Type, quoted bool) error {
 				return InvalidRequest
 			}
 
+			if t == reflect.TypeFor[RDMANIC]() && tag[0] == "gid" && value == "" {
+				return InvalidRequest
+			}
+
 			if err := checkShape(value, f.Type, len(tag) > 1 && tag[1] == "string"); err != nil {
 				return err
 			}
@@ -409,6 +466,10 @@ func checkShape(v any, t reflect.Type, quoted bool) error {
 			return TooLarge
 		}
 
+		if t.Elem() == reflect.TypeFor[RDMANIC]() && len(a) > MaxRDMANICs {
+			return TooLarge
+		}
+
 		for _, x := range a {
 			if err := checkShape(x, t.Elem(), false); err != nil {
 				return err
@@ -422,7 +483,7 @@ func checkShape(v any, t reflect.Type, quoted bool) error {
 		if _, ok := v.(bool); !ok {
 			return InvalidRequest
 		}
-	case reflect.Uint16, reflect.Uint32, reflect.Uint64:
+	case reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		var s string
 
 		if quoted {

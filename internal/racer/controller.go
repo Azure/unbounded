@@ -574,7 +574,7 @@ func nodeChanges() predicate.Predicate {
 			return false
 		}
 
-		for _, key := range []string{wire.SharesAnnotation, wire.RailsAnnotation, wire.AlignmentAnnotation, enrolledSharesAnnotation} {
+		for _, key := range []string{wire.SharesAnnotation, wire.RDMANICsAnnotation, enrolledRDMANICsAnnotation, wire.RailsAnnotation, wire.AlignmentAnnotation, enrolledSharesAnnotation} {
 			av, ap := a.GetAnnotations()[key]
 
 			bv, bp := b.GetAnnotations()[key]

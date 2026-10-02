@@ -96,6 +96,7 @@ func TestBootstrapAuthoritativeBindings(t *testing.T) {
 			a.Lifecycle.SetServingReady(true)
 			a.Server.tlsConfig(t.Context(), servingTestCertificate(t, 1, time.Now().Add(-time.Minute), time.Now().Add(time.Hour), nil, false))
 			_, enrollment, _ := issuanceRequest(t, a.Keyring)
+			enrollment.RDMANICs = []wire.RDMANIC{{Device: "mlx5_0", Port: 1}}
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -236,8 +237,8 @@ func TestBootstrapAuthoritativeBindings(t *testing.T) {
 						t.Fatal(err)
 					}
 
-					if node.Annotations[enrolledSharesAnnotation] != "" {
-						t.Fatal("rejected enrollment persisted shares")
+					if node.Annotations[enrolledSharesAnnotation] != "" || node.Annotations[enrolledRDMANICsAnnotation] != "" {
+						t.Fatal("rejected enrollment persisted hardware proposal")
 					}
 				}
 			}

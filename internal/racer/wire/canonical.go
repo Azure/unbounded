@@ -40,21 +40,38 @@ func canonicalPublication(v Publication) Publication {
 
 	v.Caches = append([]CacheDefinition{}, v.Caches...)
 	for i := range v.Members {
-		v.Members[i].Rails = append([]Rail{}, v.Members[i].Rails...)
-		for j := range v.Members[i].Rails {
-			if n := v.Members[i].Rails[j].NUMANode; n != nil {
-				value := *n
-				v.Members[i].Rails[j].NUMANode = &value
-			}
-		}
-
-		slices.SortFunc(v.Members[i].Rails, func(a, b Rail) int { return cmp.Compare(a.Rail, b.Rail) })
+		v.Members[i].RDMANICs = CanonicalRDMANICs(v.Members[i].RDMANICs)
 	}
 
 	slices.SortFunc(v.Members, func(a, b Member) int { return cmp.Compare(a.Node, b.Node) })
 	slices.SortFunc(v.Caches, func(a, b CacheDefinition) int { return cmp.Compare(a.ID, b.ID) })
 
 	return v
+}
+
+// CanonicalRDMANICs copies NICs, including nested pointers, in rail/device/port order.
+func CanonicalRDMANICs(nics []RDMANIC) []RDMANIC {
+	nics = append([]RDMANIC{}, nics...)
+	for i := range nics {
+		if n := nics[i].NUMANode; n != nil {
+			value := *n
+			nics[i].NUMANode = &value
+		}
+	}
+
+	slices.SortFunc(nics, func(a, b RDMANIC) int {
+		if n := cmp.Compare(a.Rail, b.Rail); n != 0 {
+			return n
+		}
+
+		if n := cmp.Compare(a.Device, b.Device); n != 0 {
+			return n
+		}
+
+		return cmp.Compare(a.Port, b.Port)
+	})
+
+	return nics
 }
 
 // CanonicalCandidate owns validated, sorted publication content, including nested

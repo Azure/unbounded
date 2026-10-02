@@ -105,7 +105,7 @@ func TestCanonicalHashSemantics(t *testing.T) {
 	v.Sequence, v.MembershipVersion = 0, 0
 	// Reorder all three collections. Hashing must not mutate caller-owned slices.
 	v.Members[0], v.Members[1] = v.Members[1], v.Members[0]
-	v.Members[0].Rails[0], v.Members[0].Rails[1] = v.Members[0].Rails[1], v.Members[0].Rails[0]
+	v.Members[0].RDMANICs[0], v.Members[0].RDMANICs[1] = v.Members[0].RDMANICs[1], v.Members[0].RDMANICs[0]
 
 	before, err := json.Marshal(v)
 	if err != nil {
@@ -138,8 +138,8 @@ func TestCanonicalHashSemantics(t *testing.T) {
 
 	for _, mutate := range []func(*Publication){
 		func(p *Publication) { p.Members[0].Shares-- },
-		func(p *Publication) { p.Members[0].AlignmentEnabled = !p.Members[0].AlignmentEnabled },
-		func(p *Publication) { p.Members[0].Rails[0].Fabric += "-new" },
+		func(p *Publication) { p.Members[0].RDMANICs[0].Port++ },
+		func(p *Publication) { p.Members[0].RDMANICs[0].Device += "-new" },
 		func(p *Publication) { p.Cluster = "aaaaaaaa-1111-4111-8111-111111111111" },
 	} {
 		mutate(&v)
@@ -246,7 +246,7 @@ func TestPublicationValidationAndLimits(t *testing.T) {
 
 	v.Caches = nil
 
-	v.Members[0].Rails = []Rail{{Fabric: strings.Repeat("x", MaxPublicationBytes)}}
+	v.Members[0].RDMANICs = []RDMANIC{{Device: strings.Repeat("x", MaxPublicationBytes), Port: 1}}
 	if _, err := EncodePublication(v); !errors.Is(err, TooLarge) {
 		t.Fatal("encoded byte limit", err)
 	}

@@ -125,7 +125,7 @@ func replicatedServingSmoke(t *testing.T, count int) {
 
 	for i := range peers {
 		id := wire.NodeID(fmt.Sprintf("22222222-2222-4222-8222-%012d", i))
-		members[id] = wire.Member{Node: id, Shares: 4, PeerEndpoint: fmt.Sprintf("10.%d.%d.%d:8082", i>>16, (i>>8)&255, i&255), Rails: []wire.Rail{}}
+		members[id] = wire.Member{Node: id, Shares: 4, PeerEndpoint: fmt.Sprintf("10.%d.%d.%d:8082", i>>16, (i>>8)&255, i&255), RDMANICs: []wire.RDMANIC{}}
 
 		pub, key, err := ed25519.GenerateKey(rand.Reader)
 		if err != nil {

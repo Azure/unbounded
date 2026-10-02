@@ -25,7 +25,7 @@ func TestMemberSiteWireValidation(t *testing.T) {
 			if site == "" {
 				require.Contains(t, string(encoded), `"site":""`)
 			} else {
-				require.Contains(t, string(encoded), `"alignment_enabled":true,"site":"`+site+`"`)
+				require.Contains(t, string(encoded), `"rdma_nics":[],"site":"`+site+`"`)
 			}
 
 			decoded, err := DecodePublication(bytes.NewReader(encoded))
@@ -54,7 +54,7 @@ func TestMemberSiteWireValidation(t *testing.T) {
 
 func TestMemberSiteJSONShape(t *testing.T) {
 	for _, value := range []string{`null`, `1`, `true`, `[]`, `{}`, `"a","site":"b"`} {
-		raw := strings.Replace(string(fixture(t, "publication.json")), `"alignment_enabled":true`, `"alignment_enabled":true,"site":`+value, 1)
+		raw := strings.Replace(string(fixture(t, "publication.json")), `"site":""`, `"site":`+value, 1)
 		_, err := DecodePublication(strings.NewReader(raw))
 		require.ErrorIs(t, err, InvalidRequest, "%s", value)
 	}

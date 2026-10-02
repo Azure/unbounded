@@ -103,7 +103,7 @@ func scaleCache(t *testing.T, r *TopologyReconciler, count int) cache.Cache {
 		uid := types.UID(fmt.Sprintf("%08x-0000-4000-8000-000000000000", i))
 		node := memberNode()
 		node.Name, node.UID, node.ResourceVersion = fmt.Sprintf("node-%d", i), uid, "1"
-		node.Annotations = map[string]string{wire.RailsAnnotation: `[{"rail":0,"fabric":"rack-a","numa_node":0},{"rail":1,"fabric":"rack-b","numa_node":1}]`}
+		node.Annotations = map[string]string{wire.RDMANICsAnnotation: `[{"rail":0,"device":"mlx5_0","port":1,"numa_node":0},{"rail":1,"device":"mlx5_1","port":1,"numa_node":1}]`}
 		pod := memberPod(uid, 1, fmt.Sprintf("10.%d.%d.%d", i>>16, (i>>8)&255, i&255))
 		pod.Spec.NodeName, pod.ResourceVersion = node.Name, "1"
 		pod.OwnerReferences[0].Name = r.Config.DaemonSetName

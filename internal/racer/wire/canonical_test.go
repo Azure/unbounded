@@ -89,8 +89,8 @@ func TestCanonicalCandidateOwnsNestedStateAndOutput(t *testing.T) {
 
 	// Mutate all caller-owned collections and the pointer nested in a rail before
 	// the candidate is first hashed or encoded.
-	*v.Members[1].Rails[1].NUMANode = 7
-	v.Members[1].Rails[0].Fabric = "changed"
+	*v.Members[1].RDMANICs[1].NUMANode = 7
+	v.Members[1].RDMANICs[0].Device = "changed"
 	v.Members[0].Shares = 0
 	v.Caches[0].Name = "changed"
 	clear(v.Members)
@@ -131,12 +131,12 @@ func TestCanonicalCandidateValidation(t *testing.T) {
 		{"duplicate node", func(v *Publication) { v.Members = append(v.Members, v.Members[0]) }, InvalidRequest},
 		{"shares", func(v *Publication) { v.Members[0].Shares = 0 }, InvalidRequest},
 		{"endpoint", func(v *Publication) { v.Members[0].PeerEndpoint = "192.0.2.1:0" }, InvalidRequest},
-		{"duplicate rail", func(v *Publication) { v.Members[1].Rails = append(v.Members[1].Rails, v.Members[1].Rails[0]) }, InvalidRequest},
-		{"fabric", func(v *Publication) { v.Members[1].Rails[0].Fabric = "\xff" }, InvalidRequest},
+		{"duplicate physical NIC", func(v *Publication) { v.Members[1].RDMANICs = append(v.Members[1].RDMANICs, v.Members[1].RDMANICs[0]) }, InvalidRequest},
+		{"device", func(v *Publication) { v.Members[1].RDMANICs[0].Device = "\xff" }, InvalidRequest},
 		{"duplicate cache", func(v *Publication) { v.Caches = append(v.Caches, v.Caches[0]) }, InvalidRequest},
 		{"socket", func(v *Publication) { v.Caches[0].ClientSocket += "x" }, InvalidRequest},
 		{"member limit", func(v *Publication) { v.Members = make([]Member, MaxMembers+1) }, TooLarge},
-		{"byte lower bound", func(v *Publication) { v.Members[1].Rails[0].Fabric = strings.Repeat("x", MaxPublicationBytes) }, TooLarge},
+		{"byte lower bound", func(v *Publication) { v.Members[1].RDMANICs[0].Device = strings.Repeat("x", MaxPublicationBytes) }, TooLarge},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			v, err := DecodePublication(bytes.NewReader(fixture(t, "publication.json")))
@@ -181,7 +181,7 @@ func TestCanonicalCandidateValidation(t *testing.T) {
 func TestCanonicalCandidateFinalByteBound(t *testing.T) {
 	v := Publication{
 		SchemaVersion: SchemaVersion, Cluster: "11111111-1111-4111-8111-111111111111", Sequence: 1, MembershipVersion: 1,
-		Members: []Member{{Node: "22222222-2222-4222-8222-222222222222", Shares: 1, PeerEndpoint: "192.0.2.1:1", Rails: []Rail{{Fabric: "x"}}}},
+		Members: []Member{{Node: "22222222-2222-4222-8222-222222222222", Shares: 1, PeerEndpoint: "192.0.2.1:1", RDMANICs: []RDMANIC{{Device: "x", Port: 1}}}},
 	}
 
 	b, err := EncodePublication(v)
@@ -191,7 +191,7 @@ func TestCanonicalCandidateFinalByteBound(t *testing.T) {
 
 	// Escaping expands tabs to two bytes while staying below the cheap input bound.
 	padding := MaxPublicationBytes - len(b)
-	v.Members[0].Rails[0].Fabric += strings.Repeat("\t", padding/2) + strings.Repeat("x", padding%2)
+	v.Members[0].RDMANICs[0].Device += strings.Repeat("\t", padding/2) + strings.Repeat("x", padding%2)
 
 	candidate, err := NewCanonicalCandidate(v)
 	if err != nil {
@@ -213,7 +213,7 @@ func TestCanonicalCandidateFinalByteBound(t *testing.T) {
 		}
 	}
 
-	v.Members[0].Rails[0].Fabric += strings.Repeat("\t", 100)
+	v.Members[0].RDMANICs[0].Device += strings.Repeat("\t", 100)
 
 	candidate, err = NewCanonicalCandidate(v)
 	if err != nil {

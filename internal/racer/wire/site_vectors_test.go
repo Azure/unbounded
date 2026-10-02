@@ -114,7 +114,7 @@ func TestSharedSiteVectors(t *testing.T) {
 			if step.site == "" {
 				require.Contains(t, string(encoded), `"site":""`)
 			} else {
-				require.Contains(t, string(encoded), `"alignment_enabled":true,"site":"`+step.site+`"`)
+				require.Contains(t, string(encoded), `"rdma_nics":[],"site":"`+step.site+`"`)
 			}
 
 			candidate, err := NewCanonicalCandidate(p)
@@ -193,6 +193,28 @@ func regenerateSharedVectors(t *testing.T) {
 
 	var p Publication
 	require.NoError(t, json.Unmarshal(fixture(t, "publication.json"), &p))
+	// Upgrade old fixture input without retaining legacy wire fields. Preserve
+	// deliberately unsorted members/NICs and escaped text for canonical tests.
+	var old struct {
+		Members []struct {
+			Rails []struct {
+				Rail     uint16
+				Fabric   string
+				NUMANode *uint32 `json:"numa_node"`
+			}
+		}
+	}
+	require.NoError(t, json.Unmarshal(fixture(t, "publication.json"), &old))
+
+	for i := range p.Members {
+		if p.Members[i].RDMANICs == nil {
+			p.Members[i].RDMANICs = []RDMANIC{}
+			for _, rail := range old.Members[i].Rails {
+				p.Members[i].RDMANICs = append(p.Members[i].RDMANICs, RDMANIC{Device: rail.Fabric, Port: 1, Rail: rail.Rail, NUMANode: rail.NUMANode})
+			}
+		}
+	}
+
 	b, err := json.Marshal(p)
 	require.NoError(t, err)
 	write("publication.json", b)
@@ -216,6 +238,60 @@ func regenerateSharedVectors(t *testing.T) {
 	b, err = EncodeBootstrapRequest(request)
 	require.NoError(t, err)
 	write("bootstrap-request.json", b)
+
+	var rejections []struct {
+		Name string    `json:"name"`
+		File string    `json:"file"`
+		Old  string    `json:"old"`
+		New  string    `json:"new"`
+		Code ErrorCode `json:"code"`
+	}
+	require.NoError(t, json.Unmarshal(fixture(t, "rejections.json"), &rejections))
+
+	for i := range rejections {
+		switch rejections[i].Name {
+		case "missing required field":
+			rejections[i].Old, rejections[i].New = `"rdma_nics":[]`, `"ignored_nics":[]`
+		case "duplicate rail":
+			rejections[i].Name = "zero NIC port"
+			rejections[i].Old, rejections[i].New = `"port":1`, `"port":0`
+		case "empty fabric":
+			rejections[i].Name = "empty device"
+		}
+	}
+
+	for _, addition := range []struct{ name, file, old, new string }{
+		{"missing bootstrap NIC report", "bootstrap-request.json", `"rdma_nics":[],`, ""},
+		{"null bootstrap NIC report", "bootstrap-request.json", `"rdma_nics":[]`, `"rdma_nics":null`},
+		{"legacy bootstrap rails", "bootstrap-request.json", `"rdma_nics":[]`, `"rails":[]`},
+		{"legacy member rails", "publication.json", `"rdma_nics":[]`, `"rails":[],"alignment_enabled":true`},
+		{"overflow NIC port", "publication.json", `"port":1`, `"port":256`},
+		{"null NIC GID", "publication.json", `"port":1`, `"port":1,"gid":null`},
+		{"empty NIC GID", "publication.json", `"port":1`, `"port":1,"gid":""`},
+		{"uppercase NIC GID", "publication.json", `"port":1`, `"port":1,"gid":"ABCDEF0123456789abcdef0123456789"`},
+	} {
+		found := false
+
+		for _, rejection := range rejections {
+			if rejection.Name == addition.name {
+				found = true
+			}
+		}
+
+		if !found {
+			rejections = append(rejections, struct {
+				Name string    `json:"name"`
+				File string    `json:"file"`
+				Old  string    `json:"old"`
+				New  string    `json:"new"`
+				Code ErrorCode `json:"code"`
+			}{addition.name, addition.file, addition.old, addition.new, InvalidRequest})
+		}
+	}
+
+	b, err = json.MarshalIndent(rejections, "", "  ")
+	require.NoError(t, err)
+	write("rejections.json", b)
 	write("bootstrap-response.json", fixture(t, "bootstrap-response.json"))
 
 	var bundle bundleJSON

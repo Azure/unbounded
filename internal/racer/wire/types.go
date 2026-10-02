@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"net/netip"
 	"strconv"
 	"strings"
@@ -33,6 +34,8 @@ const (
 	CertificateLifetime = 24 * time.Hour
 	DefaultShares       = 4
 	SharesAnnotation    = "racer.unbounded-cloud.io/shares"
+	RDMANICsAnnotation  = "racer.unbounded-cloud.io/rdma-nics"
+	MaxRDMANICs         = 64
 	RailsAnnotation     = "racer.unbounded-cloud.io/rails"
 	AlignmentAnnotation = "racer.unbounded-cloud.io/aligned-rails"
 	ExclusionLabel      = "racer.unbounded-cloud.io/exclude"
@@ -48,18 +51,19 @@ type (
 	Generation        uint64
 )
 
-type Rail struct {
+type RDMANIC struct {
+	Device   string  `json:"device"`
+	Port     uint8   `json:"port"`
 	Rail     uint16  `json:"rail"`
-	Fabric   string  `json:"fabric"`
+	GID      string  `json:"gid,omitempty"`
 	NUMANode *uint32 `json:"numa_node,omitempty"`
 }
 
 type Member struct {
-	Node             NodeID `json:"node"`
-	Shares           uint32 `json:"shares"`
-	PeerEndpoint     string `json:"peer_endpoint"`
-	Rails            []Rail `json:"rails"`
-	AlignmentEnabled bool   `json:"alignment_enabled"`
+	Node         NodeID    `json:"node"`
+	Shares       uint32    `json:"shares"`
+	PeerEndpoint string    `json:"peer_endpoint"`
+	RDMANICs     []RDMANIC `json:"rdma_nics"`
 	// Site is the RDMA boundary. Empty means HTTP-only, not a shared default site.
 	Site string `json:"site"`
 }
@@ -84,6 +88,7 @@ type Publication struct {
 // token for each issuance attempt and supplies it in Authorization.
 type BootstrapRequest struct {
 	Shares        uint32       `json:"shares"`
+	RDMANICs      []RDMANIC    `json:"rdma_nics"`
 	SchemaVersion uint32       `json:"schema_version"`
 	Cluster       ClusterID    `json:"cluster"`
 	Enrollment    EnrollmentID `json:"enrollment"`
@@ -207,8 +212,46 @@ func ValidUUID(s string) bool {
 	return true
 }
 
-func validRail(r Rail) bool {
-	return r.Fabric != "" && utf8.ValidString(r.Fabric) && !strings.ContainsAny(r.Fabric, "\x00\r\n")
+func validRDMANIC(r RDMANIC) bool {
+	if r.Device == "" || !utf8.ValidString(r.Device) || strings.ContainsAny(r.Device, "\x00\r\n") || r.Port == 0 {
+		return false
+	}
+
+	if r.GID != "" {
+		if len(r.GID) != 32 || strings.ToLower(r.GID) != r.GID {
+			return false
+		}
+
+		if _, err := hex.DecodeString(r.GID); err != nil {
+			return false
+		}
+	}
+
+	return true
+}
+
+func validateRDMANICs(nics []RDMANIC) error {
+	if len(nics) > MaxRDMANICs {
+		return TooLarge
+	}
+
+	type physical struct {
+		device string
+		port   uint8
+	}
+
+	seen := map[physical]bool{}
+
+	for _, nic := range nics {
+		key := physical{nic.Device, nic.Port}
+		if !validRDMANIC(nic) || seen[key] {
+			return InvalidRequest
+		}
+
+		seen[key] = true
+	}
+
+	return nil
 }
 
 func validateHeader(version uint32, cluster ClusterID) error {
@@ -239,14 +282,32 @@ func ValidateBootstrapRequest(v BootstrapRequest) error {
 		return TooLarge
 	}
 
+	if err := validateRDMANICs(v.RDMANICs); err != nil {
+		return err
+	}
+
+	remaining := MaxBootstrapBytes
+	for _, nic := range v.RDMANICs {
+		if len(nic.Device) > remaining {
+			return TooLarge
+		}
+
+		remaining -= len(nic.Device)
+	}
+
 	if _, err := x509.ParseCertificateRequest(v.CSRDER); err != nil {
 		return InvalidRequest
 	}
 
 	// The validated version is 1 and UUIDs are unescaped ASCII. Only padded
 	// base64 contributes variable framing size; no encoder newline is on the wire.
-	const framing = len(`{"shares":,"schema_version":1,"cluster":"","enrollment":"","csr_der":""}`)
-	if framing+len(strconv.FormatUint(uint64(v.Shares), 10))+len(v.Cluster)+len(v.Enrollment)+base64.StdEncoding.EncodedLen(len(v.CSRDER)) > MaxBootstrapBytes {
+	nics, err := encode(CanonicalRDMANICs(v.RDMANICs), MaxBootstrapBytes)
+	if err != nil {
+		return err
+	}
+
+	const framing = len(`{"shares":,"rdma_nics":,"schema_version":1,"cluster":"","enrollment":"","csr_der":""}`)
+	if framing+len(nics)+len(strconv.FormatUint(uint64(v.Shares), 10))+len(v.Cluster)+len(v.Enrollment)+base64.StdEncoding.EncodedLen(len(v.CSRDER)) > MaxBootstrapBytes {
 		return TooLarge
 	}
 
@@ -347,8 +408,8 @@ func validatePublication(v Publication, counters bool) error {
 			return TooLarge
 		}
 
-		for _, r := range m.Rails {
-			if !consume(len(r.Fabric) + 1) {
+		for _, r := range m.RDMANICs {
+			if !consume(len(r.Device) + len(r.GID) + 1) {
 				return TooLarge
 			}
 		}
@@ -373,13 +434,8 @@ func validatePublication(v Publication, counters bool) error {
 			return InvalidRequest
 		}
 
-		rails := map[uint16]bool{}
-		for _, r := range m.Rails {
-			if rails[r.Rail] || !validRail(r) {
-				return InvalidRequest
-			}
-
-			rails[r.Rail] = true
+		if err := validateRDMANICs(m.RDMANICs); err != nil {
+			return err
 		}
 	}
 

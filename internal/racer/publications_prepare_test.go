@@ -14,7 +14,7 @@ import (
 func TestPrepareCanonicalEquivalence(t *testing.T) {
 	numa := uint32(3)
 	members := AcceptedMembers{
-		testNodeUID:  {Node: testNodeUID, Shares: 4, PeerEndpoint: "192.0.2.1:7443", Rails: []wire.Rail{{Rail: 2, Fabric: "β<&>", NUMANode: &numa}, {Rail: 1, Fabric: "fabric"}}},
+		testNodeUID:  {Node: testNodeUID, Shares: 4, PeerEndpoint: "192.0.2.1:7443", RDMANICs: []wire.RDMANIC{{Rail: 2, Device: "β<&>", Port: 1, NUMANode: &numa}, {Rail: 1, Device: "mlx5_0", Port: 1}}},
 		testOtherUID: {Node: testOtherUID, Shares: 1, PeerEndpoint: "[2001:db8::1]:7443"},
 	}
 	caches := []wire.CacheDefinition{{ID: testNodeUID, Name: "cache", ClientSocket: "/run/racer/cache/client/socket", OriginSocket: "/run/racer/cache/origin/socket"}}
@@ -77,7 +77,7 @@ func TestPrepareCanonicalEquivalence(t *testing.T) {
 func TestPrepareRejectsFinalCounterGrowth(t *testing.T) {
 	v := wire.Publication{
 		SchemaVersion: wire.SchemaVersion, Cluster: testNodeUID, Sequence: 9, MembershipVersion: 9,
-		Members: []wire.Member{{Node: testNodeUID, Shares: 1, PeerEndpoint: "192.0.2.1:1", Rails: []wire.Rail{{Fabric: "x"}}}},
+		Members: []wire.Member{{Node: testNodeUID, Shares: 1, PeerEndpoint: "192.0.2.1:1", RDMANICs: []wire.RDMANIC{{Device: "x", Port: 1}}}},
 	}
 
 	b, err := wire.EncodePublication(v)
@@ -85,7 +85,7 @@ func TestPrepareRejectsFinalCounterGrowth(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	v.Members[0].Rails[0].Fabric += strings.Repeat("x", wire.MaxPublicationBytes-len(b))
+	v.Members[0].RDMANICs[0].Device += strings.Repeat("x", wire.MaxPublicationBytes-len(b))
 
 	content, membership, err := wire.ContentHashes(v)
 	if err != nil {

@@ -526,7 +526,7 @@ func (b *Bootstrap) Enroll(ctx context.Context, r *http.Request, request wire.Bo
 		return nil, err
 	}
 	// Resolve the same live UID again before persisting an authenticated proposal.
-	// The annotation is a proposal only; explicit administrator shares win.
+	// Both annotations are proposals only; explicit administrator values win.
 	var live corev1.Node
 	if err := b.APIReader.Get(ctx, client.ObjectKey{Name: identity.nodeName}, &live); err != nil {
 		return nil, err
@@ -539,13 +539,31 @@ func (b *Bootstrap) Enroll(ctx context.Context, r *http.Request, request wire.Bo
 		}
 
 		value := strconv.FormatUint(uint64(request.Shares), 10)
-		if node.Annotations[enrolledSharesAnnotation] != value {
+
+		nics, err := json.Marshal(wire.CanonicalRDMANICs(request.RDMANICs))
+		if err != nil {
+			return nil, err
+		}
+
+		nicValue := string(nics)
+		if len(request.RDMANICs) == 0 {
+			nicValue = ""
+		}
+
+		_, nicPresent := node.Annotations[enrolledRDMANICsAnnotation]
+		if node.Annotations[enrolledSharesAnnotation] != value || node.Annotations[enrolledRDMANICsAnnotation] != nicValue || nicValue == "" && nicPresent {
 			before := node.DeepCopy()
 			if node.Annotations == nil {
 				node.Annotations = map[string]string{}
 			}
 
 			node.Annotations[enrolledSharesAnnotation] = value
+			if nicValue == "" {
+				delete(node.Annotations, enrolledRDMANICsAnnotation)
+			} else {
+				node.Annotations[enrolledRDMANICsAnnotation] = nicValue
+			}
+
 			if err := b.Client.Patch(ctx, node, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
 				return nil, err
 			}

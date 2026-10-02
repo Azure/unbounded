@@ -33,7 +33,7 @@ func TestPublicationDeltaSelectionAndDisconnectedFallback(t *testing.T) {
 
 	for i := range 100 {
 		id := wire.NodeID(fmt.Sprintf("22222222-2222-4222-8222-%012d", i))
-		members[id] = wire.Member{Node: id, Shares: 4, PeerEndpoint: "192.0.2.1:8082", Rails: []wire.Rail{}}
+		members[id] = wire.Member{Node: id, Shares: 4, PeerEndpoint: "192.0.2.1:8082", RDMANICs: []wire.RDMANIC{}}
 	}
 
 	install := func() *CommittedPublication {
@@ -196,7 +196,7 @@ func TestPublicationBoundsOverflowAndInstallProof(t *testing.T) {
 
 	oversized := members[testNodeUID]
 
-	oversized.Rails = []wire.Rail{{Fabric: strings.Repeat("a", wire.MaxPublicationBytes)}}
+	oversized.RDMANICs = []wire.RDMANIC{{Device: strings.Repeat("a", wire.MaxPublicationBytes), Port: 1}}
 	if _, err := r.Publications.Prepare(p.record, "rv", AcceptedMembers{testNodeUID: oversized}, nil); !errors.Is(err, wire.TooLarge) {
 		t.Fatalf("oversized candidate: %v", err)
 	}
@@ -213,7 +213,7 @@ func TestPublicationDeepIsolationAndReplay(t *testing.T) {
 	}
 
 	numa := uint32(1)
-	members := AcceptedMembers{testNodeUID: {Node: testNodeUID, Shares: 4, PeerEndpoint: "192.0.2.1:8082", Rails: []wire.Rail{{Fabric: "fabric", NUMANode: &numa}}}}
+	members := AcceptedMembers{testNodeUID: {Node: testNodeUID, Shares: 4, PeerEndpoint: "192.0.2.1:8082", RDMANICs: []wire.RDMANIC{{Device: "mlx5_0", Port: 1, NUMANode: &numa}}}}
 
 	prepared, err := r.Publications.Prepare(previous, cm.ResourceVersion, members, nil)
 	if err != nil {
@@ -234,7 +234,7 @@ func TestPublicationDeepIsolationAndReplay(t *testing.T) {
 	}
 
 	decoded, err := wire.DecodePublication(strings.NewReader(committed.encoded))
-	if err != nil || len(decoded.Members) != 1 || *decoded.Members[0].Rails[0].NUMANode != 1 {
+	if err != nil || len(decoded.Members) != 1 || *decoded.Members[0].RDMANICs[0].NUMANode != 1 {
 		t.Fatalf("mutable alias: %+v, %v", decoded, err)
 	}
 

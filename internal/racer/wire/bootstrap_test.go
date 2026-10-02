@@ -22,6 +22,7 @@ func TestBootstrapRequestEncodedBoundary(t *testing.T) {
 	}
 
 	request.CSRDER = []byte{}
+	request.RDMANICs = []RDMANIC{{Device: "mlx5_0", Port: 1, Rail: 1, GID: "abcdef0123456789abcdef0123456789"}}
 
 	framing, err := json.Marshal(request)
 	if err != nil {

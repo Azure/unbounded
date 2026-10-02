@@ -65,25 +65,33 @@ func TestParseAnnotations(t *testing.T) {
 		want        MemberAttributes
 		wantError   bool
 	}{
-		{"defaults", nil, MemberAttributes{Shares: 4, Rails: []wire.Rail{}, AlignmentEnabled: true}, false},
-		{"explicit empty rails", map[string]string{wire.RailsAnnotation: "[]"}, MemberAttributes{Shares: 4, Rails: []wire.Rail{}, AlignmentEnabled: true}, false},
+		{"defaults", nil, MemberAttributes{Shares: 4, RDMANICs: []wire.RDMANIC{}}, false},
+		{"explicit empty NICs", map[string]string{wire.RDMANICsAnnotation: "[]", enrolledRDMANICsAnnotation: `[{"device":"a","port":1,"rail":0}]`}, MemberAttributes{Shares: 4, RDMANICs: []wire.RDMANIC{}}, false},
+		{"enrolled fallback", map[string]string{enrolledRDMANICsAnnotation: `[{"device":"a","port":1,"rail":0}]`}, MemberAttributes{Shares: 4, RDMANICs: []wire.RDMANIC{{Device: "a", Port: 1}}}, false},
+		{"legacy ignored", map[string]string{wire.RailsAnnotation: "malformed", wire.AlignmentAnnotation: "false"}, MemberAttributes{Shares: 4, RDMANICs: []wire.RDMANIC{}}, false},
 		{"bounds and sorting", map[string]string{
-			wire.SharesAnnotation: "4294967295", wire.AlignmentAnnotation: "false",
-			wire.RailsAnnotation: `[{"rail":65535,"fabric":"β<&>","numa_node":4294967295},{"rail":0,"fabric":"a","numa_node":0}]`,
-		}, MemberAttributes{Shares: ^uint32(0), Rails: []wire.Rail{{Rail: 0, Fabric: "a", NUMANode: &zero}, {Rail: 65535, Fabric: "β<&>", NUMANode: &maxNUMA}}}, false},
+			wire.SharesAnnotation:   "4294967295",
+			wire.RDMANICsAnnotation: `[{"rail":65535,"device":"β<&>","port":255,"numa_node":4294967295},{"rail":0,"device":"a","port":1,"numa_node":0}]`,
+		}, MemberAttributes{Shares: ^uint32(0), RDMANICs: []wire.RDMANIC{{Rail: 0, Device: "a", Port: 1, NUMANode: &zero}, {Rail: 65535, Device: "β<&>", Port: 255, NUMANode: &maxNUMA}}}, false},
 		{
 			"identical duplicates",
-			map[string]string{wire.RailsAnnotation: `[{"rail":2,"fabric":"b","numa_node":0},{"rail":1,"fabric":"a"},{"rail":2,"fabric":"b","numa_node":0},{"rail":1,"fabric":"a"}]`},
-			MemberAttributes{Shares: 4, Rails: []wire.Rail{{Rail: 1, Fabric: "a"}, {Rail: 2, Fabric: "b", NUMANode: &zero}}, AlignmentEnabled: true},
+			map[string]string{wire.RDMANICsAnnotation: `[{"rail":2,"device":"b","port":1},{"rail":2,"device":"b","port":1}]`},
+			MemberAttributes{},
+			true,
+		},
+		{
+			"same rail different physical ports",
+			map[string]string{wire.RDMANICsAnnotation: `[{"rail":1,"device":"b","port":1},{"rail":1,"device":"a","port":2},{"rail":1,"device":"a","port":1}]`},
+			MemberAttributes{Shares: 4, RDMANICs: []wire.RDMANIC{{Rail: 1, Device: "a", Port: 1}, {Rail: 1, Device: "a", Port: 2}, {Rail: 1, Device: "b", Port: 1}}},
 			false,
 		},
 		{
 			"unknown fields rejected",
-			map[string]string{wire.RailsAnnotation: `[{"rail":0,"fabric":"a","Rail":1,"future":{"x":true}}]`},
+			map[string]string{wire.RDMANICsAnnotation: `[{"rail":0,"device":"a","port":1,"Rail":1,"future":{"x":true}}]`},
 			MemberAttributes{},
 			true,
 		},
-		{"decimal shares", map[string]string{wire.SharesAnnotation: "0008"}, MemberAttributes{Shares: 8, Rails: []wire.Rail{}, AlignmentEnabled: true}, false},
+		{"decimal shares", map[string]string{wire.SharesAnnotation: "0008"}, MemberAttributes{Shares: 8, RDMANICs: []wire.RDMANIC{}}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			node := memberNode()
@@ -107,23 +115,22 @@ func TestParseAnnotations(t *testing.T) {
 
 func TestParseAnnotationsRejectsInvalidUpdates(t *testing.T) {
 	for field, values := range map[string][]string{
-		wire.SharesAnnotation:    {"", "0", "-1", "+1", "4294967296", "1.0", "1e2", "0x10", " 4", "4 ", "٤"},
-		wire.AlignmentAnnotation: {"", "True", "FALSE", "1", "0", " true", "false "},
-		wire.RailsAnnotation: {
-			"", "null", "{}", "[null]", "[{}]", `[{"rail":0}]`, `[{"fabric":"a"}]`,
-			`[{"rail":65536,"fabric":"a"}]`, `[{"rail":-1,"fabric":"a"}]`, `[{"rail":1.0,"fabric":"a"}]`,
-			`[{"rail":"0","fabric":"a"}]`, `[{"rail":0,"fabric":""}]`, `[{"rail":0,"fabric":"a\n"}]`,
-			`[{"rail":0,"fabric":"a\r"}]`, `[{"rail":0,"fabric":"a\u0000"}]`,
-			`[{"rail":0,"fabric":"a","numa_node":null}]`, `[{"rail":0,"fabric":"a","numa_node":4294967296}]`,
-			`[{"rail":0,"fabric":"a","numa_node":-1}]`, `[{"rail":0,"fabric":"a","numa_node":1e0}]`,
-			`[{"rail":0,"fabric":"a","rail":1}]`, `[{"rail":0,"fabric":"a","\u0072ail":1}]`,
-			`[{"rail":0,"fabric":"a","future":{"x":1,"x":2}}]`,
-			`[{"Rail":0,"fabric":"a"}]`, `[{"rail":0,"fabric":"\ud800"}]`,
-			"[{\"rail\":0,\"fabric\":\"\xff\"}]", "[] []",
-			`[{"rail":0,"fabric":"a"},{"rail":0,"fabric":"b"}]`,
-			`[{"rail":0,"fabric":"a"},{"rail":0,"fabric":"a","numa_node":0}]`,
-			`[{"rail":0,"fabric":"a","numa_node":1},{"rail":0,"fabric":"a","numa_node":2}]`,
-			`[{"rail":0,"fabric":"a","future":` + strings.Repeat("[", 64) + "0" + strings.Repeat("]", 64) + "}]",
+		wire.SharesAnnotation: {"", "0", "-1", "+1", "4294967296", "1.0", "1e2", "0x10", " 4", "4 ", "٤"},
+		wire.RDMANICsAnnotation: {
+			"", "null", "{}", "[null]", "[{}]", `[{"rail":0}]`, `[{"device":"a","port":1}]`,
+			`[{"rail":65536,"device":"a","port":1}]`, `[{"rail":-1,"device":"a","port":1}]`, `[{"rail":1.0,"device":"a","port":1}]`,
+			`[{"rail":"0","device":"a","port":1}]`, `[{"rail":0,"device":"","port":1}]`, `[{"rail":0,"device":"a\n","port":1}]`,
+			`[{"rail":0,"device":"a\r","port":1}]`, `[{"rail":0,"device":"a\u0000","port":1}]`,
+			`[{"rail":0,"device":"a","port":1,"numa_node":null}]`, `[{"rail":0,"device":"a","port":1,"numa_node":4294967296}]`,
+			`[{"rail":0,"device":"a","port":1,"numa_node":-1}]`, `[{"rail":0,"device":"a","port":1,"numa_node":1e0}]`,
+			`[{"rail":0,"device":"a","port":1,"rail":1}]`, `[{"rail":0,"device":"a","port":1,"\u0072ail":1}]`,
+			`[{"rail":0,"device":"a","port":1,"future":{"x":1,"x":2}}]`,
+			`[{"Rail":0,"device":"a","port":1}]`, `[{"rail":0,"device":"\ud800","port":1}]`,
+			"[{\"rail\":0,\"device\":\"\xff\",\"port\":1}]", "[] []",
+			`[{"rail":0,"device":"a","port":1},{"rail":1,"device":"a","port":1}]`,
+			`[{"rail":0,"device":"a","port":1},{"rail":0,"device":"a","port":1,"numa_node":0}]`,
+			`[{"rail":0,"device":"a","port":1,"numa_node":1},{"rail":0,"device":"a","port":1,"numa_node":2}]`,
+			`[{"rail":0,"device":"a","port":1,"future":` + strings.Repeat("[", 64) + "0" + strings.Repeat("]", 64) + "}]",
 		},
 	} {
 		for _, value := range values {
@@ -145,7 +152,7 @@ func TestParseAnnotationsRejectsInvalidUpdates(t *testing.T) {
 
 	node := memberNode()
 
-	node.Annotations = map[string]string{wire.RailsAnnotation: strings.Repeat(" ", 256*1024+1)}
+	node.Annotations = map[string]string{wire.RDMANICsAnnotation: strings.Repeat(" ", 256*1024+1)}
 	if _, err := ParseAnnotations(&node); !errors.Is(err, wire.TooLarge) {
 		t.Fatalf("oversized rails: %v", err)
 	}
@@ -221,7 +228,7 @@ func TestReconcileMembersColdStartAndRetention(t *testing.T) {
 	pod := memberPod("a", 1, "192.0.2.1")
 	initial, diagnostics, err := reconcileMembers([]corev1.Node{node}, map[string][]corev1.Pod{node.Name: {pod}}, memberOwnership(t, testDaemonSetUID), nil, 7443)
 
-	want := wire.Member{Node: testNodeUID, Shares: 4, Rails: []wire.Rail{}, AlignmentEnabled: true, PeerEndpoint: "192.0.2.1:7443"}
+	want := wire.Member{Node: testNodeUID, Shares: 4, RDMANICs: []wire.RDMANIC{}, PeerEndpoint: "192.0.2.1:7443"}
 	if err != nil || len(diagnostics) != 0 || !reflect.DeepEqual(initial[testNodeUID], want) {
 		t.Fatalf("cold start: %#v, %v, %v", initial, diagnostics, err)
 	}
@@ -237,7 +244,7 @@ func TestReconcileMembersColdStartAndRetention(t *testing.T) {
 		{"pod gap", map[string]string{wire.SharesAnnotation: "8"}, nil, 8, "192.0.2.1:7443", 1},
 		{"invalid annotations", map[string]string{wire.SharesAnnotation: "0"}, []corev1.Pod{memberPod("b", 2, "192.0.2.2")}, 4, "192.0.2.2:7443", 1},
 		{"both missing", map[string]string{wire.SharesAnnotation: "0"}, nil, 4, "192.0.2.1:7443", 2},
-		{"annotation unit", map[string]string{wire.SharesAnnotation: "8", wire.AlignmentAnnotation: "invalid"}, []corev1.Pod{pod}, 4, "192.0.2.1:7443", 1},
+		{"annotation unit", map[string]string{wire.SharesAnnotation: "8", wire.RDMANICsAnnotation: "invalid"}, []corev1.Pod{pod}, 4, "192.0.2.1:7443", 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			node := node.DeepCopy()
@@ -322,7 +329,7 @@ func TestReconcileMembersIdentityAndRemoval(t *testing.T) {
 
 func TestReconcileMembersDefaultsAndIsolation(t *testing.T) {
 	node := memberNode()
-	node.Annotations = map[string]string{wire.SharesAnnotation: "8", wire.AlignmentAnnotation: "false", wire.RailsAnnotation: `[{"rail":0,"fabric":"a","numa_node":1}]`}
+	node.Annotations = map[string]string{wire.SharesAnnotation: "8", wire.RDMANICsAnnotation: `[{"rail":0,"device":"a","port":1,"numa_node":1}]`}
 	pod := memberPod("a", 1, "192.0.2.1")
 
 	pods := map[string][]corev1.Pod{node.Name: {pod}}
@@ -346,11 +353,11 @@ func TestReconcileMembersDefaultsAndIsolation(t *testing.T) {
 		t.Fatalf("retention: %v, %v", got, err)
 	}
 
-	got[testNodeUID].Rails[0].Fabric = "changed"
-	*got[testNodeUID].Rails[0].NUMANode = 9
+	got[testNodeUID].RDMANICs[0].Device = "changed"
+	*got[testNodeUID].RDMANICs[0].NUMANode = 9
 	delete(got, testNodeUID)
 
-	if accepted[testNodeUID].Rails[0].Fabric != "a" || *accepted[testNodeUID].Rails[0].NUMANode != 1 {
+	if accepted[testNodeUID].RDMANICs[0].Device != "a" || *accepted[testNodeUID].RDMANICs[0].NUMANode != 1 {
 		t.Fatal("retention aliases accepted state")
 	}
 
@@ -359,17 +366,17 @@ func TestReconcileMembersDefaultsAndIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	accepted[testNodeUID].Rails[0].Fabric = "changed input"
+	accepted[testNodeUID].RDMANICs[0].Device = "changed input"
 
-	*accepted[testNodeUID].Rails[0].NUMANode = 7
-	if got[testNodeUID].Rails[0].Fabric != "a" || *got[testNodeUID].Rails[0].NUMANode != 1 {
+	*accepted[testNodeUID].RDMANICs[0].NUMANode = 7
+	if got[testNodeUID].RDMANICs[0].Device != "a" || *got[testNodeUID].RDMANICs[0].NUMANode != 1 {
 		t.Fatal("accepted input mutation changed retained output")
 	}
 
 	node.Annotations = nil
 
 	got, _, err = reconcileMembers([]corev1.Node{node}, nil, memberOwnership(t, testDaemonSetUID), accepted, 7443)
-	if err != nil || got[testNodeUID].Shares != 4 || !got[testNodeUID].AlignmentEnabled || len(got[testNodeUID].Rails) != 0 {
+	if err != nil || got[testNodeUID].Shares != 4 || len(got[testNodeUID].RDMANICs) != 0 {
 		t.Fatalf("removed annotations did not default: %v, %v", got, err)
 	}
 }
@@ -460,7 +467,7 @@ func TestReconcileMembersGroupedPods(t *testing.T) {
 func TestReconcileCandidateHashesAndOrdering(t *testing.T) {
 	nodeA, nodeB := memberNode(), memberNode()
 	nodeB.Name, nodeB.UID = "node-b", testOtherUID
-	nodeA.Annotations = map[string]string{wire.RailsAnnotation: `[{"rail":2,"fabric":"b"},{"rail":1,"fabric":"a"},{"rail":1,"fabric":"a"}]`}
+	nodeA.Annotations = map[string]string{wire.RDMANICsAnnotation: `[{"rail":1,"device":"b","port":1},{"rail":1,"device":"a","port":1}]`}
 	podA, podB := memberPod("a", 1, "192.0.2.1"), memberPod("b", 1, "192.0.2.2")
 	podB.Spec.NodeName = "node-b"
 	nodes := []corev1.Node{nodeB, nodeA}
@@ -484,7 +491,7 @@ func TestReconcileCandidateHashesAndOrdering(t *testing.T) {
 
 	pods = map[string][]corev1.Pod{nodeB.Name: {podB}, nodeA.Name: {podA}}
 
-	nodes[0].Annotations[wire.RailsAnnotation] = `[{"rail":1,"fabric":"a"},{"rail":2,"fabric":"b"}]`
+	nodes[0].Annotations[wire.RDMANICsAnnotation] = `[{"rail":1,"device":"a","port":1},{"rail":1,"device":"b","port":1}]`
 
 	members, _, err = reconcileMembers(nodes, pods, memberOwnership(t, testDaemonSetUID), nil, 7443)
 	if err != nil {
@@ -523,7 +530,7 @@ func TestReconcileMembersLimit(t *testing.T) {
 	for i := range nodes {
 		id := fmt.Sprintf("%08x-0000-0000-0000-000000000000", i)
 		nodes[i] = corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: id, UID: types.UID(id)}}
-		accepted[wire.NodeID(id)] = wire.Member{Node: wire.NodeID(id), Shares: 4, PeerEndpoint: "192.0.2.1:7443", Rails: []wire.Rail{}, AlignmentEnabled: true}
+		accepted[wire.NodeID(id)] = wire.Member{Node: wire.NodeID(id), Shares: 4, PeerEndpoint: "192.0.2.1:7443", RDMANICs: []wire.RDMANIC{}}
 	}
 
 	got, _, err := reconcileMembers(nodes, nil, memberOwnership(t, testDaemonSetUID), accepted, 7443)

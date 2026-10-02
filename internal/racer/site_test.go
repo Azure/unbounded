@@ -41,10 +41,10 @@ func TestMemberSiteLabelsOverrideHistory(t *testing.T) {
 
 					var accepted AcceptedMembers
 
-					previous := wire.Member{Node: testNodeUID, Shares: 8, PeerEndpoint: "192.0.2.1:7443", Rails: []wire.Rail{{Rail: 1, Fabric: "fabric-a"}}, AlignmentEnabled: true, Site: "stale-site"}
+					previous := wire.Member{Node: testNodeUID, Shares: 8, PeerEndpoint: "192.0.2.1:7443", RDMANICs: []wire.RDMANIC{{Rail: 1, Device: "mlx5_0", Port: 1}}, Site: "stale-site"}
 
 					if mode != "cold" {
-						node.Annotations = map[string]string{wire.RailsAnnotation: "malformed"}
+						node.Annotations = map[string]string{wire.RDMANICsAnnotation: "malformed"}
 						pods = nil
 
 						if mode == "memory" {
@@ -100,7 +100,7 @@ func TestNodeChangesSiteLabels(t *testing.T) {
 func TestTopologySiteChangesPersistAcrossRestart(t *testing.T) {
 	node := memberNode()
 	node.Labels = map[string]string{machinav1.MachineSiteLabelKey: "site-a"}
-	node.Annotations = map[string]string{wire.RailsAnnotation: `[{"rail":0,"fabric":"fabric-a"}]`}
+	node.Annotations = map[string]string{wire.RDMANICsAnnotation: `[{"rail":0,"device":"mlx5_0","port":1}]`}
 	pod := memberPod("a", 1, "192.0.2.1")
 	r := initializedTopology(t, &node, &pod, &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: DataplaneDaemonSetName, Namespace: "racer", UID: testDaemonSetUID}})
 	first := reconcileTopology(t, r, t.Context())
@@ -116,7 +116,7 @@ func TestTopologySiteChangesPersistAcrossRestart(t *testing.T) {
 			node.Labels = map[string]string{machinav1.MachineSiteLabelKey: site}
 		}
 
-		node.Annotations[wire.RailsAnnotation] = "malformed"
+		node.Annotations[wire.RDMANICsAnnotation] = "malformed"
 		require.NoError(t, r.Update(t.Context(), &node))
 		// Drop all in-memory history before processing the changed boundary.
 		r = Assemble(r.Config, r.Client, r.APIReader).Topology
@@ -124,7 +124,7 @@ func TestTopologySiteChangesPersistAcrossRestart(t *testing.T) {
 		next, err := wire.DecodePublication(strings.NewReader(committed.encoded))
 		require.NoError(t, err)
 		require.Equal(t, site, next.Members[0].Site)
-		require.Equal(t, base.Members[0].Rails, next.Members[0].Rails)
+		require.Equal(t, base.Members[0].RDMANICs, next.Members[0].RDMANICs)
 		require.Equal(t, base.Sequence+1, next.Sequence)
 		require.Equal(t, base.MembershipVersion+1, next.MembershipVersion)
 		oldContent, oldMembership, err := wire.ContentHashes(base)

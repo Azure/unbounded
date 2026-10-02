@@ -353,8 +353,9 @@ func (ids DataplaneWorkloadIdentities) Owns(pod *corev1.Pod) bool {
 }
 
 const (
-	enrolledSharesAnnotation = "racer.unbounded-cloud.io/enrolled-shares"
-	admittedMemberAnnotation = "racer.unbounded-cloud.io/last-admitted-member"
+	enrolledSharesAnnotation   = "racer.unbounded-cloud.io/enrolled-shares"
+	enrolledRDMANICsAnnotation = "racer.unbounded-cloud.io/enrolled-rdma-nics"
+	admittedMemberAnnotation   = "racer.unbounded-cloud.io/last-admitted-member"
 )
 
 // nodeSite uses only the canonical Machine Site label.
@@ -368,9 +369,8 @@ func nodeSite(node *corev1.Node) string {
 type AcceptedMembers map[wire.NodeID]wire.Member
 
 type MemberAttributes struct {
-	Shares           uint32
-	Rails            []wire.Rail
-	AlignmentEnabled bool
+	Shares   uint32
+	RDMANICs []wire.RDMANIC
 }
 
 type Diagnostic struct {
@@ -385,7 +385,7 @@ func ParseAnnotations(node *corev1.Node) (MemberAttributes, error) {
 		return MemberAttributes{}, wire.InvalidRequest
 	}
 
-	attributes := MemberAttributes{Shares: wire.DefaultShares, Rails: []wire.Rail{}, AlignmentEnabled: true}
+	attributes := MemberAttributes{Shares: wire.DefaultShares, RDMANICs: []wire.RDMANIC{}}
 
 	if _, explicit := node.Annotations[wire.SharesAnnotation]; !explicit {
 		if value := node.Annotations[enrolledSharesAnnotation]; value != "" {
@@ -407,41 +407,24 @@ func ParseAnnotations(node *corev1.Node) (MemberAttributes, error) {
 		attributes.Shares = uint32(shares)
 	}
 
-	if value, present := node.Annotations[wire.AlignmentAnnotation]; present {
-		if value != "true" && value != "false" {
-			return MemberAttributes{}, fmt.Errorf("%s: %w", wire.AlignmentAnnotation, wire.InvalidRequest)
-		}
+	field := wire.RDMANICsAnnotation
 
-		attributes.AlignmentEnabled = value == "true"
+	value, present := node.Annotations[field]
+	if !present {
+		field = enrolledRDMANICsAnnotation
+		value, present = node.Annotations[field]
 	}
 
-	if value, present := node.Annotations[wire.RailsAnnotation]; present {
-		rails, err := wire.DecodeRails(strings.NewReader(value))
+	if present {
+		nics, err := wire.DecodeRDMANICs(strings.NewReader(value))
 		if err != nil {
-			return MemberAttributes{}, fmt.Errorf("%s: %w", wire.RailsAnnotation, err)
+			return MemberAttributes{}, fmt.Errorf("%s: %w", field, err)
 		}
 
-		slices.SortFunc(rails, func(a, b wire.Rail) int { return cmp.Compare(a.Rail, b.Rail) })
-
-		for _, rail := range rails {
-			if n := len(attributes.Rails); n > 0 && attributes.Rails[n-1].Rail == rail.Rail {
-				previous := attributes.Rails[n-1]
-				if previous.Fabric != rail.Fabric || !equalNUMA(previous.NUMANode, rail.NUMANode) {
-					return MemberAttributes{}, fmt.Errorf("%s: conflicting rail mappings: %w", wire.RailsAnnotation, wire.InvalidRequest)
-				}
-
-				continue
-			}
-
-			attributes.Rails = append(attributes.Rails, rail)
-		}
+		attributes.RDMANICs = nics
 	}
 
 	return attributes, nil
-}
-
-func equalNUMA(a, b *uint32) bool {
-	return a == nil && b == nil || a != nil && b != nil && *a == *b
 }
 
 // selectEndpoint verifies workload ownership, ignores terminating/IP-less Pods,
@@ -522,12 +505,14 @@ func reconcileMembers(nodes []corev1.Node, podsByNode map[string][]corev1.Pod, o
 
 		previous, known := accepted[id]
 		if !known {
-			var saved wire.Member
-			if raw := node.Annotations[admittedMemberAnnotation]; len(raw) <= 64*1024 && raw != "" && json.Unmarshal([]byte(raw), &saved) == nil && saved.Node == id {
-				probe := wire.Publication{SchemaVersion: wire.SchemaVersion, Cluster: wire.ClusterID(id), Sequence: 1, MembershipVersion: 1, Members: []wire.Member{saved}}
-				if _, err := wire.EncodePublication(probe); err == nil {
-					previous, known = saved, true
-				}
+			if saved, err := wire.DecodeAdmittedMember(strings.NewReader(node.Annotations[admittedMemberAnnotation])); err == nil && saved.Node == id {
+				previous, known = saved, true
+			}
+		}
+
+		for _, field := range []string{wire.RailsAnnotation, wire.AlignmentAnnotation} {
+			if _, present := node.Annotations[field]; present {
+				diagnostics = append(diagnostics, Diagnostic{Object: node.Name, Field: field, Reason: "legacy annotation ignored; use " + wire.RDMANICsAnnotation})
 			}
 		}
 
@@ -536,7 +521,7 @@ func reconcileMembers(nodes []corev1.Node, podsByNode map[string][]corev1.Pod, o
 			diagnostics = append(diagnostics, Diagnostic{Object: node.Name, Field: "annotations", Reason: annotationErr.Error()})
 
 			if known {
-				attributes = MemberAttributes{Shares: previous.Shares, Rails: previous.Rails, AlignmentEnabled: previous.AlignmentEnabled}
+				attributes = MemberAttributes{Shares: previous.Shares, RDMANICs: previous.RDMANICs}
 			}
 		}
 
@@ -557,15 +542,7 @@ func reconcileMembers(nodes []corev1.Node, podsByNode map[string][]corev1.Pod, o
 			continue
 		}
 
-		member := wire.Member{Node: id, Shares: attributes.Shares, Rails: attributes.Rails, AlignmentEnabled: attributes.AlignmentEnabled, PeerEndpoint: endpoint, Site: nodeSite(node)}
-
-		member.Rails = append([]wire.Rail{}, member.Rails...)
-		for j := range member.Rails {
-			if numa := member.Rails[j].NUMANode; numa != nil {
-				value := *numa
-				member.Rails[j].NUMANode = &value
-			}
-		}
+		member := wire.Member{Node: id, Shares: attributes.Shares, RDMANICs: wire.CanonicalRDMANICs(attributes.RDMANICs), PeerEndpoint: endpoint, Site: nodeSite(node)}
 
 		result[id] = member
 	}
