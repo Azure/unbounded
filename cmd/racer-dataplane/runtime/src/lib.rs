@@ -9,6 +9,8 @@ pub mod deadline;
 pub mod environment;
 pub mod group;
 pub mod reactor;
+mod retry;
+pub use retry::retry_listener;
 
 use std::{future::Future, pin::Pin};
 
