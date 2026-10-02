@@ -21,20 +21,37 @@ pub struct Member {
     pub rails: Vec<RailMapping>,
     pub site: String,
 }
+
+#[cfg(test)]
+thread_local! {
+    // Counts algorithm weight reads, including scoring. Placement/selection tests
+    // sample only ranking polls, excluding publication and weighted path queries.
+    static WEIGHT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(crate) fn scored_members() -> usize {
+    WEIGHT_READS.get()
+}
+
+impl ::topology::Member for Member {
+    const DOMAIN: &'static str = "racer";
+
+    fn id(&self) -> &[u8] {
+        self.node.0.as_bytes()
+    }
+
+    fn weight(&self) -> NonZeroU32 {
+        #[cfg(test)]
+        WEIGHT_READS.set(WEIGHT_READS.get() + 1);
+        self.shares
+    }
+}
 #[derive(Debug)]
 pub struct Membership {
     pub version: MembershipVersion,
-    members: Vec<Member>,
-    placement_identity: [u8; 32],
+    pub(crate) inner: ::topology::Membership<Member>,
     retained_bytes: usize,
     rail_domain: Vec<super::rails::RailId>,
-    pub(crate) placement_delta: Option<PlacementDelta>,
-}
-#[derive(Debug)]
-pub(crate) struct PlacementDelta {
-    pub base: [u8; 32],
-    pub old_count: usize,
-    pub changes: Vec<(Option<usize>, Option<usize>)>,
 }
 pub type MembershipLease = Arc<Membership>;
 impl Membership {
@@ -72,16 +89,6 @@ impl Membership {
                 return Err(Error::InvalidConfiguration);
             }
         }
-        members.sort_unstable_by(|a, b| a.node.cmp(&b.node));
-        if members.windows(2).any(|pair| pair[0].node == pair[1].node) {
-            return Err(Error::InvalidConfiguration);
-        }
-        use sha2::Digest;
-        let mut hash = super::hash::domain(b"racer/placement-identity/v1\0");
-        for member in &members {
-            super::hash::bytes(&mut hash, member.node.0.as_bytes());
-            hash.update(member.shares.get().to_be_bytes());
-        }
         // Compute once per publication, never from a request's selected route.
         // A partially equipped hop must fall back rather than rehash the page.
         let rail_domain: Vec<_> = members
@@ -105,9 +112,7 @@ impl Membership {
                 .sum::<usize>();
         Ok(Self {
             version,
-            placement_identity: super::hash::finish(hash),
-            members,
-            placement_delta: None,
+            inner: ::topology::Membership::new(members).map_err(|_| Error::InvalidConfiguration)?,
             retained_bytes,
             rail_domain,
         })
@@ -115,65 +120,29 @@ impl Membership {
     /// Prepare bounded incremental ranking hints outside the publication lock.
     /// Larger changes use exact cooperative cold computation on demand.
     pub fn with_predecessor(mut self, old: &Membership) -> Self {
-        if self.placement_identity == old.placement_identity {
-            return self;
-        }
-        let mut changes = Vec::new();
-        let (mut a, mut b) = (0, 0);
-        while a < old.members.len() || b < self.members.len() {
-            let order = match (old.members.get(a), self.members.get(b)) {
-                (Some(a), Some(b)) => a.node.cmp(&b.node),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                _ => std::cmp::Ordering::Greater,
-            };
-            match order {
-                std::cmp::Ordering::Less => {
-                    changes.push((Some(a), None));
-                    a += 1;
-                }
-                std::cmp::Ordering::Greater => {
-                    changes.push((None, Some(b)));
-                    b += 1;
-                }
-                std::cmp::Ordering::Equal => {
-                    if old.members[a].shares != self.members[b].shares {
-                        changes.push((Some(a), Some(b)));
-                    }
-                    a += 1;
-                    b += 1;
-                }
-            }
-            if changes.len() > 64 {
-                return self;
-            }
-        }
-        self.placement_delta = Some(PlacementDelta {
-            base: old.placement_identity,
-            old_count: old.members.len(),
-            changes,
-        });
+        self.inner = self.inner.with_predecessor(&old.inner);
         self
     }
     /// Local cache identity only. Routing still uses the authenticated version.
     pub fn placement_identity(&self) -> [u8; 32] {
-        self.placement_identity
+        self.inner.identity()
     }
     pub fn retained_bytes(&self) -> usize {
         self.retained_bytes + 64 * std::mem::size_of::<(Option<usize>, Option<usize>)>()
     }
     pub fn members(&self) -> &[Member] {
-        &self.members
+        self.inner.members()
     }
     pub fn rail_domain(&self) -> &[super::rails::RailId] {
         &self.rail_domain
     }
     pub fn position(&self, node: &NodeId) -> Result<usize> {
-        self.members
-            .binary_search_by(|member| member.node.cmp(node))
-            .map_err(|_| Error::IncompatibleMembership)
+        self.inner
+            .position(node.0.as_bytes())
+            .ok_or(Error::IncompatibleMembership)
     }
     pub fn member(&self, node: &NodeId) -> Result<&Member> {
-        Ok(&self.members[self.position(node)?])
+        Ok(&self.members()[self.position(node)?])
     }
 }
 

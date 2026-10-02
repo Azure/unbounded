@@ -739,14 +739,11 @@ mod hash {
     }
 }
 
-/// Algorithm changes require a new version and new interoperability vectors.
-/// Latest supported contract; topology changes require coordinated rollout.
-pub const ALGORITHM_VERSION: u32 = 5;
-
-pub const RADIX: usize = 32;
+#[cfg(test)]
+pub(crate) const RADIX: usize = 32;
 
 /// Shared capacity bound for every supported topology, including first-hop masks.
-pub const MAX_DEGREE: usize = 2 * RADIX;
+pub use ::topology::MAX_DEGREE;
 const _: () = assert!(MAX_DEGREE <= u64::BITS as usize);
 
 #[cfg(test)]

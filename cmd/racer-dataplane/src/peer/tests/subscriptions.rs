@@ -263,7 +263,7 @@ fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failure
 #[test]
 fn signed_ingress_cold_selection_is_bounded_cancellable_and_does_not_block_other_workers() {
     use crate::peer::subscriptions::Selection;
-    use crate::topology::placement::scored_members;
+    use crate::topology::membership::scored_members;
 
     struct Never;
     impl PeerTransport for Never {
