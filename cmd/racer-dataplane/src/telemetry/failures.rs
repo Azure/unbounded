@@ -12,6 +12,7 @@ use crate::{
     model::{AttemptId, RequestId, ResourceClass, WorkerId},
     runtime::deadline::RequestScope,
 };
+use ::telemetry::Ring;
 use std::sync::{Arc, Mutex};
 
 pub const CAPACITY: usize = 128;
@@ -115,31 +116,7 @@ impl AeadFailure {
     }
 }
 
-type AeadRing = Ring<crate::runtime::crypto::CryptoId, AeadFailure, AEAD_CAPACITY>;
-struct Ring<I: Copy, F: Copy, const N: usize> {
-    entries: [Option<(u64, I, F)>; N],
-    total: u64,
-    next: usize,
-    len: usize,
-}
-impl<I: Copy, F: Copy, const N: usize> Default for Ring<I, F, N> {
-    fn default() -> Self {
-        Self {
-            entries: [None; N],
-            total: 0,
-            next: 0,
-            len: 0,
-        }
-    }
-}
-impl<I: Copy, F: Copy, const N: usize> Ring<I, F, N> {
-    fn push(&mut self, id: I, failure: F) {
-        self.total = self.total.saturating_add(1);
-        self.entries[self.next] = Some((self.total, id, failure));
-        self.next = (self.next + 1) % N;
-        self.len = (self.len + 1).min(N);
-    }
-}
+type AeadRing = Ring<(crate::runtime::crypto::CryptoId, AeadFailure), AEAD_CAPACITY>;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Stage {
@@ -260,7 +237,7 @@ impl Failure {
 
 #[derive(Clone, Default)]
 pub struct Failures(
-    Arc<Mutex<Ring<WorkerId, Failure, CAPACITY>>>,
+    Arc<Mutex<Ring<(WorkerId, Failure), CAPACITY>>>,
     Arc<Mutex<AeadRing>>,
 );
 
@@ -269,44 +246,39 @@ pub struct Failures(
 pub struct Observer(Option<(Failures, WorkerId)>);
 impl Failures {
     pub fn write_aead(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
-        let (entries, total, next, len) = {
-            let ring = self.1.lock().unwrap_or_else(|e| e.into_inner());
-            (ring.entries, ring.total, ring.next, ring.len)
-        };
+        let ring = self.1.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let (total, len) = (ring.total(), ring.len());
         writeln!(
             out,
             "total={total} retained={len} overwritten={} capacity={AEAD_CAPACITY}",
             total.saturating_sub(len as u64)
         )?;
-        for offset in 0..len {
-            let index = (next + AEAD_CAPACITY - len + offset) % AEAD_CAPACITY;
-            if let Some((sequence, id, f)) = entries[index] {
+        for (sequence, (id, f)) in ring.iter() {
+            write!(
+                out,
+                "seq={sequence} w={} crypto={}:{} ms={} request=",
+                id.worker.0, id.generation, id.sequence, f.unix_millis
+            )?;
+            hex(out, &f.request.0)?;
+            if let Some(p) = f.peer {
+                write!(out, " acquisition=")?;
+                hex(out, &p.request.0)?;
+                write!(out, " attempt=")?;
+                hex(out, &p.attempt.0)?;
                 write!(
                     out,
-                    "seq={sequence} w={} crypto={}:{} ms={} request=",
-                    id.worker.0, id.generation, id.sequence, f.unix_millis
+                    " supplier={} remote={}",
+                    std::str::from_utf8(&p.supplier).unwrap_or("unknown"),
+                    std::str::from_utf8(&p.remote).unwrap_or("unknown")
                 )?;
-                hex(out, &f.request.0)?;
-                if let Some(p) = f.peer {
-                    write!(out, " acquisition=")?;
-                    hex(out, &p.request.0)?;
-                    write!(out, " attempt=")?;
-                    hex(out, &p.attempt.0)?;
-                    write!(
-                        out,
-                        " supplier={} remote={}",
-                        std::str::from_utf8(&p.supplier).unwrap_or("unknown"),
-                        std::str::from_utf8(&p.remote).unwrap_or("unknown")
-                    )?;
-                } else {
-                    write!(
-                        out,
-                        " acquisition=none attempt=none supplier=none remote=none"
-                    )?;
-                }
-                f.write_fingerprint(out)?;
-                writeln!(out)?;
+            } else {
+                write!(
+                    out,
+                    " acquisition=none attempt=none supplier=none remote=none"
+                )?;
             }
+            f.write_fingerprint(out)?;
+            writeln!(out)?;
         }
         Ok(())
     }
@@ -315,69 +287,64 @@ impl Failures {
     }
     pub fn write(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
         // Copy bounded records before formatting; never hold the lock across I/O.
-        let (entries, total, next, len) = {
-            let ring = self.0.lock().unwrap_or_else(|e| e.into_inner());
-            (ring.entries, ring.total, ring.next, ring.len)
-        };
+        let ring = self.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let (total, len) = (ring.total(), ring.len());
         writeln!(out, "total={total} retained={len} capacity={CAPACITY}")?;
-        for offset in 0..len {
-            let index = (next + CAPACITY - len + offset) % CAPACITY;
-            if let Some((sequence, worker, failure)) = entries[index] {
-                let body = matches!(failure.detail, Detail::Body(_));
-                if body {
-                    write!(
-                        out,
-                        "seq={sequence:x} w={} stage={:?} error={:?} request=",
-                        worker.0, failure.stage, failure.error
-                    )?;
+        for (sequence, (worker, failure)) in ring.iter() {
+            let body = matches!(failure.detail, Detail::Body(_));
+            if body {
+                write!(
+                    out,
+                    "seq={sequence:x} w={} stage={:?} error={:?} request=",
+                    worker.0, failure.stage, failure.error
+                )?;
+            } else {
+                write!(
+                    out,
+                    "sequence={sequence} worker={} stage={:?} error={:?} request=",
+                    worker.0, failure.stage, failure.error
+                )?;
+            }
+            if let Some(request) = failure.request {
+                hex(out, &request.0)?;
+            } else {
+                write!(out, "none")?;
+            }
+            write!(out, " attempt=")?;
+            if let Some(attempt) = failure.attempt {
+                hex(out, &attempt.0)?;
+            } else {
+                write!(out, "none")?;
+            }
+            if let Detail::Body(b) = failure.detail {
+                // Compact formatting keeps all 128 worst-case records within
+                // the existing 64-KiB diagnostic response budget.
+                write!(
+                    out,
+                    " detail=Body rx={}/{} n={} ms=hex f={:x} l={:x} now={:x} orig={:x} share={:x} sig={:x} remote={}",
+                    b.received,
+                    b.expected,
+                    b.reads,
+                    b.first,
+                    b.last,
+                    b.now,
+                    b.original,
+                    b.share,
+                    b.signed,
+                    std::str::from_utf8(&b.remote).unwrap_or("unknown")
+                )?;
+                if let Some((local, remote)) = b.tuple {
+                    write!(out, " tcp={local}>{remote}")?;
                 } else {
-                    write!(
-                        out,
-                        "sequence={sequence} worker={} stage={:?} error={:?} request=",
-                        worker.0, failure.stage, failure.error
-                    )?;
+                    write!(out, " tcp=none")?;
                 }
-                if let Some(request) = failure.request {
-                    hex(out, &request.0)?;
-                } else {
-                    write!(out, "none")?;
-                }
-                write!(out, " attempt=")?;
-                if let Some(attempt) = failure.attempt {
-                    hex(out, &attempt.0)?;
-                } else {
-                    write!(out, "none")?;
-                }
-                if let Detail::Body(b) = failure.detail {
-                    // Compact formatting keeps all 128 worst-case records within
-                    // the existing 64-KiB diagnostic response budget.
-                    write!(
-                        out,
-                        " detail=Body rx={}/{} n={} ms=hex f={:x} l={:x} now={:x} orig={:x} share={:x} sig={:x} remote={}",
-                        b.received,
-                        b.expected,
-                        b.reads,
-                        b.first,
-                        b.last,
-                        b.now,
-                        b.original,
-                        b.share,
-                        b.signed,
-                        std::str::from_utf8(&b.remote).unwrap_or("unknown")
-                    )?;
-                    if let Some((local, remote)) = b.tuple {
-                        write!(out, " tcp={local}>{remote}")?;
-                    } else {
-                        write!(out, " tcp=none")?;
-                    }
-                    writeln!(out)?;
-                } else {
-                    writeln!(
-                        out,
-                        " unix_millis={} detail={:?}",
-                        failure.unix_millis, failure.detail
-                    )?;
-                }
+                writeln!(out)?;
+            } else {
+                writeln!(
+                    out,
+                    " unix_millis={} detail={:?}",
+                    failure.unix_millis, failure.detail
+                )?;
             }
         }
         Ok(())
@@ -389,14 +356,14 @@ impl Observer {
             return;
         };
         let mut ring = failures.1.lock().unwrap_or_else(|e| e.into_inner());
-        ring.push(id, failure);
+        ring.push((id, failure));
     }
     pub fn record(&self, failure: Failure) {
         let Some((failures, worker)) = &self.0 else {
             return;
         };
         let mut ring = failures.0.lock().unwrap_or_else(|e| e.into_inner());
-        ring.push(*worker, failure);
+        ring.push((*worker, failure));
     }
     pub fn result<T>(&self, stage: Stage, scope: &RequestScope, result: Result<T>) -> Result<T> {
         if let Err(error) = &result {
@@ -431,6 +398,93 @@ pub(crate) fn test_aead_failure() -> AeadFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_output_and_formatting_outside_both_locks() {
+        let failures = Failures::default();
+        let observer = failures.observer(WorkerId(3));
+        observer.record(Failure {
+            unix_millis: 42,
+            stage: Stage::Admission,
+            error: Error::Overloaded,
+            request: None,
+            attempt: None,
+            detail: Detail::None,
+        });
+        let id = crate::runtime::crypto::CryptoId {
+            worker: WorkerId(3),
+            generation: 4,
+            sequence: 5,
+        };
+        let mut aead = test_aead_failure();
+        aead.peer = None;
+        aead.crc = None;
+        observer.record_aead(id, aead);
+        struct Unlocked<'a> {
+            failures: &'a Failures,
+            text: String,
+        }
+        impl std::fmt::Write for Unlocked<'_> {
+            fn write_str(&mut self, value: &str) -> std::fmt::Result {
+                assert!(self.failures.0.try_lock().is_ok());
+                assert!(self.failures.1.try_lock().is_ok());
+                self.text.push_str(value);
+                Ok(())
+            }
+        }
+        let mut out = Unlocked {
+            failures: &failures,
+            text: String::new(),
+        };
+        failures.write(&mut out).unwrap();
+        assert_eq!(
+            out.text,
+            "total=1 retained=1 capacity=128\nsequence=1 worker=3 stage=Admission error=Overloaded request=none attempt=none unix_millis=42 detail=None\n"
+        );
+        out.text.clear();
+        failures.write_aead(&mut out).unwrap();
+        assert_eq!(
+            out.text,
+            format!(
+                "total=1 retained=1 overwritten=0 capacity=64\nseq=1 w=3 crypto=4:5 ms=18446744073709551615 request={} acquisition=none attempt=none supplier=none remote=none page={} number=18446744073709551615 key={} nonce={} lengths=4294967295/4294967295 aad={} crc=none\n",
+                "ff".repeat(16),
+                "ff".repeat(32),
+                "ff".repeat(16),
+                "ff".repeat(24),
+                "ff".repeat(32),
+            )
+        );
+    }
+
+    #[test]
+    fn failed_formatting_does_not_consume_records() {
+        struct Full;
+        impl std::fmt::Write for Full {
+            fn write_str(&mut self, _: &str) -> std::fmt::Result {
+                Err(std::fmt::Error)
+            }
+        }
+        let failures = Failures::default();
+        let observer = failures.observer(WorkerId(7));
+        observer.record(Failure::new(Stage::ClientRead, Error::Io));
+        observer.record_aead(
+            crate::runtime::crypto::CryptoId {
+                worker: WorkerId(7),
+                generation: 1,
+                sequence: 2,
+            },
+            test_aead_failure(),
+        );
+        assert!(failures.write(&mut Full).is_err());
+        assert!(failures.write_aead(&mut Full).is_err());
+        let mut text = String::new();
+        failures.write(&mut text).unwrap();
+        assert!(text.starts_with("total=1 retained=1 capacity=128\n"));
+        text.clear();
+        failures.write_aead(&mut text).unwrap();
+        assert!(text.starts_with("total=1 retained=1 overwritten=0 capacity=64\n"));
+    }
+
     #[test]
     fn aead_ring_survives_admission_flood_and_wraps_independently() {
         let failures = Failures::default();
@@ -476,7 +530,6 @@ mod tests {
             remote: [b'f'; 36],
             tuple: Some((address, address)),
         };
-        failures.0.lock().unwrap().total = u64::MAX - 128;
         for _ in 0..CAPACITY {
             observer.record(Failure {
                 unix_millis: u64::MAX,
@@ -490,10 +543,16 @@ mod tests {
         let mut text = String::new();
         failures.write(&mut text).unwrap();
         assert_eq!(text.lines().count(), CAPACITY + 1);
+        // The generic ring's saturation is tested in the core. Account for the
+        // widest sequence and total here without exposing a mutable sequence API.
+        let sequence_growth: usize = (1..=CAPACITY)
+            .map(|sequence| 16 - format!("{sequence:x}").len())
+            .sum();
+        let worst_case_len = text.len() + sequence_growth + 20 - CAPACITY.to_string().len();
         assert!(
-            text.len() <= crate::telemetry::MAX_RESPONSE_BYTES - 256,
+            worst_case_len <= crate::telemetry::MAX_RESPONSE_BYTES - 256,
             "{}",
-            text.len()
+            worst_case_len
         );
     }
     #[test]
@@ -506,7 +565,7 @@ mod tests {
         )
         .unwrap();
         observer.result(Stage::ClientRead, &scope, Ok(())).unwrap();
-        assert_eq!(failures.0.lock().unwrap().total, 0);
+        assert_eq!(failures.0.lock().unwrap().total(), 0);
         std::thread::spawn(move || {
             for _ in 0..CAPACITY + 2 {
                 observer.record(

@@ -12,26 +12,9 @@
 //! and identify rejection/check location, not where corruption originated. Source
 //! totals need not equal crypto totals, especially with abandoned fill waiters.
 use crate::{error::Result, model::WorkerId, runtime::admission::AdmissionUsage};
-use std::sync::{
-    Arc, OnceLock,
-    atomic::{AtomicU64, Ordering},
-};
+use ::telemetry::metrics;
+use std::sync::{Arc, OnceLock};
 
-// Declaration order is the counter index; names are the exported wire contract.
-macro_rules! metric_names {
-    ($kind:ident, $all:ident, $count:ident; $(Self::$variant:ident => $name:literal,)*) => {
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-        #[repr(usize)]
-        pub enum $kind { $($variant,)* }
-        pub const $count: usize = [$($name,)*].len();
-        pub const $all: [$kind; $count] = [$($kind::$variant,)*];
-        impl $kind {
-            pub fn name(self) -> &'static str {
-                match self { $(Self::$variant => $name,)* }
-            }
-        }
-    };
-}
 #[derive(Clone, Copy)]
 pub(crate) enum LookupTier {
     Plaintext,
@@ -42,34 +25,10 @@ pub(crate) enum LookupTier {
 /// Clones retain their writer shard; reads aggregate the fixed node registry.
 #[derive(Clone)]
 pub struct Metrics {
-    registry: Arc<Registry>,
+    core: ::telemetry::Metrics<Event, Gauge>,
+    admission: Arc<[OnceLock<(WorkerId, AdmissionUsage)>]>,
     shard: usize,
 }
-struct Registry {
-    // Retain every shard until the registry is dropped, even after a worker exits.
-    shards: Box<[Counters]>,
-    gauges: [GaugeCounter; GAUGE_COUNT],
-}
-// Match the runtime's 64-byte cache-line policy. Padding the entire writer block
-// avoids false sharing between workers without padding every event separately.
-#[repr(align(64))]
-struct Counters {
-    events: [AtomicU64; EVENT_COUNT],
-    admission: OnceLock<(WorkerId, AdmissionUsage)>,
-}
-impl Default for Counters {
-    fn default() -> Self {
-        Self {
-            events: std::array::from_fn(|_| AtomicU64::new(0)),
-            admission: OnceLock::new(),
-        }
-    }
-}
-// Gauges retain exact node-wide lease overflow checks and replacement semantics.
-// Separate lines prevent unrelated resource classes from invalidating each other.
-#[repr(align(64))]
-#[derive(Default)]
-struct GaugeCounter(AtomicU64);
 
 impl Default for Metrics {
     fn default() -> Self {
@@ -79,7 +38,8 @@ impl Default for Metrics {
             .unwrap()
     }
 }
-metric_names! { Event, EVENTS, EVENT_COUNT;
+// Declaration order is the counter index; names are the exported wire contract.
+metrics! { Event, EVENTS, EVENT_COUNT;
             Self::PageHedgeStarted => "racer_page_hedges_started_total",
             Self::PageHedgeWon => "racer_page_hedges_won_total",
             Self::PageHedgeSuppressed => "racer_page_hedges_suppressed_total",
@@ -159,7 +119,7 @@ metric_names! { Event, EVENTS, EVENT_COUNT;
             Self::OpaqueRelayBodyBytes => "racer_opaque_relay_body_completed_bytes_total",
             Self::OpaqueRelayBodyFailed => "racer_opaque_relay_body_failed_total",
 }
-metric_names! { Gauge, GAUGES, GAUGE_COUNT;
+metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::PeerAdmissionLimit => "racer_peer_admission_limit",
             Self::PeerExchanges => "racer_peer_exchanges_active",
             Self::DiagnosticConnections => "racer_diagnostic_connections",
@@ -175,10 +135,7 @@ metric_names! { Gauge, GAUGES, GAUGE_COUNT;
             Self::CheckpointSequence => "racer_checkpoint_sequence",
 }
 /// Keep with the actual resource, including through a submitted I/O fence.
-pub struct GaugeLease {
-    metrics: Metrics,
-    gauge: Gauge,
-}
+pub type GaugeLease = ::telemetry::Lease;
 /// One nonempty intermediate HTTP relay_body call, after sending its response head.
 /// Success credits the entire ciphertext body only after both HTTP finish checks.
 /// Error or abandonment credits one failure and no bytes, even after partial writes.
@@ -209,7 +166,8 @@ impl Drop for OpaqueRelayBody<'_> {
 }
 /// One complete client head through final delivery, including cancellation/drop.
 pub(crate) struct RequestMetrics {
-    active: GaugeLease,
+    _active: GaugeLease,
+    metrics: Metrics,
     succeeded: bool,
     overloaded: bool,
 }
@@ -219,7 +177,7 @@ impl RequestMetrics {
     }
     pub(crate) fn fail(&mut self, error: crate::error::Error) {
         if error == crate::error::Error::Overloaded && !self.overloaded {
-            let _ = self.active.metrics.record(Event::Overload, 1);
+            let _ = self.metrics.record(Event::Overload, 1);
             self.overloaded = true;
         }
     }
@@ -227,15 +185,8 @@ impl RequestMetrics {
 impl Drop for RequestMetrics {
     fn drop(&mut self) {
         if !self.succeeded {
-            let _ = self.active.metrics.record(Event::RequestError, 1);
+            let _ = self.metrics.record(Event::RequestError, 1);
         }
-    }
-}
-impl Drop for GaugeLease {
-    fn drop(&mut self) {
-        self.metrics.registry.gauges[self.gauge as usize]
-            .0
-            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 impl Metrics {
@@ -248,8 +199,7 @@ impl Metrics {
     }
     /// Install once during worker assembly, not on the admission hot path.
     pub(crate) fn observe_admission(&self, worker: WorkerId, usage: AdmissionUsage) -> Result<()> {
-        self.registry.shards[self.shard]
-            .admission
+        self.admission[self.shard]
             .set((worker, usage))
             .map_err(|_| crate::error::Error::InvalidConfiguration)
     }
@@ -295,13 +245,13 @@ impl Metrics {
         if count == 0 {
             return Err(crate::error::Error::InvalidConfiguration);
         }
-        let registry = Arc::new(Registry {
-            shards: (0..count).map(|_| Counters::default()).collect(),
-            gauges: std::array::from_fn(|_| GaugeCounter::default()),
-        });
-        Ok((0..count)
-            .map(|shard| Self {
-                registry: registry.clone(),
+        let admission: Arc<[_]> = (0..count).map(|_| OnceLock::new()).collect();
+        Ok(::telemetry::Metrics::shards(count)
+            .into_iter()
+            .enumerate()
+            .map(|(shard, core)| Self {
+                core,
+                admission: admission.clone(),
                 shard,
             })
             .collect())
@@ -311,73 +261,38 @@ impl Metrics {
         let active = self.lease(Gauge::ActiveRequests)?;
         self.record(Event::Request, 1)?;
         Ok(RequestMetrics {
-            active,
+            _active: active,
+            metrics: self.clone(),
             succeeded: false,
             overloaded: false,
         })
     }
     /// Saturate instead of wrapping a long-lived Prometheus counter.
     pub fn record(&self, event: Event, amount: u64) -> Result<()> {
-        let _ = self.registry.shards[self.shard].events[event as usize].fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |old| Some(old.saturating_add(amount)),
-        );
+        self.core.add(event, amount);
         Ok(())
     }
     pub fn count(&self, event: Event) -> u64 {
-        self.registry.shards.iter().fold(0u64, |total, shard| {
-            total.saturating_add(shard.events[event as usize].load(Ordering::Relaxed))
-        })
+        self.core.count(event)
     }
     pub fn gauge(&self, gauge: Gauge) -> u64 {
-        self.registry.gauges[gauge as usize]
-            .0
-            .load(Ordering::Relaxed)
+        self.core.gauge(gauge)
     }
     pub(crate) fn set_gauge(&self, gauge: Gauge, value: u64) {
-        self.registry.gauges[gauge as usize]
-            .0
-            .store(value, Ordering::Relaxed);
+        self.core.set(gauge, value);
     }
     pub(crate) fn add_gauge(&self, gauge: Gauge, value: u64) {
-        self.registry.gauges[gauge as usize]
-            .0
-            .fetch_add(value, Ordering::Relaxed);
+        self.core.increase(gauge, value);
     }
     pub fn lease(&self, gauge: Gauge) -> Result<GaugeLease> {
-        self.registry.gauges[gauge as usize]
-            .0
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
-                old.checked_add(1)
-            })
-            .map_err(|_| crate::error::Error::Overloaded)?;
-        Ok(GaugeLease {
-            metrics: self.clone(),
-            gauge,
-        })
+        self.core
+            .lease(gauge)
+            .ok_or(crate::error::Error::Overloaded)
     }
     /// The destination is bounded by the diagnostic server; no intermediate String.
     /// Relaxed per-series observations are not a coherent snapshot of all workers.
     pub fn write_prometheus(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
-        for event in EVENTS {
-            writeln!(
-                out,
-                "# TYPE {} counter\n{} {}",
-                event.name(),
-                event.name(),
-                self.count(event)
-            )?;
-        }
-        for gauge in GAUGES {
-            writeln!(
-                out,
-                "# TYPE {} gauge\n{} {}",
-                gauge.name(),
-                gauge.name(),
-                self.gauge(gauge)
-            )?;
-        }
+        self.core.write_prometheus(out)?;
         // Only runtime worker IDs are labels. Read the authority's actual charge,
         // including pooled ciphertext capacity, without sampling on worker polls.
         // A stalled worker therefore remains observable from another worker.
@@ -387,17 +302,12 @@ impl Metrics {
             "racer_worker_ciphertext_used_bytes",
             "racer_worker_ciphertext_limit_bytes",
         ];
-        if self
-            .registry
-            .shards
-            .iter()
-            .any(|s| s.admission.get().is_some())
-        {
+        if self.admission.iter().any(|s| s.get().is_some()) {
             for name in QUOTAS {
                 writeln!(out, "# TYPE {name} gauge")?;
             }
-            for shard in &self.registry.shards {
-                if let Some((worker, usage)) = shard.admission.get() {
+            for shard in self.admission.iter() {
+                if let Some((worker, usage)) = shard.get() {
                     let (relay_used, relay_limit) = usage.relay();
                     let (ciphertext_used, ciphertext_limit) = usage.ciphertext();
                     for (name, value) in QUOTAS.into_iter().zip([
@@ -418,6 +328,19 @@ impl Metrics {
 mod tests {
     use super::*;
     use crate::{model::ResourceClass, runtime::admission::Admission};
+
+    #[test]
+    fn request_lease_overflow_preserves_counters_and_error() {
+        let metrics = Metrics::default();
+        metrics.set_gauge(Gauge::ActiveRequests, u64::MAX);
+        assert!(matches!(
+            metrics.request(),
+            Err(crate::error::Error::Overloaded)
+        ));
+        assert_eq!(metrics.count(Event::Request), 0);
+        assert_eq!(metrics.count(Event::RequestError), 0);
+        assert_eq!(metrics.gauge(Gauge::ActiveRequests), u64::MAX);
+    }
 
     #[test]
     fn opaque_body_attempts_exclude_empty_and_count_abandonment_once() {
@@ -696,21 +619,14 @@ mod tests {
             Err(crate::error::Error::InvalidConfiguration)
         ));
         let workers = Metrics::for_workers(3).unwrap();
-        assert_eq!(std::mem::align_of::<Counters>(), 64);
-        assert_eq!(std::mem::size_of::<Counters>() % 64, 0);
-        assert_eq!(std::mem::size_of::<GaugeCounter>(), 64);
+        // Cache-line alignment and per-shard storage assertions live in the core
+        // test of the same name; this adapter retains its worker mapping checks.
         for (index, worker) in workers.iter().enumerate() {
             assert_eq!(worker.shard, index);
             let clone = worker.clone();
             assert_eq!(clone.shard, index);
-            assert!(Arc::ptr_eq(&clone.registry, &workers[0].registry));
+            assert!(Arc::ptr_eq(&clone.admission, &workers[0].admission));
             clone.record(Event::MemoryHit, (index + 1) as u64).unwrap();
-            let shard = &worker.registry.shards[index];
-            assert_eq!(std::ptr::from_ref(shard) as usize % 64, 0);
-            assert_eq!(
-                shard.events[Event::MemoryHit as usize].load(Ordering::Relaxed),
-                (index + 1) as u64
-            );
         }
         assert_eq!(workers[0].count(Event::MemoryHit), 6);
     }

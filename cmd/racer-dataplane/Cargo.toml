@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "runtime", "alloc", "crypto", "verbs", "http", "topology"]
+members = [".", "runtime", "alloc", "crypto", "verbs", "http", "topology", "telemetry"]
 resolver = "3"
 
 [package]
@@ -23,6 +23,7 @@ required-features = ["subscription-interop"]
 
 [dependencies]
 topology = { path = "topology" }
+telemetry = { path = "telemetry" }
 http1 = { path = "http" }
 racer-crypto = { path = "crypto" }
 rdma-verbs = { path = "verbs" }
