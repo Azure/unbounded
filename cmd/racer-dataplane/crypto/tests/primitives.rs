@@ -99,6 +99,10 @@ fn aead_tampering_never_writes_output() {
 fn aead_malformed_lengths_never_panic_or_write_output() {
     let key = [7; 32];
     let nonce = [2; 24];
+    let error = aead::open(&key, &nonce, b"", b"", &mut []).unwrap_err();
+    let error: &dyn std::error::Error = &error;
+    assert_eq!(error.to_string(), "cryptographic operation failed");
+    assert!(error.source().is_none());
     let plaintext = b"hello";
     let mut sealed = vec![0; plaintext.len() + TAG_LEN];
     aead::seal(&key, &nonce, b"", plaintext, &mut sealed).unwrap();
@@ -261,6 +265,18 @@ fn ed25519_pkcs8_roundtrip_and_malformed_documents() {
     assert_eq!(imported.verifying_key(), key.verifying_key());
     assert_eq!(imported.sign(b"roundtrip"), key.sign(b"roundtrip"));
     assert_eq!(*imported.to_pkcs8_der().unwrap(), *der);
+    // A receiver needs only the public bytes; the original signer can be gone.
+    let public_bytes = *key.verifying_key().as_bytes();
+    drop(key);
+    let receiver = VerifyingKey::from_bytes(&public_bytes).unwrap();
+    let message = b"message signed after restoring the persisted key";
+    let signature = imported.sign(message);
+    receiver.verify_strict(message, &signature).unwrap();
+    assert!(
+        receiver
+            .verify_strict(b"changed message", &signature)
+            .is_err()
+    );
     for length in 0..der.len() {
         assert!(SigningKey::from_pkcs8_der(&der[..length]).is_err());
     }
@@ -274,7 +290,7 @@ fn ed25519_pkcs8_roundtrip_and_malformed_documents() {
     wrong_algorithm[oid + 2] = 0x6e;
     assert!(SigningKey::from_pkcs8_der(&wrong_algorithm).is_err());
     let mut mismatched_public = der.clone();
-    let public = key.verifying_key();
+    let public = imported.verifying_key();
     let public_offset = mismatched_public
         .windows(32)
         .position(|w| w == public.as_bytes())
@@ -285,12 +301,4 @@ fn ed25519_pkcs8_roundtrip_and_malformed_documents() {
     let mut trailing_bytes = der.clone();
     trailing_bytes.push(0);
     assert!(SigningKey::from_pkcs8_der(&trailing_bytes).is_err());
-}
-
-#[test]
-fn opaque_error_implements_standard_error() {
-    let error = aead::open(&[0; 32], &[0; 24], b"", b"", &mut []).unwrap_err();
-    let error: &dyn std::error::Error = &error;
-    assert_eq!(error.to_string(), "cryptographic operation failed");
-    assert!(error.source().is_none());
 }

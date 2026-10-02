@@ -30,3 +30,16 @@ are required in addition to `chacha20poly1305/zeroize`.
 Run `cargo test -p racer-crypto` from the parent workspace. The two ignored CRC
 hardware tests must be selected individually on supported x86 or AArch64 hosts;
 they deliberately fail on unsupported hardware rather than silently skip.
+
+Coverage starts with two small public-API scenarios in `tests/workflows.rs`:
+exchanging records in reusable caller-owned buffer slices (including empty
+records and rejection followed by retry), and authenticating shared-key messages
+(including empty and multi-block messages, changed messages/keys/tags, and
+truncated tags). `tests/primitives.rs` also restores a persisted PKCS#8 signing
+key and verifies a new signature using only exported public-key bytes.
+
+Independent standard vectors, exhaustive tamper and malformed-length checks,
+strict Ed25519 rejection cases, malformed PKCS#8 documents, and CRC reference
+comparisons remain separate regression coverage. These tests do not establish
+timing guarantees or secret zeroization; protocol trust, replay, key rotation,
+and admitted-buffer lifecycle tests belong to the parent dataplane.
