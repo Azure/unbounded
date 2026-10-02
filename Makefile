@@ -591,7 +591,7 @@ racer-controller-build: ## Build the Racer controller without lint/test
 .PHONY: racer-dataplane-build racer-dataplane-test racer-dataplane-dst racer-dataplane-dst-10m racer-dataplane-contention racer-dataplane-native-build racer-dataplane-native-install image-racer-dataplane-local
 racer-dataplane-test: ## Run Rust unit tests with all features; pass filters/options via RACER_TEST_ARGS
 	$(RACER_CARGO) test --locked --manifest-path cmd/racer-dataplane/Cargo.toml \
-		--target-dir "$(RACER_CARGO_TARGET_DIR)" --all-features --lib --bins -- $(RACER_TEST_ARGS)
+		--target-dir "$(RACER_CARGO_TARGET_DIR)" --workspace --all-features --lib --bins -- $(RACER_TEST_ARGS)
 
 # The wrapper starts before Cargo so compilation and all test descendants share
 # the same hard memory limit. It fails before Cargo if enforcement is unavailable.
@@ -650,9 +650,9 @@ racer-test: racer-server-test ## Check Racer server and committed Rust contracts
 racer-rust-test: ## Check the complete Rust suite, including integration tests and doctests
 	@# Integration fixtures use this scratch root even with a separate Cargo target-dir.
 	@mkdir -p cmd/racer-dataplane/target
-	$(RACER_CARGO) fmt --manifest-path cmd/racer-dataplane/Cargo.toml --check
-	$(RACER_CARGO) check --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" --all-targets --all-features
-	$(RACER_CARGO) test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" --all-features -- $(RACER_TEST_ARGS)
+	$(RACER_CARGO) fmt --manifest-path cmd/racer-dataplane/Cargo.toml --all --check
+	$(RACER_CARGO) check --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" --workspace --all-targets --all-features
+	$(RACER_CARGO) test --locked --manifest-path cmd/racer-dataplane/Cargo.toml --target-dir "$(RACER_CARGO_TARGET_DIR)" --workspace --all-features -- $(RACER_TEST_ARGS)
 
 racer-sdk-conformance: ## Run the ignored real Go SDK / Rust conformance test (requires Go and Linux)
 	@# The fixture uses these paths independently of Cargo's build cache.
