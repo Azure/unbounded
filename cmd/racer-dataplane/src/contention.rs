@@ -854,10 +854,13 @@ mod waiter_detach {
             else {
                 panic!("expected first acquisition")
             };
+            let fill_reservation = real.reserve_fill(&origin.object.cache, true).unwrap();
             let operation = flights
                 .retain_operation(
                     &leader,
-                    real.reserve_fill(&origin.object.cache, true).unwrap(),
+                    crate::telemetry::metrics::Metrics::default()
+                        .lease(crate::telemetry::metrics::Gauge::ActiveFills)
+                        .unwrap(),
                 )
                 .unwrap();
             let JoinedFlight::Waiter(mut terminal) =
@@ -928,6 +931,7 @@ mod waiter_detach {
                 2
             );
             operation.complete().unwrap();
+            drop(fill_reservation);
             flights
                 .fail(leader, AcquisitionFailure::Terminal(Error::Io))
                 .unwrap();

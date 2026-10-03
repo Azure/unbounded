@@ -582,7 +582,6 @@ fn subscription_selection_is_canonical_signed_and_bound_to_exact_grant() {
 
 #[test]
 fn subscription_runs_through_real_tcp_requester_session_and_provider() {
-    use crate::peer::PeerClient;
     struct Local(Rc<flow_control::Quotas<AdmissionPolicy>>);
     impl server::LocalPageService for Local {
         fn serve_peer<'a>(

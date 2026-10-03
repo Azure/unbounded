@@ -349,7 +349,7 @@ fn adapter_connection(
 
 struct Rig {
     bootstrap: Bootstrap,
-    drivers: Rc<racer_dataplane::read::drivers::DriverQueue>,
+    drivers: Rc<uring_runtime::drivers::DriverQueue>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     reactor: Rc<Reactor>,
     crypto: Rc<CryptoClient>,
@@ -578,7 +578,7 @@ impl Rig {
         Self {
             bootstrap,
             admission,
-            drivers: Rc::new(racer_dataplane::read::drivers::DriverQueue::default()),
+            drivers: Rc::new(uring_runtime::drivers::DriverQueue::new(1024)),
             reactor,
             crypto,
             engine,

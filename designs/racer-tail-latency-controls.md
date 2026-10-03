@@ -40,7 +40,7 @@ link evidence; generic I/O errors, local deadlines/cancellation and downstream
 overload are not peer-failure evidence. Signed downstream overload is also not
 adaptive recovery (`D/http/connection.rs:1263`, `HttpPool::checkout_peer`;
 `D/peer/transport.rs:1050`, `observe_read`; `D/peer.rs:493`,
-`Requester::exchange_inner_mode`). Permits follow accepted transport ownership;
+`NetworkRequester::exchange_inner_mode`). Permits follow accepted transport ownership;
 native teardown failure retains/quarantines its permit rather than pretending
 timeout means DMA completion (`D/rdma/lifecycle.rs:55-67,480-505`).
 
@@ -71,11 +71,11 @@ An expired exchange is canceled and polled through its completion fence before
 fallback; a late success cannot override expiry (`D/read/candidates.rs:733-795`).
 Tests assert healthy progress beyond the idle share, slow-body rejection even
 without another route, unchanged signed deadlines, conserved credits, and
-fenced late-success rejection (`D/read/candidates/timeout_tests.rs:280`,
+fenced late-success rejection (`D/read/tests/timeouts.rs`,
 `slow_body_without_alternative_or_failure_route_credit_keeps_original_ceiling`;
-`:340`, `known_healthy_body_outlives_share_with_or_without_affordable_fallback`;
-`:386`, `configured_total_cap_never_renews_or_accepts_late_success`;
-`:438`, `retries_get_independent_local_caps_but_never_extend_overall_authority`).
+`known_healthy_body_outlives_share_with_or_without_affordable_fallback`;
+`configured_total_cap_never_renews_or_accepts_late_success`;
+`retries_get_independent_local_caps_but_never_extend_overall_authority`).
 Thus the cap is not a promise that all resource teardown finishes at that instant.
 
 ## 3. Opt-in hedging is deliberately narrower than general request racing
@@ -93,7 +93,7 @@ selection, ciphertext relay, and native transfers do not race through this hook.
 There is no whole-GET duplication; an eligible fixed-page fallback within a read
 can still reach the hook (`D/read/candidates.rs:138-219`,
 `D/peer.rs:398`, `Requester::request_direct`, and `:493`,
-`Requester::exchange_inner_mode`; `D/read/fill.rs:888`, `Fill::acquire_once`).
+`NetworkRequester::exchange_inner_mode`; `D/read/fill.rs:888`, `Fill::acquire_once`).
 
 Slots and duplicate-byte capacity are shared by all workers of one node owner
 (`D/app.rs:610-617`). Each slot charges a full 33554448-byte pair, including during
@@ -141,7 +141,7 @@ winner election, not just at publication (`D/read/fill.rs:1016-1038`). This is
 New regressions cover stalled-primary/fast-miss fallback through the third
 candidate, primary and secondary stale refresh, full 16 MiB pages at exact
 32/48/64 MiB quotas, AEAD-valid conflicting length/content type, and accepted
-crypto cancellation/fencing (in `D/read/fill/scenarios/peer_copies.rs`:
+crypto cancellation/fencing (in `D/read/tests/peer_copies.rs`:
 `hedge_stalled_primary_copy_miss_keeps_time_and_credits_for_later_acquire`,
 `hedge_stale_membership_refreshes_once_without_fresh_credits`,
 `hedge_full_page_exact_plaintext_quotas_suppress_before_spending_serial_credits`,

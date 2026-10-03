@@ -11,14 +11,14 @@ mod duplex_release {
         for mode in ["valid", "duplicate", "malformed", "short", "drop"] {
             let sim = Simulation::new();
             let _sim = sim.enter();
-            let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+            let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
             let _owner = queue.enter();
             let signers = network(1);
             let mut f = fixture();
             f.reactor.init().unwrap();
             let membership = local_membership(&signers[0]);
             let (local, mut endpoint, _publication) =
-                coordinator(&f, &signers[0], &membership, Rc::new(NoPeer));
+                coordinator(&f, &signers[0], &membership, NoPeer::requester());
             let response = futures::executor::block_on(local.read(
                 ClientRequest {
                     kind: ReadKind::Subscription {
@@ -62,7 +62,7 @@ mod duplex_release {
             let mut bytes = Vec::new();
             let mut pump = |endpoint: &mut crate::read::dispatch::WorkerEndpoint| {
                 endpoint.poll(&mut cx, 64).unwrap();
-                crate::read::drivers::poll(&mut cx, 64);
+                uring_runtime::drivers::poll(&mut cx, 64);
                 f.engine.poll_budgeted(64).unwrap();
                 f.crypto.poll_budgeted(64).unwrap();
                 f.reactor.poll_budgeted(64).unwrap();
@@ -184,7 +184,7 @@ mod duplex_release {
     }
 
     fn run(mode: &str) {
-        let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         let clock = uring_runtime::environment::SimulationClock::new(311);
         let environment = clock.environment(0);
@@ -194,7 +194,7 @@ mod duplex_release {
         f.reactor.init().unwrap();
         let membership = local_membership(&signers[0]);
         let (local, mut endpoint, _publication) =
-            coordinator(&f, &signers[0], &membership, Rc::new(NoPeer));
+            coordinator(&f, &signers[0], &membership, NoPeer::requester());
         let scope = RequestScope::new(
             f.scope.request,
             uring_runtime::environment::now() + Duration::from_secs(60),
@@ -534,7 +534,7 @@ mod duplex_release {
         endpoint.uninstall().unwrap();
     }
 }
-use super::*;
+use super::fill::*;
 use crate::{
     client::{ClientRequest, ReadKind},
     control::state::PublishedState,
@@ -556,10 +556,10 @@ use crate::{
 };
 
 struct Link {
-    client: Rc<dyn PeerClient>,
+    client: Rc<Requester>,
     demands: Rc<RefCell<Vec<u64>>>,
 }
-impl PeerClient for Link {
+impl Link {
     fn direct_hedge_available(&self, _: &MembershipLease, _: &crate::model::NodeId) -> bool {
         false
     }
@@ -642,7 +642,7 @@ pub(super) fn coordinator(
     f: &Fixture,
     signer: &Rc<Signatures>,
     membership: &MembershipLease,
-    peers: Rc<dyn PeerClient>,
+    peers: Rc<Requester>,
 ) -> (
     Rc<Coordinator>,
     crate::read::dispatch::WorkerEndpoint,
@@ -672,14 +672,14 @@ pub(super) fn coordinator(
 
 #[test]
 fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let signers = network(1);
     let mut f = fixture_with(3 * PAGE_BYTES + 7, None);
     f.reactor.init().unwrap();
     let membership = local_membership(&signers[0]);
     let (local, mut endpoint, _publication) =
-        coordinator(&f, &signers[0], &membership, Rc::new(NoPeer));
+        coordinator(&f, &signers[0], &membership, NoPeer::requester());
     let open = |ordered, credits, start| {
         let request = ClientRequest {
             kind: ReadKind::Subscription {
@@ -791,7 +791,7 @@ fn ordered_acquisitions_overlap_delivery_share_work_and_bound_reordering() {
 
 #[test]
 fn ordered_acquisition_window_is_not_an_unreleased_credit_ceiling() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     // Full-page batch, then a one-byte boundary with byte credit just below
     // and exactly at the threshold for two additional full pages.
@@ -805,7 +805,7 @@ fn ordered_acquisition_window_is_not_an_unreleased_credit_ceiling() {
         f.reactor.init().unwrap();
         let membership = local_membership(&signers[0]);
         let (local, mut endpoint, _publication) =
-            coordinator(&f, &signers[0], &membership, Rc::new(NoPeer));
+            coordinator(&f, &signers[0], &membership, NoPeer::requester());
         let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
         let mut stream = futures::executor::block_on(local.read(
             ClientRequest {
@@ -899,7 +899,7 @@ fn ordered_acquisition_window_is_not_an_unreleased_credit_ceiling() {
 
 #[test]
 fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fence() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for mode in ["success", "cancel", "drop", "failure"] {
         let signers = network(1);
@@ -907,7 +907,7 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
         f.reactor.init().unwrap();
         let membership = local_membership(&signers[0]);
         let (local, mut endpoint, _publication) =
-            coordinator(&f, &signers[0], &membership, Rc::new(NoPeer));
+            coordinator(&f, &signers[0], &membership, NoPeer::requester());
         let scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
         let request = ClientRequest {
             kind: ReadKind::Subscription {
@@ -946,7 +946,7 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
         let mut pump = |endpoint: &mut crate::read::dispatch::WorkerEndpoint| {
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             endpoint.poll(&mut cx, 64).unwrap();
-            crate::read::drivers::poll(&mut cx, 64);
+            uring_runtime::drivers::poll(&mut cx, 64);
             f.engine.poll_budgeted(64).unwrap();
             f.crypto.poll_budgeted(64).unwrap();
             f.reactor.poll_budgeted(128).unwrap();
@@ -1001,7 +1001,7 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
             }
             assert!(matches!(
                 unordered.poll_next(&mut cx),
-                Poll::Ready(Ok(crate::read::subscription::Next::Select(_)))
+                Poll::Ready(Ok(crate::read::range_stream::Next::Select(_)))
             ));
         } else if mode == "failure" {
             f.origin.version_unavailable.set(true);
@@ -1050,7 +1050,7 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
             // prefetch can refill, even though this stream still has credit.
             stream.poll_prefetch(&mut cx);
             assert_eq!(&*f.origin.started_pages.borrow(), &[0, 1]);
-            let Poll::Ready(Ok(crate::read::subscription::Next::Select(selection))) =
+            let Poll::Ready(Ok(crate::read::range_stream::Next::Select(selection))) =
                 unordered.poll_next(&mut cx)
             else {
                 panic!("unordered turn after the fixed batch completes")
@@ -1112,7 +1112,7 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
 
 #[test]
 fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_local_readers() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let signers = network(3);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1148,8 +1148,8 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
     let mut endpoints = Vec::new();
     let mut publications = Vec::new();
     for i in 0..3 {
-        let peers: Rc<dyn PeerClient> = if i == 2 {
-            Rc::new(NoPeer)
+        let peers: Rc<Requester> = if i == 2 {
+            NoPeer::requester()
         } else {
             let admission = fixtures[i].fill.dependencies.admission.clone();
             let reactor = fixtures[i].reactor.clone();
@@ -1180,10 +1180,15 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
                         .unwrap(),
                 ),
             ));
-            Rc::new(Link {
-                client: requester,
-                demands: demands.clone(),
-            })
+            Requester::scripted(
+                Rc::new(Link {
+                    client: requester,
+                    demands: demands.clone(),
+                }),
+                Link::direct_hedge_available,
+                Link::request,
+                Link::request_direct,
+            )
         };
         let (local, endpoint, published) =
             coordinator(&fixtures[i], &signers[i], &membership, peers);
@@ -1286,7 +1291,7 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
                 )
                 .unwrap();
         }
-        crate::read::drivers::poll(
+        uring_runtime::drivers::poll(
             &mut Context::from_waker(futures::task::noop_waker_ref()),
             64,
         );
@@ -1471,7 +1476,7 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
 }
 #[test]
 fn origin_fill_preserves_ciphertext_for_memory_and_pending_candidate_copy() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);

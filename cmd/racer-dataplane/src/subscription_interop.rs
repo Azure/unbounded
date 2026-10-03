@@ -114,7 +114,7 @@ impl origin::Origin for GeneratedOrigin {
     }
 }
 struct NoPeer;
-impl peer::PeerClient for NoPeer {
+impl NoPeer {
     fn direct_hedge_available(
         &self,
         _: &topology::membership::MembershipLease,
@@ -157,7 +157,7 @@ struct SubscriptionFixture {
     root: PathBuf,
     clients: client::listener::ClientListeners,
     endpoint: read::dispatch::WorkerEndpoint,
-    drivers: Rc<read::drivers::DriverQueue>,
+    drivers: Rc<uring_runtime::drivers::DriverQueue>,
     engine: security::aead::PageCryptoEngine,
     crypto: Rc<runtime::crypto::CryptoClient>,
     reactor: Rc<Reactor>,
@@ -275,7 +275,12 @@ impl SubscriptionFixture {
         let crypto = Rc::new(runtime::crypto::CryptoClient::new(port));
         let engine = PageCryptoEngine::new(CryptoRuntime { port: engine });
         let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
-        let peers = Rc::new(NoPeer);
+        let peers = peer::Requester::scripted(
+            Rc::new(NoPeer),
+            NoPeer::direct_hedge_available,
+            NoPeer::request,
+            NoPeer::request_direct,
+        );
         let candidates = Rc::new(CandidatePolicy::new(
             keys.node().clone(),
             Rc::new(topology::routing::Placement::new(16)),
@@ -346,7 +351,7 @@ impl SubscriptionFixture {
         .unwrap();
         futures::executor::block_on(clients.reconcile(&[cache.clone()], &scope)).unwrap();
         std::fs::write(root.join("ready"), b"ready").unwrap();
-        let drivers = Rc::new(read::drivers::DriverQueue::default());
+        let drivers = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
         Self {
             root,
             clients,

@@ -1,3 +1,19 @@
+fn metric_lease() -> telemetry::Lease {
+    crate::telemetry::metrics::Metrics::default()
+        .lease(crate::telemetry::metrics::Gauge::ActiveFills)
+        .unwrap()
+}
+use crate::{
+    error::{Error, Operation, Result},
+    memory::page::PageResult,
+    model::{OriginContext, PageId, ResourceClass},
+    runtime::{admission::AdmissionPolicy, deadline::RequestScope},
+};
+use std::{
+    rc::Rc,
+    task::{Context, Poll, Waker},
+    time::Instant,
+};
 mod lifecycle_tests {
     //! Waiter election, cancellation, and actual-completion fencing scenarios.
     use super::*;
@@ -11,7 +27,7 @@ mod lifecycle_tests {
         let mut budget = budget();
         let mut supplier = join(&flights, &context, &supplier, &mut budget);
         let leader = lead(&mut supplier);
-        let operation = flights.retain_operation(&leader, ()).unwrap();
+        let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
         for _ in 0..1100 {
             let mut copy = match flights.join_copy(&fence().page, &readers).unwrap() {
                 JoinedCopy::Waiter(waiter) => waiter,
@@ -74,7 +90,7 @@ mod lifecycle_tests {
             _ => panic!("expected waiter"),
         };
         let leader = lead(&mut a);
-        let operation = flights.retain_operation(&leader, ()).unwrap();
+        let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
         let result = page_result(&flights);
         assert_eq!(
             flights.publish(leader, result.clone()),
@@ -135,33 +151,34 @@ mod lifecycle_tests {
 
     #[test]
     fn worker_poll_drives_owned_completion_after_waiter_disappears() {
-        let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         let flights = flights(FlightLimits::default());
         let (context, scope) = (origin(), scope());
         let mut a_budget = budget();
         let mut a = join(&flights, &context, &scope, &mut a_budget);
         let leader = lead(&mut a);
-        let operation = flights.retain_operation(&leader, ()).unwrap();
+        let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
         let (send, receive) = futures::channel::oneshot::channel::<()>();
         let worker = flights.clone();
-        crate::read::drivers::spawn(Box::pin(async move {
-            receive.await.map_err(|_| Error::Io)?;
-            operation.complete()?;
-            assert_eq!(
-                worker.fail(leader, AcquisitionFailure::Terminal(Error::Io)),
-                Err(Error::StaleFlight)
-            );
-            Ok(())
-        }))
-        .unwrap();
+        uring_runtime::drivers::reserve()
+            .unwrap()
+            .submit_detached(Box::pin(async move {
+                receive.await.map_err(|_| Error::Io)?;
+                operation.complete()?;
+                assert_eq!(
+                    worker.fail(leader, AcquisitionFailure::Terminal(Error::Io)),
+                    Err(Error::StaleFlight)
+                );
+                Ok::<_, Error>(())
+            }));
         drop(a);
         flights.poll_budgeted(1).unwrap();
         assert_eq!(flights.table.borrow().entries.len(), 1);
         send.send(()).unwrap();
         flights.poll_budgeted(1).unwrap();
         assert!(flights.table.borrow().entries.is_empty());
-        assert_eq!(crate::read::drivers::pending(), 0);
+        assert_eq!(uring_runtime::drivers::pending(), 0);
     }
 
     #[test]
@@ -224,7 +241,7 @@ mod lifecycle_tests {
             .begin_peer_attempt(Instant::now(), scope_a.deadline.0, 3)
             .unwrap();
         assert!(poll(b.wait()).is_pending());
-        let operation = flights.retain_operation(&leader, ()).unwrap();
+        let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
         let id = operation.id;
         assert_eq!(
             flights.fail(leader, AcquisitionFailure::OriginRejected),
@@ -266,33 +283,28 @@ mod lifecycle_tests {
 
     #[test]
     fn drop_leader_retains_resources_until_actual_completion_without_ticket() {
-        struct Resource(Rc<std::cell::Cell<bool>>);
-        impl Drop for Resource {
-            fn drop(&mut self) {
-                self.0.set(true);
-            }
-        }
+        use crate::telemetry::metrics::{Gauge, Metrics};
         let flights = flights(FlightLimits::default());
         let (context, scope_a, scope_b) = (origin(), scope(), scope());
         let (mut a_budget, mut b_budget) = (budget(), budget());
         let mut a = join(&flights, &context, &scope_a, &mut a_budget);
         let mut b = join(&flights, &context, &scope_b, &mut b_budget);
         let leader = lead(&mut a);
-        let released = Rc::new(std::cell::Cell::new(false));
+        let metrics = Metrics::default();
         let operation = flights
-            .retain_operation(&leader, Resource(released.clone()))
+            .retain_operation(&leader, metrics.lease(Gauge::ActiveFills).unwrap())
             .unwrap();
         drop(leader);
         drop(a);
         flights.poll_budgeted(1).unwrap();
-        assert!(!released.get());
+        assert_eq!(metrics.gauge(Gauge::ActiveFills), 1);
         assert_eq!(
             flights.table.borrow().entries[&fence().page].phase.state(),
             FlightState::Draining
         );
         assert!(poll(b.wait()).is_pending());
         operation.complete().unwrap();
-        assert!(released.get());
+        assert_eq!(metrics.gauge(Gauge::ActiveFills), 0);
         drop(lead(&mut b));
     }
 
@@ -307,7 +319,7 @@ mod lifecycle_tests {
         ));
         let mut a = join(&flights, &context, &scope_a, &mut a_budget);
         let leader = lead(&mut a);
-        let operation = flights.retain_operation(&leader, ()).unwrap();
+        let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
         let mut copy = match flights.join_copy(&fence().page, &copy_scope).unwrap() {
             JoinedCopy::Waiter(waiter) => waiter,
             _ => panic!("expected copy waiter"),
@@ -389,9 +401,9 @@ mod lifecycle_tests {
             Err(Error::Overloaded)
         ));
         let leader = lead(&mut a);
-        let operation = flights.retain_operation(&leader, ()).unwrap();
+        let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
         assert!(matches!(
-            flights.retain_operation(&leader, ()),
+            flights.retain_operation(&leader, metric_lease()),
             Err(Error::Overloaded)
         ));
         flights
@@ -414,7 +426,7 @@ mod lifecycle_tests {
         let mut a_budget = budget();
         let mut a = join(&flights, &context, &scope, &mut a_budget);
         let leader = lead(&mut a);
-        let operation = flights.retain_operation(&leader, ()).unwrap();
+        let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
         drop(leader);
         assert!(operation.cancellation_requested());
         assert!(matches!(
@@ -442,7 +454,7 @@ mod lifecycle_tests {
         let mut a_budget = budget();
         let mut a = join(&flights, &context, &scope, &mut a_budget);
         let leader = lead(&mut a);
-        let operation = flights.retain_operation(&leader, ()).unwrap();
+        let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
         let (fence, id) = (operation.fence.clone(), operation.id);
         drop(operation);
         drop(leader);
@@ -455,7 +467,7 @@ mod lifecycle_tests {
     }
 }
 
-use super::*;
+use crate::read::flight::*;
 #[test]
 fn failure_ceiling_is_inherited_without_allocating_additional_links() {
     let deadline = Instant::now() + std::time::Duration::from_secs(60);
@@ -663,7 +675,7 @@ fn validated_publication_waits_for_fences_and_shares_original_bundle() {
         _ => panic!("expected copy"),
     };
     let leader = lead(&mut a);
-    let operation = flights.retain_operation(&leader, ()).unwrap();
+    let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
     let page = result(&flights, fence().page);
     assert_eq!(
         flights.publish(leader, page.clone()),
@@ -780,28 +792,29 @@ fn forbidden_retries_but_peer_unauthorized_is_terminal() {
 
 #[test]
 fn worker_poll_drives_parent_owned_queue_after_caller_drop() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let flights = flights(FlightLimits::default());
     let (context, scope) = (origin(), scope());
     let mut budget = budget();
     let mut a = join(&flights, &context, &scope, &mut budget);
     let leader = lead(&mut a);
-    let operation = flights.retain_operation(&leader, ()).unwrap();
+    let operation = flights.retain_operation(&leader, metric_lease()).unwrap();
     let (send, recv) = futures::channel::oneshot::channel::<()>();
-    super::super::drivers::spawn(Box::pin(async move {
-        recv.await.map_err(|_| Error::Io)?;
-        operation.complete()?;
-        drop(leader);
-        Ok(())
-    }))
-    .unwrap();
+    uring_runtime::drivers::reserve()
+        .unwrap()
+        .submit_detached(Box::pin(async move {
+            recv.await.map_err(|_| Error::Io)?;
+            operation.complete()?;
+            drop(leader);
+            Ok::<_, Error>(())
+        }));
     drop(a);
     flights.poll_budgeted(1).unwrap();
     assert_eq!(flights.table.borrow().entries.len(), 1);
     send.send(()).unwrap();
     assert!(matches!(poll(flights.drain(&scope)), Poll::Ready(Ok(()))));
-    assert_eq!(super::super::drivers::pending(), 0);
+    assert_eq!(uring_runtime::drivers::pending(), 0);
 }
 
 #[test]

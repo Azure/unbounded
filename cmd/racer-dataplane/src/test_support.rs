@@ -130,7 +130,15 @@ pub fn availability_for(
 
 pub struct NoPeers;
 
-impl crate::peer::PeerClient for NoPeers {
+impl NoPeers {
+    pub fn requester() -> std::rc::Rc<crate::peer::Requester> {
+        crate::peer::Requester::scripted(
+            std::rc::Rc::new(Self),
+            Self::direct_hedge_available,
+            Self::request,
+            Self::request_direct,
+        )
+    }
     fn direct_hedge_available(
         &self,
         _: &crate::topology::membership::MembershipLease,

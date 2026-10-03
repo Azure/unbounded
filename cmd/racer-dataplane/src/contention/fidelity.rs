@@ -541,7 +541,7 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
     let (port, engine_port) = crypto::pair(worker, 0, NonZeroUsize::new(4).unwrap());
     let client = Rc::new(CryptoClient::new(port));
     let mut engine = PageCryptoEngine::new(CryptoRuntime { port: engine_port });
-    let peers = Rc::new(crate::test_support::NoPeers);
+    let peers = crate::test_support::NoPeers::requester();
     let node = crate::model::NodeId(crate::security::test_support::NODE.into());
     let membership = Arc::new(
         Membership::validate(
@@ -594,7 +594,7 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
     };
     let scope = scope();
     let mut budget = AcquisitionBudget::new(scope.deadline.0, 4, 8);
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut read = fill.publish_bootstrap_with_context(
         OriginPage {
@@ -609,7 +609,7 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let mut result = None;
     for _ in 0..32 {
-        crate::read::drivers::poll(&mut cx, 8);
+        uring_runtime::drivers::poll(&mut cx, 8);
         engine.poll_budgeted(8).unwrap();
         client.poll_budgeted(8).unwrap();
         if let std::task::Poll::Ready(value) = read.as_mut().poll(&mut cx) {
@@ -640,7 +640,7 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
     assert!(old_model.bundle.idle());
     assert!(next_model.bundle.idle());
     drop(fill);
-    assert_eq!(crate::read::drivers::pending(), 0);
+    assert_eq!(uring_runtime::drivers::pending(), 0);
     drop((old_model, next_model, model_dirty, real_dirty));
     assert_eq!(memory.evict_idle(usize::MAX), Ok(44));
     checkpoint("dirty and page owners drained", &model, &real, [0, 0, 0]);

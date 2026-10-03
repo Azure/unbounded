@@ -464,7 +464,7 @@ impl MetadataService {
             let deadline = self.deadlines.register(scope.deadline.0)?;
             let cancellation = scope.cancellation.subscribe()?;
             let event = poll_fn(|cx| {
-                super::drivers::poll(cx, 64);
+                uring_runtime::drivers::poll(cx, 64);
                 cancellation.register(cx.waker());
                 if let Err(error) = deadline.check(scope, cx.waker()) {
                     return Poll::Ready(Err(error));
@@ -483,7 +483,7 @@ impl MetadataService {
                     if budget.remaining_attempts() == 0 {
                         return Err(Error::Unavailable);
                     }
-                    let driver_permit = super::drivers::reserve()?;
+                    let driver_permit = uring_runtime::drivers::reserve().map_err(Error::from)?;
                     let mut nonce = [0; 16];
                     uring_runtime::environment::fill_random(&mut nonce)
                         .map_err(|_| Error::Unavailable)?;
@@ -502,7 +502,7 @@ impl MetadataService {
                         RequestScope::new(caller_scope.request, caller_scope.deadline.0)?;
                     let mut owned_budget = budget.transfer();
                     let (send, mut receive) = futures::channel::oneshot::channel();
-                    driver_permit.submit(Box::pin(async move {
+                    driver_permit.submit_detached(Box::pin(async move {
                         let mut work = Box::pin(service.refresh(
                             selector,
                             membership,
@@ -546,12 +546,12 @@ impl MetadataService {
                         // Completion, not receiver lifetime, releases this context
                         // and registration. The original budget is returned intact.
                         let _ = send.send((result, owned_budget));
-                        Ok(())
+                        Ok::<_, Error>(())
                     }));
                     let (result, remaining) = poll_fn(|cx| {
                         cancellation.register(cx.waker());
                         deadline.check(scope, cx.waker())?;
-                        super::drivers::poll(cx, 64);
+                        uring_runtime::drivers::poll(cx, 64);
                         match Pin::new(&mut receive).poll(cx) {
                             Poll::Ready(Ok(value)) => Poll::Ready(Ok(value)),
                             Poll::Ready(Err(_)) => Poll::Ready(Err(Error::Unavailable)),
@@ -1109,7 +1109,7 @@ pub(crate) mod tests {
 
     #[test]
     fn worker_driver_retains_leadership_after_request_drop_until_completion() {
-        let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         let table = Rc::new(RefreshTable::default());
         let request = table.join(key(), 1).unwrap();
@@ -1121,19 +1121,20 @@ pub(crate) mod tests {
         ));
         let driver = request.clone();
         let (complete, fence) = futures::channel::oneshot::channel::<()>();
-        super::super::drivers::spawn(Box::pin(async move {
-            fence.await.map_err(|_| Error::Io)?;
-            driver.retry();
-            Ok(())
-        }))
-        .unwrap();
+        uring_runtime::drivers::reserve()
+            .unwrap()
+            .submit_detached(Box::pin(async move {
+                fence.await.map_err(|_| Error::Io)?;
+                driver.retry();
+                Ok::<_, Error>(())
+            }));
         let mut cx = std::task::Context::from_waker(&waker);
-        super::super::drivers::poll(&mut cx, 64);
+        uring_runtime::drivers::poll(&mut cx, 64);
         drop(request);
         assert!(follower.event(&waker).is_pending());
         assert_eq!(table.registrations.get(), 2);
         complete.send(()).unwrap();
-        super::super::drivers::poll(&mut cx, 64);
+        uring_runtime::drivers::poll(&mut cx, 64);
         assert_eq!(table.registrations.get(), 1);
         assert!(matches!(
             follower.event(&waker),

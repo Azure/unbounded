@@ -216,6 +216,12 @@ pub struct Permit {
 }
 
 impl Permit {
+    /// Discard the outcome, but retain the completed future until queue capacity
+    /// has been released. An async wrapper would destroy it during its final poll.
+    pub fn submit_detached<F: Future + 'static>(self, driver: F) {
+        self.submit(Box::pin(Detached(Box::pin(driver))));
+    }
+
     pub fn submit(mut self, driver: Task) {
         self.queue.new.borrow_mut().push(driver);
         self.reserved = false;
@@ -223,6 +229,16 @@ impl Permit {
         if let Some(waker) = waker {
             waker.wake();
         }
+    }
+}
+
+struct Detached<F>(Pin<Box<F>>);
+
+impl<F: Future> Future for Detached<F> {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.0.as_mut().poll(cx).map(|_| ())
     }
 }
 
@@ -267,6 +283,30 @@ pub fn pending() -> usize {
 mod tests {
     use super::*;
     use futures::{channel::oneshot, task::noop_waker};
+
+    #[test]
+    fn completed_operation_is_dropped_after_releasing_capacity() {
+        struct Complete;
+        impl Future for Complete {
+            type Output = std::result::Result<(), &'static str>;
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Ready(Err("detached failure"))
+            }
+        }
+        impl Drop for Complete {
+            fn drop(&mut self) {
+                assert_eq!(pending(), 1023);
+                assert!(reserve().is_ok());
+            }
+        }
+        let queue = Rc::new(DriverQueue::new(1024));
+        let _owner = queue.enter();
+        let permits: Vec<_> = (0..1023).map(|_| reserve().unwrap()).collect();
+        reserve().unwrap().submit_detached(Complete);
+        poll(&mut Context::from_waker(futures::task::noop_waker_ref()), 1);
+        drop(permits);
+        assert_eq!(pending(), 0);
+    }
 
     #[test]
     fn blocked_driver_is_not_repolled_until_its_own_wake() {

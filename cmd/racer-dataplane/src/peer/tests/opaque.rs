@@ -851,7 +851,7 @@ fn send_crc_http_success_failure_drop_do_not_wait_for_crypto() {
     };
     for mode in ["success", "failure", "drop"] {
         let f = RelayFixture::new(true);
-        let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
         let _guard = queue.enter();
         let (_, ids) = identities();
         let (io, _engine) = pair(

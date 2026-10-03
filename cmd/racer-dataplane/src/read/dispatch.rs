@@ -52,7 +52,7 @@ struct MailboxState {
 /// The map is immutable for the lifetime of this directory. Construct a replacement
 /// only after all endpoints and completion receipts have drained.
 pub struct WorkerDirectory {
-    pub(crate) subscriptions: Arc<super::subscription::Scheduler>,
+    pub(crate) subscriptions: Arc<super::range_stream::Scheduler>,
     map: Arc<WorkerMap>,
     mailboxes: Vec<Arc<Mailbox>>,
     capacity: usize,
@@ -62,7 +62,7 @@ pub struct WorkerDirectory {
 enum Work {
     Select(
         ObjectVersion,
-        super::subscription::Selection,
+        super::range_stream::Selection,
         MembershipLease,
         PeerOriginContext,
     ),
@@ -74,7 +74,7 @@ enum Work {
         PageId,
         MembershipLease,
         PeerOriginContext,
-        Arc<super::subscription::FixedAcquisition>,
+        Arc<super::range_stream::FixedAcquisition>,
     ),
     Publish(VersionMetadata),
     Retained(ObjectVersion),
@@ -214,7 +214,7 @@ impl WorkerDirectory {
     pub(crate) fn start_selection(
         &self,
         version: ObjectVersion,
-        selection: super::subscription::Selection,
+        selection: super::range_stream::Selection,
         membership: MembershipLease,
         context: &OriginContext,
         scope: &RequestScope,
@@ -310,7 +310,7 @@ impl WorkerDirectory {
             return Err(Error::InvalidConfiguration);
         }
         Ok(Self {
-            subscriptions: super::subscription::Scheduler::new(
+            subscriptions: super::range_stream::Scheduler::new(
                 capacity.saturating_mul(workers.len()),
             ),
             map,
@@ -537,7 +537,7 @@ impl WorkerDirectory {
     pub(crate) fn start_ordered_page(
         &self,
         page: PageId,
-        guard: super::subscription::FixedAcquisition,
+        guard: super::range_stream::FixedAcquisition,
         membership: MembershipLease,
         context: &OriginContext,
         scope: &RequestScope,

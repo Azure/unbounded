@@ -633,7 +633,7 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
             futures::join!(relay.forward(ingress, membership, &scope), destination)
         });
         served.unwrap();
-        assert_eq!(requester.outbound_requests.get(), 1);
+        assert_eq!(requester.outbound_requests(), 1);
         if fail {
             assert!(matches!(result, Err(Error::Io)));
         } else {
@@ -752,7 +752,6 @@ fn v5_equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
 
 #[test]
 fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
-    use super::PeerClient;
     use crate::{
         http::{Codec, HttpIo, HttpPool},
         runtime::reactor::Reactor,
@@ -907,7 +906,6 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
 }
 
 fn signed_tcp_case(case: &str) {
-    use super::PeerClient;
     use crate::topology::{
         health::LinkHealth,
         membership::{Member, Membership},

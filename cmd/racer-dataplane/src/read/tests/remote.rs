@@ -1,6 +1,6 @@
 //! Candidate policy exercised through real signing, handshake, TCP, and Requester.
-use super::candidates::{CandidatePolicy, CandidateResolution};
-use super::flight::AcquisitionBudget;
+use crate::read::candidates::{CandidatePolicy, CandidateResolution};
+use crate::read::flight::AcquisitionBudget;
 use crate::{
     error::{Error, Operation},
     http::{Codec, HttpIo, HttpPool},
@@ -130,7 +130,7 @@ fn remote_origin_absence_preserves_fresh_404_pinned_412_and_later_cached_version
 
 #[test]
 fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     use crate::test_support::NoPeers;
     let ids = identities(&[node(0), node(1)]);
@@ -158,7 +158,7 @@ fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
         ids[1].keys.clone(),
         admission.clone(),
         reactor.clone(),
-        Rc::new(NoPeers),
+        NoPeers::requester(),
         calls.clone(),
         true,
     );
@@ -258,7 +258,7 @@ fn live_read_routes_after_cache_only_publication_and_membership_update() {
 }
 
 fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn: bool) {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     use crate::control::{
         state::Publication,
@@ -402,7 +402,12 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
                 b.keys.clone(),
                 admission.clone(),
                 reactor.clone(),
-                copies,
+                crate::peer::Requester::scripted(
+                    copies,
+                    CachedCopies::direct_hedge_available,
+                    CachedCopies::request,
+                    CachedCopies::request_direct,
+                ),
                 origin_calls.clone(),
             )
         });
@@ -434,22 +439,27 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         transfers,
         source_network,
     ));
-    let requester: Rc<dyn crate::peer::PeerClient> = if matches!(absence, Some(Absence::Pinned)) {
-        Rc::new(PinnedFallback {
-            requester,
-            destination,
-            sender: Forwarding::new(a.signatures.clone()),
-            receivers: identities
-                .iter()
-                .skip(2)
-                .map(|id| {
-                    (
-                        id.signatures.node().clone(),
-                        Forwarding::new(id.signatures.clone()),
-                    )
-                })
-                .collect(),
-        })
+    let requester: Rc<crate::peer::Requester> = if matches!(absence, Some(Absence::Pinned)) {
+        crate::peer::Requester::scripted(
+            Rc::new(PinnedFallback {
+                requester,
+                destination,
+                sender: Forwarding::new(a.signatures.clone()),
+                receivers: identities
+                    .iter()
+                    .skip(2)
+                    .map(|id| {
+                        (
+                            id.signatures.node().clone(),
+                            Forwarding::new(id.signatures.clone()),
+                        )
+                    })
+                    .collect(),
+            }),
+            PinnedFallback::direct_hedge_available,
+            PinnedFallback::request,
+            PinnedFallback::request_direct,
+        )
     } else {
         requester
     };
@@ -687,7 +697,7 @@ struct PinnedFallback {
     sender: Forwarding,
     receivers: Vec<(NodeId, Forwarding)>,
 }
-impl crate::peer::PeerClient for PinnedFallback {
+impl PinnedFallback {
     fn direct_hedge_available(
         &self,
         _: &crate::topology::membership::MembershipLease,
@@ -711,7 +721,7 @@ impl crate::peer::PeerClient for PinnedFallback {
     ) -> Operation<'a, protocol::VerifiedResponse> {
         Box::pin(async move {
             if request.route.destination == self.destination {
-                return crate::peer::PeerClient::request(
+                return crate::peer::Requester::request(
                     self.requester.as_ref(),
                     request,
                     membership,
@@ -785,7 +795,7 @@ struct CachedCopies {
     calls: Rc<RefCell<Vec<NodeId>>>,
     metadata: Option<ObjectMetadata>,
 }
-impl crate::peer::PeerClient for CachedCopies {
+impl CachedCopies {
     fn direct_hedge_available(
         &self,
         _: &crate::topology::membership::MembershipLease,
@@ -848,7 +858,7 @@ fn metadata_coordinator(
     keys: Rc<Keyring>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     reactor: Rc<Reactor>,
-    peers: Rc<dyn crate::peer::PeerClient>,
+    peers: Rc<crate::peer::Requester>,
     adapter: Rc<AdapterOrigin>,
 ) -> (Rc<super::Coordinator>, super::dispatch::WorkerEndpoint) {
     metadata_coordinator_with_newer_publication(
@@ -862,7 +872,7 @@ fn metadata_coordinator_with_newer_publication(
     keys: Rc<Keyring>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     reactor: Rc<Reactor>,
-    peers: Rc<dyn crate::peer::PeerClient>,
+    peers: Rc<crate::peer::Requester>,
     adapter: Rc<AdapterOrigin>,
     newer_publication: bool,
 ) -> (Rc<super::Coordinator>, super::dispatch::WorkerEndpoint) {
@@ -959,22 +969,24 @@ fn metadata_coordinator_with_newer_publication(
         .unwrap(),
     );
     let (port, _engine) = crypto::pair(WorkerId(0), 0, std::num::NonZeroUsize::new(16).unwrap());
-    let fill = Rc::new(super::fill::Fill::new(super::fill::FillDependencies {
-        memory: Rc::new(MemoryCache::new(buffers.clone(), availability.clone())),
-        buffers,
-        disk,
-        writer,
-        origin: origin.clone(),
-        candidates: candidates.clone(),
-        flights: Rc::new(super::flight::Flights::new(
-            admission.clone(),
-            availability.clone(),
-        )),
-        crypto: Rc::new(PageCrypto::new(keys, Rc::new(CryptoClient::new(port)))),
-        credentials: credentials.clone(),
-        admission: admission.clone(),
-        metadata_owner: owners.clone(),
-    }));
+    let fill = Rc::new(crate::read::fill::Fill::new(
+        crate::read::fill::FillDependencies {
+            memory: Rc::new(MemoryCache::new(buffers.clone(), availability.clone())),
+            buffers,
+            disk,
+            writer,
+            origin: origin.clone(),
+            candidates: candidates.clone(),
+            flights: Rc::new(crate::read::flight::Flights::new(
+                admission.clone(),
+                availability.clone(),
+            )),
+            crypto: Rc::new(PageCrypto::new(keys, Rc::new(CryptoClient::new(port)))),
+            credentials: credentials.clone(),
+            admission: admission.clone(),
+            metadata_owner: owners.clone(),
+        },
+    ));
     let metadata = Rc::new(super::metadata::MetadataService::new(
         candidates,
         origin,

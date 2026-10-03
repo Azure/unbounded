@@ -305,7 +305,7 @@ fn real_uds_root_remapping_keeps_public_authority_and_http_validation() {
     let policy = CandidatePolicy::new(
         candidates.ordered[0].clone(),
         Rc::new(Placement::new(2)),
-        Rc::new(NoPeers),
+        NoPeers::requester(),
         credentials(admission.clone()),
         Arc::new(PublishedState::default()),
     );
@@ -963,7 +963,7 @@ fn public_operations_reject_wrong_authority_before_io() {
     let policy = CandidatePolicy::new(
         node,
         Rc::new(Placement::new(2)),
-        Rc::new(NoPeers),
+        NoPeers::requester(),
         credentials(client().1),
         Arc::new(PublishedState::default()),
     );

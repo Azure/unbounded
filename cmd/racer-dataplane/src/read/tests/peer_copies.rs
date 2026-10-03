@@ -1,5 +1,5 @@
 //! Real AEAD and signed peer responses, with deterministic ranked source scripts.
-use super::*;
+use super::fill::*;
 use crate::{
     memory::page::CiphertextCopy,
     model::NodeId,
@@ -29,7 +29,15 @@ struct ScriptedPeers {
     calls: RefCell<Vec<(NodeId, bool, u32, u8, Instant)>>,
     local_deadlines: RefCell<Vec<(Instant, Instant)>>,
 }
-impl PeerClient for ScriptedPeers {
+impl ScriptedPeers {
+    fn requester(self: &Rc<Self>) -> Rc<Requester> {
+        Requester::scripted(
+            self.clone(),
+            Self::direct_hedge_available,
+            Self::request,
+            Self::request_direct,
+        )
+    }
     fn direct_hedge_available(
         &self,
         _: &crate::topology::membership::MembershipLease,
@@ -179,7 +187,12 @@ fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Ve
     dependencies.candidates = Rc::new(CandidatePolicy::new(
         local,
         placement,
-        peers.clone(),
+        Requester::scripted(
+            peers.clone(),
+            ScriptedPeers::direct_hedge_available,
+            ScriptedPeers::request,
+            ScriptedPeers::request_direct,
+        ),
         dependencies.credentials.clone(),
         Arc::new(Default::default()),
     ));
@@ -189,7 +202,7 @@ fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Ve
 
 #[test]
 fn invalid_signed_selection_falls_back_without_resetting_acquisition_budget() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for missing_key in [false, true] {
         for origin in [false, true] {
@@ -213,7 +226,7 @@ fn invalid_signed_selection_falls_back_without_resetting_acquisition_budget() {
                 &f,
                 &signers[peers.local],
                 &f.membership,
-                peers.clone(),
+                peers.requester(),
             );
             let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
             let demand = crate::peer::subscriptions::Demand::new(vec![
@@ -236,7 +249,7 @@ fn invalid_signed_selection_falls_back_without_resetting_acquisition_budget() {
                     break;
                 }
                 endpoint.poll(&mut cx, 64).unwrap();
-                crate::read::drivers::poll(&mut cx, 64);
+                uring_runtime::drivers::poll(&mut cx, 64);
                 f.engine.poll_budgeted(64).unwrap();
                 f.crypto.poll_budgeted(64).unwrap();
                 f.reactor.poll_budgeted(64).unwrap();
@@ -259,7 +272,7 @@ fn invalid_signed_selection_falls_back_without_resetting_acquisition_budget() {
 
 #[test]
 fn hedged_plaintext_validates_aead_and_preserves_singleflight_and_original_credits() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for corrupt in [false, true] {
         let mut f = fixture();
@@ -332,18 +345,18 @@ fn hedged_plaintext_validates_aead_and_preserves_singleflight_and_original_credi
 
 #[test]
 fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for reason in ["route", "credits", "memory", "slots"] {
         let mut f = fixture();
         let (peers, ordered) = install_peers(&mut f, None);
         peers.hedge.set(reason != "route");
         let metrics = crate::telemetry::metrics::Metrics::default();
-        let hedges = super::super::super::hedge::Hedges::new(
-            super::super::super::hedge::Config {
+        let hedges = crate::read::hedge::Hedges::new(
+            crate::read::hedge::Config {
                 delay: Duration::from_millis(1),
                 slots: 1,
-                bytes: super::super::super::hedge::DUPLICATE_BYTES,
+                bytes: crate::read::hedge::DUPLICATE_BYTES,
             },
             metrics.clone(),
         )
@@ -354,7 +367,7 @@ fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
             CandidatePolicy::new(
                 node(peers.local),
                 Rc::new(Placement::new(16)),
-                peers.clone(),
+                peers.requester(),
                 deps.credentials.clone(),
                 Arc::new(Default::default()),
             )
@@ -396,9 +409,9 @@ fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
             &f.scope,
             &mut budget,
             admission,
-            &mut super::super::super::candidates::HedgeContinuation::default(),
+            &mut crate::read::candidates::HedgeContinuation::default(),
             |_, _| Box::pin(async { panic!("suppressed hedge validation") }),
-        )) as Result<Option<()>>;
+        ));
         assert!(matches!(result, Ok(None)));
         assert_eq!(
             before,
@@ -442,11 +455,11 @@ fn encrypted_copy(f: &mut Fixture) -> CiphertextCopy {
 fn enable_hedge(f: &mut Fixture, peers: &Rc<ScriptedPeers>) -> crate::telemetry::metrics::Metrics {
     peers.hedge.set(true);
     let metrics = crate::telemetry::metrics::Metrics::default();
-    let hedges = super::super::super::hedge::Hedges::new(
-        super::super::super::hedge::Config {
+    let hedges = crate::read::hedge::Hedges::new(
+        crate::read::hedge::Config {
             delay: Duration::from_nanos(1),
             slots: 1,
-            bytes: super::super::super::hedge::DUPLICATE_BYTES,
+            bytes: crate::read::hedge::DUPLICATE_BYTES,
         },
         metrics.clone(),
     )
@@ -456,7 +469,7 @@ fn enable_hedge(f: &mut Fixture, peers: &Rc<ScriptedPeers>) -> crate::telemetry:
         CandidatePolicy::new(
             node(peers.local),
             Rc::new(Placement::new(16)),
-            peers.clone(),
+            peers.requester(),
             deps.credentials.clone(),
             Arc::new(Default::default()),
         )
@@ -468,7 +481,7 @@ fn enable_hedge(f: &mut Fixture, peers: &Rc<ScriptedPeers>) -> crate::telemetry:
 
 #[test]
 fn hedge_stalled_primary_copy_miss_keeps_time_and_credits_for_later_acquire() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for third in [false, true] {
         let clock = uring_runtime::environment::SimulationClock::new(920);
@@ -527,7 +540,7 @@ fn hedge_stalled_primary_copy_miss_keeps_time_and_credits_for_later_acquire() {
 
 #[test]
 fn hedge_stale_membership_refreshes_once_without_fresh_credits() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for stale_again in [false, true] {
         for secondary_stale in [false, true] {
@@ -547,7 +560,7 @@ fn hedge_stale_membership_refreshes_once_without_fresh_credits() {
                 CandidatePolicy::new(
                     node(peers.local),
                     Rc::new(Placement::new(16)),
-                    peers.clone(),
+                    peers.requester(),
                     deps.credentials.clone(),
                     crate::control::state::PublishedState::for_membership(latest.clone()),
                 )
@@ -604,7 +617,7 @@ fn hedge_stale_membership_refreshes_once_without_fresh_credits() {
 
 #[test]
 fn hedge_continuation_preserves_version_failure_and_never_restarts_consumed_primary() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let (peers, ordered) = install_peers(&mut f, None);
@@ -627,7 +640,7 @@ fn hedge_continuation_preserves_version_failure_and_never_restarts_consumed_prim
 
 #[test]
 fn hedge_default_budget_never_sends_underfunded_second_cold_fallback() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let (peers, ordered) = install_peers(&mut f, None);
@@ -654,7 +667,7 @@ fn hedge_default_budget_never_sends_underfunded_second_cold_fallback() {
 
 #[test]
 fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_original_budget() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     use crate::{peer::server::LocalPageService, read::Coordinator};
     struct Mesh {
@@ -668,7 +681,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
         mesh: Rc<Mesh>,
         local: usize,
     }
-    impl PeerClient for Peer {
+    impl Peer {
         fn direct_hedge_available(&self, _: &MembershipLease, _: &NodeId) -> bool {
             true
         }
@@ -775,24 +788,29 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
         let mut endpoints = Vec::new();
         for (i, f) in fixtures.iter_mut().enumerate() {
             f.membership = membership.clone();
-            let peers: Rc<dyn PeerClient> = Rc::new(Peer {
+            let peers = Rc::new(Peer {
                 mesh: mesh.clone(),
                 local: i,
             });
             let mut policy = CandidatePolicy::new(
                 node(i),
                 Rc::new(Placement::new(16)),
-                peers.clone(),
+                Requester::scripted(
+                    peers.clone(),
+                    Peer::direct_hedge_available,
+                    Peer::request,
+                    Peer::request_direct,
+                ),
                 f.fill.dependencies.credentials.clone(),
                 Arc::new(Default::default()),
             );
             if i == source {
                 policy = policy.with_hedges(
-                    super::super::super::hedge::Hedges::new(
-                        super::super::super::hedge::Config {
+                    crate::read::hedge::Hedges::new(
+                        crate::read::hedge::Config {
                             slots: 1,
                             delay: Duration::from_nanos(1),
-                            bytes: super::super::super::hedge::DUPLICATE_BYTES,
+                            bytes: crate::read::hedge::DUPLICATE_BYTES,
                         },
                         hedge_metrics.clone(),
                     )
@@ -819,7 +837,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
         }
         let (attempts, links) = if target_rank == 1 { (8, 16) } else { (10, 18) };
         let mut budget = if target_rank == 1 {
-            super::super::super::range_stream::client_page_budget_for_test(
+            crate::read::range_stream::client_page_budget_for_test(
                 fixtures[source].scope.deadline.0,
             )
         } else {
@@ -842,7 +860,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let mut result = None;
         for _ in 0..512 {
-            super::super::super::drivers::poll(&mut cx, 64);
+            uring_runtime::drivers::poll(&mut cx, 64);
             for f in &mut fixtures {
                 f.engine.poll_budgeted(64).unwrap();
                 f.crypto.poll_budgeted(64).unwrap();
@@ -903,7 +921,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
 
 #[test]
 fn hedge_full_page_exact_plaintext_quotas_suppress_before_spending_serial_credits() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for pages in [2, 3, 4] {
         let mut limits = crate::test_support::cluster::config(false).limits;
@@ -975,7 +993,7 @@ fn hedge_full_page_exact_plaintext_quotas_suppress_before_spending_serial_credit
 
 #[test]
 fn hedge_authenticated_metadata_conflict_cannot_win_over_retained_descriptor() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for content_type in [false, true] {
         let mut f = fixture_with(PAGE_BYTES + 3, None);
@@ -1049,7 +1067,7 @@ fn hedge_authenticated_metadata_conflict_cannot_win_over_retained_descriptor() {
 
 #[test]
 fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let (peers, ordered) = install_peers(&mut f, None);
@@ -1068,7 +1086,7 @@ fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
         mode: FetchMode::Acquire,
     };
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
-    let mut continuation = super::super::super::candidates::HedgeContinuation::default();
+    let mut continuation = crate::read::candidates::HedgeContinuation::default();
     let scopes = RefCell::new(Vec::<RequestScope>::new());
     let primary_canceled = Cell::new(false);
     let mut pair = Box::pin(f.fill.dependencies.candidates.hedge_page(
@@ -1089,9 +1107,9 @@ fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
                 if first {
                     let result = fill.decrypt_response(page, response, None, &child).await;
                     canceled.set(matches!(result, Err(Error::Cancelled)));
-                    result.map(|_| 1)
+                    result
                 } else {
-                    Ok(2)
+                    Ok(crate::read::tests::page(2))
                 }
             })
         },
@@ -1118,7 +1136,7 @@ fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
     f.crypto.poll_budgeted(8).unwrap();
     assert!(matches!(
         pair.as_mut().poll(&mut cx),
-        Poll::Ready(Ok(Some(2)))
+        Poll::Ready(Ok(Some(page))) if page.plaintext.bytes() == [2]
     ));
     assert!(primary_canceled.get());
     assert_eq!(f.crypto.outstanding(), 0);
@@ -1127,7 +1145,7 @@ fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
 
 #[test]
 fn hedge_child_cancellation_removes_crypto_admission_wait_without_canceling_accepted_job() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.queue_entries = std::num::NonZeroUsize::new(1).unwrap();
@@ -1250,7 +1268,7 @@ fn assert_published(f: &Fixture, result: &PageResult, persist: bool) {
         assert_eq!(copy.ciphertext.bytes(), result.ciphertext.bytes());
     }
     assert_eq!(f.crypto.outstanding(), 0);
-    assert_eq!(super::super::super::drivers::pending(), 0);
+    assert_eq!(uring_runtime::drivers::pending(), 0);
 }
 
 fn assert_unpublished(f: &Fixture) {
@@ -1279,7 +1297,7 @@ fn assert_unpublished(f: &Fixture) {
 
 #[test]
 fn unusable_peer_copy_advances_to_alternate_or_authorized_origin() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for missing_key in [false, true] {
         for (rank, use_origin) in [(None, false), (Some(2), false), (Some(2), true)] {
@@ -1357,7 +1375,7 @@ fn unusable_peer_copy_advances_to_alternate_or_authorized_origin() {
 
 #[test]
 fn peer_ciphertext_from_another_version_cannot_be_published_under_the_pin() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let (peers, ordered) = install_peers(&mut f, Some(1));
@@ -1406,7 +1424,7 @@ fn peer_ciphertext_from_another_version_cannot_be_published_under_the_pin() {
 
 #[test]
 fn origin_version_miss_checks_every_later_copy_without_claiming_false_absence() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for healthy_last in [false, true] {
         let mut f = fixture();
@@ -1447,7 +1465,7 @@ fn origin_version_miss_checks_every_later_copy_without_claiming_false_absence() 
 
 #[test]
 fn corrupt_predecessor_evidence_survives_origin_and_later_copy_misses() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let (peers, ordered) = install_peers(&mut f, Some(1));
@@ -1471,7 +1489,7 @@ fn corrupt_predecessor_evidence_survives_origin_and_later_copy_misses() {
 
 #[test]
 fn corrupt_copies_exhaust_sources_or_original_credits_without_origin_for_noncandidate() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for (attempts, links, expected_calls, expected_error) in [
         (8, 16, 3, Error::Unavailable),
@@ -1510,7 +1528,7 @@ fn corrupt_copies_exhaust_sources_or_original_credits_without_origin_for_noncand
 
 #[test]
 fn unauthorized_after_corrupt_copy_is_terminal_not_origin_evidence() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let (peers, ordered) = install_peers(&mut f, Some(2));
@@ -1533,7 +1551,7 @@ fn unauthorized_after_corrupt_copy_is_terminal_not_origin_evidence() {
 
 #[test]
 fn corrupt_copy_cannot_extend_original_budget_deadline() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let (peers, ordered) = install_peers(&mut f, Some(2));

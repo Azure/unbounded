@@ -352,32 +352,125 @@ impl Relay {
     }
 }
 
-/// Candidate-policy boundary with one shipping implementation, [`Requester`].
-/// Precise-fence fixtures hold completion after cancellation to prove fallback
-/// cannot reuse accepted work early; real socket timing cannot prescribe that
-/// boundary. Ordinary transport behavior is covered by signed socket exchanges.
-/// Implementations must explicitly declare and implement direct hedge behavior.
-pub trait PeerClient {
-    /// Conservative hedge capability: the destination must itself be the first hop.
-    fn direct_hedge_available(
+/// Concrete candidate requester. Scripted outcomes exist only in unit tests and
+/// the subscription interoperability fixture, so cancellation and an adversarial
+/// late-success completion fence remain distinct.
+pub enum Requester {
+    Network(NetworkRequester),
+    #[cfg(any(test, feature = "subscription-interop"))]
+    Scripted {
+        available: Box<dyn Fn(&MembershipLease, &crate::model::NodeId) -> bool>,
+        request: Box<
+            dyn Fn(
+                PeerRequest,
+                MembershipLease,
+                RequestScope,
+                bool,
+            ) -> Operation<'static, VerifiedResponse>,
+        >,
+    },
+}
+impl Requester {
+    #[cfg(any(test, feature = "subscription-interop"))]
+    pub(crate) fn scripted<T: 'static>(
+        state: Rc<T>,
+        available: fn(&T, &MembershipLease, &crate::model::NodeId) -> bool,
+        request: for<'a> fn(
+            &'a T,
+            PeerRequest,
+            MembershipLease,
+            &'a RequestScope,
+        ) -> Operation<'a, VerifiedResponse>,
+        direct: for<'a> fn(
+            &'a T,
+            PeerRequest,
+            MembershipLease,
+            &'a RequestScope,
+        ) -> Operation<'a, VerifiedResponse>,
+    ) -> Rc<Self> {
+        let capability = state.clone();
+        Rc::new(Self::Scripted {
+            available: Box::new(move |m, n| available(&capability, m, n)),
+            request: Box::new(move |r, m, scope, is_direct| {
+                let state = state.clone();
+                Box::pin(async move {
+                    if is_direct {
+                        direct(&state, r, m, &scope).await
+                    } else {
+                        request(&state, r, m, &scope).await
+                    }
+                })
+            }),
+        })
+    }
+    pub fn new(
+        paths: Rc<Paths>,
+        forwarding: Rc<Forwarding>,
+        transfers: Rc<Transfers>,
+        network: Rc<PeerNetwork>,
+    ) -> Self {
+        Self::Network(NetworkRequester::new(paths, forwarding, transfers, network))
+    }
+    pub(crate) fn with_observer(self, observer: Observer) -> Self {
+        match self {
+            Self::Network(network) => Self::Network(network.with_observer(observer)),
+            #[cfg(any(test, feature = "subscription-interop"))]
+            scripted => scripted,
+        }
+    }
+    pub(crate) fn with_metrics(self, metrics: crate::telemetry::metrics::Metrics) -> Self {
+        match self {
+            Self::Network(network) => Self::Network(network.with_metrics(metrics)),
+            #[cfg(any(test, feature = "subscription-interop"))]
+            scripted => scripted,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn admission(&self) -> &std::sync::Arc<adaptive::AdaptivePeers> {
+        match self {
+            Self::Network(network) => network.admission(),
+            _ => panic!("scripted requester has no network admission"),
+        }
+    }
+    pub fn direct_hedge_available(
         &self,
         membership: &MembershipLease,
         destination: &crate::model::NodeId,
-    ) -> bool;
-    fn request_direct<'a>(
+    ) -> bool {
+        match self {
+            Self::Network(network) => network.direct_hedge_available(membership, destination),
+            #[cfg(any(test, feature = "subscription-interop"))]
+            Self::Scripted { available, .. } => available(membership, destination),
+        }
+    }
+    pub fn request_direct<'a>(
         &'a self,
         request: PeerRequest,
         membership: MembershipLease,
         scope: &'a RequestScope,
-    ) -> Operation<'a, VerifiedResponse>;
-    /// Carry the originating operation's lease through routing and completion.
-    /// Cancellation does not release accepted transport work before its fence.
-    fn request<'a>(
+    ) -> Operation<'a, VerifiedResponse> {
+        match self {
+            Self::Network(network) => network.request_direct(request, membership, scope),
+            #[cfg(any(test, feature = "subscription-interop"))]
+            Self::Scripted {
+                request: script, ..
+            } => script(request, membership, scope.clone(), true),
+        }
+    }
+    pub fn request<'a>(
         &'a self,
         request: PeerRequest,
         membership: MembershipLease,
         scope: &'a RequestScope,
-    ) -> Operation<'a, VerifiedResponse>;
+    ) -> Operation<'a, VerifiedResponse> {
+        match self {
+            Self::Network(network) => network.request(request, membership, scope),
+            #[cfg(any(test, feature = "subscription-interop"))]
+            Self::Scripted {
+                request: script, ..
+            } => script(request, membership, scope.clone(), false),
+        }
+    }
 }
 /// Owned signed-envelope exchange shared by requesters and opaque relays.
 /// Receiving a signed response does not authenticate it: callers must verify it
@@ -385,13 +478,13 @@ pub trait PeerClient {
 /// Requesters handle both complete and opaque I/O.
 ///
 /// ```no_run
-/// use racer_dataplane::{error::Result, peer::{PeerClient, Requester,
+/// use racer_dataplane::{error::Result, peer::{Requester,
 ///     Relay, server::PeerServer,
 ///     protocol::{PeerRequest, SignedRequest, SignedResponse, VerifiedResponse}},
 ///     runtime::deadline::RequestScope, security::forwarding::Forwarding,
 ///     topology::membership::MembershipLease};
 /// async fn interfaces(
-///     client: &dyn PeerClient, transport: &Requester,
+///     client: &Requester, transport: &Requester,
 ///     server: &PeerServer, relay: &Relay, auth: &Forwarding,
 ///     local: PeerRequest, wire: SignedRequest, outbound: SignedRequest,
 ///     inbound: SignedRequest, membership: MembershipLease, scope: &RequestScope,
@@ -407,7 +500,7 @@ pub trait PeerClient {
 ///     Ok(())
 /// }
 /// ```
-pub struct Requester {
+pub struct NetworkRequester {
     #[cfg(test)]
     outbound_requests: std::cell::Cell<usize>,
     metrics: crate::telemetry::metrics::Metrics,
@@ -418,7 +511,7 @@ pub struct Requester {
     transfers: Rc<Transfers>,
     network: Rc<PeerNetwork>,
 }
-impl Requester {
+impl NetworkRequester {
     #[cfg(test)]
     pub(crate) fn admission(&self) -> &std::sync::Arc<adaptive::AdaptivePeers> {
         self.paths.peer_admission.as_ref().unwrap()
@@ -450,7 +543,7 @@ impl Requester {
         self
     }
 }
-impl PeerClient for Requester {
+impl NetworkRequester {
     fn direct_hedge_available(
         &self,
         membership: &MembershipLease,
@@ -534,7 +627,43 @@ impl PeerClient for Requester {
     }
 }
 impl Requester {
+    #[cfg(test)]
+    fn outbound_requests(&self) -> usize {
+        match self {
+            Self::Network(network) => network.outbound_requests.get(),
+            Self::Scripted { .. } => panic!("scripted requester has no network attempts"),
+        }
+    }
     pub fn exchange_relay<'a>(
+        &'a self,
+        request: SignedRequest,
+        membership: MembershipLease,
+        reservation: Rc<flow_control::Charge<AdmissionPolicy>>,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, transport::RelayResponse> {
+        match self {
+            Self::Network(network) => {
+                network.exchange_relay(request, membership, reservation, scope)
+            }
+            #[cfg(any(test, feature = "subscription-interop"))]
+            _ => panic!("scripted candidate cannot relay"),
+        }
+    }
+    pub fn exchange<'a>(
+        &'a self,
+        request: SignedRequest,
+        membership: MembershipLease,
+        scope: &'a RequestScope,
+    ) -> Operation<'a, SignedResponse> {
+        match self {
+            Self::Network(network) => network.exchange(request, membership, scope),
+            #[cfg(any(test, feature = "subscription-interop"))]
+            _ => panic!("scripted candidate cannot exchange opaque envelopes"),
+        }
+    }
+}
+impl NetworkRequester {
+    fn exchange_relay<'a>(
         &'a self,
         request: SignedRequest,
         membership: MembershipLease,
@@ -561,7 +690,7 @@ impl Requester {
         })
     }
 }
-impl Requester {
+impl NetworkRequester {
     fn exchange_inner<'a>(
         &'a self,
         request: SignedRequest,

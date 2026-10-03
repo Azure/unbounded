@@ -1,4 +1,17 @@
-use super::*;
+use crate::read::candidates::*;
+use crate::{
+    error::{Error, Operation, Result},
+    model::{MetadataSelector, NodeId, OriginContext, PageNumber},
+    peer::{
+        Requester,
+        protocol::{
+            FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse, VerifiedResponse,
+        },
+    },
+    read::flight::AcquisitionBudget,
+    runtime::deadline::{Deadline, RequestScope},
+    topology::routing::Candidates,
+};
 use crate::{
     model::{ExpiresAt, MembershipVersion, ObjectMetadata, ObjectVersion, RequestId, StrongEtag},
     security::{connection::Signatures, forwarding::Forwarding, test_support::network},
@@ -11,6 +24,7 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
+use std::{cell::RefCell, rc::Rc, sync::Arc, time::Instant};
 
 struct Call {
     scope: RequestScope,
@@ -68,7 +82,7 @@ impl Peers {
     }
 }
 
-impl PeerClient for Peers {
+impl Peers {
     fn direct_hedge_available(
         &self,
         _: &crate::topology::membership::MembershipLease,
@@ -160,7 +174,7 @@ impl Fixture {
         self
     }
     fn new(rank: Option<usize>, stalled: usize, late_success: bool) -> Self {
-        let (_, placement, context, _, credentials) = super::tests::fixture();
+        let (_, placement, context, _, credentials) = crate::read::candidates::tests::fixture();
         let signers = network(5);
         let membership = std::sync::Arc::new(
             Membership::validate(
@@ -196,7 +210,12 @@ impl Fixture {
         let policy = CandidatePolicy::new(
             local,
             placement,
-            peers.clone(),
+            Requester::scripted(
+                peers.clone(),
+                Peers::direct_hedge_available,
+                Peers::request,
+                Peers::request_direct,
+            ),
             credentials,
             Arc::new(Default::default()),
         );
@@ -504,7 +523,7 @@ fn retries_get_independent_local_caps_but_never_extend_overall_authority() {
 fn subscription_stall_must_leave_time_for_fixed_page_fallback() {
     let mut f = Fixture::new(Some(1), 1, false);
     f.peers.fenced.set(false);
-    let scheduler = super::super::subscription::Scheduler::new(1);
+    let scheduler = crate::read::range_stream::Scheduler::new(1);
     let demand =
         crate::peer::subscriptions::Demand::new(vec![crate::peer::subscriptions::PageInterval {
             start: 0,
@@ -622,7 +641,7 @@ fn subscription_stall_must_leave_time_for_fixed_page_fallback() {
 fn subscription_parent_cancellation_waits_for_fence_without_fallback() {
     let mut f = Fixture::new(Some(1), 1, false);
     f.peers.fenced.set(false);
-    let scheduler = super::super::subscription::Scheduler::new(1);
+    let scheduler = crate::read::range_stream::Scheduler::new(1);
     let demand =
         crate::peer::subscriptions::Demand::new(vec![crate::peer::subscriptions::PageInterval {
             start: 0,

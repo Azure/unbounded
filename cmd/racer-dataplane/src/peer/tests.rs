@@ -754,7 +754,14 @@ mod destination_disconnect {
                 Poll::Ready(Ok(AcquisitionEvent::Lead(leader))) => leader,
                 _ => panic!("leader"),
             };
-            let accepted = flights.retain_operation(&leader, ()).unwrap();
+            let accepted = flights
+                .retain_operation(
+                    &leader,
+                    crate::telemetry::metrics::Metrics::default()
+                        .lease(crate::telemetry::metrics::Gauge::ActiveFills)
+                        .unwrap(),
+                )
+                .unwrap();
             let JoinedCopy::Waiter(mut other) = flights.join_copy(&page, &independent).unwrap()
             else {
                 panic!("independent waiter")
@@ -1846,13 +1853,10 @@ mod timing {
 
     #[test]
     fn page_timing_requester_reuses_authenticated_session_and_rejects_bad_signature() {
-        use crate::{
-            peer::PeerClient,
-            topology::{
-                health::LinkHealth,
-                membership::{Member, Membership},
-                routing::Paths,
-            },
+        use crate::topology::{
+            health::LinkHealth,
+            membership::{Member, Membership},
+            routing::Paths,
         };
         use std::{
             net::TcpListener,
@@ -2185,7 +2189,7 @@ impl NoOutbound {
 impl Drop for NoOutbound {
     fn drop(&mut self) {
         assert_eq!(
-            self.requester.outbound_requests.get(),
+            self.requester.outbound_requests(),
             0,
             "destination must issue zero outbound requests"
         );

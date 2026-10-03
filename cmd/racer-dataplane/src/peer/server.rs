@@ -114,7 +114,7 @@ impl PeerServer {
         ciphertext.provenance?;
         let receiver = connection.state().session.as_ref()?.peer();
         let (ticket, sample) = samples.begin(pair, self.signatures.node(), receiver)?;
-        let permit = match crate::read::drivers::reserve() {
+        let permit = match uring_runtime::drivers::reserve().map_err(Error::from) {
             Ok(p) => p,
             Err(error) => {
                 sample.finish(Some(error));
@@ -134,11 +134,11 @@ impl PeerServer {
         };
         let crypto = crypto.clone();
         let ciphertext = ciphertext.clone();
-        permit.submit(Box::pin(async move {
+        permit.submit_detached(Box::pin(async move {
             crypto
                 .sample_send(ciphertext, &diagnostic_scope, sample)
                 .await;
-            Ok(())
+            Ok::<_, Error>(())
         }));
         Some(ticket)
     }

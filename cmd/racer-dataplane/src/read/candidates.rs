@@ -6,7 +6,7 @@ use crate::{
     error::{Error, Operation, Result},
     model::{AttemptId, MetadataSelector, NodeId, ObjectId, OriginContext, PageNumber},
     peer::{
-        PeerClient,
+        Requester,
         protocol::{
             FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse, VerifiedResponse,
         },
@@ -67,9 +67,9 @@ pub struct CandidatePolicy {
     hedge: Option<std::sync::Arc<super::hedge::Hedges>>,
     attempt_timeout: std::time::Duration,
     observer: Observer,
-    node: NodeId,
+    pub(super) node: NodeId,
     placement: Rc<Placement>,
-    peers: Rc<dyn PeerClient>,
+    peers: Rc<Requester>,
     credentials: Rc<CredentialCrypto>,
     published: Arc<crate::control::state::PublishedState>,
 }
@@ -94,7 +94,7 @@ impl CandidatePolicy {
     }
     /// Only Fill's plaintext fixed-page path calls this. Direct HTTP destinations
     /// prove independent first hops. Drain both attempts before releasing escrow.
-    pub(crate) async fn hedge_page<'a, T: 'a>(
+    pub(crate) async fn hedge_page<'a>(
         &'a self,
         candidates: &Candidates,
         context: &'a OriginContext,
@@ -103,8 +103,11 @@ impl CandidatePolicy {
         budget: &mut AcquisitionBudget,
         admission: &Rc<flow_control::Quotas<crate::runtime::admission::AdmissionPolicy>>,
         continuation: &mut HedgeContinuation,
-        validate: impl Fn(VerifiedResponse, RequestScope) -> Operation<'a, T>,
-    ) -> Result<Option<T>> {
+        validate: impl Fn(
+            VerifiedResponse,
+            RequestScope,
+        ) -> Operation<'a, crate::memory::page::PageResult>,
+    ) -> Result<Option<crate::memory::page::PageResult>> {
         let Some(hedges) = self.hedge.as_ref().filter(|h| h.enabled()) else {
             return Ok(None);
         };
@@ -256,7 +259,7 @@ impl CandidatePolicy {
         &self,
         version: crate::model::ObjectVersion,
         demand: crate::peer::subscriptions::Demand,
-        scheduler: &super::subscription::Scheduler,
+        scheduler: &super::range_stream::Scheduler,
         membership: MembershipLease,
         context: &OriginContext,
         scope: &RequestScope,
@@ -336,7 +339,7 @@ impl CandidatePolicy {
     pub fn new(
         node: NodeId,
         placement: Rc<Placement>,
-        peers: Rc<dyn PeerClient>,
+        peers: Rc<Requester>,
         credentials: Rc<CredentialCrypto>,
         published: Arc<crate::control::state::PublishedState>,
     ) -> Self {
@@ -431,16 +434,16 @@ impl CandidatePolicy {
         )
     }
 
-    pub(crate) fn resolve_after_hedge<'a, T: 'a>(
+    pub(crate) fn resolve_after_hedge<'a>(
         &'a self,
         candidates: Candidates,
         context: &'a OriginContext,
         operation: PeerOperation,
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
-        validate: impl FnMut(VerifiedResponse) -> Operation<'a, T> + 'a,
+        validate: impl FnMut(VerifiedResponse) -> Operation<'a, crate::memory::page::AcquiredPage> + 'a,
         continuation: HedgeContinuation,
-    ) -> Operation<'a, CandidateResolution<T>> {
+    ) -> Operation<'a, CandidateResolution<crate::memory::page::AcquiredPage>> {
         self.resolve_epoch(
             candidates,
             context,
@@ -751,7 +754,7 @@ impl CandidatePolicy {
         self.candidates_scoped(latest, object, page, scope).await
     }
 
-    async fn request(
+    pub(super) async fn request(
         &self,
         membership: &MembershipLease,
         destination: &NodeId,
@@ -1139,15 +1142,12 @@ fn classify(
 }
 
 #[cfg(test)]
-mod timeout_tests;
-
-#[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     #[test]
     fn candidate_failure_routes_spend_initial_allowance_with_four_then_eight_link_ceiling() {
         struct Routes(RefCell<Vec<(u8, u32)>>);
-        impl PeerClient for Routes {
+        impl Routes {
             fn direct_hedge_available(&self, _: &MembershipLease, _: &NodeId) -> bool {
                 false
             }
@@ -1177,7 +1177,12 @@ mod tests {
         let policy = CandidatePolicy::new(
             NodeId("outside".into()),
             placement,
-            peers.clone(),
+            Requester::scripted(
+                peers.clone(),
+                Routes::direct_hedge_available,
+                Routes::request,
+                Routes::request_direct,
+            ),
             credentials,
             Arc::new(Default::default()),
         );
@@ -1222,7 +1227,7 @@ mod tests {
         calls: RefCell<Vec<(NodeId, bool)>>,
         error: Error,
     }
-    impl PeerClient for ProbePeer {
+    impl ProbePeer {
         fn direct_hedge_available(&self, _: &MembershipLease, _: &NodeId) -> bool {
             false
         }
@@ -1256,7 +1261,7 @@ mod tests {
             Box::pin(async move { Err(self.error) })
         }
     }
-    pub(super) fn fixture() -> (
+    pub(crate) fn fixture() -> (
         MembershipLease,
         Rc<Placement>,
         OriginContext,
@@ -1328,7 +1333,12 @@ mod tests {
         let policy = CandidatePolicy::new(
             ordered[2].clone(),
             placement,
-            peer.clone(),
+            Requester::scripted(
+                peer.clone(),
+                ProbePeer::direct_hedge_available,
+                ProbePeer::request,
+                ProbePeer::request_direct,
+            ),
             credentials,
             Arc::new(Default::default()),
         );
@@ -1377,7 +1387,12 @@ mod tests {
         let policy = CandidatePolicy::new(
             ordered[1].clone(),
             placement.clone(),
-            peer.clone(),
+            Requester::scripted(
+                peer.clone(),
+                ProbePeer::direct_hedge_available,
+                ProbePeer::request,
+                ProbePeer::request_direct,
+            ),
             credentials.clone(),
             Arc::new(Default::default()),
         );
@@ -1405,7 +1420,12 @@ mod tests {
         let policy = CandidatePolicy::new(
             NodeId("outside".into()),
             placement,
-            peer.clone(),
+            Requester::scripted(
+                peer.clone(),
+                ProbePeer::direct_hedge_available,
+                ProbePeer::request,
+                ProbePeer::request_direct,
+            ),
             credentials,
             Arc::new(Default::default()),
         );
@@ -1513,7 +1533,7 @@ mod tests {
         calls: RefCell<Vec<(NodeId, bool)>>,
         error: Error,
     }
-    impl PeerClient for RecordedPeer {
+    impl RecordedPeer {
         fn direct_hedge_available(&self, _: &MembershipLease, _: &NodeId) -> bool {
             false
         }
@@ -1582,7 +1602,12 @@ mod tests {
         let policy = CandidatePolicy::new(
             node,
             Rc::new(Placement::new(8)),
-            peers,
+            Requester::scripted(
+                peers,
+                RecordedPeer::direct_hedge_available,
+                RecordedPeer::request,
+                RecordedPeer::request_direct,
+            ),
             Rc::new(CredentialCrypto::new(keys, admission)),
             Arc::new(Default::default()),
         );

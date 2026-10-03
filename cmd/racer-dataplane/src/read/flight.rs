@@ -27,7 +27,6 @@ use crate::{
     topology::membership::MembershipLease,
 };
 use std::{
-    any::Any,
     cell::RefCell,
     collections::BTreeMap,
     future::poll_fn,
@@ -37,11 +36,11 @@ use std::{
 };
 
 pub struct Flights {
-    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+    pub(super) admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     availability: Rc<crate::control::state::Availability>,
     owner: Rc<()>,
     limits: FlightLimits,
-    table: RefCell<Table>,
+    pub(super) table: RefCell<Table>,
 }
 
 /// Local caps in addition to shared admission quotas. All dimensions must be nonzero.
@@ -64,8 +63,8 @@ impl Default for FlightLimits {
 }
 
 #[derive(Default)]
-struct Table {
-    entries: HashMap<PageId, Entry>,
+pub(super) struct Table {
+    pub(super) entries: HashMap<PageId, Entry>,
     sweep: BTreeMap<u64, PageId>,
     sweep_cursor: u64,
     next_incarnation: u64,
@@ -74,37 +73,37 @@ struct Table {
     stopping: bool,
     drain_waker: Option<Waker>,
 }
-struct Entry {
+pub(super) struct Entry {
     fence: Fence,
-    phase: Phase,
+    pub(super) phase: Phase,
     leader: Option<u64>,
-    waiters: BTreeMap<u64, WaiterRecord>,
-    deadlines: BTreeMap<(Instant, u64), ()>,
+    pub(super) waiters: BTreeMap<u64, WaiterRecord>,
+    pub(super) deadlines: BTreeMap<(Instant, u64), ()>,
     waiter_cursor: u64,
     operations: HashMap<u64, Option<Retained>>,
     ciphertext: Option<UnverifiedPage>,
     _reservation: flow_control::Charge<AdmissionPolicy>,
 }
-struct WaiterRecord {
+pub(super) struct WaiterRecord {
     scope: RequestScope,
     acquisition: bool,
     plaintext: bool,
-    budget_deadline: Instant,
+    pub(super) budget_deadline: Instant,
     issued: bool,
     error: Option<Error>,
     waker: Option<Waker>,
     _reservation: flow_control::Charge<AdmissionPolicy>,
 }
 struct Retained {
-    _resources: Box<dyn Any>,
+    _resources: telemetry::Lease,
     _reservation: flow_control::Charge<AdmissionPolicy>,
 }
-enum Outcome {
+pub(super) enum Outcome {
     Published(AcquiredPage),
     Failed(Error),
     Retry,
 }
-enum Phase {
+pub(super) enum Phase {
     Acquiring,
     RetryPending,
     Draining(Outcome),
@@ -112,7 +111,7 @@ enum Phase {
     Failed(Error),
 }
 impl Phase {
-    fn state(&self) -> FlightState {
+    pub(super) fn state(&self) -> FlightState {
         match self {
             Self::Acquiring => FlightState::Acquiring,
             Self::RetryPending => FlightState::RetryPending,
@@ -130,8 +129,8 @@ impl Phase {
 /// must continue owning the table until `drain` succeeds.
 pub struct FlightOperation {
     flights: Rc<Flights>,
-    fence: Fence,
-    id: u64,
+    pub(super) fence: Fence,
+    pub(super) id: u64,
 }
 impl FlightOperation {
     pub fn complete(self) -> Result<()> {
@@ -314,14 +313,14 @@ impl AcquisitionBudget {
 /// incarnation and acquisition generation to fence remove/rejoin and retry races.
 /// Counters must never wrap; drain/restart the owner before exhaustion.
 #[derive(Clone)]
-struct Fence {
-    owner: Rc<()>,
-    page: PageId,
-    incarnation: u64,
-    generation: u64,
+pub(super) struct Fence {
+    pub(super) owner: Rc<()>,
+    pub(super) page: PageId,
+    pub(super) incarnation: u64,
+    pub(super) generation: u64,
 }
 impl Fence {
-    fn validate(&self, current: &Self) -> Result<()> {
+    pub(super) fn validate(&self, current: &Self) -> Result<()> {
         if !Rc::ptr_eq(&self.owner, &current.owner)
             || self.page != current.page
             || self.incarnation != current.incarnation
@@ -340,10 +339,10 @@ impl Fence {
 /// fn duplicate(leader: FlightLeader) { let _other = leader.clone(); }
 /// ```
 pub struct FlightLeader {
-    flights: Rc<Flights>,
-    fence: Fence,
-    caller: u64,
-    active: bool,
+    pub(super) flights: Rc<Flights>,
+    pub(super) fence: Fence,
+    pub(super) caller: u64,
+    pub(super) active: bool,
 }
 
 /// Per-request registration; cannot be stored in a completed flight/cache entry.
@@ -356,20 +355,20 @@ pub struct FlightLeader {
 /// fn retain(waiter: AcquisitionWaiter<'_>) -> AcquisitionWaiter<'static> { waiter }
 /// ```
 pub struct AcquisitionWaiter<'a> {
-    registration: Registration,
+    pub(super) registration: Registration,
     context: &'a OriginContext,
     scope: &'a RequestScope,
-    membership: MembershipLease,
+    pub(super) membership: MembershipLease,
     budget: &'a mut AcquisitionBudget,
 }
 
-struct Registration {
+pub(super) struct Registration {
     flights: Rc<Flights>,
     cancellation: crate::runtime::deadline::CancellationRegistration,
     // Waiters survive acquisition generations. Match owner/page/incarnation/id
     // for registration, then refresh this generation only on a new election.
     fence: Fence,
-    id: u64,
+    pub(super) id: u64,
     attached: bool,
 }
 
@@ -927,7 +926,7 @@ impl Flights {
     /// Reactor-facing variant registers its real waker with owned drivers. The
     /// worker must also poll at request deadlines to expire parked waiters.
     pub fn poll_with_context(&self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
-        super::drivers::poll(cx, work_budget);
+        uring_runtime::drivers::poll(cx, work_budget);
         self.sweep_budgeted(work_budget)
     }
 
@@ -1018,7 +1017,7 @@ impl Flights {
                 cancellation.register(cx.waker());
                 self.poll_with_context(cx, self.limits.entries)?;
                 let mut table = self.table.borrow_mut();
-                if table.entries.is_empty() && super::drivers::pending() == 0 {
+                if table.entries.is_empty() && uring_runtime::drivers::pending() == 0 {
                     return Poll::Ready(Ok(()));
                 }
                 scope.check()?;
@@ -1031,10 +1030,10 @@ impl Flights {
 
     /// Retain actual resources before submission. The worker completing the I/O
     /// owns the token; the request future must not report cancellation as completion.
-    pub fn retain_operation<T: 'static>(
+    pub fn retain_operation(
         self: &Rc<Self>,
         leader: &FlightLeader,
-        resources: T,
+        resources: telemetry::Lease,
     ) -> Result<FlightOperation> {
         self.update(|table, wakes| {
             let id = next(&mut table.next_operation)?;
@@ -1050,7 +1049,7 @@ impl Flights {
             entry.operations.insert(
                 id,
                 Some(Retained {
-                    _resources: Box::new(resources),
+                    _resources: resources,
                     _reservation: reservation,
                 }),
             );
@@ -1062,7 +1061,7 @@ impl Flights {
         })
     }
 
-    fn complete_operation(&self, fence: &Fence, id: u64) -> Result<()> {
+    pub(super) fn complete_operation(&self, fence: &Fence, id: u64) -> Result<()> {
         // Drop caller-owned resource bundles outside the table borrow.
         let resources = self.update(|table, _wakes| {
             let entry = table
@@ -1318,12 +1317,9 @@ impl Drop for FlightLeader {
     }
 }
 
-fn validate_context(page: &PageId, context: &OriginContext) -> Result<()> {
+pub(super) fn validate_context(page: &PageId, context: &OriginContext) -> Result<()> {
     if page.version.object != context.object {
         return Err(Error::InvalidRequest);
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests;

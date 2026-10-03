@@ -53,22 +53,22 @@ type LocalCopy = futures::future::Shared<
 >;
 #[derive(Clone)]
 pub struct Fill {
-    dependencies: FillDependencies,
-    metrics: Metrics,
-    local_copies: Rc<RefCell<BTreeMap<PageId, LocalCopy>>>,
+    pub(super) dependencies: FillDependencies,
+    pub(super) metrics: Metrics,
+    pub(super) local_copies: Rc<RefCell<BTreeMap<PageId, LocalCopy>>>,
 }
 
 /// Immediate acquisition tier, not the original producer or corruption location.
 /// Retained includes flights, memory cache, and pending writer copies, even when
 /// the retained copy still has a disk invalidation token.
 #[derive(Clone, Copy)]
-enum DecryptSource {
+pub(super) enum DecryptSource {
     Disk,
     Retained,
     Peer,
 }
 impl DecryptSource {
-    fn observe<T>(self, metrics: &Metrics, result: Result<T>) -> Result<T> {
+    fn observe(self, metrics: &Metrics, result: Result<PageResult>) -> Result<PageResult> {
         result.inspect_err(|error| {
             if *error == Error::CorruptRecord {
                 let _ = metrics.record(
@@ -236,7 +236,7 @@ impl Fill {
     pub(crate) fn record_peer_bootstrap(&self) -> Result<()> {
         self.metrics.record(Event::PeerBootstrap, 1)
     }
-    fn reserve_with_reclamation(
+    pub(super) fn reserve_with_reclamation(
         &self,
         cache: &crate::model::CacheId,
         class: ResourceClass,
@@ -250,7 +250,7 @@ impl Fill {
         })
     }
 
-    fn reserve_reclaiming(
+    pub(super) fn reserve_reclaiming(
         &self,
         cache: &crate::model::CacheId,
         class: ResourceClass,
@@ -362,7 +362,7 @@ impl Fill {
         context: &OriginContext,
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
-        guard: std::sync::Arc<super::subscription::FixedAcquisition>,
+        guard: std::sync::Arc<super::range_stream::FixedAcquisition>,
     ) -> Result<PageResult> {
         match self
             .acquire_with_prefetch(
@@ -442,7 +442,7 @@ impl Fill {
         budget: &'a mut AcquisitionBudget,
         mut prefetch: Option<crate::origin::OriginPage>,
         plaintext: bool,
-        guard: Option<std::sync::Arc<super::subscription::FixedAcquisition>>,
+        guard: Option<std::sync::Arc<super::range_stream::FixedAcquisition>>,
     ) -> Operation<'a, AcquiredPage> {
         Box::pin(async move {
             scope.check()?;
@@ -510,7 +510,7 @@ impl Fill {
         waiter: &mut AcquisitionWaiter<'_>,
         prefetch: &mut Option<crate::origin::OriginPage>,
         plaintext: bool,
-        completion_guard: Option<Arc<super::subscription::FixedAcquisition>>,
+        completion_guard: Option<Arc<super::range_stream::FixedAcquisition>>,
     ) -> Result<()> {
         use std::future::Future;
 
@@ -519,7 +519,7 @@ impl Fill {
             LookupTier::Ciphertext,
             self.dependencies.memory.unverified(page),
         )?);
-        let driver_permit = super::drivers::reserve()?;
+        let driver_permit = uring_runtime::drivers::reserve().map_err(Error::from)?;
         let acquisition = waiter.acquisition(&leader)?;
         // The driver stays on this owner. Admit an independent zeroizing context
         // without crossing an AEAD domain.
@@ -543,7 +543,7 @@ impl Fill {
         let fill = self.clone();
         let flights = self.dependencies.flights.clone();
         let (send, mut receive) = futures::channel::oneshot::channel();
-        driver_permit.submit(Box::pin(async move {
+        driver_permit.submit_detached(Box::pin(async move {
             let _completion_guard = completion_guard;
             let mut work = Box::pin(async {
                 if let Some(copy) = ready {
@@ -630,7 +630,7 @@ impl Fill {
             Ok(())
         }));
         let remaining = std::future::poll_fn(|cx| {
-            super::drivers::poll(cx, 64);
+            uring_runtime::drivers::poll(cx, 64);
             acquisition.cancellation.register(cx.waker());
             acquisition.scope.check()?;
             std::pin::Pin::new(&mut receive)
@@ -775,7 +775,7 @@ impl Fill {
         let mut receive = if let Some(existing) = existing {
             existing
         } else {
-            let permit = super::drivers::reserve()?;
+            let permit = uring_runtime::drivers::reserve().map_err(Error::from)?;
             let flight = self.dependencies.admission.reserve(
                 Some(&page.version.object.cache),
                 ResourceClass::Flight,
@@ -791,7 +791,7 @@ impl Fill {
                 .insert(page.clone(), receive.clone());
             let fill = self.clone();
             let page = page.clone();
-            permit.submit(Box::pin(async move {
+            permit.submit_detached(Box::pin(async move {
                 let _flight = flight;
                 let result = async {
                     let Some((copy, token)) = fill
@@ -825,14 +825,14 @@ impl Fill {
                 .await;
                 fill.local_copies.borrow_mut().remove(&page);
                 let _ = send.send(result);
-                Ok(())
+                Ok::<_, Error>(())
             }));
             receive
         };
         std::future::poll_fn(|cx| {
             cancellation.register(cx.waker());
             scope.check()?;
-            super::drivers::poll(cx, 64);
+            uring_runtime::drivers::poll(cx, 64);
             std::pin::Pin::new(&mut receive).poll(cx)
         })
         .await
@@ -840,7 +840,7 @@ impl Fill {
 
     /// Local copies own ciphertext already; the temporary plaintext reservation
     /// ends here before network acquisition reserves its independent progress budget.
-    async fn acquire_local_copy(
+    pub(super) async fn acquire_local_copy(
         &self,
         page: &PageId,
         scope: &RequestScope,
@@ -945,7 +945,7 @@ impl Fill {
         Ok(None)
     }
 
-    async fn validate_disk_copy(
+    pub(super) async fn validate_disk_copy(
         &self,
         copy: &crate::memory::page::CiphertextCopy,
         page: &PageId,
@@ -967,7 +967,7 @@ impl Fill {
         result
     }
 
-    async fn acquire_once(
+    pub(super) async fn acquire_once(
         &self,
         page: &PageId,
         membership: MembershipLease,
@@ -1192,7 +1192,7 @@ impl Fill {
         })
     }
 
-    async fn decrypt_response(
+    pub(super) async fn decrypt_response(
         &self,
         page: &PageId,
         response: crate::peer::protocol::VerifiedResponse,
@@ -1218,7 +1218,7 @@ impl Fill {
             })
     }
 
-    async fn decrypt(
+    pub(super) async fn decrypt(
         &self,
         page: &PageId,
         copy: crate::memory::page::CiphertextCopy,
@@ -1325,7 +1325,10 @@ fn response_copy(
         _ => Err(Error::CorruptRecord),
     }
 }
-fn validate_copy(copy: &crate::memory::page::CiphertextCopy, page: &PageId) -> Result<()> {
+pub(super) fn validate_copy(
+    copy: &crate::memory::page::CiphertextCopy,
+    page: &PageId,
+) -> Result<()> {
     if &copy.ciphertext.envelope().page != page {
         return Err(Error::CorruptRecord);
     }
@@ -1349,8 +1352,6 @@ fn merge_metadata(
     Ok(())
 }
 #[cfg(test)]
-mod scenarios;
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{CacheId, CacheKey, ObjectId, ObjectVersion, StrongEtag};
@@ -1362,19 +1363,26 @@ mod tests {
             (DecryptSource::Retained, Event::FillDecryptRetainedCorrupt),
             (DecryptSource::Peer, Event::FillDecryptPeerCorrupt),
         ] {
-            assert_eq!(source.observe(&metrics, Ok(42)), Ok(42));
+            assert_eq!(
+                source
+                    .observe(&metrics, Ok(crate::read::tests::page(42)))
+                    .unwrap()
+                    .plaintext
+                    .bytes(),
+                &[42]
+            );
             for error in [
                 Error::Cancelled,
                 Error::MissingKey,
                 Error::Overloaded,
                 Error::Io,
             ] {
-                assert_eq!(source.observe::<()>(&metrics, Err(error)), Err(error));
+                assert_eq!(source.observe(&metrics, Err(error)).err(), Some(error));
             }
             assert_eq!(metrics.count(event), 0);
             assert_eq!(
-                source.observe::<()>(&metrics, Err(Error::CorruptRecord)),
-                Err(Error::CorruptRecord)
+                source.observe(&metrics, Err(Error::CorruptRecord)).err(),
+                Some(Error::CorruptRecord)
             );
             assert_eq!(metrics.count(event), 1);
         }

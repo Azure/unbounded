@@ -1,10 +1,34 @@
-use super::*;
-use crate::peer::PeerClient;
-mod hot_reads;
+pub(super) use crate::peer::Requester;
+pub(super) use crate::read::fill::*;
+pub(super) use crate::{
+    error::{Error, Operation, Result},
+    memory::{
+        cache::MemoryCache,
+        page::{PageResult, UnverifiedPage},
+        pool::{BufferPool, CiphertextPage},
+    },
+    model::{ObjectMetadata, OriginContext, PAGE_BYTES, PageId},
+    origin::Origin,
+    peer::protocol::{FetchMode, Operation as PeerOperation, PeerResponse},
+    read::{
+        candidates::CandidatePolicy,
+        flight::{AcquisitionBudget, AcquisitionEvent, Flights, JoinedCopy, JoinedFlight},
+    },
+    runtime::{
+        admission::{AdmissionExt, AdmissionPolicy},
+        deadline::RequestScope,
+    },
+    security::{aead::PageCrypto, credentials::CredentialCrypto},
+    store::{StoreReader, StoreWriter},
+    telemetry::metrics::{Event, Gauge, Metrics},
+    topology::membership::MembershipLease,
+};
+pub(super) use std::{rc::Rc, sync::Arc};
 mod metadata {
     //! Metadata refresh, bootstrap publication, and independently timed callers.
     use super::*;
-    use crate::read::{candidates::OriginAuthority, drivers};
+    use crate::read::candidates::OriginAuthority;
+    use uring_runtime::drivers;
 
     pub(super) struct GatedMetadataOrigin {
         pub(super) buffers: BufferPool,
@@ -26,7 +50,7 @@ mod metadata {
             );
             let environment = clock.environment(1);
             let _environment = environment.enter();
-            let queue = Rc::new(drivers::DriverQueue::default());
+            let queue = Rc::new(drivers::DriverQueue::new(1024));
             let _owner = queue.enter();
             let mut f = fixture();
             let adapter = AdapterOrigin::new("fixture", f.origin.metadata.clone());
@@ -112,7 +136,7 @@ mod metadata {
 
     #[test]
     fn bootstrap_rejection_re_elects_and_version_changes_never_mix_pages() {
-        let queue = Rc::new(drivers::DriverQueue::default());
+        let queue = Rc::new(drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         let mut f = fixture();
         use crate::test_support::origin::{AdapterOrigin, RequestKind};
@@ -275,7 +299,7 @@ mod metadata {
 
     #[test]
     fn bootstrap_after_catalog_eviction_checks_cached_content_type_and_preserves_fresh_expiry() {
-        let queue = Rc::new(drivers::DriverQueue::default());
+        let queue = Rc::new(drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         use crate::model::ContentType;
         for with_origin_page in [false, true] {
@@ -402,7 +426,7 @@ mod metadata {
 
     #[test]
     fn blocked_metadata_leader_and_follower_notify_without_spinning() {
-        let queue = Rc::new(drivers::DriverQueue::default());
+        let queue = Rc::new(drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         use crate::{model::MetadataSelector, test_support::WakeCounter};
         use std::task::Waker;
@@ -494,7 +518,7 @@ mod metadata {
 
     #[test]
     fn metadata_deadline_wakes_parked_follower_without_polling_gated_leader() {
-        let queue = Rc::new(drivers::DriverQueue::default());
+        let queue = Rc::new(drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         use crate::{
             model::MetadataSelector, read::metadata::tests::assert_ingress_counts,
@@ -633,14 +657,13 @@ mod metadata {
         }
     }
 }
-mod peer_copies;
 mod pressure {
     //! Reclamation scenarios share the acquisition fixture and real crypto pipeline.
     use super::*;
 
     #[test]
     fn sequential_full_pages_reclaim_idle_bytes_and_preserve_busy_reader_leases() {
-        let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         for (pages, ciphertext_pages, dirty_pages, hold_bundle) in
             [(8, 4, 2, false), (8, 3, 1, false), (12, 3, 2, true)]
@@ -724,7 +747,7 @@ mod pressure {
 
     #[test]
     fn bootstrap_admission_discards_queued_copy_before_evicting_idle_bundle() {
-        let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         let mut limits = crate::test_support::cluster::config(false).limits;
         limits.plaintext_bytes = std::num::NonZeroUsize::new(PAGE_BYTES as usize).unwrap();
@@ -989,7 +1012,7 @@ mod pressure {
 
     #[test]
     fn dirty_only_pressure_skips_persistence_without_flushing_memory_or_queue() {
-        let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
         let _owner = queue.enter();
         let mut f = fixture();
         let cache = &f.context.object.cache;
@@ -1087,7 +1110,7 @@ mod pressure {
         assert!(deps.memory.get(&second).unwrap().is_some());
     }
 }
-use crate::{
+pub(super) use crate::{
     model::{
         CacheId, CacheKey, ExpiresAt, ObjectId, ObjectVersion, PageNumber, RequestId,
         ResourceClass, StrongEtag, WorkerId,
@@ -1106,7 +1129,7 @@ use crate::{
         routing::Placement,
     },
 };
-use std::{
+pub(super) use std::{
     cell::{Cell, RefCell},
     future::Future,
     num::NonZeroU32,
@@ -1115,15 +1138,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::test_support::NoPeers as NoPeer;
-struct TestOrigin {
-    buffers: BufferPool,
-    calls: Cell<usize>,
-    metadata: ObjectMetadata,
-    reject_once: Cell<bool>,
-    version_unavailable: Cell<bool>,
-    blocked_pages: RefCell<std::collections::BTreeSet<u64>>,
-    started_pages: RefCell<Vec<u64>>,
+pub(super) use crate::test_support::NoPeers as NoPeer;
+pub(super) struct TestOrigin {
+    pub(super) buffers: BufferPool,
+    pub(super) calls: Cell<usize>,
+    pub(super) metadata: ObjectMetadata,
+    pub(super) reject_once: Cell<bool>,
+    pub(super) version_unavailable: Cell<bool>,
+    pub(super) blocked_pages: RefCell<std::collections::BTreeSet<u64>>,
+    pub(super) started_pages: RefCell<Vec<u64>>,
 }
 impl Origin for TestOrigin {
     fn bootstrap_reserved<'a>(
@@ -1198,18 +1221,18 @@ impl Origin for TestOrigin {
     }
 }
 
-struct Fixture {
-    fill: Fill,
-    reactor: Rc<Reactor>,
-    keys: Rc<racer_identity::Keyring>,
-    origin: Rc<TestOrigin>,
-    crypto: Rc<CryptoClient>,
-    engine: PageCryptoEngine,
-    context: OriginContext,
-    membership: MembershipLease,
-    page: PageId,
-    scope: RequestScope,
-    directory: std::path::PathBuf,
+pub(super) struct Fixture {
+    pub(super) fill: Fill,
+    pub(super) reactor: Rc<Reactor>,
+    pub(super) keys: Rc<racer_identity::Keyring>,
+    pub(super) origin: Rc<TestOrigin>,
+    pub(super) crypto: Rc<CryptoClient>,
+    pub(super) engine: PageCryptoEngine,
+    pub(super) context: OriginContext,
+    pub(super) membership: MembershipLease,
+    pub(super) page: PageId,
+    pub(super) scope: RequestScope,
+    pub(super) directory: std::path::PathBuf,
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -1258,7 +1281,7 @@ impl Fixture {
 
     // Keep graph sizing explicit: cold-copy and hot-range scenarios deliberately
     // use different catalog, delivery, and acquisition bounds.
-    fn read_graph(
+    pub(super) fn read_graph(
         &self,
         fill: Rc<Fill>,
         membership: &MembershipLease,
@@ -1343,15 +1366,15 @@ impl Fixture {
     }
 }
 
-struct ReadGraphSettings {
-    name: &'static str,
-    snapshots: usize,
-    metadata: usize,
-    window: usize,
-    stall: Duration,
-    seed: Option<crate::model::VersionMetadata>,
+pub(super) struct ReadGraphSettings {
+    pub(super) name: &'static str,
+    pub(super) snapshots: usize,
+    pub(super) metadata: usize,
+    pub(super) window: usize,
+    pub(super) stall: Duration,
+    pub(super) seed: Option<crate::model::VersionMetadata>,
 }
-fn pump_worker(
+pub(super) fn pump_worker(
     endpoint: &mut crate::read::dispatch::WorkerEndpoint,
     engine: &mut PageCryptoEngine,
     crypto: &CryptoClient,
@@ -1359,16 +1382,16 @@ fn pump_worker(
 ) {
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     endpoint.poll(&mut cx, 64).unwrap();
-    crate::read::drivers::poll(&mut cx, 64);
+    uring_runtime::drivers::poll(&mut cx, 64);
     engine.poll_budgeted(64).unwrap();
     crypto.poll_budgeted(64).unwrap();
     reactor.poll_budgeted(128).unwrap();
 }
-fn fixture() -> Fixture {
+pub(super) fn fixture() -> Fixture {
     fixture_with(3, None)
 }
 
-fn acquire(f: &mut Fixture, budget: &mut AcquisitionBudget) -> Result<PageResult> {
+pub(super) fn acquire(f: &mut Fixture, budget: &mut AcquisitionBudget) -> Result<PageResult> {
     drive(
         f.fill.acquire(
             f.page.clone(),
@@ -1381,7 +1404,7 @@ fn acquire(f: &mut Fixture, budget: &mut AcquisitionBudget) -> Result<PageResult
         &f.crypto,
     )
 }
-fn fixture_with(length: u64, limits: Option<crate::model::Limits>) -> Fixture {
+pub(super) fn fixture_with(length: u64, limits: Option<crate::model::Limits>) -> Fixture {
     fixture_with_caches(
         length,
         limits,
@@ -1494,7 +1517,7 @@ fn fixture_with_caches(
     let (port, engine) = crypto::pair(worker, 0, config.limits.queue_entries);
     let crypto = Rc::new(CryptoClient::new(port));
     let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
-    let peers = Rc::new(NoPeer);
+    let peers = NoPeer::requester();
     let candidates = Rc::new(CandidatePolicy::new(
         node,
         Rc::new(Placement::new(16)),
@@ -1545,7 +1568,7 @@ fn fixture_with_caches(
         .unwrap(),
     }
 }
-fn drive<T>(
+pub(super) fn drive<T>(
     future: impl Future<Output = T>,
     engine: &mut PageCryptoEngine,
     crypto: &CryptoClient,
@@ -1553,7 +1576,7 @@ fn drive<T>(
     let mut future = Box::pin(future);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     for _ in 0..256 {
-        super::super::drivers::poll(&mut cx, 64);
+        uring_runtime::drivers::poll(&mut cx, 64);
         engine.poll_budgeted(64).unwrap();
         crypto.poll_budgeted(64).unwrap();
         if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
@@ -1602,7 +1625,7 @@ fn adapter_client(
     )
 }
 
-fn drive_io<T>(
+pub(super) fn drive_io<T>(
     future: impl Future<Output = T>,
     reactor: &Reactor,
     engine: &mut PageCryptoEngine,
@@ -1612,7 +1635,7 @@ fn drive_io<T>(
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        super::super::drivers::poll(&mut cx, 64);
+        uring_runtime::drivers::poll(&mut cx, 64);
         engine.poll_budgeted(64).unwrap();
         crypto.poll_budgeted(64).unwrap();
         if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
@@ -1638,7 +1661,7 @@ fn abandoned_acquisition_preserves_peer_scope(metadata: bool) {
     use crate::model::MetadataSelector;
     {
         let mut f = fixture();
-        let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+        let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
         let _queue = queue.enter();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
@@ -1695,7 +1718,7 @@ fn abandoned_acquisition_preserves_peer_scope(metadata: bool) {
 fn completed_fill_waits_release_shared_cancellation_capacity() {
     use futures::{StreamExt, stream::FuturesUnordered};
     let mut f = fixture();
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _queue = queue.enter();
     // Force a terminal fill failure without any accepted I/O. Every cohort must
     // release its waiter and driver before the same long-lived scope is reused.
@@ -1750,7 +1773,7 @@ fn completed_fill_waits_release_shared_cancellation_capacity() {
 
 #[test]
 fn selected_owner_reclaims_foreign_receive_charges_across_full_pages() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     use crate::model::PAGE_BYTES;
     use std::num::NonZeroUsize;
@@ -1857,7 +1880,7 @@ fn selected_owner_reclaims_foreign_receive_charges_across_full_pages() {
 
 #[test]
 fn ordinary_publication_rejects_foreign_worker_charges() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut source = fixture();
     let target = fixture();
@@ -1896,7 +1919,7 @@ fn ordinary_publication_rejects_foreign_worker_charges() {
 
 #[test]
 fn cached_corrupt_ciphertext_falls_back_without_exposing_plaintext() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
@@ -1956,7 +1979,7 @@ fn cached_corrupt_ciphertext_falls_back_without_exposing_plaintext() {
 
 #[test]
 fn ciphertext_ready_promotes_once_for_concurrent_plaintext_readers() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let metrics = Metrics::default();
@@ -2039,13 +2062,13 @@ fn ciphertext_ready_promotes_once_for_concurrent_plaintext_readers() {
         assert_eq!(budget.deadline(), f.scope.deadline.0);
     }
     assert_eq!(metrics.gauge(Gauge::ActiveFills), 0);
-    assert_eq!(super::super::drivers::pending(), 0);
+    assert_eq!(uring_runtime::drivers::pending(), 0);
     drop(holder);
 }
 
 #[test]
 fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     use crate::security::test_support::rotation_bundle;
     use racer_identity::KeyPurpose;
@@ -2265,7 +2288,12 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
     else {
         panic!("expected election")
     };
-    let operation = flights.retain_operation(&leader, ()).unwrap();
+    let operation = flights
+        .retain_operation(
+            &leader,
+            Metrics::default().lease(Gauge::ActiveFills).unwrap(),
+        )
+        .unwrap();
     flights.publish(leader, replacement.clone()).unwrap();
     let roots = (*f.keys.peer_trust_roots().unwrap()).clone();
     f.keys.install(rotation_bundle(3, roots)).unwrap();
@@ -2293,7 +2321,7 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
 
 #[test]
 fn concurrent_readers_share_origin_encryption_and_pending_original_ciphertext() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let mut a = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
@@ -2353,7 +2381,7 @@ fn concurrent_readers_share_origin_encryption_and_pending_original_ciphertext() 
 
 #[test]
 fn ciphertext_origin_fill_retains_verified_publication_without_a_plaintext_waiter() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     f.context.authorization =
@@ -2441,12 +2469,12 @@ fn ciphertext_origin_fill_retains_verified_publication_without_a_plaintext_waite
     );
 }
 
-fn drive_disk<T>(f: &Fixture, future: impl Future<Output = T>) -> T {
+pub(super) fn drive_disk<T>(f: &Fixture, future: impl Future<Output = T>) -> T {
     let mut future = Box::pin(future);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     loop {
         f.scope.check().unwrap();
-        super::super::drivers::poll(&mut cx, 64);
+        uring_runtime::drivers::poll(&mut cx, 64);
         if let Poll::Ready(result) = future.as_mut().poll(&mut cx) {
             return result;
         }
@@ -2490,7 +2518,7 @@ fn cold_disk_fixture() -> Fixture {
 
 #[test]
 fn copy_only_rejects_disk_payload_and_tag_corruption_before_retention() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     for acquire in [false, true] {
         for corrupt_tag in [false, true] {
@@ -2616,7 +2644,7 @@ fn copy_only_rejects_disk_payload_and_tag_corruption_before_retention() {
 
 #[test]
 fn disk_crc_validation_preserves_replacement_and_intact_acquire() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = cold_disk_fixture();
     let (mut stale, token) = drive_disk(
@@ -2690,7 +2718,7 @@ fn disk_crc_validation_preserves_replacement_and_intact_acquire() {
 
 #[test]
 fn concurrent_cold_disk_copy_only_shares_io_and_retains_original_ciphertext() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = cold_disk_fixture();
     let disk_hits = f.fill.metrics.count(Event::DiskIndexLookupHit);
@@ -2781,7 +2809,7 @@ fn concurrent_cold_disk_copy_only_shares_io_and_retains_original_ciphertext() {
 
 #[test]
 fn detached_copy_only_keeps_disk_fence_and_independent_waiters() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = cold_disk_fixture();
     let caller = RequestScope::new(RequestId([9; 16]), f.scope.deadline.0).unwrap();
@@ -2818,7 +2846,7 @@ fn detached_copy_only_keeps_disk_fence_and_independent_waiters() {
 
 #[test]
 fn copy_only_miss_releases_shared_scope_subscriptions_across_cohorts() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     use futures::{StreamExt, stream::FuturesUnordered};
     let mut f = fixture();
@@ -2835,7 +2863,7 @@ fn copy_only_miss_releases_shared_scope_subscriptions_across_cohorts() {
         assert!(f.fill.local_copies.borrow().is_empty());
         assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Flight), 0);
         assert_eq!(f.fill.dependencies.admission.used(ResourceClass::Waiter), 0);
-        assert_eq!(super::super::drivers::pending(), 0);
+        assert_eq!(uring_runtime::drivers::pending(), 0);
     }
     assert_eq!(f.origin.calls.get(), 0);
     assert_eq!(f.fill.metrics.count(Event::CiphertextLookupMiss), 1100);
@@ -2846,7 +2874,7 @@ fn copy_only_miss_releases_shared_scope_subscriptions_across_cohorts() {
 
 #[test]
 fn canceled_before_lookup_has_no_outcome() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let f = fixture();
     f.scope.cancel().unwrap();
@@ -2874,7 +2902,7 @@ fn canceled_before_lookup_has_no_outcome() {
 
 #[test]
 fn lookup_plaintext_and_pending_hits_do_not_probe_disk() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     assert!(f.fill.cached_page(&f.page, &f.scope).unwrap().is_none());
@@ -2928,7 +2956,7 @@ fn lookup_plaintext_and_pending_hits_do_not_probe_disk() {
 
 #[test]
 fn copy_only_local_state_admission_failure_releases_all_reservations() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let admission = &f.fill.dependencies.admission;
@@ -2949,7 +2977,7 @@ fn copy_only_local_state_admission_failure_releases_all_reservations() {
     ));
     assert!(f.fill.local_copies.borrow().is_empty());
     assert_eq!(admission.used(ResourceClass::Waiter), 0);
-    assert_eq!(super::super::drivers::pending(), 0);
+    assert_eq!(uring_runtime::drivers::pending(), 0);
     drop(pressure);
     assert!(
         drive(
@@ -2976,7 +3004,7 @@ fn peer_bootstrap_disk_copy_reclaims_idle_ciphertext_before_fresh_acquisition() 
 }
 
 fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut limits = crate::test_support::cluster::config(false).limits;
     limits.plaintext_bytes = std::num::NonZeroUsize::new(512 * 1024 * 1024).unwrap();
@@ -3143,7 +3171,7 @@ fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
 
 #[test]
 fn copy_only_miss_has_no_origin_side_effect_and_wrong_context_never_joins() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     assert!(
@@ -3168,7 +3196,7 @@ fn copy_only_miss_has_no_origin_side_effect_and_wrong_context_never_joins() {
 
 #[test]
 fn rejected_origin_supplier_does_not_fail_an_independent_coalesced_reader() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     f.origin.reject_once.set(true);
@@ -3200,7 +3228,7 @@ fn rejected_origin_supplier_does_not_fail_an_independent_coalesced_reader() {
 
 #[test]
 fn canceled_supplier_retains_crypto_fence_before_replacement_origin_work() {
-    let queue = Rc::new(crate::read::drivers::DriverQueue::default());
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
     let mut f = fixture();
     let mut a = AcquisitionBudget::new(f.scope.deadline.0, 4, 8);
@@ -3216,7 +3244,7 @@ fn canceled_supplier_retains_crypto_fence_before_replacement_origin_work() {
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     assert!(first.as_mut().poll(&mut cx).is_pending());
     assert_eq!(f.origin.calls.get(), 1);
-    super::super::drivers::poll(&mut cx, 64);
+    uring_runtime::drivers::poll(&mut cx, 64);
     assert_eq!(
         f.crypto.outstanding(),
         1,
@@ -3239,7 +3267,7 @@ fn canceled_supplier_retains_crypto_fence_before_replacement_origin_work() {
     );
     // Reap no crypto here: a cancellation notification must not stand in for its
     // accepted completion even when the detached read driver is polled again.
-    super::super::drivers::poll(&mut cx, 64);
+    uring_runtime::drivers::poll(&mut cx, 64);
     assert!(second.as_mut().poll(&mut cx).is_pending());
     assert_eq!(
         f.origin.calls.get(),
@@ -3252,4 +3280,4 @@ fn canceled_supplier_retains_crypto_fence_before_replacement_origin_work() {
     assert_eq!(f.fill.metrics.gauge(Gauge::ActiveFills), 0);
     assert_eq!(f.fill.metrics.count(Event::OriginFill), 1);
 }
-use uring_runtime::reactor::IoBuffer;
+pub(super) use uring_runtime::reactor::IoBuffer;

@@ -2,114 +2,6 @@
 //! page-zero bootstrap use the same metadata owner and Fill flights.
 pub mod candidates;
 pub mod dispatch;
-pub mod drivers {
-    //! Racer's worker capacity and error adapter for runtime-owned local drivers.
-    use crate::error::{Error, Operation, Result};
-    use std::{
-        future::Future,
-        pin::Pin,
-        rc::Rc,
-        task::{Context, Poll},
-    };
-    use uring_runtime::drivers as runtime;
-    pub use uring_runtime::drivers::{QueueGuard, Queued, pending, poll};
-
-    const MAX_DRIVERS: usize = 1024;
-    pub struct DriverQueue(Rc<runtime::DriverQueue>);
-    impl Default for DriverQueue {
-        fn default() -> Self {
-            Self(Rc::new(runtime::DriverQueue::new(MAX_DRIVERS)))
-        }
-    }
-    impl DriverQueue {
-        #[cfg(test)]
-        pub(crate) fn simulation_crash(&self) {
-            self.0.simulation_crash();
-        }
-        pub fn scope<F: std::future::Future>(self: &Rc<Self>, future: F) -> Queued<F> {
-            self.0.scope(future)
-        }
-        pub fn enter(self: &Rc<Self>) -> QueueGuard {
-            self.0.enter()
-        }
-        pub fn pending(&self) -> usize {
-            self.0.pending()
-        }
-        pub fn poll(self: &Rc<Self>, cx: &mut Context<'_>, budget: usize) {
-            self.0.poll(cx, budget);
-        }
-    }
-    pub struct Permit(runtime::Permit);
-    struct Detached(Operation<'static, ()>);
-    impl Future for Detached {
-        type Output = ();
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            // Detached Racer operations deliver outcomes through their own
-            // completion channels. Discard the result, but retain the future
-            // until the runtime releases its count and drops the completed task.
-            self.0.as_mut().poll(cx).map(|_| ())
-        }
-    }
-    impl Permit {
-        pub fn submit(self, driver: Operation<'static, ()>) {
-            self.0.submit(Box::pin(Detached(driver)));
-        }
-    }
-    pub fn reserve() -> Result<Permit> {
-        runtime::reserve().map(Permit).map_err(Error::from)
-    }
-    pub fn spawn(driver: Operation<'static, ()>) -> Result<()> {
-        reserve()?.submit(driver);
-        Ok(())
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        #[test]
-        fn racer_capacity_and_reservation_errors_are_preserved() {
-            assert!(matches!(reserve(), Err(Error::InvalidConfiguration)));
-            let queue = Rc::new(DriverQueue::default());
-            let _owner = queue.enter();
-            let permits: Vec<_> = (0..1024).map(|_| reserve().unwrap()).collect();
-            assert_eq!(queue.pending(), 1024);
-            assert!(matches!(reserve(), Err(Error::Overloaded)));
-            drop(permits);
-            assert_eq!(queue.pending(), 0);
-        }
-        #[test]
-        fn detached_operation_errors_release_capacity() {
-            let queue = Rc::new(DriverQueue::default());
-            let _owner = queue.enter();
-            spawn(Box::pin(async { Err(Error::Io) })).unwrap();
-            poll(&mut Context::from_waker(futures::task::noop_waker_ref()), 1);
-            assert_eq!(pending(), 0);
-        }
-        #[test]
-        fn completed_operation_is_dropped_after_releasing_capacity() {
-            struct Complete;
-            impl Future for Complete {
-                type Output = Result<()>;
-                fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
-                    Poll::Ready(Err(Error::Io))
-                }
-            }
-            impl Drop for Complete {
-                fn drop(&mut self) {
-                    assert_eq!(pending(), 1023);
-                    assert!(reserve().is_ok());
-                }
-            }
-            let queue = Rc::new(DriverQueue::default());
-            let _owner = queue.enter();
-            let permits: Vec<_> = (0..1023).map(|_| reserve().unwrap()).collect();
-            spawn(Box::pin(Complete)).unwrap();
-            poll(&mut Context::from_waker(futures::task::noop_waker_ref()), 1);
-            drop(permits);
-            assert_eq!(pending(), 0);
-        }
-    }
-}
 pub mod fill;
 pub mod flight;
 pub mod hedge {
@@ -282,14 +174,14 @@ pub mod hedge {
 
     /// Validation is inside each future. Cancellation is requested, never mistaken
     /// for completion: even a validated winner waits for the losing exchange fence.
-    pub(crate) async fn race<T>(
-        primary: impl std::future::Future<Output = Result<T>>,
-        secondary: impl std::future::Future<Output = Result<T>>,
+    pub(crate) async fn race(
+        primary: impl std::future::Future<Output = Result<crate::memory::page::PageResult>>,
+        secondary: impl std::future::Future<Output = Result<crate::memory::page::PageResult>>,
         primary_scope: &crate::runtime::deadline::RequestScope,
         secondary_scope: &crate::runtime::deadline::RequestScope,
         parent: &crate::runtime::deadline::RequestScope,
         permit: &Permit,
-    ) -> Result<T> {
+    ) -> Result<crate::memory::page::PageResult> {
         parent.check()?;
         let mut primary = Box::pin(primary);
         let mut secondary = Box::pin(secondary);
@@ -393,6 +285,7 @@ pub mod hedge {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::read::tests::page;
         use crate::{model::RequestId, runtime::deadline::RequestScope};
         use std::{cell::Cell, future::Future, rc::Rc};
         use uring_runtime::environment::{SimulationClock, now};
@@ -425,7 +318,7 @@ pub mod hedge {
                     let malformed_ready = Cell::new(false);
                     let primary = std::future::poll_fn(|_| {
                         if ready.get() {
-                            Poll::Ready(Ok(42))
+                            Poll::Ready(Ok(page(42)))
                         } else {
                             Poll::Pending
                         }
@@ -473,12 +366,16 @@ pub mod hedge {
                     }
                     let result = work.as_mut().poll(&mut cx);
                     if same_poll {
-                        assert_eq!(result, Poll::Ready(Ok(42)));
+                        assert!(
+                            matches!(result, Poll::Ready(Ok(page)) if page.plaintext.bytes() == [42])
+                        );
                     } else {
                         assert!(result.is_pending());
                         assert!(!a.cancellation.is_cancelled());
                         ready.set(true);
-                        assert_eq!(work.as_mut().poll(&mut cx), Poll::Ready(Ok(42)));
+                        assert!(
+                            matches!(work.as_mut().poll(&mut cx), Poll::Ready(Ok(page)) if page.plaintext.bytes() == [42])
+                        );
                     }
                 }
             }
@@ -491,18 +388,18 @@ pub mod hedge {
             let b = scope();
             let parent = scope();
             let result = futures::executor::block_on(race(
-                async { Ok(1) },
+                async { Ok(page(1)) },
                 async {
                     panic!("unexpected speculative launch");
                     #[allow(unreachable_code)]
-                    Ok(2)
+                    Ok(page(2))
                 },
                 &a,
                 &b,
                 &parent,
                 &permit,
             ));
-            assert_eq!(result, Ok(1));
+            assert_eq!(result.unwrap().plaintext.bytes(), &[1]);
             assert_eq!(owner.metrics.count(Event::PageHedgeStarted), 0);
             assert_eq!(owner.metrics.count(Event::PageHedgeDuplicateBytes), 0);
         }
@@ -517,11 +414,11 @@ pub mod hedge {
             let never = || async {
                 panic!("canceled parent submitted work");
                 #[allow(unreachable_code)]
-                Ok::<_, Error>(())
+                Ok::<_, Error>(page(0))
             };
             assert_eq!(
-                futures::executor::block_on(race(never(), never(), &a, &b, &parent, &permit)),
-                Err(Error::Cancelled)
+                futures::executor::block_on(race(never(), never(), &a, &b, &parent, &permit)).err(),
+                Some(Error::Cancelled)
             );
         }
         #[test]
@@ -530,32 +427,34 @@ pub mod hedge {
             let _env = clock.environment(0).enter();
             let owner = controller(1, DUPLICATE_BYTES);
             let permit = owner.acquire().unwrap();
-            let queue = Rc::new(super::super::drivers::DriverQueue::default());
+            let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
             let _guard = queue.enter();
             let (send, receive) = futures::channel::oneshot::channel();
             let fence = Rc::new(Cell::new(false));
             let primary_fence = fence.clone();
             let completion = Rc::new(Cell::new(false));
             let done = completion.clone();
-            super::super::drivers::spawn(Box::pin(async move {
-                let a = scope();
-                let b = scope();
-                let parent = scope();
-                let primary = std::future::poll_fn(|cx| {
-                    if primary_fence.get() {
-                        Poll::Ready(Err(Error::Cancelled))
-                    } else {
-                        cx.waker().wake_by_ref();
-                        Poll::Pending
-                    }
-                });
-                let result = race(primary, async { Ok(3) }, &a, &b, &parent, &permit).await;
-                drop(permit);
-                done.set(true);
-                let _ = send.send(result);
-                Ok(())
-            }))
-            .unwrap();
+            uring_runtime::drivers::reserve()
+                .unwrap()
+                .submit_detached(Box::pin(async move {
+                    let a = scope();
+                    let b = scope();
+                    let parent = scope();
+                    let primary = std::future::poll_fn(|cx| {
+                        if primary_fence.get() {
+                            Poll::Ready(Err(Error::Cancelled))
+                        } else {
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                    });
+                    let result =
+                        race(primary, async { Ok(page(3)) }, &a, &b, &parent, &permit).await;
+                    drop(permit);
+                    done.set(true);
+                    let _ = send.send(result);
+                    Ok::<_, Error>(())
+                }));
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             queue.poll(&mut cx, 4);
             clock.advance(Duration::from_millis(10));
@@ -611,7 +510,14 @@ pub mod hedge {
                     Poll::Pending
                 }
             });
-            let mut race = Box::pin(race(primary, async { Ok(42) }, &a, &b, &parent, &permit));
+            let mut race = Box::pin(race(
+                primary,
+                async { Ok(page(42)) },
+                &a,
+                &b,
+                &parent,
+                &permit,
+            ));
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             assert!(race.as_mut().poll(&mut cx).is_pending());
             clock.advance(Duration::from_millis(10));
@@ -620,7 +526,9 @@ pub mod hedge {
             assert!(!parent.cancellation.is_cancelled());
             assert!(matches!(owner.acquire(), Err(Error::Overloaded)));
             fence.set(true);
-            assert_eq!(race.as_mut().poll(&mut cx), Poll::Ready(Ok(42)));
+            assert!(
+                matches!(race.as_mut().poll(&mut cx), Poll::Ready(Ok(page)) if page.plaintext.bytes() == [42])
+            );
             drop(race);
             drop(permit);
             assert!(owner.acquire().is_ok());
@@ -637,7 +545,7 @@ pub mod hedge {
             let ready = Cell::new(false);
             let primary = std::future::poll_fn(|_| {
                 if ready.get() {
-                    Poll::Ready(Ok(7))
+                    Poll::Ready(Ok(page(7)))
                 } else {
                     Poll::Pending
                 }
@@ -656,7 +564,9 @@ pub mod hedge {
             assert!(race.as_mut().poll(&mut cx).is_pending());
             assert!(!a.cancellation.is_cancelled());
             ready.set(true);
-            assert_eq!(race.as_mut().poll(&mut cx), Poll::Ready(Ok(7)));
+            assert!(
+                matches!(race.as_mut().poll(&mut cx), Poll::Ready(Ok(page)) if page.plaintext.bytes() == [7])
+            );
             assert_eq!(owner.metrics.count(Event::PageHedgeWon), 0);
         }
         #[test]
@@ -672,7 +582,7 @@ pub mod hedge {
             let child = || {
                 std::future::poll_fn(|_| {
                     if fence.get() {
-                        Poll::Ready(Ok(9))
+                        Poll::Ready(Ok(page(9)))
                     } else {
                         Poll::Pending
                     }
@@ -688,18 +598,15 @@ pub mod hedge {
             assert!(a.cancellation.is_cancelled() && b.cancellation.is_cancelled());
             assert!(matches!(owner.acquire(), Err(Error::Overloaded)));
             fence.set(true);
-            assert_eq!(
+            assert!(matches!(
                 race.as_mut().poll(&mut cx),
                 Poll::Ready(Err(Error::Cancelled))
-            );
+            ));
         }
     }
 }
 pub mod metadata;
 pub mod range_stream;
-#[cfg(test)]
-mod remote_tests;
-pub mod subscription;
 
 use self::{
     fill::Fill,
@@ -1089,78 +996,4 @@ fn peer_error(error: Error) -> Result<PeerResponse> {
     }
 }
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::model::AttemptId;
-    #[test]
-    fn remote_budget_charges_final_incoming_link_and_never_restores_attempts() {
-        let now = uring_runtime::environment::now();
-        let scope = RequestScope::new(
-            crate::model::RequestId([1; 16]),
-            now + std::time::Duration::from_secs(60),
-        )
-        .unwrap();
-        let mut route = crate::topology::routing::RouteBudget {
-            membership: crate::model::MembershipVersion(1),
-            request: scope.request,
-            attempt: AttemptId([2; 16]),
-            destination: crate::model::NodeId("destination".into()),
-            visited: vec![crate::model::NodeId("sender".into())],
-            remaining_links: 1,
-            remaining_attempts: 0,
-            deadline: scope.deadline,
-        };
-        let mut budget = inherited_budget(&route, &scope).unwrap();
-        assert_eq!(budget.remaining_links(), 0);
-        assert_eq!(
-            budget.begin_attempt(now, scope.deadline.0),
-            Err(Error::Unavailable)
-        );
-        route.remaining_links = 8;
-        route.remaining_attempts = 3;
-        route.deadline.0 = now + std::time::Duration::from_secs(5);
-        let mut budget = inherited_budget(&route, &scope).unwrap();
-        assert_eq!(budget.route_links(), 7);
-        assert_eq!(
-            budget.begin_attempt(now, scope.deadline.0),
-            Ok(route.deadline.0)
-        );
-        assert_eq!(budget.remaining_attempts(), 2);
-        route.remaining_links = 0;
-        assert!(matches!(
-            inherited_budget(&route, &scope),
-            Err(Error::HopBudgetExhausted)
-        ));
-    }
-    #[test]
-    fn peer_failures_are_not_copy_misses() {
-        assert!(matches!(
-            peer_error(Error::NotFound),
-            Ok(PeerResponse::NotFound)
-        ));
-        assert!(matches!(
-            peer_error(Error::VersionUnavailable),
-            Ok(PeerResponse::VersionUnavailable)
-        ));
-        assert!(matches!(
-            peer_error(Error::OriginRejected),
-            Ok(PeerResponse::OriginRejected)
-        ));
-        assert!(matches!(
-            peer_error(Error::Unauthorized),
-            Err(Error::Unauthorized)
-        ));
-        assert!(matches!(
-            peer_error(Error::OriginForbidden),
-            Ok(PeerResponse::OriginForbidden)
-        ));
-        assert!(matches!(
-            peer_error(Error::Overloaded),
-            Ok(PeerResponse::Overloaded)
-        ));
-        assert!(matches!(
-            peer_error(Error::CorruptRecord),
-            Err(Error::CorruptRecord)
-        ));
-    }
-}
+mod tests;

@@ -755,7 +755,7 @@ pub struct WorkerApplication {
     ingress_peers: futures::stream::FuturesUnordered<Operation<'static, ()>>,
     next_health: std::time::Instant,
     environment: uring_runtime::environment::Environment,
-    drivers: Rc<crate::read::drivers::DriverQueue>,
+    drivers: Rc<uring_runtime::drivers::DriverQueue>,
     http: Rc<HttpPool>,
     pub worker: WorkerId,
     runtime: WorkerRuntime,
@@ -833,7 +833,7 @@ impl WorkerApplication {
         runtime
             .crypto
             .set_failure_observer(node.failures.observer(worker));
-        let drivers = Rc::new(crate::read::drivers::DriverQueue::default());
+        let drivers = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
         let _queue = drivers.enter();
         let admission = runtime.admission.clone();
         config.page_hedge.validate()?;
