@@ -11,7 +11,6 @@ use crate::{
     runtime::{
         admission::{AdmissionExt, AdmissionPolicy},
         deadline::{Cancellation, RequestScope},
-        reactor::Descriptor,
     },
 };
 use std::{
@@ -32,14 +31,15 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
+use uring_runtime::reactor::Descriptor;
 
 enum Listener {
     Real(UnixListener),
     #[cfg(test)]
-    Sim(crate::runtime::reactor::Descriptor),
+    Sim(uring_runtime::reactor::Descriptor),
 }
 impl Listener {
-    fn accept(&self) -> std::io::Result<(crate::runtime::reactor::Descriptor, ())> {
+    fn accept(&self) -> std::io::Result<(uring_runtime::reactor::Descriptor, ())> {
         match self {
             Self::Real(listener) => listener.accept().map(|(socket, _)| (socket.into(), ())),
             #[cfg(test)]
@@ -62,7 +62,7 @@ enum Directory {
     Real(File),
     #[cfg(test)]
     Sim {
-        sim: crate::runtime::reactor::simulation::Simulation,
+        sim: uring_runtime::reactor::simulation::Simulation,
         path: PathBuf,
     },
 }
@@ -94,7 +94,7 @@ struct BoundListener {
     directory: Directory,
     device: u64,
     inode: u64,
-    retired: Arc<crate::runtime::ingress::Retired>,
+    retired: Arc<std::sync::atomic::AtomicBool>,
     basename: RefCell<String>,
     witness: Option<String>,
     owner: Option<Rc<EndpointOwner>>,
@@ -102,7 +102,8 @@ struct BoundListener {
 
 impl Drop for BoundListener {
     fn drop(&mut self) {
-        self.retired.set(true);
+        self.retired
+            .store(true, std::sync::atomic::Ordering::Release);
         let path = self
             .directory
             .anchor()
@@ -143,7 +144,7 @@ struct Active {
     deadline: Rc<Cell<std::time::Instant>>,
     expired: Option<std::time::Instant>,
     cache: CacheId,
-    retired: Arc<crate::runtime::ingress::Retired>,
+    retired: Arc<std::sync::atomic::AtomicBool>,
     idle: Rc<Cell<bool>>,
     cancellation: Cancellation,
     operation: Operation<'static, ()>,
@@ -219,9 +220,9 @@ impl ClientListeners {
         &self,
         connection: ConnectionLease,
         cache: CacheId,
-        retired: Arc<crate::runtime::ingress::Retired>,
+        retired: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<()> {
-        if retired.get() || !self.accepting.get() {
+        if retired.load(std::sync::atomic::Ordering::Acquire) || !self.accepting.get() {
             return Ok(());
         }
         let cancellation = Cancellation::new()?;
@@ -230,7 +231,7 @@ impl ClientListeners {
         let idle = Rc::new(Cell::new(true));
         let task_idle = idle.clone();
         let timeout = self.request_timeout;
-        let deadline = Rc::new(Cell::new(crate::runtime::environment::now() + timeout));
+        let deadline = Rc::new(Cell::new(uring_runtime::environment::now() + timeout));
         let task_deadline = deadline.clone();
         let parser = self.parser.clone();
         let reads = self.reads.clone();
@@ -350,7 +351,7 @@ impl ClientListeners {
                     continue;
                 }
                 let mut random = [0; 16];
-                crate::runtime::environment::fill_random(&mut random)
+                uring_runtime::environment::fill_random(&mut random)
                     .map_err(|_| Error::Unavailable)?;
                 let temporary = format!(".racer-{:032x}", u128::from_ne_bytes(random));
                 let previous = old
@@ -451,12 +452,12 @@ impl ClientListeners {
             let Some(mut active) = self.active.borrow_mut().pop_front() else {
                 break;
             };
-            if active.retired.get() && active.idle.get() {
+            if active.retired.load(std::sync::atomic::Ordering::Acquire) && active.idle.get() {
                 let _ = active.cancellation.cancel();
             }
             let deadline = active.deadline.get();
             let force = active.expired != Some(deadline)
-                && (crate::runtime::environment::now() >= deadline
+                && (uring_runtime::environment::now() >= deadline
                     || active.cancellation.is_cancelled());
             if force {
                 active.expired = Some(deadline);
@@ -494,7 +495,7 @@ impl ClientListeners {
             #[cfg(not(test))]
             let simulated = false;
             #[cfg(test)]
-            let simulated = crate::runtime::reactor::simulation::Simulation::current().is_some();
+            let simulated = uring_runtime::reactor::simulation::Simulation::current().is_some();
             let listener = if simulated {
                 let listeners = self.listeners.borrow();
                 let key = self.sim_cursor.borrow().clone();
@@ -588,7 +589,9 @@ impl ClientListeners {
     pub fn stop_cache(&self, cache: &CacheId) {
         if let Some(listener) = self.listeners.borrow_mut().remove(cache) {
             self.generation.set(self.generation.get().wrapping_add(1));
-            listener.retired.set(true);
+            listener
+                .retired
+                .store(true, std::sync::atomic::Ordering::Release);
             self.cleanup.borrow_mut().push_back(listener);
         }
         for active in self
@@ -597,7 +600,9 @@ impl ClientListeners {
             .iter()
             .filter(|active| &active.cache == cache)
         {
-            active.retired.set(true);
+            active
+                .retired
+                .store(true, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -620,7 +625,9 @@ impl ClientListeners {
         self.accepting.set(false);
         *self.readiness.borrow_mut() = ReadyListeners::default();
         for (_, listener) in std::mem::take(&mut *self.listeners.borrow_mut()) {
-            listener.retired.set(true);
+            listener
+                .retired
+                .store(true, std::sync::atomic::Ordering::Release);
             self.cleanup.borrow_mut().push_back(listener);
         }
     }
@@ -661,14 +668,14 @@ async fn serve_connection(
     io: &HttpIo,
     admission: &flow_control::Quotas<AdmissionPolicy>,
     cancellation: Cancellation,
-    retired: Arc<crate::runtime::ingress::Retired>,
+    retired: Arc<std::sync::atomic::AtomicBool>,
     idle: Rc<Cell<bool>>,
     timeout: Duration,
     metrics: &crate::telemetry::metrics::Metrics,
     deadline: Rc<Cell<std::time::Instant>>,
 ) -> Result<()> {
     loop {
-        if retired.get() {
+        if retired.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
         }
         idle.set(true);
@@ -685,7 +692,7 @@ async fn serve_connection(
             .receive_request_head_limited(connection, &idle_scope, parser.header_limit())
             .await?;
         connection = received.connection;
-        if retired.get() {
+        if retired.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
         }
         idle.set(false);
@@ -813,11 +820,11 @@ async fn serve_connection(
 
 fn new_scope(timeout: Duration, cancellation: Cancellation) -> Result<RequestScope> {
     let mut id = [0; 16];
-    crate::runtime::environment::fill_random(&mut id).map_err(|_| Error::Unavailable)?;
+    uring_runtime::environment::fill_random(&mut id).map_err(|_| Error::Unavailable)?;
     Ok(RequestScope {
         body_deadlines: None,
         request: RequestId(id),
-        deadline: crate::runtime::deadline::Deadline(crate::runtime::environment::now() + timeout),
+        deadline: crate::runtime::deadline::Deadline(uring_runtime::environment::now() + timeout),
         cancellation,
     })
 }
@@ -992,14 +999,18 @@ impl PreparedListeners {
                     .get(&id)
                     .is_some_and(|next| Rc::ptr_eq(next, &listener))
                 {
-                    listener.retired.set(true);
+                    listener
+                        .retired
+                        .store(true, std::sync::atomic::Ordering::Release);
                     cleanup.push_back(listener);
                 }
             }
         } else {
             // Shutdown may overtake preparation, but must never revive admission.
             for (_, listener) in std::mem::take(&mut self.next) {
-                listener.retired.set(true);
+                listener
+                    .retired
+                    .store(true, std::sync::atomic::Ordering::Release);
                 cleanup.push_back(listener);
             }
         }
@@ -1135,12 +1146,12 @@ fn bind(
     previous: Option<&BoundListener>,
 ) -> Result<BoundListener> {
     #[cfg(test)]
-    if let Some(sim) = crate::runtime::reactor::simulation::Simulation::current() {
+    if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
         let directory = root.join(&definition.name).join("client");
         sim.create_dir_all(&directory).map_err(|_| Error::Io)?;
         let path = directory.join(basename);
         let listener = sim
-            .listen(crate::runtime::reactor::SocketAddress::Unix(path.clone()))
+            .listen(uring_runtime::reactor::SocketAddress::Unix(path.clone()))
             .map_err(|_| Error::Io)?;
         let (inode, _) = sim.metadata(&path).map_err(|_| Error::Io)?;
         let bound = BoundListener {
@@ -1152,7 +1163,7 @@ fn bind(
             },
             device: 1,
             inode,
-            retired: Arc::new(crate::runtime::ingress::Retired::default()),
+            retired: Arc::new(std::sync::atomic::AtomicBool::default()),
             basename: RefCell::new(basename.into()),
             witness: None,
             owner: None,
@@ -1183,7 +1194,7 @@ fn bind(
         directory: Directory::Real(directory),
         device: metadata.dev(),
         inode: metadata.ino(),
-        retired: Arc::new(crate::runtime::ingress::Retired::default()),
+        retired: Arc::new(std::sync::atomic::AtomicBool::default()),
         basename: RefCell::new(basename.into()),
         witness: Some(witness),
         owner: Some(owner),

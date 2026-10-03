@@ -216,7 +216,7 @@ pub(crate) mod testing {
             ca,
             key,
             node,
-            crate::runtime::environment::wall_now() - std::time::Duration::from_secs(1),
+            uring_runtime::environment::wall_now() - std::time::Duration::from_secs(1),
         )
     }
     pub(crate) fn issue_at(
@@ -510,11 +510,11 @@ impl ControlClient {
         let failures = self.failures.get().saturating_add(1);
         self.failures.set(failures);
         let mut random = [0; 8];
-        crate::runtime::environment::fill_random(&mut random).map_err(|_| Error::Io)?;
+        uring_runtime::environment::fill_random(&mut random).map_err(|_| Error::Io)?;
         let ceiling = (1u64 << failures.saturating_sub(1).min(5)).min(30) * 1000;
         let delay = Duration::from_millis(1000 + u64::from_ne_bytes(random) % (ceiling - 1000 + 1));
         let delay = delay.max(self.retry_after.take().unwrap_or_default());
-        crate::runtime::environment::now()
+        uring_runtime::environment::now()
             .checked_add(delay)
             .ok_or(Error::InvalidRequest)
     }
@@ -558,7 +558,7 @@ impl ControlClient {
             if self
                 .next
                 .get()
-                .is_some_and(|n| n > crate::runtime::environment::now())
+                .is_some_and(|n| n > uring_runtime::environment::now())
             {
                 return Err(Error::Unavailable);
             }
@@ -566,7 +566,7 @@ impl ControlClient {
             turn.deadline.0 = turn
                 .deadline
                 .0
-                .min(crate::runtime::environment::now() + Duration::from_secs(40));
+                .min(uring_runtime::environment::now() + Duration::from_secs(40));
             *self.active_scope.borrow_mut() = Some(turn.clone());
             let _turn = ActiveTurn(&self.active_scope);
             let result = self.start_inner(&turn).await;
@@ -598,7 +598,7 @@ impl ControlClient {
         *self.identity.borrow_mut() = Some(identity.clone());
         *self.startup_bundle.borrow_mut() = Some(bundle);
         self.started.set(true);
-        self.next.set(Some(crate::runtime::environment::now()));
+        self.next.set(Some(uring_runtime::environment::now()));
         Ok(identity)
     }
     pub fn activate_identity(&self) -> Result<()> {
@@ -642,9 +642,10 @@ impl ControlClient {
                 }
             }
             let mut turn = scope.clone();
-            turn.deadline.0 = turn.deadline.0.min(
-                crate::runtime::environment::now() + wire::POLL_WAIT + Duration::from_secs(10),
-            );
+            turn.deadline.0 = turn
+                .deadline
+                .0
+                .min(uring_runtime::environment::now() + wire::POLL_WAIT + Duration::from_secs(10));
             *self.active_scope.borrow_mut() = Some(turn.clone());
             let _turn = ActiveTurn(&self.active_scope);
             let mut advance = Box::pin(self.advance(&turn));
@@ -653,10 +654,10 @@ impl ControlClient {
                     && self
                         .install_next
                         .get()
-                        .is_none_or(|next| next <= crate::runtime::environment::now())
+                        .is_none_or(|next| next <= uring_runtime::environment::now())
                 {
                     self.install_next.set(Some(
-                        crate::runtime::environment::now() + Duration::from_millis(10),
+                        uring_runtime::environment::now() + Duration::from_millis(10),
                     ));
                     match self.install_pending() {
                         Ok(()) | Err(Error::Unavailable | Error::Overloaded | Error::Io) => (),
@@ -674,9 +675,9 @@ impl ControlClient {
                     if self
                         .next
                         .get()
-                        .is_none_or(|next| next <= crate::runtime::environment::now())
+                        .is_none_or(|next| next <= uring_runtime::environment::now())
                     {
-                        self.next.set(Some(crate::runtime::environment::now()));
+                        self.next.set(Some(uring_runtime::environment::now()));
                     }
                     Ok(())
                 }
@@ -686,7 +687,7 @@ impl ControlClient {
                             match self
                                 .renew_next
                                 .get()
-                                .filter(|next| *next > crate::runtime::environment::now())
+                                .filter(|next| *next > uring_runtime::environment::now())
                             {
                                 Some(next) => next,
                                 None => self.backoff()?,
@@ -708,7 +709,7 @@ impl ControlClient {
                 self.transport
                     .io()?
                     .sleep(
-                        crate::runtime::environment::now() + Duration::from_secs(1),
+                        uring_runtime::environment::now() + Duration::from_secs(1),
                         scope,
                     )
                     .await?;
@@ -735,7 +736,7 @@ impl ControlClient {
             if self
                 .next
                 .get()
-                .filter(|next| *next > crate::runtime::environment::now())
+                .filter(|next| *next > uring_runtime::environment::now())
                 .is_some()
             {
                 return Ok(());
@@ -777,9 +778,10 @@ impl ControlClient {
                 self.key_transport.io()?.sleep(next, scope).await?;
             }
             let mut turn = scope.clone();
-            turn.deadline.0 = turn.deadline.0.min(
-                crate::runtime::environment::now() + wire::POLL_WAIT + Duration::from_secs(10),
-            );
+            turn.deadline.0 = turn
+                .deadline
+                .0
+                .min(uring_runtime::environment::now() + wire::POLL_WAIT + Duration::from_secs(10));
             let result = async {
                 if let Some(bundle) = self.fetch_keyring(self.secrets.generation(), &turn).await? {
                     turn.check()?;
@@ -794,7 +796,7 @@ impl ControlClient {
                 let failures = self.keyring_failures.get().saturating_add(1);
                 self.keyring_failures.set(failures);
                 let mut random = [0; 8];
-                crate::runtime::environment::fill_random(&mut random).map_err(|_| Error::Io)?;
+                uring_runtime::environment::fill_random(&mut random).map_err(|_| Error::Io)?;
                 let ceiling = (1u64 << failures.min(5)).min(30) * 1000;
                 Duration::from_millis(1000 + u64::from_ne_bytes(random) % (ceiling - 999))
             } else {
@@ -803,7 +805,7 @@ impl ControlClient {
             };
             let delay = delay.max(self.keyring_retry_after.take().unwrap_or_default());
             self.keyring_next
-                .set(crate::runtime::environment::now().checked_add(delay));
+                .set(uring_runtime::environment::now().checked_add(delay));
             scope.check()
         })
     }
@@ -893,7 +895,7 @@ impl ControlClient {
             && self
                 .renew_next
                 .get()
-                .is_none_or(|n| n <= crate::runtime::environment::now())
+                .is_none_or(|n| n <= uring_runtime::environment::now())
         {
             match self.renew(scope).await {
                 Ok(()) => {
@@ -976,7 +978,7 @@ impl ControlClient {
             .transpose()?;
         self.snapshots.publish_prepared(&publication, transition)?;
         self.pending.borrow_mut().take();
-        self.next.set(Some(crate::runtime::environment::now()));
+        self.next.set(Some(uring_runtime::environment::now()));
         Ok(())
     }
     async fn renew(&self, scope: &RequestScope) -> Result<()> {

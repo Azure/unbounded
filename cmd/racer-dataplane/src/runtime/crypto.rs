@@ -31,7 +31,6 @@ mod measurement {
     use crate::{
         memory::pool::BufferPool,
         model::{Nonce, PageEnvelope, ResourceClass, *},
-        runtime::reactor::IoBuffer,
         security::aead::{PageCryptoEngine, page_aad},
     };
     use racer_crypto::aead;
@@ -39,6 +38,7 @@ mod measurement {
         rc::Rc,
         time::{Duration, Instant},
     };
+    use uring_runtime::reactor::IoBuffer;
 
     fn page() -> PageId {
         PageId {
@@ -184,7 +184,7 @@ mod measurement {
         let (io, mut engine) = pair(WorkerId(0), 0, NonZeroUsize::new(8).unwrap());
         let client = CryptoClient::new(io);
         client.set_metrics(metrics.clone());
-        let environment = crate::runtime::environment::Environment::current();
+        let environment = uring_runtime::environment::Environment::current();
         let thread = std::thread::spawn(move || {
             let _env = environment.enter();
             while let Some(job) =
@@ -196,7 +196,7 @@ mod measurement {
         });
         let scope = RequestScope::new(
             RequestId([0; 16]),
-            crate::runtime::environment::now() + Duration::from_secs(240),
+            uring_runtime::environment::now() + Duration::from_secs(240),
         )
         .unwrap();
         for batch in (0..iterations).step_by(8) {
@@ -248,7 +248,7 @@ mod measurement {
         ]) {
             assert_eq!(metrics.count(event), expected);
         }
-        if crate::runtime::environment::simulation_seed().is_none() {
+        if uring_runtime::environment::simulation_seed().is_none() {
             assert!(metrics.count(events[5]) > 0);
             assert!(metrics.count(events[7]) > 0);
         }
@@ -256,7 +256,7 @@ mod measurement {
 
     #[test]
     fn attribution_preserves_client_cleanup_and_dst() {
-        use crate::runtime::environment::{self, SimulationClock};
+        use uring_runtime::environment::{self, SimulationClock};
         let clock = SimulationClock::new(73);
         let env = clock.environment(0);
         let _env = env.enter();
@@ -268,8 +268,8 @@ mod measurement {
 
     #[test]
     fn measurements_account_once_at_reap_even_for_cancel_and_abandon() {
-        use crate::runtime::environment::{self, SimulationClock};
         use std::time::Duration;
+        use uring_runtime::environment::{self, SimulationClock};
         let clock = SimulationClock::new(42);
         let env = clock.environment(0);
         let _env = env.enter();
@@ -431,11 +431,11 @@ mod measurement {
 
     #[test]
     fn send_crc_computes_fresh_body_and_holds_owner_through_abandoned_reap() {
-        use crate::runtime::environment;
         use crate::{
             security::aead::PageCryptoEngine,
             telemetry::send_crc::{Pair, Samples},
         };
+        use uring_runtime::environment;
         let admission = std::rc::Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
@@ -563,7 +563,7 @@ mod measurement {
                 .unwrap();
             let scope = RequestScope::new(
                 crate::model::RequestId([7; 16]),
-                crate::runtime::environment::now() + Duration::from_secs(10),
+                uring_runtime::environment::now() + Duration::from_secs(10),
             )
             .unwrap();
             let (io, mut engine) = pair(WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
@@ -658,11 +658,9 @@ mod measurement {
     }
 
     fn shared_worker_queue_measurements(decrypt: bool) {
-        use crate::{
-            runtime::environment::{self, SimulationClock},
-            security::aead::PageCryptoEngine,
-        };
+        use crate::security::aead::PageCryptoEngine;
         use std::time::Duration;
+        use uring_runtime::environment::{self, SimulationClock};
 
         let clock = SimulationClock::new(43);
         let env = clock.environment(0);
@@ -806,7 +804,7 @@ mod measurement {
 
     #[test]
     fn duration_saturates_without_host_time_in_dst() {
-        use crate::runtime::environment::{self, SimulationClock};
+        use uring_runtime::environment::{self, SimulationClock};
         let clock = SimulationClock::new(19);
         let env = clock.environment(0);
         let _env = env.enter();
@@ -1030,11 +1028,92 @@ mod measurement {
     }
 }
 
-use super::{
-    admission::AdmissionPolicy,
-    channel::{self, Receiver, SendFailure, Sender},
-    deadline::RequestScope,
-};
+use super::{admission::AdmissionPolicy, deadline::RequestScope};
+use channel::{Receiver, SendFailure, Sender};
+
+mod channel {
+    //! Racer error adapters for the runtime's bounded SPSC ownership handoffs.
+    use crate::error::{Error, Result};
+    use std::task::{Context, Poll};
+    use uring_runtime::channel;
+
+    pub struct Sender<T>(channel::Sender<T>);
+    pub struct Receiver<T>(channel::Receiver<T>);
+    pub struct SendFailure<T> {
+        pub command: T,
+        pub error: Error,
+    }
+
+    pub fn bounded<T>(capacity: usize) -> Result<(Sender<T>, Receiver<T>)> {
+        let (sender, receiver) = channel::bounded(capacity)?;
+        Ok((Sender(sender), Receiver(receiver)))
+    }
+
+    impl<T> Sender<T> {
+        pub fn discard_closed(&self) -> bool {
+            self.0.discard_closed()
+        }
+
+        pub fn try_send(&self, command: T) -> std::result::Result<(), SendFailure<T>> {
+            self.0.try_send(command).map_err(|failure| SendFailure {
+                command: failure.command,
+                error: failure.error.into(),
+            })
+        }
+
+        pub fn close(&self) {
+            self.0.close();
+        }
+
+        #[cfg(test)]
+        pub fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+            self.0
+                .poll_ready(cx)
+                .map(|result| result.map_err(Into::into))
+        }
+    }
+
+    impl<T> Receiver<T> {
+        pub fn is_closed(&self) -> bool {
+            self.0.is_closed()
+        }
+
+        pub fn receive(&mut self) -> Result<Option<T>> {
+            self.0.receive().map_err(Into::into)
+        }
+
+        pub fn poll_receive(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<T>>> {
+            self.0
+                .poll_receive(cx)
+                .map(|result| result.map_err(Into::into))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn adapter_maps_errors_without_losing_command_ownership() {
+            assert!(matches!(bounded::<u8>(0), Err(Error::InvalidConfiguration)));
+            let (sender, mut receiver) = bounded(1).unwrap();
+            assert!(sender.try_send(String::from("first")).is_ok());
+            let failure = sender.try_send(String::from("second")).err().unwrap();
+            assert_eq!(failure.error, Error::Overloaded);
+            assert_eq!(failure.command, "second");
+            assert_eq!(receiver.receive().unwrap().as_deref(), Some("first"));
+            drop(receiver);
+            let failure = sender.try_send(failure.command).err().unwrap();
+            assert_eq!(failure.error, Error::Unavailable);
+            assert_eq!(failure.command, "second");
+            assert_eq!(
+                sender.poll_ready(&mut Context::from_waker(futures::task::noop_waker_ref())),
+                Poll::Ready(Err(Error::Unavailable))
+            );
+            assert!(sender.discard_closed());
+        }
+    }
+}
 use crate::{
     error::{Error, Operation, Result},
     memory::pool::{CiphertextPage, PlaintextBuffer, VerifiedPage},
@@ -1147,7 +1226,7 @@ pub(crate) enum IntegrityRejection {
 }
 
 fn elapsed_ns(start: std::time::Instant) -> u64 {
-    super::environment::now()
+    uring_runtime::environment::now()
         .saturating_duration_since(start)
         .as_nanos()
         .min(u128::from(u64::MAX)) as u64
@@ -1155,7 +1234,7 @@ fn elapsed_ns(start: std::time::Instant) -> u64 {
 
 impl CryptoPermit {
     pub(crate) fn execution_start(&self) -> Option<std::time::Instant> {
-        Some(super::environment::now())
+        Some(uring_runtime::environment::now())
     }
 
     pub(crate) fn executed(&mut self, start: std::time::Instant) {
@@ -1246,7 +1325,7 @@ pub struct CryptoJob {
 
 impl CryptoPermit {
     pub fn job(mut self, input: CryptoInput, key: KeyLease, scope: RequestScope) -> CryptoJob {
-        use super::reactor::IoBuffer;
+        use uring_runtime::reactor::IoBuffer;
         self.measurement.checksum_only = matches!(input, CryptoInput::Checksum { .. });
         self.measurement.decrypt = matches!(input, CryptoInput::Decrypt { .. });
         self.measurement.bytes = match &input {
@@ -1402,7 +1481,7 @@ impl IoCryptoPort {
         }
         // Capture at publication attempt, not permit reservation/admission. A
         // rejected attempt never reaches dequeue and is overwritten on retry.
-        job.permit.measurement.submitted = Some(super::environment::now());
+        job.permit.measurement.submitted = Some(uring_runtime::environment::now());
         self.jobs.try_send(job)?;
         self.handoff.engine_waker.wake();
         Ok(())
@@ -1861,7 +1940,7 @@ mod tests {
                 engine,
                 scope: RequestScope::new(
                     crate::model::RequestId([0; 16]),
-                    crate::runtime::environment::now() + std::time::Duration::from_secs(5),
+                    uring_runtime::environment::now() + std::time::Duration::from_secs(5),
                 )
                 .unwrap(),
             }
@@ -1961,7 +2040,7 @@ mod tests {
 
     #[test]
     fn accepted_deadline_expiry_waits_for_engine_completion() {
-        let clock = crate::runtime::environment::SimulationClock::new(91);
+        let clock = uring_runtime::environment::SimulationClock::new(91);
         let _environment = clock.environment(0).enter();
         let Fixture {
             admission,

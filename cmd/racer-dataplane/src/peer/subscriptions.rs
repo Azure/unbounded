@@ -239,7 +239,7 @@ impl Subscriptions {
         scope: &crate::runtime::deadline::RequestScope,
     ) -> Result<Selection> {
         use crate::security::protocol::{encode_deadline, millis};
-        let now = || millis(crate::runtime::environment::wall_now());
+        let now = || millis(uring_runtime::environment::wall_now());
         scope.check()?;
         let object = subscription.version.object.clone();
         let key = self.admit(

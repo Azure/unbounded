@@ -250,7 +250,7 @@ impl Index {
             .borrow()
             .current
             .get(object)
-            .filter(|v| crate::runtime::environment::wall_now() < v.expires_at.as_system_time())
+            .filter(|v| uring_runtime::environment::wall_now() < v.expires_at.as_system_time())
             .cloned())
     }
     /// Page-zero owner only, after fresh revalidation. Atomically retain the
@@ -263,7 +263,7 @@ impl Index {
         self.publish_version(metadata.immutable())?;
         let mut s = self.state.borrow_mut();
         s.current.remove(&metadata.version.object);
-        if crate::runtime::environment::wall_now() < metadata.expires_at.as_system_time() {
+        if uring_runtime::environment::wall_now() < metadata.expires_at.as_system_time() {
             s.current.insert(
                 metadata.version.object.clone(),
                 CurrentVersion {

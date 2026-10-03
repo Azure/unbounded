@@ -16,7 +16,7 @@ fn worker_subscriptions_contend_across_servers_and_recover_after_release() {
     let _os = sim.enter();
     let clock = SimulationClock::new(73);
     let _time = clock.environment(0).enter();
-    let _strict = crate::runtime::environment::require_simulated();
+    let _strict = uring_runtime::environment::require_simulated();
     let mut harness = Harness::new(73, sim, clock, false);
     harness.add(None);
     harness.add(None);
@@ -153,7 +153,7 @@ fn completed_peer_dispatches_do_not_exhaust_worker_cancellation() {
     let clock = SimulationClock::new(73);
     let environment = clock.environment(0);
     let _time = environment.enter();
-    let _strict = crate::runtime::environment::require_simulated();
+    let _strict = uring_runtime::environment::require_simulated();
     let mut harness = Harness::new(73, sim, clock, false);
     harness.add(None);
     harness.add(None);
@@ -190,7 +190,7 @@ fn completed_peer_dispatches_do_not_exhaust_worker_cancellation() {
     for round in 0u64..1100 {
         let scope = RequestScope::new(
             RequestId([1; 16]),
-            crate::runtime::environment::now() + Duration::from_secs(5),
+            uring_runtime::environment::now() + Duration::from_secs(5),
         )
         .unwrap();
         let mut attempt = [0; 16];
@@ -276,7 +276,7 @@ fn listeners_survive_repeated_reactor_queue_pressure() {
     let clock = SimulationClock::new(73);
     let environment = clock.environment(0);
     let _time = environment.enter();
-    let _strict = crate::runtime::environment::require_simulated();
+    let _strict = uring_runtime::environment::require_simulated();
     let mut harness = Harness::new(73, sim.clone(), clock.clone(), false);
     harness.add(None);
     // The DST harness bypasses control enrollment and already attaches diagnostic
@@ -391,7 +391,7 @@ fn healthy_relayed_page_reads_with_mode(opaque: bool) {
     let clock = SimulationClock::new(71);
     let environment = clock.environment(0);
     let _time = environment.enter();
-    let _strict = crate::runtime::environment::require_simulated();
+    let _strict = uring_runtime::environment::require_simulated();
     let mut harness = Harness::new(71, sim, clock, false);
     harness.opaque_relay = opaque;
     // Match the deployed 64 MiB per-worker payload budgets. A five-page layer
@@ -437,7 +437,7 @@ fn concurrent_relayed_layers_with_mode(opaque: bool) {
     let clock = SimulationClock::new(73);
     let environment = clock.environment(0);
     let _time = environment.enter();
-    let _strict = crate::runtime::environment::require_simulated();
+    let _strict = uring_runtime::environment::require_simulated();
     let mut harness = Harness::new(73, sim, clock, false);
     harness.concurrent_layers = true;
     harness.opaque_relay = opaque;

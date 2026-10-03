@@ -11,7 +11,6 @@ use crate::{
             CryptoPermit, IntegrityRejection,
         },
         deadline::RequestScope,
-        reactor::IoBuffer,
         worker::{CryptoRuntime, CryptoService},
     },
     telemetry::failures::{AeadFailure, Failure, Stage},
@@ -26,7 +25,7 @@ use zeroize::Zeroizing;
 
 pub(crate) fn fresh_nonce() -> Result<Nonce> {
     let mut nonce = [0u8; 24];
-    crate::runtime::environment::fill_random(&mut nonce).map_err(|_| Error::Unavailable)?;
+    uring_runtime::environment::fill_random(&mut nonce).map_err(|_| Error::Unavailable)?;
     Ok(Nonce(nonce))
 }
 pub(crate) fn field(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
@@ -234,7 +233,7 @@ impl PageCrypto {
 /// The vetted AEAD adapter processes owned jobs in bounded quanta, checks the
 /// original deadline/cancellation, and returns every accepted job as a completion.
 pub struct PageCryptoEngine {
-    environment: crate::runtime::environment::Environment,
+    environment: uring_runtime::environment::Environment,
     runtime: CryptoRuntime,
     pending: Option<CryptoCompletion>,
     closed: bool,
@@ -242,7 +241,7 @@ pub struct PageCryptoEngine {
 impl PageCryptoEngine {
     pub fn new(runtime: CryptoRuntime) -> Self {
         Self {
-            environment: crate::runtime::environment::Environment::current(),
+            environment: uring_runtime::environment::Environment::current(),
             runtime,
             pending: None,
             closed: false,
@@ -1309,3 +1308,4 @@ mod tests {
         assert_eq!(admission.used(ResourceClass::Plaintext), 0);
     }
 }
+use uring_runtime::reactor::IoBuffer;

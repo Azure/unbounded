@@ -1,5 +1,4 @@
 //! Bounded file operations issued only through the serving worker's reactor.
-use crate::runtime::reactor::Descriptor;
 use crate::{
     error::{Error, Result},
     runtime::{deadline::RequestScope, reactor::Reactor},
@@ -10,6 +9,7 @@ use std::{
     path::{Component, Path},
     rc::Rc,
 };
+use uring_runtime::reactor::Descriptor;
 use zeroize::Zeroizing;
 pub(crate) type Directory = Rc<Descriptor>;
 const BENEATH: u64 = 0x08;
@@ -78,7 +78,7 @@ pub(crate) async fn directory(
 }
 fn check_private(stat: &libc::statx, regular: bool) -> Result<()> {
     #[cfg(test)]
-    let uid = if crate::runtime::reactor::simulation::Simulation::current().is_some() {
+    let uid = if uring_runtime::reactor::simulation::Simulation::current().is_some() {
         0
     } else {
         unsafe { libc::geteuid() }

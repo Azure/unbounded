@@ -480,7 +480,7 @@ mod destination_disconnect {
             AcquisitionBudget, AcquisitionEvent, AcquisitionFailure, Flights, JoinedCopy,
             JoinedFlight,
         },
-        runtime::reactor::{IoBuffer, Reactor},
+        runtime::reactor::Reactor,
         topology::{
             health::LinkHealth,
             membership::{Member, Membership},
@@ -986,7 +986,7 @@ mod encrypted_http {
         memory::pool::CiphertextPage,
         runtime::{
             crypto::{self, CryptoClient},
-            reactor::{IoBuffer, Reactor},
+            reactor::Reactor,
             worker::{CryptoRuntime, CryptoService},
         },
         security::aead::{PageCrypto, PageCryptoEngine},
@@ -1145,7 +1145,7 @@ mod encrypted_http {
         assert_ne!(pages[0].envelope().nonce, pages[1].envelope().nonce);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
-        let listener = Rc::new(crate::runtime::reactor::Descriptor::from(listener));
+        let listener = Rc::new(uring_runtime::reactor::Descriptor::from(listener));
         let canceled = RequestScope::new(RequestId([9; 16]), scope.deadline.0).unwrap();
         let accepts = Cell::new(0);
         let prefix_sent = Cell::new(false);
@@ -1354,10 +1354,7 @@ mod requester_safety {
             protocol::{PeerResponse, decode_envelope, encode_envelope},
             transport::RelayResponse,
         },
-        runtime::{
-            admission::AdmissionPolicy,
-            reactor::{Descriptor, Reactor},
-        },
+        runtime::{admission::AdmissionPolicy, reactor::Reactor},
         security::connection,
         telemetry::metrics::{Event, Gauge, Metrics},
         topology::{
@@ -1535,7 +1532,10 @@ mod requester_safety {
         };
         let server = async {
             let fd = reactor
-                .accept(Rc::new(Descriptor::from(listener)), &scope)
+                .accept(
+                    Rc::new(uring_runtime::reactor::Descriptor::from(listener)),
+                    &scope,
+                )
                 .await?;
             let conn = crate::http::connection::from_accepted(fd, &admission)?;
             let conn = connection::accept(&io, conn, signers[2].clone(), &scope).await?;
@@ -1646,7 +1646,6 @@ mod timing {
     use super::*;
     use crate::{
         peer::timing::{PageTiming, STAGES},
-        runtime::environment::SimulationClock,
         telemetry::metrics::{Event, Metrics},
         topology::rails::{RailId, TransportPlan},
     };
@@ -1679,7 +1678,7 @@ mod timing {
                 version: page.version.clone(),
                 length: 3,
                 expires_at: crate::model::ExpiresAt::test_time(
-                    crate::runtime::environment::wall_now() + Duration::from_secs(60),
+                    uring_runtime::environment::wall_now() + Duration::from_secs(60),
                 ),
             },
             // Intentionally not AEAD-valid: forwarding verification does not decrypt.
@@ -2179,3 +2178,4 @@ impl PeerTransport for NeverTransport {
         Box::pin(async { panic!("direct request must not relay") })
     }
 }
+use uring_runtime::{environment::SimulationClock, reactor::IoBuffer};

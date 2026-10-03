@@ -97,7 +97,7 @@ impl WorkerApplication {
         if !self.started {
             return Ok(());
         }
-        let now = crate::runtime::environment::now();
+        let now = uring_runtime::environment::now();
         if let Some(task) = self.checkpoint_task.as_mut() {
             if let Poll::Ready(result) = task.as_mut().poll(cx) {
                 self.checkpoint_task = None;

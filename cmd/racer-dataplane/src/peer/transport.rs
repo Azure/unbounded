@@ -15,11 +15,8 @@ use crate::{
         AuthenticatedDescriptor, COMPLETION_HEADER, DESCRIPTOR_HEADER, SETUP_BINDING_HEADER,
         SETUP_HEADER, SetupParameters,
     },
+    runtime::admission::{AdmissionExt, AdmissionPolicy},
     runtime::deadline::RequestScope,
-    runtime::{
-        admission::{AdmissionExt, AdmissionPolicy},
-        reactor::IoBuffer,
-    },
     security::{
         connection::{Signatures, SignedHead, VerifiedHead, signed_digest},
         forwarding::ForwardedHead,
@@ -1047,7 +1044,7 @@ impl Binding {
         rail: RailId,
     ) -> Result<Self> {
         let mut transfer = [0; 16];
-        crate::runtime::environment::fill_random(&mut transfer).map_err(|_| Error::Unavailable)?;
+        uring_runtime::environment::fill_random(&mut transfer).map_err(|_| Error::Unavailable)?;
         Ok(Self {
             request: envelope_digest(auth)?,
             response: [0; 32],
@@ -1136,7 +1133,7 @@ impl Binding {
         scope: &RequestScope,
     ) -> Result<(VerifiedHead, Phase)> {
         scope.check()?;
-        if p::decode_deadline(self.deadline)?.0 <= crate::runtime::environment::now() {
+        if p::decode_deadline(self.deadline)?.0 <= uring_runtime::environment::now() {
             return Err(Error::DeadlineExceeded);
         }
         let kind = p::field(&signed.head, "racer-kind")?;
@@ -1249,7 +1246,7 @@ fn native_scope(scope: &RequestScope) -> RequestScope {
     bounded.deadline.0 = bounded
         .deadline
         .0
-        .min(crate::runtime::environment::now() + Duration::from_secs(5));
+        .min(uring_runtime::environment::now() + Duration::from_secs(5));
     bounded
 }
 fn native_failure(error: Error, scope: &RequestScope) -> bool {
@@ -2094,7 +2091,7 @@ fn observe_read(
 fn adaptive_socket_attribution_ignores_local_pressure_and_expired_scope() {
     let scope = RequestScope::new(
         crate::model::RequestId([91; 16]),
-        crate::runtime::environment::now() + std::time::Duration::from_secs(10),
+        uring_runtime::environment::now() + std::time::Duration::from_secs(10),
     )
     .unwrap();
     let owner =
@@ -2445,7 +2442,7 @@ impl Transfers {
                             reads,
                             first: first.map(timestamp).unwrap_or_default(),
                             last: last.map(timestamp).unwrap_or_default(),
-                            now: timestamp(crate::runtime::environment::now()),
+                            now: timestamp(uring_runtime::environment::now()),
                             original: scope
                                 .body_deadlines
                                 .map(|d| timestamp(d.0))
@@ -2478,7 +2475,7 @@ impl Transfers {
                     return Err(Error::Io);
                 }
                 offset += completion.bytes;
-                let now = crate::runtime::environment::now();
+                let now = uring_runtime::environment::now();
                 first.get_or_insert(now);
                 last = Some(now);
                 reads = reads.saturating_add(1);
@@ -2656,3 +2653,4 @@ mod tests {
         }
     }
 }
+use uring_runtime::reactor::IoBuffer;

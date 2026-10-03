@@ -336,7 +336,7 @@ mod tests {
         let members = membership(100_000);
         let scope = RequestScope::new(
             RequestId([1; 16]),
-            crate::runtime::environment::now() + std::time::Duration::from_secs(30),
+            uring_runtime::environment::now() + std::time::Duration::from_secs(30),
         )
         .unwrap();
         let mut future = placement.rank_scoped(members, &object(), PageNumber(0), Some(&scope));

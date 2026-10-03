@@ -4,17 +4,17 @@ use super::*;
 use crate::{
     control::{state::CacheDefinition, wire},
     model::{PAGE_BYTES, ResourceClass, *},
-    runtime::{
-        environment::SimulationClock,
-        reactor::{
-            Descriptor, SocketAddress,
-            simulation::{Fault, Simulation},
-        },
-    },
     security::identity::{PendingIdentity, SigningIdentity},
 };
 use sha2::{Digest, Sha256};
 use std::{cell::RefCell, collections::BTreeMap};
+use uring_runtime::{
+    environment::SimulationClock,
+    reactor::{
+        Descriptor, SocketAddress,
+        simulation::{Fault, Simulation},
+    },
+};
 
 const MAX_NODES: usize = 32;
 const MAX_TURNS: usize = 100_000;
@@ -384,7 +384,7 @@ mod traffic {
                 }
                 Action::Partition if self.nodes.len() > 1 => self.partition_traffic(),
                 Action::WallJump => {
-                    let wall = crate::runtime::environment::wall_now();
+                    let wall = uring_runtime::environment::wall_now();
                     let amount = Duration::from_secs(1 + self.rng.pick(120) as u64);
                     self.clock.set_wall_time(if self.rng.pick(2) == 0 {
                         wall + amount
@@ -394,9 +394,9 @@ mod traffic {
                     self.traffic(1, true);
                     // Recover past replay admission's wall high-water mark.
                     self.clock.advance(Duration::from_secs(121));
-                    let (anchor, wall_anchor) = crate::runtime::environment::clock_anchor();
+                    let (anchor, wall_anchor) = uring_runtime::environment::clock_anchor();
                     self.clock.set_wall_time(
-                        wall_anchor + crate::runtime::environment::now().duration_since(anchor),
+                        wall_anchor + uring_runtime::environment::now().duration_since(anchor),
                     );
                     self.coverage.action("wall-jump");
                 }
@@ -661,7 +661,7 @@ impl PartialEq for ReplayTrace {
 }
 impl Eq for ReplayTrace {}
 
-fn handle(fd: &Descriptor) -> &crate::runtime::reactor::simulation::Handle {
+fn handle(fd: &Descriptor) -> &uring_runtime::reactor::simulation::Handle {
     fd.as_sim().expect("DST escaped into host I/O")
 }
 fn would_block(error: &std::io::Error) -> bool {
@@ -1813,7 +1813,7 @@ fn dst_origin_recovery_completes_before_concurrent_healthy_reads() {
         let clock = SimulationClock::new(106);
         let environment = clock.environment(0);
         let _time = environment.enter();
-        let _strict = crate::runtime::environment::require_simulated();
+        let _strict = uring_runtime::environment::require_simulated();
         let mut harness = Harness::new(106, sim, clock, native);
         for object in 0..8 {
             harness.update(object);
@@ -1856,7 +1856,7 @@ fn dst_native_faults_reach_warmed_peers_in_small_topologies() {
         let clock = SimulationClock::new(118);
         let environment = clock.environment(0);
         let _time = environment.enter();
-        let _strict = crate::runtime::environment::require_simulated();
+        let _strict = uring_runtime::environment::require_simulated();
         let mut harness = Harness::new(118, sim, clock, true);
         for _ in 0..nodes {
             harness.add(None);
@@ -2029,7 +2029,7 @@ fn replay(seed: u64, steps: usize, native: bool) -> Coverage {
     let clock = SimulationClock::new(seed);
     let environment = clock.environment(0);
     let _time = environment.enter();
-    let _strict = crate::runtime::environment::require_simulated();
+    let _strict = uring_runtime::environment::require_simulated();
     let mut harness = Harness::new(seed, sim, clock, native);
     harness
         .coverage

@@ -9,7 +9,7 @@ use model::{OriginContext, PAGE_BYTES, ResourceClass, *};
 use runtime::{
     admission::AdmissionPolicy,
     deadline::RequestScope,
-    reactor::{IoBuffer, Reactor},
+    reactor::Reactor,
     worker::{CryptoRuntime, CryptoService, WorkerMap},
 };
 use std::{
@@ -487,3 +487,4 @@ fn interop_keys() -> security::identity::Keyring {
     .unwrap();
     keys
 }
+use uring_runtime::reactor::IoBuffer;

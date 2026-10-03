@@ -35,7 +35,7 @@ impl Drop for PlaintextBuffer {
     }
 }
 // SAFETY: private fixed backing and reservation remain exclusively owned.
-unsafe impl crate::runtime::reactor::IoBuffer for PlaintextBuffer {
+unsafe impl uring_runtime::reactor::IoBuffer for PlaintextBuffer {
     type Error = Error;
     fn bytes(&self) -> Result<&[u8]> {
         Ok(&self.bytes)
@@ -246,7 +246,7 @@ impl CiphertextPage {
     }
 }
 // SAFETY: shared ciphertext backing is immutable and retained by the owner.
-unsafe impl crate::runtime::reactor::SendBuffer for CiphertextPage {
+unsafe impl uring_runtime::reactor::SendBuffer for CiphertextPage {
     type Error = Error;
     fn send_bytes(&self) -> Result<&[u8]> {
         Ok(self.bytes())
@@ -255,10 +255,7 @@ unsafe impl crate::runtime::reactor::SendBuffer for CiphertextPage {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::{
-        model::{Nonce, PageNumber, VersionMetadata},
-        runtime::reactor::IoBuffer,
-    };
+    use crate::model::{Nonce, PageNumber, VersionMetadata};
 
     pub(in crate::memory) fn admission(
         entries: usize,
@@ -622,3 +619,5 @@ pub(crate) mod tests {
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
     }
 }
+#[cfg(test)]
+use uring_runtime::reactor::IoBuffer;

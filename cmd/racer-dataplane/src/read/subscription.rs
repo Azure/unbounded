@@ -46,7 +46,7 @@ impl Scheduler {
         deadline: std::time::Instant,
     ) -> Result<(crate::peer::subscriptions::Subscription, std::time::Instant)> {
         let mut state = self.state.lock().unwrap();
-        let now = crate::runtime::environment::now();
+        let now = uring_runtime::environment::now();
         state.contracts.retain(|_, (_, deadline)| *deadline > now);
         let key = (version.clone(), membership.0, provider);
         if !state.contracts.contains_key(&key) {
@@ -54,7 +54,7 @@ impl Scheduler {
                 return Err(Error::Overloaded);
             }
             let mut id = [0; 16];
-            crate::runtime::environment::fill_random(&mut id).map_err(|_| Error::Unavailable)?;
+            uring_runtime::environment::fill_random(&mut id).map_err(|_| Error::Unavailable)?;
             state.contracts.insert(
                 key.clone(),
                 (
@@ -738,7 +738,7 @@ pub(super) mod tests {
             &[PageInterval { start: 0, end: 1 }]
         );
         assert!(second.poll_next(&mut cx).is_pending());
-        let deadline = crate::runtime::environment::now() + std::time::Duration::from_secs(30);
+        let deadline = uring_runtime::environment::now() + std::time::Duration::from_secs(30);
         let (one, _) = scheduler
             .contract(
                 version(),

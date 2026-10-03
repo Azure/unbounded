@@ -37,7 +37,7 @@ fn fixture(
     ));
     let scope = RequestScope::new(
         RequestId([1; 16]),
-        crate::runtime::environment::now() + std::time::Duration::from_secs(30),
+        uring_runtime::environment::now() + std::time::Duration::from_secs(30),
     )
     .unwrap();
     (sim, devices, native, admission, scope)
@@ -94,7 +94,7 @@ fn repeated_rail_selects_exact_physical_binding_and_revokes_changed_gid() {
     ));
     let scope = RequestScope::new(
         RequestId([3; 16]),
-        crate::runtime::environment::now() + std::time::Duration::from_secs(30),
+        uring_runtime::environment::now() + std::time::Duration::from_secs(30),
     )
     .unwrap();
     assert!(matches!(

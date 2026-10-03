@@ -601,7 +601,7 @@ impl Application {
 fn scope(timeout: Duration) -> Result<RequestScope> {
     RequestScope::new(
         RequestId([0; 16]),
-        crate::runtime::environment::now() + timeout,
+        uring_runtime::environment::now() + timeout,
     )
 }
 
@@ -653,7 +653,7 @@ fn bootstrap(
                         &io,
                         control
                             .next_attempt()
-                            .unwrap_or_else(crate::runtime::environment::now),
+                            .unwrap_or_else(uring_runtime::environment::now),
                         startup,
                     )
                     .await?;
@@ -754,7 +754,7 @@ pub struct WorkerApplication {
     peer_requester: Rc<Requester>,
     ingress_peers: futures::stream::FuturesUnordered<Operation<'static, ()>>,
     next_health: std::time::Instant,
-    environment: crate::runtime::environment::Environment,
+    environment: uring_runtime::environment::Environment,
     drivers: Rc<crate::read::drivers::DriverQueue>,
     http: Rc<HttpPool>,
     pub worker: WorkerId,
@@ -822,7 +822,7 @@ impl WorkerApplication {
         runtime: WorkerRuntime,
         discovered_nics: Vec<crate::topology::rails::RailMapping>,
     ) -> Result<Self> {
-        let environment = crate::runtime::environment::Environment::current();
+        let environment = uring_runtime::environment::Environment::current();
         let metrics = node
             .metrics
             .iter()
@@ -845,7 +845,7 @@ impl WorkerApplication {
             })
             .clone();
         admission.set_observer(node.failures.observer(worker));
-        metrics.observe_admission(worker, admission.usage())?;
+        metrics.observe_admission(worker, admission.shared())?;
         node.ingress.install(worker, &admission)?;
         let reactor = runtime.reactor.clone();
         let limits = admission.limits();
@@ -1037,7 +1037,7 @@ impl WorkerApplication {
         #[cfg(not(test))]
         let distributed = true;
         #[cfg(test)]
-        let distributed = crate::runtime::reactor::simulation::Simulation::current().is_none();
+        let distributed = uring_runtime::reactor::simulation::Simulation::current().is_none();
         let peers = PeerServer::new(
             io.clone(),
             forwarding,
@@ -1106,7 +1106,7 @@ impl WorkerApplication {
             inventory_generation: 0,
             native_numa: node.native.numa(worker)?,
             native_task: None,
-            native_retry: crate::runtime::environment::now(),
+            native_retry: uring_runtime::environment::now(),
             telemetry: Rc::new(telemetry),
             directory: node.workers.clone(),
             node,
@@ -1140,7 +1140,7 @@ impl WorkerApplication {
             cache_prepare_task: None,
             cache_preparing_generation: 0,
             control_scope: None,
-            next_health: crate::runtime::environment::now(),
+            next_health: uring_runtime::environment::now(),
         })
     }
 
@@ -1416,7 +1416,7 @@ impl WorkerApplication {
         self.http.poll_waiters(budget);
         // Expire metadata before advancing peer/listener tasks.
         self.metadata
-            .poll_deadlines(crate::runtime::environment::now(), budget);
+            .poll_deadlines(uring_runtime::environment::now(), budget);
         if !self.stopping {
             self.poll_cache_preparation(cx)?;
         }
@@ -1426,7 +1426,7 @@ impl WorkerApplication {
             self.poll_control(cx)?;
             self.refresh_snapshot(&scope(self.timeout)?)?;
         }
-        let now = crate::runtime::environment::now();
+        let now = uring_runtime::environment::now();
         if now >= self.next_health {
             self.observe_health()?;
             self.next_health = now + Duration::from_millis(100);
@@ -2032,10 +2032,8 @@ pub(crate) mod tests {
 
     #[test]
     fn worker_sizing_funds_derived_connection_pools() {
-        use crate::{
-            model::ResourceClass,
-            runtime::affinity::{CpuLocation, EffectiveTopology},
-        };
+        use crate::model::ResourceClass;
+        use uring_runtime::affinity::{CpuLocation, EffectiveTopology};
         let config = Config::from_lookup(|name| {
             Ok(match name {
                 "RACER_CLUSTER_ID" => Some("00000000-0000-4000-8000-000000000001".into()),

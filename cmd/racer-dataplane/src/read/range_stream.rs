@@ -41,12 +41,12 @@ impl RangeBudget {
     fn next_page(&mut self, _pending: bool) -> Result<Option<AcquisitionBudget>> {
         match self {
             Self::ProgressingPages { timeout } => Ok(Some(AcquisitionBudget::new(
-                crate::runtime::environment::now() + *timeout,
+                uring_runtime::environment::now() + *timeout,
                 8,
                 16,
             ))),
             Self::ClientPages { deadline } => {
-                if crate::runtime::environment::now() >= *deadline {
+                if uring_runtime::environment::now() >= *deadline {
                     return Err(Error::DeadlineExceeded);
                 }
                 Ok(Some(AcquisitionBudget::new(*deadline, 8, 16)))
@@ -333,7 +333,7 @@ impl RangeStream {
     fn operation_scope(&self) -> RequestScope {
         let mut scope = self.scope.clone();
         if let RangeBudget::ProgressingPages { timeout } = self.budget {
-            scope.deadline.0 = crate::runtime::environment::now() + timeout;
+            scope.deadline.0 = uring_runtime::environment::now() + timeout;
         }
         scope
     }
@@ -1171,7 +1171,7 @@ pub(super) mod tests {
         let total = 4 * PAGE_BYTES + 17;
         let range = ByteRange::From(PAGE_BYTES).resolve(total).unwrap();
         for (capped, progressing) in [(true, false), (false, true), (false, false)] {
-            let clock = crate::runtime::environment::SimulationClock::new(55);
+            let clock = uring_runtime::environment::SimulationClock::new(55);
             let environment = clock.environment(0);
             let _clock = environment.enter();
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
@@ -1214,7 +1214,7 @@ pub(super) mod tests {
             let _queue = worker.drivers.enter();
             let scope = RequestScope::new(
                 RequestId([7; 16]),
-                crate::runtime::environment::now()
+                uring_runtime::environment::now()
                     + if progressing {
                         Duration::from_millis(30)
                     } else {
@@ -1362,7 +1362,7 @@ pub(super) mod tests {
             admission.reclaim_buffers();
             if progressing {
                 assert!(
-                    crate::runtime::environment::now() > scope.deadline.0,
+                    uring_runtime::environment::now() > scope.deadline.0,
                     "stream must cross the scaled old absolute deadline"
                 );
             }
@@ -1373,32 +1373,32 @@ pub(super) mod tests {
 
     #[test]
     fn progressing_page_children_keep_deadlines_and_retry_limits_across_long_streams() {
-        let clock = crate::runtime::environment::SimulationClock::new(81);
+        let clock = uring_runtime::environment::SimulationClock::new(81);
         let _environment = clock.environment(0).enter();
         let timeout = Duration::from_millis(30);
-        let old_deadline = crate::runtime::environment::now() + timeout;
+        let old_deadline = uring_runtime::environment::now() + timeout;
         let mut budget = RangeBudget::ProgressingPages { timeout };
         for _ in 0..12 {
             let mut page = budget.next_page(false).unwrap().unwrap();
             let deadline = page.deadline();
-            assert_eq!(deadline, crate::runtime::environment::now() + timeout);
+            assert_eq!(deadline, uring_runtime::environment::now() + timeout);
             for _ in 0..8 {
-                page.begin_attempt(crate::runtime::environment::now(), deadline)
+                page.begin_attempt(uring_runtime::environment::now(), deadline)
                     .unwrap();
             }
             assert_eq!(
-                page.begin_attempt(crate::runtime::environment::now(), deadline),
+                page.begin_attempt(uring_runtime::environment::now(), deadline),
                 Err(Error::Unavailable)
             );
             clock.advance(Duration::from_millis(20));
             assert_eq!(page.deadline(), deadline);
             budget.complete(page).unwrap();
         }
-        assert!(crate::runtime::environment::now() > old_deadline);
+        assert!(uring_runtime::environment::now() > old_deadline);
         let mut stalled = budget.next_page(false).unwrap().unwrap();
         clock.advance(timeout);
         assert_eq!(
-            stalled.begin_attempt(crate::runtime::environment::now(), stalled.deadline()),
+            stalled.begin_attempt(uring_runtime::environment::now(), stalled.deadline()),
             Err(Error::DeadlineExceeded)
         );
     }

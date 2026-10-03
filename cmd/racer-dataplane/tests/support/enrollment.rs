@@ -45,7 +45,7 @@ impl dataplane::control::transport::ControlIo for ControlIo {
     }
     fn ready<'a>(
         &'a self,
-        fd: Rc<dataplane::runtime::reactor::Descriptor>,
+        fd: Rc<uring_runtime::reactor::Descriptor>,
         read: bool,
         write: bool,
         scope: &'a dataplane::runtime::deadline::RequestScope,

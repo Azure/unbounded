@@ -627,7 +627,7 @@ fn queued_handoffs_reject_retired_generations_and_stopped_receivers() {
 
 #[test]
 fn simulated_listener_preparation_rollback_and_real_http_exchange() {
-    use crate::runtime::reactor::{SocketAddress, simulation::Simulation};
+    use uring_runtime::reactor::{SocketAddress, simulation::Simulation};
     let sim = Simulation::new();
     let _environment = sim.enter();
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits())));
@@ -935,7 +935,7 @@ fn client_listener_readiness_recovers_from_queue_pressure() {
     fixture.reconcile(&[definition()]).unwrap();
     let scope = scope();
     let (reader, _writer) = UnixStream::pair().unwrap();
-    let reader = Rc::new(crate::runtime::reactor::Descriptor::from(reader));
+    let reader = Rc::new(uring_runtime::reactor::Descriptor::from(reader));
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let mut pressure = Vec::new();
     for _ in 0..8 {
@@ -1128,7 +1128,7 @@ fn accepted_client_wakes_before_first_poll_and_blocked_clients_are_fair() {
             deadline: Rc::new(Cell::new(Instant::now() + Duration::from_secs(5))),
             expired: None,
             cache: definition().id,
-            retired: Arc::new(crate::runtime::ingress::Retired::default()),
+            retired: Arc::new(std::sync::atomic::AtomicBool::default()),
             idle: Rc::new(Cell::new(false)),
             cancellation: Cancellation::new().unwrap(),
             operation: Box::pin(std::future::poll_fn(move |cx| {
@@ -1178,7 +1178,7 @@ fn accepted_client_wakes_before_first_poll_and_blocked_clients_are_fair() {
         deadline: Rc::new(Cell::new(Instant::now() + Duration::from_secs(5))),
         expired: None,
         cache: definition().id,
-        retired: Arc::new(crate::runtime::ingress::Retired::default()),
+        retired: Arc::new(std::sync::atomic::AtomicBool::default()),
         idle: Rc::new(Cell::new(false)),
         cancellation: Cancellation::new().unwrap(),
         operation: Box::pin(std::future::poll_fn(move |cx| {

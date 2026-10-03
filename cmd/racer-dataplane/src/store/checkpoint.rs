@@ -286,7 +286,7 @@ impl Drop for Checkpointer {
 
 fn publish_bytes(directory: &Path, slot: usize, bytes: &[u8]) -> Result<()> {
     #[cfg(test)]
-    if let Some(sim) = crate::runtime::reactor::simulation::Simulation::current() {
+    if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
         sim.create_dir_all(directory).map_err(|_| Error::Io)?;
         let temporary = directory.join(format!(".checkpoint.{}.tmp", sim.next_sequence()));
         let result = (|| {
@@ -503,14 +503,14 @@ impl Iterator for Candidates {
 enum CandidateFile {
     Real(std::fs::File),
     #[cfg(test)]
-    Sim(crate::runtime::reactor::simulation::Handle, u64),
+    Sim(uring_runtime::reactor::simulation::Handle, u64),
 }
 impl CandidateFile {
     fn open(path: &Path, directory: bool) -> std::io::Result<Self> {
         let flags =
             libc::O_NOFOLLOW | libc::O_NONBLOCK | if directory { libc::O_DIRECTORY } else { 0 };
         #[cfg(test)]
-        if let Some(sim) = crate::runtime::reactor::simulation::Simulation::current() {
+        if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
             let handle = sim
                 .open(None, path, libc::O_RDONLY | flags)?
                 .into_sim()

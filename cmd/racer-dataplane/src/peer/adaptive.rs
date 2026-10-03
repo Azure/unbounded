@@ -95,13 +95,13 @@ impl AdaptivePeers {
             state: Mutex::new(State {
                 active: 0,
                 limit: config.total,
-                updated: crate::runtime::environment::now(),
+                updated: uring_runtime::environment::now(),
                 peers: BTreeMap::new(),
             }),
         }))
     }
     pub(crate) fn available(&self, node: &NodeId) -> bool {
-        let now = crate::runtime::environment::now();
+        let now = uring_runtime::environment::now();
         self.state.lock().is_ok_and(|state| {
             state
                 .peers
@@ -110,7 +110,7 @@ impl AdaptivePeers {
         })
     }
     pub(crate) fn acquire(self: &Arc<Self>, node: &NodeId) -> Result<Arc<Permit>> {
-        let now = crate::runtime::environment::now();
+        let now = uring_runtime::environment::now();
         let mut state = self.state.lock().map_err(|_| Error::Unavailable)?;
         if state.active >= state.limit {
             self.metrics.record(Event::PeerAdmissionRejected, 1)?;
@@ -173,7 +173,7 @@ impl AdaptivePeers {
 }
 impl Permit {
     pub(crate) fn observe(&self, outcome: Outcome) {
-        let now = crate::runtime::environment::now();
+        let now = uring_runtime::environment::now();
         let Ok(mut state) = self.owner.state.lock() else {
             return;
         };
@@ -248,7 +248,7 @@ impl Drop for Permit {
         if self.probe {
             peer.probe = false;
             if peer.retry.is_some() {
-                let now = crate::runtime::environment::now();
+                let now = uring_runtime::environment::now();
                 peer.retry = Some(now + BACKOFF);
                 peer.updated = now;
             }
@@ -265,7 +265,7 @@ mod tests {
     use super::*;
     #[test]
     fn hedges_require_spare_capacity_and_no_local_or_peer_pressure() {
-        let clock = crate::runtime::environment::SimulationClock::new(905);
+        let clock = uring_runtime::environment::SimulationClock::new(905);
         let _env = clock.environment(0).enter();
         let owner = AdaptivePeers::new(
             Config {
@@ -296,7 +296,7 @@ mod tests {
     }
     #[test]
     fn churn_cannot_evict_neutral_probe_backoff_with_old_update_time() {
-        let clock = crate::runtime::environment::SimulationClock::new(783);
+        let clock = uring_runtime::environment::SimulationClock::new(783);
         let _env = clock.environment(0).enter();
         let owner = AdaptivePeers::new(
             Config {
@@ -329,7 +329,7 @@ mod tests {
             .peers
             .get_mut(&node)
             .unwrap()
-            .updated = crate::runtime::environment::now() - Duration::from_secs(61);
+            .updated = uring_runtime::environment::now() - Duration::from_secs(61);
         assert!(matches!(
             owner.acquire(&NodeId("new".into())),
             Err(Error::Overloaded)
@@ -371,7 +371,7 @@ mod tests {
     }
     #[test]
     fn recovery_requires_exclusive_verified_probe_and_old_success_cannot_clear_failure() {
-        let clock = crate::runtime::environment::SimulationClock::new(779);
+        let clock = uring_runtime::environment::SimulationClock::new(779);
         let _env = clock.environment(0).enter();
         let owner = AdaptivePeers::new(
             Config {
@@ -405,7 +405,7 @@ mod tests {
     }
     #[test]
     fn state_capacity_never_evicts_live_permits_and_ages_retired_entries() {
-        let clock = crate::runtime::environment::SimulationClock::new(780);
+        let clock = uring_runtime::environment::SimulationClock::new(780);
         let _env = clock.environment(0).enter();
         let owner = AdaptivePeers::new(
             Config {
@@ -430,7 +430,7 @@ mod tests {
 
     #[test]
     fn local_pressure_shrinks_node_limit_without_revoking_work_or_blame() {
-        let clock = crate::runtime::environment::SimulationClock::new(781);
+        let clock = uring_runtime::environment::SimulationClock::new(781);
         let _env = clock.environment(0).enter();
         let metrics = Metrics::default();
         let owner = AdaptivePeers::new(

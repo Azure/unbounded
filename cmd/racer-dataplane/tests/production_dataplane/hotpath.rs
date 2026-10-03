@@ -9,7 +9,7 @@ use super::*;
 use racer_dataplane::{
     config::{Config, DEFAULT_MAX_THREADS},
     runtime::{
-        affinity::{AffinityPlan, EffectiveTopology},
+        affinity::AffinityPlan,
         worker::{WorkerFactory, WorkerGroup, WorkerRuntime, WorkerService},
     },
 };
@@ -416,7 +416,7 @@ fn balanced_workload_covers_owners_without_multiplying_pages() {
 
 #[test]
 fn automatic_and_capped_plans_preserve_shared_and_explicit_paired_crypto() {
-    use racer_dataplane::runtime::affinity::CpuLocation;
+    use uring_runtime::affinity::CpuLocation;
     let mut config = default_config();
     let topology = EffectiveTopology {
         cpus: (0..12)
@@ -941,3 +941,4 @@ impl Drop for Brd {
         }
     }
 }
+use uring_runtime::affinity::EffectiveTopology;

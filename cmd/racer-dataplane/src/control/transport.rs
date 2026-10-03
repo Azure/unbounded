@@ -2,7 +2,7 @@
 use super::{ControlEndpoint, enrollment::LocalSigningIdentity, wire};
 use crate::{
     error::{Error, Operation, Result},
-    runtime::{deadline::RequestScope, reactor::Descriptor},
+    runtime::deadline::RequestScope,
 };
 use std::{
     net::SocketAddr,
@@ -148,15 +148,15 @@ impl ControlIo for ReactorControlIo {
     fn sleep<'a>(&'a self, until: Instant, scope: &'a RequestScope) -> Operation<'a, ()> {
         Box::pin(async move {
             scope.check()?;
-            let duration = until.saturating_duration_since(crate::runtime::environment::now());
+            let duration = until.saturating_duration_since(uring_runtime::environment::now());
             if duration.is_zero() {
                 return Ok(());
             }
             #[cfg(test)]
-            if crate::runtime::reactor::simulation::Simulation::current().is_some() {
+            if uring_runtime::reactor::simulation::Simulation::current().is_some() {
                 return std::future::poll_fn(|cx| {
                     scope.check()?;
-                    if crate::runtime::environment::now() >= until {
+                    if uring_runtime::environment::now() >= until {
                         std::task::Poll::Ready(Ok(()))
                     } else {
                         cx.waker().wake_by_ref();
@@ -330,3 +330,4 @@ impl ControlConnection {
 
 #[cfg(test)]
 pub(super) mod scenarios;
+use uring_runtime::reactor::Descriptor;

@@ -561,7 +561,7 @@ fn not_yet_valid_identity_is_rejected_before_transport_io() {
     let (ca, key) = testing::ca();
     let identity = enrolled(&r, &d, &ca, &key);
     assert!(identity.valid_now());
-    let clock = crate::runtime::environment::SimulationClock::new(17);
+    let clock = uring_runtime::environment::SimulationClock::new(17);
     let environment = clock.environment(1);
     // Roll only the scoped wall clock back after real enrollment. The generic
     // Identity has expiry only; Racer must enforce its not-before policy itself.
@@ -575,7 +575,7 @@ fn not_yet_valid_identity_is_rejected_before_transport_io() {
     // No Io attached: reaching generic transport would yield InvalidConfiguration.
     let scope = RequestScope::new(
         crate::model::RequestId([7; 16]),
-        crate::runtime::environment::now() + Duration::from_secs(10),
+        uring_runtime::environment::now() + Duration::from_secs(10),
     )
     .unwrap();
     assert!(matches!(

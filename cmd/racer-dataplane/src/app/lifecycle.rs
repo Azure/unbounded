@@ -26,7 +26,7 @@ impl Observations {
     ) -> Result<()> {
         let mut workers = self.workers.lock().map_err(|_| Error::Unavailable)?;
         workers.insert(worker, (resources, sequence));
-        let now = crate::runtime::environment::now();
+        let now = uring_runtime::environment::now();
         let complete = workers.len() == count;
         let all = |test: fn(&Resources) -> bool| {
             complete
@@ -70,7 +70,7 @@ impl Observations {
         count: usize,
     ) -> Result<()> {
         let workers = self.workers.lock().map_err(|_| Error::Unavailable)?;
-        let now = crate::runtime::environment::now();
+        let now = uring_runtime::environment::now();
         diagnostic.expected_workers = count;
         diagnostic.matching_workers = workers
             .values()
@@ -118,7 +118,7 @@ impl WorkerApplication {
     }
     pub(super) fn observe_health(&self) -> Result<()> {
         let node = &self.node;
-        let now = crate::runtime::environment::now();
+        let now = uring_runtime::environment::now();
         if self.control.is_some() {
             self.telemetry.metrics.set_gauge(
                 crate::telemetry::metrics::Gauge::KeyringGeneration,
@@ -134,7 +134,7 @@ impl WorkerApplication {
                 );
             }
             let remaining = (UNIX_EPOCH + Duration::from_secs(expiry))
-                .duration_since(crate::runtime::environment::wall_now())
+                .duration_since(uring_runtime::environment::wall_now())
                 .ok()?;
             now.checked_add(remaining)
         });
@@ -233,7 +233,7 @@ impl WorkerApplication {
                             &io,
                             control
                                 .next_attempt()
-                                .unwrap_or_else(crate::runtime::environment::now),
+                                .unwrap_or_else(uring_runtime::environment::now),
                             startup,
                         )
                         .await?;
@@ -278,7 +278,7 @@ impl WorkerApplication {
                         let io = ReactorControlIo::new(self.runtime.reactor.clone());
                         crate::control::transport::ControlIo::sleep(
                             &io,
-                            crate::runtime::environment::now() + Duration::from_millis(100),
+                            uring_runtime::environment::now() + Duration::from_millis(100),
                             startup,
                         )
                         .await?;
@@ -342,7 +342,7 @@ mod tests {
     fn membership_attestation_requires_fresh_matching_workers() {
         use crate::control::wire::PublicationSequence;
         let observations = Observations::default();
-        let now = crate::runtime::environment::now();
+        let now = uring_runtime::environment::now();
         let resources = Resources {
             workers_usable: true,
             observed_until: Some(now + Duration::from_secs(2)),
@@ -389,7 +389,7 @@ mod tests {
     #[test]
     fn readiness_requires_every_worker_and_expires_without_progress() {
         let observations = Observations::default();
-        let now = crate::runtime::environment::now();
+        let now = uring_runtime::environment::now();
         let resources = Resources {
             workers_usable: true,
             storage_usable: true,

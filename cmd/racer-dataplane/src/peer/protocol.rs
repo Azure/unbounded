@@ -547,7 +547,7 @@ mod metadata_tests {
         drop(response);
         let scope = RequestScope::new(
             RequestId([1; 16]),
-            crate::runtime::environment::now() + Duration::from_secs(30),
+            uring_runtime::environment::now() + Duration::from_secs(30),
         )
         .unwrap();
         for case in 0..5 {

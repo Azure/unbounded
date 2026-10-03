@@ -116,9 +116,10 @@ fn peer_tcp_nodelay_accept_failure_closes_owned_socket_and_false_preserves_polic
 
 #[test]
 fn assembly_applies_configured_client_request_timeout() {
-    use crate::{model::ResourceClass, runtime::ingress::Retired};
+    use crate::model::ResourceClass;
+    use std::sync::atomic::AtomicBool;
     for timeout in [Duration::from_millis(250), Duration::from_secs(45)] {
-        let clock = crate::runtime::environment::SimulationClock::new(908);
+        let clock = uring_runtime::environment::SimulationClock::new(908);
         let _environment = clock.environment(0).enter();
         let mut config = crate::test_support::cluster::config(false);
         config.request_timeout = timeout;
@@ -136,7 +137,7 @@ fn assembly_applies_configured_client_request_timeout() {
             .install_connection(
                 connection,
                 test_support::definition().id,
-                Arc::new(Retired::default()),
+                Arc::new(AtomicBool::default()),
             )
             .unwrap();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -189,7 +190,7 @@ fn worker_requesters_share_configured_admission_and_production_metrics() {
 
 #[test]
 fn workers_share_configured_page_hedge_slots_and_bytes() {
-    let clock = crate::runtime::environment::SimulationClock::new(907);
+    let clock = uring_runtime::environment::SimulationClock::new(907);
     let _environment = clock.environment(0).enter();
     let mut config = crate::test_support::cluster::config(false);
     config.page_hedge.slots = 1;
@@ -229,7 +230,7 @@ fn distributed_peer_listener_recovers_from_queue_pressure() {
     let mut serving = app.peers.listen(address, &scope);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
-    let reader = Rc::new(crate::runtime::reactor::Descriptor::from(reader));
+    let reader = Rc::new(uring_runtime::reactor::Descriptor::from(reader));
     let mut pressure = Vec::new();
     for _ in 0..8 {
         let mut wait = runtime
@@ -544,7 +545,7 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
 
 #[test]
 fn peer_worker_partition_rejects_underfunding_and_reduces_worker_count() {
-    use crate::runtime::affinity::{CpuLocation, EffectiveTopology};
+    use uring_runtime::affinity::{CpuLocation, EffectiveTopology};
     let mut config = crate::test_support::cluster::config(false);
     config.max_threads = 4;
     config.limits.range_window_pages = NonZeroUsize::new(1).unwrap();

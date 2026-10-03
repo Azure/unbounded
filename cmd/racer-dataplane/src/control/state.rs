@@ -65,7 +65,7 @@ impl PublishedState {
     /// dead entries before admission, bounding the registry as well as live state.
     pub fn membership(&self, version: MembershipVersion) -> Result<MembershipLease> {
         let mut state = self.state.lock().map_err(|_| Error::Unavailable)?;
-        let now = crate::runtime::environment::now();
+        let now = uring_runtime::environment::now();
         state.grace.retain(|(until, _)| *until > now);
         state
             .memberships
@@ -260,7 +260,7 @@ impl SnapshotStore {
         {
             return Ok(old.clone());
         }
-        let now = crate::runtime::environment::now();
+        let now = uring_runtime::environment::now();
         state.grace.retain(|(until, _)| *until > now);
         // Grace-only owners are disposable under the configured generation bound.
         // Externally pinned operations still block replacement rather than revoke.

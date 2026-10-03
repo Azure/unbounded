@@ -22,7 +22,7 @@ struct ScriptedPeers {
     hedge: Cell<bool>,
     primary_polls: Cell<usize>,
     canceled_primary: Cell<bool>,
-    advance_primary: RefCell<Option<crate::runtime::environment::SimulationClock>>,
+    advance_primary: RefCell<Option<uring_runtime::environment::SimulationClock>>,
     local: usize,
     signing: Vec<Forwarding>,
     replies: RefCell<VecDeque<(NodeId, Reply)>>,
@@ -471,12 +471,12 @@ fn hedge_stalled_primary_copy_miss_keeps_time_and_credits_for_later_acquire() {
     let queue = Rc::new(crate::read::drivers::DriverQueue::default());
     let _owner = queue.enter();
     for third in [false, true] {
-        let clock = crate::runtime::environment::SimulationClock::new(920);
+        let clock = uring_runtime::environment::SimulationClock::new(920);
         let _env = clock.environment(0).enter();
         let mut f = fixture();
         f.scope = RequestScope::new(
             f.scope.request,
-            crate::runtime::environment::now() + Duration::from_secs(30),
+            uring_runtime::environment::now() + Duration::from_secs(30),
         )
         .unwrap();
         let (peers, ordered) = install_peers(&mut f, None);
@@ -502,15 +502,13 @@ fn hedge_stalled_primary_copy_miss_keeps_time_and_credits_for_later_acquire() {
                 .borrow_mut()
                 .push_back((ordered[2].clone(), Reply::Copy(good)));
         }
-        let start = crate::runtime::environment::now();
+        let start = uring_runtime::environment::now();
         let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 10, 18);
         let result = acquire(&mut f, &mut budget).unwrap();
         assert_eq!(result.plaintext.bytes(), b"abc");
         assert!(peers.canceled_primary.get());
-        assert!(crate::runtime::environment::now() < f.scope.deadline.0);
-        assert!(
-            crate::runtime::environment::now().duration_since(start) <= Duration::from_secs(12)
-        );
+        assert!(uring_runtime::environment::now() < f.scope.deadline.0);
+        assert!(uring_runtime::environment::now().duration_since(start) <= Duration::from_secs(12));
         let calls = peers.calls.borrow();
         assert_eq!(calls.len(), if third { 4 } else { 3 });
         assert!(calls[1].1);

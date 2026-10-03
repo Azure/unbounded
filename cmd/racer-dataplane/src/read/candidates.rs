@@ -795,7 +795,7 @@ impl CandidatePolicy {
         if links == 0 {
             return Err(Error::HopBudgetExhausted);
         }
-        let now = crate::runtime::environment::now();
+        let now = uring_runtime::environment::now();
         let overall = budget.begin_peer_attempt(now, scope.deadline.0, links)?;
         // Share bounds idle fallback. A separate nonrenewable local cap bounds
         // every exchange, even when no alternative is affordable.
@@ -851,7 +851,7 @@ impl CandidatePolicy {
             .max(std::time::Duration::from_nanos(1));
         attempt_scope.set_candidate_body_budget(observation, complete_by)?;
         let mut bytes = [0; 16];
-        crate::runtime::environment::fill_random(&mut bytes).map_err(|_| Error::Unavailable)?;
+        uring_runtime::environment::fill_random(&mut bytes).map_err(|_| Error::Unavailable)?;
         let attempt = AttemptId(bytes);
         let credentials = &self.credentials;
         // Sealing is synchronous, but can still use up a very short time share.
@@ -959,7 +959,7 @@ impl CandidatePolicy {
 
 fn check_budget(scope: &RequestScope, budget: &AcquisitionBudget) -> Result<()> {
     scope.check()?;
-    if crate::runtime::environment::now() >= budget.deadline() {
+    if uring_runtime::environment::now() >= budget.deadline() {
         Err(Error::DeadlineExceeded)
     } else {
         Ok(())

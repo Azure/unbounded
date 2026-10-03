@@ -15,7 +15,7 @@ use super::{
     affinity::AffinityPlan,
     crypto::{self, CryptoClient, CryptoPort, IoCryptoPort},
     deadline::{Cancellation, Deadline, RequestScope},
-    reactor::{Reactor, ReactorWake},
+    reactor::Reactor,
 };
 use crate::{
     error::{Error, Operation, Result},
@@ -28,6 +28,7 @@ use std::{
     collections::{HashMap, HashSet},
     marker::PhantomData,
     num::NonZeroUsize,
+    ops::Deref,
     rc::Rc,
     sync::{Arc, Mutex},
     task::{Context, Poll, Wake, Waker},
@@ -55,8 +56,11 @@ pub struct CryptoRuntime {
     pub port: CryptoPort,
 }
 #[cfg(test)]
-use super::affinity::{WorkerPair, current_cpus};
+use super::affinity::WorkerPair;
+#[cfg(test)]
+use uring_runtime::affinity::current_cpus;
 use uring_runtime::group::{Factory, FailureReporter, Group, Helper, Lane, Plan, Service};
+use uring_runtime::reactor::ReactorWake;
 pub struct WorkerMap {
     workers: Vec<WorkerId>,
 }
@@ -405,7 +409,7 @@ fn lifecycle_scope() -> Result<RequestScope> {
     Ok(RequestScope {
         body_deadlines: None,
         request: RequestId([0; 16]),
-        deadline: Deadline(crate::runtime::environment::now() + Duration::from_secs(30)),
+        deadline: Deadline(uring_runtime::environment::now() + Duration::from_secs(30)),
         cancellation: Cancellation::new()?,
     })
 }
@@ -492,20 +496,11 @@ struct Adapter<F> {
     factory: F,
     resources: Resources,
 }
-trait FactoryRef: Sync {
-    fn factory(&self) -> &dyn WorkerFactory;
-}
-impl FactoryRef for Arc<dyn WorkerFactory + Send> {
-    fn factory(&self) -> &dyn WorkerFactory {
-        &**self
-    }
-}
-impl FactoryRef for &dyn WorkerFactory {
-    fn factory(&self) -> &dyn WorkerFactory {
-        *self
-    }
-}
-impl<F: FactoryRef> Factory<RequestScope> for Adapter<F> {
+impl<F> Factory<RequestScope> for Adapter<F>
+where
+    F: Deref + Sync,
+    F::Target: WorkerFactory,
+{
     fn abandon_lane(&self, lane: usize) -> Result<()> {
         if let Some(port) = self.resources.ports[lane].lock().unwrap().0.take() {
             port.close_submissions()?;
@@ -530,7 +525,7 @@ impl<F: FactoryRef> Factory<RequestScope> for Adapter<F> {
         // Retain the runtime even if user construction fails or panics. Returning
         // a failed-start adapter lets the group execute the same close and fence.
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.factory.factory().build(
+            self.factory.build(
                 self.resources.workers[lane],
                 WorkerRuntime {
                     reactor: runtime.reactor.clone(),
@@ -555,7 +550,6 @@ impl<F: FactoryRef> Factory<RequestScope> for Adapter<F> {
             .ok_or(Error::Io)?;
         let service = self
             .factory
-            .factory()
             .build_crypto(self.resources.workers[lane], CryptoRuntime { port })?;
         Ok(Box::new(HelperService(service)))
     }
@@ -645,7 +639,7 @@ impl Service<RequestScope> for HelperService {
 
 #[cfg(test)]
 fn colocated_plan(max_threads: usize, workers: u16) -> AffinityPlan {
-    let location = super::affinity::CpuLocation {
+    let location = uring_runtime::affinity::CpuLocation {
         cpu: *current_cpus().unwrap().first().unwrap(),
         package: 0,
         core: 0,

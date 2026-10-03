@@ -503,7 +503,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     let service = async {
         let fd = reactor
             .accept(
-                Rc::new(crate::runtime::reactor::Descriptor::from(listener)),
+                Rc::new(uring_runtime::reactor::Descriptor::from(listener)),
                 &scope,
             )
             .await?;

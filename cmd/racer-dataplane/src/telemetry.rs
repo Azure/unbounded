@@ -48,7 +48,7 @@ pub mod health {
     }
     impl Health {
         pub fn state(&self) -> Result<State> {
-            self.state_at(crate::runtime::environment::now())
+            self.state_at(uring_runtime::environment::now())
         }
         pub fn state_at(&self, now: Instant) -> Result<State> {
             let status = self.0.lock().map_err(|_| Error::Unavailable)?;
@@ -76,7 +76,7 @@ pub mod health {
                 || state == State::Ready
                     && !status
                         .resources
-                        .usable_at(crate::runtime::environment::now())
+                        .usable_at(uring_runtime::environment::now())
             {
                 return Err(Error::Unavailable);
             }
@@ -90,7 +90,7 @@ pub mod health {
         use std::time::Duration;
         #[test]
         fn observation_and_credential_expiry_are_inclusive() {
-            let now = crate::runtime::environment::now();
+            let now = uring_runtime::environment::now();
             for (observed, boundary) in [(5, 5), (20, 10)] {
                 let health = Health::default();
                 health
@@ -129,7 +129,6 @@ pub mod send_crc {
     use crate::{
         error::{Error, Result},
         model::NodeId,
-        runtime::environment,
         telemetry::failures::AeadFailure,
     };
     use ::telemetry::Ring;
@@ -137,6 +136,7 @@ pub mod send_crc {
         sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
+    use uring_runtime::environment;
     pub const CAPACITY: usize = 64;
     #[derive(Clone, Debug)]
     pub struct Pair {
@@ -501,7 +501,6 @@ pub mod send_crc {
     }
 }
 
-use crate::runtime::reactor::Descriptor;
 use crate::{
     error::{Error, Operation, Result},
     model::ResourceClass,
@@ -520,6 +519,7 @@ use std::time::Instant;
 use std::{cell::OnceCell, fmt::Write, net::SocketAddr, rc::Rc};
 #[cfg(test)]
 use std::{task::Poll, time::Duration};
+use uring_runtime::reactor::Descriptor;
 
 #[derive(Default)]
 pub struct Telemetry {
@@ -649,8 +649,7 @@ impl DiagnosticIo {
     ) -> Result<Self> {
         let control = admission.reserve(None, ResourceClass::ControlProgress, CONTROL_SLOTS)?;
         let mut memory = admission.reserve(None, ResourceClass::RequestContext, RESERVED_BYTES)?;
-        let bookkeeping =
-            memory.split(CONTROL_SLOTS * crate::runtime::reactor::SUBMISSION_BYTES)?;
+        let bookkeeping = memory.split(CONTROL_SLOTS * uring_runtime::reactor::SUBMISSION_BYTES)?;
         let submissions = reactor.reserve_submissions(control, bookkeeping)?;
         Ok(Self {
             reactor,

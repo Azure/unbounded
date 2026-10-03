@@ -4,7 +4,7 @@ use super::test_support::*;
 use super::*;
 use crate::{
     model::{ResourceClass, TransferId},
-    runtime::{admission::AdmissionPolicy, environment},
+    runtime::admission::AdmissionPolicy,
     security::connection::signature_tests::network,
 };
 use rdma_verbs::testing::{Contention, State};
@@ -221,3 +221,4 @@ fn receive_case(readback: bool, terminal: Option<Error>, failed_fence: bool) {
     assert!(native.drained());
     assert_eq!(charged.get(), 0);
 }
+use uring_runtime::environment;

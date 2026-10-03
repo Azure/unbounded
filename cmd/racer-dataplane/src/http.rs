@@ -28,7 +28,7 @@ pub mod connection {
         runtime::{
             admission::{AdmissionExt, AdmissionPolicy, ConnectionReservation},
             deadline::RequestScope,
-            reactor::{Descriptor, IoBuffer, Reactor, SocketAddress},
+            reactor::Reactor,
         },
     };
     #[cfg(test)]
@@ -37,6 +37,7 @@ pub mod connection {
     use std::{cell::RefCell, ops::Deref, path::PathBuf, rc::Rc, task::Poll, time::Duration};
     #[cfg(test)]
     use std::{task::Waker, time::Instant};
+    use uring_runtime::reactor::{Descriptor, IoBuffer, SocketAddress};
     pub type ConnectionLease = http1::connection::ConnectionLease<HttpContext>;
     pub type OwnedBuffer = http1::connection::OwnedBuffer<HttpContext>;
     pub type HeadCompletion<T> = http1::connection::HeadCompletion<HttpContext, T>;

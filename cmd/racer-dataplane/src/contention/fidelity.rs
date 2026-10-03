@@ -23,7 +23,7 @@ use crate::{
     runtime::{
         crypto::{self, CryptoClient},
         deadline::RequestScope,
-        reactor::{IoBuffer, Reactor},
+        reactor::Reactor,
         worker::{CryptoRuntime, CryptoService, WorkerMap},
     },
     security::{
@@ -733,3 +733,4 @@ fn canceled_crypto_matches_metadata_owner_trace_through_completion_reap() {
     );
     assert!(CLASSES.iter().all(|class| real.used(*class) == 0));
 }
+use uring_runtime::reactor::IoBuffer;

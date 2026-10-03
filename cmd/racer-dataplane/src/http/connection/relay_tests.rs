@@ -34,7 +34,7 @@ use super::io_tests::drive;
 fn drive_worker<T>(reactor: &Reactor, work: impl Future<Output = T>) -> T {
     use futures::{Stream, stream::FuturesUnordered};
     use std::{sync::Arc, task::Wake};
-    struct WakeReactor(crate::runtime::reactor::ReactorWake);
+    struct WakeReactor(uring_runtime::reactor::ReactorWake);
     impl Wake for WakeReactor {
         fn wake(self: Arc<Self>) {
             self.0.wake().unwrap();

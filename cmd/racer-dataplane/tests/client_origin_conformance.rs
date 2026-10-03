@@ -15,11 +15,7 @@ use racer_dataplane::{
     },
     origin::{metadata, page},
     read::ReadResponse,
-    runtime::{
-        admission::AdmissionPolicy,
-        deadline::RequestScope,
-        reactor::{IoBuffer, Reactor},
-    },
+    runtime::{admission::AdmissionPolicy, deadline::RequestScope, reactor::Reactor},
 };
 use std::{
     future::Future,
@@ -31,6 +27,7 @@ use std::{
     thread,
     time::{Duration, Instant, UNIX_EPOCH},
 };
+use uring_runtime::reactor::IoBuffer;
 
 const LIMIT: usize = 32768;
 const P: u64 = 16777216;

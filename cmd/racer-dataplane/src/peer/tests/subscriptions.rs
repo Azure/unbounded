@@ -711,7 +711,7 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
     let server_work = async {
         let fd = reactor
             .accept(
-                Rc::new(crate::runtime::reactor::Descriptor::from(listener)),
+                Rc::new(uring_runtime::reactor::Descriptor::from(listener)),
                 &scope,
             )
             .await?;

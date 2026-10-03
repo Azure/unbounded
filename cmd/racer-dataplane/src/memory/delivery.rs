@@ -9,16 +9,11 @@
 //! rest of that page uses direct sends instead of repeating pipe drain round trips.
 //! Backpressured direct sends own immutable page views, not copied staging bytes.
 use super::pool::VerifiedPage;
-use crate::runtime::reactor::Descriptor;
 use crate::{
     error::{Error, Operation, Result},
     http::connection::{ConnectionLease, HttpContext, OwnedBuffer},
     model::PageSlice,
-    runtime::{
-        admission::AdmissionPolicy,
-        deadline::RequestScope,
-        reactor::{IoBuffer, Reactor, SendBuffer},
-    },
+    runtime::{admission::AdmissionPolicy, deadline::RequestScope, reactor::Reactor},
 };
 use flow_control::pipe::{PipeLease, PipePool};
 #[cfg(test)]
@@ -28,6 +23,7 @@ use std::task::Poll;
 #[cfg(test)]
 use std::time::Instant;
 use std::{io, rc::Rc, time::Duration};
+use uring_runtime::reactor::{Descriptor, IoBuffer, SendBuffer};
 
 // Limit both syscall size and work in one executor turn, even for a writable peer.
 const SEND_CHUNK_BYTES: usize = 64 * 1024;
@@ -236,7 +232,7 @@ impl Delivery {
             let socket = connection.socket();
             validate_socket(&socket)?;
             drop(socket);
-            let mut stalled_at = crate::runtime::environment::now();
+            let mut stalled_at = uring_runtime::environment::now();
             let mut copying = false;
             let mut budget = 0;
             let mut calls = 0;
@@ -342,7 +338,7 @@ impl Delivery {
                     return Err(Error::Io);
                 }
                 reader.sent += sent;
-                stalled_at = crate::runtime::environment::now();
+                stalled_at = uring_runtime::environment::now();
                 budget += sent;
                 calls += 1;
                 if (budget >= SEND_BUDGET_BYTES || calls >= SEND_BUDGET_CALLS)

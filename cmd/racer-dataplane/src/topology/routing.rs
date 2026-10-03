@@ -54,7 +54,7 @@ pub const FAILURE_LINKS: u8 = 8;
 impl RouteBudget {
     /// `visited` contains prior senders, excluding the current recipient.
     pub fn forwarded(&self, from: &NodeId, next: &NodeId) -> Result<Self> {
-        self.validate_at(from, crate::runtime::environment::now())?;
+        self.validate_at(from, uring_runtime::environment::now())?;
         if self.remaining_links == 0 {
             return Err(Error::HopBudgetExhausted);
         }
@@ -80,7 +80,7 @@ impl RouteBudget {
         {
             return Err(Error::InvalidRequest);
         }
-        forwarded.validate_at(next, crate::runtime::environment::now())
+        forwarded.validate_at(next, uring_runtime::environment::now())
     }
     fn validate_at(&self, from: &NodeId, now: Instant) -> Result<()> {
         if now >= self.deadline.0 {
@@ -149,7 +149,7 @@ impl Paths {
     ) -> Operation<'a, Route> {
         Box::pin(async move {
             scope.check()?;
-            budget.validate_at(from, crate::runtime::environment::now())?;
+            budget.validate_at(from, uring_runtime::environment::now())?;
             if membership.version != budget.membership {
                 return Err(Error::IncompatibleMembership);
             }
@@ -180,7 +180,7 @@ impl Paths {
                 std::future::poll_fn(|cx| {
                     if let Err(error) = scope
                         .check()
-                        .and_then(|()| budget.validate_at(from, crate::runtime::environment::now()))
+                        .and_then(|()| budget.validate_at(from, uring_runtime::environment::now()))
                     {
                         return Poll::Ready(Err(error));
                     }
@@ -192,7 +192,7 @@ impl Paths {
                 .await
             };
             scope.check()?;
-            budget.validate_at(from, crate::runtime::environment::now())?;
+            budget.validate_at(from, uring_runtime::environment::now())?;
             // Health/admission may change while yielded. Retry under the same budget.
             if self.blocked(&membership, source)? != blocked {
                 return Err(Error::Unavailable);
@@ -432,14 +432,14 @@ mod scenarios {
     #[test]
     fn yielded_search_rechecks_adaptive_peer_admission() {
         use crate::peer::adaptive::{AdaptivePeers, Config, Outcome};
-        let clock = crate::runtime::environment::SimulationClock::new(110);
+        let clock = uring_runtime::environment::SimulationClock::new(110);
         let _env = clock.environment(0).enter();
         let members = membership(100_000);
         let source = &members.members()[0].node;
         let admission = AdaptivePeers::new(Config::default(), Default::default()).unwrap();
         let paths = Paths::new(Rc::new(LinkHealth), 1).with_peer_admission(admission.clone());
         let mut request = budget(&members, 80_003, 4);
-        request.deadline = Deadline(crate::runtime::environment::now() + Duration::from_secs(60));
+        request.deadline = Deadline(uring_runtime::environment::now() + Duration::from_secs(60));
         let scope = RequestScope::new(request.request, request.deadline.0).unwrap();
         let mut operation = paths.shortest_async(members.clone(), source, &request, &scope);
         let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
@@ -464,7 +464,7 @@ mod scenarios {
 
     #[test]
     fn yielded_and_cached_searches_enforce_scope_budget_and_membership() {
-        let clock = crate::runtime::environment::SimulationClock::new(109);
+        let clock = uring_runtime::environment::SimulationClock::new(109);
         let _env = clock.environment(0).enter();
         let members = membership(100_000);
         let source = &members.members()[0].node;
@@ -472,7 +472,7 @@ mod scenarios {
         for case in 0..3 {
             let paths = Paths::new(Rc::new(LinkHealth), 1);
             let mut request = budget(&members, 80_003, 4);
-            let now = crate::runtime::environment::now();
+            let now = uring_runtime::environment::now();
             request.deadline = Deadline(now + Duration::from_secs(if case == 1 { 1 } else { 60 }));
             let scope = RequestScope::new(
                 request.request,
@@ -497,7 +497,7 @@ mod scenarios {
             );
             // Failure drops the algorithm admission before a new request starts.
             let mut fresh = request.clone();
-            fresh.deadline = Deadline(crate::runtime::environment::now() + Duration::from_secs(60));
+            fresh.deadline = Deadline(uring_runtime::environment::now() + Duration::from_secs(60));
             paths.shortest(members.clone(), source, &fresh).unwrap();
             assert_eq!(
                 futures::executor::block_on(paths.shortest_async(

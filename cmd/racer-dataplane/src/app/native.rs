@@ -113,7 +113,7 @@ impl WorkerApplication {
             self.actual_rails.clear();
             self.discovered_nics = snapshot.nics;
             self.inventory_generation = snapshot.generation;
-            self.native_retry = crate::runtime::environment::now();
+            self.native_retry = uring_runtime::environment::now();
         }
         Ok(())
     }
@@ -138,7 +138,7 @@ impl WorkerApplication {
         if let Some(task) = self.native_task.as_mut() {
             if let Poll::Ready(result) = task.as_mut().poll(cx) {
                 self.native_task = None;
-                self.native_retry = crate::runtime::environment::now() + Duration::from_secs(1);
+                self.native_retry = uring_runtime::environment::now() + Duration::from_secs(1);
                 match result {
                     Ok(actual) => self.actual_rails = actual,
                     Err(_) => {
@@ -152,7 +152,7 @@ impl WorkerApplication {
         if self.stopping
             || self.native_task.is_some()
             || !self.actual_rails.is_empty()
-            || crate::runtime::environment::now() < self.native_retry
+            || uring_runtime::environment::now() < self.native_retry
         {
             return Ok(());
         }
@@ -382,7 +382,7 @@ mod tests {
     }
 
     fn four_pair_plan(config: &Config) -> AffinityPlan {
-        use crate::runtime::affinity::{CpuLocation, EffectiveTopology};
+        use uring_runtime::affinity::{CpuLocation, EffectiveTopology};
         let plan = AffinityPlan::from_topology(
             config,
             EffectiveTopology {
@@ -406,7 +406,7 @@ mod tests {
 
     #[test]
     fn smt_startup_final_count_partitions_live_budgets_and_obeys_memory_floors() {
-        use crate::runtime::affinity::{CpuLocation, EffectiveTopology};
+        use uring_runtime::affinity::{CpuLocation, EffectiveTopology};
         for (allow_smt, expected) in [(false, 3), (true, 5)] {
             let mut config = Config::from_lookup(|name| {
                 Ok(match name {
@@ -480,7 +480,7 @@ mod tests {
 
     #[test]
     fn resource_shortage_reduces_and_regroups_uneven_numa_workers() {
-        use crate::runtime::affinity::{CpuLocation, EffectiveTopology};
+        use uring_runtime::affinity::{CpuLocation, EffectiveTopology};
         let mut config = default_config(false);
         let floor = 3 * crate::model::PAGE_BYTES as usize;
         for supported in 1..=10 {
@@ -850,7 +850,7 @@ mod tests {
         worker.actual_rails.clear();
         service.poll_budgeted(256).unwrap();
         assert_eq!(worker.runtime.admission.used(ResourceClass::Registered), 0);
-        worker.native_retry = crate::runtime::environment::now();
+        worker.native_retry = uring_runtime::environment::now();
         for _ in 0..20 {
             worker.poll_native(&mut cx).unwrap();
             service.poll_budgeted(8).unwrap();

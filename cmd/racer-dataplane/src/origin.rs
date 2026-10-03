@@ -15,11 +15,7 @@ use crate::{
     memory::pool::{BufferPool, PlaintextBuffer},
     model::{MetadataSelector, OriginContext, PAGE_BYTES, PageId, PageNumber, ResourceClass},
     read::candidates::OriginAuthority,
-    runtime::{
-        admission::AdmissionPolicy,
-        deadline::RequestScope,
-        reactor::{Completion, IoBuffer},
-    },
+    runtime::{admission::AdmissionPolicy, deadline::RequestScope},
 };
 use std::{
     path::{Path, PathBuf},
@@ -1150,3 +1146,4 @@ mod protocol {
         }
     }
 }
+use uring_runtime::reactor::{Completion, IoBuffer};

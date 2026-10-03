@@ -175,7 +175,7 @@ pub struct Failure {
 impl Failure {
     pub fn new(stage: Stage, error: Error) -> Self {
         Self {
-            unix_millis: crate::runtime::environment::wall_now()
+            unix_millis: uring_runtime::environment::wall_now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis()

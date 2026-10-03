@@ -663,10 +663,7 @@ fn profile_plan(io_shards: usize) -> racer_dataplane::runtime::affinity::Affinit
 
 #[test]
 fn capped_profiles_count_io_shards_and_unique_crypto_threads() {
-    use racer_dataplane::{
-        config::Config,
-        runtime::affinity::{AffinityPlan, CpuLocation, EffectiveTopology},
-    };
+    use racer_dataplane::{config::Config, runtime::affinity::AffinityPlan};
     let mut config = Config::from_lookup(|name| {
         Ok(match name {
             "RACER_CLUSTER_ID" => Some(CLUSTER.into()),
@@ -1438,3 +1435,4 @@ fn periodic_checkpoint_sigkill_recovers_older_pages_and_bounds_recent_loss() {
     );
     assert!(second.stop(libc::SIGTERM).success(), "{}", second.logs());
 }
+use uring_runtime::affinity::{CpuLocation, EffectiveTopology};

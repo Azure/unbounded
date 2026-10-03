@@ -157,7 +157,7 @@ struct Fixture {
 
 impl Fixture {
     fn bounded(mut self, request: u8, seconds: u64, links: u8) -> Self {
-        let deadline = crate::runtime::environment::now() + Duration::from_secs(seconds);
+        let deadline = uring_runtime::environment::now() + Duration::from_secs(seconds);
         self.scope = RequestScope::new(RequestId([request; 16]), deadline).unwrap();
         self.budget = AcquisitionBudget::new(deadline, 16, links);
         self
@@ -237,7 +237,7 @@ fn expire(deadline: Instant) {
 
 #[test]
 fn continuously_slow_candidate_reserves_fenced_fallback_and_conserves_credits() {
-    let clock = crate::runtime::environment::SimulationClock::new_at(
+    let clock = uring_runtime::environment::SimulationClock::new_at(
         94,
         Instant::now(),
         std::time::SystemTime::now(),
@@ -294,13 +294,13 @@ fn continuously_slow_candidate_reserves_fenced_fallback_and_conserves_credits() 
     );
     assert_eq!(f.budget.remaining_links(), 12);
     assert_eq!(f.budget.deadline(), original);
-    assert!(crate::runtime::environment::now() < original);
+    assert!(uring_runtime::environment::now() < original);
 }
 
 #[test]
 fn slow_body_without_alternative_or_failure_route_credit_keeps_original_ceiling() {
     for (opportunities, links) in [(1, 24), (3, 4)] {
-        let clock = crate::runtime::environment::SimulationClock::new_at(
+        let clock = uring_runtime::environment::SimulationClock::new_at(
             95,
             Instant::now(),
             std::time::SystemTime::now(),
@@ -358,7 +358,7 @@ fn slow_body_without_alternative_or_failure_route_credit_keeps_original_ceiling(
 #[test]
 fn known_healthy_body_outlives_share_with_or_without_affordable_fallback() {
     for links in [4, 24] {
-        let clock = crate::runtime::environment::SimulationClock::new_at(
+        let clock = uring_runtime::environment::SimulationClock::new_at(
             100,
             Instant::now(),
             std::time::SystemTime::now(),
@@ -386,7 +386,7 @@ fn known_healthy_body_outlives_share_with_or_without_affordable_fallback() {
             assert!(poll(request.as_mut()).is_pending());
             assert!(!first.cancellation.is_cancelled());
         }
-        assert!(crate::runtime::environment::now() > first.body_deadlines.unwrap().1);
+        assert!(uring_runtime::environment::now() > first.body_deadlines.unwrap().1);
         assert_eq!(f.peers.calls.borrow()[0].signed_deadline, original);
         f.scope.cancel().unwrap();
         assert!(matches!(
@@ -400,7 +400,7 @@ fn known_healthy_body_outlives_share_with_or_without_affordable_fallback() {
 
 #[test]
 fn configured_total_cap_never_renews_or_accepts_late_success() {
-    let clock = crate::runtime::environment::SimulationClock::new_at(
+    let clock = uring_runtime::environment::SimulationClock::new_at(
         96,
         Instant::now(),
         std::time::SystemTime::now(),
@@ -450,7 +450,7 @@ fn configured_total_cap_never_renews_or_accepts_late_success() {
 
 #[test]
 fn retries_get_independent_local_caps_but_never_extend_overall_authority() {
-    let clock = crate::runtime::environment::SimulationClock::new_at(
+    let clock = uring_runtime::environment::SimulationClock::new_at(
         101,
         Instant::now(),
         std::time::SystemTime::now(),
@@ -601,7 +601,7 @@ fn subscription_stall_must_leave_time_for_fixed_page_fallback() {
                 f.candidates.membership.version,
                 f.policy.node.clone(),
                 crate::security::protocol::encode_deadline(Deadline(call.signed_deadline)).unwrap(),
-                crate::security::protocol::millis(crate::runtime::environment::wall_now()).unwrap(),
+                crate::security::protocol::millis(uring_runtime::environment::wall_now()).unwrap(),
             )
             .expect("later exchange must not renew the provider contract");
         let crate::peer::subscriptions::Selection::Leader { work, waiter } = selected else {

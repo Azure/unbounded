@@ -335,7 +335,7 @@ impl Metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{model::ResourceClass, runtime::admission::AdmissionExt};
+    use crate::model::ResourceClass;
 
     #[test]
     fn request_lease_overflow_preserves_counters_and_error() {
@@ -413,13 +413,13 @@ mod tests {
             crate::test_support::cluster::config(false).limits,
         ));
         workers[0]
-            .observe_admission(WorkerId(7), admission.usage())
+            .observe_admission(WorkerId(7), admission.shared())
             .unwrap();
         workers[1]
-            .observe_admission(WorkerId(19), other.usage())
+            .observe_admission(WorkerId(19), other.shared())
             .unwrap();
         assert!(matches!(
-            workers[0].observe_admission(WorkerId(20), other.usage()),
+            workers[0].observe_admission(WorkerId(20), other.shared()),
             Err(crate::error::Error::InvalidConfiguration)
         ));
         let scrape = || {
@@ -495,7 +495,7 @@ mod tests {
             crate::test_support::cluster::config(false).limits,
         ));
         metrics
-            .observe_admission(WorkerId(0), admission.usage())
+            .observe_admission(WorkerId(0), admission.shared())
             .unwrap();
         let mut reservation = admission
             .reserve(None, ResourceClass::Ciphertext, 1 << 20)

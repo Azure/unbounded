@@ -142,8 +142,8 @@ mod materialized_pairing {
         let downstream_closed = Cell::new(false);
         let healthy_first = Cell::new(false);
         let overlapped = Cell::new(false);
-        let listener: Rc<crate::runtime::reactor::Descriptor> = Rc::new(listener.into());
-        let destination = |listener: Rc<crate::runtime::reactor::Descriptor>| async {
+        let listener: Rc<uring_runtime::reactor::Descriptor> = Rc::new(listener.into());
+        let destination = |listener: Rc<uring_runtime::reactor::Descriptor>| async {
             let fd = reactors[2].accept(listener, &scope).await?;
             accepted.set(accepted.get() + 1);
             let conn = crate::http::connection::from_accepted(fd, &admissions[2])?;
@@ -759,7 +759,7 @@ use crate::{
         connection::{ConnectionLease, HttpPool},
     },
     model::{ExpiresAt, ObjectMetadata, PageEnvelope},
-    runtime::reactor::{IoBuffer, Reactor},
+    runtime::reactor::Reactor,
     security::connection,
     topology::{
         health::LinkHealth,
@@ -1532,7 +1532,7 @@ fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution()
         if attack == "deadline" {
             // The binding retains its signed monotonic deadline; scope changes
             // cannot make a stale head eligible for reverse forwarding.
-            let clock = crate::runtime::environment::SimulationClock::new_at(
+            let clock = uring_runtime::environment::SimulationClock::new_at(
                 91,
                 Instant::now() + Duration::from_secs(60),
                 std::time::SystemTime::now() + Duration::from_secs(60),
@@ -1555,3 +1555,4 @@ fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution()
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
     }
 }
+use uring_runtime::reactor::IoBuffer;

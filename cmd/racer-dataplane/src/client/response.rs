@@ -34,13 +34,14 @@ mod subscription {
         },
         model::{ObjectMetadata, PAGE_BYTES, PageNumber, ResolvedRange},
         read::{ReadResponse, range_stream::RangeStream},
-        runtime::{deadline::RequestScope, reactor::IoBuffer},
+        runtime::deadline::RequestScope,
     };
     use std::{
         collections::BTreeMap,
         task::{Context, Poll},
         time::Duration,
     };
+    use uring_runtime::reactor::IoBuffer;
 
     pub(super) fn success_head(
         metadata: &ObjectMetadata,
@@ -94,7 +95,7 @@ mod subscription {
         fn poll(
             &mut self,
             cx: &mut Context<'_>,
-            socket: &std::rc::Rc<crate::runtime::reactor::Descriptor>,
+            socket: &std::rc::Rc<uring_runtime::reactor::Descriptor>,
             stream: &mut RangeStream,
             outstanding: &mut BTreeMap<PageNumber, u32>,
             current: Option<(crate::model::PageSlice, &crate::memory::delivery::FinalSend)>,
@@ -249,7 +250,7 @@ mod subscription {
                     stream.enable_progress(timeout);
                     while sent < expected {
                         let mut progress_scope = scope.clone();
-                        progress_scope.deadline.0 = crate::runtime::environment::now() + timeout;
+                        progress_scope.deadline.0 = uring_runtime::environment::now() + timeout;
                         let reader = if let Some(reader) = first.take() {
                             reader
                         } else {
@@ -366,7 +367,7 @@ mod subscription {
                                 let reservation = reservation.clone();
                                 let mut receive_scope = scope.clone();
                                 receive_scope.deadline.0 =
-                                    crate::runtime::environment::now() + timeout;
+                                    uring_runtime::environment::now() + timeout;
                                 ready = Some(Box::pin(async move {
                                     reactor
                                         .readiness_with_lease(
@@ -410,7 +411,7 @@ mod subscription {
                     }
                 }
                 let mut final_scope = scope.clone();
-                final_scope.deadline.0 = crate::runtime::environment::now() + timeout;
+                final_scope.deadline.0 = uring_runtime::environment::now() + timeout;
                 connection =
                     send_frame(&self.io, connection, frame(2, pages, sent, 0), &final_scope)
                         .await?;
@@ -579,7 +580,7 @@ impl Responses {
             let scope = if scope.check().is_err() {
                 final_scope = RequestScope::new(
                     scope.request,
-                    crate::runtime::environment::now() + Duration::from_secs(1),
+                    uring_runtime::environment::now() + Duration::from_secs(1),
                 )?;
                 &final_scope
             } else {

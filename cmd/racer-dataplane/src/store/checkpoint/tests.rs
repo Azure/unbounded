@@ -333,10 +333,7 @@ fn unreadable_slot_is_disposable_but_storage_directory_failure_is_fatal() {
 
 #[test]
 fn candidate_read_failure_tries_older_slot() {
-    use crate::{
-        runtime::reactor::simulation::{Fault, Simulation},
-        store::checkpoint::candidates,
-    };
+    use crate::store::checkpoint::candidates;
     let sim = Simulation::new();
     let _environment = sim.enter();
     let path = PathBuf::from("/recovery-budget-test");
@@ -848,3 +845,4 @@ fn outstanding_lease_and_wrong_worker_cannot_partially_install() {
     );
 }
 use crate::store::checkpoint as checkpoint_format;
+use uring_runtime::reactor::simulation::{Fault, Simulation};

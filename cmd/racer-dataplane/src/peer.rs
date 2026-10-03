@@ -8,11 +8,11 @@ mod tests;
 mod timing {
     use super::protocol::{Operation, PeerRequest, PeerResponse, VerifiedResponse};
     use crate::{
-        runtime::environment::now,
         telemetry::metrics::{Event, Metrics},
         topology::rails::TransportPlan,
     };
     use std::time::Instant;
+    use uring_runtime::environment::now;
 
     pub(super) const STAGES: [(Event, Event); 4] = [
         (Event::PeerPageCheckoutCount, Event::PeerPageCheckoutNs),
@@ -86,8 +86,8 @@ mod timing {
         use super::*;
         #[test]
         fn page_timing_duration_conversion_saturates_and_reversed_clock_is_zero() {
-            use crate::runtime::environment::SimulationClock;
             use std::time::Duration;
+            use uring_runtime::environment::SimulationClock;
             let metrics = Metrics::default();
             let clock = SimulationClock::new(9);
             let _environment = clock.environment(1).enter();

@@ -1,9 +1,7 @@
 //! Public handoffs held at deterministic native mailbox boundaries.
 use super::{lifecycle::*, test_support::*, *};
 use crate::{
-    model::*,
-    runtime::{admission::AdmissionPolicy, environment},
-    security::connection::signature_tests::network,
+    model::*, runtime::admission::AdmissionPolicy, security::connection::signature_tests::network,
 };
 use rdma_verbs::testing::{Contention, State};
 use std::time::Duration;
@@ -369,3 +367,4 @@ fn activation_contention_retains_quota_and_cancellation_releases_unsubmitted_con
         assert_eq!(admission.used(ResourceClass::Registered), 0);
     }
 }
+use uring_runtime::environment;

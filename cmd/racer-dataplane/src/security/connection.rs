@@ -74,7 +74,7 @@ impl Signatures {
         push(
             &mut head,
             "racer-timestamp",
-            p::millis(crate::runtime::environment::wall_now())?,
+            p::millis(uring_runtime::environment::wall_now())?,
         );
         if head.unique("racer-kind")? == Some(b"request".as_slice()) {
             let cache = crate::model::CacheId(field(&head, "racer-cache")?);
@@ -161,7 +161,7 @@ impl Signatures {
         let timestamp = UNIX_EPOCH
             .checked_add(Duration::from_millis(number(head, "racer-timestamp")?))
             .ok_or(Error::Unauthorized)?;
-        let now = crate::runtime::environment::wall_now();
+        let now = uring_runtime::environment::wall_now();
         if timestamp
             > now
                 .checked_add(Duration::from_secs(5))
@@ -359,14 +359,14 @@ impl Session {
             direction,
             tx: 0,
             rx: 0,
-            expires: crate::runtime::environment::now() + Duration::from_secs(3600),
+            expires: uring_runtime::environment::now() + Duration::from_secs(3600),
         }
     }
     pub fn peer(&self) -> &NodeId {
         &self.peer
     }
     fn check(&self) -> Result<()> {
-        if crate::runtime::environment::now() >= self.expires {
+        if uring_runtime::environment::now() >= self.expires {
             return Err(Error::DeadlineExceeded);
         }
         Ok(())
@@ -442,7 +442,7 @@ fn signed(head: MessageHead) -> Result<SignedHead> {
 }
 fn random() -> Result<[u8; 32]> {
     let mut bytes = [0; 32];
-    crate::runtime::environment::fill_random(&mut bytes).map_err(|_| Error::Unavailable)?;
+    uring_runtime::environment::fill_random(&mut bytes).map_err(|_| Error::Unavailable)?;
     Ok(bytes)
 }
 fn transcript(client: &NodeId, server: &NodeId, a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
@@ -526,7 +526,7 @@ fn scope(parent: &RequestScope) -> Result<RequestScope> {
     scope.deadline.0 = scope
         .deadline
         .0
-        .min(crate::runtime::environment::now() + Duration::from_secs(5));
+        .min(uring_runtime::environment::now() + Duration::from_secs(5));
     Ok(scope)
 }
 pub async fn connect(
@@ -742,7 +742,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn parallel_connections_isolate_counters_and_wall_rollback_cannot_resurrect_frames() {
-        let clock = crate::runtime::environment::SimulationClock::new_at(
+        let clock = uring_runtime::environment::SimulationClock::new_at(
             92,
             Instant::now(),
             std::time::SystemTime::now(),
@@ -759,7 +759,7 @@ pub(crate) mod tests {
         assert_eq!(other_b.rx, 0);
         other_b.admit(other_a.sign(frame()).unwrap()).unwrap();
         clock.advance(Duration::from_secs(61));
-        clock.set_wall_time(crate::runtime::environment::wall_now() - Duration::from_secs(61));
+        clock.set_wall_time(uring_runtime::environment::wall_now() - Duration::from_secs(61));
         assert!(b.admit(old).is_err());
         assert_eq!(b.rx, 1);
         b.admit(a.sign(frame()).unwrap()).unwrap();
@@ -807,7 +807,7 @@ pub(crate) mod tests {
 
     #[test]
     pub(crate) fn more_than_4096_frames_at_fixed_time_have_constant_session_storage() {
-        let clock = crate::runtime::environment::SimulationClock::new_at(
+        let clock = uring_runtime::environment::SimulationClock::new_at(
             71,
             Instant::now(),
             std::time::SystemTime::now(),
@@ -815,7 +815,7 @@ pub(crate) mod tests {
         let environment = clock.environment(0);
         let _guard = environment.enter();
         let (mut a, mut b) = pair();
-        let now = crate::runtime::environment::wall_now();
+        let now = uring_runtime::environment::wall_now();
         let bytes = std::mem::size_of_val(&a) + std::mem::size_of_val(&b);
         for sequence in 1..=5000 {
             let h = a.sign(frame()).unwrap();
@@ -838,7 +838,7 @@ pub(crate) mod tests {
             Session::new(b.signatures.clone(), b.peer.clone(), random().unwrap(), 1);
         assert!(reconnected.admit(clone_head(&old)).is_err());
         assert_eq!(reconnected.rx, 0);
-        b.expires = crate::runtime::environment::now();
+        b.expires = uring_runtime::environment::now();
         assert!(matches!(b.admit(old), Err(Error::DeadlineExceeded)));
         a.tx = u64::MAX;
         assert!(matches!(a.sign(frame()), Err(Error::Replay)));
@@ -890,7 +890,7 @@ pub(crate) mod tests {
         let pool = HttpPool::new(reactor.clone(), admission.clone(), 2);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
-        let listener = Rc::new(crate::runtime::reactor::Descriptor::from(listener));
+        let listener = Rc::new(uring_runtime::reactor::Descriptor::from(listener));
         let scope = RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(30))
             .unwrap();
         let mut previous_id = None;
@@ -1021,7 +1021,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn socket_admission_rejects_replay_before_dispatch_and_closes_pool_slot() {
-        use crate::runtime::reactor::IoBuffer;
+        use uring_runtime::reactor::IoBuffer;
         let n = super::signature_tests::network(2);
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,

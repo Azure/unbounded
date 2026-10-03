@@ -74,7 +74,7 @@ pub fn millis(time: SystemTime) -> Result<u64> {
 /// Stable environment clock mapping. Decode wire deadlines with `decode_deadline`,
 /// never reconstruct them from a new relative timeout at each hop.
 pub fn encode_deadline(deadline: Deadline) -> Result<u64> {
-    let (mono, wall) = crate::runtime::environment::clock_anchor();
+    let (mono, wall) = uring_runtime::environment::clock_anchor();
     let time = if deadline.0 >= mono {
         wall.checked_add(deadline.0.duration_since(mono))
     } else {
@@ -84,7 +84,7 @@ pub fn encode_deadline(deadline: Deadline) -> Result<u64> {
     millis(time)
 }
 pub fn decode_deadline(value: u64) -> Result<Deadline> {
-    let (mono, wall) = crate::runtime::environment::clock_anchor();
+    let (mono, wall) = uring_runtime::environment::clock_anchor();
     let base = millis(wall)?;
     // Account for submillisecond wall-clock origin, making encode/decode exact.
     let fraction = wall

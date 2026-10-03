@@ -536,7 +536,7 @@ fn concurrent_writes_reserve_distinct_extents_and_capacity_before_completion() {
 
 #[test]
 fn pipeline_out_of_order_failure_and_short_cqes_preserve_other_mapping() {
-    use crate::runtime::reactor::simulation::{Fault, Simulation};
+    use uring_runtime::reactor::simulation::{Fault, Simulation};
     for fault in [Fault::Delay(6), Fault::Errno(libc::EIO), Fault::Short(512)] {
         let simulation = Simulation::new();
         let _environment = simulation.enter();

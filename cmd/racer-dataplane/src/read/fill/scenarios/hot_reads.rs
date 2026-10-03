@@ -7,7 +7,7 @@ mod duplex_release {
 
     #[test]
     fn duplex_exact_release_before_final_send_cqe_is_provisional() {
-        use crate::runtime::reactor::simulation::{Fault, Simulation};
+        use uring_runtime::reactor::simulation::{Fault, Simulation};
         for mode in ["valid", "duplicate", "malformed", "short", "drop"] {
             let sim = Simulation::new();
             let _sim = sim.enter();
@@ -186,7 +186,7 @@ mod duplex_release {
     fn run(mode: &str) {
         let queue = Rc::new(crate::read::drivers::DriverQueue::default());
         let _owner = queue.enter();
-        let clock = crate::runtime::environment::SimulationClock::new(311);
+        let clock = uring_runtime::environment::SimulationClock::new(311);
         let environment = clock.environment(0);
         let _clock = environment.enter();
         let signers = network(1);
@@ -197,7 +197,7 @@ mod duplex_release {
             coordinator(&f, &signers[0], &membership, Rc::new(NoPeer));
         let scope = RequestScope::new(
             f.scope.request,
-            crate::runtime::environment::now() + Duration::from_secs(60),
+            uring_runtime::environment::now() + Duration::from_secs(60),
         )
         .unwrap();
         let request = ClientRequest {

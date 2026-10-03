@@ -52,7 +52,7 @@ use super::io_tests::drive;
 fn scope() -> RequestScope {
     RequestScope::new(
         RequestId([7; 16]),
-        crate::runtime::environment::now() + Duration::from_secs(5),
+        uring_runtime::environment::now() + Duration::from_secs(5),
     )
     .unwrap()
 }
@@ -160,7 +160,7 @@ fn peer_tcp_nodelay_does_not_touch_unix_or_origin_sockets() {
 
 #[test]
 fn idle_expiration_runs_without_checkout_or_waiters_and_is_budgeted() {
-    let clock = crate::runtime::environment::SimulationClock::new(91);
+    let clock = uring_runtime::environment::SimulationClock::new(91);
     let _environment = clock.environment(0).enter();
     let (admission, _, mut pool) = setup();
     pool.core.config_mut().idle_timeout = Duration::ZERO;
@@ -179,7 +179,7 @@ fn idle_expiration_runs_without_checkout_or_waiters_and_is_budgeted() {
 }
 #[test]
 fn origin_wait_is_bounded_fifo_without_blocking_peers_or_other_caches() {
-    let clock = crate::runtime::environment::SimulationClock::new(92);
+    let clock = uring_runtime::environment::SimulationClock::new(92);
     let _environment = clock.environment(0).enter();
     let (admission, reactor, pool) = setup();
     let (listener, endpoint) = Listener::origin();

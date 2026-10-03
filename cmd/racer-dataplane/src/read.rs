@@ -222,7 +222,7 @@ pub mod hedge {
             state.alarms.insert(
                 id,
                 Alarm {
-                    due: crate::runtime::environment::now() + self.config.delay,
+                    due: uring_runtime::environment::now() + self.config.delay,
                     wake: None,
                 },
             );
@@ -232,7 +232,7 @@ pub mod hedge {
             })
         }
         pub(crate) fn poll(&self) {
-            let now = crate::runtime::environment::now();
+            let now = uring_runtime::environment::now();
             let wakes: Vec<_> = self
                 .state
                 .lock()
@@ -254,7 +254,7 @@ pub mod hedge {
         pub(crate) fn delay(&self, cx: &mut Context<'_>) -> Poll<()> {
             let mut state = self.owner.state.lock().expect("hedge alarm lock");
             let alarm = state.alarms.get_mut(&self.id).expect("live hedge alarm");
-            if crate::runtime::environment::now() >= alarm.due {
+            if uring_runtime::environment::now() >= alarm.due {
                 Poll::Ready(())
             } else {
                 alarm.wake = Some(cx.waker().clone());
@@ -393,14 +393,9 @@ pub mod hedge {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::{
-            model::RequestId,
-            runtime::{
-                deadline::RequestScope,
-                environment::{SimulationClock, now},
-            },
-        };
+        use crate::{model::RequestId, runtime::deadline::RequestScope};
         use std::{cell::Cell, future::Future, rc::Rc};
+        use uring_runtime::environment::{SimulationClock, now};
         fn scope() -> RequestScope {
             RequestScope::new(RequestId([1; 16]), now() + Duration::from_secs(10)).unwrap()
         }
@@ -1099,7 +1094,7 @@ mod tests {
     use crate::model::AttemptId;
     #[test]
     fn remote_budget_charges_final_incoming_link_and_never_restores_attempts() {
-        let now = crate::runtime::environment::now();
+        let now = uring_runtime::environment::now();
         let scope = RequestScope::new(
             crate::model::RequestId([1; 16]),
             now + std::time::Duration::from_secs(60),

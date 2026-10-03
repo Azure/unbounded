@@ -1,6 +1,5 @@
 use super::*;
 use crate::model::RequestId;
-use crate::runtime::admission::AdmissionExt;
 use std::{
     io::{Read, Write as IoWrite},
     net::TcpStream,
@@ -741,7 +740,7 @@ fn metrics_http_response_exports_worker_quotas_with_bounded_output() {
             limits.ciphertext_bytes = std::num::NonZeroUsize::new(usize::MAX).unwrap();
             let admission = flow_control::Quotas::new(AdmissionPolicy::new(limits));
             metrics
-                .observe_admission(WorkerId(u16::MAX - index as u16), admission.usage())
+                .observe_admission(WorkerId(u16::MAX - index as u16), admission.shared())
                 .unwrap();
             admission
         })

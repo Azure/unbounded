@@ -678,7 +678,7 @@ impl WorkerEndpoint {
     /// without polling them; the simulated reactor still fences owned buffers.
     #[cfg(test)]
     pub(crate) fn simulation_crash(&mut self) {
-        assert!(crate::runtime::reactor::simulation::Simulation::current().is_some());
+        assert!(uring_runtime::reactor::simulation::Simulation::current().is_some());
         self.directory.simulation_crash();
         self.active.clear();
     }

@@ -6,7 +6,7 @@ use racer_dataplane::{
         CacheId, CacheKey, KeyId, Nonce, ObjectId, ObjectVersion, PageEnvelope, PageId, PageNumber,
         ResourceClass, StrongEtag,
     },
-    runtime::{admission::AdmissionPolicy, reactor::IoBuffer},
+    runtime::admission::AdmissionPolicy,
 };
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -347,3 +347,4 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
     }
 }
+use uring_runtime::reactor::IoBuffer;

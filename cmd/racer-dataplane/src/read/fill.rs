@@ -653,10 +653,7 @@ impl Fill {
         if origin.metadata.version != page.version {
             return Err(Error::CorruptRecord);
         }
-        use crate::{
-            model::{PAGE_BYTES, ResourceClass},
-            runtime::reactor::IoBuffer,
-        };
+        use crate::model::{PAGE_BYTES, ResourceClass};
         if origin.plaintext.bytes()?.len()
             != origin.metadata.immutable().page_length(page)? as usize
         {
@@ -1095,7 +1092,7 @@ impl Fill {
             CandidateResolution::Copy(result) => result,
             CandidateResolution::Origin(authority) => {
                 authority.validate(&context.object, page.number)?;
-                budget.begin_attempt(crate::runtime::environment::now(), scope.deadline.0)?;
+                budget.begin_attempt(uring_runtime::environment::now(), scope.deadline.0)?;
                 scope.check()?;
                 // Peer reception owns its ciphertext allocation. Reserve encryption
                 // output only when this candidate actually needs an origin fill.
@@ -1175,7 +1172,7 @@ impl Fill {
         ciphertext: flow_control::Charge<AdmissionPolicy>,
         scope: &RequestScope,
     ) -> Result<PageResult> {
-        use crate::runtime::reactor::IoBuffer;
+        use uring_runtime::reactor::IoBuffer;
         if origin.metadata.version != page.version {
             return Err(Error::CorruptRecord);
         }
@@ -1433,3 +1430,4 @@ mod tests {
         );
     }
 }
+use uring_runtime::reactor::IoBuffer;

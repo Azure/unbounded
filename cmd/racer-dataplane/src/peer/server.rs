@@ -77,8 +77,8 @@ pub struct PeerServer {
 impl PeerServer {
     pub(crate) fn configure_accepted(
         &self,
-        fd: crate::runtime::reactor::Descriptor,
-    ) -> crate::error::Result<crate::runtime::reactor::Descriptor> {
+        fd: uring_runtime::reactor::Descriptor,
+    ) -> crate::error::Result<uring_runtime::reactor::Descriptor> {
         fd.enable_tcp_nodelay(self.tcp_nodelay)?;
         Ok(fd)
     }
@@ -124,7 +124,7 @@ impl PeerServer {
         let deadline = scope
             .deadline
             .0
-            .min(crate::runtime::environment::now() + Duration::from_secs(2));
+            .min(uring_runtime::environment::now() + Duration::from_secs(2));
         let diagnostic_scope = match RequestScope::new(scope.request, deadline) {
             Ok(s) => s,
             Err(error) => {
@@ -207,7 +207,7 @@ impl PeerServer {
             use futures::{StreamExt, stream::FuturesUnordered};
             scope.check()?;
             let reactor = self.io.reactor();
-            let fd = Rc::new(crate::runtime::reactor::Descriptor::tcp_listener(address)?);
+            let fd = Rc::new(uring_runtime::reactor::Descriptor::tcp_listener(address)?);
             let mut active = FuturesUnordered::new();
             let maximum = self
                 .admission
@@ -345,7 +345,7 @@ impl PeerServer {
             let header_scope = header_scope(
                 scope,
                 self.request_timeout,
-                crate::runtime::environment::now(),
+                uring_runtime::environment::now(),
             )?;
             let connection = self
                 .authenticate_connection(connection, &header_scope)
@@ -743,7 +743,7 @@ impl PeerServer {
                     membership.version,
                     request.origin().node().clone(),
                     encode_deadline(scope.deadline)?,
-                    millis(crate::runtime::environment::wall_now())?,
+                    millis(uring_runtime::environment::wall_now())?,
                 )?
             } else {
                 self.subscriptions
@@ -783,7 +783,7 @@ impl PeerServer {
                                     metadata,
                                     ciphertext,
                                 },
-                                millis(crate::runtime::environment::wall_now())?,
+                                millis(uring_runtime::environment::wall_now())?,
                             )?;
                         }
                         Ok(other) => {
@@ -805,7 +805,7 @@ impl PeerServer {
                     if let Err(error) = scope.check() {
                         return std::task::Poll::Ready(Err(error));
                     }
-                    let now = match millis(crate::runtime::environment::wall_now()) {
+                    let now = match millis(uring_runtime::environment::wall_now()) {
                         Ok(now) => now,
                         Err(error) => return std::task::Poll::Ready(Err(error)),
                     };
@@ -842,9 +842,9 @@ async fn next_accepted<A, C>(
     accept: A,
     active: &mut futures::stream::FuturesUnordered<C>,
     scope: &RequestScope,
-) -> crate::error::Result<crate::runtime::reactor::Descriptor>
+) -> crate::error::Result<uring_runtime::reactor::Descriptor>
 where
-    A: std::future::Future<Output = crate::error::Result<crate::runtime::reactor::Descriptor>>,
+    A: std::future::Future<Output = crate::error::Result<uring_runtime::reactor::Descriptor>>,
     C: std::future::Future,
 {
     use futures::{FutureExt, StreamExt};
@@ -965,7 +965,7 @@ mod tests {
             }
         }
     }
-    impl<F: Future<Output = crate::error::Result<crate::runtime::reactor::Descriptor>>> Future
+    impl<F: Future<Output = crate::error::Result<uring_runtime::reactor::Descriptor>>> Future
         for CountedAccept<F>
     {
         type Output = F::Output;
@@ -1313,7 +1313,7 @@ mod tests {
                 let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                 listener.set_nonblocking(true).unwrap();
                 let address = listener.local_addr().unwrap();
-                let fd = Rc::new(crate::runtime::reactor::Descriptor::from(listener));
+                let fd = Rc::new(uring_runtime::reactor::Descriptor::from(listener));
                 let weak = Rc::downgrade(&fd);
                 let counts = Rc::new(AcceptCounts::default());
                 let accept = CountedAccept::new(reactor.accept(fd, &scope), &counts);
@@ -1432,7 +1432,7 @@ mod tests {
             },
             memory::pool::BufferPool,
             peer::{PeerTransport, protocol::SecurityCodec},
-            runtime::{environment::SimulationClock, reactor::Reactor},
+            runtime::reactor::Reactor,
             security::connection::tests::{finish, hello},
             topology::{health::LinkHealth, routing::Paths},
         };
@@ -1556,7 +1556,7 @@ mod tests {
                 ));
                 let scope = RequestScope::new(
                     RequestId([5; 16]),
-                    crate::runtime::environment::now() + Duration::from_secs(365 * 24 * 3600),
+                    uring_runtime::environment::now() + Duration::from_secs(365 * 24 * 3600),
                 )
                 .unwrap();
                 let (socket, mut peer) = UnixStream::pair().unwrap();
@@ -1706,3 +1706,5 @@ mod tests {
         }
     }
 }
+#[cfg(test)]
+use uring_runtime::environment::SimulationClock;

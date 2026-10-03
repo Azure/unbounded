@@ -207,7 +207,7 @@ impl Enrollment {
         }
         let mut scope = scope.clone();
         let mut id = [0; 16];
-        crate::runtime::environment::fill_random(&mut id).map_err(|_| Error::Io)?;
+        uring_runtime::environment::fill_random(&mut id).map_err(|_| Error::Io)?;
         scope.request = crate::model::RequestId(id);
         self.previous.set(Some(scope.request));
         Ok((guard, scope))
@@ -345,7 +345,7 @@ impl Enrollment {
         params.distinguished_name = rcgen::DistinguishedName::new();
         let csr = params.serialize_request(&key).map_err(|_| Error::Io)?;
         let mut id = [0; 16];
-        crate::runtime::environment::fill_random(&mut id).map_err(|_| Error::Io)?;
+        uring_runtime::environment::fill_random(&mut id).map_err(|_| Error::Io)?;
         id[6] = (id[6] & 0x0f) | 0x40;
         id[8] = (id[8] & 0x3f) | 0x80;
         let h = format!("{:032x}", u128::from_be_bytes(id));
@@ -438,11 +438,7 @@ impl Enrollment {
             .map(rustls::pki_types::CertificateDer::from)
             .collect();
         verifier(&self.roots.borrow())?
-            .verify_client_cert(
-                &certs[0],
-                &certs[1..],
-                crate::runtime::environment::unix_time(),
-            )
+            .verify_client_cert(&certs[0], &certs[1..], crate::runtime::unix_time())
             .map_err(|_| Error::Unauthorized)?;
         let (_, cert) = x509_parser::parse_x509_certificate(&r.certificate_chain[0])
             .map_err(|_| Error::Unauthorized)?;
@@ -549,12 +545,12 @@ impl LocalSigningIdentity {
         UNIX_EPOCH + Duration::from_secs(self.not_after)
     }
     pub fn valid_now(&self) -> bool {
-        crate::runtime::environment::wall_now() >= UNIX_EPOCH + Duration::from_secs(self.not_before)
-            && crate::runtime::environment::wall_now() < self.expires_at()
+        uring_runtime::environment::wall_now() >= UNIX_EPOCH + Duration::from_secs(self.not_before)
+            && uring_runtime::environment::wall_now() < self.expires_at()
     }
     pub fn renewal_due(&self) -> bool {
         let lifetime = Duration::from_secs(self.not_after - self.not_before);
-        crate::runtime::environment::wall_now()
+        uring_runtime::environment::wall_now()
             >= UNIX_EPOCH
                 + Duration::from_secs(self.not_before)
                 + (lifetime * 2 / 3).min(wire::RENEW_AFTER)
@@ -613,7 +609,7 @@ mod tests {
                 not_before: 1000,
                 not_after: 1000 + lifetime,
             };
-            let clock = crate::runtime::environment::SimulationClock::new_at(
+            let clock = uring_runtime::environment::SimulationClock::new_at(
                 51,
                 std::time::Instant::now(),
                 UNIX_EPOCH + Duration::from_secs(1000 + due - 1),
@@ -649,7 +645,7 @@ mod tests {
                 e.accept_response_async(testing::issue(&request, &ca, &key, OLD_NODE), &scope),
             )
             .unwrap();
-            let clock = crate::runtime::environment::SimulationClock::new_at(
+            let clock = uring_runtime::environment::SimulationClock::new_at(
                 31,
                 std::time::Instant::now(),
                 SystemTime::now() + Duration::from_secs(172800),

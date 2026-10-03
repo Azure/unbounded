@@ -180,7 +180,7 @@ impl HttpIo {
             tick.deadline.0 = tick
                 .deadline
                 .0
-                .min(crate::runtime::environment::now() + Duration::from_millis(10));
+                .min(uring_runtime::environment::now() + Duration::from_millis(10));
             match self
                 .reactor()
                 .readiness_with_lease(fd, interest as u32, state.clone(), &tick)

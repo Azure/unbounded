@@ -241,8 +241,8 @@ fn startup_finishes_local_snapshot_installation_while_next_long_poll_is_held() {
 
 #[test]
 fn same_node_renewal_backs_off_expires_closed_and_recovers() {
-    use crate::runtime::environment::{SimulationClock, now, wall_now};
     use crate::telemetry::health::State;
+    use uring_runtime::environment::{SimulationClock, now, wall_now};
 
     // Complete each real control turn through the application's error handling.
     // Leave the next turn unsubmitted so the test controls all retry boundaries.
@@ -742,7 +742,8 @@ fn startup_reauthenticates_retained_identity_and_fails_closed() {
 
 #[test]
 fn node_replacement_drains_all_workers_and_restart_converges() {
-    use crate::runtime::affinity::{EffectiveTopology, WorkerPair};
+    use crate::runtime::affinity::WorkerPair;
+    use uring_runtime::affinity::EffectiveTopology;
     for renewal_due in [false, true] {
         let mut fixture = ControlFixture::new();
         let (config, node) = fixture.bootstrap_node(2, Duration::from_secs(15));
@@ -843,10 +844,7 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
 
 #[test]
 fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
-    use crate::{
-        runtime::affinity::{EffectiveTopology, WorkerPair},
-        store::checkpoint,
-    };
+    use crate::{runtime::affinity::WorkerPair, store::checkpoint};
     let mut fixture = ControlFixture::new();
     let (config, node) = fixture.bootstrap_node(2, Duration::from_secs(15));
     let keys = Keyring::new(
@@ -1432,3 +1430,4 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     assert_eq!(runtime.crypto.outstanding(), 0);
     assert!(fixture.directory.join("slabs/checkpoint.0").is_file());
 }
+use uring_runtime::affinity::EffectiveTopology;

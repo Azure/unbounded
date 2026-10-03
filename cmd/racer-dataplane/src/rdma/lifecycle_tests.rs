@@ -85,7 +85,7 @@ fn simultaneous_timeout_and_healthy_write_preserve_worker_and_quarantine() {
     immediate(source.poll_copy_from(&[7; 16])).unwrap();
     let written = immediate(healthy.poll_write(source, grant.address(), grant.key())).unwrap();
     native.poll_budgeted(2).unwrap();
-    failed.expire_at(crate::runtime::environment::now());
+    failed.expire_at(uring_runtime::environment::now());
     let sessions = Sessions::new(Rc::new(Devices::new()), 2);
     sessions.track_test(failed.clone());
     sessions.track_test(healthy.clone());

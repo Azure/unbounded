@@ -84,7 +84,7 @@ impl RequestScope {
             .candidate_idle
             .set(Mutex::new((
                 allowance,
-                crate::runtime::environment::now() + allowance,
+                uring_runtime::environment::now() + allowance,
             )))
             .map_err(|_| Error::Internal)?;
         Ok(())
@@ -94,7 +94,7 @@ impl RequestScope {
         self.check()?;
         if let Some(idle) = self.cancellation.state.candidate_idle.get() {
             let mut idle = idle.lock().map_err(|_| Error::Unavailable)?;
-            idle.1 = crate::runtime::environment::now() + idle.0;
+            idle.1 = uring_runtime::environment::now() + idle.0;
         }
         Ok(())
     }
@@ -130,7 +130,7 @@ impl RequestScope {
             return Err(Error::InvalidRequest);
         }
         if let Some(body) = self.cancellation.state.candidate_body.get() {
-            let now = crate::runtime::environment::now();
+            let now = uring_runtime::environment::now();
             let mut body = body.lock().map_err(|_| Error::Unavailable)?;
             if received == total {
                 body.first = None;
@@ -163,11 +163,11 @@ impl RequestScope {
     pub fn check(&self) -> Result<()> {
         if self.cancellation.is_cancelled() {
             Err(Error::Cancelled)
-        } else if crate::runtime::environment::now() >= self.deadline.0 {
+        } else if uring_runtime::environment::now() >= self.deadline.0 {
             Err(Error::DeadlineExceeded)
         } else {
             if let Some(expires) = self.cancellation.state.candidate_total.get()
-                && crate::runtime::environment::now() >= *expires
+                && uring_runtime::environment::now() >= *expires
             {
                 return Err(Error::DeadlineExceeded);
             }
@@ -175,13 +175,13 @@ impl RequestScope {
                 let body = body.lock().map_err(|_| Error::Unavailable)?;
                 if body.expired
                     || (body.first.is_some()
-                        && crate::runtime::environment::now() >= body.complete_by)
+                        && uring_runtime::environment::now() >= body.complete_by)
                 {
                     return Err(Error::DeadlineExceeded);
                 }
             }
             if let Some(idle) = self.cancellation.state.candidate_idle.get()
-                && crate::runtime::environment::now()
+                && uring_runtime::environment::now()
                     >= idle.lock().map_err(|_| Error::Unavailable)?.1
             {
                 return Err(Error::DeadlineExceeded);
@@ -226,9 +226,9 @@ mod tests {
     #[test]
     fn rest_narrowing_preserves_policy_cancellation_and_parent_deadline() {
         use rest_client::Scope;
-        let clock = crate::runtime::environment::SimulationClock::new(102);
+        let clock = uring_runtime::environment::SimulationClock::new(102);
         let _env = clock.environment(0).enter();
-        let start = crate::runtime::environment::now();
+        let start = uring_runtime::environment::now();
         let end = start + Duration::from_secs(30);
         let scope = RequestScope::new(RequestId([102; 16]), end).unwrap();
         scope
@@ -246,9 +246,9 @@ mod tests {
 
     #[test]
     fn candidate_total_survives_body_completion_and_never_changes_authority() {
-        let clock = crate::runtime::environment::SimulationClock::new(97);
+        let clock = uring_runtime::environment::SimulationClock::new(97);
         let _env = clock.environment(0).enter();
-        let start = crate::runtime::environment::now();
+        let start = uring_runtime::environment::now();
         let scope =
             RequestScope::new(RequestId([97; 16]), start + Duration::from_secs(60)).unwrap();
         let signed = crate::security::protocol::encode_deadline(scope.deadline).unwrap();
@@ -284,9 +284,9 @@ mod tests {
 
     #[test]
     fn candidate_body_budget_accepts_original_ceiling_and_rejects_invalid_bounds() {
-        let clock = crate::runtime::environment::SimulationClock::new(98);
+        let clock = uring_runtime::environment::SimulationClock::new(98);
         let _env = clock.environment(0).enter();
-        let start = crate::runtime::environment::now();
+        let start = uring_runtime::environment::now();
         let end = start + Duration::from_secs(30);
         let scope = RequestScope::new(RequestId([98; 16]), end).unwrap();
         assert_eq!(
@@ -323,9 +323,9 @@ mod tests {
 
     #[test]
     fn candidate_body_reserve_keeps_healthy_progress_and_ignores_unknown_lengths() {
-        let clock = crate::runtime::environment::SimulationClock::new(91);
+        let clock = uring_runtime::environment::SimulationClock::new(91);
         let _env = clock.environment(0).enter();
-        let start = crate::runtime::environment::now();
+        let start = uring_runtime::environment::now();
         let healthy =
             RequestScope::new(RequestId([91; 16]), start + Duration::from_secs(30)).unwrap();
         healthy.set_candidate_idle(Duration::from_secs(10)).unwrap();
@@ -337,13 +337,13 @@ mod tests {
             clock.advance(Duration::from_secs(2));
             healthy.candidate_body_progress(received, 80).unwrap();
         }
-        assert!(crate::runtime::environment::now() > start + Duration::from_secs(10));
+        assert!(uring_runtime::environment::now() > start + Duration::from_secs(10));
         assert_eq!(healthy.deadline.0, start + Duration::from_secs(30));
         // Completed network body does not subject later verification to the reserve.
         clock.advance(Duration::from_secs(7));
         healthy.check().unwrap();
         for reserve in [false, true] {
-            let now = crate::runtime::environment::now();
+            let now = uring_runtime::environment::now();
             let scope =
                 RequestScope::new(RequestId([92; 16]), now + Duration::from_secs(30)).unwrap();
             scope.set_candidate_idle(Duration::from_secs(10)).unwrap();
@@ -372,9 +372,9 @@ mod tests {
 
     #[test]
     fn candidate_body_rate_starts_at_first_bytes_and_expiry_is_sticky() {
-        let clock = crate::runtime::environment::SimulationClock::new(93);
+        let clock = uring_runtime::environment::SimulationClock::new(93);
         let _env = clock.environment(0).enter();
-        let start = crate::runtime::environment::now();
+        let start = uring_runtime::environment::now();
         let scope =
             RequestScope::new(RequestId([93; 16]), start + Duration::from_secs(30)).unwrap();
         scope.set_candidate_idle(Duration::from_secs(10)).unwrap();
@@ -398,14 +398,14 @@ mod tests {
             scope.candidate_body_progress(usize::MAX, usize::MAX),
             Err(Error::DeadlineExceeded)
         );
-        assert!(crate::runtime::environment::now() < scope.deadline.0);
+        assert!(uring_runtime::environment::now() < scope.deadline.0);
     }
 
     #[test]
     fn candidate_idle_progress_never_renews_hard_deadline_or_revives_expiry() {
-        let clock = crate::runtime::environment::SimulationClock::new(39);
+        let clock = uring_runtime::environment::SimulationClock::new(39);
         let _env = clock.environment(0).enter();
-        let start = crate::runtime::environment::now();
+        let start = uring_runtime::environment::now();
         let scope = RequestScope::new(RequestId([39; 16]), start + Duration::from_secs(3)).unwrap();
         scope.set_candidate_idle(Duration::from_secs(1)).unwrap();
         let signed = crate::security::protocol::encode_deadline(scope.deadline).unwrap();
@@ -434,9 +434,9 @@ mod tests {
     }
     #[test]
     fn runtime_scope_retains_candidate_policy_and_shared_cancellation() {
-        let clock = crate::runtime::environment::SimulationClock::new(101);
+        let clock = uring_runtime::environment::SimulationClock::new(101);
         let _env = clock.environment(0).enter();
-        let start = crate::runtime::environment::now();
+        let start = uring_runtime::environment::now();
         let scope =
             RequestScope::new(RequestId([101; 16]), start + Duration::from_secs(30)).unwrap();
         scope

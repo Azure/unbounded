@@ -14,7 +14,6 @@ use racer_dataplane::{
         admission::AdmissionPolicy,
         crypto::{self, CryptoClient, CryptoInput, CryptoOutput},
         deadline::RequestScope,
-        reactor::IoBuffer,
         worker::{CryptoRuntime, CryptoService},
     },
     security::aead::PageCryptoEngine,
@@ -25,6 +24,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use uring_runtime::reactor::IoBuffer;
 
 const CLUSTER: &str = "11111111-1111-4111-8111-111111111111";
 const NODE: &str = "22222222-2222-4222-8222-222222222222";

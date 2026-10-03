@@ -19,7 +19,7 @@ mod metadata {
             test_support::origin::{AdapterOrigin, RequestKind},
         };
         for failure in [None, Some(502)] {
-            let clock = crate::runtime::environment::SimulationClock::new_at(
+            let clock = uring_runtime::environment::SimulationClock::new_at(
                 71,
                 Instant::now(),
                 std::time::SystemTime::now(),
@@ -1096,7 +1096,7 @@ use crate::{
     read::dispatch::WorkerDirectory,
     runtime::{
         crypto::{self, CryptoClient},
-        reactor::{IoBuffer, Reactor},
+        reactor::Reactor,
         worker::{CryptoRuntime, CryptoService, WorkerMap},
     },
     security::aead::PageCryptoEngine,
@@ -3249,3 +3249,4 @@ fn canceled_supplier_retains_crypto_fence_before_replacement_origin_work() {
     assert_eq!(f.fill.metrics.gauge(Gauge::ActiveFills), 0);
     assert_eq!(f.fill.metrics.count(Event::OriginFill), 1);
 }
+use uring_runtime::reactor::IoBuffer;

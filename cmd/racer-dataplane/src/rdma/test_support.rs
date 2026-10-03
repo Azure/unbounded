@@ -2,7 +2,6 @@ use super::{lifecycle::*, *};
 use crate::{
     http::{Header, MessageHead, StartLine},
     model::*,
-    runtime::environment,
     security::connection::{Signatures, VerifiedHead},
 };
 use std::{
@@ -154,3 +153,4 @@ pub(super) fn envelope() -> PageEnvelope {
         ciphertext_length: 32,
     }
 }
+use uring_runtime::environment;

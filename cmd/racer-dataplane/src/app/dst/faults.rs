@@ -233,7 +233,7 @@ impl Harness {
     }
 
     pub(super) fn disk_corruption(&mut self) {
-        use crate::runtime::reactor::simulation::DiskState;
+        use uring_runtime::reactor::simulation::DiskState;
         self.settle();
         let entries: Vec<_> = self
             .nodes

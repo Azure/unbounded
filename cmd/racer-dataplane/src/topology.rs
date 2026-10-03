@@ -87,7 +87,7 @@ pub mod health {
             }
         }
         pub fn observe(&self, neighbor: &NodeId, outcome: LinkOutcome) -> Result<()> {
-            self.observe_at(neighbor, outcome, crate::runtime::environment::now())
+            self.observe_at(neighbor, outcome, uring_runtime::environment::now())
         }
         pub fn observe_at(
             &self,
@@ -115,7 +115,7 @@ pub mod health {
         }
         /// Routing hint only; actual sends acquire an exclusive half-open probe.
         pub fn available(&self, neighbor: &NodeId) -> Result<bool> {
-            self.available_at(neighbor, crate::runtime::environment::now())
+            self.available_at(neighbor, uring_runtime::environment::now())
         }
         pub fn available_at(&self, neighbor: &NodeId, now: Instant) -> Result<bool> {
             if self.probes.borrow().contains(neighbor) {
@@ -126,7 +126,7 @@ pub mod health {
             }))
         }
         pub fn try_acquire(&self, neighbor: &NodeId) -> Result<bool> {
-            self.try_acquire_at(neighbor, crate::runtime::environment::now())
+            self.try_acquire_at(neighbor, uring_runtime::environment::now())
         }
         pub fn try_acquire_at(&self, neighbor: &NodeId, now: Instant) -> Result<bool> {
             if self.probes.borrow().contains(neighbor) {
@@ -179,7 +179,7 @@ pub mod health {
                 .observe_at(
                     &node,
                     LinkOutcome::Timeout,
-                    crate::runtime::environment::now() - Duration::from_secs(60),
+                    uring_runtime::environment::now() - Duration::from_secs(60),
                 )
                 .unwrap();
             let probe = health.acquire(&node).unwrap();
@@ -187,7 +187,7 @@ pub mod health {
                 !health
                     .try_acquire_at(
                         &node,
-                        crate::runtime::environment::now() + Duration::from_secs(60)
+                        uring_runtime::environment::now() + Duration::from_secs(60)
                     )
                     .unwrap()
             );
@@ -196,7 +196,7 @@ pub mod health {
                 health
                     .try_acquire_at(
                         &node,
-                        crate::runtime::environment::now() + Duration::from_secs(60)
+                        uring_runtime::environment::now() + Duration::from_secs(60)
                     )
                     .unwrap()
             );

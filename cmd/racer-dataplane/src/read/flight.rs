@@ -471,7 +471,7 @@ impl AcquisitionWaiter<'_> {
                     return Poll::Ready(Ok(AcquisitionEvent::Failed(error)));
                 }
                 if matches!(entry.phase, Phase::RetryPending) && !waiter.issued {
-                    if crate::runtime::environment::now() >= self.budget.deadline
+                    if uring_runtime::environment::now() >= self.budget.deadline
                         || (self.budget.attempts == 0 && entry.ciphertext.is_none())
                     {
                         let error = if self.budget.attempts == 0 {
@@ -699,7 +699,7 @@ impl Flights {
                     return Err(Error::Overloaded);
                 }
             }
-            if crate::runtime::environment::now() >= budget.deadline {
+            if uring_runtime::environment::now() >= budget.deadline {
                 return Err(Error::DeadlineExceeded);
             }
             if budget.attempts == 0
@@ -1190,7 +1190,7 @@ fn refresh(entry: &mut Entry, wakes: &mut Vec<Waker>) {
         let Some((&(deadline, id), _)) = entry.deadlines.first_key_value() else {
             break;
         };
-        if deadline > crate::runtime::environment::now() {
+        if deadline > uring_runtime::environment::now() {
             break;
         }
         entry.deadlines.remove(&(deadline, id));
@@ -1224,7 +1224,7 @@ fn refresh_waiter(entry: &mut Entry, id: u64, wakes: &mut Vec<Waker>) {
     };
     if waiter.error.is_none() {
         waiter.error = waiter.scope.check().err().or_else(|| {
-            (crate::runtime::environment::now() >= waiter.budget_deadline)
+            (uring_runtime::environment::now() >= waiter.budget_deadline)
                 .then_some(Error::DeadlineExceeded)
         });
     }

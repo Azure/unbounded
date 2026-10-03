@@ -426,11 +426,11 @@ impl MetadataService {
     }
 
     fn observe_clock(&self) -> Result<SystemTime> {
-        let now = crate::runtime::environment::wall_now();
+        let now = uring_runtime::environment::wall_now();
         if self
             .clock
             .borrow_mut()
-            .observe(now, crate::runtime::environment::now())
+            .observe(now, uring_runtime::environment::now())
         {
             self.storage.index.invalidate_freshness()?;
         }
@@ -485,7 +485,7 @@ impl MetadataService {
                     }
                     let driver_permit = super::drivers::reserve()?;
                     let mut nonce = [0; 16];
-                    crate::runtime::environment::fill_random(&mut nonce)
+                    uring_runtime::environment::fill_random(&mut nonce)
                         .map_err(|_| Error::Unavailable)?;
                     let attempt = crate::model::AttemptId(nonce);
                     let sealed = self.credentials.seal(context, attempt, scope)?;
@@ -680,7 +680,7 @@ impl MetadataService {
         bootstrap: bool,
     ) -> std::result::Result<RefreshOutput, RefreshFailure> {
         authority.validate(&context.object, PageNumber(0))?;
-        budget.begin_attempt(crate::runtime::environment::now(), scope.deadline.0)?;
+        budget.begin_attempt(uring_runtime::environment::now(), scope.deadline.0)?;
         let acquisition = if bootstrap && matches!(selector, MetadataSelector::Fresh) {
             let reservation = self.storage.fill.reserve_bootstrap(&context.object.cache)?;
             self.origin
