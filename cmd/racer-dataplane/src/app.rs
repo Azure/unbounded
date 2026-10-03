@@ -28,7 +28,7 @@ use crate::{
     model::{Limits, NodeId, RequestId, WorkerId},
     origin::{Origin, OriginClient},
     peer::{Relay, Requester, server::PeerServer, transport::Transfers},
-    rdma::{Devices, RdmaTransfer, Sessions},
+    rdma::{Devices, Sessions},
     read::{
         Coordinator,
         candidates::CandidatePolicy,
@@ -770,7 +770,7 @@ pub struct WorkerApplication {
     metadata: Rc<MetadataService>,
     /// Same table as Fill; the worker drives abandoned work without user futures.
     flights: Rc<Flights>,
-    rdma: Option<Rc<RdmaTransfer>>,
+    rdma: Option<Rc<Sessions>>,
     devices: Option<Rc<Devices>>,
     discovered_nics: Vec<crate::topology::rails::RailMapping>,
     actual_rails: Vec<crate::topology::rails::RailMapping>,
@@ -930,8 +930,7 @@ impl WorkerApplication {
                 devices.clone(),
                 config.limits.connections_per_neighbor.get(),
             ));
-            let transfer = Rc::new(RdmaTransfer::new(sessions.clone()));
-            (Some(sessions), Some(transfer), Some(devices))
+            (Some(sessions.clone()), Some(sessions), Some(devices))
         } else {
             (None, None, None)
         };

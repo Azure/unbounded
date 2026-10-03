@@ -1,6 +1,7 @@
 //! Pre-enrollment inventory and deterministic per-worker physical NIC selection.
-use super::{DiscoveredPort, RailId, RailMapping};
+use super::{RailId, RailMapping};
 use crate::error::{Error, Result};
+use rdma_verbs::PortInfo;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -139,7 +140,7 @@ pub fn inventory() -> Vec<RailMapping> {
     )
 }
 
-fn inventory_at(mut ports: Vec<DiscoveredPort>, root: &Path) -> Vec<RailMapping> {
+fn inventory_at(mut ports: Vec<PortInfo>, root: &Path) -> Vec<RailMapping> {
     // Names come from the native provider, not membership. Still reject path
     // components before joining sysfs paths.
     ports.retain(|p| valid_device(&p.device) && p.port != 0 && p.gid != [0; 16]);
@@ -385,7 +386,7 @@ mod tests {
             std::fs::write(dir.0.join(bdf).join("numa_node"), numa).unwrap();
             symlink(dir.0.join(bdf), dir.0.join(name).join("device")).unwrap();
         }
-        let port = |name: &str, port| DiscoveredPort {
+        let port = |name: &str, port| PortInfo {
             device: name.into(),
             port,
             gid: [1; 16],
@@ -411,7 +412,7 @@ mod tests {
     fn inventory_absence_and_unknown_numa_are_safe() {
         let root = Path::new("/nonexistent-racer-infiniband");
         assert!(inventory_at(vec![], root).is_empty());
-        let port = |device: &str, port| DiscoveredPort {
+        let port = |device: &str, port| PortInfo {
             device: device.into(),
             port,
             gid: [1; 16],

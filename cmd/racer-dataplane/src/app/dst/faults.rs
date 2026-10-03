@@ -634,9 +634,7 @@ impl Harness {
     }
 
     pub(super) fn native_fault(&mut self) {
-        use crate::rdma::lifecycle::simulation::{
-            Fault as NativeFault, Operation as NativeOperation,
-        };
+        use rdma_verbs::simulation::{Fault as NativeFault, Operation as NativeOperation};
         if self.native_rules.is_empty() {
             for op in [
                 NativeOperation::Bind,

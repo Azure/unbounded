@@ -10,7 +10,7 @@ use crate::{
         connection::{ConnectionLease, HttpPool},
     },
     model::{NodeId, ResourceClass, TransferId},
-    rdma::RdmaTransfer,
+    rdma::Sessions,
     rdma::{
         AuthenticatedDescriptor, COMPLETION_HEADER, DESCRIPTOR_HEADER, SETUP_BINDING_HEADER,
         SETUP_HEADER, SetupParameters,
@@ -224,7 +224,7 @@ mod native_exchange_tests {
         memory::BufferPool,
         model::{ExpiresAt, KeyId, Nonce, ObjectMetadata, PageEnvelope, ResourceClass, *},
         peer::protocol as p,
-        rdma::{Devices, RdmaTransfer, Sessions},
+        rdma::{Devices, Sessions},
         runtime::reactor::Reactor,
         security::connection::Signatures,
     };
@@ -243,7 +243,7 @@ mod native_exchange_tests {
     ) -> Transfers {
         let devices = Rc::new(Devices::new());
         let sessions = Rc::new(Sessions::new(devices.clone(), 2));
-        let rdma = Rc::new(RdmaTransfer::new(sessions.clone()));
+        let rdma = sessions.clone();
         let io = Rc::new(HttpIo::with_admission(
             reactor.clone(),
             Codec::new(super::super::protocol::MAX_ENVELOPE_HEAD),
@@ -645,11 +645,11 @@ mod native_exchange_tests {
         relayed: bool,
     ) {
         let reject_sender = rejected_site.is_some();
-        use crate::rdma::lifecycle::{NativeService, pair};
         use crate::topology::{
             membership::{Member, Membership},
             rails::{RailId, RailMapping},
         };
+        use rdma_verbs::{NativeService, pair};
         let device = if simulated {
             "sim-rnic".into()
         } else {
@@ -673,8 +673,8 @@ mod native_exchange_tests {
         for (i, b) in gid.iter_mut().enumerate() {
             *b = u8::from_str_radix(&text[2 * i..2 * i + 2], 16).unwrap();
         }
-        let fabric = crate::rdma::lifecycle::simulation::Simulation::new()
-            .with_devices(vec![crate::rdma::lifecycle::simulation::Device::new(
+        let fabric = rdma_verbs::simulation::Simulation::new()
+            .with_devices(vec![rdma_verbs::simulation::Device::new(
                 device.clone(),
                 gid,
             )])
@@ -702,7 +702,7 @@ mod native_exchange_tests {
             let devices = Rc::new(Devices::new());
             devices.attach(io).unwrap();
             let sessions = Rc::new(Sessions::new(devices.clone(), 2));
-            let rdma = Rc::new(RdmaTransfer::new(sessions.clone()));
+            let rdma = sessions.clone();
             let http = Rc::new(HttpIo::with_admission(
                 reactor.clone(),
                 Codec::new(super::super::protocol::MAX_ENVELOPE_HEAD),
@@ -2146,7 +2146,7 @@ pub struct Transfers {
     pub(super) native_fallbacks: std::cell::Cell<usize>,
     pub(super) http: Rc<HttpPool>,
     pub(super) io: Rc<HttpIo>,
-    pub(super) rdma: Option<Rc<RdmaTransfer>>,
+    pub(super) rdma: Option<Rc<Sessions>>,
     pub(super) wire: (Rc<flow_control::Quotas<AdmissionPolicy>>, Rc<SecurityCodec>),
     pub(super) native: Option<Rc<crate::rdma::Sessions>>,
 }
@@ -2163,7 +2163,7 @@ impl Transfers {
     pub fn new(
         http: Rc<HttpPool>,
         io: Rc<HttpIo>,
-        rdma: Option<Rc<RdmaTransfer>>,
+        rdma: Option<Rc<Sessions>>,
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         codec: Rc<SecurityCodec>,
         signatures: Rc<crate::security::connection::Signatures>,

@@ -4,21 +4,6 @@
 //! Public contracts always compile; native FFI is gated by `rdma`. Attach bounded
 //! lifecycle endpoints, activate devices against publication, and run `WithNative`
 //! on the crypto role. I/O turns consume mailboxes and drive session progress.
-#[cfg(test)]
-mod activation_tests;
-pub mod lifecycle;
-#[cfg(test)]
-mod lifecycle_tests;
-#[cfg(test)]
-mod mailbox_tests;
-#[cfg(test)]
-mod receive_tests;
-#[cfg(test)]
-mod test_support;
-
-use self::lifecycle::{
-    DeviceHandle, Endpoint, IoPort, QueuePairHandle, Region, Ticket, Window, wait,
-};
 use crate::{
     error::{Error, Operation, Result},
     memory::{BufferPool, CiphertextPage},
@@ -26,19 +11,84 @@ use crate::{
     runtime::{
         admission::AdmissionPolicy,
         deadline::{Deadline, RequestScope},
+        worker::CryptoService,
     },
-    security::connection::VerifiedHead,
+    security::{aead::PageCryptoEngine, connection::VerifiedHead},
     topology::rails::{RailId, RailMapping},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use racer_identity::VerifiedPeer;
+use rdma_verbs::{
+    DeviceHandle, Endpoint, IoPort, NativePort, NativeService, PortInfo, QueuePairHandle, Region,
+    Ticket, Window,
+};
 use sha2::{Digest, Sha256};
 use std::{
     cell::{Cell, RefCell},
     future::poll_fn,
     rc::Rc,
-    task::Poll,
+    task::{Context, Poll, Waker},
 };
+
+pub(crate) async fn wait<T, E: Into<Error>>(
+    scope: &RequestScope,
+    mut poll: impl FnMut(&mut Context<'_>) -> Poll<std::result::Result<T, E>>,
+) -> Result<T> {
+    let cancellation = scope.cancellation.subscribe()?;
+    std::future::poll_fn(|cx| {
+        cancellation.register(cx.waker());
+        scope.check()?;
+        poll(cx).map_err(Into::into)
+    })
+    .await
+}
+
+/// Compose page crypto and native progress on the existing paired crypto thread.
+pub struct WithNative {
+    inner: PageCryptoEngine,
+    native: NativeService,
+}
+impl WithNative {
+    pub fn new(inner: PageCryptoEngine, port: NativePort) -> Self {
+        Self {
+            inner,
+            native: NativeService::new(port),
+        }
+    }
+}
+impl CryptoService for WithNative {
+    fn register_driver(&self, waker: &Waker) {
+        self.inner.register_driver(waker);
+        self.native.register_driver(waker);
+    }
+    fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
+        self.inner.start(scope)
+    }
+    fn poll_budgeted(&mut self, budget: usize) -> Result<()> {
+        self.inner.poll_budgeted(budget)?;
+        self.native.poll_budgeted(budget).map_err(Into::into)
+    }
+    fn drain<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
+        Box::pin(async move {
+            self.native.close();
+            futures::future::poll_fn(|cx| -> Poll<Result<()>> {
+                self.native.register_driver(cx.waker());
+                self.native.poll_budgeted(1)?;
+                if self.native.drained() {
+                    Poll::Ready(Ok(()))
+                } else {
+                    // The worker's bounded tick retries failed native fences.
+                    Poll::Pending
+                }
+            })
+            .await?;
+            self.inner.drain(scope).await
+        })
+    }
+    fn shutdown<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
+        self.inner.shutdown(scope)
+    }
+}
 
 pub const SETUP_HEADER: &str = "racer-rdma-setup";
 pub const SETUP_BINDING_HEADER: &str = "racer-rdma-setup-binding";
@@ -805,10 +855,6 @@ mod permission_tests {
     }
 }
 
-/// Ciphertext-only movement. Failed attempts are fenced before HTTP fallback.
-pub struct RdmaTransfer {
-    sessions: Rc<Sessions>,
-}
 /// Produced only by a successful native write CQE. Sign this header as part of
 /// the request-bound HTTP control response; the ciphertext is not hashed here.
 pub struct SendCompletion {
@@ -828,19 +874,8 @@ impl Drop for AbortOnDrop {
         let _ = self.0.stop();
     }
 }
-impl RdmaTransfer {
-    pub fn register_driver(&self, waker: &std::task::Waker) {
-        self.sessions.register_driver(waker);
-    }
-    pub fn new(sessions: Rc<Sessions>) -> Self {
-        Self { sessions }
-    }
-    pub fn ready(&self, rail: RailId) -> bool {
-        self.sessions.ready(rail)
-    }
-    pub fn progress(&self) -> Result<usize> {
-        self.sessions.progress()
-    }
+/// Ciphertext-only movement. Failed attempts are fenced before HTTP fallback.
+impl Sessions {
     pub fn send_to<'a>(
         &'a self,
         session: &'a SessionLease,
@@ -933,9 +968,6 @@ impl RdmaTransfer {
             let bytes = buffer.to_vec(scope).await?;
             BufferPool::new(admission.clone()).ciphertext(reservation, envelope, bytes)
         })
-    }
-    pub fn drain(&self) -> Operation<'_, ()> {
-        self.sessions.drain()
     }
 }
 fn validate_envelope(envelope: &PageEnvelope) -> Result<()> {
@@ -1071,11 +1103,10 @@ pub struct Device {
     pub(crate) handle: Rc<DeviceHandle>,
     pub rail: RailId,
 }
-pub use rdma_verbs::PortInfo as DiscoveredPort;
 /// Match authenticated physical bindings against live eligible verbs ports.
 pub fn match_publication(
     publication: &[RailMapping],
-    discovered: &[DiscoveredPort],
+    discovered: &[PortInfo],
 ) -> Result<Vec<(RailMapping, usize)>> {
     if publication.len() > 64 || discovered.len() > 64 {
         return Err(Error::InvalidConfiguration);
@@ -1311,7 +1342,7 @@ impl Devices {
     }
 }
 #[cfg(test)]
-mod tests {
+mod publication_tests {
     use super::*;
     #[test]
     fn unconfigured_rails_require_http() {
@@ -1328,7 +1359,7 @@ mod tests {
             gid: Some([1; 16]),
             numa_node: Some(1),
         }];
-        let port = DiscoveredPort {
+        let port = PortInfo {
             device: "mlx5_0".into(),
             port: 1,
             gid: [1; 16],
@@ -1346,7 +1377,7 @@ mod tests {
         assert!(
             match_publication(
                 &publication,
-                &[DiscoveredPort {
+                &[PortInfo {
                     numa_node: Some(0),
                     ..port.clone()
                 }]
@@ -1359,3 +1390,5 @@ mod tests {
         );
     }
 }
+#[cfg(test)]
+mod tests;

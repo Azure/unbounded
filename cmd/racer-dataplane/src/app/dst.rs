@@ -119,13 +119,10 @@ mod traffic {
             }
             counts
         }
-        pub(super) fn collect_native(
-            &mut self,
-            fabric: &crate::rdma::lifecycle::simulation::Simulation,
-        ) {
+        pub(super) fn collect_native(&mut self, fabric: &rdma_verbs::simulation::Simulation) {
             for event in fabric.take_trace() {
                 self.native_writes += usize::from(
-                    event.operation == crate::rdma::lifecycle::simulation::Operation::Write
+                    event.operation == rdma_verbs::simulation::Operation::Write
                         && event.completion
                         && event.result == 0,
                 );
@@ -918,15 +915,15 @@ struct Harness {
     ca: rcgen::Certificate,
     ca_key: rcgen::KeyPair,
     clock: SimulationClock,
-    fabric: crate::rdma::lifecycle::simulation::Simulation,
+    fabric: rdma_verbs::simulation::Simulation,
     native: bool,
     key_epoch: u8,
     cache_epoch: u64,
     origin_faults: Vec<OriginFault>,
     security_faults: Vec<bool>,
     native_rules: Vec<(
-        crate::rdma::lifecycle::simulation::Operation,
-        crate::rdma::lifecycle::simulation::Fault,
+        rdma_verbs::simulation::Operation,
+        rdma_verbs::simulation::Fault,
     )>,
     payload_regression: bool,
     opaque_relay: bool,
@@ -963,7 +960,7 @@ impl Harness {
             ca,
             ca_key,
             clock,
-            fabric: crate::rdma::lifecycle::simulation::Simulation::new(),
+            fabric: rdma_verbs::simulation::Simulation::new(),
             native,
             key_epoch: 0,
             cache_epoch: 0,
@@ -1030,7 +1027,7 @@ impl Harness {
         let gid = [1 + (id % 254) as u8; 16];
         let fabric = self
             .fabric
-            .with_devices(vec![crate::rdma::lifecycle::simulation::Device::new(
+            .with_devices(vec![rdma_verbs::simulation::Device::new(
                 device.clone(),
                 gid,
             )])

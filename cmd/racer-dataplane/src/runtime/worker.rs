@@ -679,7 +679,7 @@ mod shared_tests {
         io_draining: AtomicUsize,
         shutdown: AtomicUsize,
         completed: AtomicUsize,
-        native: Mutex<Vec<crate::rdma::lifecycle::IoPort>>,
+        native: Mutex<Vec<rdma_verbs::IoPort>>,
     }
     impl Observed {
         fn event(&self, worker: WorkerId, name: &'static str) {
@@ -777,22 +777,21 @@ mod shared_tests {
             if worker.0 == 1 && self.failure == Failure::BuildCrypto {
                 return Err(Error::Unauthorized);
             }
-            let engine = Engine {
+            let page = PageCryptoEngine::new(runtime);
+            let engine: Box<dyn CryptoService> = if self.native {
+                let (io, native) = rdma_verbs::pair(1)?;
+                self.observed.native.lock().unwrap().push(io);
+                Box::new(crate::rdma::WithNative::new(page, native))
+            } else {
+                Box::new(page)
+            };
+            Ok(Box::new(Engine {
                 worker,
-                engine: PageCryptoEngine::new(runtime),
+                engine: Some(engine),
                 observed: self.observed.clone(),
                 failure: self.failure,
                 local: Rc::new(thread::current().id()),
-            };
-            if self.native {
-                let (io, native) = crate::rdma::lifecycle::pair(1)?;
-                self.observed.native.lock().unwrap().push(io);
-                Ok(Box::new(crate::rdma::lifecycle::WithNative::new(
-                    engine, native,
-                )))
-            } else {
-                Ok(Box::new(engine))
-            }
+            }))
         }
     }
 
@@ -927,7 +926,8 @@ mod shared_tests {
 
     struct Engine {
         worker: WorkerId,
-        engine: PageCryptoEngine,
+        // Observe the concrete native/page service from outside, including destruction.
+        engine: Option<Box<dyn CryptoService>>,
         observed: Arc<Observed>,
         failure: Failure,
         local: Rc<thread::ThreadId>,
@@ -935,26 +935,31 @@ mod shared_tests {
     impl Drop for Engine {
         fn drop(&mut self) {
             assert_eq!(*self.local, thread::current().id());
+            drop(self.engine.take());
             self.observed.event(self.worker, "crypto-drop");
         }
     }
     impl CryptoService for Engine {
         fn register_driver(&self, waker: &Waker) {
-            self.engine.register_driver(waker);
+            self.engine.as_ref().unwrap().register_driver(waker);
         }
-        fn start<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
-            Box::pin(std::future::poll_fn(move |_| {
-                if self.worker.0 == 1 {
-                    if self.failure == Failure::StartCrypto {
-                        return Poll::Ready(Err(Error::Unauthorized));
+        fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
+            Box::pin(async move {
+                std::future::poll_fn(|_| {
+                    if self.worker.0 == 1 {
+                        if self.failure == Failure::StartCrypto {
+                            return Poll::Ready(Err(Error::Unauthorized));
+                        }
+                        if self.failure == Failure::PendingStart {
+                            return Poll::Pending;
+                        }
                     }
-                    if self.failure == Failure::PendingStart {
-                        return Poll::Pending;
-                    }
-                }
-                self.observed.event(self.worker, "crypto-start");
-                Poll::Ready(Ok(()))
-            }))
+                    self.observed.event(self.worker, "crypto-start");
+                    Poll::Ready(Ok(()))
+                })
+                .await?;
+                self.engine.as_mut().unwrap().start(scope).await
+            })
         }
         fn poll_budgeted(&mut self, budget: usize) -> Result<()> {
             assert_eq!(*self.local, thread::current().id());
@@ -968,7 +973,7 @@ mod shared_tests {
             if self.observed.release.load(Ordering::SeqCst)
                 || self.observed.io_draining.load(Ordering::SeqCst) > 0
             {
-                self.engine.poll_budgeted(budget)?;
+                self.engine.as_mut().unwrap().poll_budgeted(budget)?;
             }
             if self.worker.0 == 1 && self.failure == Failure::PollCrypto {
                 Err(Error::Io)
@@ -1001,7 +1006,7 @@ mod shared_tests {
                     }
                 })
                 .await;
-                self.engine.drain(scope).await?;
+                self.engine.as_mut().unwrap().drain(scope).await?;
                 if self.worker.0 == 1 && self.failure == Failure::DrainCrypto {
                     Err(Error::Io)
                 } else {
@@ -1026,7 +1031,7 @@ mod shared_tests {
                     }
                 })
                 .await;
-                self.engine.shutdown(scope).await?;
+                self.engine.as_mut().unwrap().shutdown(scope).await?;
                 if self.worker.0 == 1 && self.failure == Failure::ShutdownCrypto {
                     Err(Error::Io)
                 } else {
@@ -1314,6 +1319,10 @@ mod shared_tests {
         group.start(Arc::new(factory), &scope).unwrap();
         assert_eq!(observed.native.lock().unwrap().len(), 2);
         group.drain(&scope).unwrap();
+        for io in observed.native.lock().unwrap().iter() {
+            assert!(io.closed());
+            assert!(io.pool_drained());
+        }
         group.shutdown(&scope).unwrap();
         group.join().unwrap();
         for io in observed.native.lock().unwrap().iter() {
@@ -1325,6 +1334,27 @@ mod shared_tests {
         }
         assert_eq!(observed.shutdown.load(Ordering::SeqCst), 2);
         assert_eq!(group.runtime.stats().done, 3);
+        let events = observed.events.lock().unwrap();
+        for worker in 0..2 {
+            let event = |name| {
+                events
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (id, kind, _))| *id == worker && *kind == name)
+                    .unwrap()
+            };
+            let (built, (_, _, owner)) = event("crypto-build");
+            let (drained, (_, _, drain_thread)) = event("crypto-drain");
+            let (shutdown, (_, _, shutdown_thread)) = event("crypto-shutdown");
+            let (dropped, (_, _, drop_thread)) = event("crypto-drop");
+            assert!(built < drained && drained < shutdown && shutdown < dropped);
+            assert_eq!(owner, drain_thread);
+            assert_eq!(owner, shutdown_thread);
+            assert_eq!(
+                owner, drop_thread,
+                "outer observer records completed native destruction"
+            );
+        }
     }
 }
 

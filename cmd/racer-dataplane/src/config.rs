@@ -513,7 +513,7 @@ mod tests {
     #[test]
     fn configured_ports_do_not_override_membership_or_discovered_hardware() {
         use crate::{
-            rdma::{DiscoveredPort, match_publication},
+            rdma::match_publication,
             topology::rails::{RailId, RailMapping},
         };
         let nic = RailMapping {
@@ -523,7 +523,7 @@ mod tests {
             gid: Some([1; 16]),
             numa_node: Some(9),
         };
-        let live = DiscoveredPort {
+        let live = rdma_verbs::PortInfo {
             device: "a".into(),
             port: 1,
             gid: [1; 16],
@@ -536,15 +536,15 @@ mod tests {
             Some(9)
         );
         for bad in [
-            DiscoveredPort {
+            rdma_verbs::PortInfo {
                 device: "b".into(),
                 ..live.clone()
             },
-            DiscoveredPort {
+            rdma_verbs::PortInfo {
                 port: 2,
                 ..live.clone()
             },
-            DiscoveredPort {
+            rdma_verbs::PortInfo {
                 gid: [2; 16],
                 ..live.clone()
             },
@@ -632,7 +632,7 @@ mod tests {
     }
     #[test]
     fn auto_without_ports_preserves_http_budget_explicit_true_reserves_hotplug() {
-        let sim = crate::rdma::lifecycle::simulation::Simulation::new()
+        let sim = rdma_verbs::simulation::Simulation::new()
             .with_devices(vec![])
             .unwrap();
         let _environment = sim.enter();

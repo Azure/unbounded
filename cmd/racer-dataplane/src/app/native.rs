@@ -1,7 +1,8 @@
 //! Native lifecycle endpoints remain per I/O shard, even with shared crypto threads.
 use super::*;
-use crate::rdma::lifecycle::{IoPort, NativePort, WithNative};
+use crate::rdma::WithNative;
 use crate::runtime::collections::HashMap;
+use rdma_verbs::{IoPort, NativePort};
 
 #[derive(Default)]
 pub(super) struct NativePairs {
@@ -59,7 +60,7 @@ impl NativePairs {
         }
         let mut ports = self.ports.lock().map_err(|_| Error::Unavailable)?;
         for worker in workers {
-            let (io, native) = crate::rdma::lifecycle::pair(slots)?;
+            let (io, native) = rdma_verbs::pair(slots)?;
             ports.insert(
                 worker,
                 NativePair {
@@ -217,7 +218,7 @@ mod tests {
 
     #[test]
     fn shared_inventory_recovers_new_hardware_and_revokes_removed_or_changed_ports() {
-        use crate::rdma::lifecycle::simulation::{Device, Simulation};
+        use rdma_verbs::simulation::{Device, Simulation};
         let sim = Simulation::new()
             .with_devices(vec![
                 Device::new("missing", [1; 16]),
@@ -824,7 +825,7 @@ mod tests {
 
     #[test]
     fn native_worker_selects_only_funded_local_rails_and_recovers() {
-        use crate::rdma::lifecycle::simulation::{Device, Simulation};
+        use rdma_verbs::simulation::{Device, Simulation};
         let sim = Simulation::new();
         let simulated = sim
             .with_devices(vec![Device::new("test-device", [1; 16])])

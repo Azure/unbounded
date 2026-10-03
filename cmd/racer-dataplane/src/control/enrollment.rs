@@ -560,7 +560,7 @@ impl LocalSigningIdentity {
 mod tests {
     #[test]
     fn enrollment_and_renewal_refresh_authenticated_physical_inventory() {
-        use crate::rdma::lifecycle::simulation::{Device, Simulation};
+        use rdma_verbs::simulation::{Device, Simulation};
         let enrollment = super::Enrollment::new(
             crate::model::ClusterId("11111111-1111-4111-8111-111111111111".into()),
             "/unused/token".into(),
@@ -859,7 +859,7 @@ mod tests {
     }
     #[test]
     fn durable_rail_journal_prevents_restart_renumbering_and_corruption_fails_closed() {
-        use crate::rdma::lifecycle::simulation::{Device, Simulation};
+        use rdma_verbs::simulation::{Device, Simulation};
         let Some(r) = testing::reactor() else { return };
         let scope = testing::scope();
         let directory = testing::Directory::new();
@@ -897,16 +897,14 @@ mod tests {
     #[test]
     fn saturated_rail_journal_still_persists_and_enrolls_known_ports() {
         use crate::{
-            rdma::{
-                discovery::{Inventory, MAX_JOURNAL_BYTES},
-                lifecycle::simulation::{Device, Simulation},
-            },
+            rdma::discovery::{Inventory, MAX_JOURNAL_BYTES},
             topology::rails::{RailId, RailMapping},
         };
         let Some(r) = testing::reactor() else { return };
         let scope = testing::scope();
         let directory = testing::Directory::new();
         let inventory = Inventory::shared();
+        use rdma_verbs::simulation::{Device, Simulation};
         let name = |i| format!("{i:04}{}", "x".repeat(59));
         for batch in 0..20 {
             inventory
