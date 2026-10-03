@@ -86,11 +86,11 @@ impl EffectiveTopology {
                         &["cpuset.effective_cpus", "cpuset.cpus"]
                     };
                     for name in names {
-                        if let Some(value) = optional_text(&directory.join(name))? {
-                            if !value.trim().is_empty() {
-                                let set = parse_cpu_list(&value)?;
-                                allowed.retain(|cpu| set.contains(cpu));
-                            }
+                        if let Some(value) = optional_text(&directory.join(name))?
+                            && !value.trim().is_empty()
+                        {
+                            let set = parse_cpu_list(&value)?;
+                            allowed.retain(|cpu| set.contains(cpu));
                         }
                     }
                 }
@@ -206,13 +206,13 @@ fn parse_v1_quota(quota: &str, period: &str) -> Result<Option<CpuQuota>> {
 }
 
 fn tighten_quota(current: &mut Option<CpuQuota>, candidate: Option<CpuQuota>) {
-    if let Some(candidate) = candidate {
-        if current.is_none_or(|old| {
+    if let Some(candidate) = candidate
+        && current.is_none_or(|old| {
             u128::from(candidate.quota.get()) * u128::from(old.period.get())
                 < u128::from(old.quota.get()) * u128::from(candidate.period.get())
-        }) {
-            *current = Some(candidate);
-        }
+        })
+    {
+        *current = Some(candidate);
     }
 }
 

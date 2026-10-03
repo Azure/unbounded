@@ -73,6 +73,68 @@ mod completion {
     use super::*;
 
     #[test]
+    fn finish_releases_slot_and_waker_borrow_before_result_destruction() {
+        struct Probe {
+            signal: Rc<Signal>,
+            drops: Rc<Cell<usize>>,
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                assert!(self.signal.waker.try_borrow_mut().unwrap().is_none());
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+        for abandoned in [false, true] {
+            let reactor = kernel_reactor(1).expect("real io_uring finish ownership");
+            let signal = Rc::new(RefCell::new(None::<Rc<Signal>>));
+            let finish_signal = signal.clone();
+            let drops = Rc::new(Cell::new(0));
+            let finish_drops = drops.clone();
+            let ordinary = reactor.ordinary.clone();
+            let waiting = reactor
+                .submit(
+                    Submission::Real(opcode::Nop::new().build()),
+                    &scope(),
+                    false,
+                    move |result| {
+                        assert_eq!(ordinary.get(), 0, "slot released before finish");
+                        match result {
+                            Ok(result) => assert_eq!(result.value(), Ok(0)),
+                            Err(error) => {
+                                assert!(abandoned);
+                                assert_eq!(error, Error::Cancelled);
+                            }
+                        }
+                        Ok(Probe {
+                            signal: finish_signal.borrow().as_ref().unwrap().clone(),
+                            drops: finish_drops,
+                        })
+                    },
+                )
+                .unwrap();
+            *signal.borrow_mut() = Some(waiting.signal.clone());
+            let counter = Arc::new(Count::default());
+            *waiting.signal.waker.borrow_mut() = Some(Waker::from(counter.clone()));
+            let reply = waiting.reply.clone();
+            let mut waiting = Some(waiting);
+            if abandoned {
+                drop(waiting.take());
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while reactor.in_flight() != 0 {
+                assert!(Instant::now() < deadline);
+                reactor.poll_budgeted(1).unwrap();
+                reactor.wait(Duration::from_millis(1)).unwrap();
+            }
+            assert_eq!(drops.get(), usize::from(abandoned));
+            assert_eq!(counter.0.load(Ordering::Relaxed), usize::from(!abandoned));
+            assert_eq!(reply.borrow().result.is_some(), !abandoned);
+            drop(reply.borrow_mut().result.take());
+            assert_eq!(drops.get(), 1);
+        }
+    }
+
+    #[test]
     fn connecting_lease_survives_abandonment_until_kernel_fence() {
         let Some(reactor) = kernel_reactor(4) else {
             return;
@@ -289,7 +351,7 @@ mod completion {
             let drops = Rc::new(Cell::new(0));
             let owned = InFlight {
                 file: fd,
-                buffer: Buffer(vec![0; 32].into(), drops.clone()),
+                buffer: Buffer(vec![0; 32], drops.clone()),
                 lease: Lease(drops.clone()),
             };
             let signal = Rc::new(Signal {
@@ -575,7 +637,7 @@ mod empty_submit_tests {
         let drops = Rc::new(Cell::new(0));
         let mut receive = reactor.recv(
             Rc::new(Descriptor::from(socket)),
-            Buffer(vec![0; 1].into(), drops.clone()),
+            Buffer(vec![0; 1], drops.clone()),
             Lease(drops.clone()),
             &request,
         );
@@ -667,7 +729,7 @@ mod empty_submit_tests {
         let drops = Rc::new(Cell::new(0));
         let mut receive = reactor.recv(
             Rc::new(Descriptor::from(socket)),
-            Buffer(vec![0; 1].into(), drops.clone()),
+            Buffer(vec![0; 1], drops.clone()),
             Lease(drops.clone()),
             &request,
         );
@@ -756,7 +818,7 @@ mod socket {
         assert_eq!(reactor.poll_budgeted(8).unwrap(), 0);
         let mut receive = reactor.recv(
             fd,
-            Buffer(vec![0; 1].into(), drops.clone()),
+            Buffer(vec![0; 1], drops.clone()),
             Lease(drops.clone()),
             &request,
         );
@@ -918,7 +980,7 @@ mod socket {
         let drops = Rc::new(Cell::new(0));
         let mut receive = reactor.recv(
             fd.clone(),
-            Buffer(vec![0; 32].into(), drops.clone()),
+            Buffer(vec![0; 32], drops.clone()),
             Lease(drops.clone()),
             &scope,
         );

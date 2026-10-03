@@ -3097,10 +3097,7 @@ impl Driver {
                             } | Op::Poll { .. }
                                 | Op::Accept(_)
                                 | Op::Connect { .. }
-                        ) =>
-                {
-                    ()
-                }
+                        ) => {}
                 result => {
                     let result = result.unwrap_or_else(|error| {
                         KernelResult::Value(-error.raw_os_error().unwrap_or(libc::EIO))

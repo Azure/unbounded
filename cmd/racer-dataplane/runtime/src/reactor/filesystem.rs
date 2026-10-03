@@ -70,7 +70,8 @@ mod partial_tests {
         assert_eq!(r.in_flight(), 1);
         drop(open);
         assert!(r.admission.used(ResourceClass::RequestContext) > baseline);
-        drive(&r, r.file_fence(scope.request)).unwrap();
+        let () = scope.request;
+        drive(&r, r.file_fence(())).unwrap();
         assert_eq!(r.in_flight(), 0);
         assert_eq!(r.admission.used(ResourceClass::RequestContext), baseline);
         let fd = drive(
@@ -90,7 +91,8 @@ mod partial_tests {
         scope.cancel().unwrap();
         drop(stat);
         assert!(weak.upgrade().is_some());
-        drive(&r, r.file_fence(scope.request)).unwrap();
+        let () = scope.request;
+        drive(&r, r.file_fence(())).unwrap();
         assert!(weak.upgrade().is_none());
         assert_eq!(r.admission.used(ResourceClass::RequestContext), baseline);
     }
@@ -377,7 +379,8 @@ mod buffer_tests {
         drop(abandoned);
         // Dropping does not reclaim kernel-owned operation metadata.
         assert!(r.admission.used(ResourceClass::RequestContext) > baseline);
-        drive(&r, r.file_fence(scope.request)).unwrap();
+        let () = scope.request;
+        drive(&r, r.file_fence(())).unwrap();
         assert_eq!(r.in_flight(), 0);
         assert_eq!(r.admission.used(ResourceClass::RequestContext), baseline);
         let fd = drive(&r, r.file_open(None, filename(), libc::O_RDONLY, 0, &scope)).unwrap();

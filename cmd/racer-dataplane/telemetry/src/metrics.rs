@@ -304,7 +304,8 @@ mod tests {
         let reader = workers[0].clone();
         let barrier = Arc::new(std::sync::Barrier::new(5));
         std::thread::scope(|scope| {
-            for worker in workers.iter().chain(workers.iter()).cloned() {
+            for worker in workers.iter().chain(workers.iter()) {
+                let worker = worker.clone();
                 let barrier = barrier.clone();
                 scope.spawn(move || {
                     barrier.wait();

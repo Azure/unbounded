@@ -291,10 +291,10 @@ enum KernelResult {
 
 impl KernelResult {
     fn observe_errno(&self, errno: &std::cell::Cell<Option<i32>>) {
-        if let Self::Value(value) = self {
-            if *value < 0 {
-                errno.set(value.checked_neg());
-            }
+        if let Self::Value(value) = self
+            && *value < 0
+        {
+            errno.set(value.checked_neg());
         }
     }
     fn value(self) -> Result<i32> {
@@ -306,9 +306,11 @@ impl KernelResult {
     }
 }
 
+type Finish<E> = Box<dyn FnOnce(Result<KernelResult, E>) -> Option<Waker>>;
+
 struct Entry<S: Scope> {
     // The finish closure owns every FD, buffer, lease and sockaddr backing.
-    finish: Box<dyn FnOnce(Result<KernelResult, S::Error>) -> Option<Waker>>,
+    finish: Finish<S::Error>,
     signal: Rc<Signal>,
     scope: S,
     original: Option<KernelResult>,
@@ -601,7 +603,9 @@ impl<S: Scope, Q: Budget> Reactor<S, Q> {
                     if !notify.abandoned.get() {
                         output.borrow_mut().result = Some(result);
                     }
-                    let waker = notify.waker.borrow_mut().take();
+                    let mut pending_waker = notify.waker.borrow_mut();
+                    let waker = pending_waker.take();
+                    drop(pending_waker);
                     waker
                 }),
                 signal: signal.clone(),

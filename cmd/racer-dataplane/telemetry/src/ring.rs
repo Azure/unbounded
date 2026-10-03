@@ -172,8 +172,10 @@ mod tests {
         one.push(1);
         one.push(2);
         assert_eq!(one.iter().collect::<Vec<_>>(), [(2, 2)]);
-        let mut ring = Ring::<u8, 2>::default();
-        ring.total = u64::MAX - 1;
+        let mut ring = Ring::<u8, 2> {
+            total: u64::MAX - 1,
+            ..Default::default()
+        };
         for value in 1..=4 {
             ring.push(value);
         }
