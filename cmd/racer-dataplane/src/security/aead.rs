@@ -3,7 +3,7 @@ use super::identity::{KeyPurpose, Keyring};
 use crate::{
     error::{Error, Operation, Result},
     memory::pool::{CiphertextBytes, CiphertextPage, PlaintextBuffer, VerifiedBytes, VerifiedPage},
-    model::{Nonce, PageEnvelope, PageId, ResourceClass},
+    model::{Nonce, PageEnvelope, PageId, RequestId, ResourceClass},
     runtime::{
         admission::AdmissionPolicy,
         crypto::{
@@ -14,6 +14,7 @@ use crate::{
         reactor::IoBuffer,
         worker::{CryptoRuntime, CryptoService},
     },
+    telemetry::failures::{AeadFailure, Failure, Stage},
 };
 use racer_crypto::aead;
 use std::{
@@ -54,6 +55,41 @@ pub fn page_aad(envelope: &PageEnvelope) -> Result<Vec<u8>> {
     out.extend_from_slice(&envelope.ciphertext_length.to_be_bytes());
     Ok(out)
 }
+/// Called only on crypto for exact AEAD rejects or opt-in send samples. Reuses
+/// the CRC already initialized by verify_checksum; never scans payload bytes.
+pub(crate) fn capture_aead_failure(
+    ciphertext: &CiphertextPage,
+    aad: &[u8],
+    request: RequestId,
+) -> AeadFailure {
+    use sha2::{Digest, Sha256};
+    let envelope = ciphertext.envelope();
+    let mut hash = Sha256::new();
+    hash.update(b"racer/diagnostic/page/v1\0");
+    for field in [
+        envelope.page.version.object.cache.0.as_bytes(),
+        &envelope.page.version.object.key.0,
+        envelope.page.version.etag.as_bytes(),
+        &envelope.page.number.0.to_be_bytes(),
+    ] {
+        hash.update((field.len() as u64).to_be_bytes());
+        hash.update(field);
+    }
+    AeadFailure {
+        unix_millis: Failure::new(Stage::PeerDecode, Error::CorruptRecord).unix_millis,
+        request,
+        peer: ciphertext.provenance,
+        page: hash.finalize().into(),
+        number: envelope.page.number.0,
+        key: envelope.key_id.0,
+        nonce: envelope.nonce.0,
+        plaintext: envelope.plaintext_length,
+        ciphertext: envelope.ciphertext_length,
+        aad: Sha256::digest(aad).into(),
+        crc: ciphertext.cached_checksum(),
+    }
+}
+
 pub struct PageCrypto {
     keys: Rc<Keyring>,
     client: Rc<CryptoClient>,
@@ -226,11 +262,7 @@ impl PageCryptoEngine {
         if let Some(sample) = &mut permit.send_sample {
             if let CryptoInput::Checksum { ciphertext } = &input {
                 if let Ok(aad) = page_aad(ciphertext.envelope()) {
-                    sample.facts = Some(crate::telemetry::failures::AeadFailure::capture(
-                        ciphertext,
-                        &aad,
-                        scope.request,
-                    ));
+                    sample.facts = Some(capture_aead_failure(ciphertext, &aad, scope.request));
                 }
             }
         }
@@ -350,11 +382,8 @@ impl PageCryptoEngine {
                 )
                 .map_err(|_| {
                     permit.rejected(IntegrityRejection::Aead);
-                    permit.aead_failure = Some(crate::telemetry::failures::AeadFailure::capture(
-                        ciphertext,
-                        &aad,
-                        scope.request,
-                    ));
+                    permit.aead_failure =
+                        Some(capture_aead_failure(ciphertext, &aad, scope.request));
                     Error::CorruptRecord
                 })?;
                 (envelope.clone(), bytes)

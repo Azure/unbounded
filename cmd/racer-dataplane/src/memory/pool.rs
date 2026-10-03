@@ -406,33 +406,70 @@ pub(crate) mod tests {
     }
     #[test]
     fn aead_fingerprints_reuse_crc_and_separate_body_from_identity() {
-        use crate::{model::RequestId, telemetry::failures::AeadFailure};
+        use crate::{model::RequestId, security::aead::capture_aead_failure};
         let admission = admission(8);
         let mut page = bundle(&admission, "sensitive-etag");
         let request = RequestId([9; 16]);
         let capture = |p: &CiphertextPage| {
-            // This fixture's cache is not a UUID, so encode a small stand-in AAD.
+            // Use a small stand-in AAD to isolate diagnostic fingerprinting.
             // Production passes the already validated canonical page_aad bytes.
             let mut aad = p.envelope().nonce.0.to_vec();
             aad.extend_from_slice(p.envelope().page.version.etag.as_bytes());
-            AeadFailure::capture(p, &aad, request)
+            capture_aead_failure(p, &aad, request)
         };
         assert_eq!(page.ciphertext.cached_checksum(), None);
         assert_eq!(capture(&page.ciphertext).crc, None);
+        assert_eq!(capture(&page.ciphertext).peer, None);
         assert_eq!(
             page.ciphertext.cached_checksum(),
             None,
             "capture must not hash payload"
         );
+        let provenance = crate::telemetry::failures::PeerProvenance {
+            request: RequestId([3; 16]),
+            attempt: crate::model::AttemptId([4; 16]),
+            supplier: [b'a'; 36],
+            remote: [b'b'; 36],
+        };
+        page.ciphertext.provenance = Some(provenance);
         page.ciphertext.verify_checksum().unwrap();
         let first = capture(&page.ciphertext);
         let repeat = capture(&page.ciphertext);
+        // Frozen SHA-256 vectors include the domain, u64 field lengths, exact
+        // quoted ETag and page number. The AAD fingerprint hashes exact bytes.
+        let hex = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        assert_eq!(
+            hex(&first.page),
+            "c862fae4132569c58e99bb681cc7e9907ea20a693ea6760bf1ea5fcf7224243e"
+        );
+        assert_eq!(
+            hex(&first.aad),
+            "611dfd441fbad13fcb7e6e98a61a2704e30651ca1f2353acdc32906dd8ae3122"
+        );
+        assert_eq!(first.request, request);
+        assert_eq!(first.peer, Some(provenance));
+        assert_eq!(first.number, 0);
+        assert_eq!(first.key, page.ciphertext.envelope().key_id.0);
+        assert_eq!(first.nonce, [2; 24]);
+        assert_eq!((first.plaintext, first.ciphertext), (3, 19));
+        assert_eq!(
+            first.crc,
+            Some(racer_crypto::crc64(page.ciphertext.bytes()))
+        );
         assert_eq!(first.page, repeat.page);
         assert_eq!(first.aad, repeat.aad);
         assert_eq!(first.crc, repeat.crc);
         let inner = Arc::get_mut(&mut page.ciphertext.inner).unwrap();
         inner.bytes[0] ^= 1;
-        inner.checksum = std::sync::OnceLock::new();
+        assert_eq!(page.ciphertext.verify_checksum(), Err(Error::CorruptRecord));
+        assert_eq!(capture(&page.ciphertext).crc, first.crc);
+        assert_eq!(page.ciphertext.cached_checksum(), first.crc);
+        Arc::get_mut(&mut page.ciphertext.inner).unwrap().checksum = std::sync::OnceLock::new();
         page.ciphertext.verify_checksum().unwrap();
         let changed = capture(&page.ciphertext);
         assert_ne!(first.crc, changed.crc);
@@ -460,6 +497,12 @@ pub(crate) mod tests {
         failures.write_aead(&mut text).unwrap();
         assert!(!text.contains("sensitive-etag"));
         assert!(!text.contains(&page.ciphertext.envelope().page.version.object.key.to_hex()));
+        drop(page);
+        assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+        assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+        let mut retained = String::new();
+        failures.write_aead(&mut retained).unwrap();
+        assert_eq!(retained, text, "diagnostic facts do not retain page owners");
     }
     #[test]
     fn plaintext_is_stable_zeroed_and_reservation_backed() {

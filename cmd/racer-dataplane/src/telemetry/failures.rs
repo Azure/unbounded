@@ -80,40 +80,6 @@ impl AeadFailure {
             None => write!(out, " crc=none"),
         }
     }
-    /// Called only on crypto for exact AEAD rejects or opt-in send samples. Reuses
-    /// the CRC already initialized by verify_checksum; never scans payload bytes.
-    pub(crate) fn capture(
-        ciphertext: &crate::memory::pool::CiphertextPage,
-        aad: &[u8],
-        request: RequestId,
-    ) -> Self {
-        use sha2::{Digest, Sha256};
-        let envelope = ciphertext.envelope();
-        let mut hash = Sha256::new();
-        hash.update(b"racer/diagnostic/page/v1\0");
-        for field in [
-            envelope.page.version.object.cache.0.as_bytes(),
-            &envelope.page.version.object.key.0,
-            envelope.page.version.etag.as_bytes(),
-            &envelope.page.number.0.to_be_bytes(),
-        ] {
-            hash.update((field.len() as u64).to_be_bytes());
-            hash.update(field);
-        }
-        Self {
-            unix_millis: Failure::new(Stage::PeerDecode, Error::CorruptRecord).unix_millis,
-            request,
-            peer: ciphertext.provenance,
-            page: hash.finalize().into(),
-            number: envelope.page.number.0,
-            key: envelope.key_id.0,
-            nonce: envelope.nonce.0,
-            plaintext: envelope.plaintext_length,
-            ciphertext: envelope.ciphertext_length,
-            aad: Sha256::digest(aad).into(),
-            crc: ciphertext.cached_checksum(),
-        }
-    }
 }
 
 type AeadRing = Ring<(crate::runtime::crypto::CryptoId, AeadFailure), AEAD_CAPACITY>;
