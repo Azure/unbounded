@@ -13,7 +13,7 @@ use racer_dataplane::{
         ByteRange, CacheId, CacheKey, ExpiresAt, Limits, ObjectId, ObjectMetadata, ObjectVersion,
         PageId, PageNumber, RequestId, StrongEtag,
     },
-    origin::{metadata, page},
+    origin::{validate_bootstrap, validate_metadata, validate_page},
     read::ReadResponse,
     runtime::{admission::AdmissionPolicy, deadline::RequestScope, reactor::Reactor},
 };
@@ -464,7 +464,7 @@ fn raw_uds_origin_metadata_canonical_numbers_and_strong_etags() {
             "HEAD",
         )
         .unwrap();
-        let metadata = metadata::validate(&head, &object()).unwrap();
+        let metadata = validate_metadata(&head, &object()).unwrap();
         assert_eq!(metadata.length.to_string(), number);
         assert_eq!(
             metadata.expires_at.to_unix_millis().unwrap().to_string(),
@@ -484,7 +484,7 @@ fn raw_uds_origin_metadata_canonical_numbers_and_strong_etags() {
                 )),
                 "HEAD",
             )
-            .and_then(|head| metadata::validate(&head, &object()));
+            .and_then(|head| validate_metadata(&head, &object()));
             assert!(result.is_err(), "accepted {field}: {value}");
         }
     }
@@ -496,7 +496,7 @@ fn raw_uds_origin_metadata_canonical_numbers_and_strong_etags() {
             "HEAD",
         )
         .unwrap();
-        assert_eq!(metadata::validate(&head, &object()), Err(Error::BadGateway));
+        assert_eq!(validate_metadata(&head, &object()), Err(Error::BadGateway));
     }
 }
 
@@ -511,7 +511,7 @@ fn raw_uds_origin_expiry_rejects_noncanonical_whitespace() {
         )
         .unwrap();
         assert_eq!(
-            metadata::validate(&head, &object()),
+            validate_metadata(&head, &object()),
             Err(Error::BadGateway),
             "expiry whitespace normalized"
         );
@@ -521,10 +521,7 @@ fn raw_uds_origin_expiry_rejects_noncanonical_whitespace() {
 #[test]
 fn raw_uds_origin_bootstrap_and_aligned_final_page() {
     let empty = raw_response(head_response("Content-Length: 0\r\nContent-Type: application/octet-stream\r\nETag: \"v\"\r\nRacer-Expires-At: 0\r\n"), "GET").unwrap();
-    assert_eq!(
-        metadata::validate_bootstrap(&empty, &object()).unwrap().1,
-        0
-    );
+    assert_eq!(validate_bootstrap(&empty, &object()).unwrap().1, 0);
     let page = PageId {
         version: ObjectVersion {
             object: object(),
@@ -541,10 +538,10 @@ fn raw_uds_origin_bootstrap_and_aligned_final_page() {
     ] {
         let raw = format!("HTTP/1.1 {status} Result\r\nContent-Length: {length}\r\nContent-Type: application/octet-stream\r\nContent-Range: {range}\r\nETag: {tag}\r\nRacer-Expires-At: 0\r\n\r\n").into_bytes();
         let head = raw_response(raw, "GET").unwrap();
-        assert_eq!(page::validate(&head, &page, length).is_ok(), valid);
+        assert_eq!(validate_page(&head, &page, length).is_ok(), valid);
         if valid {
             assert_eq!(
-                page::validate(&head, &page, length - 1),
+                validate_page(&head, &page, length - 1),
                 Err(Error::BadGateway)
             );
         }
@@ -592,7 +589,7 @@ fn raw_uds_origin_response_singletons_statuses_and_error_framing() {
             "HEAD",
         )
         .unwrap();
-        let expected = metadata::validate(&base, &object());
+        let expected = validate_metadata(&base, &object());
         assert!(
             expected.is_ok()
                 || matches!(
@@ -603,7 +600,7 @@ fn raw_uds_origin_response_singletons_statuses_and_error_framing() {
         fields.push_str(&format!("{}: {value}\r\n", name.to_ascii_lowercase()));
         let raw = format!("HTTP/1.1 {status} Result\r\n{fields}\r\n").into_bytes();
         assert!(matches!(
-            raw_response(raw, "HEAD").and_then(|h| metadata::validate(&h, &object())),
+            raw_response(raw, "HEAD").and_then(|h| validate_metadata(&h, &object())),
             Err(Error::InvalidRequest | Error::BadGateway)
         ));
     }
@@ -629,7 +626,7 @@ fn raw_uds_origin_response_singletons_statuses_and_error_framing() {
         let raw =
             format!("HTTP/1.1 {status} Result\r\nContent-Length: 0\r\n{extra}\r\n").into_bytes();
         let head = raw_response(raw, "HEAD").unwrap();
-        assert_eq!(metadata::validate(&head, &object()), Err(expected));
+        assert_eq!(validate_metadata(&head, &object()), Err(expected));
     }
     for fields in [
         "Content-Length: 1\r\n",
@@ -641,7 +638,7 @@ fn raw_uds_origin_response_singletons_statuses_and_error_framing() {
         let raw = format!("HTTP/1.1 503 Result\r\n{fields}\r\n").into_bytes();
         assert!(
             raw_response(raw, "HEAD")
-                .and_then(|h| metadata::validate(&h, &object()))
+                .and_then(|h| validate_metadata(&h, &object()))
                 .is_err()
         );
     }
@@ -1381,10 +1378,10 @@ mod sdk {
                     head.unique("Racer-Content-Type").unwrap(),
                     Some(b"text/plain".as_slice())
                 );
-                assert_eq!(metadata::validate(&head, &object()).unwrap().length, 3);
+                assert_eq!(validate_metadata(&head, &object()).unwrap().length, 3);
             } else if !fields.contains("If-Match") {
                 assert_eq!(
-                    metadata::validate_bootstrap(&head, &object()).unwrap().1,
+                    validate_bootstrap(&head, &object()).unwrap().1,
                     if key == 1 { 0 } else { 3 }
                 );
             } else {
@@ -1395,7 +1392,7 @@ mod sdk {
                     },
                     number: PageNumber(0),
                 };
-                assert_eq!(page::validate(&head, &page, 3).unwrap().length, 3);
+                assert_eq!(validate_page(&head, &page, 3).unwrap().length, 3);
             }
         }
         child.0.stdin.take().unwrap().write_all(b"x").unwrap();
@@ -1436,10 +1433,7 @@ fn raw_uds_fixed_body_is_not_scanned_for_heads_and_short_eof_is_failure() {
                 .unwrap();
             let sent = rig.io.send_head(rig.lease(local), head, &scope).await?;
             let received = rig.io.receive_head(sent.connection, &scope).await?;
-            assert_eq!(
-                metadata::validate_bootstrap(&received.value, &object())?.1,
-                9
-            );
+            assert_eq!(validate_bootstrap(&received.value, &object())?.1, 9);
             let mut connection = received.connection;
             let mut body = Vec::new();
             while body.len() < 9 {
@@ -1592,8 +1586,7 @@ fn raw_uds_response_limit_and_informational_rejection() {
         let base = head_response(&format!("{fields}\r\n")).len();
         let raw = head_response(&format!("{fields}{}\r\n", "x".repeat(length - base)));
         assert_eq!(raw.len(), length);
-        let result =
-            raw_response(raw, "HEAD").and_then(|head| metadata::validate(&head, &object()));
+        let result = raw_response(raw, "HEAD").and_then(|head| validate_metadata(&head, &object()));
         assert_eq!(result.is_ok(), length == LIMIT);
     }
     for status in [100, 101, 103] {

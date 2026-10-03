@@ -41,9 +41,8 @@ use racer_dataplane::{
         forwarding::Forwarding,
     },
     store::{
-        StoreReader,
+        StoreReader, StoreWriter,
         catalog::{Index, SegmentClock},
-        writer::StoreWriter,
     },
     topology::{
         health::LinkHealth,

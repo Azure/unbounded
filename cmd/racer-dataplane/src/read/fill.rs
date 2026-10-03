@@ -26,7 +26,7 @@ use crate::{
         deadline::RequestScope,
     },
     security::{aead::PageCrypto, credentials::CredentialCrypto},
-    store::{StoreReader, writer::StoreWriter},
+    store::{StoreReader, StoreWriter},
     telemetry::metrics::{Event, Gauge, LookupTier, Metrics},
     topology::membership::MembershipLease,
 };
@@ -403,7 +403,7 @@ impl Fill {
     /// plaintext is dropped. Only the elected supplier encrypts/publishes it.
     pub fn publish_bootstrap_with_context<'a>(
         &'a self,
-        origin: crate::origin::page::OriginPage,
+        origin: crate::origin::OriginPage,
         membership: MembershipLease,
         context: &'a OriginContext,
         scope: &'a RequestScope,
@@ -440,7 +440,7 @@ impl Fill {
         context: &'a OriginContext,
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
-        mut prefetch: Option<crate::origin::page::OriginPage>,
+        mut prefetch: Option<crate::origin::OriginPage>,
         plaintext: bool,
         guard: Option<std::sync::Arc<super::subscription::FixedAcquisition>>,
     ) -> Operation<'a, AcquiredPage> {
@@ -508,7 +508,7 @@ impl Fill {
         page: &PageId,
         leader: FlightLeader,
         waiter: &mut AcquisitionWaiter<'_>,
-        prefetch: &mut Option<crate::origin::page::OriginPage>,
+        prefetch: &mut Option<crate::origin::OriginPage>,
         plaintext: bool,
         completion_guard: Option<Arc<super::subscription::FixedAcquisition>>,
     ) -> Result<()> {
@@ -644,7 +644,7 @@ impl Fill {
 
     async fn admit_bootstrap(
         &self,
-        origin: crate::origin::page::OriginPage,
+        origin: crate::origin::OriginPage,
         page: &PageId,
         membership: MembershipLease,
         scope: &RequestScope,
@@ -1168,7 +1168,7 @@ impl Fill {
     async fn encrypt_origin_page(
         &self,
         page: &PageId,
-        origin: crate::origin::page::OriginPage,
+        origin: crate::origin::OriginPage,
         ciphertext: flow_control::Charge<AdmissionPolicy>,
         scope: &RequestScope,
     ) -> Result<PageResult> {

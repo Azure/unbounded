@@ -662,9 +662,8 @@ pub(crate) mod test_support {
             credentials::CredentialCrypto,
         },
         store::{
-            StoreReader,
+            StoreReader, StoreWriter,
             catalog::{Index, SegmentClock},
-            writer::StoreWriter,
         },
         test_support::origin::AdapterOrigin,
         topology::{membership::Member, placement::Placement},

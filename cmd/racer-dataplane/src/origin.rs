@@ -3,7 +3,6 @@
 //!
 //! Credentials are only origin-fetch context, never Racer authorization. Do not
 //! persist headers or retain them in pooled connections after an operation ends.
-use self::{metadata::MetadataReply, page::OriginPage};
 use crate::{
     control::state::{CacheDefinition, SnapshotStore, canonical_socket_paths},
     error::{Error, Operation, Result},
@@ -13,7 +12,10 @@ use crate::{
         connection::{ConnectionLease, Endpoint, HttpPool},
     },
     memory::pool::{BufferPool, PlaintextBuffer},
-    model::{MetadataSelector, OriginContext, PAGE_BYTES, PageId, PageNumber, ResourceClass},
+    model::{
+        MetadataSelector, ObjectId, ObjectMetadata, OriginContext, PAGE_BYTES, PageId, PageNumber,
+        ResourceClass,
+    },
     read::candidates::OriginAuthority,
     runtime::{admission::AdmissionPolicy, deadline::RequestScope},
 };
@@ -127,7 +129,7 @@ impl OriginClient {
             .receive_head_limited(sent.connection, scope, 32 * 1024)
             .await
             .map_err(response_error)?;
-        let (metadata, length) = metadata::validate_bootstrap(&response.value, &context.object)?;
+        let (metadata, length) = validate_bootstrap(&response.value, &context.object)?;
         if length == 0 {
             scope.check()?;
             response
@@ -145,7 +147,7 @@ impl OriginClient {
             version: metadata.version.clone(),
             number: PageNumber(0),
         };
-        page::validate(&response.value, &page, body.bytes)?;
+        validate_page(&response.value, &page, body.bytes)?;
         scope.check()?;
         body.lease
             .finish_exchange()
@@ -206,7 +208,7 @@ impl OriginClient {
             &response.value,
             matches!(selector, MetadataSelector::Pinned(_)),
         )?;
-        let metadata = metadata::validate(&response.value, &context.object)?;
+        let metadata = validate_metadata(&response.value, &context.object)?;
         if let MetadataSelector::Pinned(etag) = selector {
             if metadata.version.etag != etag {
                 return Err(Error::BadGateway);
@@ -269,10 +271,10 @@ impl OriginClient {
             .receive_head_limited(sent.connection, scope, 32 * 1024)
             .await
             .map_err(response_error)?;
-        let (_, length) = page::validate_head(&response.value, page)?;
+        let (_, length) = validate_page_head(&response.value, page)?;
         let buffer = buffers.plaintext(reservation, length as usize)?;
         let mut body = self.read_page(response.connection, buffer, scope).await?;
-        let metadata = page::validate(&response.value, page, body.bytes)?;
+        let metadata = validate_page(&response.value, page, body.bytes)?;
         scope.check()?;
         body.lease
             .finish_exchange()
@@ -445,311 +447,293 @@ fn opaque(bytes: &[u8]) -> Result<()> {
 mod tests;
 
 /// HEAD/initial-GET validation; empty objects produce metadata without a page.
-pub mod metadata {
-    use super::{page::OriginPage, protocol};
-    use crate::{
-        error::{Error, Result},
-        http::MessageHead,
-        model::{ObjectId, ObjectMetadata, PAGE_BYTES},
-    };
-    pub struct MetadataReply {
-        pub metadata: ObjectMetadata,
-        pub page_zero: Option<OriginPage>,
-    }
+pub struct MetadataReply {
+    pub metadata: ObjectMetadata,
+    pub page_zero: Option<OriginPage>,
+}
 
-    /// The initial GET selects metadata and page zero atomically at the adapter.
-    pub fn validate_bootstrap(
-        head: &MessageHead,
-        object: &ObjectId,
-    ) -> Result<(ObjectMetadata, u64)> {
-        let (status, length) = protocol::response(head, false)?;
-        if protocol::required(head, "Content-Type")? != b"application/octet-stream" {
-            return Err(Error::BadGateway);
-        }
-        let total = if status == 200 {
-            if length != 0 {
-                return Err(Error::BadGateway);
-            }
-            protocol::absent(head, &["Content-Range"])?;
-            0
-        } else {
-            let (first, last, total) = protocol::content_range(head)?;
-            if first != 0 || length != last + 1 || length != total.min(PAGE_BYTES) {
-                return Err(Error::BadGateway);
-            }
-            total
-        };
-        Ok((protocol::metadata(head, object, total)?, length))
+/// The initial GET selects metadata and page zero atomically at the adapter.
+pub fn validate_bootstrap(head: &MessageHead, object: &ObjectId) -> Result<(ObjectMetadata, u64)> {
+    let (status, length) = protocol::response(head, false)?;
+    if protocol::required(head, "Content-Type")? != b"application/octet-stream" {
+        return Err(Error::BadGateway);
     }
-    pub fn validate(head: &MessageHead, object: &ObjectId) -> Result<ObjectMetadata> {
-        let (status, length) = protocol::response(head, false)?;
-        if status != 200 {
+    let total = if status == 200 {
+        if length != 0 {
             return Err(Error::BadGateway);
         }
         protocol::absent(head, &["Content-Range"])?;
-        protocol::metadata(head, object, length)
+        0
+    } else {
+        let (first, last, total) = protocol::content_range(head)?;
+        if first != 0 || length != last + 1 || length != total.min(PAGE_BYTES) {
+            return Err(Error::BadGateway);
+        }
+        total
+    };
+    Ok((protocol::metadata(head, object, total)?, length))
+}
+pub fn validate_metadata(head: &MessageHead, object: &ObjectId) -> Result<ObjectMetadata> {
+    let (status, length) = protocol::response(head, false)?;
+    if status != 200 {
+        return Err(Error::BadGateway);
     }
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use crate::{
-            http::{Header, StartLine},
-            model::{CacheId, CacheKey},
-        };
-        use std::time::{Duration, UNIX_EPOCH};
+    protocol::absent(head, &["Content-Range"])?;
+    protocol::metadata(head, object, length)
+}
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use crate::{
+        http::{Header, StartLine},
+        model::{CacheId, CacheKey},
+    };
+    use std::time::{Duration, UNIX_EPOCH};
 
-        pub(super) fn object() -> ObjectId {
-            ObjectId {
-                cache: CacheId("cache-uid".into()),
-                key: CacheKey([0xab; 32]),
-            }
+    pub(super) fn object() -> ObjectId {
+        ObjectId {
+            cache: CacheId("cache-uid".into()),
+            key: CacheKey([0xab; 32]),
         }
+    }
 
-        fn head(length: &[u8], expiry: &[u8], etag: &[u8]) -> MessageHead {
-            crate::origin::tests::response_head(
-                200,
-                &[
-                    ("Content-Length", length),
-                    ("Racer-Expires-At", expiry),
-                    ("ETag", etag),
-                ],
+    fn head(length: &[u8], expiry: &[u8], etag: &[u8]) -> MessageHead {
+        crate::origin::tests::response_head(
+            200,
+            &[
+                ("Content-Length", length),
+                ("Racer-Expires-At", expiry),
+                ("ETag", etag),
+            ],
+        )
+    }
+
+    #[test]
+    fn head_retains_quoted_validator_and_exact_millisecond_expiry() {
+        let metadata = validate_metadata(&head(b"0", b"1234", b"\"v,\\1\""), &object()).unwrap();
+        assert_eq!(metadata.length, 0);
+        assert_eq!(metadata.version.etag.as_bytes(), b"\"v,\\1\"");
+        assert_eq!(
+            metadata.expires_at.as_system_time(),
+            UNIX_EPOCH + Duration::from_millis(1234)
+        );
+        assert_eq!(
+            validate_metadata(
+                &head(b"9223372036854775807", b"9223372036854775807", b"\"\""),
+                &object()
             )
-        }
+            .unwrap()
+            .length,
+            i64::MAX as u64
+        );
+    }
 
-        #[test]
-        fn head_retains_quoted_validator_and_exact_millisecond_expiry() {
-            let metadata = validate(&head(b"0", b"1234", b"\"v,\\1\""), &object()).unwrap();
-            assert_eq!(metadata.length, 0);
-            assert_eq!(metadata.version.etag.as_bytes(), b"\"v,\\1\"");
+    #[test]
+    fn metadata_rejects_ambiguous_and_out_of_domain_fields() {
+        for invalid in [
+            b"".as_slice(),
+            b"01",
+            b"-1",
+            b"+1",
+            b" 1",
+            b"1 ",
+            b"\t1",
+            b"1\t",
+            b"1.0",
+            b"9223372036854775808",
+        ] {
+            assert_eq!(protocol::decimal(invalid), Err(Error::BadGateway));
             assert_eq!(
-                metadata.expires_at.as_system_time(),
-                UNIX_EPOCH + Duration::from_millis(1234)
+                validate_metadata(&head(b"1", invalid, b"\"v\""), &object()),
+                Err(Error::BadGateway)
             );
             assert_eq!(
-                validate(
-                    &head(b"9223372036854775807", b"9223372036854775807", b"\"\""),
-                    &object()
-                )
+                validate_metadata(&head(invalid, b"0", b"\"v\""), &object()),
+                Err(Error::BadGateway)
+            );
+        }
+        for etag in [b"v".as_slice(), b"W/\"v\"", b"*", b"\"v\", \"w\""] {
+            assert_eq!(
+                validate_metadata(&head(b"1", b"0", etag), &object()),
+                Err(Error::BadGateway)
+            );
+        }
+        for name in [
+            "ETag",
+            "Content-Length",
+            "Racer-Expires-At",
+            "Content-Range",
+            "Transfer-Encoding",
+            "Content-Encoding",
+        ] {
+            let mut response = head(b"1", b"0", b"\"v\"");
+            response.headers.push(Header {
+                name: name.into(),
+                value: b"1".to_vec(),
+            });
+            assert_eq!(
+                validate_metadata(&response, &object()),
+                Err(Error::BadGateway)
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_empty_and_short_page_are_distinct_from_head() {
+        let mut response = head(b"0", b"0", b"\"v\"");
+        response.headers.push(Header {
+            name: "Content-Type".into(),
+            value: b"application/octet-stream".to_vec(),
+        });
+        assert_eq!(validate_bootstrap(&response, &object()).unwrap().1, 0);
+        response.headers[0].value = b"3".to_vec();
+        assert_eq!(
+            validate_bootstrap(&response, &object()),
+            Err(Error::BadGateway)
+        );
+        response.start = StartLine::Response { status: 206 };
+        response.headers.push(Header {
+            name: "Content-Range".into(),
+            value: b"bytes 0-2/3".to_vec(),
+        });
+        assert_eq!(
+            validate_bootstrap(&response, &object()).unwrap().0.length,
+            3
+        );
+        response.headers.last_mut().unwrap().value = b"bytes 0-2/4".to_vec();
+        assert_eq!(
+            validate_bootstrap(&response, &object()),
+            Err(Error::BadGateway)
+        );
+    }
+
+    #[test]
+    fn raw_expiry_whitespace_is_rejected_before_metadata_publication() {
+        use crate::http::Codec;
+        for expiry in ["0", " 0", "0 ", "\t0", "0\t", "0 \t"] {
+            let raw = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"v\"\r\nRacer-Expires-At: {expiry}\r\n\r\n"
+            );
+            let (head, _) = Codec::new(32768)
+                .decode_head(raw.as_bytes())
                 .unwrap()
-                .length,
-                i64::MAX as u64
-            );
-        }
-
-        #[test]
-        fn metadata_rejects_ambiguous_and_out_of_domain_fields() {
-            for invalid in [
-                b"".as_slice(),
-                b"01",
-                b"-1",
-                b"+1",
-                b" 1",
-                b"1 ",
-                b"\t1",
-                b"1\t",
-                b"1.0",
-                b"9223372036854775808",
-            ] {
-                assert_eq!(protocol::decimal(invalid), Err(Error::BadGateway));
-                assert_eq!(
-                    validate(&head(b"1", invalid, b"\"v\""), &object()),
-                    Err(Error::BadGateway)
-                );
-                assert_eq!(
-                    validate(&head(invalid, b"0", b"\"v\""), &object()),
-                    Err(Error::BadGateway)
-                );
-            }
-            for etag in [b"v".as_slice(), b"W/\"v\"", b"*", b"\"v\", \"w\""] {
-                assert_eq!(
-                    validate(&head(b"1", b"0", etag), &object()),
-                    Err(Error::BadGateway)
-                );
-            }
-            for name in [
-                "ETag",
-                "Content-Length",
-                "Racer-Expires-At",
-                "Content-Range",
-                "Transfer-Encoding",
-                "Content-Encoding",
-            ] {
-                let mut response = head(b"1", b"0", b"\"v\"");
-                response.headers.push(Header {
-                    name: name.into(),
-                    value: b"1".to_vec(),
-                });
-                assert_eq!(validate(&response, &object()), Err(Error::BadGateway));
-            }
-        }
-
-        #[test]
-        fn bootstrap_empty_and_short_page_are_distinct_from_head() {
-            let mut response = head(b"0", b"0", b"\"v\"");
-            response.headers.push(Header {
-                name: "Content-Type".into(),
-                value: b"application/octet-stream".to_vec(),
-            });
-            assert_eq!(validate_bootstrap(&response, &object()).unwrap().1, 0);
-            response.headers[0].value = b"3".to_vec();
-            assert_eq!(
-                validate_bootstrap(&response, &object()),
-                Err(Error::BadGateway)
-            );
-            response.start = StartLine::Response { status: 206 };
-            response.headers.push(Header {
-                name: "Content-Range".into(),
-                value: b"bytes 0-2/3".to_vec(),
-            });
-            assert_eq!(
-                validate_bootstrap(&response, &object()).unwrap().0.length,
-                3
-            );
-            response.headers.last_mut().unwrap().value = b"bytes 0-2/4".to_vec();
-            assert_eq!(
-                validate_bootstrap(&response, &object()),
-                Err(Error::BadGateway)
-            );
-        }
-
-        #[test]
-        fn raw_expiry_whitespace_is_rejected_before_metadata_publication() {
-            use crate::http::Codec;
-            for expiry in ["0", " 0", "0 ", "\t0", "0\t", "0 \t"] {
-                let raw = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"v\"\r\nRacer-Expires-At: {expiry}\r\n\r\n"
-                );
-                let (head, _) = Codec::new(32768)
-                    .decode_head(raw.as_bytes())
-                    .unwrap()
-                    .unwrap();
-                let result = validate(&head, &object());
-                if expiry == "0" {
-                    assert_eq!(result.unwrap().expires_at.as_system_time(), UNIX_EPOCH);
-                } else {
-                    assert_eq!(result, Err(Error::BadGateway), "expiry={expiry:?}");
-                }
+                .unwrap();
+            let result = validate_metadata(&head, &object());
+            if expiry == "0" {
+                assert_eq!(result.unwrap().expires_at.as_system_time(), UNIX_EPOCH);
+            } else {
+                assert_eq!(result, Err(Error::BadGateway), "expiry={expiry:?}");
             }
         }
     }
 }
 
 /// Conditional full-page GET validation before authenticated publication.
-pub mod page {
-    use super::protocol;
+pub struct OriginPage {
+    pub metadata: ObjectMetadata,
+    pub plaintext: PlaintextBuffer,
+}
+/// Require exact If-Match, Content-Range, whole-page length, and final-page bounds.
+/// Reject multipart, short/overlong bodies, and unexpected versions.
+pub fn validate_page(
+    head: &MessageHead,
+    page: &PageId,
+    received_bytes: usize,
+) -> Result<ObjectMetadata> {
+    let (metadata, length) = validate_page_head(head, page)?;
+    if received_bytes as u64 != length {
+        return Err(Error::BadGateway);
+    }
+    Ok(metadata)
+}
+
+/// Validate before allocating or receiving any payload.
+fn validate_page_head(head: &MessageHead, page: &PageId) -> Result<(ObjectMetadata, u64)> {
+    let (status, length) = protocol::response(head, true)?;
+    if status != 206 || protocol::required(head, "Content-Type")? != b"application/octet-stream" {
+        return Err(Error::BadGateway);
+    }
+    let (first, last, total) = protocol::content_range(head)?;
+    let expected_first = page
+        .number
+        .0
+        .checked_mul(PAGE_BYTES)
+        .ok_or(Error::InvalidRange)?;
+    if first != expected_first
+        || length != last - first + 1
+        || length != (total - first).min(PAGE_BYTES)
+    {
+        return Err(Error::BadGateway);
+    }
+    let metadata = protocol::metadata(head, &page.version.object, total)?;
+    if metadata.version != page.version {
+        return Err(Error::BadGateway);
+    }
+    Ok((metadata, length))
+}
+#[cfg(test)]
+mod page_tests {
+    use super::*;
     use crate::{
-        error::{Error, Result},
-        http::MessageHead,
-        memory::pool::PlaintextBuffer,
-        model::{ObjectMetadata, PAGE_BYTES, PageId},
+        http::StartLine,
+        model::{CacheId, CacheKey, ObjectId, ObjectVersion, PageNumber, StrongEtag},
     };
-    pub struct OriginPage {
-        pub metadata: ObjectMetadata,
-        pub plaintext: PlaintextBuffer,
-    }
-    /// Require exact If-Match, Content-Range, whole-page length, and final-page bounds.
-    /// Reject multipart, short/overlong bodies, and unexpected versions.
-    pub fn validate(
-        head: &MessageHead,
-        page: &PageId,
-        received_bytes: usize,
-    ) -> Result<ObjectMetadata> {
-        let (metadata, length) = validate_head(head, page)?;
-        if received_bytes as u64 != length {
-            return Err(Error::BadGateway);
-        }
-        Ok(metadata)
-    }
 
-    /// Validate before allocating or receiving any payload.
-    pub(super) fn validate_head(
-        head: &MessageHead,
-        page: &PageId,
-    ) -> Result<(ObjectMetadata, u64)> {
-        let (status, length) = protocol::response(head, true)?;
-        if status != 206 || protocol::required(head, "Content-Type")? != b"application/octet-stream"
-        {
-            return Err(Error::BadGateway);
-        }
-        let (first, last, total) = protocol::content_range(head)?;
-        let expected_first = page
-            .number
-            .0
-            .checked_mul(PAGE_BYTES)
-            .ok_or(Error::InvalidRange)?;
-        if first != expected_first
-            || length != last - first + 1
-            || length != (total - first).min(PAGE_BYTES)
-        {
-            return Err(Error::BadGateway);
-        }
-        let metadata = protocol::metadata(head, &page.version.object, total)?;
-        if metadata.version != page.version {
-            return Err(Error::BadGateway);
-        }
-        Ok((metadata, length))
-    }
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use crate::{
-            http::StartLine,
-            model::{CacheId, CacheKey, ObjectId, ObjectVersion, PageNumber, StrongEtag},
-        };
-
-        fn page() -> PageId {
-            PageId {
-                version: ObjectVersion {
-                    object: ObjectId {
-                        cache: CacheId("cache".into()),
-                        key: CacheKey([0; 32]),
-                    },
-                    etag: StrongEtag::parse(b"\"v\"").unwrap(),
+    fn page() -> PageId {
+        PageId {
+            version: ObjectVersion {
+                object: ObjectId {
+                    cache: CacheId("cache".into()),
+                    key: CacheKey([0; 32]),
                 },
-                number: PageNumber(1),
-            }
+                etag: StrongEtag::parse(b"\"v\"").unwrap(),
+            },
+            number: PageNumber(1),
         }
-        fn head() -> MessageHead {
-            crate::origin::tests::response_head(
-                206,
-                &[
-                    ("Content-Length", b"3"),
-                    ("Content-Type", b"application/octet-stream"),
-                    ("Content-Range", b"bytes 16777216-16777218/16777219"),
-                    ("ETag", b"\"v\""),
-                    ("Racer-Expires-At", b"0"),
-                ],
-            )
-        }
+    }
+    fn head() -> MessageHead {
+        crate::origin::tests::response_head(
+            206,
+            &[
+                ("Content-Length", b"3"),
+                ("Content-Type", b"application/octet-stream"),
+                ("Content-Range", b"bytes 16777216-16777218/16777219"),
+                ("ETag", b"\"v\""),
+                ("Racer-Expires-At", b"0"),
+            ],
+        )
+    }
 
-        #[test]
-        fn pinned_final_page_accepts_only_exact_body_range_and_version() {
-            let page = page();
-            assert_eq!(validate(&head(), &page, 3).unwrap().length, PAGE_BYTES + 3);
-            for count in [0, 2, 4, PAGE_BYTES as usize] {
-                assert_eq!(validate(&head(), &page, count), Err(Error::BadGateway));
-            }
-            for range in [
-                "bytes 0-2/3",
-                "bytes 16777216-16777218/16777220",
-                "bytes */16777219",
-                "bytes 16777216-16777219/16777219",
-                "bytes 016777216-16777218/16777219",
-            ] {
-                let mut response = head();
-                response.headers[2].value = range.as_bytes().to_vec();
-                assert_eq!(validate(&response, &page, 3), Err(Error::BadGateway));
-            }
-            let mut response = head();
-            response.headers[3].value = b"\"other\"".to_vec();
-            assert_eq!(validate(&response, &page, 3), Err(Error::BadGateway));
-            response = head();
-            response.start = StartLine::Response { status: 200 };
-            assert_eq!(validate(&response, &page, 3), Err(Error::BadGateway));
-            response = head();
-            response.headers[1].value = b"multipart/byteranges".to_vec();
-            assert_eq!(validate(&response, &page, 3), Err(Error::BadGateway));
+    #[test]
+    fn pinned_final_page_accepts_only_exact_body_range_and_version() {
+        let page = page();
+        assert_eq!(
+            validate_page(&head(), &page, 3).unwrap().length,
+            PAGE_BYTES + 3
+        );
+        for count in [0, 2, 4, PAGE_BYTES as usize] {
+            assert_eq!(validate_page(&head(), &page, count), Err(Error::BadGateway));
         }
+        for range in [
+            "bytes 0-2/3",
+            "bytes 16777216-16777218/16777220",
+            "bytes */16777219",
+            "bytes 16777216-16777219/16777219",
+            "bytes 016777216-16777218/16777219",
+        ] {
+            let mut response = head();
+            response.headers[2].value = range.as_bytes().to_vec();
+            assert_eq!(validate_page(&response, &page, 3), Err(Error::BadGateway));
+        }
+        let mut response = head();
+        response.headers[3].value = b"\"other\"".to_vec();
+        assert_eq!(validate_page(&response, &page, 3), Err(Error::BadGateway));
+        response = head();
+        response.start = StartLine::Response { status: 200 };
+        assert_eq!(validate_page(&response, &page, 3), Err(Error::BadGateway));
+        response = head();
+        response.headers[1].value = b"multipart/byteranges".to_vec();
+        assert_eq!(validate_page(&response, &page, 3), Err(Error::BadGateway));
     }
 }
 
@@ -1059,7 +1043,7 @@ mod protocol {
                         .decode_head(raw.as_bytes())
                         .map_err(|_| Error::BadGateway)
                         .and_then(|head| {
-                            super::super::metadata::validate_bootstrap(&head.unwrap().0, &object)
+                            super::super::validate_bootstrap(&head.unwrap().0, &object)
                         });
                     if prefix.is_empty() && suffix.is_empty() {
                         assert_eq!(result.unwrap().1, 1);

@@ -1,4 +1,5 @@
 use super::*;
+mod checkpoint;
 use page_alloc::{Alignment, Generation, SegmentId, SegmentState, Segments, Slab};
 mod index_pressure {
     use super::*;
@@ -305,7 +306,7 @@ impl Fixture {
             .with_metrics(metrics.clone()),
         );
         let writer = Rc::new(
-            writer::StoreWriter::new(
+            StoreWriter::new(
                 index.clone(),
                 segments.clone(),
                 slabs,
@@ -318,12 +319,16 @@ impl Fixture {
         let store = Store {
             reader,
             writer,
-            checkpoint: Rc::new(checkpoint::Checkpointer::new(
+            checkpoint: Rc::new(super::checkpoint::Checkpointer::new(
                 directory.0.clone(),
                 index.clone(),
                 segments.clone(),
             )),
-            recovery: checkpoint::Recovery::new(directory.0.clone(), index, segments.clone()),
+            recovery: super::checkpoint::Recovery::new(
+                directory.0.clone(),
+                index,
+                segments.clone(),
+            ),
             eviction,
         };
         store.configure(admission.clone(), 2, 16).unwrap();
@@ -591,10 +596,10 @@ fn incremental_checkpoint_budget_thaws_and_async_publication_roundtrips() {
     drive(&f.reactor, task).unwrap();
     f.store.checkpoint.finish_snapshot();
     let bytes = std::fs::read(f._directory.0.join("checkpoint.1")).unwrap();
-    let image = checkpoint::decode(&bytes).unwrap();
+    let image = super::checkpoint::decode(&bytes).unwrap();
     assert_eq!(image.sequence, 7);
     assert_eq!(image.shards[0].index.entries.len(), 1);
-    let geometry = checkpoint::CheckpointGeometry::new(
+    let geometry = super::checkpoint::CheckpointGeometry::new(
         1024 * 1024 * 1024,
         64 * 1024 * 1024,
         16,
@@ -850,7 +855,7 @@ fn index_capacity_rejection_preserves_segments_and_releases_all_charges_without_
     let mut f = Fixture::new();
     let alignment = futures::executor::block_on(f.store.open()).unwrap();
     // A writer without a configured clock must still reject safely, before I/O.
-    f.store.writer = Rc::new(writer::StoreWriter::new(
+    f.store.writer = Rc::new(StoreWriter::new(
         f.store.writer.index().clone(),
         f.segments.clone(),
         f.store.writer.slabs().clone(),

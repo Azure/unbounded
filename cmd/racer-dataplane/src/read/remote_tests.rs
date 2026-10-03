@@ -887,9 +887,8 @@ fn metadata_coordinator_with_newer_publication(
         },
         security::aead::PageCrypto,
         store::{
-            StoreReader,
+            StoreReader, StoreWriter,
             catalog::{Index, SegmentClock},
-            writer::StoreWriter,
         },
     };
     let published = Arc::new(PublishedState::default());

@@ -55,10 +55,9 @@ use crate::{
         forwarding::Forwarding,
     },
     store::{
-        Store, StoreReader,
+        Store, StoreReader, StoreWriter,
         catalog::{Index, SegmentClock},
         checkpoint::{CheckpointGeometry, Checkpointer, Recovery, ShardImage},
-        writer::StoreWriter,
     },
     telemetry::Telemetry,
     topology::{health::LinkHealth, placement::Placement, routing::Paths},

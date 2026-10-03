@@ -13,7 +13,7 @@ use crate::{
         CacheKey, MetadataSelector, Nonce, ObjectId, ObjectVersion, OriginContext, PageEnvelope,
         PageId, PageNumber, RequestId, StrongEtag, VersionMetadata, WorkerId,
     },
-    origin::{Origin, metadata::MetadataReply, page::OriginPage},
+    origin::{MetadataReply, Origin, OriginPage},
     read::{
         candidates::{CandidatePolicy, OriginAuthority},
         dispatch::WorkerDirectory,
@@ -31,9 +31,8 @@ use crate::{
         credentials::CredentialCrypto,
     },
     store::{
-        StoreReader,
+        StoreReader, StoreWriter,
         catalog::{Index, SegmentClock},
-        writer::StoreWriter,
     },
     topology::{
         membership::{Member, Membership},

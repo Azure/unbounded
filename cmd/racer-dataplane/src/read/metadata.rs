@@ -750,7 +750,7 @@ impl MetadataService {
         context: &OriginContext,
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
-    ) -> Result<crate::origin::metadata::MetadataReply> {
+    ) -> Result<crate::origin::MetadataReply> {
         let candidates = self
             .candidates
             .candidates_scoped(membership, &context.object, PageNumber(0), scope)
@@ -766,7 +766,7 @@ impl MetadataService {
             .await?
             .ok_or_else(|| self.candidates.origin_miss_error(authority))?;
         match response.response() {
-            PeerResponse::Metadata(metadata) => Ok(crate::origin::metadata::MetadataReply {
+            PeerResponse::Metadata(metadata) => Ok(crate::origin::MetadataReply {
                 metadata: metadata.clone(),
                 page_zero: None,
             }),

@@ -579,7 +579,7 @@ pub const CHECKPOINT_VERSION: u32 = 2;
 pub const MAX_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
 const MAGIC: &[u8; 8] = b"RACERCP\0";
 const HEADER_BYTES: usize = 32;
-const DIGEST_BYTES: usize = 32;
+pub(super) const DIGEST_BYTES: usize = 32;
 const MAX_SHARDS: usize = 4096;
 const MAX_ITEMS: usize = 1_000_000;
 const MAX_STRING_BYTES: usize = 8192;
@@ -949,7 +949,7 @@ pub fn decode_with_budget(bytes: &[u8], budget: usize) -> Result<CheckpointImage
 /// isolated segment slots, lease Rc allocations and free-tree nodes. String copies
 /// include page identity duplication and descriptor parsing during validation.
 /// Live restored index storage has its own page/catalog capacities.
-fn recovery_memory(bytes: &[u8], budget: usize) -> Result<usize> {
+pub(super) fn recovery_memory(bytes: &[u8], budget: usize) -> Result<usize> {
     if bytes.len() < HEADER_BYTES + 4 + DIGEST_BYTES || bytes.len() > MAX_CHECKPOINT_BYTES {
         return Err(Error::CorruptRecord);
     }
@@ -1148,4 +1148,32 @@ impl<'a> Decoder<'a> {
 }
 
 #[cfg(test)]
-mod tests;
+// Standalone store fixtures use the production candidate scanner and cache-scoped
+// filter, but do not create an application worker directory. No legacy loader is
+// compiled into the dataplane.
+impl Recovery {
+    pub(crate) fn load(&self, alignment: Alignment) -> Operation<'_, Option<CheckpointImage>> {
+        self.load_filtered(alignment, |_, _| true)
+    }
+    pub(super) fn load_filtered(
+        &self,
+        alignment: Alignment,
+        available: impl Fn(&CacheId, KeyId) -> bool,
+    ) -> Operation<'_, Option<CheckpointImage>> {
+        let result = candidates(&self.directory, MAX_CHECKPOINT_BYTES).map(|mut cuts| {
+            cuts.find_map(|(_, mut image)| {
+                Recovery::filter_available(&mut image, |_| true, &available);
+                let valid = image.shards.iter().all(|s| {
+                    s.geometry.matches_alignment(alignment)
+                        && self.geometry.get().is_none_or(|g| s.geometry == g)
+                }) && image
+                    .shards
+                    .iter()
+                    .find(|s| s.worker == self.index.worker())
+                    .is_some_and(|s| self.index.validate_snapshot(&s.index).is_ok());
+                valid.then_some(image)
+            })
+        });
+        Box::pin(async move { result })
+    }
+}

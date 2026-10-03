@@ -50,7 +50,7 @@ impl origin::Origin for GeneratedOrigin {
         context: &'a OriginContext,
         reservation: flow_control::Charge<AdmissionPolicy>,
         scope: &'a RequestScope,
-    ) -> Operation<'a, origin::metadata::MetadataReply> {
+    ) -> Operation<'a, origin::MetadataReply> {
         Box::pin(async move {
             scope.check()?;
             authority.validate(&context.object, PageNumber(0))?;
@@ -67,7 +67,7 @@ impl origin::Origin for GeneratedOrigin {
                         .await?,
                 )
             };
-            Ok(origin::metadata::MetadataReply {
+            Ok(origin::MetadataReply {
                 metadata,
                 page_zero,
             })
@@ -79,10 +79,10 @@ impl origin::Origin for GeneratedOrigin {
         context: &'a OriginContext,
         _: MetadataSelector,
         scope: &'a RequestScope,
-    ) -> Operation<'a, origin::metadata::MetadataReply> {
+    ) -> Operation<'a, origin::MetadataReply> {
         Box::pin(async move {
             scope.check()?;
-            Ok(origin::metadata::MetadataReply {
+            Ok(origin::MetadataReply {
                 metadata: metadata(context),
                 page_zero: None,
             })
@@ -95,7 +95,7 @@ impl origin::Origin for GeneratedOrigin {
         page: &'a PageId,
         reservation: flow_control::Charge<AdmissionPolicy>,
         scope: &'a RequestScope,
-    ) -> Operation<'a, origin::page::OriginPage> {
+    ) -> Operation<'a, origin::OriginPage> {
         Box::pin(async move {
             scope.check()?;
             authority.validate(&context.object, page.number)?;
@@ -106,7 +106,7 @@ impl origin::Origin for GeneratedOrigin {
             for (i, byte) in plaintext.bytes_mut()?.iter_mut().enumerate() {
                 *byte = ((offset + i as u64) % 251) as u8;
             }
-            Ok(origin::page::OriginPage {
+            Ok(origin::OriginPage {
                 metadata,
                 plaintext,
             })
@@ -161,7 +161,7 @@ struct SubscriptionFixture {
     engine: security::aead::PageCryptoEngine,
     crypto: Rc<runtime::crypto::CryptoClient>,
     reactor: Rc<Reactor>,
-    writer: Rc<store::writer::StoreWriter>,
+    writer: Rc<store::StoreWriter>,
     memory: Rc<memory::cache::MemoryCache>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     cache: control::state::CacheDefinition,
@@ -192,9 +192,8 @@ impl SubscriptionFixture {
             credentials::CredentialCrypto,
         };
         use store::{
-            StoreReader,
+            StoreReader, StoreWriter,
             catalog::{Index, SegmentClock},
-            writer::StoreWriter,
         };
 
         let mut limits = interop_limits();

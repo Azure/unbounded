@@ -1092,7 +1092,7 @@ use crate::{
         CacheId, CacheKey, ExpiresAt, ObjectId, ObjectVersion, PageNumber, RequestId,
         ResourceClass, StrongEtag, WorkerId,
     },
-    origin::{metadata::MetadataReply, page::OriginPage},
+    origin::{MetadataReply, OriginPage},
     read::dispatch::WorkerDirectory,
     runtime::{
         crypto::{self, CryptoClient},
