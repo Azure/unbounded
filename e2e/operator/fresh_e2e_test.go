@@ -111,6 +111,7 @@ func assertCRDRepairWithConfig(t *testing.T, cfg *rest.Config, c client.Client) 
 	ctx, cancel := context.WithCancel(t.Context())
 
 	done := make(chan error, 1)
+
 	go func() { done <- mgr.Start(ctx) }()
 
 	defer func() { cancel(); require.NoError(t, <-done) }()
