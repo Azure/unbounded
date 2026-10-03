@@ -216,6 +216,7 @@ mod tests {
         topology::{membership::Member, rails::RailId},
     };
     use racer_control_wire::PublicationSequence;
+    use std::num::NonZeroUsize;
 
     #[test]
     fn shared_inventory_recovers_new_hardware_and_revokes_removed_or_changed_ports() {

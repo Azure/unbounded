@@ -2309,7 +2309,7 @@ pub(super) mod tests {
             metadata.version.object.cache = CacheId(crate::security::test_support::CACHE.into());
             let (client_socket, origin_socket) =
                 crate::control::state::canonical_socket_paths("framing").unwrap();
-            let worker = crate::client::test_support::ReadWorker::new(
+            let worker = crate::test_support::ReadWorker::new(
                 crate::control::state::CacheDefinition {
                     id: metadata.version.object.cache.clone(),
                     name: "framing".into(),

@@ -110,7 +110,374 @@ pub mod clock {
         assert_eq!(clock.now(), monotonic);
     }
 }
-pub mod origin;
+pub mod origin {
+    //! Controllable adapter boundary shared by read and client scenarios.
+    //! The client, HTTP parser, reactor, and plaintext admission remain production code.
+    use crate::{
+        control::state::SnapshotStore,
+        http::{Codec, HttpIo, HttpPool},
+        memory::BufferPool,
+        model::{ObjectMetadata, PAGE_BYTES},
+        origin::OriginClient,
+        runtime::{admission::AdmissionPolicy, reactor::Reactor},
+    };
+    use std::{
+        collections::{BTreeMap, BTreeSet, VecDeque},
+        fs::File,
+        io::{Read, Write},
+        os::{
+            fd::AsRawFd,
+            unix::net::{UnixListener, UnixStream},
+        },
+        path::PathBuf,
+        rc::Rc,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+        },
+        thread::{self, JoinHandle},
+        time::{Duration, Instant, UNIX_EPOCH},
+    };
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    pub enum RequestKind {
+        Head,
+        InitialGet,
+        PinnedGet,
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct Call {
+        pub kind: RequestKind,
+        pub page: u64,
+        pub if_match: Option<Vec<u8>>,
+    }
+
+    struct State {
+        metadata: ObjectMetadata,
+        missing: bool,
+        body: Option<Vec<u8>>,
+        calls: Vec<Call>,
+        rejections: BTreeMap<RequestKind, VecDeque<u16>>,
+        rejected_pages: BTreeMap<u64, u16>,
+        blocked: BTreeSet<RequestKind>,
+        delays: BTreeMap<RequestKind, Duration>,
+    }
+
+    pub struct AdapterOrigin {
+        state: Arc<Mutex<State>>,
+        stop: Arc<AtomicBool>,
+        server: Option<JoinHandle<()>>,
+        directory: PathBuf,
+        // Keep the short /proc path valid even for long worktree names.
+        _directory_fd: File,
+        pub root: PathBuf,
+    }
+
+    impl AdapterOrigin {
+        /// With no explicit body, three-byte objects contain `abc`; other pages
+        /// contain their page number repeated. Large fixtures need no object allocation.
+        pub fn new(cache_name: &str, metadata: ObjectMetadata) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            assert!(!cache_name.contains('/') && !cache_name.is_empty());
+            let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join(format!(
+                    "adapter-origin-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+            std::fs::create_dir_all(directory.join(cache_name).join("origin")).unwrap();
+            let directory_fd = File::open(&directory).unwrap();
+            let root = PathBuf::from(format!(
+                "/proc/{}/fd/{}",
+                std::process::id(),
+                directory_fd.as_raw_fd()
+            ));
+            let listener = UnixListener::bind(root.join(cache_name).join("origin/socket")).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let state = Arc::new(Mutex::new(State {
+                metadata,
+                missing: false,
+                body: None,
+                calls: vec![],
+                rejections: BTreeMap::new(),
+                rejected_pages: BTreeMap::new(),
+                blocked: BTreeSet::new(),
+                delays: BTreeMap::new(),
+            }));
+            let stop = Arc::new(AtomicBool::new(false));
+            let server = {
+                let state = state.clone();
+                let stop = stop.clone();
+                thread::spawn(move || {
+                    let mut connections = vec![];
+                    while !stop.load(Ordering::Acquire) {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                let state = state.clone();
+                                let stop = stop.clone();
+                                connections
+                                    .push(thread::spawn(move || serve(stream, &state, &stop)));
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(Duration::from_millis(1))
+                            }
+                            Err(error) => panic!("adapter accept: {error}"),
+                        }
+                    }
+                    for connection in connections {
+                        connection.join().unwrap();
+                    }
+                })
+            };
+            Self {
+                state,
+                stop,
+                server: Some(server),
+                directory,
+                _directory_fd: directory_fd,
+                root,
+            }
+        }
+
+        pub fn client(
+            &self,
+            snapshots: Rc<SnapshotStore>,
+            admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+            reactor: Rc<Reactor>,
+            buffers: BufferPool,
+        ) -> Rc<OriginClient> {
+            Rc::new(
+                OriginClient::new(
+                    snapshots,
+                    Rc::new(HttpPool::new(reactor.clone(), admission.clone(), 8)),
+                    Rc::new(HttpIo::with_admission(
+                        reactor,
+                        Codec::new(32768),
+                        admission.clone(),
+                        PAGE_BYTES,
+                    )),
+                    admission,
+                    buffers,
+                    self.root.clone(),
+                )
+                .unwrap(),
+            )
+        }
+
+        pub fn set_version(&self, metadata: ObjectMetadata) {
+            self.state.lock().unwrap().metadata = metadata;
+        }
+        /// Missing current objects return 404; unsatisfied explicit pins return 412.
+        pub fn set_missing(&self, missing: bool) {
+            self.state.lock().unwrap().missing = missing;
+        }
+        pub fn set_body(&self, body: Vec<u8>) {
+            let mut state = self.state.lock().unwrap();
+            assert_eq!(body.len() as u64, state.metadata.length);
+            state.body = Some(body);
+        }
+        pub fn reject_next(&self, kind: RequestKind, status: u16) {
+            assert!((400..600).contains(&status));
+            self.state
+                .lock()
+                .unwrap()
+                .rejections
+                .entry(kind)
+                .or_default()
+                .push_back(status);
+        }
+        /// Reject every GET for this page, including retries, without failing HEAD.
+        pub fn reject_page(&self, page: u64, status: u16) {
+            assert!((400..600).contains(&status));
+            self.state
+                .lock()
+                .unwrap()
+                .rejected_pages
+                .insert(page, status);
+        }
+        pub fn block(&self, kind: RequestKind) {
+            self.state.lock().unwrap().blocked.insert(kind);
+        }
+        pub fn release(&self, kind: RequestKind) {
+            self.state.lock().unwrap().blocked.remove(&kind);
+        }
+        pub fn delay(&self, kind: RequestKind, delay: Duration) {
+            self.state.lock().unwrap().delays.insert(kind, delay);
+        }
+        pub fn calls(&self) -> Vec<Call> {
+            self.state.lock().unwrap().calls.clone()
+        }
+        pub fn count(&self, kind: RequestKind) -> usize {
+            self.calls().iter().filter(|call| call.kind == kind).count()
+        }
+    }
+
+    impl Drop for AdapterOrigin {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            self.server.take().unwrap().join().unwrap();
+            std::fs::remove_dir_all(&self.directory).unwrap();
+        }
+    }
+
+    fn serve(mut stream: UnixStream, state: &Mutex<State>, stop: &AtomicBool) {
+        stream
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+                return;
+            }
+            let mut byte = [0];
+            match stream.read(&mut byte) {
+                Ok(0) => return,
+                Ok(_) => request.push(byte[0]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                Err(_) => return,
+            }
+            assert!(request.len() <= 32768, "oversized adapter request");
+        }
+        let request = Codec::new(32768).decode_head(&request).unwrap().unwrap().0;
+        let head = matches!(&request.start, crate::http::StartLine::Request { method, .. } if method == "HEAD");
+        let if_match = request.unique("If-Match").unwrap().map(<[u8]>::to_vec);
+        let first = request
+            .unique("Range")
+            .unwrap()
+            .map(|range| {
+                std::str::from_utf8(range)
+                    .unwrap()
+                    .strip_prefix("bytes=")
+                    .unwrap()
+                    .split('-')
+                    .next()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+            })
+            .unwrap_or(0);
+        let kind = if head {
+            RequestKind::Head
+        } else if if_match.is_some() {
+            RequestKind::PinnedGet
+        } else {
+            RequestKind::InitialGet
+        };
+        let call = Call {
+            kind,
+            page: first / PAGE_BYTES,
+            if_match,
+        };
+        let started = Instant::now();
+        state.lock().unwrap().calls.push(call.clone());
+        loop {
+            if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+                return;
+            }
+            let state = state.lock().unwrap();
+            let blocked = state.blocked.contains(&kind)
+                || started.elapsed() < state.delays.get(&kind).copied().unwrap_or_default();
+            drop(state);
+            if !blocked {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let mut state = state.lock().unwrap();
+        let rejected = state
+            .rejections
+            .entry(kind)
+            .or_default()
+            .pop_front()
+            .or_else(|| {
+                (!head)
+                    .then(|| state.rejected_pages.get(&call.page).copied())
+                    .flatten()
+            });
+        let metadata = &state.metadata;
+        let status = rejected.unwrap_or_else(|| {
+            if state.missing {
+                if call.if_match.is_some() { 412 } else { 404 }
+            } else if call
+                .if_match
+                .as_deref()
+                .is_some_and(|etag| etag != metadata.version.etag.as_bytes())
+            {
+                412
+            } else if !head && first >= metadata.length && metadata.length != 0 {
+                416
+            } else if head || metadata.length == 0 {
+                200
+            } else {
+                206
+            }
+        });
+        let length = if head {
+            metadata.length
+        } else {
+            metadata.length.saturating_sub(first).min(PAGE_BYTES)
+        };
+        let mut response = format!("HTTP/1.1 {status} Fixture\r\nConnection: close\r\n");
+        let body = if status >= 400 {
+            response.push_str("Content-Length: 0\r\n\r\n");
+            vec![]
+        } else {
+            response.push_str(&format!(
+                "Content-Length: {length}\r\nETag: {}\r\nRacer-Expires-At: {}\r\n",
+                std::str::from_utf8(metadata.version.etag.as_bytes()).unwrap(),
+                metadata
+                    .expires_at
+                    .as_system_time()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+            ));
+            if let Some(content_type) = &metadata.content_type {
+                response.push_str(&format!(
+                    "Racer-Content-Type: {}\r\n",
+                    content_type.as_str()
+                ));
+            }
+            if !head {
+                response.push_str("Content-Type: application/octet-stream\r\n");
+            }
+            if !head && length != 0 {
+                response.push_str(&format!(
+                    "Content-Range: bytes {first}-{}/{}\r\n",
+                    first + length - 1,
+                    metadata.length
+                ));
+            }
+            response.push_str("\r\n");
+            if head {
+                vec![]
+            } else if let Some(body) = &state.body {
+                body[first as usize..(first + length) as usize].to_vec()
+            } else if metadata.length == 3 {
+                b"abc".to_vec()
+            } else {
+                vec![call.page as u8; length as usize]
+            }
+        };
+        drop(state);
+        if stream.write_all(response.as_bytes()).is_ok() {
+            let _ = stream.write_all(&body);
+        }
+    }
+}
 
 /// Minimal real control-plane state for storage and flight fixtures. Callers with
 /// rotating keys or publications should share their own Availability instead.
@@ -243,5 +610,205 @@ impl WakeCounter {
 impl std::task::Wake for WakeCounter {
     fn wake(self: std::sync::Arc<Self>) {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+// Real read ownership shared by read and client scenarios. Only the UDS adapter is scripted.
+use crate::{
+    control::{
+        state::{CacheDefinition, PublishedState, SnapshotStore},
+        state::Publication,
+    },
+    memory::{cache::MemoryCache, delivery::Delivery, BufferPool},
+    model::{MembershipVersion, ObjectMetadata, WorkerId},
+    read::{
+        Coordinator,
+        candidates::CandidatePolicy,
+        dispatch::{WorkerDirectory, WorkerEndpoint},
+        fill::{Fill, FillDependencies},
+        flight::Flights,
+        metadata::{MetadataDependencies, MetadataService},
+        range_stream::RangeStreams,
+    },
+    runtime::{
+        admission::AdmissionPolicy,
+        crypto::{self, CryptoClient},
+        reactor::Reactor,
+        worker::{CryptoRuntime, CryptoService, WorkerMap},
+    },
+    security::{
+        aead::{PageCrypto, PageCryptoEngine},
+        credentials::CredentialCrypto,
+    },
+    store::{
+        StoreReader, StoreWriter,
+        catalog::{Index, SegmentClock},
+    },
+    test_support::origin::AdapterOrigin,
+    topology::{membership::Member, routing::Placement},
+};
+use std::{cell::RefCell, num::NonZeroU32, rc::Rc, sync::Arc, task::Context};
+use racer_control_wire::PublicationSequence;
+use uring_runtime::drivers::DriverQueue;
+
+pub(crate) struct ReadWorker {
+    pub coordinator: Rc<Coordinator>,
+    pub streams: Rc<RangeStreams>,
+    pub membership: crate::topology::membership::MembershipLease,
+    pub origin: AdapterOrigin,
+    pub drivers: Rc<DriverQueue>,
+    endpoint: RefCell<WorkerEndpoint>,
+    engine: RefCell<PageCryptoEngine>,
+    crypto: Rc<CryptoClient>,
+    writer: Rc<StoreWriter>,
+    memory: Rc<MemoryCache>,
+    cache: crate::model::CacheId,
+}
+
+impl ReadWorker {
+    pub fn new(
+        cache: CacheDefinition,
+        metadata: ObjectMetadata,
+        admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+        reactor: Rc<Reactor>,
+        delivery: Rc<Delivery>,
+        window: usize,
+    ) -> Self {
+        let origin = AdapterOrigin::new(&cache.name, metadata);
+        let keys = Rc::new(crate::security::test_support::keys());
+        let publications = Arc::new(PublishedState::default());
+        let availability = Rc::new(crate::control::state::Availability::new(
+            publications.clone(),
+            keys.clone(),
+        ));
+        let snapshots = Rc::new(SnapshotStore::new(keys.cluster().clone(), publications, 2));
+        snapshots
+            .publish(Publication {
+                schema_version: 1,
+                cluster: keys.cluster().clone(),
+                sequence: PublicationSequence(1),
+                membership_version: MembershipVersion(1),
+                members: vec![Member {
+                    node: keys.node().clone(),
+                    shares: NonZeroU32::new(1).unwrap(),
+                    peer_endpoint: "127.0.0.1:1".into(),
+                    rails: vec![],
+                    site: String::new(),
+                }],
+                caches: vec![cache.clone()],
+            })
+            .unwrap();
+        let directory = Arc::new(
+            WorkerDirectory::new(
+                Arc::new(WorkerMap::new(vec![WorkerId(0)]).unwrap()),
+                vec![WorkerId(0)],
+                16,
+            )
+            .unwrap(),
+        );
+        let buffers = BufferPool::new(admission.clone());
+        let index = Rc::new(Index::new(WorkerId(0), 16, availability.clone()));
+        let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
+        // Reads use an empty disk index. No slabs need to be opened or written.
+        let slabs = Rc::new(page_alloc::Slab::new(
+            origin.root.join("slabs/worker-0-slab-0.dat"),
+            256 * 1024 * 1024,
+            64 * 1024 * 1024,
+            crate::model::PAGE_BYTES as usize + crate::store::format::MAX_HEADER_BYTES + 16,
+        ));
+        let writer = Rc::new(StoreWriter::new(
+            index.clone(),
+            segments.clone(),
+            slabs.clone(),
+            admission.clone(),
+            reactor.clone(),
+            availability.clone(),
+        ));
+        let disk = Rc::new(StoreReader::new(
+            Rc::new(SegmentClock::new(index.clone(), segments.clone(), 1)),
+            index.clone(),
+            segments,
+            slabs,
+            admission.clone(),
+            reactor.clone(),
+            buffers.clone(),
+        ));
+        let (port, engine) = crypto::pair(WorkerId(0), 0, std::num::NonZeroUsize::new(16).unwrap());
+        let crypto = Rc::new(CryptoClient::new(port));
+        let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
+        let candidates = Rc::new(CandidatePolicy::new(
+            keys.node().clone(),
+            Rc::new(Placement::new(16)),
+            crate::test_support::NoPeers::requester(),
+            credentials.clone(),
+            Arc::new(Default::default()),
+        ));
+        let client = origin.client(
+            snapshots.clone(),
+            admission.clone(),
+            reactor,
+            buffers.clone(),
+        );
+        let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
+        let fill = Rc::new(Fill::new(FillDependencies {
+            memory: memory.clone(),
+            buffers,
+            disk,
+            writer: writer.clone(),
+            origin: client.clone(),
+            candidates: candidates.clone(),
+            flights: Rc::new(Flights::new(admission.clone(), availability.clone())),
+            crypto: Rc::new(PageCrypto::new(keys, crypto.clone())),
+            credentials: credentials.clone(),
+            admission,
+            metadata_owner: directory.clone(),
+        }));
+        let metadata = Rc::new(MetadataService::new(
+            candidates,
+            client,
+            credentials.clone(),
+            16,
+            MetadataDependencies {
+                index,
+                owners: directory.clone(),
+                fill: fill.clone(),
+            },
+        ));
+        let streams = Rc::new(RangeStreams::new(directory.clone(), delivery, window));
+        let membership = snapshots.current().unwrap().membership.clone();
+        let coordinator = Rc::new(Coordinator::new(
+            snapshots,
+            metadata,
+            fill,
+            streams.clone(),
+            credentials,
+            availability,
+        ));
+        let endpoint = directory.install(WorkerId(0), coordinator.clone()).unwrap();
+        Self {
+            coordinator,
+            streams,
+            membership,
+            origin,
+            drivers: Rc::new(DriverQueue::new(1024)),
+            endpoint: RefCell::new(endpoint),
+            engine: RefCell::new(PageCryptoEngine::new(CryptoRuntime { port: engine })),
+            crypto,
+            writer,
+            memory,
+            cache: cache.id,
+        }
+    }
+
+    pub fn poll(&self, cx: &mut Context<'_>) {
+        let _queue = self.drivers.enter();
+        self.endpoint.borrow_mut().poll_budgeted(64).unwrap();
+        self.drivers.poll(cx, 64);
+        self.engine.borrow_mut().poll_budgeted(64).unwrap();
+        self.crypto.poll_budgeted(64).unwrap();
+        // Exercise acquisition/authentication, not persistence or cache retention.
+        // Delivered leases remain charged even after the cache drops its copy.
+        self.writer.discard_unsubmitted();
+        self.memory.remove_cache(&self.cache).unwrap();
     }
 }

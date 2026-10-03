@@ -802,7 +802,7 @@ struct Fixture {
     listeners: ClientListeners,
     reactor: Rc<Reactor>,
     reads: Rc<Heads>,
-    worker: Option<crate::client::test_support::ReadWorker>,
+    worker: Option<crate::test_support::ReadWorker>,
 }
 impl Fixture {
     fn install_handoff(&self, ingress: &crate::runtime::ingress::Ingress) {
@@ -1207,8 +1207,8 @@ fn install_body_worker(
     fail_first: bool,
 ) {
     use crate::{
-        client::test_support::ReadWorker,
         model::{CacheKey, ObjectId, PAGE_BYTES},
+        test_support::ReadWorker,
     };
     let length = if large { PAGE_BYTES + 1 } else { 5 };
     let worker = ReadWorker::new(

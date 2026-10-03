@@ -754,7 +754,6 @@ impl Simulator {
 }
 
 mod fidelity;
-mod queues;
 mod scenarios;
 mod waiter_detach {
     use super::*;

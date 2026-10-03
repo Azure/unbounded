@@ -409,7 +409,7 @@ mod tests {
         CheckpointGeometry::new(8192, 4096, 2, Alignment::new(4096, 4096, 4096).unwrap()).unwrap()
     }
     fn caches() -> Vec<crate::control::state::CacheDefinition> {
-        let mut cache = super::super::test_support::definition();
+        let mut cache = crate::app::tests::definition();
         cache.id = crate::model::CacheId(crate::security::test_support::CACHE.into());
         vec![cache]
     }
@@ -697,7 +697,7 @@ mod tests {
 
     #[test]
     fn configured_tiny_recovery_budget_starts_cold_and_completes_installation() {
-        use super::super::test_support::{ControlFixture, local_worker, publication};
+        use crate::app::tests::{ControlFixture, local_worker, publication};
         for budget in [1, 64 * 1024 * 1024] {
             let mut fixture = ControlFixture::new();
             let mut config = fixture.config.take().unwrap();

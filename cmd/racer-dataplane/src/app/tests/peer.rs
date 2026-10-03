@@ -1,5 +1,4 @@
 //! Exercise assembled peer I/O, including socket session signatures and full paths.
-use super::test_support::local_worker;
 use super::*;
 
 fn tcp_nodelay(fd: &impl std::os::fd::AsRawFd) -> i32 {
@@ -133,11 +132,7 @@ fn assembly_applies_configured_client_request_timeout() {
             .unwrap();
         let connection = crate::http::from_reserved(server.into(), reservation).unwrap();
         app.clients
-            .install_connection(
-                connection,
-                test_support::definition().id,
-                Arc::new(AtomicBool::default()),
-            )
+            .install_connection(connection, definition().id, Arc::new(AtomicBool::default()))
             .unwrap();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         app.clients.poll_budgeted(&mut cx, 64).unwrap();
