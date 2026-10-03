@@ -517,16 +517,6 @@ mod destination_disconnect {
             })
         }
     }
-    impl PeerTransport for PendingPage {
-        fn exchange<'a>(
-            &'a self,
-            _: protocol::SignedRequest,
-            _: crate::topology::membership::MembershipLease,
-            _: &'a RequestScope,
-        ) -> crate::error::Operation<'a, protocol::SignedResponse> {
-            Box::pin(async { panic!("final destination must not relay") })
-        }
-    }
     fn poll<F: Future + ?Sized>(work: std::pin::Pin<&mut F>) -> Poll<F::Output> {
         work.poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
     }
@@ -627,6 +617,7 @@ mod destination_disconnect {
     }
 
     struct DestinationFixture {
+        outbound: NoOutbound,
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         reactor: Rc<Reactor>,
         io: Rc<HttpIo>,
@@ -697,10 +688,11 @@ mod destination_disconnect {
                 page: page.clone(),
                 entered: Cell::new(0),
             });
+            let outbound = NoOutbound::new(signers[2].clone(), network.clone());
             let relay = Rc::new(Relay::new(
                 Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
                 forwarding.clone(),
-                service.clone(),
+                outbound.requester.clone(),
                 admission.clone(),
                 network.clone(),
             ));
@@ -717,6 +709,7 @@ mod destination_disconnect {
                 RequestScope::new(RequestId([9; 16]), Instant::now() + Duration::from_secs(60))
                     .unwrap();
             Self {
+                outbound,
                 admission,
                 reactor,
                 io,
@@ -732,6 +725,7 @@ mod destination_disconnect {
 
         fn run(self, order: CompletionOrder) {
             let Self {
+                outbound: _outbound,
                 admission,
                 reactor,
                 io,
@@ -2151,15 +2145,55 @@ impl SocketFixture {
     }
 }
 
-struct NeverTransport;
-impl PeerTransport for NeverTransport {
-    fn exchange<'a>(
-        &'a self,
-        _: protocol::SignedRequest,
-        _: crate::topology::membership::MembershipLease,
-        _: &'a RequestScope,
-    ) -> crate::error::Operation<'a, protocol::SignedResponse> {
-        Box::pin(async { panic!("direct request must not relay") })
+/// Real outbound stack for destination-only tests. Count attempts even when a
+/// route would fail before opening a socket, rather than relying on bad endpoints.
+pub(crate) struct NoOutbound {
+    pub requester: Rc<Requester>,
+    _socket: SocketFixture,
+}
+pub(crate) fn signed_fixture_response() -> protocol::SignedResponse {
+    let admission = flow_control::Quotas::new(AdmissionPolicy::new(
+        crate::test_support::cluster::config(false).limits,
+    ));
+    let signers = signers();
+    let sender = Forwarding::new(signers[0].clone());
+    let receiver = Forwarding::new(signers[2].clone());
+    let (signed, _) = sender.sign_request(request(&admission, 42)).unwrap();
+    let admitted = receiver.verify_request(signed).unwrap();
+    receiver
+        .sign_response(admitted.binding(), PeerResponse::Miss)
+        .unwrap()
+}
+impl NoOutbound {
+    pub fn new(signer: Rc<Signatures>, network: Rc<PeerNetwork>) -> Self {
+        let socket = SocketFixture::new(2);
+        let requester = Rc::new(Requester::new(
+            Rc::new(crate::topology::routing::Paths::new(
+                Rc::new(crate::topology::health::LinkHealth),
+                4,
+            )),
+            Rc::new(Forwarding::new(signer.clone())),
+            socket.transfers(signer),
+            network,
+        ));
+        Self {
+            requester,
+            _socket: socket,
+        }
+    }
+}
+impl Drop for NoOutbound {
+    fn drop(&mut self) {
+        assert_eq!(
+            self.requester.outbound_requests.get(),
+            0,
+            "destination must issue zero outbound requests"
+        );
+        assert_eq!(
+            self._socket.reactor.in_flight(),
+            0,
+            "destination outbound stack must have no pending submissions"
+        );
     }
 }
 use uring_runtime::{environment::SimulationClock, reactor::IoBuffer};

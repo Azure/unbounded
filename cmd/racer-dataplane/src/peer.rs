@@ -4,7 +4,7 @@ pub mod protocol;
 pub mod server;
 pub mod subscriptions;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod timing {
     use super::protocol::{Operation, PeerRequest, PeerResponse, VerifiedResponse};
     use crate::{
@@ -212,7 +212,7 @@ pub(crate) fn search_budget(
 pub struct Relay {
     paths: Rc<Paths>,
     forwarding: Rc<Forwarding>,
-    transport: Rc<dyn PeerTransport>,
+    transport: Rc<Requester>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     network: Rc<PeerNetwork>,
 }
@@ -221,7 +221,7 @@ impl Relay {
     pub fn new(
         paths: Rc<Paths>,
         forwarding: Rc<Forwarding>,
-        transport: Rc<dyn PeerTransport>,
+        transport: Rc<Requester>,
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         network: Rc<PeerNetwork>,
     ) -> Self {
@@ -382,17 +382,16 @@ pub trait PeerClient {
 /// Owned signed-envelope exchange shared by requesters and opaque relays.
 /// Receiving a signed response does not authenticate it: callers must verify it
 /// against their retained request binding before use or reverse forwarding.
-/// The test seam drives signed relay outcomes and asserts destination-only paths
-/// never forward; production uses [`Requester`] for both complete and opaque I/O.
+/// Requesters handle both complete and opaque I/O.
 ///
 /// ```no_run
-/// use racer_dataplane::{error::Result, peer::{PeerClient, PeerTransport,
+/// use racer_dataplane::{error::Result, peer::{PeerClient, Requester,
 ///     Relay, server::PeerServer,
 ///     protocol::{PeerRequest, SignedRequest, SignedResponse, VerifiedResponse}},
 ///     runtime::deadline::RequestScope, security::forwarding::Forwarding,
 ///     topology::membership::MembershipLease};
 /// async fn interfaces(
-///     client: &dyn PeerClient, transport: &dyn PeerTransport,
+///     client: &dyn PeerClient, transport: &Requester,
 ///     server: &PeerServer, relay: &Relay, auth: &Forwarding,
 ///     local: PeerRequest, wire: SignedRequest, outbound: SignedRequest,
 ///     inbound: SignedRequest, membership: MembershipLease, scope: &RequestScope,
@@ -408,29 +407,9 @@ pub trait PeerClient {
 ///     Ok(())
 /// }
 /// ```
-pub trait PeerTransport {
-    fn exchange_relay<'a>(
-        &'a self,
-        request: SignedRequest,
-        membership: MembershipLease,
-        reservation: Rc<flow_control::Charge<AdmissionPolicy>>,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, transport::RelayResponse> {
-        Box::pin(async move {
-            let response = self.exchange(request, membership, scope).await;
-            drop(reservation);
-            response.map(transport::RelayResponse::Complete)
-        })
-    }
-    /// Use this exact lease for the signed route; never resolve its version again.
-    fn exchange<'a>(
-        &'a self,
-        request: SignedRequest,
-        membership: MembershipLease,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, SignedResponse>;
-}
 pub struct Requester {
+    #[cfg(test)]
+    outbound_requests: std::cell::Cell<usize>,
     metrics: crate::telemetry::metrics::Metrics,
     observer: Observer,
     health: Rc<crate::topology::health::LinkHealth>,
@@ -451,6 +430,8 @@ impl Requester {
         network: Rc<PeerNetwork>,
     ) -> Self {
         Self {
+            #[cfg(test)]
+            outbound_requests: std::cell::Cell::new(0),
             metrics: crate::telemetry::metrics::Metrics::default(),
             observer: Observer::default(),
             health: paths.link_health(),
@@ -552,8 +533,8 @@ impl PeerClient for Requester {
         })
     }
 }
-impl PeerTransport for Requester {
-    fn exchange_relay<'a>(
+impl Requester {
+    pub fn exchange_relay<'a>(
         &'a self,
         request: SignedRequest,
         membership: MembershipLease,
@@ -562,7 +543,8 @@ impl PeerTransport for Requester {
     ) -> Operation<'a, transport::RelayResponse> {
         self.exchange_inner(request, membership, Some(reservation), scope)
     }
-    fn exchange<'a>(
+    /// Use this exact lease for the signed route; never resolve its version again.
+    pub fn exchange<'a>(
         &'a self,
         request: SignedRequest,
         membership: MembershipLease,
@@ -599,6 +581,8 @@ impl Requester {
         timing: Option<&'a mut timing::PageTiming<'_>>,
     ) -> Operation<'a, transport::RelayResponse> {
         Box::pin(async move {
+            #[cfg(test)]
+            self.outbound_requests.set(self.outbound_requests.get() + 1);
             let scope = request_scope(&request.request, scope)?;
             check_membership(&request.request, &membership)?;
             let network = &self.network;

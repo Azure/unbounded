@@ -542,8 +542,8 @@ use crate::{
     memory::{delivery::Delivery, new_pipe_pool},
     model::{ByteRange, MembershipVersion},
     peer::{
-        PeerNetwork, PeerTransport,
-        protocol::{PeerRequest, SignedRequest, SignedResponse, VerifiedResponse},
+        PeerNetwork,
+        protocol::{PeerRequest, VerifiedResponse},
         server::{LocalPageService, PeerServer},
     },
     read::{Coordinator, ReadService},
@@ -586,16 +586,6 @@ impl PeerClient for Link {
                 .push(subscription.demand.page_count());
             self.client.request(request, membership, scope).await
         })
-    }
-}
-impl PeerTransport for NoPeer {
-    fn exchange<'a>(
-        &'a self,
-        _: SignedRequest,
-        _: MembershipLease,
-        _: &'a RequestScope,
-    ) -> Operation<'a, SignedResponse> {
-        Box::pin(async { panic!("no speculative relay") })
     }
 }
 struct Gate {
@@ -1209,10 +1199,11 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
     let admission = fixtures[2].fill.dependencies.admission.clone();
     let auth = Rc::new(Forwarding::new(signers[2].clone()));
     let network = Rc::new(PeerNetwork::new(node(2), publications[2].clone()).unwrap());
+    let outbound = crate::peer::tests::NoOutbound::new(signers[2].clone(), network.clone());
     let relay = Rc::new(crate::peer::Relay::new(
         Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
         auth.clone(),
-        Rc::new(NoPeer),
+        outbound.requester.clone(),
         admission.clone(),
         network.clone(),
     ));

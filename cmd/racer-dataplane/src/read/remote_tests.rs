@@ -7,8 +7,8 @@ use crate::{
     memory::BufferPool,
     model::{ExpiresAt, MetadataSelector, ObjectMetadata, OriginContext, *},
     peer::{
-        PeerNetwork, PeerTransport, Relay, Requester,
-        protocol::{self, FetchMode, PeerResponse, SignedRequest, SignedResponse, VerifiedRequest},
+        PeerNetwork, Relay, Requester,
+        protocol::{self, FetchMode, PeerResponse, VerifiedRequest},
         server::{LocalPageService, PeerServer},
         transport::Transfers,
     },
@@ -52,17 +52,6 @@ fn identities(nodes: &[NodeId]) -> Vec<Identity> {
         ));
         keys
     })
-}
-struct NeverRelay;
-impl PeerTransport for NeverRelay {
-    fn exchange<'a>(
-        &'a self,
-        _: SignedRequest,
-        _: crate::topology::membership::MembershipLease,
-        _: &'a RequestScope,
-    ) -> Operation<'a, SignedResponse> {
-        Box::pin(async { panic!("direct candidate must not relay") })
-    }
 }
 struct CandidateService {
     calls: Rc<Cell<usize>>,
@@ -365,10 +354,12 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     );
     let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 8));
     let auth = Rc::new(Forwarding::new(b.signatures.clone()));
+    let outbound =
+        crate::peer::tests::NoOutbound::new(b.signatures.clone(), destination_network.clone());
     let relay = Rc::new(Relay::new(
         paths.clone(),
         auth.clone(),
-        Rc::new(NeverRelay),
+        outbound.requester.clone(),
         admission.clone(),
         destination_network.clone(),
     ));

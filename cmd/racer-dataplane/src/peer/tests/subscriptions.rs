@@ -83,17 +83,6 @@ fn copy(admission: &Rc<flow_control::Quotas<AdmissionPolicy>>, page: PageId) -> 
 
 #[test]
 fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failures() {
-    struct Never;
-    impl PeerTransport for Never {
-        fn exchange<'a>(
-            &'a self,
-            _: protocol::SignedRequest,
-            _: crate::topology::membership::MembershipLease,
-            _: &'a RequestScope,
-        ) -> crate::error::Operation<'a, protocol::SignedResponse> {
-            Box::pin(async { panic!("destination must not relay") })
-        }
-    }
     struct Service {
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         ready: Cell<bool>,
@@ -165,10 +154,11 @@ fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failure
             .unwrap(),
         );
         let destination = Rc::new(Forwarding::new(signers[2].clone()));
+        let outbound = NoOutbound::new(signers[2].clone(), network.clone());
         let relay = Rc::new(Relay::new(
             Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
             destination.clone(),
-            Rc::new(Never),
+            outbound.requester.clone(),
             admission.clone(),
             network.clone(),
         ));
@@ -266,16 +256,6 @@ fn signed_ingress_cold_selection_is_bounded_cancellable_and_does_not_block_other
     use crate::topology::membership::scored_members;
 
     struct Never;
-    impl PeerTransport for Never {
-        fn exchange<'a>(
-            &'a self,
-            _: protocol::SignedRequest,
-            _: crate::topology::membership::MembershipLease,
-            _: &'a RequestScope,
-        ) -> crate::error::Operation<'a, protocol::SignedResponse> {
-            Box::pin(async { panic!("destination must not relay") })
-        }
-    }
     impl server::LocalPageService for Never {
         fn serve_peer<'a>(
             &'a self,
@@ -320,10 +300,11 @@ fn signed_ingress_cold_selection_is_bounded_cancellable_and_does_not_block_other
         )
         .unwrap(),
     );
+    let outbound = NoOutbound::new(signers[2].clone(), network.clone());
     let relay = Rc::new(Relay::new(
         Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
         destination.clone(),
-        Rc::new(Never),
+        outbound.requester.clone(),
         admission.clone(),
         network,
     ));
@@ -628,16 +609,6 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
             })
         }
     }
-    impl PeerTransport for Local {
-        fn exchange<'a>(
-            &'a self,
-            _: protocol::SignedRequest,
-            _: crate::topology::membership::MembershipLease,
-            _: &'a RequestScope,
-        ) -> crate::error::Operation<'a, protocol::SignedResponse> {
-            Box::pin(async { panic!("no relay or speculative backup") })
-        }
-    }
     let signers = signers();
     let fixture = SocketFixture::new(2);
     let transfers = fixture.transfers(signers[0].clone());
@@ -684,10 +655,11 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
     let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4));
     let destination = Rc::new(Forwarding::new(signers[2].clone()));
     let local = Rc::new(Local(admission.clone()));
+    let outbound = NoOutbound::new(signers[2].clone(), network(C));
     let relay = Rc::new(Relay::new(
         paths.clone(),
         destination.clone(),
-        local.clone(),
+        outbound.requester.clone(),
         admission.clone(),
         network(C),
     ));

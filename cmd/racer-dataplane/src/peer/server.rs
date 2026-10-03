@@ -862,13 +862,13 @@ where
     }
 }
 /// Cancel an abandoned HTTP exchange without dropping work before its completion fences.
-async fn materialized_exchange<T>(
+async fn materialized_exchange(
     io: &crate::http::HttpIo,
     connection: &crate::http::ConnectionLease,
     parent: &RequestScope,
     exchange: &RequestScope,
-    work: impl std::future::Future<Output = crate::error::Result<T>>,
-) -> crate::error::Result<T> {
+    work: impl std::future::Future<Output = crate::error::Result<SignedResponse>>,
+) -> crate::error::Result<SignedResponse> {
     use std::task::Poll;
     let parent_wake = parent.cancellation.subscribe()?;
     let watch_scope = RequestScope::new(exchange.request, exchange.deadline.0)?;
@@ -1049,7 +1049,7 @@ mod tests {
                             connection = read.lease;
                             buffer = read.buffer;
                         }
-                        Ok(())
+                        Ok(crate::peer::tests::signed_fixture_response())
                     }
                     .await;
                     completed.set(true);
@@ -1084,7 +1084,10 @@ mod tests {
                     // Real TCP FIN, not Unix full-close/POLLHUP. Keep the read side open.
                     upstream.shutdown(Shutdown::Write).unwrap();
                 }
-                assert_eq!(drive(&reactor, work.as_mut()), Err(Error::Cancelled));
+                assert!(matches!(
+                    drive(&reactor, work.as_mut()),
+                    Err(Error::Cancelled)
+                ));
                 assert!(start.elapsed() < Duration::from_secs(2));
                 assert!(
                     completed.get(),
@@ -1132,22 +1135,30 @@ mod tests {
             connection = received.connection;
             let exchange = RequestScope::new(RequestId([7; 16]), parent.deadline.0).unwrap();
             let mut pending_once = true;
+            let mut signed = Some(crate::peer::tests::signed_fixture_response());
+            let signature = signed
+                .as_ref()
+                .unwrap()
+                .authentication
+                .original
+                .signature
+                .clone();
             let work = std::future::poll_fn(|cx| {
                 if pending_once {
                     pending_once = false;
                     cx.waker().wake_by_ref();
                     Poll::Pending
                 } else {
-                    Poll::Ready(Ok(42))
+                    Poll::Ready(Ok(signed.take().unwrap()))
                 }
             });
-            assert_eq!(
-                drive(
-                    &reactor,
-                    materialized_exchange(&io, &connection, &parent, &exchange, work)
-                ),
-                Ok(42)
-            );
+            let response = drive(
+                &reactor,
+                materialized_exchange(&io, &connection, &parent, &exchange, work),
+            )
+            .unwrap();
+            assert!(matches!(response.response, PeerResponse::Miss));
+            assert_eq!(response.authentication.original.signature, signature);
             assert_eq!(reactor.in_flight(), 0);
             assert_eq!(exchange.check(), Ok(()));
             let head = Codec::new(4096)
@@ -1425,7 +1436,7 @@ mod tests {
         use crate::{
             http::{Codec, ConnectionLease, HttpIo},
             memory::BufferPool,
-            peer::{PeerTransport, protocol::SecurityCodec},
+            peer::protocol::SecurityCodec,
             runtime::reactor::Reactor,
             security::connection::tests::{finish, hello},
             topology::{health::LinkHealth, routing::Paths},
@@ -1440,16 +1451,6 @@ mod tests {
                 _: &'a RequestScope,
             ) -> Operation<'a, PeerResponse> {
                 Box::pin(async { panic!("handshake must not dispatch") })
-            }
-        }
-        impl PeerTransport for Never {
-            fn exchange<'a>(
-                &'a self,
-                _: SignedRequest,
-                _: MembershipLease,
-                _: &'a RequestScope,
-            ) -> Operation<'a, SignedResponse> {
-                Box::pin(async { panic!("handshake must not relay") })
             }
         }
         fn fill(socket: &mut UnixStream) -> usize {
@@ -1520,10 +1521,20 @@ mod tests {
                     0,
                 ));
                 let forwarding = Rc::new(Forwarding::new(signers[1].clone()));
+                let outbound = crate::peer::tests::NoOutbound::new(
+                    signers[1].clone(),
+                    Rc::new(
+                        super::super::PeerNetwork::new(
+                            signers[1].node().clone(),
+                            std::sync::Arc::new(Default::default()),
+                        )
+                        .unwrap(),
+                    ),
+                );
                 let relay = Rc::new(Relay::new(
                     Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
                     forwarding.clone(),
-                    Rc::new(Never),
+                    outbound.requester.clone(),
                     admission.clone(),
                     Rc::new(
                         super::super::PeerNetwork::new(

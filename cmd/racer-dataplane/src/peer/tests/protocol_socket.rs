@@ -331,17 +331,6 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
         },
     };
     use std::{cell::Cell, num::NonZeroU32};
-    struct NeverTransport;
-    impl PeerTransport for NeverTransport {
-        fn exchange<'a>(
-            &'a self,
-            _: protocol::SignedRequest,
-            _: crate::topology::membership::MembershipLease,
-            _: &'a RequestScope,
-        ) -> crate::error::Operation<'a, protocol::SignedResponse> {
-            Box::pin(async { panic!("local service must not relay") })
-        }
-    }
     struct Service(Rc<Cell<usize>>);
     impl server::LocalPageService for Service {
         fn serve_peer<'a>(
@@ -394,10 +383,11 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
         .unwrap(),
     );
     let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4));
+    let outbound = NoOutbound::new(signers[2].clone(), network.clone());
     let relay = Rc::new(Relay::new(
         paths,
         destination.clone(),
-        Rc::new(NeverTransport),
+        outbound.requester.clone(),
         admission.clone(),
         network.clone(),
     ));
@@ -539,56 +529,24 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
         membership::{Member, Membership},
         routing::Paths,
     };
-    struct Destination {
-        auth: Forwarding,
-        fail: bool,
-    }
-    impl PeerTransport for Destination {
-        fn exchange<'a>(
-            &'a self,
-            request: protocol::SignedRequest,
-            _: crate::topology::membership::MembershipLease,
-            scope: &'a RequestScope,
-        ) -> crate::error::Operation<'a, protocol::SignedResponse> {
-            Box::pin(async move {
-                scope.check()?;
-                if self.fail {
-                    return Err(Error::Io);
-                }
-                let admitted = self.auth.verify_request(request)?;
-                assert_eq!(admitted.request().route.remaining_links, 3);
-                assert_eq!(
-                    admitted
-                        .request()
-                        .origin
-                        .authorization
-                        .as_ref()
-                        .unwrap()
-                        .ciphertext,
-                    vec![5; 32]
-                );
-                self.auth
-                    .sign_response(admitted.binding(), PeerResponse::Miss)
-            })
-        }
-    }
     for fail in [false, true] {
         let signers = signers();
         let origin = Forwarding::new(signers[0].clone());
         let forwarding = Rc::new(Forwarding::new(signers[1].clone()));
-        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
-            crate::test_support::cluster::config(false).limits,
-        )));
+        let socket = SocketFixture::new(2);
+        let admission = socket.admission.clone();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap().to_string();
         let membership = Arc::new(
             Membership::validate(
                 MembershipVersion(1),
                 [A, B, C]
                     .iter()
-                    .enumerate()
-                    .map(|(i, n)| Member {
+                    .map(|n| Member {
                         node: NodeId((*n).into()),
                         shares: std::num::NonZeroU32::new(1).unwrap(),
-                        peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
+                        peer_endpoint: address.clone(),
                         rails: vec![],
                         site: String::new(),
                     })
@@ -603,13 +561,17 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
             )
             .unwrap(),
         );
-        let relay = Relay::new(
-            Rc::new(Paths::new(Rc::new(LinkHealth), 1)),
+        let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 1));
+        let requester = Rc::new(Requester::new(
+            paths.clone(),
             forwarding.clone(),
-            Rc::new(Destination {
-                auth: Forwarding::new(signers[2].clone()),
-                fail,
-            }),
+            socket.transfers(signers[1].clone()),
+            network.clone(),
+        ));
+        let relay = Relay::new(
+            paths,
+            forwarding.clone(),
+            requester.clone(),
             admission.clone(),
             network,
         );
@@ -617,7 +579,61 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
         let scope = local.origin.scope().clone();
         let (signed, binding) = origin.sign_request_to(local, signers[1].node()).unwrap();
         let ingress = forwarding.verify_request(signed).unwrap();
-        let result = futures::executor::block_on(relay.forward(ingress, membership, &scope));
+        let destination = async {
+            let fd = socket
+                .reactor
+                .accept(
+                    Rc::new(uring_runtime::reactor::Descriptor::from(listener)),
+                    &scope,
+                )
+                .await?;
+            let connection = crate::http::connection::from_accepted(fd, &admission)?;
+            let connection = crate::security::connection::accept(
+                &socket.io,
+                connection,
+                signers[2].clone(),
+                &scope,
+            )
+            .await?;
+            let received = socket.io.receive_head(connection, &scope).await?;
+            let (envelope, length) = decode_envelope(received.value, false)?;
+            assert_eq!(length, 0);
+            let auth = Forwarding::new(signers[2].clone());
+            let admitted = auth.verify_request(socket.codec.request(envelope, &scope)?)?;
+            assert_eq!(admitted.request().route.remaining_links, 3);
+            assert_eq!(
+                admitted
+                    .request()
+                    .origin
+                    .authorization
+                    .as_ref()
+                    .unwrap()
+                    .ciphertext,
+                vec![5; 32]
+            );
+            assert_eq!(
+                admission.used(ResourceClass::Relay),
+                1,
+                "relay reservation spans downstream I/O"
+            );
+            if !fail {
+                let response = auth.sign_response(admitted.binding(), PeerResponse::Miss)?;
+                socket
+                    .io
+                    .send_head(
+                        received.connection,
+                        encode_envelope(&response.authentication, true, 0)?,
+                        &scope,
+                    )
+                    .await?;
+            }
+            Ok::<_, Error>(())
+        };
+        let (result, served) = crate::http::connection::io_tests::drive(&socket.reactor, async {
+            futures::join!(relay.forward(ingress, membership, &scope), destination)
+        });
+        served.unwrap();
+        assert_eq!(requester.outbound_requests.get(), 1);
         if fail {
             assert!(matches!(result, Err(Error::Io)));
         } else {
@@ -632,6 +648,7 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
             ));
         }
         assert_eq!(admission.used(ResourceClass::Relay), 0);
+        assert_eq!(socket.reactor.in_flight(), 0);
     }
 }
 
@@ -822,7 +839,7 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
         .sign_request_to(page_request, &NodeId(B.into()))
         .unwrap();
     assert!(matches!(
-        futures::executor::block_on(PeerTransport::exchange(
+        futures::executor::block_on(Requester::exchange(
             &requester,
             wrong,
             members.clone(),
@@ -982,10 +999,11 @@ fn signed_tcp_case(case: &str) {
     let adaptive =
         crate::peer::adaptive::AdaptivePeers::new(Default::default(), metrics.clone()).unwrap();
     let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4).with_peer_admission(adaptive));
+    let outbound = NoOutbound::new(signers[2].clone(), destination_network.clone());
     let relay = Rc::new(Relay::new(
         paths.clone(),
         destination_auth.clone(),
-        Rc::new(NeverTransport),
+        outbound.requester.clone(),
         admission.clone(),
         destination_network.clone(),
     ));
@@ -1104,16 +1122,6 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
     };
 
     struct Never;
-    impl PeerTransport for Never {
-        fn exchange<'a>(
-            &'a self,
-            _: protocol::SignedRequest,
-            _: crate::topology::membership::MembershipLease,
-            _: &'a RequestScope,
-        ) -> crate::error::Operation<'a, protocol::SignedResponse> {
-            Box::pin(async { panic!("incomplete headers must not relay") })
-        }
-    }
     impl server::LocalPageService for Never {
         fn serve_peer<'a>(
             &'a self,
@@ -1158,10 +1166,16 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
         ));
         let (signers, _) = identities();
         let forwarding = Rc::new(Forwarding::new(signers[2].clone()));
+        let outbound = NoOutbound::new(
+            signers[2].clone(),
+            Rc::new(
+                PeerNetwork::new(signers[2].node().clone(), Arc::new(Default::default())).unwrap(),
+            ),
+        );
         let relay = Rc::new(Relay::new(
             Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
             forwarding.clone(),
-            Rc::new(Never),
+            outbound.requester.clone(),
             admission.clone(),
             Rc::new(
                 PeerNetwork::new(signers[2].node().clone(), Arc::new(Default::default())).unwrap(),
@@ -1608,17 +1622,8 @@ mod established_sessions {
             })
         }
     }
-    impl PeerTransport for CountedService {
-        fn exchange<'a>(
-            &'a self,
-            _: protocol::SignedRequest,
-            _: crate::topology::membership::MembershipLease,
-            _: &'a RequestScope,
-        ) -> crate::error::Operation<'a, protocol::SignedResponse> {
-            Box::pin(async { panic!("direct request must not relay") })
-        }
-    }
     struct Fixture {
+        _outbound: NoOutbound,
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         reactor: Rc<Reactor>,
         io: Rc<HttpIo>,
@@ -1668,10 +1673,11 @@ mod established_sessions {
                 )
                 .unwrap(),
             );
+            let outbound = NoOutbound::new(signers[2].clone(), network.clone());
             let relay = Rc::new(Relay::new(
                 Rc::new(Paths::new(Rc::new(LinkHealth), 4)),
                 forwarding.clone(),
-                service.clone(),
+                outbound.requester.clone(),
                 admission.clone(),
                 network.clone(),
             ));
@@ -1685,6 +1691,7 @@ mod established_sessions {
                 signers[2].clone(),
             );
             Self {
+                _outbound: outbound,
                 admission,
                 reactor,
                 io,
