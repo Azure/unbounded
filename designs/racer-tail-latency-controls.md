@@ -4,7 +4,8 @@ Evaluated at `3255648690259da3ac95ec2c5c8586c7a802d576`, 2026-10-01.
 Section 3 was corrected after the six-blocker safety review on 2026-10-01;
 its updated behavior and regression references supersede that initial evaluation.
 Other line references below describe the initial evaluated revision, except
-references with symbol names, refreshed after the readability refactor.
+references with symbol names, refreshed after the readability refactor and module
+consolidation. These reference updates do not refresh the dated validation results.
 Implementation and test assertions were read before related prose. No cluster
 inspection, rollout, load change, or performance measurement was performed.
 This document changes no defaults. Below, `D/` means
@@ -46,7 +47,7 @@ timeout means DMA completion (`D/rdma/lifecycle.rs:55-67,480-505`).
 
 Assertions cover shared caps and retained permits, local-pressure reduction,
 exclusive recovery, and production workers' shared permits and metrics
-(`D/peer/adaptive.rs`, tests; `D/app/peer_tests.rs`,
+(`D/peer/adaptive.rs`, tests; `D/app/tests/peer.rs`,
 `worker_requesters_share_configured_admission_and_production_metrics`).
 
 ## 2. Attempt cap and body ETA are distinct from signed authority

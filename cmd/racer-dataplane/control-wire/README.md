@@ -15,8 +15,9 @@ timeout --signal=TERM --kill-after=10s 300s cargo test --locked --manifest-path 
 
 The independent performance controller consumes this crate through
 `internal/racer-test/control.rs`, without linking the dataplane. The dataplane's
-`src/control/wire.rs` is an explicit application adapter. It converts wire
-members, rail mappings, and cache definitions to application-owned records.
+`src/control/state.rs` contains explicit application adapters for wire members
+and rail mappings. It re-exports `racer_control_wire::CacheDefinition` directly;
+publication adapters pass cache definitions through without conversion.
 Key bundles transfer directly into `racer-identity`, which owns epoch validation,
 certificate identities, and purpose-bound leases. Placement traits, publication
 installation, transport, persistence, and accepted control cursors remain in the

@@ -11,7 +11,10 @@ execution-policy or common/model crate.
   event-driven proxy could supply its own capacity, polling budget, task futures,
   result handling, and shutdown fencing without any Racer model or read types.
   Queues, permits and scoped futures remain non-Send. Wakes may cross threads.
-- `src/read.rs:5-112` keeps Racer's 1024-task ceiling and error/result adaptation.
+- Racer consumes `uring_runtime::drivers` directly;
+  `src/app.rs::WorkerApplication::assemble` sets its 1024-task ceiling.
+  `src/read/tests.rs::racer_capacity_and_reservation_errors_are_preserved` and
+  `detached_operation_errors_release_capacity` cover the application contract.
   Acquisition, routing, retry and lifecycle decisions remain in main. Client
   listeners and dispatch consume the runtime wake primitive directly.
 - `src/runtime/admission.rs:39-89` remains Racer policy, including resource
@@ -23,8 +26,9 @@ execution-policy or common/model crate.
   request semantics. Generic cancellation and I/O scope enforcement already live
   in `runtime/src/deadline.rs` and `runtime/src/reactor.rs`. No application model
   types or error taxonomy are moved downstairs merely to satisfy imports.
-- `src/runtime/ingress.rs:90-112` chooses admitted destinations. Its queue bound
-  follows target reservations (`:159-165`). This is application ingress policy, not a reason to invent a
+- The inline `ingress` module in `src/runtime.rs` chooses admitted destinations
+  in `Ingress::reserve`. Its queue bound follows target reservations in
+  `Offer::deliver`. This is application ingress policy, not a reason to invent a
   generic routing callback. The SPSC channel is not interchangeable with this
   shared, target-selected handoff. The implementation remains upstairs.
 - `src/runtime/reactor.rs` retains validated Racer resource-class/provenance
@@ -42,9 +46,10 @@ execution-policy or common/model crate.
 | Bounded permits, nested owners, wake gating, detached completion | `runtime/src/drivers.rs` mechanism tests, including all five prior driver tests |
 | Zero capacity/budget, scoped destruction, recursive polling, crash with outstanding permit | New runtime driver edge tests |
 | Non-Send queue, guard, permit, scoped future | Four runtime compile-fail examples |
-| Exact Racer ceiling, error conversion, completion-before-drop accounting | `src/read.rs::drivers::tests` |
+| Exact Racer ceiling and error conversion | `src/read/tests.rs::racer_capacity_and_reservation_errors_are_preserved`, `detached_operation_errors_release_capacity` |
+| Capacity released before completed detached operation is dropped | `runtime/src/drivers.rs::tests::completed_operation_is_dropped_after_releasing_capacity` |
 | Cancellation fences and safe reactor construction | Existing reactor and worker tests/compile-fail examples, unchanged |
-| Cross-cache zeroization and accounting transfer | `src/runtime/admission/tests.rs:32-62`, unchanged |
+| Cross-cache zeroization and accounting transfer | Inline `src/runtime/admission.rs::tests::recycled_truncated_capacity_is_zero_before_cross_cache_and_class_reuse` |
 | Reserved outbound/control progress and resource floors | Existing admission and ingress tests, unchanged |
 | Held offer delivered after close releases socket and both charges | New `runtime::ingress::tests::offer_delivered_after_target_close_releases_socket_and_charges` |
 | Diagnostic meanings, independent ring lifetimes and exact formatting | Existing `telemetry::failures::tests` plus expanded page fingerprint/cached-CRC test |

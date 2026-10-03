@@ -84,12 +84,12 @@ Checkpoint recovery restores index and segment metadata without scanning page
 records (`cmd/racer-dataplane/src/store/checkpoint.rs:382-418`). Its decoder shares
 a cursor, not the page-record schema (`:834-864`). The fallback test deliberately
 retains invalid slab content while recovering checkpoint metadata
-(`cmd/racer-dataplane/src/store/checkpoint/tests.rs:644-683`). This is not evidence
+(`cmd/racer-dataplane/src/store/tests/checkpoint.rs::alternating_publication_falls_back_to_valid_older_cut_and_ignores_temp_and_payload`). This is not evidence
 of an offline page-record recovery consumer.
 
 Integrity has distinct stages: the format parser verifies header SHA-256 and
 returns the stored CRC; the reader installs that CRC; `CiphertextPage` verifies
-it before AEAD decryption (`cmd/racer-dataplane/src/memory/pool.rs:222-239`,
+it before AEAD decryption (`cmd/racer-dataplane/src/memory.rs::CiphertextPage::verify_checksum`,
 `cmd/racer-dataplane/src/security/aead.rs:312-339`). The format module's opening
 comment mentions header SHA and AEAD but omits this mandatory CRC stage. The
 payload-corruption assertions explicitly check the later checksum failure

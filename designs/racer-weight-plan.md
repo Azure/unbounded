@@ -32,7 +32,12 @@ baseline/fixed/equal-healthy TX/RX. Refresh resourceVersions before execution.
 
 Positive uint32 shares are accepted (`internal/racer/topology.go:372-391`);
 maximum/invalid values are asserted in `membership_test.go:47-86`. Integer
-placement compares cost/share with UID-order ties (`cmd/racer-dataplane/src/topology/placement.rs:72-120`).
+placement compares cost/share with UID-order ties. The application adapter is
+`cmd/racer-dataplane/src/topology/routing.rs::Placement::rank`; comparison and
+its `integer_log_edges_and_ties` test live in
+`cmd/racer-dataplane/topology/src/placement.rs` (`Score::compare`). Tie indexes
+follow ID order from `topology/src/membership.rs::Membership::new`, using Racer
+node ID bytes from `src/topology/membership.rs`'s `topology::Member` implementation.
 V5 weights eligible equal-cost next hops (`topology/routing.rs:370-438`). Uniform
 400/100 scaling preserves placement and expected routing probabilities, not
 necessarily individual hashed next hops. Shares enter placement identity; more
