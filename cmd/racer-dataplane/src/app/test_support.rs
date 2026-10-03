@@ -484,7 +484,7 @@ pub(super) fn publication(
 }
 
 pub(super) fn page(app: &WorkerApplication) -> crate::memory::page::PageResult {
-    use crate::memory::pool::{VerifiedBytes, VerifiedPage};
+    use crate::memory::{VerifiedBytes, VerifiedPage};
     use crate::model::{ResourceClass, VersionMetadata, *};
     let version = ObjectVersion {
         object: ObjectId {

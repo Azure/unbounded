@@ -699,7 +699,7 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
 use crate::{
     client::ClientRequest,
     http::Codec,
-    memory::{delivery::Delivery, pipe::new_pipe_pool},
+    memory::{delivery::Delivery, new_pipe_pool},
     model::{ExpiresAt, Limits, ObjectMetadata, ObjectVersion, StrongEtag},
     read::ReadResponse,
     runtime::reactor::Reactor,

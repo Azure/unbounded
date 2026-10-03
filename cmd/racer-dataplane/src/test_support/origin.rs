@@ -6,7 +6,7 @@ use crate::{
         Codec,
         connection::{HttpIo, HttpPool},
     },
-    memory::pool::BufferPool,
+    memory::BufferPool,
     model::{ObjectMetadata, PAGE_BYTES},
     origin::OriginClient,
     runtime::{admission::AdmissionPolicy, reactor::Reactor},

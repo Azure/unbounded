@@ -5,7 +5,7 @@ use racer_dataplane::{
     config::Config,
     control::secrets::BundleInstaller,
     error::Error,
-    memory::pool::BufferPool,
+    memory::BufferPool,
     model::{
         CacheKey, ObjectId, ObjectVersion, PageId, PageNumber, RequestId, ResourceClass,
         StrongEtag, WorkerId,

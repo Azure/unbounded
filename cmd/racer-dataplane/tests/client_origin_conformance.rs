@@ -8,7 +8,7 @@ use racer_dataplane::{
         Codec, Header, MessageHead, StartLine,
         connection::{ConnectionLease, HttpIo},
     },
-    memory::{delivery::Delivery, pipe::new_pipe_pool},
+    memory::{delivery::Delivery, new_pipe_pool},
     model::{
         ByteRange, CacheId, CacheKey, ExpiresAt, Limits, ObjectId, ObjectMetadata, ObjectVersion,
         PageId, PageNumber, RequestId, StrongEtag,

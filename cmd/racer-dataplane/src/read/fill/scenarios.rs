@@ -796,8 +796,8 @@ mod pressure {
         };
         let mut page = PageResult {
             metadata: descriptor.for_pin(),
-            plaintext: crate::memory::pool::VerifiedPage {
-                inner: Arc::new(crate::memory::pool::VerifiedBytes {
+            plaintext: crate::memory::VerifiedPage {
+                inner: Arc::new(crate::memory::VerifiedBytes {
                     page: id.clone(),
                     bytes: vec![1; 3],
                     reservation: admission
@@ -1273,7 +1273,7 @@ impl Fixture {
                 state::{Availability, CacheDefinition, PublishedState, SnapshotStore},
                 wire::*,
             },
-            memory::{delivery::Delivery, pipe::new_pipe_pool},
+            memory::{delivery::Delivery, new_pipe_pool},
             read::{
                 Coordinator,
                 metadata::{MetadataDependencies, MetadataService},

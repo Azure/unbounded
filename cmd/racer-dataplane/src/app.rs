@@ -24,7 +24,7 @@ use crate::{
     },
     error::{Error, Operation, Result},
     http::connection::{HttpIo, HttpPool},
-    memory::{cache::MemoryCache, delivery::Delivery, pipe::new_pipe_pool, pool::BufferPool},
+    memory::{BufferPool, cache::MemoryCache, delivery::Delivery, new_pipe_pool},
     model::{Limits, NodeId, RequestId, WorkerId},
     origin::{Origin, OriginClient},
     peer::{Relay, Requester, server::PeerServer, transport::Transfers},

@@ -14,9 +14,9 @@ use super::{
 use crate::{
     error::{Error, Operation, Result},
     memory::{
+        BufferPool, CiphertextPage,
         cache::MemoryCache,
         page::{AcquiredPage, PageResult, UnverifiedPage},
-        pool::{BufferPool, CiphertextPage},
     },
     model::{ObjectMetadata, OriginContext, PAGE_BYTES, PageId, ResourceClass, VersionMetadata},
     origin::Origin,

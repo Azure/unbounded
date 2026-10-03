@@ -639,7 +639,7 @@ pub(crate) mod test_support {
             state::{CacheDefinition, PublishedState, SnapshotStore},
             wire::{Publication, PublicationSequence},
         },
-        memory::{cache::MemoryCache, delivery::Delivery, pool::BufferPool},
+        memory::{BufferPool, cache::MemoryCache, delivery::Delivery},
         model::{MembershipVersion, ObjectMetadata, WorkerId},
         read::{
             Coordinator,

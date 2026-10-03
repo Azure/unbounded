@@ -540,7 +540,7 @@ use crate::{
     client::{ClientRequest, ReadKind},
     control::state::PublishedState,
     http::{Codec, connection::HttpIo},
-    memory::{delivery::Delivery, pipe::new_pipe_pool},
+    memory::{delivery::Delivery, new_pipe_pool},
     model::{ByteRange, MembershipVersion},
     peer::{
         PeerNetwork, PeerTransport,

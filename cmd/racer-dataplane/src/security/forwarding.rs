@@ -829,13 +829,10 @@ mod tests {
         security::test_support::{clone_head, network, node},
     };
     use std::time::{Duration, Instant};
-    fn wire_ciphertext(
-        envelope: PageEnvelope,
-        length: usize,
-    ) -> crate::memory::pool::CiphertextPage {
-        crate::memory::pool::CiphertextPage {
+    fn wire_ciphertext(envelope: PageEnvelope, length: usize) -> crate::memory::CiphertextPage {
+        crate::memory::CiphertextPage {
             provenance: None,
-            inner: Arc::new(crate::memory::pool::CiphertextBytes {
+            inner: Arc::new(crate::memory::CiphertextBytes {
                 checksum: std::sync::OnceLock::new(),
                 envelope,
                 bytes: vec![0; length],
@@ -1014,7 +1011,7 @@ mod tests {
 
     #[test]
     fn bootstrap_binds_intent_empty_page_zero_length_and_destination() {
-        use crate::memory::pool::tests::bundle_for;
+        use crate::memory::tests::bundle_for;
         use crate::model::{ExpiresAt, ObjectMetadata};
         let mut request = request(90);
         request.operation = Operation::Bootstrap {
@@ -1280,10 +1277,8 @@ mod tests {
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
-        let codec = SecurityCodec::new(
-            admission.clone(),
-            crate::memory::pool::BufferPool::new(admission),
-        );
+        let codec =
+            SecurityCodec::new(admission.clone(), crate::memory::BufferPool::new(admission));
         let (auth, _) = decode_envelope(
             encode_envelope(&forwarded.authentication, false, 0).unwrap(),
             false,

@@ -21,7 +21,7 @@ use self::lifecycle::{
 };
 use crate::{
     error::{Error, Operation, Result},
-    memory::pool::{BufferPool, CiphertextPage},
+    memory::{BufferPool, CiphertextPage},
     model::{NodeId, PageEnvelope, ResourceClass, TransferId},
     runtime::{
         admission::AdmissionPolicy,

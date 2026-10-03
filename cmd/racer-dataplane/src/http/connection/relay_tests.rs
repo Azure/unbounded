@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     http::{Codec, Header, MessageHead, StartLine},
-    memory::pipe::{acquire_wait, new_pipe_pool},
+    memory::{acquire_wait, new_pipe_pool},
     model::{RequestId, ResourceClass},
     runtime::{admission::AdmissionPolicy, reactor::Reactor},
 };

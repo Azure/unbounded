@@ -994,7 +994,7 @@ mod tests {
                 crate::test_support::cluster::config(false).limits,
             ),
         ));
-        let page = crate::memory::pool::tests::bundle_for(
+        let page = crate::memory::tests::bundle_for(
             &admission,
             VersionMetadata {
                 version: version(),

@@ -152,7 +152,7 @@ impl PeerServer {
         wire: Rc<super::protocol::SecurityCodec>,
         signatures: Rc<crate::security::connection::Signatures>,
     ) -> Self {
-        let pipes = Rc::new(crate::memory::pipe::new_pipe_pool(admission.clone()));
+        let pipes = Rc::new(crate::memory::new_pipe_pool(admission.clone()));
         let transfers = Rc::new(super::transport::Transfers::new(
             Rc::new(crate::http::connection::HttpPool::new(
                 io.reactor().clone(),
@@ -1430,7 +1430,7 @@ mod tests {
                 Codec,
                 connection::{ConnectionLease, HttpIo},
             },
-            memory::pool::BufferPool,
+            memory::BufferPool,
             peer::{PeerTransport, protocol::SecurityCodec},
             runtime::reactor::Reactor,
             security::connection::tests::{finish, hello},

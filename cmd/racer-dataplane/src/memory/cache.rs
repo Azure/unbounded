@@ -1,7 +1,7 @@
 //! Worker-local idle verified pages and original ciphertext; independent of disk clock.
 use super::{
+    BufferPool,
     page::{CiphertextCopy, PageResult},
-    pool::BufferPool,
 };
 use crate::runtime::collections::{HashMap, HashSet};
 use crate::{
@@ -355,7 +355,7 @@ fn idle(entry: &PageResult) -> bool {
 mod tests {
     use super::*;
     use crate::{
-        memory::pool::tests::{admission, bundle, bundle_for},
+        memory::tests::{admission, bundle, bundle_for},
         model::{ExpiresAt, ResourceClass},
     };
     #[test]

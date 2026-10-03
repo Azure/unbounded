@@ -4,7 +4,7 @@
 use crate::{
     error::{Error, Result},
     http::{Codec, Header, MessageHead, StartLine},
-    memory::pool::{BufferPool, CiphertextPage},
+    memory::{BufferPool, CiphertextPage},
     model::{
         EncryptedAuthorization, ExpiresAt, KeyId, MetadataSelector, Nonce, ObjectMetadata,
         OpaqueMetadata, PageEnvelope, PeerOriginContext, ResourceClass, *,

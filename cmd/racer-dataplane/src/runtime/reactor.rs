@@ -24,7 +24,7 @@
 //! ```
 //! Audited production buffers own independent storage:
 //! ```
-//! use racer_dataplane::{memory::pool::PlaintextBuffer,
+//! use racer_dataplane::{memory::PlaintextBuffer,
 //!     runtime::admission::AdmissionPolicy};
 //! use uring_runtime::reactor::IoBuffer;
 //! use flow_control::Charge;
@@ -37,7 +37,7 @@
 //! Immutable ciphertext cannot be used for receive:
 //! ```compile_fail
 //! use std::rc::Rc;
-//! use racer_dataplane::{memory::pool::CiphertextPage,
+//! use racer_dataplane::{memory::CiphertextPage,
 //!     runtime::{reactor::Reactor, deadline::RequestScope}};
 //! use uring_runtime::reactor::Descriptor;
 //! fn receive(r: &Reactor, fd: Rc<Descriptor>, page: CiphertextPage, scope: &RequestScope) {
@@ -192,7 +192,7 @@ mod tests {
     fn movable_production_buffers_preserve_subrange_through_completion() {
         use crate::{
             http::connection::{BufferRange, OwnedBuffer},
-            memory::pool::BufferPool,
+            memory::BufferPool,
             peer::transport::WireBuffer,
         };
         fn check<B: IoBuffer>(buffer: B)
@@ -523,7 +523,7 @@ mod simulation_tests {
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
-        let pool = crate::memory::pipe::new_pipe_pool(admission);
+        let pool = crate::memory::new_pipe_pool(admission);
         let mut pipe = pool.acquire().unwrap();
         let (a, b) = sim.socket_pair();
         sim.set_stream_capacity(2);
@@ -704,7 +704,7 @@ mod simulation_tests {
             let _environment = sim.enter();
             let r = reactor();
             let scope = scope();
-            let bundle = crate::memory::pool::tests::bundle_for(
+            let bundle = crate::memory::tests::bundle_for(
                 &r.admission,
                 VersionMetadata {
                     content_type: None,

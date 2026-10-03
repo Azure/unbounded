@@ -733,16 +733,15 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
                         ciphertext,
                     } => {
                         let admission = &self.mesh.admissions[self.local];
-                        let copy = crate::memory::pool::BufferPool::new(admission.clone())
-                            .ciphertext(
-                                admission.reserve(
-                                    Some(&metadata.version.object.cache),
-                                    ResourceClass::Ciphertext,
-                                    ciphertext.bytes().len(),
-                                )?,
-                                ciphertext.envelope().clone(),
-                                ciphertext.bytes().to_vec(),
-                            )?;
+                        let copy = crate::memory::BufferPool::new(admission.clone()).ciphertext(
+                            admission.reserve(
+                                Some(&metadata.version.object.cache),
+                                ResourceClass::Ciphertext,
+                                ciphertext.bytes().len(),
+                            )?,
+                            ciphertext.envelope().clone(),
+                            ciphertext.bytes().to_vec(),
+                        )?;
                         PeerResponse::Page {
                             metadata,
                             ciphertext: copy,

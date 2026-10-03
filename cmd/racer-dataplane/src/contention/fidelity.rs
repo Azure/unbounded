@@ -4,11 +4,7 @@
 use super::*;
 use crate::{
     error::Operation,
-    memory::{
-        cache::MemoryCache,
-        page::PageResult,
-        pool::{BufferPool, VerifiedBytes, VerifiedPage},
-    },
+    memory::{BufferPool, VerifiedBytes, VerifiedPage, cache::MemoryCache, page::PageResult},
     model::{
         CacheKey, MetadataSelector, Nonce, ObjectId, ObjectVersion, OriginContext, PageEnvelope,
         PageId, PageNumber, RequestId, StrongEtag, VersionMetadata, WorkerId,

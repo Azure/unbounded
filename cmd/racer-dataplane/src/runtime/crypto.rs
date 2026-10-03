@@ -29,7 +29,7 @@ mod measurement {
     use super::*;
     use crate::telemetry::metrics::{Event, Event::*, Metrics};
     use crate::{
-        memory::pool::BufferPool,
+        memory::BufferPool,
         model::{Nonce, PageEnvelope, ResourceClass, *},
         security::aead::{PageCryptoEngine, page_aad},
     };
@@ -530,7 +530,7 @@ mod measurement {
         )
         .unwrap();
         for mode in ["cached", "cancel", "missing", "capacity"] {
-            let mut page = crate::memory::pool::tests::bundle_for(
+            let mut page = crate::memory::tests::bundle_for(
                 &admission,
                 crate::model::VersionMetadata {
                     content_type: None,
@@ -1116,7 +1116,7 @@ mod channel {
 }
 use crate::{
     error::{Error, Operation, Result},
-    memory::pool::{CiphertextPage, PlaintextBuffer, VerifiedPage},
+    memory::{CiphertextPage, PlaintextBuffer, VerifiedPage},
     model::{PageId, WorkerId},
 };
 use racer_identity::KeyLease;
@@ -1951,7 +1951,7 @@ mod tests {
         admission: &std::rc::Rc<flow_control::Quotas<AdmissionPolicy>>,
     ) -> CryptoInput {
         use crate::{
-            memory::pool::BufferPool,
+            memory::BufferPool,
             model::{ResourceClass, *},
         };
         let cache = CacheId("00000000-0000-4000-8000-000000000003".into());
@@ -2277,7 +2277,7 @@ mod tests {
     #[test]
     fn abandoned_future_retains_buffers_key_and_permit_until_reaped() {
         use crate::{
-            memory::pool::BufferPool,
+            memory::BufferPool,
             model::{ResourceClass, *},
         };
         use std::{
@@ -2369,7 +2369,7 @@ mod tests {
     #[test]
     fn engine_drop_reclaims_queued_jobs_and_drain_finishes() {
         use crate::{
-            memory::pool::BufferPool,
+            memory::BufferPool,
             model::{ResourceClass, *},
         };
         use std::{
@@ -2431,7 +2431,7 @@ mod tests {
     #[test]
     fn original_scope_failure_is_returned_without_submission() {
         use crate::{
-            memory::pool::BufferPool,
+            memory::BufferPool,
             model::{ResourceClass, *},
         };
         use std::{rc::Rc, time::Instant};

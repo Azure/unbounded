@@ -8,7 +8,7 @@
 //! through abandonment and the final completion fence. After backpressure, the
 //! rest of that page uses direct sends instead of repeating pipe drain round trips.
 //! Backpressured direct sends own immutable page views, not copied staging bytes.
-use super::pool::VerifiedPage;
+use super::VerifiedPage;
 use crate::{
     error::{Error, Operation, Result},
     http::connection::{ConnectionLease, HttpContext, OwnedBuffer},
@@ -155,7 +155,7 @@ impl Delivery {
         &'a self,
         scope: &'a RequestScope,
     ) -> Operation<'a, PipeLease<AdmissionPolicy>> {
-        super::pipe::acquire_wait(&self.pipes, scope)
+        super::acquire_wait(&self.pipes, scope)
     }
 
     pub(crate) fn attach_reserved(
@@ -382,7 +382,7 @@ use crate::error::cooperative_turn as yield_once;
 mod tests {
     use super::*;
     use crate::{
-        memory::{pipe::tests::admission, pool::VerifiedBytes},
+        memory::{VerifiedBytes, pipe_tests::admission},
         model::{
             CacheId, CacheKey, ObjectId, ObjectVersion, PageId, PageNumber, RequestId,
             ResourceClass, StrongEtag,
@@ -405,7 +405,7 @@ mod tests {
     ) {
         let admission = admission(pipes);
         let reactor = Rc::new(Reactor::new(admission.clone()));
-        let pool = Rc::new(super::super::pipe::new_pipe_pool(admission.clone()));
+        let pool = Rc::new(super::super::new_pipe_pool(admission.clone()));
         (
             admission,
             reactor.clone(),

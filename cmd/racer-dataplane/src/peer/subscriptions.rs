@@ -5,7 +5,7 @@
 //! completed responses, retain capacity until consumed or dropped.
 use crate::{
     error::{Error, Result},
-    memory::{page::CiphertextCopy, pool::CiphertextPage},
+    memory::{CiphertextPage, page::CiphertextCopy},
     model::{
         MAX_FIELD_BYTES, MembershipVersion, NodeId, ObjectMetadata, ObjectVersion, PageId,
         PageNumber,
@@ -1113,7 +1113,7 @@ mod tests {
     #[test]
     fn successful_fanout_shares_allocation_and_charges_each_receiver_once() {
         use crate::{
-            memory::pool::BufferPool,
+            memory::BufferPool,
             model::{ExpiresAt, KeyId, Nonce, PageEnvelope, ResourceClass},
             runtime::admission::AdmissionPolicy,
         };

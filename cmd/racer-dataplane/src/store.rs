@@ -8,7 +8,7 @@ use crate::runtime::collections::HashMap;
 use crate::runtime::reactor::Reactor;
 use crate::{
     error::{Error, Operation, Result},
-    memory::{page::CiphertextCopy, pool::BufferPool},
+    memory::{BufferPool, page::CiphertextCopy},
     model::{CacheId, ObjectVersion, PageId, ResourceClass, VersionMetadata},
     runtime::{admission::AdmissionPolicy, deadline::RequestScope},
 };

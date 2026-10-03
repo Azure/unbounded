@@ -1,7 +1,7 @@
 //! Observe the allocation at deallocation, before the system allocator can reuse it.
 use racer_dataplane::{
     config::Config,
-    memory::pool::BufferPool,
+    memory::BufferPool,
     model::{
         CacheId, CacheKey, KeyId, Nonce, ObjectId, ObjectVersion, PageEnvelope, PageId, PageNumber,
         ResourceClass, StrongEtag,

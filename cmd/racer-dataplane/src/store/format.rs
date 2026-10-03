@@ -288,7 +288,7 @@ impl<'a> Decoder<'a> {
 mod tests {
     use super::*;
     use crate::{
-        memory::pool::{CiphertextBytes, CiphertextPage},
+        memory::{CiphertextBytes, CiphertextPage},
         model::{ExpiresAt, PAGE_BYTES, ResourceClass},
     };
     use std::{sync::Arc, time::UNIX_EPOCH};

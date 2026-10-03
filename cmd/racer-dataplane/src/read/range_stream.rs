@@ -92,7 +92,7 @@ pub struct RangeStream {
     prefetch_error: Option<Error>,
     selected_ready: Option<PageResult>,
     selection: Option<Operation<'static, (Result<PageResult>, AcquisitionBudget)>>,
-    retained: std::collections::BTreeMap<PageNumber, crate::memory::pool::VerifiedPage>,
+    retained: std::collections::BTreeMap<PageNumber, crate::memory::VerifiedPage>,
     subscription: Option<super::subscription::DemandLease>,
     metadata: ObjectMetadata,
     range: ResolvedRange,
@@ -527,7 +527,7 @@ pub(super) mod tests {
         ByteRange, CacheId, CacheKey, ExpiresAt, ObjectId, ObjectVersion, PAGE_BYTES, StrongEtag,
     };
     use crate::{
-        memory::pipe::new_pipe_pool,
+        memory::new_pipe_pool,
         model::{MembershipVersion, RequestId, ResourceClass, WorkerId},
         runtime::{admission::AdmissionPolicy, reactor::Reactor, worker::WorkerMap},
         topology::membership::Membership,
@@ -601,7 +601,7 @@ pub(super) mod tests {
         number: u64,
     ) -> PageResult {
         use crate::{
-            memory::pool::{CiphertextBytes, CiphertextPage, VerifiedBytes, VerifiedPage},
+            memory::{CiphertextBytes, CiphertextPage, VerifiedBytes, VerifiedPage},
             model::{Nonce, PageEnvelope, ResourceClass},
         };
         let length = (metadata.length - number * PAGE_BYTES).min(PAGE_BYTES) as usize;
@@ -1158,7 +1158,7 @@ pub(super) mod tests {
         use crate::{
             client::response::Responses,
             http::{Codec, connection::HttpIo},
-            memory::pipe::new_pipe_pool,
+            memory::new_pipe_pool,
             model::{RequestId, ResourceClass},
             read::ReadResponse,
             runtime::reactor::Reactor,

@@ -23,7 +23,7 @@ use std::{
 
 // Only origin content is generated. No client wire framing, scheduling, credit
 // accounting, page validation, encryption, or delivery is implemented here.
-struct GeneratedOrigin(memory::pool::BufferPool);
+struct GeneratedOrigin(memory::BufferPool);
 fn metadata(context: &OriginContext) -> ObjectMetadata {
     let length = match context.object.key.0[0] {
         0 => 0,
@@ -175,9 +175,7 @@ impl SubscriptionFixture {
             state::{CacheDefinition, PublishedState, SnapshotStore},
             wire::*,
         };
-        use memory::{
-            cache::MemoryCache, delivery::Delivery, pipe::new_pipe_pool, pool::BufferPool,
-        };
+        use memory::{BufferPool, cache::MemoryCache, delivery::Delivery, new_pipe_pool};
         use read::{
             Coordinator,
             candidates::CandidatePolicy,

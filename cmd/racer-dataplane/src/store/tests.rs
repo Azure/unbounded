@@ -216,7 +216,7 @@ mod index_pressure {
 }
 use crate::{
     error::{Error, Result},
-    memory::{page::CiphertextCopy, pool::BufferPool},
+    memory::{BufferPool, page::CiphertextCopy},
     model::{
         CacheId, CacheKey, ExpiresAt, Nonce, ObjectId, ObjectMetadata, ObjectVersion, PageEnvelope,
         PageId, PageNumber, RequestId, ResourceClass, StrongEtag, WorkerId,
@@ -421,7 +421,7 @@ fn scope() -> RequestScope {
 fn storage_requires_published_cache_and_live_keys_including_restore() {
     use crate::{
         control::state::{Availability, PublishedState, for_caches},
-        memory::{cache::MemoryCache, pool::tests::bundle_for},
+        memory::{cache::MemoryCache, tests::bundle_for},
         security::test_support::{keys, rotation_bundle},
     };
     use std::sync::Arc;
@@ -1364,7 +1364,7 @@ fn cache_removal_during_write_fences_late_publication() {
 fn sustained_rotation_reclaims_history_and_fences_held_pages_and_write_completions() {
     use crate::{
         control::state::for_caches,
-        memory::{cache::MemoryCache, pool::tests::bundle_for},
+        memory::{cache::MemoryCache, tests::bundle_for},
         security::test_support::{keys, rotation_bundle},
     };
     use racer_identity::KeyPurpose;

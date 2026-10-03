@@ -587,7 +587,7 @@ mod destination_disconnect {
         page: &PageId,
     ) -> crate::memory::page::PageResult {
         use crate::{
-            memory::pool::{CiphertextBytes, CiphertextPage, VerifiedBytes, VerifiedPage},
+            memory::{CiphertextBytes, CiphertextPage, VerifiedBytes, VerifiedPage},
             model::{ExpiresAt, ObjectMetadata, PageEnvelope},
         };
         crate::memory::page::PageResult {
@@ -983,7 +983,7 @@ mod encrypted_http {
             Codec,
             connection::{Endpoint, HttpIo, HttpPool},
         },
-        memory::pool::CiphertextPage,
+        memory::CiphertextPage,
         runtime::{
             crypto::{self, CryptoClient},
             reactor::Reactor,
@@ -2024,7 +2024,7 @@ mod timing {
     }
 }
 use crate::{
-    memory::pool::BufferPool,
+    memory::BufferPool,
     model::{
         EncryptedAuthorization, KeyId, MetadataSelector, Nonce, PeerOriginContext, ResourceClass, *,
     },

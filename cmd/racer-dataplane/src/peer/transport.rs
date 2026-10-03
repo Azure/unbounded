@@ -221,7 +221,7 @@ mod native_exchange_tests {
             Codec, MessageHead, StartLine,
             connection::{HttpIo, HttpPool},
         },
-        memory::pool::BufferPool,
+        memory::BufferPool,
         model::{ExpiresAt, KeyId, Nonce, ObjectMetadata, PageEnvelope, ResourceClass, *},
         peer::protocol as p,
         rdma::{Devices, RdmaTransfer, Sessions},

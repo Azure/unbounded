@@ -609,7 +609,7 @@ fn partition_transfer_and_peer_debits_conserve_original_credits() {
 
 fn result(flights: &Flights, page: PageId) -> PageResult {
     use crate::{
-        memory::pool::{CiphertextBytes, CiphertextPage, VerifiedBytes, VerifiedPage},
+        memory::{CiphertextBytes, CiphertextPage, VerifiedBytes, VerifiedPage},
         model::{ExpiresAt, Nonce, ObjectMetadata, PageEnvelope},
     };
     use std::sync::Arc;

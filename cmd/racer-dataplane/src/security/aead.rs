@@ -1,7 +1,7 @@
 //! Vetted XChaCha20-Poly1305 adapter, canonical page AAD, fresh cryptographic nonces.
 use crate::{
     error::{Error, Operation, Result},
-    memory::pool::{CiphertextBytes, CiphertextPage, PlaintextBuffer, VerifiedBytes, VerifiedPage},
+    memory::{CiphertextBytes, CiphertextPage, PlaintextBuffer, VerifiedBytes, VerifiedPage},
     model::{Nonce, PageEnvelope, PageId, RequestId, ResourceClass},
     runtime::{
         admission::AdmissionPolicy,
@@ -155,7 +155,7 @@ impl PageCrypto {
     /// Futures stay on I/O, even though inputs/completions are Send:
     /// ```compile_fail
     /// use racer_dataplane::{security::aead::PageCrypto,
-    ///     memory::pool::CiphertextPage,
+    ///     memory::CiphertextPage,
     ///     runtime::{admission::AdmissionPolicy, deadline::RequestScope}};
     /// fn require_send<T: Send>(_: T) {}
     /// fn move_future(crypto: &PageCrypto, page: CiphertextPage,
@@ -611,7 +611,7 @@ mod tests {
     #[test]
     fn libsodium_boundary_and_full_page_detached_vectors() {
         use crate::{
-            memory::pool::BufferPool,
+            memory::BufferPool,
             runtime::{
                 admission::AdmissionPolicy,
                 crypto::{CryptoId, pair},
@@ -808,7 +808,7 @@ mod tests {
     #[test]
     fn engine_preserves_failed_inputs_and_completion_capacity() {
         use crate::{
-            memory::pool::BufferPool,
+            memory::BufferPool,
             runtime::{
                 admission::AdmissionPolicy,
                 crypto::{CryptoId, pair},
@@ -934,7 +934,7 @@ mod tests {
     #[test]
     fn encryption_preserves_staging_and_charges_on_failure() {
         use crate::{
-            memory::pool::BufferPool,
+            memory::BufferPool,
             runtime::{
                 admission::AdmissionPolicy,
                 crypto::{CryptoId, pair},
@@ -1058,7 +1058,7 @@ mod tests {
     #[test]
     fn engine_encrypts_and_returns_original_staging_on_failure() {
         use crate::{
-            memory::pool::BufferPool,
+            memory::BufferPool,
             runtime::{
                 admission::AdmissionPolicy,
                 crypto::{CryptoId, pair},

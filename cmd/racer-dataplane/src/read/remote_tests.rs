@@ -5,7 +5,7 @@ use crate::{
     control::wire::SCHEMA_VERSION,
     error::{Error, Operation},
     http::{Codec, connection::HttpIo, connection::HttpPool},
-    memory::pool::BufferPool,
+    memory::BufferPool,
     model::{ExpiresAt, MetadataSelector, ObjectMetadata, OriginContext, *},
     peer::{
         PeerNetwork, PeerTransport, Relay, Requester,
@@ -632,7 +632,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         let responses = crate::client::response::Responses::new(
             Rc::new(HttpIo::for_clients(reactor.clone(), admission.clone())),
             Rc::new(crate::memory::delivery::Delivery::new(
-                Rc::new(crate::memory::pipe::new_pipe_pool(admission.clone())),
+                Rc::new(crate::memory::new_pipe_pool(admission.clone())),
                 reactor.clone(),
                 Duration::from_secs(10),
             )),
@@ -880,7 +880,7 @@ fn metadata_coordinator_with_newer_publication(
             state::{PublishedState, SnapshotStore},
             wire::{Publication, PublicationSequence},
         },
-        memory::{cache::MemoryCache, delivery::Delivery, pipe::new_pipe_pool},
+        memory::{cache::MemoryCache, delivery::Delivery, new_pipe_pool},
         runtime::{
             crypto::{self, CryptoClient},
             worker::WorkerMap,

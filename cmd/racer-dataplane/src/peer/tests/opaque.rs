@@ -2,7 +2,7 @@ use super::*;
 mod materialized_pairing {
     //! Distinct bodies make cross-exchange substitution visible across relay reuse.
     use super::*;
-    use crate::{error::Result, memory::pool::CiphertextPage};
+    use crate::{error::Result, memory::CiphertextPage};
     use std::net::Shutdown;
 
     pub(super) async fn until(condition: impl Fn() -> bool) {
@@ -853,7 +853,7 @@ struct RelayFixture {
     plaintext: Vec<u8>,
     body: Vec<u8>,
     metadata: ObjectMetadata,
-    page: crate::memory::pool::CiphertextPage,
+    page: crate::memory::CiphertextPage,
 }
 
 #[test]

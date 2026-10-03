@@ -9,7 +9,7 @@ use racer_dataplane::{
     },
     error::{Error, Operation, Result},
     http::{Codec, connection::HttpIo, connection::HttpPool},
-    memory::{cache::MemoryCache, delivery::Delivery, pipe::new_pipe_pool, pool::BufferPool},
+    memory::{BufferPool, cache::MemoryCache, delivery::Delivery, new_pipe_pool},
     model::{Limits, PAGE_BYTES, ResourceClass, *},
     origin::OriginClient,
     peer::{

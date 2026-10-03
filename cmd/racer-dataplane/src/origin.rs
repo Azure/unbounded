@@ -11,7 +11,7 @@ use crate::{
         connection::HttpIo,
         connection::{ConnectionLease, Endpoint, HttpPool},
     },
-    memory::pool::{BufferPool, PlaintextBuffer},
+    memory::{BufferPool, PlaintextBuffer},
     model::{
         MetadataSelector, ObjectId, ObjectMetadata, OriginContext, PAGE_BYTES, PageId, PageNumber,
         ResourceClass,
