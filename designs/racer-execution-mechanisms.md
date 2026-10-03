@@ -15,7 +15,8 @@ execution-policy or common/model crate.
   Acquisition, routing, retry and lifecycle decisions remain in main. Client
   listeners and dispatch consume the runtime wake primitive directly.
 - `src/runtime/admission.rs:39-89` remains Racer policy, including resource
-  classes, store-aware ciphertext floors and three reserved control connections.
+  classes, store-aware ciphertext floors and up to three reserved control
+  connections (`min(client_connections / 4, 3)`).
   Generic accounting/enforcement already belongs to `flow-control`; moving this
   policy would invert the corrected ownership rather than improve reuse.
 - `src/runtime/deadline.rs:62-195` retains candidate total/idle/body decisions and
