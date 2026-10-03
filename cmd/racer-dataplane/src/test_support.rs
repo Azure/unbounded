@@ -158,6 +158,7 @@ pub mod origin {
         missing: bool,
         body: Option<Vec<u8>>,
         calls: Vec<Call>,
+        completed: Vec<Call>,
         rejections: BTreeMap<RequestKind, VecDeque<u16>>,
         rejected_pages: BTreeMap<u64, u16>,
         blocked: BTreeSet<RequestKind>,
@@ -201,6 +202,7 @@ pub mod origin {
                 missing: false,
                 body: None,
                 calls: vec![],
+                completed: vec![],
                 rejections: BTreeMap::new(),
                 rejected_pages: BTreeMap::new(),
                 blocked: BTreeSet::new(),
@@ -312,6 +314,15 @@ pub mod origin {
         pub fn count(&self, kind: RequestKind) -> usize {
             self.calls().iter().filter(|call| call.kind == kind).count()
         }
+        pub fn completed(&self, kind: RequestKind) -> usize {
+            self.state
+                .lock()
+                .unwrap()
+                .completed
+                .iter()
+                .filter(|call| call.kind == kind)
+                .count()
+        }
     }
 
     impl Drop for AdapterOrigin {
@@ -398,6 +409,7 @@ pub mod origin {
             thread::sleep(Duration::from_millis(1));
         }
         let mut state = state.lock().unwrap();
+        state.completed.push(call.clone());
         let rejected = state
             .rejections
             .entry(kind)

@@ -250,7 +250,7 @@ fn validate_opaque(value: &[u8]) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+mod parser_tests {
     use super::*;
     use crate::http::Codec;
     use http1::Header;
@@ -632,3 +632,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

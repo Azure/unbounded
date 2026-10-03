@@ -26,6 +26,7 @@ mod subscription {
     use crate::{
         error::{Error, Operation, Result},
         http::{ConnectionLease, HttpIo, OwnedBuffer},
+        memory::delivery::ReaderLease,
         model::{ObjectMetadata, PAGE_BYTES, PageNumber, ResolvedRange},
         read::{ReadResponse, range_stream::RangeStream},
         runtime::deadline::RequestScope,
@@ -162,11 +163,11 @@ mod subscription {
         Ok(io.write_body(connection, buffer, scope).await?.lease)
     }
 
-    fn poll_slice_or_readiness<T>(
+    fn poll_slice_or_readiness(
         cx: &mut Context<'_>,
-        slice: impl FnOnce(&mut Context<'_>) -> Poll<Result<T>>,
+        slice: impl FnOnce(&mut Context<'_>) -> Poll<Result<Option<ReaderLease>>>,
         readiness: impl FnOnce(&mut Context<'_>) -> Poll<Result<u32>>,
-    ) -> Poll<Result<T>> {
+    ) -> Poll<Result<Option<ReaderLease>>> {
         // A ready page needs no release-readiness submission. Do not let auxiliary
         // admission discard it. If acquisition needs to wait, readiness still owns
         // the release wakeup and its errors remain terminal, without a busy retry.
@@ -422,21 +423,57 @@ mod subscription {
         use super::*;
         #[test]
         fn ready_slice_precedes_auxiliary_overload() {
+            use crate::{
+                memory::{delivery::Delivery, new_pipe_pool},
+                model::{PageNumber, PageSlice},
+                runtime::{admission::AdmissionPolicy, reactor::Reactor},
+            };
+            use std::rc::Rc;
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+                crate::test_support::cluster::config(false).limits,
+            )));
+            let delivery = Delivery::new(
+                Rc::new(new_pipe_pool(admission.clone())),
+                Rc::new(Reactor::new(admission)),
+                Duration::from_secs(2),
+            );
+            let slice = PageSlice {
+                page: PageNumber(0),
+                offset: 0,
+                length: 1,
+            };
+            let reader = delivery
+                .attach(crate::read::tests::page(7).plaintext, slice)
+                .unwrap();
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             let mut polled = false;
             let result = poll_slice_or_readiness(
                 &mut cx,
                 |_| {
                     polled = true;
-                    Poll::Ready(Ok(7))
+                    Poll::Ready(Ok(Some(reader)))
                 },
                 |_| Poll::Ready(Err(Error::Overloaded)),
             );
-            assert_eq!(result, Poll::Ready(Ok(7)));
+            assert!(
+                matches!(result, Poll::Ready(Ok(Some(reader))) if reader.slice() == slice && reader.bytes_sent() == 0 && reader.remaining() == 1)
+            );
             assert!(
                 polled,
                 "an available slice must not be discarded by auxiliary admission"
             );
+        }
+        #[test]
+        fn completed_stream_never_submits_auxiliary_readiness() {
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            assert!(matches!(
+                poll_slice_or_readiness(
+                    &mut cx,
+                    |_| Poll::Ready(Ok(None)),
+                    |_| panic!("completed stream must not submit readiness"),
+                ),
+                Poll::Ready(Ok(None))
+            ));
         }
         #[test]
         fn pending_slice_preserves_readiness_errors_without_retry() {
@@ -448,14 +485,14 @@ mod subscription {
                 Error::Cancelled,
                 Error::DeadlineExceeded,
             ] {
-                assert_eq!(
-                    poll_slice_or_readiness::<()>(
+                assert!(matches!(
+                    poll_slice_or_readiness(
                         &mut cx,
                         |_| Poll::Pending,
                         |_| Poll::Ready(Err(error))
                     ),
-                    Poll::Ready(Err(error)),
-                );
+                    Poll::Ready(Err(actual)) if actual == error
+                ));
             }
         }
         #[test]
@@ -466,14 +503,14 @@ mod subscription {
                 Error::DeadlineExceeded,
                 Error::Unavailable,
             ] {
-                assert_eq!(
-                    poll_slice_or_readiness::<()>(
+                assert!(matches!(
+                    poll_slice_or_readiness(
                         &mut cx,
                         |_| Poll::Ready(Err(error)),
                         |_| panic!("terminal acquisition must not submit readiness")
                     ),
-                    Poll::Ready(Err(error)),
-                );
+                    Poll::Ready(Err(actual)) if actual == error
+                ));
             }
         }
         #[test]
@@ -492,18 +529,17 @@ mod subscription {
             let wakes = Arc::new(Wakes::default());
             let waker = futures::task::waker(wakes.clone());
             let mut cx = Context::from_waker(&waker);
-            assert_eq!(
-                poll_slice_or_readiness::<()>(&mut cx, |_| Poll::Pending, |_| Poll::Pending),
-                Poll::Pending
+            assert!(
+                poll_slice_or_readiness(&mut cx, |_| Poll::Pending, |_| Poll::Pending).is_pending()
             );
             assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
-            assert_eq!(
-                poll_slice_or_readiness::<()>(
+            assert!(
+                poll_slice_or_readiness(
                     &mut cx,
                     |_| Poll::Pending,
                     |_| Poll::Ready(Ok(libc::POLLIN as u32))
-                ),
-                Poll::Pending
+                )
+                .is_pending()
             );
             assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
         }

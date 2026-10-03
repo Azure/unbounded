@@ -20,7 +20,7 @@ use racer_dataplane::{
         transport::Transfers,
     },
     read::{
-        Coordinator, ReadService,
+        Coordinator,
         candidates::CandidatePolicy,
         dispatch::{WorkerDirectory, WorkerEndpoint},
         fill::{Fill, FillDependencies},

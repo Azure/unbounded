@@ -1,6 +1,33 @@
 //! Client socket scenarios: ownership, publication, HTTP delivery, and retirement.
 use super::*;
+use super::{listener::*, response::Responses};
+use crate::{
+    control::state::CacheDefinition,
+    http::HttpIo,
+    runtime::{
+        admission::AdmissionPolicy,
+        deadline::{Cancellation, RequestScope},
+    },
+    test_support::{ReadWorker, origin::RequestKind},
+};
 use std::time::Instant;
+use std::{
+    cell::{Cell, RefCell},
+    ffi::CString,
+    fs::{self, File, OpenOptions},
+    os::{
+        fd::AsRawFd,
+        unix::{
+            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+            net::UnixListener,
+        },
+    },
+    path::{Path, PathBuf},
+    rc::Rc,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 mod acquisition {
     use super::*;
 
@@ -307,7 +334,7 @@ mod recovery {
                 Command::new(std::env::current_exe().unwrap())
                     .args([
                         "--exact",
-                        "client::listener::tests::recovery::crash_owner_child",
+                        "client::tests::recovery::crash_owner_child",
                         "--nocapture",
                     ])
                     .env("RACER_SOCKET_CRASH_ROOT", &fixture.root.0)
@@ -517,13 +544,12 @@ fn local_and_distributed_installs_drain_responses_and_retire_idle_generations() 
             } else {
                 &mut acceptor
             };
-            let reads = Rc::new(GatedRead {
-                inner: receiver.reads.clone(),
-                scopes: RefCell::new(Vec::new()),
-                release: Cell::new(false),
-                wake: RefCell::new(None),
-            });
-            receiver.listeners.reads = reads.clone();
+            receiver
+                .worker
+                .as_ref()
+                .unwrap()
+                .origin
+                .block(RequestKind::Head);
             acceptor.reconcile(&[definition()]).unwrap();
             let mut socket = acceptor.connect();
             let wakes = Arc::new(WakeCounter::default());
@@ -551,7 +577,13 @@ fn local_and_distributed_installs_drain_responses_and_retire_idle_generations() 
             for _ in 0..16 {
                 receiver.pump(16);
             }
-            assert_eq!(reads.scopes.borrow().len(), usize::from(busy));
+            assert_eq!(
+                receiver.listeners.read_scopes.borrow().len(),
+                usize::from(busy)
+            );
+            if busy {
+                receiver.wait_for_origin(RequestKind::Head, 1);
+            }
             acceptor.reconcile(&[]).unwrap();
             // Reusing a UID creates a fresh generation, not a revival of the old one.
             acceptor.reconcile(&[definition()]).unwrap();
@@ -559,10 +591,14 @@ fn local_and_distributed_installs_drain_responses_and_retire_idle_generations() 
                 receiver.pump(16);
             }
             if busy {
-                assert!(reads.scopes.borrow()[0].check().is_ok());
+                assert!(receiver.listeners.read_scopes.borrow()[0].check().is_ok());
                 assert_eq!(receiver.listeners.active_connections(), 1);
-                reads.release.set(true);
-                reads.wake.borrow().as_ref().unwrap().wake_by_ref();
+                receiver
+                    .worker
+                    .as_ref()
+                    .unwrap()
+                    .origin
+                    .release(RequestKind::Head);
             }
             let response = receiver.receive(&mut socket, true);
             if busy {
@@ -570,7 +606,7 @@ fn local_and_distributed_installs_drain_responses_and_retire_idle_generations() 
             } else {
                 assert!(response.is_empty());
             }
-            assert_eq!(receiver.reads.calls.get(), usize::from(busy));
+            assert_eq!(receiver.completed_heads(), usize::from(busy));
             assert_no_body_leases(receiver);
         }
     }
@@ -620,7 +656,7 @@ fn queued_handoffs_reject_retired_generations_and_stopped_receivers() {
         // A concurrent fork can briefly retain the closed socket until exec.
         // Wait for EOF through the same bounded path as other real UDS tests.
         assert!(worker.receive(&mut socket, true).is_empty());
-        assert_eq!(worker.reads.calls.get(), 0);
+        assert_eq!(worker.completed_heads(), 0);
         assert_no_body_leases(&worker);
     }
 }
@@ -643,11 +679,21 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
         reactor.clone(),
         Duration::from_secs(2),
     ));
-    let reads = Rc::new(Heads {
-        calls: Cell::new(0),
-    });
+    let worker = ReadWorker::new(
+        definition(),
+        body_metadata(17),
+        admission.clone(),
+        reactor.clone(),
+        delivery.clone(),
+        1,
+    );
+    worker
+        .coordinator
+        .metadata
+        .publish_version(body_metadata(17).immutable())
+        .unwrap();
     let listeners = ClientListeners::new(
-        reads.clone(),
+        worker.coordinator.clone(),
         RequestParser::new(32768),
         Rc::new(Responses::new(io.clone(), delivery)),
         io,
@@ -668,10 +714,13 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
     assert_eq!(sim.metadata(&path).unwrap().1 & 0o777, 0o666);
     let client = sim.connect(SocketAddress::Unix(path)).unwrap();
     let client = client.into_sim().unwrap();
-    client.send(&request("HEAD", "")).unwrap();
+    client
+        .send(&request("HEAD", "If-Match: \"v1\"\r\n"))
+        .unwrap();
     let mut response = Vec::new();
     let mut bytes = [0; 4096];
     for _ in 0..1000 {
+        let _queue = worker.drivers.enter();
         listeners
             .poll_budgeted(
                 &mut Context::from_waker(futures::task::noop_waker_ref()),
@@ -679,6 +728,7 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
             )
             .unwrap();
         reactor.poll_budgeted(16).unwrap();
+        worker.poll(&mut Context::from_waker(futures::task::noop_waker_ref()));
         match client.recv(&mut bytes) {
             Ok(n) => response.extend_from_slice(&bytes[..n]),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
@@ -689,15 +739,15 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
         }
     }
     assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
-    assert_eq!(reads.calls.get(), 1);
+    assert_eq!(listeners.read_scopes.borrow().len(), 1);
     drop(client);
     listeners.stop_admission();
     drop(listeners);
+    drop(worker);
     drop(reactor);
     assert_eq!(sim.live_handles(), 0);
 }
 use crate::{
-    client::ClientRequest,
     http::Codec,
     memory::{delivery::Delivery, new_pipe_pool},
     model::{ExpiresAt, Limits, ObjectMetadata, ObjectVersion, StrongEtag},
@@ -766,42 +816,10 @@ fn definition() -> CacheDefinition {
 fn scope() -> RequestScope {
     new_scope(Duration::from_secs(5), Cancellation::new().unwrap()).unwrap()
 }
-struct Heads {
-    calls: Cell<usize>,
-}
-impl ReadService for Heads {
-    fn read<'a>(
-        &'a self,
-        request: ClientRequest,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, ReadResponse> {
-        Box::pin(async move {
-            scope.check()?;
-            self.calls.set(self.calls.get() + 1);
-            Ok(ReadResponse {
-                metadata: ObjectMetadata {
-                    content_type: None,
-                    version: ObjectVersion {
-                        object: request.origin.object,
-                        etag: StrongEtag::parse(b"\"v1\"")?,
-                    },
-                    length: 17,
-                    expires_at: ExpiresAt::from_system_time(
-                        UNIX_EPOCH + Duration::from_millis(1234),
-                    )
-                    .unwrap(),
-                },
-                range: None,
-                body: None,
-            })
-        })
-    }
-}
 struct Fixture {
     root: Root,
     listeners: ClientListeners,
     reactor: Rc<Reactor>,
-    reads: Rc<Heads>,
     worker: Option<crate::test_support::ReadWorker>,
 }
 impl Fixture {
@@ -839,12 +857,20 @@ impl Fixture {
             reactor.clone(),
             Duration::from_secs(2),
         ));
-        let reads = Rc::new(Heads {
-            calls: Cell::new(0),
-        });
+        let mut metadata = body_metadata(17);
+        metadata.expires_at =
+            ExpiresAt::from_system_time(UNIX_EPOCH + Duration::from_millis(1234)).unwrap();
+        let worker = ReadWorker::new(
+            definition(),
+            metadata,
+            admission.clone(),
+            reactor.clone(),
+            delivery.clone(),
+            1,
+        );
         let responses = Rc::new(Responses::new(io.clone(), delivery));
         let mut listeners = ClientListeners::new(
-            reads.clone(),
+            worker.coordinator.clone(),
             RequestParser::new(32768),
             responses,
             io,
@@ -855,12 +881,73 @@ impl Fixture {
             root,
             listeners,
             reactor,
-            reads,
-            worker: None,
+            worker: Some(worker),
         }
     }
     fn reconcile(&self, caches: &[CacheDefinition]) -> Result<()> {
         futures::executor::block_on(self.listeners.reconcile(caches, &scope()))
+    }
+    fn completed_heads(&self) -> usize {
+        self.worker
+            .as_ref()
+            .unwrap()
+            .origin
+            .completed(RequestKind::Head)
+    }
+    fn wait_for_origin(&self, kind: RequestKind, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.worker.as_ref().unwrap().origin.count(kind) < count {
+            self.pump(16);
+            assert!(
+                Instant::now() < deadline,
+                "gated origin request was not submitted"
+            );
+            std::thread::yield_now();
+        }
+    }
+    // Exercise the completed-result defense directly, never fake Coordinator reads.
+    fn result_output(
+        &self,
+        kind: ReadKind,
+        result: Result<ReadResponse>,
+        canceled: bool,
+    ) -> Vec<u8> {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client.set_nonblocking(true).unwrap();
+        let admission = self.listeners.admission.clone();
+        let connection = crate::http::from_accepted(server.into(), &admission).unwrap();
+        let responses = self.listeners.responses.clone();
+        let metrics = self.listeners.metrics.clone();
+        let scope = scope();
+        if canceled {
+            scope.cancel().unwrap();
+        }
+        self.listeners.active.borrow_mut().push_back(Active {
+            runnable: uring_runtime::drivers::Runnable::new(),
+            deadline: Rc::new(Cell::new(scope.deadline.0)),
+            expired: None,
+            cache: definition().id,
+            retired: Arc::new(std::sync::atomic::AtomicBool::default()),
+            idle: Rc::new(Cell::new(false)),
+            cancellation: scope.cancellation.clone(),
+            operation: Box::pin(async move {
+                let mut observation = metrics.request()?;
+                handle_read_result(
+                    connection,
+                    &kind,
+                    &body_metadata(0).version.object,
+                    result,
+                    &responses,
+                    &admission,
+                    &scope,
+                    &mut observation,
+                    Duration::from_secs(5),
+                )
+                .await?;
+                Ok(())
+            }),
+        });
+        self.receive(&mut client, true)
     }
     fn socket(&self) -> PathBuf {
         self.root.0.join("example/client/socket")
@@ -960,36 +1047,6 @@ fn client_listener_readiness_recovers_from_queue_pressure() {
     );
 }
 
-struct GatedRead {
-    wake: RefCell<Option<std::task::Waker>>,
-    inner: Rc<dyn ReadService>,
-    scopes: RefCell<Vec<RequestScope>>,
-    release: Cell<bool>,
-}
-impl ReadService for GatedRead {
-    fn read<'a>(
-        &'a self,
-        request: ClientRequest,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, ReadResponse> {
-        Box::pin(async move {
-            self.scopes.borrow_mut().push(scope.clone());
-            std::future::poll_fn(|cx| {
-                *self.wake.borrow_mut() = Some(cx.waker().clone());
-                if let Err(error) = scope.check() {
-                    Poll::Ready(Err(error))
-                } else if self.release.get() {
-                    Poll::Ready(Ok(()))
-                } else {
-                    Poll::Pending
-                }
-            })
-            .await?;
-            self.inner.read(request, scope).await
-        })
-    }
-}
-
 fn sleep_until(deadline: Instant) {
     std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
 }
@@ -1033,7 +1090,7 @@ fn configured_timeout_bounds_idle_partial_headers_and_keepalive() {
         }
         assert_eq!(fixture.listeners.active_connections(), 0, "{mode}");
         assert_eq!(socket.read(&mut [0; 1]).unwrap(), 0, "{mode}");
-        assert_eq!(fixture.reads.calls.get(), usize::from(mode == "keepalive"));
+        assert_eq!(fixture.completed_heads(), usize::from(mode == "keepalive"));
         assert_no_body_leases(&fixture);
     }
 }
@@ -1043,13 +1100,12 @@ fn configured_timeout_starts_fresh_operations_after_headers_and_on_reuse() {
     let mut fixture = Fixture::new();
     let timeout = Duration::from_millis(500);
     fixture.listeners = fixture.listeners.with_request_timeout(timeout);
-    let reads = Rc::new(GatedRead {
-        inner: fixture.reads.clone(),
-        scopes: RefCell::new(Vec::new()),
-        release: Cell::new(false),
-        wake: RefCell::new(None),
-    });
-    fixture.listeners.reads = reads.clone();
+    fixture
+        .worker
+        .as_ref()
+        .unwrap()
+        .origin
+        .block(RequestKind::Head);
     fixture.reconcile(&[definition()]).unwrap();
     let mut socket = fixture.connect();
     let head = request("HEAD", "");
@@ -1057,31 +1113,40 @@ fn configured_timeout_starts_fresh_operations_after_headers_and_on_reuse() {
     for _ in 0..16 {
         fixture.pump(16);
     }
-    assert!(reads.scopes.borrow().is_empty());
+    assert!(fixture.listeners.read_scopes.borrow().is_empty());
     std::thread::sleep(Duration::from_millis(100));
     let before = Instant::now();
     socket.write_all(b"\r\n").unwrap();
     for _ in 0..16 {
         fixture.pump(16);
     }
-    let first = reads.scopes.borrow()[0].clone();
+    let first = fixture.listeners.read_scopes.borrow()[0].clone();
+    fixture.wait_for_origin(RequestKind::Head, 1);
     assert!(first.deadline.0 >= before + timeout);
     assert!(first.deadline.0 <= Instant::now() + timeout);
-    reads.release.set(true);
-    if let Some(waker) = reads.wake.borrow().as_ref() {
-        waker.wake_by_ref();
-    }
+    fixture
+        .worker
+        .as_ref()
+        .unwrap()
+        .origin
+        .release(RequestKind::Head);
     assert!(
         fixture
             .receive(&mut socket, false)
             .starts_with(b"HTTP/1.1 200 ")
     );
-    reads.release.set(false);
+    fixture
+        .worker
+        .as_ref()
+        .unwrap()
+        .origin
+        .block(RequestKind::Head);
     socket.write_all(&head).unwrap();
     for _ in 0..16 {
         fixture.pump(16);
     }
-    let second = reads.scopes.borrow()[1].clone();
+    let second = fixture.listeners.read_scopes.borrow()[1].clone();
+    fixture.wait_for_origin(RequestKind::Head, 2);
     assert_ne!(first.request, second.request);
     assert!(second.deadline.0 > first.deadline.0);
     assert_no_head(&mut socket);
@@ -1089,7 +1154,7 @@ fn configured_timeout_starts_fresh_operations_after_headers_and_on_reuse() {
     let output = fixture.receive(&mut socket, true);
     assert!(output.starts_with(b"HTTP/1.1 503 "), "{output:?}");
     assert!(output.ends_with(b"\r\n\r\n"));
-    assert_eq!(fixture.reads.calls.get(), 1);
+    assert_eq!(fixture.completed_heads(), 1);
     assert_no_body_leases(&fixture);
 }
 
@@ -1512,13 +1577,12 @@ fn configured_timeout_is_not_renewed_by_response_or_stream_progress() {
     let (mut fixture, _pipes) = body_fixture_with_large_page(16, false, true);
     let timeout = Duration::from_millis(800);
     fixture.listeners = fixture.listeners.with_request_timeout(timeout);
-    let reads = Rc::new(GatedRead {
-        inner: fixture.listeners.reads.clone(),
-        scopes: RefCell::new(Vec::new()),
-        release: Cell::new(false),
-        wake: RefCell::new(None),
-    });
-    fixture.listeners.reads = reads.clone();
+    fixture
+        .worker
+        .as_ref()
+        .unwrap()
+        .origin
+        .block(RequestKind::Head);
     let mut socket = fixture.connect();
     socket
         .write_all(&request(
@@ -1529,13 +1593,16 @@ fn configured_timeout_is_not_renewed_by_response_or_stream_progress() {
     for _ in 0..16 {
         fixture.pump(16);
     }
-    let scope = reads.scopes.borrow()[0].clone();
+    let scope = fixture.listeners.read_scopes.borrow()[0].clone();
     // Consume part of the total budget before committing response headers.
+    fixture.wait_for_origin(RequestKind::Head, 1);
     sleep_until(scope.deadline.0 - timeout / 2);
-    reads.release.set(true);
-    if let Some(waker) = reads.wake.borrow().as_ref() {
-        waker.wake_by_ref();
-    }
+    fixture
+        .worker
+        .as_ref()
+        .unwrap()
+        .origin
+        .release(RequestKind::Head);
     let mut output = fixture.receive(&mut socket, false);
     assert!(output.starts_with(b"HTTP/1.1 200 "));
     let head_end = output
@@ -1584,22 +1651,22 @@ fn configured_timeout_is_not_renewed_by_response_or_stream_progress() {
 
 #[test]
 fn client_disconnect_cancels_pending_metadata_before_acquisition_deadline() {
-    let mut fixture = Fixture::new();
-    let reads = Rc::new(GatedRead {
-        inner: fixture.reads.clone(),
-        scopes: RefCell::new(Vec::new()),
-        release: Cell::new(false),
-        wake: RefCell::new(None),
-    });
-    fixture.listeners.reads = reads.clone();
+    let fixture = Fixture::new();
+    fixture
+        .worker
+        .as_ref()
+        .unwrap()
+        .origin
+        .block(RequestKind::Head);
     fixture.reconcile(&[definition()]).unwrap();
     let mut socket = fixture.connect();
     socket.write_all(&request("HEAD", "")).unwrap();
     for _ in 0..16 {
         fixture.pump(16);
     }
-    let scope = reads.scopes.borrow()[0].clone();
+    let scope = fixture.listeners.read_scopes.borrow()[0].clone();
     assert_eq!(scope.check(), Ok(()));
+    fixture.wait_for_origin(RequestKind::Head, 1);
     drop(socket);
     for _ in 0..64 {
         fixture.pump(16);
@@ -1711,42 +1778,40 @@ fn actual_uds_waiting_deadline_and_cache_shutdown_release_all_leases() {
 
 #[test]
 fn actual_uds_empty_bootstrap_and_canceled_success() {
-    struct Empty(bool);
-    impl ReadService for Empty {
-        fn read<'a>(
-            &'a self,
-            request: ClientRequest,
-            scope: &'a RequestScope,
-        ) -> Operation<'a, ReadResponse> {
-            Box::pin(async move {
-                if self.0 {
-                    scope.cancel()?;
-                }
+    let fixture = Fixture::new();
+    fixture.reconcile(&[definition()]).unwrap();
+    let mut metadata = body_metadata(0);
+    metadata.version.etag = StrongEtag::parse(b"\"\"").unwrap();
+    fixture
+        .worker
+        .as_ref()
+        .unwrap()
+        .origin
+        .set_version(metadata.clone());
+    for canceled in [false, true] {
+        let output = if canceled {
+            fixture.result_output(
+                ReadKind::Subscription {
+                    pin: None,
+                    range: None,
+                    page_credits: 2,
+                    byte_credits: 2 * PAGE_BYTES,
+                    ordered: false,
+                },
                 Ok(ReadResponse {
-                    metadata: ObjectMetadata {
-                        content_type: None,
-                        version: ObjectVersion {
-                            object: request.origin.object,
-                            etag: StrongEtag::parse(b"\"\"")?,
-                        },
-                        length: 0,
-                        expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
-                    },
+                    metadata: metadata.clone(),
                     range: None,
                     body: None,
-                })
-            })
-        }
-    }
-    let mut fixture = Fixture::new();
-    fixture.reconcile(&[definition()]).unwrap();
-    for canceled in [false, true] {
-        fixture.listeners.reads = Rc::new(Empty(canceled));
-        let mut socket = fixture.connect();
-        socket
-            .write_all(&request("POST", "Connection: close\r\n"))
-            .unwrap();
-        let output = fixture.receive(&mut socket, true);
+                }),
+                true,
+            )
+        } else {
+            let mut socket = fixture.connect();
+            socket
+                .write_all(&request("POST", "Connection: close\r\n"))
+                .unwrap();
+            fixture.receive(&mut socket, true)
+        };
         let text = std::str::from_utf8(&output).unwrap().to_ascii_lowercase();
         let status = if canceled { 503 } else { 200 };
         assert!(text.starts_with(&format!("http/1.1 {status}")), "{text}");
@@ -1804,12 +1869,12 @@ fn actual_uds_head_keepalive_removal_and_accept_fairness() {
     assert!(text.ends_with("\r\n\r\n"));
     socket.write_all(&request("HEAD", "")).unwrap();
     fixture.receive(&mut socket, false);
-    assert_eq!(fixture.reads.calls.get(), 2);
+    assert_eq!(fixture.completed_heads(), 2);
     fixture.reconcile(&[]).unwrap();
     assert!(!fixture.socket().exists());
     assert!(fixture.receive(&mut socket, true).is_empty());
     assert!(fixture.receive(&mut idle, true).is_empty());
-    assert_eq!(fixture.reads.calls.get(), 2);
+    assert_eq!(fixture.completed_heads(), 2);
 }
 
 #[test]
@@ -1839,7 +1904,7 @@ fn actual_uds_errors_and_idle_drain() {
         assert!(text.contains(extra), "{text}");
         assert!(text.ends_with("\r\n\r\n"));
     }
-    assert_eq!(fixture.reads.calls.get(), 0);
+    assert_eq!(fixture.completed_heads(), 0);
     let mut idle = fixture.connect();
     fixture.pump(16);
     fixture.pump(16);
@@ -1878,12 +1943,12 @@ fn actual_uds_rejected_raw_heads_receive_sdk_errors() {
         assert!(text.contains("content-length: 0\r\n"));
         assert!(text.ends_with("\r\n\r\n"));
     }
-    assert_eq!(fixture.reads.calls.get(), 0);
+    assert_eq!(fixture.completed_heads(), 0);
 }
 
 #[test]
 fn actual_uds_configured_head_cap_counts_only_wire_bytes() {
-    for limit in [512, super::super::MAX_HEAD_BYTES] {
+    for limit in [512, super::MAX_HEAD_BYTES] {
         let mut fixture = Fixture::new();
         fixture.listeners.parser = RequestParser::new(limit);
         fixture.reconcile(&[definition()]).unwrap();
@@ -1902,7 +1967,7 @@ fn actual_uds_configured_head_cap_counts_only_wire_bytes() {
             let output = fixture.receive(&mut socket, true);
             assert!(output.starts_with(b"HTTP/1.1 200 "));
         }
-        let admitted = fixture.reads.calls.get();
+        let admitted = fixture.completed_heads();
         // Exhaust the raw cap on an unterminated head. Decoded value bytes
         // alone would fit; only framing can reject this before dispatch.
         let mut raw = request("HEAD", &format!("X:{}\r\n", "x".repeat(limit)));
@@ -1911,7 +1976,7 @@ fn actual_uds_configured_head_cap_counts_only_wire_bytes() {
         socket.write_all(&raw).unwrap();
         let output = fixture.receive(&mut socket, true);
         assert!(output.starts_with(b"HTTP/1.1 431 "));
-        assert_eq!(fixture.reads.calls.get(), admitted);
+        assert_eq!(fixture.completed_heads(), admitted);
     }
 }
 
@@ -1943,27 +2008,12 @@ fn actual_uds_configured_head_limit_counts_received_bytes() {
         let reply = fixture.receive(&mut socket, true);
         assert!(reply.starts_with(b"HTTP/1.1 431 "));
     }
-    assert_eq!(fixture.reads.calls.get(), 4);
+    assert_eq!(fixture.completed_heads(), 4);
 }
 
 #[test]
 fn actual_uds_read_failures_and_immutable_result_validation() {
-    struct Failing(Error);
-    impl ReadService for Failing {
-        fn read<'a>(
-            &'a self,
-            _: ClientRequest,
-            scope: &'a RequestScope,
-        ) -> Operation<'a, ReadResponse> {
-            Box::pin(async move {
-                if self.0 == Error::Cancelled {
-                    scope.cancel()?;
-                }
-                Err(self.0)
-            })
-        }
-    }
-    let mut fixture = Fixture::new();
+    let fixture = Fixture::new();
     fixture.reconcile(&[definition()]).unwrap();
     for (error, fields, status, range) in [
         (Error::NotFound, "", 404, None),
@@ -1979,10 +2029,14 @@ fn actual_uds_read_failures_and_immutable_result_validation() {
         (Error::OriginForbidden, "", 403, None),
         (Error::Overloaded, "", 503, None),
     ] {
-        fixture.listeners.reads = Rc::new(Failing(error));
-        let mut socket = fixture.connect();
-        socket.write_all(&request("HEAD", fields)).unwrap();
-        let output = fixture.receive(&mut socket, true);
+        let kind = if fields.is_empty() {
+            ReadKind::Head
+        } else {
+            ReadKind::HeadPinned {
+                etag: StrongEtag::parse(b"\"v1\"").unwrap(),
+            }
+        };
+        let output = fixture.result_output(kind, Err(error), error == Error::Cancelled);
         let text = std::str::from_utf8(&output).unwrap().to_ascii_lowercase();
         assert!(text.starts_with(&format!("http/1.1 {status}")), "{text}");
         assert!(text.contains("content-length: 0\r\n"));
@@ -1992,7 +2046,6 @@ fn actual_uds_read_failures_and_immutable_result_validation() {
         }
         assert!(text.ends_with("\r\n\r\n"));
     }
-    struct WrongIdentity(bool);
     fixture.assert_metrics(7, 7, 0);
     assert_eq!(
         fixture
@@ -2001,47 +2054,63 @@ fn actual_uds_read_failures_and_immutable_result_validation() {
             .count(crate::telemetry::metrics::Event::Overload),
         1
     );
-    impl ReadService for WrongIdentity {
-        fn read<'a>(
-            &'a self,
-            mut request: ClientRequest,
-            _: &'a RequestScope,
-        ) -> Operation<'a, ReadResponse> {
-            Box::pin(async move {
-                if self.0 {
-                    request.origin.object.key.0[0] ^= 1;
-                }
-                Ok(ReadResponse {
-                    metadata: ObjectMetadata {
-                        content_type: None,
-                        version: ObjectVersion {
-                            object: request.origin.object,
-                            etag: StrongEtag::parse(b"\"other\"")?,
-                        },
-                        length: 0,
-                        expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
-                    },
-                    range: None,
-                    body: None,
-                })
-            })
-        }
-    }
     for wrong_object in [true, false] {
-        fixture.listeners.reads = Rc::new(WrongIdentity(wrong_object));
+        let mut metadata = body_metadata(0);
+        metadata.version.etag = StrongEtag::parse(b"\"other\"").unwrap();
+        let kind = if wrong_object {
+            metadata.version.object.key.0[0] ^= 1;
+            ReadKind::Head
+        } else {
+            ReadKind::HeadPinned {
+                etag: StrongEtag::parse(b"\"v1\"").unwrap(),
+            }
+        };
+        let output = fixture.result_output(
+            kind,
+            Ok(ReadResponse {
+                metadata,
+                range: None,
+                body: None,
+            }),
+            false,
+        );
+        assert!(output.starts_with(b"HTTP/1.1 502"));
+    }
+}
+
+#[test]
+fn real_coordinator_maps_adapter_metadata_failures() {
+    for (status, pin, expected) in [
+        (404, false, 404),
+        (404, true, 502),
+        (412, true, 412),
+        (401, false, 401),
+        (403, false, 403),
+        (503, false, 503),
+    ] {
+        let fixture = Fixture::new();
+        fixture
+            .worker
+            .as_ref()
+            .unwrap()
+            .origin
+            .reject_next(RequestKind::Head, status);
+        fixture.reconcile(&[definition()]).unwrap();
         let mut socket = fixture.connect();
         socket
             .write_all(&request(
                 "HEAD",
-                if wrong_object {
-                    ""
-                } else {
-                    "If-Match: \"v1\"\r\n"
-                },
+                if pin { "If-Match: \"v1\"\r\n" } else { "" },
             ))
             .unwrap();
         let output = fixture.receive(&mut socket, true);
-        assert!(output.starts_with(b"HTTP/1.1 502"));
+        assert!(
+            output.starts_with(format!("HTTP/1.1 {expected} ").as_bytes()),
+            "{output:?}"
+        );
+        assert_eq!(fixture.completed_heads(), 1);
+        fixture.assert_metrics(1, 1, 0);
+        assert_no_body_leases(&fixture);
     }
 }
 
@@ -2237,14 +2306,13 @@ fn prepared_uid_reuse_and_foreign_replacement_are_inode_safe() {
 
 #[test]
 fn removal_commit_drains_active_response_and_reused_uid_does_not_revive_old_keepalive() {
-    let mut fixture = Fixture::new();
-    let gated = Rc::new(GatedRead {
-        inner: fixture.reads.clone(),
-        scopes: RefCell::new(vec![]),
-        release: Cell::new(false),
-        wake: RefCell::new(None),
-    });
-    fixture.listeners.reads = gated.clone();
+    let fixture = Fixture::new();
+    fixture
+        .worker
+        .as_ref()
+        .unwrap()
+        .origin
+        .block(RequestKind::Head);
     fixture.reconcile(&[definition()]).unwrap();
     // Model the descriptor reference inherited by a concurrent fork before exec.
     // Releasing the endpoint must not wait for that unrelated reference to close.
@@ -2260,8 +2328,9 @@ fn removal_commit_drains_active_response_and_reused_uid_does_not_revive_old_keep
     for _ in 0..16 {
         fixture.pump(16);
     }
-    assert_eq!(gated.scopes.borrow().len(), 1);
-    let operation_scope = gated.scopes.borrow()[0].clone();
+    assert_eq!(fixture.listeners.read_scopes.borrow().len(), 1);
+    let operation_scope = fixture.listeners.read_scopes.borrow()[0].clone();
+    fixture.wait_for_origin(RequestKind::Head, 1);
     fixture.reconcile(&[]).unwrap();
     for _ in 0..16 {
         fixture.pump(16);
@@ -2270,10 +2339,12 @@ fn removal_commit_drains_active_response_and_reused_uid_does_not_revive_old_keep
     assert_eq!(fixture.listeners.active_connections(), 1);
     fixture.reconcile(&[definition()]).unwrap();
     drop(inherited_lock);
-    gated.release.set(true);
-    if let Some(waker) = gated.wake.borrow().as_ref() {
-        waker.wake_by_ref();
-    }
+    fixture
+        .worker
+        .as_ref()
+        .unwrap()
+        .origin
+        .release(RequestKind::Head);
     let response = fixture.receive(&mut socket, true);
     assert!(response.starts_with(b"HTTP/1.1 200"));
     assert_eq!(fixture.listeners.active_connections(), 0);
@@ -2281,31 +2352,18 @@ fn removal_commit_drains_active_response_and_reused_uid_does_not_revive_old_keep
     new.write_all(&request("HEAD", "Connection: close\r\n"))
         .unwrap();
     assert!(fixture.receive(&mut new, true).starts_with(b"HTTP/1.1 200"));
-    assert_eq!(fixture.reads.calls.get(), 2);
+    assert_eq!(fixture.completed_heads(), 2);
 }
 
 #[test]
 fn per_cache_cancellation_drains_active_read_and_keeps_other_cache() {
-    struct Waiting(Rc<Cell<usize>>);
-    impl ReadService for Waiting {
-        fn read<'a>(
-            &'a self,
-            _: ClientRequest,
-            scope: &'a RequestScope,
-        ) -> Operation<'a, ReadResponse> {
-            Box::pin(async move {
-                self.0.set(self.0.get() + 1);
-                std::future::poll_fn(|_| match scope.check() {
-                    Ok(()) => Poll::Pending,
-                    Err(error) => Poll::Ready(Err(error)),
-                })
-                .await
-            })
-        }
-    }
-    let mut fixture = Fixture::new();
-    let calls = Rc::new(Cell::new(0));
-    fixture.listeners.reads = Rc::new(Waiting(calls.clone()));
+    let fixture = Fixture::new();
+    fixture
+        .worker
+        .as_ref()
+        .unwrap()
+        .origin
+        .block(RequestKind::Head);
     let mut other = definition();
     other.id = CacheId("00000000-0000-4000-8000-000000000002".into());
     other.name = "other".into();
@@ -2317,11 +2375,12 @@ fn per_cache_cancellation_drains_active_read_and_keeps_other_cache() {
     for _ in 0..16 {
         fixture.pump(16);
     }
-    assert_eq!(calls.get(), 1);
+    assert_eq!(fixture.listeners.read_scopes.borrow().len(), 1);
     assert_eq!(
         fixture.listeners.active_connections_for(&definition().id),
         1
     );
+    fixture.wait_for_origin(RequestKind::Head, 1);
     fixture.listeners.cancel_cache(&definition().id).unwrap();
     assert!(
         fixture

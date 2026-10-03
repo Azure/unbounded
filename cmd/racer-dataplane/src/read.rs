@@ -637,13 +637,6 @@ pub struct ReadResponse {
     pub range: Option<ResolvedRange>,
     pub body: Option<RangeStream>,
 }
-pub trait ReadService {
-    fn read<'a>(
-        &'a self,
-        request: ClientRequest,
-        scope: &'a RequestScope,
-    ) -> Operation<'a, ReadResponse>;
-}
 pub struct Coordinator {
     snapshots: Rc<SnapshotStore>,
     pub(super) metadata: Rc<MetadataService>,
@@ -792,8 +785,8 @@ impl Coordinator {
         })
     }
 }
-impl ReadService for Coordinator {
-    fn read<'a>(
+impl Coordinator {
+    pub fn read<'a>(
         &'a self,
         request: ClientRequest,
         scope: &'a RequestScope,
@@ -996,4 +989,4 @@ fn peer_error(error: Error) -> Result<PeerResponse> {
     }
 }
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -2189,7 +2189,6 @@ fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
         use crate::{
             client::{ClientRequest, ReadKind},
             model::ByteRange,
-            read::ReadService,
         };
         let (coordinator, mut endpoint, _) = f.read_graph(
             Rc::new(Fill::new(f.fill.dependencies.clone())),

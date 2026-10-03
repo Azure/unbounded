@@ -6,8 +6,8 @@ use crate::{
     control::state::CacheDefinition,
     error::{Error, Operation, Result},
     http::{ConnectionLease, HttpIo},
-    model::{CacheId, RequestId},
-    read::ReadService,
+    model::{CacheId, ObjectId, RequestId},
+    read::{Coordinator, ReadResponse},
     runtime::{
         admission::{AdmissionExt, AdmissionPolicy},
         deadline::{Cancellation, RequestScope},
@@ -75,7 +75,7 @@ impl AsRawFd for Directory {
         }
     }
 }
-fn file_path(file: &File) -> PathBuf {
+pub(super) fn file_path(file: &File) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
 }
 impl Directory {
@@ -88,7 +88,7 @@ impl Directory {
     }
 }
 
-struct BoundListener {
+pub(super) struct BoundListener {
     definition: CacheDefinition,
     listener: Listener,
     directory: Directory,
@@ -97,7 +97,7 @@ struct BoundListener {
     retired: Arc<std::sync::atomic::AtomicBool>,
     basename: RefCell<String>,
     witness: Option<String>,
-    owner: Option<Rc<EndpointOwner>>,
+    pub(super) owner: Option<Rc<EndpointOwner>>,
 }
 
 impl Drop for BoundListener {
@@ -139,15 +139,15 @@ impl Drop for BoundListener {
     }
 }
 
-struct Active {
-    runnable: Arc<uring_runtime::drivers::Runnable>,
-    deadline: Rc<Cell<std::time::Instant>>,
-    expired: Option<std::time::Instant>,
-    cache: CacheId,
-    retired: Arc<std::sync::atomic::AtomicBool>,
-    idle: Rc<Cell<bool>>,
-    cancellation: Cancellation,
-    operation: Operation<'static, ()>,
+pub(super) struct Active {
+    pub(super) runnable: Arc<uring_runtime::drivers::Runnable>,
+    pub(super) deadline: Rc<Cell<std::time::Instant>>,
+    pub(super) expired: Option<std::time::Instant>,
+    pub(super) cache: CacheId,
+    pub(super) retired: Arc<std::sync::atomic::AtomicBool>,
+    pub(super) idle: Rc<Cell<bool>>,
+    pub(super) cancellation: Cancellation,
+    pub(super) operation: Operation<'static, ()>,
 }
 
 pub struct ClientListeners {
@@ -155,24 +155,27 @@ pub struct ClientListeners {
     readiness: RefCell<ReadyListeners>,
     sim_cursor: RefCell<Option<CacheId>>,
     ingress: Option<Arc<crate::runtime::ingress::Ingress>>,
-    metrics: crate::telemetry::metrics::Metrics,
-    reads: Rc<dyn ReadService>,
-    parser: RequestParser,
-    responses: Rc<Responses>,
-    io: Rc<HttpIo>,
-    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
-    listeners: Rc<RefCell<BTreeMap<CacheId, Rc<BoundListener>>>>,
-    preparing: Rc<Cell<bool>>,
+    pub(super) metrics: crate::telemetry::metrics::Metrics,
+    pub(super) reads: Rc<Coordinator>,
+    pub(super) parser: RequestParser,
+    pub(super) responses: Rc<Responses>,
+    pub(super) io: Rc<HttpIo>,
+    pub(super) admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+    pub(super) listeners: Rc<RefCell<BTreeMap<CacheId, Rc<BoundListener>>>>,
+    pub(super) preparing: Rc<Cell<bool>>,
     cleanup: Rc<RefCell<VecDeque<Rc<BoundListener>>>>,
-    active: RefCell<VecDeque<Active>>,
-    accepting: Rc<Cell<bool>>,
+    pub(super) active: RefCell<VecDeque<Active>>,
+    pub(super) accepting: Rc<Cell<bool>>,
     accept_turn: Cell<bool>,
-    root: PathBuf,
+    pub(super) root: PathBuf,
     request_timeout: Duration,
+    // Observe the exact dispatched scopes without replacing acquisition or polling.
+    #[cfg(test)]
+    pub(super) read_scopes: Rc<RefCell<Vec<RequestScope>>>,
 }
 impl ClientListeners {
     pub fn new(
-        reads: Rc<dyn ReadService>,
+        reads: Rc<Coordinator>,
         parser: RequestParser,
         responses: Rc<Responses>,
         io: Rc<HttpIo>,
@@ -197,6 +200,8 @@ impl ClientListeners {
             accept_turn: Cell::new(true),
             root: PathBuf::from("/run/racer"),
             request_timeout: Duration::from_secs(30),
+            #[cfg(test)]
+            read_scopes: Rc::new(RefCell::new(Vec::new())),
         }
     }
     /// Bound header/idle admission and initial metadata/first-page work. After
@@ -240,6 +245,8 @@ impl ClientListeners {
         let admission = self.admission.clone();
         let task_cache = cache.clone();
         let metrics = self.metrics.clone();
+        #[cfg(test)]
+        let read_scopes = self.read_scopes.clone();
         let operation = Box::pin(async move {
             serve_connection(
                 connection,
@@ -255,6 +262,8 @@ impl ClientListeners {
                 timeout,
                 &metrics,
                 task_deadline,
+                #[cfg(test)]
+                &read_scopes,
             )
             .await
         });
@@ -662,7 +671,7 @@ async fn serve_connection(
     mut connection: ConnectionLease,
     cache: &CacheId,
     parser: &RequestParser,
-    reads: &dyn ReadService,
+    reads: &Coordinator,
     responses: &Responses,
     io: &HttpIo,
     admission: &flow_control::Quotas<AdmissionPolicy>,
@@ -672,6 +681,7 @@ async fn serve_connection(
     timeout: Duration,
     metrics: &crate::telemetry::metrics::Metrics,
     deadline: Rc<Cell<std::time::Instant>>,
+    #[cfg(test)] read_scopes: &RefCell<Vec<RequestScope>>,
 ) -> Result<()> {
     loop {
         if retired.load(std::sync::atomic::Ordering::Acquire) {
@@ -720,6 +730,8 @@ async fn serve_connection(
         };
         let mut disconnected = Some(io.disconnected(&connection, &watch_scope));
         let mut disconnect_observed = false;
+        #[cfg(test)]
+        read_scopes.borrow_mut().push(scope.clone());
         let mut read = reads.read(request, scope);
         let read_result = std::future::poll_fn(|cx| {
             let hangup = match disconnected.as_mut().map(|f| f.as_mut().poll(cx)) {
@@ -740,65 +752,25 @@ async fn serve_connection(
         if let Some(watch) = disconnected.take() {
             let _ = watch.await;
         }
-        let response = match read_result {
-            Ok(response) => response,
-            Err(error) => {
-                admission.observer().record(
-                    crate::telemetry::failures::Failure::new(
-                        crate::telemetry::failures::Stage::ClientRead,
-                        error,
-                    )
-                    .request(scope),
-                );
-                let error = if error == Error::NotFound && kind.pin().is_some() {
-                    Error::VersionUnavailable
-                } else {
-                    error
-                };
-                observation.fail(error);
-                responses.send_error(connection, error, scope).await?;
-                return Ok(());
-            }
-        };
         drop(disconnected);
-        if let Err(error) = scope.check() {
-            observation.fail(error);
-            responses.send_error(connection, error, scope).await?;
-            return Ok(());
-        }
-        if response.metadata.version.object != object {
-            responses
-                .send_error(connection, Error::BadGateway, scope)
-                .await?;
-            return Ok(());
-        }
-        if let Err(error) = responses.validate(&kind, &response) {
-            observation.fail(error);
-            responses.send_error(connection, error, scope).await?;
-            return Ok(());
-        }
         drop(read);
-        let mut send = if matches!(kind, super::ReadKind::Subscription { .. }) {
-            responses.send_subscription(connection, response, scope, &mut observation, timeout)
-        } else {
-            responses.send_observed(connection, response, scope, &mut observation)
+        connection = match handle_read_result(
+            connection,
+            &kind,
+            &object,
+            read_result,
+            responses,
+            admission,
+            scope,
+            &mut observation,
+            timeout,
+        )
+        .await?
+        {
+            Some(connection) => connection,
+            None => return Ok(()),
         };
-        let result = std::future::poll_fn(|cx| {
-            if socket.peer_disconnected() {
-                let _ = scope.cancel();
-            }
-            send.as_mut().poll(cx)
-        })
-        .await;
-        drop(send);
         drop(socket);
-        connection = match result {
-            Ok(connection) => connection,
-            Err(error) => {
-                observation.fail(error);
-                return Err(error);
-            }
-        };
         if !connection.is_reusable() {
             return Ok(());
         }
@@ -817,7 +789,81 @@ async fn serve_connection(
     }
 }
 
-fn new_scope(timeout: Duration, cancellation: Cancellation) -> Result<RequestScope> {
+/// Validate a completed read before committing success headers. Keep this boundary
+/// independent of acquisition so canceled or inconsistent successes fail closed.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn handle_read_result(
+    connection: ConnectionLease,
+    kind: &super::ReadKind,
+    object: &ObjectId,
+    read_result: Result<ReadResponse>,
+    responses: &Responses,
+    admission: &flow_control::Quotas<AdmissionPolicy>,
+    scope: &RequestScope,
+    observation: &mut crate::telemetry::metrics::RequestMetrics,
+    timeout: Duration,
+) -> Result<Option<ConnectionLease>> {
+    let response = match read_result {
+        Ok(response) => response,
+        Err(error) => {
+            admission.observer().record(
+                crate::telemetry::failures::Failure::new(
+                    crate::telemetry::failures::Stage::ClientRead,
+                    error,
+                )
+                .request(scope),
+            );
+            let error = if error == Error::NotFound && kind.pin().is_some() {
+                Error::VersionUnavailable
+            } else {
+                error
+            };
+            observation.fail(error);
+            responses.send_error(connection, error, scope).await?;
+            return Ok(None);
+        }
+    };
+    if let Err(error) = scope.check() {
+        observation.fail(error);
+        responses.send_error(connection, error, scope).await?;
+        return Ok(None);
+    }
+    if &response.metadata.version.object != object {
+        responses
+            .send_error(connection, Error::BadGateway, scope)
+            .await?;
+        return Ok(None);
+    }
+    if let Err(error) = responses.validate(kind, &response) {
+        observation.fail(error);
+        responses.send_error(connection, error, scope).await?;
+        return Ok(None);
+    }
+    let socket = connection.socket();
+    let mut send = if matches!(kind, super::ReadKind::Subscription { .. }) {
+        responses.send_subscription(connection, response, scope, observation, timeout)
+    } else {
+        responses.send_observed(connection, response, scope, observation)
+    };
+    let result = std::future::poll_fn(|cx| {
+        if socket.peer_disconnected() {
+            let _ = scope.cancel();
+        }
+        send.as_mut().poll(cx)
+    })
+    .await;
+    drop(send);
+    drop(socket);
+    match result {
+        Ok(connection) => Ok(Some(connection)),
+        Err(error) => {
+            observation.fail(error);
+            Err(error)
+        }
+    }
+}
+
+pub(super) fn new_scope(timeout: Duration, cancellation: Cancellation) -> Result<RequestScope> {
     let mut id = [0; 16];
     uring_runtime::environment::fill_random(&mut id).map_err(|_| Error::Unavailable)?;
     Ok(RequestScope {
@@ -1070,7 +1116,7 @@ impl Drop for PreparedListeners {
     }
 }
 
-fn open_directory(path: &Path) -> Result<File> {
+pub(super) fn open_directory(path: &Path) -> Result<File> {
     // Open every component with O_NOFOLLOW, including /run/racer's ancestors.
     let mut directory = OpenOptions::new()
         .read(true)
@@ -1089,7 +1135,7 @@ fn open_directory(path: &Path) -> Result<File> {
     Ok(directory)
 }
 
-fn child_directory(parent: &File, name: &[u8]) -> Result<File> {
+pub(super) fn child_directory(parent: &File, name: &[u8]) -> Result<File> {
     let name = CString::new(name).map_err(|_| Error::InvalidConfiguration)?;
     // SAFETY: C strings are terminated; descriptors remain owned for each syscall.
     unsafe {
@@ -1110,7 +1156,7 @@ fn child_directory(parent: &File, name: &[u8]) -> Result<File> {
     }
 }
 
-fn prepare_client_directory(directory: &File) -> Result<()> {
+pub(super) fn prepare_client_directory(directory: &File) -> Result<()> {
     let before = directory.metadata().map_err(|_| Error::Io)?;
     // Only harden directories we own, even when running with CAP_FOWNER.
     // SAFETY: geteuid has no preconditions.
@@ -1333,8 +1379,8 @@ fn rename(directory: &Directory, from: &str, to: &str, flags: u32) -> Result<()>
 const LOCK: &str = ".racer-client.lock";
 const WITNESS: &str = ".racer-owned-";
 
-struct EndpointOwner {
-    lock: File,
+pub(super) struct EndpointOwner {
+    pub(super) lock: File,
     directory: File,
 }
 
@@ -1349,7 +1395,7 @@ impl Drop for EndpointOwner {
 }
 
 impl EndpointOwner {
-    fn acquire(directory: &File) -> Result<Self> {
+    pub(super) fn acquire(directory: &File) -> Result<Self> {
         let metadata = directory.metadata().map_err(|_| Error::Io)?;
         // SAFETY: geteuid has no preconditions.
         if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
@@ -1472,7 +1518,7 @@ fn temporary_name(name: &str) -> bool {
         && name[7..].bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn same_inode(first: &fs::Metadata, second: &fs::Metadata) -> bool {
+pub(super) fn same_inode(first: &fs::Metadata, second: &fs::Metadata) -> bool {
     first.dev() == second.dev() && first.ino() == second.ino()
 }
 
@@ -1517,8 +1563,6 @@ fn refused(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 thread_local! {
-    static FAIL_CHMOD: Cell<bool> = const { Cell::new(false) };
-    static FAIL_RENAME_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+    pub(super) static FAIL_CHMOD: Cell<bool> = const { Cell::new(false) };
+    pub(super) static FAIL_RENAME_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
 }
-#[cfg(test)]
-mod tests;

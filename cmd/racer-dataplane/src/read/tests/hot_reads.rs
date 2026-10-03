@@ -546,7 +546,7 @@ use crate::{
         protocol::{PeerRequest, VerifiedResponse},
         server::{LocalPageService, PeerServer},
     },
-    read::{Coordinator, ReadService},
+    read::Coordinator,
     security::{
         connection::Signatures,
         forwarding::Forwarding,
