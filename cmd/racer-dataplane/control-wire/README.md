@@ -16,12 +16,14 @@ timeout --signal=TERM --kill-after=10s 300s cargo test --locked --manifest-path 
 The independent performance controller consumes this crate through
 `internal/racer-test/control.rs`, without linking the dataplane. The dataplane's
 `src/control/wire.rs` is an explicit application adapter. It converts wire
-members, rail mappings, cache definitions, and staged keys to application-owned
-records. Placement traits, publication installation, key epoch validation,
-transport, and lifecycle policy remain in the application. Shared cluster,
-cache, node, and membership identifiers are re-exported by the application;
-the application key ID retains its installation-specific generation validation
-and error mapping.
+members, rail mappings, and cache definitions to application-owned records.
+Key bundles transfer directly into `racer-identity`, which owns epoch validation,
+certificate identities, and purpose-bound leases. Placement traits, publication
+installation, transport, persistence, and accepted control cursors remain in the
+application. Shared identifiers, including the storage key ID, are re-exported
+by the application. Its `model::key_id_from_generation` helper preserves the
+configuration-error classification for zero generations; the wire constructor
+continues reporting a syntax error. Identity independently validates generations.
 
 Wire key material is private and deliberately non-Debug. `into_installation`
 consumes its record and returns a `Zeroizing<[u8; 32]>` owner; there is no borrowed

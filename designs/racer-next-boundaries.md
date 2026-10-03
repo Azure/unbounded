@@ -9,10 +9,32 @@ See `cmd/racer-dataplane/control-wire/README.md` for the contract, validation
 commands, secret ownership, and explicit application adapters.
 
 Runtime members remain local so their placement trait implementations do not
-violate Rust's orphan rules. Snapshot installation, key installation, enrollment
-lifecycle, transport, admission, readiness, and topology algorithms stay in the
-application. Shared identifiers are limited to the contract's needs; this is not
-a general model or security extraction.
+violate Rust's orphan rules. Snapshot installation, enrollment lifecycle,
+transport, admission, readiness, and topology algorithms stay in the application.
+Shared identifiers are limited to the contract's needs; no general model crate
+is introduced.
+
+## Identity: cohesive component ownership
+
+`racer-identity` now owns CSR/recovery, signing identity and peer certificate
+validation, atomic key epochs, and immutable purpose-bound leases. It consumes
+wire bundles directly, with private zeroizing validation staging. Application
+secret DTO duplication is removed. The wire storage KeyId is shared; the
+application configuration helper explicitly maps its constructor failure, and
+identity validates opaque, zero, future, and resurrected epochs independently.
+
+Page and credential AEAD use borrowed inputs and caller output. Request MAC
+derivation stays inside the credential lease. No raw lease key getter or generic
+key callback is exported. Held operations never reconsult current admission.
+The application still owns canonical AAD/messages, nonce generation, quotas,
+CRC/telemetry/cancellation ordering, transport, persistence, and accepted cursors.
+Worker-local certificate caches retain Rc/RefCell ownership.
+
+Component tests retain private lifetime assertions; the runtime/page-engine
+ownership scenario and real decode/BundleInstaller rotation scenario are in
+`tests/identity_integration.rs`. See the component README for focused gates.
+This component boundary is justified by cohesive ownership, not an invented
+second consumer. The independent performance controller remains wire-only.
 
 ## R2: circuit-core extraction deferred
 

@@ -119,7 +119,7 @@ impl CacheEncryptionKey {
         }
     }
 
-    /// Consume the wire record when transferring to the application's key installer.
+    /// Consume the wire record when transferring to the identity component's installer.
     /// Both the source record and returned secret owner wipe their storage on drop.
     pub fn into_installation(self) -> (CacheKeyRef, CacheKeyState, zeroize::Zeroizing<[u8; 32]>) {
         (
