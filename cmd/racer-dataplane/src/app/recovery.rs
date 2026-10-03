@@ -609,10 +609,10 @@ mod tests {
         .unwrap();
         assert!(filtered.shards[0].index.entries.is_empty());
         assert_eq!(filtered.shards[0].index.metadata.len(), 1);
-        keys.install(crate::control::wire::KeyringBundle {
+        keys.install(racer_control_wire::KeyringBundle {
             schema_version: 1,
             cluster: keys.cluster().clone(),
-            generation: crate::control::wire::BundleGeneration(2),
+            generation: racer_control_wire::BundleGeneration(2),
             peer_trust_roots: (*keys.peer_trust_roots().unwrap()).clone(),
             cache_keys: vec![],
         })

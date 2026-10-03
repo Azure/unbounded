@@ -1057,10 +1057,7 @@ fn enrolled_identity(
     control: &control::Control,
     processes: usize,
 ) -> racer_dataplane::control::enrollment::LocalSigningIdentity {
-    use racer_dataplane::{
-        control::{enrollment::Enrollment, wire},
-        model::ClusterId,
-    };
+    use racer_dataplane::{control::enrollment::Enrollment, model::ClusterId};
     assert_eq!(
         control.enrollments.load(Ordering::Acquire),
         2 * processes,
@@ -1075,7 +1072,7 @@ fn enrolled_identity(
         scratch.0.join("token"),
         scratch.0.join("identity"),
     );
-    let bundle = wire::decode_bundle(&control.bundle).unwrap();
+    let bundle = racer_control_wire::decode_bundle(&control.bundle).unwrap();
     enrollment
         .set_peer_trust_roots(bundle.peer_trust_roots)
         .unwrap();

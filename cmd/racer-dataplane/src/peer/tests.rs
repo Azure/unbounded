@@ -978,7 +978,6 @@ mod encrypted_http {
     //! Production page AEAD across independent keyrings and the signed HTTP transport.
     use super::*;
     use crate::{
-        control::wire::{CacheEncryptionKey, CacheKeyPurpose, CacheKeyRef, CacheKeyState},
         http::{
             Codec,
             connection::{Endpoint, HttpIo, HttpPool},
@@ -993,6 +992,7 @@ mod encrypted_http {
         telemetry::metrics::{Event, Metrics},
         topology::rails::TransportPlan,
     };
+    use racer_control_wire::{CacheEncryptionKey, CacheKeyPurpose, CacheKeyRef, CacheKeyState};
     use std::{
         cell::Cell,
         future::Future,

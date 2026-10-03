@@ -164,7 +164,7 @@ fn published_client() -> (
     crate::control::state::SnapshotLease,
 ) {
     let (mut client, admission, reactor) = client();
-    let publication = crate::control::wire::decode_publication(include_bytes!(concat!(
+    let publication = crate::control::state::decode_publication(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../internal/racer/wire/testdata/publication.json"
     )))
@@ -475,7 +475,7 @@ fn same_name_new_uid_dials_replacement_without_reusing_old_keepalive() {
     let old_listener = UnixListener::bind(&socket).unwrap();
     old_listener.set_nonblocking(true).unwrap();
     let (mut client, admission, reactor) = self::client();
-    let mut publication = crate::control::wire::decode_publication(include_bytes!(concat!(
+    let mut publication = crate::control::state::decode_publication(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../internal/racer/wire/testdata/publication.json"
     )))

@@ -636,8 +636,8 @@ pub(crate) mod test_support {
     //! Real read ownership behind client wire scenarios. Only the UDS adapter is scripted.
     use crate::{
         control::{
+            state::Publication,
             state::{CacheDefinition, PublishedState, SnapshotStore},
-            wire::{Publication, PublicationSequence},
         },
         memory::{BufferPool, cache::MemoryCache, delivery::Delivery},
         model::{MembershipVersion, ObjectMetadata, WorkerId},
@@ -668,6 +668,7 @@ pub(crate) mod test_support {
         test_support::origin::AdapterOrigin,
         topology::{membership::Member, routing::Placement},
     };
+    use racer_control_wire::PublicationSequence;
     use std::{cell::RefCell, num::NonZeroU32, rc::Rc, sync::Arc, task::Context};
 
     pub(crate) struct ReadWorker {

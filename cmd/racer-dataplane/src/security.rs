@@ -21,13 +21,13 @@ impl From<racer_identity::Error> for crate::error::Error {
 pub(crate) mod test_support {
     use super::connection::{Signatures, SignedHead};
     use crate::{
-        control::wire::{
-            BundleGeneration, CacheEncryptionKey, CacheKeyPurpose, CacheKeyRef, CacheKeyState,
-            KeyringBundle, SCHEMA_VERSION,
-        },
         http::Codec,
         model::{CacheId, ClusterId, NodeId},
         peer::protocol,
+    };
+    use racer_control_wire::{
+        BundleGeneration, CacheEncryptionKey, CacheKeyPurpose, CacheKeyRef, CacheKeyState,
+        KeyringBundle, SCHEMA_VERSION,
     };
     use racer_identity::{Certificates, KeyEpochs, KeyLease, Keyring, PendingIdentity};
     use std::{rc::Rc, sync::Arc};

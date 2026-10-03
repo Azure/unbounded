@@ -459,7 +459,6 @@ mod session_tests {
     #[test]
     fn real_signed_setup_rejects_tampering_and_replay() {
         use crate::{
-            control::wire::{BundleGeneration, KeyringBundle, SCHEMA_VERSION},
             http::{Header, MessageHead, StartLine},
             model::ClusterId,
             security::{
@@ -467,6 +466,7 @@ mod session_tests {
                 test_support::{CLUSTER, NODE, issued},
             },
         };
+        use racer_control_wire::{BundleGeneration, KeyringBundle, SCHEMA_VERSION};
         use racer_identity::{Certificates, KeyEpochs, Keyring};
         use std::sync::Arc;
         let (pending, chain, roots) = issued();

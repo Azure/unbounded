@@ -1,6 +1,7 @@
 //! Shared application fixtures. Scenarios import these directly, not through other tests.
 use super::*;
-use crate::control::wire;
+use crate::control::state;
+use racer_control_wire as wire;
 use std::{
     io::{Read, Write},
     path::PathBuf,
@@ -23,8 +24,8 @@ pub(super) struct ControlFixture {
     pub bootstrap_status: Arc<AtomicUsize>,
     pub poll_status: Arc<AtomicUsize>,
     pub certificate_age: Arc<AtomicUsize>,
-    pub publication: Arc<Mutex<Option<wire::Publication>>>,
-    pub bootstrap_requests: Arc<Mutex<Vec<wire::EnrollmentRequest>>>,
+    pub publication: Arc<Mutex<Option<state::Publication>>>,
+    pub bootstrap_requests: Arc<Mutex<Vec<state::EnrollmentRequest>>>,
     pub poll_certificates: Arc<Mutex<Vec<Vec<u8>>>>,
     pub hold_long_poll: Arc<AtomicBool>,
     pub long_polls: Arc<AtomicUsize>,
@@ -45,7 +46,7 @@ struct EnrollmentHandler {
     status: Arc<AtomicUsize>,
     age: Arc<AtomicUsize>,
     issued: Arc<AtomicUsize>,
-    requests: Arc<Mutex<Vec<wire::EnrollmentRequest>>>,
+    requests: Arc<Mutex<Vec<state::EnrollmentRequest>>>,
 }
 #[derive(Clone)]
 struct KeyringHandler {
@@ -56,8 +57,8 @@ struct KeyringHandler {
 }
 #[derive(Clone)]
 struct PublicationHandler {
-    initial: wire::Publication,
-    published: Arc<Mutex<Option<wire::Publication>>>,
+    initial: state::Publication,
+    published: Arc<Mutex<Option<state::Publication>>>,
     binding: Arc<Mutex<NodeId>>,
     status: Arc<AtomicUsize>,
     certificates: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -81,7 +82,7 @@ impl EnrollmentHandler {
     fn respond(&self, head: &str, body: &[u8], stream: &ControlStream) -> (usize, Vec<u8>) {
         assert!(head.contains("Authorization: Bearer fixture.token"));
         assert!(stream.conn.peer_certificates().is_none());
-        let request = wire::decode_enrollment_request(body).unwrap();
+        let request = state::decode_enrollment_request(body).unwrap();
         self.requests.lock().unwrap().push(request.clone());
         let status = self.status.load(Ordering::Acquire);
         if status != 200 {
@@ -162,7 +163,7 @@ impl PublicationHandler {
             }
             (204, Vec::new())
         } else {
-            (200, wire::encode_publication(&publication).unwrap())
+            (200, state::encode_publication(&publication).unwrap())
         }
     }
 }
@@ -466,8 +467,8 @@ pub(super) fn publication(
     config: &Config,
     sequence: u64,
     caches: Vec<crate::control::state::CacheDefinition>,
-) -> wire::Publication {
-    wire::Publication {
+) -> state::Publication {
+    state::Publication {
         schema_version: 1,
         cluster: config.cluster.clone(),
         sequence: wire::PublicationSequence(sequence),

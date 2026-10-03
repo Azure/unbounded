@@ -754,7 +754,7 @@ fn owner_key(cache: &str, page: u64, owner: u16) -> u64 {
 #[test]
 #[ignore = "requires root, mount namespaces, io_uring and O_DIRECT; blocked listener publication and recovery"]
 fn production_blocked_listener_publication() {
-    use racer_dataplane::control::wire::PublicationSequence;
+    use racer_control_wire::PublicationSequence;
     let scratch = Scratch::new();
     let profile = Profile::new(2, 113, 2);
     let control = control::Control::start_with(&scratch.0, profile.caches.clone());
@@ -880,7 +880,6 @@ fn production_multicache_disk_baseline() {
 #[ignore = "requires root, mount namespaces, io_uring and O_DIRECT; two actual Applications with authenticated TCP peers"]
 fn production_peer_and_failed_neighbor_progress() {
     use racer_dataplane::{
-        control::wire,
         model::{CacheId, CacheKey, MembershipVersion, NodeId, ObjectId, PageNumber},
         topology::{
             membership::{Member, Membership},
@@ -992,7 +991,7 @@ fn production_peer_and_failed_neighbor_progress() {
         // Preserve failed neighbor membership: deletion would hide the failure.
         assert_eq!(
             control.publication.lock().unwrap().sequence,
-            wire::PublicationSequence(1)
+            racer_control_wire::PublicationSequence(1)
         );
         for origin in &origins[receiver] {
             origin.offline.store(false, Ordering::Release);

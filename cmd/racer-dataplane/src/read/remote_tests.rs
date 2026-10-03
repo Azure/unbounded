@@ -2,7 +2,6 @@
 use super::candidates::{CandidatePolicy, CandidateResolution};
 use super::flight::AcquisitionBudget;
 use crate::{
-    control::wire::SCHEMA_VERSION,
     error::{Error, Operation},
     http::{Codec, connection::HttpIo, connection::HttpPool},
     memory::BufferPool,
@@ -23,6 +22,7 @@ use crate::{
         routing::Placement,
     },
 };
+use racer_control_wire::{PublicationSequence, SCHEMA_VERSION};
 use racer_identity::Keyring;
 use std::{
     cell::{Cell, RefCell},
@@ -41,13 +41,13 @@ fn node(n: usize) -> NodeId {
 fn identities(nodes: &[NodeId]) -> Vec<Identity> {
     crate::security::test_support::identities(ClusterId(CLUSTER.into()), nodes, || {
         let mut keys = crate::security::test_support::mac_test_key(CACHE);
-        keys.push(crate::control::wire::CacheEncryptionKey::new(
-            crate::control::wire::CacheKeyRef {
+        keys.push(racer_control_wire::CacheEncryptionKey::new(
+            racer_control_wire::CacheKeyRef {
                 cache: CacheId(CACHE.into()),
                 id: crate::model::key_id_from_generation(1, 1).unwrap(),
-                purpose: crate::control::wire::CacheKeyPurpose::Page,
+                purpose: racer_control_wire::CacheKeyPurpose::Page,
             },
-            crate::control::wire::CacheKeyState::Active,
+            racer_control_wire::CacheKeyState::Active,
             zeroize::Zeroizing::new([7; 32]),
         ));
         keys
@@ -272,8 +272,8 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     let queue = Rc::new(crate::read::drivers::DriverQueue::default());
     let _owner = queue.enter();
     use crate::control::{
+        state::Publication,
         state::{PublishedState, SnapshotStore},
-        wire::{Publication, PublicationSequence},
     };
     let object = ObjectId {
         cache: CacheId(CACHE.into()),
@@ -877,8 +877,8 @@ fn metadata_coordinator_with_newer_publication(
 ) -> (Rc<super::Coordinator>, super::dispatch::WorkerEndpoint) {
     use crate::{
         control::{
+            state::Publication,
             state::{PublishedState, SnapshotStore},
-            wire::{Publication, PublicationSequence},
         },
         memory::{cache::MemoryCache, delivery::Delivery, new_pipe_pool},
         runtime::{

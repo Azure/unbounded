@@ -1,82 +1,10 @@
 use super::dataplane;
 use dataplane::{
-    error::{Error, Operation},
+    error::Operation,
     model::Limits,
     runtime::{admission::AdmissionPolicy, reactor::Reactor},
 };
 
-/// Blocking readiness for loopback TLS fixtures only, never the serving graph.
-pub struct ControlIo;
-impl dataplane::control::transport::ControlIo for ControlIo {
-    fn read_file<'a>(
-        &'a self,
-        path: &'a std::path::Path,
-        limit: usize,
-        scope: &'a dataplane::runtime::deadline::RequestScope,
-    ) -> Operation<'a, zeroize::Zeroizing<Vec<u8>>> {
-        Box::pin(async move {
-            use std::{io::Read, os::unix::fs::OpenOptionsExt};
-            scope.check()?;
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-                .open(path)
-                .map_err(|_| Error::Io)?;
-            if !file.metadata().map_err(|_| Error::Io)?.is_file() {
-                return Err(Error::InvalidRequest);
-            }
-            let mut bytes = zeroize::Zeroizing::new(Vec::new());
-            file.take(limit as u64 + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|_| Error::Io)?;
-            if bytes.len() > limit {
-                return Err(Error::Overloaded);
-            }
-            Ok(bytes)
-        })
-    }
-    fn resolve<'a>(
-        &'a self,
-        _: &'a str,
-        port: u16,
-        _: &'a dataplane::runtime::deadline::RequestScope,
-    ) -> Operation<'a, Vec<std::net::SocketAddr>> {
-        Box::pin(async move { Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))]) })
-    }
-    fn ready<'a>(
-        &'a self,
-        fd: Rc<uring_runtime::reactor::Descriptor>,
-        read: bool,
-        write: bool,
-        scope: &'a dataplane::runtime::deadline::RequestScope,
-    ) -> Operation<'a, ()> {
-        Box::pin(async move {
-            use std::os::fd::AsRawFd;
-            loop {
-                scope.check()?;
-                let mut poll = libc::pollfd {
-                    fd: fd.as_raw_fd(),
-                    events: (if read { libc::POLLIN } else { 0 })
-                        | (if write { libc::POLLOUT } else { 0 }),
-                    revents: 0,
-                };
-                // SAFETY: poll references one initialized entry for the call.
-                match unsafe { libc::poll(&mut poll, 1, 10) } {
-                    n if n > 0 => return Ok(()),
-                    n if n < 0 => return Err(Error::Io),
-                    _ => (),
-                }
-            }
-        })
-    }
-    fn sleep<'a>(
-        &'a self,
-        _: Instant,
-        _: &'a dataplane::runtime::deadline::RequestScope,
-    ) -> Operation<'a, ()> {
-        Box::pin(async { Ok(()) })
-    }
-}
 use std::{
     num::NonZeroUsize,
     rc::Rc,
@@ -111,8 +39,17 @@ pub fn reactor() -> Rc<Reactor> {
     reactor
 }
 
-pub fn drive<T>(reactor: &Reactor, mut future: Operation<'_, T>) -> dataplane::error::Result<T> {
-    let deadline = Instant::now() + Duration::from_secs(15);
+pub fn drive<T>(reactor: &Reactor, future: Operation<'_, T>) -> dataplane::error::Result<T> {
+    drive_until(reactor, future, Instant::now() + Duration::from_secs(15))
+}
+
+/// Drive network and enrollment operations on the same production reactor.
+pub fn drive_until<T>(
+    reactor: &Reactor,
+    future: impl std::future::Future<Output = dataplane::error::Result<T>>,
+    deadline: Instant,
+) -> dataplane::error::Result<T> {
+    let mut future = std::pin::pin!(future);
     loop {
         if let std::task::Poll::Ready(result) = future.as_mut().poll(
             &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),

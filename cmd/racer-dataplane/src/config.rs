@@ -580,7 +580,7 @@ mod tests {
             r#"[{"device":"a","port":1,"rail":0},{"device":"a","port":1,"rail":1}]"#,
         ] {
             assert!(
-                crate::control::wire::decode_enrollment_request(&nic_request(nics)).is_err(),
+                racer_control_wire::decode_enrollment_request(&nic_request(nics)).is_err(),
                 "{nics}"
             );
         }
@@ -591,23 +591,23 @@ mod tests {
             .map(|i| format!(r#"{{"device":"d{i}","port":1,"rail":0}}"#))
             .collect();
         assert!(
-            crate::control::wire::decode_enrollment_request(&nic_request(&format!(
+            racer_control_wire::decode_enrollment_request(&nic_request(&format!(
                 "[{}]",
                 entries[..64].join(",")
             )))
             .is_ok()
         );
         assert!(
-            crate::control::wire::decode_enrollment_request(&nic_request(&format!(
+            racer_control_wire::decode_enrollment_request(&nic_request(&format!(
                 "[{}]",
                 entries.join(",")
             )))
             .is_err()
         );
         assert!(
-            crate::control::wire::decode_enrollment_request(&vec![
+            racer_control_wire::decode_enrollment_request(&vec![
                 b' ';
-                crate::control::wire::MAX_ENROLLMENT_BYTES
+                racer_control_wire::MAX_ENROLLMENT_BYTES
                     + 1
             ])
             .is_err()
@@ -624,7 +624,7 @@ mod tests {
             assert!(parse(&[("RACER_FABRIC_PORTS", value)]).is_err());
         }
         assert!(
-            crate::control::wire::decode_enrollment_request(&nic_request(
+            racer_control_wire::decode_enrollment_request(&nic_request(
                 r#"[{"device":"a","port":1,"rail":0}]"#
             ))
             .is_ok()

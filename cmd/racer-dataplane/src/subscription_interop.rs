@@ -172,10 +172,11 @@ impl SubscriptionFixture {
     fn construct(root: PathBuf) -> Self {
         use client::{RequestParser, listener::ClientListeners, response::Responses};
         use control::{
+            state::Publication,
             state::{CacheDefinition, PublishedState, SnapshotStore},
-            wire::*,
         };
         use memory::{BufferPool, cache::MemoryCache, delivery::Delivery, new_pipe_pool};
+        use racer_control_wire::*;
         use read::{
             Coordinator,
             candidates::CandidatePolicy,
@@ -446,7 +447,7 @@ fn interop_limits() -> Limits {
 }
 
 fn interop_keys() -> racer_identity::Keyring {
-    use control::wire::*;
+    use racer_control_wire::*;
     use racer_identity::{KeyEpochs, Keyring};
 
     let cluster = ClusterId("11111111-1111-4111-8111-111111111111".into());

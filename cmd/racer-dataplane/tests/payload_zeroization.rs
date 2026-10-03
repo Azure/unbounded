@@ -177,7 +177,6 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
     use base64::Engine;
     use racer_crypto::aead;
     use racer_dataplane::{
-        control::wire,
         model::{ClusterId, NodeId, RequestId, WorkerId},
         runtime::{
             crypto::{CryptoId, CryptoInput, pair},
@@ -212,7 +211,7 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
             .encode([i as u8 + 7; 32])
             .into();
     }
-    keys.install(wire::decode_bundle(&serde_json::to_vec(&bundle).unwrap()).unwrap())
+    keys.install(racer_control_wire::decode_bundle(&serde_json::to_vec(&bundle).unwrap()).unwrap())
         .unwrap();
     let cache = CacheId("44444444-4444-4444-8444-444444444444".into());
     // Unusual sizes isolate the admitted payload allocation from engine metadata.

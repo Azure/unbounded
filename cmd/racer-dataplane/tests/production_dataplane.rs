@@ -1,11 +1,12 @@
 //! Single-node production graph validation. Only control publication, origin data,
 //! and the worker polling loop are fixtures. No read/storage/crypto success doubles.
 use base64::Engine;
+use racer_control_wire::{self as wire, PublicationSequence};
 use racer_dataplane::{
     client::{RequestParser, response::Responses},
     control::{
+        state::Publication,
         state::{CacheDefinition, PublishedState, SnapshotStore, canonical_socket_paths},
-        wire::{self, Publication, PublicationSequence},
     },
     error::{Error, Operation, Result},
     http::{Codec, connection::HttpIo, connection::HttpPool},

@@ -2,9 +2,10 @@
 //! The oracle owns immutable origin versions, never consults placement or cache data.
 use super::*;
 use crate::{
-    control::{state::CacheDefinition, wire},
+    control::state::CacheDefinition,
     model::{PAGE_BYTES, ResourceClass, *},
 };
+use racer_control_wire as wire;
 use racer_identity::{PendingIdentity, SigningIdentity};
 use sha2::{Digest, Sha256};
 use std::{cell::RefCell, collections::BTreeMap};

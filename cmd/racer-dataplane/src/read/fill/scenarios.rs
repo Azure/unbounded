@@ -1270,8 +1270,8 @@ impl Fixture {
     ) {
         use crate::{
             control::{
+                state::Publication,
                 state::{Availability, CacheDefinition, PublishedState, SnapshotStore},
-                wire::*,
             },
             memory::{delivery::Delivery, new_pipe_pool},
             read::{
@@ -1280,6 +1280,7 @@ impl Fixture {
                 range_stream::RangeStreams,
             },
         };
+        use racer_control_wire::{PublicationSequence, SCHEMA_VERSION};
         let published = Arc::new(PublishedState::default());
         let availability = Rc::new(Availability::new(published.clone(), self.keys.clone()));
         let snapshots = Rc::new(SnapshotStore::new(
@@ -1567,9 +1568,10 @@ fn adapter_client(
     adapter: &crate::test_support::origin::AdapterOrigin,
 ) -> Rc<crate::origin::OriginClient> {
     use crate::control::{
+        state::Publication,
         state::{PublishedState, SnapshotStore},
-        wire::{Publication, PublicationSequence, SCHEMA_VERSION},
     };
+    use racer_control_wire::{PublicationSequence, SCHEMA_VERSION};
     let snapshots = Rc::new(SnapshotStore::new(
         f.keys.cluster().clone(),
         Arc::new(PublishedState::default()),

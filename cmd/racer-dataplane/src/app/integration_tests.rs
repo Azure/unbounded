@@ -1,7 +1,7 @@
 //! Real TLS enrollment/publication fixture driving the production application graph.
 use super::test_support::*;
 use super::*;
-use crate::control::wire;
+use racer_control_wire as wire;
 use std::{
     io::{Read, Write},
     thread,
@@ -1234,7 +1234,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     assert!(fixture.polls.load(Ordering::Acquire) >= 1);
     assert_eq!(
         worker.snapshots.current().unwrap().sequence,
-        crate::control::wire::PublicationSequence(1)
+        racer_control_wire::PublicationSequence(1)
     );
     assert_eq!(
         fixture.enrollments.load(Ordering::Acquire),

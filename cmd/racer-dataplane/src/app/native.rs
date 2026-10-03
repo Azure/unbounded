@@ -210,11 +210,12 @@ impl WorkerApplication {
 mod tests {
     use super::*;
     use crate::{
-        control::wire::{Publication, PublicationSequence},
+        control::state::Publication,
         model::{MembershipVersion, ResourceClass},
         runtime::crypto::{self, CryptoClient},
         topology::{membership::Member, rails::RailId},
     };
+    use racer_control_wire::PublicationSequence;
 
     #[test]
     fn shared_inventory_recovers_new_hardware_and_revokes_removed_or_changed_ports() {
@@ -230,7 +231,7 @@ mod tests {
         let (mut worker, engine) = worker(&app, true, true);
         let mut service = app.build_crypto(WorkerId(0), engine).unwrap();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        let mut publication = crate::control::wire::Publication {
+        let mut publication = crate::control::state::Publication {
             schema_version: 1,
             cluster: app.config.cluster.clone(),
             sequence: PublicationSequence(2),

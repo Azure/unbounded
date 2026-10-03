@@ -1,12 +1,13 @@
 //! Generate node-private Ed25519 keys locally and enroll/rotate with node-bound SA identity.
-use super::wire;
-use super::wire::{EnrollmentId, EnrollmentRequest, EnrollmentResponse};
+use super::state::EnrollmentRequest;
 use crate::{
     error::{Error, Operation, Result},
     model::{ClusterId, NodeId},
     runtime::deadline::RequestScope,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
+use racer_control_wire as wire;
+use racer_control_wire::{EnrollmentId, EnrollmentResponse};
 use serde::{Deserialize, Serialize};
 use std::{
     cell::{Cell, RefCell},
@@ -68,23 +69,17 @@ impl PersistedIdentity {
     }
 
     fn response(&self) -> Result<EnrollmentResponse> {
-        wire::decode_enrollment_response(
+        Ok(wire::decode_enrollment_response(
             &STANDARD
                 .decode(&self.response)
                 .map_err(|_| Error::CorruptRecord)?,
-        )
+        )?)
     }
 
     fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {
         Ok(Zeroizing::new(
             serde_json::to_vec(self).map_err(|_| Error::Io)?,
         ))
-    }
-}
-struct TransactionGuard<'a>(&'a Cell<bool>);
-impl Drop for TransactionGuard<'_> {
-    fn drop(&mut self) {
-        self.0.set(false);
     }
 }
 fn token(b: &[u8]) -> Result<Zeroizing<String>> {
@@ -196,12 +191,9 @@ impl Enrollment {
         &'a self,
         r: &crate::runtime::reactor::Reactor,
         scope: &RequestScope,
-    ) -> Result<(TransactionGuard<'a>, RequestScope)> {
+    ) -> Result<(super::Busy<'a>, RequestScope)> {
         scope.check()?;
-        if self.busy.replace(true) {
-            return Err(Error::Overloaded);
-        }
-        let guard = TransactionGuard(&self.busy);
+        let guard = super::enter(&self.busy)?;
         if let Some(id) = self.previous.get() {
             r.file_fence(id).await?;
         }
@@ -377,7 +369,7 @@ impl Enrollment {
             enrollment: EnrollmentId(p.enrollment.clone()),
             csr_der: STANDARD.decode(&p.csr).map_err(|_| Error::CorruptRecord)?,
         };
-        wire::encode_enrollment_request(&r)?;
+        super::state::encode_enrollment_request(&r)?;
         // A corrupt pending key must never be submitted, even if its CSR parses.
         use x509_parser::prelude::FromDer;
         let secret = Zeroizing::new(

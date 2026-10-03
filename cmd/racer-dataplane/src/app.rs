@@ -16,9 +16,8 @@ use crate::{
     client::{RequestParser, listener::ClientListeners, response::Responses},
     config::Config,
     control::{
-        ControlClient, ControlEndpoint,
+        BundleInstaller, ControlClient, ControlEndpoint,
         enrollment::Enrollment,
-        secrets::BundleInstaller,
         state::{PublishedState, SnapshotStore},
         transport::ReactorControlIo,
     },
@@ -317,7 +316,7 @@ pub(crate) mod caches {
             assert_eq!(node.cache_cut.lock().unwrap().generation, previous + 1);
             assert_eq!(
                 store.cursor().unwrap(),
-                Some(crate::control::wire::PublicationSequence(1))
+                Some(racer_control_wire::PublicationSequence(1))
             );
         }
     }
@@ -650,7 +649,7 @@ fn bootstrap(
                 ) => {
                     startup.check()?;
                     let io = ReactorControlIo::new(reactor.clone());
-                    crate::control::transport::ControlIo::sleep(
+                    ReactorControlIo::sleep(
                         &io,
                         control
                             .next_attempt()
@@ -803,7 +802,7 @@ pub struct WorkerApplication {
     shutdown_timeout: Duration,
     started: bool,
     stopping: bool,
-    snapshot_sequence: Option<crate::control::wire::PublicationSequence>,
+    snapshot_sequence: Option<racer_control_wire::PublicationSequence>,
     memory: Rc<MemoryCache>,
     caches: Vec<crate::control::state::CacheDefinition>,
     slab_directory: std::path::PathBuf,
@@ -1590,7 +1589,7 @@ impl WorkerApplication {
             && let Some(control) = &self.control
         {
             let control = control.clone();
-            let turn = scope(crate::control::wire::POLL_WAIT + Duration::from_secs(10))?;
+            let turn = scope(racer_control_wire::POLL_WAIT + Duration::from_secs(10))?;
             self.control_scope = Some(turn.clone());
             self.control_task = Some(Box::pin(async move { control.progress(&turn).await }));
         }
@@ -1879,7 +1878,7 @@ mod lifetime_tests {
 
     #[test]
     fn snapshot_refresh_retries_canceled_publication_and_applies_skipped_removal() {
-        use crate::control::wire;
+        use racer_control_wire as wire;
         let config = crate::test_support::cluster::config(false);
         let node = Arc::new(NodeState::default());
         let (mut worker, _, _) = test_support::local_worker(&config, &node, 1);
@@ -2352,7 +2351,7 @@ pub(crate) mod tests {
             assert_eq!(worker.poll_budgeted(&mut cx, 1), Err(Error::Unavailable));
             // Admission bounds retained generations once across the node.
             let mut publication =
-                crate::control::wire::decode_publication(include_bytes!(concat!(
+                crate::control::state::decode_publication(include_bytes!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
                     "/../../internal/racer/wire/testdata/publication.json"
                 )))
@@ -2384,7 +2383,7 @@ pub(crate) mod tests {
     #[test]
     fn multiworker_memberships_retire_after_request_leases_and_reuse_capacity() {
         use crate::{model::MembershipVersion, peer::PeerNetwork};
-        let mut publication = crate::control::wire::decode_publication(include_bytes!(concat!(
+        let mut publication = crate::control::state::decode_publication(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../internal/racer/wire/testdata/publication.json"
         )))

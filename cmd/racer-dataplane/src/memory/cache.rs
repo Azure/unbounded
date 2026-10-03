@@ -619,10 +619,7 @@ mod tests {
     }
     #[test]
     fn empty_stable_catalog_rotates_without_consuming_page_metadata_capacity() {
-        use crate::{
-            control::{state::for_caches, wire::CacheKeyPurpose},
-            security::test_support::rotation_bundle,
-        };
+        use crate::{control::state::for_caches, security::test_support::rotation_bundle};
         let admission = admission(1024);
         let keys = Rc::new(crate::security::test_support::keys());
         let roots = (*keys.peer_trust_roots().unwrap()).clone();
@@ -633,7 +630,8 @@ mod tests {
             BufferPool::new(admission.clone()),
             for_caches(keys.clone(), caches.clone()),
         );
-        let mut previous: Vec<crate::control::wire::CacheKeyRef> = Vec::new();
+        use racer_control_wire::CacheKeyPurpose;
+        let mut previous: Vec<racer_control_wire::CacheKeyRef> = Vec::new();
         for generation in 2u64..=6 {
             let mut next = rotation_bundle(generation, roots.clone());
             let templates = std::mem::take(&mut next.cache_keys);
@@ -643,7 +641,7 @@ mod tests {
                     key.key.cache = CacheId(format!("{cache:08x}-0000-4000-8000-000000000000"));
                     let (reference, state, mut material) = key.clone().into_installation();
                     material[8..16].copy_from_slice(&cache.to_be_bytes());
-                    key = crate::control::wire::CacheEncryptionKey::new(reference, state, material);
+                    key = racer_control_wire::CacheEncryptionKey::new(reference, state, material);
                     next.cache_keys.push(key);
                 }
             }

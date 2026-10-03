@@ -772,7 +772,7 @@ mod signature_tests {
     }
     #[test]
     fn request_mac_rotates_and_rejects_missing_retired_or_mutated_tags() {
-        use crate::control::wire::*;
+        use racer_control_wire::*;
         let network = network(2);
         let make = || {
             let mut request = head(1);
@@ -808,7 +808,7 @@ mod signature_tests {
                 key.key.id.0[4..12].copy_from_slice(&2u64.to_be_bytes());
                 let (reference, state, mut material) = key.clone().into_installation();
                 material[0] ^= 1;
-                *key = crate::control::wire::CacheEncryptionKey::new(reference, state, material);
+                *key = racer_control_wire::CacheEncryptionKey::new(reference, state, material);
             }
             signer
                 .keys

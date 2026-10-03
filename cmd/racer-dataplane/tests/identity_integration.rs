@@ -3,7 +3,7 @@
 use racer_control_wire::{self as wire, *};
 use racer_dataplane::{
     config::Config,
-    control::secrets::BundleInstaller,
+    control::BundleInstaller,
     error::Error,
     memory::BufferPool,
     model::{

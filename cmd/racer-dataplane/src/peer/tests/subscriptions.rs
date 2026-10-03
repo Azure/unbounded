@@ -767,7 +767,7 @@ fn retained_subscription_cannot_complete_after_request_mac_key_retirement() {
         key.key.id.0[4..12].copy_from_slice(&2u64.to_be_bytes());
         let (reference, state, mut material) = key.clone().into_installation();
         material[0] ^= 1;
-        *key = crate::control::wire::CacheEncryptionKey::new(reference, state, material);
+        *key = racer_control_wire::CacheEncryptionKey::new(reference, state, material);
     }
     keys.install(KeyringBundle {
         schema_version: SCHEMA_VERSION,
@@ -783,4 +783,4 @@ fn retained_subscription_cannot_complete_after_request_mac_key_retirement() {
             .is_err()
     );
 }
-use crate::control::wire::{BundleGeneration, KeyringBundle, SCHEMA_VERSION};
+use racer_control_wire::{BundleGeneration, KeyringBundle, SCHEMA_VERSION};

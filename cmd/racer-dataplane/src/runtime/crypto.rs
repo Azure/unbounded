@@ -2240,10 +2240,8 @@ mod tests {
     }
 
     pub(super) fn keyring() -> racer_identity::Keyring {
-        use crate::{
-            control::wire::*,
-            model::{CacheId, ClusterId, NodeId},
-        };
+        use crate::model::{CacheId, ClusterId, NodeId};
+        use racer_control_wire::*;
         use racer_identity::{KeyEpochs, Keyring};
         let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
         let mut params = rcgen::CertificateParams::default();

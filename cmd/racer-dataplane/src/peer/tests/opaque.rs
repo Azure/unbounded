@@ -369,7 +369,6 @@ mod safety {
     //! Opaque transit keeps deadline and endpoint authentication safety boundaries.
     use super::*;
     use crate::{
-        control::wire::{CacheEncryptionKey, CacheKeyPurpose, CacheKeyRef, CacheKeyState},
         runtime::{
             crypto::{self, CryptoClient},
             worker::{CryptoRuntime, CryptoService},
@@ -377,6 +376,7 @@ mod safety {
         security::aead::{PageCrypto, PageCryptoEngine},
         telemetry::metrics::{Event, Metrics},
     };
+    use racer_control_wire::{CacheEncryptionKey, CacheKeyPurpose, CacheKeyRef, CacheKeyState};
     use std::{cell::RefCell, net::Shutdown};
 
     #[test]

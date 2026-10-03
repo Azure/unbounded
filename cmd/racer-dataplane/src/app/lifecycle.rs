@@ -9,8 +9,7 @@ use std::time::UNIX_EPOCH;
 #[derive(Default)]
 pub(super) struct Observations {
     pub health: Health,
-    workers:
-        Mutex<HashMap<WorkerId, (Resources, Option<crate::control::wire::PublicationSequence>)>>,
+    workers: Mutex<HashMap<WorkerId, (Resources, Option<racer_control_wire::PublicationSequence>)>>,
 }
 impl Observations {
     #[cfg(test)]
@@ -22,7 +21,7 @@ impl Observations {
         worker: WorkerId,
         resources: Resources,
         count: usize,
-        sequence: Option<crate::control::wire::PublicationSequence>,
+        sequence: Option<racer_control_wire::PublicationSequence>,
     ) -> Result<()> {
         let mut workers = self.workers.lock().map_err(|_| Error::Unavailable)?;
         workers.insert(worker, (resources, sequence));
@@ -229,7 +228,7 @@ impl WorkerApplication {
                     ) => {
                         startup.check()?;
                         let io = ReactorControlIo::new(self.runtime.reactor.clone());
-                        crate::control::transport::ControlIo::sleep(
+                        ReactorControlIo::sleep(
                             &io,
                             control
                                 .next_attempt()
@@ -276,7 +275,7 @@ impl WorkerApplication {
                         | Error::DeadlineExceeded,
                     ) => {
                         let io = ReactorControlIo::new(self.runtime.reactor.clone());
-                        crate::control::transport::ControlIo::sleep(
+                        ReactorControlIo::sleep(
                             &io,
                             uring_runtime::environment::now() + Duration::from_millis(100),
                             startup,
@@ -340,7 +339,7 @@ mod tests {
     use super::*;
     #[test]
     fn membership_attestation_requires_fresh_matching_workers() {
-        use crate::control::wire::PublicationSequence;
+        use racer_control_wire::PublicationSequence;
         let observations = Observations::default();
         let now = uring_runtime::environment::now();
         let resources = Resources {
