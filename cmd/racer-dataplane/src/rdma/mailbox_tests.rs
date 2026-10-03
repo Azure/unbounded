@@ -1,10 +1,6 @@
 //! Public handoffs held at deterministic native mailbox boundaries.
 use super::{lifecycle::*, test_support::*, *};
-use crate::{
-    model::*,
-    runtime::admission::AdmissionPolicy,
-    security::test_support::network,
-};
+use crate::{model::*, runtime::admission::AdmissionPolicy, security::test_support::network};
 use rdma_verbs::testing::{Contention, State};
 use std::time::Duration;
 
