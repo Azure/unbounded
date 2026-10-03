@@ -177,6 +177,29 @@ mod tests {
     use super::*;
     use crate::model::ResourceClass;
     #[test]
+    fn offer_delivered_after_target_close_releases_socket_and_charges() {
+        use std::io::Read;
+        let admission = flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        ));
+        let ingress = Arc::new(Ingress::new(&[WorkerId(7)]));
+        ingress.install(WorkerId(7), &admission).unwrap();
+        let waker = futures::task::noop_waker();
+        let offer = ingress.reserve(&waker).unwrap();
+        ingress.close(WorkerId(7));
+        assert_eq!(admission.used(ResourceClass::Connection), 1);
+        let (fd, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        assert!(matches!(
+            offer.deliver(fd.into(), Kind::Peer),
+            Err(Error::Unavailable)
+        ));
+        assert_eq!(admission.used(ResourceClass::Connection), 0);
+        assert_eq!(admission.used(ResourceClass::IngressConnection), 0);
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+        assert!(matches!(ingress.reserve(&waker), Err(Error::Overloaded)));
+    }
+    #[test]
     fn batch_pop_respects_budget_and_releases_unconsumed_entries() {
         let admission = flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
