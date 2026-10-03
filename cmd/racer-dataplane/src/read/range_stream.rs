@@ -1195,7 +1195,7 @@ pub(super) mod tests {
             ));
             let mut metadata = metadata();
             metadata.length = total;
-            metadata.version.object.cache = CacheId(crate::security::identity::tests::CACHE.into());
+            metadata.version.object.cache = CacheId(crate::security::test_support::CACHE.into());
             let (client_socket, origin_socket) =
                 crate::control::state::canonical_socket_paths("framing").unwrap();
             let worker = crate::client::test_support::ReadWorker::new(

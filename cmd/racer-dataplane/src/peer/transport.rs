@@ -25,7 +25,7 @@ use crate::{
 };
 use crate::{
     http::{Header, MessageHead, StartLine},
-    security::protocol as p,
+    peer::protocol as p,
 };
 use std::{rc::Rc, sync::Arc, time::Duration};
 
@@ -223,9 +223,10 @@ mod native_exchange_tests {
         },
         memory::pool::BufferPool,
         model::{ExpiresAt, KeyId, Nonce, ObjectMetadata, PageEnvelope, ResourceClass, *},
+        peer::protocol as p,
         rdma::{Devices, RdmaTransfer, Sessions},
         runtime::reactor::Reactor,
-        security::{connection::Signatures, protocol as p},
+        security::connection::Signatures,
     };
     use std::{
         os::unix::net::UnixStream,
@@ -1278,8 +1279,8 @@ impl Transfers {
         if connection.state().session.as_ref().map(|s| s.peer()) != Some(peer) {
             return Err(Error::Unauthorized);
         }
-        let path = crate::security::protocol::decode_nodes(
-            crate::security::protocol::field(&authentication.original.head, "racer-response-path")?
+        let path = crate::peer::protocol::decode_nodes(
+            crate::peer::protocol::field(&authentication.original.head, "racer-response-path")?
                 .as_bytes(),
         )?;
         let receiver_index = path
@@ -1348,7 +1349,7 @@ impl Transfers {
         bounded_scope.deadline.0 = bounded_scope
             .deadline
             .0
-            .min(crate::security::protocol::decode_deadline(binding.deadline)?.0);
+            .min(crate::peer::protocol::decode_deadline(binding.deadline)?.0);
         let scope = &bounded_scope;
         scope.check()?;
         let peer = accept.peer.node();
@@ -1637,7 +1638,7 @@ impl Transfers {
             || binding.response != [0; 32]
             || binding.membership != request.request.route.membership.0
             || binding.deadline
-                > crate::security::protocol::encode_deadline(request.request.route.deadline)?
+                > crate::peer::protocol::encode_deadline(request.request.route.deadline)?
         {
             return Err(Error::Unauthorized);
         }
@@ -1943,7 +1944,7 @@ impl Transfers {
         // The original envelope is verified by the requester/relay's outstanding
         // binding after this transport returns. No plaintext is published here.
         let response =
-            if crate::security::protocol::field(&authentication.original.head, "racer-outcome")?
+            if crate::peer::protocol::field(&authentication.original.head, "racer-outcome")?
                 == "selected"
             {
                 PeerResponse::Selected {
@@ -1958,17 +1959,17 @@ impl Transfers {
                 }
             };
         let original = &authentication.original.head;
-        let request_digest = crate::security::protocol::decode_binary(
-            crate::security::protocol::field(original, "racer-request-binding")?.as_bytes(),
+        let request_digest = crate::peer::protocol::decode_binary(
+            crate::peer::protocol::field(original, "racer-request-binding")?.as_bytes(),
         )?
         .try_into()
         .map_err(|_| Error::InvalidRequest)?;
-        let path = crate::security::protocol::decode_nodes(
-            crate::security::protocol::field(original, "racer-response-path")?.as_bytes(),
+        let path = crate::peer::protocol::decode_nodes(
+            crate::peer::protocol::field(original, "racer-response-path")?.as_bytes(),
         )?;
-        crate::security::protocol::agrees(
+        crate::peer::protocol::agrees(
             original,
-            &crate::security::protocol::response_head(&response, &request_digest, &path)?,
+            &crate::peer::protocol::response_head(&response, &request_digest, &path)?,
             false,
         )?;
         conn.finish_exchange()?;
@@ -2429,7 +2430,7 @@ impl Transfers {
                           last: Option<std::time::Instant>,
                           reads| {
                 let mut remote = [b'?'; 36];
-                if crate::security::identity::canonical_uuid(&peer.0) {
+                if racer_identity::canonical_uuid(&peer.0) {
                     remote.copy_from_slice(peer.0.as_bytes());
                 }
                 observer.record(

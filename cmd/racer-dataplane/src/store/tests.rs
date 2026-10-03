@@ -147,7 +147,7 @@ mod index_pressure {
         assert!(f.store.writer.index().lookup(&first).unwrap().is_none());
         f.store
             .writer
-            .remove_cache(&CacheId(crate::security::identity::tests::CACHE.into()))
+            .remove_cache(&CacheId(crate::security::test_support::CACHE.into()))
             .unwrap();
         drive(&f.reactor, write).unwrap();
         assert!(f.store.writer.index().lookup(&second).unwrap().is_none());
@@ -347,7 +347,7 @@ impl Fixture {
     fn copy(&self, number: u8, length: usize) -> CiphertextCopy {
         let version = ObjectVersion {
             object: ObjectId {
-                cache: CacheId(crate::security::identity::tests::CACHE.into()),
+                cache: CacheId(crate::security::test_support::CACHE.into()),
                 key: CacheKey([number; 32]),
             },
             etag: StrongEtag::parse(b"\"v1\"").unwrap(),
@@ -417,13 +417,13 @@ fn storage_requires_published_cache_and_live_keys_including_restore() {
     use crate::{
         control::state::{Availability, PublishedState, for_caches},
         memory::{cache::MemoryCache, pool::tests::bundle_for},
-        security::identity::keyring_tests::{keys, rotation_bundle},
+        security::test_support::{keys, rotation_bundle},
     };
     use std::sync::Arc;
 
     for mode in ["unpublished", "absent", "keyless", "available"] {
         let keys = Rc::new(keys());
-        let cache = CacheId(crate::security::identity::tests::CACHE.into());
+        let cache = CacheId(crate::security::test_support::CACHE.into());
         let availability = match mode {
             "unpublished" => Rc::new(Availability::new(
                 Arc::new(PublishedState::default()),
@@ -659,7 +659,7 @@ fn dirty_queue_is_bounded_and_cache_removal_discards_without_io() {
     assert!(f.store.writer.copy_only(&id).unwrap().is_some());
     f.store
         .writer
-        .remove_cache(&CacheId(crate::security::identity::tests::CACHE.into()))
+        .remove_cache(&CacheId(crate::security::test_support::CACHE.into()))
         .unwrap();
     assert_eq!(f.store.writer.pending_count(), 0);
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
@@ -1320,7 +1320,7 @@ fn cache_removal_during_write_fences_late_publication() {
     assert!(operation.as_mut().poll(&mut cx).is_pending());
     f.store
         .writer
-        .remove_cache(&CacheId(crate::security::identity::tests::CACHE.into()))
+        .remove_cache(&CacheId(crate::security::test_support::CACHE.into()))
         .unwrap();
     // Reinsert the same immutable page while the original submitted write still
     // owns its segment/buffer. The old completion cannot publish or remove it.
@@ -1360,15 +1360,13 @@ fn sustained_rotation_reclaims_history_and_fences_held_pages_and_write_completio
     use crate::{
         control::state::for_caches,
         memory::{cache::MemoryCache, pool::tests::bundle_for},
-        security::identity::{
-            KeyPurpose,
-            keyring_tests::{keys, rotation_bundle},
-        },
+        security::test_support::{keys, rotation_bundle},
     };
+    use racer_identity::KeyPurpose;
     use std::sync::Arc;
     let keys = Rc::new(keys());
     let roots = (*keys.peer_trust_roots().unwrap()).clone();
-    let cache = CacheId(crate::security::identity::tests::CACHE.into());
+    let cache = CacheId(crate::security::test_support::CACHE.into());
     let availability = for_caches(keys.clone(), vec![cache.clone()]);
     let f = Fixture::assemble(Directory::new(), availability.clone());
     let memory = MemoryCache::new(f.pool.clone(), availability);
@@ -1636,7 +1634,7 @@ fn incremental_ciphertext_reclamation_preserves_submitted_fence_and_remaining_qu
     assert_eq!(f.store.writer.writes_in_flight(), 1);
     let before = f.admission.used(ResourceClass::Ciphertext);
     let released = f.store.writer.reclaim_ciphertext(
-        Some(&CacheId(crate::security::identity::tests::CACHE.into())),
+        Some(&CacheId(crate::security::test_support::CACHE.into())),
         1,
     );
     assert!(released > 0);

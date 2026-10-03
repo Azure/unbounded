@@ -448,9 +448,9 @@ fn interop_limits() -> Limits {
     }
 }
 
-fn interop_keys() -> security::identity::Keyring {
+fn interop_keys() -> racer_identity::Keyring {
     use control::wire::*;
-    use security::identity::{KeyEpochs, Keyring};
+    use racer_identity::{KeyEpochs, Keyring};
 
     let cluster = ClusterId("11111111-1111-4111-8111-111111111111".into());
     let keys = Keyring::new(

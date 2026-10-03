@@ -159,7 +159,7 @@ pub struct BodyProgress {
 }
 
 pub(crate) fn timestamp(at: std::time::Instant) -> u64 {
-    crate::security::protocol::encode_deadline(crate::runtime::deadline::Deadline(at))
+    crate::peer::protocol::encode_deadline(crate::runtime::deadline::Deadline(at))
         .unwrap_or_default()
 }
 

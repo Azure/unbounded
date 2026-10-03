@@ -96,7 +96,7 @@ mod environment_tests {
         let start = now();
         let wall = wall_now();
         let scope = RequestScope::new(RequestId([1; 16]), start + Duration::from_secs(2)).unwrap();
-        let wire = crate::security::protocol::encode_deadline(scope.deadline).unwrap();
+        let wire = crate::peer::protocol::encode_deadline(scope.deadline).unwrap();
         let mut first = [0; 64];
         fill_random(&mut first[..3]).unwrap();
         fill_random(&mut first[3..]).unwrap();
@@ -115,11 +115,11 @@ mod environment_tests {
         clock.set_wall_time(wall - Duration::from_secs(60));
         assert_eq!(now(), start + Duration::from_secs(2));
         assert_eq!(
-            crate::security::protocol::encode_deadline(scope.deadline).unwrap(),
+            crate::peer::protocol::encode_deadline(scope.deadline).unwrap(),
             wire
         );
         assert_eq!(
-            crate::security::protocol::decode_deadline(wire).unwrap().0,
+            crate::peer::protocol::decode_deadline(wire).unwrap().0,
             scope.deadline.0
         );
     }

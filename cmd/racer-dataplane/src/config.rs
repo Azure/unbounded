@@ -402,8 +402,7 @@ fn to_usize(value: u64) -> Result<usize> {
 }
 
 fn valid_uuid(value: &str) -> bool {
-    crate::security::identity::canonical_uuid(value)
-        && value != "00000000-0000-0000-0000-000000000000"
+    racer_identity::canonical_uuid(value) && value != "00000000-0000-0000-0000-000000000000"
 }
 
 // Kubernetes expands a single bracketed Pod IP template for both IP families.

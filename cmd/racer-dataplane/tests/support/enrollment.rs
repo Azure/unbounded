@@ -156,12 +156,12 @@ pub fn ca() -> (rcgen::Certificate, rcgen::KeyPair) {
 }
 
 pub fn signing_identity(
-    pending: dataplane::security::identity::PendingIdentity,
+    pending: racer_identity::PendingIdentity,
     ca: &rcgen::Certificate,
     ca_key: &rcgen::KeyPair,
     cluster: dataplane::model::ClusterId,
     node: dataplane::model::NodeId,
-) -> std::sync::Arc<dataplane::security::identity::SigningIdentity> {
+) -> std::sync::Arc<racer_identity::SigningIdentity> {
     let secret = pending.export_pkcs8_for_persistence().unwrap();
     let key = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
         &rustls::pki_types::PrivatePkcs8KeyDer::from(secret.as_slice()),

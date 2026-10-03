@@ -665,11 +665,9 @@ mod shared_tests {
         memory::pool::BufferPool,
         model::{ResourceClass, *},
         runtime::crypto::{CryptoInput, CryptoOutput},
-        security::{
-            aead::PageCryptoEngine,
-            identity::{KeyPurpose, Keyring},
-        },
+        security::aead::PageCryptoEngine,
     };
+    use racer_identity::{KeyPurpose, Keyring};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[derive(Default)]
@@ -755,7 +753,7 @@ mod shared_tests {
                 worker,
                 runtime,
                 observed: self.observed.clone(),
-                keys: crate::security::identity::keyring_tests::keys(),
+                keys: crate::security::test_support::keys(),
                 failure: self.failure,
                 jobs: self.jobs,
                 roundtrip: self.roundtrip,
@@ -810,7 +808,7 @@ mod shared_tests {
 
     impl Io {
         fn input(&self) -> CryptoInput {
-            let cache = CacheId(crate::security::identity::tests::CACHE.into());
+            let cache = CacheId(crate::security::test_support::CACHE.into());
             CryptoInput::Encrypt {
                 page: PageId {
                     version: ObjectVersion {
@@ -845,7 +843,7 @@ mod shared_tests {
             Box::pin(async move {
                 self.observed.event(self.worker, "io-start");
                 if self.roundtrip {
-                    let cache = CacheId(crate::security::identity::tests::CACHE.into());
+                    let cache = CacheId(crate::security::test_support::CACHE.into());
                     let key = self.keys.active(&cache, KeyPurpose::Page)?;
                     let CryptoOutput::Encrypted(plain, ciphertext) = self
                         .runtime
@@ -880,7 +878,7 @@ mod shared_tests {
                         let key = self
                             .keys
                             .active(
-                                &CacheId(crate::security::identity::tests::CACHE.into()),
+                                &CacheId(crate::security::test_support::CACHE.into()),
                                 KeyPurpose::Page,
                             )
                             .unwrap();

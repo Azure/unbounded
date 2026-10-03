@@ -53,8 +53,6 @@ use crate::{
         connection::Signatures,
         credentials::CredentialCrypto,
         forwarding::Forwarding,
-        identity::Certificates,
-        identity::{KeyEpochs, KeyPurpose, Keyring},
     },
     store::{
         Store, StoreReader,
@@ -65,6 +63,7 @@ use crate::{
     telemetry::Telemetry,
     topology::{health::LinkHealth, placement::Placement, routing::Paths},
 };
+use racer_identity::{Certificates, KeyEpochs, KeyPurpose, Keyring};
 #[cfg(test)]
 use std::{collections::VecDeque, num::NonZeroUsize, time::Instant};
 use std::{
@@ -1899,7 +1898,7 @@ mod lifetime_tests {
             .unwrap();
         worker.refresh_snapshot(&current_scope).unwrap();
         assert_eq!(worker.caches, vec![original.clone()]);
-        let (_, _, roots) = crate::security::identity::tests::issued();
+        let (_, _, roots) = crate::security::test_support::issued();
         worker
             .keys
             .install(wire::KeyringBundle {

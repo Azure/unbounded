@@ -119,7 +119,7 @@ mod measurement {
             .unwrap();
             let job = permit.job(
                 input,
-                keys.active(cache, crate::security::identity::KeyPurpose::Page)
+                keys.active(cache, racer_identity::KeyPurpose::Page)
                     .unwrap(),
                 scope.clone(),
             );
@@ -205,7 +205,7 @@ mod measurement {
                 let output = client
                     .execute(
                         input,
-                        keys.active(cache, crate::security::identity::KeyPurpose::Page)
+                        keys.active(cache, racer_identity::KeyPurpose::Page)
                             .unwrap(),
                         &scope,
                     )
@@ -311,7 +311,7 @@ mod measurement {
                 .unwrap();
                 let cache = crate::model::CacheId("00000000-0000-4000-8000-000000000003".into());
                 let lease = || {
-                    keys.active(&cache, crate::security::identity::KeyPurpose::Page)
+                    keys.active(&cache, racer_identity::KeyPurpose::Page)
                         .unwrap()
                 };
                 let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -442,7 +442,7 @@ mod measurement {
         let keys = keyring();
         let cache = crate::model::CacheId("00000000-0000-4000-8000-000000000003".into());
         let lease = || {
-            keys.active(&cache, crate::security::identity::KeyPurpose::Page)
+            keys.active(&cache, racer_identity::KeyPurpose::Page)
                 .unwrap()
         };
         let scope = RequestScope::new(
@@ -559,7 +559,7 @@ mod measurement {
             }
             let cache = page.envelope().page.version.object.cache.clone();
             let lease = keys
-                .active(&cache, crate::security::identity::KeyPurpose::Page)
+                .active(&cache, racer_identity::KeyPurpose::Page)
                 .unwrap();
             let scope = RequestScope::new(
                 crate::model::RequestId([7; 16]),
@@ -672,7 +672,7 @@ mod measurement {
         let keys = keyring();
         let cache = crate::model::CacheId("00000000-0000-4000-8000-000000000003".into());
         let lease = || {
-            keys.active(&cache, crate::security::identity::KeyPurpose::Page)
+            keys.active(&cache, racer_identity::KeyPurpose::Page)
                 .unwrap()
         };
         let events = measurement_events(decrypt);
@@ -1118,8 +1118,8 @@ use crate::{
     error::{Error, Operation, Result},
     memory::pool::{CiphertextPage, PlaintextBuffer, VerifiedPage},
     model::{PageId, WorkerId},
-    security::identity::KeyLease,
 };
+use racer_identity::KeyLease;
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, VecDeque},
@@ -2234,17 +2234,17 @@ mod tests {
         keyring()
             .active(
                 &crate::model::CacheId("00000000-0000-4000-8000-000000000003".into()),
-                crate::security::identity::KeyPurpose::Page,
+                racer_identity::KeyPurpose::Page,
             )
             .unwrap()
     }
 
-    pub(super) fn keyring() -> crate::security::identity::Keyring {
+    pub(super) fn keyring() -> racer_identity::Keyring {
         use crate::{
             control::wire::*,
             model::{CacheId, ClusterId, NodeId},
-            security::identity::{KeyEpochs, Keyring},
         };
+        use racer_identity::{KeyEpochs, Keyring};
         let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
         let mut params = rcgen::CertificateParams::default();
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);

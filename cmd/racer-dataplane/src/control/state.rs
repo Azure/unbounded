@@ -3,9 +3,9 @@ use super::wire::{Publication, PublicationSequence};
 use crate::{
     error::{Error, Result},
     model::{CacheId, ClusterId, KeyId, MembershipVersion},
-    security::identity::{KeyPurpose, Keyring},
     topology::membership::{Membership, MembershipLease},
 };
+use racer_identity::{KeyPurpose, Keyring};
 use sha2::{Digest, Sha256};
 use std::{
     path::PathBuf,

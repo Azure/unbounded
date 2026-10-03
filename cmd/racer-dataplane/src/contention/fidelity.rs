@@ -173,7 +173,7 @@ fn duplicate_owners_match_full_page_occupancy_until_each_last_owner() {
     assert_eq!((PLAIN, CIPHER), (16 * 1024 * 1024, 16 * 1024 * 1024 + 16));
     let model = admission(2);
     let real = admission(2);
-    let cache = CacheId(crate::security::identity::tests::CACHE.into());
+    let cache = CacheId(crate::security::test_support::CACHE.into());
     let memory = MemoryCache::new(
         BufferPool::new(real.clone()),
         crate::test_support::availability(),
@@ -256,7 +256,7 @@ fn fair_reclamation_matches_metadata_trace_and_keeps_other_cache() {
         });
         let real = admission(4);
         // The simulator uses numeric IDs; the real cache uses published UUIDs.
-        let a = CacheId(crate::security::identity::tests::CACHE.into());
+        let a = CacheId(crate::security::test_support::CACHE.into());
         let b = CacheId("44444444-4444-4444-8444-444444444444".into());
         let memory = MemoryCache::new(
             BufferPool::new(real.clone()),
@@ -473,7 +473,7 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
     // the read and idle working set. No simulator dirty event is driven here.
     let model = admission(4);
     let real = admission(4);
-    let cache = CacheId(crate::security::identity::tests::CACHE.into());
+    let cache = CacheId(crate::security::test_support::CACHE.into());
     let model_dirty = model
         .reserve(Some(&cache), ResourceClass::DirtyCiphertext, CIPHER)
         .unwrap();
@@ -481,7 +481,7 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
         .reserve(Some(&cache), ResourceClass::DirtyCiphertext, CIPHER)
         .unwrap();
     let buffers = BufferPool::new(real.clone());
-    let keys = Rc::new(crate::security::identity::keyring_tests::keys());
+    let keys = Rc::new(crate::security::test_support::keys());
     let availability = crate::control::state::for_caches(keys.clone(), vec![cache.clone()]);
     let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
     let mut old_model = MetadataOwners::reserve(&model, &cache);
@@ -547,7 +547,7 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
     let client = Rc::new(CryptoClient::new(port));
     let mut engine = PageCryptoEngine::new(CryptoRuntime { port: engine_port });
     let peers = Rc::new(crate::test_support::NoPeers);
-    let node = crate::model::NodeId(crate::security::identity::tests::NODE.into());
+    let node = crate::model::NodeId(crate::security::test_support::NODE.into());
     let membership = Arc::new(
         Membership::validate(
             crate::model::MembershipVersion(1),
@@ -658,7 +658,7 @@ fn canceled_crypto_matches_metadata_owner_trace_through_completion_reap() {
     // work through reap. This does not verify Simulator's cancellation scheduling.
     let model = admission(1);
     let real = admission(1);
-    let cache = CacheId(crate::security::identity::tests::CACHE.into());
+    let cache = CacheId(crate::security::test_support::CACHE.into());
     let mut caller = MetadataOwners::reserve(&model, &cache);
     Arc::get_mut(&mut caller.bundle.plain)
         .unwrap()
@@ -674,7 +674,7 @@ fn canceled_crypto_matches_metadata_owner_trace_through_completion_reap() {
     let (port, engine_port) = crypto::pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
     let client = Rc::new(CryptoClient::new(port));
     let crypto = PageCrypto::new(
-        Rc::new(crate::security::identity::keyring_tests::keys()),
+        Rc::new(crate::security::test_support::keys()),
         client.clone(),
     );
     let mut engine = PageCryptoEngine::new(CryptoRuntime { port: engine_port });

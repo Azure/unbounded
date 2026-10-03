@@ -2,26 +2,168 @@
 pub mod aead;
 pub mod connection;
 pub mod credentials;
-#[cfg(test)]
-pub(crate) mod fixtures;
 pub mod forwarding;
-pub mod identity;
-pub mod protocol;
+
+impl From<racer_identity::Error> for crate::error::Error {
+    fn from(error: racer_identity::Error) -> Self {
+        match error {
+            racer_identity::Error::InvalidRequest => Self::InvalidRequest,
+            racer_identity::Error::InvalidConfiguration => Self::InvalidConfiguration,
+            racer_identity::Error::Unauthorized => Self::Unauthorized,
+            racer_identity::Error::Unavailable => Self::Unavailable,
+            racer_identity::Error::MissingKey => Self::MissingKey,
+            racer_identity::Error::CorruptRecord => Self::CorruptRecord,
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{
-        connection::Signatures,
-        identity::{Certificates, KeyEpochs, Keyring, PendingIdentity},
-    };
+    use super::connection::{Signatures, SignedHead};
     use crate::{
-        control::wire::{BundleGeneration, CacheEncryptionKey, KeyringBundle, SCHEMA_VERSION},
-        model::{ClusterId, NodeId},
+        control::wire::{
+            BundleGeneration, CacheEncryptionKey, CacheKeyPurpose, CacheKeyRef, CacheKeyState,
+            KeyringBundle, SCHEMA_VERSION,
+        },
+        http::Codec,
+        model::{CacheId, ClusterId, NodeId},
+        peer::protocol,
     };
+    use racer_identity::{Certificates, KeyEpochs, KeyLease, Keyring, PendingIdentity};
     use std::{rc::Rc, sync::Arc};
     pub struct Identity {
         pub keys: Rc<Keyring>,
         pub certificates: Rc<Certificates>,
         pub signatures: Rc<Signatures>,
+    }
+    pub(crate) const CLUSTER: &str = "11111111-1111-4111-8111-111111111111";
+    pub(crate) const NODE: &str = "22222222-2222-4222-8222-222222222222";
+    pub(crate) const CACHE: &str = "33333333-3333-4333-8333-333333333333";
+    pub(crate) fn issued() -> (PendingIdentity, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let (ca, ca_key) = ca();
+        let (pending, chain) = issue(
+            &ca,
+            &ca_key,
+            &ClusterId(CLUSTER.into()),
+            &NodeId(NODE.into()),
+            |_| {},
+        );
+        (pending, chain, vec![ca.der().to_vec()])
+    }
+    pub(crate) fn keys() -> Keyring {
+        keys_for(&[CacheId(CACHE.into())])
+    }
+    pub(crate) fn assert_page_key(lease: &KeyLease, expected: &[u8; 32]) {
+        let mut sealed = [0; 19];
+        lease
+            .seal_page(lease.cache(), &[1; 24], b"retained", b"abc", &mut sealed)
+            .unwrap();
+        let mut opened = [0; 3];
+        racer_crypto::aead::open(expected, &[1; 24], b"retained", &sealed, &mut opened).unwrap();
+        assert_eq!(&opened, b"abc");
+    }
+    pub(crate) fn keys_for(caches: &[CacheId]) -> Keyring {
+        let (_, _, roots) = issued();
+        let keys = Keyring::new(
+            ClusterId(CLUSTER.into()),
+            NodeId(NODE.into()),
+            Arc::new(KeyEpochs::default()),
+        );
+        let mut initial = rotation_bundle(1, roots);
+        // keys() historically used the unrotated seed bundle; rotation_bundle(1)
+        // intentionally has different suffixes and material just like later epochs.
+        for (i, record) in initial.cache_keys.iter_mut().enumerate() {
+            record.key.id = crate::model::key_id_from_generation(1, i as u32 + 1).unwrap();
+            *record = CacheEncryptionKey::new(
+                record.key.clone(),
+                record.state,
+                zeroize::Zeroizing::new([7 + i as u8; 32]),
+            );
+        }
+        let templates = std::mem::take(&mut initial.cache_keys);
+        for (i, cache) in caches.iter().enumerate() {
+            for template in &templates {
+                let (mut key, state, mut material) = template.clone().into_installation();
+                key.cache = cache.clone();
+                if i != 0 {
+                    material[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                }
+                initial
+                    .cache_keys
+                    .push(CacheEncryptionKey::new(key, state, material));
+            }
+        }
+        keys.install(initial).unwrap();
+        keys
+    }
+    pub(crate) fn rotation_bundle(generation: u64, roots: Vec<Vec<u8>>) -> KeyringBundle {
+        KeyringBundle {
+            schema_version: SCHEMA_VERSION,
+            cluster: ClusterId(CLUSTER.into()),
+            generation: BundleGeneration(generation),
+            peer_trust_roots: roots,
+            cache_keys: [CacheKeyPurpose::Page, CacheKeyPurpose::OriginCredentials]
+                .into_iter()
+                .enumerate()
+                .map(|(i, purpose)| {
+                    let mut material = zeroize::Zeroizing::new([7 + i as u8; 32]);
+                    material[..8].copy_from_slice(&generation.to_be_bytes());
+                    CacheEncryptionKey::new(
+                        CacheKeyRef {
+                            cache: CacheId(CACHE.into()),
+                            id: crate::model::key_id_from_generation(generation, i as u32).unwrap(),
+                            purpose,
+                        },
+                        CacheKeyState::Active,
+                        material,
+                    )
+                })
+                .collect(),
+        }
+    }
+    pub(crate) fn node(n: usize) -> NodeId {
+        NodeId(format!("{n:08x}-1111-4111-8111-111111111111"))
+    }
+    pub(crate) fn network(count: usize) -> Vec<Rc<Signatures>> {
+        identities(
+            ClusterId(node(99).0),
+            &(0..count).map(node).collect::<Vec<_>>(),
+            mac_test_keys,
+        )
+        .into_iter()
+        .map(|identity| identity.signatures)
+        .collect()
+    }
+    pub(crate) fn mac_test_keys() -> Vec<CacheEncryptionKey> {
+        [node(88).0, CACHE.into()]
+            .into_iter()
+            .enumerate()
+            .map(|(i, cache)| {
+                CacheEncryptionKey::new(
+                    CacheKeyRef {
+                        cache: CacheId(cache),
+                        id: crate::model::key_id_from_generation(1, 100 + i as u32).unwrap(),
+                        purpose: CacheKeyPurpose::OriginCredentials,
+                    },
+                    CacheKeyState::Active,
+                    zeroize::Zeroizing::new([100 + i as u8; 32]),
+                )
+            })
+            .collect()
+    }
+    pub(crate) fn mac_test_key(cache: &str) -> Vec<CacheEncryptionKey> {
+        let mut keys = mac_test_keys();
+        keys.truncate(1);
+        keys[0].key.cache = CacheId(cache.into());
+        keys
+    }
+    pub(crate) fn clone_head(head: &SignedHead) -> SignedHead {
+        let codec = Codec::new(protocol::MAX_HEAD);
+        let encoded = codec.encode_head(&head.head).unwrap();
+        SignedHead {
+            head: codec.decode_head(&encoded).unwrap().unwrap().0,
+            signature: head.signature.clone(),
+        }
     }
     pub(crate) fn ca() -> (rcgen::Certificate, rcgen::KeyPair) {
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -102,20 +244,34 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use racer_identity::KeyPurpose;
+    #[test]
+    fn complete_component_error_mapping_preserves_application_meanings() {
+        use crate::error::Error as App;
+        use racer_identity::Error as Identity;
+        for (component, application) in [
+            (Identity::InvalidRequest, App::InvalidRequest),
+            (Identity::InvalidConfiguration, App::InvalidConfiguration),
+            (Identity::Unauthorized, App::Unauthorized),
+            (Identity::Unavailable, App::Unavailable),
+            (Identity::MissingKey, App::MissingKey),
+            (Identity::CorruptRecord, App::CorruptRecord),
+        ] {
+            assert_eq!(App::from(component), application);
+        }
+    }
     #[test]
     fn request_key_purpose_separation() {
-        let keys = identity::keyring_tests::keys();
-        let cache = crate::model::CacheId(identity::tests::CACHE.into());
+        let keys = test_support::keys();
+        let cache = crate::model::CacheId(test_support::CACHE.into());
         let mut tag = [0; 32];
         assert!(
-            keys.active(&cache, identity::KeyPurpose::Page)
+            keys.active(&cache, KeyPurpose::Page)
                 .unwrap()
                 .request_mac(&cache, b"request", &mut tag)
                 .is_err()
         );
-        let credential = keys
-            .active(&cache, identity::KeyPurpose::OriginCredentials)
-            .unwrap();
+        let credential = keys.active(&cache, KeyPurpose::OriginCredentials).unwrap();
         credential
             .request_mac(&cache, b"request", &mut tag)
             .unwrap();

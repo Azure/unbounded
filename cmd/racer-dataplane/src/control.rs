@@ -66,7 +66,7 @@ pub mod secrets {
         use std::{os::unix::fs::symlink, sync::Arc};
         #[test]
         fn bundle_installation_is_idempotent_and_rejects_rollback() {
-            use crate::security::identity::{KeyEpochs, KeyPurpose};
+            use racer_identity::{KeyEpochs, KeyPurpose};
             let publication = wire::decode_publication(include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../internal/racer/wire/testdata/publication.json"
@@ -249,6 +249,7 @@ pub(crate) mod testing {
 }
 pub mod transport;
 pub mod wire;
+use racer_identity::Keyring;
 
 use self::{
     enrollment::{Enrollment, LocalSigningIdentity},
@@ -260,7 +261,6 @@ use self::{
 use crate::{
     error::{Error, Operation, Result},
     runtime::deadline::RequestScope,
-    security::identity::Keyring,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -1083,8 +1083,8 @@ mod tests {
     use crate::{
         control::{state::PublishedState, testing},
         model::{ClusterId, NodeId},
-        security::identity::KeyEpochs,
     };
+    use racer_identity::KeyEpochs;
     use std::sync::Arc;
     fn client(d: &testing::Directory) -> ControlClient {
         let cluster = ClusterId("11111111-1111-4111-8111-111111111111".into());
@@ -1411,7 +1411,7 @@ mod tests {
                 .borrow()
                 .active(
                     &bundle.cache_keys[0].key.cache,
-                    crate::security::identity::KeyPurpose::Page
+                    racer_identity::KeyPurpose::Page
                 )
                 .is_ok()
         );

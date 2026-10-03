@@ -39,9 +39,6 @@ use racer_dataplane::{
         connection::Signatures,
         credentials::CredentialCrypto,
         forwarding::Forwarding,
-        identity::Certificates,
-        identity::PendingIdentity,
-        identity::{KeyEpochs, Keyring},
     },
     store::{
         StoreReader,
@@ -55,6 +52,7 @@ use racer_dataplane::{
         routing::{Paths, RouteBudget},
     },
 };
+use racer_identity::{Certificates, KeyEpochs, Keyring, PendingIdentity};
 use std::{
     cell::RefCell,
     collections::BTreeMap,

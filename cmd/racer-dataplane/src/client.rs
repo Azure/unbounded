@@ -695,7 +695,7 @@ pub(crate) mod test_support {
             window: usize,
         ) -> Self {
             let origin = AdapterOrigin::new(&cache.name, metadata);
-            let keys = Rc::new(crate::security::identity::keyring_tests::keys());
+            let keys = Rc::new(crate::security::test_support::keys());
             let publications = Arc::new(PublishedState::default());
             let availability = Rc::new(crate::control::state::Availability::new(
                 publications.clone(),

@@ -1,10 +1,7 @@
 use super::*;
 use crate::{
     model::{ExpiresAt, MembershipVersion, ObjectMetadata, ObjectVersion, RequestId, StrongEtag},
-    security::{
-        connection::{Signatures, signature_tests::network},
-        forwarding::Forwarding,
-    },
+    security::{connection::Signatures, forwarding::Forwarding, test_support::network},
     topology::membership::{Member, Membership},
 };
 use std::{
@@ -600,8 +597,8 @@ fn subscription_stall_must_leave_time_for_fixed_page_fallback() {
                 subscription.clone(),
                 f.candidates.membership.version,
                 f.policy.node.clone(),
-                crate::security::protocol::encode_deadline(Deadline(call.signed_deadline)).unwrap(),
-                crate::security::protocol::millis(uring_runtime::environment::wall_now()).unwrap(),
+                crate::peer::protocol::encode_deadline(Deadline(call.signed_deadline)).unwrap(),
+                crate::peer::protocol::millis(uring_runtime::environment::wall_now()).unwrap(),
             )
             .expect("later exchange must not renew the provider contract");
         let crate::peer::subscriptions::Selection::Leader { work, waiter } = selected else {

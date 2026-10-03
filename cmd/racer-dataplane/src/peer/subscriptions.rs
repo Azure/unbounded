@@ -238,7 +238,7 @@ impl Subscriptions {
         placement: &crate::topology::placement::Placement,
         scope: &crate::runtime::deadline::RequestScope,
     ) -> Result<Selection> {
-        use crate::security::protocol::{encode_deadline, millis};
+        use crate::peer::protocol::{encode_deadline, millis};
         let now = || millis(uring_runtime::environment::wall_now());
         scope.check()?;
         let object = subscription.version.object.clone();

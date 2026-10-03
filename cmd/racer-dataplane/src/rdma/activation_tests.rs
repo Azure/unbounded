@@ -7,8 +7,9 @@ use crate::{
         crypto,
         worker::{CryptoRuntime, CryptoService},
     },
-    security::{aead::PageCryptoEngine, identity::KeyPurpose},
+    security::aead::PageCryptoEngine,
 };
+use racer_identity::KeyPurpose;
 use rdma_verbs::testing::{Contention, State};
 use simulation::{Fault, Operation as NativeOp};
 use std::task::Context;
@@ -142,11 +143,11 @@ fn configured_activation_spends_budget_and_yields_to_sibling_page_jobs() {
     native.poll_budgeted(0).unwrap();
     assert!(sim.trace().is_empty());
     assert_eq!(admission.used(ResourceClass::Registered), 4 * 8192);
-    let keys = crate::security::identity::keyring_tests::keys();
+    let keys = crate::security::test_support::keys();
     let page = PageId {
         version: ObjectVersion {
             object: ObjectId {
-                cache: CacheId(crate::security::identity::tests::CACHE.into()),
+                cache: CacheId(crate::security::test_support::CACHE.into()),
                 key: CacheKey([3; 32]),
             },
             etag: StrongEtag::test_value("v1"),

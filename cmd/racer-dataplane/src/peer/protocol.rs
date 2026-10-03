@@ -1,4 +1,6 @@
-//! Signed peer operations and canonical security decoding with charged ownership.
+//! Signed peer operations and canonical encoding/decoding with charged ownership.
+//! Binary fields use padded standard base64, integers minimal decimal, and keys
+//! lowercase hex. Encoders never include page bytes; transports preserve signed heads.
 use crate::{
     error::{Error, Result},
     http::{Codec, Header, MessageHead, StartLine},
@@ -7,12 +9,19 @@ use crate::{
         EncryptedAuthorization, ExpiresAt, KeyId, MetadataSelector, Nonce, ObjectMetadata,
         OpaqueMetadata, PageEnvelope, PeerOriginContext, ResourceClass, *,
     },
-    runtime::{admission::AdmissionPolicy, deadline::RequestScope},
-    security::{connection::SignedHead, forwarding::ForwardedHead, protocol as p},
+    runtime::{
+        admission::AdmissionPolicy,
+        deadline::{Deadline, RequestScope},
+    },
+    security::{connection::SignedHead, forwarding::ForwardedHead},
     topology::routing::RouteBudget,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use std::{rc::Rc, sync::Arc};
+use std::{
+    rc::Rc,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 pub use crate::security::forwarding::{VerifiedRequest, VerifiedResponse};
 
@@ -91,12 +100,589 @@ pub struct SignedResponse {
 pub const VERSION: &str = "5";
 pub const REQUEST_TARGET: &str = "/racer/peer/v5/exchange";
 pub const MAX_HOPS: usize = 8;
-pub const MAX_SIGNED_HEAD: usize = crate::security::protocol::MAX_HEAD;
+pub const MAX_SIGNED_HEAD: usize = MAX_HEAD;
 pub const MAX_ENVELOPE_HEAD: usize = (MAX_HOPS + 1) * (MAX_SIGNED_HEAD * 2);
 /// Per-worker progress floor: retained inbound/outbound envelopes, decoded context,
 /// signing/encoding scratch and simultaneous receive/send staging during a relay.
 /// Runtime admission still rejects concurrent work when this shared budget is full.
 pub const MIN_REQUEST_CONTEXT_BYTES: usize = 8 * MAX_ENVELOPE_HEAD;
+
+pub const PROFILE: &str = "racer-peer-v5";
+pub const MAX_HEAD: usize = 64 * 1024;
+
+/// Canonical Kubernetes UUID spelling. Reject normalization at the trust boundary.
+pub fn uuid(value: &str) -> Result<()> {
+    if !racer_identity::canonical_uuid(value) {
+        return Err(Error::InvalidRequest);
+    }
+    Ok(())
+}
+
+pub fn binary(bytes: &[u8]) -> String {
+    STANDARD.encode(bytes)
+}
+pub fn decode_binary(value: &[u8]) -> Result<Vec<u8>> {
+    if value.len() > MAX_HEAD {
+        return Err(Error::InvalidRequest);
+    }
+    let bytes = STANDARD.decode(value).map_err(|_| Error::Unauthorized)?;
+    if binary(&bytes).as_bytes() != value {
+        return Err(Error::Unauthorized);
+    }
+    Ok(bytes)
+}
+pub fn field(head: &MessageHead, name: &str) -> Result<String> {
+    let value = head.unique(name)?.ok_or(Error::Unauthorized)?;
+    if value.len() > MAX_HEAD {
+        return Err(Error::InvalidRequest);
+    }
+    String::from_utf8(value.to_vec()).map_err(|_| Error::Unauthorized)
+}
+pub fn number(head: &MessageHead, name: &str) -> Result<u64> {
+    let value = field(head, name)?;
+    let n: u64 = value.parse().map_err(|_| Error::Unauthorized)?;
+    if n.to_string() != value {
+        return Err(Error::Unauthorized);
+    }
+    Ok(n)
+}
+pub fn push(head: &mut MessageHead, name: &str, value: impl ToString) {
+    head.headers.push(Header {
+        name: name.into(),
+        value: value.to_string().into_bytes(),
+    });
+}
+pub fn push_binary(head: &mut MessageHead, name: &str, bytes: &[u8]) {
+    push(head, name, binary(bytes));
+}
+pub fn millis(time: SystemTime) -> Result<u64> {
+    u64::try_from(
+        time.duration_since(UNIX_EPOCH)
+            .map_err(|_| Error::InvalidRequest)?
+            .as_millis(),
+    )
+    .map_err(|_| Error::InvalidRequest)
+}
+/// Stable environment clock mapping. Decode wire deadlines with `decode_deadline`,
+/// never reconstruct them from a new relative timeout at each hop.
+pub fn encode_deadline(deadline: Deadline) -> Result<u64> {
+    let (mono, wall) = uring_runtime::environment::clock_anchor();
+    let time = if deadline.0 >= mono {
+        wall.checked_add(deadline.0.duration_since(mono))
+    } else {
+        wall.checked_sub(mono.duration_since(deadline.0))
+    }
+    .ok_or(Error::InvalidRequest)?;
+    millis(time)
+}
+pub fn decode_deadline(value: u64) -> Result<Deadline> {
+    let (mono, wall) = uring_runtime::environment::clock_anchor();
+    let base = millis(wall)?;
+    // Account for submillisecond wall-clock origin, making encode/decode exact.
+    let fraction = wall
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Error::InvalidRequest)?
+        .subsec_nanos()
+        % 1_000_000;
+    let instant = if value >= base {
+        mono.checked_add(Duration::from_millis(value - base))
+    } else {
+        mono.checked_sub(Duration::from_millis(base - value))
+    }
+    .and_then(|i| i.checked_sub(Duration::from_nanos(u64::from(fraction))))
+    .ok_or(Error::InvalidRequest)?;
+    Ok(Deadline(instant))
+}
+/// Canonical node-list encoding: concatenated u32 big-endian length + UTF-8 ID,
+/// then padded base64. Empty lists encode as an empty header value.
+pub fn nodes(nodes: &[NodeId]) -> Result<String> {
+    if nodes.len() > MAX_HOPS + 1 {
+        return Err(Error::HopBudgetExhausted);
+    }
+    let mut bytes = Vec::new();
+    for node in nodes {
+        uuid(&node.0)?;
+        bytes.extend_from_slice(&(node.0.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(node.0.as_bytes());
+    }
+    Ok(binary(&bytes))
+}
+pub fn decode_nodes(value: &[u8]) -> Result<Vec<NodeId>> {
+    let bytes = decode_binary(value)?;
+    let mut rest = bytes.as_slice();
+    let mut result = Vec::new();
+    while !rest.is_empty() {
+        if rest.len() < 4 || result.len() > MAX_HOPS {
+            return Err(Error::Unauthorized);
+        }
+        let length =
+            u32::from_be_bytes(rest[..4].try_into().map_err(|_| Error::Unauthorized)?) as usize;
+        rest = &rest[4..];
+        if length == 0 || length > 256 || rest.len() < length {
+            return Err(Error::Unauthorized);
+        }
+        let node =
+            NodeId(String::from_utf8(rest[..length].to_vec()).map_err(|_| Error::Unauthorized)?);
+        uuid(&node.0)?;
+        if result.contains(&node) {
+            return Err(Error::Unauthorized);
+        }
+        result.push(node);
+        rest = &rest[length..];
+    }
+    Ok(result)
+}
+fn object_fields(head: &mut MessageHead, object: &ObjectId) -> Result<()> {
+    uuid(&object.cache.0)?;
+    push(head, "racer-cache", &object.cache.0);
+    push(
+        head,
+        "racer-key",
+        object
+            .key
+            .0
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+    );
+    Ok(())
+}
+fn version_fields(head: &mut MessageHead, version: &ObjectVersion) -> Result<()> {
+    object_fields(head, &version.object)?;
+    push(head, "racer-etag", version.etag.as_str());
+    Ok(())
+}
+pub fn route_headers(head: &mut MessageHead, route: &RouteBudget) -> Result<()> {
+    if route.membership.0 == 0 {
+        return Err(Error::InvalidRequest);
+    }
+    push(head, "racer-route-membership", route.membership.0);
+    push_binary(head, "racer-route-request", &route.request.0);
+    push_binary(head, "racer-route-attempt", &route.attempt.0);
+    uuid(&route.destination.0)?;
+    push(head, "racer-route-destination", &route.destination.0);
+    push(head, "racer-route-visited", nodes(&route.visited)?);
+    push(head, "racer-route-links", route.remaining_links);
+    push(head, "racer-route-attempts", route.remaining_attempts);
+    push(
+        head,
+        "racer-route-deadline",
+        encode_deadline(route.deadline)?,
+    );
+    Ok(())
+}
+/// Encode every logical request field, including absent/present opaque context.
+/// Authentication headers are added only by `Signatures`.
+pub fn request_head(request: &PeerRequest) -> Result<MessageHead> {
+    if request
+        .origin
+        .metadata
+        .as_ref()
+        .map(|m| m.as_header())
+        .is_some_and(|b| b.len() > 8192)
+        || request
+            .origin
+            .authorization
+            .as_ref()
+            .is_some_and(|a| a.ciphertext.len() > 8192 + 16)
+    {
+        return Err(Error::InvalidRequest);
+    }
+    if request.origin.request != request.route.request
+        || request.origin.attempt != request.route.attempt
+    {
+        return Err(Error::InvalidRequest);
+    }
+    let mut head = MessageHead {
+        start: StartLine::Request {
+            method: "POST".into(),
+            target: "/racer/peer/v1".into(),
+        },
+        headers: Vec::new(),
+    };
+    push(&mut head, "racer-kind", "request");
+    push(&mut head, "content-length", 0);
+    let (op_object, mode) = match &request.operation {
+        Operation::Subscribe { subscription, mode } => {
+            version_fields(&mut head, &subscription.version)?;
+            push(&mut head, "racer-operation", "subscribe");
+            push_binary(&mut head, "racer-subscription", &subscription.id);
+            push(
+                &mut head,
+                "racer-subscription-sequence",
+                subscription.sequence,
+            );
+            push(&mut head, "racer-page-budget", subscription.page_budget);
+            push(&mut head, "racer-byte-budget", subscription.byte_budget);
+            let mut intervals = Vec::new();
+            for interval in subscription.demand.intervals() {
+                intervals.extend_from_slice(&interval.start.to_be_bytes());
+                intervals.extend_from_slice(&interval.end.to_be_bytes());
+            }
+            push_binary(&mut head, "racer-demand", &intervals);
+            if matches!(mode, FetchMode::CopyOnly)
+                && (request.origin.authorization.is_some() || request.origin.metadata.is_some())
+            {
+                return Err(Error::Unauthorized);
+            }
+            (&subscription.version.object, mode)
+        }
+        Operation::Bootstrap { object: id, mode } => {
+            object_fields(&mut head, id)?;
+            push(&mut head, "racer-operation", "bootstrap");
+            push(&mut head, "racer-selector", "fresh");
+            (id, mode)
+        }
+        Operation::Page { page, mode } => {
+            push(&mut head, "racer-operation", "page");
+            version_fields(&mut head, &page.version)?;
+            push(&mut head, "racer-page", page.number.0);
+            let start = page
+                .number
+                .0
+                .checked_mul(PAGE_BYTES)
+                .ok_or(Error::InvalidRange)?;
+            let end = start
+                .checked_add(PAGE_BYTES - 1)
+                .ok_or(Error::InvalidRange)?;
+            push(&mut head, "range", format!("bytes={start}-{end}"));
+            (&page.version.object, mode)
+        }
+        Operation::Metadata {
+            object: id,
+            selector,
+            mode,
+        } => {
+            object_fields(&mut head, id)?;
+            push(&mut head, "racer-operation", "metadata");
+            match selector {
+                crate::model::MetadataSelector::Fresh => push(&mut head, "racer-selector", "fresh"),
+                crate::model::MetadataSelector::Pinned(etag) => {
+                    push(&mut head, "racer-selector", "pinned");
+                    push(&mut head, "racer-etag", etag.as_str());
+                }
+            }
+            (id, mode)
+        }
+    };
+    if op_object != &request.origin.object {
+        return Err(Error::InvalidRequest);
+    }
+    if matches!(mode, FetchMode::CopyOnly) && request.route.remaining_attempts != 0 {
+        return Err(Error::InvalidRequest);
+    }
+    push(
+        &mut head,
+        "racer-mode",
+        match mode {
+            FetchMode::CopyOnly => "copy",
+            FetchMode::Acquire => "acquire",
+        },
+    );
+    push_binary(&mut head, "racer-request", &request.origin.request.0);
+    push_binary(&mut head, "racer-attempt", &request.origin.attempt.0);
+    push(
+        &mut head,
+        "racer-metadata-present",
+        u8::from(request.origin.metadata.is_some()),
+    );
+    if let Some(metadata) = &request.origin.metadata {
+        push_binary(&mut head, "racer-metadata", metadata.as_header());
+    }
+    push(
+        &mut head,
+        "racer-authorization-present",
+        u8::from(request.origin.authorization.is_some()),
+    );
+    if let Some(auth) = &request.origin.authorization {
+        if auth.ciphertext.len() < 16 {
+            return Err(Error::InvalidRequest);
+        }
+        push_binary(&mut head, "racer-authorization-key", &auth.key_id.0);
+        push_binary(&mut head, "racer-authorization-nonce", &auth.nonce.0);
+        push_binary(&mut head, "racer-authorization", &auth.ciphertext);
+    }
+    route_headers(&mut head, &request.route)?;
+    Ok(head)
+}
+fn metadata_fields(head: &mut MessageHead, metadata: &ObjectMetadata) -> Result<()> {
+    version_fields(head, &metadata.version)?;
+    push(head, "racer-length", metadata.length);
+    push(head, "racer-expires", metadata.expires_at.to_header()?);
+    push(head, "racer-metadata-version", 2);
+    if let Some(content_type) = &metadata.content_type {
+        push(head, "racer-content-type", content_type.as_str());
+    }
+    Ok(())
+}
+/// Encode all response outcomes against SHA-256 of the exact original signed
+/// request. `path` is the verified forward path including the responder.
+pub fn response_head(
+    response: &PeerResponse,
+    request_digest: &[u8; 32],
+    path: &[NodeId],
+) -> Result<MessageHead> {
+    let mut head = MessageHead {
+        start: StartLine::Response { status: 200 },
+        headers: Vec::new(),
+    };
+    push(&mut head, "racer-kind", "response");
+    push_binary(&mut head, "racer-request-binding", request_digest);
+    push(&mut head, "racer-response-path", nodes(path)?);
+    let (outcome, length) = match response {
+        PeerResponse::Selected {
+            metadata: m,
+            ciphertext,
+            grant,
+        } => {
+            if &grant.page != &ciphertext.envelope().page
+                || ciphertext.bytes().len() != ciphertext.envelope().ciphertext_length as usize
+            {
+                return Err(Error::InvalidRequest);
+            }
+            page_fields(&mut head, m, ciphertext.envelope())?;
+            grant_fields(&mut head, grant)?;
+            (
+                "selected",
+                u64::from(ciphertext.envelope().ciphertext_length),
+            )
+        }
+        PeerResponse::Bootstrap {
+            metadata: m,
+            page_zero,
+        } => match page_zero {
+            Some(page) => {
+                if m.length == 0 || page.envelope().page.number.0 != 0 {
+                    return Err(Error::InvalidRequest);
+                }
+                let page_head = response_head(
+                    &PeerResponse::Page {
+                        metadata: m.clone(),
+                        ciphertext: page.clone(),
+                    },
+                    request_digest,
+                    path,
+                )?;
+                for header in page_head.headers {
+                    if !matches!(
+                        header.name.as_str(),
+                        "racer-kind"
+                            | "racer-request-binding"
+                            | "racer-response-path"
+                            | "racer-outcome"
+                            | "content-length"
+                    ) {
+                        head.headers.push(header);
+                    }
+                }
+                push(&mut head, "racer-page-present", 1);
+                ("bootstrap", u64::from(page.envelope().ciphertext_length))
+            }
+            None => {
+                if m.length != 0 {
+                    return Err(Error::InvalidRequest);
+                }
+                metadata_fields(&mut head, m)?;
+                push(&mut head, "racer-page-present", 0);
+                ("bootstrap", 0)
+            }
+        },
+        PeerResponse::Page {
+            metadata: m,
+            ciphertext,
+        } => {
+            let e = ciphertext.envelope();
+            if ciphertext.bytes().len() != e.ciphertext_length as usize {
+                return Err(Error::InvalidRequest);
+            }
+            page_fields(&mut head, m, e)?;
+            ("page", u64::from(e.ciphertext_length))
+        }
+        PeerResponse::Metadata(m) => {
+            metadata_fields(&mut head, m)?;
+            ("metadata", 0)
+        }
+        PeerResponse::Miss => ("miss", 0),
+        PeerResponse::NotFound => ("not-found", 0),
+        PeerResponse::VersionUnavailable => ("version-unavailable", 0),
+        PeerResponse::Unavailable => ("unavailable", 0),
+        PeerResponse::Overloaded => ("overloaded", 0),
+        PeerResponse::OriginRejected => ("origin-rejected", 0),
+        PeerResponse::OriginForbidden => ("origin-forbidden", 0),
+        PeerResponse::StaleMembership => ("stale-membership", 0),
+    };
+    head.start = StartLine::Response {
+        status: match response {
+            PeerResponse::NotFound => 404,
+            PeerResponse::OriginRejected => 401,
+            PeerResponse::OriginForbidden => 403,
+            _ => 200,
+        },
+    };
+    push(&mut head, "racer-outcome", outcome);
+    push(&mut head, "content-length", length);
+    Ok(head)
+}
+pub(crate) fn grant_fields(
+    head: &mut MessageHead,
+    grant: &crate::peer::subscriptions::TransferGrant,
+) -> Result<()> {
+    uuid(&grant.receiver.0)?;
+    if grant.membership.0 == 0 {
+        return Err(Error::InvalidRequest);
+    }
+    push_binary(head, "racer-subscription", &grant.subscription_id);
+    push(head, "racer-subscription-sequence", grant.sequence);
+    push(head, "racer-grant-membership", grant.membership.0);
+    push(head, "racer-grant-receiver", &grant.receiver.0);
+    push(head, "racer-grant-deadline", grant.deadline);
+    push(head, "racer-page-budget", grant.remaining_page_budget);
+    push(head, "racer-byte-budget", grant.remaining_byte_budget);
+    Ok(())
+}
+fn page_fields(
+    head: &mut MessageHead,
+    m: &ObjectMetadata,
+    e: &crate::model::PageEnvelope,
+) -> Result<()> {
+    m.immutable().validate_page(e)?;
+    if e.plaintext_length.checked_add(16) != Some(e.ciphertext_length) {
+        return Err(Error::InvalidRequest);
+    }
+    metadata_fields(head, m)?;
+    push(head, "racer-page", e.page.number.0);
+    push_binary(head, "racer-page-key", &e.key_id.0);
+    push_binary(head, "racer-page-nonce", &e.nonce.0);
+    push(head, "racer-plaintext-length", e.plaintext_length);
+    push(head, "racer-ciphertext-length", e.ciphertext_length);
+    let start = e
+        .page
+        .number
+        .0
+        .checked_mul(PAGE_BYTES)
+        .ok_or(Error::InvalidRange)?;
+    let end = start
+        .checked_add(u64::from(e.plaintext_length))
+        .and_then(|n| n.checked_sub(1))
+        .ok_or(Error::InvalidRange)?;
+    push(
+        head,
+        "content-range",
+        format!("bytes {start}-{end}/{}", m.length),
+    );
+    Ok(())
+}
+
+/// Canonical page metadata without materializing an opaque transit body.
+pub(crate) fn opaque_page_head(
+    m: &ObjectMetadata,
+    e: &crate::model::PageEnvelope,
+    bootstrap: bool,
+    binding: &[u8; 32],
+    path: &[NodeId],
+) -> Result<MessageHead> {
+    if bootstrap && (m.length == 0 || e.page.number.0 != 0) {
+        return Err(Error::InvalidRequest);
+    }
+    let mut head = MessageHead {
+        start: StartLine::Response { status: 200 },
+        headers: Vec::new(),
+    };
+    push(&mut head, "racer-kind", "response");
+    push_binary(&mut head, "racer-request-binding", binding);
+    push(&mut head, "racer-response-path", nodes(path)?);
+    page_fields(&mut head, m, e)?;
+    if bootstrap {
+        push(&mut head, "racer-page-present", 1);
+    }
+    push(
+        &mut head,
+        "racer-outcome",
+        if bootstrap { "bootstrap" } else { "page" },
+    );
+    push(&mut head, "content-length", e.ciphertext_length);
+    Ok(head)
+}
+/// Exact logical agreement, rejecting unknown application fields as well as
+/// missing fields. Only the signing layer's fixed authentication fields are elided.
+pub fn agrees(actual: &MessageHead, expected: &MessageHead, ignore_route: bool) -> Result<()> {
+    fn start(head: &MessageHead) -> String {
+        match &head.start {
+            StartLine::Request { method, target } => format!("{method} {target}"),
+            StartLine::Response { status } => status.to_string(),
+        }
+    }
+    let fields = |head: &MessageHead| -> Result<std::collections::BTreeMap<String, Vec<u8>>> {
+        let mut map = std::collections::BTreeMap::new();
+        for h in &head.headers {
+            let name = h.name.to_ascii_lowercase();
+            if crate::security::connection::is_auth_field(&name)
+                || (ignore_route
+                    && matches!(
+                        name.as_str(),
+                        "racer-route-membership"
+                            | "racer-route-request"
+                            | "racer-route-attempt"
+                            | "racer-route-destination"
+                            | "racer-route-visited"
+                            | "racer-route-links"
+                            | "racer-route-attempts"
+                            | "racer-route-deadline"
+                    ))
+            {
+                continue;
+            }
+            if map.insert(name, h.value.clone()).is_some() {
+                return Err(Error::Unauthorized);
+            }
+        }
+        Ok(map)
+    };
+    if start(actual) != start(expected) || fields(actual)? != fields(expected)? {
+        return Err(Error::Unauthorized);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod canonical_tests {
+    use super::*;
+    use std::time::Instant;
+    #[test]
+    fn canonical_binary_numbers_node_lists_and_deadline_round_trip() {
+        assert_eq!(binary(&[0, 1, 255]), "AAH/");
+        assert!(decode_binary(b"YQ").is_err());
+        assert!(decode_binary(b"YR==").is_err());
+        let mut head = MessageHead {
+            start: StartLine::Response { status: 200 },
+            headers: Vec::new(),
+        };
+        push(&mut head, "n", "01");
+        assert!(number(&head, "n").is_err());
+        let nodes = vec![
+            crate::security::test_support::node(1),
+            crate::security::test_support::node(2),
+        ];
+        assert_eq!(
+            decode_nodes(super::nodes(&nodes).unwrap().as_bytes()).unwrap(),
+            nodes
+        );
+        assert!(
+            decode_nodes(
+                super::nodes(&[nodes[0].clone(), nodes[0].clone()])
+                    .unwrap()
+                    .as_bytes()
+            )
+            .is_err()
+        );
+        let deadline = Deadline(Instant::now() + Duration::from_secs(30));
+        let encoded = encode_deadline(deadline).unwrap();
+        let decoded = decode_deadline(encoded).unwrap();
+        assert_eq!(encode_deadline(decoded).unwrap(), encoded);
+        assert!(decoded.0 <= deadline.0);
+        assert_eq!(MAX_HEAD, MAX_SIGNED_HEAD);
+    }
+}
 
 /// Versioned HTTP envelope. Signed header values and signatures are preserved using
 /// the HTTP codec; this wrapper is framing only and is never a signing authority.
@@ -314,7 +900,7 @@ mod envelope_tests {
     }
     #[test]
     fn maximum_signed_heads_and_hop_count_fit_outer_signature_profile() {
-        let signers = crate::security::connection::signature_tests::network(2);
+        let signers = crate::security::test_support::network(2);
         let mut head = MessageHead {
             start: StartLine::Response { status: 200 },
             headers: vec![
@@ -355,7 +941,7 @@ mod envelope_tests {
                 .collect(),
         };
         let mut outer = encode_envelope(&envelope, true, 0).unwrap();
-        crate::security::protocol::push(&mut outer, "racer-receiver", &signers[1].node().0);
+        push(&mut outer, "racer-receiver", &signers[1].node().0);
         let outer = signers[0].sign_fields(outer).unwrap();
         signers[1].verify_proof(outer).unwrap();
         envelope.hops.push(decode_signed(&encoded).unwrap());
@@ -390,7 +976,7 @@ impl SecurityCodec {
     }
 }
 fn bytes(head: &MessageHead, name: &str) -> Result<Vec<u8>> {
-    p::decode_binary(p::field(head, name)?.as_bytes())
+    decode_binary(field(head, name)?.as_bytes())
 }
 fn array<const N: usize>(head: &MessageHead, name: &str) -> Result<[u8; N]> {
     bytes(head, name)?
@@ -401,12 +987,12 @@ fn node(head: &MessageHead, name: &str) -> Result<NodeId> {
     crate::security::connection::node_field(head, name)
 }
 fn object(head: &MessageHead) -> Result<ObjectId> {
-    let cache = p::field(head, "racer-cache")?;
-    p::uuid(&cache)?;
+    let cache = field(head, "racer-cache")?;
+    uuid(&cache)?;
     if cache.is_empty() || cache.len() > 256 {
         return Err(Error::InvalidRequest);
     }
-    let key = p::field(head, "racer-key")?;
+    let key = field(head, "racer-key")?;
     if key.len() != 64
         || !key
             .bytes()
@@ -425,7 +1011,7 @@ fn object(head: &MessageHead) -> Result<ObjectId> {
     })
 }
 fn etag(head: &MessageHead) -> Result<StrongEtag> {
-    StrongEtag::parse(p::field(head, "racer-etag")?.as_bytes())
+    StrongEtag::parse(field(head, "racer-etag")?.as_bytes())
 }
 fn version(head: &MessageHead) -> Result<ObjectVersion> {
     Ok(ObjectVersion {
@@ -452,18 +1038,18 @@ pub(crate) fn demand(head: &MessageHead) -> Result<super::subscriptions::Demand>
 pub(crate) fn grant(head: &MessageHead) -> Result<super::subscriptions::TransferGrant> {
     Ok(super::subscriptions::TransferGrant {
         subscription_id: array(head, "racer-subscription")?,
-        sequence: p::number(head, "racer-subscription-sequence")?,
+        sequence: number(head, "racer-subscription-sequence")?,
         page: PageId {
             version: version(head)?,
-            number: PageNumber(p::number(head, "racer-page")?),
+            number: PageNumber(number(head, "racer-page")?),
         },
-        membership: MembershipVersion(p::number(head, "racer-grant-membership")?),
+        membership: MembershipVersion(number(head, "racer-grant-membership")?),
         receiver: node(head, "racer-grant-receiver")?,
-        deadline: p::number(head, "racer-grant-deadline")?,
-        remaining_page_budget: p::number(head, "racer-page-budget")?
+        deadline: number(head, "racer-grant-deadline")?,
+        remaining_page_budget: number(head, "racer-page-budget")?
             .try_into()
             .map_err(|_| Error::InvalidRequest)?,
-        remaining_byte_budget: p::number(head, "racer-byte-budget")?,
+        remaining_byte_budget: number(head, "racer-byte-budget")?,
     })
 }
 fn metadata(head: &MessageHead) -> Result<ObjectMetadata> {
@@ -477,8 +1063,8 @@ fn metadata(head: &MessageHead) -> Result<ObjectMetadata> {
     Ok(ObjectMetadata {
         content_type,
         version: version(head)?,
-        length: p::number(head, "racer-length")?,
-        expires_at: ExpiresAt::from_unix_millis(p::number(head, "racer-expires")?)?,
+        length: number(head, "racer-length")?,
+        expires_at: ExpiresAt::from_unix_millis(number(head, "racer-expires")?)?,
     })
 }
 
@@ -533,13 +1119,13 @@ mod metadata_tests {
             metadata,
             ciphertext: page,
         };
-        let mut head = p::response_head(
+        let mut head = response_head(
             &response,
             &[3; 32],
             &[signers[0].node().clone(), signers[2].node().clone()],
         )
         .unwrap();
-        p::push(&mut head, "racer-receiver", &signers[0].node().0);
+        push(&mut head, "racer-receiver", &signers[0].node().0);
         let authentication = ForwardedHead {
             original: std::sync::Arc::new(signers[2].sign(head).unwrap()),
             hops: vec![],
@@ -594,7 +1180,7 @@ mod metadata_tests {
             content_type: None,
             version: ObjectVersion {
                 object: ObjectId {
-                    cache: CacheId(crate::security::identity::tests::CACHE.into()),
+                    cache: CacheId(crate::security::test_support::CACHE.into()),
                     key: CacheKey([0; 32]),
                 },
                 etag: StrongEtag::test_value("v1"),
@@ -602,17 +1188,16 @@ mod metadata_tests {
             length: 17,
             expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
         };
-        let path = [NodeId(crate::security::identity::tests::NODE.into())];
+        let path = [NodeId(crate::security::test_support::NODE.into())];
         for typed in [false, true] {
             if typed {
                 m.content_type =
                     Some(crate::model::ContentType::parse(b"text/plain; charset=utf-8").unwrap());
             }
-            let head =
-                p::response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path).unwrap();
+            let head = response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path).unwrap();
             assert_eq!(metadata(&head).unwrap(), m);
             let mut missing_version =
-                p::response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path).unwrap();
+                response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path).unwrap();
             missing_version
                 .headers
                 .retain(|h| h.name != "racer-metadata-version");
@@ -628,8 +1213,7 @@ mod metadata_tests {
             if typed {
                 for value in [b"3".as_slice(), b"1", b""] {
                     let mut bad =
-                        p::response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path)
-                            .unwrap();
+                        response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path).unwrap();
                     bad.headers
                         .iter_mut()
                         .find(|h| h.name == "racer-metadata-version")
@@ -638,12 +1222,12 @@ mod metadata_tests {
                     assert!(metadata(&bad).is_err());
                 }
                 let mut bad =
-                    p::response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path).unwrap();
+                    response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path).unwrap();
                 bad.headers.retain(|h| h.name != "racer-metadata-version");
                 assert!(metadata(&bad).is_err());
                 let mut bad =
-                    p::response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path).unwrap();
-                p::push(&mut bad, "racer-content-type", "text/plain");
+                    response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path).unwrap();
+                push(&mut bad, "racer-content-type", "text/plain");
                 assert!(metadata(&bad).is_err());
             }
         }
@@ -654,14 +1238,14 @@ pub(crate) fn page_descriptor(head: &MessageHead) -> Result<(ObjectMetadata, Pag
     let envelope = PageEnvelope {
         page: PageId {
             version: metadata.version.clone(),
-            number: PageNumber(p::number(head, "racer-page")?),
+            number: PageNumber(number(head, "racer-page")?),
         },
         key_id: KeyId(array(head, "racer-page-key")?),
         nonce: Nonce(array(head, "racer-page-nonce")?),
-        plaintext_length: p::number(head, "racer-plaintext-length")?
+        plaintext_length: number(head, "racer-plaintext-length")?
             .try_into()
             .map_err(|_| Error::InvalidRequest)?,
-        ciphertext_length: p::number(head, "racer-ciphertext-length")?
+        ciphertext_length: number(head, "racer-ciphertext-length")?
             .try_into()
             .map_err(|_| Error::InvalidRequest)?,
     };
@@ -672,7 +1256,7 @@ pub(crate) fn page_descriptor(head: &MessageHead) -> Result<(ObjectMetadata, Pag
     Ok((metadata, envelope))
 }
 fn present(head: &MessageHead, name: &str) -> Result<bool> {
-    match p::number(head, name)? {
+    match number(head, name)? {
         0 => Ok(false),
         1 => Ok(true),
         _ => Err(Error::InvalidRequest),
@@ -681,9 +1265,9 @@ fn present(head: &MessageHead, name: &str) -> Result<bool> {
 /// Decode only the canonical signed metadata. The caller must authenticate the
 /// original and reverse proofs before exposing this head or any body bytes.
 pub(crate) fn opaque_response_head(head: &MessageHead, length: usize) -> Result<MessageHead> {
-    let outcome = p::field(head, "racer-outcome")?;
+    let outcome = field(head, "racer-outcome")?;
     let binding = array(head, "racer-request-binding")?;
-    let path = p::decode_nodes(p::field(head, "racer-response-path")?.as_bytes())?;
+    let path = decode_nodes(field(head, "racer-response-path")?.as_bytes())?;
     if matches!(outcome.as_str(), "page" | "selected")
         || (outcome == "bootstrap" && present(head, "racer-page-present")?)
     {
@@ -691,7 +1275,7 @@ pub(crate) fn opaque_response_head(head: &MessageHead, length: usize) -> Result<
         if length != envelope.ciphertext_length as usize {
             return Err(Error::InvalidRequest);
         }
-        let mut canonical = p::opaque_page_head(
+        let mut canonical = opaque_page_head(
             &metadata,
             &envelope,
             outcome == "bootstrap",
@@ -705,7 +1289,7 @@ pub(crate) fn opaque_response_head(head: &MessageHead, length: usize) -> Result<
                 .find(|h| h.name == "racer-outcome")
                 .unwrap()
                 .value = b"selected".to_vec();
-            p::grant_fields(&mut canonical, &grant(head)?)?;
+            grant_fields(&mut canonical, &grant(head)?)?;
         }
         return Ok(canonical);
     }
@@ -713,7 +1297,7 @@ pub(crate) fn opaque_response_head(head: &MessageHead, length: usize) -> Result<
         return Err(Error::InvalidRequest);
     }
     let response = bodyless_response(head, &outcome)?;
-    p::response_head(&response, &binding, &path)
+    response_head(&response, &binding, &path)
 }
 
 fn bodyless_response(head: &MessageHead, outcome: &str) -> Result<PeerResponse> {
@@ -735,24 +1319,24 @@ fn bodyless_response(head: &MessageHead, outcome: &str) -> Result<PeerResponse> 
     })
 }
 fn route(head: &MessageHead) -> Result<RouteBudget> {
-    let remaining_links = p::number(head, "racer-route-links")?
+    let remaining_links = number(head, "racer-route-links")?
         .try_into()
         .map_err(|_| Error::InvalidRequest)?;
-    let visited = p::decode_nodes(p::field(head, "racer-route-visited")?.as_bytes())?;
+    let visited = decode_nodes(field(head, "racer-route-visited")?.as_bytes())?;
     if remaining_links as usize + visited.len() > 9 {
         return Err(Error::HopBudgetExhausted);
     }
     Ok(RouteBudget {
-        membership: MembershipVersion(p::number(head, "racer-route-membership")?),
+        membership: MembershipVersion(number(head, "racer-route-membership")?),
         request: RequestId(array(head, "racer-route-request")?),
         attempt: AttemptId(array(head, "racer-route-attempt")?),
         destination: node(head, "racer-route-destination")?,
         visited,
         remaining_links,
-        remaining_attempts: p::number(head, "racer-route-attempts")?
+        remaining_attempts: number(head, "racer-route-attempts")?
             .try_into()
             .map_err(|_| Error::InvalidRequest)?,
-        deadline: p::decode_deadline(p::number(head, "racer-route-deadline")?)?,
+        deadline: decode_deadline(number(head, "racer-route-deadline")?)?,
     })
 }
 impl SecurityCodec {
@@ -767,13 +1351,13 @@ impl SecurityCodec {
         let length = head.headers.iter().try_fold(0usize, |n, h| {
             n.checked_add(h.value.len()).ok_or(Error::InvalidRequest)
         })?;
-        if length > p::MAX_HEAD {
+        if length > MAX_HEAD {
             return Err(Error::InvalidRequest);
         }
         let _decode_reservation =
             self.admission
                 .reserve(None, ResourceClass::RequestContext, length.max(1))?;
-        let mode = match p::field(head, "racer-mode")?.as_str() {
+        let mode = match field(head, "racer-mode")?.as_str() {
             "copy" => FetchMode::CopyOnly,
             "acquire" => FetchMode::Acquire,
             _ => return Err(Error::InvalidRequest),
@@ -784,17 +1368,17 @@ impl SecurityCodec {
             ResourceClass::RequestContext,
             length.checked_add(512).ok_or(Error::InvalidRequest)?,
         )?;
-        let operation = match p::field(head, "racer-operation")?.as_str() {
+        let operation = match field(head, "racer-operation")?.as_str() {
             "subscribe" => Operation::Subscribe {
                 subscription: super::subscriptions::Subscription {
                     id: array(head, "racer-subscription")?,
                     version: version(head)?,
                     demand: demand(head)?,
-                    sequence: p::number(head, "racer-subscription-sequence")?,
-                    page_budget: p::number(head, "racer-page-budget")?
+                    sequence: number(head, "racer-subscription-sequence")?,
+                    page_budget: number(head, "racer-page-budget")?
                         .try_into()
                         .map_err(|_| Error::InvalidRequest)?,
-                    byte_budget: p::number(head, "racer-byte-budget")?,
+                    byte_budget: number(head, "racer-byte-budget")?,
                 },
                 mode,
             },
@@ -805,13 +1389,13 @@ impl SecurityCodec {
             "page" => Operation::Page {
                 page: PageId {
                     version: version(head)?,
-                    number: PageNumber(p::number(head, "racer-page")?),
+                    number: PageNumber(number(head, "racer-page")?),
                 },
                 mode,
             },
             "metadata" => Operation::Metadata {
                 object: object.clone(),
-                selector: match p::field(head, "racer-selector")?.as_str() {
+                selector: match field(head, "racer-selector")?.as_str() {
                     "fresh" => MetadataSelector::Fresh,
                     "pinned" => MetadataSelector::Pinned(etag(head)?),
                     _ => return Err(Error::InvalidRequest),
@@ -854,7 +1438,7 @@ impl SecurityCodec {
             origin,
             route: original_route,
         };
-        p::agrees(head, &p::request_head(&request)?, false)?;
+        agrees(head, &request_head(&request)?, false)?;
         request.route = effective_route;
         Ok(SignedRequest {
             authentication,
@@ -879,7 +1463,7 @@ impl SecurityCodec {
     ) -> Result<SignedResponse> {
         scope.check()?;
         let head = &authentication.original.head;
-        let outcome = p::field(head, "racer-outcome")?;
+        let outcome = field(head, "racer-outcome")?;
         let response = match outcome.as_str() {
             "page" | "selected" | "bootstrap"
                 if outcome != "bootstrap" || present(head, "racer-page-present")? =>
@@ -934,8 +1518,8 @@ impl SecurityCodec {
             }
         };
         let binding = array(head, "racer-request-binding")?;
-        let path = p::decode_nodes(p::field(head, "racer-response-path")?.as_bytes())?;
-        p::agrees(head, &p::response_head(&response, &binding, &path)?, false)?;
+        let path = decode_nodes(field(head, "racer-response-path")?.as_bytes())?;
+        agrees(head, &response_head(&response, &binding, &path)?, false)?;
         Ok(SignedResponse {
             authentication,
             response,

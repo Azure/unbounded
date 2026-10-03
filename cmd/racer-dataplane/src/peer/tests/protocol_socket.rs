@@ -84,7 +84,7 @@ fn signed_opaque_relay_roundtrip_and_exact_attempt_binding() {
 
 #[test]
 fn not_found_is_authenticated_through_relay_and_restricted_to_fresh_acquire() {
-    use crate::{http::StartLine, security::protocol as p};
+    use crate::{http::StartLine, peer::protocol as p};
     let signers = signers();
     let auth: Vec<_> = signers.iter().map(|s| Forwarding::new(s.clone())).collect();
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
@@ -217,7 +217,7 @@ fn not_found_is_authenticated_through_relay_and_restricted_to_fresh_acquire() {
             ("racer-outcome", "miss"),
             ("racer-outcome", "unknown"),
         ] {
-            let mut changed = crate::security::connection::signature_tests::clone_head(&original);
+            let mut changed = crate::security::test_support::clone_head(&original);
             if field == "status" {
                 changed.head.start = StartLine::Response { status: 200 };
             } else {
@@ -235,7 +235,7 @@ fn not_found_is_authenticated_through_relay_and_restricted_to_fresh_acquire() {
             };
             assert!(codec.response(envelope, vec![], &scope).is_err());
         }
-        let mut changed = crate::security::connection::signature_tests::clone_head(&original);
+        let mut changed = crate::security::test_support::clone_head(&original);
         // A structurally valid alternate outcome/status still needs a valid signature.
         changed.head.start = StartLine::Response { status: 200 };
         changed
@@ -441,7 +441,8 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
 fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
     use crate::{
         http::{MessageHead, StartLine},
-        security::{connection::signed_digest, protocol as p},
+        peer::protocol as p,
+        security::connection::signed_digest,
         topology::membership::{Member, Membership},
     };
     let signers = signers();
@@ -1303,8 +1304,9 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
             connection::{Endpoint, HttpPool},
         },
         model::{ExpiresAt, ObjectMetadata, PageEnvelope},
+        peer::protocol,
         runtime::reactor::Reactor,
-        security::{forwarding::ForwardedHead, protocol},
+        security::forwarding::ForwardedHead,
         topology::{
             membership::{Member, Membership},
             rails::{self, RailId, RailMapping, TransportPlan},
@@ -1592,8 +1594,9 @@ mod established_sessions {
             Codec,
             connection::{ConnectionLease, HttpIo},
         },
+        peer::protocol as p,
         runtime::reactor::Reactor,
-        security::{connection, protocol as p},
+        security::connection,
         topology::{
             health::LinkHealth,
             membership::{Member, Membership},

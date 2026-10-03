@@ -4,8 +4,8 @@ use super::*;
 use crate::{
     control::{state::CacheDefinition, wire},
     model::{PAGE_BYTES, ResourceClass, *},
-    security::identity::{PendingIdentity, SigningIdentity},
 };
+use racer_identity::{PendingIdentity, SigningIdentity};
 use sha2::{Digest, Sha256};
 use std::{cell::RefCell, collections::BTreeMap};
 use uring_runtime::{

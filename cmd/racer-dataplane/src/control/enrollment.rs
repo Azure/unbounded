@@ -530,8 +530,8 @@ impl LocalSigningIdentity {
     pub fn signing_identity(
         &self,
         roots: &[Vec<u8>],
-    ) -> Result<Arc<crate::security::identity::SigningIdentity>> {
-        crate::security::identity::SigningIdentity::from_pkcs8(
+    ) -> Result<Arc<racer_identity::SigningIdentity>> {
+        racer_identity::SigningIdentity::from_pkcs8(
             self.cluster.clone(),
             self.node.clone(),
             &self.private_material,

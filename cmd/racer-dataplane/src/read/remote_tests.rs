@@ -14,10 +14,7 @@ use crate::{
         transport::Transfers,
     },
     runtime::{admission::AdmissionPolicy, deadline::RequestScope, reactor::Reactor},
-    security::{
-        credentials::CredentialCrypto, forwarding::Forwarding, identity::Keyring,
-        test_support::Identity,
-    },
+    security::{credentials::CredentialCrypto, forwarding::Forwarding, test_support::Identity},
     test_support::origin::AdapterOrigin,
     topology::{
         health::LinkHealth,
@@ -26,6 +23,7 @@ use crate::{
         routing::Paths,
     },
 };
+use racer_identity::Keyring;
 use std::{
     cell::{Cell, RefCell},
     net::TcpListener,
@@ -42,7 +40,7 @@ fn node(n: usize) -> NodeId {
 }
 fn identities(nodes: &[NodeId]) -> Vec<Identity> {
     crate::security::test_support::identities(ClusterId(CLUSTER.into()), nodes, || {
-        let mut keys = crate::security::connection::signature_tests::mac_test_key(CACHE);
+        let mut keys = crate::security::test_support::mac_test_key(CACHE);
         keys.push(crate::control::wire::CacheEncryptionKey::new(
             crate::control::wire::CacheKeyRef {
                 cache: CacheId(CACHE.into()),

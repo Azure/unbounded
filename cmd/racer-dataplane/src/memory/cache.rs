@@ -576,7 +576,7 @@ mod tests {
         let admission = admission(8);
         let other_cache = CacheId("44444444-4444-4444-8444-444444444444".into());
         let availability = crate::test_support::availability_for(vec![
-            CacheId(crate::security::identity::tests::CACHE.into()),
+            CacheId(crate::security::test_support::CACHE.into()),
             other_cache.clone(),
         ]);
         let cache = MemoryCache::new(BufferPool::new(admission.clone()), availability);
@@ -621,10 +621,10 @@ mod tests {
     fn empty_stable_catalog_rotates_without_consuming_page_metadata_capacity() {
         use crate::{
             control::{state::for_caches, wire::CacheKeyPurpose},
-            security::identity::keyring_tests::rotation_bundle,
+            security::test_support::rotation_bundle,
         };
         let admission = admission(1024);
-        let keys = Rc::new(crate::security::identity::keyring_tests::keys());
+        let keys = Rc::new(crate::security::test_support::keys());
         let roots = (*keys.peer_trust_roots().unwrap()).clone();
         let caches: Vec<_> = (0..356)
             .map(|cache| CacheId(format!("{cache:08x}-0000-4000-8000-000000000000")))

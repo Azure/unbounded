@@ -1033,7 +1033,7 @@ mod encrypted_http {
             ClusterId(CLUSTER.into()),
             &[NodeId(A.into()), NodeId(C.into())],
             || {
-                let mut keys = crate::security::connection::signature_tests::mac_test_key(CACHE);
+                let mut keys = crate::security::test_support::mac_test_key(CACHE);
                 keys.push(CacheEncryptionKey::new(
                     CacheKeyRef {
                         cache: CacheId(CACHE.into()),
@@ -2036,13 +2036,10 @@ use crate::{
         admission::{AdmissionExt, AdmissionPolicy},
         deadline::{Deadline, RequestScope},
     },
-    security::{
-        connection::Signatures,
-        forwarding::Forwarding,
-        identity::{Certificates, Keyring},
-    },
+    security::{connection::Signatures, forwarding::Forwarding},
     topology::routing::RouteBudget,
 };
+use racer_identity::{Certificates, Keyring};
 use std::{
     rc::Rc,
     sync::Arc,
@@ -2059,7 +2056,7 @@ fn identities() -> (Vec<Rc<Signatures>>, Vec<Discovery>) {
     crate::security::test_support::identities(
         ClusterId(CLUSTER.into()),
         &[A, B, C].map(|name| NodeId(name.into())),
-        || crate::security::connection::signature_tests::mac_test_key(CACHE),
+        || crate::security::test_support::mac_test_key(CACHE),
     )
     .into_iter()
     .map(|identity| (identity.signatures, (identity.keys, identity.certificates)))

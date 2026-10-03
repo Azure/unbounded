@@ -1,5 +1,4 @@
 //! Vetted XChaCha20-Poly1305 adapter, canonical page AAD, fresh cryptographic nonces.
-use super::identity::{KeyPurpose, Keyring};
 use crate::{
     error::{Error, Operation, Result},
     memory::pool::{CiphertextBytes, CiphertextPage, PlaintextBuffer, VerifiedBytes, VerifiedPage},
@@ -16,6 +15,7 @@ use crate::{
     telemetry::failures::{AeadFailure, Failure, Stage},
 };
 use racer_crypto::aead;
+use racer_identity::{KeyPurpose, Keyring};
 use std::{
     rc::Rc,
     sync::Arc,
@@ -38,7 +38,7 @@ pub(crate) fn field(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
 /// (length:u32 BE, bytes), page:u64 BE, key ID, nonce, lengths:u32 BE.
 pub fn page_aad(envelope: &PageEnvelope) -> Result<Vec<u8>> {
     envelope.validate()?;
-    if !super::identity::canonical_uuid(&envelope.page.version.object.cache.0)
+    if !racer_identity::canonical_uuid(&envelope.page.version.object.cache.0)
         || envelope.page.version.etag.as_bytes().len() > crate::model::MAX_FIELD_BYTES
     {
         return Err(Error::CorruptRecord);
@@ -282,7 +282,7 @@ impl PageCryptoEngine {
     /// Borrow every quota owner until crypto and the final cancellation check succeed.
     fn prepare(
         input: &CryptoInput,
-        key: &super::identity::KeyLease,
+        key: &racer_identity::KeyLease,
         scope: &RequestScope,
         permit: &mut CryptoPermit,
     ) -> Result<(PageEnvelope, Zeroizing<Vec<u8>>)> {
@@ -525,7 +525,7 @@ mod tests {
             page: PageId {
                 version: ObjectVersion {
                     object: ObjectId {
-                        cache: CacheId(super::super::identity::tests::CACHE.into()),
+                        cache: CacheId(crate::security::test_support::CACHE.into()),
                         key: CacheKey([3; 32]),
                     },
                     etag: StrongEtag::parse(b"\"v1\"").unwrap(),
@@ -550,7 +550,7 @@ mod tests {
             match index {
                 0 => {
                     changed.page.version.object.cache =
-                        CacheId(super::super::identity::tests::NODE.into())
+                        CacheId(crate::security::test_support::NODE.into())
                 }
                 1 => changed.page.version.object.key.0[0] ^= 1,
                 2 => changed.page.version.etag = StrongEtag::parse(b"\"v2\"").unwrap(),
@@ -672,7 +672,7 @@ mod tests {
                 "b8a08e70bf42b3eb50de6a5e9f852c9a664bfa8a4a497aa2a393f5ccc8ad74e0",
             ),
         ];
-        let keys = super::super::identity::keyring_tests::keys();
+        let keys = crate::security::test_support::keys();
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
@@ -814,7 +814,7 @@ mod tests {
                 crypto::{CryptoId, pair},
             },
         };
-        let keys = super::super::identity::keyring_tests::keys();
+        let keys = crate::security::test_support::keys();
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
@@ -940,7 +940,7 @@ mod tests {
                 crypto::{CryptoId, pair},
             },
         };
-        let keys = super::super::identity::keyring_tests::keys();
+        let keys = crate::security::test_support::keys();
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
@@ -956,7 +956,7 @@ mod tests {
             let undersized = sequence == 4;
             let wrong_cache = sequence == 5;
             let staging_cache = if wrong_cache {
-                CacheId(super::super::identity::tests::NODE.into())
+                CacheId(crate::security::test_support::NODE.into())
             } else {
                 cache.clone()
             };
@@ -1064,7 +1064,7 @@ mod tests {
                 crypto::{CryptoId, pair},
             },
         };
-        let keys = super::super::identity::keyring_tests::keys();
+        let keys = crate::security::test_support::keys();
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
@@ -1197,7 +1197,7 @@ mod tests {
                 self.0.fetch_add(1, Ordering::SeqCst);
             }
         }
-        let keys = super::super::identity::keyring_tests::keys();
+        let keys = crate::security::test_support::keys();
         let admission = flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         ));

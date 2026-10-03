@@ -251,7 +251,7 @@ mod tests {
         let start = uring_runtime::environment::now();
         let scope =
             RequestScope::new(RequestId([97; 16]), start + Duration::from_secs(60)).unwrap();
-        let signed = crate::security::protocol::encode_deadline(scope.deadline).unwrap();
+        let signed = crate::peer::protocol::encode_deadline(scope.deadline).unwrap();
         scope
             .set_candidate_total(start + Duration::from_secs(30))
             .unwrap();
@@ -277,7 +277,7 @@ mod tests {
             Err(Error::DeadlineExceeded)
         );
         assert_eq!(
-            crate::security::protocol::encode_deadline(scope.deadline).unwrap(),
+            crate::peer::protocol::encode_deadline(scope.deadline).unwrap(),
             signed
         );
     }
@@ -408,12 +408,12 @@ mod tests {
         let start = uring_runtime::environment::now();
         let scope = RequestScope::new(RequestId([39; 16]), start + Duration::from_secs(3)).unwrap();
         scope.set_candidate_idle(Duration::from_secs(1)).unwrap();
-        let signed = crate::security::protocol::encode_deadline(scope.deadline).unwrap();
+        let signed = crate::peer::protocol::encode_deadline(scope.deadline).unwrap();
         for _ in 0..5 {
             clock.advance(Duration::from_millis(500));
             scope.candidate_progress().unwrap();
             assert_eq!(
-                crate::security::protocol::encode_deadline(scope.deadline).unwrap(),
+                crate::peer::protocol::encode_deadline(scope.deadline).unwrap(),
                 signed
             );
         }

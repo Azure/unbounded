@@ -27,10 +27,11 @@ use crate::{
         admission::AdmissionPolicy,
         deadline::{Deadline, RequestScope},
     },
-    security::{connection::VerifiedHead, identity::VerifiedPeer},
+    security::connection::VerifiedHead,
     topology::rails::{RailId, RailMapping},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
+use racer_identity::VerifiedPeer;
 use sha2::{Digest, Sha256};
 use std::{
     cell::{Cell, RefCell},
@@ -413,11 +414,10 @@ mod session_tests {
             model::ClusterId,
             security::{
                 connection::{Signatures, SignedHead},
-                identity::Certificates,
-                identity::tests::{CLUSTER, NODE, issued},
-                identity::{KeyEpochs, Keyring},
+                test_support::{CLUSTER, NODE, issued},
             },
         };
+        use racer_identity::{Certificates, KeyEpochs, Keyring};
         use std::sync::Arc;
         let (pending, chain, roots) = issued();
         let cluster = ClusterId(CLUSTER.into());

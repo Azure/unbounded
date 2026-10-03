@@ -383,7 +383,7 @@ fn signed_ingress_cold_selection_is_bounded_cancellable_and_does_not_block_other
     other.id = [71; 16];
     let (send, receive) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
-        let now = crate::security::protocol::millis(std::time::SystemTime::now()).unwrap();
+        let now = crate::peer::protocol::millis(std::time::SystemTime::now()).unwrap();
         let Selection::Leader { work, mut waiter } = scheduler
             .schedule(
                 other,
@@ -531,7 +531,7 @@ fn subscription_selection_is_canonical_signed_and_bound_to_exact_grant() {
         page: page.clone(),
         membership: MembershipVersion(1),
         receiver: NodeId(A.into()),
-        deadline: crate::security::protocol::encode_deadline(admitted.request().route.deadline)
+        deadline: crate::peer::protocol::encode_deadline(admitted.request().route.deadline)
             .unwrap(),
         remaining_page_budget: 1,
         remaining_byte_budget: subscription.byte_budget - 19,
@@ -557,14 +557,14 @@ fn subscription_selection_is_canonical_signed_and_bound_to_exact_grant() {
             grant,
         };
         // Sign directly to test receiver validation independently of sign_response.
-        let mut head = crate::security::protocol::response_head(
+        let mut head = crate::peer::protocol::response_head(
             &response,
             &crate::security::connection::signed_digest(&admitted.signed().authentication.original)
                 .unwrap(),
             &[NodeId(A.into()), NodeId(C.into())],
         )
         .unwrap();
-        crate::security::protocol::push(&mut head, "racer-receiver", A);
+        crate::peer::protocol::push(&mut head, "racer-receiver", A);
         let signed = protocol::SignedResponse {
             authentication: crate::security::forwarding::ForwardedHead {
                 original: Arc::new(signers[2].sign(head).unwrap()),
@@ -762,7 +762,7 @@ fn retained_subscription_cannot_complete_after_request_mac_key_retirement() {
         .unwrap();
     let admitted = destination.verify_request(request).unwrap();
     let keys = &discovery[2].0;
-    let mut replacement = crate::security::connection::signature_tests::mac_test_key(CACHE);
+    let mut replacement = crate::security::test_support::mac_test_key(CACHE);
     for key in &mut replacement {
         key.key.id.0[4..12].copy_from_slice(&2u64.to_be_bytes());
         let (reference, state, mut material) = key.clone().into_installation();

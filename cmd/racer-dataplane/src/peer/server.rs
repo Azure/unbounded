@@ -729,7 +729,7 @@ impl PeerServer {
     ) -> Operation<'a, PeerResponse> {
         Box::pin(async move {
             use super::subscriptions::Selection;
-            use crate::security::protocol::{encode_deadline, millis};
+            use crate::peer::protocol::{encode_deadline, millis};
             let super::protocol::Operation::Subscribe { subscription, mode } =
                 &request.request().operation
             else {
@@ -1512,7 +1512,7 @@ mod tests {
                     SimulationClock::new_at(83, Instant::now(), std::time::SystemTime::now());
                 let environment = clock.environment(0);
                 let _guard = environment.enter();
-                let signers = crate::security::connection::signature_tests::network(2);
+                let signers = crate::security::test_support::network(2);
                 let mut limits = crate::test_support::cluster::config(false).limits;
                 limits.client_connections = std::num::NonZeroUsize::new(1).unwrap();
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));

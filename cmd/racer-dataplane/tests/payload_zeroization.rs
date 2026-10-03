@@ -183,11 +183,9 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
             crypto::{CryptoId, CryptoInput, pair},
             deadline::RequestScope,
         },
-        security::{
-            aead::{PageCryptoEngine, page_aad},
-            identity::{KeyEpochs, KeyPurpose, Keyring},
-        },
+        security::aead::{PageCryptoEngine, page_aad},
     };
+    use racer_identity::{KeyEpochs, KeyPurpose, Keyring};
     use std::{
         sync::Arc,
         task::{Context, Poll},

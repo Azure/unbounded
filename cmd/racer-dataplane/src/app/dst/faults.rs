@@ -142,8 +142,8 @@ impl Harness {
     pub(super) fn peer_security(&mut self) {
         use crate::{
             http::{Codec, MessageHead, StartLine},
+            peer::protocol as p,
             peer::protocol::encode_envelope,
-            security::protocol as p,
         };
         let receiver = self.rng.pick(self.nodes.len());
         let sender = (receiver + 1) % self.nodes.len();
@@ -199,7 +199,7 @@ impl Harness {
             // The envelope wraps the signed original in a base64 field. Mutate the
             // signed signature before encoding so the outer HTTP remains legal.
             let original = &envelope.original;
-            let mut signed = crate::security::connection::signature_tests::clone_head(original);
+            let mut signed = crate::security::test_support::clone_head(original);
             let signature = signed
                 .head
                 .headers

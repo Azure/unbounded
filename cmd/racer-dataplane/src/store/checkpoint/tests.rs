@@ -155,7 +155,7 @@ fn descriptor(etag: &str, length: u64) -> VersionMetadata {
         content_type: None,
         version: ObjectVersion {
             object: ObjectId {
-                cache: CacheId(crate::security::identity::tests::CACHE.into()),
+                cache: CacheId(crate::security::test_support::CACHE.into()),
                 key: CacheKey([7; 32]),
             },
             etag: StrongEtag::parse(format!("\"{etag}\"").as_bytes()).unwrap(),

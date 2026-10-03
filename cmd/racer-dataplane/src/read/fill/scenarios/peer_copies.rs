@@ -5,8 +5,8 @@ use crate::{
     model::NodeId,
     peer::protocol::{PeerRequest, VerifiedResponse},
     security::{
-        connection::signature_tests::{network, node},
         forwarding::Forwarding,
+        test_support::{network, node},
     },
 };
 use std::collections::VecDeque;
@@ -110,8 +110,8 @@ impl PeerClient for ScriptedPeers {
                             page: copy.ciphertext.envelope().page.clone(),
                             membership: request.route.membership,
                             receiver: node(self.local),
-                            deadline: crate::security::protocol::number(
-                                &crate::security::protocol::request_head(&request)?,
+                            deadline: crate::peer::protocol::number(
+                                &crate::peer::protocol::request_head(&request)?,
                                 "racer-route-deadline",
                             )?,
                             remaining_page_budget: subscription.page_budget - 1,

@@ -1268,9 +1268,9 @@ mod tests {
             model::ClusterId,
             model::{MembershipVersion, RequestId},
             runtime::admission::AdmissionPolicy,
-            security::identity::{KeyEpochs, Keyring},
             topology::membership::{Member, Membership},
         };
+        use racer_identity::{KeyEpochs, Keyring};
         let membership = std::sync::Arc::new(
             Membership::validate(
                 MembershipVersion(1),
@@ -1570,7 +1570,7 @@ mod tests {
         )
     }
     fn policy(node: NodeId, peers: Rc<RecordedPeer>) -> CandidatePolicy {
-        use crate::security::identity::{KeyEpochs, Keyring};
+        use racer_identity::{KeyEpochs, Keyring};
         let config = crate::test_support::cluster::config(false);
         let admission = Rc::new(flow_control::Quotas::new(
             crate::runtime::admission::AdmissionPolicy::new(config.limits),

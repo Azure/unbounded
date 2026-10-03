@@ -39,18 +39,18 @@
 //!     requester.verify_response(reverse, &outstanding)
 //! }
 //! ```
-use super::{
-    connection::{Signatures, SignedHead, node_field, receiver, signed_digest},
-    identity::VerifiedPeer,
-    protocol::{self, field, number, push, push_binary},
-};
+use super::connection::{Signatures, SignedHead, node_field, receiver, signed_digest};
 use crate::{
     error::{Error, Result},
     http::{MessageHead, StartLine},
     model::NodeId,
-    peer::protocol::{PeerRequest, PeerResponse, SignedRequest, SignedResponse},
+    peer::protocol::{
+        self, PeerRequest, PeerResponse, SignedRequest, SignedResponse, field, number, push,
+        push_binary,
+    },
     topology::routing::RouteBudget,
 };
+use racer_identity::VerifiedPeer;
 use std::{rc::Rc, sync::Arc};
 pub struct Forwarding {
     signatures: Rc<Signatures>,
@@ -826,7 +826,7 @@ mod tests {
         },
         peer::protocol::{FetchMode, Operation},
         runtime::{admission::AdmissionPolicy, deadline::RequestScope},
-        security::connection::signature_tests::{clone_head, network, node},
+        security::test_support::{clone_head, network, node},
     };
     use std::time::{Duration, Instant};
     fn wire_ciphertext(

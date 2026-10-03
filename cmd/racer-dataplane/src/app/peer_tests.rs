@@ -303,7 +303,7 @@ use crate::{
     },
     security::{
         connection,
-        connection::signature_tests::{network, node},
+        test_support::{network, node},
     },
     topology::routing::RouteBudget,
 };
@@ -351,11 +351,11 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
     let forwarding: Vec<_> = signers.iter().map(|s| Forwarding::new(s.clone())).collect();
     let codec = protocol::SecurityCodec::new(admission.clone(), BufferPool::new(admission.clone()));
     let crypto = CredentialCrypto::new(
-        Rc::new(crate::security::identity::keyring_tests::keys()),
+        Rc::new(crate::security::test_support::keys()),
         admission.clone(),
     );
     let scope = scope(Duration::from_secs(30)).unwrap();
-    let cache = CacheId(crate::security::identity::tests::CACHE.into());
+    let cache = CacheId(crate::security::test_support::CACHE.into());
     let metadata = vec![b'm'; 8192];
     let authorization = vec![b'a'; 8192];
     let etag = format!("\"{}\"", "v".repeat(8190));

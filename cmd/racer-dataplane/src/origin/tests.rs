@@ -89,10 +89,8 @@ impl OriginClient {
 fn credentials(
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
 ) -> Rc<crate::security::credentials::CredentialCrypto> {
-    use crate::security::{
-        credentials::CredentialCrypto,
-        identity::{KeyEpochs, Keyring},
-    };
+    use crate::security::credentials::CredentialCrypto;
+    use racer_identity::{KeyEpochs, Keyring};
     Rc::new(CredentialCrypto::new(
         Rc::new(Keyring::new(
             ClusterId("cluster".into()),

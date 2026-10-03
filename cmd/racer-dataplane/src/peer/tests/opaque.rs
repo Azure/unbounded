@@ -526,7 +526,7 @@ mod safety {
             ClusterId(CLUSTER.into()),
             &[NodeId(A.into()), NodeId(C.into())],
             || {
-                let mut keys = crate::security::connection::signature_tests::mac_test_key(CACHE);
+                let mut keys = crate::security::test_support::mac_test_key(CACHE);
                 keys.push(CacheEncryptionKey::new(
                     CacheKeyRef {
                         cache: CacheId(CACHE.into()),
@@ -1447,7 +1447,7 @@ fn opaque_relay_benchmark() {
 
 #[test]
 fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution() {
-    use crate::security::{forwarding::ForwardedHead, protocol};
+    use crate::{peer::protocol, security::forwarding::ForwardedHead};
     fn copy(head: &crate::http::MessageHead) -> crate::http::MessageHead {
         let codec = Codec::new(crate::peer::protocol::MAX_SIGNED_HEAD);
         let mut head = codec

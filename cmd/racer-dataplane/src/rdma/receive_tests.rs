@@ -5,7 +5,7 @@ use super::*;
 use crate::{
     model::{ResourceClass, TransferId},
     runtime::admission::AdmissionPolicy,
-    security::connection::signature_tests::network,
+    security::test_support::network,
 };
 use rdma_verbs::testing::{Contention, State};
 use std::{

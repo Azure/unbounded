@@ -907,7 +907,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
     .unwrap();
     let until = Instant::now() + Duration::from_secs(10);
     assert!(keys.lease(Some(&cache), key.id, KeyPurpose::Page).is_err());
-    crate::security::fixtures::assert_page_key(&lease, &[21; 32]);
+    crate::security::test_support::assert_page_key(&lease, &[21; 32]);
     assert!(node.observations.health.ready());
     drop(lease);
     while !node.observations.health.ready() {
@@ -1053,10 +1053,8 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
     let node = Arc::new(NodeState::new(vec![WorkerId(0)], 64).unwrap());
     {
         let mut bundle = fixture.bundle.lock().unwrap();
-        *bundle = crate::security::identity::keyring_tests::rotation_bundle(
-            1,
-            bundle.peer_trust_roots.clone(),
-        );
+        *bundle =
+            crate::security::test_support::rotation_bundle(1, bundle.peer_trust_roots.clone());
         bundle.cluster = config.cluster.clone();
     }
     config.node = bootstrap(
@@ -1096,10 +1094,8 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
     let key_scope = scope(Duration::from_secs(15)).unwrap();
     {
         let mut bundle = fixture.bundle.lock().unwrap();
-        *bundle = crate::security::identity::keyring_tests::rotation_bundle(
-            2,
-            bundle.peer_trust_roots.clone(),
-        );
+        *bundle =
+            crate::security::test_support::rotation_bundle(2, bundle.peer_trust_roots.clone());
         bundle.cluster = config.cluster.clone();
     }
     let mut rotation = control.keyring_progress(&key_scope);
@@ -1170,10 +1166,8 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
     std::fs::write(&config.service_account_token, b"fixture.token.fresh").unwrap();
     {
         let mut bundle = fixture.bundle.lock().unwrap();
-        *bundle = crate::security::identity::keyring_tests::rotation_bundle(
-            3,
-            bundle.peer_trust_roots.clone(),
-        );
+        *bundle =
+            crate::security::test_support::rotation_bundle(3, bundle.peer_trust_roots.clone());
         bundle.cluster = config.cluster.clone();
     }
     drive(
@@ -1364,7 +1358,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     assert_eq!(runtime.crypto.outstanding(), 1);
     assert!(worker.peer_task.is_some());
     assert!(worker.diagnostic_task.is_some());
-    crate::security::fixtures::assert_page_key(&lease, &[19; 32]);
+    crate::security::test_support::assert_page_key(&lease, &[19; 32]);
     assert!(
         worker
             .keys

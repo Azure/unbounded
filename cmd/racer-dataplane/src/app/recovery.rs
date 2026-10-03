@@ -410,7 +410,7 @@ mod tests {
     }
     fn caches() -> Vec<crate::control::state::CacheDefinition> {
         let mut cache = super::super::test_support::definition();
-        cache.id = crate::model::CacheId(crate::security::identity::tests::CACHE.into());
+        cache.id = crate::model::CacheId(crate::security::test_support::CACHE.into());
         vec![cache]
     }
     fn image(sequence: u64, ids: &[WorkerId]) -> CheckpointImage {
@@ -445,7 +445,7 @@ mod tests {
     #[test]
     fn newest_complete_cut_wins_and_partial_duplicate_or_foreign_workers_fall_back() {
         let node = NodeState::default();
-        let keys = crate::security::identity::keyring_tests::keys();
+        let keys = crate::security::test_support::keys();
         let geometry = [(WorkerId(0), geometry()), (WorkerId(1), geometry())]
             .into_iter()
             .collect();
@@ -470,7 +470,7 @@ mod tests {
         );
         let mut oversized = image(3, &[WorkerId(0), WorkerId(1)]);
         let object = crate::model::ObjectId {
-            cache: crate::model::CacheId(crate::security::identity::tests::CACHE.into()),
+            cache: crate::model::CacheId(crate::security::test_support::CACHE.into()),
             key: crate::model::CacheKey([9; 32]),
         };
         let owner = node.workers.metadata_owner(&object).unwrap();
@@ -523,7 +523,7 @@ mod tests {
             checkpoint,
         };
         let node = NodeState::new(vec![WorkerId(0)], 16).unwrap();
-        let keys = crate::security::identity::keyring_tests::keys();
+        let keys = crate::security::test_support::keys();
         let caches = caches();
         let cache = caches[0].id.clone();
         let g = geometry();
@@ -655,12 +655,12 @@ mod tests {
             CacheId, CacheKey, ObjectId, ObjectVersion, StrongEtag, VersionMetadata,
         };
         let node = NodeState::default();
-        let keys = crate::security::identity::keyring_tests::keys();
+        let keys = crate::security::test_support::keys();
         let geometry = [(WorkerId(0), geometry()), (WorkerId(1), geometry())]
             .into_iter()
             .collect();
         let object = ObjectId {
-            cache: CacheId(crate::security::identity::tests::CACHE.into()),
+            cache: CacheId(crate::security::test_support::CACHE.into()),
             key: CacheKey([3; 32]),
         };
         let owner = node.workers.metadata_owner(&object).unwrap();
@@ -744,7 +744,7 @@ mod tests {
     #[test]
     fn distinct_live_catalog_and_page_capacities_select_an_installable_cut() {
         let node = NodeState::new(vec![WorkerId(0)], 16).unwrap();
-        let keys = crate::security::identity::keyring_tests::keys();
+        let keys = crate::security::test_support::keys();
         let geometry = [(WorkerId(0), geometry())].into_iter().collect();
         let candidate = |sequence, count| {
             let mut cut = image(sequence, &[WorkerId(0)]);

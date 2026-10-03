@@ -549,11 +549,9 @@ use crate::{
     },
     read::{Coordinator, ReadService},
     security::{
-        connection::{
-            Signatures,
-            signature_tests::{network, node},
-        },
+        connection::Signatures,
         forwarding::Forwarding,
+        test_support::{network, node},
     },
     topology::{health::LinkHealth, routing::Paths},
 };

@@ -612,7 +612,7 @@ mod tests {
             content_type: None,
             version: ObjectVersion {
                 object: ObjectId {
-                    cache: CacheId(crate::security::identity::tests::CACHE.into()),
+                    cache: CacheId(crate::security::test_support::CACHE.into()),
                     key: CacheKey([0; 32]),
                 },
                 etag: StrongEtag::test_value(etag),

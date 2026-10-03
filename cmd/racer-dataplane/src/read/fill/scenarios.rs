@@ -928,7 +928,7 @@ mod pressure {
                 3,
                 Some(limits),
                 vec![
-                    CacheId(crate::security::identity::tests::CACHE.into()),
+                    CacheId(crate::security::test_support::CACHE.into()),
                     other_cache.clone(),
                 ],
             );
@@ -1201,7 +1201,7 @@ impl Origin for TestOrigin {
 struct Fixture {
     fill: Fill,
     reactor: Rc<Reactor>,
-    keys: Rc<crate::security::identity::Keyring>,
+    keys: Rc<racer_identity::Keyring>,
     origin: Rc<TestOrigin>,
     crypto: Rc<CryptoClient>,
     engine: PageCryptoEngine,
@@ -1384,7 +1384,7 @@ fn fixture_with(length: u64, limits: Option<crate::model::Limits>) -> Fixture {
     fixture_with_caches(
         length,
         limits,
-        vec![CacheId(crate::security::identity::tests::CACHE.into())],
+        vec![CacheId(crate::security::test_support::CACHE.into())],
     )
 }
 fn fixture_with_caches(
@@ -1400,7 +1400,7 @@ fn fixture_with_caches(
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         config.limits.clone(),
     )));
-    let keys = Rc::new(crate::security::identity::keyring_tests::keys_for(&caches));
+    let keys = Rc::new(crate::security::test_support::keys_for(&caches));
     let availability = crate::control::state::for_caches(keys.clone(), caches);
     let buffers = BufferPool::new(admission.clone());
     let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
@@ -2045,7 +2045,8 @@ fn ciphertext_ready_promotes_once_for_concurrent_plaintext_readers() {
 fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
     let queue = Rc::new(crate::read::drivers::DriverQueue::default());
     let _owner = queue.enter();
-    use crate::security::identity::{KeyPurpose, keyring_tests::rotation_bundle};
+    use crate::security::test_support::rotation_bundle;
+    use racer_identity::KeyPurpose;
     let mut f = fixture_with(3, None);
     let flights = f.fill.dependencies.flights.clone();
     let mut held_budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
