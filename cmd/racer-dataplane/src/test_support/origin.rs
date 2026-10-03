@@ -2,10 +2,7 @@
 //! The client, HTTP parser, reactor, and plaintext admission remain production code.
 use crate::{
     control::state::SnapshotStore,
-    http::{
-        Codec,
-        connection::{HttpIo, HttpPool},
-    },
+    http::{Codec, HttpIo, HttpPool},
     memory::BufferPool,
     model::{ObjectMetadata, PAGE_BYTES},
     origin::OriginClient,
@@ -241,7 +238,8 @@ fn serve(mut stream: UnixStream, state: &Mutex<State>, stop: &AtomicBool) {
         assert!(request.len() <= 32768, "oversized adapter request");
     }
     let request = Codec::new(32768).decode_head(&request).unwrap().unwrap().0;
-    let head = matches!(&request.start, crate::http::StartLine::Request { method, .. } if method == "HEAD");
+    let head =
+        matches!(&request.start, http1::StartLine::Request { method, .. } if method == "HEAD");
     let if_match = request.unique("If-Match").unwrap().map(<[u8]>::to_vec);
     let first = request
         .unique("Range")

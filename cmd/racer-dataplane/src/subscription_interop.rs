@@ -324,7 +324,7 @@ impl SubscriptionFixture {
             availability,
         ));
         let endpoint = directory.install(WorkerId(0), coordinator.clone()).unwrap();
-        let io = Rc::new(http::connection::HttpIo::with_admission(
+        let io = Rc::new(http::HttpIo::with_admission(
             reactor.clone(),
             http::Codec::new(32768),
             admission.clone(),

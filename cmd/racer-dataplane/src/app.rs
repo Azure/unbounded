@@ -22,7 +22,7 @@ use crate::{
         transport::ReactorControlIo,
     },
     error::{Error, Operation, Result},
-    http::connection::{HttpIo, HttpPool},
+    http::{HttpIo, HttpPool},
     memory::{BufferPool, cache::MemoryCache, delivery::Delivery, new_pipe_pool},
     model::{Limits, NodeId, RequestId, WorkerId},
     origin::{Origin, OriginClient},
@@ -1442,10 +1442,8 @@ impl WorkerApplication {
                 .into_iter()
                 .flatten()
             {
-                let connection = crate::http::connection::from_reserved(
-                    accepted.fd.into(),
-                    accepted.reservation,
-                )?;
+                let connection =
+                    crate::http::from_reserved(accepted.fd.into(), accepted.reservation)?;
                 match accepted.kind {
                     crate::runtime::ingress::Kind::Client(cache, retired) => {
                         self.clients

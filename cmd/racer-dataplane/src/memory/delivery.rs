@@ -11,7 +11,7 @@
 use super::VerifiedPage;
 use crate::{
     error::{Error, Operation, Result},
-    http::connection::{ConnectionLease, HttpContext, OwnedBuffer},
+    http::{ConnectionLease, HttpContext, OwnedBuffer},
     model::PageSlice,
     runtime::{admission::AdmissionPolicy, deadline::RequestScope, reactor::Reactor},
 };
@@ -456,7 +456,7 @@ mod tests {
         admission: &flow_control::Quotas<AdmissionPolicy>,
         length: u64,
     ) -> ConnectionLease {
-        let mut connection = crate::http::connection::from_accepted(socket, admission).unwrap();
+        let mut connection = crate::http::from_accepted(socket, admission).unwrap();
         connection.set_framing(None, Some(length), false);
         connection
     }
@@ -574,8 +574,7 @@ mod tests {
             let (socket, mut peer) = UnixStream::pair().unwrap();
             small_send_buffer(&socket);
             peer.set_nonblocking(true).unwrap();
-            let mut connection =
-                crate::http::connection::from_accepted(socket.into(), &admission).unwrap();
+            let mut connection = crate::http::from_accepted(socket.into(), &admission).unwrap();
             connection.set_framing(None, Some(500 * 1024), false);
             let mut scope = scope();
             if failure == "deadline" {
@@ -679,8 +678,7 @@ mod tests {
             },
             0
         );
-        let mut connection =
-            crate::http::connection::from_accepted(socket.into(), &admission).unwrap();
+        let mut connection = crate::http::from_accepted(socket.into(), &admission).unwrap();
         let mut scratch = [0; 64 * 1024];
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         for sample in 0..4 {
@@ -861,14 +859,14 @@ mod tests {
         let scope = scope();
         let reader = delivery.attach(page.clone(), slice(0, 3)).unwrap();
         let (socket, _peer) = UnixStream::pair().unwrap();
-        let unframed = crate::http::connection::from_accepted(socket.into(), &admission).unwrap();
+        let unframed = crate::http::from_accepted(socket.into(), &admission).unwrap();
         assert!(matches!(
             drive(&reactor, delivery.finish_to(reader, unframed, &scope)),
             Err(Error::InvalidRequest)
         ));
         let reader = delivery.attach(page, slice(3, 0)).unwrap();
         let (socket, _peer) = UnixStream::pair().unwrap();
-        let unframed = crate::http::connection::from_accepted(socket.into(), &admission).unwrap();
+        let unframed = crate::http::from_accepted(socket.into(), &admission).unwrap();
         assert!(matches!(
             drive(&reactor, delivery.finish_to(reader, unframed, &scope)),
             Err(Error::InvalidRequest)
@@ -1059,8 +1057,7 @@ mod tests {
         let (admission, reactor, delivery) = setup(1, Duration::from_secs(1));
         let page = page(&admission, b"abc".to_vec());
         let (socket, mut peer) = UnixStream::pair().unwrap();
-        let mut connection =
-            crate::http::connection::from_accepted(socket.into(), &admission).unwrap();
+        let mut connection = crate::http::from_accepted(socket.into(), &admission).unwrap();
         // Equivalent to successful head I/O: there are no request body bytes and
         // the response head promised exactly three bytes.
         connection.set_framing(Some(0), Some(3), false);
@@ -1092,8 +1089,7 @@ mod tests {
         for remaining in [None, Some(2)] {
             let page = page(&admission, b"abc".to_vec());
             let (socket, mut peer) = UnixStream::pair().unwrap();
-            let mut connection =
-                crate::http::connection::from_accepted(socket.into(), &admission).unwrap();
+            let mut connection = crate::http::from_accepted(socket.into(), &admission).unwrap();
             connection.set_framing(None, remaining, false);
             let reader = delivery.attach(page, slice(0, 3)).unwrap();
             assert!(matches!(
@@ -1269,8 +1265,7 @@ mod tests {
         let (socket, mut peer) = UnixStream::pair().unwrap();
         small_send_buffer(&socket);
         peer.set_nonblocking(true).unwrap();
-        let mut connection =
-            crate::http::connection::from_accepted(socket.into(), &admission).unwrap();
+        let mut connection = crate::http::from_accepted(socket.into(), &admission).unwrap();
         connection.set_framing(None, Some(bytes.len() as u64), false);
         let scope = scope();
         let mut operation = delivery.finish_to(reader, connection, &scope);
@@ -1373,8 +1368,7 @@ mod tests {
         let weak = Arc::downgrade(&page.inner);
         let reader = delivery.attach(page, slice(0, 3)).unwrap();
         let (socket, mut peer) = UnixStream::pair().unwrap();
-        let mut connection =
-            crate::http::connection::from_accepted(socket.into(), &admission).unwrap();
+        let mut connection = crate::http::from_accepted(socket.into(), &admission).unwrap();
         connection.set_framing(None, Some(3), false);
         let scope = scope();
         let operation = delivery.finish_to(reader, connection, &scope);
@@ -1404,8 +1398,7 @@ mod tests {
         let page = page(&admission, bytes.clone());
         let weak = Arc::downgrade(&page.inner);
         let reader = delivery.attach(page, slice(0, bytes.len() as u32)).unwrap();
-        let mut connection =
-            crate::http::connection::from_accepted(socket.into(), &admission).unwrap();
+        let mut connection = crate::http::from_accepted(socket.into(), &admission).unwrap();
         connection.set_framing(None, Some(bytes.len() as u64), false);
         let connection = drive(&reactor, delivery.finish_to(reader, connection, &scope())).unwrap();
         assert_eq!(connection.send_remaining(), Some(0));

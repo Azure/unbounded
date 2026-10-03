@@ -3,15 +3,13 @@ use super::ReadKind;
 use crate::telemetry::failures::Observer;
 use crate::{
     error::{Error, Operation, Result},
-    http::{
-        Header, MessageHead, StartLine,
-        connection::{ConnectionLease, HttpIo},
-    },
+    http::{ConnectionLease, HttpIo},
     memory::delivery::Delivery,
     model::{ObjectMetadata, ResolvedRange},
     read::ReadResponse,
     runtime::deadline::RequestScope,
 };
+use http1::{Header, MessageHead, StartLine};
 use std::{
     rc::Rc,
     time::{Duration, UNIX_EPOCH},
@@ -27,15 +25,12 @@ mod subscription {
     use super::{Responses, header};
     use crate::{
         error::{Error, Operation, Result},
-        http::{
-            MessageHead, StartLine,
-            connection::ConnectionLease,
-            connection::{HttpIo, OwnedBuffer},
-        },
+        http::{ConnectionLease, HttpIo, OwnedBuffer},
         model::{ObjectMetadata, PAGE_BYTES, PageNumber, ResolvedRange},
         read::{ReadResponse, range_stream::RangeStream},
         runtime::deadline::RequestScope,
     };
+    use http1::{MessageHead, StartLine};
     use std::{
         collections::BTreeMap,
         task::{Context, Poll},

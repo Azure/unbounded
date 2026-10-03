@@ -1,13 +1,11 @@
 //! Independent client v2 and origin v1 wire checks.
 //! These exercise production HTTP/parser/writer components over real Unix sockets;
 //! they do not substitute for an Application/Coordinator end-to-end deployment.
+use http1::{Header, MessageHead, StartLine};
 use racer_dataplane::{
     client::{ClientRequest, ReadKind, RequestParser, response::Responses},
     error::{Error, Result},
-    http::{
-        Codec, Header, MessageHead, StartLine,
-        connection::{ConnectionLease, HttpIo},
-    },
+    http::{Codec, ConnectionLease, HttpIo},
     memory::{delivery::Delivery, new_pipe_pool},
     model::{
         ByteRange, CacheId, CacheKey, ExpiresAt, Limits, ObjectId, ObjectMetadata, ObjectVersion,
@@ -76,7 +74,7 @@ impl Rig {
         }
     }
     fn lease(&self, socket: UnixStream) -> ConnectionLease {
-        racer_dataplane::http::connection::from_accepted(socket.into(), &self.admission).unwrap()
+        racer_dataplane::http::from_accepted(socket.into(), &self.admission).unwrap()
     }
     fn drive<T>(&self, future: impl Future<Output = T>) -> T {
         let mut future = std::pin::pin!(future);
@@ -1113,7 +1111,7 @@ mod sdk {
     // One credit forces exact releases before the next page, including clipped pages.
     async fn send_subscription(
         rig: &Rig,
-        connection: racer_dataplane::http::connection::ConnectionLease,
+        connection: racer_dataplane::http::ConnectionLease,
         releases: &mut UnixStream,
         size: u64,
         first: u64,

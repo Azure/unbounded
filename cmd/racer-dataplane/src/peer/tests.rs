@@ -3,11 +3,7 @@ use super::*;
 mod body_progress {
     use super::*;
     use crate::{
-        http::{
-            Codec,
-            connection::HttpIo,
-            connection::{Endpoint, HttpPool},
-        },
+        http::{Codec, Endpoint, HttpIo, HttpPool},
         model::{ExpiresAt, ObjectMetadata, PageEnvelope},
         runtime::reactor::Reactor,
         telemetry::Telemetry,
@@ -195,7 +191,7 @@ mod body_progress {
                 let fd = reactor
                     .accept(Rc::new(listener.into()), &server_scope)
                     .await?;
-                let conn = crate::http::connection::from_accepted(fd, &admission)?;
+                let conn = crate::http::from_accepted(fd, &admission)?;
                 let conn = crate::security::connection::accept(
                     &io,
                     conn,
@@ -474,7 +470,7 @@ mod destination_disconnect {
     //! Real destination HTTP ingress with an independently owned, pending page flight.
     use super::*;
     use crate::{
-        http::{Codec, connection::HttpIo},
+        http::{Codec, HttpIo},
         model::OriginContext,
         read::flight::{
             AcquisitionBudget, AcquisitionEvent, AcquisitionFailure, Flights, JoinedCopy,
@@ -773,13 +769,10 @@ mod destination_disconnect {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let upstream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let (socket, _) = listener.accept().unwrap();
-            let client = crate::http::connection::from_accepted(
-                upstream.try_clone().unwrap().into(),
-                &admission,
-            )
-            .unwrap();
-            let connection =
-                crate::http::connection::from_accepted(socket.into(), &admission).unwrap();
+            let client =
+                crate::http::from_accepted(upstream.try_clone().unwrap().into(), &admission)
+                    .unwrap();
+            let connection = crate::http::from_accepted(socket.into(), &admission).unwrap();
             let mut work = server.serve_connection(connection, &parent);
             let sender = Forwarding::new(signers[0].clone());
             let mut request = request(&admission, 41);
@@ -978,10 +971,7 @@ mod encrypted_http {
     //! Production page AEAD across independent keyrings and the signed HTTP transport.
     use super::*;
     use crate::{
-        http::{
-            Codec,
-            connection::{Endpoint, HttpIo, HttpPool},
-        },
+        http::{Codec, Endpoint, HttpIo, HttpPool},
         memory::CiphertextPage,
         runtime::{
             crypto::{self, CryptoClient},
@@ -1158,7 +1148,7 @@ mod encrypted_http {
                     None => {
                         accepts.set(accepts.get() + 1);
                         let fd = reactor.accept(listener.clone(), &scope).await?;
-                        let conn = crate::http::connection::from_accepted(fd, &admissions[1])?;
+                        let conn = crate::http::from_accepted(fd, &admissions[1])?;
                         crate::security::connection::accept(
                             &ios[1],
                             conn,
@@ -1344,10 +1334,7 @@ mod requester_safety {
     //! Real socket exchange with the adaptive controller attached to routing/requester.
     use crate::peer::*;
     use crate::{
-        http::{
-            Codec,
-            connection::{HttpIo, HttpPool},
-        },
+        http::{Codec, HttpIo, HttpPool},
         model::{MembershipVersion, ResourceClass},
         peer::{
             adaptive::{AdaptivePeers, Outcome},
@@ -1537,7 +1524,7 @@ mod requester_safety {
                     &scope,
                 )
                 .await?;
-            let conn = crate::http::connection::from_accepted(fd, &admission)?;
+            let conn = crate::http::from_accepted(fd, &admission)?;
             let conn = connection::accept(&io, conn, signers[2].clone(), &scope).await?;
             let received = io.receive_head(conn, &scope).await?;
             let (head, length) = decode_envelope(received.value, false)?;
@@ -1952,7 +1939,7 @@ mod timing {
         let server = async {
             // Only one accept and handshake: all three exchanges must reuse this session.
             let fd = reactor.accept(Rc::new(listener.into()), &scope).await?;
-            let connection = crate::http::connection::from_accepted(fd, &admission)?;
+            let connection = crate::http::from_accepted(fd, &admission)?;
             let mut connection =
                 crate::security::connection::accept(&io, connection, signers[2].clone(), &scope)
                     .await?;
@@ -2119,9 +2106,9 @@ pub(super) fn codec(admission: &Rc<flow_control::Quotas<AdmissionPolicy>>) -> Se
 pub(crate) struct SocketFixture {
     pub admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     pub reactor: Rc<crate::runtime::reactor::Reactor>,
-    pub io: Rc<crate::http::connection::HttpIo>,
+    pub io: Rc<crate::http::HttpIo>,
     pub codec: Rc<SecurityCodec>,
-    pub pool: Rc<crate::http::connection::HttpPool>,
+    pub pool: Rc<crate::http::HttpPool>,
 }
 
 impl SocketFixture {
@@ -2133,7 +2120,7 @@ impl SocketFixture {
             crate::test_support::cluster::config(false).limits,
         )));
         let reactor = Rc::new(crate::runtime::reactor::Reactor::new(admission.clone()));
-        let io = Rc::new(crate::http::connection::HttpIo::with_admission(
+        let io = Rc::new(crate::http::HttpIo::with_admission(
             reactor.clone(),
             crate::http::Codec::new(protocol::MAX_ENVELOPE_HEAD),
             admission.clone(),
@@ -2141,7 +2128,7 @@ impl SocketFixture {
         ));
         Self {
             codec: Rc::new(codec(&admission)),
-            pool: Rc::new(crate::http::connection::HttpPool::new(
+            pool: Rc::new(crate::http::HttpPool::new(
                 reactor.clone(),
                 admission.clone(),
                 pool_limit,

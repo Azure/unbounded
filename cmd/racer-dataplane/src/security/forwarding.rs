@@ -42,7 +42,6 @@
 use super::connection::{Signatures, SignedHead, node_field, receiver, signed_digest};
 use crate::{
     error::{Error, Result},
-    http::{MessageHead, StartLine},
     model::NodeId,
     peer::protocol::{
         self, PeerRequest, PeerResponse, SignedRequest, SignedResponse, field, number, push,
@@ -50,6 +49,7 @@ use crate::{
     },
     topology::routing::RouteBudget,
 };
+use http1::{MessageHead, StartLine};
 use racer_identity::VerifiedPeer;
 use std::{rc::Rc, sync::Arc};
 pub struct Forwarding {

@@ -2,13 +2,11 @@
 use super::protocol::{
     PeerResponse, SecurityCodec, SignedRequest, SignedResponse, decode_envelope, encode_envelope,
 };
+use crate::peer::protocol as p;
 use crate::telemetry::failures::{BodyProgress, Detail, Failure, Stage, timestamp};
 use crate::{
     error::{Error, Operation, Result},
-    http::{
-        connection::HttpIo,
-        connection::{ConnectionLease, HttpPool},
-    },
+    http::{ConnectionLease, HttpIo, HttpPool},
     model::{NodeId, ResourceClass, TransferId},
     rdma::Sessions,
     rdma::{
@@ -23,10 +21,7 @@ use crate::{
     },
     topology::rails::{RailId, TransportPlan},
 };
-use crate::{
-    http::{Header, MessageHead, StartLine},
-    peer::protocol as p,
-};
+use http1::{Header, MessageHead, StartLine};
 use std::{rc::Rc, sync::Arc, time::Duration};
 
 #[cfg(test)]
@@ -217,10 +212,7 @@ mod native_exchange_tests {
     //! Signed native offer/fallback exchanges over real sockets and optional hardware.
     use super::*;
     use crate::{
-        http::{
-            Codec, MessageHead, StartLine,
-            connection::{HttpIo, HttpPool},
-        },
+        http::{Codec, HttpIo, HttpPool},
         memory::BufferPool,
         model::{ExpiresAt, KeyId, Nonce, ObjectMetadata, PageEnvelope, ResourceClass, *},
         peer::protocol as p,
@@ -440,8 +432,8 @@ mod native_exchange_tests {
             response,
         };
         let (a, b) = UnixStream::pair().unwrap();
-        let a = crate::http::connection::from_accepted(a.into(), &admission).unwrap();
-        let b = crate::http::connection::from_accepted(b.into(), &admission).unwrap();
+        let a = crate::http::from_accepted(a.into(), &admission).unwrap();
+        let b = crate::http::from_accepted(b.into(), &admission).unwrap();
         let receive = async {
             let a = crate::security::connection::connect(
                 &receiver.io,
@@ -866,8 +858,8 @@ mod native_exchange_tests {
             .unwrap(),
         );
         let (a, b) = UnixStream::pair().unwrap();
-        let a = crate::http::connection::from_accepted(a.into(), &admission).unwrap();
-        let b = crate::http::connection::from_accepted(b.into(), &admission).unwrap();
+        let a = crate::http::from_accepted(a.into(), &admission).unwrap();
+        let b = crate::http::from_accepted(b.into(), &admission).unwrap();
         let receive = async {
             let a = crate::security::connection::connect(
                 &receiver.io,
@@ -2130,7 +2122,7 @@ pub enum RelayResponse {
     Complete(SignedResponse),
     Http {
         authentication: crate::security::forwarding::ForwardedHead,
-        connection: Box<crate::http::connection::ConnectionLease>,
+        connection: Box<crate::http::ConnectionLease>,
         length: usize,
     },
 }
@@ -2154,7 +2146,7 @@ impl Transfers {
     /// Authentication and charged decoding are mandatory, even for HTTP-only peers.
     ///
     /// ```compile_fail
-    /// use racer_dataplane::{http::connection::{HttpIo, HttpPool}, peer::transport::Transfers};
+    /// use racer_dataplane::{http::{HttpIo, HttpPool}, peer::transport::Transfers};
     /// use std::rc::Rc;
     /// fn unsigned(pool: Rc<HttpPool>, io: Rc<HttpIo>) {
     ///     let _ = Transfers::new(pool, io, None);
@@ -2199,7 +2191,7 @@ impl Transfers {
     /// A failed/abandoned exchange is never marked reusable.
     pub(super) fn exchange_timed<'a>(
         &'a self,
-        endpoint: crate::http::connection::Endpoint,
+        endpoint: crate::http::Endpoint,
         request: SignedRequest,
         plan: TransportPlan,
         membership: Option<crate::topology::membership::MembershipLease>,

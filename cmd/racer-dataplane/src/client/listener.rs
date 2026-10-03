@@ -5,7 +5,7 @@ use super::{RequestParser, response::Responses};
 use crate::{
     control::state::CacheDefinition,
     error::{Error, Operation, Result},
-    http::connection::{ConnectionLease, HttpIo},
+    http::{ConnectionLease, HttpIo},
     model::{CacheId, RequestId},
     read::ReadService,
     runtime::{
@@ -547,12 +547,11 @@ impl ClientListeners {
                         worked += 1;
                         continue;
                     }
-                    let connection =
-                        match crate::http::connection::from_accepted(socket, &self.admission) {
-                            Ok(connection) => connection,
-                            Err(Error::Overloaded) => break,
-                            Err(error) => return Err(error),
-                        };
+                    let connection = match crate::http::from_accepted(socket, &self.admission) {
+                        Ok(connection) => connection,
+                        Err(Error::Overloaded) => break,
+                        Err(error) => return Err(error),
+                    };
                     self.install_connection(
                         connection,
                         listener.definition.id.clone(),

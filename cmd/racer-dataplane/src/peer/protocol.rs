@@ -3,7 +3,7 @@
 //! lowercase hex. Encoders never include page bytes; transports preserve signed heads.
 use crate::{
     error::{Error, Result},
-    http::{Codec, Header, MessageHead, StartLine},
+    http::Codec,
     memory::{BufferPool, CiphertextPage},
     model::{
         EncryptedAuthorization, ExpiresAt, KeyId, MetadataSelector, Nonce, ObjectMetadata,
@@ -17,6 +17,7 @@ use crate::{
     topology::routing::RouteBudget,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
+use http1::{Header, MessageHead, StartLine};
 use std::{
     rc::Rc,
     sync::Arc,

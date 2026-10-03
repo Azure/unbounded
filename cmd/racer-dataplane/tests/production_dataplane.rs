@@ -9,7 +9,7 @@ use racer_dataplane::{
         state::{CacheDefinition, PublishedState, SnapshotStore, canonical_socket_paths},
     },
     error::{Error, Operation, Result},
-    http::{Codec, connection::HttpIo, connection::HttpPool},
+    http::{Codec, HttpIo, HttpPool},
     memory::{BufferPool, cache::MemoryCache, delivery::Delivery, new_pipe_pool},
     model::{Limits, PAGE_BYTES, ResourceClass, *},
     origin::OriginClient,
@@ -635,8 +635,7 @@ impl Rig {
         }
     }
     async fn serve(&self, stream: UnixStream, scope: &RequestScope) -> Result<()> {
-        let lease =
-            racer_dataplane::http::connection::from_accepted(stream.into(), &self.admission)?;
+        let lease = racer_dataplane::http::from_accepted(stream.into(), &self.admission)?;
         let received = self.io.receive_head(lease, scope).await?;
         let request = RequestParser::new(32768).parse(&CacheId(CACHE.into()), received.value)?;
         let kind = request.kind.clone();

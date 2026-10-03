@@ -8,7 +8,6 @@ pub mod response;
 use crate::runtime::collections::HashSet;
 use crate::{
     error::{Error, Result},
-    http::{MessageHead, StartLine, is_token, trim_ows},
     model::{
         Authorization, ByteRange, CacheId, CacheKey, ObjectId, OpaqueMetadata, OriginContext,
         PAGE_BYTES, StrongEtag,
@@ -16,6 +15,7 @@ use crate::{
 };
 
 pub use crate::{http::MAX_HEAD_BYTES, model::MAX_FIELD_BYTES};
+use http1::{MessageHead, StartLine, is_token, trim_ows};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReadKind {
@@ -252,7 +252,8 @@ fn validate_opaque(value: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::{Codec, Header};
+    use crate::http::Codec;
+    use http1::Header;
 
     fn head(method: &str, fields: &[(&str, &[u8])]) -> MessageHead {
         MessageHead {

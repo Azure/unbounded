@@ -140,11 +140,8 @@ impl Harness {
     }
 
     pub(super) fn peer_security(&mut self) {
-        use crate::{
-            http::{Codec, MessageHead, StartLine},
-            peer::protocol as p,
-            peer::protocol::encode_envelope,
-        };
+        use crate::{http::Codec, peer::protocol as p, peer::protocol::encode_envelope};
+        use http1::{MessageHead, StartLine};
         let receiver = self.rng.pick(self.nodes.len());
         let sender = (receiver + 1) % self.nodes.len();
         let keys = self.nodes[sender].workers[0].app.keys.clone();
@@ -405,7 +402,7 @@ impl Harness {
             .unwrap();
         listener_scope.cancel().unwrap();
         self.nodes[index].workers[0].app.peer_task.take();
-        let endpoint = crate::http::connection::Endpoint::Peer(address.to_string());
+        let endpoint = crate::http::Endpoint::Peer(address.to_string());
         for node in &self.nodes {
             node.workers[0].app.http.invalidate(&endpoint);
         }

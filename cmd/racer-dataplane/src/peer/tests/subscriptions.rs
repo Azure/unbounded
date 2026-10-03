@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    http::{Codec, connection::HttpIo},
+    http::{Codec, HttpIo},
     memory::page::CiphertextCopy,
     model::{ExpiresAt, ObjectMetadata, PageEnvelope},
     peer::subscriptions::{Demand, PageInterval, Subscription, TransferGrant},
@@ -716,10 +716,7 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
             )
             .await?;
         server
-            .serve_connection(
-                crate::http::connection::from_accepted(fd, &admission)?,
-                &scope,
-            )
+            .serve_connection(crate::http::from_accepted(fd, &admission)?, &scope)
             .await?;
         Ok::<_, Error>(())
     };

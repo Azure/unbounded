@@ -1,9 +1,8 @@
 //! Real head/body exchanges, parser boundaries, zeroization, and ownership fences.
 use super::*;
-use crate::{
-    http::{Codec, Header},
-    model::RequestId,
-};
+use crate::model::RequestId;
+use http1::{Header, StartLine};
+mod pool;
 use std::{
     future::Future,
     io::{Read, Write},

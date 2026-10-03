@@ -410,10 +410,10 @@ mod activation_tests {
     }
 }
 use crate::{
-    http::{Header, MessageHead, StartLine},
     model::*,
     security::connection::{Signatures, VerifiedHead},
 };
+use http1::{Header, MessageHead, StartLine};
 use std::{
     sync::{
         Arc,

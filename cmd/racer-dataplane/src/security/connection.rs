@@ -6,13 +6,11 @@
 use crate::peer::protocol::{self as p, field, number, push, push_binary};
 use crate::{
     error::{Error, Result},
-    http::{
-        Codec, MessageHead, StartLine,
-        connection::{ConnectionLease, HttpIo},
-    },
+    http::{Codec, ConnectionLease, HttpIo},
     model::NodeId,
     runtime::deadline::RequestScope,
 };
+use http1::{MessageHead, StartLine};
 use racer_identity::{Certificates, Keyring, VerifiedPeer};
 use sha2::{Digest, Sha256};
 use std::{
@@ -572,7 +570,7 @@ pub async fn connect(
     scope.check()?;
     connection = response.connection;
     connection.next_round()?;
-    crate::http::connection::install_session(
+    crate::http::install_session(
         &mut connection,
         Session::new(
             signatures.clone(),
@@ -631,10 +629,7 @@ pub async fn accept(
     scope.check()?;
     connection.next_round()?;
     let id = transcript(&peer, signatures.node(), &a, &b);
-    crate::http::connection::install_session(
-        &mut connection,
-        Session::new(signatures, peer, id, 1),
-    )?;
+    crate::http::install_session(&mut connection, Session::new(signatures, peer, id, 1))?;
     Ok(connection)
 }
 
@@ -944,10 +939,7 @@ mod signature_tests {
 pub(crate) mod tests {
     use super::*;
     use crate::{
-        http::{
-            Codec,
-            connection::{Endpoint, HttpPool},
-        },
+        http::{Codec, Endpoint, HttpPool},
         model::{RequestId, ResourceClass},
         runtime::{admission::AdmissionPolicy, reactor::Reactor},
     };
@@ -963,7 +955,7 @@ pub(crate) mod tests {
                 method: "POST".into(),
                 target: crate::peer::protocol::REQUEST_TARGET.into(),
             },
-            headers: vec![crate::http::Header {
+            headers: vec![http1::Header {
                 name: "content-length".into(),
                 value: b"0".to_vec(),
             }],
@@ -1029,9 +1021,9 @@ pub(crate) mod tests {
             crate::test_support::cluster::config(false).limits,
         ));
         let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
-        let mut conn = crate::http::connection::from_accepted(socket.into(), &admission).unwrap();
-        crate::http::connection::install_session(&mut conn, a).unwrap();
-        assert!(crate::http::connection::install_session(&mut conn, b).is_err());
+        let mut conn = crate::http::from_accepted(socket.into(), &admission).unwrap();
+        crate::http::install_session(&mut conn, a).unwrap();
+        assert!(crate::http::install_session(&mut conn, b).is_err());
         conn.set_framing(Some(0), Some(0), false);
         conn.next_round().unwrap();
         assert!(!conn.is_reusable());
@@ -1198,7 +1190,7 @@ pub(crate) mod tests {
             };
             let server = async {
                 let fd = reactor.accept(listener.clone(), &scope).await?;
-                let conn = crate::http::connection::from_accepted(fd, &admission)?;
+                let conn = crate::http::from_accepted(fd, &admission)?;
                 accept(&io, conn, n[1].clone(), &scope).await
             };
             let (mut client, mut server) =
@@ -1328,8 +1320,8 @@ pub(crate) mod tests {
         let scope = RequestScope::new(RequestId([2; 16]), Instant::now() + Duration::from_secs(10))
             .unwrap();
         let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
-        let a = crate::http::connection::from_accepted(a.into(), &admission).unwrap();
-        let b = crate::http::connection::from_accepted(b.into(), &admission).unwrap();
+        let a = crate::http::from_accepted(a.into(), &admission).unwrap();
+        let b = crate::http::from_accepted(b.into(), &admission).unwrap();
         let (mut a, mut b) = drive(&reactor, async {
             futures::try_join!(
                 connect(&io, a, n[0].clone(), n[1].node(), &scope),
@@ -1386,7 +1378,7 @@ pub(crate) mod tests {
             )
             .unwrap();
             let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
-            let conn = crate::http::connection::from_accepted(socket.into(), &admission).unwrap();
+            let conn = crate::http::from_accepted(socket.into(), &admission).unwrap();
             let mut work = Box::pin(accept(&io, conn, n[1].clone(), &scope));
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             assert!(work.as_mut().poll(&mut cx).is_pending());

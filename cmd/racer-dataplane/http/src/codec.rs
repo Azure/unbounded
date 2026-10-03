@@ -296,7 +296,7 @@ fn validate_opaque_edges(value: &[u8]) -> Result<()> {
     }
     Ok(())
 }
-fn is_token(b: u8) -> bool {
+pub fn is_token(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
 fn invalid_line_endings(bytes: &[u8]) -> bool {
@@ -305,7 +305,7 @@ fn invalid_line_endings(bytes: &[u8]) -> bool {
             || (*b == b'\r' && i + 1 < bytes.len() && bytes[i + 1] != b'\n')
     })
 }
-fn trim_ows(mut value: &[u8]) -> &[u8] {
+pub fn trim_ows(mut value: &[u8]) -> &[u8] {
     while value.first().is_some_and(|b| *b == b' ' || *b == b'\t') {
         value = &value[1..];
     }

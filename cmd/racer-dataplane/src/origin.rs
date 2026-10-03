@@ -6,11 +6,7 @@
 use crate::{
     control::state::{CacheDefinition, SnapshotStore, canonical_socket_paths},
     error::{Error, Operation, Result},
-    http::{
-        Header, MessageHead, StartLine,
-        connection::HttpIo,
-        connection::{ConnectionLease, Endpoint, HttpPool},
-    },
+    http::{ConnectionLease, Endpoint, HttpIo, HttpPool},
     memory::{BufferPool, PlaintextBuffer},
     model::{
         MetadataSelector, ObjectId, ObjectMetadata, OriginContext, PAGE_BYTES, PageId, PageNumber,
@@ -19,6 +15,7 @@ use crate::{
     read::candidates::OriginAuthority,
     runtime::{admission::AdmissionPolicy, deadline::RequestScope},
 };
+use http1::{Header, MessageHead, StartLine};
 use std::{
     path::{Path, PathBuf},
     rc::Rc,
@@ -484,10 +481,7 @@ pub fn validate_metadata(head: &MessageHead, object: &ObjectId) -> Result<Object
 #[cfg(test)]
 mod metadata_tests {
     use super::*;
-    use crate::{
-        http::{Header, StartLine},
-        model::{CacheId, CacheKey},
-    };
+    use crate::model::{CacheId, CacheKey};
     use std::time::{Duration, UNIX_EPOCH};
 
     pub(super) fn object() -> ObjectId {
@@ -674,10 +668,7 @@ fn validate_page_head(head: &MessageHead, page: &PageId) -> Result<(ObjectMetada
 #[cfg(test)]
 mod page_tests {
     use super::*;
-    use crate::{
-        http::StartLine,
-        model::{CacheId, CacheKey, ObjectId, ObjectVersion, PageNumber, StrongEtag},
-    };
+    use crate::model::{CacheId, CacheKey, ObjectId, ObjectVersion, PageNumber, StrongEtag};
 
     fn page() -> PageId {
         PageId {
@@ -741,9 +732,9 @@ mod page_tests {
 mod protocol {
     use crate::{
         error::{Error, Result},
-        http::{MessageHead, StartLine},
         model::{ExpiresAt, ObjectId, ObjectMetadata, ObjectVersion, StrongEtag},
     };
+    use http1::{MessageHead, StartLine};
 
     pub(super) fn field<'a>(head: &'a MessageHead, name: &str) -> Result<Option<&'a [u8]>> {
         let mut values = head
@@ -767,19 +758,9 @@ mod protocol {
             {
                 value
             } else {
-                trim_ows(value)
+                http1::trim_ows(value)
             }
         }))
-    }
-
-    fn trim_ows(mut value: &[u8]) -> &[u8] {
-        while matches!(value.first(), Some(b' ' | b'\t')) {
-            value = &value[1..];
-        }
-        while matches!(value.last(), Some(b' ' | b'\t')) {
-            value = &value[..value.len() - 1];
-        }
-        value
     }
 
     pub(super) fn required<'a>(head: &'a MessageHead, name: &str) -> Result<&'a [u8]> {
@@ -943,7 +924,7 @@ mod protocol {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::http::Header;
+        use http1::Header;
 
         #[test]
         fn optional_content_type_is_validated_without_transport_substitution() {

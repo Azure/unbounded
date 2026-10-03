@@ -190,11 +190,8 @@ mod tests {
 
     #[test]
     fn movable_production_buffers_preserve_subrange_through_completion() {
-        use crate::{
-            http::connection::{BufferRange, OwnedBuffer},
-            memory::BufferPool,
-            peer::transport::WireBuffer,
-        };
+        use crate::{http::OwnedBuffer, memory::BufferPool, peer::transport::WireBuffer};
+        use http1::connection::BufferRange;
         fn check<B: IoBuffer>(buffer: B)
         where
             Error: From<B::Error>,
@@ -209,9 +206,7 @@ mod tests {
             assert_eq!(buffer.bytes().unwrap(), &[0, 7, 0]);
         }
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits(4))));
-        check(
-            OwnedBuffer::new(&crate::http::connection::HttpContext(admission.clone()), 3).unwrap(),
-        );
+        check(OwnedBuffer::new(&crate::http::HttpContext(admission.clone()), 3).unwrap());
         check(WireBuffer::new(&admission, 3).unwrap());
         let pool = BufferPool::new(admission.clone());
         check(

@@ -3,7 +3,7 @@ use super::candidates::{CandidatePolicy, CandidateResolution};
 use super::flight::AcquisitionBudget;
 use crate::{
     error::{Error, Operation},
-    http::{Codec, connection::HttpIo, connection::HttpPool},
+    http::{Codec, HttpIo, HttpPool},
     memory::BufferPool,
     model::{ExpiresAt, MetadataSelector, ObjectMetadata, OriginContext, *},
     peer::{
@@ -505,7 +505,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
                 &scope,
             )
             .await?;
-        let connection = crate::http::connection::from_accepted(fd, &admission)?;
+        let connection = crate::http::from_accepted(fd, &admission)?;
         server.serve_connection(connection, &scope).await?;
         Ok::<(), Error>(())
     };
@@ -638,7 +638,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
             )),
         );
         assert!(matches!(responses.error_head(expected).unwrap().start,
-                crate::http::StartLine::Response { status }
+                http1::StartLine::Response { status }
                 if status == if matches!(case, Absence::Fresh | Absence::Subscription) { 404 } else { 412 }));
     } else if forbidden {
         assert!(matches!(result, Err(Error::OriginForbidden)));

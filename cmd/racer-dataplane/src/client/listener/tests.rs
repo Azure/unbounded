@@ -815,8 +815,7 @@ impl Fixture {
             panic!("client endpoint delivered a peer socket");
         };
         let connection =
-            crate::http::connection::from_reserved(accepted.fd.into(), accepted.reservation)
-                .unwrap();
+            crate::http::from_reserved(accepted.fd.into(), accepted.reservation).unwrap();
         self.listeners
             .install_connection(connection, cache, retired)
             .unwrap();

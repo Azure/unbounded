@@ -84,7 +84,8 @@ fn signed_opaque_relay_roundtrip_and_exact_attempt_binding() {
 
 #[test]
 fn not_found_is_authenticated_through_relay_and_restricted_to_fresh_acquire() {
-    use crate::{http::StartLine, peer::protocol as p};
+    use crate::peer::protocol as p;
+    use http1::StartLine;
     let signers = signers();
     let auth: Vec<_> = signers.iter().map(|s| Forwarding::new(s.clone())).collect();
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
@@ -321,7 +322,7 @@ fn search_view_consumes_ingress_without_changing_signed_route() {
 #[test]
 fn server_authenticates_before_copy_only_service_and_signs_failures() {
     use crate::{
-        http::{Codec, connection::HttpIo},
+        http::{Codec, HttpIo},
         runtime::reactor::Reactor,
         topology::{
             health::LinkHealth,
@@ -440,11 +441,11 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
 #[test]
 fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
     use crate::{
-        http::{MessageHead, StartLine},
         peer::protocol as p,
         security::connection::signed_digest,
         topology::membership::{Member, Membership},
     };
+    use http1::{MessageHead, StartLine};
     let signers = signers();
     let membership = Arc::new(
         Membership::validate(
@@ -736,10 +737,7 @@ fn v5_equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
 fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
     use super::PeerClient;
     use crate::{
-        http::{
-            Codec,
-            connection::{HttpIo, HttpPool},
-        },
+        http::{Codec, HttpIo, HttpPool},
         runtime::reactor::Reactor,
         topology::{
             health::LinkHealth,
@@ -1056,7 +1054,7 @@ fn signed_tcp_case(case: &str) {
                 &scope,
             )
             .await?;
-        let connection = crate::http::connection::from_accepted(fd, &admission)?;
+        let connection = crate::http::from_accepted(fd, &admission)?;
         server.serve_connection(connection, &listener_scope).await?;
         Ok::<(), Error>(())
     };
@@ -1094,7 +1092,7 @@ fn signed_tcp_case(case: &str) {
 #[test]
 fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
     use crate::{
-        http::{Codec, connection::HttpIo},
+        http::{Codec, HttpIo},
         runtime::reactor::Reactor,
         topology::{health::LinkHealth, routing::Paths},
     };
@@ -1198,14 +1196,10 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
         let (socket, mut peer) = UnixStream::pair().unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
-        let mut connection =
-            crate::http::connection::from_accepted(socket.into(), &admission).unwrap();
+        let mut connection = crate::http::from_accepted(socket.into(), &admission).unwrap();
         if case == "idle" {
-            let client = crate::http::connection::from_accepted(
-                peer.try_clone().unwrap().into(),
-                &admission,
-            )
-            .unwrap();
+            let client =
+                crate::http::from_accepted(peer.try_clone().unwrap().into(), &admission).unwrap();
             let (client, accepted) = drive(&reactor, async {
                 futures::try_join!(
                     crate::security::connection::connect(
@@ -1298,11 +1292,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
 #[test]
 fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     use crate::{
-        http::{
-            Codec,
-            connection::HttpIo,
-            connection::{Endpoint, HttpPool},
-        },
+        http::{Codec, Endpoint, HttpIo, HttpPool},
         model::{ExpiresAt, ObjectMetadata, PageEnvelope},
         peer::protocol,
         runtime::reactor::Reactor,
@@ -1425,7 +1415,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
                 &scope,
             )
             .await?;
-        let conn = crate::http::connection::from_accepted(fd, &admission)?;
+        let conn = crate::http::from_accepted(fd, &admission)?;
         let mut conn =
             crate::security::connection::accept(&io, conn, signers[2].clone(), &scope).await?;
         for attempt in 0..3 {
@@ -1566,7 +1556,7 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
         if neighbors.contains(&member.node) {
             assert_eq!(
                 endpoint.unwrap(),
-                crate::http::connection::Endpoint::Peer(member.peer_endpoint.clone())
+                crate::http::Endpoint::Peer(member.peer_endpoint.clone())
             );
         } else {
             assert!(matches!(endpoint, Err(Error::InvalidRequest)));
@@ -1587,10 +1577,7 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
 mod established_sessions {
     use super::*;
     use crate::{
-        http::{
-            Codec,
-            connection::{ConnectionLease, HttpIo},
-        },
+        http::{Codec, ConnectionLease, HttpIo},
         peer::protocol as p,
         runtime::reactor::Reactor,
         security::connection,
@@ -1726,11 +1713,11 @@ mod established_sessions {
         fn sockets(&self) -> (ConnectionLease, ConnectionLease) {
             let (a, b) = UnixStream::pair().unwrap();
             (
-                crate::http::connection::from_accepted(a.into(), &self.admission).unwrap(),
-                crate::http::connection::from_accepted(b.into(), &self.admission).unwrap(),
+                crate::http::from_accepted(a.into(), &self.admission).unwrap(),
+                crate::http::from_accepted(b.into(), &self.admission).unwrap(),
             )
         }
-        fn frame(&self, large: bool) -> crate::http::MessageHead {
+        fn frame(&self, large: bool) -> http1::MessageHead {
             let mut request = request(&self.admission, 1);
             if large {
                 request.origin.metadata =

@@ -35,7 +35,7 @@ fn peer_tcp_nodelay_assembled_outbound_and_distributed_accept() {
         let mut serving = app.peers.listen(address, &scope);
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(serving.as_mut().poll(&mut cx).is_pending());
-        let endpoint = crate::http::connection::Endpoint::Peer(address.to_string());
+        let endpoint = crate::http::Endpoint::Peer(address.to_string());
         let mut connecting = app.http.checkout(&endpoint, &scope);
         let mut outbound = None;
         let mut inbound = None;
@@ -131,8 +131,7 @@ fn assembly_applies_configured_client_request_timeout() {
             .admission
             .reserve_connection(ResourceClass::IngressConnection)
             .unwrap();
-        let connection =
-            crate::http::connection::from_reserved(server.into(), reservation).unwrap();
+        let connection = crate::http::from_reserved(server.into(), reservation).unwrap();
         app.clients
             .install_connection(
                 connection,
@@ -295,7 +294,7 @@ fn assembly_uses_node_metrics_for_sparse_worker_ids() {
     assert_eq!(second.telemetry.metrics.gauge(Gauge::ActiveRequests), 0);
 }
 use crate::{
-    http::{Codec, Header, MessageHead, StartLine},
+    http::Codec,
     model::{ExpiresAt, MetadataSelector, ObjectMetadata, ResourceClass, *},
     peer::protocol::{
         self, FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse, decode_envelope,
@@ -307,6 +306,7 @@ use crate::{
     },
     topology::routing::RouteBudget,
 };
+use http1::{Header, MessageHead, StartLine};
 use std::{future::Future, os::unix::net::UnixStream};
 
 fn drive<T>(reactor: &Reactor, future: impl Future<Output = T>) -> T {
@@ -430,8 +430,8 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
     let mut destination = None;
     for index in 1..=protocol::MAX_HOPS {
         let (left, right) = UnixStream::pair().unwrap();
-        let left = crate::http::connection::from_accepted(left.into(), admission).unwrap();
-        let right = crate::http::connection::from_accepted(right.into(), admission).unwrap();
+        let left = crate::http::from_accepted(left.into(), admission).unwrap();
+        let right = crate::http::from_accepted(right.into(), admission).unwrap();
         let next = node(index);
         let (left, right) = drive(reactor, async {
             futures::try_join!(
@@ -614,13 +614,13 @@ fn assembled_peer_io_rejects_oversize_and_admission_pressure_before_submission()
         }],
     };
     let (socket, _other) = UnixStream::pair().unwrap();
-    let conn = crate::http::connection::from_accepted(socket.into(), admission).unwrap();
+    let conn = crate::http::from_accepted(socket.into(), admission).unwrap();
     assert!(matches!(
         drive(reactor, io.send_head(conn, head(), &scope)),
         Err(Error::HeaderTooLarge)
     ));
     let (socket, mut other) = UnixStream::pair().unwrap();
-    let conn = crate::http::connection::from_accepted(socket.into(), admission).unwrap();
+    let conn = crate::http::from_accepted(socket.into(), admission).unwrap();
     let writer = std::thread::spawn(move || {
         let _ = other.write_all(&vec![b'x'; protocol::MAX_ENVELOPE_HEAD + 1]);
     });
@@ -662,7 +662,7 @@ fn assembled_peer_io_rejects_oversize_and_admission_pressure_before_submission()
         other
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
-        let conn = crate::http::connection::from_accepted(socket.into(), admission).unwrap();
+        let conn = crate::http::from_accepted(socket.into(), admission).unwrap();
         let operation = async {
             if send {
                 io.send_head(conn, response(), &scope).await.map(|_| ())
