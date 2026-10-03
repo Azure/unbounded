@@ -176,7 +176,7 @@ impl Drop for Receipt {
 }
 struct Active {
     cancellation: Result<crate::runtime::deadline::CancellationRegistration>,
-    runnable: Arc<super::drivers::Runnable>,
+    runnable: Arc<uring_runtime::drivers::Runnable>,
     future: Operation<'static, ()>,
     scope: RequestScope,
     caller: RequestScope,
@@ -728,7 +728,7 @@ impl WorkerEndpoint {
                 let reply = command.reply.clone();
                 self.active.push_back(Active {
                     cancellation: caller.cancellation.subscribe(),
-                    runnable: super::drivers::Runnable::new(),
+                    runnable: uring_runtime::drivers::Runnable::new(),
                     scope: active_scope,
                     caller,
                     reply,
@@ -1184,7 +1184,7 @@ mod tests {
             let caller = scope();
             endpoint.active.push_back(Active {
                 cancellation: caller.cancellation.subscribe(),
-                runnable: crate::read::drivers::Runnable::new(),
+                runnable: uring_runtime::drivers::Runnable::new(),
                 scope: scope(),
                 caller,
                 reply: Arc::new(Reply {

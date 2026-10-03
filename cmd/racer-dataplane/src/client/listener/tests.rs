@@ -1124,7 +1124,7 @@ fn accepted_client_wakes_before_first_poll_and_blocked_clients_are_fair() {
         senders.push(send);
         let order = order.clone();
         fixture.listeners.active.borrow_mut().push_back(Active {
-            runnable: crate::read::drivers::Runnable::new(),
+            runnable: uring_runtime::drivers::Runnable::new(),
             deadline: Rc::new(Cell::new(Instant::now() + Duration::from_secs(5))),
             expired: None,
             cache: definition().id,
@@ -1174,7 +1174,7 @@ fn accepted_client_wakes_before_first_poll_and_blocked_clients_are_fair() {
     assert_eq!(fixture.listeners.active_connections(), 0);
     let mut yielded = false;
     fixture.listeners.active.borrow_mut().push_back(Active {
-        runnable: crate::read::drivers::Runnable::new(),
+        runnable: uring_runtime::drivers::Runnable::new(),
         deadline: Rc::new(Cell::new(Instant::now() + Duration::from_secs(5))),
         expired: None,
         cache: definition().id,

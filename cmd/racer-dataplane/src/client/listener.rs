@@ -139,7 +139,7 @@ impl Drop for BoundListener {
 }
 
 struct Active {
-    runnable: Arc<crate::read::drivers::Runnable>,
+    runnable: Arc<uring_runtime::drivers::Runnable>,
     deadline: Rc<Cell<std::time::Instant>>,
     expired: Option<std::time::Instant>,
     cache: CacheId,
@@ -258,7 +258,7 @@ impl ClientListeners {
             .await
         });
         self.active.borrow_mut().push_back(Active {
-            runnable: crate::read::drivers::Runnable::new(),
+            runnable: uring_runtime::drivers::Runnable::new(),
             deadline,
             expired: None,
             cache,

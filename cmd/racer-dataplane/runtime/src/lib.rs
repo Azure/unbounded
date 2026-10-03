@@ -6,6 +6,7 @@
 pub mod affinity;
 pub mod channel;
 pub mod deadline;
+pub mod drivers;
 pub mod environment;
 pub mod group;
 pub mod reactor;
