@@ -666,7 +666,7 @@ pub(crate) mod test_support {
             catalog::{Index, SegmentClock},
         },
         test_support::origin::AdapterOrigin,
-        topology::{membership::Member, placement::Placement},
+        topology::{membership::Member, routing::Placement},
     };
     use std::{cell::RefCell, num::NonZeroU32, rc::Rc, sync::Arc, task::Context};
 

@@ -93,7 +93,7 @@ pub struct Delivery {
 /// A reader pins an immutable page and a separately admitted pipe for its lifetime.
 /// Each reader has its own staging pipe and socket-accepted cursor.
 pub struct ReaderLease {
-    _active: crate::telemetry::metrics::GaugeLease,
+    _active: ::telemetry::Lease,
     page: VerifiedPage,
     pipe: PipeLease<AdmissionPolicy>,
     slice: PageSlice,

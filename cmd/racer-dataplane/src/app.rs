@@ -60,7 +60,10 @@ use crate::{
         checkpoint::{CheckpointGeometry, Checkpointer, Recovery, ShardImage},
     },
     telemetry::Telemetry,
-    topology::{health::LinkHealth, placement::Placement, routing::Paths},
+    topology::{
+        health::LinkHealth,
+        routing::{Paths, Placement},
+    },
 };
 use racer_identity::{Certificates, KeyEpochs, KeyPurpose, Keyring};
 #[cfg(test)]
@@ -938,7 +941,7 @@ impl WorkerApplication {
                 .with_peer_admission(node.peer_admission.clone()),
         );
         let placement = Rc::new(Placement::with_memory_budget(
-            limits.cached_rankings.get() * crate::topology::placement::RANKING_BYTES,
+            limits.cached_rankings.get() * crate::topology::routing::RANKING_BYTES,
         ));
         let network = Rc::new(crate::peer::PeerNetwork::new(
             config.node.clone(),

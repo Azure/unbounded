@@ -272,7 +272,7 @@ fn real_uds_root_remapping_keeps_public_authority_and_http_validation() {
     use crate::{
         peer::protocol::{FetchMode, Operation as PeerOperation},
         read::candidates::{CandidatePolicy, CandidateResolution},
-        topology::placement::Placement,
+        topology::routing::Placement,
     };
     use std::os::fd::AsRawFd;
     struct Directory(PathBuf);
@@ -943,7 +943,7 @@ fn public_operations_reject_wrong_authority_before_io() {
         read::candidates::{CandidatePolicy, CandidateResolution},
         topology::{
             membership::{Member, Membership},
-            placement::Placement,
+            routing::Placement,
         },
     };
     let node = NodeId("node".into());

@@ -138,8 +138,6 @@ metrics! { Gauge, GAUGES, GAUGE_COUNT;
             Self::DiskPageEntries => "racer_disk_page_index_capacity",
             Self::CheckpointSequence => "racer_checkpoint_sequence",
 }
-/// Keep with the actual resource, including through a submitted I/O fence.
-pub type GaugeLease = ::telemetry::Lease;
 /// One nonempty intermediate HTTP relay_body call, after sending its response head.
 /// Success credits the entire ciphertext body only after both HTTP finish checks.
 /// Error or abandonment credits one failure and no bytes, even after partial writes.
@@ -170,7 +168,7 @@ impl Drop for OpaqueRelayBody<'_> {
 }
 /// One complete client head through final delivery, including cancellation/drop.
 pub(crate) struct RequestMetrics {
-    _active: GaugeLease,
+    _active: ::telemetry::Lease,
     metrics: Metrics,
     succeeded: bool,
     overloaded: bool,
@@ -292,7 +290,8 @@ impl Metrics {
     pub(crate) fn add_gauge(&self, gauge: Gauge, value: u64) {
         self.core.increase(gauge, value);
     }
-    pub fn lease(&self, gauge: Gauge) -> Result<GaugeLease> {
+    /// Keep with the actual resource, including through a submitted I/O fence.
+    pub fn lease(&self, gauge: Gauge) -> Result<::telemetry::Lease> {
         self.core
             .lease(gauge)
             .ok_or(crate::error::Error::Overloaded)

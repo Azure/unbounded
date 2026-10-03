@@ -279,7 +279,7 @@ impl SubscriptionFixture {
         let peers = Rc::new(NoPeer);
         let candidates = Rc::new(CandidatePolicy::new(
             keys.node().clone(),
-            Rc::new(topology::placement::Placement::new(16)),
+            Rc::new(topology::routing::Placement::new(16)),
             peers.clone(),
             credentials.clone(),
             Arc::new(Default::default()),

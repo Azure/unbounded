@@ -47,7 +47,7 @@ use racer_dataplane::{
     topology::{
         health::LinkHealth,
         membership::{Member, MembershipLease},
-        placement::Placement,
+        routing::Placement,
         routing::{Paths, RouteBudget},
     },
 };

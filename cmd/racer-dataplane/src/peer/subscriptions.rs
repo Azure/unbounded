@@ -235,7 +235,7 @@ impl Subscriptions {
         membership: crate::topology::membership::MembershipLease,
         receiver: NodeId,
         local: &NodeId,
-        placement: &crate::topology::placement::Placement,
+        placement: &crate::topology::routing::Placement,
         scope: &crate::runtime::deadline::RequestScope,
     ) -> Result<Selection> {
         use crate::peer::protocol::{encode_deadline, millis};

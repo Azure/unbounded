@@ -1,11 +1,11 @@
 //! Typed boundary failures. Error values contain no headers, tokens, or body bytes.
 
-use std::{fmt, future::Future, pin::Pin};
+use std::fmt;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Worker-local future: deliberately not `Send`, and never drives a hidden executor.
-pub type Operation<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + 'a>>;
+pub type Operation<'a, T> = uring_runtime::Operation<'a, T, Error>;
 
 /// Yield one cooperative turn without retaining an executor or I/O owner.
 pub(crate) async fn cooperative_turn() {
@@ -144,7 +144,20 @@ impl From<uring_runtime::Error> for Error {
 
 #[cfg(test)]
 mod tests {
-    use super::Error;
+    use super::{Error, Operation};
+
+    #[test]
+    fn operation_preserves_local_borrows_and_racer_results() {
+        let value = std::rc::Rc::new(7);
+        let operation: Operation<'_, _> = Box::pin(async { Ok(*value) });
+        let operation: uring_runtime::Operation<'_, _, Error> = operation;
+        assert_eq!(futures::executor::block_on(operation), Ok(7));
+        let operation: Operation<'_, ()> = Box::pin(async { Err(Error::HopBudgetExhausted) });
+        assert_eq!(
+            futures::executor::block_on(operation),
+            Err(Error::HopBudgetExhausted)
+        );
+    }
 
     #[test]
     fn quota_errors_keep_racer_boundary_meanings() {

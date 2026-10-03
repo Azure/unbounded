@@ -9,6 +9,7 @@ use crate::{
     error::{Error, Result},
     model::{MembershipVersion, NodeId},
 };
+use racer_control_wire::valid_site;
 use std::{net::SocketAddr, num::NonZeroU32, sync::Arc};
 
 pub const MAX_MEMBERS: usize = 100_000;
@@ -144,10 +145,15 @@ impl Membership {
     pub fn member(&self, node: &NodeId) -> Result<&Member> {
         Ok(&self.members()[self.position(node)?])
     }
-}
-
-pub(crate) fn valid_site(value: &str) -> bool {
-    racer_control_wire::valid_site(value)
+    pub fn neighbors(&self, node: &NodeId) -> Result<Vec<NodeId>> {
+        let position = self.position(node)?;
+        Ok(self
+            .inner
+            .neighbors(position)
+            .into_iter()
+            .map(|index| self.members()[index].node.clone())
+            .collect())
+    }
 }
 
 fn valid_identity(value: &str) -> bool {

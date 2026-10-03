@@ -381,7 +381,7 @@ fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
             budget.remaining_links(),
             budget.deadline(),
         );
-        let candidates = crate::topology::placement::Candidates {
+        let candidates = crate::topology::routing::Candidates {
             membership: f.membership.clone(),
             ordered,
         };
@@ -1060,7 +1060,7 @@ fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
         (ordered[0].clone(), Reply::Copy(good.clone())),
         (ordered[1].clone(), Reply::Copy(good)),
     ]);
-    let candidates = crate::topology::placement::Candidates {
+    let candidates = crate::topology::routing::Candidates {
         membership: f.membership.clone(),
         ordered,
     };

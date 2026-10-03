@@ -884,7 +884,7 @@ fn production_peer_and_failed_neighbor_progress() {
         model::{CacheId, CacheKey, MembershipVersion, NodeId, ObjectId, PageNumber},
         topology::{
             membership::{Member, Membership},
-            placement::Placement,
+            routing::Placement,
         },
     };
     const OTHER: &str = "33333333-3333-4333-8333-333333333333";
@@ -1022,7 +1022,7 @@ fn production_remote_bootstrap_one_get_and_empty() {
         model::{CacheId, CacheKey, MembershipVersion, NodeId, ObjectId, PageNumber},
         topology::{
             membership::{Member, Membership},
-            placement::Placement,
+            routing::Placement,
         },
     };
     for length in [0, 113] {

@@ -265,7 +265,7 @@ impl StoreReader {
 }
 
 struct Dirty {
-    _metric: crate::telemetry::metrics::GaugeLease,
+    _metric: ::telemetry::Lease,
     ticket: u64,
     page: CiphertextCopy,
     _reservation: Rc<flow_control::Charge<AdmissionPolicy>>,

@@ -1103,7 +1103,7 @@ use crate::{
     store::catalog::{Index, SegmentClock},
     topology::{
         membership::{Member, Membership},
-        placement::Placement,
+        routing::Placement,
     },
 };
 use std::{

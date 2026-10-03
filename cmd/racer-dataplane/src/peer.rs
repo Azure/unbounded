@@ -150,10 +150,7 @@ impl PeerNetwork {
         membership: &MembershipLease,
         node: &NodeId,
     ) -> Result<crate::http::connection::Endpoint> {
-        if !crate::topology::routing::Graph::new(membership.clone())
-            .neighbors(&self.local)?
-            .contains(node)
-        {
+        if !membership.neighbors(&self.local)?.contains(node) {
             return Err(Error::InvalidRequest);
         }
         let member = membership.member(node)?;

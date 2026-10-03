@@ -167,12 +167,12 @@ impl Config {
             Duration::from_millis(number("RACER_READER_STALL_TIMEOUT_MS", 10_000)?);
         let shutdown_timeout = Duration::from_millis(number("RACER_SHUTDOWN_TIMEOUT_MS", 30_000)?);
         let ranking_bytes = number("RACER_PLACEMENT_CACHE_BYTES", 16 * MIB)?;
-        if ranking_bytes < crate::topology::placement::RANKING_BYTES as u64
+        if ranking_bytes < crate::topology::routing::RANKING_BYTES as u64
             || ranking_bytes > 512 * MIB
         {
             return Err(Error::InvalidConfiguration);
         }
-        let ranking_entries = ranking_bytes / crate::topology::placement::RANKING_BYTES as u64;
+        let ranking_entries = ranking_bytes / crate::topology::routing::RANKING_BYTES as u64;
         let mut limit = |name: &str, default| {
             NonZeroUsize::new(to_usize(number(name, default)?)?).ok_or(Error::InvalidConfiguration)
         };

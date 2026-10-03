@@ -511,7 +511,7 @@ use crate::{
     },
 };
 use ::telemetry::server::{self, Handler, Response, Server};
-use metrics::{Event, Gauge, GaugeLease};
+use metrics::{Event, Gauge};
 #[cfg(test)]
 use std::net::TcpListener;
 #[cfg(test)]
@@ -681,8 +681,8 @@ struct DiagnosticHandler<'a> {
     admission: &'a flow_control::Quotas<AdmissionPolicy>,
 }
 impl Handler for DiagnosticHandler<'_> {
-    type Connection = GaugeLease;
-    fn connect(&self) -> Option<GaugeLease> {
+    type Connection = ::telemetry::Lease;
+    fn connect(&self) -> Option<::telemetry::Lease> {
         self.telemetry
             .metrics
             .lease(Gauge::DiagnosticConnections)

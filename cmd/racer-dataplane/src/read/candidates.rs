@@ -15,8 +15,7 @@ use crate::{
     security::credentials::CredentialCrypto,
     topology::{
         membership::MembershipLease,
-        placement::{Candidates, Placement},
-        routing::RouteBudget,
+        routing::{Candidates, Placement, RouteBudget},
     },
 };
 #[cfg(test)]

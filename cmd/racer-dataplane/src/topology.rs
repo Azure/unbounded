@@ -168,7 +168,7 @@ pub mod health {
             model::PageNumber,
             topology::{
                 fixtures::{membership, object},
-                placement::Placement,
+                routing::Placement,
             },
         };
         #[test]
@@ -322,7 +322,6 @@ pub mod health {
     }
 }
 pub mod membership;
-pub mod placement;
 pub mod rails {
     //! RDMA requires compatible authenticated mappings; discovery can only veto.
     use super::{

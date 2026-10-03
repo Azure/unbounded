@@ -36,7 +36,7 @@ use crate::{
     },
     topology::{
         membership::{Member, Membership},
-        placement::Placement,
+        routing::Placement,
     },
 };
 use std::{

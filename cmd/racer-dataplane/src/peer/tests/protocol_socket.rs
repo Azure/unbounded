@@ -1519,10 +1519,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
 }
 #[test]
 fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
-    use crate::topology::{
-        membership::{Member, Membership},
-        routing::Graph,
-    };
+    use crate::topology::membership::{Member, Membership};
     let membership = Arc::new(
         Membership::validate(
             MembershipVersion(7),
@@ -1548,7 +1545,7 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
         network.membership(membership.version),
         Err(Error::IncompatibleMembership)
     ));
-    let neighbors = Graph::new(membership.clone()).neighbors(&local).unwrap();
+    let neighbors = membership.neighbors(&local).unwrap();
     assert!(neighbors.len() < membership.members().len() - 1);
     assert_eq!(neighbors.len(), 62);
     {

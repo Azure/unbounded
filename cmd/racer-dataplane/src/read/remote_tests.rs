@@ -19,8 +19,8 @@ use crate::{
     topology::{
         health::LinkHealth,
         membership::{Member, Membership},
-        placement::Placement,
         routing::Paths,
+        routing::Placement,
     },
 };
 use racer_identity::Keyring;

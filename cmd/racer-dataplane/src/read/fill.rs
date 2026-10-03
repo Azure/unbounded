@@ -1061,7 +1061,7 @@ impl Fill {
             .dependencies
             .candidates
             .resolve_after_hedge(
-                crate::topology::placement::Candidates {
+                crate::topology::routing::Candidates {
                     membership: candidates.membership.clone(),
                     ordered: candidates.ordered.clone(),
                 },
