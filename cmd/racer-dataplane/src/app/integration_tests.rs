@@ -32,15 +32,15 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
             cluster: config.cluster.clone(),
             generation: wire::BundleGeneration(2),
             peer_trust_roots: (*first.keys.peer_trust_roots().unwrap()).clone(),
-            cache_keys: vec![wire::CacheEncryptionKey {
-                key: wire::CacheKeyRef {
+            cache_keys: vec![wire::CacheEncryptionKey::new(
+                wire::CacheKeyRef {
                     cache: definition().id,
-                    id: crate::model::KeyId::from_generation(2, 7).unwrap(),
+                    id: crate::model::key_id_from_generation(2, 7).unwrap(),
                     purpose: wire::CacheKeyPurpose::Page,
                 },
-                state: wire::CacheKeyState::Active,
-                material: [19; 32],
-            }],
+                wire::CacheKeyState::Active,
+                zeroize::Zeroizing::new([19; 32]),
+            )],
         })
         .unwrap();
     let late0 = page(&first);
@@ -472,7 +472,7 @@ fn same_node_renewal_backs_off_expires_closed_and_recovers() {
 
 #[test]
 fn removal_publication_finishes_locally_after_controller_disappears() {
-    use crate::model::{KeyId, VersionMetadata, *};
+    use crate::model::{VersionMetadata, *};
     let mut fixture = ControlFixture::new();
     let mut config = fixture.config.take().unwrap();
     let diagnostic_address = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -511,15 +511,15 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
             cluster: config.cluster.clone(),
             generation: wire::BundleGeneration(2),
             peer_trust_roots: (*worker.keys.peer_trust_roots().unwrap()).clone(),
-            cache_keys: vec![wire::CacheEncryptionKey {
-                key: wire::CacheKeyRef {
+            cache_keys: vec![wire::CacheEncryptionKey::new(
+                wire::CacheKeyRef {
                     cache: keep.id.clone(),
-                    id: KeyId::from_generation(2, 9).unwrap(),
+                    id: crate::model::key_id_from_generation(2, 9).unwrap(),
                     purpose: wire::CacheKeyPurpose::Page,
                 },
-                state: wire::CacheKeyState::Active,
-                material: [29; 32],
-            }],
+                wire::CacheKeyState::Active,
+                zeroize::Zeroizing::new([29; 32]),
+            )],
         })
         .unwrap();
     let metadata = VersionMetadata {
@@ -882,7 +882,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
     let cache = crate::model::CacheId("33333333-3333-4333-8333-333333333333".into());
     let key = wire::CacheKeyRef {
         cache: cache.clone(),
-        id: crate::model::KeyId::from_generation(2, 8).unwrap(),
+        id: crate::model::key_id_from_generation(2, 8).unwrap(),
         purpose: wire::CacheKeyPurpose::Page,
     };
     let roots = (*keys.peer_trust_roots().unwrap()).clone();
@@ -891,11 +891,11 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
         cluster: app.config.cluster.clone(),
         generation: wire::BundleGeneration(2),
         peer_trust_roots: roots.clone(),
-        cache_keys: vec![wire::CacheEncryptionKey {
-            key: key.clone(),
-            state: wire::CacheKeyState::Active,
-            material: [21; 32],
-        }],
+        cache_keys: vec![wire::CacheEncryptionKey::new(
+            key.clone(),
+            wire::CacheKeyState::Active,
+            zeroize::Zeroizing::new([21; 32]),
+        )],
     })
     .unwrap();
     let lease = keys.lease(Some(&cache), key.id, KeyPurpose::Page).unwrap();
@@ -909,7 +909,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
     .unwrap();
     let until = Instant::now() + Duration::from_secs(10);
     assert!(keys.lease(Some(&cache), key.id, KeyPurpose::Page).is_err());
-    assert_eq!(lease.material(KeyPurpose::Page).unwrap(), &[21; 32]);
+    crate::security::fixtures::assert_page_key(&lease, &[21; 32]);
     assert!(node.observations.health.ready());
     drop(lease);
     while !node.observations.health.ready() {
@@ -1088,7 +1088,10 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
         .clone();
     let lease = worker.keys.active(&cache, KeyPurpose::Page).unwrap();
     let old_id = lease.id();
-    let old_material = *lease.material(KeyPurpose::Page).unwrap();
+    let mut old_sealed = [0; 19];
+    lease
+        .seal_page(&cache, &[1; 24], b"retained", b"abc", &mut old_sealed)
+        .unwrap();
     fixture.hold_long_poll.store(true, Ordering::Release);
     let poll_scope = scope(Duration::from_secs(30)).unwrap();
     let mut topology = control.progress(&poll_scope);
@@ -1122,7 +1125,18 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
             .lease(Some(&cache), old_id, KeyPurpose::Page)
             .is_err()
     );
-    assert_eq!(lease.material(KeyPurpose::Page).unwrap(), &old_material);
+    let mut opened = [0; 3];
+    lease
+        .open_page(
+            &cache,
+            old_id,
+            &[1; 24],
+            b"retained",
+            &old_sealed,
+            &mut opened,
+        )
+        .unwrap();
+    assert_eq!(&opened, b"abc");
     drop(topology);
     fixture.hold_long_poll.store(false, Ordering::Release);
     let accepted = worker.keys.active(&cache, KeyPurpose::Page).unwrap().id();
@@ -1249,7 +1263,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     let cache = crate::model::CacheId("33333333-3333-4333-8333-333333333333".into());
     let reference = wire::CacheKeyRef {
         cache: cache.clone(),
-        id: crate::model::KeyId::from_generation(2, 7).unwrap(),
+        id: crate::model::key_id_from_generation(2, 7).unwrap(),
         purpose: wire::CacheKeyPurpose::Page,
     };
     let roots = (*worker.keys.peer_trust_roots().unwrap()).clone();
@@ -1260,11 +1274,11 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
             cluster: config.cluster.clone(),
             generation: wire::BundleGeneration(2),
             peer_trust_roots: roots.clone(),
-            cache_keys: vec![wire::CacheEncryptionKey {
-                key: reference.clone(),
-                state: wire::CacheKeyState::Active,
-                material: [19; 32],
-            }],
+            cache_keys: vec![wire::CacheEncryptionKey::new(
+                reference.clone(),
+                wire::CacheKeyState::Active,
+                zeroize::Zeroizing::new([19; 32]),
+            )],
         })
         .unwrap();
     let lease = worker
@@ -1352,7 +1366,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     assert_eq!(runtime.crypto.outstanding(), 1);
     assert!(worker.peer_task.is_some());
     assert!(worker.diagnostic_task.is_some());
-    assert_eq!(lease.material(KeyPurpose::Page).unwrap(), &[19; 32]);
+    crate::security::fixtures::assert_page_key(&lease, &[19; 32]);
     assert!(
         worker
             .keys

@@ -1364,16 +1364,26 @@ mod tests {
         bundle.generation.0 = 2;
         bundle.peer_trust_roots = vec![ca.der().to_vec()];
         // Production rejects material reuse across independent key purposes.
-        bundle.cache_keys[2].material = [2; 32];
-        assert_eq!(
-            client.secrets.install(bundle.clone()).unwrap().0,
-            wire::BundleGeneration(2)
+        let key = &bundle.cache_keys[2];
+        bundle.cache_keys[2] = wire::CacheEncryptionKey::new(
+            key.key.clone(),
+            key.state,
+            zeroize::Zeroizing::new([2; 32]),
         );
         assert_eq!(
             client.secrets.install(bundle.clone()).unwrap().0,
             wire::BundleGeneration(2)
         );
-        bundle.cache_keys[0].material = [3; 32];
+        assert_eq!(
+            client.secrets.install(bundle.clone()).unwrap().0,
+            wire::BundleGeneration(2)
+        );
+        let key = &bundle.cache_keys[0];
+        bundle.cache_keys[0] = wire::CacheEncryptionKey::new(
+            key.key.clone(),
+            key.state,
+            zeroize::Zeroizing::new([3; 32]),
+        );
         assert!(matches!(
             client.secrets.install(bundle.clone()),
             Err(Error::Replay)

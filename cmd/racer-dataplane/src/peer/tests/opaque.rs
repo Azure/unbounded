@@ -527,15 +527,15 @@ mod safety {
             &[NodeId(A.into()), NodeId(C.into())],
             || {
                 let mut keys = crate::security::connection::signature_tests::mac_test_key(CACHE);
-                keys.push(CacheEncryptionKey {
-                    key: CacheKeyRef {
+                keys.push(CacheEncryptionKey::new(
+                    CacheKeyRef {
                         cache: CacheId(CACHE.into()),
-                        id: KeyId::from_generation(1, 7).unwrap(),
+                        id: crate::model::key_id_from_generation(1, 7).unwrap(),
                         purpose: CacheKeyPurpose::Page,
                     },
-                    state: CacheKeyState::Active,
-                    material: [19; 32],
-                });
+                    CacheKeyState::Active,
+                    zeroize::Zeroizing::new([19; 32]),
+                ));
                 keys
             },
         );

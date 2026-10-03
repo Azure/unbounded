@@ -602,7 +602,7 @@ pub(super) mod tests {
     ) -> PageResult {
         use crate::{
             memory::pool::{CiphertextBytes, CiphertextPage, VerifiedBytes, VerifiedPage},
-            model::{KeyId, Nonce, PageEnvelope, ResourceClass},
+            model::{Nonce, PageEnvelope, ResourceClass},
         };
         let length = (metadata.length - number * PAGE_BYTES).min(PAGE_BYTES) as usize;
         let page = PageId {
@@ -627,7 +627,7 @@ pub(super) mod tests {
                     checksum: Default::default(),
                     envelope: PageEnvelope {
                         page,
-                        key_id: KeyId::from_generation(1, 1).unwrap(),
+                        key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
                         nonce: Nonce([2; 24]),
                         plaintext_length: length as u32,
                         ciphertext_length: length as u32 + 16,

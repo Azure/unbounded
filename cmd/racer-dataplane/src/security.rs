@@ -2,6 +2,8 @@
 pub mod aead;
 pub mod connection;
 pub mod credentials;
+#[cfg(test)]
+pub(crate) mod fixtures;
 pub mod forwarding;
 pub mod identity;
 pub mod protocol;
@@ -97,19 +99,6 @@ pub(crate) mod test_support {
     }
 }
 
-use zeroize::Zeroizing;
-
-/// Request-only derivation from a credential epoch, never an AEAD or page key.
-pub(crate) fn request_key(key: &identity::KeyLease) -> crate::error::Result<Zeroizing<[u8; 32]>> {
-    let mut domain = b"racer/request-mac/key/v1\0".to_vec();
-    aead::field(&mut domain, key.cache().0.as_bytes())?;
-    domain.extend_from_slice(&key.id().0);
-    Ok(Zeroizing::new(racer_crypto::hmac_sha256(
-        key.material(identity::KeyPurpose::OriginCredentials)?,
-        &domain,
-    )))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,15 +106,26 @@ mod tests {
     fn request_key_purpose_separation() {
         let keys = identity::keyring_tests::keys();
         let cache = crate::model::CacheId(identity::tests::CACHE.into());
-        assert!(request_key(&keys.active(&cache, identity::KeyPurpose::Page).unwrap()).is_err());
+        let mut tag = [0; 32];
+        assert!(
+            keys.active(&cache, identity::KeyPurpose::Page)
+                .unwrap()
+                .request_mac(&cache, b"request", &mut tag)
+                .is_err()
+        );
         let credential = keys
             .active(&cache, identity::KeyPurpose::OriginCredentials)
             .unwrap();
-        assert_ne!(
-            &*request_key(&credential).unwrap(),
+        credential
+            .request_mac(&cache, b"request", &mut tag)
+            .unwrap();
+        credential
+            .verify_request_mac(&cache, credential.id(), b"request", &tag)
+            .unwrap();
+        assert!(
             credential
-                .material(identity::KeyPurpose::OriginCredentials)
-                .unwrap()
+                .verify_request_mac(&cache, credential.id(), b"changed", &tag)
+                .is_err()
         );
     }
 }

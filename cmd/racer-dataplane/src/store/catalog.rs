@@ -628,7 +628,7 @@ mod tests {
             },
             IndexedPage {
                 metadata,
-                key_id: KeyId::from_generation(1, 1).unwrap(),
+                key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
                 location: RecordLocation {
                     segment: SegmentId(segment),
                     generation: Generation(1),

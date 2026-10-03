@@ -1907,15 +1907,15 @@ mod lifetime_tests {
                 cluster: config.cluster.clone(),
                 generation: wire::BundleGeneration(1),
                 peer_trust_roots: roots,
-                cache_keys: vec![wire::CacheEncryptionKey {
-                    key: wire::CacheKeyRef {
+                cache_keys: vec![wire::CacheEncryptionKey::new(
+                    wire::CacheKeyRef {
                         cache: original.id.clone(),
-                        id: crate::model::KeyId::from_generation(1, 7).unwrap(),
+                        id: crate::model::key_id_from_generation(1, 7).unwrap(),
                         purpose: wire::CacheKeyPurpose::Page,
                     },
-                    state: wire::CacheKeyState::Active,
-                    material: [19; 32],
-                }],
+                    wire::CacheKeyState::Active,
+                    zeroize::Zeroizing::new([19; 32]),
+                )],
             })
             .unwrap();
         let page = test_support::page(&worker);

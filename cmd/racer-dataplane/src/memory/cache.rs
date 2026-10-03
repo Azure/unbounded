@@ -641,7 +641,9 @@ mod tests {
                 for template in &templates {
                     let mut key = template.clone();
                     key.key.cache = CacheId(format!("{cache:08x}-0000-4000-8000-000000000000"));
-                    key.material[8..16].copy_from_slice(&cache.to_be_bytes());
+                    let (reference, state, mut material) = key.clone().into_installation();
+                    material[8..16].copy_from_slice(&cache.to_be_bytes());
+                    key = crate::control::wire::CacheEncryptionKey::new(reference, state, material);
                     next.cache_keys.push(key);
                 }
             }

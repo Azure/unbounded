@@ -524,7 +524,7 @@ pub(super) fn page(app: &WorkerApplication) -> crate::memory::page::PageResult {
                         crate::security::identity::KeyPurpose::Page,
                     )
                     .map(|key| key.id())
-                    .unwrap_or_else(|_| KeyId::from_generation(2, 7).unwrap()),
+                    .unwrap_or_else(|_| crate::model::key_id_from_generation(2, 7).unwrap()),
                 nonce: Nonce([2; 24]),
                 plaintext_length: 3,
                 ciphertext_length: 19,

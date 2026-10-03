@@ -256,7 +256,7 @@ unsafe impl crate::runtime::reactor::SendBuffer for CiphertextPage {
 pub(crate) mod tests {
     use super::*;
     use crate::{
-        model::{KeyId, Nonce, PageNumber, VersionMetadata},
+        model::{Nonce, PageNumber, VersionMetadata},
         runtime::reactor::IoBuffer,
     };
 
@@ -312,7 +312,7 @@ pub(crate) mod tests {
                     .unwrap(),
                 PageEnvelope {
                     page,
-                    key_id: KeyId::from_generation(1, 1).unwrap(),
+                    key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
                     nonce: Nonce([2; 24]),
                     plaintext_length: 3,
                     ciphertext_length: 19,

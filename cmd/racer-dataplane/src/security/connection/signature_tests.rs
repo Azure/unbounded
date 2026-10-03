@@ -21,14 +21,16 @@ pub(crate) fn mac_test_keys() -> Vec<crate::control::wire::CacheEncryptionKey> {
     [node(88).0, super::super::identity::tests::CACHE.into()]
         .into_iter()
         .enumerate()
-        .map(|(i, cache)| CacheEncryptionKey {
-            key: CacheKeyRef {
-                cache: crate::model::CacheId(cache),
-                id: crate::model::KeyId::from_generation(1, 100 + i as u32).unwrap(),
-                purpose: CacheKeyPurpose::OriginCredentials,
-            },
-            state: CacheKeyState::Active,
-            material: [100 + i as u8; 32],
+        .map(|(i, cache)| {
+            CacheEncryptionKey::new(
+                CacheKeyRef {
+                    cache: crate::model::CacheId(cache),
+                    id: crate::model::key_id_from_generation(1, 100 + i as u32).unwrap(),
+                    purpose: CacheKeyPurpose::OriginCredentials,
+                },
+                CacheKeyState::Active,
+                zeroize::Zeroizing::new([100 + i as u8; 32]),
+            )
         })
         .collect()
 }
@@ -207,7 +209,9 @@ fn request_mac_rotates_and_rejects_missing_retired_or_mutated_tags() {
         let mut keys = mac_test_keys();
         for key in &mut keys {
             key.key.id.0[4..12].copy_from_slice(&2u64.to_be_bytes());
-            key.material[0] ^= 1;
+            let (reference, state, mut material) = key.clone().into_installation();
+            material[0] ^= 1;
+            *key = crate::control::wire::CacheEncryptionKey::new(reference, state, material);
         }
         signer
             .keys

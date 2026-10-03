@@ -10,8 +10,8 @@ use crate::{
         pool::{BufferPool, VerifiedBytes, VerifiedPage},
     },
     model::{
-        CacheKey, KeyId, MetadataSelector, Nonce, ObjectId, ObjectVersion, OriginContext,
-        PageEnvelope, PageId, PageNumber, RequestId, StrongEtag, VersionMetadata, WorkerId,
+        CacheKey, MetadataSelector, Nonce, ObjectId, ObjectVersion, OriginContext, PageEnvelope,
+        PageId, PageNumber, RequestId, StrongEtag, VersionMetadata, WorkerId,
     },
     origin::{Origin, metadata::MetadataReply, page::OriginPage},
     read::{
@@ -133,7 +133,7 @@ fn allocated_page(
             reserved.ciphertext,
             PageEnvelope {
                 page: id,
-                key_id: KeyId::from_generation(1, 1).unwrap(),
+                key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
                 nonce: Nonce([2; 24]),
                 plaintext_length: length as u32,
                 ciphertext_length: (length + 16) as u32,

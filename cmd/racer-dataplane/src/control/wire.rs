@@ -1,22 +1,21 @@
 //! Application adapters for the independent Racer control wire contract.
 //!
-//! Runtime membership, cache installation, and key epochs remain application-owned.
+//! Runtime membership and cache installation remain application-owned.
 use super::state::CacheDefinition;
 use crate::{
     error::{Error, Result},
-    model::{CacheId, ClusterId, KeyId, MembershipVersion},
+    model::{ClusterId, MembershipVersion},
     topology::{membership::Member, rails::RailMapping},
 };
 use racer_control_wire as contract;
 pub use racer_control_wire::{
-    ALIGNMENT_ANNOTATION, BOOTSTRAP_PATH, BundleGeneration, CERTIFICATE_LIFETIME, CacheKeyPurpose,
-    CacheKeyState, DEFAULT_SHARES, EXCLUSION_LABEL, EnrollmentId, EnrollmentResponse,
-    ErrorResponse, KEYRING_PATH, MAX_BUNDLE_BYTES, MAX_ENROLLMENT_BYTES, MAX_MEMBERS,
-    MAX_PUBLICATION_BYTES, POLL_WAIT, ProtocolFailure, PublicationSequence, RAILS_ANNOTATION,
-    RENEW_AFTER, RETRY_MAX, RETRY_MIN, SCHEMA_VERSION, SHARES_ANNOTATION, SNAPSHOT_PATH,
-    SnapshotRequest, TOKEN_AUDIENCE, valid_uuid,
+    ALIGNMENT_ANNOTATION, BOOTSTRAP_PATH, BundleGeneration, CERTIFICATE_LIFETIME,
+    CacheEncryptionKey, CacheKeyPurpose, CacheKeyRef, CacheKeyState, DEFAULT_SHARES,
+    EXCLUSION_LABEL, EnrollmentId, EnrollmentResponse, ErrorResponse, KEYRING_PATH, KeyringBundle,
+    MAX_BUNDLE_BYTES, MAX_ENROLLMENT_BYTES, MAX_MEMBERS, MAX_PUBLICATION_BYTES, POLL_WAIT,
+    ProtocolFailure, PublicationSequence, RAILS_ANNOTATION, RENEW_AFTER, RETRY_MAX, RETRY_MIN,
+    SCHEMA_VERSION, SHARES_ANNOTATION, SNAPSHOT_PATH, SnapshotRequest, TOKEN_AUDIENCE, valid_uuid,
 };
-use zeroize::Zeroizing;
 
 pub enum SnapshotResponse {
     Updated(Publication),
@@ -39,33 +38,6 @@ pub struct EnrollmentRequest {
     pub cluster: ClusterId,
     pub enrollment: EnrollmentId,
     pub csr_der: Vec<u8>,
-}
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CacheKeyRef {
-    pub cache: CacheId,
-    pub id: KeyId,
-    pub purpose: CacheKeyPurpose,
-}
-/// Application staging owner, never Debug; only installation code sees material.
-#[derive(Clone)]
-pub struct CacheEncryptionKey {
-    pub key: CacheKeyRef,
-    pub state: CacheKeyState,
-    pub(crate) material: [u8; 32],
-}
-impl Drop for CacheEncryptionKey {
-    fn drop(&mut self) {
-        use zeroize::Zeroize;
-        self.material.zeroize();
-    }
-}
-#[derive(Clone)]
-pub struct KeyringBundle {
-    pub schema_version: u32,
-    pub cluster: ClusterId,
-    pub generation: BundleGeneration,
-    pub peer_trust_roots: Vec<Vec<u8>>,
-    pub cache_keys: Vec<CacheEncryptionKey>,
 }
 
 impl From<contract::Error> for Error {
@@ -191,55 +163,6 @@ impl From<EnrollmentRequest> for contract::EnrollmentRequest {
         }
     }
 }
-impl From<contract::CacheEncryptionKey> for CacheEncryptionKey {
-    fn from(value: contract::CacheEncryptionKey) -> Self {
-        let (key, state, material) = value.into_installation();
-        Self {
-            key: CacheKeyRef {
-                cache: key.cache,
-                id: KeyId(key.id.0),
-                purpose: key.purpose,
-            },
-            state,
-            material: *material,
-        }
-    }
-}
-impl From<CacheEncryptionKey> for contract::CacheEncryptionKey {
-    fn from(value: CacheEncryptionKey) -> Self {
-        Self::new(
-            contract::CacheKeyRef {
-                cache: value.key.cache.clone(),
-                id: contract::KeyId(value.key.id.0),
-                purpose: value.key.purpose,
-            },
-            value.state,
-            Zeroizing::new(value.material),
-        )
-    }
-}
-impl From<contract::KeyringBundle> for KeyringBundle {
-    fn from(value: contract::KeyringBundle) -> Self {
-        Self {
-            schema_version: value.schema_version,
-            cluster: value.cluster,
-            generation: value.generation,
-            peer_trust_roots: value.peer_trust_roots,
-            cache_keys: value.cache_keys.into_iter().map(Into::into).collect(),
-        }
-    }
-}
-impl From<KeyringBundle> for contract::KeyringBundle {
-    fn from(value: KeyringBundle) -> Self {
-        Self {
-            schema_version: value.schema_version,
-            cluster: value.cluster,
-            generation: value.generation,
-            peer_trust_roots: value.peer_trust_roots,
-            cache_keys: value.cache_keys.into_iter().map(Into::into).collect(),
-        }
-    }
-}
 
 pub fn decode_publication(bytes: &[u8]) -> Result<Publication> {
     Ok(contract::decode_publication(bytes)?.into())
@@ -272,10 +195,10 @@ pub fn encode_enrollment_response(value: &EnrollmentResponse) -> Result<Vec<u8>>
     Ok(contract::encode_enrollment_response(value)?)
 }
 pub fn decode_bundle(bytes: &[u8]) -> Result<KeyringBundle> {
-    Ok(contract::decode_bundle(bytes)?.into())
+    Ok(contract::decode_bundle(bytes)?)
 }
 pub fn encode_bundle(value: &KeyringBundle) -> Result<Vec<u8>> {
-    Ok(contract::encode_bundle(&value.clone().into())?)
+    Ok(contract::encode_bundle(value)?)
 }
 pub fn decode_error(bytes: &[u8]) -> Result<ErrorResponse> {
     Ok(contract::decode_error(bytes)?)

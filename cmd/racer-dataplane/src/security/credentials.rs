@@ -192,14 +192,8 @@ impl CredentialCrypto {
             let nonce = fresh_nonce()?;
             let aad = aad(key.id(), &context.object, scope.request, attempt, metadata)?;
             let mut bytes = Zeroizing::new(vec![0; raw.len() + aead::TAG_LEN]);
-            aead::seal(
-                key.material(KeyPurpose::OriginCredentials)?,
-                &nonce.0,
-                &aad,
-                raw,
-                &mut bytes,
-            )
-            .map_err(|_| Error::Unauthorized)?;
+            key.seal_credentials(&context.object.cache, &nonce.0, &aad, raw, &mut bytes)
+                .map_err(Error::from)?;
             Some(EncryptedAuthorization {
                 key_id: key.id(),
                 nonce,
@@ -269,14 +263,15 @@ impl CredentialCrypto {
             )?;
             let aad = aad(key.id(), &context.object, request, attempt, metadata)?;
             let mut bytes = Zeroizing::new(vec![0; encrypted.ciphertext.len() - aead::TAG_LEN]);
-            aead::open(
-                key.material(KeyPurpose::OriginCredentials)?,
+            key.open_credentials(
+                &context.object.cache,
+                encrypted.key_id,
                 &encrypted.nonce.0,
                 &aad,
                 &encrypted.ciphertext,
                 &mut bytes,
             )
-            .map_err(|_| Error::Unauthorized)?;
+            .map_err(Error::from)?;
             Some(Authorization::from_header(&bytes)?)
         } else {
             None

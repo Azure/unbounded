@@ -695,6 +695,7 @@ dependencies = [
  "page-alloc",
  "racer-control-wire",
  "racer-crypto",
+ "racer-identity",
  "rcgen",
  "rdma-verbs",
  "rest-client",
@@ -704,6 +705,20 @@ dependencies = [
  "sha2",
  "telemetry",
  "topology",
+ "uring-runtime",
+ "x509-parser",
+ "zeroize",
+]
+
+[[package]]
+name = "racer-identity"
+version = "0.1.0"
+dependencies = [
+ "racer-control-wire",
+ "racer-crypto",
+ "rcgen",
+ "rustls",
+ "sha2",
  "uring-runtime",
  "x509-parser",
  "zeroize",

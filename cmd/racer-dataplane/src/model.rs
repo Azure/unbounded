@@ -568,27 +568,11 @@ pub enum MetadataSelector {
 
 pub const AEAD_TAG_BYTES: u32 = 16;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct KeyId(pub [u8; 16]);
-impl KeyId {
-    /// Controller-issued epoch namespace. Zero and opaque IDs are invalid.
-    pub(crate) fn generation(self) -> Option<u64> {
-        (self.0[..4] == *b"RKG1")
-            .then(|| u64::from_be_bytes(self.0[4..12].try_into().expect("generation bytes")))
-            .filter(|generation| *generation != 0)
-    }
+pub use racer_control_wire::KeyId;
 
-    /// Construct an epoch-bound ID with a controller-selected uniqueness suffix.
-    pub fn from_generation(generation: u64, suffix: u32) -> Result<Self> {
-        if generation == 0 {
-            return Err(Error::InvalidConfiguration);
-        }
-        let mut bytes = [0; 16];
-        bytes[..4].copy_from_slice(b"RKG1");
-        bytes[4..12].copy_from_slice(&generation.to_be_bytes());
-        bytes[12..].copy_from_slice(&suffix.to_be_bytes());
-        Ok(Self(bytes))
-    }
+/// Application configuration constructor, distinct from wire syntax errors.
+pub fn key_id_from_generation(generation: u64, suffix: u32) -> Result<KeyId> {
+    KeyId::from_generation(generation, suffix).map_err(|_| Error::InvalidConfiguration)
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Nonce(pub [u8; 24]);

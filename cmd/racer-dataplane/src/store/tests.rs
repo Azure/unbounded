@@ -217,8 +217,8 @@ use crate::{
     error::{Error, Result},
     memory::{page::CiphertextCopy, pool::BufferPool},
     model::{
-        CacheId, CacheKey, ExpiresAt, KeyId, Nonce, ObjectId, ObjectMetadata, ObjectVersion,
-        PageEnvelope, PageId, PageNumber, RequestId, ResourceClass, StrongEtag, WorkerId,
+        CacheId, CacheKey, ExpiresAt, Nonce, ObjectId, ObjectMetadata, ObjectVersion, PageEnvelope,
+        PageId, PageNumber, RequestId, ResourceClass, StrongEtag, WorkerId,
     },
     runtime::{
         admission::{AdmissionExt, AdmissionPolicy},
@@ -357,7 +357,7 @@ impl Fixture {
                 version: version.clone(),
                 number: PageNumber(0),
             },
-            key_id: KeyId::from_generation(1, 1).unwrap(),
+            key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
             nonce: Nonce([2; 24]),
             plaintext_length: length as u32,
             ciphertext_length: length as u32 + 16,
@@ -1421,7 +1421,15 @@ fn sustained_rotation_reclaims_history_and_fences_held_pages_and_write_completio
         assert!(matches!(f.enqueue(page.copy()), Err(Error::MissingKey)));
         assert!(keys.lease(Some(&cache), old.id, KeyPurpose::Page).is_err());
         assert_eq!(lease.id(), old.id);
-        assert!(lease.material(KeyPurpose::Page).is_ok());
+        let mut sealed = [0; 19];
+        lease
+            .seal_page(&cache, &[1; 24], b"retained", b"abc", &mut sealed)
+            .unwrap();
+        let mut opened = [0; 3];
+        lease
+            .open_page(&cache, old.id, &[1; 24], b"retained", &sealed, &mut opened)
+            .unwrap();
+        assert_eq!(&opened, b"abc");
         assert_eq!(page.plaintext.bytes(), &[1; 3]);
         if let Some(operation) = write.take() {
             assert!(f.store.writer.writes_in_flight() > 0);

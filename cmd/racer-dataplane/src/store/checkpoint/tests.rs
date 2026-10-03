@@ -206,7 +206,7 @@ fn shard() -> ShardImage {
                     extent: lease.1,
                 },
                 metadata,
-                key_id: KeyId::from_generation(1, 1).unwrap(),
+                key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
             },
         )
         .unwrap();
@@ -363,7 +363,10 @@ fn binary_round_trip_retains_locations_keys_metadata_and_is_send() {
     assert_eq!(shard.geometry, geometry());
     let (_, entry) = &shard.index.entries[0];
     assert_eq!(entry.metadata, descriptor("v1", 17));
-    assert_eq!(entry.key_id, KeyId::from_generation(1, 1).unwrap());
+    assert_eq!(
+        entry.key_id,
+        crate::model::key_id_from_generation(1, 1).unwrap()
+    );
     assert_eq!(entry.location.extent.length(), 4096);
     assert!(
         shard

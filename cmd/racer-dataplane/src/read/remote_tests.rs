@@ -43,15 +43,15 @@ fn node(n: usize) -> NodeId {
 fn identities(nodes: &[NodeId]) -> Vec<Identity> {
     crate::security::test_support::identities(ClusterId(CLUSTER.into()), nodes, || {
         let mut keys = crate::security::connection::signature_tests::mac_test_key(CACHE);
-        keys.push(crate::control::wire::CacheEncryptionKey {
-            key: crate::control::wire::CacheKeyRef {
+        keys.push(crate::control::wire::CacheEncryptionKey::new(
+            crate::control::wire::CacheKeyRef {
                 cache: CacheId(CACHE.into()),
-                id: KeyId::from_generation(1, 1).unwrap(),
+                id: crate::model::key_id_from_generation(1, 1).unwrap(),
                 purpose: crate::control::wire::CacheKeyPurpose::Page,
             },
-            state: crate::control::wire::CacheKeyState::Active,
-            material: [7; 32],
-        });
+            crate::control::wire::CacheKeyState::Active,
+            zeroize::Zeroizing::new([7; 32]),
+        ));
         keys
     })
 }

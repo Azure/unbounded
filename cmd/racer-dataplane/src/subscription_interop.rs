@@ -471,14 +471,16 @@ fn interop_keys() -> security::identity::Keyring {
         cache_keys: [CacheKeyPurpose::Page, CacheKeyPurpose::OriginCredentials]
             .into_iter()
             .enumerate()
-            .map(|(i, purpose)| CacheEncryptionKey {
-                key: CacheKeyRef {
-                    cache: CacheId("33333333-3333-4333-8333-333333333333".into()),
-                    id: KeyId::from_generation(1, i as u32 + 1).unwrap(),
-                    purpose,
-                },
-                state: CacheKeyState::Active,
-                material: [i as u8 + 7; 32],
+            .map(|(i, purpose)| {
+                CacheEncryptionKey::new(
+                    CacheKeyRef {
+                        cache: CacheId("33333333-3333-4333-8333-333333333333".into()),
+                        id: crate::model::key_id_from_generation(1, i as u32 + 1).unwrap(),
+                        purpose,
+                    },
+                    CacheKeyState::Active,
+                    zeroize::Zeroizing::new([i as u8 + 7; 32]),
+                )
             })
             .collect(),
     })

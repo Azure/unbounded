@@ -543,6 +543,7 @@ impl LocalSigningIdentity {
             roots,
         )
         .map(Arc::new)
+        .map_err(Into::into)
     }
     pub fn expires_at(&self) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(self.not_after)

@@ -82,7 +82,8 @@ impl Signatures {
                 .keys
                 .active(&cache, super::identity::KeyPurpose::OriginCredentials)?;
             push_binary(&mut head, "racer-mac-key", &key.id().0);
-            let tag = racer_crypto::hmac_sha256(&*super::request_key(&key)?, &mac_base(&head)?);
+            let mut tag = [0; 32];
+            key.request_mac(&cache, &mac_base(&head)?, &mut tag)?;
             push_binary(&mut head, "racer-request-mac", &tag);
         }
         let input = signature_input(&head)?;
@@ -140,13 +141,12 @@ impl Signatures {
                 crate::model::KeyId(id),
                 super::identity::KeyPurpose::OriginCredentials,
             )?;
-            let expected = racer_crypto::hmac_sha256(&*super::request_key(&key)?, &mac_base(head)?);
-            if !racer_crypto::ct_eq(
+            key.verify_request_mac(
+                &cache,
+                key.id(),
+                &mac_base(head)?,
                 &p::decode_binary(field(head, "racer-request-mac")?.as_bytes())?,
-                &expected,
-            ) {
-                return Err(Error::Unauthorized);
-            }
+            )?;
         }
         let base = signature_base(head)?;
         if signed.signature.len() != 64
@@ -175,6 +175,7 @@ impl Signatures {
         }
         self.certificates
             .verify_signed(&chain, &signer, &base, &signed.signature)
+            .map_err(Into::into)
     }
 }
 pub(crate) fn is_auth_field(name: &str) -> bool {

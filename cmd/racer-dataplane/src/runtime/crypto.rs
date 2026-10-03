@@ -30,7 +30,7 @@ mod measurement {
     use crate::telemetry::metrics::{Event, Event::*, Metrics};
     use crate::{
         memory::pool::BufferPool,
-        model::{KeyId, Nonce, PageEnvelope, ResourceClass, *},
+        model::{Nonce, PageEnvelope, ResourceClass, *},
         runtime::reactor::IoBuffer,
         security::aead::{PageCryptoEngine, page_aad},
     };
@@ -55,7 +55,7 @@ mod measurement {
     fn envelope(size: usize) -> PageEnvelope {
         PageEnvelope {
             page: page(),
-            key_id: KeyId::from_generation(1, 1).unwrap(),
+            key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
             nonce: Nonce([2; 24]),
             plaintext_length: size as u32,
             ciphertext_length: size as u32 + 16,
@@ -2163,7 +2163,6 @@ mod tests {
     pub(super) fn keyring() -> crate::security::identity::Keyring {
         use crate::{
             control::wire::*,
-            model::KeyId,
             model::{CacheId, ClusterId, NodeId},
             security::identity::{KeyEpochs, Keyring},
         };
@@ -2182,15 +2181,15 @@ mod tests {
             cluster: ClusterId("00000000-0000-4000-8000-000000000001".into()),
             generation: BundleGeneration(1),
             peer_trust_roots: vec![ca.der().to_vec()],
-            cache_keys: vec![CacheEncryptionKey {
-                key: CacheKeyRef {
+            cache_keys: vec![CacheEncryptionKey::new(
+                CacheKeyRef {
                     cache: cache.clone(),
-                    id: KeyId::from_generation(1, 1).unwrap(),
+                    id: crate::model::key_id_from_generation(1, 1).unwrap(),
                     purpose: CacheKeyPurpose::Page,
                 },
-                state: CacheKeyState::Active,
-                material: [7; 32],
-            }],
+                CacheKeyState::Active,
+                zeroize::Zeroizing::new([7; 32]),
+            )],
         })
         .unwrap();
         keys

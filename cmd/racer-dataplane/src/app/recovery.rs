@@ -562,7 +562,7 @@ mod tests {
                     extent: append.1,
                 },
                 metadata: metadata.clone(),
-                key_id: crate::model::KeyId::from_generation(1, 1).unwrap(),
+                key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
             },
         ));
         drop(append);

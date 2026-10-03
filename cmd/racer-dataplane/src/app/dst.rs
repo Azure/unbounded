@@ -3,7 +3,7 @@
 use super::*;
 use crate::{
     control::{state::CacheDefinition, wire},
-    model::{KeyId, PAGE_BYTES, ResourceClass, *},
+    model::{PAGE_BYTES, ResourceClass, *},
     runtime::{
         environment::SimulationClock,
         reactor::{
@@ -1228,18 +1228,20 @@ impl Harness {
             ]
             .into_iter()
             .enumerate()
-            .map(|(i, purpose)| wire::CacheEncryptionKey {
-                key: wire::CacheKeyRef {
-                    cache: self.definition(0).id,
-                    id: KeyId::from_generation(
-                        u64::from(self.key_epoch) + 1,
-                        7 + i as u32 + u32::from(self.key_epoch) * 2,
-                    )
-                    .unwrap(),
-                    purpose,
-                },
-                state: wire::CacheKeyState::Active,
-                material: [19 + i as u8 + self.key_epoch * 2; 32],
+            .map(|(i, purpose)| {
+                wire::CacheEncryptionKey::new(
+                    wire::CacheKeyRef {
+                        cache: self.definition(0).id,
+                        id: crate::model::key_id_from_generation(
+                            u64::from(self.key_epoch) + 1,
+                            7 + i as u32 + u32::from(self.key_epoch) * 2,
+                        )
+                        .unwrap(),
+                        purpose,
+                    },
+                    wire::CacheKeyState::Active,
+                    zeroize::Zeroizing::new([19 + i as u8 + self.key_epoch * 2; 32]),
+                )
             })
             .collect(),
         }

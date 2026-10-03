@@ -610,7 +610,7 @@ fn partition_transfer_and_peer_debits_conserve_original_credits() {
 fn result(flights: &Flights, page: PageId) -> PageResult {
     use crate::{
         memory::pool::{CiphertextBytes, CiphertextPage, VerifiedBytes, VerifiedPage},
-        model::{ExpiresAt, KeyId, Nonce, ObjectMetadata, PageEnvelope},
+        model::{ExpiresAt, Nonce, ObjectMetadata, PageEnvelope},
     };
     use std::sync::Arc;
     PageResult {
@@ -636,7 +636,7 @@ fn result(flights: &Flights, page: PageId) -> PageResult {
                 checksum: std::sync::OnceLock::new(),
                 envelope: PageEnvelope {
                     page,
-                    key_id: KeyId::from_generation(1, 1).unwrap(),
+                    key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
                     nonce: Nonce([0; 24]),
                     plaintext_length: 3,
                     ciphertext_length: 19,

@@ -73,7 +73,7 @@ impl PageCrypto {
         ) {
             Ok(key) => key,
             Err(error) => {
-                sample.finish(Some(error));
+                sample.finish(Some(error.into()));
                 return;
             }
         };
@@ -267,7 +267,7 @@ impl PageCryptoEngine {
             scope.check()?;
             return Ok((ciphertext.envelope().clone(), Zeroizing::new(Vec::new())));
         }
-        let material = key.material(KeyPurpose::Page)?;
+        key.require_purpose(KeyPurpose::Page)?;
         let (envelope, mut bytes) = match input {
             CryptoInput::Checksum { .. } => unreachable!("checksum handled above"),
             CryptoInput::Encrypt {
@@ -305,8 +305,13 @@ impl PageCryptoEngine {
                     Zeroizing::new(ciphertext.buffer(envelope.ciphertext_length as usize)?);
                 // Input remains immutable until the final cancellation check.
                 // Admission supplies initialized output, including the tag tail.
-                aead::seal(material, &envelope.nonce.0, &aad, raw, &mut bytes)
-                    .map_err(|_| Error::CorruptRecord)?;
+                key.seal_page(
+                    &page.version.object.cache,
+                    &envelope.nonce.0,
+                    &aad,
+                    raw,
+                    &mut bytes,
+                )?;
                 (envelope, bytes)
             }
             CryptoInput::Decrypt {
@@ -335,8 +340,9 @@ impl PageCryptoEngine {
                 // Decryption allocates only plaintext-length storage,
                 // never an uncharged tag-sized tail under plaintext admission.
                 let mut bytes = Zeroizing::new(plaintext.buffer(length)?);
-                aead::open(
-                    material,
+                key.open_page(
+                    &envelope.page.version.object.cache,
+                    envelope.key_id,
                     &envelope.nonce.0,
                     &aad,
                     ciphertext.bytes(),
@@ -498,7 +504,7 @@ mod tests {
                 },
                 number: PageNumber(7),
             },
-            key_id: KeyId::from_generation(1, 1).unwrap(),
+            key_id: crate::model::key_id_from_generation(1, 1).unwrap(),
             nonce: Nonce([2; 24]),
             plaintext_length: 5,
             ciphertext_length: 21,

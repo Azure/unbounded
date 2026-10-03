@@ -765,7 +765,9 @@ fn retained_subscription_cannot_complete_after_request_mac_key_retirement() {
     let mut replacement = crate::security::connection::signature_tests::mac_test_key(CACHE);
     for key in &mut replacement {
         key.key.id.0[4..12].copy_from_slice(&2u64.to_be_bytes());
-        key.material[0] ^= 1;
+        let (reference, state, mut material) = key.clone().into_installation();
+        material[0] ^= 1;
+        *key = crate::control::wire::CacheEncryptionKey::new(reference, state, material);
     }
     keys.install(KeyringBundle {
         schema_version: SCHEMA_VERSION,
