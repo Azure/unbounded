@@ -587,7 +587,7 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
                     &scope,
                 )
                 .await?;
-            let connection = crate::http::connection::from_accepted(fd, &admission)?;
+            let connection = crate::http::from_accepted(fd, &admission)?;
             let connection = crate::security::connection::accept(
                 &socket.io,
                 connection,
@@ -629,7 +629,7 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
             }
             Ok::<_, Error>(())
         };
-        let (result, served) = crate::http::connection::io_tests::drive(&socket.reactor, async {
+        let (result, served) = crate::http::tests::drive(&socket.reactor, async {
             futures::join!(relay.forward(ingress, membership, &scope), destination)
         });
         served.unwrap();

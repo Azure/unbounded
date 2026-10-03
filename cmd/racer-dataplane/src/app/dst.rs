@@ -164,11 +164,8 @@ mod faults {
         }
 
         pub(super) fn peer_security(&mut self) {
-            use crate::{
-                http::{Codec, MessageHead, StartLine},
-                peer::protocol as p,
-                peer::protocol::encode_envelope,
-            };
+            use crate::{http::Codec, peer::protocol as p, peer::protocol::encode_envelope};
+            use http1::{MessageHead, StartLine};
             let receiver = self.rng.pick(self.nodes.len());
             let sender = (receiver + 1) % self.nodes.len();
             let keys = self.nodes[sender].workers[0].app.keys.clone();
@@ -662,9 +659,7 @@ mod faults {
         }
 
         pub(super) fn native_fault(&mut self) {
-            use rdma_verbs::simulation::{
-                Fault as NativeFault, Operation as NativeOperation,
-            };
+            use rdma_verbs::simulation::{Fault as NativeFault, Operation as NativeOperation};
             if self.native_rules.is_empty() {
                 for op in [
                     NativeOperation::Bind,

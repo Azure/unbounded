@@ -3,9 +3,9 @@ pub(super) use crate::read::fill::*;
 pub(super) use crate::{
     error::{Error, Operation, Result},
     memory::{
+        BufferPool, CiphertextPage,
         cache::MemoryCache,
         page::{PageResult, UnverifiedPage},
-        pool::{BufferPool, CiphertextPage},
     },
     model::{ObjectMetadata, OriginContext, PAGE_BYTES, PageId},
     origin::Origin,

@@ -9,7 +9,7 @@ mod timeouts;
 
 pub(crate) fn page(byte: u8) -> crate::memory::page::PageResult {
     use crate::{
-        memory::pool::{CiphertextBytes, CiphertextPage, VerifiedBytes, VerifiedPage},
+        memory::{CiphertextBytes, CiphertextPage, VerifiedBytes, VerifiedPage},
         model::*,
     };
     use std::sync::Arc;

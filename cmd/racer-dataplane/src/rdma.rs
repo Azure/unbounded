@@ -465,8 +465,8 @@ mod session_tests {
                 test_support::{CLUSTER, NODE, issued},
             },
         };
-        use racer_control_wire::{BundleGeneration, KeyringBundle, SCHEMA_VERSION};
         use http1::{Header, MessageHead, StartLine};
+        use racer_control_wire::{BundleGeneration, KeyringBundle, SCHEMA_VERSION};
         use racer_identity::{Certificates, KeyEpochs, Keyring};
         use std::sync::Arc;
         let (pending, chain, roots) = issued();

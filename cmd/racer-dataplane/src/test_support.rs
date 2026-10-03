@@ -352,7 +352,8 @@ pub mod origin {
             assert!(request.len() <= 32768, "oversized adapter request");
         }
         let request = Codec::new(32768).decode_head(&request).unwrap().unwrap().0;
-        let head = matches!(&request.start, crate::http::StartLine::Request { method, .. } if method == "HEAD");
+        let head =
+            matches!(&request.start, http1::StartLine::Request { method, .. } if method == "HEAD");
         let if_match = request.unique("If-Match").unwrap().map(<[u8]>::to_vec);
         let first = request
             .unique("Range")
@@ -616,10 +617,10 @@ impl std::task::Wake for WakeCounter {
 // Real read ownership shared by read and client scenarios. Only the UDS adapter is scripted.
 use crate::{
     control::{
-        state::{CacheDefinition, PublishedState, SnapshotStore},
         state::Publication,
+        state::{CacheDefinition, PublishedState, SnapshotStore},
     },
-    memory::{cache::MemoryCache, delivery::Delivery, BufferPool},
+    memory::{BufferPool, cache::MemoryCache, delivery::Delivery},
     model::{MembershipVersion, ObjectMetadata, WorkerId},
     read::{
         Coordinator,
@@ -647,8 +648,8 @@ use crate::{
     test_support::origin::AdapterOrigin,
     topology::{membership::Member, routing::Placement},
 };
-use std::{cell::RefCell, num::NonZeroU32, rc::Rc, sync::Arc, task::Context};
 use racer_control_wire::PublicationSequence;
+use std::{cell::RefCell, num::NonZeroU32, rc::Rc, sync::Arc, task::Context};
 use uring_runtime::drivers::DriverQueue;
 
 pub(crate) struct ReadWorker {
