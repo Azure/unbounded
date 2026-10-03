@@ -132,6 +132,7 @@ pub mod send_crc {
         runtime::environment,
         telemetry::failures::AeadFailure,
     };
+    use ::telemetry::Ring;
     use std::{
         sync::{Arc, Mutex},
         time::{Duration, Instant},
@@ -171,7 +172,7 @@ pub mod send_crc {
         eligible: u64,
         sampled: u64,
         skipped: u64,
-        entries: [Option<Arc<Sample>>; CAPACITY],
+        entries: Ring<Arc<Sample>, CAPACITY>,
     }
     impl Default for State {
         fn default() -> Self {
@@ -182,7 +183,7 @@ pub mod send_crc {
                 eligible: 0,
                 sampled: 0,
                 skipped: 0,
-                entries: std::array::from_fn(|_| None),
+                entries: Ring::default(),
             }
         }
     }
@@ -264,8 +265,7 @@ pub mod send_crc {
                     facts: None,
                 }),
             });
-            let index = (state.sampled as usize - 1) % CAPACITY;
-            state.entries[index] = Some(sample.clone());
+            state.entries.push(sample.clone());
             Some((
                 Ticket(sample.clone()),
                 Work {
@@ -294,31 +294,29 @@ pub mod send_crc {
                 sampled.min(CAPACITY as u64),
                 sampled.saturating_sub(CAPACITY as u64)
             )?;
-            for sequence in sampled.saturating_sub(CAPACITY as u64) + 1..=sampled {
-                if let Some(sample) = &entries[(sequence as usize - 1) % CAPACITY] {
-                    let data = sample.data.lock().unwrap_or_else(|e| e.into_inner());
+            for (_, sample) in entries.iter_refs() {
+                let data = sample.data.lock().unwrap_or_else(|e| e.into_inner());
+                write!(
+                    out,
+                    "seq={} sender={} receiver={} send={} status={} error={:?}",
+                    sample.sequence,
+                    sample.sender.0,
+                    sample.receiver.0,
+                    data.send,
+                    data.status,
+                    data.error
+                )?;
+                if let Some(id) = data.crypto {
                     write!(
                         out,
-                        "seq={} sender={} receiver={} send={} status={} error={:?}",
-                        sample.sequence,
-                        sample.sender.0,
-                        sample.receiver.0,
-                        data.send,
-                        data.status,
-                        data.error
+                        " w={} crypto={}:{}",
+                        id.worker.0, id.generation, id.sequence
                     )?;
-                    if let Some(id) = data.crypto {
-                        write!(
-                            out,
-                            " w={} crypto={}:{}",
-                            id.worker.0, id.generation, id.sequence
-                        )?;
-                    }
-                    if let Some(f) = data.facts {
-                        f.write_fields(out)?;
-                    }
-                    writeln!(out)?;
                 }
+                if let Some(f) = data.facts {
+                    f.write_fields(out)?;
+                }
+                writeln!(out)?;
             }
             Ok(())
         }
@@ -412,6 +410,71 @@ pub mod send_crc {
             samples.0.lock().unwrap().first = Some(environment::now() - Duration::from_secs(120));
             assert!(samples.begin(&p, &p.sender, &p.receiver).is_none());
         }
+        #[test]
+        fn send_crc_interval_accepts_exactly_500ms() {
+            let clock = environment::SimulationClock::new(73);
+            let _env = clock.environment(0).enter();
+            let _strict = environment::require_simulated();
+            let p = pair();
+            let samples = Samples::default();
+            let (ticket, work) = samples.begin(&p, &p.sender, &p.receiver).unwrap();
+            drop(work);
+            drop(ticket);
+            clock.advance(Duration::from_millis(500) - Duration::from_nanos(1));
+            assert!(samples.begin(&p, &p.sender, &p.receiver).is_none());
+            clock.advance(Duration::from_nanos(1));
+            let (ticket, work) = samples.begin(&p, &p.sender, &p.receiver).unwrap();
+            assert_eq!(ticket.0.sequence, 2);
+            drop(work);
+            drop(ticket);
+            let state = samples.0.lock().unwrap();
+            assert_eq!((state.eligible, state.sampled, state.skipped), (3, 2, 1));
+            assert!(!state.busy);
+        }
+
+        #[test]
+        fn send_crc_ticket_and_snapshot_survive_retention_overwrite() {
+            let clock = environment::SimulationClock::new(74);
+            let _env = clock.environment(0).enter();
+            let _strict = environment::require_simulated();
+            let p = pair();
+            let samples = Samples::default();
+            let (ticket, work) = samples.begin(&p, &p.sender, &p.receiver).unwrap();
+            let weak = Arc::downgrade(&ticket.0);
+            work.finish(None);
+            drop(work);
+            let snapshot = samples.0.lock().unwrap().entries.clone();
+            for _ in 0..CAPACITY {
+                clock.advance(Duration::from_millis(500));
+                let (next, work) = samples.begin(&p, &p.sender, &p.receiver).unwrap();
+                next.finish(true);
+                work.finish(None);
+            }
+            let mut before = String::new();
+            samples.write(&mut before).unwrap();
+            assert!(before.starts_with(
+                "eligible=65 sampled=65 skipped=0 busy=0 retained=64 overwritten=1 capacity=64\nseq=2 "
+            ));
+            assert_eq!(before.lines().count(), CAPACITY + 1);
+            ticket.finish(false);
+            let mut after = String::new();
+            samples.write(&mut after).unwrap();
+            assert_eq!(
+                before, after,
+                "evicted Ticket cannot change retained records"
+            );
+            let (_, retained) = snapshot.iter_refs().next().unwrap();
+            assert!(Arc::ptr_eq(retained, &ticket.0));
+            assert_eq!(retained.data.lock().unwrap().send, "failed");
+            drop(ticket);
+            assert!(
+                weak.upgrade().is_some(),
+                "snapshot retains the evicted sample"
+            );
+            drop(snapshot);
+            assert!(weak.upgrade().is_none(), "last handle releases the sample");
+        }
+
         #[test]
         fn send_crc_ring_is_bounded_and_preserves_send_outcomes() {
             let p = pair();

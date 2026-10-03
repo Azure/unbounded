@@ -10,9 +10,13 @@ payloads, admission policy, or error types.
   and release on drop, retaining the registry after workers exit.
 - `write_prometheus` writes directly to a caller-provided `fmt::Write`; reads are
   relaxed observations, not an atomic registry snapshot.
-- `Ring<T, N>` retains the newest `N` copyable records with saturating sequence
-  numbers and oldest-first iteration. Capacity must be positive. The caller owns
-  synchronization: clone under a lock and format after releasing it.
+- `Ring<T, N>` retains the newest `N` records with saturating sequence numbers
+  and oldest-first iteration. `iter_refs()` borrows records without cloning;
+  `iter()` preserves by-value iteration for `Copy` records. Capacity must be
+  positive. For `Clone` records, the caller can clone the ring under its own lock
+  and format after releasing that lock. An `Arc` handle snapshot retains the same
+  records, not frozen copies of their mutable contents; any record-level locks
+  remain the caller's responsibility. Overwrite releases only the ring's owner.
 
 Racer owns all application adapters, worker quota labels, failure payloads, and
 request/body lifecycle helpers. This crate does not register dynamic metrics or
