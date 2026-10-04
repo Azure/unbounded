@@ -44,10 +44,10 @@
 //!     let _ = r.recv(fd, page, (), scope);
 //! }
 //! ```
-
-use super::admission::AdmissionPolicy;
-use super::admission::ConnectionReservation;
 use super::deadline::RequestScope;
+use crate::admission::AdmissionPolicy;
+use crate::admission::ConnectionReservation;
+use crate::admission::reserve_connection;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -55,37 +55,10 @@ use crate::model::RequestId;
 use crate::model::ResourceClass;
 use std::ops::Deref;
 use std::rc::Rc;
+use uring_runtime::filesystem::Buffer;
 use uring_runtime::ReactorWake;
 use uring_runtime::SUBMISSION_BYTES;
 use uring_runtime::SubmissionCapacity;
-pub mod filesystem {
-    //! Racer filesystem buffer error boundary.
-    use crate::error::Error;
-    use crate::error::Result;
-    use uring_runtime::IoBuffer;
-    pub struct Buffer(pub(super) uring_runtime::filesystem::Buffer);
-    // SAFETY: the runtime owner retains its private stable allocation and charge.
-    unsafe impl IoBuffer for Buffer {
-        type Error = Error;
-        fn bytes(&self) -> Result<&[u8]> {
-            self.0.bytes().map_err(Into::into)
-        }
-        fn bytes_mut(&mut self) -> Result<&mut [u8]> {
-            self.0.bytes_mut().map_err(Into::into)
-        }
-    }
-    impl Buffer {
-        pub fn advance(&mut self, n: usize) -> Result<()> {
-            self.0.advance(n).map_err(Into::into)
-        }
-        pub fn remaining(&self) -> usize {
-            self.0.remaining()
-        }
-        pub fn prefix(&self, n: usize) -> Result<&[u8]> {
-            self.0.prefix(n).map_err(Into::into)
-        }
-    }
-}
 
 pub struct AdmissionBudget(Rc<flow_control::Quotas<AdmissionPolicy>>);
 impl uring_runtime::Budget for AdmissionBudget {
@@ -133,23 +106,17 @@ impl Reactor {
     pub fn waker(&self) -> Result<ReactorWake> {
         self.core.waker().map_err(Into::into)
     }
-    pub fn file_buffer(&self, length: usize) -> Result<filesystem::Buffer> {
+    pub fn file_buffer(&self, length: usize) -> Result<Buffer> {
         if length == 0 {
             return Err(Error::InvalidConfiguration);
         }
-        self.core
-            .file_buffer(length)
-            .map(filesystem::Buffer)
-            .map_err(Into::into)
+        self.core.file_buffer(length).map_err(Into::into)
     }
-    pub fn file_bytes(&self, bytes: &[u8]) -> Result<filesystem::Buffer> {
+    pub fn file_bytes(&self, bytes: &[u8]) -> Result<Buffer> {
         if bytes.is_empty() {
             return Err(Error::InvalidConfiguration);
         }
-        self.core
-            .file_bytes(bytes)
-            .map(filesystem::Buffer)
-            .map_err(Into::into)
+        self.core.file_bytes(bytes).map_err(Into::into)
     }
     pub fn reserve_connection(&self, role: ResourceClass) -> Result<ConnectionReservation> {
         reserve_connection(&self.admission, role)
@@ -195,6 +162,36 @@ mod tests {
     use uring_runtime::IoBuffer;
     use uring_runtime::SocketAddress;
     use uring_runtime::simulation;
+
+    #[test]
+    fn direct_filesystem_buffers_preserve_nonempty_boundary_and_charge() {
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits(4))));
+        let reactor = Reactor::new(admission.clone());
+        assert!(matches!(
+            reactor.file_buffer(0),
+            Err(Error::InvalidConfiguration)
+        ));
+        assert!(matches!(
+            reactor.file_bytes(b""),
+            Err(Error::InvalidConfiguration)
+        ));
+        assert_eq!(admission.used(ResourceClass::RequestContext), 0);
+        let mut buffer: uring_runtime::filesystem::Buffer =
+            reactor.file_bytes(b"abc").unwrap();
+        assert_eq!(buffer.prefix(3).unwrap(), b"abc");
+        assert!(buffer.prefix(4).is_err());
+        assert!(buffer.advance(4).is_err());
+        buffer.advance(1).unwrap();
+        assert_eq!(buffer.remaining(), 2);
+        assert_eq!(buffer.bytes().unwrap(), b"bc");
+        assert!(admission.used(ResourceClass::RequestContext) >= 3);
+        drop(buffer);
+        assert_eq!(admission.used(ResourceClass::RequestContext), 0);
+        let buffer = reactor.file_buffer(3).unwrap();
+        assert_eq!(buffer.bytes().unwrap(), &[0; 3]);
+        drop(buffer);
+        assert_eq!(admission.used(ResourceClass::RequestContext), 0);
+    }
 
     #[test]
     fn movable_production_buffers_preserve_subrange_through_completion() {
@@ -351,7 +348,7 @@ mod tests {
         let address = SocketAddress::Unix("/retry-listener".into());
         let listener = Rc::new(sim.listen(address.clone()).unwrap());
         let mut accept =
-            crate::runtime::retry_listener(&request, || reactor.accept(listener.clone(), &request));
+            uring_runtime::retry_listener(&request, || reactor.accept(listener.clone(), &request));
         assert!(poll(&mut accept).is_pending());
         assert_eq!(reactor.in_flight(), 1);
         drop(busy);
@@ -511,10 +508,10 @@ mod simulation_tests {
     use super::tests::drive;
     use super::tests::poll;
     use super::tests::scope;
-    use crate::error::Error;
-    use crate::error::Result;
     use crate::model::ResourceClass;
     use crate::admission::AdmissionPolicy;
+    use crate::error::Error;
+    use crate::error::Result;
     use crate::runtime::RequestScope;
     use std::cell::Cell;
     use std::ffi::CString;

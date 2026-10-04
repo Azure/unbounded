@@ -875,7 +875,7 @@ pub(super) fn new_scope(timeout: Duration, cancellation: Cancellation) -> Result
     Ok(RequestScope {
         body_deadlines: None,
         request: RequestId(id),
-        deadline: uring_runtime::deadline::Deadline(uring_runtime::environment::now() + timeout),
+        deadline: uring_uring_runtime::deadline::Deadline(uring_runtime::environment::now() + timeout),
         cancellation,
     })
 }
@@ -993,7 +993,7 @@ impl ReadyListeners {
         let fd = fd.clone();
         let scope = self.scope.as_ref().ok_or(Error::Internal)?.clone();
         self.wait = Some(Box::pin(async move {
-            crate::runtime::retry_listener(&scope, || {
+            uring_runtime::retry_listener(&scope, || {
                 reactor.readiness_with_lease(fd.clone(), libc::POLLIN as u32, fd.clone(), &scope)
             })
             .await

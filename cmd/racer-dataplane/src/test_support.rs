@@ -46,7 +46,7 @@ use uring_runtime::drivers::DriverQueue;
 pub mod clock {
     use crate::error::Error;
     use crate::error::Result;
-    use uring_runtime::deadline::Deadline;
+    use uring_uring_runtime::deadline::Deadline;
     use std::cell::Cell;
     use std::time::Duration;
     use std::time::Instant;

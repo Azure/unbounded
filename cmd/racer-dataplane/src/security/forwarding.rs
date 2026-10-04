@@ -2011,7 +2011,7 @@ mod tests {
     }
     #[test]
     fn deadline_roundtrip_and_verified_mailbox_ownership() {
-        let deadline = uring_runtime::deadline::Deadline(Instant::now() + Duration::from_secs(20));
+        let deadline = uring_uring_runtime::deadline::Deadline(Instant::now() + Duration::from_secs(20));
         let value = protocol::encode_deadline(deadline).unwrap();
         let decoded = protocol::decode_deadline(value).unwrap();
         assert_eq!(protocol::encode_deadline(decoded).unwrap(), value);
