@@ -7,10 +7,10 @@ mod tests {
     use std::task::Poll;
     use std::time::Duration;
     use std::time::Instant;
-    use uring_runtime::Descriptor;
-    use uring_runtime::IoBuffer;
-    use uring_runtime::SocketAddress;
-    use uring_runtime::simulation;
+    use uring_runtime::reactor::Descriptor;
+    use uring_runtime::reactor::IoBuffer;
+    use uring_runtime::reactor::SocketAddress;
+    use uring_runtime::reactor::simulation;
 
     #[test]
     fn direct_filesystem_buffers_preserve_nonempty_boundary_and_charge() {
@@ -25,7 +25,7 @@ mod tests {
             Err(Error::InvalidConfiguration)
         ));
         assert_eq!(admission.used(ResourceClass::RequestContext), 0);
-        let mut buffer: uring_runtime::filesystem::Buffer =
+        let mut buffer: uring_runtime::reactor::filesystem::Buffer =
             reactor.file_bytes(b"abc").unwrap();
         assert_eq!(buffer.prefix(3).unwrap(), b"abc");
         assert!(buffer.prefix(4).is_err());
@@ -357,20 +357,20 @@ mod simulation_tests {
     use super::tests::drive;
     use super::tests::poll;
     use super::tests::scope;
-    use crate::model::ResourceClass;
     use crate::admission::AdmissionPolicy;
     use crate::error::Error;
     use crate::error::Result;
+    use crate::model::ResourceClass;
     use crate::runtime::RequestScope;
     use std::cell::Cell;
     use std::ffi::CString;
     use std::path::Path;
     use std::rc::Rc;
     use std::time::Duration;
-    use uring_runtime::simulation::DiskState;
-    use uring_runtime::simulation::Environment;
-    use uring_runtime::simulation::Fault;
-    use uring_runtime::simulation::Simulation;
+    use uring_runtime::reactor::simulation::DiskState;
+    use uring_runtime::reactor::simulation::Environment;
+    use uring_runtime::reactor::simulation::Fault;
+    use uring_runtime::reactor::simulation::Simulation;
     fn reactor() -> Reactor {
         Reactor::new(Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
@@ -406,7 +406,7 @@ mod simulation_tests {
     fn direct_io_faults_check_address_offset_and_length_independently() {
         use page_alloc::AlignedBuffer;
         use page_alloc::Alignment;
-        use uring_runtime::IoBuffer;
+        use uring_runtime::reactor::IoBuffer;
         struct View {
             buffer: AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
             start: usize,

@@ -11,22 +11,22 @@ use self::protocol::PeerRequest;
 use self::protocol::SignedRequest;
 use self::protocol::SignedResponse;
 use self::transport::Transfers;
+use crate::admission::AdmissionPolicy;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
 use crate::model::MembershipVersion;
 use crate::model::NodeId;
 use crate::model::ResourceClass;
-use crate::admission::AdmissionPolicy;
 use crate::runtime::RequestScope;
-use crate::telemetry::Observer;
-use crate::telemetry::Stage;
 use crate::telemetry::Event;
 use crate::telemetry::Gauge;
 use crate::telemetry::Metrics;
+use crate::telemetry::Observer;
+use crate::telemetry::Stage;
 
-use crate::topology::rails;
-use crate::topology::rails::TransportPlan;
+use crate::rdma;
+use crate::rdma::TransportPlan;
 use crate::topology::Paths;
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -201,7 +201,7 @@ impl AdaptivePeers {
         let now = now();
         let mut state = self.state.lock().map_err(|_| Error::Unavailable)?;
         if state.active >= state.limit {
-            self.metrics.record(Event::PeerAdmissionRejected, 1)?;
+            self.metrics.record(Event::PeerAdmissionRejected, 1);
             return Err(Error::Overloaded);
         }
         if !state.peers.contains_key(node) && state.peers.len() == CAPACITY {
@@ -220,7 +220,7 @@ impl AdaptivePeers {
             if let Some(retired) = retired {
                 state.peers.remove(&retired);
             } else {
-                self.metrics.record(Event::PeerAdmissionRejected, 1)?;
+                self.metrics.record(Event::PeerAdmissionRejected, 1);
                 return Err(Error::Overloaded);
             }
         }
@@ -233,11 +233,11 @@ impl AdaptivePeers {
             updated: now,
         });
         if peer.probe || peer.retry.is_some_and(|at| now < at) {
-            self.metrics.record(Event::PeerCircuitRejected, 1)?;
+            self.metrics.record(Event::PeerCircuitRejected, 1);
             return Err(Error::Unavailable);
         }
         if peer.active >= peer.limit {
-            self.metrics.record(Event::PeerAdmissionRejected, 1)?;
+            self.metrics.record(Event::PeerAdmissionRejected, 1);
             return Err(Error::Overloaded);
         }
         let probe = peer.retry.is_some();
@@ -247,9 +247,9 @@ impl AdaptivePeers {
         state.active += 1;
         self.metrics
             .set_gauge(Gauge::PeerExchanges, state.active as u64);
-        self.metrics.record(Event::PeerAdmissionAccepted, 1)?;
+        self.metrics.record(Event::PeerAdmissionAccepted, 1);
         if probe {
-            self.metrics.record(Event::PeerProbe, 1)?;
+            self.metrics.record(Event::PeerProbe, 1);
         }
         Ok(Arc::new(Permit {
             owner: self.clone(),
@@ -354,17 +354,17 @@ pub struct PeerNetwork {
 }
 
 impl PeerNetwork {
-    pub fn new(
-        local: NodeId,
-        published: Arc<crate::control::PublishedState>,
-    ) -> Result<Self> {
+    pub fn new(local: NodeId, published: Arc<crate::control::PublishedState>) -> Result<Self> {
         if local.0.is_empty() {
             return Err(Error::InvalidConfiguration);
         }
         Ok(Self { local, published })
     }
 
-    pub fn membership(&self, version: MembershipVersion) -> Result<std::sync::Arc<crate::topology::Membership>> {
+    pub fn membership(
+        &self,
+        version: MembershipVersion,
+    ) -> Result<std::sync::Arc<crate::topology::Membership>> {
         self.published.membership(version)
     }
 
@@ -592,7 +592,9 @@ pub enum Requester {
     },
     #[cfg(any(test, feature = "subscription-interop"))]
     Scripted {
-        available: Box<dyn Fn(&std::sync::Arc<crate::topology::Membership>, &crate::model::NodeId) -> bool>,
+        available: Box<
+            dyn Fn(&std::sync::Arc<crate::topology::Membership>, &crate::model::NodeId) -> bool,
+        >,
         request: Box<
             dyn Fn(
                 PeerRequest,
@@ -607,7 +609,11 @@ impl Requester {
     #[cfg(any(test, feature = "subscription-interop"))]
     pub(crate) fn scripted<T: 'static>(
         state: Rc<T>,
-        available: fn(&T, &std::sync::Arc<crate::topology::Membership>, &crate::model::NodeId) -> bool,
+        available: fn(
+            &T,
+            &std::sync::Arc<crate::topology::Membership>,
+            &crate::model::NodeId,
+        ) -> bool,
         request: for<'a> fn(
             &'a T,
             PeerRequest,
@@ -962,7 +968,7 @@ impl Requester {
                 if next != budget.destination {
                     return Err(Error::InvalidRequest);
                 }
-                crate::topology::rails::TransportPlan::Http
+                crate::rdma::TransportPlan::Http
             } else if let Some(page) = rail_hint {
                 let search = search_budget(budget, &network.local)?;
                 let route = paths
@@ -971,9 +977,9 @@ impl Requester {
                 if route.nodes.get(1) != Some(&next) {
                     return Err(Error::Unavailable);
                 }
-                rails::select_hop(&route, &page, &network.local, &next)?
+                rdma::select_hop(&route, &page, &network.local, &next)?
             } else {
-                crate::topology::rails::TransportPlan::Http
+                crate::rdma::TransportPlan::Http
             };
             let _probe = health.acquire(&next)?;
             let permit = paths

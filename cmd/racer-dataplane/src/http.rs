@@ -1,23 +1,23 @@
 //! Racer policy adapters for the standalone fixed-length HTTP implementation.
-use crate::runtime::cooperative_turn as yield_once;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
 use crate::memory::VerifiedPage;
 use crate::model::PageSlice;
 use crate::model::ResourceClass;
+use crate::runtime::cooperative_turn as yield_once;
 
 use crate::admission::AdmissionPolicy;
 use crate::admission::ConnectionReservation;
-use crate::runtime::RequestScope;
 use crate::runtime::Reactor;
+use crate::runtime::RequestScope;
 use flow_control::pipe::PipeLease;
 use flow_control::pipe::PipePool;
 use http1::MessageHead;
-use std::task::Waker;
 use std::io;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::task::Waker;
 use std::time::Duration;
 use uring_runtime::reactor::Descriptor;
 use uring_runtime::reactor::IoBuffer;
@@ -76,7 +76,7 @@ impl http1::connection::Context for HttpContext {
             .map_err(Into::into)
     }
     fn outbound_slot(&self) -> Result<ConnectionReservation> {
-        self.0.reserve_connection(ResourceClass::OutboundConnection)
+        crate::admission::reserve_connection(&self.0, ResourceClass::OutboundConnection)
     }
     fn stopped(&self) -> bool {
         self.0.is_stopped()
@@ -147,7 +147,7 @@ pub fn from_accepted(
 ) -> Result<ConnectionLease> {
     from_reserved(
         fd,
-        admission.reserve_connection(ResourceClass::IngressConnection)?,
+        crate::admission::reserve_connection(admission, ResourceClass::IngressConnection)?,
     )
 }
 pub(crate) fn from_reserved(
@@ -187,7 +187,14 @@ pub fn client_io(
 ) -> HttpIo {
     HttpIo::new(
         reactor,
-        Codec::new(admission.policy().limits().header_bytes.get().min(MAX_HEAD_BYTES)),
+        Codec::new(
+            admission
+                .policy()
+                .limits()
+                .header_bytes
+                .get()
+                .min(MAX_HEAD_BYTES),
+        ),
         Rc::new(HttpContext(admission)),
         crate::model::PAGE_BYTES + 16,
         i64::MAX as u64,
@@ -495,10 +502,9 @@ impl Delivery {
                 let sent = match reader.try_send(&connection.socket(), copying) {
                     Ok(sent) => {
                         if copying {
-                            let _ = self.metrics.record(
-                                crate::telemetry::Event::DeliveryDirectBytes,
-                                sent as u64,
-                            );
+                            let _ = self
+                                .metrics
+                                .record(crate::telemetry::Event::DeliveryDirectBytes, sent as u64);
                         }
                         sent
                     }

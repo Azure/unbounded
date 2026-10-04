@@ -3,9 +3,8 @@
 //!
 //! Credentials are only origin-fetch context, never Racer authorization. Do not
 //! persist headers or retain them in pooled connections after an operation ends.
-use racer_control_wire::CacheDefinition;
+use crate::admission::AdmissionPolicy;
 use crate::control::SnapshotStore;
-use racer_control_wire::canonical_socket_paths;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -27,11 +26,12 @@ use crate::model::PageNumber;
 use crate::model::ResourceClass;
 use crate::model::StrongEtag;
 use crate::read::candidates::OriginAuthority;
-use crate::admission::AdmissionPolicy;
 use crate::runtime::RequestScope;
 use http1::Header;
 use http1::MessageHead;
 use http1::StartLine;
+use racer_control_wire::CacheDefinition;
+use racer_control_wire::canonical_socket_paths;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;

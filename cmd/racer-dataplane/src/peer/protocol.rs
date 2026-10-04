@@ -1,6 +1,7 @@
 //! Signed peer operations and canonical encoding/decoding with charged ownership.
 //! Binary fields use padded standard base64, integers minimal decimal, and keys
 //! lowercase hex. Encoders never include page bytes; transports preserve signed heads.
+use crate::admission::AdmissionPolicy;
 use crate::error::Error;
 use crate::error::Result;
 use crate::http::Codec;
@@ -20,8 +21,6 @@ use crate::model::PeerOriginContext;
 use crate::model::ResourceClass;
 use crate::model::*;
 use crate::peer::forwarding::ForwardedHead;
-use crate::admission::AdmissionPolicy;
-use uring_runtime::deadline::Deadline;
 use crate::runtime::RequestScope;
 use crate::topology::RouteBudget;
 use base64::Engine;
@@ -40,6 +39,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
+use uring_runtime::deadline::Deadline;
 
 pub enum FetchMode {
     CopyOnly,

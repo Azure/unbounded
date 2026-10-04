@@ -1,12 +1,10 @@
 //! Deterministic test-only seams; no fake implementation is linked into production.
-use crate::read::dispatch::WorkerMap;
-use racer_control_wire::Publication;
-use racer_control_wire::CacheDefinition;
+use crate::admission::AdmissionPolicy;
 use crate::control::PublishedState;
 use crate::control::SnapshotStore;
+use crate::http::Delivery;
 use crate::memory::BufferPool;
 use crate::memory::cache::MemoryCache;
-use crate::http::Delivery;
 use crate::model::MembershipVersion;
 use crate::model::ObjectMetadata;
 use crate::model::WorkerId;
@@ -14,17 +12,19 @@ use crate::read::Coordinator;
 use crate::read::candidates::CandidatePolicy;
 use crate::read::dispatch::WorkerDirectory;
 use crate::read::dispatch::WorkerEndpoint;
+use crate::read::dispatch::WorkerMap;
 use crate::read::fill::Fill;
 use crate::read::fill::FillDependencies;
 use crate::read::flight::Flights;
 use crate::read::metadata::MetadataDependencies;
 use crate::read::metadata::MetadataService;
 use crate::read::range_stream::RangeStreams;
-use crate::admission::AdmissionPolicy;
+use crate::runtime::Reactor;
 use crate::runtime::crypto;
 use crate::runtime::crypto::CryptoClient;
-use crate::runtime::Reactor;
 use crate::runtime::worker::CryptoRuntime;
+use racer_control_wire::CacheDefinition;
+use racer_control_wire::Publication;
 
 use crate::security::aead::PageCrypto;
 use crate::security::aead::PageCryptoEngine;
@@ -34,7 +34,6 @@ use crate::store::StoreWriter;
 use crate::store::catalog::Index;
 use crate::store::catalog::SegmentClock;
 use crate::test_support::origin::AdapterOrigin;
-use crate::topology::Member;
 use crate::topology::Placement;
 use racer_control_wire::PublicationSequence;
 use std::cell::RefCell;
@@ -46,12 +45,12 @@ use uring_runtime::drivers::DriverQueue;
 pub mod clock {
     use crate::error::Error;
     use crate::error::Result;
-    use uring_runtime::deadline::Deadline;
     use std::cell::Cell;
     use std::time::Duration;
     use std::time::Instant;
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
+    use uring_runtime::deadline::Deadline;
 
     /// Pure deadline/freshness fixture. Reactor timers use SimulationClock.
     pub struct Clock {
@@ -161,13 +160,13 @@ pub mod clock {
 pub mod origin {
     //! Controllable adapter boundary shared by read and client scenarios.
     //! The client, HTTP parser, reactor, and plaintext admission remain production code.
+    use crate::admission::AdmissionPolicy;
     use crate::control::SnapshotStore;
     use crate::http::Codec;
     use crate::memory::BufferPool;
     use crate::model::ObjectMetadata;
     use crate::model::PAGE_BYTES;
     use crate::origin::OriginClient;
-    use crate::admission::AdmissionPolicy;
     use crate::runtime::Reactor;
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
@@ -599,8 +598,8 @@ impl NoPeers {
 /// Side-effect-free configuration for assembled worker scenarios.
 pub mod cluster {
     use crate::config::Config;
-    use crate::model::ClusterId;
     use crate::config::Limits;
+    use crate::model::ClusterId;
     use crate::model::NodeId;
     use std::num::NonZeroU32;
     use std::num::NonZeroUsize;
@@ -716,7 +715,7 @@ impl ReadWorker {
                 cluster: keys.cluster().clone(),
                 sequence: PublicationSequence(1),
                 membership_version: MembershipVersion(1),
-                members: vec![Member {
+                members: vec![racer_control_wire::Member {
                     node: keys.node().clone(),
                     shares: NonZeroU32::new(1).unwrap(),
                     peer_endpoint: "127.0.0.1:1".into(),

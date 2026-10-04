@@ -18,10 +18,10 @@ use crate::model::ObjectMetadata;
 use crate::model::OriginContext;
 use crate::model::PeerOriginContext;
 use crate::model::ResolvedRange;
+use crate::peer::forwarding::VerifiedRequest;
 use crate::peer::protocol::FetchMode;
 use crate::peer::protocol::Operation as PeerOperation;
 use crate::peer::protocol::PeerResponse;
-use crate::peer::forwarding::VerifiedRequest;
 use crate::peer::server::LocalPageService;
 use crate::runtime::RequestScope;
 use crate::security::credentials::ChargedOriginContext;
@@ -301,7 +301,7 @@ impl LocalPageService for Coordinator {
                         } => {
                             self.fill
                                 .metrics
-                                .record(crate::telemetry::Event::PeerBootstrap, 1)?;
+                                .record(crate::telemetry::Event::PeerBootstrap, 1);
                             self.metadata
                                 .bootstrap_peer(membership, &context, &effective, &mut budget)
                                 .await

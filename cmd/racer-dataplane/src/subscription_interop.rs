@@ -1,6 +1,7 @@
 //! Opt-in Go SDK fixture using the production library, not a second crate root.
-use crate::read::dispatch::WorkerMap;
+use crate::admission::AdmissionPolicy;
 use crate::client;
+use crate::config::Limits;
 use crate::control;
 use crate::error;
 use crate::http;
@@ -9,6 +10,7 @@ use crate::model;
 use crate::origin;
 use crate::peer;
 use crate::read;
+use crate::read::dispatch::WorkerMap;
 use crate::runtime;
 use crate::security;
 use crate::store;
@@ -27,9 +29,8 @@ use racer_control_wire::KeyringBundle;
 use racer_control_wire::SCHEMA_VERSION;
 use racer_identity::KeyEpochs;
 use racer_identity::Keyring;
-use admission::AdmissionPolicy;
-use runtime::RequestScope;
 use runtime::Reactor;
+use runtime::RequestScope;
 use runtime::worker::CryptoRuntime;
 
 use std::num::NonZeroUsize;
@@ -40,7 +41,7 @@ use std::task::Context;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::UNIX_EPOCH;
-use uring_runtime::IoBuffer;
+use uring_runtime::reactor::IoBuffer;
 
 // Only origin content is generated. No client wire framing, scheduling, credit
 // accounting, page validation, encryption, or delivery is implemented here.
@@ -192,14 +193,14 @@ struct SubscriptionFixture {
 impl SubscriptionFixture {
     fn construct(root: PathBuf) -> Self {
         use client::RequestParser;
-        use client::listener::ClientListeners;
         use client::Responses;
+        use client::listener::ClientListeners;
         use control::PublishedState;
         use control::SnapshotStore;
-        use memory::BufferPool;
-        use memory::cache::MemoryCache;
         use http::Delivery;
         use http::new_pipe_pool;
+        use memory::BufferPool;
+        use memory::cache::MemoryCache;
         use racer_control_wire::CacheDefinition;
         use racer_control_wire::Publication;
         use racer_control_wire::*;

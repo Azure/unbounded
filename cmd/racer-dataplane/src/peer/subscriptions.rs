@@ -1120,13 +1120,13 @@ mod tests {
     }
     #[test]
     fn successful_fanout_shares_allocation_and_charges_each_receiver_once() {
+        use crate::admission::AdmissionPolicy;
         use crate::memory::BufferPool;
         use crate::model::ExpiresAt;
         use crate::model::KeyId;
         use crate::model::Nonce;
         use crate::model::PageEnvelope;
         use crate::model::ResourceClass;
-        use crate::admission::AdmissionPolicy;
         use std::rc::Rc;
         use std::time::UNIX_EPOCH;
         let scheduler = Arc::new(Subscriptions::new(Default::default()).unwrap());

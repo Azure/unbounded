@@ -3,9 +3,9 @@
 //!
 //! A verified proof establishes identity and provenance, not replay admission.
 //! Only the carrying connection session admits a fresh immediate-hop message.
-use super::*;
 use super::session_head as head;
 use super::verify_session as verify;
+use super::*;
 use crate::peer::protocol as p;
 
 #[cfg(test)]
@@ -317,11 +317,11 @@ mod signature_tests {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::admission::AdmissionPolicy;
     use crate::http::Codec;
     use crate::http::Endpoint;
     use crate::model::RequestId;
     use crate::model::ResourceClass;
-    use crate::admission::AdmissionPolicy;
     use crate::runtime::Reactor;
     use std::future::Future;
     use std::task::Context;

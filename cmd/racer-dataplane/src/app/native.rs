@@ -205,14 +205,13 @@ impl WorkerApplication {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use racer_control_wire::Publication;
     use crate::model::MembershipVersion;
     use crate::model::ResourceClass;
     use crate::runtime::crypto;
     use crate::runtime::crypto::CryptoClient;
-    use crate::topology::Member;
-    use racer_control_wire::RailId;
+    use racer_control_wire::Publication;
     use racer_control_wire::PublicationSequence;
+    use racer_control_wire::RailId;
     use std::num::NonZeroUsize;
 
     #[test]
@@ -235,7 +234,7 @@ mod tests {
             cluster: app.config.cluster.clone(),
             sequence: PublicationSequence(2),
             membership_version: MembershipVersion(2),
-            members: vec![Member {
+            members: vec![racer_control_wire::Member {
                 node: app.config.node.clone(),
                 shares: std::num::NonZeroU32::new(1).unwrap(),
                 peer_endpoint: "127.0.0.1:7443".into(),
@@ -823,7 +822,7 @@ mod tests {
                 cluster: app.config.cluster.clone(),
                 sequence: PublicationSequence(1),
                 membership_version: MembershipVersion(1),
-                members: vec![Member {
+                members: vec![racer_control_wire::Member {
                     node: app.config.node.clone(),
                     shares: std::num::NonZeroU32::new(1).unwrap(),
                     peer_endpoint: "127.0.0.1:7443".into(),
@@ -895,7 +894,7 @@ mod tests {
                 cluster: app.config.cluster.clone(),
                 sequence: PublicationSequence(2),
                 membership_version: MembershipVersion(2),
-                members: vec![Member {
+                members: vec![racer_control_wire::Member {
                     node: app.config.node.clone(),
                     shares: std::num::NonZeroU32::new(1).unwrap(),
                     peer_endpoint: "127.0.0.1:7443".into(),
@@ -925,14 +924,8 @@ mod tests {
         let mut app = configured();
         app.discovered_nics.push(app.discovered_nics[0].clone());
         assert!(
-            crate::rdma::select_worker(
-                &app.discovered_nics[..1],
-                &app.discovered_nics,
-                0,
-                None,
-                1
-            )
-            .is_empty()
+            crate::rdma::select_worker(&app.discovered_nics[..1], &app.discovered_nics, 0, None, 1)
+                .is_empty()
         );
     }
 

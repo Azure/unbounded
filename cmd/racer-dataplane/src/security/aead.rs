@@ -1,4 +1,5 @@
 //! Vetted XChaCha20-Poly1305 adapter, canonical page AAD, fresh cryptographic nonces.
+use crate::admission::AdmissionPolicy;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -12,7 +13,7 @@ use crate::model::PageEnvelope;
 use crate::model::PageId;
 use crate::model::RequestId;
 use crate::model::ResourceClass;
-use crate::admission::AdmissionPolicy;
+use crate::runtime::RequestScope;
 use crate::runtime::crypto::CryptoClient;
 use crate::runtime::crypto::CryptoCompletion;
 use crate::runtime::crypto::CryptoInput;
@@ -21,8 +22,9 @@ use crate::runtime::crypto::CryptoOutcome;
 use crate::runtime::crypto::CryptoOutput;
 use crate::runtime::crypto::CryptoPermit;
 use crate::runtime::crypto::IntegrityRejection;
-use crate::runtime::RequestScope;
 use crate::runtime::worker::CryptoRuntime;
+#[cfg(test)]
+use uring_runtime::group::Service;
 
 use crate::telemetry::AeadFailure;
 use crate::telemetry::Failure;
@@ -622,8 +624,8 @@ mod tests {
     }
     #[test]
     fn libsodium_boundary_and_full_page_detached_vectors() {
-        use crate::memory::BufferPool;
         use crate::admission::AdmissionPolicy;
+        use crate::memory::BufferPool;
         use crate::runtime::crypto::CryptoId;
         use crate::runtime::crypto::pair;
         use sha2::Digest;
@@ -817,8 +819,8 @@ mod tests {
     }
     #[test]
     fn engine_preserves_failed_inputs_and_completion_capacity() {
-        use crate::memory::BufferPool;
         use crate::admission::AdmissionPolicy;
+        use crate::memory::BufferPool;
         use crate::runtime::crypto::CryptoId;
         use crate::runtime::crypto::pair;
         let keys = crate::security::test_support::keys();
@@ -942,8 +944,8 @@ mod tests {
     }
     #[test]
     fn encryption_preserves_staging_and_charges_on_failure() {
-        use crate::memory::BufferPool;
         use crate::admission::AdmissionPolicy;
+        use crate::memory::BufferPool;
         use crate::runtime::crypto::CryptoId;
         use crate::runtime::crypto::pair;
         let keys = crate::security::test_support::keys();
@@ -1065,8 +1067,8 @@ mod tests {
     }
     #[test]
     fn engine_encrypts_and_returns_original_staging_on_failure() {
-        use crate::memory::BufferPool;
         use crate::admission::AdmissionPolicy;
+        use crate::memory::BufferPool;
         use crate::runtime::crypto::CryptoId;
         use crate::runtime::crypto::pair;
         let keys = crate::security::test_support::keys();
@@ -1317,4 +1319,4 @@ mod tests {
         assert_eq!(admission.used(ResourceClass::Plaintext), 0);
     }
 }
-use uring_runtime::IoBuffer;
+use uring_runtime::reactor::IoBuffer;

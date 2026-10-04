@@ -10,7 +10,6 @@ use super::catalog::RecordLocation;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
-use crate::runtime::cooperative_turn;
 use crate::model::CacheId;
 use crate::model::CacheKey;
 use crate::model::KeyId;
@@ -23,6 +22,7 @@ use crate::model::VersionMetadata;
 use crate::model::WorkerId;
 use crate::runtime::HashMap;
 use crate::runtime::HashSet;
+use crate::runtime::cooperative_turn;
 use page_alloc::Alignment;
 use page_alloc::Extent;
 use page_alloc::Generation;
@@ -303,7 +303,7 @@ impl Drop for Checkpointer {
 
 fn publish_bytes(directory: &Path, slot: usize, bytes: &[u8]) -> Result<()> {
     #[cfg(test)]
-    if let Some(sim) = uring_runtime::simulation::Simulation::current() {
+    if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
         sim.create_dir_all(directory).map_err(|_| Error::Io)?;
         let temporary = directory.join(format!(".checkpoint.{}.tmp", sim.next_sequence()));
         let result = (|| {
@@ -520,14 +520,14 @@ impl Iterator for Candidates {
 enum CandidateFile {
     Real(std::fs::File),
     #[cfg(test)]
-    Sim(uring_runtime::simulation::Handle, u64),
+    Sim(uring_runtime::reactor::simulation::Handle, u64),
 }
 impl CandidateFile {
     fn open(path: &Path, directory: bool) -> std::io::Result<Self> {
         let flags =
             libc::O_NOFOLLOW | libc::O_NONBLOCK | if directory { libc::O_DIRECTORY } else { 0 };
         #[cfg(test)]
-        if let Some(sim) = uring_runtime::simulation::Simulation::current() {
+        if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
             let handle = sim
                 .open(None, path, libc::O_RDONLY | flags)?
                 .into_sim()

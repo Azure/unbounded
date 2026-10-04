@@ -5,8 +5,7 @@ use self::catalog::Index;
 use self::catalog::IndexedPage;
 use self::catalog::RecordLocation;
 use self::catalog::SegmentClock;
-use crate::runtime::HashMap;
-use crate::runtime::Reactor;
+use crate::admission::AdmissionPolicy;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -24,7 +23,8 @@ use crate::model::PageNumber;
 use crate::model::ResourceClass;
 use crate::model::StrongEtag;
 use crate::model::VersionMetadata;
-use crate::admission::AdmissionPolicy;
+use crate::runtime::HashMap;
+use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
 use page_alloc::AlignedBuffer;
 use page_alloc::Alignment;
@@ -134,9 +134,7 @@ impl StoreReader {
         self
     }
     fn corrupt_miss(&self) {
-        let _ = self
-            .metrics
-            .record(crate::telemetry::Event::CorruptMiss, 1);
+        let _ = self.metrics.record(crate::telemetry::Event::CorruptMiss, 1);
     }
     pub fn invalidate(&self, token: &ReadToken) -> Result<()> {
         self.index.remove_if_matches(&token.page, &token.location);
@@ -754,7 +752,7 @@ impl StoreWriter {
                 },
             )?;
             self.metrics
-                .record(crate::telemetry::Event::DiskPublication, 1)?;
+                .record(crate::telemetry::Event::DiskPublication, 1);
         } else if self.pending.borrow().contains_key(id) {
             self.note_discard(1);
         }

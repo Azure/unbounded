@@ -6,8 +6,8 @@ use crate::model::ClusterId;
 use crate::model::KeyId;
 use crate::model::MembershipVersion;
 use crate::model::NodeId;
-use crate::runtime::RequestScope;
 use crate::runtime::Reactor;
+use crate::runtime::RequestScope;
 use crate::topology::Member;
 use crate::topology::Membership;
 use base64::Engine;
@@ -51,7 +51,7 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
-use uring_runtime::Descriptor;
+use uring_runtime::reactor::Descriptor;
 use zeroize::Zeroize;
 use zeroize::Zeroizing;
 
@@ -1423,7 +1423,7 @@ impl ReactorControlIo {
                 return Ok(());
             }
             #[cfg(test)]
-            if uring_runtime::simulation::Simulation::current().is_some() {
+            if uring_runtime::reactor::simulation::Simulation::current().is_some() {
                 return std::future::poll_fn(|cx| {
                     scope.check()?;
                     if uring_runtime::environment::now() >= until {
@@ -2194,7 +2194,7 @@ pub(crate) async fn directory(
 }
 fn check_private(stat: &libc::statx, regular: bool) -> Result<()> {
     #[cfg(test)]
-    let uid = if uring_runtime::simulation::Simulation::current().is_some() {
+    let uid = if uring_runtime::reactor::simulation::Simulation::current().is_some() {
         0
     } else {
         unsafe { libc::geteuid() }

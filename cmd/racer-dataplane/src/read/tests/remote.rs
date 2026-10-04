@@ -1,8 +1,5 @@
 //! Candidate policy exercised through real signing, handshake, TCP, and Requester.
-use crate::read::candidates::CandidatePolicy;
-use crate::read::candidates::CandidateResolution;
-use crate::read::dispatch::WorkerMap;
-use crate::read::flight::AcquisitionBudget;
+use crate::admission::AdmissionPolicy;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::http::Codec;
@@ -12,20 +9,23 @@ use crate::model::MetadataSelector;
 use crate::model::ObjectMetadata;
 use crate::model::OriginContext;
 use crate::model::*;
-use crate::peer::forwarding::Forwarding;
 use crate::peer::PeerNetwork;
 use crate::peer::Relay;
 use crate::peer::Requester;
+use crate::peer::forwarding::Forwarding;
+use crate::peer::forwarding::VerifiedRequest;
 use crate::peer::protocol;
 use crate::peer::protocol::FetchMode;
 use crate::peer::protocol::PeerResponse;
-use crate::peer::forwarding::VerifiedRequest;
 use crate::peer::server::LocalPageService;
 use crate::peer::server::PeerServer;
 use crate::peer::transport::Transfers;
-use crate::admission::AdmissionPolicy;
-use crate::runtime::RequestScope;
+use crate::read::candidates::CandidatePolicy;
+use crate::read::candidates::CandidateResolution;
+use crate::read::dispatch::WorkerMap;
+use crate::read::flight::AcquisitionBudget;
 use crate::runtime::Reactor;
+use crate::runtime::RequestScope;
 use crate::security::credentials::CredentialCrypto;
 use crate::security::test_support::Identity;
 use crate::test_support::origin::AdapterOrigin;
@@ -274,9 +274,9 @@ fn live_read_routes_after_cache_only_publication_and_membership_update() {
 fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn: bool) {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    use racer_control_wire::Publication;
     use crate::control::PublishedState;
     use crate::control::SnapshotStore;
+    use racer_control_wire::Publication;
     let object = ObjectId {
         cache: CacheId(CACHE.into()),
         key: CacheKey([3; 32]),
@@ -299,7 +299,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
             origin_socket: "/run/racer/remote/origin/socket".into(),
         }],
         members: (0..4)
-            .map(|i| Member {
+            .map(|i| racer_control_wire::Member {
                 node: node(i),
                 shares: std::num::NonZeroU32::new(4).unwrap(),
                 peer_endpoint: address.clone(),
@@ -515,7 +515,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     let service = async {
         let fd = reactor
             .accept(
-                Rc::new(uring_runtime::Descriptor::from(listener)),
+                Rc::new(uring_runtime::reactor::Descriptor::from(listener)),
                 &scope,
             )
             .await?;
@@ -887,12 +887,11 @@ fn metadata_coordinator_with_newer_publication(
     adapter: Rc<AdapterOrigin>,
     newer_publication: bool,
 ) -> (Rc<super::Coordinator>, super::dispatch::WorkerEndpoint) {
-    use racer_control_wire::Publication;
     use crate::control::PublishedState;
     use crate::control::SnapshotStore;
-    use crate::memory::cache::MemoryCache;
     use crate::http::Delivery;
     use crate::http::new_pipe_pool;
+    use crate::memory::cache::MemoryCache;
     use crate::runtime::crypto;
     use crate::runtime::crypto::CryptoClient;
     use crate::security::aead::PageCrypto;
@@ -900,6 +899,7 @@ fn metadata_coordinator_with_newer_publication(
     use crate::store::StoreWriter;
     use crate::store::catalog::Index;
     use crate::store::catalog::SegmentClock;
+    use racer_control_wire::Publication;
     let published = Arc::new(PublishedState::default());
     let availability = Rc::new(crate::control::Availability::new(
         published.clone(),
@@ -911,7 +911,12 @@ fn metadata_coordinator_with_newer_publication(
         cluster: ClusterId(CLUSTER.into()),
         sequence: PublicationSequence(1),
         membership_version: membership.version,
-        members: membership.members().to_vec(),
+        members: membership
+            .members()
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .collect(),
         caches: vec![racer_control_wire::CacheDefinition {
             id: CacheId(CACHE.into()),
             name: "remote".into(),

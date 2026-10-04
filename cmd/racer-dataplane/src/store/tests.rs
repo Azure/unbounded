@@ -19,8 +19,8 @@ use crate::model::StrongEtag;
 use crate::model::WorkerId;
 
 use crate::admission::AdmissionPolicy;
-use crate::runtime::RequestScope;
 use crate::runtime::Reactor;
+use crate::runtime::RequestScope;
 use page_alloc::Alignment;
 use page_alloc::Generation;
 use page_alloc::SegmentId;
@@ -554,8 +554,8 @@ fn concurrent_writes_reserve_distinct_extents_and_capacity_before_completion() {
 
 #[test]
 fn pipeline_out_of_order_failure_and_short_cqes_preserve_other_mapping() {
-    use uring_runtime::simulation::Fault;
-    use uring_runtime::simulation::Simulation;
+    use uring_runtime::reactor::simulation::Fault;
+    use uring_runtime::reactor::simulation::Simulation;
     for fault in [Fault::Delay(6), Fault::Errno(libc::EIO), Fault::Short(512)] {
         let simulation = Simulation::new();
         let _environment = simulation.enter();
@@ -2367,9 +2367,6 @@ mod records {
 }
 
 mod checkpoint {
-    use crate::store::checkpoint as checkpoint_format;
-    use crate::store::checkpoint::*;
-    use crate::store::tests::Directory;
     use crate::error::Error;
     use crate::model::CacheId;
     use crate::model::CacheKey;
@@ -2383,6 +2380,9 @@ mod checkpoint {
     use crate::store::catalog::Index;
     use crate::store::catalog::IndexedPage;
     use crate::store::catalog::RecordLocation;
+    use crate::store::checkpoint as checkpoint_format;
+    use crate::store::checkpoint::*;
+    use crate::store::tests::Directory;
     use futures::executor::block_on;
     use page_alloc::Alignment;
     use page_alloc::Extent;
@@ -2393,16 +2393,16 @@ mod checkpoint {
     use std::fs;
     use std::path::PathBuf;
     use std::rc::Rc;
-    use uring_runtime::simulation::Fault;
-    use uring_runtime::simulation::Simulation;
+    use uring_runtime::reactor::simulation::Fault;
+    use uring_runtime::reactor::simulation::Simulation;
 
     const SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
 
     #[test]
     fn canceled_async_publication_preserves_existing_slots_without_submission() {
         use crate::admission::AdmissionPolicy;
-        use crate::runtime::RequestScope;
         use crate::runtime::Reactor;
+        use crate::runtime::RequestScope;
         use std::time::Duration;
         use std::time::Instant;
         let directory = Directory::new();
@@ -2438,8 +2438,8 @@ mod checkpoint {
     #[test]
     fn abandoned_async_publication_fences_io_and_preserves_existing_slots() {
         use crate::admission::AdmissionPolicy;
-        use crate::runtime::RequestScope;
         use crate::runtime::Reactor;
+        use crate::runtime::RequestScope;
         use std::task::Context;
         use std::task::Poll;
         use std::time::Duration;

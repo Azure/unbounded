@@ -3,6 +3,8 @@
 use crate::model::CacheId;
 use crate::model::PAGE_BYTES;
 use crate::model::ResourceClass;
+#[cfg(test)]
+use uring_runtime::group::Service;
 
 use crate::admission::AdmissionPolicy;
 use std::collections::BTreeMap;
@@ -1021,7 +1023,6 @@ mod fidelity {
     //! Dirty Fill and crypto checks below cover production contracts against explicit
     //! Bundle owner traces, not the simulator's event scheduling or completion timing.
     use super::*;
-    use crate::read::dispatch::WorkerMap;
     use crate::error::Operation;
     use crate::memory::BufferPool;
     use crate::memory::VerifiedBytes;
@@ -1047,14 +1048,15 @@ mod fidelity {
     use crate::read::candidates::CandidatePolicy;
     use crate::read::candidates::OriginAuthority;
     use crate::read::dispatch::WorkerDirectory;
+    use crate::read::dispatch::WorkerMap;
     use crate::read::fill::Fill;
     use crate::read::fill::FillDependencies;
     use crate::read::flight::AcquisitionBudget;
     use crate::read::flight::Flights;
+    use crate::runtime::Reactor;
+    use crate::runtime::RequestScope;
     use crate::runtime::crypto;
     use crate::runtime::crypto::CryptoClient;
-    use crate::runtime::RequestScope;
-    use crate::runtime::Reactor;
     use crate::runtime::worker::CryptoRuntime;
 
     use crate::security::aead::PageCrypto;
@@ -1073,7 +1075,7 @@ mod fidelity {
     use std::task::Context;
     use std::time::Duration;
     use std::time::Instant;
-    use uring_runtime::IoBuffer;
+    use uring_runtime::reactor::IoBuffer;
 
     // The abstract side owns no payload. Production pages put the same non-cloneable
     // charges inside Arc<VerifiedBytes>/Arc<CiphertextBytes> (memory/pool.rs:41-58).
@@ -1083,7 +1085,7 @@ mod fidelity {
 
     impl MetadataOwners {
         fn reserve(admission: &flow_control::Quotas<AdmissionPolicy>, cache: &CacheId) -> Self {
-            let reserved = admission.reserve_fill(cache, false).unwrap();
+            let reserved = crate::admission::reserve_fill(&admission, cache, false).unwrap();
             Self {
                 bundle: super::Bundle {
                     plain: Arc::new(reserved.plaintext),
@@ -1142,7 +1144,7 @@ mod fidelity {
     ) -> PageResult {
         let metadata = descriptor(cache, version, length);
         let id = page_id(&metadata);
-        let reserved = admission.reserve_fill(cache, false).unwrap();
+        let reserved = crate::admission::reserve_fill(&admission, cache, false).unwrap();
         let pool = BufferPool::new(admission.clone());
         let mut plaintext = pool.plaintext(reserved.plaintext, length).unwrap();
         plaintext.bytes_mut().unwrap().fill(7);
@@ -1643,7 +1645,7 @@ mod fidelity {
         let mut result = None;
         for _ in 0..32 {
             uring_runtime::drivers::poll(&mut cx, 8);
-            engine.poll_budgeted(8).unwrap();
+            engine.poll_budgeted(&mut cx, 8).unwrap();
             client.poll_budgeted(8).unwrap();
             if let std::task::Poll::Ready(value) = read.as_mut().poll(&mut cx) {
                 result = Some(value.unwrap());
@@ -1696,7 +1698,7 @@ mod fidelity {
         let completion_owner = caller.clone();
         assert!(!caller.bundle.idle());
         assert!(!completion_owner.bundle.idle());
-        let reserved = real.reserve_fill(&cache, false).unwrap();
+        let reserved = crate::admission::reserve_fill(&real, &cache, false).unwrap();
         let buffers = BufferPool::new(real.clone());
         let plaintext = buffers.plaintext(reserved.plaintext, 3).unwrap();
         let (port, engine_port) = crypto::pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
@@ -1740,7 +1742,7 @@ mod fidelity {
         assert_eq!(client.outstanding(), 1);
         // Failed inputs survive the engine as well, security/aead.rs:259-260;
         // abandoned completion release occurs in runtime/crypto.rs:497-518.
-        engine.poll_budgeted(1).unwrap();
+        engine.poll_budgeted(&mut cx, 1).unwrap();
         assert!(completion_owner.bundle.idle());
         checkpoint(
             "completion published but not reaped",

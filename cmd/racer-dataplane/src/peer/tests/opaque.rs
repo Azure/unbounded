@@ -143,8 +143,8 @@ mod materialized_pairing {
         let downstream_closed = Cell::new(false);
         let healthy_first = Cell::new(false);
         let overlapped = Cell::new(false);
-        let listener: Rc<uring_runtime::Descriptor> = Rc::new(listener.into());
-        let destination = |listener: Rc<uring_runtime::Descriptor>| async {
+        let listener: Rc<uring_runtime::reactor::Descriptor> = Rc::new(listener.into());
+        let destination = |listener: Rc<uring_runtime::reactor::Descriptor>| async {
             let fd = reactors[2].accept(listener, &scope).await?;
             accepted.set(accepted.get() + 1);
             let conn = crate::http::from_accepted(fd, &admissions[2])?;
@@ -803,8 +803,8 @@ use crate::http::HttpPool;
 use crate::model::ExpiresAt;
 use crate::model::ObjectMetadata;
 use crate::model::PageEnvelope;
+use crate::peer::protocol as connection;
 use crate::runtime::Reactor;
-use crate::security::connection;
 use crate::topology::LinkHealth;
 use crate::topology::Member;
 use crate::topology::Membership;
@@ -837,7 +837,7 @@ struct Never;
 impl server::LocalPageService for Never {
     fn serve_peer<'a>(
         &'a self,
-        _: protocol::VerifiedRequest,
+        _: crate::peer::forwarding::VerifiedRequest,
         _: std::sync::Arc<crate::topology::Membership>,
         _: &'a RequestScope,
     ) -> crate::error::Operation<'a, PeerResponse> {
@@ -1487,8 +1487,8 @@ fn opaque_relay_benchmark() {
 
 #[test]
 fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution() {
-    use crate::peer::protocol;
     use crate::peer::forwarding::ForwardedHead;
+    use crate::peer::protocol;
     fn copy(head: &http1::MessageHead) -> http1::MessageHead {
         let codec = Codec::new(crate::peer::protocol::MAX_SIGNED_HEAD);
         let mut head = codec
@@ -1596,4 +1596,4 @@ fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution()
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
     }
 }
-use uring_runtime::IoBuffer;
+use uring_runtime::reactor::IoBuffer;

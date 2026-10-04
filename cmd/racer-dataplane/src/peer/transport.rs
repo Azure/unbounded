@@ -14,43 +14,35 @@ use crate::http::HttpPool;
 use crate::model::NodeId;
 use crate::model::ResourceClass;
 use crate::model::TransferId;
+use crate::peer::forwarding::ForwardedHead;
 use crate::peer::protocol as p;
-use crate::telemetry::BodyProgress;
-use crate::telemetry::Detail;
-use crate::telemetry::Failure;
-use crate::telemetry::Stage;
-use crate::telemetry::timestamp;
-use crate::error::Error;
-use crate::error::Operation;
-use crate::error::Result;
-use crate::http::ConnectionLease;
-use crate::http::HttpIo;
-use crate::http::HttpPool;
-use crate::model::NodeId;
-use crate::model::ResourceClass;
-use crate::model::TransferId;
-use crate::rdma::Sessions;
 use crate::rdma::AuthenticatedDescriptor;
 use crate::rdma::COMPLETION_HEADER;
 use crate::rdma::DESCRIPTOR_HEADER;
 use crate::rdma::SETUP_BINDING_HEADER;
 use crate::rdma::SETUP_HEADER;
+use crate::rdma::Sessions;
 use crate::rdma::SetupParameters;
+use crate::telemetry::BodyProgress;
+use crate::telemetry::Detail;
+use crate::telemetry::Failure;
+use crate::telemetry::Stage;
+use crate::telemetry::timestamp;
 
 use crate::admission::AdmissionPolicy;
-use crate::runtime::RequestScope;
 use crate::peer::protocol::Signatures;
 use crate::peer::protocol::SignedHead;
 use crate::peer::protocol::VerifiedHead;
 use crate::peer::protocol::signed_digest;
-use racer_control_wire::RailId;
-use crate::topology::rails::TransportPlan;
+use crate::rdma::TransportPlan;
+use crate::runtime::RequestScope;
 use http1::Header;
 use http1::MessageHead;
 use http1::StartLine;
-use std::task::Poll;
+use racer_control_wire::RailId;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 use uring_runtime::reactor::IoBuffer;
 
@@ -82,8 +74,8 @@ mod native_control_tests {
     }
     #[test]
     fn session_admitted_setup_grant_completion_still_require_exact_transfer_and_phase() {
-        use crate::peer::protocol::tests::pair;
-        use crate::peer::protocol::tests::signer;
+        use crate::peer::protocol::connection_tests::tests::pair;
+        use crate::peer::protocol::connection_tests::tests::signer;
         let (mut sender, mut receiver) = pair();
         let a = signer(&sender);
         let b = signer(&receiver);
@@ -211,7 +203,7 @@ mod native_control_tests {
                 )
                 .unwrap();
         }
-        crate::peer::protocol::tests::replay_and_binding_checks();
+        crate::peer::protocol::connection_tests::tests::replay_and_binding_checks();
     }
     #[test]
     fn control_extension_and_fallback_length_schema_is_closed() {
@@ -252,10 +244,10 @@ mod native_exchange_tests {
     use crate::model::ResourceClass;
     use crate::model::*;
     use crate::peer::protocol as p;
+    use crate::peer::protocol::Signatures;
     use crate::rdma::Devices;
     use crate::rdma::Sessions;
     use crate::runtime::Reactor;
-    use crate::peer::protocol::Signatures;
     use std::os::unix::net::UnixStream;
     use std::rc::Rc;
     use std::sync::Arc;
@@ -554,8 +546,8 @@ mod native_exchange_tests {
                 .await
         };
         let send = async {
-            let b = crate::peer::protocol::accept(&sender.io, b, signers[2].clone(), &scope)
-                .await?;
+            let b =
+                crate::peer::protocol::accept(&sender.io, b, signers[2].clone(), &scope).await?;
             let received = sender.io.receive_head(b, &scope).await?;
             let sent = sender
                 .io
@@ -943,8 +935,8 @@ mod native_exchange_tests {
                 .await
         };
         let send = async {
-            let b = crate::peer::protocol::accept(&sender.io, b, signers[2].clone(), &scope)
-                .await?;
+            let b =
+                crate::peer::protocol::accept(&sender.io, b, signers[2].clone(), &scope).await?;
             let received = sender.io.receive_head(b, &scope).await?;
             let (verified, _) = binding.verify(
                 &signers[2],
@@ -2305,10 +2297,8 @@ impl Transfers {
                 observer.result(
                     Stage::PeerHandshake,
                     scope,
-                    crate::peer::protocol::connect(
-                        &self.io, connection, signatures, &peer, scope,
-                    )
-                    .await,
+                    crate::peer::protocol::connect(&self.io, connection, signatures, &peer, scope)
+                        .await,
                 )?
             };
             if let Some(timing) = timing.as_deref_mut() {

@@ -1,11 +1,11 @@
 //! Generated traffic through the assembled production graph on hostless descriptors.
 //! The oracle owns immutable origin versions, never consults placement or cache data.
 use crate::app::*;
-use racer_control_wire::CacheDefinition;
 use crate::model::PAGE_BYTES;
 use crate::model::ResourceClass;
 use crate::model::*;
 use racer_control_wire as wire;
+use racer_control_wire::CacheDefinition;
 use racer_identity::PendingIdentity;
 use racer_identity::SigningIdentity;
 use sha2::Digest;
@@ -15,10 +15,12 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use uring_runtime::environment::SimulationClock;
-use uring_runtime::Descriptor;
-use uring_runtime::SocketAddress;
-use uring_runtime::simulation::Fault;
-use uring_runtime::simulation::Simulation;
+#[cfg(test)]
+use uring_runtime::group::Service;
+use uring_runtime::reactor::Descriptor;
+use uring_runtime::reactor::SocketAddress;
+use uring_runtime::reactor::simulation::Fault;
+use uring_runtime::reactor::simulation::Simulation;
 
 const MAX_NODES: usize = 32;
 const MAX_TURNS: usize = 100_000;
@@ -259,7 +261,7 @@ mod faults {
         }
 
         pub(super) fn disk_corruption(&mut self) {
-            use uring_runtime::simulation::DiskState;
+            use uring_runtime::reactor::simulation::DiskState;
             self.settle();
             let entries: Vec<_> = self
                 .nodes
@@ -618,7 +620,7 @@ mod faults {
                                 vec![],
                             );
                             publication.membership_version = MembershipVersion(self.generation);
-                            publication.members = members.clone();
+                            publication.members = members.iter().cloned().map(Into::into).collect();
                             node.workers[0]
                                 .app
                                 .snapshots
@@ -1903,7 +1905,7 @@ impl PartialEq for ReplayTrace {
 }
 impl Eq for ReplayTrace {}
 
-fn handle(fd: &Descriptor) -> &uring_runtime::simulation::Handle {
+fn handle(fd: &Descriptor) -> &uring_runtime::reactor::simulation::Handle {
     fd.as_sim().expect("DST escaped into host I/O")
 }
 fn would_block(error: &std::io::Error) -> bool {
@@ -1917,8 +1919,7 @@ fn node_id(id: usize) -> NodeId {
 }
 fn cache(id: usize) -> CacheDefinition {
     let name = format!("dst-{id}");
-    let (client_socket, origin_socket) =
-        racer_control_wire::canonical_socket_paths(&name).unwrap();
+    let (client_socket, origin_socket) = racer_control_wire::canonical_socket_paths(&name).unwrap();
     CacheDefinition {
         name,
         id: CacheId("33333333-3333-4333-8333-333333333333".into()),
@@ -2255,7 +2256,7 @@ impl Harness {
             .to_pkcs8_der()
             .unwrap();
         let pending = PendingIdentity::recover(&key).unwrap();
-        crate::control::testing::signing_identity(
+        crate::control::tests::testing::signing_identity(
             pending,
             &self.ca,
             &self.ca_key,
@@ -2353,8 +2354,8 @@ impl Harness {
         let mut publication =
             crate::app::tests::publication(&config, self.generation, vec![self.definition(id)]);
         publication.membership_version = MembershipVersion(self.generation);
-        publication.members = self.members();
-        publication.members.push(member(&config));
+        publication.members = self.members().into_iter().map(Into::into).collect();
+        publication.members.push(member(&config).into());
         app.snapshots.publish(publication).unwrap();
         let startup = scope(Duration::from_secs(30)).unwrap();
         let mut workers = vec![LocalWorker {
@@ -2502,7 +2503,7 @@ impl Harness {
             let mut p =
                 crate::app::tests::publication(&node.config, self.generation, vec![definition]);
             p.membership_version = MembershipVersion(self.generation);
-            p.members = members.clone();
+            p.members = members.iter().cloned().map(Into::into).collect();
             node.workers[0].app.snapshots.publish(p).unwrap();
         }
     }
@@ -3016,7 +3017,7 @@ fn phase5_default_grace_staggered_nodes_and_periodic_checkpoint_traffic() {
             vec![harness.definition(node.id)],
         );
         p.membership_version = MembershipVersion(harness.generation);
-        p.members = members.clone();
+        p.members = members.iter().cloned().map(Into::into).collect();
         node.workers[0].app.snapshots.publish(p).unwrap();
         assert!(
             node.workers[0]

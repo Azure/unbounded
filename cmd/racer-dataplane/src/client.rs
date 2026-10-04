@@ -4,10 +4,10 @@
 //! signed-63-bit decimal ranges, and byte-preserving opaque context.
 pub mod listener;
 
-use crate::runtime::HashSet;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
+use crate::http::ConnectionLease;
 use crate::model::Authorization;
 use crate::model::ByteRange;
 use crate::model::CacheId;
@@ -17,19 +17,19 @@ use crate::model::OpaqueMetadata;
 use crate::model::OriginContext;
 use crate::model::PAGE_BYTES;
 use crate::model::StrongEtag;
-use crate::http::ConnectionLease;
 use crate::read::ReadResponse;
+use crate::runtime::HashSet;
 
 use crate::admission::AdmissionPolicy;
-use crate::runtime::RequestScope;
+use crate::http::Delivery;
 use crate::http::HttpIo;
 use crate::http::OwnedBuffer;
-use crate::http::Delivery;
 use crate::http::ReaderLease;
 use crate::model::ObjectMetadata;
 use crate::model::PageNumber;
 use crate::model::ResolvedRange;
 use crate::read::range_stream::RangeStream;
+use crate::runtime::RequestScope;
 use crate::telemetry::Observer;
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -297,11 +297,8 @@ async fn handle_read_result(
         Ok(response) => response,
         Err(error) => {
             admission.policy().observer().record(
-                crate::telemetry::Failure::new(
-                    crate::telemetry::Stage::ClientRead,
-                    error,
-                )
-                .request(scope),
+                crate::telemetry::Failure::new(crate::telemetry::Stage::ClientRead, error)
+                    .request(scope),
             );
             let error = if error == Error::NotFound && kind.pin().is_some() {
                 Error::VersionUnavailable
@@ -603,9 +600,7 @@ impl Responses {
                                     error,
                                 )
                                 .request(scope)
-                                .detail(
-                                    crate::telemetry::Detail::Delivery { sent, expected },
-                                ),
+                                .detail(crate::telemetry::Detail::Delivery { sent, expected }),
                             );
                         })?
                         .ok_or(Error::BadGateway)?

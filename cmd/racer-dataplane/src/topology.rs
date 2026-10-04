@@ -7,7 +7,6 @@ use crate::model::NodeId;
 use crate::model::ObjectId;
 use crate::model::PageNumber;
 use crate::model::RequestId;
-use uring_runtime::deadline::Deadline;
 use crate::runtime::RequestScope;
 pub use ::topology::MAX_DEGREE;
 use racer_control_wire::RailMapping;
@@ -25,6 +24,7 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
+use uring_runtime::deadline::Deadline;
 
 // Immutable placement, authenticated routing, and worker-local endpoint circuits.
 

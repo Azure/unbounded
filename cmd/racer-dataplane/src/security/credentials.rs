@@ -36,6 +36,7 @@
 //! ```
 use super::aead::field;
 use super::aead::fresh_nonce;
+use crate::admission::AdmissionPolicy;
 use crate::error::Error;
 use crate::error::Result;
 use crate::model::AttemptId;
@@ -48,7 +49,6 @@ use crate::model::OriginContext;
 use crate::model::PeerOriginContext;
 use crate::model::RequestId;
 use crate::model::ResourceClass;
-use crate::admission::AdmissionPolicy;
 use crate::runtime::RequestScope;
 use racer_crypto::aead;
 use racer_identity::KeyPurpose;

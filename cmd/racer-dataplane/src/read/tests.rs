@@ -165,27 +165,27 @@ fn peer_failures_are_not_copy_misses() {
 }
 
 mod flight {
-    use crate::model::CacheId;
-    use crate::model::CacheKey;
-    use crate::model::ObjectId;
-    use crate::model::ObjectVersion;
-    use crate::model::PageNumber;
-    use crate::model::StrongEtag;
-    use crate::read::flight::*;
+    use crate::admission::AdmissionPolicy;
     use crate::error::Error;
     use crate::error::Operation;
     use crate::error::Result;
     use crate::memory::page::PageResult;
+    use crate::model::CacheId;
+    use crate::model::CacheKey;
+    use crate::model::ObjectId;
+    use crate::model::ObjectVersion;
     use crate::model::OriginContext;
     use crate::model::PageId;
+    use crate::model::PageNumber;
     use crate::model::ResourceClass;
-    use crate::admission::AdmissionPolicy;
+    use crate::model::StrongEtag;
+    use crate::read::flight::*;
     use crate::runtime::RequestScope;
-    use std::time::Duration;
     use std::rc::Rc;
     use std::task::Context;
     use std::task::Poll;
     use std::task::Waker;
+    use std::time::Duration;
     use std::time::Instant;
     fn metric_lease() -> telemetry::Lease {
         crate::telemetry::Metrics::default()
@@ -708,11 +708,8 @@ mod flight {
         budget: &'a mut AcquisitionBudget,
     ) -> AcquisitionWaiter<'a> {
         let membership = std::sync::Arc::new(
-            crate::topology::Membership::validate(
-                crate::model::MembershipVersion(1),
-                vec![],
-            )
-            .unwrap(),
+            crate::topology::Membership::validate(crate::model::MembershipVersion(1), vec![])
+                .unwrap(),
         );
         match flights
             .join(fence().page, membership, context, scope, budget)
@@ -1109,46 +1106,46 @@ mod flight {
 }
 
 mod timeouts {
-    use crate::read::candidates::*;
     use crate::error::Error;
     use crate::error::Operation;
     use crate::error::Result;
+    use crate::model::ExpiresAt;
+    use crate::model::MembershipVersion;
     use crate::model::MetadataSelector;
     use crate::model::NodeId;
+    use crate::model::ObjectMetadata;
+    use crate::model::ObjectVersion;
     use crate::model::OriginContext;
     use crate::model::PageNumber;
+    use crate::model::RequestId;
+    use crate::model::StrongEtag;
     use crate::peer::Requester;
+    use crate::peer::forwarding::Forwarding;
+    use crate::peer::forwarding::VerifiedResponse;
     use crate::peer::protocol::FetchMode;
     use crate::peer::protocol::Operation as PeerOperation;
     use crate::peer::protocol::PeerRequest;
     use crate::peer::protocol::PeerResponse;
-    use crate::peer::forwarding::VerifiedResponse;
-    use crate::read::flight::AcquisitionBudget;
-    use uring_runtime::deadline::Deadline;
-    use crate::runtime::RequestScope;
-    use crate::topology::Candidates;
-    use crate::model::ExpiresAt;
-    use crate::model::MembershipVersion;
-    use crate::model::ObjectMetadata;
-    use crate::model::ObjectVersion;
-    use crate::model::RequestId;
-    use crate::model::StrongEtag;
     use crate::peer::protocol::Signatures;
-    use crate::peer::forwarding::Forwarding;
+    use crate::read::candidates::*;
+    use crate::read::flight::AcquisitionBudget;
+    use crate::runtime::RequestScope;
     use crate::security::test_support::network;
+    use crate::topology::Candidates;
     use crate::topology::Member;
     use crate::topology::Membership;
     use std::cell::Cell;
+    use std::cell::RefCell;
     use std::future::Future;
     use std::future::poll_fn;
     use std::pin::Pin;
+    use std::rc::Rc;
+    use std::sync::Arc;
     use std::task::Context;
     use std::task::Poll;
     use std::time::Duration;
-    use std::cell::RefCell;
-    use std::rc::Rc;
-    use std::sync::Arc;
     use std::time::Instant;
+    use uring_runtime::deadline::Deadline;
 
     struct Call {
         scope: RequestScope,

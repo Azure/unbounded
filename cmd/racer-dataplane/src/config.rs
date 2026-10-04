@@ -6,7 +6,6 @@
 use crate::error::Error;
 use crate::error::Result;
 use crate::model::ClusterId;
-use crate::config::Limits;
 use crate::model::NodeId;
 use crate::model::PAGE_BYTES;
 use crate::store::MAX_HEADER_BYTES;
@@ -194,9 +193,7 @@ impl Config {
             Duration::from_millis(number("RACER_READER_STALL_TIMEOUT_MS", 10_000)?);
         let shutdown_timeout = Duration::from_millis(number("RACER_SHUTDOWN_TIMEOUT_MS", 30_000)?);
         let ranking_bytes = number("RACER_PLACEMENT_CACHE_BYTES", 16 * MIB)?;
-        if ranking_bytes < crate::topology::RANKING_BYTES as u64
-            || ranking_bytes > 512 * MIB
-        {
+        if ranking_bytes < crate::topology::RANKING_BYTES as u64 || ranking_bytes > 512 * MIB {
             return Err(Error::InvalidConfiguration);
         }
         let ranking_entries = ranking_bytes / crate::topology::RANKING_BYTES as u64;

@@ -9,24 +9,21 @@
 //! until completion even after cancellation. Queue wakeups and completion capacity
 //! must permit progress when both threads share one CPU.
 
-use super::admission::AdmissionPolicy;
 use super::affinity::AffinityPlan;
 use super::crypto;
 use super::crypto::CryptoClient;
 use super::crypto::CryptoPort;
 use super::crypto::IoCryptoPort;
-use super::deadline::Cancellation;
-use super::deadline::Deadline;
-use super::deadline::RequestScope;
-use super::reactor::Reactor;
+use crate::admission::AdmissionPolicy;
+use crate::config::Limits;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
-use crate::config::Limits;
 use crate::model::RequestId;
 use crate::model::WorkerId;
-#[cfg(test)]
-use std::time::Instant;
+use crate::runtime::Cancellation;
+use crate::runtime::Reactor;
+use crate::runtime::RequestScope;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::marker::PhantomData;
@@ -41,6 +38,9 @@ use std::task::Wake;
 use std::task::Waker;
 use std::thread;
 use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
+use uring_runtime::deadline::Deadline;
 
 const WORK_BUDGET: usize = 64;
 const IDLE_WAIT: Duration = Duration::from_millis(1);
@@ -72,7 +72,7 @@ use uring_runtime::group::Helper;
 use uring_runtime::group::Lane;
 use uring_runtime::group::Plan;
 use uring_runtime::group::Service;
-use uring_runtime::ReactorWake;
+use uring_runtime::reactor::ReactorWake;
 pub struct WorkerGroup<'a> {
     plan: AffinityPlan,
     runtime: Group<RequestScope>,

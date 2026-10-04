@@ -1,4 +1,5 @@
 //! Observe the allocation at deallocation, before the system allocator can reuse it.
+use racer_dataplane::admission::AdmissionPolicy;
 use racer_dataplane::config::Config;
 use racer_dataplane::memory::BufferPool;
 use racer_dataplane::model::CacheId;
@@ -12,7 +13,6 @@ use racer_dataplane::model::PageId;
 use racer_dataplane::model::PageNumber;
 use racer_dataplane::model::ResourceClass;
 use racer_dataplane::model::StrongEtag;
-use racer_dataplane::admission::AdmissionPolicy;
 use std::alloc::GlobalAlloc;
 use std::alloc::Layout;
 use std::alloc::System;
@@ -186,10 +186,10 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
     use racer_dataplane::model::NodeId;
     use racer_dataplane::model::RequestId;
     use racer_dataplane::model::WorkerId;
+    use racer_dataplane::runtime::RequestScope;
     use racer_dataplane::runtime::crypto::CryptoId;
     use racer_dataplane::runtime::crypto::CryptoInput;
     use racer_dataplane::runtime::crypto::pair;
-    use racer_dataplane::runtime::RequestScope;
     use racer_dataplane::security::aead::PageCryptoEngine;
     use racer_dataplane::security::aead::page_aad;
     use racer_identity::KeyEpochs;
@@ -354,4 +354,4 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
     }
 }
-use uring_runtime::IoBuffer;
+use uring_runtime::reactor::IoBuffer;

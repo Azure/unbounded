@@ -2,8 +2,6 @@
 use super::BufferPool;
 use super::page::CiphertextCopy;
 use super::page::PageResult;
-use crate::runtime::HashMap;
-use crate::runtime::HashSet;
 use crate::error::Error;
 use crate::error::Result;
 use crate::model::CacheId;
@@ -11,6 +9,8 @@ use crate::model::ObjectVersion;
 use crate::model::PageId;
 use crate::model::ResourceClass;
 use crate::model::VersionMetadata;
+use crate::runtime::HashMap;
+use crate::runtime::HashSet;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;

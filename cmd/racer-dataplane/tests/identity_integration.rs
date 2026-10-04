@@ -2,6 +2,7 @@
 //! immutable identity leases, and completion-retained page crypto work.
 use racer_control_wire as wire;
 use racer_control_wire::*;
+use racer_dataplane::admission::AdmissionPolicy;
 use racer_dataplane::config::Config;
 use racer_dataplane::control::BundleInstaller;
 use racer_dataplane::error::Error;
@@ -15,12 +16,11 @@ use racer_dataplane::model::RequestId;
 use racer_dataplane::model::ResourceClass;
 use racer_dataplane::model::StrongEtag;
 use racer_dataplane::model::WorkerId;
-use racer_dataplane::admission::AdmissionPolicy;
+use racer_dataplane::runtime::RequestScope;
 use racer_dataplane::runtime::crypto;
 use racer_dataplane::runtime::crypto::CryptoClient;
 use racer_dataplane::runtime::crypto::CryptoInput;
 use racer_dataplane::runtime::crypto::CryptoOutput;
-use racer_dataplane::runtime::RequestScope;
 use racer_dataplane::runtime::worker::CryptoRuntime;
 
 use racer_dataplane::security::aead::PageCryptoEngine;
@@ -31,7 +31,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
-use uring_runtime::IoBuffer;
+use uring_runtime::reactor::IoBuffer;
 
 const CLUSTER: &str = "11111111-1111-4111-8111-111111111111";
 const NODE: &str = "22222222-2222-4222-8222-222222222222";

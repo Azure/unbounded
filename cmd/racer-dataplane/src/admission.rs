@@ -1,11 +1,11 @@
 //! Racer resource policy and compound admission operations.
-use crate::model::WorkerId;
+use crate::config::Limits;
 use crate::error::Error;
 use crate::error::Result;
 use crate::model::CacheId;
-use crate::config::Limits;
 use crate::model::PAGE_BYTES;
 use crate::model::ResourceClass;
+use crate::model::WorkerId;
 use crate::telemetry::Detail;
 use crate::telemetry::Failure;
 use crate::telemetry::Observer;

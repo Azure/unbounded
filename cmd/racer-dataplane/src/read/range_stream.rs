@@ -3,14 +3,13 @@
 //! it cannot replace headers or reopen against a newer version.
 use super::dispatch::WorkerDirectory;
 use super::flight::AcquisitionBudget;
-use crate::memory::page::PageResult;
-#[cfg(test)]
-use crate::read::dispatch::WorkerMap;
+use crate::admission::AdmissionPolicy;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
 use crate::http::Delivery;
 use crate::http::ReaderLease;
+use crate::memory::page::PageResult;
 use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
 use crate::model::OriginContext;
@@ -18,7 +17,8 @@ use crate::model::PAGE_BYTES;
 use crate::model::PageId;
 use crate::model::PageNumber;
 use crate::model::ResolvedRange;
-use crate::admission::AdmissionPolicy;
+#[cfg(test)]
+use crate::read::dispatch::WorkerMap;
 use crate::runtime::RequestScope;
 
 use flow_control::Window;
@@ -991,20 +991,20 @@ fn validate_pin(expected: &ObjectMetadata, actual: &ObjectMetadata) -> Result<()
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use crate::admission::AdmissionPolicy;
+    use crate::http::new_pipe_pool;
     use crate::model::ByteRange;
     use crate::model::CacheId;
     use crate::model::CacheKey;
     use crate::model::ExpiresAt;
+    use crate::model::MembershipVersion;
     use crate::model::ObjectId;
     use crate::model::ObjectVersion;
     use crate::model::PAGE_BYTES;
-    use crate::model::StrongEtag;
-    use crate::http::new_pipe_pool;
-    use crate::model::MembershipVersion;
     use crate::model::RequestId;
     use crate::model::ResourceClass;
+    use crate::model::StrongEtag;
     use crate::model::WorkerId;
-    use crate::admission::AdmissionPolicy;
     use crate::runtime::Reactor;
     use crate::topology::Membership;
 
@@ -1870,12 +1870,12 @@ pub(super) mod tests {
 
     mod subscriptions {
         use super::*;
+        use crate::admission::AdmissionPolicy;
         use crate::model::ByteRange;
         use crate::model::CacheId;
         use crate::model::CacheKey;
         use crate::model::ObjectId;
         use crate::model::StrongEtag;
-        use crate::admission::AdmissionPolicy;
         use flow_control::Quotas;
         use std::task::Context;
         use std::task::Poll;

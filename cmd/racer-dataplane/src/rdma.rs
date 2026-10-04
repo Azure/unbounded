@@ -1,3 +1,4 @@
+use crate::admission::AdmissionPolicy;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -8,12 +9,13 @@ use crate::model::PageEnvelope;
 use crate::model::PageId;
 use crate::model::ResourceClass;
 use crate::model::TransferId;
-use crate::admission::AdmissionPolicy;
-use uring_runtime::deadline::Deadline;
 use crate::runtime::RequestScope;
+use uring_runtime::deadline::Deadline;
+#[cfg(test)]
+use uring_runtime::group::Service;
 
-use crate::security::aead::PageCryptoEngine;
 use crate::peer::protocol::VerifiedHead;
+use crate::security::aead::PageCryptoEngine;
 use crate::topology::FAILURE_LINKS;
 use crate::topology::Route;
 use base64::Engine;
@@ -1569,7 +1571,7 @@ pub(crate) mod tests {
                 signature: verified.signed.signature,
             };
             signatures.verify_proof(replay).unwrap();
-            crate::peer::protocol::tests::replay_and_binding_checks();
+            crate::peer::protocol::connection_tests::tests::replay_and_binding_checks();
             let mut tampered = signatures.sign(head()).unwrap();
             tampered
                 .head
@@ -2204,8 +2206,8 @@ pub(crate) mod tests {
         mod mailbox {
             //! Public handoffs held at deterministic native mailbox boundaries.
             use super::*;
-            use crate::model::*;
             use crate::admission::AdmissionPolicy;
+            use crate::model::*;
             use crate::security::test_support::network;
             use rdma_verbs::testing::Contention;
             use rdma_verbs::testing::State;
@@ -2798,8 +2800,8 @@ pub(crate) mod tests {
         /// Production activation through the public simulated fabric.
         mod activation_tests {
             use super::*;
-            use crate::model::*;
             use crate::admission::AdmissionPolicy;
+            use crate::model::*;
             use crate::runtime::crypto;
             use crate::runtime::worker::CryptoRuntime;
 
@@ -3014,7 +3016,7 @@ pub(crate) mod tests {
                         );
                         assert!(!devices.ready(RailId(0)));
                     }
-                    sibling.poll_budgeted(1).unwrap();
+                    sibling.poll_budgeted(&mut cx, 1).unwrap();
                     let Poll::Ready(Ok(Some(completion))) = io.poll_completion(&mut cx) else {
                         panic!("sibling must progress")
                     };
@@ -3157,8 +3159,8 @@ pub(crate) mod tests {
                 let mut cx = Context::from_waker(futures::task::noop_waker_ref());
                 let mut activation = activate(&devices, &admission, &scope);
                 assert!(activation.as_mut().poll(&mut cx).is_pending());
-                service.poll_budgeted(4).unwrap();
-                service.poll_budgeted(1).unwrap();
+                service.poll_budgeted(&mut cx, 4).unwrap();
+                service.poll_budgeted(&mut cx, 1).unwrap();
                 assert!(matches!(
                     activation.as_mut().poll(&mut cx),
                     Poll::Ready(Ok(_))

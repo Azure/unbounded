@@ -3,14 +3,14 @@ use super::Relay;
 use super::protocol::PeerResponse;
 use super::protocol::SignedRequest;
 use super::protocol::SignedResponse;
-use super::protocol::VerifiedRequest;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::model::ResourceClass;
+use crate::peer::forwarding::VerifiedRequest;
 
 use crate::admission::AdmissionPolicy;
-use crate::runtime::RequestScope;
 use crate::peer::forwarding::Forwarding;
+use crate::runtime::RequestScope;
 use std::rc::Rc;
 use std::time::Duration;
 use std::time::Instant;
@@ -74,8 +74,8 @@ pub struct PeerServer {
 impl PeerServer {
     pub(crate) fn configure_accepted(
         &self,
-        fd: uring_runtime::Descriptor,
-    ) -> crate::error::Result<uring_runtime::Descriptor> {
+        fd: uring_runtime::reactor::Descriptor,
+    ) -> crate::error::Result<uring_runtime::reactor::Descriptor> {
         fd.enable_tcp_nodelay(self.tcp_nodelay)?;
         Ok(fd)
     }
@@ -205,7 +205,7 @@ impl PeerServer {
             use futures::stream::FuturesUnordered;
             scope.check()?;
             let reactor = self.io.reactor();
-            let fd = Rc::new(uring_runtime::Descriptor::tcp_listener(address)?);
+            let fd = Rc::new(uring_runtime::reactor::Descriptor::tcp_listener(address)?);
             let mut active = FuturesUnordered::new();
             let maximum = self
                 .admission
@@ -558,13 +558,9 @@ impl PeerServer {
             ResourceClass::ControlProgress,
             1,
         )?);
-        let mut connection = crate::peer::protocol::accept(
-            &self.io,
-            connection,
-            self.signatures.clone(),
-            scope,
-        )
-        .await?;
+        let mut connection =
+            crate::peer::protocol::accept(&self.io, connection, self.signatures.clone(), scope)
+                .await?;
         // Successful accept has fenced every control operation. On error or
         // abandonment the reactor-owned connection retains this charge.
         connection.state_mut().control_reservation.take();
@@ -855,9 +851,9 @@ async fn next_accepted<A, C>(
     accept: A,
     active: &mut futures::stream::FuturesUnordered<C>,
     scope: &RequestScope,
-) -> crate::error::Result<uring_runtime::Descriptor>
+) -> crate::error::Result<uring_runtime::reactor::Descriptor>
 where
-    A: std::future::Future<Output = crate::error::Result<uring_runtime::Descriptor>>,
+    A: std::future::Future<Output = crate::error::Result<uring_runtime::reactor::Descriptor>>,
     C: std::future::Future,
 {
     use futures::FutureExt;
@@ -982,7 +978,7 @@ mod tests {
             }
         }
     }
-    impl<F: Future<Output = crate::error::Result<uring_runtime::Descriptor>>> Future
+    impl<F: Future<Output = crate::error::Result<uring_runtime::reactor::Descriptor>>> Future
         for CountedAccept<F>
     {
         type Output = F::Output;
@@ -1333,7 +1329,7 @@ mod tests {
                 let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                 listener.set_nonblocking(true).unwrap();
                 let address = listener.local_addr().unwrap();
-                let fd = Rc::new(uring_runtime::Descriptor::from(listener));
+                let fd = Rc::new(uring_runtime::reactor::Descriptor::from(listener));
                 let weak = Rc::downgrade(&fd);
                 let counts = Rc::new(AcceptCounts::default());
                 let accept = CountedAccept::new(reactor.accept(fd, &scope), &counts);
@@ -1449,9 +1445,9 @@ mod tests {
         use crate::http::ConnectionLease;
         use crate::memory::BufferPool;
         use crate::peer::protocol::SecurityCodec;
+        use crate::peer::protocol::connection_tests::tests::finish;
+        use crate::peer::protocol::connection_tests::tests::hello;
         use crate::runtime::Reactor;
-        use crate::peer::protocol::tests::finish;
-        use crate::peer::protocol::tests::hello;
         use crate::topology::LinkHealth;
         use crate::topology::Paths;
 

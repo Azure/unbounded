@@ -2,9 +2,9 @@
 //! Bind /run/racer/<cache name>/client/socket; mount its client directory separately
 //! from the origin directory so pods receive only their authorized endpoint.
 use super::RequestParser;
+use super::Responses;
 use super::handle_read_result;
-use super::response::Responses;
-use racer_control_wire::CacheDefinition;
+use crate::admission::AdmissionPolicy;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -13,9 +13,9 @@ use crate::http::HttpIo;
 use crate::model::CacheId;
 use crate::model::RequestId;
 use crate::read::Coordinator;
-use crate::admission::AdmissionPolicy;
 use crate::runtime::Cancellation;
 use crate::runtime::RequestScope;
+use racer_control_wire::CacheDefinition;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -43,10 +43,10 @@ use uring_runtime::reactor::Descriptor;
 enum Listener {
     Real(UnixListener),
     #[cfg(test)]
-    Sim(uring_runtime::Descriptor),
+    Sim(uring_runtime::reactor::Descriptor),
 }
 impl Listener {
-    fn accept(&self) -> std::io::Result<(uring_runtime::Descriptor, ())> {
+    fn accept(&self) -> std::io::Result<(uring_runtime::reactor::Descriptor, ())> {
         match self {
             Self::Real(listener) => listener.accept().map(|(socket, _)| (socket.into(), ())),
             #[cfg(test)]
@@ -69,7 +69,7 @@ enum Directory {
     Real(File),
     #[cfg(test)]
     Sim {
-        sim: uring_runtime::simulation::Simulation,
+        sim: uring_runtime::reactor::simulation::Simulation,
         path: PathBuf,
     },
 }
@@ -511,7 +511,7 @@ impl ClientListeners {
             #[cfg(not(test))]
             let simulated = false;
             #[cfg(test)]
-            let simulated = uring_runtime::simulation::Simulation::current().is_some();
+            let simulated = uring_runtime::reactor::simulation::Simulation::current().is_some();
             let listener = if simulated {
                 let listeners = self.listeners.borrow();
                 let key = self.sim_cursor.borrow().clone();
@@ -1124,12 +1124,12 @@ fn bind(
     previous: Option<&BoundListener>,
 ) -> Result<BoundListener> {
     #[cfg(test)]
-    if let Some(sim) = uring_runtime::simulation::Simulation::current() {
+    if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
         let directory = root.join(&definition.name).join("client");
         sim.create_dir_all(&directory).map_err(|_| Error::Io)?;
         let path = directory.join(basename);
         let listener = sim
-            .listen(uring_runtime::SocketAddress::Unix(path.clone()))
+            .listen(uring_runtime::reactor::SocketAddress::Unix(path.clone()))
             .map_err(|_| Error::Io)?;
         let (inode, _) = sim.metadata(&path).map_err(|_| Error::Io)?;
         let bound = BoundListener {

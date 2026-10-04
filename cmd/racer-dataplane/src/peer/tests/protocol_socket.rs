@@ -290,7 +290,7 @@ fn changed_operation_credentials_replay_and_deadlines_fail() {
     receiver
         .verify_request(codec.request(envelope, &scope).unwrap())
         .unwrap();
-    crate::peer::protocol::tests::replay_and_binding_checks();
+    crate::peer::protocol::connection_tests::tests::replay_and_binding_checks();
     let mut expired = request(&admission, 3);
     expired.route.deadline = Deadline(Instant::now() - Duration::from_secs(1));
     assert!(matches!(
@@ -333,7 +333,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
     impl server::LocalPageService for Service {
         fn serve_peer<'a>(
             &'a self,
-            request: protocol::VerifiedRequest,
+            request: crate::peer::forwarding::VerifiedRequest,
             _: std::sync::Arc<crate::topology::Membership>,
             _: &'a RequestScope,
         ) -> crate::error::Operation<'a, PeerResponse> {
@@ -512,7 +512,7 @@ fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
         .unwrap()
         .value = b"1".to_vec();
     assert!(signers[0].verify_proof(tampered).is_err());
-    crate::peer::protocol::tests::replay_and_binding_checks();
+    crate::peer::protocol::connection_tests::tests::replay_and_binding_checks();
     drop(response_lease);
     assert!(
         weak.upgrade().is_none(),
@@ -580,18 +580,14 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
             let fd = socket
                 .reactor
                 .accept(
-                    Rc::new(uring_runtime::Descriptor::from(listener)),
+                    Rc::new(uring_runtime::reactor::Descriptor::from(listener)),
                     &scope,
                 )
                 .await?;
             let connection = crate::http::from_accepted(fd, &admission)?;
-            let connection = crate::peer::protocol::accept(
-                &socket.io,
-                connection,
-                signers[2].clone(),
-                &scope,
-            )
-            .await?;
+            let connection =
+                crate::peer::protocol::accept(&socket.io, connection, signers[2].clone(), &scope)
+                    .await?;
             let received = socket.io.receive_head(connection, &scope).await?;
             let (envelope, length) = decode_envelope(received.value, false)?;
             assert_eq!(length, 0);
@@ -912,7 +908,7 @@ fn signed_tcp_case(case: &str) {
     impl server::LocalPageService for Local {
         fn serve_peer<'a>(
             &'a self,
-            request: protocol::VerifiedRequest,
+            request: crate::peer::forwarding::VerifiedRequest,
             _: std::sync::Arc<crate::topology::Membership>,
             scope: &'a RequestScope,
         ) -> crate::error::Operation<'a, PeerResponse> {
@@ -987,8 +983,7 @@ fn signed_tcp_case(case: &str) {
     );
     let destination_auth = Rc::new(Forwarding::new(signers[2].clone()));
     let metrics = crate::telemetry::Metrics::default();
-    let adaptive =
-        crate::peer::AdaptivePeers::new(Default::default(), metrics.clone()).unwrap();
+    let adaptive = crate::peer::AdaptivePeers::new(Default::default(), metrics.clone()).unwrap();
     let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4).with_peer_admission(adaptive));
     let outbound = NoOutbound::new(signers[2].clone(), destination_network.clone());
     let relay = Rc::new(Relay::new(
@@ -1059,7 +1054,7 @@ fn signed_tcp_case(case: &str) {
     let server_work = async {
         let fd = reactor
             .accept(
-                Rc::new(uring_runtime::Descriptor::from(listener)),
+                Rc::new(uring_runtime::reactor::Descriptor::from(listener)),
                 &scope,
             )
             .await?;
@@ -1109,7 +1104,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
     impl server::LocalPageService for Never {
         fn serve_peer<'a>(
             &'a self,
-            _: protocol::VerifiedRequest,
+            _: crate::peer::forwarding::VerifiedRequest,
             _: std::sync::Arc<crate::topology::Membership>,
             _: &'a RequestScope,
         ) -> crate::error::Operation<'a, PeerResponse> {
@@ -1207,12 +1202,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
                         signers[2].node(),
                         &scope
                     ),
-                    crate::peer::protocol::accept(
-                        &io,
-                        connection,
-                        signers[2].clone(),
-                        &scope
-                    )
+                    crate::peer::protocol::accept(&io, connection, signers[2].clone(), &scope)
                 )
             })
             .unwrap();
@@ -1296,14 +1286,14 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     use crate::model::PageEnvelope;
     use crate::peer::forwarding::ForwardedHead;
     use crate::peer::protocol;
+    use crate::rdma;
+    use crate::rdma::TransportPlan;
     use crate::runtime::Reactor;
     use crate::topology::Member;
     use crate::topology::Membership;
-    use crate::topology::rails;
+    use crate::topology::Route;
     use racer_control_wire::RailId;
     use racer_control_wire::RailMapping;
-    use crate::topology::rails::TransportPlan;
-    use crate::topology::Route;
     use std::net::TcpListener;
     use std::task::Context;
     use std::task::Poll;
@@ -1408,16 +1398,15 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     let scope =
         RequestScope::new(RequestId([7; 16]), Instant::now() + Duration::from_secs(30)).unwrap();
     let server = async {
-        use uring_runtime::IoBuffer;
+        use uring_runtime::reactor::IoBuffer;
         let fd = reactor
             .accept(
-                Rc::new(uring_runtime::Descriptor::from(listener)),
+                Rc::new(uring_runtime::reactor::Descriptor::from(listener)),
                 &scope,
             )
             .await?;
         let conn = crate::http::from_accepted(fd, &admission)?;
-        let mut conn =
-            crate::peer::protocol::accept(&io, conn, signers[2].clone(), &scope).await?;
+        let mut conn = crate::peer::protocol::accept(&io, conn, signers[2].clone(), &scope).await?;
         for attempt in 0..3 {
             let mut received = io.receive_head(conn, &scope).await?;
             assert!(
@@ -1581,8 +1570,8 @@ mod established_sessions {
     use crate::http::ConnectionLease;
     use crate::http::HttpIo;
     use crate::peer::protocol as p;
+    use crate::peer::protocol as connection;
     use crate::runtime::Reactor;
-    use crate::security::connection;
     use crate::topology::LinkHealth;
     use crate::topology::Member;
     use crate::topology::Membership;
@@ -1597,7 +1586,7 @@ mod established_sessions {
     impl server::LocalPageService for CountedService {
         fn serve_peer<'a>(
             &'a self,
-            _: protocol::VerifiedRequest,
+            _: crate::peer::forwarding::VerifiedRequest,
             _: std::sync::Arc<crate::topology::Membership>,
             _: &'a RequestScope,
         ) -> crate::error::Operation<'a, PeerResponse> {
@@ -1895,4 +1884,4 @@ mod established_sessions {
         );
     }
 }
-use uring_runtime::IoBuffer;
+use uring_runtime::reactor::IoBuffer;

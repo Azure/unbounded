@@ -28,9 +28,6 @@ mod measurement {
     use super::tests::input;
     use super::tests::keyring;
     use super::*;
-    use crate::telemetry::Event;
-    use crate::telemetry::Event::*;
-    use crate::telemetry::Metrics;
     use crate::memory::BufferPool;
     use crate::model::Nonce;
     use crate::model::PageEnvelope;
@@ -38,11 +35,14 @@ mod measurement {
     use crate::model::*;
     use crate::security::aead::PageCryptoEngine;
     use crate::security::aead::page_aad;
+    use crate::telemetry::Event;
+    use crate::telemetry::Event::*;
+    use crate::telemetry::Metrics;
     use racer_crypto::aead;
     use std::rc::Rc;
     use std::time::Duration;
     use std::time::Instant;
-    use uring_runtime::IoBuffer;
+    use uring_runtime::reactor::IoBuffer;
 
     fn page() -> PageId {
         PageId {
@@ -1035,8 +1035,8 @@ mod measurement {
     }
 }
 
-use super::admission::AdmissionPolicy;
-use super::deadline::RequestScope;
+use crate::admission::AdmissionPolicy;
+use crate::runtime::RequestScope;
 use channel::Receiver;
 use channel::SendFailure;
 use channel::Sender;
@@ -1342,7 +1342,7 @@ pub struct CryptoJob {
 
 impl CryptoPermit {
     pub fn job(mut self, input: CryptoInput, key: KeyLease, scope: RequestScope) -> CryptoJob {
-        use uring_runtime::IoBuffer;
+        use uring_runtime::reactor::IoBuffer;
         self.measurement.checksum_only = matches!(input, CryptoInput::Checksum { .. });
         self.measurement.decrypt = matches!(input, CryptoInput::Decrypt { .. });
         self.measurement.bytes = match &input {

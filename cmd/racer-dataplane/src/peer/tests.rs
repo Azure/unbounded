@@ -1,5 +1,7 @@
 //! Shared signed peer fixtures and scenario suites.
 use super::*;
+#[cfg(test)]
+use uring_runtime::group::Service;
 mod body_progress {
     use super::*;
     use crate::http::Codec;
@@ -81,7 +83,9 @@ mod body_progress {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            admission.set_observer(telemetry.failures.observer(WorkerId(2)));
+            admission
+                .policy()
+                .set_observer(telemetry.failures.observer(WorkerId(2)));
             let reactor = Rc::new(Reactor::new(admission.clone()));
             let io = Rc::new(crate::http::new_io(
                 reactor.clone(),
@@ -194,13 +198,9 @@ mod body_progress {
                     .accept(Rc::new(listener.into()), &server_scope)
                     .await?;
                 let conn = crate::http::from_accepted(fd, &admission)?;
-                let conn = crate::peer::protocol::accept(
-                    &io,
-                    conn,
-                    signers[2].clone(),
-                    &server_scope,
-                )
-                .await?;
+                let conn =
+                    crate::peer::protocol::accept(&io, conn, signers[2].clone(), &server_scope)
+                        .await?;
                 let received = io.receive_head(conn, &server_scope).await?;
                 let (head, _) = decode_envelope(received.value, false)?;
                 let remote_auth = Forwarding::new(signers[2].clone());
@@ -308,7 +308,7 @@ mod body_progress {
             let mut client = transfers.exchange_timed(
                 Endpoint::Peer(address.to_string()),
                 signed,
-                crate::topology::rails::TransportPlan::Http,
+                crate::rdma::TransportPlan::Http,
                 None,
                 None,
                 None,
@@ -980,16 +980,16 @@ mod encrypted_http {
     use crate::http::Codec;
     use crate::http::Endpoint;
     use crate::memory::CiphertextPage;
+    use crate::runtime::Reactor;
     use crate::runtime::crypto;
     use crate::runtime::crypto::CryptoClient;
-    use crate::runtime::Reactor;
     use crate::runtime::worker::CryptoRuntime;
 
+    use crate::rdma::TransportPlan;
     use crate::security::aead::PageCrypto;
     use crate::security::aead::PageCryptoEngine;
     use crate::telemetry::Event;
     use crate::telemetry::Metrics;
-    use crate::topology::rails::TransportPlan;
     use racer_control_wire::CacheEncryptionKey;
     use racer_control_wire::CacheKeyPurpose;
     use racer_control_wire::CacheKeyRef;
@@ -1016,7 +1016,7 @@ mod encrypted_http {
             }
             assert!(Instant::now() < until, "encrypted HTTP regression watchdog");
             for engine in engines.iter_mut() {
-                engine.poll_budgeted(8).unwrap();
+                engine.poll_budgeted(&mut cx, 8).unwrap();
             }
             for client in clients {
                 client.poll_budgeted(8).unwrap();
@@ -1346,19 +1346,19 @@ mod opaque;
 mod protocol_socket;
 mod requester_safety {
     //! Real socket exchange with the adaptive controller attached to routing/requester.
-    use crate::peer::*;
+    use crate::admission::AdmissionPolicy;
     use crate::http::Codec;
     use crate::model::MembershipVersion;
     use crate::model::ResourceClass;
     use crate::peer::AdaptivePeers;
     use crate::peer::Outcome;
+    use crate::peer::protocol as connection;
     use crate::peer::protocol::PeerResponse;
     use crate::peer::protocol::decode_envelope;
     use crate::peer::protocol::encode_envelope;
     use crate::peer::transport::RelayResponse;
-    use crate::admission::AdmissionPolicy;
+    use crate::peer::*;
     use crate::runtime::Reactor;
-    use crate::security::connection;
     use crate::telemetry::Event;
     use crate::telemetry::Gauge;
     use crate::telemetry::Metrics;
@@ -2400,10 +2400,10 @@ mod timing {
     use super::*;
     use crate::peer::PageTiming;
     use crate::peer::STAGES;
+    use crate::rdma::TransportPlan;
     use crate::telemetry::Event;
     use crate::telemetry::Metrics;
     use racer_control_wire::RailId;
-    use crate::topology::rails::TransportPlan;
 
     fn page_request(admission: &flow_control::Quotas<AdmissionPolicy>, attempt: u8) -> PeerRequest {
         let mut local = request(admission, attempt);
@@ -2705,8 +2705,7 @@ mod timing {
             let fd = reactor.accept(Rc::new(listener.into()), &scope).await?;
             let connection = crate::http::from_accepted(fd, &admission)?;
             let mut connection =
-                crate::peer::protocol::accept(&io, connection, signers[2].clone(), &scope)
-                    .await?;
+                crate::peer::protocol::accept(&io, connection, signers[2].clone(), &scope).await?;
             let auth = Forwarding::new(signers[2].clone());
             for attempt in 0..3 {
                 let received = io.receive_head(connection, &scope).await?;
@@ -2792,9 +2791,8 @@ use crate::peer::protocol::decode_envelope;
 use crate::peer::protocol::encode_envelope;
 
 use crate::admission::AdmissionPolicy;
-use uring_runtime::deadline::Deadline;
-use crate::runtime::RequestScope;
 use crate::peer::protocol::Signatures;
+use crate::runtime::RequestScope;
 use crate::topology::RouteBudget;
 use racer_identity::Certificates;
 use racer_identity::Keyring;
@@ -2802,6 +2800,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use uring_runtime::deadline::Deadline;
 
 const A: &str = "00000001-1111-4111-8111-111111111111";
 const B: &str = "00000002-1111-4111-8111-111111111111";

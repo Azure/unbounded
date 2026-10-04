@@ -1,12 +1,6 @@
 //! Ranked acquisition and copy-only predecessor probes. Only a validated local
 //! candidate can mint origin authority; request headers never change placement.
 use super::flight::AcquisitionBudget;
-use crate::telemetry::Detail;
-use crate::telemetry::Failure;
-use crate::telemetry::Observer;
-use crate::telemetry::Stage;
-use crate::telemetry::Event;
-use crate::telemetry::Metrics;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -17,22 +11,28 @@ use crate::model::ObjectId;
 use crate::model::OriginContext;
 use crate::model::PageNumber;
 use crate::peer::Requester;
+use crate::peer::forwarding::VerifiedResponse;
 use crate::peer::protocol::FetchMode;
 use crate::peer::protocol::Operation as PeerOperation;
 use crate::peer::protocol::PeerRequest;
 use crate::peer::protocol::PeerResponse;
-use crate::peer::forwarding::VerifiedResponse;
-use uring_runtime::deadline::Deadline;
 use crate::runtime::RequestScope;
 use crate::security::credentials::CredentialCrypto;
+use crate::telemetry::Detail;
+use crate::telemetry::Event;
+use crate::telemetry::Failure;
+use crate::telemetry::Metrics;
+use crate::telemetry::Observer;
+use crate::telemetry::Stage;
+use uring_runtime::deadline::Deadline;
 
 use crate::topology::Candidates;
 use crate::topology::Placement;
 use crate::topology::RouteBudget;
 #[cfg(test)]
 use std::cell::RefCell;
-use std::rc::Rc;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::Context;
@@ -1435,7 +1435,11 @@ pub(super) mod tests {
     fn candidate_failure_routes_spend_initial_allowance_with_four_then_eight_link_ceiling() {
         struct Routes(RefCell<Vec<(u8, u32)>>);
         impl Routes {
-            fn direct_hedge_available(&self, _: &std::sync::Arc<crate::topology::Membership>, _: &NodeId) -> bool {
+            fn direct_hedge_available(
+                &self,
+                _: &std::sync::Arc<crate::topology::Membership>,
+                _: &NodeId,
+            ) -> bool {
                 false
             }
             fn request_direct<'a>(
@@ -1514,7 +1518,11 @@ pub(super) mod tests {
         error: Error,
     }
     impl ProbePeer {
-        fn direct_hedge_available(&self, _: &std::sync::Arc<crate::topology::Membership>, _: &NodeId) -> bool {
+        fn direct_hedge_available(
+            &self,
+            _: &std::sync::Arc<crate::topology::Membership>,
+            _: &NodeId,
+        ) -> bool {
             false
         }
         fn request_direct<'a>(
@@ -1554,10 +1562,10 @@ pub(super) mod tests {
         RequestScope,
         Rc<CredentialCrypto>,
     ) {
+        use crate::admission::AdmissionPolicy;
         use crate::model::ClusterId;
         use crate::model::MembershipVersion;
         use crate::model::RequestId;
-        use crate::admission::AdmissionPolicy;
         use crate::topology::Member;
         use crate::topology::Membership;
         use racer_identity::KeyEpochs;
@@ -1821,7 +1829,11 @@ pub(super) mod tests {
         error: Error,
     }
     impl RecordedPeer {
-        fn direct_hedge_available(&self, _: &std::sync::Arc<crate::topology::Membership>, _: &NodeId) -> bool {
+        fn direct_hedge_available(
+            &self,
+            _: &std::sync::Arc<crate::topology::Membership>,
+            _: &NodeId,
+        ) -> bool {
             false
         }
         fn request_direct<'a>(
@@ -2013,8 +2025,8 @@ pub(super) mod tests {
 
     mod hedging {
         use super::*;
-        use crate::read::tests::page;
         use crate::model::RequestId;
+        use crate::read::tests::page;
         use crate::runtime::RequestScope;
         use std::cell::Cell;
         use std::future::Future;

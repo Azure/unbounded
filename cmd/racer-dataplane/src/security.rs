@@ -17,13 +17,13 @@ impl From<racer_identity::Error> for crate::error::Error {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use crate::peer::protocol::Signatures;
-    use crate::peer::protocol::SignedHead;
     use crate::http::Codec;
     use crate::model::CacheId;
     use crate::model::ClusterId;
     use crate::model::NodeId;
     use crate::peer::protocol;
+    use crate::peer::protocol::Signatures;
+    use crate::peer::protocol::SignedHead;
     use racer_control_wire::BundleGeneration;
     use racer_control_wire::CacheEncryptionKey;
     use racer_control_wire::CacheKeyPurpose;

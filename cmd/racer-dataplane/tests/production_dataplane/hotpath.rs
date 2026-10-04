@@ -6,9 +6,9 @@
 //! reconnect per request. Focused harness checks are not new performance results;
 //! historical paired-worker measurements do not characterize this shared policy.
 use super::*;
-use racer_dataplane::read::dispatch::WorkerMap;
 use racer_dataplane::config::Config;
 use racer_dataplane::config::DEFAULT_MAX_THREADS;
+use racer_dataplane::read::dispatch::WorkerMap;
 use racer_dataplane::runtime::affinity::AffinityPlan;
 use racer_dataplane::runtime::worker::WorkerFactory;
 use racer_dataplane::runtime::worker::WorkerGroup;

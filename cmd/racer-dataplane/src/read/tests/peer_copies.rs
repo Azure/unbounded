@@ -2,9 +2,9 @@
 use super::fill::*;
 use crate::memory::page::CiphertextCopy;
 use crate::model::NodeId;
-use crate::peer::protocol::PeerRequest;
-use crate::peer::forwarding::VerifiedResponse;
 use crate::peer::forwarding::Forwarding;
+use crate::peer::forwarding::VerifiedResponse;
+use crate::peer::protocol::PeerRequest;
 use crate::security::test_support::network;
 use crate::security::test_support::node;
 use std::collections::VecDeque;
@@ -897,7 +897,11 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
         local: usize,
     }
     impl Peer {
-        fn direct_hedge_available(&self, _: &std::sync::Arc<crate::topology::Membership>, _: &NodeId) -> bool {
+        fn direct_hedge_available(
+            &self,
+            _: &std::sync::Arc<crate::topology::Membership>,
+            _: &NodeId,
+        ) -> bool {
             true
         }
         fn request_direct<'a>(

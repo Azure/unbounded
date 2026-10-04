@@ -1,13 +1,12 @@
 //! Client socket scenarios: ownership, publication, HTTP delivery, and retirement.
 use super::listener::*;
 use super::*;
-use racer_control_wire::CacheDefinition;
 use crate::admission::AdmissionPolicy;
 use crate::runtime::Cancellation;
 use crate::runtime::RequestScope;
 use crate::test_support::ReadWorker;
 use crate::test_support::origin::RequestKind;
-use std::time::Instant;
+use racer_control_wire::CacheDefinition;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::ffi::CString;
@@ -26,6 +25,7 @@ use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
+use std::time::Instant;
 mod acquisition {
     use super::*;
 
@@ -524,8 +524,8 @@ mod recovery {
 
 #[test]
 fn local_and_distributed_installs_drain_responses_and_retire_idle_generations() {
-    use crate::model::WorkerId;
     use crate::admission::Ingress;
+    use crate::model::WorkerId;
     use crate::test_support::WakeCounter;
     use std::task::Waker;
 
@@ -615,9 +615,9 @@ fn local_and_distributed_installs_drain_responses_and_retire_idle_generations() 
 
 #[test]
 fn queued_handoffs_reject_retired_generations_and_stopped_receivers() {
+    use crate::admission::Ingress;
     use crate::model::ResourceClass;
     use crate::model::WorkerId;
-    use crate::admission::Ingress;
 
     for stop_receiver in [false, true] {
         let mut acceptor = Fixture::new();
@@ -748,11 +748,11 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
     drop(reactor);
     assert_eq!(sim.live_handles(), 0);
 }
+use crate::config::Limits;
 use crate::http::Codec;
 use crate::http::Delivery;
 use crate::http::new_pipe_pool;
 use crate::model::ExpiresAt;
-use crate::config::Limits;
 use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
 use crate::model::StrongEtag;
@@ -828,8 +828,8 @@ struct Fixture {
 }
 impl Fixture {
     fn install_handoff(&self, ingress: &crate::admission::Ingress) {
-        use crate::model::WorkerId;
         use crate::admission::Kind;
+        use crate::model::WorkerId;
         let [accepted] = ingress
             .pop_batch::<1>(WorkerId(1), futures::task::noop_waker_ref(), 1)
             .unwrap();
@@ -2561,11 +2561,11 @@ mod response {
     }
     #[test]
     fn ready_slice_precedes_auxiliary_overload() {
+        use crate::admission::AdmissionPolicy;
         use crate::http::Delivery;
         use crate::http::new_pipe_pool;
         use crate::model::PageNumber;
         use crate::model::PageSlice;
-        use crate::admission::AdmissionPolicy;
         use crate::runtime::Reactor;
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,

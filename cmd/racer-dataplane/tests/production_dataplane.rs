@@ -1,27 +1,26 @@
 //! Single-node production graph validation. Only control publication, origin data,
 //! and the worker polling loop are fixtures. No read/storage/crypto success doubles.
 use base64::Engine;
-use racer_control_wire::self as wire;
+use racer_control_wire as wire;
+use racer_control_wire::CacheDefinition;
+use racer_control_wire::Publication;
 use racer_control_wire::PublicationSequence;
-use racer_dataplane::read::dispatch::WorkerMap;
+use racer_control_wire::canonical_socket_paths;
+use racer_dataplane::admission::AdmissionPolicy;
 use racer_dataplane::client::RequestParser;
 use racer_dataplane::client::Responses;
-use racer_control_wire::Publication;
-use racer_control_wire::CacheDefinition;
+use racer_dataplane::config::Limits;
 use racer_dataplane::control::PublishedState;
 use racer_dataplane::control::SnapshotStore;
-use racer_control_wire::canonical_socket_paths;
 use racer_dataplane::error::Error;
 use racer_dataplane::error::Operation;
 use racer_dataplane::error::Result;
 use racer_dataplane::http::Codec;
+use racer_dataplane::http::Delivery;
 use racer_dataplane::http::HttpIo;
-use racer_dataplane::http::HttpPool;
+use racer_dataplane::http::new_pipe_pool;
 use racer_dataplane::memory::BufferPool;
 use racer_dataplane::memory::cache::MemoryCache;
-use racer_dataplane::http::Delivery;
-use racer_dataplane::http::new_pipe_pool;
-use racer_dataplane::config::Limits;
 use racer_dataplane::model::PAGE_BYTES;
 use racer_dataplane::model::ResourceClass;
 use racer_dataplane::model::*;
@@ -38,84 +37,33 @@ use racer_dataplane::read::Coordinator;
 use racer_dataplane::read::candidates::CandidatePolicy;
 use racer_dataplane::read::dispatch::WorkerDirectory;
 use racer_dataplane::read::dispatch::WorkerEndpoint;
+use racer_dataplane::read::dispatch::WorkerMap;
 use racer_dataplane::read::fill::Fill;
 use racer_dataplane::read::fill::FillDependencies;
 use racer_dataplane::read::flight::Flights;
 use racer_dataplane::read::metadata::MetadataDependencies;
 use racer_dataplane::read::metadata::MetadataService;
 use racer_dataplane::read::range_stream::RangeStreams;
-use racer_dataplane::admission::AdmissionPolicy;
+use racer_dataplane::runtime::Reactor;
+use racer_dataplane::runtime::RequestScope;
 use racer_dataplane::runtime::crypto;
 use racer_dataplane::runtime::crypto::CryptoClient;
-use racer_dataplane::runtime::RequestScope;
-use racer_dataplane::runtime::Reactor;
 use racer_dataplane::runtime::worker::CryptoRuntime;
 
-use racer_dataplane::security::aead::PageCrypto;
-use racer_dataplane::security::aead::PageCryptoEngine;
-use racer_dataplane::peer::protocol::Signatures;
-use racer_dataplane::security::credentials::CredentialCrypto;
 use racer_dataplane::peer::forwarding::Forwarding;
-use racer_dataplane::client::RequestParser;
-use racer_dataplane::client::Responses;
-use racer_control_wire::Publication;
-use racer_control_wire::CacheDefinition;
-use racer_dataplane::control::PublishedState;
-use racer_dataplane::control::SnapshotStore;
-use racer_control_wire::canonical_socket_paths;
-use racer_dataplane::error::Error;
-use racer_dataplane::error::Operation;
-use racer_dataplane::error::Result;
-use racer_dataplane::http::Codec;
-use racer_dataplane::http::HttpIo;
-use racer_dataplane::memory::BufferPool;
-use racer_dataplane::memory::cache::MemoryCache;
-use racer_dataplane::http::Delivery;
-use racer_dataplane::http::new_pipe_pool;
-use racer_dataplane::config::Limits;
-use racer_dataplane::model::PAGE_BYTES;
-use racer_dataplane::model::ResourceClass;
-use racer_dataplane::model::*;
-use racer_dataplane::origin::OriginClient;
-use racer_dataplane::peer::PeerNetwork;
-use racer_dataplane::peer::Requester;
-use racer_dataplane::peer::protocol::FetchMode;
-use racer_dataplane::peer::protocol::Operation as PeerOperation;
-use racer_dataplane::peer::protocol::PeerRequest;
-use racer_dataplane::peer::protocol::PeerResponse;
-use racer_dataplane::peer::server::LocalPageService;
-use racer_dataplane::peer::transport::Transfers;
-use racer_dataplane::read::Coordinator;
-use racer_dataplane::read::candidates::CandidatePolicy;
-use racer_dataplane::read::dispatch::WorkerDirectory;
-use racer_dataplane::read::dispatch::WorkerEndpoint;
-use racer_dataplane::read::fill::Fill;
-use racer_dataplane::read::fill::FillDependencies;
-use racer_dataplane::read::flight::Flights;
-use racer_dataplane::read::metadata::MetadataDependencies;
-use racer_dataplane::read::metadata::MetadataService;
-use racer_dataplane::read::range_stream::RangeStreams;
-use racer_dataplane::admission::AdmissionPolicy;
-use racer_dataplane::runtime::crypto;
-use racer_dataplane::runtime::crypto::CryptoClient;
-use racer_dataplane::runtime::RequestScope;
-use racer_dataplane::runtime::Reactor;
-use racer_dataplane::runtime::worker::CryptoRuntime;
-
-use racer_dataplane::read::dispatch::WorkerMap;
+use racer_dataplane::peer::protocol::Signatures;
 use racer_dataplane::security::aead::PageCrypto;
 use racer_dataplane::security::aead::PageCryptoEngine;
-use racer_dataplane::peer::protocol::Signatures;
 use racer_dataplane::security::credentials::CredentialCrypto;
+
 use racer_dataplane::store::StoreReader;
 use racer_dataplane::store::StoreWriter;
 use racer_dataplane::store::catalog::Index;
 use racer_dataplane::store::catalog::SegmentClock;
 use racer_dataplane::topology::LinkHealth;
-use racer_dataplane::topology::Member;
 
-use racer_dataplane::topology::Placement;
 use racer_dataplane::topology::Paths;
+use racer_dataplane::topology::Placement;
 use racer_dataplane::topology::RouteBudget;
 use racer_identity::Certificates;
 use racer_identity::KeyEpochs;
@@ -865,7 +813,7 @@ fn fixture_publication() -> Publication {
         cluster: ClusterId(CLUSTER.into()),
         sequence: PublicationSequence(1),
         membership_version: MembershipVersion(1),
-        members: vec![Member {
+        members: vec![racer_control_wire::Member {
             node: NodeId(NODE.into()),
             shares: NonZeroU32::new(4).unwrap(),
             peer_endpoint: "127.0.0.1:8000".into(),

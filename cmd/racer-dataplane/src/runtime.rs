@@ -49,13 +49,13 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Instant;
-use uring_runtime::CancellationRegistration;
+use uring_runtime::deadline::CancellationRegistration;
 use uring_runtime::deadline::Deadline;
 
 /// Racer candidate policy shares the cancellation lifetime, but is not runtime policy.
 #[derive(Clone)]
 pub struct Cancellation {
-    inner: uring_runtime::Cancellation,
+    inner: uring_runtime::deadline::Cancellation,
     state: Arc<CancellationState>,
 }
 struct CancellationState {
@@ -72,7 +72,7 @@ struct CandidateBody {
 impl Cancellation {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            inner: uring_runtime::Cancellation::new()?,
+            inner: uring_runtime::deadline::Cancellation::new()?,
             state: Arc::new(CancellationState {
                 candidate_total: OnceLock::new(),
                 candidate_idle: OnceLock::new(),
@@ -243,7 +243,7 @@ impl uring_runtime::Scope for RequestScope {
         RequestScope::check(self)
     }
 
-    fn cancellation(&self) -> Option<&uring_runtime::Cancellation> {
+    fn cancellation(&self) -> Option<&uring_runtime::deadline::Cancellation> {
         Some(&self.cancellation.inner)
     }
 }
@@ -264,10 +264,10 @@ use crate::admission::reserve_connection;
 use crate::model::ResourceClass;
 use std::ops::Deref;
 use std::rc::Rc;
-use uring_runtime::filesystem::Buffer;
-use uring_runtime::ReactorWake;
-use uring_runtime::SUBMISSION_BYTES;
-use uring_runtime::SubmissionCapacity;
+use uring_runtime::reactor::ReactorWake;
+use uring_runtime::reactor::SUBMISSION_BYTES;
+use uring_runtime::reactor::SubmissionCapacity;
+use uring_runtime::reactor::filesystem::Buffer;
 
 pub struct AdmissionBudget(Rc<flow_control::Quotas<AdmissionPolicy>>);
 impl uring_runtime::Budget for AdmissionBudget {
@@ -288,7 +288,7 @@ impl uring_runtime::Budget for AdmissionBudget {
 /// Inline storage cannot meet the stable-buffer contract:
 /// ```compile_fail
 /// use racer_dataplane::error::Result;
-/// use uring_runtime::IoBuffer;
+/// use uring_runtime::reactor::IoBuffer;
 /// struct Inline([u8; 16]);
 /// impl IoBuffer for Inline {
 ///     type Error = racer_dataplane::error::Error;
@@ -299,7 +299,7 @@ impl uring_runtime::Budget for AdmissionBudget {
 /// Borrowed storage does not have an independent completion lifetime:
 /// ```compile_fail
 /// use racer_dataplane::error::Result;
-/// use uring_runtime::IoBuffer;
+/// use uring_runtime::reactor::IoBuffer;
 /// struct Borrowed<'a>(&'a mut [u8]);
 /// unsafe impl IoBuffer for Borrowed<'_> {
 ///     type Error = racer_dataplane::error::Error;
@@ -310,7 +310,7 @@ impl uring_runtime::Budget for AdmissionBudget {
 /// Audited production buffers own independent storage:
 /// ```
 /// use racer_dataplane::{memory::PlaintextBuffer, admission::AdmissionPolicy};
-/// use uring_runtime::IoBuffer;
+/// use uring_runtime::reactor::IoBuffer;
 /// use flow_control::Charge;
 /// use page_alloc::AlignedBuffer;
 /// fn independent<T: 'static>() {}
@@ -322,17 +322,17 @@ impl uring_runtime::Budget for AdmissionBudget {
 /// ```compile_fail
 /// use std::rc::Rc;
 /// use racer_dataplane::{memory::CiphertextPage, runtime::{Reactor, RequestScope}};
-/// use uring_runtime::Descriptor;
+/// use uring_runtime::reactor::Descriptor;
 /// fn receive(r: &Reactor, fd: Rc<Descriptor>, page: CiphertextPage, scope: &RequestScope) {
 ///     let _ = r.recv(fd, page, (), scope);
 /// }
 /// ```
 pub struct Reactor {
-    core: uring_runtime::Reactor<RequestScope, AdmissionBudget>,
+    core: uring_runtime::reactor::Reactor<RequestScope, AdmissionBudget>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
 }
 impl Deref for Reactor {
-    type Target = uring_runtime::Reactor<RequestScope, AdmissionBudget>;
+    type Target = uring_runtime::reactor::Reactor<RequestScope, AdmissionBudget>;
     fn deref(&self) -> &Self::Target {
         &self.core
     }
@@ -340,7 +340,7 @@ impl Deref for Reactor {
 impl Reactor {
     pub fn new(admission: Rc<flow_control::Quotas<AdmissionPolicy>>) -> Self {
         Self {
-            core: uring_runtime::Reactor::new(
+            core: uring_runtime::reactor::Reactor::new(
                 admission.policy().limits().queue_entries.get(),
                 AdmissionBudget(admission.clone()),
             ),
@@ -417,15 +417,6 @@ pub(crate) async fn cooperative_turn() {
     })
     .await
 }
-/// Racer TLS time adapter over the runtime's scoped wall clock.
-pub fn unix_time() -> rustls::pki_types::UnixTime {
-    rustls::pki_types::UnixTime::since_unix_epoch(
-        uring_runtime::environment::wall_now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or_default(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     mod deadline;
@@ -501,9 +492,9 @@ mod tests {
         );
     }
     mod listener_tests {
-        use crate::runtime::RequestScope;
         use crate::error::Error;
         use crate::model::RequestId;
+        use crate::runtime::RequestScope;
         use crate::test_support::WakeCounter;
         use std::cell::Cell;
         use std::sync::Arc;
@@ -594,7 +585,7 @@ mod tests {
             use crate::admission::AdmissionPolicy;
             use crate::runtime::Reactor;
             use std::rc::Rc;
-            use uring_runtime::simulation::Simulation;
+            use uring_runtime::reactor::simulation::Simulation;
             let sim = Simulation::new();
             let _os = sim.enter();
             let clock = SimulationClock::new(3);

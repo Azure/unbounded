@@ -49,7 +49,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use uring_runtime::IoBuffer;
+use uring_runtime::reactor::IoBuffer;
 
 #[derive(Clone)]
 pub struct FillDependencies {
@@ -118,7 +118,7 @@ impl Fill {
             .lookup(LookupTier::Plaintext, self.dependencies.memory.get(page))?;
         if let Some(result) = &result {
             result.validate_for(page)?;
-            self.metrics.record(Event::MemoryHit, 1)?;
+            self.metrics.record(Event::MemoryHit, 1);
         }
         Ok(result)
     }
@@ -236,7 +236,7 @@ impl Fill {
         self.publish(result.clone(), None, scope).await?;
         // Selected subscription pages bypass acquire_inner's source accounting.
         // Count only authenticated, published reception on the stable owner.
-        self.metrics.record(Event::PeerHit, 1)?;
+        self.metrics.record(Event::PeerHit, 1);
         Ok(result)
     }
     pub(crate) fn observe_peer_error(
@@ -486,7 +486,7 @@ impl Fill {
                 .lookup(LookupTier::Plaintext, self.dependencies.memory.get(&page))?
             {
                 result.validate_for(&page)?;
-                self.metrics.record(Event::MemoryHit, 1)?;
+                self.metrics.record(Event::MemoryHit, 1);
                 return Ok(result.into());
             }
             let mut waiter = match self.dependencies.flights.join_for(
@@ -728,7 +728,7 @@ impl Fill {
         };
         result.validate_for(page)?;
         self.publish(result.clone(), dirty, scope).await?;
-        self.metrics.record(Event::OriginFill, 1)?;
+        self.metrics.record(Event::OriginFill, 1);
         Ok(result)
     }
     /// Strictly local completed/pending copy or join of existing work; never starts
@@ -746,7 +746,7 @@ impl Fill {
                 self.dependencies.memory.ciphertext(page),
             )? {
                 validate_copy(&copy, page)?;
-                self.metrics.record(Event::MemoryHit, 1)?;
+                self.metrics.record(Event::MemoryHit, 1);
                 return Ok(Some((copy.metadata, copy.ciphertext)));
             }
             if let Some(copy) = self.metrics.lookup(
@@ -754,7 +754,7 @@ impl Fill {
                 self.dependencies.writer.copy_only(page),
             )? {
                 validate_copy(&copy, page)?;
-                self.metrics.record(Event::MemoryHit, 1)?;
+                self.metrics.record(Event::MemoryHit, 1);
                 return Ok(Some((copy.metadata, copy.ciphertext)));
             }
             // Copy-only forbids new acquisition, not reclamation of idle local
@@ -764,7 +764,7 @@ impl Fill {
                     return Ok(Some((copy.metadata, copy.ciphertext)));
                 }
                 Err(Error::CorruptRecord) => {
-                    self.metrics.record(Event::CorruptMiss, 1)?;
+                    self.metrics.record(Event::CorruptMiss, 1);
                 }
                 Ok(None) | Err(Error::MissingKey | Error::Io) => {}
                 Err(error) => return Err(error),
@@ -854,7 +854,7 @@ impl Fill {
                         | Err(Error::Overloaded | Error::MissingKey | Error::Unavailable) => {}
                         Err(error) => return Err(error),
                     }
-                    fill.metrics.record(Event::DiskHit, 1)?;
+                    fill.metrics.record(Event::DiskHit, 1);
                     Ok(Some(copy))
                 }
                 .await;
@@ -915,7 +915,7 @@ impl Fill {
                     match self.validate_disk_copy(&copy, page, token, scope).await {
                         Ok(()) => {}
                         Err(Error::CorruptRecord) => {
-                            self.metrics.record(Event::CorruptMiss, 1)?;
+                            self.metrics.record(Event::CorruptMiss, 1);
                             return Ok(None);
                         }
                         Err(Error::MissingKey) => return Ok(None),
@@ -931,7 +931,7 @@ impl Fill {
                         Event::MemoryHit
                     },
                     1,
-                )?;
+                );
                 return Ok(Some(AcquiredPage::Ciphertext(UnverifiedPage {
                     copy,
                     disk_token: token,
@@ -958,12 +958,12 @@ impl Fill {
                             Event::MemoryHit
                         },
                         1,
-                    )?;
+                    );
                     return Ok(Some(result.into()));
                 }
                 Err(error @ (Error::CorruptRecord | Error::MissingKey)) => {
                     if error == Error::CorruptRecord {
-                        self.metrics.record(Event::CorruptMiss, 1)?;
+                        self.metrics.record(Event::CorruptMiss, 1);
                     }
                     if let Some(token) = &token {
                         self.dependencies.disk.invalidate(token)?;
@@ -1082,7 +1082,7 @@ impl Fill {
                 result.validate_for(page)?;
                 scope.check()?;
                 self.publish(result.clone(), dirty, scope).await?;
-                self.metrics.record(Event::PeerHit, 1)?;
+                self.metrics.record(Event::PeerHit, 1);
                 return Ok(result.into());
             }
         }
@@ -1191,7 +1191,7 @@ impl Fill {
             // that evidence even when the supplier requested only ciphertext.
             self.publish(page.clone(), dirty, scope).await?;
         }
-        self.metrics.record(source, 1)?;
+        self.metrics.record(source, 1);
         Ok(result)
     }
 
@@ -1202,7 +1202,7 @@ impl Fill {
         ciphertext: flow_control::Charge<AdmissionPolicy>,
         scope: &RequestScope,
     ) -> Result<PageResult> {
-        use uring_runtime::IoBuffer;
+        use uring_runtime::reactor::IoBuffer;
         if origin.metadata.version != page.version {
             return Err(Error::CorruptRecord);
         }
@@ -1262,7 +1262,7 @@ impl Fill {
         let result = async {
             validate_copy(&copy, page)?;
             // Keep the original immutable ciphertext lease across crypto submission.
-            self.metrics.record(Event::PageDecrypt, 1)?;
+            self.metrics.record(Event::PageDecrypt, 1);
             let plaintext = self
                 .dependencies
                 .crypto

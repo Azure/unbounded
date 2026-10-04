@@ -8,6 +8,7 @@
 //! through abandonment and the final completion fence. After backpressure, the
 //! rest of that page uses direct sends instead of repeating pipe drain round trips.
 //! Backpressured direct sends own immutable page views, not copied staging bytes.
+use crate::admission::AdmissionPolicy;
 use crate::http::*;
 use crate::memory::VerifiedBytes;
 use crate::model::CacheId;
@@ -19,17 +20,16 @@ use crate::model::PageNumber;
 use crate::model::RequestId;
 use crate::model::ResourceClass;
 use crate::model::StrongEtag;
-use crate::admission::AdmissionPolicy;
 use crate::runtime::Cancellation;
-use uring_runtime::deadline::Deadline;
 use crate::runtime::Reactor;
 use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::task::Context;
-use std::os::fd::AsRawFd;
 use std::task::Poll;
 use std::time::Instant;
+use uring_runtime::deadline::Deadline;
 fn admission(pipes: usize) -> Rc<flow_control::Quotas<AdmissionPolicy>> {
     let small = std::num::NonZeroUsize::new(8).unwrap();
     let bytes = std::num::NonZeroUsize::new(32 * 1024 * 1024).unwrap();

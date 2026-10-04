@@ -39,23 +39,23 @@
 //!     requester.verify_response(reverse, &outstanding)
 //! }
 //! ```
-use crate::peer::protocol::Signatures;
-use crate::peer::protocol::SignedHead;
-use crate::peer::protocol::node_field;
-use crate::peer::protocol::receiver;
-use crate::peer::protocol::signed_digest;
 use crate::error::Error;
 use crate::error::Result;
 use crate::model::NodeId;
 use crate::peer::protocol;
 use crate::peer::protocol::PeerRequest;
 use crate::peer::protocol::PeerResponse;
+use crate::peer::protocol::Signatures;
+use crate::peer::protocol::SignedHead;
 use crate::peer::protocol::SignedRequest;
 use crate::peer::protocol::SignedResponse;
 use crate::peer::protocol::field;
+use crate::peer::protocol::node_field;
 use crate::peer::protocol::number;
 use crate::peer::protocol::push;
 use crate::peer::protocol::push_binary;
+use crate::peer::protocol::receiver;
+use crate::peer::protocol::signed_digest;
 use crate::topology::RouteBudget;
 use http1::MessageHead;
 use http1::StartLine;
@@ -830,9 +830,10 @@ fn check_grant_deadline(head: &MessageHead, request: &RequestBinding) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admission::AdmissionPolicy;
+    use crate::config::Limits;
     use crate::model::EncryptedAuthorization;
     use crate::model::KeyId;
-    use crate::config::Limits;
     use crate::model::MetadataSelector;
     use crate::model::Nonce;
     use crate::model::OpaqueMetadata;
@@ -841,7 +842,6 @@ mod tests {
     use crate::model::*;
     use crate::peer::protocol::FetchMode;
     use crate::peer::protocol::Operation;
-    use crate::admission::AdmissionPolicy;
     use crate::runtime::RequestScope;
     use crate::security::test_support::clone_head;
     use crate::security::test_support::network;
@@ -1464,7 +1464,7 @@ mod tests {
         let replay = copy_response(&response);
         let verified = f[1].verify_response(response, &reverse).unwrap();
         f[1].verify_response(replay, &reverse).unwrap();
-        crate::peer::protocol::tests::replay_and_binding_checks();
+        crate::peer::protocol::connection_tests::tests::replay_and_binding_checks();
         assert!(f[1].append_response(verified, &node(2)).is_err());
         // Historical response proofs may be carried by fresh session heads.
         let response = f[2]

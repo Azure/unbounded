@@ -1,7 +1,7 @@
 use super::dataplane;
-use dataplane::error::Operation;
-use dataplane::config::Limits;
 use dataplane::admission::AdmissionPolicy;
+use dataplane::config::Limits;
+use dataplane::error::Operation;
 use dataplane::runtime::Reactor;
 
 use std::num::NonZeroUsize;

@@ -1,11 +1,11 @@
 //! Application lifecycle tests and shared assembled-worker fixtures.
 use super::*;
+use crate::admission::reserve_connection;
 use racer_control_wire as state;
+#[cfg(test)]
+use uring_runtime::group::Service;
 
 use crate::admission::AdmissionPolicy;
-use crate::runtime::crypto;
-use crate::runtime::crypto::CryptoClient;
-use crate::runtime::Reactor;
 use crate::http::Codec;
 use crate::model::ExpiresAt;
 use crate::model::MetadataSelector;
@@ -13,13 +13,16 @@ use crate::model::ObjectMetadata;
 use crate::model::ResourceClass;
 use crate::model::*;
 use crate::peer::protocol;
+use crate::peer::protocol as connection;
 use crate::peer::protocol::FetchMode;
 use crate::peer::protocol::Operation as PeerOperation;
 use crate::peer::protocol::PeerRequest;
 use crate::peer::protocol::PeerResponse;
 use crate::peer::protocol::decode_envelope;
 use crate::peer::protocol::encode_envelope;
-use crate::security::connection;
+use crate::runtime::Reactor;
+use crate::runtime::crypto;
+use crate::runtime::crypto::CryptoClient;
 use crate::security::test_support::network;
 use crate::security::test_support::node;
 use crate::topology::RouteBudget;
@@ -28,14 +31,14 @@ use http1::MessageHead;
 use http1::StartLine;
 use racer_control_wire as wire;
 use std::collections::VecDeque;
+use std::future::Future;
 use std::io::Read;
 use std::io::Write;
 use std::num::NonZeroUsize;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::thread;
 use std::time::Instant;
-use std::future::Future;
-use std::os::unix::net::UnixStream;
 use uring_runtime::affinity::EffectiveTopology;
 
 pub(super) struct ControlFixture {
@@ -124,7 +127,7 @@ impl EnrollmentHandler {
         self.issued.fetch_add(1, Ordering::Release);
         (
             200,
-            wire::encode_enrollment_response(&crate::control::testing::issue_at(
+            wire::encode_enrollment_response(&crate::control::tests::testing::issue_at(
                 &request,
                 &self.ca,
                 &self.ca_key,
@@ -355,7 +358,7 @@ fn control_tls() -> (
     rcgen::KeyPair,
     Arc<rustls::ServerConfig>,
 ) {
-    let (ca, ca_key) = crate::control::testing::ca();
+    let (ca, ca_key) = crate::control::tests::testing::ca();
     let server_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
     let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
@@ -503,7 +506,7 @@ pub(super) fn publication(
         cluster: config.cluster.clone(),
         sequence: wire::PublicationSequence(sequence),
         membership_version: crate::model::MembershipVersion(1),
-        members: vec![crate::topology::Member {
+        members: vec![racer_control_wire::Member {
             node: config.node.clone(),
             shares: std::num::NonZeroU32::new(1).unwrap(),
             peer_endpoint: "127.0.0.1:7443".into(),
@@ -934,7 +937,7 @@ fn composes_http_and_optional_rdma_without_operational_side_effects() {
         assert_eq!(worker.poll_budgeted(&mut cx, 0), Err(Error::Unavailable));
         assert_eq!(worker.poll_budgeted(&mut cx, 1), Err(Error::Unavailable));
         // Admission bounds retained generations once across the node.
-        let mut publication = crate::control::decode_publication(include_bytes!(concat!(
+        let mut publication = racer_control_wire::decode_publication(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../internal/racer/wire/testdata/publication.json"
         )))
@@ -967,7 +970,7 @@ fn shared_factory_is_send_and_sync_without_moving_worker_graphs() {
 fn multiworker_memberships_retire_after_request_leases_and_reuse_capacity() {
     use crate::model::MembershipVersion;
     use crate::peer::PeerNetwork;
-    let mut publication = crate::control::decode_publication(include_bytes!(concat!(
+    let mut publication = racer_control_wire::decode_publication(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../internal/racer/wire/testdata/publication.json"
     )))
@@ -1321,8 +1324,7 @@ fn two_workers_start_from_real_control_and_checkpoint_one_complete_cut() {
                 use crate::telemetry::Event;
                 app.telemetry
                     .metrics
-                    .record(Event::MemoryHit, u64::from(id) + 1)
-                    .unwrap();
+                    .record(Event::MemoryHit, u64::from(id) + 1);
                 drive(
                     &runtime,
                     &mut engine,
@@ -2723,10 +2725,8 @@ fn assembly_applies_configured_client_request_timeout() {
         let (app, runtime, _) = local_worker(&config, &Arc::new(NodeState::default()), 0);
         let (server, mut client) = std::os::unix::net::UnixStream::pair().unwrap();
         client.set_nonblocking(true).unwrap();
-        let reservation = runtime
-            .admission
-            .reserve_connection(ResourceClass::IngressConnection)
-            .unwrap();
+        let reservation =
+            reserve_connection(&runtime.admission, ResourceClass::IngressConnection).unwrap();
         let connection = crate::http::from_reserved(server.into(), reservation).unwrap();
         app.clients
             .install_connection(connection, definition().id, Arc::new(AtomicBool::default()))
@@ -2822,7 +2822,7 @@ fn distributed_peer_listener_recovers_from_queue_pressure() {
     let mut serving = app.peers.listen(address, &scope);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
-    let reader = Rc::new(uring_runtime::Descriptor::from(reader));
+    let reader = Rc::new(uring_runtime::reactor::Descriptor::from(reader));
     let mut pressure = Vec::new();
     for _ in 0..8 {
         let mut wait = runtime
@@ -2873,12 +2873,8 @@ fn assembly_uses_node_metrics_for_sparse_worker_ids() {
     let node = Arc::new(NodeState::new(vec![WorkerId(9), WorkerId(2)], 16).unwrap());
     let (first, _, _) = local_worker(&config, &node, 9);
     let (second, _, _) = local_worker(&config, &node, 2);
-    first.telemetry.metrics.record(Event::MemoryHit, 2).unwrap();
-    second
-        .telemetry
-        .metrics
-        .record(Event::MemoryHit, 3)
-        .unwrap();
+    first.telemetry.metrics.record(Event::MemoryHit, 2);
+    second.telemetry.metrics.record(Event::MemoryHit, 3);
     let request = first.telemetry.metrics.request().unwrap();
     assert_eq!(second.telemetry.metrics.count(Event::MemoryHit), 5);
     assert_eq!(second.telemetry.metrics.gauge(Gauge::ActiveRequests), 1);

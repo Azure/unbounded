@@ -1,11 +1,10 @@
 //! Shared semantic values. This layer imports neither I/O nor read policy.
 
+use crate::admission::AdmissionPolicy;
 use crate::error::Error;
 use crate::error::Result;
-use crate::admission::AdmissionPolicy;
 use crate::runtime::RequestScope;
 use std::fmt;
-use std::num::NonZeroUsize;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;

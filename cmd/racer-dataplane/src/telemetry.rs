@@ -1,3 +1,4 @@
+use crate::admission::AdmissionPolicy;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -6,11 +7,9 @@ use crate::model::NodeId;
 use crate::model::RequestId;
 use crate::model::ResourceClass;
 use crate::model::WorkerId;
-use crate::admission::AdmissionPolicy;
 
-use uring_runtime::deadline::Deadline;
-use crate::runtime::RequestScope;
 use crate::runtime::Reactor;
+use crate::runtime::RequestScope;
 use ::telemetry::Ring;
 use ::telemetry::metrics;
 use ::telemetry::server;
@@ -36,8 +35,9 @@ use std::sync::OnceLock;
 use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
+use uring_runtime::deadline::Deadline;
 use uring_runtime::environment;
-use uring_runtime::Descriptor;
+use uring_runtime::reactor::Descriptor;
 
 // Bounded diagnostics and HTTP endpoints, polled by an existing worker.
 
@@ -164,7 +164,7 @@ impl DiagnosticIo {
     ) -> Result<Self> {
         let control = admission.reserve(None, ResourceClass::ControlProgress, CONTROL_SLOTS)?;
         let mut memory = admission.reserve(None, ResourceClass::RequestContext, RESERVED_BYTES)?;
-        let bookkeeping = memory.split(CONTROL_SLOTS * uring_runtime::SUBMISSION_BYTES)?;
+        let bookkeeping = memory.split(CONTROL_SLOTS * uring_runtime::reactor::SUBMISSION_BYTES)?;
         let submissions = reactor.reserve_submissions(control, bookkeeping)?;
         Ok(Self {
             reactor,
@@ -1245,8 +1245,14 @@ impl Metrics {
             }
             for shard in self.admission.iter() {
                 if let Some((worker, usage)) = shard.get() {
-                    let (relay_used, relay_limit) = usage.relay();
-                    let (ciphertext_used, ciphertext_limit) = usage.ciphertext();
+                    let (relay_used, relay_limit) = (
+                        usage.used(crate::model::ResourceClass::Relay),
+                        usage.limit(crate::model::ResourceClass::Relay),
+                    );
+                    let (ciphertext_used, ciphertext_limit) = (
+                        usage.used(crate::model::ResourceClass::Ciphertext),
+                        usage.limit(crate::model::ResourceClass::Ciphertext),
+                    );
                     for (name, value) in QUOTAS.into_iter().zip([
                         relay_used,
                         relay_limit,

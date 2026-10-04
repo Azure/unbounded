@@ -4,11 +4,10 @@
 //! before changing the worker map; no live remapping is implied.
 use super::Coordinator;
 use super::flight::AcquisitionBudget;
-use crate::memory::page::PageResult;
-use crate::runtime::HashMap;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
+use crate::memory::page::PageResult;
 use crate::model::AttemptId;
 use crate::model::MetadataSelector;
 use crate::model::ObjectId;
@@ -19,10 +18,11 @@ use crate::model::PageId;
 use crate::model::PeerOriginContext;
 use crate::model::VersionMetadata;
 use crate::model::WorkerId;
-use crate::peer::protocol::PeerResponse;
 use crate::peer::forwarding::VerifiedRequest;
+use crate::peer::protocol::PeerResponse;
 use crate::peer::server::LocalPageService;
 use crate::runtime::Cancellation;
+use crate::runtime::HashMap;
 use crate::runtime::RequestScope;
 
 use sha2::Digest;
@@ -78,8 +78,16 @@ enum Work {
     ),
     Selected(crate::memory::page::CiphertextCopy),
     Cached(PageId),
-    Resolve(MetadataSelector, std::sync::Arc<crate::topology::Membership>, PeerOriginContext),
-    Acquire(PageId, std::sync::Arc<crate::topology::Membership>, PeerOriginContext),
+    Resolve(
+        MetadataSelector,
+        std::sync::Arc<crate::topology::Membership>,
+        PeerOriginContext,
+    ),
+    Acquire(
+        PageId,
+        std::sync::Arc<crate::topology::Membership>,
+        PeerOriginContext,
+    ),
     Ordered(
         PageId,
         std::sync::Arc<crate::topology::Membership>,
@@ -153,7 +161,7 @@ struct Command {
 struct Receipt {
     reply: Arc<Reply>,
     scope: RequestScope,
-    cancellation: uring_runtime::CancellationRegistration,
+    cancellation: uring_runtime::deadline::CancellationRegistration,
     _permit: Arc<Permit>,
 }
 impl Future for Receipt {
@@ -185,7 +193,7 @@ impl Drop for Receipt {
     }
 }
 struct Active {
-    cancellation: Result<uring_runtime::CancellationRegistration>,
+    cancellation: Result<uring_runtime::deadline::CancellationRegistration>,
     runnable: Arc<uring_runtime::drivers::Runnable>,
     future: Operation<'static, ()>,
     scope: RequestScope,
@@ -688,7 +696,7 @@ impl WorkerEndpoint {
     /// without polling them; the simulated reactor still fences owned buffers.
     #[cfg(test)]
     pub(crate) fn simulation_crash(&mut self) {
-        assert!(uring_runtime::simulation::Simulation::current().is_some());
+        assert!(uring_runtime::reactor::simulation::Simulation::current().is_some());
         self.directory.simulation_crash();
         self.active.clear();
     }
