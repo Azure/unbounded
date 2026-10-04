@@ -8,7 +8,10 @@ use crate::admission::AdmissionPolicy;
 use crate::admission::ConnectionReservation;
 use crate::runtime::RequestScope;
 use crate::runtime::Reactor;
+use flow_control::pipe::PipeLease;
+use flow_control::pipe::PipePool;
 use http1::MessageHead;
+use std::task::Waker;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -16,6 +19,29 @@ use uring_runtime::reactor::Descriptor;
 use uring_runtime::reactor::SocketAddress;
 
 pub const MAX_HEAD_BYTES: usize = 32 * 1024;
+pub fn new_pipe_pool(
+    admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
+) -> PipePool<AdmissionPolicy> {
+    let waiter_limit = admission.policy().limits().queue_entries.get();
+    PipePool::new(
+        admission,
+        ResourceClass::Pipe,
+        ResourceClass::RequestContext,
+        waiter_limit,
+    )
+}
+pub(crate) fn acquire_wait<'a>(
+    pool: &'a PipePool<AdmissionPolicy>,
+    scope: &'a RequestScope,
+) -> Operation<'a, PipeLease<AdmissionPolicy>> {
+    Box::pin(pool.acquire_wait(
+        || scope.check(),
+        || {
+            let cancellation = scope.cancellation.subscribe()?;
+            Ok(move |waker: &Waker| cancellation.register(waker))
+        },
+    ))
+}
 pub struct RacerOpaque;
 impl http1::Opaque for RacerOpaque {
     const NAMES: &'static [&'static str] = &["authorization", "racer-metadata"];
@@ -263,8 +289,6 @@ mod relay_tests {
     //! Opaque transit, fallback, cancellation, and ownership-fence scenarios.
     use super::*;
     use crate::peer::transport::relay_body;
-    use crate::http::acquire_wait;
-    use crate::http::new_pipe_pool;
     use crate::model::RequestId;
     use crate::model::ResourceClass;
     use crate::admission::AdmissionPolicy;

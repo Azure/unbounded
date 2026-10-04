@@ -164,7 +164,7 @@ impl Delivery {
         &'a self,
         scope: &'a RequestScope,
     ) -> Operation<'a, PipeLease<AdmissionPolicy>> {
-        super::acquire_wait(&self.pipes, scope)
+        crate::http::acquire_wait(&self.pipes, scope)
     }
 
     pub(crate) fn attach_reserved(
@@ -413,7 +413,7 @@ mod tests {
     ) {
         let admission = admission(pipes);
         let reactor = Rc::new(Reactor::new(admission.clone()));
-        let pool = Rc::new(super::super::new_pipe_pool(admission.clone()));
+        let pool = Rc::new(crate::http::new_pipe_pool(admission.clone()));
         (
             admission,
             reactor.clone(),

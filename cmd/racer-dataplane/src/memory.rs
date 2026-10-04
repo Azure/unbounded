@@ -4,7 +4,6 @@
 pub mod cache;
 pub mod delivery;
 use crate::error::Error;
-use crate::error::Operation;
 use crate::error::Result;
 use crate::model::CacheId;
 use crate::model::PAGE_BYTES;
@@ -13,13 +12,8 @@ use crate::model::PageId;
 use crate::model::ResourceClass;
 
 use crate::admission::AdmissionPolicy;
-use crate::runtime::RequestScope;
-use flow_control::Quotas;
-use flow_control::pipe::PipeLease;
-use flow_control::pipe::PipePool;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::task::Waker;
 
 #[derive(Clone)]
 pub struct BufferPool {
@@ -824,34 +818,16 @@ pub mod page {
     }
 }
 
-pub fn new_pipe_pool(admission: Rc<Quotas<AdmissionPolicy>>) -> PipePool<AdmissionPolicy> {
-    let waiter_limit = admission.policy().limits().queue_entries.get();
-    PipePool::new(
-        admission,
-        ResourceClass::Pipe,
-        ResourceClass::RequestContext,
-        waiter_limit,
-    )
-}
-
-pub(crate) fn acquire_wait<'a>(
-    pool: &'a PipePool<AdmissionPolicy>,
-    scope: &'a RequestScope,
-) -> Operation<'a, PipeLease<AdmissionPolicy>> {
-    Box::pin(pool.acquire_wait(
-        || scope.check(),
-        || {
-            let cancellation = scope.cancellation.subscribe()?;
-            Ok(move |waker: &Waker| cancellation.register(waker))
-        },
-    ))
-}
-
 #[cfg(test)]
 mod pipe_tests {
     use super::*;
     use crate::error::Error;
     use crate::config::Limits;
+    use crate::http::acquire_wait;
+    use crate::http::new_pipe_pool;
+    use crate::runtime::RequestScope;
+    use flow_control::Quotas;
+    use std::task::Waker;
 
     pub(in crate::memory) fn admission(pipes: usize) -> Rc<Quotas<AdmissionPolicy>> {
         let small = std::num::NonZeroUsize::new(8).unwrap();
