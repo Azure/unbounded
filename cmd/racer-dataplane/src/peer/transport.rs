@@ -12,7 +12,7 @@ use crate::http::ConnectionLease;
 use crate::http::HttpIo;
 use crate::http::HttpPool;
 use crate::model::NodeId;
-use crate::model::ResourceClass;
+use crate::admission::ResourceClass;
 use crate::model::TransferId;
 use crate::peer::forwarding::ForwardedHead;
 use crate::peer::protocol as p;
@@ -241,7 +241,7 @@ mod native_exchange_tests {
     use crate::model::Nonce;
     use crate::model::ObjectMetadata;
     use crate::model::PageEnvelope;
-    use crate::model::ResourceClass;
+    use crate::admission::ResourceClass;
     use crate::model::*;
     use crate::peer::protocol as p;
     use crate::peer::protocol::Signatures;

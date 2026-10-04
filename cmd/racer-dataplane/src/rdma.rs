@@ -7,7 +7,7 @@ use crate::memory::CiphertextPage;
 use crate::model::NodeId;
 use crate::model::PageEnvelope;
 use crate::model::PageId;
-use crate::model::ResourceClass;
+use crate::admission::ResourceClass;
 use crate::model::TransferId;
 use crate::runtime::RequestScope;
 use uring_runtime::deadline::Deadline;

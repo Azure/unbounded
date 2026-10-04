@@ -2,7 +2,7 @@
 //! queues, service times, placement, and page ownership are explicit abstractions.
 use crate::model::CacheId;
 use crate::model::PAGE_BYTES;
-use crate::model::ResourceClass;
+use crate::admission::ResourceClass;
 #[cfg(test)]
 use uring_runtime::group::Service;
 
@@ -761,7 +761,7 @@ mod waiter_detach {
     use crate::model::MembershipVersion;
     use crate::model::ObjectId;
     use crate::model::ObjectVersion;
-    use crate::model::OriginContext;
+    use crate::security::OriginContext;
     use crate::model::PageId;
     use crate::model::PageNumber;
     use crate::model::RequestId;
@@ -1034,7 +1034,7 @@ mod fidelity {
     use crate::model::Nonce;
     use crate::model::ObjectId;
     use crate::model::ObjectVersion;
-    use crate::model::OriginContext;
+    use crate::security::OriginContext;
     use crate::model::PageEnvelope;
     use crate::model::PageId;
     use crate::model::PageNumber;

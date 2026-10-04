@@ -260,7 +260,7 @@ impl rest_client::Scope for RequestScope {
 use crate::admission::AdmissionPolicy;
 use crate::admission::ConnectionReservation;
 use crate::admission::reserve_connection;
-use crate::model::ResourceClass;
+use crate::admission::ResourceClass;
 use std::ops::Deref;
 use std::rc::Rc;
 use uring_runtime::reactor::ReactorWake;

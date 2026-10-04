@@ -877,7 +877,7 @@ fn ordered_acquisition_window_is_not_an_unreleased_credit_ceiling() {
             f.fill
                 .dependencies
                 .admission
-                .used(crate::model::ResourceClass::Plaintext)
+                .used(crate::admission::ResourceClass::Plaintext)
                 >= batch as usize * PAGE_BYTES as usize
         );
         let first = slices[0];

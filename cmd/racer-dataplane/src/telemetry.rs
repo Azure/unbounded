@@ -5,7 +5,7 @@ use crate::error::Result;
 use crate::model::AttemptId;
 use crate::model::NodeId;
 use crate::model::RequestId;
-use crate::model::ResourceClass;
+use crate::admission::ResourceClass;
 use crate::model::WorkerId;
 
 use crate::runtime::Reactor;
@@ -1246,12 +1246,12 @@ impl Metrics {
             for shard in self.admission.iter() {
                 if let Some((worker, usage)) = shard.get() {
                     let (relay_used, relay_limit) = (
-                        usage.used(crate::model::ResourceClass::Relay),
-                        usage.limit(crate::model::ResourceClass::Relay),
+                        usage.used(crate::admission::ResourceClass::Relay),
+                        usage.limit(crate::admission::ResourceClass::Relay),
                     );
                     let (ciphertext_used, ciphertext_limit) = (
-                        usage.used(crate::model::ResourceClass::Ciphertext),
-                        usage.limit(crate::model::ResourceClass::Ciphertext),
+                        usage.used(crate::admission::ResourceClass::Ciphertext),
+                        usage.limit(crate::admission::ResourceClass::Ciphertext),
                     );
                     for (name, value) in QUOTAS.into_iter().zip([
                         relay_used,
@@ -2568,7 +2568,7 @@ pub(crate) mod tests {
 
     pub(crate) mod metrics_tests {
         use super::*;
-        use crate::model::ResourceClass;
+        use crate::admission::ResourceClass;
 
         #[test]
         fn request_lease_overflow_preserves_counters_and_error() {

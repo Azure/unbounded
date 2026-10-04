@@ -21,9 +21,9 @@ use crate::error::Result;
 use crate::memory::AcquiredPage;
 use crate::memory::PageResult;
 use crate::memory::UnverifiedPage;
-use crate::model::OriginContext;
+use crate::security::OriginContext;
 use crate::model::PageId;
-use crate::model::ResourceClass;
+use crate::admission::ResourceClass;
 
 use crate::admission::AdmissionPolicy;
 use crate::runtime::HashMap;

@@ -1702,7 +1702,7 @@ mod established_sessions {
             let mut request = request(&self.admission, 1);
             if large {
                 request.origin.metadata =
-                    Some(crate::model::OpaqueMetadata::from_header(&vec![b'm'; 8192]).unwrap());
+                    Some(crate::security::OpaqueMetadata::from_header(&vec![b'm'; 8192]).unwrap());
                 request.origin.authorization.as_mut().unwrap().ciphertext = vec![5; 8208];
             }
             let (signed, _) = Forwarding::new(self.signers[0].clone())

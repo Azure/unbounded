@@ -13,7 +13,7 @@ use crate::model::ObjectVersion;
 use crate::model::PAGE_BYTES;
 use crate::model::PageEnvelope;
 use crate::model::PageId;
-use crate::model::ResourceClass;
+use crate::admission::ResourceClass;
 use crate::model::VersionMetadata;
 use crate::runtime::RequestScope;
 use flow_control::Quotas;

@@ -20,7 +20,7 @@ use crate::model::ObjectVersion;
 use crate::model::PageEnvelope;
 use crate::model::PageId;
 use crate::model::PageNumber;
-use crate::model::ResourceClass;
+use crate::admission::ResourceClass;
 use crate::model::StrongEtag;
 use crate::model::VersionMetadata;
 use crate::runtime::HashMap;

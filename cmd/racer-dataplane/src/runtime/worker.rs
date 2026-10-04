@@ -595,7 +595,7 @@ fn colocated_plan(max_threads: usize, workers: u16) -> AffinityPlan {
 mod shared_tests {
     use super::*;
     use crate::memory::BufferPool;
-    use crate::model::ResourceClass;
+    use crate::admission::ResourceClass;
     use crate::model::*;
     use crate::security::CryptoInput;
     use crate::security::CryptoOutput;

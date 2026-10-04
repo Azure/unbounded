@@ -34,7 +34,7 @@ mod measurement {
     use crate::memory::BufferPool;
     use crate::model::Nonce;
     use crate::model::PageEnvelope;
-    use crate::model::ResourceClass;
+    use crate::admission::ResourceClass;
     use crate::model::*;
     use crate::security::PageCryptoEngine;
     use crate::security::page_aad;
@@ -882,7 +882,7 @@ mod measurement {
             CryptoInput::Decrypt {
                 ciphertext,
                 plaintext: admission
-                    .reserve(Some(&cache), crate::model::ResourceClass::Plaintext, 1)
+                    .reserve(Some(&cache), crate::admission::ResourceClass::Plaintext, 1)
                     .unwrap(),
             }
         } else {
@@ -1101,7 +1101,7 @@ mod tests {
         admission: &std::rc::Rc<flow_control::Quotas<AdmissionPolicy>>,
     ) -> CryptoInput {
         use crate::memory::BufferPool;
-        use crate::model::ResourceClass;
+        use crate::admission::ResourceClass;
         use crate::model::*;
         let cache = CacheId("00000000-0000-4000-8000-000000000003".into());
         CryptoInput::Encrypt {
@@ -1131,7 +1131,7 @@ mod tests {
 
     #[test]
     fn engine_loss_reclaims_queued_owners_and_unblocks_drain() {
-        use crate::model::ResourceClass;
+        use crate::admission::ResourceClass;
         let Fixture {
             admission,
             client,
@@ -1151,7 +1151,7 @@ mod tests {
 
     #[test]
     fn accepted_cancellation_cannot_return_before_completion_consumption() {
-        use crate::model::ResourceClass;
+        use crate::admission::ResourceClass;
         let Fixture {
             admission,
             client,
@@ -1427,7 +1427,7 @@ mod tests {
     #[test]
     fn abandoned_future_retains_buffers_key_and_permit_until_reaped() {
         use crate::memory::BufferPool;
-        use crate::model::ResourceClass;
+        use crate::admission::ResourceClass;
         use crate::model::*;
         use std::rc::Rc;
         use std::time::Duration;
@@ -1517,7 +1517,7 @@ mod tests {
     #[test]
     fn engine_drop_reclaims_queued_jobs_and_drain_finishes() {
         use crate::memory::BufferPool;
-        use crate::model::ResourceClass;
+        use crate::admission::ResourceClass;
         use crate::model::*;
         use std::rc::Rc;
         use std::time::Duration;
@@ -1577,7 +1577,7 @@ mod tests {
     #[test]
     fn original_scope_failure_is_returned_without_submission() {
         use crate::memory::BufferPool;
-        use crate::model::ResourceClass;
+        use crate::admission::ResourceClass;
         use crate::model::*;
         use std::rc::Rc;
         use std::time::Instant;

@@ -14,7 +14,7 @@ use crate::model::PageEnvelope;
 use crate::model::PageId;
 use crate::model::PageNumber;
 use crate::model::RequestId;
-use crate::model::ResourceClass;
+use crate::admission::ResourceClass;
 use crate::model::StrongEtag;
 use crate::model::WorkerId;
 
@@ -1797,7 +1797,7 @@ mod records {
     use crate::memory::CiphertextPage;
     use crate::model::ExpiresAt;
     use crate::model::PAGE_BYTES;
-    use crate::model::ResourceClass;
+    use crate::admission::ResourceClass;
     use std::sync::Arc;
     use std::time::UNIX_EPOCH;
 

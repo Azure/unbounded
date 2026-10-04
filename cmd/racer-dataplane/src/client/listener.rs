@@ -496,13 +496,13 @@ impl ClientListeners {
         }
         let maximum = self
             .admission
-            .limit(crate::model::ResourceClass::IngressConnection);
+            .limit(crate::admission::ResourceClass::IngressConnection);
         // Reserve some acceptance opportunity even when all active readers wait.
         let attempts = budget.saturating_sub(worked).min(count);
         for _ in 0..attempts {
             if self
                 .admission
-                .used(crate::model::ResourceClass::IngressConnection)
+                .used(crate::admission::ResourceClass::IngressConnection)
                 >= maximum
                 && self.ingress.is_none()
             {
@@ -699,7 +699,7 @@ async fn serve_connection(
         // bounded representation until the read and every stream slice complete.
         let _context = admission.reserve(
             Some(cache),
-            crate::model::ResourceClass::RequestContext,
+            crate::admission::ResourceClass::RequestContext,
             super::MAX_HEAD_BYTES,
         )?;
         let idle_scope = new_scope(timeout, cancellation.clone())?;

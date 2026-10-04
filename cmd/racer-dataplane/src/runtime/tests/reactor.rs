@@ -360,7 +360,7 @@ mod simulation_tests {
     use crate::admission::AdmissionPolicy;
     use crate::error::Error;
     use crate::error::Result;
-    use crate::model::ResourceClass;
+    use crate::admission::ResourceClass;
     use crate::runtime::RequestScope;
     use std::cell::Cell;
     use std::ffi::CString;

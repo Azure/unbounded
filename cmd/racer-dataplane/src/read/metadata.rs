@@ -14,7 +14,7 @@ use crate::model::MetadataSelector;
 use crate::model::ObjectId;
 use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
-use crate::model::OriginContext;
+use crate::security::OriginContext;
 use crate::model::PageId;
 use crate::model::PageNumber;
 use crate::model::StrongEtag;

@@ -206,7 +206,7 @@ impl WorkerApplication {
 mod tests {
     use super::*;
     use crate::model::MembershipVersion;
-    use crate::model::ResourceClass;
+    use crate::admission::ResourceClass;
     use crate::security;
     use crate::security::CryptoClient;
     use racer_control_wire::Publication;

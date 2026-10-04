@@ -1,4 +1,5 @@
 use super::*;
+use crate::admission::ResourceClass;
 use crate::model::AttemptId;
 mod fill;
 mod hot_reads;
@@ -174,10 +175,10 @@ mod flight {
     use crate::model::CacheKey;
     use crate::model::ObjectId;
     use crate::model::ObjectVersion;
-    use crate::model::OriginContext;
+    use crate::security::OriginContext;
     use crate::model::PageId;
     use crate::model::PageNumber;
-    use crate::model::ResourceClass;
+    use crate::admission::ResourceClass;
     use crate::model::StrongEtag;
     use crate::read::flight::*;
     use crate::runtime::RequestScope;
@@ -1115,7 +1116,7 @@ mod timeouts {
     use crate::model::NodeId;
     use crate::model::ObjectMetadata;
     use crate::model::ObjectVersion;
-    use crate::model::OriginContext;
+    use crate::security::OriginContext;
     use crate::model::PageNumber;
     use crate::model::RequestId;
     use crate::model::StrongEtag;

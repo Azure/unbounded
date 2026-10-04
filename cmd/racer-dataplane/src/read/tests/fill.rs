@@ -8,7 +8,7 @@ pub(super) use crate::memory::MemoryCache;
 pub(super) use crate::memory::PageResult;
 pub(super) use crate::memory::UnverifiedPage;
 pub(super) use crate::model::ObjectMetadata;
-pub(super) use crate::model::OriginContext;
+pub(super) use crate::security::OriginContext;
 pub(super) use crate::model::PAGE_BYTES;
 pub(super) use crate::model::PageId;
 pub(super) use crate::origin::Origin;
@@ -1130,7 +1130,7 @@ pub(super) use crate::model::ObjectId;
 pub(super) use crate::model::ObjectVersion;
 pub(super) use crate::model::PageNumber;
 pub(super) use crate::model::RequestId;
-pub(super) use crate::model::ResourceClass;
+pub(super) use crate::admission::ResourceClass;
 pub(super) use crate::model::StrongEtag;
 pub(super) use crate::model::WorkerId;
 pub(super) use crate::origin::MetadataReply;
@@ -2427,7 +2427,7 @@ fn ciphertext_origin_fill_retains_verified_publication_without_a_plaintext_waite
     let _owner = queue.enter();
     let mut f = fixture();
     f.context.authorization =
-        Some(crate::model::Authorization::from_header(b"test-supplier-credential").unwrap());
+        Some(crate::security::Authorization::from_header(b"test-supplier-credential").unwrap());
     let flights = f.fill.dependencies.flights.clone();
     let mut holder_budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 8);
     let JoinedFlight::Waiter(holder) = flights

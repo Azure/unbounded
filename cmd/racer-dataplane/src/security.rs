@@ -13,6 +13,7 @@ impl From<racer_identity::Error> for crate::error::Error {
     }
 }
 use crate::admission::AdmissionPolicy;
+use crate::admission::ResourceClass;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -22,18 +23,13 @@ use crate::memory::PlaintextBuffer;
 use crate::memory::VerifiedBytes;
 use crate::memory::VerifiedPage;
 use crate::model::AttemptId;
-use crate::model::Authorization;
-use crate::model::EncryptedAuthorization;
 use crate::model::KeyId;
+use crate::model::MAX_FIELD_BYTES;
 use crate::model::Nonce;
 use crate::model::ObjectId;
-use crate::model::OpaqueMetadata;
-use crate::model::OriginContext;
 use crate::model::PageEnvelope;
 use crate::model::PageId;
-use crate::model::PeerOriginContext;
 use crate::model::RequestId;
-use crate::model::ResourceClass;
 use crate::runtime::RequestScope;
 use crate::runtime::worker::CryptoRuntime;
 use crate::telemetry::AeadFailure;
@@ -42,12 +38,129 @@ use crate::telemetry::Stage;
 use racer_crypto::aead;
 use racer_identity::KeyPurpose;
 use racer_identity::Keyring;
+use std::fmt;
 use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use zeroize::Zeroizing;
+
+// Request-scoped adapter context, deliberately absent from cache identities.
+// Credentials travel encrypted across peers and as local origin headers, never
+// in caches, checkpoints, logs, metrics, or durable retry queues.
+pub const METADATA_HEADER: &str = "Racer-Metadata";
+/// Sensitive bytes with redacted diagnostics and zeroization on drop. Not Clone.
+pub struct Authorization {
+    bytes: Zeroizing<Vec<u8>>,
+}
+impl Authorization {
+    /// Validate HTTP field syntax/size without interpreting the credential scheme.
+    pub fn from_header(bytes: &[u8]) -> Result<Self> {
+        validate_opaque(bytes)?;
+        Ok(Self {
+            bytes: Zeroizing::new(bytes.to_vec()),
+        })
+    }
+    /// Expose only for encryption or local adapter writes, never diagnostics.
+    pub fn expose_for_origin(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
+}
+/// Preserve one bounded field value. The HTTP parser must reject duplicate fields.
+pub struct OpaqueMetadata {
+    bytes: Zeroizing<Vec<u8>>,
+}
+impl OpaqueMetadata {
+    pub fn from_header(bytes: &[u8]) -> Result<Self> {
+        validate_opaque(bytes)?;
+        Ok(Self {
+            bytes: Zeroizing::new(bytes.to_vec()),
+        })
+    }
+    pub fn as_header(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
+}
+fn validate_opaque(bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty()
+        || bytes.len() > MAX_FIELD_BYTES
+        || bytes.first() == Some(&b' ')
+        || bytes.last() == Some(&b' ')
+        || bytes.iter().any(|&byte| byte < 0x20 || byte == 0x7f)
+    {
+        return Err(Error::InvalidRequest);
+    }
+    Ok(())
+}
+impl fmt::Debug for Authorization {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Authorization([redacted])")
+    }
+}
+impl fmt::Debug for OpaqueMetadata {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OpaqueMetadata([redacted])")
+    }
+}
+/// One request owns the raw context and lends it to origin writes and sealing.
+/// Retrying/fanning out must not require duplicating secrets:
+/// ```compile_fail
+/// use racer_dataplane::security::OriginContext;
+/// fn duplicate(origin: OriginContext) { let _copy = origin.clone(); }
+/// ```
+pub struct OriginContext {
+    pub object: ObjectId,
+    pub metadata: Option<OpaqueMetadata>,
+    pub authorization: Option<Authorization>,
+}
+impl fmt::Debug for OriginContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OriginContext([redacted])")
+    }
+}
+/// Separate AEAD domain from pages. Bind request/attempt/object/metadata with
+/// canonical AAD; retries reseal with fresh nonces rather than change bound fields.
+/// Eligible origin-fetching nodes can open this cache-scoped credential envelope.
+pub struct EncryptedAuthorization {
+    pub key_id: KeyId,
+    pub nonce: Nonce,
+    pub ciphertext: Vec<u8>,
+}
+impl fmt::Debug for EncryptedAuthorization {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("EncryptedAuthorization([redacted])")
+    }
+}
+/// Owned per-attempt envelope, with no borrow of raw context. Relays preserve it
+/// unopened. Local quota and scope are never serialized on the wire.
+/// ```compile_fail
+/// use racer_dataplane::security::PeerOriginContext;
+/// fn duplicate(envelope: PeerOriginContext) { let _copy = envelope.clone(); }
+/// ```
+/// Wire decoding must admit allocations before constructing this owner:
+/// ```compile_fail
+/// use racer_dataplane::{security::PeerOriginContext, model::{ObjectId, RequestId, AttemptId}};
+/// fn uncharged(object: ObjectId, request: RequestId, attempt: AttemptId) {
+///     let _envelope = PeerOriginContext { object, request, attempt, metadata: None, authorization: None };
+/// }
+/// ```
+pub struct PeerOriginContext {
+    pub object: ObjectId,
+    pub request: RequestId,
+    pub attempt: AttemptId,
+    pub metadata: Option<OpaqueMetadata>,
+    pub authorization: Option<EncryptedAuthorization>,
+    /// Retain field allocation charges until transport I/O is fenced.
+    pub(crate) reservation: flow_control::Charge<AdmissionPolicy>,
+    pub(crate) scope: RequestScope,
+}
+impl PeerOriginContext {
+    /// Original deadline/shared cancellation, never reset by retry or fanout.
+    pub fn scope(&self) -> &RequestScope {
+        &self.scope
+    }
+}
 
 pub(crate) fn fresh_nonce() -> Result<Nonce> {
     let mut nonce = [0u8; 24];
@@ -602,8 +715,8 @@ fn credential_bounds(
 /// envelopes can coexist and leave that borrow's lifetime. Nonces are generated
 /// internally and temporary secrets are zeroized.
 /// ```no_run
-/// use racer_dataplane::{error::Result, model::{OriginContext, PeerOriginContext, AttemptId},
-///     runtime::RequestScope, security::CredentialCrypto};
+/// use racer_dataplane::{error::Result, model::AttemptId,
+///     runtime::RequestScope, security::{CredentialCrypto, OriginContext, PeerOriginContext}};
 /// fn fanout(crypto: &CredentialCrypto, origin: &OriginContext, scope: &RequestScope,
 ///     first: AttemptId, second: AttemptId) -> Result<(PeerOriginContext, PeerOriginContext)> {
 ///     let a = crypto.seal(origin, first, scope)?;
@@ -1576,6 +1689,70 @@ impl CryptoClient {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn opaque_context_round_trips_non_utf8_without_normalization() {
+        let bytes = b"opaque,  credential\\\"\xff";
+        let authorization = Authorization::from_header(bytes).unwrap();
+        let metadata = OpaqueMetadata::from_header(bytes).unwrap();
+        assert_eq!(authorization.expose_for_origin(), bytes);
+        assert_eq!(metadata.as_header(), bytes);
+        let context = OriginContext {
+            object: ObjectId {
+                cache: CacheId("cache".into()),
+                key: CacheKey([0; 32]),
+            },
+            authorization: Some(authorization),
+            metadata: Some(metadata),
+        };
+        assert_eq!(format!("{context:?}"), "OriginContext([redacted])");
+        assert_eq!(
+            format!("{:#?}", context.authorization.unwrap()),
+            "Authorization([redacted])"
+        );
+        assert_eq!(
+            format!("{:#?}", context.metadata.unwrap()),
+            "OpaqueMetadata([redacted])"
+        );
+    }
+    #[test]
+    fn context_rejects_present_empty_controls_padding_and_oversize() {
+        for bytes in [
+            b"".as_slice(),
+            b" leading",
+            b"trailing ",
+            b"a\tb",
+            b"a\rb",
+            b"a\nb",
+            b"a\0b",
+            b"a\x7fb",
+        ] {
+            assert!(matches!(
+                Authorization::from_header(bytes),
+                Err(Error::InvalidRequest)
+            ));
+            assert!(matches!(
+                OpaqueMetadata::from_header(bytes),
+                Err(Error::InvalidRequest)
+            ));
+        }
+        for length in [MAX_FIELD_BYTES, MAX_FIELD_BYTES + 1] {
+            let bytes = vec![b'x'; length];
+            assert_eq!(
+                Authorization::from_header(&bytes).is_ok(),
+                length == MAX_FIELD_BYTES
+            );
+            assert_eq!(
+                OpaqueMetadata::from_header(&bytes).is_ok(),
+                length == MAX_FIELD_BYTES
+            );
+        }
+    }
+    #[test]
+    fn sensitive_storage_uses_zeroizing_owners() {
+        fn zeroizing(_: &Zeroizing<Vec<u8>>) {}
+        zeroizing(&Authorization::from_header(b"secret").unwrap().bytes);
+        zeroizing(&OpaqueMetadata::from_header(b"private").unwrap().bytes);
+    }
     mod credentials;
     mod crypto;
     use super::*;

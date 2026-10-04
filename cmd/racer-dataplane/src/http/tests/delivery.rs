@@ -18,7 +18,7 @@ use crate::model::ObjectVersion;
 use crate::model::PageId;
 use crate::model::PageNumber;
 use crate::model::RequestId;
-use crate::model::ResourceClass;
+use crate::admission::ResourceClass;
 use crate::model::StrongEtag;
 use crate::runtime::Cancellation;
 use crate::runtime::Reactor;

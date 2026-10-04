@@ -5,7 +5,7 @@ use super::protocol::SignedRequest;
 use super::protocol::SignedResponse;
 use crate::error::Error;
 use crate::error::Operation;
-use crate::model::ResourceClass;
+use crate::admission::ResourceClass;
 use crate::peer::forwarding::VerifiedRequest;
 
 use crate::admission::AdmissionPolicy;
@@ -209,7 +209,7 @@ impl PeerServer {
             let mut active = FuturesUnordered::new();
             let maximum = self
                 .admission
-                .limit(crate::model::ResourceClass::IngressConnection);
+                .limit(crate::admission::ResourceClass::IngressConnection);
             loop {
                 scope.check()?;
                 if let AcceptMode::Distributed(ingress) = &self.accept {

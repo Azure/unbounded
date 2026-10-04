@@ -1348,7 +1348,7 @@ impl rest_client::Io for ReactorControlIo {
 
     fn lease(&self) -> Result<Option<Rc<Self::Lease>>> {
         self.reactor
-            .reserve_connection(crate::model::ResourceClass::ControlConnection)
+            .reserve_connection(crate::admission::ResourceClass::ControlConnection)
             .map(|lease| Some(Rc::new(lease)))
     }
     fn ready<'a>(

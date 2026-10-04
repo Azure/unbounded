@@ -7,7 +7,7 @@ use crate::memory::BufferPool;
 use crate::model::ExpiresAt;
 use crate::model::MetadataSelector;
 use crate::model::ObjectMetadata;
-use crate::model::OriginContext;
+use crate::security::OriginContext;
 use crate::model::*;
 use crate::peer::PeerNetwork;
 use crate::peer::Relay;

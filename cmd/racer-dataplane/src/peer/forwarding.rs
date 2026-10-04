@@ -832,13 +832,13 @@ mod tests {
     use super::*;
     use crate::admission::AdmissionPolicy;
     use crate::config::Limits;
-    use crate::model::EncryptedAuthorization;
+    use crate::security::EncryptedAuthorization;
     use crate::model::KeyId;
     use crate::model::MetadataSelector;
     use crate::model::Nonce;
-    use crate::model::OpaqueMetadata;
-    use crate::model::PeerOriginContext;
-    use crate::model::ResourceClass;
+    use crate::security::OpaqueMetadata;
+    use crate::security::PeerOriginContext;
+    use crate::admission::ResourceClass;
     use crate::model::*;
     use crate::peer::protocol::FetchMode;
     use crate::peer::protocol::Operation;

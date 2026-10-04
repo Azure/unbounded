@@ -11,7 +11,7 @@ use racer_dataplane::model::ObjectVersion;
 use racer_dataplane::model::PageEnvelope;
 use racer_dataplane::model::PageId;
 use racer_dataplane::model::PageNumber;
-use racer_dataplane::model::ResourceClass;
+use racer_dataplane::admission::ResourceClass;
 use racer_dataplane::model::StrongEtag;
 use std::alloc::GlobalAlloc;
 use std::alloc::Layout;

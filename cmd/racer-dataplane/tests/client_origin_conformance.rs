@@ -824,7 +824,7 @@ fn raw_uds_client_empty_bootstrap_and_head_success_writer() {
 // Keep this module path: the racer-sdk-conformance Make target selects it exactly.
 mod sdk {
     use super::*;
-    use racer_dataplane::model::ResourceClass;
+    use racer_dataplane::admission::ResourceClass;
     use std::fs;
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixListener;

@@ -1,11 +1,10 @@
 //! Racer resource policy and compound admission operations.
+use crate::model::WorkerId;
 use crate::config::Limits;
 use crate::error::Error;
 use crate::error::Result;
 use crate::model::CacheId;
 use crate::model::PAGE_BYTES;
-use crate::model::ResourceClass;
-use crate::model::WorkerId;
 use crate::telemetry::Detail;
 use crate::telemetry::Failure;
 use crate::telemetry::Observer;
@@ -21,6 +20,30 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::task::Waker;
+
+#[derive(Clone, Copy, Debug)]
+pub enum ResourceClass {
+    Plaintext,
+    Ciphertext,
+    DirtyCiphertext,
+    Registered,
+    RequestContext,
+    Flight,
+    Waiter,
+    Connection,
+    Pipe,
+    ControlProgress,
+    Relay,
+    IngressConnection,
+    OutboundConnection,
+    ControlConnection,
+}
+impl flow_control::Class for ResourceClass {
+    const COUNT: usize = 14;
+    fn index(self) -> usize {
+        self as usize
+    }
+}
 
 pub struct AdmissionPolicy {
     limits: Limits,

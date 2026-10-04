@@ -1126,7 +1126,7 @@ mod tests {
         use crate::model::KeyId;
         use crate::model::Nonce;
         use crate::model::PageEnvelope;
-        use crate::model::ResourceClass;
+        use crate::admission::ResourceClass;
         use std::rc::Rc;
         use std::time::UNIX_EPOCH;
         let scheduler = Arc::new(Subscriptions::new(Default::default()).unwrap());

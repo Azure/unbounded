@@ -10,7 +10,7 @@ use crate::http::Codec;
 use crate::model::ExpiresAt;
 use crate::model::MetadataSelector;
 use crate::model::ObjectMetadata;
-use crate::model::ResourceClass;
+use crate::admission::ResourceClass;
 use crate::model::*;
 use crate::peer::protocol;
 use crate::peer::protocol as connection;
@@ -520,7 +520,7 @@ pub(super) fn publication(
 pub(super) fn page(app: &WorkerApplication) -> crate::memory::PageResult {
     use crate::memory::VerifiedBytes;
     use crate::memory::VerifiedPage;
-    use crate::model::ResourceClass;
+    use crate::admission::ResourceClass;
     use crate::model::VersionMetadata;
     use crate::model::*;
     let version = ObjectVersion {
@@ -632,7 +632,7 @@ fn worker_sizing_reports_specific_resource_floor() {
 
 #[test]
 fn worker_sizing_funds_derived_connection_pools() {
-    use crate::model::ResourceClass;
+    use crate::admission::ResourceClass;
     use uring_runtime::affinity::CpuLocation;
     use uring_runtime::affinity::EffectiveTopology;
     let config = Config::from_lookup(|name| {
@@ -743,7 +743,7 @@ pub(crate) fn wake_test_coordinator() -> Rc<Coordinator> {
 
 #[test]
 fn assembled_worker_exports_live_quota_gauges() {
-    use crate::model::ResourceClass;
+    use crate::admission::ResourceClass;
     let worker = wake_test_worker();
     let relay = worker
         .runtime
@@ -1281,7 +1281,7 @@ fn two_worker_removal_preserves_late_driver_and_blocks_late_memory_and_disk_fill
             .admission
             .reserve(
                 Some(&definition().id),
-                crate::model::ResourceClass::DirtyCiphertext,
+                crate::admission::ResourceClass::DirtyCiphertext,
                 19,
             )
             .unwrap();
@@ -2462,14 +2462,18 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
         .plaintext(
             runtime
                 .admission
-                .reserve(Some(&cache), crate::model::ResourceClass::Plaintext, 8)
+                .reserve(Some(&cache), crate::admission::ResourceClass::Plaintext, 8)
                 .unwrap(),
             8,
         )
         .unwrap();
     let ciphertext = runtime
         .admission
-        .reserve(Some(&cache), crate::model::ResourceClass::Ciphertext, 24)
+        .reserve(
+            Some(&cache),
+            crate::admission::ResourceClass::Ciphertext,
+            24,
+        )
         .unwrap();
     let accepted_scope = scope(Duration::from_secs(10)).unwrap();
     let mut accepted = runtime.crypto.execute(
@@ -2572,7 +2576,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
         .admission
         .reserve(
             Some(&cache),
-            crate::model::ResourceClass::DirtyCiphertext,
+            crate::admission::ResourceClass::DirtyCiphertext,
             19,
         )
         .unwrap();
@@ -2678,7 +2682,7 @@ fn peer_tcp_nodelay_assembled_outbound_and_distributed_accept() {
         assert_eq!(
             runtime
                 .admission
-                .used(crate::model::ResourceClass::Connection),
+                .used(crate::admission::ResourceClass::Connection),
             0
         );
     }
@@ -2714,7 +2718,7 @@ fn peer_tcp_nodelay_accept_failure_closes_owned_socket_and_false_preserves_polic
 
 #[test]
 fn assembly_applies_configured_client_request_timeout() {
-    use crate::model::ResourceClass;
+    use crate::admission::ResourceClass;
     use std::sync::atomic::AtomicBool;
     for timeout in [Duration::from_millis(250), Duration::from_secs(45)] {
         let clock = uring_runtime::environment::SimulationClock::new(908);

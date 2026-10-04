@@ -616,7 +616,7 @@ fn local_and_distributed_installs_drain_responses_and_retire_idle_generations() 
 #[test]
 fn queued_handoffs_reject_retired_generations_and_stopped_receivers() {
     use crate::admission::Ingress;
-    use crate::model::ResourceClass;
+    use crate::admission::ResourceClass;
     use crate::model::WorkerId;
 
     for stop_receiver in [false, true] {
@@ -1435,7 +1435,7 @@ fn actual_uds_nonempty_range_and_late_failure_truncates() {
 
 #[test]
 fn subscription_retains_delivered_page_until_release_and_rejects_invalid_releases() {
-    use crate::model::ResourceClass;
+    use crate::admission::ResourceClass;
     for release in [Some((0u64, 2u32)), Some((0, 1)), Some((1, 2)), None] {
         let (fixture, pipes) = body_fixture_with_large_page(4, false, true);
         let mut socket = fixture.connect();
@@ -1547,7 +1547,7 @@ fn assert_no_head(socket: &mut UnixStream) {
 }
 
 fn assert_no_body_leases(fixture: &Fixture) {
-    use crate::model::ResourceClass;
+    use crate::admission::ResourceClass;
     assert_eq!(fixture.listeners.active_connections(), 0);
     for class in [
         ResourceClass::Pipe,
@@ -1564,7 +1564,7 @@ fn assert_only_idle_pipes(
     pipes: &flow_control::pipe::PipePool<AdmissionPolicy>,
 ) {
     fixture.listeners.admission.reclaim_buffers();
-    use crate::model::ResourceClass;
+    use crate::admission::ResourceClass;
     assert_eq!(fixture.listeners.active_connections(), 0);
     assert_eq!(
         fixture.listeners.admission.used(ResourceClass::Pipe),

@@ -12,7 +12,7 @@ use crate::http::ReaderLease;
 use crate::memory::PageResult;
 use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
-use crate::model::OriginContext;
+use crate::security::OriginContext;
 use crate::model::PAGE_BYTES;
 use crate::model::PageId;
 use crate::model::PageNumber;
@@ -1002,7 +1002,7 @@ pub(super) mod tests {
     use crate::model::ObjectVersion;
     use crate::model::PAGE_BYTES;
     use crate::model::RequestId;
-    use crate::model::ResourceClass;
+    use crate::admission::ResourceClass;
     use crate::model::StrongEtag;
     use crate::model::WorkerId;
     use crate::runtime::Reactor;
@@ -1081,7 +1081,7 @@ pub(super) mod tests {
         use crate::memory::VerifiedPage;
         use crate::model::Nonce;
         use crate::model::PageEnvelope;
-        use crate::model::ResourceClass;
+        use crate::admission::ResourceClass;
         let length = (metadata.length - number * PAGE_BYTES).min(PAGE_BYTES) as usize;
         let page = PageId {
             version: metadata.version.clone(),
@@ -1626,7 +1626,7 @@ pub(super) mod tests {
         use crate::http::Codec;
         use crate::http::new_pipe_pool;
         use crate::model::RequestId;
-        use crate::model::ResourceClass;
+        use crate::admission::ResourceClass;
         use crate::read::ReadResponse;
         use crate::runtime::Reactor;
         use std::io::Read;

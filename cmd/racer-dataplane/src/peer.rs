@@ -17,7 +17,7 @@ use crate::error::Operation;
 use crate::error::Result;
 use crate::model::MembershipVersion;
 use crate::model::NodeId;
-use crate::model::ResourceClass;
+use crate::admission::ResourceClass;
 use crate::runtime::RequestScope;
 use crate::telemetry::Event;
 use crate::telemetry::Gauge;

@@ -971,7 +971,7 @@ impl WorkerApplication {
         writer: Rc<StoreWriter>,
     ) -> impl Fn(&crate::model::CacheId, usize) {
         move |cache, amount| {
-            let class = crate::model::ResourceClass::Ciphertext;
+            let class = crate::admission::ResourceClass::Ciphertext;
             for _ in 0..2 {
                 let Some((owner, bytes)) = admission.reclamation(cache, class, amount) else {
                     break;
@@ -2042,7 +2042,7 @@ fn partition_limits_with_cause(
     }
     // Snapshot polling, renewal, and key delivery need independent control slots.
     let admission = flow_control::Quotas::new(AdmissionPolicy::new(limits.clone()));
-    if admission.limit(crate::model::ResourceClass::ControlConnection) < 3 {
+    if admission.limit(crate::admission::ResourceClass::ControlConnection) < 3 {
         return Err(invalid("control_connections"));
     }
     Ok(limits)

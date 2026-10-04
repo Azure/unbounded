@@ -4,7 +4,7 @@ use crate::error::Operation;
 use crate::error::Result;
 use crate::memory::VerifiedPage;
 use crate::model::PageSlice;
-use crate::model::ResourceClass;
+use crate::admission::ResourceClass;
 use crate::runtime::cooperative_turn as yield_once;
 
 use crate::admission::AdmissionPolicy;

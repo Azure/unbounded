@@ -473,7 +473,7 @@ mod destination_disconnect {
     use super::*;
     use crate::http::Codec;
     use crate::http::HttpIo;
-    use crate::model::OriginContext;
+    use crate::security::OriginContext;
     use crate::read::flight::AcquisitionBudget;
     use crate::read::flight::AcquisitionEvent;
     use crate::read::flight::AcquisitionFailure;
@@ -1349,7 +1349,7 @@ mod requester_safety {
     use crate::admission::AdmissionPolicy;
     use crate::http::Codec;
     use crate::model::MembershipVersion;
-    use crate::model::ResourceClass;
+    use crate::admission::ResourceClass;
     use crate::peer::AdaptivePeers;
     use crate::peer::Outcome;
     use crate::peer::protocol as connection;
@@ -2774,12 +2774,12 @@ mod timing {
     }
 }
 use crate::memory::BufferPool;
-use crate::model::EncryptedAuthorization;
+use crate::security::EncryptedAuthorization;
 use crate::model::KeyId;
 use crate::model::MetadataSelector;
 use crate::model::Nonce;
-use crate::model::PeerOriginContext;
-use crate::model::ResourceClass;
+use crate::security::PeerOriginContext;
+use crate::admission::ResourceClass;
 use crate::model::*;
 use crate::peer::forwarding::Forwarding;
 use crate::peer::protocol::FetchMode;

@@ -321,7 +321,7 @@ pub(crate) mod tests {
     use crate::http::Codec;
     use crate::http::Endpoint;
     use crate::model::RequestId;
-    use crate::model::ResourceClass;
+    use crate::admission::ResourceClass;
     use crate::runtime::Reactor;
     use std::future::Future;
     use std::task::Context;

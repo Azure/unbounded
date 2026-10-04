@@ -2,7 +2,7 @@
 //! The oracle owns immutable origin versions, never consults placement or cache data.
 use crate::app::*;
 use crate::model::PAGE_BYTES;
-use crate::model::ResourceClass;
+use crate::admission::ResourceClass;
 use crate::model::*;
 use racer_control_wire as wire;
 use racer_control_wire::CacheDefinition;
@@ -728,7 +728,7 @@ mod scenarios {
 
     #[test]
     fn worker_subscriptions_contend_across_servers_and_recover_after_release() {
-        use crate::model::OriginContext;
+        use crate::security::OriginContext;
         use crate::peer::protocol::FetchMode;
         use crate::peer::protocol::Operation as PeerOperation;
         use crate::peer::protocol::PeerRequest;
@@ -870,7 +870,7 @@ mod scenarios {
     #[test]
     fn completed_peer_dispatches_do_not_exhaust_worker_cancellation() {
         use crate::model::MetadataSelector;
-        use crate::model::OriginContext;
+        use crate::security::OriginContext;
         use crate::peer::protocol::FetchMode;
         use crate::peer::protocol::Operation as PeerOperation;
         use crate::peer::protocol::PeerRequest;

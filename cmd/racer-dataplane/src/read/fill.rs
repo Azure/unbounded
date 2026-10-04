@@ -24,10 +24,10 @@ use crate::memory::AcquiredPage;
 use crate::memory::PageResult;
 use crate::memory::UnverifiedPage;
 use crate::model::ObjectMetadata;
-use crate::model::OriginContext;
+use crate::security::OriginContext;
 use crate::model::PAGE_BYTES;
 use crate::model::PageId;
-use crate::model::ResourceClass;
+use crate::admission::ResourceClass;
 use crate::model::VersionMetadata;
 use crate::origin::Origin;
 use crate::peer::protocol::FetchMode;
@@ -688,7 +688,7 @@ impl Fill {
             return Err(Error::CorruptRecord);
         }
         use crate::model::PAGE_BYTES;
-        use crate::model::ResourceClass;
+        use crate::admission::ResourceClass;
         if origin.plaintext.bytes()?.len()
             != origin.metadata.immutable().page_length(page)? as usize
         {

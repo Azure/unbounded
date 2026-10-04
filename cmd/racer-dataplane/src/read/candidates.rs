@@ -8,7 +8,7 @@ use crate::model::AttemptId;
 use crate::model::MetadataSelector;
 use crate::model::NodeId;
 use crate::model::ObjectId;
-use crate::model::OriginContext;
+use crate::security::OriginContext;
 use crate::model::PageNumber;
 use crate::peer::Requester;
 use crate::peer::forwarding::VerifiedResponse;
@@ -50,7 +50,7 @@ fn reserve_hedge_pages(
     flow_control::Charge<crate::admission::AdmissionPolicy>,
 )> {
     use crate::model::PAGE_BYTES;
-    use crate::model::ResourceClass;
+    use crate::admission::ResourceClass;
     let plaintext = admission.reserve(
         Some(cache),
         ResourceClass::Plaintext,
