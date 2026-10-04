@@ -287,9 +287,6 @@ fn peer_connect_failure(errno: Option<i32>) -> bool {
     )
 }
 
-#[cfg(test)]
-pub(crate) mod tests;
-
 // Limit both syscall size and work in one executor turn, even for a writable peer.
 const SEND_CHUNK_BYTES: usize = 64 * 1024;
 const SEND_BUDGET_BYTES: usize = 256 * 1024;
@@ -615,6 +612,8 @@ fn splice_unsupported(error: &io::Error) -> bool {
     )
 }
 
+#[cfg(test)]
+pub(crate) mod tests;
 #[cfg(test)]
 mod relay_tests {
     //! Opaque transit, fallback, cancellation, and ownership-fence scenarios.

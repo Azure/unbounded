@@ -52,6 +52,7 @@ use std::task::Poll;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
+use uring_runtime::reactor::IoBuffer;
 
 #[cfg(test)]
 mod native_control_tests {
@@ -2683,7 +2684,6 @@ mod tests {
         }
     }
 }
-use uring_runtime::reactor::IoBuffer;
 /// Racer-specific opaque relay. Both connections remain completion-owned.
 struct Transit {
     source: crate::http::ConnectionLease,
