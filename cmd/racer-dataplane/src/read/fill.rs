@@ -33,7 +33,7 @@ use crate::origin::Origin;
 use crate::peer::protocol::FetchMode;
 use crate::peer::protocol::Operation as PeerOperation;
 use crate::peer::protocol::PeerResponse;
-use crate::runtime::admission::AdmissionExt;
+
 use crate::runtime::admission::AdmissionPolicy;
 use crate::runtime::deadline::RequestScope;
 use crate::security::aead::PageCrypto;
@@ -247,7 +247,7 @@ impl Fill {
     ) {
         use crate::telemetry::Failure;
         use crate::telemetry::Stage;
-        self.dependencies.admission.observer().record(
+        self.dependencies.admission.policy().observer().record(
             Failure::new(Stage::PeerLocal, error)
                 .request(scope)
                 .attempt(attempt),

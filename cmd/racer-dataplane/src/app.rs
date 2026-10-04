@@ -62,7 +62,7 @@ use crate::read::flight::Flights;
 use crate::read::metadata::MetadataDependencies;
 use crate::read::metadata::MetadataService;
 use crate::read::range_stream::RangeStreams;
-use crate::runtime::admission::AdmissionExt;
+
 use crate::runtime::admission::AdmissionPolicy;
 use crate::runtime::affinity::AffinityPlan;
 use crate::runtime::deadline::RequestScope;
@@ -491,11 +491,13 @@ impl WorkerApplication {
                     .expect("validated hedge config")
             })
             .clone();
-        admission.set_observer(node.failures.observer(worker));
+        admission
+            .policy()
+            .set_observer(node.failures.observer(worker));
         metrics.observe_admission(worker, admission.shared())?;
         node.ingress.install(worker, &admission)?;
         let reactor = runtime.reactor.clone();
-        let limits = admission.limits();
+        let limits = admission.policy().limits();
         let snapshots = Rc::new(SnapshotStore::new(
             config.cluster.clone(),
             node.publications.clone(),
@@ -621,7 +623,7 @@ impl WorkerApplication {
                 network.clone(),
             )
             .with_metrics(metrics.clone())
-            .with_observer(admission.observer()),
+            .with_observer(admission.policy().observer()),
         );
         let candidates = Rc::new(
             CandidatePolicy::new(
@@ -633,7 +635,7 @@ impl WorkerApplication {
             )
             .with_hedges(hedges)
             .with_attempt_timeout(config.peer_attempt_timeout)
-            .with_observer(admission.observer()),
+            .with_observer(admission.policy().observer()),
         );
         let origin: Rc<dyn Origin> = Rc::new(OriginClient::new(
             snapshots.clone(),
@@ -809,7 +811,7 @@ impl WorkerApplication {
             candidates,
             origin,
             credentials.clone(),
-            admission.limits().metadata_entries.get(),
+            admission.policy().limits().metadata_entries.get(),
             MetadataDependencies {
                 index,
                 fill: fill.clone(),
@@ -846,8 +848,9 @@ impl WorkerApplication {
             runtime.reactor.clone(),
             admission.clone(),
         ));
-        let responses =
-            Rc::new(Responses::new(io.clone(), delivery).with_observer(admission.observer()));
+        let responses = Rc::new(
+            Responses::new(io.clone(), delivery).with_observer(admission.policy().observer()),
+        );
         let clients = ClientListeners::new(
             coordinator,
             RequestParser::new(config.limits.header_bytes.get()),
@@ -904,7 +907,7 @@ impl WorkerApplication {
         availability: Rc<crate::control::Availability>,
         metrics: &crate::telemetry::Metrics,
     ) -> Result<Store> {
-        let limits = runtime.admission.limits();
+        let limits = runtime.admission.policy().limits();
         let index = Rc::new(Index::new(
             worker,
             limits.metadata_entries.get(),
@@ -1558,7 +1561,7 @@ impl WorkerApplication {
             control.attach_cache_publication(Rc::new(CachePublication {
                 node: self.node.clone(),
                 listeners: self.prepared_listeners.clone(),
-                capacity: self.runtime.admission.limits().metadata_entries.get(),
+                capacity: self.runtime.admission.policy().limits().metadata_entries.get(),
             }));
         }
     }
@@ -1595,7 +1598,7 @@ impl WorkerApplication {
             return Ok(());
         }
         // Reject publications exceeding this worker's metadata catalog.
-        if definitions.len() > self.runtime.admission.limits().metadata_entries.get() {
+        if definitions.len() > self.runtime.admission.policy().limits().metadata_entries.get() {
             return Ok(());
         }
         if self.control.is_some() && self.prepared_listeners.borrow().is_none() {

@@ -23,7 +23,7 @@ use crate::rdma::SETUP_HEADER;
 use crate::rdma::Sessions;
 use crate::rdma::SetupParameters;
 use crate::rdma::TransportPlan;
-use crate::runtime::admission::AdmissionExt;
+
 use crate::runtime::admission::AdmissionPolicy;
 use crate::runtime::deadline::RequestScope;
 use crate::security::connection::Signatures;
@@ -2260,7 +2260,7 @@ impl Transfers {
                     .unwrap_or(&request.authentication.original)
                     .head,
             )?;
-            let observer = admission.observer();
+            let observer = admission.policy().observer();
             if let Some(timing) = timing.as_deref_mut() {
                 timing.enable(&request.request, plan, relay.is_some());
             }
@@ -2419,7 +2419,7 @@ impl Transfers {
         Option<flow_control::Charge<AdmissionPolicy>>,
     )> {
         let (admission, _) = &self.wire;
-        let observer = admission.observer();
+        let observer = admission.policy().observer();
         let (body, staging_reservation) = if length == 0 {
             (Vec::new(), None)
         } else {

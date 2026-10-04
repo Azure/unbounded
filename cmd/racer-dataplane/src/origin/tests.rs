@@ -10,7 +10,7 @@ use crate::model::ObjectId;
 use crate::model::OpaqueMetadata;
 use crate::model::RequestId;
 use crate::model::StrongEtag;
-use crate::runtime::admission::AdmissionExt;
+
 use crate::runtime::reactor::Reactor;
 use futures::executor::block_on;
 use std::future::Future;
@@ -814,7 +814,7 @@ fn real_uds_head_progresses_when_page_plaintext_budget_is_exhausted() {
         .reserve(
             Some(&context.object.cache),
             ResourceClass::Plaintext,
-            admission.limits().plaintext_bytes.get(),
+            admission.policy().limits().plaintext_bytes.get(),
         )
         .unwrap();
     let page = PageId {
@@ -856,7 +856,7 @@ fn real_uds_head_progresses_when_page_plaintext_budget_is_exhausted() {
     assert!(reply.page_zero.is_none());
     assert_eq!(
         admission.used(ResourceClass::Plaintext),
-        admission.limits().plaintext_bytes.get()
+        admission.policy().limits().plaintext_bytes.get()
     );
     drop(held);
     client.pool.close();

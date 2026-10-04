@@ -1,7 +1,7 @@
 //! Application lifecycle tests and shared assembled-worker fixtures.
 use super::*;
 use racer_control_wire as state;
-use crate::runtime::admission::AdmissionExt;
+
 use crate::runtime::admission::AdmissionPolicy;
 use crate::runtime::crypto;
 use crate::runtime::crypto::CryptoClient;
@@ -697,23 +697,13 @@ fn worker_sizing_funds_derived_connection_pools() {
         }
         let admission = flow_control::Quotas::new(AdmissionPolicy::new(result.unwrap()));
         let control = (0..3)
-            .map(|_| {
-                admission
-                    .reserve_connection(ResourceClass::ControlConnection)
-                    .unwrap()
-            })
+            .map(|_| reserve_connection(&admission, ResourceClass::ControlConnection).unwrap())
             .collect::<Vec<_>>();
         let outbound_count = neighbor.min(admission.limit(ResourceClass::OutboundConnection));
         let outbound = (0..outbound_count)
-            .map(|_| {
-                admission
-                    .reserve_connection(ResourceClass::OutboundConnection)
-                    .unwrap()
-            })
+            .map(|_| reserve_connection(&admission, ResourceClass::OutboundConnection).unwrap())
             .collect::<Vec<_>>();
-        let ingress = admission
-            .reserve_connection(ResourceClass::IngressConnection)
-            .unwrap();
+        let ingress = reserve_connection(&admission, ResourceClass::IngressConnection).unwrap();
         assert_eq!(
             admission.used(ResourceClass::Connection),
             3 + outbound_count + 1
@@ -3232,7 +3222,7 @@ fn assembled_peer_io_rejects_oversize_and_admission_pressure_before_submission()
             .reserve(
                 None,
                 ResourceClass::RequestContext,
-                admission.limits().request_context_bytes.get() - baseline - available,
+                admission.policy().limits().request_context_bytes.get() - baseline - available,
             )
             .unwrap();
         let baseline = admission.used(ResourceClass::RequestContext);

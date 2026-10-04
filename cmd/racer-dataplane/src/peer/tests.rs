@@ -81,7 +81,9 @@ mod body_progress {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            admission.set_observer(telemetry.failures.observer(WorkerId(2)));
+            admission
+                .policy()
+                .set_observer(telemetry.failures.observer(WorkerId(2)));
             let reactor = Rc::new(Reactor::new(admission.clone()));
             let io = Rc::new(HttpIo::with_admission(
                 reactor.clone(),
@@ -2038,7 +2040,7 @@ use crate::peer::protocol::PeerResponse;
 use crate::peer::protocol::SecurityCodec;
 use crate::peer::protocol::decode_envelope;
 use crate::peer::protocol::encode_envelope;
-use crate::runtime::admission::AdmissionExt;
+
 use crate::runtime::admission::AdmissionPolicy;
 use crate::runtime::deadline::Deadline;
 use crate::runtime::deadline::RequestScope;

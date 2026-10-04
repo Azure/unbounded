@@ -35,7 +35,13 @@ impl AdmissionPolicy {
             observer: Mutex::default(),
         }
     }
-    fn observer(&self) -> Observer {
+    pub fn limits(&self) -> &Limits {
+        &self.limits
+    }
+    pub fn set_observer(&self, observer: Observer) {
+        *self.observer.lock().unwrap_or_else(|e| e.into_inner()) = observer;
+    }
+    pub fn observer(&self) -> Observer {
         self.observer
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -123,6 +129,7 @@ impl Policy for AdmissionPolicy {
     }
 }
 
+#[cfg(test)]
 pub struct FillReservation {
     pub plaintext: Charge<AdmissionPolicy>,
     pub ciphertext: Charge<AdmissionPolicy>,
@@ -134,97 +141,65 @@ pub struct ConnectionReservation {
     _role: Charge<AdmissionPolicy>,
 }
 
-/// Racer operations on the generic local authority. No quota facade or alias.
-pub trait AdmissionExt {
-    fn limits(&self) -> &Limits;
-    fn observer(&self) -> Observer;
-    fn set_observer(&self, observer: Observer);
-    fn reserve_connection(&self, role: ResourceClass) -> Result<ConnectionReservation>;
-    fn reserve_fill(&self, cache: &CacheId, persist: bool) -> Result<FillReservation>;
-}
-impl AdmissionExt for Quotas<AdmissionPolicy> {
-    fn limits(&self) -> &Limits {
-        &self.policy().limits
+/// Reserve the socket role and total together, rolling back on either rejection.
+pub fn reserve_connection(
+    admission: &Quotas<AdmissionPolicy>,
+    role: ResourceClass,
+) -> Result<ConnectionReservation> {
+    if matches!(role, ResourceClass::IngressConnection) {
+        return reserve_ingress(&admission.shared());
     }
-    fn observer(&self) -> Observer {
-        self.policy().observer()
+    if !matches!(
+        role,
+        ResourceClass::OutboundConnection | ResourceClass::ControlConnection
+    ) {
+        return Err(Error::InvalidConfiguration);
     }
-    fn set_observer(&self, observer: Observer) {
-        *self
-            .policy()
-            .observer
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = observer;
-    }
-    fn reserve_connection(&self, role: ResourceClass) -> Result<ConnectionReservation> {
-        if matches!(role, ResourceClass::IngressConnection) {
-            return self.shared().reserve_ingress();
-        }
-        if !matches!(
-            role,
-            ResourceClass::OutboundConnection | ResourceClass::ControlConnection
-        ) {
-            return Err(Error::InvalidConfiguration);
-        }
-        let role_charge = self.reserve(None, role, 1)?;
-        let total = self.reserve(None, ResourceClass::Connection, 1)?;
-        Ok(ConnectionReservation {
-            _total: total,
-            _role: role_charge,
-        })
-    }
-    fn reserve_fill(&self, cache: &CacheId, persist: bool) -> Result<FillReservation> {
-        let plaintext = self.reserve(Some(cache), ResourceClass::Plaintext, PAGE_BYTES as usize)?;
-        let ciphertext = self.reserve(
-            Some(cache),
-            ResourceClass::Ciphertext,
-            PAGE_BYTES as usize + 16,
-        )?;
-        let dirty = if persist {
-            Some(self.reserve(
-                Some(cache),
-                ResourceClass::DirtyCiphertext,
-                PAGE_BYTES as usize + 16,
-            )?)
-        } else {
-            None
-        };
-        Ok(FillReservation {
-            plaintext,
-            ciphertext,
-            dirty,
-        })
-    }
+    let role_charge = admission.reserve(None, role, 1)?;
+    let total = admission.reserve(None, ResourceClass::Connection, 1)?;
+    Ok(ConnectionReservation {
+        _total: total,
+        _role: role_charge,
+    })
 }
 
-/// Compound ingress admission and Racer-specific usage views on the direct
-/// generic shared handle. No cache authority or payload pool crosses workers.
-pub trait SharedAdmissionExt {
-    fn reserve_ingress(&self) -> Result<ConnectionReservation>;
-    fn relay(&self) -> (usize, usize);
-    fn ciphertext(&self) -> (usize, usize);
+#[cfg(test)]
+pub fn reserve_fill(
+    admission: &Quotas<AdmissionPolicy>,
+    cache: &CacheId,
+    persist: bool,
+) -> Result<FillReservation> {
+    let plaintext =
+        admission.reserve(Some(cache), ResourceClass::Plaintext, PAGE_BYTES as usize)?;
+    let ciphertext = admission.reserve(
+        Some(cache),
+        ResourceClass::Ciphertext,
+        PAGE_BYTES as usize + 16,
+    )?;
+    let dirty = if persist {
+        Some(admission.reserve(
+            Some(cache),
+            ResourceClass::DirtyCiphertext,
+            PAGE_BYTES as usize + 16,
+        )?)
+    } else {
+        None
+    };
+    Ok(FillReservation {
+        plaintext,
+        ciphertext,
+        dirty,
+    })
 }
-impl SharedAdmissionExt for SharedQuotas<AdmissionPolicy> {
-    fn reserve_ingress(&self) -> Result<ConnectionReservation> {
-        let role = self.reserve(ResourceClass::IngressConnection, 1)?;
-        let total = self.reserve(ResourceClass::Connection, 1)?;
-        Ok(ConnectionReservation {
-            _total: total,
-            _role: role,
-        })
-    }
-    fn relay(&self) -> (usize, usize) {
-        (
-            self.used(ResourceClass::Relay),
-            self.limit(ResourceClass::Relay),
-        )
-    }
-    fn ciphertext(&self) -> (usize, usize) {
-        (
-            self.used(ResourceClass::Ciphertext),
-            self.limit(ResourceClass::Ciphertext),
-        )
-    }
+
+/// Shared ingress admission never transfers cache authority or payload pools.
+pub fn reserve_ingress(admission: &SharedQuotas<AdmissionPolicy>) -> Result<ConnectionReservation> {
+    let role = admission.reserve(ResourceClass::IngressConnection, 1)?;
+    let total = admission.reserve(ResourceClass::Connection, 1)?;
+    Ok(ConnectionReservation {
+        _total: total,
+        _role: role,
+    })
 }
 
 #[cfg(test)]
@@ -242,7 +217,7 @@ mod tests {
         ));
         let usage = admission.shared();
         let ingress = admission.shared();
-        let connection = std::thread::spawn(move || ingress.reserve_ingress().unwrap())
+        let connection = std::thread::spawn(move || reserve_ingress(&ingress).unwrap())
             .join()
             .unwrap();
         assert_eq!(admission.used(ResourceClass::Connection), 1);
@@ -254,9 +229,9 @@ mod tests {
             .unwrap();
         charge.recycle(vec![0xa7; 1 << 20]);
         drop(charge);
-        assert_eq!(usage.ciphertext().0, 1 << 20);
+        assert_eq!(usage.used(ResourceClass::Ciphertext), 1 << 20);
         drop(admission);
-        assert_eq!(usage.ciphertext().0, 0);
+        assert_eq!(usage.used(ResourceClass::Ciphertext), 0);
     }
 
     #[test]
@@ -517,35 +492,15 @@ mod tests {
             crate::test_support::cluster::config(false).limits,
         ));
         let ingress: Vec<_> = (0..admission.limit(ResourceClass::IngressConnection))
-            .map(|_| {
-                admission
-                    .reserve_connection(ResourceClass::IngressConnection)
-                    .unwrap()
-            })
+            .map(|_| reserve_connection(&admission, ResourceClass::IngressConnection).unwrap())
             .collect();
-        assert!(
-            admission
-                .reserve_connection(ResourceClass::IngressConnection)
-                .is_err()
-        );
+        assert!(reserve_connection(&admission, ResourceClass::IngressConnection).is_err());
         let outbound: Vec<_> = (0..admission.limit(ResourceClass::OutboundConnection))
-            .map(|_| {
-                admission
-                    .reserve_connection(ResourceClass::OutboundConnection)
-                    .unwrap()
-            })
+            .map(|_| reserve_connection(&admission, ResourceClass::OutboundConnection).unwrap())
             .collect();
-        assert!(
-            admission
-                .reserve_connection(ResourceClass::OutboundConnection)
-                .is_err()
-        );
+        assert!(reserve_connection(&admission, ResourceClass::OutboundConnection).is_err());
         let control: Vec<_> = (0..admission.limit(ResourceClass::ControlConnection))
-            .map(|_| {
-                admission
-                    .reserve_connection(ResourceClass::ControlConnection)
-                    .unwrap()
-            })
+            .map(|_| reserve_connection(&admission, ResourceClass::ControlConnection).unwrap())
             .collect();
         assert_eq!(
             control.len(),
@@ -588,7 +543,7 @@ mod tests {
         limits.ciphertext_bytes = std::num::NonZeroUsize::new(1).unwrap();
         let admission = Quotas::new(AdmissionPolicy::new(limits));
         assert!(matches!(
-            admission.reserve_fill(&CacheId("c".into()), false),
+            reserve_fill(&admission, &CacheId("c".into()), false),
             Err(Error::Overloaded)
         ));
         assert_eq!(admission.used(ResourceClass::Plaintext), 0);

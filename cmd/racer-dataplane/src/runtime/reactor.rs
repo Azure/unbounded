@@ -44,7 +44,7 @@
 //!     let _ = r.recv(fd, page, (), scope);
 //! }
 //! ```
-use super::admission::AdmissionExt;
+
 use super::admission::AdmissionPolicy;
 use super::admission::ConnectionReservation;
 use super::deadline::RequestScope;
@@ -115,7 +115,7 @@ impl Reactor {
     pub fn new(admission: Rc<flow_control::Quotas<AdmissionPolicy>>) -> Self {
         Self {
             core: uring_runtime::reactor::Reactor::new(
-                admission.limits().queue_entries.get(),
+                admission.policy().limits().queue_entries.get(),
                 AdmissionBudget(admission.clone()),
             ),
             admission,
@@ -152,7 +152,7 @@ impl Reactor {
             .map_err(Into::into)
     }
     pub fn reserve_connection(&self, role: ResourceClass) -> Result<ConnectionReservation> {
-        self.admission.reserve_connection(role)
+        reserve_connection(&self.admission, role)
     }
     pub(crate) fn reserve_submissions(
         &self,

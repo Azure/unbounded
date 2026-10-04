@@ -131,7 +131,7 @@ pub(crate) mod ingress {
     //! Bounded pre-session socket handoff. No submitted operation crosses reactors.
     use super::admission::AdmissionPolicy;
     use super::admission::ConnectionReservation;
-    use super::admission::SharedAdmissionExt;
+
     use crate::error::Error;
     use crate::error::Result;
     use crate::model::CacheId;
@@ -218,7 +218,7 @@ pub(crate) mod ingress {
                     continue;
                 };
                 admission.register(waker);
-                if let Ok(reservation) = admission.reserve_ingress() {
+                if let Ok(reservation) = reserve_ingress(admission) {
                     state.cursor = (index + 1) % state.targets.len();
                     return Ok(Offer {
                         ingress: self.clone(),
@@ -296,7 +296,7 @@ pub(crate) mod ingress {
     mod tests {
         use super::*;
         use crate::model::ResourceClass;
-        use crate::runtime::admission::AdmissionExt;
+        use crate::runtime::admission::reserve_connection;
         #[test]
         fn offer_delivered_after_target_close_releases_socket_and_charges() {
             use std::io::Read;
@@ -381,16 +381,8 @@ pub(crate) mod ingress {
             assert!(matches!(ingress.reserve(&waker), Err(Error::Overloaded)));
             for admission in &admissions {
                 assert_eq!(admission.used(ResourceClass::IngressConnection), per_worker);
-                assert!(
-                    admission
-                        .reserve_connection(ResourceClass::OutboundConnection)
-                        .is_ok()
-                );
-                assert!(
-                    admission
-                        .reserve_connection(ResourceClass::ControlConnection)
-                        .is_ok()
-                );
+                assert!(reserve_connection(admission, ResourceClass::OutboundConnection).is_ok());
+                assert!(reserve_connection(admission, ResourceClass::ControlConnection).is_ok());
             }
             let mut peers = Vec::new();
             for offer in offers {

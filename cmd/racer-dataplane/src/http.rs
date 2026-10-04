@@ -3,7 +3,7 @@ use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
 use crate::model::ResourceClass;
-use crate::runtime::admission::AdmissionExt;
+
 use crate::runtime::admission::AdmissionPolicy;
 use crate::runtime::admission::ConnectionReservation;
 use crate::runtime::deadline::RequestScope;
@@ -49,7 +49,7 @@ impl http1::connection::Context for HttpContext {
             .map_err(Into::into)
     }
     fn outbound_slot(&self) -> Result<ConnectionReservation> {
-        self.0.reserve_connection(ResourceClass::OutboundConnection)
+        reserve_connection(&self.0, ResourceClass::OutboundConnection)
     }
     fn stopped(&self) -> bool {
         self.0.is_stopped()
@@ -120,7 +120,7 @@ pub fn from_accepted(
 ) -> Result<ConnectionLease> {
     from_reserved(
         fd,
-        admission.reserve_connection(ResourceClass::IngressConnection)?,
+        reserve_connection(&admission, ResourceClass::IngressConnection)?,
     )
 }
 pub(crate) fn from_reserved(
@@ -168,7 +168,14 @@ impl HttpIo {
     ) -> Self {
         Self(http1::connection::HttpIo::new(
             reactor,
-            Codec::new(admission.limits().header_bytes.get().min(MAX_HEAD_BYTES)),
+            Codec::new(
+                admission
+                    .policy()
+                    .limits()
+                    .header_bytes
+                    .get()
+                    .min(MAX_HEAD_BYTES),
+            ),
             Rc::new(HttpContext(admission)),
             crate::model::PAGE_BYTES + 16,
             i64::MAX as u64,
@@ -256,7 +263,7 @@ impl HttpPool {
                     secondary_cap: per_endpoint,
                     max_endpoints,
                     idle_timeout,
-                    waiter_cap: admission.limits().queue_entries.get(),
+                    waiter_cap: admission.policy().limits().queue_entries.get(),
                     tcp_nodelay: false,
                 },
             ),

@@ -7,7 +7,7 @@ use super::protocol::VerifiedRequest;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::model::ResourceClass;
-use crate::runtime::admission::AdmissionExt;
+
 use crate::runtime::admission::AdmissionPolicy;
 use crate::runtime::deadline::RequestScope;
 use crate::security::forwarding::Forwarding;
@@ -441,7 +441,7 @@ impl PeerServer {
                         }
                         Ok(response)
                     });
-                    let result = self.admission.observer().result(
+                    let result = self.admission.policy().observer().result(
                         crate::telemetry::Stage::PeerRelay,
                         &request_scope,
                         result,
@@ -670,7 +670,7 @@ impl PeerServer {
             if request.request().route.destination != network.local {
                 let binding = request.binding().clone();
                 let result = self.relay.forward(request, membership, &scope).await;
-                let result = self.admission.observer().result(
+                let result = self.admission.policy().observer().result(
                     crate::telemetry::Stage::PeerRelay,
                     &scope,
                     result,
@@ -708,7 +708,7 @@ impl PeerServer {
                 Err(error) => return Err(error),
             };
             let result = self.serve_selected(request, membership, &scope).await;
-            let result = self.admission.observer().result(
+            let result = self.admission.policy().observer().result(
                 crate::telemetry::Stage::PeerLocal,
                 &scope,
                 result,

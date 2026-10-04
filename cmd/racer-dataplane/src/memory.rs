@@ -11,7 +11,7 @@ use crate::model::PAGE_BYTES;
 use crate::model::PageEnvelope;
 use crate::model::PageId;
 use crate::model::ResourceClass;
-use crate::runtime::admission::AdmissionExt;
+
 use crate::runtime::admission::AdmissionPolicy;
 use crate::runtime::deadline::RequestScope;
 use flow_control::Quotas;
@@ -145,7 +145,7 @@ impl BufferPool {
         })
     }
     fn entry_limit(&self) -> usize {
-        self.admission.limits().metadata_entries.get()
+        self.admission.policy().limits().metadata_entries.get()
     }
     fn reclaim_buffers(&self) {
         self.admission.reclaim_buffers();
@@ -825,7 +825,7 @@ pub mod page {
 }
 
 pub fn new_pipe_pool(admission: Rc<Quotas<AdmissionPolicy>>) -> PipePool<AdmissionPolicy> {
-    let waiter_limit = admission.limits().queue_entries.get();
+    let waiter_limit = admission.policy().limits().queue_entries.get();
     PipePool::new(
         admission,
         ResourceClass::Pipe,

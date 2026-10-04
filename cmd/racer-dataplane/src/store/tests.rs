@@ -17,7 +17,7 @@ use crate::model::RequestId;
 use crate::model::ResourceClass;
 use crate::model::StrongEtag;
 use crate::model::WorkerId;
-use crate::runtime::admission::AdmissionExt;
+
 use crate::runtime::admission::AdmissionPolicy;
 use crate::runtime::deadline::RequestScope;
 use crate::runtime::reactor::Reactor;
@@ -344,7 +344,7 @@ impl Fixture {
         };
         store.configure(admission.clone(), 2, 16).unwrap();
         let foreign = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
-            admission.limits().clone(),
+            admission.policy().limits().clone(),
         )));
         assert_eq!(
             store.configure(foreign, 2, 16),
@@ -690,7 +690,8 @@ fn dirty_queue_is_bounded_and_cache_removal_discards_without_io() {
 fn allocator_integration_rejects_foreign_and_mismatched_writer_charges() {
     let f = Fixture::new();
     futures::executor::block_on(f.store.open()).unwrap();
-    let foreign = flow_control::Quotas::new(AdmissionPolicy::new(f.admission.limits().clone()));
+    let foreign =
+        flow_control::Quotas::new(AdmissionPolicy::new(f.admission.policy().limits().clone()));
     let page = f.copy(1, 64);
     let cache = &page.metadata.version.object.cache;
     let other_cache = CacheId("other".into());
@@ -753,7 +754,8 @@ fn allocator_integration_validates_reader_charges_before_submission() {
     let page = f.copy(1, 64);
     let id = page.ciphertext.envelope().page.clone();
     let cache = &id.version.object.cache;
-    let foreign = flow_control::Quotas::new(AdmissionPolicy::new(f.admission.limits().clone()));
+    let foreign =
+        flow_control::Quotas::new(AdmissionPolicy::new(f.admission.policy().limits().clone()));
     let other_cache = CacheId("other".into());
     let length = f
         .store

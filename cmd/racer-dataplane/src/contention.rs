@@ -3,7 +3,7 @@
 use crate::model::CacheId;
 use crate::model::PAGE_BYTES;
 use crate::model::ResourceClass;
-use crate::runtime::admission::AdmissionExt;
+
 use crate::runtime::admission::AdmissionPolicy;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
@@ -817,7 +817,7 @@ mod waiter_detach {
                 sim.pump(id);
             }
             let real = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
-                sim.workers[0].admission.limits().clone(),
+                sim.workers[0].admission.policy().limits().clone(),
             )));
             let flights = Rc::new(Flights::new(
                 real.clone(),
@@ -855,7 +855,8 @@ mod waiter_detach {
             else {
                 panic!("expected first acquisition")
             };
-            let fill_reservation = real.reserve_fill(&origin.object.cache, true).unwrap();
+            let fill_reservation =
+                crate::runtime::admission::reserve_fill(&real, &origin.object.cache, true).unwrap();
             let operation = flights
                 .retain_operation(
                     &leader,

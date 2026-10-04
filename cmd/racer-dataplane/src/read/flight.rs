@@ -24,7 +24,7 @@ use crate::memory::page::UnverifiedPage;
 use crate::model::OriginContext;
 use crate::model::PageId;
 use crate::model::ResourceClass;
-use crate::runtime::admission::AdmissionExt;
+
 use crate::runtime::admission::AdmissionPolicy;
 use crate::runtime::collections::HashMap;
 use crate::runtime::deadline::RequestScope;
@@ -577,9 +577,9 @@ impl Flights {
         availability: Rc<crate::control::Availability>,
     ) -> Self {
         let limits = FlightLimits {
-            entries: admission.limits().flights.get(),
-            waiters_per_flight: admission.limits().waiters_per_flight.get(),
-            operations_per_flight: admission.limits().queue_entries.get(),
+            entries: admission.policy().limits().flights.get(),
+            waiters_per_flight: admission.policy().limits().waiters_per_flight.get(),
+            operations_per_flight: admission.policy().limits().queue_entries.get(),
             generations_per_flight: 1024,
         };
         Self {

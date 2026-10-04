@@ -7,7 +7,7 @@ use crate::model::RequestId;
 use crate::model::ResourceClass;
 use crate::model::WorkerId;
 use crate::runtime::admission::AdmissionPolicy;
-use crate::runtime::admission::SharedAdmissionExt;
+
 use crate::runtime::deadline::Deadline;
 use crate::runtime::deadline::RequestScope;
 use crate::runtime::reactor::Reactor;

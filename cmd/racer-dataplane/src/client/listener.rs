@@ -13,7 +13,7 @@ use crate::model::ObjectId;
 use crate::model::RequestId;
 use crate::read::Coordinator;
 use crate::read::ReadResponse;
-use crate::runtime::admission::AdmissionExt;
+
 use crate::runtime::admission::AdmissionPolicy;
 use crate::runtime::deadline::Cancellation;
 use crate::runtime::deadline::RequestScope;
@@ -815,7 +815,7 @@ pub(super) async fn handle_read_result(
     let response = match read_result {
         Ok(response) => response,
         Err(error) => {
-            admission.observer().record(
+            admission.policy().observer().record(
                 crate::telemetry::Failure::new(crate::telemetry::Stage::ClientRead, error)
                     .request(scope),
             );

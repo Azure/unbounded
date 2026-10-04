@@ -298,7 +298,7 @@ fn endpoint_caps_accept_exact_boundary_and_reject_one_extra_byte() {
     let client = HttpIo::for_clients(reactor.clone(), admission.clone());
     let origin = peer.capped(crate::http::MAX_HEAD_BYTES);
     for (io, limit) in [
-        (&client, admission.limits().header_bytes.get()),
+        (&client, admission.policy().limits().header_bytes.get()),
         (&origin, crate::http::MAX_HEAD_BYTES),
         (&peer, crate::peer::protocol::MAX_ENVELOPE_HEAD),
     ] {
@@ -700,7 +700,7 @@ fn dropped_checkout_and_destroyed_pool_release_quota_only_after_connect_fence() 
             .reserve(
                 None,
                 ResourceClass::Connection,
-                admission.limits().client_connections.get(),
+                admission.policy().limits().client_connections.get(),
             )
             .unwrap();
         drop(charge);
