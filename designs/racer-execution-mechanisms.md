@@ -6,6 +6,10 @@ The corrected boundary keeps core business logic in `racer-dataplane`, not only
 composition glue. This round extends `uring-runtime`; it does not introduce an
 execution-policy or common/model crate.
 
+Application source references below follow the subsequent within-crate source
+consolidation. Reusable workspace-crate paths such as `runtime/src/` are unchanged;
+the layout update does not imply new validation or another library extraction.
+
 - `runtime/src/drivers.rs` owns explicitly polled local tasks, reserved capacity,
   scoped queue selection, deferred child submission, and wake gating. Another
   event-driven proxy could supply its own capacity, polling budget, task futures,
@@ -17,25 +21,26 @@ execution-policy or common/model crate.
   `detached_operation_errors_release_capacity` cover the application contract.
   Acquisition, routing, retry and lifecycle decisions remain in main. Client
   listeners and dispatch consume the runtime wake primitive directly.
-- `src/runtime/admission.rs:39-89` remains Racer policy, including resource
+- `src/admission.rs::AdmissionPolicy` remains Racer policy, including resource
   classes, store-aware ciphertext floors and up to three reserved control
   connections (`min(client_connections / 4, 3)`).
   Generic accounting/enforcement already belongs to `flow-control`; moving this
   policy would invert the corrected ownership rather than improve reuse.
-- `src/runtime/deadline.rs:62-195` retains candidate total/idle/body decisions and
+- `src/runtime.rs::RequestScope` retains candidate total/idle/body decisions and
   request semantics. Generic cancellation and I/O scope enforcement already live
   in `runtime/src/deadline.rs` and `runtime/src/reactor.rs`. No application model
   types or error taxonomy are moved downstairs merely to satisfy imports.
-- The inline `ingress` module in `src/runtime.rs` chooses admitted destinations
+- `src/admission.rs` chooses admitted ingress destinations
   in `Ingress::reserve`. Its queue bound follows target reservations in
   `Offer::deliver`. This is application ingress policy, not a reason to invent a
   generic routing callback. The SPSC channel is not interchangeable with this
   shared, target-selected handoff. The implementation remains upstairs.
-- `src/runtime/reactor.rs` retains validated Racer resource-class/provenance
+- `src/runtime.rs::Reactor` retains validated Racer resource-class/provenance
   adapters around the existing generic reactor. Worker/page crypto completion
-  ownership stays in main; no wholesale runtime directory move occurs.
-- `src/security/aead.rs::capture_aead_failure` captures page fingerprints using
-  the existing cached checksum; `src/telemetry/failures.rs` owns records/rings
+  ownership stays in main, in `src/worker.rs` and `src/security.rs`. The later
+  flattening changes application source organization, not this library boundary.
+- `src/security.rs::capture_aead_failure` captures page fingerprints using
+  the existing cached checksum; `src/telemetry.rs` owns records/rings
   without importing a page buffer. Both remain upstairs: diagnostic semantics
   and the crypto-operation identity are Racer-specific. No raw-key APIs change.
 
@@ -49,10 +54,10 @@ execution-policy or common/model crate.
 | Exact Racer ceiling and error conversion | `src/read/tests.rs::racer_capacity_and_reservation_errors_are_preserved`, `detached_operation_errors_release_capacity` |
 | Capacity released before completed detached operation is dropped | `runtime/src/drivers.rs::tests::completed_operation_is_dropped_after_releasing_capacity` |
 | Cancellation fences and safe reactor construction | Existing reactor and worker tests/compile-fail examples, unchanged |
-| Cross-cache zeroization and accounting transfer | Inline `src/runtime/admission.rs::tests::recycled_truncated_capacity_is_zero_before_cross_cache_and_class_reuse` |
+| Cross-cache zeroization and accounting transfer | Inline `src/admission.rs::tests::recycled_truncated_capacity_is_zero_before_cross_cache_and_class_reuse` |
 | Reserved outbound/control progress and resource floors | Existing admission and ingress tests, unchanged |
-| Held offer delivered after close releases socket and both charges | New `runtime::ingress::tests::offer_delivered_after_target_close_releases_socket_and_charges` |
-| Diagnostic meanings, independent ring lifetimes and exact formatting | Existing `telemetry::failures::tests` plus expanded page fingerprint/cached-CRC test |
+| Held offer delivered after close releases socket and both charges | `admission::tests::offer_delivered_after_target_close_releases_socket_and_charges` |
+| Diagnostic meanings, independent ring lifetimes and exact formatting | `telemetry::tests::failures_tests` plus the page fingerprint/cached-CRC test in `src/memory.rs` |
 | Real cross-component ownership/compatibility | Top-level production_dataplane, process_restart, payload_zeroization, identity_integration and client_origin_conformance suites |
 
 The existing runtime `simulation` feature explicitly exports driver crash support;

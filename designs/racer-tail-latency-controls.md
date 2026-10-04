@@ -22,8 +22,9 @@ This document changes no defaults. Below, `D/` means
 | `RACER_PAGE_HEDGE_DELAY_MS` | 100 | Positive delayed-launch threshold, maximum 30000 ms |
 | `RACER_PAGE_HEDGE_BYTES` | 33554448 | One maximum duplicate plaintext/ciphertext pair: 32 MiB + 16 bytes |
 
-Sources: `D/config.rs:204-228`, `D/read/hedge.rs:25-51`. Admission requires
-`1 <= per_neighbor <= total <= 65536` (`D/peer/adaptive.rs:32-38`). These are
+Sources: `D/config.rs::Config::from_lookup`,
+`D/read/candidates.rs::HedgeConfig::default`. Admission requires
+`1 <= per_neighbor <= total <= 65536` (`D/peer.rs::Config::validate`). These are
 actual parser defaults, not assertions about deployed configuration.
 
 Production constructs one adaptive owner after worker sizing and shares it with
@@ -34,20 +35,21 @@ accepted work or marking a neighbor unhealthy. Verified completions restore one
 node slot per second. Attributable immediate-link failures halve that peer's
 limit and open a 250 ms backoff; one exclusive verified probe can recover the
 circuit. Old-generation success cannot erase a newer peer failure. Peer state is
-bounded to 256 entries with guarded retirement (`D/peer/adaptive.rs:41-43,112-260`).
+bounded to 256 entries with guarded retirement (`D/peer.rs::AdaptivePeers` and `Permit`).
 
 Blame is deliberately narrow: selected observed connect errors and live-scope EOF provide
 link evidence; generic I/O errors, local deadlines/cancellation and downstream
 overload are not peer-failure evidence. Signed downstream overload is also not
-adaptive recovery (`D/http/connection.rs:1263`, `HttpPool::checkout_peer`;
-`D/peer/transport.rs:1050`, `observe_read`; `D/peer.rs:493`,
-`NetworkRequester::exchange_inner_mode`). Permits follow accepted transport ownership;
+adaptive recovery (`D/http.rs::checkout_peer`;
+`D/peer/transport.rs::observe_read`; `D/peer.rs::Requester::exchange_inner_mode`).
+Permits follow accepted transport ownership;
 native teardown failure retains/quarantines its permit rather than pretending
-timeout means DMA completion (`D/rdma/lifecycle.rs:55-67,480-505`).
+timeout means DMA completion (`D/rdma.rs::Sessions::prepare_admitted` and
+`tests::scenarios::lifecycle_tests::failed_native_service_teardown_quarantines_adaptive_permit_after_both_roles_drop`).
 
 Assertions cover shared caps and retained permits, local-pressure reduction,
 exclusive recovery, and production workers' shared permits and metrics
-(`D/peer/adaptive.rs`, tests; `D/app/tests/peer.rs`,
+(`D/peer/tests.rs`, adaptive tests; `D/app/tests.rs`,
 `worker_requesters_share_configured_admission_and_production_metrics`).
 
 ## 2. Attempt cap and body ETA are distinct from signed authority
@@ -66,13 +68,13 @@ finish by the local completion boundary. When another route is affordable, that
 boundary also reserves fallback time. Even the last affordable candidate gets
 an ETA check. Unknown-length progress has no rate prediction. Completion clears
 the body projection, not the total cap; expiration is sticky
-(`D/runtime/deadline.rs:147-238,248-275`).
+(`D/runtime.rs::RequestScope::candidate_body_progress` and `RequestScope::check`).
 
 An expired exchange is canceled and polled through its completion fence before
 fallback; a late success cannot override expiry (`D/read/candidates.rs:733-795`).
 Tests assert healthy progress beyond the idle share, slow-body rejection even
 without another route, unchanged signed deadlines, conserved credits, and
-fenced late-success rejection (`D/read/tests/timeouts.rs`,
+fenced late-success rejection (`D/read/tests.rs`, timeout tests:
 `slow_body_without_alternative_or_failure_route_credit_keeps_original_ceiling`;
 `known_healthy_body_outlives_share_with_or_without_affordable_fallback`;
 `configured_total_cap_never_renews_or_accepts_late_success`;
@@ -93,8 +95,8 @@ their own direct first hop and forced to HTTP. Metadata, bootstrap, subscription
 selection, ciphertext relay, and native transfers do not race through this hook.
 There is no whole-GET duplication; an eligible fixed-page fallback within a read
 can still reach the hook (`D/read/candidates.rs:138-219`,
-`D/peer.rs:398`, `Requester::request_direct`, and `:493`,
-`NetworkRequester::exchange_inner_mode`; `D/read/fill.rs:888`, `Fill::acquire_once`).
+`D/peer.rs::Requester::request_direct` and `Requester::exchange_inner_mode`;
+`D/read/fill.rs::Fill::acquire_once`).
 
 Slots and duplicate-byte capacity are shared by all workers of one node owner
 (`D/app.rs:610-617`). Each slot charges a full 33554448-byte pair, including during
@@ -161,8 +163,8 @@ ciphertext under the requester quota, and verifies cold rank1/rank2 predecessor
 probes reach real origin encryption. It does not substitute cached-success replies.
 
 **No fleet-global distributed hedge budget is implemented.** The owner is local
-`Arc`/`Mutex` state, not a distributed coordinator (`D/read/hedge.rs:58-108`,
-`D/app.rs:610-617`). Operators must account for enabled node/process count,
+`Arc`/`Mutex` state, not a distributed coordinator (`D/read/candidates.rs::Hedges`,
+`D/app.rs::NodeState`). Operators must account for enabled node/process count,
 including overlapping replicas during rollout. For homogeneous settings, the
 capacity ceiling is `N * min(slots, floor(bytes / 33554448))` concurrent pairs;
 this is not a bytes-per-second or experiment-total traffic limit. More slots
@@ -205,7 +207,8 @@ are `test_page_window.py:100-223` in the same directory.
 Prose reconciliation: `page-window.md:28-36` records historical deployed values
 of 1, not today's state or compiled defaults. Its abbreviated `D/config.rs` and
 `D/app.rs` line references have drifted; current acquisition memory floors are
-at `D/config.rs:405-430`, and startup sizing is at `D/app.rs:203-205`. This is not
+at `D/admission.rs::AdmissionPolicy` and `D/config.rs::Config::validate`, and startup
+sizing is at `D/app.rs::size_workers`. This is not
 evidence to raise anything. Its warning that 2Gi is not proof of safety remains
 consistent with the two-buffer SDK implementation (`page-window.md:19-26`).
 
@@ -240,8 +243,8 @@ For every arm collect the same fleet coverage and interval:
 `racer_page_hedges_started_total`, `racer_page_hedges_won_total`, and
 `racer_page_hedges_suppressed_total` explain participation. Crucially,
 `racer_page_hedge_duplicate_reserved_bytes_total` increments by one full pair per
-secondary launch, **not measured duplicate wire bytes** (`D/read/hedge.rs:140-148`,
-`D/telemetry/metrics.rs:184-196`). A "win" likewise does not prove earlier user
+secondary launch, **not measured duplicate wire bytes** (`D/read/candidates.rs::Permit::started`,
+`D/telemetry.rs::Event`). A "win" likewise does not prove earlier user
 completion because return waits for the loser fence. Require repeatable p99
 improvement with acceptable errors, traffic, queue and memory deltas before any
 promotion; reject or roll back regressions. This phase establishes no such result.

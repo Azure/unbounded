@@ -140,7 +140,9 @@ Relevant diagnostic counters are `racer_crypto_decrypt_aead_rejected_total`,
 diagnostics use `racer_loadgen_pull_failures_total{reason="digest_mismatch"}`.
 These counters count attempts, not unique corrupt records or corrupt client
 deliveries, and locate the rejection rather than its origin; see
-`cmd/racer-dataplane/src/telemetry/metrics.rs:3-13`.
+the integrity-counter contract beside `Metrics` in
+`cmd/racer-dataplane/src/telemetry.rs`. This current source reference does not
+refresh the campaign observations above.
 Sender/receiver CRC disagreement narrowed a boundary in one joined acquisition,
 but did not attribute the cause to the kernel, NIC, network, or allocator.
 

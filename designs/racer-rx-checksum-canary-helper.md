@@ -61,7 +61,8 @@ recovered, the command fails and parent must investigate, not automatically
 toggle additional settings.
 
 The AEAD ring provides rejection timestamps, not acquisition-start timestamps
-(`cmd/racer-dataplane/src/telemetry/failures.rs:289-323`). Fresh means a new ring
+(`cmd/racer-dataplane/src/security.rs::capture_aead_failure` and
+`cmd/racer-dataplane/src/telemetry.rs::Failures::write_aead`). Fresh means a new ring
 sequence and acquisition/attempt identity first observed in that stage. Retained
 bad pages first decrypted later cannot be conclusively excluded. Pair rejects
 are diagnostic during off, not an automatic abort. Readiness loss, digest mismatch,

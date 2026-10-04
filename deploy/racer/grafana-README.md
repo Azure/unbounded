@@ -42,7 +42,7 @@ errors/aborts and downstream writes. Node CPU, memory, and NIC panels include al
 host workloads, not just Racer. There is no exported cache occupancy metric here.
 
 Definitions: `cmd/gantry/agent_racer_metrics.go`,
-`cmd/racer-dataplane/src/telemetry/metrics.rs`, and `cmd/racer-loadgen/metrics.go`.
+`cmd/racer-dataplane/src/telemetry.rs`, and `cmd/racer-loadgen/metrics.go`.
 See also `designs/racer-prometheus-queries.md` and the dataplane telemetry
 `INTEGRATION.md` for interpretation, checking implementation when prose drifts.
 

@@ -15,15 +15,19 @@ timeout --signal=TERM --kill-after=10s 300s cargo test --locked --manifest-path 
 
 The independent performance controller consumes this crate through
 `internal/racer-test/control.rs`, without linking the dataplane. The dataplane's
-`src/control/state.rs` contains explicit application adapters for wire members
-and rail mappings. It re-exports `racer_control_wire::CacheDefinition` directly;
-publication adapters pass cache definitions through without conversion.
+`src/control.rs` consumes wire publications, enrollment records, cache definitions,
+rail mappings, and codecs directly, without compatibility re-exports or mirror DTOs.
+`SnapshotStore::prepare` converts wire members at `Membership::validate`; the local
+`src/topology.rs::Member` adapter remains necessary for the external
+`topology::Member` trait under Rust's orphan rules. Rail mappings and cache
+definitions pass through without conversion.
 Key bundles transfer directly into `racer-identity`, which owns epoch validation,
 certificate identities, and purpose-bound leases. Placement traits, publication
 installation, transport, persistence, and accepted control cursors remain in the
-application. Shared identifiers, including the storage key ID, are re-exported
-by the application. Its `model::key_id_from_generation` helper preserves the
-configuration-error classification for zero generations; the wire constructor
+application. Callers import shared identifiers, including the storage key ID,
+directly from `racer_control_wire`. The application's `model::key_id_from_generation`
+helper preserves the configuration-error classification for zero generations;
+the wire constructor
 continues reporting a syntax error. Identity independently validates generations.
 
 Wire key material is private and deliberately non-Debug. `into_installation`
