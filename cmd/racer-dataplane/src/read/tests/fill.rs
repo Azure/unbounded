@@ -1,4 +1,155 @@
 use crate::read::dispatch::WorkerMap;
+
+#[test]
+fn final_fill_reclaim_success_and_ignored_writeback_are_silent() {
+    let f = fixture();
+    let admission = &f.fill.dependencies.admission;
+    let failures = crate::telemetry::Failures::default();
+    admission
+        .policy()
+        .set_observer(failures.observer(WorkerId(7)));
+    let idle = crate::memory::tests::bundle_for(admission, f.origin.metadata.immutable());
+    f.fill.dependencies.memory.publish(idle).unwrap();
+    let pressure = admission
+        .reserve(
+            None,
+            ResourceClass::Plaintext,
+            admission.limit(ResourceClass::Plaintext) - 3,
+        )
+        .unwrap();
+    let reserved = f
+        .fill
+        .observe_reservation(
+            &f.scope,
+            &f.page,
+            crate::telemetry::FillAdmissionSite::LocalPlaintext,
+            || {
+                f.fill.reserve_with_reclamation(
+                    &f.context.object.cache,
+                    ResourceClass::Plaintext,
+                    3,
+                )
+            },
+        )
+        .unwrap();
+    assert_eq!(reserved.amount(), 3);
+    let mut text = String::new();
+    failures.write_protected(true, &mut text).unwrap();
+    assert!(text.contains("total=0 retained=0"));
+    drop((reserved, pressure));
+    let page = crate::memory::tests::bundle_for(admission, f.origin.metadata.immutable());
+    let _cipher_pressure = admission
+        .reserve(
+            None,
+            ResourceClass::Ciphertext,
+            admission.limit(ResourceClass::Ciphertext) - admission.used(ResourceClass::Ciphertext),
+        )
+        .unwrap();
+    let dirty = admission
+        .reserve(
+            Some(&f.context.object.cache),
+            ResourceClass::DirtyCiphertext,
+            19,
+        )
+        .unwrap();
+    futures::executor::block_on(f.fill.publish(page, Some(dirty), &f.scope)).unwrap();
+    assert_eq!(f.fill.dependencies.writer.pending_count(), 0);
+    text.clear();
+    failures.write_protected(true, &mut text).unwrap();
+    assert!(text.contains("total=0 retained=0"));
+}
+
+#[test]
+fn final_fill_disk_outer_retry_emits_only_exhausted_last_rejection() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    for recover in [true, false] {
+        let f = cold_disk_fixture();
+        let admission = &f.fill.dependencies.admission;
+        let failures = crate::telemetry::Failures::default();
+        admission
+            .policy()
+            .set_observer(failures.observer(WorkerId(9)));
+        let calls = Cell::new(0);
+        let result = drive_disk(
+            &f,
+            f.fill.read_disk_observed_with(&f.page, &f.scope, |amount| {
+                calls.set(calls.get() + 1);
+                admission
+                    .reserve(
+                        Some(&f.context.object.cache),
+                        ResourceClass::Ciphertext,
+                        if recover && calls.get() == 2 {
+                            amount
+                        } else {
+                            usize::MAX
+                        },
+                    )
+                    .map_err(Error::from)
+            }),
+        );
+        assert_eq!(calls.get(), 2);
+        let mut text = String::new();
+        failures.write_protected(true, &mut text).unwrap();
+        if recover {
+            assert!(result.unwrap().is_some());
+            assert!(text.contains("total=0 retained=0"), "{text}");
+        } else {
+            assert!(matches!(result, Err(Error::Overloaded)));
+            assert!(text.contains("total=1 retained=1"), "{text}");
+            assert!(text.contains("site=Some(DiskCiphertext) page=Some(0)"));
+            assert!(text.contains(&format!("requested: {}", usize::MAX)));
+        }
+        assert_eq!(f.reactor.in_flight(), 0);
+        assert_eq!(f.origin.calls.get(), 0);
+    }
+}
+
+#[test]
+fn final_fill_diagnostic_reports_exhaustion_not_recovered_or_optional_reserves() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    let mut f = fixture();
+    let admission = f.fill.dependencies.admission.clone();
+    let failures = crate::telemetry::Failures::default();
+    admission
+        .policy()
+        .set_observer(failures.observer(WorkerId(7)));
+    let pressure = admission
+        .reserve(
+            None,
+            ResourceClass::Plaintext,
+            admission.limit(ResourceClass::Plaintext),
+        )
+        .unwrap();
+    // Legacy helper remains unobserved for optional writeback/test preflights.
+    assert!(matches!(
+        f.fill.reserve_bootstrap(&f.context.object.cache),
+        Err(Error::Overloaded)
+    ));
+    let mut text = String::new();
+    failures.write_protected(true, &mut text).unwrap();
+    assert!(text.contains("total=0 retained=0"));
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+    assert!(matches!(
+        acquire(&mut f, &mut budget),
+        Err(Error::Overloaded)
+    ));
+    text.clear();
+    failures.write_protected(true, &mut text).unwrap();
+    assert!(text.contains("total=1 retained=1"), "{text}");
+    assert!(text.contains("worker=7"));
+    assert!(text.contains("site=Some(NetworkPlaintext) page=Some(0)"));
+    assert!(text.contains("class: Plaintext"));
+    assert!(text.contains("requested: 16777216"));
+    assert!(!text.contains("request=none"));
+    drop(pressure);
+    let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+    acquire(&mut f, &mut budget).unwrap();
+    text.clear();
+    failures.write_protected(true, &mut text).unwrap();
+    assert!(text.contains("total=1 retained=1"));
+}
 pub(super) use uring_runtime::reactor::IoBuffer;
 
 pub(super) use crate::admission::AdmissionPolicy;

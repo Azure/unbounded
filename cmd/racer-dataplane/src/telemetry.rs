@@ -234,9 +234,11 @@ fn get(
         "/readyz" => (Response::Unavailable, "not ready\n", Event::DiagnosticReady),
         "/metrics" => (Response::Metrics, "", Event::DiagnosticMetrics),
         "/debug/membership" => (Response::Text, "", Event::DiagnosticMetrics),
-        "/debug/failures" | "/debug/aead" | "/debug/send-crc" => {
-            (Response::Text, "", Event::DiagnosticFailures)
-        }
+        "/debug/failures"
+        | "/debug/aead"
+        | "/debug/send-crc"
+        | "/debug/terminal"
+        | "/debug/admission-final" => (Response::Text, "", Event::DiagnosticFailures),
         _ => return Ok(Response::NotFound),
     };
     telemetry.metrics.record(event, 1);
@@ -257,6 +259,10 @@ fn get(
         telemetry.send_crc.write(&mut output)?;
     } else if path == "/debug/aead" {
         telemetry.failures.write_aead(&mut output)?;
+    } else if path == "/debug/terminal" {
+        telemetry.failures.write_protected(false, &mut output)?;
+    } else if path == "/debug/admission-final" {
+        telemetry.failures.write_protected(true, &mut output)?;
     } else if path == "/debug/failures" {
         telemetry.failures.write(&mut output)?;
     } else {
@@ -778,12 +784,93 @@ impl Failure {
 pub struct Failures(
     Arc<Mutex<Ring<(WorkerId, Failure), FAILURE_CAPACITY>>>,
     Arc<Mutex<AeadRing>>,
+    Arc<Mutex<Ring<ProtectedFailure, 64>>>,
+    Arc<Mutex<Ring<ProtectedFailure, 64>>>,
 );
+
+/// Fixed call sites, never user input or identifier labels. Admission records
+/// describe a failed Fill operation, not necessarily the final client outcome.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum FillAdmissionSite {
+    RetainedPlaintext,
+    SelectedCiphertext,
+    SelectedPlaintext,
+    LocalPlaintext,
+    DiskCiphertext,
+    NetworkPlaintext,
+    OriginCiphertext,
+    OriginPlaintext,
+    ResponsePlaintext,
+}
+#[derive(Clone, Copy)]
+struct ProtectedFailure {
+    worker: WorkerId,
+    failure: Failure,
+    site: Option<FillAdmissionSite>,
+    page: Option<u64>,
+}
 
 /// Absent in standalone components until the production composition attaches it.
 #[derive(Clone, Default)]
 pub struct Observer(Option<(Failures, WorkerId)>);
 impl Failures {
+    pub(crate) fn write_protected(
+        &self,
+        admission: bool,
+        out: &mut impl std::fmt::Write,
+    ) -> std::fmt::Result {
+        let ring = if admission { &self.3 } else { &self.2 };
+        let snapshot = ring.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        writeln!(
+            out,
+            "schema_version=1 total={} retained={} overwritten={} capacity=64 coverage={}",
+            snapshot.total(),
+            snapshot.len(),
+            snapshot.total().saturating_sub(snapshot.len() as u64),
+            if admission {
+                "fill_only"
+            } else {
+                "client_boundaries_resource_unknown"
+            }
+        )?;
+        for (sequence, record) in snapshot.iter() {
+            let failure = record.failure;
+            write!(
+                out,
+                "sequence={sequence} worker={} stage={:?} error={:?} unix_millis={} request=",
+                record.worker.0, failure.stage, failure.error, failure.unix_millis
+            )?;
+            if let Some(request) = failure.request {
+                hex(out, &request.0)?;
+            } else {
+                write!(out, "none")?;
+            }
+            write!(out, " attempt=")?;
+            if let Some(attempt) = failure.attempt {
+                hex(out, &attempt.0)?;
+            } else {
+                write!(out, "none")?;
+            }
+            writeln!(
+                out,
+                " site={:?} page={:?} facts={} detail={:?}",
+                record.site,
+                record.page,
+                if admission
+                    && matches!(
+                        failure.detail,
+                        Detail::Resource { .. } | Detail::CacheEntries { .. }
+                    )
+                {
+                    "same_call_rejection"
+                } else {
+                    "unknown"
+                },
+                failure.detail
+            )?;
+        }
+        Ok(())
+    }
     pub fn write_aead(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
         let ring = self.1.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let (total, len) = (ring.total(), ring.len());
@@ -904,14 +991,166 @@ impl Observer {
         let Some((failures, worker)) = &self.0 else {
             return;
         };
-        let mut ring = failures.0.lock().unwrap_or_else(|e| e.into_inner());
-        ring.push((*worker, failure));
+        failures
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((*worker, failure));
+        if matches!(
+            failure.stage,
+            Stage::ClientRead | Stage::FirstSlice | Stage::NextSlice | Stage::ClientWrite
+        ) {
+            failures
+                .2
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(ProtectedFailure {
+                    worker: *worker,
+                    failure,
+                    site: None,
+                    page: None,
+                });
+        }
+    }
+    pub(crate) fn final_fill_admission(
+        &self,
+        scope: &RequestScope,
+        page: Option<u64>,
+        site: FillAdmissionSite,
+        detail: Option<Detail>,
+    ) {
+        let Some((failures, worker)) = &self.0 else {
+            return;
+        };
+        failures
+            .3
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(ProtectedFailure {
+                worker: *worker,
+                failure: Failure::new(Stage::Admission, Error::Overloaded)
+                    .request(scope)
+                    .detail(detail.unwrap_or_default()),
+                site: Some(site),
+                page,
+            });
     }
     pub fn result<T>(&self, stage: Stage, scope: &RequestScope, result: Result<T>) -> Result<T> {
         if let Err(error) = &result {
             self.record(Failure::new(stage, *error).request(scope));
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod protected_failure_tests {
+    use super::*;
+    #[test]
+    fn protected_endpoints_preserve_records_and_format_outside_locks() {
+        let telemetry = Telemetry::default();
+        let observer = telemetry.failures.observer(WorkerId(3));
+        observer.record(Failure::new(Stage::ClientWrite, Error::Io));
+        struct Output<'a> {
+            failures: &'a Failures,
+            text: String,
+            fail: bool,
+        }
+        impl std::fmt::Write for Output<'_> {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                assert!(self.failures.0.try_lock().is_ok());
+                assert!(self.failures.1.try_lock().is_ok());
+                assert!(self.failures.2.try_lock().is_ok());
+                assert!(self.failures.3.try_lock().is_ok());
+                if self.fail {
+                    return Err(std::fmt::Error);
+                }
+                self.text.push_str(s);
+                Ok(())
+            }
+        }
+        let mut out = Output {
+            failures: &telemetry.failures,
+            text: String::new(),
+            fail: true,
+        };
+        assert!(get(&telemetry, "/debug/terminal", true, &mut out).is_err());
+        out.fail = false;
+        get(&telemetry, "/debug/terminal", true, &mut out).unwrap();
+        assert!(out.text.contains("schema_version=1 total=1 retained=1"));
+        assert!(out.text.contains("stage=ClientWrite error=Io"));
+        assert!(out.text.contains("facts=unknown"));
+        out.text.clear();
+        get(&telemetry, "/debug/admission-final", true, &mut out).unwrap();
+        assert!(out.text.contains("total=0 retained=0"));
+        for _ in 0..64 {
+            observer.record(Failure::new(Stage::ClientRead, Error::Unavailable));
+        }
+        out.text.clear();
+        get(&telemetry, "/debug/terminal", true, &mut out).unwrap();
+        assert!(out.text.contains("total=65 retained=64 overwritten=1"));
+        assert!(!out.text.contains("stage=ClientWrite"));
+    }
+    #[test]
+    fn terminal_and_final_fill_survive_noise_and_wrap_independently() {
+        let failures = Failures::default();
+        let observer = failures.observer(WorkerId(u16::MAX));
+        let scope = RequestScope::new(
+            RequestId([255; 16]),
+            uring_runtime::environment::now() + std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        observer.record(
+            Failure::new(Stage::NextSlice, Error::Overloaded)
+                .request(&scope)
+                .detail(Detail::Delivery {
+                    sent: u64::MAX,
+                    expected: u64::MAX,
+                }),
+        );
+        let detail = Detail::Resource {
+            class: ResourceClass::Plaintext,
+            used: usize::MAX,
+            limit: usize::MAX,
+            requested: usize::MAX,
+            cache_used: Some(usize::MAX),
+            cache_limit: Some(usize::MAX),
+        };
+        observer.final_fill_admission(
+            &scope,
+            Some(u64::MAX),
+            FillAdmissionSite::NetworkPlaintext,
+            Some(detail),
+        );
+        for _ in 0..4096 {
+            observer.record(Failure::new(Stage::Admission, Error::Overloaded));
+        }
+        for admission in [false, true] {
+            let mut output = String::new();
+            failures.write_protected(admission, &mut output).unwrap();
+            assert!(output.contains("total=1 retained=1 overwritten=0 capacity=64"));
+            assert!(output.contains(if admission {
+                "class: Plaintext"
+            } else {
+                "stage=NextSlice"
+            }));
+        }
+        for _ in 0..64 {
+            observer.final_fill_admission(
+                &scope,
+                Some(u64::MAX),
+                FillAdmissionSite::DiskCiphertext,
+                Some(detail),
+            );
+        }
+        let mut output = String::new();
+        failures.write_protected(true, &mut output).unwrap();
+        assert!(output.contains("total=65 retained=64 overwritten=1 capacity=64"));
+        assert_eq!(output.lines().count(), 65);
+        assert!(output.len() + 64 * 20 < MAX_RESPONSE_BYTES - 256);
+        output.clear();
+        failures.write_protected(false, &mut output).unwrap();
+        assert!(output.contains("total=1 retained=1 overwritten=0"));
     }
 }
 

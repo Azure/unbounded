@@ -44,6 +44,7 @@ use crate::telemetry::Event;
 use crate::telemetry::Gauge;
 use crate::telemetry::LookupTier;
 use crate::telemetry::Metrics;
+use crate::telemetry::{Detail, FillAdmissionSite};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -221,14 +222,24 @@ impl Fill {
             .admission
             .owns(&copy.ciphertext.inner.reservation)
         {
-            let reservation = self.reserve_with_reclamation(
-                &page.version.object.cache,
-                ResourceClass::Ciphertext,
-                copy.ciphertext.inner.bytes.capacity(),
+            let reservation = self.observe_reservation(
+                scope,
+                &page,
+                FillAdmissionSite::SelectedCiphertext,
+                || {
+                    self.reserve_with_reclamation(
+                        &page.version.object.cache,
+                        ResourceClass::Ciphertext,
+                        copy.ciphertext.inner.bytes.capacity(),
+                    )
+                },
             )?;
             copy.ciphertext = copy.ciphertext.rehome(reservation)?;
         }
-        let reservation = self.reserve_copy_plaintext(&page, &copy)?;
+        let reservation =
+            self.observe_reservation(scope, &page, FillAdmissionSite::SelectedPlaintext, || {
+                self.reserve_copy_plaintext(&page, &copy)
+            })?;
         let result = self
             .decrypt(&page, copy, reservation, scope, DecryptSource::Peer)
             .await?;
@@ -301,6 +312,81 @@ impl Fill {
                     .reclaim_ciphertext(owner.as_ref(), bytes - released);
             }
             result = reserve();
+        }
+        result
+    }
+
+    /// Observe mandatory acquisition only, never optional persistence or hedges.
+    pub(super) fn observe_reservation<T>(
+        &self,
+        scope: &RequestScope,
+        page: &PageId,
+        site: FillAdmissionSite,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let (result, detail) = self
+            .dependencies
+            .admission
+            .policy()
+            .capture_rejection(operation);
+        if matches!(result, Err(Error::Overloaded)) {
+            self.dependencies
+                .admission
+                .policy()
+                .observer()
+                .final_fill_admission(scope, Some(page.number.0), site, detail);
+        }
+        result
+    }
+
+    /// StoreReader retries its callback after slab reclamation. Retain facts in
+    /// this operation, never as an active policy capture across disk I/O.
+    async fn read_disk_observed(
+        &self,
+        page: &PageId,
+        scope: &RequestScope,
+    ) -> Result<Option<(crate::memory::CiphertextCopy, crate::store::ReadToken)>> {
+        self.read_disk_observed_with(page, scope, |amount| {
+            self.reserve_with_reclamation(
+                &page.version.object.cache,
+                ResourceClass::Ciphertext,
+                amount,
+            )
+        })
+        .await
+    }
+
+    pub(super) async fn read_disk_observed_with(
+        &self,
+        page: &PageId,
+        scope: &RequestScope,
+        reserve: impl Fn(usize) -> Result<flow_control::Charge<AdmissionPolicy>>,
+    ) -> Result<Option<(crate::memory::CiphertextCopy, crate::store::ReadToken)>> {
+        let rejected = std::cell::Cell::new(None::<Detail>);
+        let result = self
+            .dependencies
+            .disk
+            .read_with_token_reclaim(page, scope, |amount| {
+                let (result, detail) = self
+                    .dependencies
+                    .admission
+                    .policy()
+                    .capture_rejection(|| reserve(amount));
+                rejected.set(detail);
+                result
+            })
+            .await;
+        if matches!(result, Err(Error::Overloaded)) && rejected.get().is_some() {
+            self.dependencies
+                .admission
+                .policy()
+                .observer()
+                .final_fill_admission(
+                    scope,
+                    Some(page.number.0),
+                    FillAdmissionSite::DiskCiphertext,
+                    rejected.get(),
+                );
         }
         result
     }
@@ -582,7 +668,12 @@ impl Fill {
                         return Ok(AcquiredPage::Ciphertext(copy));
                     }
                     let result = async {
-                        let reservation = fill.reserve_copy_plaintext(&owned_page, &copy.copy)?;
+                        let reservation = fill.observe_reservation(
+                            &owned_scope,
+                            &owned_page,
+                            FillAdmissionSite::RetainedPlaintext,
+                            || fill.reserve_copy_plaintext(&owned_page, &copy.copy),
+                        )?;
                         fill.decrypt(
                             &owned_page,
                             copy.copy.clone(),
@@ -701,11 +792,14 @@ impl Fill {
         if !self.dependencies.candidates.is_candidate(&candidates) {
             return Err(Error::Unauthorized);
         }
-        let ciphertext = self.reserve_with_reclamation(
-            &page.version.object.cache,
-            ResourceClass::Ciphertext,
-            PAGE_BYTES as usize + 16,
-        )?;
+        let ciphertext =
+            self.observe_reservation(scope, page, FillAdmissionSite::OriginCiphertext, || {
+                self.reserve_with_reclamation(
+                    &page.version.object.cache,
+                    ResourceClass::Ciphertext,
+                    PAGE_BYTES as usize + 16,
+                )
+            })?;
         let dirty = match self.dependencies.admission.reserve(
             Some(&page.version.object.cache),
             ResourceClass::DirtyCiphertext,
@@ -828,17 +922,7 @@ impl Fill {
             permit.submit_detached(Box::pin(async move {
                 let _flight = flight;
                 let result = async {
-                    let Some((copy, token)) = fill
-                        .dependencies
-                        .disk
-                        .read_with_token_reclaim(&page, &owned_scope, |amount| {
-                            fill.reserve_with_reclamation(
-                                &page.version.object.cache,
-                                ResourceClass::Ciphertext,
-                                amount,
-                            )
-                        })
-                        .await?
+                    let Some((copy, token)) = fill.read_disk_observed(&page, &owned_scope).await?
                     else {
                         return Ok(None);
                     };
@@ -889,18 +973,7 @@ impl Fill {
         )?;
         let (local, token) = match local {
             Some(copy) => (Some(copy), None),
-            None => match self
-                .dependencies
-                .disk
-                .read_with_token_reclaim(page, scope, |amount| {
-                    self.reserve_with_reclamation(
-                        &page.version.object.cache,
-                        ResourceClass::Ciphertext,
-                        amount,
-                    )
-                })
-                .await
-            {
+            None => match self.read_disk_observed(page, scope).await {
                 Ok(Some((copy, token))) => (Some(copy), Some(token)),
                 Ok(None) | Err(Error::CorruptRecord | Error::MissingKey | Error::Io) => {
                     (None, None)
@@ -943,7 +1016,12 @@ impl Fill {
             };
             let result = async {
                 scope.check()?;
-                let reservation = self.reserve_copy_plaintext(page, &copy)?;
+                let reservation = self.observe_reservation(
+                    scope,
+                    page,
+                    FillAdmissionSite::LocalPlaintext,
+                    || self.reserve_copy_plaintext(page, &copy),
+                )?;
                 self.decrypt(page, copy, reservation, scope, source).await
             }
             .await;
@@ -1017,7 +1095,12 @@ impl Fill {
         // Cipher-only acquisitions reserve no plaintext until origin actually
         // supplies a page. Requester consumers still authenticate before acceptance.
         let mut plaintext = if want_plaintext {
-            Some(self.reserve_bootstrap(&context.object.cache)?)
+            Some(self.observe_reservation(
+                scope,
+                page,
+                FillAdmissionSite::NetworkPlaintext,
+                || self.reserve_bootstrap(&context.object.cache),
+            )?)
         } else {
             None
         };
@@ -1125,14 +1208,26 @@ impl Fill {
                 scope.check()?;
                 // Peer reception owns its ciphertext allocation. Reserve encryption
                 // output only when this candidate actually needs an origin fill.
-                let ciphertext = self.reserve_with_reclamation(
-                    &context.object.cache,
-                    ResourceClass::Ciphertext,
-                    PAGE_BYTES as usize + 16,
+                let ciphertext = self.observe_reservation(
+                    scope,
+                    page,
+                    FillAdmissionSite::OriginCiphertext,
+                    || {
+                        self.reserve_with_reclamation(
+                            &context.object.cache,
+                            ResourceClass::Ciphertext,
+                            PAGE_BYTES as usize + 16,
+                        )
+                    },
                 )?;
                 let plaintext = match plaintext.take() {
                     Some(reserved) => reserved,
-                    None => self.reserve_bootstrap(&context.object.cache)?,
+                    None => self.observe_reservation(
+                        scope,
+                        page,
+                        FillAdmissionSite::OriginPlaintext,
+                        || self.reserve_bootstrap(&context.object.cache),
+                    )?,
                 };
                 match self
                     .dependencies
@@ -1236,7 +1331,11 @@ impl Fill {
         })?;
         let reservation = match reservation {
             Some(reserved) => reserved,
-            None => self.reserve_copy_plaintext(page, &copy)?,
+            None => {
+                self.observe_reservation(scope, page, FillAdmissionSite::ResponsePlaintext, || {
+                    self.reserve_copy_plaintext(page, &copy)
+                })?
+            }
         };
         self.decrypt(page, copy, reservation, scope, DecryptSource::Peer)
             .await
@@ -1279,7 +1378,7 @@ impl Fill {
         source.observe(&self.metrics, result)
     }
 
-    async fn publish(
+    pub(super) async fn publish(
         &self,
         result: PageResult,
         dirty: Option<flow_control::Charge<AdmissionPolicy>>,

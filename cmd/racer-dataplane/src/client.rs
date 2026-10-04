@@ -342,6 +342,11 @@ async fn handle_read_result(
     match result {
         Ok(connection) => Ok(Some(connection)),
         Err(error) => {
+            // A nested NextSlice record may precede this generic send outcome.
+            admission.policy().observer().record(
+                crate::telemetry::Failure::new(crate::telemetry::Stage::ClientWrite, error)
+                    .request(scope),
+            );
             observation.fail(error);
             Err(error)
         }
