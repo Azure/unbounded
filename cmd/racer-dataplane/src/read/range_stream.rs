@@ -1660,7 +1660,7 @@ pub(super) mod tests {
             ));
             let mut metadata = metadata();
             metadata.length = total;
-            metadata.version.object.cache = CacheId(crate::security::test_support::CACHE.into());
+            metadata.version.object.cache = CacheId(crate::test_support::security::CACHE.into());
             let (client_socket, origin_socket) =
                 racer_control_wire::canonical_socket_paths("framing").unwrap();
             let worker = crate::test_support::ReadWorker::new(

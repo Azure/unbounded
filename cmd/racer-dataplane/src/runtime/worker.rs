@@ -154,7 +154,7 @@ impl<'a> WorkerGroup<'a> {
         factory: Arc<dyn WorkerFactory + Send>,
         scope: &RequestScope,
     ) -> Result<()> {
-        self.start_with_allocator(factory, scope, crypto::try_pair)
+        self.start_with_allocator(factory, scope, security::try_pair)
     }
 
     fn start_with_allocator(
@@ -262,7 +262,7 @@ impl<'a> WorkerGroup<'a> {
         scope: &RequestScope,
         check_scope: bool,
     ) -> Result<()> {
-        self.run_with_allocator(factory, scope, check_scope, crypto::try_pair)
+        self.run_with_allocator(factory, scope, check_scope, security::try_pair)
     }
 
     fn run_with_allocator(
@@ -597,9 +597,9 @@ mod shared_tests {
     use crate::memory::BufferPool;
     use crate::model::ResourceClass;
     use crate::model::*;
-    use crate::runtime::crypto::CryptoInput;
-    use crate::runtime::crypto::CryptoOutput;
-    use crate::security::aead::PageCryptoEngine;
+    use crate::security::CryptoInput;
+    use crate::security::CryptoOutput;
+    use crate::security::PageCryptoEngine;
     use racer_identity::KeyPurpose;
     use racer_identity::Keyring;
     use std::sync::atomic::AtomicBool;
@@ -689,7 +689,7 @@ mod shared_tests {
                 worker,
                 runtime,
                 observed: self.observed.clone(),
-                keys: crate::security::test_support::keys(),
+                keys: crate::test_support::security::keys(),
                 failure: self.failure,
                 jobs: self.jobs,
                 roundtrip: self.roundtrip,
@@ -743,7 +743,7 @@ mod shared_tests {
 
     impl Io {
         fn input(&self) -> CryptoInput {
-            let cache = CacheId(crate::security::test_support::CACHE.into());
+            let cache = CacheId(crate::test_support::security::CACHE.into());
             CryptoInput::Encrypt {
                 page: PageId {
                     version: ObjectVersion {
@@ -778,7 +778,7 @@ mod shared_tests {
             Box::pin(async move {
                 self.observed.event(self.worker, "io-start");
                 if self.roundtrip {
-                    let cache = CacheId(crate::security::test_support::CACHE.into());
+                    let cache = CacheId(crate::test_support::security::CACHE.into());
                     let key = self.keys.active(&cache, KeyPurpose::Page)?;
                     let CryptoOutput::Encrypted(plain, ciphertext) = self
                         .runtime
@@ -813,7 +813,7 @@ mod shared_tests {
                         let key = self
                             .keys
                             .active(
-                                &CacheId(crate::security::test_support::CACHE.into()),
+                                &CacheId(crate::test_support::security::CACHE.into()),
                                 KeyPurpose::Page,
                             )
                             .unwrap();
@@ -1200,7 +1200,7 @@ mod shared_tests {
             let allocate = move |worker, generation, capacity| {
                 assert!(allocator_observed.events.lock().unwrap().is_empty());
                 if worker == WorkerId(0) {
-                    return crypto::try_pair(worker, generation, capacity);
+                    return security::try_pair(worker, generation, capacity);
                 }
                 Err(Error::Overloaded)
             };
@@ -1620,7 +1620,7 @@ mod tests {
             }
         }
         let (_, factory) = fixture(3);
-        let (io, port) = crypto::pair(WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
+        let (io, port) = security::pair(WorkerId(0), 1, NonZeroUsize::new(1).unwrap());
         let mut engine = TestCrypto {
             factory,
             _port: port,
@@ -1923,7 +1923,7 @@ mod tests {
             &scope,
             |worker, generation, capacity| {
                 if worker == WorkerId(0) {
-                    return crypto::try_pair(worker, generation, capacity);
+                    return security::try_pair(worker, generation, capacity);
                 }
                 // All endpoints are allocated before any owning thread starts.
                 Err(Error::Overloaded)
@@ -1952,7 +1952,7 @@ mod tests {
         let result =
             scoped.run_with_allocator(&factory, &scope, false, |worker, generation, capacity| {
                 if worker == WorkerId(0) {
-                    return crypto::try_pair(worker, generation, capacity);
+                    return security::try_pair(worker, generation, capacity);
                 }
                 Err(Error::Overloaded)
             });

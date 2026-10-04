@@ -54,7 +54,7 @@ pub struct PeerServer {
     send_crc: Option<(
         crate::telemetry::Pair,
         crate::telemetry::Samples,
-        Rc<crate::security::aead::PageCrypto>,
+        Rc<crate::security::PageCrypto>,
     )>,
     subscriptions: std::sync::Arc<super::subscriptions::Subscriptions>,
     placement: crate::topology::Placement,
@@ -87,7 +87,7 @@ impl PeerServer {
         mut self,
         pair: Option<crate::telemetry::Pair>,
         samples: crate::telemetry::Samples,
-        crypto: Rc<crate::security::aead::PageCrypto>,
+        crypto: Rc<crate::security::PageCrypto>,
     ) -> Self {
         self.send_crc = pair.map(|pair| (pair, samples, crypto));
         self
@@ -1516,7 +1516,7 @@ mod tests {
                     SimulationClock::new_at(83, Instant::now(), std::time::SystemTime::now());
                 let environment = clock.environment(0);
                 let _guard = environment.enter();
-                let signers = crate::security::test_support::network(2);
+                let signers = crate::test_support::security::network(2);
                 let mut limits = crate::test_support::cluster::config(false).limits;
                 limits.client_connections = std::num::NonZeroUsize::new(1).unwrap();
                 let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));

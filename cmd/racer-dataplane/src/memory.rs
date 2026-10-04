@@ -768,7 +768,7 @@ pub(crate) mod tests {
                 content_type: None,
                 version: ObjectVersion {
                     object: ObjectId {
-                        cache: CacheId(crate::security::test_support::CACHE.into()),
+                        cache: CacheId(crate::test_support::security::CACHE.into()),
                         key: CacheKey([0; 32]),
                     },
                     etag: StrongEtag::test_value(version),
@@ -897,7 +897,7 @@ pub(crate) mod tests {
     #[test]
     fn aead_fingerprints_reuse_crc_and_separate_body_from_identity() {
         use crate::model::RequestId;
-        use crate::security::aead::capture_aead_failure;
+        use crate::security::capture_aead_failure;
         let admission = admission(8);
         let mut page = bundle(&admission, "sensitive-etag");
         let request = RequestId([9; 16]);
@@ -977,7 +977,7 @@ pub(crate) mod tests {
         assert_ne!(changed.aad, changed_aad.aad);
         let failures = crate::telemetry::Failures::default();
         failures.observer(crate::model::WorkerId(0)).record_aead(
-            crate::runtime::crypto::CryptoId {
+            crate::security::CryptoId {
                 worker: crate::model::WorkerId(0),
                 generation: 0,
                 sequence: 1,

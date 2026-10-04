@@ -46,15 +46,15 @@ use racer_dataplane::read::metadata::MetadataService;
 use racer_dataplane::read::range_stream::RangeStreams;
 use racer_dataplane::runtime::Reactor;
 use racer_dataplane::runtime::RequestScope;
-use racer_dataplane::runtime::crypto;
-use racer_dataplane::runtime::crypto::CryptoClient;
+use racer_dataplane::security;
+use racer_dataplane::security::CryptoClient;
 use racer_dataplane::runtime::worker::CryptoRuntime;
 
 use racer_dataplane::peer::forwarding::Forwarding;
 use racer_dataplane::peer::protocol::Signatures;
-use racer_dataplane::security::aead::PageCrypto;
-use racer_dataplane::security::aead::PageCryptoEngine;
-use racer_dataplane::security::credentials::CredentialCrypto;
+use racer_dataplane::security::PageCrypto;
+use racer_dataplane::security::PageCryptoEngine;
+use racer_dataplane::security::CredentialCrypto;
 
 use racer_dataplane::store::StoreReader;
 use racer_dataplane::store::StoreWriter;
@@ -534,7 +534,7 @@ impl Rig {
         let (crypto, engine) = match runtime {
             Some(runtime) => (runtime.crypto, None),
             None => {
-                let (port, engine) = crypto::pair(WorkerId(0), 0, nz(64));
+                let (port, engine) = security::pair(WorkerId(0), 0, nz(64));
                 (
                     Rc::new(CryptoClient::new(port)),
                     Some(RefCell::new(PageCryptoEngine::new(CryptoRuntime {
@@ -959,7 +959,7 @@ impl Bootstrap {
                     racer_crypto::aead::open(
                         &[7; 32],
                         &page.envelope().nonce.0,
-                        &racer_dataplane::security::aead::page_aad(page.envelope())?,
+                        &racer_dataplane::security::page_aad(page.envelope())?,
                         page.bytes(),
                         &mut body,
                     )

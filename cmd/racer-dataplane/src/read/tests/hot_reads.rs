@@ -16,8 +16,8 @@ use crate::peer::protocol::Signatures;
 use crate::peer::server::LocalPageService;
 use crate::peer::server::PeerServer;
 use crate::read::Coordinator;
-use crate::security::test_support::network;
-use crate::security::test_support::node;
+use crate::test_support::security::network;
+use crate::test_support::security::node;
 use crate::topology::LinkHealth;
 use crate::topology::Paths;
 mod duplex_release {

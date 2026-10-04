@@ -40,7 +40,6 @@ impl std::hash::BuildHasher for HashState {
         }
     }
 }
-pub mod crypto;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;

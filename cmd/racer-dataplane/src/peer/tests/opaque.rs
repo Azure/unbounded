@@ -366,12 +366,12 @@ mod materialized_pairing {
 mod safety {
     //! Opaque transit keeps deadline and endpoint authentication safety boundaries.
     use super::*;
-    use crate::runtime::crypto;
-    use crate::runtime::crypto::CryptoClient;
+    use crate::security;
+    use crate::security::CryptoClient;
     use crate::runtime::worker::CryptoRuntime;
 
-    use crate::security::aead::PageCrypto;
-    use crate::security::aead::PageCryptoEngine;
+    use crate::security::PageCrypto;
+    use crate::security::PageCryptoEngine;
     use crate::telemetry::Event;
     use crate::telemetry::Metrics;
     use racer_control_wire::CacheEncryptionKey;
@@ -565,11 +565,11 @@ mod safety {
         let relay_metrics = Metrics::default();
         f.server = f.server.with_metrics(relay_metrics.clone());
         assert!(f.server.opaque_relay());
-        let identities = crate::security::test_support::identities(
+        let identities = crate::test_support::security::identities(
             ClusterId(CLUSTER.into()),
             &[NodeId(A.into()), NodeId(C.into())],
             || {
-                let mut keys = crate::security::test_support::mac_test_key(CACHE);
+                let mut keys = crate::test_support::security::mac_test_key(CACHE);
                 keys.push(CacheEncryptionKey::new(
                     CacheKeyRef {
                         cache: CacheId(CACHE.into()),
@@ -587,7 +587,7 @@ mod safety {
         let mut cryptos = Vec::new();
         let engines = RefCell::new(Vec::new());
         for (index, identity) in identities.iter().enumerate() {
-            let (io, port) = crypto::pair(
+            let (io, port) = security::pair(
                 WorkerId(index as u16),
                 1,
                 std::num::NonZeroUsize::new(4).unwrap(),
@@ -901,9 +901,9 @@ struct RelayFixture {
 
 #[test]
 fn send_crc_http_success_failure_drop_do_not_wait_for_crypto() {
-    use crate::runtime::crypto::CryptoClient;
-    use crate::runtime::crypto::pair;
-    use crate::security::aead::PageCrypto;
+    use crate::security::CryptoClient;
+    use crate::security::pair;
+    use crate::security::PageCrypto;
     use crate::telemetry::Pair;
     use crate::telemetry::Samples;
     for mode in ["success", "failure", "drop"] {

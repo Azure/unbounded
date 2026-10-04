@@ -12,10 +12,10 @@ use crate::peer::protocol as p;
 mod signature_tests {
     use super::p as protocol;
     use super::*;
-    use crate::security::test_support::clone_head;
-    use crate::security::test_support::mac_test_keys;
-    use crate::security::test_support::network;
-    use crate::security::test_support::node;
+    use crate::test_support::security::clone_head;
+    use crate::test_support::security::mac_test_keys;
+    use crate::test_support::security::network;
+    use crate::test_support::security::node;
     use std::time::SystemTime;
 
     fn head(receiver: usize) -> MessageHead {
@@ -349,7 +349,7 @@ pub(crate) mod tests {
             .0
     }
     pub(crate) fn pair() -> (Session, Session) {
-        let n = crate::security::test_support::network(3);
+        let n = crate::test_support::security::network(3);
         let id = random().unwrap();
         (
             Session::new(n[0].clone(), n[1].node().clone(), id, 0),
@@ -544,7 +544,7 @@ pub(crate) mod tests {
 
     #[test]
     fn loopback_mutual_authentication_pool_reuse_and_fresh_reconnect() {
-        let n = crate::security::test_support::network(2);
+        let n = crate::test_support::security::network(2);
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
@@ -613,7 +613,7 @@ pub(crate) mod tests {
     }
     #[test]
     pub(crate) fn signed_challenges_bind_both_identities_protocol_and_fresh_randomness() {
-        let n = crate::security::test_support::network(3);
+        let n = crate::test_support::security::network(3);
         let a = random().unwrap();
         let b = random().unwrap();
         assert_ne!(a, random().unwrap());
@@ -659,7 +659,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn handshake_codec_bounds() {
-        let n = crate::security::test_support::network(2);
+        let n = crate::test_support::security::network(2);
         let h = head(
             &n[1],
             n[0].node(),
@@ -690,7 +690,7 @@ pub(crate) mod tests {
     #[test]
     fn socket_admission_rejects_replay_before_dispatch_and_closes_pool_slot() {
         use uring_runtime::reactor::IoBuffer;
-        let n = crate::security::test_support::network(2);
+        let n = crate::test_support::security::network(2);
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
@@ -737,7 +737,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn handshake_cancel_expiry_and_abandonment_retain_only_fenced_admissions() {
-        let n = crate::security::test_support::network(2);
+        let n = crate::test_support::security::network(2);
         for end in ["cancel", "expiry", "drop"] {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,

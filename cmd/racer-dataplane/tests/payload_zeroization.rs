@@ -187,11 +187,11 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
     use racer_dataplane::model::RequestId;
     use racer_dataplane::model::WorkerId;
     use racer_dataplane::runtime::RequestScope;
-    use racer_dataplane::runtime::crypto::CryptoId;
-    use racer_dataplane::runtime::crypto::CryptoInput;
-    use racer_dataplane::runtime::crypto::pair;
-    use racer_dataplane::security::aead::PageCryptoEngine;
-    use racer_dataplane::security::aead::page_aad;
+    use racer_dataplane::security::CryptoId;
+    use racer_dataplane::security::CryptoInput;
+    use racer_dataplane::security::pair;
+    use racer_dataplane::security::PageCryptoEngine;
+    use racer_dataplane::security::page_aad;
     use racer_identity::KeyEpochs;
     use racer_identity::KeyPurpose;
     use racer_identity::Keyring;

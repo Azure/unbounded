@@ -224,13 +224,13 @@ fn mac_base(head: &MessageHead) -> Result<Vec<u8>> {
         StartLine::Request { method, target } => format!("{method} {target}"),
         _ => return Err(Error::Unauthorized),
     };
-    crate::security::aead::field(&mut out, start.as_bytes())?;
+    crate::security::field(&mut out, start.as_bytes())?;
     for name in components(head)? {
         if name.starts_with('@') || name == "racer-request-mac" {
             continue;
         }
-        crate::security::aead::field(&mut out, name.as_bytes())?;
-        crate::security::aead::field(&mut out, head.unique(&name)?.ok_or(Error::Unauthorized)?)?;
+        crate::security::field(&mut out, name.as_bytes())?;
+        crate::security::field(&mut out, head.unique(&name)?.ok_or(Error::Unauthorized)?)?;
     }
     Ok(out)
 }
@@ -1488,7 +1488,7 @@ mod envelope_tests {
     }
     #[test]
     fn maximum_signed_heads_and_hop_count_fit_outer_signature_profile() {
-        let signers = crate::security::test_support::network(2);
+        let signers = crate::test_support::security::network(2);
         let mut head = MessageHead {
             start: StartLine::Response { status: 200 },
             headers: vec![
@@ -1767,7 +1767,7 @@ mod metadata_tests {
             content_type: None,
             version: ObjectVersion {
                 object: ObjectId {
-                    cache: CacheId(crate::security::test_support::CACHE.into()),
+                    cache: CacheId(crate::test_support::security::CACHE.into()),
                     key: CacheKey([0; 32]),
                 },
                 etag: StrongEtag::test_value("v1"),
@@ -1775,7 +1775,7 @@ mod metadata_tests {
             length: 17,
             expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
         };
-        let path = [NodeId(crate::security::test_support::NODE.into())];
+        let path = [NodeId(crate::test_support::security::NODE.into())];
         for typed in [false, true] {
             if typed {
                 m.content_type =
@@ -2132,8 +2132,8 @@ mod canonical_tests {
         push(&mut head, "n", "01");
         assert!(number(&head, "n").is_err());
         let nodes = vec![
-            crate::security::test_support::node(1),
-            crate::security::test_support::node(2),
+            crate::test_support::security::node(1),
+            crate::test_support::security::node(2),
         ];
         assert_eq!(
             decode_nodes(super::nodes(&nodes).unwrap().as_bytes()).unwrap(),

@@ -17,13 +17,13 @@ use racer_dataplane::model::ResourceClass;
 use racer_dataplane::model::StrongEtag;
 use racer_dataplane::model::WorkerId;
 use racer_dataplane::runtime::RequestScope;
-use racer_dataplane::runtime::crypto;
-use racer_dataplane::runtime::crypto::CryptoClient;
-use racer_dataplane::runtime::crypto::CryptoInput;
-use racer_dataplane::runtime::crypto::CryptoOutput;
+use racer_dataplane::security;
+use racer_dataplane::security::CryptoClient;
+use racer_dataplane::security::CryptoInput;
+use racer_dataplane::security::CryptoOutput;
 use racer_dataplane::runtime::worker::CryptoRuntime;
 
-use racer_dataplane::security::aead::PageCryptoEngine;
+use racer_dataplane::security::PageCryptoEngine;
 use racer_identity::KeyEpochs;
 use racer_identity::KeyPurpose;
 use racer_identity::Keyring;
@@ -146,7 +146,7 @@ fn active_crypto_operation_completes_after_rotation_with_its_original_key_lease(
         config.limits,
     )));
     let pool = BufferPool::new(admission.clone());
-    let (io, engine) = crypto::pair(WorkerId(0), 0, std::num::NonZeroUsize::new(8).unwrap());
+    let (io, engine) = security::pair(WorkerId(0), 0, std::num::NonZeroUsize::new(8).unwrap());
     let client = CryptoClient::new(io);
     let mut engine = PageCryptoEngine::new(CryptoRuntime { port: engine });
     let mut plaintext = pool
@@ -208,7 +208,7 @@ fn active_crypto_operation_completes_after_rotation_with_its_original_key_lease(
     racer_crypto::aead::open(
         &[7; 32],
         &ciphertext.envelope().nonce.0,
-        &racer_dataplane::security::aead::page_aad(ciphertext.envelope()).unwrap(),
+        &racer_dataplane::security::page_aad(ciphertext.envelope()).unwrap(),
         ciphertext.bytes(),
         &mut opened,
     )

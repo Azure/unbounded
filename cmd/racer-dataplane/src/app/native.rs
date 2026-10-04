@@ -207,8 +207,8 @@ mod tests {
     use super::*;
     use crate::model::MembershipVersion;
     use crate::model::ResourceClass;
-    use crate::runtime::crypto;
-    use crate::runtime::crypto::CryptoClient;
+    use crate::security;
+    use crate::security::CryptoClient;
     use racer_control_wire::Publication;
     use racer_control_wire::PublicationSequence;
     use racer_control_wire::RailId;
@@ -800,7 +800,7 @@ mod tests {
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             app.limits.clone(),
         )));
-        let (io, engine) = crypto::pair(WorkerId(0), 0, app.limits.queue_entries);
+        let (io, engine) = security::pair(WorkerId(0), 0, app.limits.queue_entries);
         let runtime = WorkerRuntime {
             reactor: Rc::new(Reactor::new(admission.clone())),
             admission,

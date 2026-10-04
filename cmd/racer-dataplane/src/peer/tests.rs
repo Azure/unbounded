@@ -981,13 +981,13 @@ mod encrypted_http {
     use crate::http::Endpoint;
     use crate::memory::CiphertextPage;
     use crate::runtime::Reactor;
-    use crate::runtime::crypto;
-    use crate::runtime::crypto::CryptoClient;
+    use crate::security;
+    use crate::security::CryptoClient;
     use crate::runtime::worker::CryptoRuntime;
 
     use crate::rdma::TransportPlan;
-    use crate::security::aead::PageCrypto;
-    use crate::security::aead::PageCryptoEngine;
+    use crate::security::PageCrypto;
+    use crate::security::PageCryptoEngine;
     use crate::telemetry::Event;
     use crate::telemetry::Metrics;
     use racer_control_wire::CacheEncryptionKey;
@@ -1029,11 +1029,11 @@ mod encrypted_http {
     #[test]
     fn production_aad_http_roundtrip_cancel_reuse_and_mismatched_body() {
         // Each identity owns a different KeyEpochs store, populated from equal bundles.
-        let identities = crate::security::test_support::identities(
+        let identities = crate::test_support::security::identities(
             ClusterId(CLUSTER.into()),
             &[NodeId(A.into()), NodeId(C.into())],
             || {
-                let mut keys = crate::security::test_support::mac_test_key(CACHE);
+                let mut keys = crate::test_support::security::mac_test_key(CACHE);
                 keys.push(CacheEncryptionKey::new(
                     CacheKeyRef {
                         cache: CacheId(CACHE.into()),
@@ -1060,7 +1060,7 @@ mod encrypted_http {
         let mut cryptos = Vec::new();
         let metrics = Metrics::default();
         for (i, identity) in identities.iter().enumerate() {
-            let (io, port) = crypto::pair(
+            let (io, port) = security::pair(
                 WorkerId(i as u16),
                 1,
                 std::num::NonZeroUsize::new(4).unwrap(),
@@ -2374,7 +2374,7 @@ mod subscriptions {
             .unwrap();
         let admitted = destination.verify_request(request).unwrap();
         let keys = &discovery[2].0;
-        let mut replacement = crate::security::test_support::mac_test_key(CACHE);
+        let mut replacement = crate::test_support::security::mac_test_key(CACHE);
         for key in &mut replacement {
             key.key.id.0[4..12].copy_from_slice(&2u64.to_be_bytes());
             let (reference, state, mut material) = key.clone().into_installation();
@@ -2809,10 +2809,10 @@ const CACHE: &str = "cccccccc-1111-4111-8111-111111111111";
 const CLUSTER: &str = "dddddddd-1111-4111-8111-111111111111";
 type Discovery = (Rc<Keyring>, Rc<Certificates>);
 fn identities() -> (Vec<Rc<Signatures>>, Vec<Discovery>) {
-    crate::security::test_support::identities(
+    crate::test_support::security::identities(
         ClusterId(CLUSTER.into()),
         &[A, B, C].map(|name| NodeId(name.into())),
-        || crate::security::test_support::mac_test_key(CACHE),
+        || crate::test_support::security::mac_test_key(CACHE),
     )
     .into_iter()
     .map(|identity| (identity.signatures, (identity.keys, identity.certificates)))

@@ -5,8 +5,8 @@ use crate::model::NodeId;
 use crate::peer::forwarding::Forwarding;
 use crate::peer::forwarding::VerifiedResponse;
 use crate::peer::protocol::PeerRequest;
-use crate::security::test_support::network;
-use crate::security::test_support::node;
+use crate::test_support::security::network;
+use crate::test_support::security::node;
 use std::collections::VecDeque;
 
 enum Reply {

@@ -15,7 +15,7 @@ use uring_runtime::deadline::Deadline;
 use uring_runtime::group::Service;
 
 use crate::peer::protocol::VerifiedHead;
-use crate::security::aead::PageCryptoEngine;
+use crate::security::PageCryptoEngine;
 use crate::topology::FAILURE_LINKS;
 use crate::topology::Route;
 use base64::Engine;
@@ -1484,9 +1484,9 @@ pub(crate) mod tests {
             use crate::model::ClusterId;
             use crate::peer::protocol::Signatures;
             use crate::peer::protocol::SignedHead;
-            use crate::security::test_support::CLUSTER;
-            use crate::security::test_support::NODE;
-            use crate::security::test_support::issued;
+            use crate::test_support::security::CLUSTER;
+            use crate::test_support::security::NODE;
+            use crate::test_support::security::issued;
             use http1::Header;
             use http1::MessageHead;
             use http1::StartLine;
@@ -2208,7 +2208,7 @@ pub(crate) mod tests {
             use super::*;
             use crate::admission::AdmissionPolicy;
             use crate::model::*;
-            use crate::security::test_support::network;
+            use crate::test_support::security::network;
             use rdma_verbs::testing::Contention;
             use rdma_verbs::testing::State;
             use std::time::Duration;
@@ -2802,10 +2802,10 @@ pub(crate) mod tests {
             use super::*;
             use crate::admission::AdmissionPolicy;
             use crate::model::*;
-            use crate::runtime::crypto;
+            use crate::security;
             use crate::runtime::worker::CryptoRuntime;
 
-            use crate::security::aead::PageCryptoEngine;
+            use crate::security::PageCryptoEngine;
             use racer_identity::KeyPurpose;
             use rdma_verbs::testing::Contention;
             use rdma_verbs::testing::State;
@@ -2947,11 +2947,11 @@ pub(crate) mod tests {
                 native.poll_budgeted(0).unwrap();
                 assert!(sim.trace().is_empty());
                 assert_eq!(admission.used(ResourceClass::Registered), 4 * 8192);
-                let keys = crate::security::test_support::keys();
+                let keys = crate::test_support::security::keys();
                 let page = PageId {
                     version: ObjectVersion {
                         object: ObjectId {
-                            cache: CacheId(crate::security::test_support::CACHE.into()),
+                            cache: CacheId(crate::test_support::security::CACHE.into()),
                             key: CacheKey([3; 32]),
                         },
                         etag: StrongEtag::test_value("v1"),
@@ -2964,12 +2964,12 @@ pub(crate) mod tests {
                 )));
                 let pool = BufferPool::new(sibling_admission.clone());
                 let (io, port) =
-                    crypto::pair(WorkerId(1), 1, std::num::NonZeroUsize::new(1).unwrap());
+                    security::pair(WorkerId(1), 1, std::num::NonZeroUsize::new(1).unwrap());
                 let mut sibling = PageCryptoEngine::new(CryptoRuntime { port });
                 for turn in 0..5 {
                     let Poll::Ready(Ok(permit)) = io.poll_reserve(
                         &mut cx,
-                        crypto::CryptoId {
+                        security::CryptoId {
                             worker: WorkerId(1),
                             generation: 1,
                             sequence: turn + 1,
@@ -2980,7 +2980,7 @@ pub(crate) mod tests {
                     assert!(
                         io.try_submit(
                             permit.job(
-                                crypto::CryptoInput::Encrypt {
+                                security::CryptoInput::Encrypt {
                                     page: page.clone(),
                                     plaintext: pool
                                         .plaintext(
@@ -3022,7 +3022,7 @@ pub(crate) mod tests {
                     };
                     assert!(matches!(
                         completion.outcome,
-                        crypto::CryptoOutcome::Completed(_)
+                        security::CryptoOutcome::Completed(_)
                     ));
                     drop(completion);
                     assert_eq!(sibling_admission.used(ResourceClass::Plaintext), 0);
@@ -3150,7 +3150,7 @@ pub(crate) mod tests {
                 ));
                 let scope = super::scope();
                 let (io, port) =
-                    crypto::pair(WorkerId(0), 1, std::num::NonZeroUsize::new(1).unwrap());
+                    security::pair(WorkerId(0), 1, std::num::NonZeroUsize::new(1).unwrap());
                 io.close_submissions().unwrap();
                 let mut service = {
                     let _environment = sim.enter();

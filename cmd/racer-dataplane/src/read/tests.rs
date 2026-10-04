@@ -1016,7 +1016,7 @@ mod flight {
             page: PageId {
                 version: ObjectVersion {
                     object: ObjectId {
-                        cache: CacheId(crate::security::test_support::CACHE.into()),
+                        cache: CacheId(crate::test_support::security::CACHE.into()),
                         key: CacheKey([0; 32]),
                     },
                     etag: StrongEtag::test_value("v1"),
@@ -1130,7 +1130,7 @@ mod timeouts {
     use crate::read::candidates::*;
     use crate::read::flight::AcquisitionBudget;
     use crate::runtime::RequestScope;
-    use crate::security::test_support::network;
+    use crate::test_support::security::network;
     use crate::topology::Candidates;
     use crate::topology::Member;
     use crate::topology::Membership;

@@ -26,8 +26,8 @@ use crate::read::dispatch::WorkerMap;
 use crate::read::flight::AcquisitionBudget;
 use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
-use crate::security::credentials::CredentialCrypto;
-use crate::security::test_support::Identity;
+use crate::security::CredentialCrypto;
+use crate::test_support::security::Identity;
 use crate::test_support::origin::AdapterOrigin;
 use crate::topology::LinkHealth;
 use crate::topology::Member;
@@ -53,8 +53,8 @@ fn node(n: usize) -> NodeId {
     NodeId(format!("22222222-2222-4222-8222-{n:012}"))
 }
 fn identities(nodes: &[NodeId]) -> Vec<Identity> {
-    crate::security::test_support::identities(ClusterId(CLUSTER.into()), nodes, || {
-        let mut keys = crate::security::test_support::mac_test_key(CACHE);
+    crate::test_support::security::identities(ClusterId(CLUSTER.into()), nodes, || {
+        let mut keys = crate::test_support::security::mac_test_key(CACHE);
         keys.push(racer_control_wire::CacheEncryptionKey::new(
             racer_control_wire::CacheKeyRef {
                 cache: CacheId(CACHE.into()),
@@ -892,9 +892,9 @@ fn metadata_coordinator_with_newer_publication(
     use crate::http::Delivery;
     use crate::http::new_pipe_pool;
     use crate::memory::MemoryCache;
-    use crate::runtime::crypto;
-    use crate::runtime::crypto::CryptoClient;
-    use crate::security::aead::PageCrypto;
+    use crate::security;
+    use crate::security::CryptoClient;
+    use crate::security::PageCrypto;
     use crate::store::StoreReader;
     use crate::store::StoreWriter;
     use crate::store::catalog::Index;
@@ -981,7 +981,7 @@ fn metadata_coordinator_with_newer_publication(
         )
         .unwrap(),
     );
-    let (port, _engine) = crypto::pair(WorkerId(0), 0, std::num::NonZeroUsize::new(16).unwrap());
+    let (port, _engine) = security::pair(WorkerId(0), 0, std::num::NonZeroUsize::new(16).unwrap());
     let fill = Rc::new(crate::read::fill::Fill::new(
         crate::read::fill::FillDependencies {
             memory: Rc::new(MemoryCache::new(buffers.clone(), availability.clone())),

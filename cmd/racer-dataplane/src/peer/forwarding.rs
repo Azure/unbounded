@@ -843,9 +843,9 @@ mod tests {
     use crate::peer::protocol::FetchMode;
     use crate::peer::protocol::Operation;
     use crate::runtime::RequestScope;
-    use crate::security::test_support::clone_head;
-    use crate::security::test_support::network;
-    use crate::security::test_support::node;
+    use crate::test_support::security::clone_head;
+    use crate::test_support::security::network;
+    use crate::test_support::security::node;
     use std::time::Duration;
     use std::time::Instant;
     fn wire_ciphertext(envelope: PageEnvelope, length: usize) -> crate::memory::CiphertextPage {

@@ -20,15 +20,15 @@ use crate::read::metadata::MetadataDependencies;
 use crate::read::metadata::MetadataService;
 use crate::read::range_stream::RangeStreams;
 use crate::runtime::Reactor;
-use crate::runtime::crypto;
-use crate::runtime::crypto::CryptoClient;
+use crate::security;
+use crate::security::CryptoClient;
 use crate::runtime::worker::CryptoRuntime;
 use racer_control_wire::CacheDefinition;
 use racer_control_wire::Publication;
 
-use crate::security::aead::PageCrypto;
-use crate::security::aead::PageCryptoEngine;
-use crate::security::credentials::CredentialCrypto;
+use crate::security::PageCrypto;
+use crate::security::PageCryptoEngine;
+use crate::security::CredentialCrypto;
 use crate::store::StoreReader;
 use crate::store::StoreWriter;
 use crate::store::catalog::Index;
@@ -547,14 +547,14 @@ pub mod origin {
 /// rotating keys or publications should share their own Availability instead.
 pub fn availability() -> std::rc::Rc<crate::control::Availability> {
     availability_for(vec![crate::model::CacheId(
-        crate::security::test_support::CACHE.into(),
+        crate::test_support::security::CACHE.into(),
     )])
 }
 pub fn availability_for(
     caches: Vec<crate::model::CacheId>,
 ) -> std::rc::Rc<crate::control::Availability> {
     crate::control::for_caches(
-        std::rc::Rc::new(crate::security::test_support::keys_for(&caches)),
+        std::rc::Rc::new(crate::test_support::security::keys_for(&caches)),
         caches,
     )
 }
@@ -702,7 +702,7 @@ impl ReadWorker {
         window: usize,
     ) -> Self {
         let origin = AdapterOrigin::new(&cache.name, metadata);
-        let keys = Rc::new(crate::security::test_support::keys());
+        let keys = Rc::new(crate::test_support::security::keys());
         let publications = Arc::new(PublishedState::default());
         let availability = Rc::new(crate::control::Availability::new(
             publications.clone(),
@@ -760,7 +760,7 @@ impl ReadWorker {
             reactor.clone(),
             buffers.clone(),
         ));
-        let (port, engine) = crypto::pair(WorkerId(0), 0, std::num::NonZeroUsize::new(16).unwrap());
+        let (port, engine) = security::pair(WorkerId(0), 0, std::num::NonZeroUsize::new(16).unwrap());
         let crypto = Rc::new(CryptoClient::new(port));
         let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
         let candidates = Rc::new(CandidatePolicy::new(
@@ -844,3 +844,4 @@ impl ReadWorker {
         self.memory.remove_cache(&self.cache).unwrap();
     }
 }
+pub(crate) mod security;

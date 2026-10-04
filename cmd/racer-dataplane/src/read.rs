@@ -24,8 +24,8 @@ use crate::peer::protocol::Operation as PeerOperation;
 use crate::peer::protocol::PeerResponse;
 use crate::peer::server::LocalPageService;
 use crate::runtime::RequestScope;
-use crate::security::credentials::ChargedOriginContext;
-use crate::security::credentials::CredentialCrypto;
+use crate::security::ChargedOriginContext;
+use crate::security::CredentialCrypto;
 
 use std::rc::Rc;
 pub mod candidates;

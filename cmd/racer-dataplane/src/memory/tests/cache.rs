@@ -217,7 +217,7 @@ fn eviction_is_cache_scoped_and_preserves_live_leases() {
     let admission = admission(8);
     let other_cache = CacheId("44444444-4444-4444-8444-444444444444".into());
     let availability = crate::test_support::availability_for(vec![
-        CacheId(crate::security::test_support::CACHE.into()),
+        CacheId(crate::test_support::security::CACHE.into()),
         other_cache.clone(),
     ]);
     let cache = MemoryCache::new(BufferPool::new(admission.clone()), availability);
@@ -261,9 +261,9 @@ fn eviction_is_idempotent_and_churn_needs_no_tombstones() {
 #[test]
 fn empty_stable_catalog_rotates_without_consuming_page_metadata_capacity() {
     use crate::control::for_caches;
-    use crate::security::test_support::rotation_bundle;
+    use crate::test_support::security::rotation_bundle;
     let admission = admission(1024);
-    let keys = Rc::new(crate::security::test_support::keys());
+    let keys = Rc::new(crate::test_support::security::keys());
     let roots = (*keys.peer_trust_roots().unwrap()).clone();
     let caches: Vec<_> = (0..356)
         .map(|cache| CacheId(format!("{cache:08x}-0000-4000-8000-000000000000")))

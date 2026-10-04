@@ -77,9 +77,9 @@ use crate::runtime::worker::WorkerRuntime;
 
 use crate::peer::forwarding::Forwarding;
 use crate::peer::protocol::Signatures;
-use crate::security::aead::PageCrypto;
-use crate::security::aead::PageCryptoEngine;
-use crate::security::credentials::CredentialCrypto;
+use crate::security::PageCrypto;
+use crate::security::PageCryptoEngine;
+use crate::security::CredentialCrypto;
 
 use crate::store::Store;
 use crate::store::StoreReader;

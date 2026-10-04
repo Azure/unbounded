@@ -811,7 +811,7 @@ fn limits() -> Limits {
 }
 fn definition() -> CacheDefinition {
     CacheDefinition {
-        id: CacheId(crate::security::test_support::CACHE.into()),
+        id: CacheId(crate::test_support::security::CACHE.into()),
         name: "example".into(),
         client_socket: "/run/racer/example/client/socket".into(),
         origin_socket: "/run/racer/example/origin/socket".into(),

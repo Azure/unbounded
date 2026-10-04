@@ -828,7 +828,7 @@ mod waiter_detach {
             let page = PageId {
                 version: ObjectVersion {
                     object: ObjectId {
-                        cache: CacheId(crate::security::test_support::CACHE.into()),
+                        cache: CacheId(crate::test_support::security::CACHE.into()),
                         key: CacheKey([0; 32]),
                     },
                     etag: StrongEtag::test_value("v1"),
@@ -1055,13 +1055,13 @@ mod fidelity {
     use crate::read::flight::Flights;
     use crate::runtime::Reactor;
     use crate::runtime::RequestScope;
-    use crate::runtime::crypto;
-    use crate::runtime::crypto::CryptoClient;
+    use crate::security;
+    use crate::security::CryptoClient;
     use crate::runtime::worker::CryptoRuntime;
 
-    use crate::security::aead::PageCrypto;
-    use crate::security::aead::PageCryptoEngine;
-    use crate::security::credentials::CredentialCrypto;
+    use crate::security::PageCrypto;
+    use crate::security::PageCryptoEngine;
+    use crate::security::CredentialCrypto;
     use crate::store::StoreReader;
     use crate::store::StoreWriter;
     use crate::store::catalog::Index;
@@ -1203,7 +1203,7 @@ mod fidelity {
         assert_eq!((PLAIN, CIPHER), (16 * 1024 * 1024, 16 * 1024 * 1024 + 16));
         let model = admission(2);
         let real = admission(2);
-        let cache = CacheId(crate::security::test_support::CACHE.into());
+        let cache = CacheId(crate::test_support::security::CACHE.into());
         let memory = MemoryCache::new(
             BufferPool::new(real.clone()),
             crate::test_support::availability(),
@@ -1286,7 +1286,7 @@ mod fidelity {
             });
             let real = admission(4);
             // The simulator uses numeric IDs; the real cache uses published UUIDs.
-            let a = CacheId(crate::security::test_support::CACHE.into());
+            let a = CacheId(crate::test_support::security::CACHE.into());
             let b = CacheId("44444444-4444-4444-8444-444444444444".into());
             let memory = MemoryCache::new(
                 BufferPool::new(real.clone()),
@@ -1503,7 +1503,7 @@ mod fidelity {
         // the read and idle working set. No simulator dirty event is driven here.
         let model = admission(4);
         let real = admission(4);
-        let cache = CacheId(crate::security::test_support::CACHE.into());
+        let cache = CacheId(crate::test_support::security::CACHE.into());
         let model_dirty = model
             .reserve(Some(&cache), ResourceClass::DirtyCiphertext, CIPHER)
             .unwrap();
@@ -1511,7 +1511,7 @@ mod fidelity {
             .reserve(Some(&cache), ResourceClass::DirtyCiphertext, CIPHER)
             .unwrap();
         let buffers = BufferPool::new(real.clone());
-        let keys = Rc::new(crate::security::test_support::keys());
+        let keys = Rc::new(crate::test_support::security::keys());
         let availability = crate::control::for_caches(keys.clone(), vec![cache.clone()]);
         let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
         let mut old_model = MetadataOwners::reserve(&model, &cache);
@@ -1573,11 +1573,11 @@ mod fidelity {
             reactor,
             availability.clone(),
         ));
-        let (port, engine_port) = crypto::pair(worker, 0, NonZeroUsize::new(4).unwrap());
+        let (port, engine_port) = security::pair(worker, 0, NonZeroUsize::new(4).unwrap());
         let client = Rc::new(CryptoClient::new(port));
         let mut engine = PageCryptoEngine::new(CryptoRuntime { port: engine_port });
         let peers = crate::test_support::NoPeers::requester();
-        let node = crate::model::NodeId(crate::security::test_support::NODE.into());
+        let node = crate::model::NodeId(crate::test_support::security::NODE.into());
         let membership = Arc::new(
             Membership::validate(
                 crate::model::MembershipVersion(1),
@@ -1688,7 +1688,7 @@ mod fidelity {
         // work through reap. This does not verify Simulator's cancellation scheduling.
         let model = admission(1);
         let real = admission(1);
-        let cache = CacheId(crate::security::test_support::CACHE.into());
+        let cache = CacheId(crate::test_support::security::CACHE.into());
         let mut caller = MetadataOwners::reserve(&model, &cache);
         Arc::get_mut(&mut caller.bundle.plain)
             .unwrap()
@@ -1701,10 +1701,10 @@ mod fidelity {
         let reserved = crate::admission::reserve_fill(&real, &cache, false).unwrap();
         let buffers = BufferPool::new(real.clone());
         let plaintext = buffers.plaintext(reserved.plaintext, 3).unwrap();
-        let (port, engine_port) = crypto::pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
+        let (port, engine_port) = security::pair(WorkerId(0), 0, NonZeroUsize::new(1).unwrap());
         let client = Rc::new(CryptoClient::new(port));
         let crypto = PageCrypto::new(
-            Rc::new(crate::security::test_support::keys()),
+            Rc::new(crate::test_support::security::keys()),
             client.clone(),
         );
         let mut engine = PageCryptoEngine::new(CryptoRuntime { port: engine_port });

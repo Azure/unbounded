@@ -404,7 +404,7 @@ struct Sample {
     data: Mutex<Data>,
 }
 struct Data {
-    crypto: Option<crate::runtime::crypto::CryptoId>,
+    crypto: Option<crate::security::CryptoId>,
     send: &'static str,
     status: &'static str,
     error: Option<Error>,
@@ -428,7 +428,7 @@ impl Samples {
             self.0.lock().unwrap().last = None;
             let (ticket, mut work) = self.begin(&pair, &pair.sender, &pair.receiver).unwrap();
             work.facts = Some(crate::telemetry::test_aead_failure());
-            work.identify(crate::runtime::crypto::CryptoId {
+            work.identify(crate::security::CryptoId {
                 worker: crate::model::WorkerId(u16::MAX),
                 generation: u64::MAX,
                 sequence: u64::MAX,
@@ -546,7 +546,7 @@ impl Drop for Ticket {
     }
 }
 impl Work {
-    pub(crate) fn identify(&self, id: crate::runtime::crypto::CryptoId) {
+    pub(crate) fn identify(&self, id: crate::security::CryptoId) {
         self.sample
             .data
             .lock()
@@ -655,7 +655,7 @@ impl AeadFailure {
     }
 }
 
-type AeadRing = Ring<(crate::runtime::crypto::CryptoId, AeadFailure), AEAD_CAPACITY>;
+type AeadRing = Ring<(crate::security::CryptoId, AeadFailure), AEAD_CAPACITY>;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Stage {
@@ -893,7 +893,7 @@ impl Failures {
     }
 }
 impl Observer {
-    pub(crate) fn record_aead(&self, id: crate::runtime::crypto::CryptoId, failure: AeadFailure) {
+    pub(crate) fn record_aead(&self, id: crate::security::CryptoId, failure: AeadFailure) {
         let Some((failures, _)) = &self.0 else {
             return;
         };
@@ -1757,7 +1757,7 @@ pub(crate) mod tests {
         #[test]
         fn aead_endpoint_exports_full_ring_with_maximum_fields() {
             use crate::model::WorkerId;
-            use crate::runtime::crypto::CryptoId;
+            use crate::security::CryptoId;
             use crate::telemetry::AEAD_CAPACITY;
             use crate::telemetry::test_aead_failure;
             let telemetry = Telemetry::default();
@@ -2383,7 +2383,7 @@ pub(crate) mod tests {
                 attempt: None,
                 detail: Detail::None,
             });
-            let id = crate::runtime::crypto::CryptoId {
+            let id = crate::security::CryptoId {
                 worker: WorkerId(3),
                 generation: 4,
                 sequence: 5,
@@ -2440,7 +2440,7 @@ pub(crate) mod tests {
             let observer = failures.observer(WorkerId(7));
             observer.record(Failure::new(Stage::ClientRead, Error::Io));
             observer.record_aead(
-                crate::runtime::crypto::CryptoId {
+                crate::security::CryptoId {
                     worker: WorkerId(7),
                     generation: 1,
                     sequence: 2,
@@ -2461,7 +2461,7 @@ pub(crate) mod tests {
         fn aead_ring_survives_admission_flood_and_wraps_independently() {
             let failures = Failures::default();
             let observer = failures.observer(WorkerId(3));
-            let id = crate::runtime::crypto::CryptoId {
+            let id = crate::security::CryptoId {
                 worker: WorkerId(3),
                 generation: 1,
                 sequence: 1,

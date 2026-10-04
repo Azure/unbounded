@@ -21,10 +21,10 @@ use crate::peer::protocol::PeerResponse;
 use crate::peer::protocol::decode_envelope;
 use crate::peer::protocol::encode_envelope;
 use crate::runtime::Reactor;
-use crate::runtime::crypto;
-use crate::runtime::crypto::CryptoClient;
-use crate::security::test_support::network;
-use crate::security::test_support::node;
+use crate::security;
+use crate::security::CryptoClient;
+use crate::test_support::security::network;
+use crate::test_support::security::node;
 use crate::topology::RouteBudget;
 use http1::Header;
 use http1::MessageHead;
@@ -465,11 +465,11 @@ pub(super) fn local_worker_with_fabric(
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         config.limits.clone(),
     )));
-    let (io, engine) = crate::runtime::crypto::pair(worker, 0, config.limits.queue_entries);
+    let (io, engine) = crate::security::pair(worker, 0, config.limits.queue_entries);
     let runtime = WorkerRuntime {
         reactor: Rc::new(Reactor::new(admission.clone())),
         admission,
-        crypto: Rc::new(crate::runtime::crypto::CryptoClient::new(io)),
+        crypto: Rc::new(crate::security::CryptoClient::new(io)),
     };
     let local = WorkerRuntime {
         reactor: runtime.reactor.clone(),
@@ -722,7 +722,7 @@ pub(crate) fn wake_test_worker() -> WorkerApplication {
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         config.limits.clone(),
     )));
-    let (io, _engine) = crypto::pair(WorkerId(0), 0, config.limits.queue_entries);
+    let (io, _engine) = security::pair(WorkerId(0), 0, config.limits.queue_entries);
     WorkerApplication::assemble(
         &config,
         Arc::new(NodeState::default()),
@@ -876,7 +876,7 @@ fn composes_http_and_optional_rdma_without_operational_side_effects() {
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             config.limits.clone(),
         )));
-        let (io, engine) = crypto::pair(WorkerId(0), 0, config.limits.queue_entries);
+        let (io, engine) = security::pair(WorkerId(0), 0, config.limits.queue_entries);
         let crypto = Rc::new(CryptoClient::new(io));
         let runtime = WorkerRuntime {
             reactor: Rc::new(Reactor::new(admission.clone())),
@@ -907,7 +907,7 @@ fn composes_http_and_optional_rdma_without_operational_side_effects() {
         let second_admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             config.limits.clone(),
         )));
-        let (second_io, second_engine) = crypto::pair(WorkerId(1), 0, config.limits.queue_entries);
+        let (second_io, second_engine) = security::pair(WorkerId(1), 0, config.limits.queue_entries);
         let second_runtime = WorkerRuntime {
             reactor: Rc::new(Reactor::new(second_admission.clone())),
             admission: second_admission,
@@ -1100,7 +1100,7 @@ fn snapshot_refresh_retries_canceled_publication_and_applies_skipped_removal() {
         .unwrap();
     worker.refresh_snapshot(&current_scope).unwrap();
     assert_eq!(worker.caches, vec![original.clone()]);
-    let (_, _, roots) = crate::security::test_support::issued();
+    let (_, _, roots) = crate::test_support::security::issued();
     worker
         .keys
         .install(wire::KeyringBundle {
@@ -2069,7 +2069,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
     .unwrap();
     let until = Instant::now() + Duration::from_secs(10);
     assert!(keys.lease(Some(&cache), key.id, KeyPurpose::Page).is_err());
-    crate::security::test_support::assert_page_key(&lease, &[21; 32]);
+    crate::test_support::security::assert_page_key(&lease, &[21; 32]);
     assert!(node.observations.health.ready());
     drop(lease);
     while !node.observations.health.ready() {
@@ -2224,7 +2224,7 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
     {
         let mut bundle = fixture.bundle.lock().unwrap();
         *bundle =
-            crate::security::test_support::rotation_bundle(1, bundle.peer_trust_roots.clone());
+            crate::test_support::security::rotation_bundle(1, bundle.peer_trust_roots.clone());
         bundle.cluster = config.cluster.clone();
     }
     config.node = bootstrap(
@@ -2265,7 +2265,7 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
     {
         let mut bundle = fixture.bundle.lock().unwrap();
         *bundle =
-            crate::security::test_support::rotation_bundle(2, bundle.peer_trust_roots.clone());
+            crate::test_support::security::rotation_bundle(2, bundle.peer_trust_roots.clone());
         bundle.cluster = config.cluster.clone();
     }
     let mut rotation = control.keyring_progress(&key_scope);
@@ -2337,7 +2337,7 @@ fn network_keyring_bootstrap_rotation_recovery_and_failure_retention() {
     {
         let mut bundle = fixture.bundle.lock().unwrap();
         *bundle =
-            crate::security::test_support::rotation_bundle(3, bundle.peer_trust_roots.clone());
+            crate::test_support::security::rotation_bundle(3, bundle.peer_trust_roots.clone());
         bundle.cluster = config.cluster.clone();
     }
     drive(
@@ -2473,7 +2473,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
         .unwrap();
     let accepted_scope = scope(Duration::from_secs(10)).unwrap();
     let mut accepted = runtime.crypto.execute(
-        crate::runtime::crypto::CryptoInput::Encrypt {
+        crate::security::CryptoInput::Encrypt {
             page,
             plaintext,
             ciphertext,
@@ -2528,7 +2528,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     assert_eq!(runtime.crypto.outstanding(), 1);
     assert!(worker.peer_task.is_some());
     assert!(worker.diagnostic_task.is_some());
-    crate::security::test_support::assert_page_key(&lease, &[19; 32]);
+    crate::test_support::security::assert_page_key(&lease, &[19; 32]);
     assert!(
         worker
             .keys
@@ -2926,11 +2926,11 @@ fn assembled_peer_io_carries_maximum_client_context_over_eight_signed_links() {
     let forwarding: Vec<_> = signers.iter().map(|s| Forwarding::new(s.clone())).collect();
     let codec = protocol::SecurityCodec::new(admission.clone(), BufferPool::new(admission.clone()));
     let crypto = CredentialCrypto::new(
-        Rc::new(crate::security::test_support::keys()),
+        Rc::new(crate::test_support::security::keys()),
         admission.clone(),
     );
     let scope = scope(Duration::from_secs(30)).unwrap();
-    let cache = CacheId(crate::security::test_support::CACHE.into());
+    let cache = CacheId(crate::test_support::security::CACHE.into());
     let metadata = vec![b'm'; 8192];
     let authorization = vec![b'a'; 8192];
     let etag = format!("\"{}\"", "v".repeat(8190));

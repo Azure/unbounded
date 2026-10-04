@@ -25,8 +25,8 @@ pub(super) use crate::read::flight::Flights;
 pub(super) use crate::read::flight::JoinedCopy;
 pub(super) use crate::read::flight::JoinedFlight;
 pub(super) use crate::runtime::RequestScope;
-pub(super) use crate::security::aead::PageCrypto;
-pub(super) use crate::security::credentials::CredentialCrypto;
+pub(super) use crate::security::PageCrypto;
+pub(super) use crate::security::CredentialCrypto;
 pub(super) use crate::store::StoreReader;
 pub(super) use crate::store::StoreWriter;
 pub(super) use crate::telemetry::Event;
@@ -964,7 +964,7 @@ mod pressure {
                 3,
                 Some(limits),
                 vec![
-                    CacheId(crate::security::test_support::CACHE.into()),
+                    CacheId(crate::test_support::security::CACHE.into()),
                     other_cache.clone(),
                 ],
             );
@@ -1137,11 +1137,11 @@ pub(super) use crate::origin::MetadataReply;
 pub(super) use crate::origin::OriginPage;
 pub(super) use crate::read::dispatch::WorkerDirectory;
 pub(super) use crate::runtime::Reactor;
-pub(super) use crate::runtime::crypto;
-pub(super) use crate::runtime::crypto::CryptoClient;
+pub(super) use crate::security;
+pub(super) use crate::security::CryptoClient;
 pub(super) use crate::runtime::worker::CryptoRuntime;
 
-pub(super) use crate::security::aead::PageCryptoEngine;
+pub(super) use crate::security::PageCryptoEngine;
 pub(super) use crate::store::catalog::Index;
 pub(super) use crate::store::catalog::SegmentClock;
 pub(super) use crate::topology::Member;
@@ -1435,7 +1435,7 @@ pub(super) fn fixture_with(length: u64, limits: Option<crate::config::Limits>) -
     fixture_with_caches(
         length,
         limits,
-        vec![CacheId(crate::security::test_support::CACHE.into())],
+        vec![CacheId(crate::test_support::security::CACHE.into())],
     )
 }
 fn fixture_with_caches(
@@ -1451,7 +1451,7 @@ fn fixture_with_caches(
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         config.limits.clone(),
     )));
-    let keys = Rc::new(crate::security::test_support::keys_for(&caches));
+    let keys = Rc::new(crate::test_support::security::keys_for(&caches));
     let availability = crate::control::for_caches(keys.clone(), caches);
     let buffers = BufferPool::new(admission.clone());
     let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
@@ -1541,7 +1541,7 @@ fn fixture_with_caches(
         blocked_pages: RefCell::new(Default::default()),
         started_pages: RefCell::new(Vec::new()),
     });
-    let (port, engine) = crypto::pair(worker, 0, config.limits.queue_entries);
+    let (port, engine) = security::pair(worker, 0, config.limits.queue_entries);
     let crypto = Rc::new(CryptoClient::new(port));
     let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
     let peers = NoPeer::requester();
@@ -2114,7 +2114,7 @@ fn ciphertext_ready_promotes_once_for_concurrent_plaintext_readers() {
 fn retired_completed_flight_misses_new_callers_but_admitted_waiters_finish() {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    use crate::security::test_support::rotation_bundle;
+    use crate::test_support::security::rotation_bundle;
     use racer_identity::KeyPurpose;
     let mut f = fixture_with(3, None);
     let flights = f.fill.dependencies.flights.clone();

@@ -218,7 +218,7 @@ fn not_found_is_authenticated_through_relay_and_restricted_to_fresh_acquire() {
             ("racer-outcome", "miss"),
             ("racer-outcome", "unknown"),
         ] {
-            let mut changed = crate::security::test_support::clone_head(&original);
+            let mut changed = crate::test_support::security::clone_head(&original);
             if field == "status" {
                 changed.head.start = StartLine::Response { status: 200 };
             } else {
@@ -236,7 +236,7 @@ fn not_found_is_authenticated_through_relay_and_restricted_to_fresh_acquire() {
             };
             assert!(codec.response(envelope, vec![], &scope).is_err());
         }
-        let mut changed = crate::security::test_support::clone_head(&original);
+        let mut changed = crate::test_support::security::clone_head(&original);
         // A structurally valid alternate outcome/status still needs a valid signature.
         changed.head.start = StartLine::Response { status: 200 };
         changed

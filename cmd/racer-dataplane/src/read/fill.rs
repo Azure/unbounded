@@ -36,8 +36,8 @@ use crate::peer::protocol::PeerResponse;
 
 use crate::admission::AdmissionPolicy;
 use crate::runtime::RequestScope;
-use crate::security::aead::PageCrypto;
-use crate::security::credentials::CredentialCrypto;
+use crate::security::PageCrypto;
+use crate::security::CredentialCrypto;
 use crate::store::StoreReader;
 use crate::store::StoreWriter;
 use crate::telemetry::Event;

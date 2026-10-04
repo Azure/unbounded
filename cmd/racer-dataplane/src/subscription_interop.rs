@@ -180,8 +180,8 @@ struct SubscriptionFixture {
     clients: client::listener::ClientListeners,
     endpoint: read::dispatch::WorkerEndpoint,
     drivers: Rc<uring_runtime::drivers::DriverQueue>,
-    engine: security::aead::PageCryptoEngine,
-    crypto: Rc<runtime::crypto::CryptoClient>,
+    engine: security::PageCryptoEngine,
+    crypto: Rc<security::CryptoClient>,
     reactor: Rc<Reactor>,
     writer: Rc<store::StoreWriter>,
     memory: Rc<memory::MemoryCache>,
@@ -213,9 +213,9 @@ impl SubscriptionFixture {
         use read::metadata::MetadataDependencies;
         use read::metadata::MetadataService;
         use read::range_stream::RangeStreams;
-        use security::aead::PageCrypto;
-        use security::aead::PageCryptoEngine;
-        use security::credentials::CredentialCrypto;
+        use security::PageCrypto;
+        use security::PageCryptoEngine;
+        use security::CredentialCrypto;
         use store::StoreReader;
         use store::StoreWriter;
         use store::catalog::Index;
@@ -294,8 +294,8 @@ impl SubscriptionFixture {
             reactor.clone(),
             buffers.clone(),
         ));
-        let (port, engine) = runtime::crypto::pair(WorkerId(0), 0, limits.queue_entries);
-        let crypto = Rc::new(runtime::crypto::CryptoClient::new(port));
+        let (port, engine) = security::pair(WorkerId(0), 0, limits.queue_entries);
+        let crypto = Rc::new(security::CryptoClient::new(port));
         let engine = PageCryptoEngine::new(CryptoRuntime { port: engine });
         let credentials = Rc::new(CredentialCrypto::new(keys.clone(), admission.clone()));
         let peers = peer::Requester::scripted(

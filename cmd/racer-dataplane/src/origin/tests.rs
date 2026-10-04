@@ -92,8 +92,8 @@ impl OriginClient {
 }
 fn credentials(
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
-) -> Rc<crate::security::credentials::CredentialCrypto> {
-    use crate::security::credentials::CredentialCrypto;
+) -> Rc<crate::security::CredentialCrypto> {
+    use crate::security::CredentialCrypto;
     use racer_identity::KeyEpochs;
     use racer_identity::Keyring;
     Rc::new(CredentialCrypto::new(

@@ -17,7 +17,7 @@ use crate::peer::protocol::Operation as PeerOperation;
 use crate::peer::protocol::PeerRequest;
 use crate::peer::protocol::PeerResponse;
 use crate::runtime::RequestScope;
-use crate::security::credentials::CredentialCrypto;
+use crate::security::CredentialCrypto;
 use crate::telemetry::Detail;
 use crate::telemetry::Event;
 use crate::telemetry::Failure;
