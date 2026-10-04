@@ -369,7 +369,7 @@ fn validate_candidate(
     if ids.len() != image.shards.len() || ids != geometry.keys().copied().collect() {
         return None;
     }
-    let available = |cache: &crate::model::CacheId| caches.iter().any(|c| &c.id == cache);
+    let available = |cache: &racer_control_wire::CacheId| caches.iter().any(|c| &c.id == cache);
     Recovery::filter_available(
         &mut image,
         |cache| available(cache) && keys.active(cache, KeyPurpose::Page).is_ok(),
@@ -413,7 +413,7 @@ mod tests {
     }
     fn caches() -> Vec<racer_control_wire::CacheDefinition> {
         let mut cache = crate::app::tests::definition();
-        cache.id = crate::model::CacheId(crate::test_support::security::CACHE.into());
+        cache.id = racer_control_wire::CacheId(crate::test_support::security::CACHE.into());
         vec![cache]
     }
     fn image(sequence: u64, ids: &[WorkerId]) -> CheckpointImage {
@@ -473,7 +473,7 @@ mod tests {
         );
         let mut oversized = image(3, &[WorkerId(0), WorkerId(1)]);
         let object = crate::model::ObjectId {
-            cache: crate::model::CacheId(crate::test_support::security::CACHE.into()),
+            cache: racer_control_wire::CacheId(crate::test_support::security::CACHE.into()),
             key: crate::model::CacheKey([9; 32]),
         };
         let owner = node.workers.metadata_owner(&object).unwrap();
@@ -600,7 +600,7 @@ mod tests {
         assert_eq!(retained.shards[0].index.entries.len(), 1);
         assert_eq!(retained.shards[0].index.metadata, vec![standalone]);
         let mut missing_page = decoded();
-        missing_page.shards[0].index.entries[0].1.key_id = crate::model::KeyId([99; 16]);
+        missing_page.shards[0].index.entries[0].1.key_id = racer_control_wire::KeyId([99; 16]);
         let filtered = select(
             vec![missing_page],
             &geometry,
@@ -654,7 +654,7 @@ mod tests {
 
     #[test]
     fn ownership_and_capacity_are_checked_on_every_worker() {
-        use crate::model::CacheId;
+        use racer_control_wire::CacheId;
         use crate::model::CacheKey;
         use crate::model::ObjectId;
         use crate::model::ObjectVersion;
@@ -666,7 +666,7 @@ mod tests {
             .into_iter()
             .collect();
         let object = ObjectId {
-            cache: CacheId(crate::test_support::security::CACHE.into()),
+            cache: racer_control_wire::CacheId(crate::test_support::security::CACHE.into()),
             key: CacheKey([3; 32]),
         };
         let owner = node.workers.metadata_owner(&object).unwrap();

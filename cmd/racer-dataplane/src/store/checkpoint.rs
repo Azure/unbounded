@@ -10,9 +10,9 @@ use super::catalog::RecordLocation;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
-use crate::model::CacheId;
+use racer_control_wire::CacheId;
 use crate::model::CacheKey;
-use crate::model::KeyId;
+use racer_control_wire::KeyId;
 use crate::model::ObjectId;
 use crate::model::ObjectVersion;
 use crate::model::PageId;
@@ -365,8 +365,8 @@ impl Recovery {
     /// has no key ID, so it requires both a current cache UID and an active page key.
     pub fn filter_available(
         image: &mut CheckpointImage,
-        mut metadata_available: impl FnMut(&crate::model::CacheId) -> bool,
-        mut available: impl FnMut(&crate::model::CacheId, KeyId) -> bool,
+        mut metadata_available: impl FnMut(&racer_control_wire::CacheId) -> bool,
+        mut available: impl FnMut(&racer_control_wire::CacheId, KeyId) -> bool,
     ) {
         for shard in &mut image.shards {
             shard

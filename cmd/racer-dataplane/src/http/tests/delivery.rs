@@ -11,7 +11,7 @@
 use crate::admission::AdmissionPolicy;
 use crate::http::*;
 use crate::memory::VerifiedBytes;
-use crate::model::CacheId;
+use racer_control_wire::CacheId;
 use crate::model::CacheKey;
 use crate::model::ObjectId;
 use crate::model::ObjectVersion;

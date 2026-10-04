@@ -842,6 +842,7 @@ fn colocated_plan(max_threads: usize, workers: u16) -> AffinityPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use racer_control_wire::CacheId;
     mod affinity;
     mod shared_tests {
         use super::*;

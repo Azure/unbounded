@@ -3,9 +3,9 @@ use crate::config::Limits;
 use crate::control::PublishedState;
 use crate::http::Codec;
 use crate::security::Authorization;
-use crate::model::CacheId;
+use racer_control_wire::CacheId;
 use crate::model::CacheKey;
-use crate::model::ClusterId;
+use racer_control_wire::ClusterId;
 use crate::model::ObjectId;
 use crate::security::OpaqueMetadata;
 use crate::model::RequestId;
@@ -99,7 +99,7 @@ fn credentials(
     Rc::new(CredentialCrypto::new(
         Rc::new(Keyring::new(
             ClusterId("cluster".into()),
-            crate::model::NodeId("local".into()),
+            racer_control_wire::NodeId("local".into()),
             Arc::new(KeyEpochs::default()),
         )),
         admission,
@@ -942,8 +942,8 @@ fn real_uds_errors_preserve_credential_and_version_contracts() {
 
 #[test]
 fn public_operations_reject_wrong_authority_before_io() {
-    use crate::model::MembershipVersion;
-    use crate::model::NodeId;
+    use racer_control_wire::MembershipVersion;
+    use racer_control_wire::NodeId;
     use crate::peer::protocol::FetchMode;
     use crate::peer::protocol::Operation as PeerOperation;
     use crate::read::candidates::CandidatePolicy;

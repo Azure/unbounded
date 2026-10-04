@@ -1123,7 +1123,7 @@ mod pressure {
         assert!(deps.memory.get(&second).unwrap().is_some());
     }
 }
-pub(super) use crate::model::CacheId;
+pub(super) use racer_control_wire::CacheId;
 pub(super) use crate::model::CacheKey;
 pub(super) use crate::model::ExpiresAt;
 pub(super) use crate::model::ObjectId;
@@ -1505,10 +1505,10 @@ fn fixture_with_caches(
         metadata: None,
         authorization: None,
     };
-    let node = crate::model::NodeId("22222222-2222-4222-8222-222222222222".into());
+    let node = racer_control_wire::NodeId("22222222-2222-4222-8222-222222222222".into());
     let membership = Arc::new(
         Membership::validate(
-            crate::model::MembershipVersion(1),
+            racer_control_wire::MembershipVersion(1),
             vec![Member {
                 node: node.clone(),
                 shares: NonZeroU32::new(4).unwrap(),

@@ -1002,7 +1002,7 @@ impl WorkerMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::CacheId;
+    use racer_control_wire::CacheId;
     use crate::model::CacheKey;
     use crate::model::RequestId;
     use crate::model::StrongEtag;
@@ -1010,7 +1010,7 @@ mod tests {
     use std::time::Instant;
     #[test]
     fn stable_assignment_ignores_etag_and_worker_input_order() {
-        use crate::model::CacheId;
+        use racer_control_wire::CacheId;
         use crate::model::CacheKey;
         use crate::model::ObjectVersion;
         use crate::model::PageNumber;

@@ -11,7 +11,7 @@ use crate::memory::BufferPool;
 use crate::memory::CiphertextPage;
 use crate::security::EncryptedAuthorization;
 use crate::model::ExpiresAt;
-use crate::model::KeyId;
+use racer_control_wire::KeyId;
 use crate::model::MetadataSelector;
 use crate::model::Nonce;
 use crate::model::ObjectMetadata;

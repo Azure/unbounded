@@ -5,7 +5,7 @@ use crate::control::SnapshotStore;
 use crate::http::Delivery;
 use crate::memory::BufferPool;
 use crate::memory::MemoryCache;
-use crate::model::MembershipVersion;
+use racer_control_wire::MembershipVersion;
 use crate::model::ObjectMetadata;
 use crate::model::WorkerId;
 use crate::read::Coordinator;
@@ -113,7 +113,7 @@ pub mod clock {
     }
     #[test]
     fn wall_time_drives_freshness_but_expired_versions_still_answer_pins() {
-        use crate::model::CacheId;
+        use racer_control_wire::CacheId;
         use crate::model::CacheKey;
         use crate::model::CurrentVersion;
         use crate::model::ExpiresAt;
@@ -546,12 +546,12 @@ pub mod origin {
 /// Minimal real control-plane state for storage and flight fixtures. Callers with
 /// rotating keys or publications should share their own Availability instead.
 pub fn availability() -> std::rc::Rc<crate::control::Availability> {
-    availability_for(vec![crate::model::CacheId(
+    availability_for(vec![racer_control_wire::CacheId(
         crate::test_support::security::CACHE.into(),
     )])
 }
 pub fn availability_for(
-    caches: Vec<crate::model::CacheId>,
+    caches: Vec<racer_control_wire::CacheId>,
 ) -> std::rc::Rc<crate::control::Availability> {
     crate::control::for_caches(
         std::rc::Rc::new(crate::test_support::security::keys_for(&caches)),
@@ -573,7 +573,7 @@ impl NoPeers {
     fn direct_hedge_available(
         &self,
         _: &std::sync::Arc<crate::topology::Membership>,
-        _: &crate::model::NodeId,
+        _: &racer_control_wire::NodeId,
     ) -> bool {
         false
     }
@@ -599,8 +599,8 @@ impl NoPeers {
 pub mod cluster {
     use crate::config::Config;
     use crate::config::Limits;
-    use crate::model::ClusterId;
-    use crate::model::NodeId;
+    use racer_control_wire::ClusterId;
+    use racer_control_wire::NodeId;
     use std::num::NonZeroU32;
     use std::num::NonZeroUsize;
     use std::time::Duration;
@@ -689,7 +689,7 @@ pub(crate) struct ReadWorker {
     crypto: Rc<CryptoClient>,
     writer: Rc<StoreWriter>,
     memory: Rc<MemoryCache>,
-    cache: crate::model::CacheId,
+    cache: racer_control_wire::CacheId,
 }
 
 impl ReadWorker {

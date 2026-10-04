@@ -18,7 +18,7 @@ use racer_dataplane::http::Delivery;
 use racer_dataplane::http::HttpIo;
 use racer_dataplane::http::new_pipe_pool;
 use racer_dataplane::model::ByteRange;
-use racer_dataplane::model::CacheId;
+use racer_control_wire::CacheId;
 use racer_dataplane::model::CacheKey;
 use racer_dataplane::model::ExpiresAt;
 use racer_dataplane::model::ObjectId;

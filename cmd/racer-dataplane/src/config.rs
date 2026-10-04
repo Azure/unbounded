@@ -5,8 +5,8 @@
 
 use crate::error::Error;
 use crate::error::Result;
-use crate::model::ClusterId;
-use crate::model::NodeId;
+use racer_control_wire::ClusterId;
+use racer_control_wire::NodeId;
 use crate::model::PAGE_BYTES;
 use crate::store::MAX_HEADER_BYTES;
 use std::net::IpAddr;

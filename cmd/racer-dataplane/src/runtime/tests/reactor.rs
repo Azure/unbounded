@@ -69,7 +69,7 @@ mod tests {
             pool.plaintext(
                 admission
                     .reserve(
-                        Some(&crate::model::CacheId("provenance".into())),
+                        Some(&racer_control_wire::CacheId("provenance".into())),
                         ResourceClass::Plaintext,
                         3,
                     )
@@ -556,7 +556,7 @@ mod simulation_tests {
     }
     #[test]
     fn immutable_ciphertext_send_shares_backing_and_retains_it_through_cancel_fences() {
-        use crate::model::CacheId;
+        use racer_control_wire::CacheId;
         use crate::model::CacheKey;
         use crate::model::ObjectId;
         use crate::model::ObjectVersion;
@@ -574,7 +574,7 @@ mod simulation_tests {
                     content_type: None,
                     version: ObjectVersion {
                         object: ObjectId {
-                            cache: CacheId("cache".into()),
+                            cache: racer_control_wire::CacheId("cache".into()),
                             key: CacheKey([0; 32]),
                         },
                         etag: StrongEtag::test_value("v1"),

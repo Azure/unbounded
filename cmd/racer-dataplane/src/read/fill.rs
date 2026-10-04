@@ -255,7 +255,7 @@ impl Fill {
     }
     pub(super) fn reserve_with_reclamation(
         &self,
-        cache: &crate::model::CacheId,
+        cache: &racer_control_wire::CacheId,
         class: ResourceClass,
         amount: usize,
     ) -> Result<flow_control::Charge<AdmissionPolicy>> {
@@ -269,7 +269,7 @@ impl Fill {
 
     pub(super) fn reserve_reclaiming(
         &self,
-        cache: &crate::model::CacheId,
+        cache: &racer_control_wire::CacheId,
         class: ResourceClass,
         amount: usize,
         reserve: impl Fn() -> Result<flow_control::Charge<AdmissionPolicy>>,
@@ -310,7 +310,7 @@ impl Fill {
     /// before origin I/O using the same bounded reclamation as ordinary fills.
     pub(crate) fn reserve_bootstrap(
         &self,
-        cache: &crate::model::CacheId,
+        cache: &racer_control_wire::CacheId,
     ) -> Result<flow_control::Charge<AdmissionPolicy>> {
         self.reserve_with_reclamation(cache, ResourceClass::Plaintext, PAGE_BYTES as usize)
     }
@@ -1378,7 +1378,7 @@ fn merge_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::CacheId;
+    use racer_control_wire::CacheId;
     use crate::model::CacheKey;
     use crate::model::ObjectId;
     use crate::model::ObjectVersion;

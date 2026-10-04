@@ -1,11 +1,11 @@
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
-use crate::model::CacheId;
-use crate::model::ClusterId;
-use crate::model::KeyId;
-use crate::model::MembershipVersion;
-use crate::model::NodeId;
+use racer_control_wire::CacheId;
+use racer_control_wire::ClusterId;
+use racer_control_wire::KeyId;
+use racer_control_wire::MembershipVersion;
+use racer_control_wire::NodeId;
 use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
 use crate::topology::Member;
@@ -1305,7 +1305,7 @@ pub(crate) fn for_caches(keys: Rc<Keyring>, caches: Vec<CacheId>) -> Rc<Availabi
             schema_version: SCHEMA_VERSION,
             cluster: keys.cluster().clone(),
             sequence: PublicationSequence(1),
-            membership_version: crate::model::MembershipVersion(1),
+            membership_version: racer_control_wire::MembershipVersion(1),
             members: vec![wire::Member {
                 node: keys.node().clone(),
                 shares: std::num::NonZeroU32::new(1).unwrap(),
@@ -1473,19 +1473,19 @@ impl ReactorControlIo {
 
 pub struct ControlTransport {
     health: Rc<crate::topology::LinkHealth>,
-    endpoint: crate::model::NodeId,
+    endpoint: racer_control_wire::NodeId,
     inner: rest_client::Transport<ReactorControlIo>,
 }
 pub struct ControlConnection {
     health: Rc<crate::topology::LinkHealth>,
-    endpoint: crate::model::NodeId,
+    endpoint: racer_control_wire::NodeId,
     inner: rest_client::Connection<ReactorControlIo>,
 }
 impl ControlTransport {
     pub fn new(endpoint: ControlEndpoint) -> Self {
         Self {
             health: Rc::new(crate::topology::LinkHealth::new(1)),
-            endpoint: crate::model::NodeId(endpoint.url.clone()),
+            endpoint: racer_control_wire::NodeId(endpoint.url.clone()),
             inner: rest_client::Transport::new(rest_client::Config {
                 url: endpoint.url,
                 trust_bundle: endpoint.trust_bundle,
@@ -2562,7 +2562,7 @@ pub(crate) mod tests {
             racer_control_wire::EnrollmentResponse {
                 schema_version: 1,
                 cluster: request.cluster.clone(),
-                node: crate::model::NodeId(node.into()),
+                node: racer_control_wire::NodeId(node.into()),
                 enrollment: request.enrollment.clone(),
                 certificate_chain: vec![cert.der().to_vec()],
             }
@@ -2573,8 +2573,8 @@ pub(crate) mod tests {
         use super::*;
         use crate::control::PublishedState;
         use crate::control::tests::testing;
-        use crate::model::ClusterId;
-        use crate::model::NodeId;
+        use racer_control_wire::ClusterId;
+        use racer_control_wire::NodeId;
         use racer_identity::KeyEpochs;
         use std::sync::Arc;
         #[test]
@@ -3583,7 +3583,7 @@ pub(crate) mod tests {
         ) -> LocalSigningIdentity {
             let scope = testing::scope();
             let enrollment = Enrollment::new(
-                crate::model::ClusterId("11111111-1111-4111-8111-111111111111".into()),
+                racer_control_wire::ClusterId("11111111-1111-4111-8111-111111111111".into()),
                 d.0.join("token"),
                 d.0.join("identity"),
             );
@@ -3847,7 +3847,7 @@ pub(crate) mod tests {
         #[test]
         fn enrollment_requires_exactly_one_identity_san() {
             let enrollment = super::super::Enrollment::new(
-                crate::model::ClusterId("11111111-1111-4111-8111-111111111111".into()),
+                racer_control_wire::ClusterId("11111111-1111-4111-8111-111111111111".into()),
                 "/unused/token".into(),
                 "/unused/identity".into(),
             );
@@ -3897,7 +3897,7 @@ pub(crate) mod tests {
             use rdma_verbs::simulation::Device;
             use rdma_verbs::simulation::Simulation;
             let enrollment = super::Enrollment::new(
-                crate::model::ClusterId("11111111-1111-4111-8111-111111111111".into()),
+                racer_control_wire::ClusterId("11111111-1111-4111-8111-111111111111".into()),
                 "/unused/token".into(),
                 "/unused/identity".into(),
             );
@@ -4342,7 +4342,7 @@ pub(crate) mod tests {
             let scope = testing::scope();
             let enrollment = |path| {
                 let e = Enrollment::new(
-                    crate::model::ClusterId("11111111-1111-4111-8111-111111111111".into()),
+                    racer_control_wire::ClusterId("11111111-1111-4111-8111-111111111111".into()),
                     d.0.join("token"),
                     path,
                 );
@@ -4642,7 +4642,7 @@ pub(crate) mod tests {
             let d = testing::Directory::new();
             let scope = testing::scope();
             let e = Enrollment::new(
-                crate::model::ClusterId("11111111-1111-4111-8111-111111111111".into()),
+                racer_control_wire::ClusterId("11111111-1111-4111-8111-111111111111".into()),
                 d.0.join("token"),
                 d.0.join("identity"),
             );

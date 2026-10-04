@@ -940,11 +940,12 @@ fn validate_bootstrap_metadata(expected: &ObjectMetadata, actual: &ObjectMetadat
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::model::CacheId;
+    use racer_control_wire::CacheId;
     use crate::model::CacheKey;
     use crate::model::ExpiresAt;
     use crate::model::WorkerId;
     use futures::task::noop_waker;
+    use racer_control_wire::CacheId;
     use std::time::UNIX_EPOCH;
 
     fn metadata(etag: &str, length: u64) -> ObjectMetadata {

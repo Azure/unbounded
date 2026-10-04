@@ -23,7 +23,7 @@ use crate::memory::PlaintextBuffer;
 use crate::memory::VerifiedBytes;
 use crate::memory::VerifiedPage;
 use crate::model::AttemptId;
-use crate::model::KeyId;
+use racer_control_wire::KeyId;
 use crate::model::MAX_FIELD_BYTES;
 use crate::model::Nonce;
 use crate::model::ObjectId;
@@ -1689,6 +1689,7 @@ impl CryptoClient {
 }
 #[cfg(test)]
 mod tests {
+    use racer_control_wire::CacheId;
     #[test]
     fn opaque_context_round_trips_non_utf8_without_normalization() {
         let bytes = b"opaque,  credential\\\"\xff";
@@ -1756,7 +1757,7 @@ mod tests {
     mod credentials;
     mod crypto;
     use super::*;
-    use crate::model::KeyId;
+    use racer_control_wire::KeyId;
     use crate::model::*;
     use uring_runtime::group::Service;
     fn envelope() -> PageEnvelope {

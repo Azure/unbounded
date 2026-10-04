@@ -32,7 +32,7 @@ use crate::http::HttpPool;
 use crate::http::new_pipe_pool;
 use crate::memory::BufferPool;
 use crate::memory::MemoryCache;
-use crate::model::NodeId;
+use racer_control_wire::NodeId;
 use crate::model::RequestId;
 use crate::model::WorkerId;
 use crate::origin::Origin;
@@ -971,7 +971,7 @@ impl WorkerApplication {
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         memory: Rc<MemoryCache>,
         writer: Rc<StoreWriter>,
-    ) -> impl Fn(&crate::model::CacheId, usize) {
+    ) -> impl Fn(&racer_control_wire::CacheId, usize) {
         move |cache, amount| {
             let class = crate::admission::ResourceClass::Ciphertext;
             for _ in 0..2 {

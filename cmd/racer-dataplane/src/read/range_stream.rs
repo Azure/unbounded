@@ -50,7 +50,7 @@ struct Demand {
 }
 struct State {
     contracts: BTreeMap<
-        (ObjectVersion, u64, crate::model::NodeId),
+        (ObjectVersion, u64, racer_control_wire::NodeId),
         (crate::peer::subscriptions::Subscription, Instant),
     >,
     selecting: BTreeSet<ObjectVersion>,
@@ -66,8 +66,8 @@ impl Scheduler {
     pub(crate) fn contract(
         &self,
         version: ObjectVersion,
-        membership: crate::model::MembershipVersion,
-        provider: crate::model::NodeId,
+        membership: racer_control_wire::MembershipVersion,
+        provider: racer_control_wire::NodeId,
         demand: crate::peer::subscriptions::Demand,
         deadline: Instant,
     ) -> Result<(crate::peer::subscriptions::Subscription, Instant)> {
@@ -994,10 +994,10 @@ pub(super) mod tests {
     use crate::admission::AdmissionPolicy;
     use crate::http::new_pipe_pool;
     use crate::model::ByteRange;
-    use crate::model::CacheId;
+    use racer_control_wire::CacheId;
     use crate::model::CacheKey;
     use crate::model::ExpiresAt;
-    use crate::model::MembershipVersion;
+    use racer_control_wire::MembershipVersion;
     use crate::model::ObjectId;
     use crate::model::ObjectVersion;
     use crate::model::PAGE_BYTES;
@@ -1872,7 +1872,7 @@ pub(super) mod tests {
         use super::*;
         use crate::admission::AdmissionPolicy;
         use crate::model::ByteRange;
-        use crate::model::CacheId;
+        use racer_control_wire::CacheId;
         use crate::model::CacheKey;
         use crate::model::ObjectId;
         use crate::model::StrongEtag;
@@ -2100,8 +2100,8 @@ pub(super) mod tests {
         }
         #[test]
         fn production_aggregate_is_compact_exclusive_and_contracts_never_refill() {
-            use crate::model::MembershipVersion;
-            use crate::model::NodeId;
+            use racer_control_wire::MembershipVersion;
+            use racer_control_wire::NodeId;
             use crate::peer::subscriptions::PageInterval;
             let scheduler = Scheduler::new(4);
             let range = ByteRange::From(0).resolve(1_000_000 * PAGE_BYTES).unwrap();

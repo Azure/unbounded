@@ -10,7 +10,7 @@ use crate::error::Operation;
 use crate::error::Result;
 use crate::http::ConnectionLease;
 use crate::http::HttpIo;
-use crate::model::CacheId;
+use racer_control_wire::CacheId;
 use crate::model::RequestId;
 use crate::read::Coordinator;
 use crate::runtime::Cancellation;

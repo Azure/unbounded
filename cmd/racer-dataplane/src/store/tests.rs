@@ -3,7 +3,7 @@ use crate::error::Error;
 use crate::error::Result;
 use crate::memory::BufferPool;
 use crate::memory::CiphertextCopy;
-use crate::model::CacheId;
+use racer_control_wire::CacheId;
 use crate::model::CacheKey;
 use crate::model::ExpiresAt;
 use crate::model::Nonce;
@@ -2368,7 +2368,7 @@ mod records {
 
 mod checkpoint {
     use crate::error::Error;
-    use crate::model::CacheId;
+    use racer_control_wire::CacheId;
     use crate::model::CacheKey;
     use crate::model::ObjectId;
     use crate::model::ObjectVersion;

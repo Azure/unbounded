@@ -2,9 +2,9 @@
 use racer_dataplane::admission::AdmissionPolicy;
 use racer_dataplane::config::Config;
 use racer_dataplane::memory::BufferPool;
-use racer_dataplane::model::CacheId;
+use racer_control_wire::CacheId;
 use racer_dataplane::model::CacheKey;
-use racer_dataplane::model::KeyId;
+use racer_control_wire::KeyId;
 use racer_dataplane::model::Nonce;
 use racer_dataplane::model::ObjectId;
 use racer_dataplane::model::ObjectVersion;
@@ -182,8 +182,8 @@ fn final_payload_owner_scrubs_full_allocation_on_reclaim_and_rejection() {
 fn failed_crypto_output_is_scrubbed(config: &Config) {
     use base64::Engine;
     use racer_crypto::aead;
-    use racer_dataplane::model::ClusterId;
-    use racer_dataplane::model::NodeId;
+    use racer_control_wire::ClusterId;
+    use racer_control_wire::NodeId;
     use racer_dataplane::model::RequestId;
     use racer_dataplane::model::WorkerId;
     use racer_dataplane::runtime::RequestScope;

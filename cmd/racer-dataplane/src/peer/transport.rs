@@ -11,7 +11,7 @@ use crate::error::Result;
 use crate::http::ConnectionLease;
 use crate::http::HttpIo;
 use crate::http::HttpPool;
-use crate::model::NodeId;
+use racer_control_wire::NodeId;
 use crate::admission::ResourceClass;
 use crate::model::TransferId;
 use crate::peer::forwarding::ForwardedHead;
@@ -237,7 +237,7 @@ mod native_exchange_tests {
     use crate::http::Codec;
     use crate::memory::BufferPool;
     use crate::model::ExpiresAt;
-    use crate::model::KeyId;
+    use racer_control_wire::KeyId;
     use crate::model::Nonce;
     use crate::model::ObjectMetadata;
     use crate::model::PageEnvelope;
@@ -2089,7 +2089,7 @@ unsafe impl IoBuffer for WireBuffer {
     }
 }
 
-type ReclaimCiphertext = dyn Fn(&crate::model::CacheId, usize);
+type ReclaimCiphertext = dyn Fn(&racer_control_wire::CacheId, usize);
 
 /// Generic Io has lost errno and may mean local ENOBUFS/ENOMEM. It is not link
 /// evidence. Only an observed orderly EOF is classified here; connect preserves
@@ -2118,7 +2118,7 @@ fn adaptive_socket_attribution_ignores_local_pressure_and_expired_scope() {
     )
     .unwrap();
     let owner = super::AdaptivePeers::new(Default::default(), Default::default()).unwrap();
-    let node = crate::model::NodeId("peer".into());
+    let node = racer_control_wire::NodeId("peer".into());
     let permit = Some(owner.acquire(&node).unwrap());
     let failed = Rc::new(std::cell::Cell::new(false));
     for error in [
@@ -2211,7 +2211,7 @@ impl Transfers {
     }
     pub(crate) fn with_reclamation(
         mut self,
-        reclaim: impl Fn(&crate::model::CacheId, usize) + 'static,
+        reclaim: impl Fn(&racer_control_wire::CacheId, usize) + 'static,
     ) -> Self {
         self.reclaim = Some(Rc::new(reclaim));
         self
@@ -2539,7 +2539,7 @@ mod tests {
 
     #[test]
     fn wire_checkout_reuses_zeroed_payload_without_moving_or_releasing_its_charge() {
-        use crate::model::CacheId;
+        use racer_control_wire::CacheId;
         let admission = flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         ));

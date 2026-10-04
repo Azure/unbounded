@@ -1,6 +1,7 @@
 use super::*;
 use crate::admission::ResourceClass;
 use crate::model::AttemptId;
+use racer_control_wire::CacheId;
 mod fill;
 mod hot_reads;
 mod peer_copies;
@@ -102,11 +103,11 @@ fn remote_budget_charges_final_incoming_link_and_never_restores_attempts() {
     )
     .unwrap();
     let mut route = crate::topology::RouteBudget {
-        membership: crate::model::MembershipVersion(1),
+        membership: racer_control_wire::MembershipVersion(1),
         request: scope.request,
         attempt: AttemptId([2; 16]),
-        destination: crate::model::NodeId("destination".into()),
-        visited: vec![crate::model::NodeId("sender".into())],
+        destination: racer_control_wire::NodeId("destination".into()),
+        visited: vec![racer_control_wire::NodeId("sender".into())],
         remaining_links: 1,
         remaining_attempts: 0,
         deadline: scope.deadline,
@@ -171,7 +172,7 @@ mod flight {
     use crate::error::Operation;
     use crate::error::Result;
     use crate::memory::PageResult;
-    use crate::model::CacheId;
+    use racer_control_wire::CacheId;
     use crate::model::CacheKey;
     use crate::model::ObjectId;
     use crate::model::ObjectVersion;
@@ -709,7 +710,7 @@ mod flight {
         budget: &'a mut AcquisitionBudget,
     ) -> AcquisitionWaiter<'a> {
         let membership = std::sync::Arc::new(
-            crate::topology::Membership::validate(crate::model::MembershipVersion(1), vec![])
+            crate::topology::Membership::validate(racer_control_wire::MembershipVersion(1), vec![])
                 .unwrap(),
         );
         match flights
@@ -1111,9 +1112,9 @@ mod timeouts {
     use crate::error::Operation;
     use crate::error::Result;
     use crate::model::ExpiresAt;
-    use crate::model::MembershipVersion;
+    use racer_control_wire::MembershipVersion;
     use crate::model::MetadataSelector;
-    use crate::model::NodeId;
+    use racer_control_wire::NodeId;
     use crate::model::ObjectMetadata;
     use crate::model::ObjectVersion;
     use crate::security::OriginContext;

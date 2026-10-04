@@ -38,10 +38,7 @@ pub(crate) fn parse_decimal(value: &[u8]) -> Result<u64> {
 // Keys are exactly 32 bytes. Strong ETags are opaque version identifiers, not
 // content hashes. Placement excludes ETag; page cache and flight identity include it.
 
-pub use racer_control_wire::CacheId;
-pub use racer_control_wire::ClusterId;
-pub use racer_control_wire::MembershipVersion;
-pub use racer_control_wire::NodeId;
+use racer_control_wire::CacheId;
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CacheKey(pub [u8; 32]);
 
@@ -566,7 +563,7 @@ pub enum MetadataSelector {
 
 pub const AEAD_TAG_BYTES: u32 = 16;
 
-pub use racer_control_wire::KeyId;
+use racer_control_wire::KeyId;
 
 /// Application configuration constructor, distinct from wire syntax errors.
 pub fn key_id_from_generation(generation: u64, suffix: u32) -> Result<KeyId> {

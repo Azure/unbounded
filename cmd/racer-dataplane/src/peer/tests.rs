@@ -1348,7 +1348,7 @@ mod requester_safety {
     //! Real socket exchange with the adaptive controller attached to routing/requester.
     use crate::admission::AdmissionPolicy;
     use crate::http::Codec;
-    use crate::model::MembershipVersion;
+    use racer_control_wire::MembershipVersion;
     use crate::admission::ResourceClass;
     use crate::peer::AdaptivePeers;
     use crate::peer::Outcome;
@@ -1392,7 +1392,9 @@ mod requester_safety {
                 MembershipVersion(1),
                 (0..1500)
                     .map(|i| Member {
-                        node: crate::model::NodeId(format!("{i:08x}-1111-4111-8111-111111111111")),
+                        node: racer_control_wire::NodeId(format!(
+                            "{i:08x}-1111-4111-8111-111111111111"
+                        )),
                         shares: std::num::NonZeroU32::new(1).unwrap(),
                         peer_endpoint: format!("127.0.0.1:{}", 8000 + i),
                         rails: vec![],
@@ -2775,7 +2777,7 @@ mod timing {
 }
 use crate::memory::BufferPool;
 use crate::security::EncryptedAuthorization;
-use crate::model::KeyId;
+use racer_control_wire::KeyId;
 use crate::model::MetadataSelector;
 use crate::model::Nonce;
 use crate::security::PeerOriginContext;

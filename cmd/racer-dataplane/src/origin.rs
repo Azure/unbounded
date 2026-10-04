@@ -357,7 +357,7 @@ impl Origin for OriginClient {
             let endpoint = self.endpoint(context)?;
             self.health
                 .run(
-                    &crate::model::NodeId(format!("{endpoint:?}")),
+                    &racer_control_wire::NodeId(format!("{endpoint:?}")),
                     self.bootstrap_reserved_at(&endpoint, context, reservation, scope),
                 )
                 .await
@@ -380,7 +380,7 @@ impl Origin for OriginClient {
             let endpoint = self.endpoint(context)?;
             self.health
                 .run(
-                    &crate::model::NodeId(format!("{endpoint:?}")),
+                    &racer_control_wire::NodeId(format!("{endpoint:?}")),
                     self.page_reserved_at(&endpoint, context, page, reservation, scope),
                 )
                 .await
@@ -399,7 +399,7 @@ impl Origin for OriginClient {
             let endpoint = self.endpoint(context)?;
             self.health
                 .run(
-                    &crate::model::NodeId(format!("{endpoint:?}")),
+                    &racer_control_wire::NodeId(format!("{endpoint:?}")),
                     self.metadata_at(&endpoint, context, selector, scope),
                 )
                 .await

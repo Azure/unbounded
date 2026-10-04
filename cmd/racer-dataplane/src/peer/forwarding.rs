@@ -5,9 +5,9 @@
 //! historical originals and hops are cryptographically verified without readmission.
 //!
 //! ```no_run
+//! use racer_control_wire::NodeId;
 //! use racer_dataplane::{
 //!     error::Result,
-//!     model::NodeId,
 //!     peer::{server::LocalPageService, protocol::{PeerRequest, VerifiedResponse}},
 //!     runtime::RequestScope,
 //!     peer::forwarding::Forwarding,
@@ -41,7 +41,7 @@
 //! ```
 use crate::error::Error;
 use crate::error::Result;
-use crate::model::NodeId;
+use racer_control_wire::NodeId;
 use crate::peer::protocol;
 use crate::peer::protocol::PeerRequest;
 use crate::peer::protocol::PeerResponse;
@@ -833,7 +833,7 @@ mod tests {
     use crate::admission::AdmissionPolicy;
     use crate::config::Limits;
     use crate::security::EncryptedAuthorization;
-    use crate::model::KeyId;
+    use racer_control_wire::KeyId;
     use crate::model::MetadataSelector;
     use crate::model::Nonce;
     use crate::security::OpaqueMetadata;

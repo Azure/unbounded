@@ -15,8 +15,8 @@ use crate::admission::AdmissionPolicy;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
-use crate::model::MembershipVersion;
-use crate::model::NodeId;
+use racer_control_wire::MembershipVersion;
+use racer_control_wire::NodeId;
 use crate::admission::ResourceClass;
 use crate::runtime::RequestScope;
 use crate::telemetry::Event;
@@ -593,7 +593,7 @@ pub enum Requester {
     #[cfg(any(test, feature = "subscription-interop"))]
     Scripted {
         available: Box<
-            dyn Fn(&std::sync::Arc<crate::topology::Membership>, &crate::model::NodeId) -> bool,
+            dyn Fn(&std::sync::Arc<crate::topology::Membership>, &racer_control_wire::NodeId) -> bool,
         >,
         request: Box<
             dyn Fn(
@@ -612,7 +612,7 @@ impl Requester {
         available: fn(
             &T,
             &std::sync::Arc<crate::topology::Membership>,
-            &crate::model::NodeId,
+            &racer_control_wire::NodeId,
         ) -> bool,
         request: for<'a> fn(
             &'a T,
@@ -690,7 +690,7 @@ impl Requester {
     pub fn direct_hedge_available(
         &self,
         membership: &std::sync::Arc<crate::topology::Membership>,
-        destination: &crate::model::NodeId,
+        destination: &racer_control_wire::NodeId,
     ) -> bool {
         match self {
             Self::Network {

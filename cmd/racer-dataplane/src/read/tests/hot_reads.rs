@@ -7,7 +7,7 @@ use crate::http::Codec;
 use crate::http::Delivery;
 use crate::http::new_pipe_pool;
 use crate::model::ByteRange;
-use crate::model::MembershipVersion;
+use racer_control_wire::MembershipVersion;
 use crate::peer::PeerNetwork;
 use crate::peer::forwarding::Forwarding;
 use crate::peer::forwarding::VerifiedResponse;
@@ -571,7 +571,7 @@ impl Link {
     fn direct_hedge_available(
         &self,
         _: &std::sync::Arc<crate::topology::Membership>,
-        _: &crate::model::NodeId,
+        _: &racer_control_wire::NodeId,
     ) -> bool {
         false
     }

@@ -489,7 +489,7 @@ pub(super) fn definition() -> racer_control_wire::CacheDefinition {
     let (client_socket, origin_socket) =
         racer_control_wire::canonical_socket_paths("app-lifecycle").unwrap();
     racer_control_wire::CacheDefinition {
-        id: crate::model::CacheId("33333333-3333-4333-8333-333333333333".into()),
+        id: racer_control_wire::CacheId("33333333-3333-4333-8333-333333333333".into()),
         name: "app-lifecycle".into(),
         client_socket,
         origin_socket,
@@ -505,7 +505,7 @@ pub(super) fn publication(
         schema_version: 1,
         cluster: config.cluster.clone(),
         sequence: wire::PublicationSequence(sequence),
-        membership_version: crate::model::MembershipVersion(1),
+        membership_version: racer_control_wire::MembershipVersion(1),
         members: vec![racer_control_wire::Member {
             node: config.node.clone(),
             shares: std::num::NonZeroU32::new(1).unwrap(),
@@ -968,7 +968,7 @@ fn shared_factory_is_send_and_sync_without_moving_worker_graphs() {
 
 #[test]
 fn multiworker_memberships_retire_after_request_leases_and_reuse_capacity() {
-    use crate::model::MembershipVersion;
+    use racer_control_wire::MembershipVersion;
     use crate::peer::PeerNetwork;
     let mut publication = racer_control_wire::decode_publication(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -1138,7 +1138,7 @@ fn snapshot_refresh_retries_canceled_publication_and_applies_skipped_removal() {
         .publish(publication(&config, 2, vec![]))
         .unwrap();
     let mut replacement = original.clone();
-    replacement.id = crate::model::CacheId("55555555-5555-4555-8555-555555555555".into());
+    replacement.id = racer_control_wire::CacheId("55555555-5555-4555-8555-555555555555".into());
     worker
         .snapshots
         .publish(publication(&config, 3, vec![replacement.clone()]))
@@ -2043,7 +2043,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
         .unwrap();
     assert_eq!(node.prepared.load(Ordering::Acquire), 2);
     assert!(node.observations.health.ready());
-    let cache = crate::model::CacheId("33333333-3333-4333-8333-333333333333".into());
+    let cache = racer_control_wire::CacheId("33333333-3333-4333-8333-333333333333".into());
     let key = wire::CacheKeyRef {
         cache: cache.clone(),
         id: crate::model::key_id_from_generation(2, 8).unwrap(),
@@ -2426,7 +2426,7 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
     }
     // Retire an omitted epoch through the actual serving loop. Accepted crypto
     // retains its key and buffers, without pausing listeners or deleting checkpoints.
-    let cache = crate::model::CacheId("33333333-3333-4333-8333-333333333333".into());
+    let cache = racer_control_wire::CacheId("33333333-3333-4333-8333-333333333333".into());
     let reference = wire::CacheKeyRef {
         cache: cache.clone(),
         id: crate::model::key_id_from_generation(2, 7).unwrap(),

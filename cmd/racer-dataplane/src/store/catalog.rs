@@ -2,7 +2,7 @@
 use crate::error::Error;
 use crate::error::Result;
 use crate::model::CurrentVersion;
-use crate::model::KeyId;
+use racer_control_wire::KeyId;
 use crate::model::ObjectId;
 use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
@@ -117,7 +117,7 @@ impl Index {
             reserved: Cell::new(0),
         }
     }
-    fn available(&self, cache: &crate::model::CacheId) -> bool {
+    fn available(&self, cache: &racer_control_wire::CacheId) -> bool {
         self.availability.metadata(cache)
     }
     pub fn worker(&self) -> WorkerId {
@@ -405,7 +405,7 @@ impl Index {
     pub fn segment_empty(&self, segment: SegmentId) -> bool {
         !self.state.borrow().reverse.contains_key(&segment)
     }
-    pub fn remove_cache(&self, cache: &crate::model::CacheId) {
+    pub fn remove_cache(&self, cache: &racer_control_wire::CacheId) {
         let mut s = self.state.borrow_mut();
         let pages: Vec<_> = s
             .pages
@@ -577,7 +577,7 @@ impl SegmentClock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::CacheId;
+    use racer_control_wire::CacheId;
     use crate::model::CacheKey;
     use crate::model::StrongEtag;
 

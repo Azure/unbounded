@@ -315,7 +315,8 @@ mod measurement {
                     environment::now() + Duration::from_secs(10),
                 )
                 .unwrap();
-                let cache = crate::model::CacheId("00000000-0000-4000-8000-000000000003".into());
+                let cache =
+                    racer_control_wire::CacheId("00000000-0000-4000-8000-000000000003".into());
                 let lease = || {
                     keys.active(&cache, racer_identity::KeyPurpose::Page)
                         .unwrap()
@@ -445,7 +446,7 @@ mod measurement {
             crate::test_support::cluster::config(false).limits,
         )));
         let keys = keyring();
-        let cache = crate::model::CacheId("00000000-0000-4000-8000-000000000003".into());
+        let cache = racer_control_wire::CacheId("00000000-0000-4000-8000-000000000003".into());
         let lease = || {
             keys.active(&cache, racer_identity::KeyPurpose::Page)
                 .unwrap()
@@ -541,7 +542,7 @@ mod measurement {
                     content_type: None,
                     version: crate::model::ObjectVersion {
                         object: crate::model::ObjectId {
-                            cache: crate::model::CacheId(
+                            cache: racer_control_wire::CacheId(
                                 "00000000-0000-4000-8000-000000000003".into(),
                             ),
                             key: crate::model::CacheKey([3; 32]),
@@ -554,13 +555,13 @@ mod measurement {
             .ciphertext;
             let inner = Arc::get_mut(&mut page.inner).unwrap();
             inner.envelope.page.version.object.cache =
-                crate::model::CacheId("00000000-0000-4000-8000-000000000003".into());
+                racer_control_wire::CacheId("00000000-0000-4000-8000-000000000003".into());
             if mode == "cached" {
                 inner.checksum.set(42).unwrap();
             }
             if mode == "missing" {
                 // The fixture keyring installs [1;16], also the bundle's default.
-                inner.envelope.key_id = crate::model::KeyId([99; 16]);
+                inner.envelope.key_id = racer_control_wire::KeyId([99; 16]);
             }
             let cache = page.envelope().page.version.object.cache.clone();
             let lease = keys
@@ -676,7 +677,7 @@ mod measurement {
             crate::test_support::cluster::config(false).limits,
         )));
         let keys = keyring();
-        let cache = crate::model::CacheId("00000000-0000-4000-8000-000000000003".into());
+        let cache = racer_control_wire::CacheId("00000000-0000-4000-8000-000000000003".into());
         let lease = || {
             keys.active(&cache, racer_identity::KeyPurpose::Page)
                 .unwrap()
@@ -1036,6 +1037,7 @@ mod measurement {
 }
 
 use crate::security::*;
+use racer_control_wire::CacheId;
 #[cfg(test)]
 mod channel_tests {
     #[cfg(test)]
@@ -1382,16 +1384,16 @@ mod tests {
     pub(super) fn key() -> KeyLease {
         keyring()
             .active(
-                &crate::model::CacheId("00000000-0000-4000-8000-000000000003".into()),
+                &racer_control_wire::CacheId("00000000-0000-4000-8000-000000000003".into()),
                 racer_identity::KeyPurpose::Page,
             )
             .unwrap()
     }
 
     pub(super) fn keyring() -> racer_identity::Keyring {
-        use crate::model::CacheId;
-        use crate::model::ClusterId;
-        use crate::model::NodeId;
+        use racer_control_wire::CacheId;
+        use racer_control_wire::ClusterId;
+        use racer_control_wire::NodeId;
         use racer_control_wire::*;
         use racer_identity::KeyEpochs;
         use racer_identity::Keyring;

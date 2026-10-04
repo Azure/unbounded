@@ -140,7 +140,7 @@ impl NoPeer {
     fn direct_hedge_available(
         &self,
         _: &std::sync::Arc<crate::topology::Membership>,
-        _: &crate::model::NodeId,
+        _: &racer_control_wire::NodeId,
     ) -> bool {
         false
     }

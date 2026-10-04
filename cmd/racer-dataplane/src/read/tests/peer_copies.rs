@@ -1,7 +1,7 @@
 //! Real AEAD and signed peer responses, with deterministic ranked source scripts.
 use super::fill::*;
 use crate::memory::CiphertextCopy;
-use crate::model::NodeId;
+use racer_control_wire::NodeId;
 use crate::peer::forwarding::Forwarding;
 use crate::peer::forwarding::VerifiedResponse;
 use crate::peer::protocol::PeerRequest;
@@ -149,7 +149,7 @@ impl ScriptedPeers {
 fn install_peers(f: &mut Fixture, rank: Option<usize>) -> (Rc<ScriptedPeers>, Vec<NodeId>) {
     f.membership = Arc::new(
         Membership::validate(
-            crate::model::MembershipVersion(1),
+            racer_control_wire::MembershipVersion(1),
             (0..4)
                 .map(|i| Member {
                     node: node(i),
@@ -764,7 +764,7 @@ fn hedge_stale_membership_refreshes_once_without_fresh_credits() {
             let metrics = enable_hedge(&mut f, &peers);
             let latest = Arc::new(
                 Membership::validate(
-                    crate::model::MembershipVersion(2),
+                    racer_control_wire::MembershipVersion(2),
                     f.membership.members().to_vec(),
                 )
                 .unwrap(),
@@ -1427,7 +1427,7 @@ fn unusable_copy(f: &Fixture, good: &CiphertextCopy, missing_key: bool) -> Ciphe
     let mut envelope = good.ciphertext.envelope().clone();
     let mut bytes = good.ciphertext.bytes().to_vec();
     if missing_key {
-        envelope.key_id = crate::model::KeyId([99; 16]);
+        envelope.key_id = racer_control_wire::KeyId([99; 16]);
     } else {
         bytes[0] ^= 1;
     }

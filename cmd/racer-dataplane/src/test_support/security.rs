@@ -2,9 +2,9 @@
 use crate::peer::protocol::Signatures;
 use crate::peer::protocol::SignedHead;
 use crate::http::Codec;
-use crate::model::CacheId;
-use crate::model::ClusterId;
-use crate::model::NodeId;
+use racer_control_wire::CacheId;
+use racer_control_wire::ClusterId;
+use racer_control_wire::NodeId;
 use crate::peer::protocol;
 use racer_control_wire::BundleGeneration;
 use racer_control_wire::CacheEncryptionKey;
@@ -250,7 +250,7 @@ mod tests {
     #[test]
     fn request_key_purpose_separation() {
         let keys = keys();
-        let cache = crate::model::CacheId(CACHE.into());
+        let cache = CacheId(CACHE.into());
         let mut tag = [0; 32];
         assert!(
             keys.active(&cache, KeyPurpose::Page)

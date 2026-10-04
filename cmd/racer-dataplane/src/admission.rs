@@ -3,7 +3,7 @@ use crate::model::WorkerId;
 use crate::config::Limits;
 use crate::error::Error;
 use crate::error::Result;
-use crate::model::CacheId;
+use racer_control_wire::CacheId;
 use crate::model::PAGE_BYTES;
 use crate::telemetry::Detail;
 use crate::telemetry::Failure;

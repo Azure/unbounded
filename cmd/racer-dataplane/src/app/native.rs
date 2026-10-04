@@ -205,7 +205,7 @@ impl WorkerApplication {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::MembershipVersion;
+    use racer_control_wire::MembershipVersion;
     use crate::admission::ResourceClass;
     use crate::security;
     use crate::security::CryptoClient;

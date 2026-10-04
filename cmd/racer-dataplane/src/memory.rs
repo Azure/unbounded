@@ -7,7 +7,7 @@ use crate::admission::AdmissionPolicy;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
-use crate::model::CacheId;
+use racer_control_wire::CacheId;
 use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
 use crate::model::PAGE_BYTES;

@@ -10,7 +10,7 @@ use crate::error::Result;
 use crate::http::ConnectionLease;
 use crate::security::Authorization;
 use crate::model::ByteRange;
-use crate::model::CacheId;
+use racer_control_wire::CacheId;
 use crate::model::CacheKey;
 use crate::model::ObjectId;
 use crate::security::OpaqueMetadata;

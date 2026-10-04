@@ -2,8 +2,8 @@ use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
 use crate::model::AttemptId;
-use crate::model::MembershipVersion;
-use crate::model::NodeId;
+use racer_control_wire::MembershipVersion;
+use racer_control_wire::NodeId;
 use crate::model::ObjectId;
 use crate::model::PageNumber;
 use crate::model::RequestId;
@@ -532,7 +532,7 @@ pub struct Route {
 /// Signed forwarding state. Retries preserve deadline and consumed link budget.
 #[derive(Clone, Debug)]
 pub struct RouteBudget {
-    pub membership: crate::model::MembershipVersion,
+    pub membership: racer_control_wire::MembershipVersion,
     pub request: RequestId,
     pub attempt: AttemptId,
     pub destination: NodeId,
@@ -1200,7 +1200,7 @@ pub(crate) mod tests {
 
     pub(crate) mod routing_tests {
         use super::*;
-        use crate::model::MembershipVersion;
+        use racer_control_wire::MembershipVersion;
         use crate::topology::Membership;
         use crate::topology::scored_members;
         use crate::topology::tests::fixtures::member;
@@ -1479,7 +1479,7 @@ pub(crate) mod tests {
                 member.shares = std::num::NonZeroU32::new(if i % 3 == 0 { 1 } else { 4 }).unwrap();
             }
             let members =
-                Arc::new(Membership::validate(crate::model::MembershipVersion(1), input).unwrap());
+                Arc::new(Membership::validate(racer_control_wire::MembershipVersion(1), input).unwrap());
             let cached = Paths::new(Rc::new(LinkHealth), 1);
             let cold = Paths::new(Rc::new(LinkHealth), 0);
             for (attempt, expected) in crate::topology::tests::fixtures::V5_NEXT_HOPS {
@@ -1504,7 +1504,7 @@ pub(crate) mod tests {
             let mut changed = members.members().to_vec();
             changed[1312].shares = std::num::NonZeroU32::new(u32::MAX).unwrap();
             let changed = Arc::new(
-                Membership::validate(crate::model::MembershipVersion(2), changed).unwrap(),
+                Membership::validate(racer_control_wire::MembershipVersion(2), changed).unwrap(),
             );
             let route = cached
                 .shortest(
@@ -1730,7 +1730,7 @@ pub(crate) mod tests {
                     .unwrap_err(),
                     expected
                 );
-                fresh.membership = crate::model::MembershipVersion(2);
+                fresh.membership = racer_control_wire::MembershipVersion(2);
                 assert_eq!(
                     paths.shortest(members.clone(), source, &fresh).unwrap_err(),
                     Error::IncompatibleMembership

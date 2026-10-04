@@ -3,7 +3,7 @@ use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
 use crate::model::AttemptId;
-use crate::model::NodeId;
+use racer_control_wire::NodeId;
 use crate::model::RequestId;
 use crate::admission::ResourceClass;
 use crate::model::WorkerId;

@@ -1,6 +1,6 @@
 //! Payload-free, discrete-event pressure model. Only admission is production code;
 //! queues, service times, placement, and page ownership are explicit abstractions.
-use crate::model::CacheId;
+use racer_control_wire::CacheId;
 use crate::model::PAGE_BYTES;
 use crate::admission::ResourceClass;
 #[cfg(test)]
@@ -758,7 +758,7 @@ mod waiter_detach {
     use super::*;
     use crate::error::Error;
     use crate::model::CacheKey;
-    use crate::model::MembershipVersion;
+    use racer_control_wire::MembershipVersion;
     use crate::model::ObjectId;
     use crate::model::ObjectVersion;
     use crate::security::OriginContext;
@@ -1577,10 +1577,10 @@ mod fidelity {
         let client = Rc::new(CryptoClient::new(port));
         let mut engine = PageCryptoEngine::new(CryptoRuntime { port: engine_port });
         let peers = crate::test_support::NoPeers::requester();
-        let node = crate::model::NodeId(crate::test_support::security::NODE.into());
+        let node = racer_control_wire::NodeId(crate::test_support::security::NODE.into());
         let membership = Arc::new(
             Membership::validate(
-                crate::model::MembershipVersion(1),
+                racer_control_wire::MembershipVersion(1),
                 vec![Member {
                     node: node.clone(),
                     shares: NonZeroU32::new(1).unwrap(),

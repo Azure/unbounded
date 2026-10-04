@@ -204,7 +204,7 @@ pub fn client_io(
 pub enum Endpoint {
     Unix(PathBuf),
     Origin {
-        cache: crate::model::CacheId,
+        cache: racer_control_wire::CacheId,
         path: PathBuf,
     },
     Peer(String),

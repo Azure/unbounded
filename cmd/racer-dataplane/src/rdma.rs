@@ -4,7 +4,7 @@ use crate::error::Operation;
 use crate::error::Result;
 use crate::memory::BufferPool;
 use crate::memory::CiphertextPage;
-use crate::model::NodeId;
+use racer_control_wire::NodeId;
 use crate::model::PageEnvelope;
 use crate::model::PageId;
 use crate::admission::ResourceClass;
@@ -1409,8 +1409,8 @@ pub fn select(route: &Route, page: &PageId) -> Result<TransportPlan> {
 pub fn select_hop(
     route: &Route,
     page: &PageId,
-    local: &crate::model::NodeId,
-    peer: &crate::model::NodeId,
+    local: &racer_control_wire::NodeId,
+    peer: &racer_control_wire::NodeId,
 ) -> Result<TransportPlan> {
     validate_route(route)?;
     if !route.nodes.windows(2).any(|pair| {
@@ -1481,7 +1481,7 @@ pub(crate) mod tests {
         use super::*;
         #[test]
         fn real_signed_setup_rejects_tampering_and_replay() {
-            use crate::model::ClusterId;
+            use racer_control_wire::ClusterId;
             use crate::peer::protocol::Signatures;
             use crate::peer::protocol::SignedHead;
             use crate::test_support::security::CLUSTER;
@@ -2622,7 +2622,7 @@ pub(crate) mod tests {
                     peer_metrics.clone(),
                 )
                 .unwrap();
-                let peer = crate::model::NodeId("native-peer".into());
+                let peer = racer_control_wire::NodeId("native-peer".into());
                 let permit = peer_admission.acquire(&peer).unwrap();
                 let qp = immediate(QueuePairHandle::poll_new_admitted(
                     io.device(0),

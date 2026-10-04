@@ -6,7 +6,7 @@ use crate::error::Operation;
 use crate::error::Result;
 use crate::model::AttemptId;
 use crate::model::MetadataSelector;
-use crate::model::NodeId;
+use racer_control_wire::NodeId;
 use crate::model::ObjectId;
 use crate::security::OriginContext;
 use crate::model::PageNumber;
@@ -43,7 +43,7 @@ use std::time::Instant;
 
 fn reserve_hedge_pages(
     admission: &flow_control::Quotas<crate::admission::AdmissionPolicy>,
-    cache: &crate::model::CacheId,
+    cache: &racer_control_wire::CacheId,
     pages: usize,
 ) -> Result<(
     flow_control::Charge<crate::admission::AdmissionPolicy>,
@@ -1422,7 +1422,7 @@ fn recoverable(error: Error) -> bool {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::model::CacheId;
+    use racer_control_wire::CacheId;
     use crate::model::CacheKey;
     use crate::model::ExpiresAt;
     use crate::model::ObjectMetadata;
@@ -1560,8 +1560,8 @@ pub(super) mod tests {
         Rc<CredentialCrypto>,
     ) {
         use crate::admission::AdmissionPolicy;
-        use crate::model::ClusterId;
-        use crate::model::MembershipVersion;
+        use racer_control_wire::ClusterId;
+        use racer_control_wire::MembershipVersion;
         use crate::model::RequestId;
         use crate::topology::Member;
         use crate::topology::Membership;
@@ -1864,7 +1864,7 @@ pub(super) mod tests {
         }
     }
     fn membership() -> std::sync::Arc<crate::topology::Membership> {
-        use crate::model::MembershipVersion;
+        use racer_control_wire::MembershipVersion;
         use crate::topology::Member;
         use crate::topology::Membership;
         std::sync::Arc::new(

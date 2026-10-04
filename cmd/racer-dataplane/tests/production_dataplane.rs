@@ -850,7 +850,7 @@ fn fixture_keys() -> (Rc<Keyring>, Rc<Keyring>) {
     {
         key["id"] = base64::engine::general_purpose::STANDARD
             .encode(
-                racer_dataplane::model::KeyId::from_generation(1, i as u32 + 1)
+                racer_control_wire::KeyId::from_generation(1, i as u32 + 1)
                     .unwrap()
                     .0,
             )

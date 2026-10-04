@@ -8,8 +8,8 @@ use crate::error::Result;
 use crate::memory::CiphertextPage;
 use crate::memory::CiphertextCopy;
 use crate::model::MAX_FIELD_BYTES;
-use crate::model::MembershipVersion;
-use crate::model::NodeId;
+use racer_control_wire::MembershipVersion;
+use racer_control_wire::NodeId;
 use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
 use crate::model::PageId;
@@ -814,7 +814,7 @@ fn include_page(intervals: &[PageInterval], page: u64) -> Vec<PageInterval> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::CacheId;
+    use racer_control_wire::CacheId;
     use crate::model::CacheKey;
     use crate::model::ObjectId;
     use crate::model::StrongEtag;
@@ -1123,7 +1123,7 @@ mod tests {
         use crate::admission::AdmissionPolicy;
         use crate::memory::BufferPool;
         use crate::model::ExpiresAt;
-        use crate::model::KeyId;
+        use racer_control_wire::KeyId;
         use crate::model::Nonce;
         use crate::model::PageEnvelope;
         use crate::admission::ResourceClass;
@@ -1158,7 +1158,7 @@ mod tests {
                     .unwrap(),
                 PageEnvelope {
                     page: page.clone(),
-                    key_id: KeyId([1; 16]),
+                    key_id: racer_control_wire::KeyId([1; 16]),
                     nonce: Nonce([2; 24]),
                     plaintext_length: 3,
                     ciphertext_length: 19,

@@ -154,7 +154,7 @@ mod pool {
             Endpoint::Unix(path.clone()),
             Endpoint::Origin {
                 path,
-                cache: crate::model::CacheId("nodelay-test".into()),
+                cache: racer_control_wire::CacheId("nodelay-test".into()),
             },
         ] {
             let scope = scope();
@@ -437,7 +437,7 @@ mod pool {
             unreachable!()
         };
         let origin = |uid: usize| Endpoint::Origin {
-            cache: crate::model::CacheId(format!("cache-{uid}")),
+            cache: racer_control_wire::CacheId(format!("cache-{uid}")),
             path: path.clone(),
         };
         let (first, peer) = held(&pool, &reactor, &admission, &origin(0), &listener);
@@ -464,7 +464,7 @@ mod pool {
             unreachable!()
         };
         let origin = Endpoint::Origin {
-            cache: crate::model::CacheId("cache".into()),
+            cache: racer_control_wire::CacheId("cache".into()),
             path,
         };
         let (first, a) = held(&pool, &reactor, &admission, &origin, &listener);
@@ -501,7 +501,7 @@ mod pool {
             unreachable!()
         };
         let endpoint = Endpoint::Origin {
-            cache: crate::model::CacheId("cache".into()),
+            cache: racer_control_wire::CacheId("cache".into()),
             path,
         };
         let (first, a) = held(&pool, &reactor, &admission, &endpoint, &listener);
@@ -617,7 +617,7 @@ mod pool {
                 metrics.clone(),
             )
             .unwrap();
-            let node = crate::model::NodeId("peer".into());
+            let node = racer_control_wire::NodeId("peer".into());
             let permit = peers.acquire(&node).unwrap();
             let failure = Rc::new(std::cell::Cell::new(false));
             let scope = RequestScope::new(
