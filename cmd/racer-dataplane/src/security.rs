@@ -1,6 +1,5 @@
 //! Verified identities, signature chains, and separate page/credential AEAD domains.
 pub mod aead;
-pub mod connection;
 pub mod credentials;
 
 impl From<racer_identity::Error> for crate::error::Error {
@@ -18,8 +17,8 @@ impl From<racer_identity::Error> for crate::error::Error {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::connection::Signatures;
-    use super::connection::SignedHead;
+    use crate::peer::protocol::Signatures;
+    use crate::peer::protocol::SignedHead;
     use crate::http::Codec;
     use crate::model::CacheId;
     use crate::model::ClusterId;
