@@ -106,7 +106,7 @@ impl RequestBinding {
 /// from modifying signed fields after verification.
 ///
 /// ```compile_fail
-/// use racer_dataplane::peer::protocol::{SignedRequest, VerifiedRequest};
+/// use racer_dataplane::peer::{protocol::SignedRequest, forwarding::VerifiedRequest};
 /// fn bypass_verification(request: SignedRequest) -> VerifiedRequest {
 ///     request.into()
 /// }
@@ -168,14 +168,14 @@ impl VerifiedRequest {
 /// This is distinct from both an unsigned local result and unverified wire input.
 ///
 /// ```compile_fail
-/// use racer_dataplane::peer::protocol::{SignedResponse, VerifiedResponse};
+/// use racer_dataplane::peer::{protocol::SignedResponse, forwarding::VerifiedResponse};
 /// fn bypass_verification(response: SignedResponse) -> VerifiedResponse {
 ///     response.into()
 /// }
 /// ```
 ///
 /// ```compile_fail
-/// use racer_dataplane::peer::protocol::{PeerResponse, VerifiedResponse};
+/// use racer_dataplane::peer::{protocol::PeerResponse, forwarding::VerifiedResponse};
 /// fn replace_verified_result(mut response: VerifiedResponse) {
 ///     *response.response() = PeerResponse::Miss;
 /// }

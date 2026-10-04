@@ -721,7 +721,7 @@ impl PinnedFallback {
         _: protocol::PeerRequest,
         _: std::sync::Arc<crate::topology::Membership>,
         _: &'a RequestScope,
-    ) -> Operation<'a, protocol::VerifiedResponse> {
+    ) -> Operation<'a, crate::peer::forwarding::VerifiedResponse> {
         panic!("pinned fallback fixture does not admit direct hedges")
     }
     fn request<'a>(
@@ -729,7 +729,7 @@ impl PinnedFallback {
         request: protocol::PeerRequest,
         membership: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
-    ) -> Operation<'a, protocol::VerifiedResponse> {
+    ) -> Operation<'a, crate::peer::forwarding::VerifiedResponse> {
         Box::pin(async move {
             if request.route.destination == self.destination {
                 return crate::peer::Requester::request(
@@ -819,7 +819,7 @@ impl CachedCopies {
         _: protocol::PeerRequest,
         _: std::sync::Arc<crate::topology::Membership>,
         _: &'a RequestScope,
-    ) -> Operation<'a, protocol::VerifiedResponse> {
+    ) -> Operation<'a, crate::peer::forwarding::VerifiedResponse> {
         panic!("metadata copy fixture does not admit direct hedges")
     }
     fn request<'a>(
@@ -827,7 +827,7 @@ impl CachedCopies {
         request: protocol::PeerRequest,
         _: std::sync::Arc<crate::topology::Membership>,
         _: &'a RequestScope,
-    ) -> Operation<'a, protocol::VerifiedResponse> {
+    ) -> Operation<'a, crate::peer::forwarding::VerifiedResponse> {
         Box::pin(async move {
             assert!(matches!(
                 request.operation,
