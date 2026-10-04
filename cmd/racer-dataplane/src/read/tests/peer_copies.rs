@@ -452,6 +452,217 @@ fn encrypted_copy(f: &mut Fixture) -> CiphertextCopy {
     }
 }
 
+#[test]
+fn retained_small_copy_admits_actual_plaintext_with_live_pressure() {
+    let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
+    let _owner = queue.enter();
+    for free in [3, 4096] {
+        let mut f = fixture();
+        let copy = encrypted_copy(&mut f);
+        let admission = f.fill.dependencies.admission.clone();
+        admission.reclaim_buffers();
+        let pressure = admission
+            .reserve(
+                None,
+                ResourceClass::Plaintext,
+                admission.limit(ResourceClass::Plaintext) - free,
+            )
+            .unwrap();
+        f.fill
+            .dependencies
+            .memory
+            .publish_ciphertext(crate::memory::page::UnverifiedPage {
+                copy: copy.clone(),
+                disk_token: None,
+            })
+            .unwrap();
+        let mut budget = AcquisitionBudget::new(f.scope.deadline.0, 8, 16);
+        let result = drive(
+            f.fill.acquire(
+                f.page.clone(),
+                f.membership.clone(),
+                &f.context,
+                &f.scope,
+                &mut budget,
+            ),
+            &mut f.engine,
+            &f.crypto,
+        )
+        .expect("known three-byte ciphertext must not require a full plaintext page");
+        assert_eq!(result.plaintext.bytes(), b"abc");
+        assert!(Arc::ptr_eq(
+            &copy.ciphertext.inner,
+            &result.ciphertext.inner
+        ));
+        assert_eq!(
+            pressure.amount(),
+            admission.limit(ResourceClass::Plaintext) - free
+        );
+        assert_eq!(
+            admission.used(ResourceClass::Plaintext),
+            pressure.amount() + 3
+        );
+        assert_eq!(f.origin.calls.get(), 0);
+        assert_eq!(budget.remaining_attempts(), 8);
+        assert_eq!(f.crypto.outstanding(), 0);
+    }
+}
+
+#[test]
+fn known_copy_admission_validates_before_reclaim_and_preserves_failures() {
+    for case in [
+        "success", "short", "canceled", "metadata", "identity", "corrupt",
+    ] {
+        let mut f = fixture();
+        let mut copy = encrypted_copy(&mut f);
+        let admission = f.fill.dependencies.admission.clone();
+        admission.reclaim_buffers();
+        if case == "metadata" {
+            copy.metadata.length = 4;
+        }
+        if case == "identity" {
+            f.page.number = PageNumber(1);
+        }
+        if case == "corrupt" {
+            let inner = Arc::get_mut(&mut copy.ciphertext.inner).unwrap();
+            inner.bytes[0] ^= 1;
+            inner.checksum.take();
+        }
+        let free = if case == "short" { 2 } else { 3 };
+        let pressure = admission
+            .reserve(
+                None,
+                ResourceClass::Plaintext,
+                admission.limit(ResourceClass::Plaintext) - free,
+            )
+            .unwrap();
+        let before = pressure.amount();
+        if case == "canceled" {
+            f.scope.cancel().unwrap();
+        }
+        let result = if case == "identity" {
+            f.fill.reserve_copy_plaintext(&f.page, &copy).map(|_| ())
+        } else {
+            drive(
+                f.fill.accept_selected(copy, &f.scope),
+                &mut f.engine,
+                &f.crypto,
+            )
+            .map(|p| {
+                assert_eq!(p.plaintext.bytes(), b"abc");
+            })
+        };
+        match case {
+            "success" => assert!(result.is_ok(), "{result:?}"),
+            "short" => assert_eq!(result, Err(Error::Overloaded)),
+            "canceled" => assert_eq!(result, Err(Error::Cancelled)),
+            _ => assert_eq!(result, Err(Error::CorruptRecord)),
+        }
+        assert_eq!(pressure.amount(), before);
+        assert_eq!(f.crypto.outstanding(), 0);
+        assert_eq!(f.origin.calls.get(), 0);
+        if case != "success" {
+            assert!(f.fill.dependencies.memory.get(&f.page).unwrap().is_none());
+            admission.reclaim_buffers();
+            assert_eq!(admission.used(ResourceClass::Plaintext), before);
+        }
+    }
+}
+
+#[test]
+fn known_copy_reclaims_only_idle_bytes_after_validation() {
+    let mut f = fixture();
+    let copy = encrypted_copy(&mut f);
+    let admission = f.fill.dependencies.admission.clone();
+    admission.reclaim_buffers();
+    let mut descriptor = copy.metadata.immutable();
+    descriptor.version.etag = StrongEtag::test_value("busy");
+    let busy = crate::memory::tests::bundle_for(&admission, descriptor.clone());
+    f.fill.dependencies.memory.publish(busy.clone()).unwrap();
+    descriptor.version.etag = StrongEtag::test_value("idle");
+    let idle = crate::memory::tests::bundle_for(&admission, descriptor);
+    let idle_id = idle.plaintext.page().clone();
+    f.fill.dependencies.memory.publish(idle).unwrap();
+    let pressure = admission
+        .reserve(
+            None,
+            ResourceClass::Plaintext,
+            admission.limit(ResourceClass::Plaintext) - admission.used(ResourceClass::Plaintext),
+        )
+        .unwrap();
+    let mut wrong = copy.clone();
+    wrong.metadata.length = 4;
+    assert!(matches!(
+        f.fill.reserve_copy_plaintext(&f.page, &wrong),
+        Err(Error::CorruptRecord)
+    ));
+    assert!(f.fill.dependencies.memory.get(&idle_id).unwrap().is_some());
+    let reservation = f.fill.reserve_copy_plaintext(&f.page, &copy).unwrap();
+    assert_eq!(reservation.amount(), 3);
+    assert!(f.fill.dependencies.memory.get(&idle_id).unwrap().is_none());
+    assert!(
+        f.fill
+            .dependencies
+            .memory
+            .get(busy.plaintext.page())
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(busy.plaintext.bytes(), &[1; 3]);
+    assert_eq!(
+        admission.used(ResourceClass::Plaintext),
+        pressure.amount() + 6
+    );
+}
+
+#[test]
+fn known_copy_full_page_still_requires_full_plaintext_admission() {
+    let mut f = fixture_with(PAGE_BYTES, None);
+    let admission = f.fill.dependencies.admission.clone();
+    let plaintext = f.fill.reserve_bootstrap(&f.context.object.cache).unwrap();
+    let plaintext = f
+        .fill
+        .dependencies
+        .buffers
+        .plaintext(plaintext, PAGE_BYTES as usize)
+        .unwrap();
+    let ciphertext = admission
+        .reserve(
+            Some(&f.context.object.cache),
+            ResourceClass::Ciphertext,
+            PAGE_BYTES as usize + 16,
+        )
+        .unwrap();
+    let (_, ciphertext) = drive(
+        f.fill
+            .dependencies
+            .crypto
+            .encrypt(f.page.clone(), plaintext, ciphertext, &f.scope),
+        &mut f.engine,
+        &f.crypto,
+    )
+    .unwrap();
+    let copy = CiphertextCopy {
+        metadata: f.origin.metadata.clone(),
+        ciphertext,
+    };
+    admission.reclaim_buffers();
+    let pressure = admission
+        .reserve(
+            None,
+            ResourceClass::Plaintext,
+            admission.limit(ResourceClass::Plaintext) - PAGE_BYTES as usize + 1,
+        )
+        .unwrap();
+    assert!(matches!(
+        f.fill.reserve_copy_plaintext(&f.page, &copy),
+        Err(Error::Overloaded)
+    ));
+    drop(pressure);
+    let reservation = f.fill.reserve_copy_plaintext(&f.page, &copy).unwrap();
+    assert_eq!(reservation.amount(), PAGE_BYTES as usize);
+}
+
 fn enable_hedge(f: &mut Fixture, peers: &Rc<ScriptedPeers>) -> crate::telemetry::metrics::Metrics {
     peers.hedge.set(true);
     let metrics = crate::telemetry::metrics::Metrics::default();

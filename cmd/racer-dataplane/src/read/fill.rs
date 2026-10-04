@@ -210,7 +210,7 @@ impl Fill {
             )?;
             copy.ciphertext = copy.ciphertext.rehome(reservation)?;
         }
-        let reservation = self.reserve_bootstrap(&page.version.object.cache)?;
+        let reservation = self.reserve_copy_plaintext(&page, &copy)?;
         let result = self
             .decrypt(&page, copy, reservation, scope, DecryptSource::Peer)
             .await?;
@@ -296,6 +296,21 @@ impl Fill {
         cache: &crate::model::CacheId,
     ) -> Result<flow_control::Charge<AdmissionPolicy>> {
         self.reserve_with_reclamation(cache, ResourceClass::Plaintext, PAGE_BYTES as usize)
+    }
+
+    /// A received or retained copy already fixes the output length. Validate it
+    /// before reclaiming, without changing unknown-origin or hedge admission.
+    pub(super) fn reserve_copy_plaintext(
+        &self,
+        page: &PageId,
+        copy: &crate::memory::page::CiphertextCopy,
+    ) -> Result<flow_control::Charge<AdmissionPolicy>> {
+        validate_copy(copy, page)?;
+        self.reserve_with_reclamation(
+            &page.version.object.cache,
+            ResourceClass::Plaintext,
+            copy.ciphertext.envelope().plaintext_length as usize,
+        )
     }
     pub fn new(dependencies: FillDependencies) -> Self {
         Self {
@@ -550,9 +565,9 @@ impl Fill {
                     if !plaintext {
                         return Ok(AcquiredPage::Ciphertext(copy));
                     }
-                    let reservation = fill.reserve_bootstrap(&owned_page.version.object.cache)?;
-                    match fill
-                        .decrypt(
+                    let result = async {
+                        let reservation = fill.reserve_copy_plaintext(&owned_page, &copy.copy)?;
+                        fill.decrypt(
                             &owned_page,
                             copy.copy.clone(),
                             reservation,
@@ -560,7 +575,9 @@ impl Fill {
                             DecryptSource::Retained,
                         )
                         .await
-                    {
+                    }
+                    .await;
+                    match result {
                         Ok(result) => {
                             fill.publish(result.clone(), None, &owned_scope).await?;
                             return Ok(result.into());
@@ -1207,7 +1224,7 @@ impl Fill {
         })?;
         let reservation = match reservation {
             Some(reserved) => reserved,
-            None => self.reserve_bootstrap(&page.version.object.cache)?,
+            None => self.reserve_copy_plaintext(page, &copy)?,
         };
         self.decrypt(page, copy, reservation, scope, DecryptSource::Peer)
             .await
