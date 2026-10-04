@@ -2,7 +2,6 @@
 //! Cache lookups retain the original encrypted page and immutable version metadata.
 //! Eviction releases idle leases; retirement hides entries without revoking owners.
 pub mod cache;
-pub mod delivery;
 use crate::error::Error;
 use crate::error::Result;
 use crate::model::CacheId;
