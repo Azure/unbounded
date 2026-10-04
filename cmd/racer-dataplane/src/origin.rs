@@ -3,7 +3,9 @@
 //!
 //! Credentials are only origin-fetch context, never Racer authorization. Do not
 //! persist headers or retain them in pooled connections after an operation ends.
+use racer_control_wire::CacheDefinition;
 use crate::control::SnapshotStore;
+use racer_control_wire::canonical_socket_paths;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -13,25 +15,28 @@ use crate::http::HttpIo;
 use crate::http::HttpPool;
 use crate::memory::BufferPool;
 use crate::memory::PlaintextBuffer;
+use crate::model::ExpiresAt;
 use crate::model::MetadataSelector;
 use crate::model::ObjectId;
 use crate::model::ObjectMetadata;
+use crate::model::ObjectVersion;
 use crate::model::OriginContext;
 use crate::model::PAGE_BYTES;
 use crate::model::PageId;
 use crate::model::PageNumber;
 use crate::model::ResourceClass;
+use crate::model::StrongEtag;
 use crate::read::candidates::OriginAuthority;
 use crate::admission::AdmissionPolicy;
 use crate::runtime::RequestScope;
 use http1::Header;
 use http1::MessageHead;
 use http1::StartLine;
-use racer_control_wire::CacheDefinition;
-use racer_control_wire::canonical_socket_paths;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
+use uring_runtime::reactor::Completion;
+use uring_runtime::reactor::IoBuffer;
 /// OriginClient is the shipping adapter implementation. Scripted implementations
 /// remain for poll-exact cancellation, wake ordering, and reservation-fence tests;
 /// ordinary adapter scenarios should use the shared test_support UDS fixture.
@@ -213,7 +218,7 @@ impl OriginClient {
             .await
             .map_err(response_error)?;
         // A pinned 404 is a broken origin contract, not permission to refresh.
-        protocol::response(
+        validate_response(
             &response.value,
             matches!(selector, MetadataSelector::Pinned(_)),
         )?;
@@ -463,32 +468,32 @@ pub struct MetadataReply {
 
 /// The initial GET selects metadata and page zero atomically at the adapter.
 pub fn validate_bootstrap(head: &MessageHead, object: &ObjectId) -> Result<(ObjectMetadata, u64)> {
-    let (status, length) = protocol::response(head, false)?;
-    if protocol::required(head, "Content-Type")? != b"application/octet-stream" {
+    let (status, length) = validate_response(head, false)?;
+    if required(head, "Content-Type")? != b"application/octet-stream" {
         return Err(Error::BadGateway);
     }
     let total = if status == 200 {
         if length != 0 {
             return Err(Error::BadGateway);
         }
-        protocol::absent(head, &["Content-Range"])?;
+        absent(head, &["Content-Range"])?;
         0
     } else {
-        let (first, last, total) = protocol::content_range(head)?;
+        let (first, last, total) = content_range(head)?;
         if first != 0 || length != last + 1 || length != total.min(PAGE_BYTES) {
             return Err(Error::BadGateway);
         }
         total
     };
-    Ok((protocol::metadata(head, object, total)?, length))
+    Ok((metadata(head, object, total)?, length))
 }
 pub fn validate_metadata(head: &MessageHead, object: &ObjectId) -> Result<ObjectMetadata> {
-    let (status, length) = protocol::response(head, false)?;
+    let (status, length) = validate_response(head, false)?;
     if status != 200 {
         return Err(Error::BadGateway);
     }
-    protocol::absent(head, &["Content-Range"])?;
-    protocol::metadata(head, object, length)
+    absent(head, &["Content-Range"])?;
+    metadata(head, object, length)
 }
 #[cfg(test)]
 mod metadata_tests {
@@ -550,7 +555,7 @@ mod metadata_tests {
             b"1.0",
             b"9223372036854775808",
         ] {
-            assert_eq!(protocol::decimal(invalid), Err(Error::BadGateway));
+            assert_eq!(decimal(invalid), Err(Error::BadGateway));
             assert_eq!(
                 validate_metadata(&head(b"1", invalid, b"\"v\""), &object()),
                 Err(Error::BadGateway)
@@ -657,11 +662,11 @@ pub fn validate_page(
 
 /// Validate before allocating or receiving any payload.
 fn validate_page_head(head: &MessageHead, page: &PageId) -> Result<(ObjectMetadata, u64)> {
-    let (status, length) = protocol::response(head, true)?;
-    if status != 206 || protocol::required(head, "Content-Type")? != b"application/octet-stream" {
+    let (status, length) = validate_response(head, true)?;
+    if status != 206 || required(head, "Content-Type")? != b"application/octet-stream" {
         return Err(Error::BadGateway);
     }
-    let (first, last, total) = protocol::content_range(head)?;
+    let (first, last, total) = content_range(head)?;
     let expected_first = page
         .number
         .0
@@ -673,7 +678,7 @@ fn validate_page_head(head: &MessageHead, page: &PageId) -> Result<(ObjectMetada
     {
         return Err(Error::BadGateway);
     }
-    let metadata = protocol::metadata(head, &page.version.object, total)?;
+    let metadata = metadata(head, &page.version.object, total)?;
     if metadata.version != page.version {
         return Err(Error::BadGateway);
     }
@@ -747,65 +752,291 @@ mod page_tests {
     }
 }
 
-/// SDK wire rules shared by HEAD and whole-page responses.
-mod protocol {
-    use crate::error::Error;
-    use crate::error::Result;
-    use crate::model::ExpiresAt;
-    use crate::model::ObjectId;
-    use crate::model::ObjectMetadata;
-    use crate::model::ObjectVersion;
-    use crate::model::StrongEtag;
-    use http1::MessageHead;
-    use http1::StartLine;
+fn field<'a>(head: &'a MessageHead, name: &str) -> Result<Option<&'a [u8]>> {
+    let value = head.unique(name).map_err(|_| Error::BadGateway)?;
+    // Preserve canonical numeric fields before decimal/range validation, just as
+    // opaque context preserves exact bytes. The codec removed only separator SP;
+    // trimming here would accept forbidden padding in expiry, lengths, or ranges.
+    Ok(value.map(|value| {
+        if name.eq_ignore_ascii_case("Authorization")
+            || name.eq_ignore_ascii_case("Racer-Metadata")
+            || name.eq_ignore_ascii_case("Racer-Expires-At")
+            || name.eq_ignore_ascii_case("Racer-Content-Type")
+            || name.eq_ignore_ascii_case("Content-Length")
+            || name.eq_ignore_ascii_case("Content-Range")
+        {
+            value
+        } else {
+            http1::trim_ows(value)
+        }
+    }))
+}
 
-    pub(super) fn field<'a>(head: &'a MessageHead, name: &str) -> Result<Option<&'a [u8]>> {
-        let mut values = head
-            .headers
-            .iter()
-            .filter(|h| h.name.eq_ignore_ascii_case(name));
-        let value = values.next().map(|h| h.value.as_slice());
-        if values.next().is_some() {
+fn required<'a>(head: &'a MessageHead, name: &str) -> Result<&'a [u8]> {
+    field(head, name)?.ok_or(Error::BadGateway)
+}
+
+/// Canonical decimal, bounded by the SDK's nonnegative signed-64-bit domain.
+fn decimal(bytes: &[u8]) -> Result<u64> {
+    crate::model::parse_decimal(bytes).map_err(|_| Error::BadGateway)
+}
+
+fn absent(head: &MessageHead, names: &[&str]) -> Result<()> {
+    for name in names {
+        if field(head, name)?.is_some() {
             return Err(Error::BadGateway);
         }
-        // Preserve canonical numeric fields before decimal/range validation, just as
-        // opaque context preserves exact bytes. The codec removed only separator SP;
-        // trimming here would accept forbidden padding in expiry, lengths, or ranges.
-        Ok(value.map(|value| {
-            if name.eq_ignore_ascii_case("Authorization")
-                || name.eq_ignore_ascii_case("Racer-Metadata")
-                || name.eq_ignore_ascii_case("Racer-Expires-At")
-                || name.eq_ignore_ascii_case("Racer-Content-Type")
-                || name.eq_ignore_ascii_case("Content-Length")
-                || name.eq_ignore_ascii_case("Content-Range")
+    }
+    Ok(())
+}
+
+/// Validate framing before interpreting status; malformed errors are never miss proof.
+fn validate_response(head: &MessageHead, pinned: bool) -> Result<(u16, u64)> {
+    for name in [
+        "Host",
+        "Content-Length",
+        "Content-Type",
+        "Content-Range",
+        "ETag",
+        "If-Match",
+        "Range",
+        "Racer-Expires-At",
+        "Racer-Content-Type",
+        "Racer-Metadata",
+        "Authorization",
+    ] {
+        field(head, name)?;
+    }
+    for name in ["Racer-Metadata", "Authorization"] {
+        if let Some(value) = field(head, name)? {
+            if value.is_empty()
+                || value.len() > 8192
+                || value.first() == Some(&b' ')
+                || value.last() == Some(&b' ')
+                || value.iter().any(|byte| *byte < 32 || *byte == 127)
             {
-                value
-            } else {
-                http1::trim_ows(value)
-            }
-        }))
-    }
-
-    pub(super) fn required<'a>(head: &'a MessageHead, name: &str) -> Result<&'a [u8]> {
-        field(head, name)?.ok_or(Error::BadGateway)
-    }
-
-    /// Canonical decimal, bounded by the SDK's nonnegative signed-64-bit domain.
-    pub(super) fn decimal(bytes: &[u8]) -> Result<u64> {
-        crate::model::parse_decimal(bytes).map_err(|_| Error::BadGateway)
-    }
-
-    pub(super) fn absent(head: &MessageHead, names: &[&str]) -> Result<()> {
-        for name in names {
-            if field(head, name)?.is_some() {
                 return Err(Error::BadGateway);
             }
         }
-        Ok(())
+    }
+    absent(
+        head,
+        &[
+            "Transfer-Encoding",
+            "Content-Encoding",
+            "Trailer",
+            "Upgrade",
+            "Expect",
+            "If-None-Match",
+            "If-Modified-Since",
+            "If-Unmodified-Since",
+            "If-Range",
+        ],
+    )?;
+    if let Some(value) = field(head, "Racer-Content-Type")? {
+        crate::model::ContentType::parse(value).map_err(|_| Error::BadGateway)?;
+    }
+    for connection in head.values("Connection") {
+        if connection
+            .split(|b| *b == b',')
+            .any(|token| token.trim_ascii().eq_ignore_ascii_case(b"upgrade"))
+        {
+            return Err(Error::BadGateway);
+        }
+    }
+    let status = match head.start {
+        StartLine::Response { status } => status,
+        _ => return Err(Error::BadGateway),
+    };
+    let length = decimal(required(head, "Content-Length")?)?;
+    if status == 200 || status == 206 {
+        return Ok((status, length));
+    }
+    if length != 0 {
+        return Err(Error::BadGateway);
+    }
+    absent(head, &["ETag", "Racer-Expires-At", "Racer-Content-Type"])?;
+    let unsatisfied_length = if status == 416 {
+        let value = required(head, "Content-Range")?;
+        Some(decimal(
+            value.strip_prefix(b"bytes */").ok_or(Error::BadGateway)?,
+        )?)
+    } else {
+        absent(head, &["Content-Range"])?;
+        None
+    };
+    if status == 405 && required(head, "Allow")? != b"HEAD, GET" {
+        return Err(Error::BadGateway);
+    }
+    Err(match status {
+        400 => Error::InvalidRequest,
+        405 => Error::MethodNotAllowed,
+        431 => Error::HeaderTooLarge,
+        401 => Error::OriginRejected,
+        403 => Error::OriginForbidden,
+        404 if pinned => Error::BadGateway,
+        404 => Error::NotFound,
+        500 => Error::Internal,
+        503 => Error::Unavailable,
+        412 => Error::VersionUnavailable,
+        416 => Error::UnsatisfiableRangeWithLength(unsatisfied_length.ok_or(Error::BadGateway)?),
+        _ => Error::BadGateway,
+    })
+}
+
+fn metadata(head: &MessageHead, object: &ObjectId, length: u64) -> Result<ObjectMetadata> {
+    let etag = StrongEtag::parse(required(head, "ETag")?).map_err(|_| Error::BadGateway)?;
+    let expires_at =
+        ExpiresAt::parse(required(head, "Racer-Expires-At")?).map_err(|_| Error::BadGateway)?;
+    Ok(ObjectMetadata {
+        content_type: field(head, "Racer-Content-Type")?
+            .map(crate::model::ContentType::parse)
+            .transpose()
+            .map_err(|_| Error::BadGateway)?,
+        version: ObjectVersion {
+            object: object.clone(),
+            etag,
+        },
+        length,
+        expires_at,
+    })
+}
+
+fn content_range(head: &MessageHead) -> Result<(u64, u64, u64)> {
+    let value = required(head, "Content-Range")?
+        .strip_prefix(b"bytes ")
+        .ok_or(Error::BadGateway)?;
+    let slash = value
+        .iter()
+        .position(|b| *b == b'/')
+        .ok_or(Error::BadGateway)?;
+    let bounds = &value[..slash];
+    let dash = bounds
+        .iter()
+        .position(|b| *b == b'-')
+        .ok_or(Error::BadGateway)?;
+    let first = decimal(&bounds[..dash])?;
+    let last = decimal(&bounds[dash + 1..])?;
+    let total = decimal(&value[slash + 1..])?;
+    if first > last || last >= total {
+        return Err(Error::BadGateway);
+    }
+    Ok((first, last, total))
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+    use http1::Header;
+
+    #[test]
+    fn optional_content_type_is_validated_without_transport_substitution() {
+        let object = ObjectId {
+            cache: crate::model::CacheId("cache".into()),
+            key: crate::model::CacheKey([0; 32]),
+        };
+        let base = crate::origin::tests::response_head(
+            200,
+            &[
+                ("ETag", b"\"v1\""),
+                ("Content-Length", b"3"),
+                ("Racer-Expires-At", b"0"),
+                ("Content-Type", b"application/octet-stream"),
+            ],
+        );
+        assert!(metadata(&base, &object, 3).unwrap().content_type.is_none());
+        for value in [
+            b"application/vnd.oci.image.manifest.v1+json".as_slice(),
+            b"",
+            b"text",
+            b"text/plain\t",
+            b"text/plain, text/html",
+            b"text/\xff",
+            b"text/plain\r\nx:y",
+        ] {
+            let mut head = MessageHead {
+                start: StartLine::Response { status: 200 },
+                headers: base
+                    .headers
+                    .iter()
+                    .map(|h| Header {
+                        name: h.name.clone(),
+                        value: h.value.clone(),
+                    })
+                    .collect(),
+            };
+            head.headers.push(Header {
+                name: "Racer-Content-Type".into(),
+                value: value.to_vec(),
+            });
+            let valid = value.starts_with(b"application/");
+            assert_eq!(validate_response(&head, false).is_ok(), valid, "{value:?}");
+            assert_eq!(metadata(&head, &object, 3).is_ok(), valid);
+            if valid {
+                assert_eq!(
+                    metadata(&head, &object, 3)
+                        .unwrap()
+                        .content_type
+                        .unwrap()
+                        .as_bytes(),
+                    value
+                );
+            }
+            head.headers.push(Header {
+                name: "racer-content-type".into(),
+                value: value.to_vec(),
+            });
+            assert_eq!(validate_response(&head, false), Err(Error::BadGateway));
+            assert!(metadata(&head, &object, 3).is_err());
+        }
     }
 
-    /// Validate framing before interpreting status; malformed errors are never miss proof.
-    pub(super) fn response(head: &MessageHead, pinned: bool) -> Result<(u16, u64)> {
+    #[test]
+    fn numeric_headers_reject_padding_before_any_normalization() {
+        use crate::http::Codec;
+        use crate::model::CacheId;
+        use crate::model::CacheKey;
+        let object = ObjectId {
+            cache: CacheId("cache".into()),
+            key: CacheKey([0; 32]),
+        };
+        for (name, canonical) in [
+            ("Racer-Expires-At", "0"),
+            ("Content-Length", "1"),
+            ("Content-Range", "bytes 0-0/1"),
+        ] {
+            for (prefix, suffix) in [("", ""), (" ", ""), ("", " "), ("\t", ""), ("", "\t")] {
+                let fields = [
+                    ("Content-Length", "1"),
+                    ("Content-Type", "application/octet-stream"),
+                    ("Content-Range", "bytes 0-0/1"),
+                    ("ETag", "\"v\""),
+                    ("Racer-Expires-At", "0"),
+                ];
+                let mut raw = String::from("HTTP/1.1 206 Partial Content\r\n");
+                for (field, value) in fields {
+                    if field == name {
+                        raw.push_str(&format!("{field}: {prefix}{canonical}{suffix}\r\n"));
+                    } else {
+                        raw.push_str(&format!("{field}: {value}\r\n"));
+                    }
+                }
+                raw.push_str("\r\n");
+                let result = Codec::new(32768)
+                    .decode_head(raw.as_bytes())
+                    .map_err(|_| Error::BadGateway)
+                    .and_then(|head| validate_bootstrap(&head.unwrap().0, &object));
+                if prefix.is_empty() && suffix.is_empty() {
+                    assert_eq!(result.unwrap().1, 1);
+                } else {
+                    assert_eq!(result, Err(Error::BadGateway), "{name}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn all_sdk_singletons_reject_case_insensitive_duplicates() {
         for name in [
             "Host",
             "Content-Length",
@@ -815,323 +1046,69 @@ mod protocol {
             "If-Match",
             "Range",
             "Racer-Expires-At",
-            "Racer-Content-Type",
             "Racer-Metadata",
             "Authorization",
         ] {
-            field(head, name)?;
-        }
-        for name in ["Racer-Metadata", "Authorization"] {
-            if let Some(value) = field(head, name)? {
-                if value.is_empty()
-                    || value.len() > 8192
-                    || value.first() == Some(&b' ')
-                    || value.last() == Some(&b' ')
-                    || value.iter().any(|byte| *byte < 32 || *byte == 127)
-                {
-                    return Err(Error::BadGateway);
-                }
-            }
-        }
-        absent(
-            head,
-            &[
-                "Transfer-Encoding",
-                "Content-Encoding",
-                "Trailer",
-                "Upgrade",
-                "Expect",
-                "If-None-Match",
-                "If-Modified-Since",
-                "If-Unmodified-Since",
-                "If-Range",
-            ],
-        )?;
-        if let Some(value) = field(head, "Racer-Content-Type")? {
-            crate::model::ContentType::parse(value).map_err(|_| Error::BadGateway)?;
-        }
-        for connection in head.values("Connection") {
-            if connection
-                .split(|b| *b == b',')
-                .any(|token| token.trim_ascii().eq_ignore_ascii_case(b"upgrade"))
-            {
-                return Err(Error::BadGateway);
-            }
-        }
-        let status = match head.start {
-            StartLine::Response { status } => status,
-            _ => return Err(Error::BadGateway),
-        };
-        let length = decimal(required(head, "Content-Length")?)?;
-        if status == 200 || status == 206 {
-            return Ok((status, length));
-        }
-        if length != 0 {
-            return Err(Error::BadGateway);
-        }
-        absent(head, &["ETag", "Racer-Expires-At", "Racer-Content-Type"])?;
-        let unsatisfied_length = if status == 416 {
-            let value = required(head, "Content-Range")?;
-            Some(decimal(
-                value.strip_prefix(b"bytes */").ok_or(Error::BadGateway)?,
-            )?)
-        } else {
-            absent(head, &["Content-Range"])?;
-            None
-        };
-        if status == 405 && required(head, "Allow")? != b"HEAD, GET" {
-            return Err(Error::BadGateway);
-        }
-        Err(match status {
-            400 => Error::InvalidRequest,
-            405 => Error::MethodNotAllowed,
-            431 => Error::HeaderTooLarge,
-            401 => Error::OriginRejected,
-            403 => Error::OriginForbidden,
-            404 if pinned => Error::BadGateway,
-            404 => Error::NotFound,
-            500 => Error::Internal,
-            503 => Error::Unavailable,
-            412 => Error::VersionUnavailable,
-            416 => {
-                Error::UnsatisfiableRangeWithLength(unsatisfied_length.ok_or(Error::BadGateway)?)
-            }
-            _ => Error::BadGateway,
-        })
-    }
-
-    pub(super) fn metadata(
-        head: &MessageHead,
-        object: &ObjectId,
-        length: u64,
-    ) -> Result<ObjectMetadata> {
-        let etag = StrongEtag::parse(required(head, "ETag")?).map_err(|_| Error::BadGateway)?;
-        let expires_at =
-            ExpiresAt::parse(required(head, "Racer-Expires-At")?).map_err(|_| Error::BadGateway)?;
-        Ok(ObjectMetadata {
-            content_type: field(head, "Racer-Content-Type")?
-                .map(crate::model::ContentType::parse)
-                .transpose()
-                .map_err(|_| Error::BadGateway)?,
-            version: ObjectVersion {
-                object: object.clone(),
-                etag,
-            },
-            length,
-            expires_at,
-        })
-    }
-
-    pub(super) fn content_range(head: &MessageHead) -> Result<(u64, u64, u64)> {
-        let value = required(head, "Content-Range")?
-            .strip_prefix(b"bytes ")
-            .ok_or(Error::BadGateway)?;
-        let slash = value
-            .iter()
-            .position(|b| *b == b'/')
-            .ok_or(Error::BadGateway)?;
-        let bounds = &value[..slash];
-        let dash = bounds
-            .iter()
-            .position(|b| *b == b'-')
-            .ok_or(Error::BadGateway)?;
-        let first = decimal(&bounds[..dash])?;
-        let last = decimal(&bounds[dash + 1..])?;
-        let total = decimal(&value[slash + 1..])?;
-        if first > last || last >= total {
-            return Err(Error::BadGateway);
-        }
-        Ok((first, last, total))
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use http1::Header;
-
-        #[test]
-        fn optional_content_type_is_validated_without_transport_substitution() {
-            let object = ObjectId {
-                cache: crate::model::CacheId("cache".into()),
-                key: crate::model::CacheKey([0; 32]),
-            };
-            let base = crate::origin::tests::response_head(
-                200,
-                &[
-                    ("ETag", b"\"v1\""),
-                    ("Content-Length", b"3"),
-                    ("Racer-Expires-At", b"0"),
-                    ("Content-Type", b"application/octet-stream"),
-                ],
-            );
-            assert!(metadata(&base, &object, 3).unwrap().content_type.is_none());
-            for value in [
-                b"application/vnd.oci.image.manifest.v1+json".as_slice(),
-                b"",
-                b"text",
-                b"text/plain\t",
-                b"text/plain, text/html",
-                b"text/\xff",
-                b"text/plain\r\nx:y",
-            ] {
-                let mut head = MessageHead {
-                    start: StartLine::Response { status: 200 },
-                    headers: base
-                        .headers
-                        .iter()
-                        .map(|h| Header {
-                            name: h.name.clone(),
-                            value: h.value.clone(),
-                        })
-                        .collect(),
-                };
+            let mut head = crate::origin::tests::response_head(200, &[("Content-Length", b"0")]);
+            if name != "Content-Length" {
                 head.headers.push(Header {
-                    name: "Racer-Content-Type".into(),
-                    value: value.to_vec(),
-                });
-                let valid = value.starts_with(b"application/");
-                assert_eq!(response(&head, false).is_ok(), valid, "{value:?}");
-                assert_eq!(metadata(&head, &object, 3).is_ok(), valid);
-                if valid {
-                    assert_eq!(
-                        metadata(&head, &object, 3)
-                            .unwrap()
-                            .content_type
-                            .unwrap()
-                            .as_bytes(),
-                        value
-                    );
-                }
-                head.headers.push(Header {
-                    name: "racer-content-type".into(),
-                    value: value.to_vec(),
-                });
-                assert_eq!(response(&head, false), Err(Error::BadGateway));
-                assert!(metadata(&head, &object, 3).is_err());
-            }
-        }
-
-        #[test]
-        fn numeric_headers_reject_padding_before_any_normalization() {
-            use crate::http::Codec;
-            use crate::model::CacheId;
-            use crate::model::CacheKey;
-            let object = ObjectId {
-                cache: CacheId("cache".into()),
-                key: CacheKey([0; 32]),
-            };
-            for (name, canonical) in [
-                ("Racer-Expires-At", "0"),
-                ("Content-Length", "1"),
-                ("Content-Range", "bytes 0-0/1"),
-            ] {
-                for (prefix, suffix) in [("", ""), (" ", ""), ("", " "), ("\t", ""), ("", "\t")] {
-                    let fields = [
-                        ("Content-Length", "1"),
-                        ("Content-Type", "application/octet-stream"),
-                        ("Content-Range", "bytes 0-0/1"),
-                        ("ETag", "\"v\""),
-                        ("Racer-Expires-At", "0"),
-                    ];
-                    let mut raw = String::from("HTTP/1.1 206 Partial Content\r\n");
-                    for (field, value) in fields {
-                        if field == name {
-                            raw.push_str(&format!("{field}: {prefix}{canonical}{suffix}\r\n"));
-                        } else {
-                            raw.push_str(&format!("{field}: {value}\r\n"));
-                        }
-                    }
-                    raw.push_str("\r\n");
-                    let result = Codec::new(32768)
-                        .decode_head(raw.as_bytes())
-                        .map_err(|_| Error::BadGateway)
-                        .and_then(|head| {
-                            super::super::validate_bootstrap(&head.unwrap().0, &object)
-                        });
-                    if prefix.is_empty() && suffix.is_empty() {
-                        assert_eq!(result.unwrap().1, 1);
-                    } else {
-                        assert_eq!(result, Err(Error::BadGateway), "{name}");
-                    }
-                }
-            }
-        }
-
-        #[test]
-        fn all_sdk_singletons_reject_case_insensitive_duplicates() {
-            for name in [
-                "Host",
-                "Content-Length",
-                "Content-Type",
-                "Content-Range",
-                "ETag",
-                "If-Match",
-                "Range",
-                "Racer-Expires-At",
-                "Racer-Metadata",
-                "Authorization",
-            ] {
-                let mut head =
-                    crate::origin::tests::response_head(200, &[("Content-Length", b"0")]);
-                if name != "Content-Length" {
-                    head.headers.push(Header {
-                        name: name.into(),
-                        value: b"x".to_vec(),
-                    });
-                }
-                head.headers.push(Header {
-                    name: name.to_ascii_lowercase(),
+                    name: name.into(),
                     value: b"x".to_vec(),
                 });
-                assert_eq!(response(&head, false), Err(Error::BadGateway), "{name}");
             }
+            head.headers.push(Header {
+                name: name.to_ascii_lowercase(),
+                value: b"x".to_vec(),
+            });
+            assert_eq!(
+                validate_response(&head, false),
+                Err(Error::BadGateway),
+                "{name}"
+            );
         }
+    }
 
-        #[test]
-        fn error_contracts_preserve_origin_credential_and_status_distinctions() {
-            for (status, expected) in [
-                (400, Error::InvalidRequest),
-                (401, Error::OriginRejected),
-                (403, Error::OriginForbidden),
-                (404, Error::NotFound),
-                (405, Error::MethodNotAllowed),
-                (412, Error::VersionUnavailable),
-                (416, Error::UnsatisfiableRangeWithLength(27)),
-                (431, Error::HeaderTooLarge),
-                (500, Error::Internal),
-                (502, Error::BadGateway),
-                (503, Error::Unavailable),
-                (302, Error::BadGateway),
-            ] {
-                let mut head =
-                    crate::origin::tests::response_head(status, &[("Content-Length", b"0")]);
-                if status == 416 {
-                    head.headers.push(Header {
-                        name: "Content-Range".into(),
-                        value: b"bytes */27".to_vec(),
-                    });
-                }
-                if status == 405 {
-                    head.headers.push(Header {
-                        name: "Allow".into(),
-                        value: b"HEAD, GET".to_vec(),
-                    });
-                }
-                assert_eq!(response(&head, false), Err(expected));
-                if status == 404 {
-                    assert_eq!(response(&head, true), Err(Error::BadGateway));
-                }
-                head.headers[0].value = b"1".to_vec();
-                assert_eq!(response(&head, false), Err(Error::BadGateway));
-                head.headers[0].value = b"0".to_vec();
+    #[test]
+    fn error_contracts_preserve_origin_credential_and_status_distinctions() {
+        for (status, expected) in [
+            (400, Error::InvalidRequest),
+            (401, Error::OriginRejected),
+            (403, Error::OriginForbidden),
+            (404, Error::NotFound),
+            (405, Error::MethodNotAllowed),
+            (412, Error::VersionUnavailable),
+            (416, Error::UnsatisfiableRangeWithLength(27)),
+            (431, Error::HeaderTooLarge),
+            (500, Error::Internal),
+            (502, Error::BadGateway),
+            (503, Error::Unavailable),
+            (302, Error::BadGateway),
+        ] {
+            let mut head = crate::origin::tests::response_head(status, &[("Content-Length", b"0")]);
+            if status == 416 {
                 head.headers.push(Header {
-                    name: "ETag".into(),
-                    value: b"\"v\"".to_vec(),
+                    name: "Content-Range".into(),
+                    value: b"bytes */27".to_vec(),
                 });
-                assert_eq!(response(&head, false), Err(Error::BadGateway));
             }
+            if status == 405 {
+                head.headers.push(Header {
+                    name: "Allow".into(),
+                    value: b"HEAD, GET".to_vec(),
+                });
+            }
+            assert_eq!(validate_response(&head, false), Err(expected));
+            if status == 404 {
+                assert_eq!(validate_response(&head, true), Err(Error::BadGateway));
+            }
+            head.headers[0].value = b"1".to_vec();
+            assert_eq!(validate_response(&head, false), Err(Error::BadGateway));
+            head.headers[0].value = b"0".to_vec();
+            head.headers.push(Header {
+                name: "ETag".into(),
+                value: b"\"v\"".to_vec(),
+            });
+            assert_eq!(validate_response(&head, false), Err(Error::BadGateway));
         }
     }
 }
-use uring_runtime::Completion;
-use uring_runtime::IoBuffer;
