@@ -22,7 +22,7 @@ use racer_dataplane::runtime::crypto::CryptoInput;
 use racer_dataplane::runtime::crypto::CryptoOutput;
 use racer_dataplane::runtime::RequestScope;
 use racer_dataplane::runtime::worker::CryptoRuntime;
-use racer_dataplane::runtime::worker::CryptoService;
+
 use racer_dataplane::security::aead::PageCryptoEngine;
 use racer_identity::KeyEpochs;
 use racer_identity::KeyPurpose;

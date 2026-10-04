@@ -23,7 +23,7 @@ use crate::runtime::crypto::CryptoPermit;
 use crate::runtime::crypto::IntegrityRejection;
 use crate::runtime::RequestScope;
 use crate::runtime::worker::CryptoRuntime;
-use crate::runtime::worker::CryptoService;
+
 use crate::telemetry::AeadFailure;
 use crate::telemetry::Failure;
 use crate::telemetry::Stage;

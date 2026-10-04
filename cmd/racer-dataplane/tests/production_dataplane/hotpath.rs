@@ -13,7 +13,7 @@ use racer_dataplane::runtime::affinity::AffinityPlan;
 use racer_dataplane::runtime::worker::WorkerFactory;
 use racer_dataplane::runtime::worker::WorkerGroup;
 use racer_dataplane::runtime::worker::WorkerRuntime;
-use racer_dataplane::runtime::worker::WorkerService;
+
 use std::collections::VecDeque;
 use std::io::BufReader;
 use std::sync::Barrier;
@@ -136,7 +136,11 @@ impl WorkerFactory for Factory {
     fn limits(&self) -> Limits {
         budgets()
     }
-    fn build(&self, worker: WorkerId, runtime: WorkerRuntime) -> Result<Box<dyn WorkerService>> {
+    fn build(
+        &self,
+        worker: WorkerId,
+        runtime: WorkerRuntime,
+    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
         let rig = Rc::new(Rig::assemble(
             P,
             false,
@@ -277,7 +281,7 @@ impl Service {
         Ok(())
     }
 }
-impl WorkerService for Service {
+impl uring_runtime::group::Service<RequestScope> for Service {
     fn start<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
         Box::pin(async { Ok(()) })
     }

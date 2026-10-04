@@ -1141,7 +1141,7 @@ pub(super) use crate::runtime::crypto;
 pub(super) use crate::runtime::crypto::CryptoClient;
 pub(super) use crate::runtime::Reactor;
 pub(super) use crate::runtime::worker::CryptoRuntime;
-pub(super) use crate::runtime::worker::CryptoService;
+
 pub(super) use crate::security::aead::PageCryptoEngine;
 pub(super) use crate::store::catalog::Index;
 pub(super) use crate::store::catalog::SegmentClock;

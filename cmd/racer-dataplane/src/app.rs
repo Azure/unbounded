@@ -68,11 +68,11 @@ use crate::runtime::affinity::AffinityPlan;
 use crate::runtime::RequestScope;
 use crate::runtime::Reactor;
 use crate::runtime::worker::CryptoRuntime;
-use crate::runtime::worker::CryptoService;
+
 use crate::runtime::worker::WorkerFactory;
 use crate::runtime::worker::WorkerGroup;
 use crate::runtime::worker::WorkerRuntime;
-use crate::runtime::worker::WorkerService;
+
 use crate::security::aead::PageCrypto;
 use crate::security::aead::PageCryptoEngine;
 use crate::security::connection::Signatures;
@@ -1300,7 +1300,11 @@ impl WorkerFactory for Application {
     fn limits(&self) -> Limits {
         self.limits.clone()
     }
-    fn build(&self, worker: WorkerId, runtime: WorkerRuntime) -> Result<Box<dyn WorkerService>> {
+    fn build(
+        &self,
+        worker: WorkerId,
+        runtime: WorkerRuntime,
+    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
         let application = WorkerApplication::assemble(
             &self.config,
             self.node.clone(),
@@ -1320,7 +1324,7 @@ impl WorkerFactory for Application {
             .crypto(worker, PageCryptoEngine::new(runtime))
     }
 }
-impl WorkerService for WorkerApplication {
+impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
     fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
         WorkerApplication::start(self, scope)
     }

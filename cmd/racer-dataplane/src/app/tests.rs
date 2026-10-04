@@ -775,7 +775,7 @@ fn assembled_worker_exports_live_quota_gauges() {
 #[test]
 fn application_budget_poll_preserves_cooperative_and_completion_wakes() {
     let mut worker = wake_test_worker();
-    // Exercise the production WorkerService entry point with side-effect-free
+    // Exercise the production runtime Service entry point with side-effect-free
     // tasks. Stopping bypasses control publication and snapshot requirements.
     worker.started = true;
     worker.stopping = true;

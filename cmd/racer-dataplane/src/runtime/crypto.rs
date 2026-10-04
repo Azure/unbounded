@@ -1573,7 +1573,7 @@ impl Drop for CryptoPort {
     }
 }
 
-/// Local submission facade, driven by WorkerService, not by the waiting future.
+/// Local submission facade, driven by the worker service, not by the waiting future.
 /// The bounded waiter table outlives canceled futures. Future drop abandons only
 /// delivery; the engine/queue retains resources until I/O reaps the completion.
 /// I/O checks generation/sequence before delivery and never publishes stale work.

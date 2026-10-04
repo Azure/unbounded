@@ -88,13 +88,13 @@ pub struct WorkerGroup<'a> {
 /// ```compile_fail
 /// use std::rc::Rc;
 /// use racer_dataplane::{error::Result, model::WorkerId,
-///     runtime::worker::{WorkerFactory, WorkerRuntime, WorkerService,
+///     runtime::worker::{WorkerFactory, WorkerRuntime,
 ///                       CryptoRuntime}};
 /// use uring_runtime::group::Service;
 /// use racer_dataplane::runtime::RequestScope;
 /// struct LocalFactory(Rc<()>);
 /// impl WorkerFactory for LocalFactory {
-///     fn build(&self, _: WorkerId, _: WorkerRuntime) -> Result<Box<dyn WorkerService>> { todo!() }
+///     fn build(&self, _: WorkerId, _: WorkerRuntime) -> Result<Box<dyn Service<RequestScope>>> { todo!() }
 ///     fn build_crypto(&self, _: WorkerId, _: CryptoRuntime) -> Result<Box<dyn Service<RequestScope>>> { todo!() }
 /// }
 /// ```
@@ -125,26 +125,16 @@ pub trait WorkerFactory: Sync {
             relay_transfers: n(16),
         }
     }
-    fn build(&self, worker: WorkerId, runtime: WorkerRuntime) -> Result<Box<dyn WorkerService>>;
+    fn build(
+        &self,
+        worker: WorkerId,
+        runtime: WorkerRuntime,
+    ) -> Result<Box<dyn Service<RequestScope>>>;
     fn build_crypto(
         &self,
         worker: WorkerId,
         runtime: CryptoRuntime,
     ) -> Result<Box<dyn Service<RequestScope>>>;
-}
-pub trait WorkerService {
-    fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()>;
-    /// Reap crypto completions before new admission, including abandoned results.
-    /// Forward the retained driver context to all service futures so cooperative
-    /// continuations and cross-worker notifications interrupt the bounded idle wait.
-    fn poll_budgeted(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()>;
-    fn stop_admission(&mut self) -> Result<()>;
-    /// The future drives service-local tasks itself while the group independently
-    /// polls reactor and crypto completions (the service is mutably borrowed).
-    /// Drain reads/dirty writes while the engine remains live. Close submissions
-    /// only after no I/O producer can submit; keep consuming until fully fenced.
-    fn drain<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()>;
-    fn shutdown<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()>;
 }
 
 impl<'a> WorkerGroup<'a> {
@@ -520,7 +510,7 @@ where
 }
 struct IoService {
     runtime: WorkerRuntime,
-    built: Result<Box<dyn WorkerService>>,
+    built: Result<Box<dyn Service<RequestScope>>>,
     reporter: Option<FailureReporter<Error>>,
 }
 impl Service<RequestScope> for IoService {
@@ -686,7 +676,7 @@ mod shared_tests {
             &self,
             worker: WorkerId,
             runtime: WorkerRuntime,
-        ) -> Result<Box<dyn WorkerService>> {
+        ) -> Result<Box<dyn Service<RequestScope>>> {
             assert_eq!(
                 current_cpus().unwrap(),
                 std::collections::BTreeSet::from([self.cpu])
@@ -783,7 +773,7 @@ mod shared_tests {
         }
     }
 
-    impl WorkerService for Io {
+    impl Service<RequestScope> for Io {
         fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
             Box::pin(async move {
                 self.observed.event(self.worker, "io-start");
@@ -1340,7 +1330,7 @@ mod tests {
         }
     }
     impl WorkerFactory for TestFactory {
-        fn build(&self, _: WorkerId, _: WorkerRuntime) -> Result<Box<dyn WorkerService>> {
+        fn build(&self, _: WorkerId, _: WorkerRuntime) -> Result<Box<dyn Service<RequestScope>>> {
             assert_eq!(
                 current_cpus().unwrap(),
                 std::collections::BTreeSet::from([self.cpu])
@@ -1374,7 +1364,7 @@ mod tests {
             }))
         }
     }
-    impl WorkerService for TestIo {
+    impl Service<RequestScope> for TestIo {
         fn start<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
             Box::pin(std::future::poll_fn(move |cx| {
                 self.driver = Some(cx.waker().clone());
@@ -1679,7 +1669,11 @@ mod tests {
             fn limits(&self) -> Limits {
                 panic!("injected limits panic")
             }
-            fn build(&self, _: WorkerId, _: WorkerRuntime) -> Result<Box<dyn WorkerService>> {
+            fn build(
+                &self,
+                _: WorkerId,
+                _: WorkerRuntime,
+            ) -> Result<Box<dyn Service<RequestScope>>> {
                 panic!("must not build")
             }
             fn build_crypto(
