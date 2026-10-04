@@ -61,7 +61,7 @@ mod body_progress {
         server_scope: RequestScope,
         auth: Forwarding,
         signed: protocol::SignedRequest,
-        binding: crate::security::forwarding::RequestBinding,
+        binding: crate::peer::forwarding::RequestBinding,
     }
 
     impl BodyFixture {
@@ -197,7 +197,7 @@ mod body_progress {
                     .accept(Rc::new(listener.into()), &server_scope)
                     .await?;
                 let conn = crate::http::from_accepted(fd, &admission)?;
-                let conn = crate::security::connection::accept(
+                let conn = crate::peer::protocol::accept(
                     &io,
                     conn,
                     signers[2].clone(),
@@ -794,7 +794,7 @@ mod destination_disconnect {
             let head = encode_envelope(&signed.authentication, false, 0).unwrap();
             let client = drive(&reactor, async {
                 let sending = async {
-                    let client = crate::security::connection::connect(
+                    let client = crate::peer::protocol::connect(
                         &io,
                         client,
                         signers[0].clone(),
@@ -1169,7 +1169,7 @@ mod encrypted_http {
                         accepts.set(accepts.get() + 1);
                         let fd = reactor.accept(listener.clone(), &scope).await?;
                         let conn = crate::http::from_accepted(fd, &admissions[1])?;
-                        crate::security::connection::accept(
+                        crate::peer::protocol::accept(
                             &ios[1],
                             conn,
                             identities[1].signatures.clone(),
@@ -1357,8 +1357,8 @@ mod requester_safety {
     use crate::http::HttpPool;
     use crate::model::MembershipVersion;
     use crate::model::ResourceClass;
-    use crate::peer::adaptive::AdaptivePeers;
-    use crate::peer::adaptive::Outcome;
+    use crate::peer::AdaptivePeers;
+    use crate::peer::Outcome;
     use crate::peer::protocol::PeerResponse;
     use crate::peer::protocol::decode_envelope;
     use crate::peer::protocol::encode_envelope;
@@ -1483,7 +1483,7 @@ mod requester_safety {
         );
         let metrics = Metrics::default();
         let adaptive = AdaptivePeers::new(
-            crate::peer::adaptive::Config {
+            crate::peer::Config {
                 total: 4,
                 per_peer: 1,
             },
@@ -1962,7 +1962,7 @@ mod timing {
             let fd = reactor.accept(Rc::new(listener.into()), &scope).await?;
             let connection = crate::http::from_accepted(fd, &admission)?;
             let mut connection =
-                crate::security::connection::accept(&io, connection, signers[2].clone(), &scope)
+                crate::peer::protocol::accept(&io, connection, signers[2].clone(), &scope)
                     .await?;
             let auth = Forwarding::new(signers[2].clone());
             for attempt in 0..3 {
@@ -2050,8 +2050,8 @@ use crate::peer::protocol::encode_envelope;
 use crate::admission::AdmissionPolicy;
 use uring_runtime::deadline::Deadline;
 use crate::runtime::RequestScope;
-use crate::security::connection::Signatures;
-use crate::security::forwarding::Forwarding;
+use crate::peer::protocol::Signatures;
+use crate::peer::forwarding::Forwarding;
 use crate::topology::RouteBudget;
 use racer_identity::Certificates;
 use racer_identity::Keyring;

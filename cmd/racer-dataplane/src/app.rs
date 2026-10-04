@@ -22,7 +22,7 @@ use crate::control::CacheTransition;
 use crate::runtime::HashSet;
 use crate::client::RequestParser;
 use crate::client::listener::ClientListeners;
-use crate::client::response::Responses;
+use crate::client::Responses;
 use crate::config::Config;
 use crate::control::BundleInstaller;
 use crate::control::ControlClient;
@@ -38,8 +38,8 @@ use crate::http::HttpIo;
 use crate::http::HttpPool;
 use crate::memory::BufferPool;
 use crate::memory::cache::MemoryCache;
-use crate::memory::delivery::Delivery;
-use crate::memory::new_pipe_pool;
+use crate::http::Delivery;
+use crate::http::new_pipe_pool;
 use crate::config::Limits;
 use crate::model::NodeId;
 use crate::model::RequestId;
@@ -75,9 +75,9 @@ use crate::runtime::worker::WorkerRuntime;
 
 use crate::security::aead::PageCrypto;
 use crate::security::aead::PageCryptoEngine;
-use crate::security::connection::Signatures;
+use crate::peer::protocol::Signatures;
 use crate::security::credentials::CredentialCrypto;
-use crate::security::forwarding::Forwarding;
+use crate::peer::forwarding::Forwarding;
 use crate::store::Store;
 use crate::store::StoreReader;
 use crate::store::StoreWriter;
@@ -124,7 +124,7 @@ pub struct NodeState {
     inventory: Arc<crate::rdma::Inventory>,
     send_crc: crate::telemetry::Samples,
     hedges: std::sync::OnceLock<Arc<crate::read::candidates::Hedges>>,
-    peer_admission: Arc<crate::peer::adaptive::AdaptivePeers>,
+    peer_admission: Arc<crate::peer::AdaptivePeers>,
     subscriptions: Arc<crate::peer::subscriptions::Subscriptions>,
     ingress: Arc<crate::admission::Ingress>,
     metrics: Vec<(WorkerId, crate::telemetry::Metrics)>,
@@ -165,13 +165,13 @@ impl NodeState {
     fn with_peer_admission(
         workers: Vec<WorkerId>,
         capacity: usize,
-        peer_config: crate::peer::adaptive::Config,
+        peer_config: crate::peer::Config,
     ) -> Result<Self> {
         let count = workers.len();
         let map = Arc::new(WorkerMap::new(workers.clone())?);
         let metrics = crate::telemetry::Metrics::for_workers(count)?;
         let peer_admission =
-            crate::peer::adaptive::AdaptivePeers::new(peer_config, metrics[0].clone())?;
+            crate::peer::AdaptivePeers::new(peer_config, metrics[0].clone())?;
         Ok(Self {
             peer_admission,
             inventory: crate::rdma::Inventory::shared(),

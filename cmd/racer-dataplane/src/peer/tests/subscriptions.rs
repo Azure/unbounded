@@ -542,14 +542,14 @@ fn subscription_selection_is_canonical_signed_and_bound_to_exact_grant() {
         // Sign directly to test receiver validation independently of sign_response.
         let mut head = crate::peer::protocol::response_head(
             &response,
-            &crate::security::connection::signed_digest(&admitted.signed().authentication.original)
+            &crate::peer::protocol::signed_digest(&admitted.signed().authentication.original)
                 .unwrap(),
             &[NodeId(A.into()), NodeId(C.into())],
         )
         .unwrap();
         crate::peer::protocol::push(&mut head, "racer-receiver", A);
         let signed = protocol::SignedResponse {
-            authentication: crate::security::forwarding::ForwardedHead {
+            authentication: crate::peer::forwarding::ForwardedHead {
                 original: Arc::new(signers[2].sign(head).unwrap()),
                 hops: vec![],
             },

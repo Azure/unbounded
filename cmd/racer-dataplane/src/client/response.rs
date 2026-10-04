@@ -6,7 +6,7 @@ use crate::error::Operation;
 use crate::error::Result;
 use crate::http::ConnectionLease;
 use crate::http::HttpIo;
-use crate::memory::delivery::Delivery;
+use crate::http::Delivery;
 use crate::model::ObjectMetadata;
 use crate::model::ResolvedRange;
 use crate::read::ReadResponse;
@@ -33,7 +33,7 @@ mod subscription {
     use crate::http::ConnectionLease;
     use crate::http::HttpIo;
     use crate::http::OwnedBuffer;
-    use crate::memory::delivery::ReaderLease;
+    use crate::http::ReaderLease;
     use crate::model::ObjectMetadata;
     use crate::model::PAGE_BYTES;
     use crate::model::PageNumber;
@@ -104,7 +104,7 @@ mod subscription {
             socket: &std::rc::Rc<uring_runtime::Descriptor>,
             stream: &mut RangeStream,
             outstanding: &mut BTreeMap<PageNumber, u32>,
-            current: Option<(crate::model::PageSlice, &crate::memory::delivery::FinalSend)>,
+            current: Option<(crate::model::PageSlice, &crate::http::FinalSend)>,
         ) -> Result<bool> {
             let mut released = false;
             // At most 64 releases per turn, even for malicious input.
@@ -324,7 +324,7 @@ mod subscription {
                             .ok_or(Error::BadGateway)?;
                         // Acquisition owns no delivery pipe and continues even while
                         // the page frame or payload is blocked on this socket.
-                        let final_send = crate::memory::delivery::FinalSend::default();
+                        let final_send = crate::http::FinalSend::default();
                         let mut write = Box::pin(async {
                             let connection = send_frame(
                                 &self.io,
@@ -428,8 +428,8 @@ mod subscription {
         use super::*;
         #[test]
         fn ready_slice_precedes_auxiliary_overload() {
-            use crate::memory::delivery::Delivery;
-            use crate::memory::new_pipe_pool;
+            use crate::http::Delivery;
+            use crate::http::new_pipe_pool;
             use crate::model::PageNumber;
             use crate::model::PageSlice;
             use crate::admission::AdmissionPolicy;

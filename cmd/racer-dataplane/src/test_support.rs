@@ -6,7 +6,7 @@ use crate::control::PublishedState;
 use crate::control::SnapshotStore;
 use crate::memory::BufferPool;
 use crate::memory::cache::MemoryCache;
-use crate::memory::delivery::Delivery;
+use crate::http::Delivery;
 use crate::model::MembershipVersion;
 use crate::model::ObjectMetadata;
 use crate::model::WorkerId;
@@ -585,7 +585,7 @@ impl NoPeers {
         _: crate::peer::protocol::PeerRequest,
         _: std::sync::Arc<crate::topology::Membership>,
         _: &'a crate::runtime::RequestScope,
-    ) -> crate::error::Operation<'a, crate::peer::protocol::VerifiedResponse> {
+    ) -> crate::error::Operation<'a, crate::peer::forwarding::VerifiedResponse> {
         panic!("local origin scenario must not hedge to a peer")
     }
     fn request<'a>(
@@ -593,7 +593,7 @@ impl NoPeers {
         _: crate::peer::protocol::PeerRequest,
         _: std::sync::Arc<crate::topology::Membership>,
         _: &'a crate::runtime::RequestScope,
-    ) -> crate::error::Operation<'a, crate::peer::protocol::VerifiedResponse> {
+    ) -> crate::error::Operation<'a, crate::peer::forwarding::VerifiedResponse> {
         Box::pin(async { panic!("local origin scenario must not contact peers") })
     }
 }

@@ -1317,8 +1317,8 @@ impl Fixture {
         use racer_control_wire::CacheDefinition;
         use crate::control::PublishedState;
         use crate::control::SnapshotStore;
-        use crate::memory::delivery::Delivery;
-        use crate::memory::new_pipe_pool;
+        use crate::http::Delivery;
+        use crate::http::new_pipe_pool;
         use crate::read::Coordinator;
         use crate::read::metadata::MetadataDependencies;
         use crate::read::metadata::MetadataService;

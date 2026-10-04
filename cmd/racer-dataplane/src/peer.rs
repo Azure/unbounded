@@ -1,5 +1,6 @@
 //! Correlated logical requests with monotonic budgets, attempts, and cancellation.
 pub mod adaptive;
+pub mod forwarding;
 pub mod protocol;
 pub mod server;
 pub mod subscriptions;
@@ -125,7 +126,7 @@ use crate::model::ResourceClass;
 use crate::rdma;
 use crate::admission::AdmissionPolicy;
 use crate::runtime::RequestScope;
-use crate::security::forwarding::Forwarding;
+use crate::peer::forwarding::Forwarding;
 use crate::telemetry::Observer;
 use crate::telemetry::Stage;
 use crate::topology::Paths;
@@ -496,7 +497,7 @@ impl Requester {
 /// use racer_dataplane::{error::Result, peer::{Requester,
 ///     Relay, server::PeerServer,
 ///     protocol::{PeerRequest, SignedRequest, SignedResponse, VerifiedResponse}},
-///     runtime::RequestScope, security::forwarding::Forwarding,
+///     runtime::RequestScope, peer::forwarding::Forwarding,
 ///     topology::Membership};
 /// async fn interfaces(
 ///     client: &Requester, transport: &Requester,
@@ -736,7 +737,7 @@ impl NetworkRequester {
                 .hops
                 .last()
                 .unwrap_or(&request.authentication.original);
-            let next = crate::security::connection::receiver(&signed_head.head)?;
+            let next = crate::peer::protocol::receiver(&signed_head.head)?;
             // A signature selects the next receiver. Never reroute this envelope
             // independently after signing, even if link health changes.
             let endpoint = network.endpoint(&membership, &next)?;
@@ -832,7 +833,7 @@ impl NetworkRequester {
     fn verify_exchange(
         &self,
         response: transport::RelayResponse,
-        binding: &crate::security::forwarding::RequestBinding,
+        binding: &crate::peer::forwarding::RequestBinding,
     ) -> Result<transport::RelayResponse> {
         match response {
             transport::RelayResponse::Complete(response) => self

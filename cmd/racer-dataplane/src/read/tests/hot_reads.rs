@@ -5,18 +5,18 @@ use crate::client::ReadKind;
 use crate::control::PublishedState;
 use crate::http::Codec;
 use crate::http::HttpIo;
-use crate::memory::delivery::Delivery;
-use crate::memory::new_pipe_pool;
+use crate::http::Delivery;
+use crate::http::new_pipe_pool;
 use crate::model::ByteRange;
 use crate::model::MembershipVersion;
 use crate::peer::PeerNetwork;
 use crate::peer::protocol::PeerRequest;
-use crate::peer::protocol::VerifiedResponse;
+use crate::peer::forwarding::VerifiedResponse;
 use crate::peer::server::LocalPageService;
 use crate::peer::server::PeerServer;
 use crate::read::Coordinator;
-use crate::security::connection::Signatures;
-use crate::security::forwarding::Forwarding;
+use crate::peer::protocol::Signatures;
+use crate::peer::forwarding::Forwarding;
 use crate::security::test_support::network;
 use crate::security::test_support::node;
 use crate::topology::LinkHealth;
@@ -24,7 +24,7 @@ use crate::topology::Paths;
 mod duplex_release {
     //! Exercise release credit through the real duplex response, not release_page.
     use super::*;
-    use crate::client::response::Responses;
+    use crate::client::Responses;
     use std::io::Read;
     use std::io::Write;
 
@@ -605,7 +605,7 @@ struct Gate {
 impl LocalPageService for Gate {
     fn serve_peer<'a>(
         &'a self,
-        request: crate::peer::protocol::VerifiedRequest,
+        request: crate::peer::forwarding::VerifiedRequest,
         membership: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
     ) -> Operation<'a, PeerResponse> {

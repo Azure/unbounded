@@ -20,7 +20,7 @@ use crate::model::PeerOriginContext;
 use crate::model::VersionMetadata;
 use crate::model::WorkerId;
 use crate::peer::protocol::PeerResponse;
-use crate::peer::protocol::VerifiedRequest;
+use crate::peer::forwarding::VerifiedRequest;
 use crate::peer::server::LocalPageService;
 use crate::runtime::Cancellation;
 use crate::runtime::RequestScope;

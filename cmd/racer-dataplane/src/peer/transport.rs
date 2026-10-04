@@ -26,11 +26,11 @@ use crate::rdma::TransportPlan;
 
 use crate::admission::AdmissionPolicy;
 use crate::runtime::RequestScope;
-use crate::security::connection::Signatures;
-use crate::security::connection::SignedHead;
-use crate::security::connection::VerifiedHead;
-use crate::security::connection::signed_digest;
-use crate::security::forwarding::ForwardedHead;
+use crate::peer::protocol::Signatures;
+use crate::peer::protocol::SignedHead;
+use crate::peer::protocol::VerifiedHead;
+use crate::peer::protocol::signed_digest;
+use crate::peer::forwarding::ForwardedHead;
 use crate::telemetry::BodyProgress;
 use crate::telemetry::Detail;
 use crate::telemetry::Failure;
@@ -72,8 +72,8 @@ mod native_control_tests {
     }
     #[test]
     fn session_admitted_setup_grant_completion_still_require_exact_transfer_and_phase() {
-        use crate::security::connection::tests::pair;
-        use crate::security::connection::tests::signer;
+        use crate::peer::protocol::tests::pair;
+        use crate::peer::protocol::tests::signer;
         let (mut sender, mut receiver) = pair();
         let a = signer(&sender);
         let b = signer(&receiver);
@@ -201,7 +201,7 @@ mod native_control_tests {
                 )
                 .unwrap();
         }
-        crate::security::connection::tests::replay_and_binding_checks();
+        crate::peer::protocol::tests::replay_and_binding_checks();
     }
     #[test]
     fn control_extension_and_fallback_length_schema_is_closed() {
@@ -247,7 +247,7 @@ mod native_exchange_tests {
     use crate::rdma::Devices;
     use crate::rdma::Sessions;
     use crate::runtime::Reactor;
-    use crate::security::connection::Signatures;
+    use crate::peer::protocol::Signatures;
     use std::os::unix::net::UnixStream;
     use std::rc::Rc;
     use std::sync::Arc;
@@ -463,7 +463,7 @@ mod native_exchange_tests {
         let a = crate::http::from_accepted(a.into(), &admission).unwrap();
         let b = crate::http::from_accepted(b.into(), &admission).unwrap();
         let receive = async {
-            let a = crate::security::connection::connect(
+            let a = crate::peer::protocol::connect(
                 &receiver.io,
                 a,
                 signers[0].clone(),
@@ -546,7 +546,7 @@ mod native_exchange_tests {
                 .await
         };
         let send = async {
-            let b = crate::security::connection::accept(&sender.io, b, signers[2].clone(), &scope)
+            let b = crate::peer::protocol::accept(&sender.io, b, signers[2].clone(), &scope)
                 .await?;
             let received = sender.io.receive_head(b, &scope).await?;
             let sent = sender
@@ -890,7 +890,7 @@ mod native_exchange_tests {
         let a = crate::http::from_accepted(a.into(), &admission).unwrap();
         let b = crate::http::from_accepted(b.into(), &admission).unwrap();
         let receive = async {
-            let a = crate::security::connection::connect(
+            let a = crate::peer::protocol::connect(
                 &receiver.io,
                 a,
                 signers[0].clone(),
@@ -935,7 +935,7 @@ mod native_exchange_tests {
                 .await
         };
         let send = async {
-            let b = crate::security::connection::accept(&sender.io, b, signers[2].clone(), &scope)
+            let b = crate::peer::protocol::accept(&sender.io, b, signers[2].clone(), &scope)
                 .await?;
             let received = sender.io.receive_head(b, &scope).await?;
             let (verified, _) = binding.verify(
@@ -1182,7 +1182,7 @@ impl Binding {
             &self.head(phase, previous, length, extensions)?,
             false,
         )?;
-        if crate::security::connection::node_field(&signed.head, "racer-signer")? != *from {
+        if crate::peer::protocol::node_field(&signed.head, "racer-signer")? != *from {
             return Err(Error::Unauthorized);
         }
         Ok((signatures.verify_proof(signed)?, phase))
@@ -1329,7 +1329,7 @@ impl Transfers {
                 .ok_or(Error::Unauthorized)?;
             let verified = self.signatures.verify_historical(signed)?;
             if verified.node() != &path[index]
-                || crate::security::connection::receiver(&signed.head)? != path[index - 1]
+                || crate::peer::protocol::receiver(&signed.head)? != path[index - 1]
             {
                 return Err(Error::Unauthorized);
             }
@@ -1628,7 +1628,7 @@ impl Transfers {
         if !sessions.ready(rail) || !self.rdma.as_ref().is_some_and(|rdma| rdma.ready(rail)) {
             return Ok(None);
         }
-        let peer = crate::security::connection::receiver(
+        let peer = crate::peer::protocol::receiver(
             &request
                 .authentication
                 .hops
@@ -1664,7 +1664,7 @@ impl Transfers {
         {
             return Err(Error::Unauthorized);
         }
-        let peer = crate::security::connection::node_field(
+        let peer = crate::peer::protocol::node_field(
             &request
                 .authentication
                 .hops
@@ -2151,7 +2151,7 @@ fn adaptive_socket_attribution_ignores_local_pressure_and_expired_scope() {
 pub enum RelayResponse {
     Complete(SignedResponse),
     Http {
-        authentication: crate::security::forwarding::ForwardedHead,
+        authentication: crate::peer::forwarding::ForwardedHead,
         connection: Box<crate::http::ConnectionLease>,
         length: usize,
     },
@@ -2159,7 +2159,7 @@ pub enum RelayResponse {
 
 pub struct Transfers {
     reclaim: Option<Rc<ReclaimCiphertext>>,
-    signatures: Rc<crate::security::connection::Signatures>,
+    signatures: Rc<crate::peer::protocol::Signatures>,
     #[cfg(test)]
     pub(super) native_completions: std::cell::Cell<usize>,
     #[cfg(test)]
@@ -2188,7 +2188,7 @@ impl Transfers {
         rdma: Option<Rc<Sessions>>,
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         codec: Rc<SecurityCodec>,
-        signatures: Rc<crate::security::connection::Signatures>,
+        signatures: Rc<crate::peer::protocol::Signatures>,
     ) -> Self {
         Self {
             reclaim: None,
@@ -2252,7 +2252,7 @@ impl Transfers {
             )?;
             let mut head = encode_envelope(&request.authentication, false, 0)?;
             let signatures = self.signatures.clone();
-            let peer = crate::security::connection::receiver(
+            let peer = crate::peer::protocol::receiver(
                 &request
                     .authentication
                     .hops
@@ -2298,7 +2298,7 @@ impl Transfers {
                 observer.result(
                     Stage::PeerHandshake,
                     scope,
-                    crate::security::connection::connect(
+                    crate::peer::protocol::connect(
                         &self.io, connection, signatures, &peer, scope,
                     )
                     .await,

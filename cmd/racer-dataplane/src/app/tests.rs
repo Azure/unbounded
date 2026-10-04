@@ -2755,7 +2755,7 @@ fn worker_requesters_share_configured_admission_and_production_metrics() {
     use crate::telemetry::Event;
     use crate::telemetry::Gauge;
     let mut config = crate::test_support::cluster::config(false);
-    config.peer_admission = crate::peer::adaptive::Config {
+    config.peer_admission = crate::peer::Config {
         total: 2,
         per_peer: 1,
     };
@@ -2774,7 +2774,7 @@ fn worker_requesters_share_configured_admission_and_production_metrics() {
     assert_eq!(node.metrics[1].1.count(Event::PeerAdmissionRejected), 1);
     assert_eq!(node.metrics[1].1.gauge(Gauge::PeerExchanges), 1);
     assert_eq!(node.metrics[1].1.gauge(Gauge::PeerAdmissionLimit), 2);
-    permit.observe(crate::peer::adaptive::Outcome::PeerFailure);
+    permit.observe(crate::peer::Outcome::PeerFailure);
     assert!(!b.available(&peer));
     drop(permit);
     assert_eq!(node.metrics[1].1.gauge(Gauge::PeerExchanges), 0);

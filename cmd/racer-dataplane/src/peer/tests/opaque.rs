@@ -1488,7 +1488,7 @@ fn opaque_relay_benchmark() {
 #[test]
 fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution() {
     use crate::peer::protocol;
-    use crate::security::forwarding::ForwardedHead;
+    use crate::peer::forwarding::ForwardedHead;
     fn copy(head: &http1::MessageHead) -> http1::MessageHead {
         let codec = Codec::new(crate::peer::protocol::MAX_SIGNED_HEAD);
         let mut head = codec
@@ -1497,7 +1497,7 @@ fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution()
             .unwrap()
             .0;
         head.headers.retain(|h| {
-            !crate::security::connection::is_auth_field(&h.name) || h.name == "racer-receiver"
+            !crate::peer::protocol::is_auth_field(&h.name) || h.name == "racer-receiver"
         });
         head
     }

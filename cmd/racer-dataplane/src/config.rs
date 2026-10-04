@@ -52,7 +52,7 @@ pub struct Limits {
 pub struct Config {
     pub send_crc_pair: Option<crate::telemetry::Pair>,
     pub page_hedge: crate::read::candidates::HedgeConfig,
-    pub peer_admission: crate::peer::adaptive::Config,
+    pub peer_admission: crate::peer::Config,
     pub shares: std::num::NonZeroU32,
     pub disk_page_entries: NonZeroUsize,
     pub checkpoint_bytes: NonZeroUsize,
@@ -176,7 +176,7 @@ impl Config {
                 crate::read::candidates::DUPLICATE_BYTES as u64,
             )?)?,
         };
-        let peer_admission = crate::peer::adaptive::Config {
+        let peer_admission = crate::peer::Config {
             total: to_usize(number("RACER_PEER_INFLIGHT_MAX", 256)?)?,
             per_peer: to_usize(number("RACER_PEER_PER_NEIGHBOR_MAX", 32)?)?,
         };

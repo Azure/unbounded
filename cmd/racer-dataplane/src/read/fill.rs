@@ -1225,7 +1225,7 @@ impl Fill {
     pub(super) async fn decrypt_response(
         &self,
         page: &PageId,
-        response: crate::peer::protocol::VerifiedResponse,
+        response: crate::peer::forwarding::VerifiedResponse,
         reservation: Option<flow_control::Charge<AdmissionPolicy>>,
         scope: &RequestScope,
     ) -> Result<PageResult> {

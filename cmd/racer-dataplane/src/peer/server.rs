@@ -10,7 +10,7 @@ use crate::model::ResourceClass;
 
 use crate::admission::AdmissionPolicy;
 use crate::runtime::RequestScope;
-use crate::security::forwarding::Forwarding;
+use crate::peer::forwarding::Forwarding;
 use std::rc::Rc;
 use std::time::Duration;
 use std::time::Instant;
@@ -67,7 +67,7 @@ pub struct PeerServer {
     local: Rc<dyn LocalPageService>,
     relay: Rc<Relay>,
     wire: Rc<super::protocol::SecurityCodec>,
-    signatures: Rc<crate::security::connection::Signatures>,
+    signatures: Rc<crate::peer::protocol::Signatures>,
     transfers: Rc<super::transport::Transfers>,
     request_timeout: Duration,
 }
@@ -147,9 +147,9 @@ impl PeerServer {
         local: Rc<dyn LocalPageService>,
         relay: Rc<Relay>,
         wire: Rc<super::protocol::SecurityCodec>,
-        signatures: Rc<crate::security::connection::Signatures>,
+        signatures: Rc<crate::peer::protocol::Signatures>,
     ) -> Self {
-        let pipes = Rc::new(crate::memory::new_pipe_pool(admission.clone()));
+        let pipes = Rc::new(crate::http::new_pipe_pool(admission.clone()));
         let transfers = Rc::new(super::transport::Transfers::new(
             Rc::new(crate::http::HttpPool::new(
                 io.reactor().clone(),
@@ -287,7 +287,7 @@ impl PeerServer {
         local: Rc<dyn LocalPageService>,
         relay: Rc<Relay>,
         wire: Rc<super::protocol::SecurityCodec>,
-        signatures: Rc<crate::security::connection::Signatures>,
+        signatures: Rc<crate::peer::protocol::Signatures>,
         subscriptions: std::sync::Arc<super::subscriptions::Subscriptions>,
         pipes: Rc<flow_control::pipe::PipePool<AdmissionPolicy>>,
         transfers: Rc<super::transport::Transfers>,
@@ -554,7 +554,7 @@ impl PeerServer {
             ResourceClass::ControlProgress,
             1,
         )?);
-        let mut connection = crate::security::connection::accept(
+        let mut connection = crate::peer::protocol::accept(
             &self.io,
             connection,
             self.signatures.clone(),
@@ -1452,8 +1452,8 @@ mod tests {
         use crate::memory::BufferPool;
         use crate::peer::protocol::SecurityCodec;
         use crate::runtime::Reactor;
-        use crate::security::connection::tests::finish;
-        use crate::security::connection::tests::hello;
+        use crate::peer::protocol::tests::finish;
+        use crate::peer::protocol::tests::hello;
         use crate::topology::LinkHealth;
         use crate::topology::Paths;
 

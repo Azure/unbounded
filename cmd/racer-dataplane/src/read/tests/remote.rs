@@ -20,7 +20,7 @@ use crate::peer::Requester;
 use crate::peer::protocol;
 use crate::peer::protocol::FetchMode;
 use crate::peer::protocol::PeerResponse;
-use crate::peer::protocol::VerifiedRequest;
+use crate::peer::forwarding::VerifiedRequest;
 use crate::peer::server::LocalPageService;
 use crate::peer::server::PeerServer;
 use crate::peer::transport::Transfers;
@@ -28,7 +28,7 @@ use crate::admission::AdmissionPolicy;
 use crate::runtime::RequestScope;
 use crate::runtime::Reactor;
 use crate::security::credentials::CredentialCrypto;
-use crate::security::forwarding::Forwarding;
+use crate::peer::forwarding::Forwarding;
 use crate::security::test_support::Identity;
 use crate::test_support::origin::AdapterOrigin;
 use crate::topology::LinkHealth;
@@ -643,10 +643,10 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
             Error::VersionUnavailable
         };
         assert_eq!(result.err(), Some(expected));
-        let responses = crate::client::response::Responses::new(
+        let responses = crate::client::Responses::new(
             Rc::new(HttpIo::for_clients(reactor.clone(), admission.clone())),
-            Rc::new(crate::memory::delivery::Delivery::new(
-                Rc::new(crate::memory::new_pipe_pool(admission.clone())),
+            Rc::new(crate::http::Delivery::new(
+                Rc::new(crate::http::new_pipe_pool(admission.clone())),
                 reactor.clone(),
                 Duration::from_secs(10),
             )),
@@ -893,8 +893,8 @@ fn metadata_coordinator_with_newer_publication(
     use crate::control::PublishedState;
     use crate::control::SnapshotStore;
     use crate::memory::cache::MemoryCache;
-    use crate::memory::delivery::Delivery;
-    use crate::memory::new_pipe_pool;
+    use crate::http::Delivery;
+    use crate::http::new_pipe_pool;
     use crate::runtime::crypto;
     use crate::runtime::crypto::CryptoClient;
     use crate::security::aead::PageCrypto;

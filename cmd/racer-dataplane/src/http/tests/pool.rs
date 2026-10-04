@@ -606,8 +606,8 @@ fn adaptive_checkout_attributes_actual_connect_completion_errno() {
         let reactor = Rc::new(Reactor::new(admission.clone()));
         let pool = HttpPool::new(reactor.clone(), admission, 1);
         let metrics = Metrics::default();
-        let peers = crate::peer::adaptive::AdaptivePeers::new(
-            crate::peer::adaptive::Config {
+        let peers = crate::peer::AdaptivePeers::new(
+            crate::peer::Config {
                 total: 1,
                 per_peer: 1,
             },

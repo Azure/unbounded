@@ -197,7 +197,7 @@ mod faults {
             p::push(&mut head, "racer-membership", self.generation);
             p::push(&mut head, "racer-receiver", &peer.0);
             let signed = signatures.sign(head).unwrap();
-            let envelope = crate::security::forwarding::ForwardedHead {
+            let envelope = crate::peer::forwarding::ForwardedHead {
                 original: Arc::new(signed),
                 hops: vec![],
             };
@@ -240,7 +240,7 @@ mod faults {
                 };
                 signed.signature[0] ^= 1;
                 let wire = encode_envelope(
-                    &crate::security::forwarding::ForwardedHead {
+                    &crate::peer::forwarding::ForwardedHead {
                         original: Arc::new(signed),
                         hops: vec![],
                     },

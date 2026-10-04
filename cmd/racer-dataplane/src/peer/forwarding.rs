@@ -10,8 +10,8 @@
 //!     model::NodeId,
 //!     peer::{server::LocalPageService, protocol::{PeerRequest, VerifiedResponse}},
 //!     runtime::RequestScope,
-//!     security::forwarding::Forwarding,
-//!     topology::{Membership, RouteBudget},
+//!     peer::forwarding::Forwarding,
+//!     topology::{membership::std::sync::Arc<crate::topology::Membership>, routing::RouteBudget},
 //! };
 //!
 //! async fn round_trip(
@@ -23,7 +23,7 @@
 //!     next: &NodeId,
 //!     previous: &NodeId,
 //!     budget: RouteBudget,
-//!     membership: std::sync::Arc<Membership>,
+//!     membership: std::sync::Arc<crate::topology::Membership>,
 //!     scope: &RequestScope,
 //! ) -> Result<VerifiedResponse> {
 //!     let (outbound, outstanding) = requester.sign_request(request)?;
@@ -39,11 +39,11 @@
 //!     requester.verify_response(reverse, &outstanding)
 //! }
 //! ```
-use super::connection::Signatures;
-use super::connection::SignedHead;
-use super::connection::node_field;
-use super::connection::receiver;
-use super::connection::signed_digest;
+use crate::peer::protocol::Signatures;
+use crate::peer::protocol::SignedHead;
+use crate::peer::protocol::node_field;
+use crate::peer::protocol::receiver;
+use crate::peer::protocol::signed_digest;
 use crate::error::Error;
 use crate::error::Result;
 use crate::model::NodeId;
@@ -78,7 +78,7 @@ pub struct ForwardedHead {
 /// request. No credentials are decoded or decrypted here.
 ///
 /// ```compile_fail
-/// use racer_dataplane::security::forwarding::RequestBinding;
+/// use racer_dataplane::peer::forwarding::RequestBinding;
 /// fn fabricate_binding() -> RequestBinding {
 ///     RequestBinding { original: todo!() }
 /// }
@@ -90,7 +90,7 @@ pub struct RequestBinding {
     deadline: u64,
 }
 impl RequestBinding {
-    pub(super) fn retained_proof(&self) -> Result<&SignedHead> {
+    pub(crate) fn retained_proof(&self) -> Result<&SignedHead> {
         check_request_deadline(self)?;
         if field(&self.original.head, "racer-kind")? != "request"
             || self.deadline > number(&self.original.head, "racer-route-deadline")?
@@ -113,7 +113,7 @@ impl RequestBinding {
 /// ```
 ///
 /// ```compile_fail
-/// use racer_dataplane::peer::protocol::VerifiedRequest;
+/// use racer_dataplane::peer::forwarding::VerifiedRequest;
 /// fn change_verified_route(request: VerifiedRequest) {
 ///     request.request().route.remaining_links = 255;
 /// }
@@ -371,7 +371,7 @@ impl Forwarding {
     /// operation, membership, attempt, and freshness without hashing page bytes.
     ///
     /// ```compile_fail
-    /// use racer_dataplane::{peer::protocol::SignedResponse, security::forwarding::Forwarding};
+    /// use racer_dataplane::{peer::protocol::SignedResponse, peer::forwarding::Forwarding};
     /// fn unbound_response(auth: &Forwarding, response: SignedResponse) {
     ///     auth.verify_response(response);
     /// }
@@ -1464,7 +1464,7 @@ mod tests {
         let replay = copy_response(&response);
         let verified = f[1].verify_response(response, &reverse).unwrap();
         f[1].verify_response(replay, &reverse).unwrap();
-        crate::security::connection::tests::replay_and_binding_checks();
+        crate::peer::protocol::tests::replay_and_binding_checks();
         assert!(f[1].append_response(verified, &node(2)).is_err());
         // Historical response proofs may be carried by fresh session heads.
         let response = f[2]

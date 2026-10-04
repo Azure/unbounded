@@ -383,7 +383,7 @@ mod simulation_tests {
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
-        let pool = crate::memory::new_pipe_pool(admission);
+        let pool = crate::http::new_pipe_pool(admission);
         let mut pipe = pool.acquire().unwrap();
         let (a, b) = sim.socket_pair();
         sim.set_stream_capacity(2);

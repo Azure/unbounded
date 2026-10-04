@@ -1122,7 +1122,7 @@ mod timeouts {
     use crate::peer::protocol::Operation as PeerOperation;
     use crate::peer::protocol::PeerRequest;
     use crate::peer::protocol::PeerResponse;
-    use crate::peer::protocol::VerifiedResponse;
+    use crate::peer::forwarding::VerifiedResponse;
     use crate::read::flight::AcquisitionBudget;
     use uring_runtime::deadline::Deadline;
     use crate::runtime::RequestScope;
@@ -1133,8 +1133,8 @@ mod timeouts {
     use crate::model::ObjectVersion;
     use crate::model::RequestId;
     use crate::model::StrongEtag;
-    use crate::security::connection::Signatures;
-    use crate::security::forwarding::Forwarding;
+    use crate::peer::protocol::Signatures;
+    use crate::peer::forwarding::Forwarding;
     use crate::security::test_support::network;
     use crate::topology::Member;
     use crate::topology::Membership;

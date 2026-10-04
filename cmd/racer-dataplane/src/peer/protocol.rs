@@ -20,8 +20,8 @@ use crate::model::*;
 use crate::admission::AdmissionPolicy;
 use uring_runtime::deadline::Deadline;
 use crate::runtime::RequestScope;
-use crate::security::connection::SignedHead;
-use crate::security::forwarding::ForwardedHead;
+use crate::peer::protocol::SignedHead;
+use crate::peer::forwarding::ForwardedHead;
 use crate::topology::RouteBudget;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -34,8 +34,8 @@ use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-pub use crate::security::forwarding::VerifiedRequest;
-pub use crate::security::forwarding::VerifiedResponse;
+pub use crate::peer::forwarding::VerifiedRequest;
+pub use crate::peer::forwarding::VerifiedResponse;
 
 pub enum FetchMode {
     CopyOnly,
@@ -628,7 +628,7 @@ pub fn agrees(actual: &MessageHead, expected: &MessageHead, ignore_route: bool) 
         let mut map = std::collections::BTreeMap::new();
         for h in &head.headers {
             let name = h.name.to_ascii_lowercase();
-            if crate::security::connection::is_auth_field(&name)
+            if crate::peer::protocol::is_auth_field(&name)
                 || (ignore_route
                     && matches!(
                         name.as_str(),
@@ -931,7 +931,7 @@ mod envelope_tests {
         let length = codec.encode_head(&small.head).unwrap().len();
         head = small.head;
         head.headers.retain(|h| {
-            !crate::security::connection::is_auth_field(&h.name) || h.name == "racer-receiver"
+            !crate::peer::protocol::is_auth_field(&h.name) || h.name == "racer-receiver"
         });
         head.headers
             .iter_mut()
@@ -996,7 +996,7 @@ fn array<const N: usize>(head: &MessageHead, name: &str) -> Result<[u8; N]> {
         .map_err(|_| Error::InvalidRequest)
 }
 fn node(head: &MessageHead, name: &str) -> Result<NodeId> {
-    crate::security::connection::node_field(head, name)
+    crate::peer::protocol::node_field(head, name)
 }
 fn object(head: &MessageHead) -> Result<ObjectId> {
     let cache = field(head, "racer-cache")?;
@@ -1089,7 +1089,7 @@ mod metadata_tests {
     use std::time::UNIX_EPOCH;
     #[test]
     fn received_page_keeps_one_charge_and_rejects_foreign_reservations() {
-        use crate::security::forwarding::ForwardedHead;
+        use crate::peer::forwarding::ForwardedHead;
         let signers = crate::peer::tests::signers();
         let cache = CacheId("cccccccc-1111-4111-8111-111111111111".into());
         let mut limits = crate::test_support::cluster::config(false).limits;

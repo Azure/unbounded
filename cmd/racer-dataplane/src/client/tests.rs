@@ -751,8 +751,8 @@ fn simulated_listener_preparation_rollback_and_real_http_exchange() {
     assert_eq!(sim.live_handles(), 0);
 }
 use crate::http::Codec;
-use crate::memory::delivery::Delivery;
-use crate::memory::new_pipe_pool;
+use crate::http::Delivery;
+use crate::http::new_pipe_pool;
 use crate::model::ExpiresAt;
 use crate::config::Limits;
 use crate::model::ObjectMetadata;

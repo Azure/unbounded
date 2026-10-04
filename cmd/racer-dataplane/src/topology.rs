@@ -599,14 +599,14 @@ impl RouteBudget {
 }
 
 pub struct Paths {
-    pub(crate) peer_admission: Option<Arc<crate::peer::adaptive::AdaptivePeers>>,
+    pub(crate) peer_admission: Option<Arc<crate::peer::AdaptivePeers>>,
     health: Rc<LinkHealth>,
     inner: ::topology::Paths,
 }
 impl Paths {
     pub(crate) fn with_peer_admission(
         mut self,
-        admission: Arc<crate::peer::adaptive::AdaptivePeers>,
+        admission: Arc<crate::peer::AdaptivePeers>,
     ) -> Self {
         self.peer_admission = Some(admission);
         self
@@ -1647,9 +1647,9 @@ pub(crate) mod tests {
 
         #[test]
         fn yielded_search_rechecks_adaptive_peer_admission() {
-            use crate::peer::adaptive::AdaptivePeers;
-            use crate::peer::adaptive::Config;
-            use crate::peer::adaptive::Outcome;
+            use crate::peer::AdaptivePeers;
+            use crate::peer::Config;
+            use crate::peer::Outcome;
             let clock = uring_runtime::environment::SimulationClock::new(110);
             let _env = clock.environment(0).enter();
             let members = membership(100_000);

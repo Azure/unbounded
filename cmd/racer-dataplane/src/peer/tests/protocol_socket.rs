@@ -153,14 +153,14 @@ fn not_found_is_authenticated_through_relay_and_restricted_to_fresh_acquire() {
             .collect();
         let mut head = p::response_head(
             &PeerResponse::NotFound,
-            &crate::security::connection::signed_digest(&admitted.signed().authentication.original)
+            &crate::peer::protocol::signed_digest(&admitted.signed().authentication.original)
                 .unwrap(),
             &path,
         )
         .unwrap();
         p::push(&mut head, "racer-receiver", &signers[signer - 1].node().0);
         let response = protocol::SignedResponse {
-            authentication: crate::security::forwarding::ForwardedHead {
+            authentication: crate::peer::forwarding::ForwardedHead {
                 original: Arc::new(signers[signer].sign(head).unwrap()),
                 hops: vec![],
             },
@@ -230,7 +230,7 @@ fn not_found_is_authenticated_through_relay_and_restricted_to_fresh_acquire() {
                     .unwrap()
                     .value = value.as_bytes().to_vec();
             }
-            let envelope = crate::security::forwarding::ForwardedHead {
+            let envelope = crate::peer::forwarding::ForwardedHead {
                 original: Arc::new(changed),
                 hops: vec![],
             };
@@ -246,13 +246,13 @@ fn not_found_is_authenticated_through_relay_and_restricted_to_fresh_acquire() {
             .find(|h| h.name == "racer-outcome")
             .unwrap()
             .value = b"miss".to_vec();
-        let envelope = crate::security::forwarding::ForwardedHead {
+        let envelope = crate::peer::forwarding::ForwardedHead {
             original: Arc::new(changed),
             hops: vec![],
         };
         let decoded = codec.response(envelope, vec![], &scope).unwrap();
         assert!(auth[1].verify_response(decoded, &reverse).is_err());
-        let envelope = crate::security::forwarding::ForwardedHead {
+        let envelope = crate::peer::forwarding::ForwardedHead {
             original,
             hops: vec![],
         };
@@ -290,7 +290,7 @@ fn changed_operation_credentials_replay_and_deadlines_fail() {
     receiver
         .verify_request(codec.request(envelope, &scope).unwrap())
         .unwrap();
-    crate::security::connection::tests::replay_and_binding_checks();
+    crate::peer::protocol::tests::replay_and_binding_checks();
     let mut expired = request(&admission, 3);
     expired.route.deadline = Deadline(Instant::now() - Duration::from_secs(1));
     assert!(matches!(
@@ -430,7 +430,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
 #[test]
 fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
     use crate::peer::protocol as p;
-    use crate::security::connection::signed_digest;
+    use crate::peer::protocol::signed_digest;
     use crate::topology::Member;
     use crate::topology::Membership;
     use http1::MessageHead;
@@ -513,7 +513,7 @@ fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
         .unwrap()
         .value = b"1".to_vec();
     assert!(signers[0].verify_proof(tampered).is_err());
-    crate::security::connection::tests::replay_and_binding_checks();
+    crate::peer::protocol::tests::replay_and_binding_checks();
     drop(response_lease);
     assert!(
         weak.upgrade().is_none(),
@@ -586,7 +586,7 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
                 )
                 .await?;
             let connection = crate::http::from_accepted(fd, &admission)?;
-            let connection = crate::security::connection::accept(
+            let connection = crate::peer::protocol::accept(
                 &socket.io,
                 connection,
                 signers[2].clone(),
@@ -701,7 +701,7 @@ fn v5_equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
             .sign_request_to(original, next)
             .unwrap();
         let receiver =
-            crate::security::connection::receiver(&signed.authentication.original.head).unwrap();
+            crate::peer::protocol::receiver(&signed.authentication.original.head).unwrap();
         let (envelope, _) = decode_envelope(
             encode_envelope(&signed.authentication, false, 0).unwrap(),
             false,
@@ -991,7 +991,7 @@ fn signed_tcp_case(case: &str) {
     let destination_auth = Rc::new(Forwarding::new(signers[2].clone()));
     let metrics = crate::telemetry::Metrics::default();
     let adaptive =
-        crate::peer::adaptive::AdaptivePeers::new(Default::default(), metrics.clone()).unwrap();
+        crate::peer::AdaptivePeers::new(Default::default(), metrics.clone()).unwrap();
     let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4).with_peer_admission(adaptive));
     let outbound = NoOutbound::new(signers[2].clone(), destination_network.clone());
     let relay = Rc::new(Relay::new(
@@ -1204,14 +1204,14 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
                 crate::http::from_accepted(peer.try_clone().unwrap().into(), &admission).unwrap();
             let (client, accepted) = drive(&reactor, async {
                 futures::try_join!(
-                    crate::security::connection::connect(
+                    crate::peer::protocol::connect(
                         &io,
                         client,
                         signers[0].clone(),
                         signers[2].node(),
                         &scope
                     ),
-                    crate::security::connection::accept(
+                    crate::peer::protocol::accept(
                         &io,
                         connection,
                         signers[2].clone(),
@@ -1304,7 +1304,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     use crate::rdma;
     use crate::rdma::TransportPlan;
     use crate::runtime::Reactor;
-    use crate::security::forwarding::ForwardedHead;
+    use crate::peer::forwarding::ForwardedHead;
     use crate::topology::Member;
     use crate::topology::Membership;
     use crate::topology::Route;
@@ -1423,7 +1423,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
             .await?;
         let conn = crate::http::from_accepted(fd, &admission)?;
         let mut conn =
-            crate::security::connection::accept(&io, conn, signers[2].clone(), &scope).await?;
+            crate::peer::protocol::accept(&io, conn, signers[2].clone(), &scope).await?;
         for attempt in 0..3 {
             let mut received = io.receive_head(conn, &scope).await?;
             assert!(

@@ -2,7 +2,6 @@
 pub mod aead;
 pub mod connection;
 pub mod credentials;
-pub mod forwarding;
 
 impl From<racer_identity::Error> for crate::error::Error {
     fn from(error: racer_identity::Error) -> Self {

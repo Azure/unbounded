@@ -148,7 +148,7 @@ impl NoPeer {
         _: peer::protocol::PeerRequest,
         _: std::sync::Arc<crate::topology::Membership>,
         _: &'a RequestScope,
-    ) -> Operation<'a, peer::protocol::VerifiedResponse> {
+    ) -> Operation<'a, peer::forwarding::VerifiedResponse> {
         panic!("single-node fixture must not hedge to a peer")
     }
     fn request<'a>(
@@ -156,7 +156,7 @@ impl NoPeer {
         _: peer::protocol::PeerRequest,
         _: std::sync::Arc<crate::topology::Membership>,
         _: &'a RequestScope,
-    ) -> Operation<'a, peer::protocol::VerifiedResponse> {
+    ) -> Operation<'a, peer::forwarding::VerifiedResponse> {
         Box::pin(async { panic!("single-node fixture contacted peer") })
     }
 }
@@ -193,13 +193,13 @@ impl SubscriptionFixture {
     fn construct(root: PathBuf) -> Self {
         use client::RequestParser;
         use client::listener::ClientListeners;
-        use client::response::Responses;
+        use client::Responses;
         use control::PublishedState;
         use control::SnapshotStore;
         use memory::BufferPool;
         use memory::cache::MemoryCache;
-        use memory::delivery::Delivery;
-        use memory::new_pipe_pool;
+        use http::Delivery;
+        use http::new_pipe_pool;
         use racer_control_wire::CacheDefinition;
         use racer_control_wire::Publication;
         use racer_control_wire::*;

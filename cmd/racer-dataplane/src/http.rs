@@ -57,7 +57,7 @@ impl http1::connection::Context for HttpContext {
 }
 #[derive(Default)]
 pub struct State {
-    pub(crate) peer_admission: Option<std::sync::Arc<crate::peer::adaptive::Permit>>,
+    pub(crate) peer_admission: Option<std::sync::Arc<crate::peer::Permit>>,
     pub(crate) peer_response_verified: bool,
     pub(crate) connect_failure: Option<Rc<std::cell::Cell<bool>>>,
     #[cfg(test)]
@@ -68,7 +68,7 @@ pub struct State {
     pub(crate) relay_pipe: Option<flow_control::pipe::PipeLease<AdmissionPolicy>>,
     pub(crate) relay_context: Option<flow_control::Charge<AdmissionPolicy>>,
     pub(crate) relay_reservation: Option<Rc<flow_control::Charge<AdmissionPolicy>>>,
-    pub(crate) session: Option<crate::security::connection::Session>,
+    pub(crate) session: Option<crate::peer::protocol::Session>,
     pub(crate) control_reservation: Option<flow_control::Charge<AdmissionPolicy>>,
 }
 impl http1::connection::State<Error> for State {
@@ -87,7 +87,7 @@ impl http1::connection::State<Error> for State {
     fn finished(&mut self) {
         if self.peer_response_verified {
             if let Some(permit) = &self.peer_admission {
-                permit.observe(crate::peer::adaptive::Outcome::Verified);
+                permit.observe(crate::peer::Outcome::Verified);
             }
             self.peer_response_verified = false;
         }
@@ -98,7 +98,7 @@ impl http1::connection::State<Error> for State {
                 failure.set(true);
             }
             if let Some(peer) = &self.peer_admission {
-                peer.observe(crate::peer::adaptive::Outcome::PeerFailure);
+                peer.observe(crate::peer::Outcome::PeerFailure);
             }
         }
     }
@@ -131,7 +131,7 @@ pub(crate) fn from_reserved(
 }
 pub(crate) fn install_session(
     connection: &mut ConnectionLease,
-    session: crate::security::connection::Session,
+    session: crate::peer::protocol::Session,
 ) -> Result<()> {
     if connection.state().session.is_some() || connection.closing() {
         return Err(Error::Unauthorized);
@@ -285,7 +285,7 @@ impl HttpPool {
         &'a self,
         endpoint: &'a Endpoint,
         relay: Option<Rc<flow_control::Charge<AdmissionPolicy>>>,
-        peer: Option<std::sync::Arc<crate::peer::adaptive::Permit>>,
+        peer: Option<std::sync::Arc<crate::peer::Permit>>,
         failure: Option<Rc<std::cell::Cell<bool>>>,
         scope: &'a RequestScope,
     ) -> Operation<'a, ConnectionLease> {
@@ -531,8 +531,8 @@ pub(crate) mod tests;
 mod relay_tests {
     //! Opaque transit, fallback, cancellation, and ownership-fence scenarios.
     use super::*;
-    use crate::memory::acquire_wait;
-    use crate::memory::new_pipe_pool;
+    use crate::http::acquire_wait;
+    use crate::http::new_pipe_pool;
     use crate::model::RequestId;
     use crate::model::ResourceClass;
     use crate::admission::AdmissionPolicy;

@@ -123,7 +123,7 @@ impl Signatures {
     /// instead of the fresh-message replay window. Revalidate current keys/trust.
     pub(crate) fn verify_retained_request(
         &self,
-        binding: &super::forwarding::RequestBinding,
+        binding: &crate::peer::forwarding::RequestBinding,
     ) -> Result<VerifiedPeer> {
         self.verify_signed_age(binding.retained_proof()?, false)
     }
@@ -266,7 +266,7 @@ fn signature_input_for_components(head: &MessageHead, components: &[String]) -> 
 /// RFC 9421 section 2.5 signature base, using the strict Racer profile. The
 /// verifier accepts only this canonical structured-field serialization, avoiding
 /// duplicate labels, unsupported parameters and alternate parsing ambiguity.
-pub fn signature_base(head: &MessageHead) -> Result<Vec<u8>> {
+fn signature_base(head: &MessageHead) -> Result<Vec<u8>> {
     let components = components(head)?;
     let input = signature_input_for_components(head, &components)?;
     if field(head, "signature-input")? != format!("racer={input}") {
@@ -1011,7 +1011,7 @@ pub(crate) mod tests {
         let mut original = frame();
         p::push(&mut original, "racer-receiver", &a.peer.0);
         let proof = std::sync::Arc::new(a.signatures.sign(original).unwrap());
-        let auth = crate::security::forwarding::ForwardedHead {
+        let auth = crate::peer::forwarding::ForwardedHead {
             original: proof.clone(),
             hops: vec![],
         };

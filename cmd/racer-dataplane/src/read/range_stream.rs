@@ -9,8 +9,8 @@ use crate::read::dispatch::WorkerMap;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
-use crate::memory::delivery::Delivery;
-use crate::memory::delivery::ReaderLease;
+use crate::http::Delivery;
+use crate::http::ReaderLease;
 use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
 use crate::model::OriginContext;
@@ -999,7 +999,7 @@ pub(super) mod tests {
     use crate::model::ObjectVersion;
     use crate::model::PAGE_BYTES;
     use crate::model::StrongEtag;
-    use crate::memory::new_pipe_pool;
+    use crate::http::new_pipe_pool;
     use crate::model::MembershipVersion;
     use crate::model::RequestId;
     use crate::model::ResourceClass;
@@ -1622,10 +1622,10 @@ pub(super) mod tests {
 
     #[test]
     fn responses_stream_more_than_three_pages_only_with_client_sized_http_framing() {
-        use crate::client::response::Responses;
+        use crate::client::Responses;
         use crate::http::Codec;
         use crate::http::HttpIo;
-        use crate::memory::new_pipe_pool;
+        use crate::http::new_pipe_pool;
         use crate::model::RequestId;
         use crate::model::ResourceClass;
         use crate::read::ReadResponse;

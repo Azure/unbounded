@@ -21,7 +21,7 @@ use crate::model::ResolvedRange;
 use crate::peer::protocol::FetchMode;
 use crate::peer::protocol::Operation as PeerOperation;
 use crate::peer::protocol::PeerResponse;
-use crate::peer::protocol::VerifiedRequest;
+use crate::peer::forwarding::VerifiedRequest;
 use crate::peer::server::LocalPageService;
 use crate::runtime::RequestScope;
 use crate::security::credentials::ChargedOriginContext;

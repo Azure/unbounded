@@ -13,7 +13,7 @@ use uring_runtime::deadline::Deadline;
 use crate::runtime::RequestScope;
 
 use crate::security::aead::PageCryptoEngine;
-use crate::security::connection::VerifiedHead;
+use crate::peer::protocol::VerifiedHead;
 use crate::topology::FAILURE_LINKS;
 use crate::topology::Route;
 use base64::Engine;
@@ -257,7 +257,7 @@ impl Sessions {
         &'a self,
         peer: &'a VerifiedPeer,
         rail: RailId,
-        permit: Option<std::sync::Arc<crate::peer::adaptive::Permit>>,
+        permit: Option<std::sync::Arc<crate::peer::Permit>>,
         scope: &'a crate::runtime::RequestScope,
     ) -> Operation<'a, PreparedSession> {
         #[cfg(test)]
@@ -271,7 +271,7 @@ impl Sessions {
         &self,
         peer: &VerifiedPeer,
         rail: RailId,
-        permit: Option<std::sync::Arc<crate::peer::adaptive::Permit>>,
+        permit: Option<std::sync::Arc<crate::peer::Permit>>,
     ) -> Poll<Result<PreparedSession>> {
         if !self.ready(rail) {
             return Poll::Ready(Err(Error::Unavailable));
@@ -1480,8 +1480,8 @@ pub(crate) mod tests {
         #[test]
         fn real_signed_setup_rejects_tampering_and_replay() {
             use crate::model::ClusterId;
-            use crate::security::connection::Signatures;
-            use crate::security::connection::SignedHead;
+            use crate::peer::protocol::Signatures;
+            use crate::peer::protocol::SignedHead;
             use crate::security::test_support::CLUSTER;
             use crate::security::test_support::NODE;
             use crate::security::test_support::issued;
@@ -1569,7 +1569,7 @@ pub(crate) mod tests {
                 signature: verified.signed.signature,
             };
             signatures.verify_proof(replay).unwrap();
-            crate::security::connection::tests::replay_and_binding_checks();
+            crate::peer::protocol::tests::replay_and_binding_checks();
             let mut tampered = signatures.sign(head()).unwrap();
             tampered
                 .head
@@ -2612,8 +2612,8 @@ pub(crate) mod tests {
                 let (sim, io, mut native, charges) = fixture(2);
                 let charged = &charges[0];
                 let peer_metrics = crate::telemetry::Metrics::default();
-                let peer_admission = crate::peer::adaptive::AdaptivePeers::new(
-                    crate::peer::adaptive::Config {
+                let peer_admission = crate::peer::AdaptivePeers::new(
+                    crate::peer::Config {
                         total: 1,
                         per_peer: 1,
                     },
@@ -3211,8 +3211,8 @@ pub(crate) mod tests {
             }
         }
         use crate::model::*;
-        use crate::security::connection::Signatures;
-        use crate::security::connection::VerifiedHead;
+        use crate::peer::protocol::Signatures;
+        use crate::peer::protocol::VerifiedHead;
         use http1::Header;
         use http1::MessageHead;
         use http1::StartLine;
@@ -3384,8 +3384,8 @@ pub(crate) mod tests {
             fn admitted_native_claim_keeps_capacity_after_proxy_drop_until_service_fence() {
                 let (sim, io, mut native, _) = fixture(1);
                 let metrics = Metrics::default();
-                let admission = crate::peer::adaptive::AdaptivePeers::new(
-                    crate::peer::adaptive::Config {
+                let admission = crate::peer::AdaptivePeers::new(
+                    crate::peer::Config {
                         total: 1,
                         per_peer: 1,
                     },
@@ -3414,8 +3414,8 @@ pub(crate) mod tests {
                 let (sim, io, mut native, charges) = fixture(1);
                 let charged = &charges[0];
                 let metrics = Metrics::default();
-                let admission = crate::peer::adaptive::AdaptivePeers::new(
-                    crate::peer::adaptive::Config {
+                let admission = crate::peer::AdaptivePeers::new(
+                    crate::peer::Config {
                         total: 1,
                         per_peer: 1,
                     },

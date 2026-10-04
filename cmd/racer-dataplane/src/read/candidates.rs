@@ -21,7 +21,7 @@ use crate::peer::protocol::FetchMode;
 use crate::peer::protocol::Operation as PeerOperation;
 use crate::peer::protocol::PeerRequest;
 use crate::peer::protocol::PeerResponse;
-use crate::peer::protocol::VerifiedResponse;
+use crate::peer::forwarding::VerifiedResponse;
 use uring_runtime::deadline::Deadline;
 use crate::runtime::RequestScope;
 use crate::security::credentials::CredentialCrypto;
