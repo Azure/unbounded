@@ -89,11 +89,13 @@ pub struct WorkerGroup<'a> {
 /// use std::rc::Rc;
 /// use racer_dataplane::{error::Result, model::WorkerId,
 ///     runtime::worker::{WorkerFactory, WorkerRuntime, WorkerService,
-///                       CryptoRuntime, CryptoService}};
+///                       CryptoRuntime}};
+/// use uring_runtime::group::Service;
+/// use racer_dataplane::runtime::RequestScope;
 /// struct LocalFactory(Rc<()>);
 /// impl WorkerFactory for LocalFactory {
 ///     fn build(&self, _: WorkerId, _: WorkerRuntime) -> Result<Box<dyn WorkerService>> { todo!() }
-///     fn build_crypto(&self, _: WorkerId, _: CryptoRuntime) -> Result<Box<dyn CryptoService>> { todo!() }
+///     fn build_crypto(&self, _: WorkerId, _: CryptoRuntime) -> Result<Box<dyn Service<RequestScope>>> { todo!() }
 /// }
 /// ```
 pub trait WorkerFactory: Sync {
@@ -128,7 +130,7 @@ pub trait WorkerFactory: Sync {
         &self,
         worker: WorkerId,
         runtime: CryptoRuntime,
-    ) -> Result<Box<dyn CryptoService>>;
+    ) -> Result<Box<dyn Service<RequestScope>>>;
 }
 pub trait WorkerService {
     fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()>;
@@ -141,19 +143,6 @@ pub trait WorkerService {
     /// polls reactor and crypto completions (the service is mutably borrowed).
     /// Drain reads/dirty writes while the engine remains live. Close submissions
     /// only after no I/O producer can submit; keep consuming until fully fenced.
-    fn drain<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()>;
-    fn shutdown<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()>;
-}
-pub trait CryptoService {
-    /// Re-arm the worker wake before every drive. Implementations with a port
-    /// forward this to CryptoPort::register_driver; lifecycle futures register
-    /// their Context waker while polling the port themselves.
-    fn register_driver(&self, _waker: &Waker) {}
-    /// Lifecycle futures share an executor with sibling shards. Each poll must
-    /// do bounded work and yield rather than blocking for another shard.
-    fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()>;
-    fn poll_budgeted(&mut self, work_budget: usize) -> Result<()>;
-    /// After submission close, complete every accepted job while I/O reaps results.
     fn drain<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()>;
     fn shutdown<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()>;
 }
@@ -522,10 +511,8 @@ where
             .1
             .take()
             .ok_or(Error::Io)?;
-        let service = self
-            .factory
-            .build_crypto(self.resources.workers[lane], CryptoRuntime { port })?;
-        Ok(Box::new(HelperService(service)))
+        self.factory
+            .build_crypto(self.resources.workers[lane], CryptoRuntime { port })
     }
     fn teardown_scope(&self, startup: &RequestScope) -> RequestScope {
         lifecycle_scope().unwrap_or_else(|_| startup.clone())
@@ -590,24 +577,6 @@ impl Service<RequestScope> for IoService {
             ),
             Err(_) => Box::pin(async { Ok(()) }),
         }
-    }
-}
-struct HelperService(Box<dyn CryptoService>);
-impl Service<RequestScope> for HelperService {
-    fn register_driver(&self, waker: &Waker) {
-        self.0.register_driver(waker);
-    }
-    fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
-        self.0.start(scope)
-    }
-    fn poll_budgeted(&mut self, _: &mut Context<'_>, budget: usize) -> Result<()> {
-        self.0.poll_budgeted(budget)
-    }
-    fn drain<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
-        self.0.drain(scope)
-    }
-    fn shutdown<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
-        self.0.shutdown(scope)
     }
 }
 
@@ -740,7 +709,7 @@ mod shared_tests {
             &self,
             worker: WorkerId,
             runtime: CryptoRuntime,
-        ) -> Result<Box<dyn CryptoService>> {
+        ) -> Result<Box<dyn Service<RequestScope>>> {
             let cpu = if worker.0 == 1 {
                 self.second_crypto_cpu
             } else {
@@ -755,7 +724,7 @@ mod shared_tests {
                 return Err(Error::Unauthorized);
             }
             let page = PageCryptoEngine::new(runtime);
-            let engine: Box<dyn CryptoService> = if self.native {
+            let engine: Box<dyn Service<RequestScope>> = if self.native {
                 let (io, native) = rdma_verbs::pair(1)?;
                 self.observed.native.lock().unwrap().push(io);
                 Box::new(crate::rdma::WithNative::new(page, native))
@@ -904,7 +873,7 @@ mod shared_tests {
     struct Engine {
         worker: WorkerId,
         // Observe the concrete native/page service from outside, including destruction.
-        engine: Option<Box<dyn CryptoService>>,
+        engine: Option<Box<dyn Service<RequestScope>>>,
         observed: Arc<Observed>,
         failure: Failure,
         local: Rc<thread::ThreadId>,
@@ -916,7 +885,7 @@ mod shared_tests {
             self.observed.event(self.worker, "crypto-drop");
         }
     }
-    impl CryptoService for Engine {
+    impl Service<RequestScope> for Engine {
         fn register_driver(&self, waker: &Waker) {
             self.engine.as_ref().unwrap().register_driver(waker);
         }
@@ -938,7 +907,7 @@ mod shared_tests {
                 self.engine.as_mut().unwrap().start(scope).await
             })
         }
-        fn poll_budgeted(&mut self, budget: usize) -> Result<()> {
+        fn poll_budgeted(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
             assert_eq!(*self.local, thread::current().id());
             assert_eq!(budget, 1, "one page per shard per pass");
             let mut polls = self.observed.polls.lock().unwrap();
@@ -950,7 +919,7 @@ mod shared_tests {
             if self.observed.release.load(Ordering::SeqCst)
                 || self.observed.io_draining.load(Ordering::SeqCst) > 0
             {
-                self.engine.as_mut().unwrap().poll_budgeted(budget)?;
+                self.engine.as_mut().unwrap().poll_budgeted(cx, budget)?;
             }
             if self.worker.0 == 1 && self.failure == Failure::PollCrypto {
                 Err(Error::Io)
@@ -1390,7 +1359,7 @@ mod tests {
             &self,
             _: WorkerId,
             runtime: CryptoRuntime,
-        ) -> Result<Box<dyn CryptoService>> {
+        ) -> Result<Box<dyn Service<RequestScope>>> {
             assert_eq!(
                 current_cpus().unwrap(),
                 std::collections::BTreeSet::from([self.cpu])
@@ -1457,7 +1426,7 @@ mod tests {
             })
         }
     }
-    impl CryptoService for TestCrypto {
+    impl Service<RequestScope> for TestCrypto {
         fn register_driver(&self, waker: &Waker) {
             self._port.register_driver(waker);
         }
@@ -1467,7 +1436,7 @@ mod tests {
                 Ok(())
             })
         }
-        fn poll_budgeted(&mut self, budget: usize) -> Result<()> {
+        fn poll_budgeted(&mut self, _: &mut Context<'_>, budget: usize) -> Result<()> {
             assert!(budget <= WORK_BUDGET);
             self.factory
                 .crypto_polls
@@ -1717,7 +1686,7 @@ mod tests {
                 &self,
                 _: WorkerId,
                 _: CryptoRuntime,
-            ) -> Result<Box<dyn CryptoService>> {
+            ) -> Result<Box<dyn Service<RequestScope>>> {
                 panic!("must not build")
             }
         }

@@ -2106,7 +2106,7 @@ struct Node {
 struct LocalWorker {
     app: WorkerApplication,
     runtime: WorkerRuntime,
-    crypto: Box<dyn CryptoService>,
+    crypto: Box<dyn uring_runtime::group::Service<RequestScope>>,
 }
 impl Node {
     fn poll(&mut self, budget: usize) {
@@ -2119,7 +2119,13 @@ impl Node {
                 .directory
                 .simulation_scope(Some((worker.app.worker, worker.app.coordinator.clone())));
             worker.runtime.reactor.poll_budgeted(budget).unwrap();
-            worker.crypto.poll_budgeted(budget).unwrap();
+            worker
+                .crypto
+                .poll_budgeted(
+                    &mut Context::from_waker(futures::task::noop_waker_ref()),
+                    budget,
+                )
+                .unwrap();
             worker.runtime.crypto.poll_budgeted(budget).unwrap();
             worker
                 .app
@@ -3352,7 +3358,12 @@ fn lifecycle(workers: &mut [LocalWorker], scope: &RequestScope, phase: Lifecycle
     for _ in 0..MAX_TURNS {
         for (runtime, crypto, operation) in &mut pending {
             runtime.reactor.poll_budgeted(64).unwrap();
-            crypto.poll_budgeted(64).unwrap();
+            crypto
+                .poll_budgeted(
+                    &mut Context::from_waker(futures::task::noop_waker_ref()),
+                    64,
+                )
+                .unwrap();
             runtime.crypto.poll_budgeted(64).unwrap();
             if let Some(op) = operation {
                 if let Poll::Ready(result) = op
@@ -3372,12 +3383,15 @@ fn lifecycle(workers: &mut [LocalWorker], scope: &RequestScope, phase: Lifecycle
 }
 fn drive_local<T>(
     runtime: &WorkerRuntime,
-    crypto: &mut dyn CryptoService,
+    crypto: &mut dyn uring_runtime::group::Service<RequestScope>,
     mut operation: Operation<'_, T>,
 ) -> Result<T> {
     for _ in 0..MAX_TURNS {
         runtime.reactor.poll_budgeted(64)?;
-        crypto.poll_budgeted(64)?;
+        crypto.poll_budgeted(
+            &mut Context::from_waker(futures::task::noop_waker_ref()),
+            64,
+        )?;
         runtime.crypto.poll_budgeted(64)?;
         if let Poll::Ready(result) = operation
             .as_mut()

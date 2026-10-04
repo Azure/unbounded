@@ -49,8 +49,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Instant;
-use uring_uring_runtime::CancellationRegistration;
-use uring_uring_runtime::deadline::Deadline;
+use uring_runtime::CancellationRegistration;
+use uring_runtime::deadline::Deadline;
 
 /// Racer candidate policy shares the cancellation lifetime, but is not runtime policy.
 #[derive(Clone)]

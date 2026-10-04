@@ -87,7 +87,12 @@ mod duplex_release {
             let mut pump = |endpoint: &mut crate::read::dispatch::WorkerEndpoint| {
                 endpoint.poll(&mut cx, 64).unwrap();
                 uring_runtime::drivers::poll(&mut cx, 64);
-                f.engine.poll_budgeted(64).unwrap();
+                uring_runtime::group::Service::poll_budgeted(
+                    &mut f.engine,
+                    &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
+                    64,
+                )
+                .unwrap();
                 f.crypto.poll_budgeted(64).unwrap();
                 f.reactor.poll_budgeted(64).unwrap();
             };
@@ -951,7 +956,12 @@ fn ordered_later_page_completes_before_head_and_cancellation_keeps_completion_fe
             let mut cx = Context::from_waker(futures::task::noop_waker_ref());
             endpoint.poll(&mut cx, 64).unwrap();
             uring_runtime::drivers::poll(&mut cx, 64);
-            f.engine.poll_budgeted(64).unwrap();
+            uring_runtime::group::Service::poll_budgeted(
+                &mut f.engine,
+                &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
+                64,
+            )
+            .unwrap();
             f.crypto.poll_budgeted(64).unwrap();
             f.reactor.poll_budgeted(128).unwrap();
         };
@@ -1300,7 +1310,12 @@ fn production_range_provider_selects_out_of_order_and_fans_out_to_two_nodes_and_
             64,
         );
         for f in &mut fixtures {
-            f.engine.poll_budgeted(64).unwrap();
+            uring_runtime::group::Service::poll_budgeted(
+                &mut f.engine,
+                &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
+                64,
+            )
+            .unwrap();
             f.crypto.poll_budgeted(64).unwrap();
             f.reactor.poll_budgeted(128).unwrap();
         }

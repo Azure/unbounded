@@ -46,7 +46,7 @@ use uring_runtime::drivers::DriverQueue;
 pub mod clock {
     use crate::error::Error;
     use crate::error::Result;
-    use uring_uring_uring_uring_runtime::deadline::Deadline;
+    use uring_runtime::deadline::Deadline;
     use std::cell::Cell;
     use std::time::Duration;
     use std::time::Instant;
@@ -834,7 +834,12 @@ impl ReadWorker {
         let _queue = self.drivers.enter();
         self.endpoint.borrow_mut().poll_budgeted(64).unwrap();
         self.drivers.poll(cx, 64);
-        self.engine.borrow_mut().poll_budgeted(64).unwrap();
+        uring_runtime::group::Service::poll_budgeted(
+            &mut *self.engine.borrow_mut(),
+            &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
+            64,
+        )
+        .unwrap();
         self.crypto.poll_budgeted(64).unwrap();
         // Exercise acquisition/authentication, not persistence or cache retention.
         // Delivered leases remain charged even after the cache drops its copy.

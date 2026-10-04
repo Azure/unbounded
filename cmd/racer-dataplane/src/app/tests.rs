@@ -2092,7 +2092,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
 fn stop_worker(
     worker: &mut WorkerApplication,
     runtime: &WorkerRuntime,
-    engine: &mut dyn CryptoService,
+    engine: &mut dyn uring_runtime::group::Service<RequestScope>,
 ) {
     drive(
         runtime,
@@ -2111,14 +2111,17 @@ fn stop_worker(
 
 fn drive<T>(
     runtime: &WorkerRuntime,
-    engine: &mut dyn CryptoService,
+    engine: &mut dyn uring_runtime::group::Service<RequestScope>,
     future: Operation<'_, T>,
 ) -> Result<T> {
     let mut future = future;
     let until = Instant::now() + Duration::from_secs(15);
     loop {
         runtime.reactor.poll_budgeted(64)?;
-        engine.poll_budgeted(64)?;
+        engine.poll_budgeted(
+            &mut Context::from_waker(futures::task::noop_waker_ref()),
+            64,
+        )?;
         runtime.crypto.poll_budgeted(64)?;
         if let Poll::Ready(result) = future
             .as_mut()
@@ -2200,7 +2203,12 @@ fn blocked_publication_is_superseded_while_projection_rotates() {
                 64,
             )
             .unwrap();
-        engine.poll_budgeted(64).unwrap();
+        engine
+            .poll_budgeted(
+                &mut Context::from_waker(futures::task::noop_waker_ref()),
+                64,
+            )
+            .unwrap();
     }
     assert!(worker.snapshots.current().unwrap().caches.is_empty());
     stop_worker(&mut worker, &runtime, &mut engine);
@@ -2526,7 +2534,12 @@ fn real_control_bootstrap_recovery_publication_readiness_and_shutdown() {
             .is_err()
     );
     while runtime.crypto.outstanding() != 0 {
-        engine.poll_budgeted(64).unwrap();
+        engine
+            .poll_budgeted(
+                &mut Context::from_waker(futures::task::noop_waker_ref()),
+                64,
+            )
+            .unwrap();
         runtime.crypto.poll_budgeted(64).unwrap();
         runtime.reactor.poll_budgeted(64).unwrap();
         worker

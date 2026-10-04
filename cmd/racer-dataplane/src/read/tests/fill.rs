@@ -1404,7 +1404,12 @@ pub(super) fn pump_worker(
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     endpoint.poll(&mut cx, 64).unwrap();
     uring_runtime::drivers::poll(&mut cx, 64);
-    engine.poll_budgeted(64).unwrap();
+    uring_runtime::group::Service::poll_budgeted(
+        engine,
+        &mut Context::from_waker(futures::task::noop_waker_ref()),
+        64,
+    )
+    .unwrap();
     crypto.poll_budgeted(64).unwrap();
     reactor.poll_budgeted(128).unwrap();
 }
@@ -1598,7 +1603,12 @@ pub(super) fn drive<T>(
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     for _ in 0..256 {
         uring_runtime::drivers::poll(&mut cx, 64);
-        engine.poll_budgeted(64).unwrap();
+        uring_runtime::group::Service::poll_budgeted(
+            engine,
+            &mut Context::from_waker(futures::task::noop_waker_ref()),
+            64,
+        )
+        .unwrap();
         crypto.poll_budgeted(64).unwrap();
         if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
             return value;
@@ -1657,7 +1667,12 @@ pub(super) fn drive_io<T>(
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         uring_runtime::drivers::poll(&mut cx, 64);
-        engine.poll_budgeted(64).unwrap();
+        uring_runtime::group::Service::poll_budgeted(
+            engine,
+            &mut Context::from_waker(futures::task::noop_waker_ref()),
+            64,
+        )
+        .unwrap();
         crypto.poll_budgeted(64).unwrap();
         if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
             return value;
@@ -3315,7 +3330,12 @@ fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
     let mut read = read_copy();
     let copy = loop {
         f.scope.check().unwrap();
-        f.engine.poll_budgeted(64).unwrap();
+        uring_runtime::group::Service::poll_budgeted(
+            &mut f.engine,
+            &mut Context::from_waker(futures::task::noop_waker_ref()),
+            64,
+        )
+        .unwrap();
         f.crypto.poll_budgeted(64).unwrap();
         if let Poll::Ready(result) = read.as_mut().poll(&mut cx) {
             break result.expect("idle cached ciphertext must not reject a disk copy");

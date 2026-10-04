@@ -875,7 +875,7 @@ pub(super) fn new_scope(timeout: Duration, cancellation: Cancellation) -> Result
     Ok(RequestScope {
         body_deadlines: None,
         request: RequestId(id),
-        deadline: uring_uring_uring_uring_runtime::deadline::Deadline(uring_runtime::environment::now() + timeout),
+        deadline: uring_runtime::deadline::Deadline(uring_runtime::environment::now() + timeout),
         cancellation,
     })
 }

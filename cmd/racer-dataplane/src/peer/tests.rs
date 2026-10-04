@@ -1,6 +1,6 @@
 //! Shared signed peer fixtures and scenario suites.
 use super::*;
-use uring_uring_runtime::deadline::Deadline;
+use uring_runtime::deadline::Deadline;
 mod body_progress {
     use super::*;
     use crate::http::Codec;
@@ -1021,7 +1021,12 @@ mod encrypted_http {
             }
             assert!(Instant::now() < until, "encrypted HTTP regression watchdog");
             for engine in engines.iter_mut() {
-                engine.poll_budgeted(8).unwrap();
+                uring_runtime::group::Service::poll_budgeted(
+                    engine,
+                    &mut Context::from_waker(futures::task::noop_waker_ref()),
+                    8,
+                )
+                .unwrap();
             }
             for client in clients {
                 client.poll_budgeted(8).unwrap();
@@ -2043,7 +2048,7 @@ use crate::peer::protocol::decode_envelope;
 use crate::peer::protocol::encode_envelope;
 
 use crate::admission::AdmissionPolicy;
-use uring_uring_uring_uring_runtime::deadline::Deadline;
+use uring_runtime::deadline::Deadline;
 use crate::runtime::RequestScope;
 use crate::security::connection::Signatures;
 use crate::security::forwarding::Forwarding;

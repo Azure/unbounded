@@ -622,7 +622,12 @@ impl Rig {
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         self.reactor.poll_budgeted(128).unwrap();
         if let Some(engine) = &self.engine {
-            engine.borrow_mut().poll_budgeted(64).unwrap();
+            uring_runtime::group::Service::poll_budgeted(
+                &mut *engine.borrow_mut(),
+                &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
+                64,
+            )
+            .unwrap();
         }
         self.crypto.poll_budgeted(64).unwrap();
         self.endpoint.borrow_mut().poll(&mut cx, 64).unwrap();

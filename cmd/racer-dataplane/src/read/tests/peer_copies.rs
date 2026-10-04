@@ -248,7 +248,12 @@ fn invalid_signed_selection_falls_back_without_resetting_acquisition_budget() {
                 }
                 endpoint.poll(&mut cx, 64).unwrap();
                 uring_runtime::drivers::poll(&mut cx, 64);
-                f.engine.poll_budgeted(64).unwrap();
+                uring_runtime::group::Service::poll_budgeted(
+                    &mut f.engine,
+                    &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
+                    64,
+                )
+                .unwrap();
                 f.crypto.poll_budgeted(64).unwrap();
                 f.reactor.poll_budgeted(64).unwrap();
             }
@@ -1072,7 +1077,12 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
         for _ in 0..512 {
             uring_runtime::drivers::poll(&mut cx, 64);
             for f in &mut fixtures {
-                f.engine.poll_budgeted(64).unwrap();
+                uring_runtime::group::Service::poll_budgeted(
+                    &mut f.engine,
+                    &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
+                    64,
+                )
+                .unwrap();
                 f.crypto.poll_budgeted(64).unwrap();
             }
             if let Poll::Ready(done) = read.as_mut().poll(&mut cx) {
@@ -1338,7 +1348,12 @@ fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
         pair.as_mut().poll(&mut cx).is_pending(),
         "cancellation is not the crypto fence"
     );
-    f.engine.poll_budgeted(8).unwrap();
+    uring_runtime::group::Service::poll_budgeted(
+        &mut f.engine,
+        &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
+        8,
+    )
+    .unwrap();
     assert!(
         pair.as_mut().poll(&mut cx).is_pending(),
         "engine completion must be consumed"
@@ -1389,7 +1404,12 @@ fn hedge_child_cancellation_removes_crypto_admission_wait_without_canceling_acce
     drop(waiting);
     assert!(!f.scope.cancellation.is_cancelled());
     assert_eq!(f.crypto.outstanding(), 1);
-    f.engine.poll_budgeted(8).unwrap();
+    uring_runtime::group::Service::poll_budgeted(
+        &mut f.engine,
+        &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
+        8,
+    )
+    .unwrap();
     f.crypto.poll_budgeted(8).unwrap();
     assert!(matches!(
         accepted.as_mut().poll(&mut cx),
@@ -1786,7 +1806,12 @@ fn corrupt_copy_cannot_extend_original_budget_deadline() {
     assert_eq!(f.crypto.outstanding(), 1);
     // Complete AEAD while live, then resume fallback after the tighter budget
     // deadline. The caller scope is still live and must not renew that deadline.
-    f.engine.poll_budgeted(64).unwrap();
+    uring_runtime::group::Service::poll_budgeted(
+        &mut f.engine,
+        &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
+        64,
+    )
+    .unwrap();
     std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
     assert!(matches!(
         drive(future, &mut f.engine, &f.crypto),

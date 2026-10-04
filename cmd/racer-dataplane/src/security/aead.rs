@@ -498,18 +498,15 @@ impl PageCryptoEngine {
         Ok(())
     }
 }
-impl CryptoService for PageCryptoEngine {
+impl uring_runtime::group::Service<RequestScope> for PageCryptoEngine {
     fn register_driver(&self, waker: &std::task::Waker) {
         self.runtime.port.register_driver(waker);
     }
     fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
         Box::pin(self.environment.scope(async move { scope.check() }))
     }
-    fn poll_budgeted(&mut self, work_budget: usize) -> Result<()> {
-        self.drive(
-            &mut Context::from_waker(futures::task::noop_waker_ref()),
-            work_budget,
-        )
+    fn poll_budgeted(&mut self, cx: &mut Context<'_>, work_budget: usize) -> Result<()> {
+        self.drive(cx, work_budget)
     }
     fn drain<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
         Box::pin(futures::future::poll_fn(move |cx| {
@@ -894,7 +891,9 @@ mod tests {
                 ))
                 .is_ok()
             );
-            engine.poll_budgeted(1).unwrap();
+            engine
+                .poll_budgeted(&mut Context::from_waker(futures::task::noop_waker_ref()), 1)
+                .unwrap();
             let next = CryptoId {
                 sequence: sequence + 1,
                 ..id
@@ -1012,7 +1011,9 @@ mod tests {
                 ))
                 .is_ok()
             );
-            engine.poll_budgeted(1).unwrap();
+            engine
+                .poll_budgeted(&mut Context::from_waker(futures::task::noop_waker_ref()), 1)
+                .unwrap();
             let Poll::Ready(Ok(Some(completion))) = io.poll_completion(&mut cx) else {
                 panic!("completion");
             };
@@ -1126,7 +1127,9 @@ mod tests {
                 ))
                 .is_ok()
             );
-            engine.poll_budgeted(1).unwrap();
+            engine
+                .poll_budgeted(&mut Context::from_waker(futures::task::noop_waker_ref()), 1)
+                .unwrap();
             let Poll::Ready(Ok(Some(completion))) = io.poll_completion(&mut cx) else {
                 panic!("completion")
             };
@@ -1219,7 +1222,9 @@ mod tests {
         let mut engine = PageCryptoEngine::new(CryptoRuntime { port });
         engine.register_driver(&waker);
         // Budget polling's noop task waker must not replace the runtime driver.
-        engine.poll_budgeted(1).unwrap();
+        engine
+            .poll_budgeted(&mut Context::from_waker(futures::task::noop_waker_ref()), 1)
+            .unwrap();
         for sequence in 1..=9 {
             let job_scope =
                 RequestScope::new(RequestId([sequence as u8; 16]), scope.deadline.0).unwrap();

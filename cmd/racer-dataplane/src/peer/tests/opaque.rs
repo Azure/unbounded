@@ -604,7 +604,12 @@ mod safety {
         }
         let poll_crypto = || {
             for engine in engines.borrow_mut().iter_mut() {
-                engine.poll_budgeted(8).unwrap();
+                uring_runtime::group::Service::poll_budgeted(
+                    engine,
+                    &mut std::task::Context::from_waker(futures::task::noop_waker_ref()),
+                    8,
+                )
+                .unwrap();
             }
             for client in &clients {
                 client.poll_budgeted(8).unwrap();

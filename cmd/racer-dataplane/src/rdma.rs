@@ -9,7 +9,7 @@ use crate::model::PageId;
 use crate::model::ResourceClass;
 use crate::model::TransferId;
 use crate::admission::AdmissionPolicy;
-use uring_uring_uring_uring_runtime::deadline::Deadline;
+use uring_runtime::deadline::Deadline;
 use crate::runtime::RequestScope;
 use crate::runtime::worker::CryptoService;
 use crate::security::aead::PageCryptoEngine;
@@ -76,7 +76,7 @@ impl WithNative {
         }
     }
 }
-impl CryptoService for WithNative {
+impl uring_runtime::group::Service<RequestScope> for WithNative {
     fn register_driver(&self, waker: &Waker) {
         self.inner.register_driver(waker);
         self.native.register_driver(waker);
@@ -84,8 +84,8 @@ impl CryptoService for WithNative {
     fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
         self.inner.start(scope)
     }
-    fn poll_budgeted(&mut self, budget: usize) -> Result<()> {
-        self.inner.poll_budgeted(budget)?;
+    fn poll_budgeted(&mut self, cx: &mut Context<'_>, budget: usize) -> Result<()> {
+        self.inner.poll_budgeted(cx, budget)?;
         self.native.poll_budgeted(budget).map_err(Into::into)
     }
     fn drain<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {

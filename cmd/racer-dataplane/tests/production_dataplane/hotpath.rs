@@ -159,7 +159,11 @@ impl WorkerFactory for Factory {
             requests: Rc::new(std::cell::Cell::new(0)),
         }))
     }
-    fn build_crypto(&self, _: WorkerId, runtime: CryptoRuntime) -> Result<Box<dyn CryptoService>> {
+    fn build_crypto(
+        &self,
+        _: WorkerId,
+        runtime: CryptoRuntime,
+    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
         Ok(Box::new(PageCryptoEngine::new(runtime)))
     }
 }

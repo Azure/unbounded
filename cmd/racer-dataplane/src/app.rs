@@ -1314,7 +1314,7 @@ impl WorkerFactory for Application {
         &self,
         worker: WorkerId,
         runtime: CryptoRuntime,
-    ) -> Result<Box<dyn CryptoService>> {
+    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
         self.node
             .native
             .crypto(worker, PageCryptoEngine::new(runtime))

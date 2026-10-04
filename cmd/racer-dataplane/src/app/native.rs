@@ -84,7 +84,7 @@ impl NativePairs {
         &self,
         worker: WorkerId,
         engine: PageCryptoEngine,
-    ) -> Result<Box<dyn CryptoService>> {
+    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
         let native = self
             .ports
             .lock()
@@ -258,7 +258,9 @@ mod tests {
         app.node.inventory.update(fresh.clone()).unwrap();
         for _ in 0..20 {
             worker.poll_native(&mut cx).unwrap();
-            service.poll_budgeted(8).unwrap();
+            service
+                .poll_budgeted(&mut Context::from_waker(futures::task::noop_waker_ref()), 8)
+                .unwrap();
         }
         assert_eq!(worker.actual_rails[0].device, "new");
         assert!(worker.devices.as_ref().unwrap().ready(RailId(7)));
@@ -266,12 +268,19 @@ mod tests {
         app.node.inventory.update(vec![]).unwrap();
         worker.refresh_inventory().unwrap();
         assert!(!worker.devices.as_ref().unwrap().ready(RailId(7)));
-        service.poll_budgeted(256).unwrap();
+        service
+            .poll_budgeted(
+                &mut Context::from_waker(futures::task::noop_waker_ref()),
+                256,
+            )
+            .unwrap();
         assert_eq!(worker.runtime.admission.used(ResourceClass::Registered), 0);
         app.node.inventory.update(fresh.clone()).unwrap();
         for _ in 0..20 {
             worker.poll_native(&mut cx).unwrap();
-            service.poll_budgeted(8).unwrap();
+            service
+                .poll_budgeted(&mut Context::from_waker(futures::task::noop_waker_ref()), 8)
+                .unwrap();
         }
         assert!(worker.devices.as_ref().unwrap().ready(RailId(7)));
         let mut changed = fresh;
@@ -279,7 +288,12 @@ mod tests {
         app.node.inventory.update(changed).unwrap();
         worker.refresh_inventory().unwrap();
         assert!(!worker.devices.as_ref().unwrap().ready(RailId(7)));
-        service.poll_budgeted(256).unwrap();
+        service
+            .poll_budgeted(
+                &mut Context::from_waker(futures::task::noop_waker_ref()),
+                256,
+            )
+            .unwrap();
         assert_eq!(worker.runtime.admission.used(ResourceClass::Registered), 0);
         // Published GID must still match refreshed discovery, never bypass it.
         publication.sequence.0 += 1;
@@ -846,19 +860,28 @@ mod tests {
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         for _ in 0..20 {
             worker.poll_native(&mut cx).unwrap();
-            service.poll_budgeted(8).unwrap();
+            service
+                .poll_budgeted(&mut Context::from_waker(futures::task::noop_waker_ref()), 8)
+                .unwrap();
         }
         assert!(worker.devices.as_ref().unwrap().ready(RailId(7)));
         let charged = worker.runtime.admission.used(ResourceClass::Registered);
         assert!(charged > 0);
         worker.devices.as_ref().unwrap().close();
         worker.actual_rails.clear();
-        service.poll_budgeted(256).unwrap();
+        service
+            .poll_budgeted(
+                &mut Context::from_waker(futures::task::noop_waker_ref()),
+                256,
+            )
+            .unwrap();
         assert_eq!(worker.runtime.admission.used(ResourceClass::Registered), 0);
         worker.native_retry = uring_runtime::environment::now();
         for _ in 0..20 {
             worker.poll_native(&mut cx).unwrap();
-            service.poll_budgeted(8).unwrap();
+            service
+                .poll_budgeted(&mut Context::from_waker(futures::task::noop_waker_ref()), 8)
+                .unwrap();
         }
         assert!(worker.devices.as_ref().unwrap().ready(RailId(7)));
         assert_eq!(
@@ -887,7 +910,12 @@ mod tests {
             .unwrap();
         assert!(worker.actual_rails.is_empty());
         assert!(!worker.devices.as_ref().unwrap().ready(RailId(7)));
-        service.poll_budgeted(256).unwrap();
+        service
+            .poll_budgeted(
+                &mut Context::from_waker(futures::task::noop_waker_ref()),
+                256,
+            )
+            .unwrap();
         assert_eq!(worker.runtime.admission.used(ResourceClass::Registered), 0);
         drop(service);
         assert_eq!(sim.live_resources(), 0);
@@ -973,7 +1001,9 @@ mod tests {
             threads
                 .spawn(|| {
                     let mut service = app.build_crypto(WorkerId(0), engine).unwrap();
-                    service.poll_budgeted(1).unwrap();
+                    service
+                        .poll_budgeted(&mut Context::from_waker(futures::task::noop_waker_ref()), 1)
+                        .unwrap();
                 })
                 .join()
                 .unwrap();
