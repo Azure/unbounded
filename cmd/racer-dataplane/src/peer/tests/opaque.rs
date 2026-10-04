@@ -378,6 +378,20 @@ mod safety {
 
     #[test]
     fn upstream_fin_before_response_head_recovers_quota_by_signed_deadline() {
+        abandoned_head(false, false);
+    }
+
+    #[test]
+    fn upstream_fin_before_response_head_promptly_releases_relay() {
+        abandoned_head(true, false);
+    }
+
+    #[test]
+    fn parent_cancel_before_response_head_promptly_releases_relay() {
+        abandoned_head(true, true);
+    }
+
+    fn abandoned_head(prompt: bool, cancel_parent: bool) {
         let mut f = RelayFixture::new(false);
         let metrics = Metrics::default();
         f.server = f.server.with_metrics(metrics.clone());
@@ -387,6 +401,8 @@ mod safety {
         let admitted = Cell::new(false);
         let finished = Cell::new(false);
         let deadline = Cell::new(None);
+        let abandoned = Cell::new(None);
+        let relay_scope = RequestScope::new(f.scope.request, f.scope.deadline.0).unwrap();
         let shutdown = f.requester_socket.try_clone().unwrap();
         let destination = async {
             let fd = f.reactors[2]
@@ -419,12 +435,26 @@ mod safety {
         };
         let relay = async {
             let conn = crate::http::from_accepted(f.relay_socket.into(), &f.admissions[1])?;
-            let result = f.server.serve_connection(conn, &f.scope).await;
+            let result = f.server.serve_connection(conn, &relay_scope).await;
             assert!(matches!(
                 result,
                 Err(Error::DeadlineExceeded | Error::Cancelled | Error::Io)
             ));
             assert!(Instant::now() <= deadline.get().unwrap() + Duration::from_secs(1));
+            if prompt {
+                assert!(
+                    Instant::now() - abandoned.get().unwrap() < Duration::from_secs(2),
+                    "abandoned pre-head work must not wait for the signed deadline"
+                );
+                assert!(Instant::now() < deadline.get().unwrap());
+            }
+            assert_eq!(
+                f.reactors[1].in_flight(),
+                0,
+                "watch and downstream I/O fenced"
+            );
+            assert_eq!(f.admissions[1].used(ResourceClass::Relay), 0);
+            assert_eq!(f.admissions[1].used(ResourceClass::Connection), 0);
             finished.set(true);
             Ok::<_, Error>(())
         };
@@ -439,7 +469,12 @@ mod safety {
             )
             .await?;
             let mut request = request(&f.admissions[0], 11);
-            let end = Instant::now() + Duration::from_millis(500);
+            let end = Instant::now()
+                + if prompt {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::from_millis(500)
+                };
             deadline.set(Some(end));
             request.route.deadline = Deadline(end);
             request.origin.scope.deadline = Deadline(end);
@@ -458,7 +493,12 @@ mod safety {
             assert_eq!(f.admissions[1].used(ResourceClass::Relay), 1);
             assert_eq!(f.admissions[1].used(ResourceClass::Ciphertext), 0);
             assert_eq!(f.admissions[1].used(ResourceClass::Pipe), 0);
-            shutdown.shutdown(Shutdown::Write).unwrap();
+            abandoned.set(Some(Instant::now()));
+            if cancel_parent {
+                relay_scope.cancel().unwrap();
+            } else {
+                shutdown.shutdown(Shutdown::Write).unwrap();
+            }
             let done = f.reactors[0]
                 .recv(conn.socket(), f.ios[0].buffer(1)?, conn, &f.scope)
                 .await?;
@@ -475,6 +515,11 @@ mod safety {
         )
         .unwrap();
         assert!(admitted.get() && finished.get());
+        assert_eq!(relay_scope.cancellation.is_cancelled(), cancel_parent);
+        assert!(
+            f.scope.check().is_ok(),
+            "unrelated listener scope remains usable"
+        );
         for event in [
             Event::OpaqueRelayBodyCompleted,
             Event::OpaqueRelayBodyBytes,

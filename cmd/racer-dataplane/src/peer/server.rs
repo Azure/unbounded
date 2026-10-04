@@ -412,14 +412,23 @@ impl PeerServer {
                             let reservation = Rc::new(reservation);
                             received.connection.state_mut().relay_reservation =
                                 Some(reservation.clone());
-                            self.relay
-                                .forward_inner(
+                            // Cancel only this downstream exchange on upstream FIN.
+                            // Fence its I/O and disconnect watch before streaming.
+                            let exchange =
+                                RequestScope::new(request_scope.request, request_scope.deadline.0)?;
+                            disconnect_fenced_exchange(
+                                &self.io,
+                                &received.connection,
+                                &request_scope,
+                                &exchange,
+                                self.relay.forward_inner(
                                     request,
                                     membership.clone(),
                                     Some(reservation),
-                                    &request_scope,
-                                )
-                                .await
+                                    &exchange,
+                                ),
+                            )
+                            .await
                         }
                         Err(error) => Err(error),
                     };
@@ -495,7 +504,7 @@ impl PeerServer {
                         // destination waiter, never independent shared-flight work.
                         let exchange =
                             RequestScope::new(request_scope.request, request_scope.deadline.0)?;
-                        materialized_exchange(
+                        disconnect_fenced_exchange(
                             &self.io,
                             &received.connection,
                             &request_scope,
@@ -862,13 +871,13 @@ where
     }
 }
 /// Cancel an abandoned HTTP exchange without dropping work before its completion fences.
-async fn materialized_exchange(
+async fn disconnect_fenced_exchange<T>(
     io: &crate::http::HttpIo,
     connection: &crate::http::ConnectionLease,
     parent: &RequestScope,
     exchange: &RequestScope,
-    work: impl std::future::Future<Output = crate::error::Result<SignedResponse>>,
-) -> crate::error::Result<SignedResponse> {
+    work: impl std::future::Future<Output = crate::error::Result<T>>,
+) -> crate::error::Result<T> {
     use std::task::Poll;
     let parent_wake = parent.cancellation.subscribe()?;
     let watch_scope = RequestScope::new(exchange.request, exchange.deadline.0)?;
@@ -1055,7 +1064,7 @@ mod tests {
                     completed.set(true);
                     result
                 };
-                let mut work = Box::pin(materialized_exchange(
+                let mut work = Box::pin(disconnect_fenced_exchange(
                     &io,
                     &connection,
                     &parent,
@@ -1154,7 +1163,7 @@ mod tests {
             });
             let response = drive(
                 &reactor,
-                materialized_exchange(&io, &connection, &parent, &exchange, work),
+                disconnect_fenced_exchange(&io, &connection, &parent, &exchange, work),
             )
             .unwrap();
             assert!(matches!(response.response, PeerResponse::Miss));
