@@ -1,7 +1,6 @@
 //! Signed peer operations and canonical encoding/decoding with charged ownership.
 //! Binary fields use padded standard base64, integers minimal decimal, and keys
 //! lowercase hex. Encoders never include page bytes; transports preserve signed heads.
-use crate::admission::AdmissionPolicy;
 use crate::error::Error;
 use crate::error::Result;
 use crate::http::Codec;
@@ -21,6 +20,8 @@ use crate::security::PeerOriginContext;
 use crate::admission::ResourceClass;
 use crate::model::*;
 use crate::peer::forwarding::ForwardedHead;
+use crate::admission::AdmissionPolicy;
+use uring_runtime::deadline::Deadline;
 use crate::runtime::RequestScope;
 use crate::topology::RouteBudget;
 use base64::Engine;
@@ -39,7 +40,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
-use uring_runtime::deadline::Deadline;
 
 pub enum FetchMode {
     CopyOnly,
@@ -1419,139 +1419,6 @@ pub(crate) fn decode_signed(bytes: &[u8]) -> Result<SignedHead> {
     })
 }
 
-#[cfg(test)]
-mod envelope_tests {
-    use super::*;
-    fn envelope() -> ForwardedHead {
-        ForwardedHead {
-            original: Arc::new(SignedHead {
-                head: MessageHead {
-                    start: StartLine::Response { status: 404 },
-                    headers: vec![Header {
-                        name: "racer-opaque".into(),
-                        value: b"AAEC/w==".to_vec(),
-                    }],
-                },
-                signature: vec![7; 64],
-            }),
-            hops: vec![],
-        }
-    }
-    #[test]
-    fn envelope_preserves_signature_and_opaque_headers() {
-        let original = envelope();
-        let (decoded, length) =
-            decode_envelope(encode_envelope(&original, true, 27).unwrap(), true).unwrap();
-        assert_eq!(length, 27);
-        assert_eq!(decoded.original.signature, original.original.signature);
-        assert_eq!(decoded.original.head.headers[0].value, b"AAEC/w==");
-    }
-    #[test]
-    fn rejects_versions_duplicates_holes_and_request_bodies() {
-        for version in ["1", "2", "3", "4", "6"] {
-            let mut head = encode_envelope(&envelope(), false, 0).unwrap();
-            head.headers[0].value = version.as_bytes().to_vec();
-            assert!(decode_envelope(head, false).is_err());
-        }
-        let mut legacy = encode_envelope(&envelope(), false, 0).unwrap();
-        legacy.start = StartLine::Request {
-            method: "POST".into(),
-            target: "/racer/peer/v2/exchange".into(),
-        };
-        assert!(decode_envelope(legacy, false).is_err());
-        let mut head = encode_envelope(&envelope(), false, 0).unwrap();
-        head.headers[0].value = b"1".to_vec();
-        assert!(decode_envelope(head, false).is_err());
-        let mut head = encode_envelope(&envelope(), false, 0).unwrap();
-        head.headers.push(Header {
-            name: "Content-Length".into(),
-            value: b"0".to_vec(),
-        });
-        assert!(decode_envelope(head, false).is_err());
-        let mut head = encode_envelope(&envelope(), false, 0).unwrap();
-        head.headers.push(Header {
-            name: "racer-hop-1".into(),
-            value: encode_signed(&envelope().original).unwrap(),
-        });
-        assert!(decode_envelope(head, false).is_err());
-        assert!(encode_envelope(&envelope(), false, 1).is_err());
-        assert!(encode_envelope(&envelope(), true, usize::MAX).is_err());
-    }
-    #[test]
-    fn rejects_trailing_or_oversized_embedded_head() {
-        let mut encoded = STANDARD
-            .decode(encode_signed(&envelope().original).unwrap())
-            .unwrap();
-        encoded.extend_from_slice(b"extra");
-        assert!(decode_signed(STANDARD.encode(encoded).as_bytes()).is_err());
-        assert!(decode_signed(&vec![b'A'; MAX_SIGNED_HEAD * 2]).is_err());
-    }
-    #[test]
-    fn maximum_signed_heads_and_hop_count_fit_outer_signature_profile() {
-        let signers = crate::test_support::security::network(2);
-        let mut head = MessageHead {
-            start: StartLine::Response { status: 200 },
-            headers: vec![
-                Header {
-                    name: "racer-receiver".into(),
-                    value: signers[1].node().0.as_bytes().to_vec(),
-                },
-                Header {
-                    name: "padding".into(),
-                    value: b"x".to_vec(),
-                },
-            ],
-        };
-        let small = signers[0].sign(head).unwrap();
-        let codec = Codec::new(MAX_SIGNED_HEAD);
-        let length = codec.encode_head(&small.head).unwrap().len();
-        head = small.head;
-        head.headers
-            .retain(|h| !is_auth_field(&h.name) || h.name == "racer-receiver");
-        head.headers
-            .iter_mut()
-            .find(|h| h.name == "padding")
-            .unwrap()
-            .value
-            .resize(1 + MAX_SIGNED_HEAD - length, b'x');
-        let maximum = signers[0].sign(head).unwrap();
-        assert_eq!(
-            codec.encode_head(&maximum.head).unwrap().len(),
-            MAX_SIGNED_HEAD
-        );
-        let encoded = encode_signed(&maximum).unwrap();
-        assert!(encoded.len() > MAX_SIGNED_HEAD);
-        let mut envelope = ForwardedHead {
-            original: Arc::new(maximum),
-            hops: (0..MAX_HOPS)
-                .map(|_| decode_signed(&encoded).unwrap())
-                .collect(),
-        };
-        let mut outer = encode_envelope(&envelope, true, 0).unwrap();
-        push(&mut outer, "racer-receiver", &signers[1].node().0);
-        let outer = signers[0].sign_fields(outer).unwrap();
-        signers[1].verify_proof(outer).unwrap();
-        envelope.hops.push(decode_signed(&encoded).unwrap());
-        assert!(encode_envelope(&envelope, true, 0).is_err());
-        let mut too_large = decode_signed(&encoded).unwrap();
-        too_large
-            .head
-            .headers
-            .iter_mut()
-            .find(|h| h.name == "padding")
-            .unwrap()
-            .value
-            .push(b'x');
-        assert!(matches!(
-            encode_signed(&too_large),
-            Err(Error::HeaderTooLarge)
-        ));
-        let mut decoded = STANDARD.decode(&encoded).unwrap();
-        decoded.insert(decoded.len() - 4, b'x');
-        assert!(decode_signed(STANDARD.encode(decoded).as_bytes()).is_err());
-    }
-}
-
 /// Decode the canonical security profile while retaining charged body ownership.
 pub struct SecurityCodec {
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
@@ -1654,172 +1521,6 @@ fn metadata(head: &MessageHead) -> Result<ObjectMetadata> {
     })
 }
 
-#[cfg(test)]
-mod metadata_tests {
-    use super::*;
-    use std::time::Duration;
-    use std::time::UNIX_EPOCH;
-    #[test]
-    fn received_page_keeps_one_charge_and_rejects_foreign_reservations() {
-        use crate::peer::forwarding::ForwardedHead;
-        let signers = crate::peer::tests::signers();
-        let cache = CacheId("cccccccc-1111-4111-8111-111111111111".into());
-        let mut limits = crate::test_support::cluster::config(false).limits;
-        limits.ciphertext_bytes = std::num::NonZeroUsize::new(19).unwrap();
-        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
-            limits.clone(),
-        )));
-        let foreign = flow_control::Quotas::new(AdmissionPolicy::new(limits));
-        let buffers = BufferPool::new(admission.clone());
-        let codec = SecurityCodec::new(admission.clone(), buffers.clone());
-        let metadata = ObjectMetadata {
-            content_type: None,
-            version: ObjectVersion {
-                object: ObjectId {
-                    cache: cache.clone(),
-                    key: CacheKey([3; 32]),
-                },
-                etag: StrongEtag::test_value("v1"),
-            },
-            length: 3,
-            expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
-        };
-        let page = buffers
-            .ciphertext(
-                admission
-                    .reserve(Some(&cache), ResourceClass::Ciphertext, 19)
-                    .unwrap(),
-                PageEnvelope {
-                    page: PageId {
-                        version: metadata.version.clone(),
-                        number: PageNumber(0),
-                    },
-                    key_id: KeyId([1; 16]),
-                    nonce: Nonce([2; 24]),
-                    plaintext_length: 3,
-                    ciphertext_length: 19,
-                },
-                vec![9; 19],
-            )
-            .unwrap();
-        let response = PeerResponse::Page {
-            metadata,
-            ciphertext: page,
-        };
-        let mut head = response_head(
-            &response,
-            &[3; 32],
-            &[signers[0].node().clone(), signers[2].node().clone()],
-        )
-        .unwrap();
-        push(&mut head, "racer-receiver", &signers[0].node().0);
-        let authentication = ForwardedHead {
-            original: std::sync::Arc::new(signers[2].sign(head).unwrap()),
-            hops: vec![],
-        };
-        drop(response);
-        let scope = RequestScope::new(
-            RequestId([1; 16]),
-            uring_runtime::environment::now() + Duration::from_secs(30),
-        )
-        .unwrap();
-        for case in 0..5 {
-            let reservation = match case {
-                1 => foreign.reserve(Some(&cache), ResourceClass::Ciphertext, 19),
-                2 => admission.reserve(
-                    Some(&CacheId("other".into())),
-                    ResourceClass::Ciphertext,
-                    19,
-                ),
-                3 => admission.reserve(Some(&cache), ResourceClass::Plaintext, 19),
-                4 => admission.reserve(Some(&cache), ResourceClass::Ciphertext, 18),
-                _ => admission.reserve(Some(&cache), ResourceClass::Ciphertext, 19),
-            }
-            .unwrap();
-            let auth = ForwardedHead {
-                original: authentication.original.clone(),
-                hops: vec![],
-            };
-            let result = codec.response_reserved(auth, vec![9; 19], Some(reservation), &scope);
-            if case == 0 {
-                let result = result.unwrap();
-                assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
-                let PeerResponse::Page { ciphertext, .. } = result.response else {
-                    panic!("page required")
-                };
-                assert_eq!(ciphertext.bytes(), &[9; 19]);
-                drop(ciphertext);
-            } else {
-                assert!(
-                    result.is_err(),
-                    "foreign or insufficient charge accepted: {case}"
-                );
-            }
-            assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
-            assert_eq!(admission.used(ResourceClass::Plaintext), 0);
-            assert_eq!(foreign.used(ResourceClass::Ciphertext), 0);
-        }
-    }
-
-    #[test]
-    fn explicit_metadata_version_round_trips_and_rejects_unknown_or_unsigned_shape() {
-        let mut m = ObjectMetadata {
-            content_type: None,
-            version: ObjectVersion {
-                object: ObjectId {
-                    cache: CacheId(crate::test_support::security::CACHE.into()),
-                    key: CacheKey([0; 32]),
-                },
-                etag: StrongEtag::test_value("v1"),
-            },
-            length: 17,
-            expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
-        };
-        let path = [NodeId(crate::test_support::security::NODE.into())];
-        for typed in [false, true] {
-            if typed {
-                m.content_type =
-                    Some(crate::model::ContentType::parse(b"text/plain; charset=utf-8").unwrap());
-            }
-            let head = response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path).unwrap();
-            assert_eq!(metadata(&head).unwrap(), m);
-            let mut missing_version =
-                response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path).unwrap();
-            missing_version
-                .headers
-                .retain(|h| h.name != "racer-metadata-version");
-            assert!(metadata(&missing_version).is_err());
-            assert_eq!(
-                head.unique("racer-metadata-version").unwrap(),
-                Some(b"2".as_slice())
-            );
-            assert_eq!(
-                head.unique("content-length").unwrap(),
-                Some(b"0".as_slice())
-            );
-            if typed {
-                for value in [b"3".as_slice(), b"1", b""] {
-                    let mut bad =
-                        response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path).unwrap();
-                    bad.headers
-                        .iter_mut()
-                        .find(|h| h.name == "racer-metadata-version")
-                        .unwrap()
-                        .value = value.to_vec();
-                    assert!(metadata(&bad).is_err());
-                }
-                let mut bad =
-                    response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path).unwrap();
-                bad.headers.retain(|h| h.name != "racer-metadata-version");
-                assert!(metadata(&bad).is_err());
-                let mut bad =
-                    response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path).unwrap();
-                push(&mut bad, "racer-content-type", "text/plain");
-                assert!(metadata(&bad).is_err());
-            }
-        }
-    }
-}
 pub(crate) fn page_descriptor(head: &MessageHead) -> Result<(ObjectMetadata, PageEnvelope)> {
     let metadata = metadata(head)?;
     let envelope = PageEnvelope {
@@ -2114,44 +1815,1100 @@ impl SecurityCodec {
     }
 }
 #[cfg(test)]
-pub(crate) mod connection_tests;
-
-#[cfg(test)]
-mod canonical_tests {
+pub(crate) mod tests {
     use super::*;
-    use std::time::Instant;
-    #[test]
-    fn canonical_binary_numbers_node_lists_and_deadline_round_trip() {
-        assert_eq!(binary(&[0, 1, 255]), "AAH/");
-        assert!(decode_binary(b"YQ").is_err());
-        assert!(decode_binary(b"YR==").is_err());
-        let mut head = MessageHead {
-            start: StartLine::Response { status: 200 },
-            headers: Vec::new(),
-        };
-        push(&mut head, "n", "01");
-        assert!(number(&head, "n").is_err());
-        let nodes = vec![
-            crate::test_support::security::node(1),
-            crate::test_support::security::node(2),
-        ];
-        assert_eq!(
-            decode_nodes(super::nodes(&nodes).unwrap().as_bytes()).unwrap(),
-            nodes
-        );
-        assert!(
-            decode_nodes(
-                super::nodes(&[nodes[0].clone(), nodes[0].clone()])
-                    .unwrap()
-                    .as_bytes()
+
+    mod metadata_tests {
+        use super::*;
+        #[test]
+        fn received_page_keeps_one_charge_and_rejects_foreign_reservations() {
+            let signers = crate::peer::tests::signers();
+            let cache = CacheId("cccccccc-1111-4111-8111-111111111111".into());
+            let mut limits = crate::test_support::cluster::config(false).limits;
+            limits.ciphertext_bytes = std::num::NonZeroUsize::new(19).unwrap();
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+                limits.clone(),
+            )));
+            let foreign = flow_control::Quotas::new(AdmissionPolicy::new(limits));
+            let buffers = BufferPool::new(admission.clone());
+            let codec = SecurityCodec::new(admission.clone(), buffers.clone());
+            let metadata = ObjectMetadata {
+                content_type: None,
+                version: ObjectVersion {
+                    object: ObjectId {
+                        cache: cache.clone(),
+                        key: CacheKey([3; 32]),
+                    },
+                    etag: StrongEtag::test_value("v1"),
+                },
+                length: 3,
+                expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
+            };
+            let page = buffers
+                .ciphertext(
+                    admission
+                        .reserve(Some(&cache), ResourceClass::Ciphertext, 19)
+                        .unwrap(),
+                    PageEnvelope {
+                        page: PageId {
+                            version: metadata.version.clone(),
+                            number: PageNumber(0),
+                        },
+                        key_id: KeyId([1; 16]),
+                        nonce: Nonce([2; 24]),
+                        plaintext_length: 3,
+                        ciphertext_length: 19,
+                    },
+                    vec![9; 19],
+                )
+                .unwrap();
+            let response = PeerResponse::Page {
+                metadata,
+                ciphertext: page,
+            };
+            let mut head = response_head(
+                &response,
+                &[3; 32],
+                &[signers[0].node().clone(), signers[2].node().clone()],
             )
-            .is_err()
-        );
-        let deadline = Deadline(Instant::now() + Duration::from_secs(30));
-        let encoded = encode_deadline(deadline).unwrap();
-        let decoded = decode_deadline(encoded).unwrap();
-        assert_eq!(encode_deadline(decoded).unwrap(), encoded);
-        assert!(decoded.0 <= deadline.0);
-        assert_eq!(MAX_HEAD, MAX_SIGNED_HEAD);
+            .unwrap();
+            push(&mut head, "racer-receiver", &signers[0].node().0);
+            let authentication = ForwardedHead {
+                original: std::sync::Arc::new(signers[2].sign(head).unwrap()),
+                hops: vec![],
+            };
+            drop(response);
+            let scope = RequestScope::new(
+                RequestId([1; 16]),
+                uring_runtime::environment::now() + Duration::from_secs(30),
+            )
+            .unwrap();
+            for case in 0..5 {
+                let reservation = match case {
+                    1 => foreign.reserve(Some(&cache), ResourceClass::Ciphertext, 19),
+                    2 => admission.reserve(
+                        Some(&CacheId("other".into())),
+                        ResourceClass::Ciphertext,
+                        19,
+                    ),
+                    3 => admission.reserve(Some(&cache), ResourceClass::Plaintext, 19),
+                    4 => admission.reserve(Some(&cache), ResourceClass::Ciphertext, 18),
+                    _ => admission.reserve(Some(&cache), ResourceClass::Ciphertext, 19),
+                }
+                .unwrap();
+                let auth = ForwardedHead {
+                    original: authentication.original.clone(),
+                    hops: vec![],
+                };
+                let result = codec.response_reserved(auth, vec![9; 19], Some(reservation), &scope);
+                if case == 0 {
+                    let result = result.unwrap();
+                    assert_eq!(admission.used(ResourceClass::Ciphertext), 19);
+                    let PeerResponse::Page { ciphertext, .. } = result.response else {
+                        panic!("page required")
+                    };
+                    assert_eq!(ciphertext.bytes(), &[9; 19]);
+                    drop(ciphertext);
+                } else {
+                    assert!(
+                        result.is_err(),
+                        "foreign or insufficient charge accepted: {case}"
+                    );
+                }
+                assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
+                assert_eq!(admission.used(ResourceClass::Plaintext), 0);
+                assert_eq!(foreign.used(ResourceClass::Ciphertext), 0);
+            }
+        }
+        #[test]
+        fn explicit_metadata_version_round_trips_and_rejects_unknown_or_unsigned_shape() {
+            let mut m = ObjectMetadata {
+                content_type: None,
+                version: ObjectVersion {
+                    object: ObjectId {
+                        cache: CacheId(crate::test_support::security::CACHE.into()),
+                        key: CacheKey([0; 32]),
+                    },
+                    etag: StrongEtag::test_value("v1"),
+                },
+                length: 17,
+                expires_at: ExpiresAt::from_system_time(UNIX_EPOCH).unwrap(),
+            };
+            let path = [NodeId(crate::test_support::security::NODE.into())];
+            for typed in [false, true] {
+                if typed {
+                    m.content_type = Some(
+                        crate::model::ContentType::parse(b"text/plain; charset=utf-8").unwrap(),
+                    );
+                }
+                let head =
+                    response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path).unwrap();
+                assert_eq!(metadata(&head).unwrap(), m);
+                let mut missing_version =
+                    response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path).unwrap();
+                missing_version
+                    .headers
+                    .retain(|h| h.name != "racer-metadata-version");
+                assert!(metadata(&missing_version).is_err());
+                assert_eq!(
+                    head.unique("racer-metadata-version").unwrap(),
+                    Some(b"2".as_slice())
+                );
+                assert_eq!(
+                    head.unique("content-length").unwrap(),
+                    Some(b"0".as_slice())
+                );
+                if typed {
+                    for value in [b"3".as_slice(), b"1", b""] {
+                        let mut bad =
+                            response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path)
+                                .unwrap();
+                        bad.headers
+                            .iter_mut()
+                            .find(|h| h.name == "racer-metadata-version")
+                            .unwrap()
+                            .value = value.to_vec();
+                        assert!(metadata(&bad).is_err());
+                    }
+                    let mut bad =
+                        response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path).unwrap();
+                    bad.headers.retain(|h| h.name != "racer-metadata-version");
+                    assert!(metadata(&bad).is_err());
+                    let mut bad =
+                        response_head(&PeerResponse::Metadata(m.clone()), &[0; 32], &path).unwrap();
+                    push(&mut bad, "racer-content-type", "text/plain");
+                    assert!(metadata(&bad).is_err());
+                }
+            }
+        }
+    }
+
+    mod envelope_tests {
+        use super::*;
+        fn envelope() -> ForwardedHead {
+            ForwardedHead {
+                original: Arc::new(SignedHead {
+                    head: MessageHead {
+                        start: StartLine::Response { status: 404 },
+                        headers: vec![Header {
+                            name: "racer-opaque".into(),
+                            value: b"AAEC/w==".to_vec(),
+                        }],
+                    },
+                    signature: vec![7; 64],
+                }),
+                hops: vec![],
+            }
+        }
+        #[test]
+        fn envelope_preserves_signature_and_opaque_headers() {
+            let original = envelope();
+            let (decoded, length) =
+                decode_envelope(encode_envelope(&original, true, 27).unwrap(), true).unwrap();
+            assert_eq!(length, 27);
+            assert_eq!(decoded.original.signature, original.original.signature);
+            assert_eq!(decoded.original.head.headers[0].value, b"AAEC/w==");
+        }
+        #[test]
+        fn rejects_versions_duplicates_holes_and_request_bodies() {
+            for version in ["1", "2", "3", "4", "6"] {
+                let mut head = encode_envelope(&envelope(), false, 0).unwrap();
+                head.headers[0].value = version.as_bytes().to_vec();
+                assert!(decode_envelope(head, false).is_err());
+            }
+            let mut legacy = encode_envelope(&envelope(), false, 0).unwrap();
+            legacy.start = StartLine::Request {
+                method: "POST".into(),
+                target: "/racer/peer/v2/exchange".into(),
+            };
+            assert!(decode_envelope(legacy, false).is_err());
+            let mut head = encode_envelope(&envelope(), false, 0).unwrap();
+            head.headers[0].value = b"1".to_vec();
+            assert!(decode_envelope(head, false).is_err());
+            let mut head = encode_envelope(&envelope(), false, 0).unwrap();
+            head.headers.push(Header {
+                name: "Content-Length".into(),
+                value: b"0".to_vec(),
+            });
+            assert!(decode_envelope(head, false).is_err());
+            let mut head = encode_envelope(&envelope(), false, 0).unwrap();
+            head.headers.push(Header {
+                name: "racer-hop-1".into(),
+                value: encode_signed(&envelope().original).unwrap(),
+            });
+            assert!(decode_envelope(head, false).is_err());
+            assert!(encode_envelope(&envelope(), false, 1).is_err());
+            assert!(encode_envelope(&envelope(), true, usize::MAX).is_err());
+        }
+        #[test]
+        fn rejects_trailing_or_oversized_embedded_head() {
+            let mut encoded = STANDARD
+                .decode(encode_signed(&envelope().original).unwrap())
+                .unwrap();
+            encoded.extend_from_slice(b"extra");
+            assert!(decode_signed(STANDARD.encode(encoded).as_bytes()).is_err());
+            assert!(decode_signed(&vec![b'A'; MAX_SIGNED_HEAD * 2]).is_err());
+        }
+        #[test]
+        fn maximum_signed_heads_and_hop_count_fit_outer_signature_profile() {
+            let signers = crate::test_support::security::network(2);
+            let mut head = MessageHead {
+                start: StartLine::Response { status: 200 },
+                headers: vec![
+                    Header {
+                        name: "racer-receiver".into(),
+                        value: signers[1].node().0.as_bytes().to_vec(),
+                    },
+                    Header {
+                        name: "padding".into(),
+                        value: b"x".to_vec(),
+                    },
+                ],
+            };
+            let small = signers[0].sign(head).unwrap();
+            let codec = Codec::new(MAX_SIGNED_HEAD);
+            let length = codec.encode_head(&small.head).unwrap().len();
+            head = small.head;
+            head.headers
+                .retain(|h| !is_auth_field(&h.name) || h.name == "racer-receiver");
+            head.headers
+                .iter_mut()
+                .find(|h| h.name == "padding")
+                .unwrap()
+                .value
+                .resize(1 + MAX_SIGNED_HEAD - length, b'x');
+            let maximum = signers[0].sign(head).unwrap();
+            assert_eq!(
+                codec.encode_head(&maximum.head).unwrap().len(),
+                MAX_SIGNED_HEAD
+            );
+            let encoded = encode_signed(&maximum).unwrap();
+            assert!(encoded.len() > MAX_SIGNED_HEAD);
+            let mut envelope = ForwardedHead {
+                original: Arc::new(maximum),
+                hops: (0..MAX_HOPS)
+                    .map(|_| decode_signed(&encoded).unwrap())
+                    .collect(),
+            };
+            let mut outer = encode_envelope(&envelope, true, 0).unwrap();
+            push(&mut outer, "racer-receiver", &signers[1].node().0);
+            let outer = signers[0].sign_fields(outer).unwrap();
+            signers[1].verify_proof(outer).unwrap();
+            envelope.hops.push(decode_signed(&encoded).unwrap());
+            assert!(encode_envelope(&envelope, true, 0).is_err());
+            let mut too_large = decode_signed(&encoded).unwrap();
+            too_large
+                .head
+                .headers
+                .iter_mut()
+                .find(|h| h.name == "padding")
+                .unwrap()
+                .value
+                .push(b'x');
+            assert!(matches!(
+                encode_signed(&too_large),
+                Err(Error::HeaderTooLarge)
+            ));
+            let mut decoded = STANDARD.decode(&encoded).unwrap();
+            decoded.insert(decoded.len() - 4, b'x');
+            assert!(decode_signed(STANDARD.encode(decoded).as_bytes()).is_err());
+        }
+    }
+
+    pub(crate) mod sessions {
+        use super::*;
+        use crate::http::Codec;
+        use crate::http::Endpoint;
+        use crate::model::RequestId;
+        use crate::admission::ResourceClass;
+        use crate::admission::AdmissionPolicy;
+        use crate::runtime::Reactor;
+        use std::future::Future;
+        use std::task::Context;
+        use std::task::Poll;
+        use std::time::Instant;
+        fn frame() -> MessageHead {
+            MessageHead {
+                start: StartLine::Request {
+                    method: "POST".into(),
+                    target: REQUEST_TARGET.into(),
+                },
+                headers: vec![http1::Header {
+                    name: "content-length".into(),
+                    value: b"0".to_vec(),
+                }],
+            }
+        }
+        fn clone_head(head: &MessageHead) -> MessageHead {
+            let codec = Codec::new(MAX_ENVELOPE_HEAD);
+            codec
+                .decode_head(&codec.encode_head(head).unwrap())
+                .unwrap()
+                .unwrap()
+                .0
+        }
+        pub(crate) fn pair() -> (Session, Session) {
+            let n = crate::test_support::security::network(3);
+            let id = random().unwrap();
+            (
+                Session::new(n[0].clone(), n[1].node().clone(), id, 0),
+                Session::new(n[1].clone(), n[0].node().clone(), id, 1),
+            )
+        }
+        pub(crate) fn signer(session: &Session) -> Rc<Signatures> {
+            session.signatures.clone()
+        }
+        pub(crate) fn hello(signatures: &Signatures, peer: &NodeId) -> MessageHead {
+            session_head(signatures, peer, "hello", &[1; 32], &[0; 32], false).unwrap()
+        }
+        pub(crate) fn finish(
+            signatures: &Signatures,
+            peer: &NodeId,
+            challenge: MessageHead,
+        ) -> MessageHead {
+            let (_, a, b) =
+                verify_session(signatures, challenge, Some(peer), "challenge", true).unwrap();
+            assert_eq!(a, [1; 32]);
+            session_head(signatures, peer, "finish", &a, &b, false).unwrap()
+        }
+        fn drive<T>(reactor: &Reactor, future: impl Future<Output = T>) -> T {
+            let mut future = std::pin::pin!(future);
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            let watchdog = Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+                    return value;
+                }
+                assert!(Instant::now() < watchdog);
+                reactor.poll_budgeted(128).unwrap();
+                reactor.wait(Duration::from_millis(1)).unwrap();
+            }
+        }
+        #[test]
+        fn historical_proof_requires_fresh_head_and_session_cannot_be_reinstalled() {
+            let (mut a, mut b) = pair();
+            let mut original = frame();
+            push(&mut original, "racer-receiver", &a.peer.0);
+            let proof = std::sync::Arc::new(a.signatures.sign(original).unwrap());
+            let auth = ForwardedHead {
+                original: proof.clone(),
+                hops: vec![],
+            };
+            let mut previous = None;
+            for sequence in 1..=2 {
+                let wire = a.sign(encode_envelope(&auth, false, 0).unwrap()).unwrap();
+                let copy = clone_head(&wire);
+                let decoded = b.admit(wire).unwrap();
+                let (retained, _) = decode_envelope(decoded, false).unwrap();
+                assert_eq!(retained.original.signature, proof.signature);
+                assert_eq!(b.rx, sequence);
+                if let Some(old) = previous {
+                    assert!(b.admit(old).is_err());
+                }
+                previous = Some(copy);
+            }
+            let admission = flow_control::Quotas::new(AdmissionPolicy::new(
+                crate::test_support::cluster::config(false).limits,
+            ));
+            let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            let mut conn = crate::http::from_accepted(socket.into(), &admission).unwrap();
+            crate::http::install_session(&mut conn, a).unwrap();
+            assert!(crate::http::install_session(&mut conn, b).is_err());
+            conn.set_framing(Some(0), Some(0), false);
+            conn.next_round().unwrap();
+            assert!(!conn.is_reusable());
+            assert_eq!(conn.state().session.as_ref().unwrap().tx, 2);
+        }
+        #[test]
+        fn parallel_connections_isolate_counters_and_wall_rollback_cannot_resurrect_frames() {
+            let clock = uring_runtime::environment::SimulationClock::new_at(
+                92,
+                Instant::now(),
+                std::time::SystemTime::now(),
+            );
+            let environment = clock.environment(1);
+            let _guard = environment.enter();
+            let (mut a, mut b) = pair();
+            let id = random().unwrap();
+            let mut other_a = Session::new(a.signatures.clone(), a.peer.clone(), id, 0);
+            let mut other_b = Session::new(b.signatures.clone(), b.peer.clone(), id, 1);
+            let old = a.sign(frame()).unwrap();
+            b.admit(clone_head(&old)).unwrap();
+            assert!(other_b.admit(clone_head(&old)).is_err());
+            assert_eq!(other_b.rx, 0);
+            other_b.admit(other_a.sign(frame()).unwrap()).unwrap();
+            clock.advance(Duration::from_secs(61));
+            clock.set_wall_time(uring_runtime::environment::wall_now() - Duration::from_secs(61));
+            assert!(b.admit(old).is_err());
+            assert_eq!(b.rx, 1);
+            b.admit(a.sign(frame()).unwrap()).unwrap();
+            assert_eq!(other_b.rx, 1);
+        }
+        pub(crate) fn replay_and_binding_checks() {
+            let (mut a, mut b) = pair();
+            let valid = a.sign(frame()).unwrap();
+            for name in [
+                "racer-sequence",
+                "racer-session",
+                "racer-direction",
+                "racer-signer",
+            ] {
+                let mut bad = clone_head(&valid);
+                bad.headers
+                    .iter_mut()
+                    .find(|h| h.name == name)
+                    .unwrap()
+                    .value = b"18446744073709551615".to_vec();
+                assert!(b.admit(bad).is_err());
+                assert_eq!(b.rx, 0, "forged {name} advanced sequence");
+            }
+            // Valid signatures with incorrect session, direction, identity or sequence.
+            for mutation in 0..4 {
+                let mut bad = Session::new(a.signatures.clone(), a.peer.clone(), a.id, a.direction);
+                match mutation {
+                    0 => bad.id[0] ^= 1,
+                    1 => bad.direction = 1,
+                    2 => bad.signatures = b.signatures.clone(),
+                    _ => bad.tx = 9000,
+                };
+                assert!(b.admit(bad.sign(frame()).unwrap()).is_err());
+                assert_eq!(b.rx, 0);
+            }
+            b.admit(clone_head(&valid)).unwrap();
+            assert!(matches!(b.admit(valid), Err(Error::Replay)));
+            assert_eq!(b.rx, 1);
+            b.admit(a.sign(frame()).unwrap()).unwrap();
+        }
+        #[test]
+        fn duplicate_wrong_session_direction_identity_and_forged_high_sequence() {
+            replay_and_binding_checks();
+        }
+        #[test]
+        pub(crate) fn more_than_4096_frames_at_fixed_time_have_constant_session_storage() {
+            let clock = uring_runtime::environment::SimulationClock::new_at(
+                71,
+                Instant::now(),
+                std::time::SystemTime::now(),
+            );
+            let environment = clock.environment(0);
+            let _guard = environment.enter();
+            let (mut a, mut b) = pair();
+            let now = uring_runtime::environment::wall_now();
+            let bytes = std::mem::size_of_val(&a) + std::mem::size_of_val(&b);
+            for sequence in 1..=5000 {
+                let h = a.sign(frame()).unwrap();
+                assert_eq!(number(&h, "racer-timestamp").unwrap(), millis(now).unwrap());
+                b.admit(h).unwrap();
+                assert_eq!(b.rx, sequence);
+                assert_eq!(a.tx, sequence);
+                assert_eq!(std::mem::size_of_val(&a) + std::mem::size_of_val(&b), bytes);
+            }
+            assert_eq!(clock.elapsed(), Duration::ZERO);
+        }
+        #[test]
+        pub(crate) fn reconnect_restart_expiry_and_counter_overflow_fail_closed() {
+            let (mut a, mut b) = pair();
+            let old = a.sign(frame()).unwrap();
+            let mut reconnected =
+                Session::new(b.signatures.clone(), b.peer.clone(), random().unwrap(), 1);
+            assert!(reconnected.admit(clone_head(&old)).is_err());
+            assert_eq!(reconnected.rx, 0);
+            b.expires = uring_runtime::environment::now();
+            assert!(matches!(b.admit(old), Err(Error::DeadlineExceeded)));
+            a.tx = u64::MAX;
+            assert!(matches!(a.sign(frame()), Err(Error::Replay)));
+            reconnected.rx = u64::MAX;
+            let mut sender = Session::new(a.signatures.clone(), a.peer.clone(), reconnected.id, 0);
+            assert!(matches!(
+                reconnected.admit(sender.sign(frame()).unwrap()),
+                Err(Error::Replay)
+            ));
+        }
+        #[test]
+        fn concurrent_workers_complete_independent_connection_handshakes() {
+            let workers: Vec<_> = (0..4)
+                .map(|_| {
+                    std::thread::spawn(
+                        loopback_mutual_authentication_pool_reuse_and_fresh_reconnect,
+                    )
+                })
+                .collect();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        }
+        #[test]
+        fn loopback_mutual_authentication_pool_reuse_and_fresh_reconnect() {
+            let n = crate::test_support::security::network(2);
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+                crate::test_support::cluster::config(false).limits,
+            )));
+            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let io = crate::http::new_io(
+                reactor.clone(),
+                Codec::new(MAX_ENVELOPE_HEAD),
+                admission.clone(),
+                u64::MAX,
+            );
+            let pool = crate::http::new_pool(reactor.clone(), admission.clone(), 2);
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
+            let listener = Rc::new(uring_runtime::reactor::Descriptor::from(listener));
+            let scope =
+                RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(30))
+                    .unwrap();
+            let mut previous_id = None;
+            for _ in 0..2 {
+                let client = async {
+                    let conn = pool.checkout(&endpoint, &scope).await?;
+                    connect(&io, conn, n[0].clone(), n[1].node(), &scope).await
+                };
+                let server = async {
+                    let fd = reactor.accept(listener.clone(), &scope).await?;
+                    let conn = crate::http::from_accepted(fd, &admission)?;
+                    accept(&io, conn, n[1].clone(), &scope).await
+                };
+                let (mut client, mut server) =
+                    drive(&reactor, async { futures::try_join!(client, server) }).unwrap();
+                let id = client.state().session.as_ref().unwrap().id;
+                assert_eq!(id, server.state().session.as_ref().unwrap().id);
+                assert_ne!(Some(id), previous_id);
+                previous_id = Some(id);
+                for sequence in 1..=3 {
+                    let exchange = async {
+                        let response = io.exchange_head(client, frame(), &scope).await?;
+                        let mut conn = response.connection;
+                        conn.finish_exchange()?;
+                        Ok::<_, Error>(conn)
+                    };
+                    let respond = async {
+                        let received = io.receive_head(server, &scope).await?;
+                        let mut response = frame();
+                        response.start = StartLine::Response { status: 200 };
+                        let mut conn = io
+                            .send_head(received.connection, response, &scope)
+                            .await?
+                            .connection;
+                        conn.finish_exchange()?;
+                        Ok::<_, Error>(conn)
+                    };
+                    (client, server) =
+                        drive(&reactor, async { futures::try_join!(exchange, respond) }).unwrap();
+                    assert_eq!(client.state().session.as_ref().unwrap().rx, sequence);
+                    drop(client);
+                    client = drive(&reactor, pool.checkout(&endpoint, &scope)).unwrap();
+                    assert_eq!(client.state().session.as_ref().unwrap().id, id);
+                    assert_eq!(client.state().session.as_ref().unwrap().tx, sequence);
+                }
+                client.poison();
+                drop(client);
+                drop(server);
+            }
+            pool.close();
+            assert_eq!(admission.used(ResourceClass::Connection), 0);
+        }
+        #[test]
+        pub(crate) fn signed_challenges_bind_both_identities_protocol_and_fresh_randomness() {
+            let n = crate::test_support::security::network(3);
+            let a = random().unwrap();
+            let b = random().unwrap();
+            assert_ne!(a, random().unwrap());
+            assert_ne!(
+                transcript(n[0].node(), n[1].node(), &a, &b),
+                transcript(n[1].node(), n[0].node(), &a, &b)
+            );
+            let reply = session_head(&n[1], n[0].node(), "challenge", &a, &b, true).unwrap();
+            let (_, x, y) = verify_session(
+                &n[0],
+                clone_head(&reply),
+                Some(n[1].node()),
+                "challenge",
+                true,
+            )
+            .unwrap();
+            assert_eq!((x, y), (a, b));
+            assert!(
+                verify_session(
+                    &n[0],
+                    clone_head(&reply),
+                    Some(n[2].node()),
+                    "challenge",
+                    true
+                )
+                .is_err()
+            );
+            assert!(
+                verify_session(&n[0], clone_head(&reply), Some(n[1].node()), "ready", true)
+                    .is_err()
+            );
+            for field in [
+                "racer-client-challenge",
+                "racer-server-challenge",
+                "racer-receiver",
+                "racer-profile",
+            ] {
+                let mut bad = clone_head(&reply);
+                bad.headers
+                    .iter_mut()
+                    .find(|h| h.name == field)
+                    .unwrap()
+                    .value[0] ^= 1;
+                assert!(verify_session(&n[0], bad, Some(n[1].node()), "challenge", true).is_err());
+            }
+        }
+        #[test]
+        fn handshake_codec_bounds() {
+            let n = crate::test_support::security::network(2);
+            let h = session_head(
+                &n[1],
+                n[0].node(),
+                "challenge",
+                &random().unwrap(),
+                &random().unwrap(),
+                true,
+            )
+            .unwrap();
+            let codec = Codec::new(65536);
+            let bytes = codec.encode_head(&h).unwrap();
+            for end in 0..bytes.len() {
+                assert!(codec.decode_head(&bytes[..end]).unwrap().is_none());
+            }
+            for value in [vec![0; 65537], vec![255; 4], vec![0; 3]] {
+                let mut bad = clone_head(&h);
+                bad.headers
+                    .iter_mut()
+                    .find(|h| h.name == "racer-certificates")
+                    .unwrap()
+                    .value = binary(&value).into_bytes();
+                assert!(verify_session(&n[0], bad, Some(n[1].node()), "challenge", true).is_err());
+            }
+            let mut extra = clone_head(&h);
+            push(&mut extra, "racer-extra", 1);
+            assert!(verify_session(&n[0], extra, Some(n[1].node()), "challenge", true).is_err());
+        }
+        #[test]
+        fn socket_admission_rejects_replay_before_dispatch_and_closes_pool_slot() {
+            use uring_runtime::reactor::IoBuffer;
+            let n = crate::test_support::security::network(2);
+            let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+                crate::test_support::cluster::config(false).limits,
+            )));
+            let reactor = Rc::new(Reactor::new(admission.clone()));
+            let io = crate::http::new_io(reactor.clone(), Codec::new(65536), admission.clone(), 0);
+            let scope =
+                RequestScope::new(RequestId([2; 16]), Instant::now() + Duration::from_secs(10))
+                    .unwrap();
+            let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+            let a = crate::http::from_accepted(a.into(), &admission).unwrap();
+            let b = crate::http::from_accepted(b.into(), &admission).unwrap();
+            let (mut a, mut b) = drive(&reactor, async {
+                futures::try_join!(
+                    connect(&io, a, n[0].clone(), n[1].node(), &scope),
+                    accept(&io, b, n[1].clone(), &scope)
+                )
+            })
+            .unwrap();
+            let valid = a
+                .state_mut()
+                .session
+                .as_mut()
+                .unwrap()
+                .sign(frame())
+                .unwrap();
+            let bytes = Codec::new(65536).encode_head(&valid).unwrap();
+            let mut dispatches = 0;
+            for replay in [false, true] {
+                let mut buffer = io.buffer(bytes.len()).unwrap();
+                buffer.bytes_mut().unwrap().copy_from_slice(&bytes);
+                let send = reactor.send(a.socket(), buffer, a, &scope);
+                let receive = io.receive_head(b, &scope);
+                let (sent, received) = drive(&reactor, async { futures::join!(send, receive) });
+                a = sent.unwrap().lease;
+                if replay {
+                    assert!(matches!(received, Err(Error::Replay)));
+                    break;
+                }
+                b = received.unwrap().connection;
+                dispatches += 1;
+            }
+            assert_eq!(dispatches, 1);
+            drop(a);
+            assert_eq!(admission.used(ResourceClass::Connection), 0);
+        }
+        #[test]
+        fn handshake_cancel_expiry_and_abandonment_retain_only_fenced_admissions() {
+            let n = crate::test_support::security::network(2);
+            for end in ["cancel", "expiry", "drop"] {
+                let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+                    crate::test_support::cluster::config(false).limits,
+                )));
+                let reactor = Rc::new(Reactor::new(admission.clone()));
+                reactor.init().unwrap();
+                let io =
+                    crate::http::new_io(reactor.clone(), Codec::new(65536), admission.clone(), 0);
+                let scope = RequestScope::new(
+                    RequestId([3; 16]),
+                    Instant::now()
+                        + if end == "expiry" {
+                            Duration::from_millis(30)
+                        } else {
+                            Duration::from_secs(10)
+                        },
+                )
+                .unwrap();
+                let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+                let conn = crate::http::from_accepted(socket.into(), &admission).unwrap();
+                let mut work = Box::pin(accept(&io, conn, n[1].clone(), &scope));
+                let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+                assert!(work.as_mut().poll(&mut cx).is_pending());
+                assert_eq!(admission.used(ResourceClass::Connection), 1);
+                if end == "cancel" {
+                    scope.cancel().unwrap();
+                }
+                if end != "drop" {
+                    let result = drive(&reactor, work.as_mut());
+                    assert!(matches!(
+                        result,
+                        Err(Error::Cancelled | Error::DeadlineExceeded)
+                    ));
+                }
+                drop(work);
+                drive(&reactor, reactor.drain()).unwrap();
+                assert_eq!(admission.used(ResourceClass::Connection), 0);
+            }
+        }
+    }
+
+    mod signature_tests {
+        use super::*;
+        use crate::test_support::security::clone_head;
+        use crate::test_support::security::mac_test_keys;
+        use crate::test_support::security::network;
+        use crate::test_support::security::node;
+        use std::time::SystemTime;
+        fn head(receiver: usize) -> MessageHead {
+            let mut head = MessageHead {
+                start: StartLine::Request {
+                    method: "POST".into(),
+                    target: "/racer/peer/v1".into(),
+                },
+                headers: Vec::new(),
+            };
+            push(&mut head, "racer-receiver", node(receiver).0);
+            push(&mut head, "content-length", 0);
+            push(&mut head, "racer-kind", "test");
+            head
+        }
+        fn canonical_fixture(response: bool, fields: usize, value_bytes: usize) -> MessageHead {
+            let mut head = head(1);
+            if response {
+                head.start = StartLine::Response { status: 200 };
+            }
+            push(&mut head, "racer-timestamp", "1700000000123");
+            push(&mut head, "racer-signer", node(0).0);
+            for i in (0..fields).rev() {
+                push(
+                    &mut head,
+                    &format!("x-fixture-{i:02}"),
+                    "a".repeat(value_bytes),
+                );
+            }
+            let input = signature_input(&head).unwrap();
+            push(&mut head, "signature-input", format!("racer={input}"));
+            push(&mut head, "signature", "racer=:fixture:");
+            head
+        }
+        #[test]
+        fn signature_base_preserves_order_case_and_rejects_invalid_components() {
+            for response in [false, true] {
+                let mut head = canonical_fixture(response, 8, 16);
+                let expected = signature_base(&head).unwrap();
+                assert_ne!(expected.last(), Some(&b'\n'));
+                head.headers.reverse();
+                for h in &mut head.headers {
+                    h.name = h.name.to_ascii_uppercase();
+                }
+                assert_eq!(signature_base(&head).unwrap(), expected);
+                for fault in [
+                    "duplicate",
+                    "duplicate-input",
+                    "duplicate-signature",
+                    "leading",
+                    "trailing",
+                    "non-ascii",
+                    "newline",
+                    "bad-name",
+                    "timestamp",
+                    "signer",
+                    "missing-input",
+                    "coverage",
+                    "oversized",
+                ] {
+                    let mut head = canonical_fixture(response, 8, 16);
+                    match fault {
+                        "duplicate" => push(&mut head, "X-Fixture-00", "duplicate"),
+                        "duplicate-input" => push(&mut head, "Signature-Input", "duplicate"),
+                        "duplicate-signature" => push(&mut head, "Signature", "duplicate"),
+                        "missing-input" => head.headers.retain(|h| h.name != "signature-input"),
+                        _ => {
+                            let (name, value) = match fault {
+                                "leading" => ("x-fixture-00", b" leading".to_vec()),
+                                "trailing" => ("x-fixture-00", b"trailing\t".to_vec()),
+                                "non-ascii" => ("x-fixture-00", vec![0xff]),
+                                "newline" => ("x-fixture-00", b"x\r\ny".to_vec()),
+                                "timestamp" => ("racer-timestamp", b"01700000000123".to_vec()),
+                                "signer" => ("racer-signer", b"not-a-uuid".to_vec()),
+                                "coverage" => ("signature-input", b"racer=()".to_vec()),
+                                "oversized" => ("x-fixture-00", vec![b'a'; MAX_ENVELOPE_HEAD]),
+                                "bad-name" => ("x-fixture-00", b"valid".to_vec()),
+                                _ => unreachable!(),
+                            };
+                            let field = head.headers.iter_mut().find(|h| h.name == name).unwrap();
+                            field.value = value;
+                            if fault == "bad-name" {
+                                field.name = "invalid name".into();
+                            }
+                        }
+                    }
+                    assert!(
+                        signature_base(&head).is_err(),
+                        "response={response} fault={fault}"
+                    );
+                }
+            }
+        }
+        #[test]
+        #[ignore = "release-only canonical signature-base construction benchmark, no cryptography"]
+        fn signature_base_benchmark() {
+            use std::hint::black_box;
+            use std::time::Instant;
+            assert!(!cfg!(debug_assertions), "run with --release");
+            for (label, fields, value_bytes) in
+                [("small", 0, 0), ("fields", 24, 64), ("envelope", 24, 4096)]
+            {
+                for response in [false, true] {
+                    let head = canonical_fixture(response, fields, value_bytes);
+                    let expected = signature_base(&head).unwrap();
+                    const ITERATIONS: usize = 2000;
+                    for sample in 0..6 {
+                        let start = Instant::now();
+                        for _ in 0..ITERATIONS {
+                            black_box(signature_base(black_box(&head)).unwrap());
+                        }
+                        let elapsed = start.elapsed();
+                        assert_eq!(signature_base(&head).unwrap(), expected);
+                        if sample != 0 {
+                            println!(
+                                "signature_base case={label} response={response} fields={} base_bytes={} sample={sample} iterations={ITERATIONS} ns_per_op={:.0}",
+                                head.headers.len(),
+                                expected.len(),
+                                elapsed.as_nanos() as f64 / ITERATIONS as f64
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        #[test]
+        fn request_mac_rotates_and_rejects_missing_retired_or_mutated_tags() {
+            use racer_control_wire::*;
+            let network = network(2);
+            let make = || {
+                let mut request = head(1);
+                request
+                    .headers
+                    .iter_mut()
+                    .find(|h| h.name == "racer-kind")
+                    .unwrap()
+                    .value = b"request".to_vec();
+                push(&mut request, "racer-cache", node(88).0);
+                request
+            };
+            let old = network[0].sign(make()).unwrap();
+            assert!(network[1].verify_proof(clone_head(&old)).is_ok());
+            let mut tampered = clone_head(&old);
+            tampered
+                .head
+                .headers
+                .iter_mut()
+                .find(|h| h.name == "racer-request-mac")
+                .unwrap()
+                .value[0] ^= 1;
+            assert!(network[1].verify_proof(tampered).is_err());
+            let mut missing = clone_head(&old);
+            missing
+                .head
+                .headers
+                .retain(|h| h.name != "racer-request-mac");
+            assert!(network[1].verify_proof(missing).is_err());
+            for signer in &network {
+                let mut keys = mac_test_keys();
+                for key in &mut keys {
+                    key.key.id.0[4..12].copy_from_slice(&2u64.to_be_bytes());
+                    let (reference, state, mut material) = key.clone().into_installation();
+                    material[0] ^= 1;
+                    *key = racer_control_wire::CacheEncryptionKey::new(reference, state, material);
+                }
+                signer
+                    .keys
+                    .install(KeyringBundle {
+                        schema_version: SCHEMA_VERSION,
+                        cluster: signer.keys.cluster().clone(),
+                        generation: BundleGeneration(2),
+                        peer_trust_roots: (*signer.keys.peer_trust_roots().unwrap()).clone(),
+                        cache_keys: keys,
+                    })
+                    .unwrap();
+            }
+            assert!(
+                network[1].verify_proof(clone_head(&old)).is_err(),
+                "removed epoch closes new admission"
+            );
+            let current = network[0].sign(make()).unwrap();
+            assert!(network[1].verify_proof(current).is_ok());
+        }
+        #[test]
+        fn rfc9421_exact_request_and_response_signature_base_vectors() {
+            let mut request = MessageHead {
+                start: StartLine::Request {
+                    method: "POST".into(),
+                    target: "/racer/peer/v1?attempt=1".into(),
+                },
+                headers: Vec::new(),
+            };
+            // Deliberately unsorted input: canonical components are sorted by name.
+            push(&mut request, "racer-timestamp", "1700000000123");
+            push(&mut request, "racer-signer", node(0).0);
+            push(&mut request, "content-length", "0");
+            let params = "(\"@method\" \"@request-target\" \"content-length\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v5\"";
+            push(&mut request, "signature-input", format!("racer={params}"));
+            assert_eq!(signature_base(&request).unwrap(), format!("\"@method\": POST\n\"@request-target\": /racer/peer/v1?attempt=1\n\"content-length\": 0\n\"racer-signer\": 00000000-1111-4111-8111-111111111111\n\"racer-timestamp\": 1700000000123\n\"@signature-params\": {params}").as_bytes());
+            request.start = StartLine::Response { status: 200 };
+            request.headers.retain(|h| h.name != "signature-input");
+            let params = "(\"@status\" \"content-length\" \"racer-signer\" \"racer-timestamp\");created=1700000000;keyid=\"00000000-1111-4111-8111-111111111111\";alg=\"ed25519\";tag=\"racer-peer-v5\"";
+            push(&mut request, "signature-input", format!("racer={params}"));
+            assert_eq!(signature_base(&request).unwrap(), format!("\"@status\": 200\n\"content-length\": 0\n\"racer-signer\": 00000000-1111-4111-8111-111111111111\n\"racer-timestamp\": 1700000000123\n\"@signature-params\": {params}").as_bytes());
+        }
+        #[test]
+        fn ed25519_rfc9421_base_tamper_replay_and_receiver_challenge() {
+            let n = network(3);
+            let original = n[0].sign(head(1)).unwrap();
+            let base = String::from_utf8(signature_base(&original.head).unwrap()).unwrap();
+            assert!(base.starts_with(
+                "\"@method\": POST\n\"@request-target\": /racer/peer/v1\n\"content-length\": 0\n"
+            ));
+            assert!(base.ends_with(";alg=\"ed25519\";tag=\"racer-peer-v5\""));
+            for h in &original.head.headers {
+                let mut tamper = clone_head(&original);
+                tamper
+                    .head
+                    .headers
+                    .iter_mut()
+                    .find(|v| v.name == h.name)
+                    .unwrap()
+                    .value
+                    .push(b'x');
+                assert!(
+                    n[1].verify_historical(&tamper).is_err(),
+                    "accepted {} mutation",
+                    h.name
+                );
+            }
+            let mut target = clone_head(&original);
+            target.head.start = StartLine::Request {
+                method: "GET".into(),
+                target: "/racer/peer/v1".into(),
+            };
+            assert!(n[1].verify_historical(&target).is_err());
+            assert!(n[2].verify_proof(clone_head(&original)).is_err());
+            n[1].verify_proof(clone_head(&original)).unwrap();
+            // Historical proofs are reusable; only fresh connection heads admit work.
+            n[1].verify_proof(clone_head(&original)).unwrap();
+            n[2].verify_historical(&original).unwrap();
+            super::sessions::replay_and_binding_checks();
+        }
+        #[test]
+        pub(crate) fn malformed_fields_unknown_algorithm_and_historical_expiry() {
+            let n = network(2);
+            let original = n[0].sign(head(1)).unwrap();
+            let mut duplicate = clone_head(&original);
+            push(&mut duplicate.head, "Racer-Kind", "test");
+            assert!(n[1].verify_historical(&duplicate).is_err());
+            let mut algorithm = clone_head(&original);
+            for h in &mut algorithm.head.headers {
+                if h.name == "signature-input" {
+                    h.value = String::from_utf8(h.value.clone())
+                        .unwrap()
+                        .replace("ed25519", "rsa-pss-sha512")
+                        .into_bytes();
+                }
+            }
+            assert!(n[1].verify_historical(&algorithm).is_err());
+            for time in [
+                SystemTime::now() - Duration::from_secs(61),
+                SystemTime::now() + Duration::from_secs(6),
+            ] {
+                let mut stale = clone_head(&original);
+                stale.head.headers.retain(|h| {
+                    h.name != "signature"
+                        && h.name != "signature-input"
+                        && h.name != "racer-timestamp"
+                });
+                push(&mut stale.head, "racer-timestamp", millis(time).unwrap());
+                let input = signature_input(&stale.head).unwrap();
+                push(&mut stale.head, "signature-input", format!("racer={input}"));
+                stale.signature = n[0]
+                    .keys
+                    .signing_identity()
+                    .unwrap()
+                    .sign(&signature_base(&stale.head).unwrap())
+                    .unwrap();
+                push(
+                    &mut stale.head,
+                    "signature",
+                    format!("racer=:{}:", binary(&stale.signature)),
+                );
+                assert!(matches!(n[1].verify_historical(&stale), Err(Error::Replay)));
+            }
+        }
+    }
+
+    mod canonical_tests {
+        use super::*;
+        use std::time::Instant;
+        #[test]
+        fn canonical_binary_numbers_node_lists_and_deadline_round_trip() {
+            assert_eq!(binary(&[0, 1, 255]), "AAH/");
+            assert!(decode_binary(b"YQ").is_err());
+            assert!(decode_binary(b"YR==").is_err());
+            let mut head = MessageHead {
+                start: StartLine::Response { status: 200 },
+                headers: Vec::new(),
+            };
+            push(&mut head, "n", "01");
+            assert!(number(&head, "n").is_err());
+            let nodes = vec![
+                crate::test_support::security::node(1),
+                crate::test_support::security::node(2),
+            ];
+            assert_eq!(
+                decode_nodes(crate::peer::protocol::nodes(&nodes).unwrap().as_bytes()).unwrap(),
+                nodes
+            );
+            assert!(
+                decode_nodes(
+                    crate::peer::protocol::nodes(&[nodes[0].clone(), nodes[0].clone()])
+                        .unwrap()
+                        .as_bytes()
+                )
+                .is_err()
+            );
+            let deadline = Deadline(Instant::now() + Duration::from_secs(30));
+            let encoded = encode_deadline(deadline).unwrap();
+            let decoded = decode_deadline(encoded).unwrap();
+            assert_eq!(encode_deadline(decoded).unwrap(), encoded);
+            assert!(decoded.0 <= deadline.0);
+            assert_eq!(MAX_HEAD, MAX_SIGNED_HEAD);
+        }
     }
 }

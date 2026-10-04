@@ -290,7 +290,7 @@ fn changed_operation_credentials_replay_and_deadlines_fail() {
     receiver
         .verify_request(codec.request(envelope, &scope).unwrap())
         .unwrap();
-    crate::peer::protocol::connection_tests::tests::replay_and_binding_checks();
+    crate::peer::protocol::tests::sessions::replay_and_binding_checks();
     let mut expired = request(&admission, 3);
     expired.route.deadline = Deadline(Instant::now() - Duration::from_secs(1));
     assert!(matches!(
@@ -512,7 +512,7 @@ fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
         .unwrap()
         .value = b"1".to_vec();
     assert!(signers[0].verify_proof(tampered).is_err());
-    crate::peer::protocol::connection_tests::tests::replay_and_binding_checks();
+    crate::peer::protocol::tests::sessions::replay_and_binding_checks();
     drop(response_lease);
     assert!(
         weak.upgrade().is_none(),

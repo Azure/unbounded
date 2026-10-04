@@ -1571,7 +1571,7 @@ pub(crate) mod tests {
                 signature: verified.signed.signature,
             };
             signatures.verify_proof(replay).unwrap();
-            crate::peer::protocol::connection_tests::tests::replay_and_binding_checks();
+            crate::peer::protocol::tests::sessions::replay_and_binding_checks();
             let mut tampered = signatures.sign(head()).unwrap();
             tampered
                 .head

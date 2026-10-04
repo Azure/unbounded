@@ -74,8 +74,8 @@ mod native_control_tests {
     }
     #[test]
     fn session_admitted_setup_grant_completion_still_require_exact_transfer_and_phase() {
-        use crate::peer::protocol::connection_tests::tests::pair;
-        use crate::peer::protocol::connection_tests::tests::signer;
+        use crate::peer::protocol::tests::sessions::pair;
+        use crate::peer::protocol::tests::sessions::signer;
         let (mut sender, mut receiver) = pair();
         let a = signer(&sender);
         let b = signer(&receiver);
@@ -203,7 +203,7 @@ mod native_control_tests {
                 )
                 .unwrap();
         }
-        crate::peer::protocol::connection_tests::tests::replay_and_binding_checks();
+        crate::peer::protocol::tests::sessions::replay_and_binding_checks();
     }
     #[test]
     fn control_extension_and_fallback_length_schema_is_closed() {

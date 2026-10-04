@@ -1445,8 +1445,8 @@ mod tests {
         use crate::http::ConnectionLease;
         use crate::memory::BufferPool;
         use crate::peer::protocol::SecurityCodec;
-        use crate::peer::protocol::connection_tests::tests::finish;
-        use crate::peer::protocol::connection_tests::tests::hello;
+        use crate::peer::protocol::tests::sessions::finish;
+        use crate::peer::protocol::tests::sessions::hello;
         use crate::runtime::Reactor;
         use crate::topology::LinkHealth;
         use crate::topology::Paths;

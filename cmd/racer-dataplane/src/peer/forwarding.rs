@@ -1464,7 +1464,7 @@ mod tests {
         let replay = copy_response(&response);
         let verified = f[1].verify_response(response, &reverse).unwrap();
         f[1].verify_response(replay, &reverse).unwrap();
-        crate::peer::protocol::connection_tests::tests::replay_and_binding_checks();
+        crate::peer::protocol::tests::sessions::replay_and_binding_checks();
         assert!(f[1].append_response(verified, &node(2)).is_err());
         // Historical response proofs may be carried by fresh session heads.
         let response = f[2]
