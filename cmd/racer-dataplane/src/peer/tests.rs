@@ -2042,7 +2042,7 @@ use crate::peer::protocol::decode_envelope;
 use crate::peer::protocol::encode_envelope;
 
 use crate::admission::AdmissionPolicy;
-use uring_uring_runtime::deadline::Deadline;
+use uring_uring_uring_runtime::deadline::Deadline;
 use crate::runtime::RequestScope;
 use crate::security::connection::Signatures;
 use crate::security::forwarding::Forwarding;

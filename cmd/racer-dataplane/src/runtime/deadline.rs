@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Instant;
 pub use uring_uring_runtime::CancellationRegistration;
-pub use uring_uring_uring_runtime::deadline::Deadline;
+pub use uring_uring_uring_uring_runtime::deadline::Deadline;
 
 /// Racer candidate policy shares the cancellation lifetime, but is not runtime policy.
 #[derive(Clone)]

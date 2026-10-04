@@ -7,7 +7,7 @@ use crate::model::NodeId;
 use crate::model::ObjectId;
 use crate::model::PageNumber;
 use crate::model::RequestId;
-use uring_uring_runtime::deadline::Deadline;
+use uring_uring_uring_runtime::deadline::Deadline;
 use crate::runtime::RequestScope;
 pub use ::topology::MAX_DEGREE;
 use racer_control_wire::RailMapping;

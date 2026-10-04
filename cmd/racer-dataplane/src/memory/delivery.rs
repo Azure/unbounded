@@ -400,7 +400,7 @@ mod tests {
     use crate::model::StrongEtag;
     use crate::admission::AdmissionPolicy;
     use crate::runtime::Cancellation;
-    use uring_uring_runtime::deadline::Deadline;
+    use uring_uring_uring_runtime::deadline::Deadline;
     use crate::runtime::Reactor;
     use std::io::Read;
     use std::os::unix::net::UnixStream;

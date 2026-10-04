@@ -24,6 +24,31 @@ const MIB: u64 = 1024 * 1024;
 const MAX_BYTES: u64 = 64 * 1024 * MIB;
 const MAX_ENTRIES: usize = 1_048_576;
 
+/// Independent bounded-resource dimensions. Validation precedes resource creation.
+#[derive(Clone, Debug)]
+pub struct Limits {
+    pub plaintext_bytes: NonZeroUsize,
+    pub ciphertext_bytes: NonZeroUsize,
+    pub dirty_bytes: NonZeroUsize,
+    pub registered_bytes: NonZeroUsize,
+    pub request_context_bytes: NonZeroUsize,
+    pub flights: NonZeroUsize,
+    pub waiters_per_flight: NonZeroUsize,
+    pub queue_entries: NonZeroUsize,
+    pub connections_per_neighbor: NonZeroUsize,
+    pub client_connections: NonZeroUsize,
+    pub pipes: NonZeroUsize,
+    pub range_window_pages: NonZeroUsize,
+    pub header_bytes: NonZeroUsize,
+    pub cached_rankings: NonZeroUsize,
+    pub cached_paths: NonZeroUsize,
+    /// Old live membership generations in addition to current; cache-only
+    /// publications reuse a generation and do not consume another slot.
+    pub retained_snapshots: NonZeroUsize,
+    pub metadata_entries: NonZeroUsize,
+    pub relay_transfers: NonZeroUsize,
+}
+
 pub struct Config {
     pub send_crc_pair: Option<crate::telemetry::Pair>,
     pub page_hedge: crate::read::candidates::HedgeConfig,

@@ -44,10 +44,12 @@ pub struct AffinityPlan {
 
 /// Pure sizing policy, not hardware discovery or a claim that threads have started.
 /// Count I/O shards using the same physical-core and NUMA policy as placement.
+#[cfg(test)]
 pub fn pair_count(max_threads: usize, topology: &EffectiveTopology) -> Result<usize> {
     pair_count_with_policy(max_threads, topology, false)
 }
 
+#[cfg(test)]
 fn pair_count_with_policy(
     max_threads: usize,
     topology: &EffectiveTopology,
