@@ -2,7 +2,9 @@
 //! complete publication are ready. Every wait keeps its original startup scope.
 use super::*;
 use crate::runtime::collections::HashMap;
-use crate::telemetry::health::{Health, Resources, State};
+use crate::telemetry::Health;
+use crate::telemetry::Resources;
+use crate::telemetry::State;
 use std::{num::NonZeroUsize, time::UNIX_EPOCH};
 
 /// Readiness expires unless every required worker keeps progressing.
@@ -120,17 +122,16 @@ impl WorkerApplication {
         let now = uring_runtime::environment::now();
         if self.control.is_some() {
             self.telemetry.metrics.set_gauge(
-                crate::telemetry::metrics::Gauge::KeyringGeneration,
+                crate::telemetry::Gauge::KeyringGeneration,
                 self.keys.generation()?.unwrap_or(0),
             );
         }
         let credentials = self.keys.signing_identity().ok().and_then(|identity| {
             let expiry = identity.expires_at_seconds();
             if self.control.is_some() {
-                self.telemetry.metrics.set_gauge(
-                    crate::telemetry::metrics::Gauge::IdentityExpiresAtSeconds,
-                    expiry,
-                );
+                self.telemetry
+                    .metrics
+                    .set_gauge(crate::telemetry::Gauge::IdentityExpiresAtSeconds, expiry);
             }
             let remaining = (UNIX_EPOCH + Duration::from_secs(expiry))
                 .duration_since(uring_runtime::environment::wall_now())

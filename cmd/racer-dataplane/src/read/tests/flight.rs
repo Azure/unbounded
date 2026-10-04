@@ -1,6 +1,6 @@
 fn metric_lease() -> telemetry::Lease {
-    crate::telemetry::metrics::Metrics::default()
-        .lease(crate::telemetry::metrics::Gauge::ActiveFills)
+    crate::telemetry::Metrics::default()
+        .lease(crate::telemetry::Gauge::ActiveFills)
         .unwrap()
 }
 use crate::{
@@ -283,7 +283,8 @@ mod lifecycle_tests {
 
     #[test]
     fn drop_leader_retains_resources_until_actual_completion_without_ticket() {
-        use crate::telemetry::metrics::{Gauge, Metrics};
+        use crate::telemetry::Gauge;
+        use crate::telemetry::Metrics;
         let flights = flights(FlightLimits::default());
         let (context, scope_a, scope_b) = (origin(), scope(), scope());
         let (mut a_budget, mut b_budget) = (budget(), budget());
@@ -491,7 +492,12 @@ fn failure_ceiling_is_inherited_without_allocating_additional_links() {
     assert_eq!(moved.route_links(), 8);
     assert_eq!(original.remaining_links(), 0);
 }
-use crate::model::{CacheId, CacheKey, ObjectId, ObjectVersion, PageNumber, StrongEtag};
+use crate::model::CacheId;
+use crate::model::CacheKey;
+use crate::model::ObjectId;
+use crate::model::ObjectVersion;
+use crate::model::PageNumber;
+use crate::model::StrongEtag;
 use std::time::Duration;
 
 fn flights(limits: FlightLimits) -> Rc<Flights> {
@@ -530,11 +536,7 @@ fn join<'a>(
     budget: &'a mut AcquisitionBudget,
 ) -> AcquisitionWaiter<'a> {
     let membership = std::sync::Arc::new(
-        crate::topology::membership::Membership::validate(
-            crate::model::MembershipVersion(1),
-            vec![],
-        )
-        .unwrap(),
+        crate::topology::Membership::validate(crate::model::MembershipVersion(1), vec![]).unwrap(),
     );
     match flights
         .join(fence().page, membership, context, scope, budget)

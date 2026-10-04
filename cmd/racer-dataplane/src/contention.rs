@@ -757,18 +757,23 @@ mod fidelity;
 mod scenarios;
 mod waiter_detach {
     use super::*;
-    use crate::{
-        error::Error,
-        model::{
-            CacheKey, MembershipVersion, ObjectId, ObjectVersion, OriginContext, PageId,
-            PageNumber, RequestId, StrongEtag,
-        },
-        read::flight::{
-            AcquisitionBudget, AcquisitionEvent, AcquisitionFailure, Flights, JoinedFlight,
-        },
-        runtime::deadline::RequestScope,
-        topology::membership::Membership,
-    };
+    use crate::error::Error;
+    use crate::model::CacheKey;
+    use crate::model::MembershipVersion;
+    use crate::model::ObjectId;
+    use crate::model::ObjectVersion;
+    use crate::model::OriginContext;
+    use crate::model::PageId;
+    use crate::model::PageNumber;
+    use crate::model::RequestId;
+    use crate::model::StrongEtag;
+    use crate::read::flight::AcquisitionBudget;
+    use crate::read::flight::AcquisitionEvent;
+    use crate::read::flight::AcquisitionFailure;
+    use crate::read::flight::Flights;
+    use crate::read::flight::JoinedFlight;
+    use crate::runtime::deadline::RequestScope;
+    use crate::topology::Membership;
     use std::{
         rc::Rc,
         task::{Context, Poll},
@@ -857,8 +862,8 @@ mod waiter_detach {
             let operation = flights
                 .retain_operation(
                     &leader,
-                    crate::telemetry::metrics::Metrics::default()
-                        .lease(crate::telemetry::metrics::Gauge::ActiveFills)
+                    crate::telemetry::Metrics::default()
+                        .lease(crate::telemetry::Gauge::ActiveFills)
                         .unwrap(),
                 )
                 .unwrap();

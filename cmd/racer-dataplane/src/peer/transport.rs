@@ -2,26 +2,39 @@
 use super::protocol::{
     PeerResponse, SecurityCodec, SignedRequest, SignedResponse, decode_envelope, encode_envelope,
 };
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::http::ConnectionLease;
+use crate::http::HttpIo;
+use crate::http::HttpPool;
+use crate::model::NodeId;
+use crate::model::ResourceClass;
+use crate::model::TransferId;
 use crate::peer::protocol as p;
-use crate::telemetry::failures::{BodyProgress, Detail, Failure, Stage, timestamp};
-use crate::{
-    error::{Error, Operation, Result},
-    http::{ConnectionLease, HttpIo, HttpPool},
-    model::{NodeId, ResourceClass, TransferId},
-    rdma::Sessions,
-    rdma::{
-        AuthenticatedDescriptor, COMPLETION_HEADER, DESCRIPTOR_HEADER, SETUP_BINDING_HEADER,
-        SETUP_HEADER, SetupParameters,
-    },
-    runtime::admission::{AdmissionExt, AdmissionPolicy},
-    runtime::deadline::RequestScope,
-    security::{
-        connection::{Signatures, SignedHead, VerifiedHead, signed_digest},
-        forwarding::ForwardedHead,
-    },
-    topology::rails::{RailId, TransportPlan},
-};
+use crate::rdma::AuthenticatedDescriptor;
+use crate::rdma::COMPLETION_HEADER;
+use crate::rdma::DESCRIPTOR_HEADER;
+use crate::rdma::SETUP_BINDING_HEADER;
+use crate::rdma::SETUP_HEADER;
+use crate::rdma::Sessions;
+use crate::rdma::SetupParameters;
+use crate::rdma::TransportPlan;
+use crate::runtime::admission::AdmissionExt;
+use crate::runtime::admission::AdmissionPolicy;
+use crate::runtime::deadline::RequestScope;
+use crate::security::connection::Signatures;
+use crate::security::connection::SignedHead;
+use crate::security::connection::VerifiedHead;
+use crate::security::connection::signed_digest;
+use crate::security::forwarding::ForwardedHead;
+use crate::telemetry::BodyProgress;
+use crate::telemetry::Detail;
+use crate::telemetry::Failure;
+use crate::telemetry::Stage;
+use crate::telemetry::timestamp;
 use http1::{Header, MessageHead, StartLine};
+use racer_control_wire::RailId;
 use std::{rc::Rc, sync::Arc, time::Duration};
 
 #[cfg(test)]
@@ -260,11 +273,11 @@ mod native_exchange_tests {
         signers: &[Rc<Signatures>],
         nodes: &[usize],
         sites: &[&str],
-    ) -> crate::topology::membership::MembershipLease {
-        use crate::topology::{
-            membership::{Member, Membership},
-            rails::{RailId, RailMapping},
-        };
+    ) -> std::sync::Arc<crate::topology::Membership> {
+        use crate::topology::Member;
+        use crate::topology::Membership;
+        use racer_control_wire::RailId;
+        use racer_control_wire::RailMapping;
         Arc::new(
             Membership::validate(
                 MembershipVersion(1),
@@ -391,7 +404,7 @@ mod native_exchange_tests {
             transfer: TransferId([6; 16]),
             membership: 1,
             deadline: p::encode_deadline(scope.deadline).unwrap(),
-            rail: crate::topology::rails::RailId(7),
+            rail: racer_control_wire::RailId(7),
         };
         let accept = binding
             .sign(
@@ -637,10 +650,10 @@ mod native_exchange_tests {
         relayed: bool,
     ) {
         let reject_sender = rejected_site.is_some();
-        use crate::topology::{
-            membership::{Member, Membership},
-            rails::{RailId, RailMapping},
-        };
+        use crate::topology::Member;
+        use crate::topology::Membership;
+        use racer_control_wire::RailId;
+        use racer_control_wire::RailMapping;
         use rdma_verbs::{NativeService, pair};
         let device = if simulated {
             "sim-rnic".into()
@@ -1263,7 +1276,7 @@ impl Transfers {
         &self,
         connection: &ConnectionLease,
         authentication: &ForwardedHead,
-        membership: &crate::topology::membership::MembershipLease,
+        membership: &std::sync::Arc<crate::topology::Membership>,
         page: &crate::model::PageId,
         peer: &NodeId,
         sending: bool,
@@ -1304,8 +1317,8 @@ impl Transfers {
                 return Err(Error::Unauthorized);
             }
         }
-        crate::topology::rails::select_hop(
-            &crate::topology::routing::Route {
+        crate::rdma::select_hop(
+            &crate::topology::Route {
                 membership: membership.clone(),
                 nodes: path,
             },
@@ -1320,7 +1333,7 @@ impl Transfers {
         mut connection: ConnectionLease,
         response: &SignedResponse,
         admitted: (Binding, VerifiedHead),
-        membership: &crate::topology::membership::MembershipLease,
+        membership: &std::sync::Arc<crate::topology::Membership>,
         scope: &RequestScope,
     ) -> Result<(ConnectionLease, bool)> {
         let sessions = self.native.as_ref().ok_or(Error::InvalidConfiguration)?;
@@ -1708,7 +1721,7 @@ impl Transfers {
         accept: SignedHead,
         peer: NodeId,
         offer: SignedHead,
-        membership: &crate::topology::membership::MembershipLease,
+        membership: &std::sync::Arc<crate::topology::Membership>,
         scope: &RequestScope,
     ) -> Result<SignedResponse> {
         let sessions = self.native.as_ref().ok_or(Error::InvalidConfiguration)?;
@@ -2194,7 +2207,7 @@ impl Transfers {
         endpoint: crate::http::Endpoint,
         request: SignedRequest,
         plan: TransportPlan,
-        membership: Option<crate::topology::membership::MembershipLease>,
+        membership: Option<std::sync::Arc<crate::topology::Membership>>,
         relay: Option<Rc<flow_control::Charge<AdmissionPolicy>>>,
         peer_admission: Option<std::sync::Arc<super::adaptive::Permit>>,
         failure: Rc<std::cell::Cell<bool>>,

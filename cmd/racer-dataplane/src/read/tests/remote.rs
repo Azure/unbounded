@@ -1,27 +1,39 @@
 //! Candidate policy exercised through real signing, handshake, TCP, and Requester.
+use crate::error::Error;
+use crate::error::Operation;
+use crate::http::Codec;
+use crate::http::HttpIo;
+use crate::http::HttpPool;
+use crate::memory::BufferPool;
+use crate::model::ExpiresAt;
+use crate::model::MetadataSelector;
+use crate::model::ObjectMetadata;
+use crate::model::OriginContext;
+use crate::model::*;
+use crate::peer::PeerNetwork;
+use crate::peer::Relay;
+use crate::peer::Requester;
+use crate::peer::protocol;
+use crate::peer::protocol::FetchMode;
+use crate::peer::protocol::PeerResponse;
+use crate::peer::protocol::VerifiedRequest;
+use crate::peer::server::LocalPageService;
+use crate::peer::server::PeerServer;
+use crate::peer::transport::Transfers;
 use crate::read::candidates::{CandidatePolicy, CandidateResolution};
 use crate::read::flight::AcquisitionBudget;
-use crate::{
-    error::{Error, Operation},
-    http::{Codec, HttpIo, HttpPool},
-    memory::BufferPool,
-    model::{ExpiresAt, MetadataSelector, ObjectMetadata, OriginContext, *},
-    peer::{
-        PeerNetwork, Relay, Requester,
-        protocol::{self, FetchMode, PeerResponse, VerifiedRequest},
-        server::{LocalPageService, PeerServer},
-        transport::Transfers,
-    },
-    runtime::{admission::AdmissionPolicy, deadline::RequestScope, reactor::Reactor},
-    security::{credentials::CredentialCrypto, forwarding::Forwarding, test_support::Identity},
-    test_support::origin::AdapterOrigin,
-    topology::{
-        health::LinkHealth,
-        membership::{Member, Membership},
-        routing::Paths,
-        routing::Placement,
-    },
-};
+use crate::runtime::admission::AdmissionPolicy;
+use crate::runtime::deadline::RequestScope;
+use crate::runtime::reactor::Reactor;
+use crate::security::credentials::CredentialCrypto;
+use crate::security::forwarding::Forwarding;
+use crate::security::test_support::Identity;
+use crate::test_support::origin::AdapterOrigin;
+use crate::topology::LinkHealth;
+use crate::topology::Member;
+use crate::topology::Membership;
+use crate::topology::Paths;
+use crate::topology::Placement;
 use racer_control_wire::{PublicationSequence, SCHEMA_VERSION};
 use racer_identity::Keyring;
 use std::{
@@ -65,7 +77,7 @@ impl LocalPageService for CandidateService {
     fn serve_peer<'a>(
         &'a self,
         request: VerifiedRequest,
-        membership: crate::topology::membership::MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
     ) -> Operation<'a, PeerResponse> {
         Box::pin(async move {
@@ -206,7 +218,7 @@ fn coordinator_copy_miss_is_not_origin_absence_and_pinned_missing_is_412() {
             origin: CredentialCrypto::new(ids[0].keys.clone(), admission.clone())
                 .seal(&context, attempt, &scope)
                 .unwrap(),
-            route: crate::topology::routing::RouteBudget {
+            route: crate::topology::RouteBudget {
                 membership: membership.version,
                 request: scope.request,
                 attempt,
@@ -260,10 +272,9 @@ fn live_read_routes_after_cache_only_publication_and_membership_update() {
 fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn: bool) {
     let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
     let _owner = queue.enter();
-    use crate::control::{
-        state::Publication,
-        state::{PublishedState, SnapshotStore},
-    };
+    use crate::control::PublishedState;
+    use crate::control::SnapshotStore;
+    use racer_control_wire::Publication;
     let object = ObjectId {
         cache: CacheId(CACHE.into()),
         key: CacheKey([3; 32]),
@@ -279,14 +290,14 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
         cluster: ClusterId(CLUSTER.into()),
         sequence: PublicationSequence(1),
         membership_version: MembershipVersion(1),
-        caches: vec![crate::control::state::CacheDefinition {
+        caches: vec![racer_control_wire::CacheDefinition {
             id: CacheId(CACHE.into()),
             name: "remote".into(),
             client_socket: "/run/racer/remote/client/socket".into(),
             origin_socket: "/run/racer/remote/origin/socket".into(),
         }],
         members: (0..4)
-            .map(|i| Member {
+            .map(|i| racer_control_wire::Member {
                 node: node(i),
                 shares: std::num::NonZeroU32::new(4).unwrap(),
                 peer_endpoint: address.clone(),
@@ -697,7 +708,7 @@ struct PinnedFallback {
 impl PinnedFallback {
     fn direct_hedge_available(
         &self,
-        _: &crate::topology::membership::MembershipLease,
+        _: &std::sync::Arc<crate::topology::Membership>,
         _: &NodeId,
     ) -> bool {
         false
@@ -705,7 +716,7 @@ impl PinnedFallback {
     fn request_direct<'a>(
         &'a self,
         _: protocol::PeerRequest,
-        _: crate::topology::membership::MembershipLease,
+        _: std::sync::Arc<crate::topology::Membership>,
         _: &'a RequestScope,
     ) -> Operation<'a, protocol::VerifiedResponse> {
         panic!("pinned fallback fixture does not admit direct hedges")
@@ -713,7 +724,7 @@ impl PinnedFallback {
     fn request<'a>(
         &'a self,
         request: protocol::PeerRequest,
-        membership: crate::topology::membership::MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
     ) -> Operation<'a, protocol::VerifiedResponse> {
         Box::pin(async move {
@@ -745,7 +756,7 @@ impl LocalPageService for OwnedCoordinator {
     fn serve_peer<'a>(
         &'a self,
         request: VerifiedRequest,
-        membership: crate::topology::membership::MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
     ) -> Operation<'a, PeerResponse> {
         self.coordinator.serve_peer(request, membership, scope)
@@ -795,7 +806,7 @@ struct CachedCopies {
 impl CachedCopies {
     fn direct_hedge_available(
         &self,
-        _: &crate::topology::membership::MembershipLease,
+        _: &std::sync::Arc<crate::topology::Membership>,
         _: &NodeId,
     ) -> bool {
         false
@@ -803,7 +814,7 @@ impl CachedCopies {
     fn request_direct<'a>(
         &'a self,
         _: protocol::PeerRequest,
-        _: crate::topology::membership::MembershipLease,
+        _: std::sync::Arc<crate::topology::Membership>,
         _: &'a RequestScope,
     ) -> Operation<'a, protocol::VerifiedResponse> {
         panic!("metadata copy fixture does not admit direct hedges")
@@ -811,7 +822,7 @@ impl CachedCopies {
     fn request<'a>(
         &'a self,
         request: protocol::PeerRequest,
-        _: crate::topology::membership::MembershipLease,
+        _: std::sync::Arc<crate::topology::Membership>,
         _: &'a RequestScope,
     ) -> Operation<'a, protocol::VerifiedResponse> {
         Box::pin(async move {
@@ -873,24 +884,22 @@ fn metadata_coordinator_with_newer_publication(
     adapter: Rc<AdapterOrigin>,
     newer_publication: bool,
 ) -> (Rc<super::Coordinator>, super::dispatch::WorkerEndpoint) {
-    use crate::{
-        control::{
-            state::Publication,
-            state::{PublishedState, SnapshotStore},
-        },
-        memory::{cache::MemoryCache, delivery::Delivery, new_pipe_pool},
-        runtime::{
-            crypto::{self, CryptoClient},
-            worker::WorkerMap,
-        },
-        security::aead::PageCrypto,
-        store::{
-            StoreReader, StoreWriter,
-            catalog::{Index, SegmentClock},
-        },
-    };
+    use crate::control::PublishedState;
+    use crate::control::SnapshotStore;
+    use crate::memory::cache::MemoryCache;
+    use crate::memory::delivery::Delivery;
+    use crate::memory::new_pipe_pool;
+    use crate::runtime::crypto;
+    use crate::runtime::crypto::CryptoClient;
+    use crate::runtime::worker::WorkerMap;
+    use crate::security::aead::PageCrypto;
+    use crate::store::StoreReader;
+    use crate::store::StoreWriter;
+    use crate::store::catalog::Index;
+    use crate::store::catalog::SegmentClock;
+    use racer_control_wire::Publication;
     let published = Arc::new(PublishedState::default());
-    let availability = Rc::new(crate::control::state::Availability::new(
+    let availability = Rc::new(crate::control::Availability::new(
         published.clone(),
         keys.clone(),
     ));
@@ -900,8 +909,13 @@ fn metadata_coordinator_with_newer_publication(
         cluster: ClusterId(CLUSTER.into()),
         sequence: PublicationSequence(1),
         membership_version: membership.version,
-        members: membership.members().to_vec(),
-        caches: vec![crate::control::state::CacheDefinition {
+        members: membership
+            .members()
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .collect(),
+        caches: vec![racer_control_wire::CacheDefinition {
             id: CacheId(CACHE.into()),
             name: "remote".into(),
             client_socket: "/run/racer/remote/client/socket".into(),

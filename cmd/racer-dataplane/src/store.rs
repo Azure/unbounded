@@ -4,14 +4,20 @@ pub mod checkpoint;
 pub mod format;
 
 use self::catalog::{Index, IndexedPage, RecordLocation, SegmentClock};
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::memory::BufferPool;
+use crate::memory::page::CiphertextCopy;
+use crate::model::CacheId;
+use crate::model::ObjectVersion;
+use crate::model::PageId;
+use crate::model::ResourceClass;
+use crate::model::VersionMetadata;
+use crate::runtime::admission::AdmissionPolicy;
 use crate::runtime::collections::HashMap;
+use crate::runtime::deadline::RequestScope;
 use crate::runtime::reactor::Reactor;
-use crate::{
-    error::{Error, Operation, Result},
-    memory::{BufferPool, page::CiphertextCopy},
-    model::{CacheId, ObjectVersion, PageId, ResourceClass, VersionMetadata},
-    runtime::{admission::AdmissionPolicy, deadline::RequestScope},
-};
 use page_alloc::{Alignment, SegmentLease, Segments, Slab};
 use std::{
     cell::{Cell, RefCell},
@@ -64,7 +70,7 @@ impl Store {
 /// Lease mappings before awaiting I/O and return validated ciphertext framing.
 /// AEAD validation remains owned by fill.
 pub struct StoreReader {
-    metrics: crate::telemetry::metrics::Metrics,
+    metrics: crate::telemetry::Metrics,
     clock: Rc<catalog::SegmentClock>,
     index: Rc<Index>,
     segments: Rc<Segments>,
@@ -96,7 +102,7 @@ impl StoreReader {
         buffers: BufferPool,
     ) -> Self {
         Self {
-            metrics: crate::telemetry::metrics::Metrics::default(),
+            metrics: crate::telemetry::Metrics::default(),
             clock,
             index,
             segments,
@@ -106,14 +112,12 @@ impl StoreReader {
             buffers,
         }
     }
-    pub fn with_metrics(mut self, metrics: crate::telemetry::metrics::Metrics) -> Self {
+    pub fn with_metrics(mut self, metrics: crate::telemetry::Metrics) -> Self {
         self.metrics = metrics;
         self
     }
     fn corrupt_miss(&self) {
-        let _ = self
-            .metrics
-            .record(crate::telemetry::metrics::Event::CorruptMiss, 1);
+        self.metrics.record(crate::telemetry::Event::CorruptMiss, 1);
     }
     pub fn invalidate(&self, token: &ReadToken) -> Result<()> {
         self.index.remove_if_matches(&token.page, &token.location);
@@ -144,7 +148,7 @@ impl StoreReader {
         Box::pin(async move {
             scope.check()?;
             let entry = match self.metrics.lookup(
-                crate::telemetry::metrics::LookupTier::DiskIndex,
+                crate::telemetry::LookupTier::DiskIndex,
                 self.index.lookup(page),
             )? {
                 Some(e) => e,
@@ -273,7 +277,7 @@ struct Dirty {
 }
 /// Bounded dirty copies persist asynchronously, with publication after full I/O.
 pub struct StoreWriter {
-    metrics: crate::telemetry::metrics::Metrics,
+    metrics: crate::telemetry::Metrics,
     index: Rc<Index>,
     segments: Rc<Segments>,
     slabs: Rc<Slab<flow_control::Charge<AdmissionPolicy>>>,
@@ -286,7 +290,7 @@ pub struct StoreWriter {
     capacity: Cell<usize>,
     busy: Cell<bool>,
     active_scope: RefCell<Option<RequestScope>>,
-    availability: Rc<crate::control::state::Availability>,
+    availability: Rc<crate::control::Availability>,
     discarded: Cell<u64>,
     closed: Cell<bool>,
 }
@@ -297,10 +301,10 @@ impl StoreWriter {
         slabs: Rc<Slab<flow_control::Charge<AdmissionPolicy>>>,
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         reactor: Rc<Reactor>,
-        availability: Rc<crate::control::state::Availability>,
+        availability: Rc<crate::control::Availability>,
     ) -> Self {
         Self {
-            metrics: crate::telemetry::metrics::Metrics::default(),
+            metrics: crate::telemetry::Metrics::default(),
             index,
             segments,
             slabs,
@@ -318,7 +322,7 @@ impl StoreWriter {
             closed: Cell::new(false),
         }
     }
-    pub fn with_metrics(mut self, metrics: crate::telemetry::metrics::Metrics) -> Self {
+    pub fn with_metrics(mut self, metrics: crate::telemetry::Metrics) -> Self {
         self.metrics = metrics;
         self
     }
@@ -461,7 +465,7 @@ impl StoreWriter {
             Dirty {
                 _metric: self
                     .metrics
-                    .lease(crate::telemetry::metrics::Gauge::PendingDiskWrites)?,
+                    .lease(crate::telemetry::Gauge::PendingDiskWrites)?,
                 ticket,
                 page,
                 _reservation: Rc::new(dirty),
@@ -500,9 +504,8 @@ impl StoreWriter {
         self.discarded.get()
     }
     fn note_discard(&self, count: usize) {
-        let _ = self
-            .metrics
-            .record(crate::telemetry::metrics::Event::DirtyDiscard, count as u64);
+        self.metrics
+            .record(crate::telemetry::Event::DirtyDiscard, count as u64);
         self.discarded
             .set(self.discarded.get().saturating_add(count as u64));
     }
@@ -730,7 +733,7 @@ impl StoreWriter {
                 },
             )?;
             self.metrics
-                .record(crate::telemetry::metrics::Event::DiskPublication, 1)?;
+                .record(crate::telemetry::Event::DiskPublication, 1);
         } else if self.pending.borrow().contains_key(id) {
             self.note_discard(1);
         }

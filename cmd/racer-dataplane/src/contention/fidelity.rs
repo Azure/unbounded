@@ -2,39 +2,52 @@
 //! Dirty Fill and crypto checks below cover production contracts against explicit
 //! Bundle owner traces, not the simulator's event scheduling or completion timing.
 use super::*;
-use crate::{
-    error::Operation,
-    memory::{BufferPool, VerifiedBytes, VerifiedPage, cache::MemoryCache, page::PageResult},
-    model::{
-        CacheKey, MetadataSelector, Nonce, ObjectId, ObjectVersion, OriginContext, PageEnvelope,
-        PageId, PageNumber, RequestId, StrongEtag, VersionMetadata, WorkerId,
-    },
-    origin::{MetadataReply, Origin, OriginPage},
-    read::{
-        candidates::{CandidatePolicy, OriginAuthority},
-        dispatch::WorkerDirectory,
-        fill::{Fill, FillDependencies},
-        flight::{AcquisitionBudget, Flights},
-    },
-    runtime::{
-        crypto::{self, CryptoClient},
-        deadline::RequestScope,
-        reactor::Reactor,
-        worker::{CryptoRuntime, CryptoService, WorkerMap},
-    },
-    security::{
-        aead::{PageCrypto, PageCryptoEngine},
-        credentials::CredentialCrypto,
-    },
-    store::{
-        StoreReader, StoreWriter,
-        catalog::{Index, SegmentClock},
-    },
-    topology::{
-        membership::{Member, Membership},
-        routing::Placement,
-    },
-};
+use crate::error::Operation;
+use crate::memory::BufferPool;
+use crate::memory::VerifiedBytes;
+use crate::memory::VerifiedPage;
+use crate::memory::cache::MemoryCache;
+use crate::memory::page::PageResult;
+use crate::model::CacheKey;
+use crate::model::MetadataSelector;
+use crate::model::Nonce;
+use crate::model::ObjectId;
+use crate::model::ObjectVersion;
+use crate::model::OriginContext;
+use crate::model::PageEnvelope;
+use crate::model::PageId;
+use crate::model::PageNumber;
+use crate::model::RequestId;
+use crate::model::StrongEtag;
+use crate::model::VersionMetadata;
+use crate::model::WorkerId;
+use crate::origin::MetadataReply;
+use crate::origin::Origin;
+use crate::origin::OriginPage;
+use crate::read::candidates::CandidatePolicy;
+use crate::read::candidates::OriginAuthority;
+use crate::read::dispatch::WorkerDirectory;
+use crate::read::fill::Fill;
+use crate::read::fill::FillDependencies;
+use crate::read::flight::AcquisitionBudget;
+use crate::read::flight::Flights;
+use crate::runtime::crypto;
+use crate::runtime::crypto::CryptoClient;
+use crate::runtime::deadline::RequestScope;
+use crate::runtime::reactor::Reactor;
+use crate::runtime::worker::CryptoRuntime;
+use crate::runtime::worker::CryptoService;
+use crate::runtime::worker::WorkerMap;
+use crate::security::aead::PageCrypto;
+use crate::security::aead::PageCryptoEngine;
+use crate::security::credentials::CredentialCrypto;
+use crate::store::StoreReader;
+use crate::store::StoreWriter;
+use crate::store::catalog::Index;
+use crate::store::catalog::SegmentClock;
+use crate::topology::Member;
+use crate::topology::Membership;
+use crate::topology::Placement;
 use std::{
     num::{NonZeroU32, NonZeroUsize},
     rc::Rc,
@@ -477,7 +490,7 @@ fn dirty_pressure_matches_metadata_skip_while_real_bootstrap_read_succeeds() {
         .unwrap();
     let buffers = BufferPool::new(real.clone());
     let keys = Rc::new(crate::security::test_support::keys());
-    let availability = crate::control::state::for_caches(keys.clone(), vec![cache.clone()]);
+    let availability = crate::control::for_caches(keys.clone(), vec![cache.clone()]);
     let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
     let mut old_model = MetadataOwners::reserve(&model, &cache);
     Arc::get_mut(&mut old_model.bundle.plain)

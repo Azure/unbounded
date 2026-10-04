@@ -15,17 +15,19 @@
 //! independently of futures/tokens. Dropping a token must schedule detach/abandon
 //! on that worker, never free live resources. Register/recheck wakeups before
 //! parking. Bound entries, waiters, retry attempts, and retained completions.
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::memory::page::AcquiredPage;
+use crate::memory::page::PageResult;
+use crate::memory::page::UnverifiedPage;
+use crate::model::OriginContext;
+use crate::model::PageId;
+use crate::model::ResourceClass;
+use crate::runtime::admission::AdmissionExt;
+use crate::runtime::admission::AdmissionPolicy;
 use crate::runtime::collections::HashMap;
-use crate::{
-    error::{Error, Operation, Result},
-    memory::page::{AcquiredPage, PageResult, UnverifiedPage},
-    model::{OriginContext, PageId, ResourceClass},
-    runtime::{
-        admission::{AdmissionExt, AdmissionPolicy},
-        deadline::RequestScope,
-    },
-    topology::membership::MembershipLease,
-};
+use crate::runtime::deadline::RequestScope;
 use std::{
     cell::RefCell,
     collections::BTreeMap,
@@ -37,7 +39,7 @@ use std::{
 
 pub struct Flights {
     pub(super) admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
-    availability: Rc<crate::control::state::Availability>,
+    availability: Rc<crate::control::Availability>,
     owner: Rc<()>,
     limits: FlightLimits,
     pub(super) table: RefCell<Table>,
@@ -358,7 +360,7 @@ pub struct AcquisitionWaiter<'a> {
     pub(super) registration: Registration,
     context: &'a OriginContext,
     scope: &'a RequestScope,
-    pub(super) membership: MembershipLease,
+    pub(super) membership: std::sync::Arc<crate::topology::Membership>,
     budget: &'a mut AcquisitionBudget,
 }
 
@@ -410,7 +412,7 @@ pub struct AcquisitionContext<'a> {
     pub origin: &'a OriginContext,
     pub scope: &'a RequestScope,
     pub(crate) cancellation: &'a crate::runtime::deadline::CancellationRegistration,
-    pub membership: &'a MembershipLease,
+    pub membership: &'a std::sync::Arc<crate::topology::Membership>,
     pub budget: &'a mut AcquisitionBudget,
 }
 
@@ -572,7 +574,7 @@ impl CopyWaiter<'_> {
 impl Flights {
     pub fn new(
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
-        availability: Rc<crate::control::state::Availability>,
+        availability: Rc<crate::control::Availability>,
     ) -> Self {
         let limits = FlightLimits {
             entries: admission.limits().flights.get(),
@@ -591,7 +593,7 @@ impl Flights {
 
     pub fn with_limits(
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
-        availability: Rc<crate::control::state::Availability>,
+        availability: Rc<crate::control::Availability>,
         limits: FlightLimits,
     ) -> Result<Self> {
         if limits.entries == 0
@@ -657,7 +659,7 @@ impl Flights {
     pub fn join<'a>(
         self: &Rc<Self>,
         page: PageId,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         context: &'a OriginContext,
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
@@ -668,7 +670,7 @@ impl Flights {
     pub(crate) fn join_for<'a>(
         self: &Rc<Self>,
         page: PageId,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         context: &'a OriginContext,
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,

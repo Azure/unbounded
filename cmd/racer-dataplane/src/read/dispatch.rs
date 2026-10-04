@@ -1,24 +1,27 @@
 //! Bounded node-local handoffs. Only owned commands and immutable results cross
 //! threads; the coordinator, futures, delivery leases, and streams stay local.
 use super::{Coordinator, flight::AcquisitionBudget};
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
 use crate::memory::page::PageResult;
+use crate::model::AttemptId;
+use crate::model::MetadataSelector;
+use crate::model::ObjectId;
+use crate::model::ObjectMetadata;
+use crate::model::ObjectVersion;
+use crate::model::OriginContext;
+use crate::model::PageId;
+use crate::model::PeerOriginContext;
+use crate::model::VersionMetadata;
+use crate::model::WorkerId;
+use crate::peer::protocol::PeerResponse;
+use crate::peer::protocol::VerifiedRequest;
+use crate::peer::server::LocalPageService;
 use crate::runtime::collections::HashMap;
-use crate::{
-    error::{Error, Operation, Result},
-    model::{
-        AttemptId, MetadataSelector, ObjectId, ObjectMetadata, ObjectVersion, OriginContext,
-        PageId, PeerOriginContext, VersionMetadata, WorkerId,
-    },
-    peer::{
-        protocol::{PeerResponse, VerifiedRequest},
-        server::LocalPageService,
-    },
-    runtime::{
-        deadline::{Cancellation, RequestScope},
-        worker::WorkerMap,
-    },
-    topology::membership::MembershipLease,
-};
+use crate::runtime::deadline::Cancellation;
+use crate::runtime::deadline::RequestScope;
+use crate::runtime::worker::WorkerMap;
 use std::{
     cell::RefCell,
     collections::VecDeque,
@@ -63,22 +66,30 @@ enum Work {
     Select(
         ObjectVersion,
         super::range_stream::Selection,
-        MembershipLease,
+        std::sync::Arc<crate::topology::Membership>,
         PeerOriginContext,
     ),
     Selected(crate::memory::page::CiphertextCopy),
     Cached(PageId),
-    Resolve(MetadataSelector, MembershipLease, PeerOriginContext),
-    Acquire(PageId, MembershipLease, PeerOriginContext),
+    Resolve(
+        MetadataSelector,
+        std::sync::Arc<crate::topology::Membership>,
+        PeerOriginContext,
+    ),
+    Acquire(
+        PageId,
+        std::sync::Arc<crate::topology::Membership>,
+        PeerOriginContext,
+    ),
     Ordered(
         PageId,
-        MembershipLease,
+        std::sync::Arc<crate::topology::Membership>,
         PeerOriginContext,
         Arc<super::range_stream::FixedAcquisition>,
     ),
     Publish(VersionMetadata),
     Retained(ObjectVersion),
-    Peer(VerifiedRequest, MembershipLease),
+    Peer(VerifiedRequest, std::sync::Arc<crate::topology::Membership>),
 }
 enum Value {
     Metadata(ObjectMetadata),
@@ -215,7 +226,7 @@ impl WorkerDirectory {
         &self,
         version: ObjectVersion,
         selection: super::range_stream::Selection,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         context: &OriginContext,
         scope: &RequestScope,
         budget: AcquisitionBudget,
@@ -481,7 +492,7 @@ impl WorkerDirectory {
     pub fn resolve_with_budget<'a>(
         &'a self,
         selector: MetadataSelector,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         context: &'a OriginContext,
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
@@ -505,7 +516,7 @@ impl WorkerDirectory {
     pub fn acquire<'a>(
         &'a self,
         page: PageId,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         context: &'a OriginContext,
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
@@ -538,7 +549,7 @@ impl WorkerDirectory {
         &self,
         page: PageId,
         guard: super::range_stream::FixedAcquisition,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         context: &OriginContext,
         scope: &RequestScope,
         budget: AcquisitionBudget,
@@ -623,7 +634,7 @@ impl WorkerDirectory {
     fn peer<'a>(
         &'a self,
         request: VerifiedRequest,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
     ) -> Operation<'a, PeerResponse> {
         Box::pin(async move {
@@ -934,7 +945,7 @@ impl LocalPageService for WorkerDirectory {
     fn serve_peer<'a>(
         &'a self,
         request: VerifiedRequest,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
     ) -> Operation<'a, PeerResponse> {
         self.peer(request, membership, scope)
@@ -946,7 +957,7 @@ impl LocalPageService for Arc<WorkerDirectory> {
     fn serve_peer<'a>(
         &'a self,
         request: VerifiedRequest,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
     ) -> Operation<'a, PeerResponse> {
         self.as_ref().serve_peer(request, membership, scope)

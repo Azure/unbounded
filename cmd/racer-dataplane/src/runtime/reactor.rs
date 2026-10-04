@@ -52,7 +52,8 @@ use crate::{
     error::{Error, Operation, Result},
     model::{RequestId, ResourceClass},
 };
-use std::{ops::Deref, rc::Rc};
+use std::ops::Deref;
+use std::rc::Rc;
 use uring_runtime::reactor::{ReactorWake, SUBMISSION_BYTES, SubmissionCapacity};
 pub mod filesystem {
     //! Racer filesystem buffer error boundary.
@@ -186,7 +187,10 @@ mod tests {
         task::{Context, Poll},
         time::{Duration, Instant},
     };
-    use uring_runtime::reactor::{Descriptor, IoBuffer, SocketAddress, simulation};
+    use uring_runtime::reactor::Descriptor;
+    use uring_runtime::reactor::IoBuffer;
+    use uring_runtime::reactor::SocketAddress;
+    use uring_runtime::reactor::simulation;
 
     #[test]
     fn movable_production_buffers_preserve_subrange_through_completion() {
@@ -499,11 +503,11 @@ mod tests {
 mod simulation_tests {
     use super::Reactor;
     use super::tests::{drive, poll, scope};
+    use crate::error::Error;
+    use crate::error::Result;
     use crate::model::ResourceClass;
-    use crate::{
-        error::{Error, Result},
-        runtime::{admission::AdmissionPolicy, deadline::RequestScope},
-    };
+    use crate::runtime::admission::AdmissionPolicy;
+    use crate::runtime::deadline::RequestScope;
     use std::{cell::Cell, ffi::CString, path::Path, rc::Rc, time::Duration};
     use uring_runtime::reactor::simulation::{DiskState, Environment, Fault, Simulation};
     fn reactor() -> Reactor {
@@ -800,7 +804,7 @@ mod simulation_tests {
             .unwrap();
         let bytes = drive(
             &r,
-            Box::pin(crate::control::async_files::projected_file(
+            Box::pin(crate::control::projected_file(
                 &r,
                 Path::new("/projected"),
                 "bundle",
@@ -812,7 +816,7 @@ mod simulation_tests {
         assert_eq!(&**bytes, b"first");
         let private = drive(
             &r,
-            Box::pin(crate::control::async_files::directory(
+            Box::pin(crate::control::directory(
                 &r,
                 Path::new("/private"),
                 true,
@@ -824,7 +828,7 @@ mod simulation_tests {
         sim.inject("write", Fault::Short(2));
         drive(
             &r,
-            Box::pin(crate::control::async_files::atomic_write(
+            Box::pin(crate::control::atomic_write(
                 &r, &private, "identity", b"secret", &scope,
             )),
         )

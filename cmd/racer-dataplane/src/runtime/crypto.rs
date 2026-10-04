@@ -27,7 +27,9 @@ mod measurement {
     //! Measurement correctness scenarios using the real page engine.
     use super::tests::{input, keyring};
     use super::*;
-    use crate::telemetry::metrics::{Event, Event::*, Metrics};
+    use crate::telemetry::Event;
+    use crate::telemetry::Event::*;
+    use crate::telemetry::Metrics;
     use crate::{
         memory::BufferPool,
         model::{Nonce, PageEnvelope, ResourceClass, *},
@@ -302,7 +304,7 @@ mod measurement {
                 let client = CryptoClient::new(io);
                 let metrics = Metrics::default();
                 client.set_metrics(metrics.clone());
-                let failures = crate::telemetry::failures::Failures::default();
+                let failures = crate::telemetry::Failures::default();
                 client.set_failure_observer(failures.observer(WorkerId(0)));
                 let scope = RequestScope::new(
                     crate::model::RequestId([0; 16]),
@@ -431,10 +433,9 @@ mod measurement {
 
     #[test]
     fn send_crc_computes_fresh_body_and_holds_owner_through_abandoned_reap() {
-        use crate::{
-            security::aead::PageCryptoEngine,
-            telemetry::send_crc::{Pair, Samples},
-        };
+        use crate::security::aead::PageCryptoEngine;
+        use crate::telemetry::Pair;
+        use crate::telemetry::Samples;
         use uring_runtime::environment;
         let admission = std::rc::Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
@@ -517,10 +518,10 @@ mod measurement {
 
     #[test]
     fn send_crc_cached_cancel_missing_key_and_capacity_are_diagnostic_only() {
-        use crate::{
-            security::aead::{PageCrypto, PageCryptoEngine},
-            telemetry::send_crc::{Pair, Samples},
-        };
+        use crate::security::aead::PageCrypto;
+        use crate::security::aead::PageCryptoEngine;
+        use crate::telemetry::Pair;
+        use crate::telemetry::Samples;
         let admission = std::rc::Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
@@ -660,7 +661,8 @@ mod measurement {
     fn shared_worker_queue_measurements(decrypt: bool) {
         use crate::security::aead::PageCryptoEngine;
         use std::time::Duration;
-        use uring_runtime::environment::{self, SimulationClock};
+        use uring_runtime::environment;
+        use uring_runtime::environment::SimulationClock;
 
         let clock = SimulationClock::new(43);
         let env = clock.environment(0);
@@ -804,7 +806,8 @@ mod measurement {
 
     #[test]
     fn duration_saturates_without_host_time_in_dst() {
-        use uring_runtime::environment::{self, SimulationClock};
+        use uring_runtime::environment;
+        use uring_runtime::environment::SimulationClock;
         let clock = SimulationClock::new(19);
         let env = clock.environment(0);
         let _env = env.enter();
@@ -1200,11 +1203,11 @@ struct Handoff {
 /// fn duplicate(permit: CryptoPermit) { let _second = permit.clone(); }
 /// ```
 pub struct CryptoPermit {
-    pub(crate) send_sample: Option<crate::telemetry::send_crc::Work>,
+    pub(crate) send_sample: Option<crate::telemetry::Work>,
     handoff: Arc<Handoff>,
     id: CryptoId,
     measurement: Measurement,
-    pub(crate) aead_failure: Option<crate::telemetry::failures::AeadFailure>,
+    pub(crate) aead_failure: Option<crate::telemetry::AeadFailure>,
 }
 
 #[derive(Default)]
@@ -1250,8 +1253,8 @@ impl CryptoCompletion {
     /// I/O is the only counter writer. Aggregate once on dequeue, even when the
     /// waiter is abandoned. Started means execution observed through completion;
     /// in-flight work and engine loss without a completion are not yet counted.
-    fn record(&self, metrics: &crate::telemetry::metrics::Metrics) {
-        use crate::telemetry::metrics::Event::*;
+    fn record(&self, metrics: &crate::telemetry::Metrics) {
+        use crate::telemetry::Event::*;
         let m = &self.permit.measurement;
         // CRC-only relay work is not an AEAD encrypt/decrypt operation.
         if m.checksum_only {
@@ -1295,10 +1298,10 @@ impl CryptoCompletion {
             m.queue_ns.unwrap_or(0),
         ];
         for (event, amount) in events.into_iter().zip(amounts) {
-            let _ = metrics.record(event, amount);
+            metrics.record(event, amount);
         }
         if let Some(rejection) = m.rejection {
-            let _ = metrics.record(
+            metrics.record(
                 match rejection {
                     IntegrityRejection::Crc => CryptoDecryptCrcRejected,
                     IntegrityRejection::Aead => CryptoDecryptAeadRejected,
@@ -1561,9 +1564,9 @@ impl Drop for CryptoPort {
 /// delivery; the engine/queue retains resources until I/O reaps the completion.
 /// I/O checks generation/sequence before delivery and never publishes stale work.
 pub struct CryptoClient {
-    observer: RefCell<crate::telemetry::failures::Observer>,
+    observer: RefCell<crate::telemetry::Observer>,
     port: IoCryptoPort,
-    metrics: RefCell<Option<crate::telemetry::metrics::Metrics>>,
+    metrics: RefCell<Option<crate::telemetry::Metrics>>,
     waiters: RefCell<BTreeMap<CryptoId, Waiter>>,
     sequence: Cell<u64>,
     pending: RefCell<VecDeque<(CryptoId, Waker, RequestScope)>>,
@@ -1612,7 +1615,7 @@ impl Drop for Registration<'_> {
 impl CryptoClient {
     pub fn new(port: IoCryptoPort) -> Self {
         Self {
-            observer: RefCell::new(crate::telemetry::failures::Observer::default()),
+            observer: RefCell::new(crate::telemetry::Observer::default()),
             port,
             metrics: RefCell::new(None),
             waiters: RefCell::new(BTreeMap::new()),
@@ -1625,10 +1628,10 @@ impl CryptoClient {
     }
 
     /// Install the I/O writer before admitting work; crypto never writes this shard.
-    pub(crate) fn set_metrics(&self, metrics: crate::telemetry::metrics::Metrics) {
+    pub(crate) fn set_metrics(&self, metrics: crate::telemetry::Metrics) {
         *self.metrics.borrow_mut() = Some(metrics);
     }
-    pub(crate) fn set_failure_observer(&self, observer: crate::telemetry::failures::Observer) {
+    pub(crate) fn set_failure_observer(&self, observer: crate::telemetry::Observer) {
         *self.observer.borrow_mut() = observer;
     }
 
@@ -1650,7 +1653,7 @@ impl CryptoClient {
         input: CryptoInput,
         key: KeyLease,
         scope: &'a RequestScope,
-        sample: Option<crate::telemetry::send_crc::Work>,
+        sample: Option<crate::telemetry::Work>,
     ) -> Operation<'a, CryptoOutput> {
         Box::pin(async move {
             scope.check()?;
@@ -2274,14 +2277,12 @@ mod tests {
 
     #[test]
     fn abandoned_future_retains_buffers_key_and_permit_until_reaped() {
-        use crate::{
-            memory::BufferPool,
-            model::{ResourceClass, *},
-        };
-        use std::{
-            rc::Rc,
-            time::{Duration, Instant},
-        };
+        use crate::memory::BufferPool;
+        use crate::model::ResourceClass;
+        use crate::model::*;
+        use std::rc::Rc;
+        use std::time::Duration;
+        use std::time::Instant;
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
@@ -2366,14 +2367,12 @@ mod tests {
 
     #[test]
     fn engine_drop_reclaims_queued_jobs_and_drain_finishes() {
-        use crate::{
-            memory::BufferPool,
-            model::{ResourceClass, *},
-        };
-        use std::{
-            rc::Rc,
-            time::{Duration, Instant},
-        };
+        use crate::memory::BufferPool;
+        use crate::model::ResourceClass;
+        use crate::model::*;
+        use std::rc::Rc;
+        use std::time::Duration;
+        use std::time::Instant;
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
@@ -2428,11 +2427,11 @@ mod tests {
 
     #[test]
     fn original_scope_failure_is_returned_without_submission() {
-        use crate::{
-            memory::BufferPool,
-            model::{ResourceClass, *},
-        };
-        use std::{rc::Rc, time::Instant};
+        use crate::memory::BufferPool;
+        use crate::model::ResourceClass;
+        use crate::model::*;
+        use std::rc::Rc;
+        use std::time::Instant;
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));

@@ -587,7 +587,9 @@ fn adaptive_connect_errno_preserves_local_exhaustion_as_neutral() {
 }
 #[test]
 fn adaptive_checkout_attributes_actual_connect_completion_errno() {
-    use crate::telemetry::metrics::{Event, Gauge, Metrics};
+    use crate::telemetry::Event;
+    use crate::telemetry::Gauge;
+    use crate::telemetry::Metrics;
     for (errno, blame) in [
         (libc::ENOBUFS, false),
         (libc::ENOMEM, false),

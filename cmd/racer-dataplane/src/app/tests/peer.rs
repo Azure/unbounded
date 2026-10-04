@@ -155,7 +155,8 @@ fn assembly_applies_configured_client_request_timeout() {
 
 #[test]
 fn worker_requesters_share_configured_admission_and_production_metrics() {
-    use crate::telemetry::metrics::{Event, Gauge};
+    use crate::telemetry::Event;
+    use crate::telemetry::Gauge;
     let mut config = crate::test_support::cluster::config(false);
     config.peer_admission = crate::peer::adaptive::Config {
         total: 2,
@@ -269,17 +270,14 @@ fn distributed_peer_listener_recovers_from_queue_pressure() {
 
 #[test]
 fn assembly_uses_node_metrics_for_sparse_worker_ids() {
-    use crate::telemetry::metrics::{Event, Gauge};
+    use crate::telemetry::Event;
+    use crate::telemetry::Gauge;
     let config = crate::test_support::cluster::config(false);
     let node = Arc::new(NodeState::new(vec![WorkerId(9), WorkerId(2)], 16).unwrap());
     let (first, _, _) = local_worker(&config, &node, 9);
     let (second, _, _) = local_worker(&config, &node, 2);
-    first.telemetry.metrics.record(Event::MemoryHit, 2).unwrap();
-    second
-        .telemetry
-        .metrics
-        .record(Event::MemoryHit, 3)
-        .unwrap();
+    first.telemetry.metrics.record(Event::MemoryHit, 2);
+    second.telemetry.metrics.record(Event::MemoryHit, 3);
     let request = first.telemetry.metrics.request().unwrap();
     assert_eq!(second.telemetry.metrics.count(Event::MemoryHit), 5);
     assert_eq!(second.telemetry.metrics.gauge(Gauge::ActiveRequests), 1);
@@ -288,19 +286,23 @@ fn assembly_uses_node_metrics_for_sparse_worker_ids() {
     assert_eq!(second.telemetry.metrics.count(Event::RequestError), 1);
     assert_eq!(second.telemetry.metrics.gauge(Gauge::ActiveRequests), 0);
 }
-use crate::{
-    http::Codec,
-    model::{ExpiresAt, MetadataSelector, ObjectMetadata, ResourceClass, *},
-    peer::protocol::{
-        self, FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse, decode_envelope,
-        encode_envelope,
-    },
-    security::{
-        connection,
-        test_support::{network, node},
-    },
-    topology::routing::RouteBudget,
-};
+use crate::http::Codec;
+use crate::model::ExpiresAt;
+use crate::model::MetadataSelector;
+use crate::model::ObjectMetadata;
+use crate::model::ResourceClass;
+use crate::model::*;
+use crate::peer::protocol;
+use crate::peer::protocol::FetchMode;
+use crate::peer::protocol::Operation as PeerOperation;
+use crate::peer::protocol::PeerRequest;
+use crate::peer::protocol::PeerResponse;
+use crate::peer::protocol::decode_envelope;
+use crate::peer::protocol::encode_envelope;
+use crate::security::connection;
+use crate::security::test_support::network;
+use crate::security::test_support::node;
+use crate::topology::RouteBudget;
 use http1::{Header, MessageHead, StartLine};
 use std::{future::Future, os::unix::net::UnixStream};
 
@@ -590,7 +592,8 @@ fn peer_worker_partition_rejects_underfunding_and_reduces_worker_count() {
 
 #[test]
 fn assembled_peer_io_rejects_oversize_and_admission_pressure_before_submission() {
-    use std::io::{Read, Write};
+    use std::io::Read;
+    use std::io::Write;
     let (app, runtime, _engine) = application();
     let io = app.peers.transport_io();
     let admission = &runtime.admission;

@@ -1,16 +1,19 @@
 use super::*;
-use crate::{
-    http::{Codec, HttpIo},
-    memory::page::CiphertextCopy,
-    model::{ExpiresAt, ObjectMetadata, PageEnvelope},
-    peer::subscriptions::{Demand, PageInterval, Subscription, TransferGrant},
-    runtime::reactor::Reactor,
-    topology::{
-        health::LinkHealth,
-        membership::{Member, Membership},
-        routing::Paths,
-    },
-};
+use crate::http::Codec;
+use crate::http::HttpIo;
+use crate::memory::page::CiphertextCopy;
+use crate::model::ExpiresAt;
+use crate::model::ObjectMetadata;
+use crate::model::PageEnvelope;
+use crate::peer::subscriptions::Demand;
+use crate::peer::subscriptions::PageInterval;
+use crate::peer::subscriptions::Subscription;
+use crate::peer::subscriptions::TransferGrant;
+use crate::runtime::reactor::Reactor;
+use crate::topology::LinkHealth;
+use crate::topology::Member;
+use crate::topology::Membership;
+use crate::topology::Paths;
 use std::{
     cell::Cell,
     task::{Context, Poll},
@@ -93,7 +96,7 @@ fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failure
         fn serve_peer<'a>(
             &'a self,
             request: protocol::VerifiedRequest,
-            _: crate::topology::membership::MembershipLease,
+            _: std::sync::Arc<crate::topology::Membership>,
             _: &'a RequestScope,
         ) -> crate::error::Operation<'a, PeerResponse> {
             Box::pin(async move {
@@ -149,7 +152,7 @@ fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failure
         let network = Rc::new(
             PeerNetwork::new(
                 NodeId(C.into()),
-                crate::control::state::PublishedState::for_membership(membership),
+                crate::control::PublishedState::for_membership(membership),
             )
             .unwrap(),
         );
@@ -253,14 +256,14 @@ fn signed_subscription_selects_hot_page_fans_out_and_isolates_credential_failure
 #[test]
 fn signed_ingress_cold_selection_is_bounded_cancellable_and_does_not_block_other_workers() {
     use crate::peer::subscriptions::Selection;
-    use crate::topology::membership::scored_members;
+    use crate::topology::scored_members;
 
     struct Never;
     impl server::LocalPageService for Never {
         fn serve_peer<'a>(
             &'a self,
             _: protocol::VerifiedRequest,
-            _: crate::topology::membership::MembershipLease,
+            _: std::sync::Arc<crate::topology::Membership>,
             _: &'a RequestScope,
         ) -> crate::error::Operation<'a, PeerResponse> {
             Box::pin(async { panic!("all demand endpoints must be ineligible") })
@@ -296,7 +299,7 @@ fn signed_ingress_cold_selection_is_bounded_cancellable_and_does_not_block_other
     let network = Rc::new(
         PeerNetwork::new(
             NodeId(C.into()),
-            crate::control::state::PublishedState::for_membership(membership),
+            crate::control::PublishedState::for_membership(membership),
         )
         .unwrap(),
     );
@@ -587,7 +590,7 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
         fn serve_peer<'a>(
             &'a self,
             request: protocol::VerifiedRequest,
-            _: crate::topology::membership::MembershipLease,
+            _: std::sync::Arc<crate::topology::Membership>,
             _: &'a RequestScope,
         ) -> crate::error::Operation<'a, PeerResponse> {
             Box::pin(async move {
@@ -646,7 +649,7 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
         Rc::new(
             PeerNetwork::new(
                 NodeId(node.into()),
-                crate::control::state::PublishedState::for_membership(membership.clone()),
+                crate::control::PublishedState::for_membership(membership.clone()),
             )
             .unwrap(),
         )

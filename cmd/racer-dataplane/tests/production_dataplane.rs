@@ -1,57 +1,69 @@
 //! Single-node production graph validation. Only control publication, origin data,
 //! and the worker polling loop are fixtures. No read/storage/crypto success doubles.
 use base64::Engine;
-use racer_control_wire::{self as wire, PublicationSequence};
-use racer_dataplane::{
-    client::{RequestParser, response::Responses},
-    control::{
-        state::Publication,
-        state::{CacheDefinition, PublishedState, SnapshotStore, canonical_socket_paths},
-    },
-    error::{Error, Operation, Result},
-    http::{Codec, HttpIo, HttpPool},
-    memory::{BufferPool, cache::MemoryCache, delivery::Delivery, new_pipe_pool},
-    model::{Limits, PAGE_BYTES, ResourceClass, *},
-    origin::OriginClient,
-    peer::{
-        PeerNetwork, Requester,
-        protocol::{FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse},
-        server::LocalPageService,
-        transport::Transfers,
-    },
-    read::{
-        Coordinator,
-        candidates::CandidatePolicy,
-        dispatch::{WorkerDirectory, WorkerEndpoint},
-        fill::{Fill, FillDependencies},
-        flight::Flights,
-        metadata::{MetadataDependencies, MetadataService},
-        range_stream::RangeStreams,
-    },
-    runtime::{
-        admission::AdmissionPolicy,
-        crypto::{self, CryptoClient},
-        deadline::RequestScope,
-        reactor::Reactor,
-        worker::{CryptoRuntime, CryptoService, WorkerMap},
-    },
-    security::{
-        aead::{PageCrypto, PageCryptoEngine},
-        connection::Signatures,
-        credentials::CredentialCrypto,
-        forwarding::Forwarding,
-    },
-    store::{
-        StoreReader, StoreWriter,
-        catalog::{Index, SegmentClock},
-    },
-    topology::{
-        health::LinkHealth,
-        membership::{Member, MembershipLease},
-        routing::Placement,
-        routing::{Paths, RouteBudget},
-    },
-};
+use racer_control_wire as wire;
+use racer_control_wire::CacheDefinition;
+use racer_control_wire::Publication;
+use racer_control_wire::PublicationSequence;
+use racer_control_wire::canonical_socket_paths;
+use racer_dataplane::client::RequestParser;
+use racer_dataplane::client::response::Responses;
+use racer_dataplane::control::PublishedState;
+use racer_dataplane::control::SnapshotStore;
+use racer_dataplane::error::Error;
+use racer_dataplane::error::Operation;
+use racer_dataplane::error::Result;
+use racer_dataplane::http::Codec;
+use racer_dataplane::http::HttpIo;
+use racer_dataplane::http::HttpPool;
+use racer_dataplane::memory::BufferPool;
+use racer_dataplane::memory::cache::MemoryCache;
+use racer_dataplane::memory::delivery::Delivery;
+use racer_dataplane::memory::new_pipe_pool;
+use racer_dataplane::model::Limits;
+use racer_dataplane::model::PAGE_BYTES;
+use racer_dataplane::model::ResourceClass;
+use racer_dataplane::model::*;
+use racer_dataplane::origin::OriginClient;
+use racer_dataplane::peer::PeerNetwork;
+use racer_dataplane::peer::Requester;
+use racer_dataplane::peer::protocol::FetchMode;
+use racer_dataplane::peer::protocol::Operation as PeerOperation;
+use racer_dataplane::peer::protocol::PeerRequest;
+use racer_dataplane::peer::protocol::PeerResponse;
+use racer_dataplane::peer::server::LocalPageService;
+use racer_dataplane::peer::transport::Transfers;
+use racer_dataplane::read::Coordinator;
+use racer_dataplane::read::candidates::CandidatePolicy;
+use racer_dataplane::read::dispatch::WorkerDirectory;
+use racer_dataplane::read::dispatch::WorkerEndpoint;
+use racer_dataplane::read::fill::Fill;
+use racer_dataplane::read::fill::FillDependencies;
+use racer_dataplane::read::flight::Flights;
+use racer_dataplane::read::metadata::MetadataDependencies;
+use racer_dataplane::read::metadata::MetadataService;
+use racer_dataplane::read::range_stream::RangeStreams;
+use racer_dataplane::runtime::admission::AdmissionPolicy;
+use racer_dataplane::runtime::crypto;
+use racer_dataplane::runtime::crypto::CryptoClient;
+use racer_dataplane::runtime::deadline::RequestScope;
+use racer_dataplane::runtime::reactor::Reactor;
+use racer_dataplane::runtime::worker::CryptoRuntime;
+use racer_dataplane::runtime::worker::CryptoService;
+use racer_dataplane::runtime::worker::WorkerMap;
+use racer_dataplane::security::aead::PageCrypto;
+use racer_dataplane::security::aead::PageCryptoEngine;
+use racer_dataplane::security::connection::Signatures;
+use racer_dataplane::security::credentials::CredentialCrypto;
+use racer_dataplane::security::forwarding::Forwarding;
+use racer_dataplane::store::StoreReader;
+use racer_dataplane::store::StoreWriter;
+use racer_dataplane::store::catalog::Index;
+use racer_dataplane::store::catalog::SegmentClock;
+use racer_dataplane::topology::LinkHealth;
+use racer_dataplane::topology::Paths;
+use racer_dataplane::topology::Placement;
+use racer_dataplane::topology::RouteBudget;
 use racer_identity::{Certificates, KeyEpochs, Keyring, PendingIdentity};
 use std::{
     cell::RefCell,
@@ -441,7 +453,7 @@ impl Rig {
         let buffers = BufferPool::new(admission.clone());
         let (keys, sender_keys) = fixture_keys();
         let published = Arc::new(PublishedState::default());
-        let availability = Rc::new(racer_dataplane::control::state::Availability::new(
+        let availability = Rc::new(racer_dataplane::control::Availability::new(
             published.clone(),
             keys.clone(),
         ));
@@ -518,7 +530,7 @@ impl Rig {
                 )
             }
         };
-        let availability = Rc::new(racer_dataplane::control::state::Availability::new(
+        let availability = Rc::new(racer_dataplane::control::Availability::new(
             published.clone(),
             keys.clone(),
         ));
@@ -727,7 +739,7 @@ struct Bootstrap {
     receiver: Rc<Forwarding>,
     credentials: CredentialCrypto,
     coordinator: Rc<Coordinator>,
-    membership: MembershipLease,
+    membership: std::sync::Arc<dataplane::topology::Membership>,
 }
 
 fn open_fixture_storage(
@@ -738,7 +750,7 @@ fn open_fixture_storage(
     reactor: &Rc<Reactor>,
     admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
     buffers: BufferPool,
-    availability: Rc<racer_dataplane::control::state::Availability>,
+    availability: Rc<racer_dataplane::control::Availability>,
 ) -> (Rc<Index>, Rc<StoreReader>, Rc<StoreWriter>) {
     let index = Rc::new(Index::new(worker, entries, availability.clone()));
     let segments = Rc::new(page_alloc::Segments::new(64 * 1024 * 1024));
@@ -782,7 +794,7 @@ fn fixture_publication() -> Publication {
         cluster: ClusterId(CLUSTER.into()),
         sequence: PublicationSequence(1),
         membership_version: MembershipVersion(1),
-        members: vec![Member {
+        members: vec![racer_control_wire::Member {
             node: NodeId(NODE.into()),
             shares: NonZeroU32::new(4).unwrap(),
             peer_endpoint: "127.0.0.1:8000".into(),
@@ -865,7 +877,7 @@ impl Bootstrap {
         receiver: Rc<Forwarding>,
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
         coordinator: Rc<Coordinator>,
-        membership: MembershipLease,
+        membership: std::sync::Arc<dataplane::topology::Membership>,
     ) -> Self {
         let certificates = Rc::new(Certificates::new(ClusterId(CLUSTER.into()), sender.clone()));
         Self {

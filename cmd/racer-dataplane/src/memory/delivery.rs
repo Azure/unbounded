@@ -16,13 +16,15 @@ use crate::{
     runtime::{admission::AdmissionPolicy, deadline::RequestScope, reactor::Reactor},
 };
 use flow_control::pipe::{PipeLease, PipePool};
+use std::io;
 #[cfg(test)]
 use std::os::fd::AsRawFd;
+use std::rc::Rc;
 #[cfg(test)]
 use std::task::Poll;
+use std::time::Duration;
 #[cfg(test)]
 use std::time::Instant;
-use std::{io, rc::Rc, time::Duration};
 use uring_runtime::reactor::{Descriptor, IoBuffer, SendBuffer};
 
 // Limit both syscall size and work in one executor turn, even for a writable peer.
@@ -84,7 +86,7 @@ unsafe impl SendBuffer for DeliveryBuffer {
 }
 
 pub struct Delivery {
-    metrics: crate::telemetry::metrics::Metrics,
+    metrics: crate::telemetry::Metrics,
     pipes: Rc<PipePool<AdmissionPolicy>>,
     reactor: Rc<Reactor>,
     stall_timeout: Duration,
@@ -135,13 +137,13 @@ impl Delivery {
         stall_timeout: Duration,
     ) -> Self {
         Self {
-            metrics: crate::telemetry::metrics::Metrics::default(),
+            metrics: crate::telemetry::Metrics::default(),
             pipes,
             reactor,
             stall_timeout,
         }
     }
-    pub(crate) fn with_metrics(mut self, metrics: crate::telemetry::metrics::Metrics) -> Self {
+    pub(crate) fn with_metrics(mut self, metrics: crate::telemetry::Metrics) -> Self {
         self.metrics = metrics;
         self
     }
@@ -168,7 +170,7 @@ impl Delivery {
         Ok(ReaderLease {
             _active: self
                 .metrics
-                .lease(crate::telemetry::metrics::Gauge::ActiveDeliveries)?,
+                .lease(crate::telemetry::Gauge::ActiveDeliveries)?,
             page,
             pipe,
             slice,
@@ -253,10 +255,8 @@ impl Delivery {
                 let sent = match reader.try_send(&connection.socket(), copying) {
                     Ok(sent) => {
                         if copying {
-                            let _ = self.metrics.record(
-                                crate::telemetry::metrics::Event::DeliveryDirectBytes,
-                                sent as u64,
-                            );
+                            self.metrics
+                                .record(crate::telemetry::Event::DeliveryDirectBytes, sent as u64);
                         }
                         sent
                     }
@@ -294,9 +294,8 @@ impl Delivery {
                                 }
                                 _ => return Err(Error::Io),
                             }
-                            let _ = self
-                                .metrics
-                                .record(crate::telemetry::metrics::Event::DeliveryPipeDrain, 1);
+                            self.metrics
+                                .record(crate::telemetry::Event::DeliveryPipeDrain, 1);
                             DeliveryBuffer::Pipe(buffer)
                         };
                         let count = buffer.send_bytes()?.len();
@@ -326,8 +325,8 @@ impl Delivery {
                         // any unsent suffix. Avoid another write/splice/drain on
                         // the next backpressured chunk; keep the owned-send fence.
                         copying = true;
-                        let _ = self.metrics.record(
-                            crate::telemetry::metrics::Event::DeliveryDirectBytes,
+                        self.metrics.record(
+                            crate::telemetry::Event::DeliveryDirectBytes,
                             completion.bytes as u64,
                         );
                         completion.bytes
@@ -687,7 +686,7 @@ mod tests {
             let mut pending_turns = 0;
             let drains = delivery
                 .metrics
-                .count(crate::telemetry::metrics::Event::DeliveryPipeDrain);
+                .count(crate::telemetry::Event::DeliveryPipeDrain);
             for _ in 0..PAGES {
                 let scope = scope();
                 connection.set_framing(connection.receive_remaining(), Some(LENGTH as u64), false);
@@ -744,7 +743,7 @@ mod tests {
             }
             let drains = delivery
                 .metrics
-                .count(crate::telemetry::metrics::Event::DeliveryPipeDrain)
+                .count(crate::telemetry::Event::DeliveryPipeDrain)
                 - drains;
             assert!(drains > 0 && pending_turns > PAGES);
             eprintln!(
@@ -1306,14 +1305,14 @@ mod tests {
         assert_eq!(
             delivery
                 .metrics
-                .count(crate::telemetry::metrics::Event::DeliveryPipeDrain),
+                .count(crate::telemetry::Event::DeliveryPipeDrain),
             1,
             "a backpressured page drains its staging pipe only once"
         );
         assert!(
             delivery
                 .metrics
-                .count(crate::telemetry::metrics::Event::DeliveryDirectBytes)
+                .count(crate::telemetry::Event::DeliveryDirectBytes)
                 > 0
         );
         assert!(weak.upgrade().is_none());

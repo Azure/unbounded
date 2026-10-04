@@ -1,11 +1,11 @@
 //! Generated traffic through the assembled production graph on hostless descriptors.
 //! The oracle owns immutable origin versions, never consults placement or cache data.
 use super::*;
-use crate::{
-    control::state::CacheDefinition,
-    model::{PAGE_BYTES, ResourceClass, *},
-};
+use crate::model::PAGE_BYTES;
+use crate::model::ResourceClass;
+use crate::model::*;
 use racer_control_wire as wire;
+use racer_control_wire::CacheDefinition;
 use racer_identity::{PendingIdentity, SigningIdentity};
 use sha2::{Digest, Sha256};
 use std::{cell::RefCell, collections::BTreeMap};
@@ -613,7 +613,7 @@ mod faults {
                                 vec![],
                             );
                             publication.membership_version = MembershipVersion(self.generation);
-                            publication.members = members.clone();
+                            publication.members = members.iter().cloned().map(Into::into).collect();
                             node.workers[0]
                                 .app
                                 .snapshots
@@ -720,14 +720,14 @@ mod scenarios {
 
     #[test]
     fn worker_subscriptions_contend_across_servers_and_recover_after_release() {
-        use crate::{
-            model::OriginContext,
-            peer::{
-                protocol::{FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse},
-                subscriptions::{Demand, PageInterval, Subscription},
-            },
-            topology::routing::RouteBudget,
+        use crate::model::OriginContext;
+        use crate::peer::protocol::{
+            FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse,
         };
+        use crate::peer::subscriptions::Demand;
+        use crate::peer::subscriptions::PageInterval;
+        use crate::peer::subscriptions::Subscription;
+        use crate::topology::RouteBudget;
 
         let sim = Simulation::new();
         let _os = sim.enter();
@@ -860,11 +860,13 @@ mod scenarios {
 
     #[test]
     fn completed_peer_dispatches_do_not_exhaust_worker_cancellation() {
-        use crate::model::{MetadataSelector, OriginContext};
-        use crate::peer::protocol::{
-            FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse,
-        };
-        use crate::topology::routing::RouteBudget;
+        use crate::model::MetadataSelector;
+        use crate::model::OriginContext;
+        use crate::peer::protocol::FetchMode;
+        use crate::peer::protocol::Operation as PeerOperation;
+        use crate::peer::protocol::PeerRequest;
+        use crate::peer::protocol::PeerResponse;
+        use crate::topology::RouteBudget;
         use futures::{Stream, stream::FuturesUnordered};
 
         let sim = Simulation::new();
@@ -1907,8 +1909,7 @@ fn node_id(id: usize) -> NodeId {
 }
 fn cache(id: usize) -> CacheDefinition {
     let name = format!("dst-{id}");
-    let (client_socket, origin_socket) =
-        crate::control::state::canonical_socket_paths(&name).unwrap();
+    let (client_socket, origin_socket) = racer_control_wire::canonical_socket_paths(&name).unwrap();
     CacheDefinition {
         name,
         id: CacheId("33333333-3333-4333-8333-333333333333".into()),
@@ -2239,7 +2240,7 @@ impl Harness {
             .to_pkcs8_der()
             .unwrap();
         let pending = PendingIdentity::recover(&key).unwrap();
-        crate::control::testing::signing_identity(
+        crate::control::tests::testing::signing_identity(
             pending,
             &self.ca,
             &self.ca_key,
@@ -2308,8 +2309,8 @@ impl Harness {
                 .unwrap();
         }
         let discovered_nics = if self.native {
-            vec![crate::topology::rails::RailMapping {
-                rail: crate::topology::rails::RailId(0),
+            vec![racer_control_wire::RailMapping {
+                rail: racer_control_wire::RailId(0),
                 numa_node: None,
                 device,
                 port: 1,
@@ -2337,8 +2338,8 @@ impl Harness {
         let mut publication =
             crate::app::tests::publication(&config, self.generation, vec![self.definition(id)]);
         publication.membership_version = MembershipVersion(self.generation);
-        publication.members = self.members();
-        publication.members.push(member(&config));
+        publication.members = self.members().into_iter().map(Into::into).collect();
+        publication.members.push(member(&config).into());
         app.snapshots.publish(publication).unwrap();
         let startup = scope(Duration::from_secs(30)).unwrap();
         let mut workers = vec![LocalWorker {
@@ -2440,7 +2441,7 @@ impl Harness {
             async move { peers.listen(address, &peer_scope).await },
         ));
     }
-    fn members(&self) -> Vec<crate::topology::membership::Member> {
+    fn members(&self) -> Vec<crate::topology::Member> {
         self.nodes.iter().map(|n| member(&n.config)).collect()
     }
     fn definition(&self, id: usize) -> CacheDefinition {
@@ -2486,7 +2487,7 @@ impl Harness {
             let mut p =
                 crate::app::tests::publication(&node.config, self.generation, vec![definition]);
             p.membership_version = MembershipVersion(self.generation);
-            p.members = members.clone();
+            p.members = members.iter().cloned().map(Into::into).collect();
             node.workers[0].app.snapshots.publish(p).unwrap();
         }
     }
@@ -3000,7 +3001,7 @@ fn phase5_default_grace_staggered_nodes_and_periodic_checkpoint_traffic() {
             vec![harness.definition(node.id)],
         );
         p.membership_version = MembershipVersion(harness.generation);
-        p.members = members.clone();
+        p.members = members.iter().cloned().map(Into::into).collect();
         node.workers[0].app.snapshots.publish(p).unwrap();
         assert!(
             node.workers[0]
@@ -3283,14 +3284,14 @@ fn replay(seed: u64, steps: usize, native: bool) -> Coverage {
     harness.coverage
 }
 
-fn member(config: &Config) -> crate::topology::membership::Member {
-    crate::topology::membership::Member {
+fn member(config: &Config) -> crate::topology::Member {
+    crate::topology::Member {
         node: config.node.clone(),
         shares: std::num::NonZeroU32::new(1).unwrap(),
         peer_endpoint: config.peer_listen.to_string(),
         rails: if config.enable_rdma {
-            vec![crate::topology::rails::RailMapping {
-                rail: crate::topology::rails::RailId(0),
+            vec![racer_control_wire::RailMapping {
+                rail: racer_control_wire::RailId(0),
                 device: format!(
                     "dst-rnic-{}",
                     usize::from_str_radix(&config.node.0[..8], 16).unwrap()

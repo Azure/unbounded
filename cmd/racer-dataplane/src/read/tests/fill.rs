@@ -1,28 +1,37 @@
+pub(super) use crate::error::Error;
+pub(super) use crate::error::Operation;
+pub(super) use crate::error::Result;
+pub(super) use crate::memory::BufferPool;
+pub(super) use crate::memory::CiphertextPage;
+pub(super) use crate::memory::cache::MemoryCache;
+pub(super) use crate::memory::page::PageResult;
+pub(super) use crate::memory::page::UnverifiedPage;
+pub(super) use crate::model::ObjectMetadata;
+pub(super) use crate::model::OriginContext;
+pub(super) use crate::model::PAGE_BYTES;
+pub(super) use crate::model::PageId;
+pub(super) use crate::origin::Origin;
 pub(super) use crate::peer::Requester;
+pub(super) use crate::peer::protocol::FetchMode;
+pub(super) use crate::peer::protocol::Operation as PeerOperation;
+pub(super) use crate::peer::protocol::PeerResponse;
+pub(super) use crate::read::candidates::CandidatePolicy;
 pub(super) use crate::read::fill::*;
-pub(super) use crate::{
-    error::{Error, Operation, Result},
-    memory::{
-        BufferPool, CiphertextPage,
-        cache::MemoryCache,
-        page::{PageResult, UnverifiedPage},
-    },
-    model::{ObjectMetadata, OriginContext, PAGE_BYTES, PageId},
-    origin::Origin,
-    peer::protocol::{FetchMode, Operation as PeerOperation, PeerResponse},
-    read::{
-        candidates::CandidatePolicy,
-        flight::{AcquisitionBudget, AcquisitionEvent, Flights, JoinedCopy, JoinedFlight},
-    },
-    runtime::{
-        admission::{AdmissionExt, AdmissionPolicy},
-        deadline::RequestScope,
-    },
-    security::{aead::PageCrypto, credentials::CredentialCrypto},
-    store::{StoreReader, StoreWriter},
-    telemetry::metrics::{Event, Gauge, Metrics},
-    topology::membership::MembershipLease,
-};
+pub(super) use crate::read::flight::AcquisitionBudget;
+pub(super) use crate::read::flight::AcquisitionEvent;
+pub(super) use crate::read::flight::Flights;
+pub(super) use crate::read::flight::JoinedCopy;
+pub(super) use crate::read::flight::JoinedFlight;
+pub(super) use crate::runtime::admission::AdmissionExt;
+pub(super) use crate::runtime::admission::AdmissionPolicy;
+pub(super) use crate::runtime::deadline::RequestScope;
+pub(super) use crate::security::aead::PageCrypto;
+pub(super) use crate::security::credentials::CredentialCrypto;
+pub(super) use crate::store::StoreReader;
+pub(super) use crate::store::StoreWriter;
+pub(super) use crate::telemetry::Event;
+pub(super) use crate::telemetry::Gauge;
+pub(super) use crate::telemetry::Metrics;
 pub(super) use std::{rc::Rc, sync::Arc};
 mod metadata {
     //! Metadata refresh, bootstrap publication, and independently timed callers.
@@ -1110,25 +1119,31 @@ mod pressure {
         assert!(deps.memory.get(&second).unwrap().is_some());
     }
 }
-pub(super) use crate::{
-    model::{
-        CacheId, CacheKey, ExpiresAt, ObjectId, ObjectVersion, PageNumber, RequestId,
-        ResourceClass, StrongEtag, WorkerId,
-    },
-    origin::{MetadataReply, OriginPage},
-    read::dispatch::WorkerDirectory,
-    runtime::{
-        crypto::{self, CryptoClient},
-        reactor::Reactor,
-        worker::{CryptoRuntime, CryptoService, WorkerMap},
-    },
-    security::aead::PageCryptoEngine,
-    store::catalog::{Index, SegmentClock},
-    topology::{
-        membership::{Member, Membership},
-        routing::Placement,
-    },
-};
+pub(super) use crate::model::CacheId;
+pub(super) use crate::model::CacheKey;
+pub(super) use crate::model::ExpiresAt;
+pub(super) use crate::model::ObjectId;
+pub(super) use crate::model::ObjectVersion;
+pub(super) use crate::model::PageNumber;
+pub(super) use crate::model::RequestId;
+pub(super) use crate::model::ResourceClass;
+pub(super) use crate::model::StrongEtag;
+pub(super) use crate::model::WorkerId;
+pub(super) use crate::origin::MetadataReply;
+pub(super) use crate::origin::OriginPage;
+pub(super) use crate::read::dispatch::WorkerDirectory;
+pub(super) use crate::runtime::crypto;
+pub(super) use crate::runtime::crypto::CryptoClient;
+pub(super) use crate::runtime::reactor::Reactor;
+pub(super) use crate::runtime::worker::CryptoRuntime;
+pub(super) use crate::runtime::worker::CryptoService;
+pub(super) use crate::runtime::worker::WorkerMap;
+pub(super) use crate::security::aead::PageCryptoEngine;
+pub(super) use crate::store::catalog::Index;
+pub(super) use crate::store::catalog::SegmentClock;
+pub(super) use crate::topology::Member;
+pub(super) use crate::topology::Membership;
+pub(super) use crate::topology::Placement;
 pub(super) use std::{
     cell::{Cell, RefCell},
     future::Future,
@@ -1229,7 +1244,7 @@ pub(super) struct Fixture {
     pub(super) crypto: Rc<CryptoClient>,
     pub(super) engine: PageCryptoEngine,
     pub(super) context: OriginContext,
-    pub(super) membership: MembershipLease,
+    pub(super) membership: std::sync::Arc<crate::topology::Membership>,
     pub(super) page: PageId,
     pub(super) scope: RequestScope,
     pub(super) directory: std::path::PathBuf,
@@ -1244,10 +1259,7 @@ impl Fixture {
         Rc::new(Index::new(
             WorkerId(0),
             capacity,
-            crate::control::state::for_caches(
-                self.keys.clone(),
-                vec![self.context.object.cache.clone()],
-            ),
+            crate::control::for_caches(self.keys.clone(), vec![self.context.object.cache.clone()]),
         ))
     }
 
@@ -1284,25 +1296,24 @@ impl Fixture {
     pub(super) fn read_graph(
         &self,
         fill: Rc<Fill>,
-        membership: &MembershipLease,
+        membership: &std::sync::Arc<crate::topology::Membership>,
         settings: ReadGraphSettings,
     ) -> (
         Rc<crate::read::Coordinator>,
         crate::read::dispatch::WorkerEndpoint,
-        Arc<crate::control::state::PublishedState>,
+        Arc<crate::control::PublishedState>,
     ) {
-        use crate::{
-            control::{
-                state::Publication,
-                state::{Availability, CacheDefinition, PublishedState, SnapshotStore},
-            },
-            memory::{delivery::Delivery, new_pipe_pool},
-            read::{
-                Coordinator,
-                metadata::{MetadataDependencies, MetadataService},
-                range_stream::RangeStreams,
-            },
-        };
+        use crate::control::Availability;
+        use crate::control::PublishedState;
+        use crate::control::SnapshotStore;
+        use crate::memory::delivery::Delivery;
+        use crate::memory::new_pipe_pool;
+        use crate::read::Coordinator;
+        use crate::read::metadata::MetadataDependencies;
+        use crate::read::metadata::MetadataService;
+        use crate::read::range_stream::RangeStreams;
+        use racer_control_wire::CacheDefinition;
+        use racer_control_wire::Publication;
         use racer_control_wire::{PublicationSequence, SCHEMA_VERSION};
         let published = Arc::new(PublishedState::default());
         let availability = Rc::new(Availability::new(published.clone(), self.keys.clone()));
@@ -1312,14 +1323,19 @@ impl Fixture {
             settings.snapshots,
         ));
         let (client_socket, origin_socket) =
-            crate::control::state::canonical_socket_paths(settings.name).unwrap();
+            racer_control_wire::canonical_socket_paths(settings.name).unwrap();
         snapshots
             .publish(Publication {
                 schema_version: SCHEMA_VERSION,
                 cluster: self.keys.cluster().clone(),
                 sequence: PublicationSequence(1),
                 membership_version: membership.version,
-                members: membership.members().to_vec(),
+                members: membership
+                    .members()
+                    .iter()
+                    .cloned()
+                    .map(Into::into)
+                    .collect(),
                 caches: vec![CacheDefinition {
                     id: self.context.object.cache.clone(),
                     name: settings.name.into(),
@@ -1425,7 +1441,7 @@ fn fixture_with_caches(
         config.limits.clone(),
     )));
     let keys = Rc::new(crate::security::test_support::keys_for(&caches));
-    let availability = crate::control::state::for_caches(keys.clone(), caches);
+    let availability = crate::control::for_caches(keys.clone(), caches);
     let buffers = BufferPool::new(admission.clone());
     let memory = Rc::new(MemoryCache::new(buffers.clone(), availability.clone()));
     let reactor = Rc::new(Reactor::new(admission.clone()));
@@ -1590,10 +1606,9 @@ fn adapter_client(
     f: &Fixture,
     adapter: &crate::test_support::origin::AdapterOrigin,
 ) -> Rc<crate::origin::OriginClient> {
-    use crate::control::{
-        state::Publication,
-        state::{PublishedState, SnapshotStore},
-    };
+    use crate::control::PublishedState;
+    use crate::control::SnapshotStore;
+    use racer_control_wire::Publication;
     use racer_control_wire::{PublicationSequence, SCHEMA_VERSION};
     let snapshots = Rc::new(SnapshotStore::new(
         f.keys.cluster().clone(),
@@ -1601,15 +1616,21 @@ fn adapter_client(
         2,
     ));
     let (client_socket, origin_socket) =
-        crate::control::state::canonical_socket_paths("fixture").unwrap();
+        racer_control_wire::canonical_socket_paths("fixture").unwrap();
     snapshots
         .publish(Publication {
             schema_version: SCHEMA_VERSION,
             cluster: f.keys.cluster().clone(),
             sequence: PublicationSequence(1),
             membership_version: f.membership.version,
-            members: f.membership.members().to_vec(),
-            caches: vec![crate::control::state::CacheDefinition {
+            members: f
+                .membership
+                .members()
+                .iter()
+                .cloned()
+                .map(Into::into)
+                .collect(),
+            caches: vec![racer_control_wire::CacheDefinition {
                 id: f.context.object.cache.clone(),
                 name: "fixture".into(),
                 client_socket,
@@ -3204,7 +3225,7 @@ fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
         deps.memory.ciphertext(&f.page).unwrap().is_none(),
         "target must be disk-only"
     );
-    let failures = crate::telemetry::failures::Failures::default();
+    let failures = crate::telemetry::Failures::default();
     deps.admission.set_observer(failures.observer(WorkerId(0)));
     let index = f.metadata_index(64);
     let mut fresh = metadata.clone();

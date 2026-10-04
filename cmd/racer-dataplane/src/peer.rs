@@ -7,10 +7,9 @@ pub mod subscriptions;
 pub(crate) mod tests;
 mod timing {
     use super::protocol::{Operation, PeerRequest, PeerResponse, VerifiedResponse};
-    use crate::{
-        telemetry::metrics::{Event, Metrics},
-        topology::rails::TransportPlan,
-    };
+    use crate::rdma::TransportPlan;
+    use crate::telemetry::Event;
+    use crate::telemetry::Metrics;
     use std::time::Instant;
     use uring_runtime::environment::now;
 
@@ -67,8 +66,8 @@ mod timing {
             {
                 // Concurrent scrapes are not atomic snapshots.
                 for ((count, sum), duration) in STAGES.into_iter().zip(self.durations) {
-                    let _ = self.metrics.record(sum, duration);
-                    let _ = self.metrics.record(count, 1);
+                    self.metrics.record(sum, duration);
+                    self.metrics.record(count, 1);
                 }
                 self.active = false;
             }
@@ -77,7 +76,7 @@ mod timing {
     impl Drop for PageTiming<'_> {
         fn drop(&mut self) {
             if self.active {
-                let _ = self.metrics.record(Event::PeerPageCensored, 1);
+                self.metrics.record(Event::PeerPageCensored, 1);
             }
         }
     }
@@ -112,42 +111,46 @@ use self::{
     protocol::{PeerRequest, SignedRequest, SignedResponse, VerifiedRequest, VerifiedResponse},
     transport::Transfers,
 };
-use crate::telemetry::failures::{Observer, Stage};
-use crate::{
-    error::{Error, Operation, Result},
-    model::{MembershipVersion, NodeId, ResourceClass},
-    runtime::admission::AdmissionPolicy,
-    runtime::deadline::RequestScope,
-    security::forwarding::Forwarding,
-    topology::{membership::MembershipLease, rails, routing::Paths},
-};
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::model::MembershipVersion;
+use crate::model::NodeId;
+use crate::model::ResourceClass;
+use crate::rdma;
+use crate::runtime::admission::AdmissionPolicy;
+use crate::runtime::deadline::RequestScope;
+use crate::security::forwarding::Forwarding;
+use crate::telemetry::Observer;
+use crate::telemetry::Stage;
+use crate::topology::Paths;
 use std::{rc::Rc, sync::Arc};
 
 /// Worker-local identity and a handle to the sole node-wide incoming registry.
 /// Outbound operations route directly from their retained membership lease.
 pub struct PeerNetwork {
     pub local: NodeId,
-    published: Arc<crate::control::state::PublishedState>,
+    published: Arc<crate::control::PublishedState>,
 }
 
 impl PeerNetwork {
-    pub fn new(
-        local: NodeId,
-        published: Arc<crate::control::state::PublishedState>,
-    ) -> Result<Self> {
+    pub fn new(local: NodeId, published: Arc<crate::control::PublishedState>) -> Result<Self> {
         if local.0.is_empty() {
             return Err(Error::InvalidConfiguration);
         }
         Ok(Self { local, published })
     }
 
-    pub fn membership(&self, version: MembershipVersion) -> Result<MembershipLease> {
+    pub fn membership(
+        &self,
+        version: MembershipVersion,
+    ) -> Result<std::sync::Arc<crate::topology::Membership>> {
         self.published.membership(version)
     }
 
     pub fn endpoint(
         &self,
-        membership: &MembershipLease,
+        membership: &std::sync::Arc<crate::topology::Membership>,
         node: &NodeId,
     ) -> Result<crate::http::Endpoint> {
         if !membership.neighbors(&self.local)?.contains(node) {
@@ -183,7 +186,7 @@ pub(crate) fn request_scope(
 
 pub(crate) fn check_membership(
     request: &protocol::PeerRequest,
-    membership: &MembershipLease,
+    membership: &std::sync::Arc<crate::topology::Membership>,
 ) -> Result<()> {
     if request.route.membership != membership.version {
         return Err(Error::IncompatibleMembership);
@@ -192,9 +195,9 @@ pub(crate) fn check_membership(
 }
 
 pub(crate) fn search_budget(
-    route: &crate::topology::routing::RouteBudget,
+    route: &crate::topology::RouteBudget,
     local: &NodeId,
-) -> Result<crate::topology::routing::RouteBudget> {
+) -> Result<crate::topology::RouteBudget> {
     let mut budget = route.clone();
     if budget.visited.last() == Some(local) {
         budget.visited.pop();
@@ -240,16 +243,16 @@ impl Relay {
     ///
     /// ```compile_fail
     /// use racer_dataplane::{peer::{Relay, protocol::SignedRequest},
-    ///     runtime::deadline::RequestScope, topology::membership::MembershipLease};
+    ///     runtime::deadline::RequestScope, topology::Membership};
     /// fn unverified(relay: &Relay, request: SignedRequest,
-    ///     membership: MembershipLease, scope: &RequestScope) {
+    ///     membership: std::sync::Arc<Membership>, scope: &RequestScope) {
     ///     relay.forward(request, membership, scope);
     /// }
     /// ```
     pub fn forward<'a>(
         &'a self,
         request: VerifiedRequest,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
     ) -> Operation<'a, SignedResponse> {
         Box::pin(async move {
@@ -263,7 +266,7 @@ impl Relay {
     pub(crate) fn forward_inner<'a>(
         &'a self,
         request: VerifiedRequest,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         relay: Option<Rc<flow_control::Charge<AdmissionPolicy>>>,
         scope: &'a RequestScope,
     ) -> Operation<'a, transport::RelayResponse> {
@@ -298,7 +301,7 @@ impl Relay {
                 .remaining_links
                 .checked_sub(1)
                 .ok_or(Error::HopBudgetExhausted)?;
-            let outbound_budget = crate::topology::routing::RouteBudget {
+            let outbound_budget = crate::topology::RouteBudget {
                 membership: budget.membership,
                 request: budget.request,
                 attempt: budget.attempt,
@@ -359,11 +362,13 @@ pub enum Requester {
     Network(NetworkRequester),
     #[cfg(any(test, feature = "subscription-interop"))]
     Scripted {
-        available: Box<dyn Fn(&MembershipLease, &crate::model::NodeId) -> bool>,
+        available: Box<
+            dyn Fn(&std::sync::Arc<crate::topology::Membership>, &crate::model::NodeId) -> bool,
+        >,
         request: Box<
             dyn Fn(
                 PeerRequest,
-                MembershipLease,
+                std::sync::Arc<crate::topology::Membership>,
                 RequestScope,
                 bool,
             ) -> Operation<'static, VerifiedResponse>,
@@ -374,17 +379,21 @@ impl Requester {
     #[cfg(any(test, feature = "subscription-interop"))]
     pub(crate) fn scripted<T: 'static>(
         state: Rc<T>,
-        available: fn(&T, &MembershipLease, &crate::model::NodeId) -> bool,
+        available: fn(
+            &T,
+            &std::sync::Arc<crate::topology::Membership>,
+            &crate::model::NodeId,
+        ) -> bool,
         request: for<'a> fn(
             &'a T,
             PeerRequest,
-            MembershipLease,
+            std::sync::Arc<crate::topology::Membership>,
             &'a RequestScope,
         ) -> Operation<'a, VerifiedResponse>,
         direct: for<'a> fn(
             &'a T,
             PeerRequest,
-            MembershipLease,
+            std::sync::Arc<crate::topology::Membership>,
             &'a RequestScope,
         ) -> Operation<'a, VerifiedResponse>,
     ) -> Rc<Self> {
@@ -418,7 +427,7 @@ impl Requester {
             scripted => scripted,
         }
     }
-    pub(crate) fn with_metrics(self, metrics: crate::telemetry::metrics::Metrics) -> Self {
+    pub(crate) fn with_metrics(self, metrics: crate::telemetry::Metrics) -> Self {
         match self {
             Self::Network(network) => Self::Network(network.with_metrics(metrics)),
             #[cfg(any(test, feature = "subscription-interop"))]
@@ -434,7 +443,7 @@ impl Requester {
     }
     pub fn direct_hedge_available(
         &self,
-        membership: &MembershipLease,
+        membership: &std::sync::Arc<crate::topology::Membership>,
         destination: &crate::model::NodeId,
     ) -> bool {
         match self {
@@ -446,7 +455,7 @@ impl Requester {
     pub fn request_direct<'a>(
         &'a self,
         request: PeerRequest,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
     ) -> Operation<'a, VerifiedResponse> {
         match self {
@@ -460,7 +469,7 @@ impl Requester {
     pub fn request<'a>(
         &'a self,
         request: PeerRequest,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
     ) -> Operation<'a, VerifiedResponse> {
         match self {
@@ -482,12 +491,12 @@ impl Requester {
 ///     Relay, server::PeerServer,
 ///     protocol::{PeerRequest, SignedRequest, SignedResponse, VerifiedResponse}},
 ///     runtime::deadline::RequestScope, security::forwarding::Forwarding,
-///     topology::membership::MembershipLease};
+///     topology::Membership};
 /// async fn interfaces(
 ///     client: &Requester, transport: &Requester,
 ///     server: &PeerServer, relay: &Relay, auth: &Forwarding,
 ///     local: PeerRequest, wire: SignedRequest, outbound: SignedRequest,
-///     inbound: SignedRequest, membership: MembershipLease, scope: &RequestScope,
+///     inbound: SignedRequest, membership: std::sync::Arc<Membership>, scope: &RequestScope,
 /// ) -> Result<()> {
 ///     let verified: VerifiedResponse = client.request(local, membership.clone(), scope).await?;
 ///     let _wire_response: SignedResponse = verified.into_signed();
@@ -503,9 +512,9 @@ impl Requester {
 pub struct NetworkRequester {
     #[cfg(test)]
     outbound_requests: std::cell::Cell<usize>,
-    metrics: crate::telemetry::metrics::Metrics,
+    metrics: crate::telemetry::Metrics,
     observer: Observer,
-    health: Rc<crate::topology::health::LinkHealth>,
+    health: Rc<crate::topology::LinkHealth>,
     paths: Rc<Paths>,
     forwarding: Rc<Forwarding>,
     transfers: Rc<Transfers>,
@@ -525,7 +534,7 @@ impl NetworkRequester {
         Self {
             #[cfg(test)]
             outbound_requests: std::cell::Cell::new(0),
-            metrics: crate::telemetry::metrics::Metrics::default(),
+            metrics: crate::telemetry::Metrics::default(),
             observer: Observer::default(),
             health: paths.link_health(),
             paths,
@@ -538,7 +547,7 @@ impl NetworkRequester {
         self.observer = observer;
         self
     }
-    pub(crate) fn with_metrics(mut self, metrics: crate::telemetry::metrics::Metrics) -> Self {
+    pub(crate) fn with_metrics(mut self, metrics: crate::telemetry::Metrics) -> Self {
         self.metrics = metrics;
         self
     }
@@ -546,7 +555,7 @@ impl NetworkRequester {
 impl NetworkRequester {
     fn direct_hedge_available(
         &self,
-        membership: &MembershipLease,
+        membership: &std::sync::Arc<crate::topology::Membership>,
         destination: &crate::model::NodeId,
     ) -> bool {
         self.network.endpoint(membership, destination).is_ok()
@@ -560,7 +569,7 @@ impl NetworkRequester {
     fn request_direct<'a>(
         &'a self,
         request: PeerRequest,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
     ) -> Operation<'a, VerifiedResponse> {
         Box::pin(async move {
@@ -591,7 +600,7 @@ impl NetworkRequester {
     fn request<'a>(
         &'a self,
         request: PeerRequest,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
     ) -> Operation<'a, VerifiedResponse> {
         Box::pin(async move {
@@ -637,7 +646,7 @@ impl Requester {
     pub fn exchange_relay<'a>(
         &'a self,
         request: SignedRequest,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         reservation: Rc<flow_control::Charge<AdmissionPolicy>>,
         scope: &'a RequestScope,
     ) -> Operation<'a, transport::RelayResponse> {
@@ -652,7 +661,7 @@ impl Requester {
     pub fn exchange<'a>(
         &'a self,
         request: SignedRequest,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
     ) -> Operation<'a, SignedResponse> {
         match self {
@@ -666,7 +675,7 @@ impl NetworkRequester {
     fn exchange_relay<'a>(
         &'a self,
         request: SignedRequest,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         reservation: Rc<flow_control::Charge<AdmissionPolicy>>,
         scope: &'a RequestScope,
     ) -> Operation<'a, transport::RelayResponse> {
@@ -676,7 +685,7 @@ impl NetworkRequester {
     pub fn exchange<'a>(
         &'a self,
         request: SignedRequest,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
     ) -> Operation<'a, SignedResponse> {
         Box::pin(async move {
@@ -694,7 +703,7 @@ impl NetworkRequester {
     fn exchange_inner<'a>(
         &'a self,
         request: SignedRequest,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         relay: Option<Rc<flow_control::Charge<AdmissionPolicy>>>,
         scope: &'a RequestScope,
     ) -> Operation<'a, transport::RelayResponse> {
@@ -703,7 +712,7 @@ impl NetworkRequester {
     fn exchange_inner_mode<'a>(
         &'a self,
         request: SignedRequest,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         relay: Option<Rc<flow_control::Charge<AdmissionPolicy>>>,
         scope: &'a RequestScope,
         direct_http: bool,
@@ -744,7 +753,7 @@ impl NetworkRequester {
                 if next != budget.destination {
                     return Err(Error::InvalidRequest);
                 }
-                crate::topology::rails::TransportPlan::Http
+                crate::rdma::TransportPlan::Http
             } else if let Some(page) = rail_hint {
                 let search = search_budget(budget, &network.local)?;
                 let route = self
@@ -754,9 +763,9 @@ impl NetworkRequester {
                 if route.nodes.get(1) != Some(&next) {
                     return Err(Error::Unavailable);
                 }
-                rails::select_hop(&route, &page, &network.local, &next)?
+                rdma::select_hop(&route, &page, &network.local, &next)?
             } else {
-                crate::topology::rails::TransportPlan::Http
+                crate::rdma::TransportPlan::Http
             };
             let _probe = self.health.acquire(&next)?;
             let permit = self
@@ -784,7 +793,7 @@ impl NetworkRequester {
             // Receiving a signed envelope is not proof. Recover only after the
             // complete reverse chain and original request binding are verified.
             let response = response.and_then(|response| self.verify_exchange(response, &binding));
-            use crate::topology::health::LinkOutcome;
+            use crate::topology::LinkOutcome;
             let outcome = match &response {
                 Ok(transport::RelayResponse::Complete(_)) => Some(LinkOutcome::Success),
                 Err(_) if permit.is_none() && socket_failure.get() => Some(LinkOutcome::Refused),

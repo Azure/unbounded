@@ -879,13 +879,15 @@ fn production_multicache_disk_baseline() {
 #[test]
 #[ignore = "requires root, mount namespaces, io_uring and O_DIRECT; two actual Applications with authenticated TCP peers"]
 fn production_peer_and_failed_neighbor_progress() {
-    use racer_dataplane::{
-        model::{CacheId, CacheKey, MembershipVersion, NodeId, ObjectId, PageNumber},
-        topology::{
-            membership::{Member, Membership},
-            routing::Placement,
-        },
-    };
+    use racer_dataplane::model::CacheId;
+    use racer_dataplane::model::CacheKey;
+    use racer_dataplane::model::MembershipVersion;
+    use racer_dataplane::model::NodeId;
+    use racer_dataplane::model::ObjectId;
+    use racer_dataplane::model::PageNumber;
+    use racer_dataplane::topology::Member;
+    use racer_dataplane::topology::Membership;
+    use racer_dataplane::topology::Placement;
     const OTHER: &str = "33333333-3333-4333-8333-333333333333";
     for pairs in [1, 2, 4] {
         let first_root = Scratch::new();
@@ -1017,13 +1019,15 @@ fn production_peer_and_failed_neighbor_progress() {
 #[test]
 #[ignore = "requires root, mount namespaces, io_uring and O_DIRECT; actual noncandidate subscription"]
 fn production_remote_bootstrap_one_get_and_empty() {
-    use racer_dataplane::{
-        model::{CacheId, CacheKey, MembershipVersion, NodeId, ObjectId, PageNumber},
-        topology::{
-            membership::{Member, Membership},
-            routing::Placement,
-        },
-    };
+    use racer_dataplane::model::CacheId;
+    use racer_dataplane::model::CacheKey;
+    use racer_dataplane::model::MembershipVersion;
+    use racer_dataplane::model::NodeId;
+    use racer_dataplane::model::ObjectId;
+    use racer_dataplane::model::PageNumber;
+    use racer_dataplane::topology::Member;
+    use racer_dataplane::topology::Membership;
+    use racer_dataplane::topology::Placement;
     for length in [0, 113] {
         let roots: Vec<_> = (0..4).map(|_| Scratch::new()).collect();
         let profile = Profile::new(1, length, 1);

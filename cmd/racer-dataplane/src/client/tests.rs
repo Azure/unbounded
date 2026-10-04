@@ -1,15 +1,13 @@
 //! Client socket scenarios: ownership, publication, HTTP delivery, and retirement.
 use super::*;
 use super::{listener::*, response::Responses};
-use crate::{
-    control::state::CacheDefinition,
-    http::HttpIo,
-    runtime::{
-        admission::AdmissionPolicy,
-        deadline::{Cancellation, RequestScope},
-    },
-    test_support::{ReadWorker, origin::RequestKind},
-};
+use crate::http::HttpIo;
+use crate::runtime::admission::AdmissionPolicy;
+use crate::runtime::deadline::Cancellation;
+use crate::runtime::deadline::RequestScope;
+use crate::test_support::ReadWorker;
+use crate::test_support::origin::RequestKind;
+use racer_control_wire::CacheDefinition;
 use std::time::Instant;
 use std::{
     cell::{Cell, RefCell},
@@ -953,7 +951,8 @@ impl Fixture {
         self.root.0.join("example/client/socket")
     }
     fn assert_metrics(&self, requests: u64, errors: u64, active: u64) {
-        use crate::telemetry::metrics::{Event, Gauge};
+        use crate::telemetry::Event;
+        use crate::telemetry::Gauge;
         assert_eq!(self.listeners.metrics.count(Event::Request), requests);
         assert_eq!(self.listeners.metrics.count(Event::RequestError), errors);
         assert_eq!(self.listeners.metrics.gauge(Gauge::ActiveRequests), active);
@@ -1161,7 +1160,8 @@ fn configured_timeout_starts_fresh_operations_after_headers_and_on_reuse() {
 #[test]
 fn accepted_client_wakes_before_first_poll_and_blocked_clients_are_fair() {
     use crate::test_support::WakeCounter;
-    use std::{sync::Arc, task::Waker};
+    use std::sync::Arc;
+    use std::task::Waker;
     let fixture = Fixture::new();
     fixture.reconcile(&[definition()]).unwrap();
     let _socket = fixture.connect();
@@ -1271,10 +1271,10 @@ fn install_body_worker(
     large: bool,
     fail_first: bool,
 ) {
-    use crate::{
-        model::{CacheKey, ObjectId, PAGE_BYTES},
-        test_support::ReadWorker,
-    };
+    use crate::model::CacheKey;
+    use crate::model::ObjectId;
+    use crate::model::PAGE_BYTES;
+    use crate::test_support::ReadWorker;
     let length = if large { PAGE_BYTES + 1 } else { 5 };
     let worker = ReadWorker::new(
         definition(),
@@ -1352,7 +1352,7 @@ fn actual_uds_nonempty_range_and_late_failure_truncates() {
     ] {
         let mut fixture = Fixture::new();
         let admission = fixture.listeners.admission.clone();
-        let failures = crate::telemetry::failures::Failures::default();
+        let failures = crate::telemetry::Failures::default();
         let observer = failures.observer(WorkerId(0));
         let delivery = Rc::new(Delivery::new(
             Rc::new(new_pipe_pool(admission.clone())),
@@ -1682,7 +1682,7 @@ fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
     // together, in addition to listener readiness. Keep reactor headroom
     // while independently exercising the bounded FIFO pipe queue.
     let (mut fixture, pipes) = body_fixture(4, false);
-    let failures = crate::telemetry::failures::Failures::default();
+    let failures = crate::telemetry::Failures::default();
     fixture.listeners.responses = Rc::new(
         Responses::new(
             fixture.listeners.io.clone(),
@@ -1724,7 +1724,7 @@ fn actual_uds_pipe_waiters_progress_within_budget_and_overflow_before_206() {
 #[test]
 fn actual_uds_first_page_failure_is_complete_503() {
     let (mut fixture, _pipes) = body_fixture(16, true);
-    let failures = crate::telemetry::failures::Failures::default();
+    let failures = crate::telemetry::Failures::default();
     let delivery = Rc::new(Delivery::new(
         _pipes.clone(),
         fixture.reactor.clone(),
@@ -2051,7 +2051,7 @@ fn actual_uds_read_failures_and_immutable_result_validation() {
         fixture
             .listeners
             .metrics
-            .count(crate::telemetry::metrics::Event::Overload),
+            .count(crate::telemetry::Event::Overload),
         1
     );
     for wrong_object in [true, false] {

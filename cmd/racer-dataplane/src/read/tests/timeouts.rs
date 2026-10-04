@@ -1,30 +1,43 @@
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::model::ExpiresAt;
+use crate::model::MembershipVersion;
+use crate::model::MetadataSelector;
+use crate::model::NodeId;
+use crate::model::ObjectMetadata;
+use crate::model::ObjectVersion;
+use crate::model::OriginContext;
+use crate::model::PageNumber;
+use crate::model::RequestId;
+use crate::model::StrongEtag;
+use crate::peer::Requester;
+use crate::peer::protocol::FetchMode;
+use crate::peer::protocol::Operation as PeerOperation;
+use crate::peer::protocol::PeerRequest;
+use crate::peer::protocol::PeerResponse;
+use crate::peer::protocol::VerifiedResponse;
 use crate::read::candidates::*;
-use crate::{
-    error::{Error, Operation, Result},
-    model::{MetadataSelector, NodeId, OriginContext, PageNumber},
-    peer::{
-        Requester,
-        protocol::{
-            FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse, VerifiedResponse,
-        },
-    },
-    read::flight::AcquisitionBudget,
-    runtime::deadline::{Deadline, RequestScope},
-    topology::routing::Candidates,
-};
-use crate::{
-    model::{ExpiresAt, MembershipVersion, ObjectMetadata, ObjectVersion, RequestId, StrongEtag},
-    security::{connection::Signatures, forwarding::Forwarding, test_support::network},
-    topology::membership::{Member, Membership},
-};
-use std::{
-    cell::Cell,
-    future::{Future, poll_fn},
-    pin::Pin,
-    task::{Context, Poll},
-    time::Duration,
-};
-use std::{cell::RefCell, rc::Rc, sync::Arc, time::Instant};
+use crate::read::flight::AcquisitionBudget;
+use crate::runtime::deadline::Deadline;
+use crate::runtime::deadline::RequestScope;
+use crate::security::connection::Signatures;
+use crate::security::forwarding::Forwarding;
+use crate::security::test_support::network;
+use crate::topology::Candidates;
+use crate::topology::Member;
+use crate::topology::Membership;
+use std::cell::Cell;
+use std::cell::RefCell;
+use std::future::Future;
+use std::future::poll_fn;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
+use std::time::Duration;
+use std::time::Instant;
 
 struct Call {
     scope: RequestScope,
@@ -85,7 +98,7 @@ impl Peers {
 impl Peers {
     fn direct_hedge_available(
         &self,
-        _: &crate::topology::membership::MembershipLease,
+        _: &std::sync::Arc<crate::topology::Membership>,
         _: &NodeId,
     ) -> bool {
         false
@@ -93,7 +106,7 @@ impl Peers {
     fn request_direct<'a>(
         &'a self,
         _: PeerRequest,
-        _: crate::topology::membership::MembershipLease,
+        _: std::sync::Arc<crate::topology::Membership>,
         _: &'a RequestScope,
     ) -> Operation<'a, VerifiedResponse> {
         panic!("completion-fence fixture does not admit direct hedges")
@@ -101,7 +114,7 @@ impl Peers {
     fn request<'a>(
         &'a self,
         request: PeerRequest,
-        membership: crate::topology::membership::MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
     ) -> Operation<'a, VerifiedResponse> {
         assert!(scope.deadline.0 <= request.route.deadline.0);

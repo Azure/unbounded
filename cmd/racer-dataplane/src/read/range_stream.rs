@@ -2,16 +2,21 @@
 //! A stream pins its version and length once. A late error terminates that stream;
 //! it cannot replace headers or reopen against a newer version.
 use super::{dispatch::WorkerDirectory, flight::AcquisitionBudget};
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::memory::delivery::Delivery;
+use crate::memory::delivery::ReaderLease;
 use crate::memory::page::PageResult;
-use crate::{
-    error::{Error, Operation, Result},
-    memory::delivery::{Delivery, ReaderLease},
-    model::{
-        ObjectMetadata, ObjectVersion, OriginContext, PAGE_BYTES, PageId, PageNumber, ResolvedRange,
-    },
-    runtime::{admission::AdmissionPolicy, deadline::RequestScope},
-    topology::membership::MembershipLease,
-};
+use crate::model::ObjectMetadata;
+use crate::model::ObjectVersion;
+use crate::model::OriginContext;
+use crate::model::PAGE_BYTES;
+use crate::model::PageId;
+use crate::model::PageNumber;
+use crate::model::ResolvedRange;
+use crate::runtime::admission::AdmissionPolicy;
+use crate::runtime::deadline::RequestScope;
 use flow_control::Window;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -144,10 +149,9 @@ mod subscription_tests {
     }
     #[test]
     fn canceled_gate_waiter_wakes_successor_without_releasing_live_fences() {
-        use std::{
-            sync::atomic::{AtomicUsize, Ordering},
-            task::Poll,
-        };
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        use std::task::Poll;
         #[derive(Default)]
         struct Wakes(AtomicUsize);
         impl futures::task::ArcWake for Wakes {
@@ -1209,7 +1213,7 @@ pub struct RangeStream {
     metadata: ObjectMetadata,
     range: ResolvedRange,
     context: OriginContext,
-    membership: MembershipLease,
+    membership: std::sync::Arc<crate::topology::Membership>,
     scope: RequestScope,
     directory: Arc<WorkerDirectory>,
     delivery: Rc<Delivery>,
@@ -1241,7 +1245,7 @@ impl RangeStreams {
         metadata: ObjectMetadata,
         range: ResolvedRange,
         context: OriginContext,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         scope: RequestScope,
     ) -> Result<RangeStream> {
         let budget = RangeBudget::ClientPages {
@@ -1634,15 +1638,23 @@ fn validate_pin(expected: &ObjectMetadata, actual: &ObjectMetadata) -> Result<()
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::model::{
-        ByteRange, CacheId, CacheKey, ExpiresAt, ObjectId, ObjectVersion, PAGE_BYTES, StrongEtag,
-    };
-    use crate::{
-        memory::new_pipe_pool,
-        model::{MembershipVersion, RequestId, ResourceClass, WorkerId},
-        runtime::{admission::AdmissionPolicy, reactor::Reactor, worker::WorkerMap},
-        topology::membership::Membership,
-    };
+    use crate::memory::new_pipe_pool;
+    use crate::model::ByteRange;
+    use crate::model::CacheId;
+    use crate::model::CacheKey;
+    use crate::model::ExpiresAt;
+    use crate::model::MembershipVersion;
+    use crate::model::ObjectId;
+    use crate::model::ObjectVersion;
+    use crate::model::PAGE_BYTES;
+    use crate::model::RequestId;
+    use crate::model::ResourceClass;
+    use crate::model::StrongEtag;
+    use crate::model::WorkerId;
+    use crate::runtime::admission::AdmissionPolicy;
+    use crate::runtime::reactor::Reactor;
+    use crate::runtime::worker::WorkerMap;
+    use crate::topology::Membership;
 
     struct Fixture {
         admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
@@ -2308,9 +2320,9 @@ pub(super) mod tests {
             metadata.length = total;
             metadata.version.object.cache = CacheId(crate::security::test_support::CACHE.into());
             let (client_socket, origin_socket) =
-                crate::control::state::canonical_socket_paths("framing").unwrap();
+                racer_control_wire::canonical_socket_paths("framing").unwrap();
             let worker = crate::test_support::ReadWorker::new(
-                crate::control::state::CacheDefinition {
+                racer_control_wire::CacheDefinition {
                     id: metadata.version.object.cache.clone(),
                     name: "framing".into(),
                     client_socket,
@@ -2428,7 +2440,7 @@ pub(super) mod tests {
             let work = async {
                 let connection = crate::http::from_accepted(server.into(), &admission)?;
                 let head = io.receive_head(connection, &scope).await?;
-                let metrics = crate::telemetry::metrics::Metrics::default();
+                let metrics = crate::telemetry::Metrics::default();
                 let mut observation = metrics.request()?;
                 responses
                     .send_subscription(

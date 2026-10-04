@@ -1,23 +1,31 @@
 //! Ranked acquisition and copy-only predecessor probes. Only a validated local
 //! candidate can mint origin authority; request headers never change placement.
 use super::flight::AcquisitionBudget;
-use crate::telemetry::failures::{Detail, Failure, Observer, Stage};
-use crate::{
-    error::{Error, Operation, Result},
-    model::{AttemptId, MetadataSelector, NodeId, ObjectId, OriginContext, PageNumber},
-    peer::{
-        Requester,
-        protocol::{
-            FetchMode, Operation as PeerOperation, PeerRequest, PeerResponse, VerifiedResponse,
-        },
-    },
-    runtime::deadline::{Deadline, RequestScope},
-    security::credentials::CredentialCrypto,
-    topology::{
-        membership::MembershipLease,
-        routing::{Candidates, Placement, RouteBudget},
-    },
-};
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::model::AttemptId;
+use crate::model::MetadataSelector;
+use crate::model::NodeId;
+use crate::model::ObjectId;
+use crate::model::OriginContext;
+use crate::model::PageNumber;
+use crate::peer::Requester;
+use crate::peer::protocol::FetchMode;
+use crate::peer::protocol::Operation as PeerOperation;
+use crate::peer::protocol::PeerRequest;
+use crate::peer::protocol::PeerResponse;
+use crate::peer::protocol::VerifiedResponse;
+use crate::runtime::deadline::Deadline;
+use crate::runtime::deadline::RequestScope;
+use crate::security::credentials::CredentialCrypto;
+use crate::telemetry::Detail;
+use crate::telemetry::Failure;
+use crate::telemetry::Observer;
+use crate::telemetry::Stage;
+use crate::topology::Candidates;
+use crate::topology::Placement;
+use crate::topology::RouteBudget;
 #[cfg(test)]
 use std::cell::RefCell;
 #[cfg(test)]
@@ -47,7 +55,7 @@ fn reserve_hedge_pages(
 }
 
 pub struct OriginAuthority {
-    membership: MembershipLease,
+    membership: std::sync::Arc<crate::topology::Membership>,
     node: NodeId,
     object: ObjectId,
     page: PageNumber,
@@ -71,7 +79,7 @@ pub struct CandidatePolicy {
     placement: Rc<Placement>,
     peers: Rc<Requester>,
     credentials: Rc<CredentialCrypto>,
-    published: Arc<crate::control::state::PublishedState>,
+    published: Arc<crate::control::PublishedState>,
 }
 #[derive(Clone, Copy)]
 enum RequestMode {
@@ -260,7 +268,7 @@ impl CandidatePolicy {
         version: crate::model::ObjectVersion,
         demand: crate::peer::subscriptions::Demand,
         scheduler: &super::range_stream::Scheduler,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         context: &OriginContext,
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
@@ -341,7 +349,7 @@ impl CandidatePolicy {
         placement: Rc<Placement>,
         peers: Rc<Requester>,
         credentials: Rc<CredentialCrypto>,
-        published: Arc<crate::control::state::PublishedState>,
+        published: Arc<crate::control::PublishedState>,
     ) -> Self {
         Self {
             hedge: None,
@@ -372,7 +380,7 @@ impl CandidatePolicy {
 
     pub fn candidates(
         &self,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         object: &ObjectId,
         page: PageNumber,
     ) -> Result<Candidates> {
@@ -386,12 +394,12 @@ impl CandidatePolicy {
             .take(3)
             .any(|node| node == &self.node)
     }
-    pub fn maintain(&self, membership: &MembershipLease) -> Result<()> {
+    pub fn maintain(&self, membership: &std::sync::Arc<crate::topology::Membership>) -> Result<()> {
         self.placement.maintain(membership)
     }
     pub fn candidates_scoped<'a>(
         &'a self,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         object: &ObjectId,
         page: PageNumber,
         scope: &'a RequestScope,
@@ -756,7 +764,7 @@ impl CandidatePolicy {
 
     pub(super) async fn request(
         &self,
-        membership: &MembershipLease,
+        membership: &std::sync::Arc<crate::topology::Membership>,
         destination: &NodeId,
         context: &OriginContext,
         operation: &PeerOperation,
@@ -780,7 +788,7 @@ impl CandidatePolicy {
     }
     async fn request_mode(
         &self,
-        membership: &MembershipLease,
+        membership: &std::sync::Arc<crate::topology::Membership>,
         destination: &NodeId,
         context: &OriginContext,
         operation: &PeerOperation,
@@ -836,7 +844,7 @@ impl CandidatePolicy {
         let mut complete_by = attempt_end;
         if remaining_opportunities > 1
             && budget.remaining_attempts() > 0
-            && budget.remaining_links() >= crate::topology::routing::FAILURE_LINKS
+            && budget.remaining_links() >= crate::topology::FAILURE_LINKS
         {
             // Reserve at most half the original post-share interval for fallback,
             // including subscription/fixed-page fallback. The local cap may be tighter.
@@ -1148,13 +1156,17 @@ pub(super) mod tests {
     fn candidate_failure_routes_spend_initial_allowance_with_four_then_eight_link_ceiling() {
         struct Routes(RefCell<Vec<(u8, u32)>>);
         impl Routes {
-            fn direct_hedge_available(&self, _: &MembershipLease, _: &NodeId) -> bool {
+            fn direct_hedge_available(
+                &self,
+                _: &std::sync::Arc<crate::topology::Membership>,
+                _: &NodeId,
+            ) -> bool {
                 false
             }
             fn request_direct<'a>(
                 &'a self,
                 _: PeerRequest,
-                _: MembershipLease,
+                _: std::sync::Arc<crate::topology::Membership>,
                 _: &'a RequestScope,
             ) -> Operation<'a, VerifiedResponse> {
                 panic!("route-budget fixture does not admit direct hedges")
@@ -1162,7 +1174,7 @@ pub(super) mod tests {
             fn request<'a>(
                 &'a self,
                 request: PeerRequest,
-                _: MembershipLease,
+                _: std::sync::Arc<crate::topology::Membership>,
                 _: &'a RequestScope,
             ) -> Operation<'a, VerifiedResponse> {
                 self.0.borrow_mut().push((
@@ -1228,13 +1240,17 @@ pub(super) mod tests {
         error: Error,
     }
     impl ProbePeer {
-        fn direct_hedge_available(&self, _: &MembershipLease, _: &NodeId) -> bool {
+        fn direct_hedge_available(
+            &self,
+            _: &std::sync::Arc<crate::topology::Membership>,
+            _: &NodeId,
+        ) -> bool {
             false
         }
         fn request_direct<'a>(
             &'a self,
             _: PeerRequest,
-            _: MembershipLease,
+            _: std::sync::Arc<crate::topology::Membership>,
             _: &'a RequestScope,
         ) -> Operation<'a, VerifiedResponse> {
             panic!("probe fixture does not admit direct hedges")
@@ -1242,7 +1258,7 @@ pub(super) mod tests {
         fn request<'a>(
             &'a self,
             request: PeerRequest,
-            _: MembershipLease,
+            _: std::sync::Arc<crate::topology::Membership>,
             _: &'a RequestScope,
         ) -> Operation<'a, VerifiedResponse> {
             let copy = matches!(
@@ -1262,18 +1278,18 @@ pub(super) mod tests {
         }
     }
     pub(crate) fn fixture() -> (
-        MembershipLease,
+        std::sync::Arc<crate::topology::Membership>,
         Rc<Placement>,
         OriginContext,
         RequestScope,
         Rc<CredentialCrypto>,
     ) {
-        use crate::{
-            model::ClusterId,
-            model::{MembershipVersion, RequestId},
-            runtime::admission::AdmissionPolicy,
-            topology::membership::{Member, Membership},
-        };
+        use crate::model::ClusterId;
+        use crate::model::MembershipVersion;
+        use crate::model::RequestId;
+        use crate::runtime::admission::AdmissionPolicy;
+        use crate::topology::Member;
+        use crate::topology::Membership;
         use racer_identity::{KeyEpochs, Keyring};
         let membership = std::sync::Arc::new(
             Membership::validate(
@@ -1534,13 +1550,17 @@ pub(super) mod tests {
         error: Error,
     }
     impl RecordedPeer {
-        fn direct_hedge_available(&self, _: &MembershipLease, _: &NodeId) -> bool {
+        fn direct_hedge_available(
+            &self,
+            _: &std::sync::Arc<crate::topology::Membership>,
+            _: &NodeId,
+        ) -> bool {
             false
         }
         fn request_direct<'a>(
             &'a self,
             _: PeerRequest,
-            _: MembershipLease,
+            _: std::sync::Arc<crate::topology::Membership>,
             _: &'a RequestScope,
         ) -> Operation<'a, VerifiedResponse> {
             panic!("candidate-recording fixture does not admit direct hedges")
@@ -1548,7 +1568,7 @@ pub(super) mod tests {
         fn request<'a>(
             &'a self,
             request: PeerRequest,
-            _: MembershipLease,
+            _: std::sync::Arc<crate::topology::Membership>,
             _scope: &'a RequestScope,
         ) -> Operation<'a, VerifiedResponse> {
             Box::pin(async move {
@@ -1567,11 +1587,10 @@ pub(super) mod tests {
             })
         }
     }
-    fn membership() -> MembershipLease {
-        use crate::{
-            model::MembershipVersion,
-            topology::membership::{Member, Membership},
-        };
+    fn membership() -> std::sync::Arc<crate::topology::Membership> {
+        use crate::model::MembershipVersion;
+        use crate::topology::Member;
+        use crate::topology::Membership;
         std::sync::Arc::new(
             Membership::validate(
                 MembershipVersion(1),

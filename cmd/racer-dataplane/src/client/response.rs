@@ -1,6 +1,6 @@
 //! Central status mapping and streaming body delivery, including late truncation.
 use super::ReadKind;
-use crate::telemetry::failures::Observer;
+use crate::telemetry::Observer;
 use crate::{
     error::{Error, Operation, Result},
     http::{ConnectionLease, HttpIo},
@@ -192,7 +192,7 @@ mod subscription {
             timeout: Duration,
         ) -> Operation<'a, ConnectionLease> {
             Box::pin(async move {
-                let metrics = crate::telemetry::metrics::Metrics::default();
+                let metrics = crate::telemetry::Metrics::default();
                 let mut observation = metrics.request()?;
                 self.send_subscription(connection, response, scope, &mut observation, timeout)
                     .await
@@ -204,7 +204,7 @@ mod subscription {
             mut connection: ConnectionLease,
             mut response: ReadResponse,
             scope: &'a RequestScope,
-            observation: &'a mut crate::telemetry::metrics::RequestMetrics,
+            observation: &'a mut crate::telemetry::RequestMetrics,
             timeout: Duration,
         ) -> Operation<'a, ConnectionLease> {
             Box::pin(async move {
@@ -216,8 +216,8 @@ mod subscription {
                         result => {
                             let error = result.err().unwrap_or(Error::BadGateway);
                             self.observer.record(
-                                crate::telemetry::failures::Failure::new(
-                                    crate::telemetry::failures::Stage::FirstSlice,
+                                crate::telemetry::Failure::new(
+                                    crate::telemetry::Stage::FirstSlice,
                                     error,
                                 )
                                 .request(scope),
@@ -286,17 +286,12 @@ mod subscription {
                             .await
                             .inspect_err(|&error| {
                                 self.observer.record(
-                                    crate::telemetry::failures::Failure::new(
-                                        crate::telemetry::failures::Stage::NextSlice,
+                                    crate::telemetry::Failure::new(
+                                        crate::telemetry::Stage::NextSlice,
                                         error,
                                     )
                                     .request(scope)
-                                    .detail(
-                                        crate::telemetry::failures::Detail::Delivery {
-                                            sent,
-                                            expected,
-                                        },
-                                    ),
+                                    .detail(crate::telemetry::Detail::Delivery { sent, expected }),
                                 );
                             })?
                             .ok_or(Error::BadGateway)?
@@ -672,7 +667,7 @@ impl Responses {
         connection: ConnectionLease,
         response: ReadResponse,
         scope: &'a RequestScope,
-        observation: &'a mut crate::telemetry::metrics::RequestMetrics,
+        observation: &'a mut crate::telemetry::RequestMetrics,
     ) -> Operation<'a, ConnectionLease> {
         self.send_inner(connection, response, scope, Some(observation))
     }
@@ -682,7 +677,7 @@ impl Responses {
         mut connection: ConnectionLease,
         response: ReadResponse,
         scope: &'a RequestScope,
-        mut observation: Option<&'a mut crate::telemetry::metrics::RequestMetrics>,
+        mut observation: Option<&'a mut crate::telemetry::RequestMetrics>,
     ) -> Operation<'a, ConnectionLease> {
         Box::pin(async move {
             scope.check()?;

@@ -11,59 +11,79 @@
 //! Cache removal closes new admission; accepted resource owners drain independently.
 //! Startup failures roll back created resources. Constructors perform no operational I/O.
 
-use crate::telemetry::metrics::Gauge;
-use crate::{
-    client::{RequestParser, listener::ClientListeners, response::Responses},
-    config::Config,
-    control::{
-        BundleInstaller, ControlClient, ControlEndpoint,
-        enrollment::Enrollment,
-        state::{PublishedState, SnapshotStore},
-        transport::ReactorControlIo,
-    },
-    error::{Error, Operation, Result},
-    http::{HttpIo, HttpPool},
-    memory::{BufferPool, cache::MemoryCache, delivery::Delivery, new_pipe_pool},
-    model::{Limits, NodeId, RequestId, WorkerId},
-    origin::{Origin, OriginClient},
-    peer::{Relay, Requester, server::PeerServer, transport::Transfers},
-    rdma::{Devices, Sessions},
-    read::{
-        Coordinator,
-        candidates::CandidatePolicy,
-        dispatch::{WorkerDirectory, WorkerEndpoint},
-        fill::{Fill, FillDependencies},
-        flight::Flights,
-        metadata::{MetadataDependencies, MetadataService},
-        range_stream::RangeStreams,
-    },
-    runtime::{
-        admission::{AdmissionExt, AdmissionPolicy},
-        affinity::AffinityPlan,
-        deadline::RequestScope,
-        reactor::Reactor,
-        worker::{
-            CryptoRuntime, CryptoService, WorkerFactory, WorkerGroup, WorkerMap, WorkerRuntime,
-            WorkerService,
-        },
-    },
-    security::{
-        aead::{PageCrypto, PageCryptoEngine},
-        connection::Signatures,
-        credentials::CredentialCrypto,
-        forwarding::Forwarding,
-    },
-    store::{
-        Store, StoreReader, StoreWriter,
-        catalog::{Index, SegmentClock},
-        checkpoint::{CheckpointGeometry, Checkpointer, Recovery, ShardImage},
-    },
-    telemetry::Telemetry,
-    topology::{
-        health::LinkHealth,
-        routing::{Paths, Placement},
-    },
-};
+use crate::client::RequestParser;
+use crate::client::listener::ClientListeners;
+use crate::client::response::Responses;
+use crate::config::Config;
+use crate::control::BundleInstaller;
+use crate::control::ControlClient;
+use crate::control::ControlEndpoint;
+use crate::control::Enrollment;
+use crate::control::PublishedState;
+use crate::control::ReactorControlIo;
+use crate::control::SnapshotStore;
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::http::HttpIo;
+use crate::http::HttpPool;
+use crate::memory::BufferPool;
+use crate::memory::cache::MemoryCache;
+use crate::memory::delivery::Delivery;
+use crate::memory::new_pipe_pool;
+use crate::model::Limits;
+use crate::model::NodeId;
+use crate::model::RequestId;
+use crate::model::WorkerId;
+use crate::origin::Origin;
+use crate::origin::OriginClient;
+use crate::peer::Relay;
+use crate::peer::Requester;
+use crate::peer::server::PeerServer;
+use crate::peer::transport::Transfers;
+use crate::rdma::Devices;
+use crate::rdma::Sessions;
+use crate::read::Coordinator;
+use crate::read::candidates::CandidatePolicy;
+use crate::read::dispatch::WorkerDirectory;
+use crate::read::dispatch::WorkerEndpoint;
+use crate::read::fill::Fill;
+use crate::read::fill::FillDependencies;
+use crate::read::flight::Flights;
+use crate::read::metadata::MetadataDependencies;
+use crate::read::metadata::MetadataService;
+use crate::read::range_stream::RangeStreams;
+use crate::runtime::admission::AdmissionExt;
+use crate::runtime::admission::AdmissionPolicy;
+use crate::runtime::affinity::AffinityPlan;
+use crate::runtime::deadline::RequestScope;
+use crate::runtime::reactor::Reactor;
+use crate::runtime::worker::CryptoRuntime;
+use crate::runtime::worker::CryptoService;
+use crate::runtime::worker::WorkerFactory;
+use crate::runtime::worker::WorkerGroup;
+use crate::runtime::worker::WorkerMap;
+use crate::runtime::worker::WorkerRuntime;
+use crate::runtime::worker::WorkerService;
+use crate::security::aead::PageCrypto;
+use crate::security::aead::PageCryptoEngine;
+use crate::security::connection::Signatures;
+use crate::security::credentials::CredentialCrypto;
+use crate::security::forwarding::Forwarding;
+use crate::store::Store;
+use crate::store::StoreReader;
+use crate::store::StoreWriter;
+use crate::store::catalog::Index;
+use crate::store::catalog::SegmentClock;
+use crate::store::checkpoint::CheckpointGeometry;
+use crate::store::checkpoint::Checkpointer;
+use crate::store::checkpoint::Recovery;
+use crate::store::checkpoint::ShardImage;
+use crate::telemetry::Gauge;
+use crate::telemetry::Telemetry;
+use crate::topology::LinkHealth;
+use crate::topology::Paths;
+use crate::topology::Placement;
 use racer_identity::{Certificates, KeyEpochs, KeyPurpose, Keyring};
 use std::{
     rc::Rc,
@@ -77,11 +97,10 @@ use std::{
 
 pub(crate) mod caches {
     use super::*;
-    use crate::{
-        client::listener::PreparedListeners,
-        control::state::{CacheDefinition, CacheTransition},
-        runtime::collections::HashSet,
-    };
+    use crate::client::listener::PreparedListeners;
+    use crate::control::CacheTransition;
+    use crate::runtime::collections::HashSet;
+    use racer_control_wire::CacheDefinition;
     use std::cell::RefCell;
 
     #[derive(Default)]
@@ -136,7 +155,7 @@ pub(crate) mod caches {
             &self,
             definitions: &[CacheDefinition],
         ) -> Result<Box<dyn CacheTransition>> {
-            crate::control::state::validate_definitions(definitions)?;
+            racer_control_wire::validate_definitions(definitions)?;
             let mut cut = self.node.cache_cut.lock().map_err(|_| Error::Unavailable)?;
             if cut.generation == 0 || cut.definitions != definitions {
                 if definitions.len() > self.capacity {
@@ -322,28 +341,29 @@ pub(crate) mod caches {
 mod lifecycle;
 mod native;
 mod recovery;
+use lifecycle::log_worker_plan;
 #[cfg(test)]
 use lifecycle::partition_limits_with_cause;
-use lifecycle::{log_worker_plan, size_workers};
+use lifecycle::size_workers;
 
 pub struct Application {
     config: Arc<Config>,
     node: Arc<NodeState>,
     limits: Limits,
-    discovered_nics: Vec<crate::topology::rails::RailMapping>,
+    discovered_nics: Vec<racer_control_wire::RailMapping>,
 }
 
 /// Shared immutable-publication and partitioned-admission roots. No Rc worker
 /// graph crosses a thread. Worker zero alone drives enrollment/control reloads.
 pub struct NodeState {
-    inventory: Arc<crate::rdma::discovery::Inventory>,
-    send_crc: crate::telemetry::send_crc::Samples,
+    inventory: Arc<crate::rdma::Inventory>,
+    send_crc: crate::telemetry::Samples,
     hedges: std::sync::OnceLock<Arc<crate::read::hedge::Hedges>>,
     peer_admission: Arc<crate::peer::adaptive::AdaptivePeers>,
     subscriptions: Arc<crate::peer::subscriptions::Subscriptions>,
     ingress: Arc<crate::runtime::ingress::Ingress>,
-    metrics: Vec<(WorkerId, crate::telemetry::metrics::Metrics)>,
-    failures: crate::telemetry::failures::Failures,
+    metrics: Vec<(WorkerId, crate::telemetry::Metrics)>,
+    failures: crate::telemetry::Failures,
     publications: Arc<PublishedState>,
     keys: Arc<KeyEpochs>,
     control_worker: WorkerId,
@@ -384,12 +404,12 @@ impl NodeState {
     ) -> Result<Self> {
         let count = workers.len();
         let map = Arc::new(WorkerMap::new(workers.clone())?);
-        let metrics = crate::telemetry::metrics::Metrics::for_workers(count)?;
+        let metrics = crate::telemetry::Metrics::for_workers(count)?;
         let peer_admission =
             crate::peer::adaptive::AdaptivePeers::new(peer_config, metrics[0].clone())?;
         Ok(Self {
             peer_admission,
-            inventory: crate::rdma::discovery::Inventory::shared(),
+            inventory: Arc::new(Default::default()),
             send_crc: Default::default(),
             hedges: std::sync::OnceLock::new(),
             ingress: Arc::new(crate::runtime::ingress::Ingress::new(&workers)),
@@ -398,7 +418,7 @@ impl NodeState {
             )?),
             publications: Arc::new(PublishedState::default()),
             metrics: workers.iter().copied().zip(metrics).collect(),
-            failures: crate::telemetry::failures::Failures::default(),
+            failures: crate::telemetry::Failures::default(),
             keys: Arc::new(KeyEpochs::default()),
             control_worker: WorkerId(0),
             workers: Arc::new(WorkerDirectory::new(map, workers, capacity)?),
@@ -427,7 +447,7 @@ impl Application {
 
     pub fn run(mut self) -> Result<()> {
         self.config.validate()?;
-        self.discovered_nics = crate::rdma::discovery::inventory();
+        self.discovered_nics = crate::rdma::inventory();
         let mut plan = AffinityPlan::discover(&self.config)?;
         log_worker_plan("planned", &plan);
         self.limits = size_workers(&self.config.limits, &mut plan, self.config.enable_rdma)?;
@@ -633,11 +653,11 @@ pub struct WorkerApplication {
     flights: Rc<Flights>,
     rdma: Option<Rc<Sessions>>,
     devices: Option<Rc<Devices>>,
-    discovered_nics: Vec<crate::topology::rails::RailMapping>,
-    actual_rails: Vec<crate::topology::rails::RailMapping>,
+    discovered_nics: Vec<racer_control_wire::RailMapping>,
+    actual_rails: Vec<racer_control_wire::RailMapping>,
     inventory_generation: u64,
     native_numa: Option<native::NativePlacement>,
-    native_task: Option<Operation<'static, Vec<crate::topology::rails::RailMapping>>>,
+    native_task: Option<Operation<'static, Vec<racer_control_wire::RailMapping>>>,
     native_retry: std::time::Instant,
     telemetry: Rc<Telemetry>,
     directory: Arc<WorkerDirectory>,
@@ -666,7 +686,7 @@ pub struct WorkerApplication {
     stopping: bool,
     snapshot_sequence: Option<racer_control_wire::PublicationSequence>,
     memory: Rc<MemoryCache>,
-    caches: Vec<crate::control::state::CacheDefinition>,
+    caches: Vec<racer_control_wire::CacheDefinition>,
     slab_directory: std::path::PathBuf,
     prepared_listeners: Rc<std::cell::RefCell<Option<crate::client::listener::PreparedListeners>>>,
     cache_prepare_task: Option<Operation<'static, ()>>,
@@ -682,7 +702,7 @@ impl WorkerApplication {
         node: Arc<NodeState>,
         worker: WorkerId,
         runtime: WorkerRuntime,
-        discovered_nics: Vec<crate::topology::rails::RailMapping>,
+        discovered_nics: Vec<racer_control_wire::RailMapping>,
     ) -> Result<Self> {
         let environment = uring_runtime::environment::Environment::current();
         let metrics = node
@@ -722,7 +742,7 @@ impl WorkerApplication {
             node.keys.clone(),
         ));
         let certificates = Rc::new(Certificates::new(config.cluster.clone(), keys.clone()));
-        let availability = Rc::new(crate::control::state::Availability::new(
+        let availability = Rc::new(crate::control::Availability::new(
             node.publications.clone(),
             keys.clone(),
         ));
@@ -801,7 +821,7 @@ impl WorkerApplication {
                 .with_peer_admission(node.peer_admission.clone()),
         );
         let placement = Rc::new(Placement::with_memory_budget(
-            limits.cached_rankings.get() * crate::topology::routing::RANKING_BYTES,
+            limits.cached_rankings.get() * crate::topology::RANKING_BYTES,
         ));
         let network = Rc::new(crate::peer::PeerNetwork::new(
             config.node.clone(),
@@ -1009,9 +1029,9 @@ impl WorkerApplication {
         config: &Config,
         node: &NodeState,
         snapshots: Rc<SnapshotStore>,
-        availability: Rc<crate::control::state::Availability>,
+        availability: Rc<crate::control::Availability>,
         delivery: Rc<Delivery>,
-        metrics: &crate::telemetry::metrics::Metrics,
+        metrics: &crate::telemetry::Metrics,
         dependencies: FillDependencies,
     ) -> (Rc<Coordinator>, Rc<MetadataService>) {
         let candidates = dependencies.candidates.clone();
@@ -1053,7 +1073,7 @@ impl WorkerApplication {
         runtime: &WorkerRuntime,
         coordinator: Rc<Coordinator>,
         delivery: Rc<Delivery>,
-        metrics: &crate::telemetry::metrics::Metrics,
+        metrics: &crate::telemetry::Metrics,
         distributed: bool,
     ) -> Rc<ClientListeners> {
         let admission = runtime.admission.clone();
@@ -1084,7 +1104,7 @@ impl WorkerApplication {
         reactor: Rc<Reactor>,
         keys: Rc<Keyring>,
         snapshots: Rc<SnapshotStore>,
-        inventory: Arc<crate::rdma::discovery::Inventory>,
+        inventory: Arc<crate::rdma::Inventory>,
     ) -> Rc<ControlClient> {
         let enrollment = Rc::new(
             Enrollment::new(
@@ -1116,8 +1136,8 @@ impl WorkerApplication {
         worker: WorkerId,
         runtime: &WorkerRuntime,
         buffers: BufferPool,
-        availability: Rc<crate::control::state::Availability>,
-        metrics: &crate::telemetry::metrics::Metrics,
+        availability: Rc<crate::control::Availability>,
+        metrics: &crate::telemetry::Metrics,
     ) -> Result<Store> {
         let limits = runtime.admission.limits();
         let index = Rc::new(Index::new(
@@ -1489,7 +1509,7 @@ impl WorkerApplication {
             self.started = false;
             self.telemetry
                 .health
-                .transition(crate::telemetry::health::State::Stopped)?;
+                .transition(crate::telemetry::State::Stopped)?;
             Ok(())
         })))
     }
@@ -1555,10 +1575,10 @@ impl WorkerService for WorkerApplication {
         }
         self.cache_prepare_task.take();
         self.prepared_listeners.borrow_mut().take();
-        if self.telemetry.health.state()? != crate::telemetry::health::State::Stopped {
+        if self.telemetry.health.state()? != crate::telemetry::State::Stopped {
             self.telemetry
                 .health
-                .transition(crate::telemetry::health::State::Draining)?;
+                .transition(crate::telemetry::State::Draining)?;
         }
         self.clients.stop_admission();
         if let Some(endpoint) = &self.endpoint {

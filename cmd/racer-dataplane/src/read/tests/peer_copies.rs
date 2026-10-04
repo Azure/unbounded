@@ -40,7 +40,7 @@ impl ScriptedPeers {
     }
     fn direct_hedge_available(
         &self,
-        _: &crate::topology::membership::MembershipLease,
+        _: &std::sync::Arc<crate::topology::Membership>,
         _: &NodeId,
     ) -> bool {
         self.hedge.get()
@@ -48,7 +48,7 @@ impl ScriptedPeers {
     fn request_direct<'a>(
         &'a self,
         request: PeerRequest,
-        membership: crate::topology::membership::MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
     ) -> Operation<'a, VerifiedResponse> {
         self.request(request, membership, scope)
@@ -56,7 +56,7 @@ impl ScriptedPeers {
     fn request<'a>(
         &'a self,
         request: PeerRequest,
-        _: crate::topology::membership::MembershipLease,
+        _: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
     ) -> Operation<'a, VerifiedResponse> {
         Box::pin(async move {
@@ -351,7 +351,7 @@ fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
         let mut f = fixture();
         let (peers, ordered) = install_peers(&mut f, None);
         peers.hedge.set(reason != "route");
-        let metrics = crate::telemetry::metrics::Metrics::default();
+        let metrics = crate::telemetry::Metrics::default();
         let hedges = crate::read::hedge::Hedges::new(
             crate::read::hedge::Config {
                 delay: Duration::from_millis(1),
@@ -394,7 +394,7 @@ fn hedge_suppresses_without_independent_route_credits_or_local_memory() {
             budget.remaining_links(),
             budget.deadline(),
         );
-        let candidates = crate::topology::routing::Candidates {
+        let candidates = crate::topology::Candidates {
             membership: f.membership.clone(),
             ordered,
         };
@@ -663,9 +663,9 @@ fn known_copy_full_page_still_requires_full_plaintext_admission() {
     assert_eq!(reservation.amount(), PAGE_BYTES as usize);
 }
 
-fn enable_hedge(f: &mut Fixture, peers: &Rc<ScriptedPeers>) -> crate::telemetry::metrics::Metrics {
+fn enable_hedge(f: &mut Fixture, peers: &Rc<ScriptedPeers>) -> crate::telemetry::Metrics {
     peers.hedge.set(true);
-    let metrics = crate::telemetry::metrics::Metrics::default();
+    let metrics = crate::telemetry::Metrics::default();
     let hedges = crate::read::hedge::Hedges::new(
         crate::read::hedge::Config {
             delay: Duration::from_nanos(1),
@@ -773,7 +773,7 @@ fn hedge_stale_membership_refreshes_once_without_fresh_credits() {
                     Rc::new(Placement::new(16)),
                     peers.requester(),
                     deps.credentials.clone(),
-                    crate::control::state::PublishedState::for_membership(latest.clone()),
+                    crate::control::PublishedState::for_membership(latest.clone()),
                 )
                 .with_hedges(deps.candidates.hedge_owner().unwrap().clone()),
             );
@@ -893,13 +893,17 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
         local: usize,
     }
     impl Peer {
-        fn direct_hedge_available(&self, _: &MembershipLease, _: &NodeId) -> bool {
+        fn direct_hedge_available(
+            &self,
+            _: &std::sync::Arc<crate::topology::Membership>,
+            _: &NodeId,
+        ) -> bool {
             true
         }
         fn request_direct<'a>(
             &'a self,
             r: PeerRequest,
-            m: MembershipLease,
+            m: std::sync::Arc<crate::topology::Membership>,
             s: &'a RequestScope,
         ) -> Operation<'a, VerifiedResponse> {
             self.request(r, m, s)
@@ -907,7 +911,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
         fn request<'a>(
             &'a self,
             request: PeerRequest,
-            membership: MembershipLease,
+            membership: std::sync::Arc<crate::topology::Membership>,
             scope: &'a RequestScope,
         ) -> Operation<'a, VerifiedResponse> {
             Box::pin(async move {
@@ -980,7 +984,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
         }
     }
     for target_rank in [1usize, 2] {
-        let hedge_metrics = crate::telemetry::metrics::Metrics::default();
+        let hedge_metrics = crate::telemetry::Metrics::default();
         let mut fixtures: Vec<_> = (0..4).map(|_| fixture()).collect();
         let (_, ordered) = install_peers(&mut fixtures[0], None);
         let membership = fixtures[0].membership.clone();
@@ -1288,7 +1292,7 @@ fn hedge_loser_child_cancels_accepted_crypto_but_waits_for_completion_fence() {
         (ordered[0].clone(), Reply::Copy(good.clone())),
         (ordered[1].clone(), Reply::Copy(good)),
     ]);
-    let candidates = crate::topology::routing::Candidates {
+    let candidates = crate::topology::Candidates {
         membership: f.membership.clone(),
         ordered,
     };

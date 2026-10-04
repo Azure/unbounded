@@ -306,7 +306,7 @@ mod body_progress {
             let mut client = transfers.exchange_timed(
                 Endpoint::Peer(address.to_string()),
                 signed,
-                crate::topology::rails::TransportPlan::Http,
+                crate::rdma::TransportPlan::Http,
                 None,
                 None,
                 None,
@@ -459,7 +459,7 @@ mod body_progress {
             assert_eq!(
                 telemetry
                     .metrics
-                    .count(crate::telemetry::metrics::Event::PeerPageCensored),
+                    .count(crate::telemetry::Event::PeerPageCensored),
                 u64::from(!success),
                 "{case}"
             );
@@ -469,20 +469,20 @@ mod body_progress {
 mod destination_disconnect {
     //! Real destination HTTP ingress with an independently owned, pending page flight.
     use super::*;
-    use crate::{
-        http::{Codec, HttpIo},
-        model::OriginContext,
-        read::flight::{
-            AcquisitionBudget, AcquisitionEvent, AcquisitionFailure, Flights, JoinedCopy,
-            JoinedFlight,
-        },
-        runtime::reactor::Reactor,
-        topology::{
-            health::LinkHealth,
-            membership::{Member, Membership},
-            routing::Paths,
-        },
-    };
+    use crate::http::Codec;
+    use crate::http::HttpIo;
+    use crate::model::OriginContext;
+    use crate::read::flight::AcquisitionBudget;
+    use crate::read::flight::AcquisitionEvent;
+    use crate::read::flight::AcquisitionFailure;
+    use crate::read::flight::Flights;
+    use crate::read::flight::JoinedCopy;
+    use crate::read::flight::JoinedFlight;
+    use crate::runtime::reactor::Reactor;
+    use crate::topology::LinkHealth;
+    use crate::topology::Member;
+    use crate::topology::Membership;
+    use crate::topology::Paths;
     use std::{
         cell::Cell,
         future::Future,
@@ -499,7 +499,7 @@ mod destination_disconnect {
         fn serve_peer<'a>(
             &'a self,
             request: protocol::VerifiedRequest,
-            _: crate::topology::membership::MembershipLease,
+            _: std::sync::Arc<crate::topology::Membership>,
             scope: &'a RequestScope,
         ) -> crate::error::Operation<'a, PeerResponse> {
             Box::pin(async move {
@@ -622,7 +622,7 @@ mod destination_disconnect {
         reactor: Rc<Reactor>,
         io: Rc<HttpIo>,
         signers: Vec<Rc<Signatures>>,
-        membership: crate::topology::membership::MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         page: PageId,
         flights: Rc<Flights>,
         service: Rc<PendingPage>,
@@ -665,7 +665,7 @@ mod destination_disconnect {
             let network = Rc::new(
                 PeerNetwork::new(
                     NodeId(C.into()),
-                    crate::control::state::PublishedState::for_membership(membership.clone()),
+                    crate::control::PublishedState::for_membership(membership.clone()),
                 )
                 .unwrap(),
             );
@@ -757,8 +757,8 @@ mod destination_disconnect {
             let accepted = flights
                 .retain_operation(
                     &leader,
-                    crate::telemetry::metrics::Metrics::default()
-                        .lease(crate::telemetry::metrics::Gauge::ActiveFills)
+                    crate::telemetry::Metrics::default()
+                        .lease(crate::telemetry::Gauge::ActiveFills)
                         .unwrap(),
                 )
                 .unwrap();
@@ -971,18 +971,21 @@ mod destination_disconnect {
 mod encrypted_http {
     //! Production page AEAD across independent keyrings and the signed HTTP transport.
     use super::*;
-    use crate::{
-        http::{Codec, Endpoint, HttpIo, HttpPool},
-        memory::CiphertextPage,
-        runtime::{
-            crypto::{self, CryptoClient},
-            reactor::Reactor,
-            worker::{CryptoRuntime, CryptoService},
-        },
-        security::aead::{PageCrypto, PageCryptoEngine},
-        telemetry::metrics::{Event, Metrics},
-        topology::rails::TransportPlan,
-    };
+    use crate::http::Codec;
+    use crate::http::Endpoint;
+    use crate::http::HttpIo;
+    use crate::http::HttpPool;
+    use crate::memory::CiphertextPage;
+    use crate::rdma::TransportPlan;
+    use crate::runtime::crypto;
+    use crate::runtime::crypto::CryptoClient;
+    use crate::runtime::reactor::Reactor;
+    use crate::runtime::worker::CryptoRuntime;
+    use crate::runtime::worker::CryptoService;
+    use crate::security::aead::PageCrypto;
+    use crate::security::aead::PageCryptoEngine;
+    use crate::telemetry::Event;
+    use crate::telemetry::Metrics;
     use racer_control_wire::{CacheEncryptionKey, CacheKeyPurpose, CacheKeyRef, CacheKeyState};
     use std::{
         cell::Cell,
@@ -1333,23 +1336,27 @@ mod opaque;
 mod protocol_socket;
 mod requester_safety {
     //! Real socket exchange with the adaptive controller attached to routing/requester.
+    use crate::http::Codec;
+    use crate::http::HttpIo;
+    use crate::http::HttpPool;
+    use crate::model::MembershipVersion;
+    use crate::model::ResourceClass;
+    use crate::peer::adaptive::AdaptivePeers;
+    use crate::peer::adaptive::Outcome;
+    use crate::peer::protocol::PeerResponse;
+    use crate::peer::protocol::decode_envelope;
+    use crate::peer::protocol::encode_envelope;
+    use crate::peer::transport::RelayResponse;
     use crate::peer::*;
-    use crate::{
-        http::{Codec, HttpIo, HttpPool},
-        model::{MembershipVersion, ResourceClass},
-        peer::{
-            adaptive::{AdaptivePeers, Outcome},
-            protocol::{PeerResponse, decode_envelope, encode_envelope},
-            transport::RelayResponse,
-        },
-        runtime::{admission::AdmissionPolicy, reactor::Reactor},
-        security::connection,
-        telemetry::metrics::{Event, Gauge, Metrics},
-        topology::{
-            health::LinkHealth,
-            membership::{Member, Membership},
-        },
-    };
+    use crate::runtime::admission::AdmissionPolicy;
+    use crate::runtime::reactor::Reactor;
+    use crate::security::connection;
+    use crate::telemetry::Event;
+    use crate::telemetry::Gauge;
+    use crate::telemetry::Metrics;
+    use crate::topology::LinkHealth;
+    use crate::topology::Member;
+    use crate::topology::Membership;
     use std::{
         sync::Arc,
         task::{Context, Poll},
@@ -1391,7 +1398,7 @@ mod requester_safety {
         let network = Rc::new(
             crate::peer::PeerNetwork::new(
                 local.clone(),
-                crate::control::state::PublishedState::for_membership(members.clone()),
+                crate::control::PublishedState::for_membership(members.clone()),
             )
             .unwrap(),
         );
@@ -1484,7 +1491,7 @@ mod requester_safety {
             Rc::new(
                 crate::peer::PeerNetwork::new(
                     signers[0].node().clone(),
-                    crate::control::state::PublishedState::for_membership(membership.clone()),
+                    crate::control::PublishedState::for_membership(membership.clone()),
                 )
                 .unwrap(),
             ),
@@ -1632,11 +1639,12 @@ mod requester_safety {
 mod subscriptions;
 mod timing {
     use super::*;
-    use crate::{
-        peer::timing::{PageTiming, STAGES},
-        telemetry::metrics::{Event, Metrics},
-        topology::rails::{RailId, TransportPlan},
-    };
+    use crate::peer::timing::PageTiming;
+    use crate::peer::timing::STAGES;
+    use crate::rdma::TransportPlan;
+    use crate::telemetry::Event;
+    use crate::telemetry::Metrics;
+    use racer_control_wire::RailId;
 
     fn page_request(admission: &flow_control::Quotas<AdmissionPolicy>, attempt: u8) -> PeerRequest {
         let mut local = request(admission, attempt);
@@ -1853,11 +1861,10 @@ mod timing {
 
     #[test]
     fn page_timing_requester_reuses_authenticated_session_and_rejects_bad_signature() {
-        use crate::topology::{
-            health::LinkHealth,
-            membership::{Member, Membership},
-            routing::Paths,
-        };
+        use crate::topology::LinkHealth;
+        use crate::topology::Member;
+        use crate::topology::Membership;
+        use crate::topology::Paths;
         use std::{
             net::TcpListener,
             task::{Context, Poll},
@@ -1900,7 +1907,7 @@ mod timing {
             Rc::new(
                 PeerNetwork::new(
                     NodeId(A.into()),
-                    crate::control::state::PublishedState::for_membership(members.clone()),
+                    crate::control::PublishedState::for_membership(members.clone()),
                 )
                 .unwrap(),
             ),
@@ -2008,22 +2015,28 @@ mod timing {
         }
     }
 }
-use crate::{
-    memory::BufferPool,
-    model::{
-        EncryptedAuthorization, KeyId, MetadataSelector, Nonce, PeerOriginContext, ResourceClass, *,
-    },
-    peer::protocol::{
-        FetchMode, Operation, PeerRequest, PeerResponse, SecurityCodec, decode_envelope,
-        encode_envelope,
-    },
-    runtime::{
-        admission::{AdmissionExt, AdmissionPolicy},
-        deadline::{Deadline, RequestScope},
-    },
-    security::{connection::Signatures, forwarding::Forwarding},
-    topology::routing::RouteBudget,
-};
+use crate::memory::BufferPool;
+use crate::model::EncryptedAuthorization;
+use crate::model::KeyId;
+use crate::model::MetadataSelector;
+use crate::model::Nonce;
+use crate::model::PeerOriginContext;
+use crate::model::ResourceClass;
+use crate::model::*;
+use crate::peer::protocol::FetchMode;
+use crate::peer::protocol::Operation;
+use crate::peer::protocol::PeerRequest;
+use crate::peer::protocol::PeerResponse;
+use crate::peer::protocol::SecurityCodec;
+use crate::peer::protocol::decode_envelope;
+use crate::peer::protocol::encode_envelope;
+use crate::runtime::admission::AdmissionExt;
+use crate::runtime::admission::AdmissionPolicy;
+use crate::runtime::deadline::Deadline;
+use crate::runtime::deadline::RequestScope;
+use crate::security::connection::Signatures;
+use crate::security::forwarding::Forwarding;
+use crate::topology::RouteBudget;
 use racer_identity::{Certificates, Keyring};
 use std::{
     rc::Rc,
@@ -2172,8 +2185,8 @@ impl NoOutbound {
     pub fn new(signer: Rc<Signatures>, network: Rc<PeerNetwork>) -> Self {
         let socket = SocketFixture::new(2);
         let requester = Rc::new(Requester::new(
-            Rc::new(crate::topology::routing::Paths::new(
-                Rc::new(crate::topology::health::LinkHealth),
+            Rc::new(crate::topology::Paths::new(
+                Rc::new(crate::topology::LinkHealth),
                 4,
             )),
             Rc::new(Forwarding::new(signer.clone())),

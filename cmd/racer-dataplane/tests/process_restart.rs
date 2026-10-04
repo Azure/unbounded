@@ -1056,8 +1056,9 @@ fn enrolled_identity(
     scratch: &Scratch,
     control: &control::Control,
     processes: usize,
-) -> racer_dataplane::control::enrollment::LocalSigningIdentity {
-    use racer_dataplane::{control::enrollment::Enrollment, model::ClusterId};
+) -> racer_dataplane::control::LocalSigningIdentity {
+    use racer_dataplane::control::Enrollment;
+    use racer_dataplane::model::ClusterId;
     assert_eq!(
         control.enrollments.load(Ordering::Acquire),
         2 * processes,

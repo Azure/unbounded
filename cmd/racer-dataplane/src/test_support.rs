@@ -113,14 +113,16 @@ pub mod clock {
 pub mod origin {
     //! Controllable adapter boundary shared by read and client scenarios.
     //! The client, HTTP parser, reactor, and plaintext admission remain production code.
-    use crate::{
-        control::state::SnapshotStore,
-        http::{Codec, HttpIo, HttpPool},
-        memory::BufferPool,
-        model::{ObjectMetadata, PAGE_BYTES},
-        origin::OriginClient,
-        runtime::{admission::AdmissionPolicy, reactor::Reactor},
-    };
+    use crate::control::SnapshotStore;
+    use crate::http::Codec;
+    use crate::http::HttpIo;
+    use crate::http::HttpPool;
+    use crate::memory::BufferPool;
+    use crate::model::ObjectMetadata;
+    use crate::model::PAGE_BYTES;
+    use crate::origin::OriginClient;
+    use crate::runtime::admission::AdmissionPolicy;
+    use crate::runtime::reactor::Reactor;
     use std::{
         collections::{BTreeMap, BTreeSet, VecDeque},
         fs::File,
@@ -494,15 +496,15 @@ pub mod origin {
 
 /// Minimal real control-plane state for storage and flight fixtures. Callers with
 /// rotating keys or publications should share their own Availability instead.
-pub fn availability() -> std::rc::Rc<crate::control::state::Availability> {
+pub fn availability() -> std::rc::Rc<crate::control::Availability> {
     availability_for(vec![crate::model::CacheId(
         crate::security::test_support::CACHE.into(),
     )])
 }
 pub fn availability_for(
     caches: Vec<crate::model::CacheId>,
-) -> std::rc::Rc<crate::control::state::Availability> {
-    crate::control::state::for_caches(
+) -> std::rc::Rc<crate::control::Availability> {
+    crate::control::for_caches(
         std::rc::Rc::new(crate::security::test_support::keys_for(&caches)),
         caches,
     )
@@ -521,7 +523,7 @@ impl NoPeers {
     }
     fn direct_hedge_available(
         &self,
-        _: &crate::topology::membership::MembershipLease,
+        _: &std::sync::Arc<crate::topology::Membership>,
         _: &crate::model::NodeId,
     ) -> bool {
         false
@@ -529,7 +531,7 @@ impl NoPeers {
     fn request_direct<'a>(
         &'a self,
         _: crate::peer::protocol::PeerRequest,
-        _: crate::topology::membership::MembershipLease,
+        _: std::sync::Arc<crate::topology::Membership>,
         _: &'a crate::runtime::deadline::RequestScope,
     ) -> crate::error::Operation<'a, crate::peer::protocol::VerifiedResponse> {
         panic!("local origin scenario must not hedge to a peer")
@@ -537,7 +539,7 @@ impl NoPeers {
     fn request<'a>(
         &'a self,
         _: crate::peer::protocol::PeerRequest,
-        _: crate::topology::membership::MembershipLease,
+        _: std::sync::Arc<crate::topology::Membership>,
         _: &'a crate::runtime::deadline::RequestScope,
     ) -> crate::error::Operation<'a, crate::peer::protocol::VerifiedResponse> {
         Box::pin(async { panic!("local origin scenario must not contact peers") })
@@ -627,39 +629,42 @@ impl std::task::Wake for WakeCounter {
 }
 
 // Real read ownership shared by read and client scenarios. Only the UDS adapter is scripted.
-use crate::{
-    control::{
-        state::Publication,
-        state::{CacheDefinition, PublishedState, SnapshotStore},
-    },
-    memory::{BufferPool, cache::MemoryCache, delivery::Delivery},
-    model::{MembershipVersion, ObjectMetadata, WorkerId},
-    read::{
-        Coordinator,
-        candidates::CandidatePolicy,
-        dispatch::{WorkerDirectory, WorkerEndpoint},
-        fill::{Fill, FillDependencies},
-        flight::Flights,
-        metadata::{MetadataDependencies, MetadataService},
-        range_stream::RangeStreams,
-    },
-    runtime::{
-        admission::AdmissionPolicy,
-        crypto::{self, CryptoClient},
-        reactor::Reactor,
-        worker::{CryptoRuntime, CryptoService, WorkerMap},
-    },
-    security::{
-        aead::{PageCrypto, PageCryptoEngine},
-        credentials::CredentialCrypto,
-    },
-    store::{
-        StoreReader, StoreWriter,
-        catalog::{Index, SegmentClock},
-    },
-    test_support::origin::AdapterOrigin,
-    topology::{membership::Member, routing::Placement},
-};
+use crate::control::PublishedState;
+use crate::control::SnapshotStore;
+use crate::memory::BufferPool;
+use crate::memory::cache::MemoryCache;
+use crate::memory::delivery::Delivery;
+use crate::model::MembershipVersion;
+use crate::model::ObjectMetadata;
+use crate::model::WorkerId;
+use crate::read::Coordinator;
+use crate::read::candidates::CandidatePolicy;
+use crate::read::dispatch::WorkerDirectory;
+use crate::read::dispatch::WorkerEndpoint;
+use crate::read::fill::Fill;
+use crate::read::fill::FillDependencies;
+use crate::read::flight::Flights;
+use crate::read::metadata::MetadataDependencies;
+use crate::read::metadata::MetadataService;
+use crate::read::range_stream::RangeStreams;
+use crate::runtime::admission::AdmissionPolicy;
+use crate::runtime::crypto;
+use crate::runtime::crypto::CryptoClient;
+use crate::runtime::reactor::Reactor;
+use crate::runtime::worker::CryptoRuntime;
+use crate::runtime::worker::CryptoService;
+use crate::runtime::worker::WorkerMap;
+use crate::security::aead::PageCrypto;
+use crate::security::aead::PageCryptoEngine;
+use crate::security::credentials::CredentialCrypto;
+use crate::store::StoreReader;
+use crate::store::StoreWriter;
+use crate::store::catalog::Index;
+use crate::store::catalog::SegmentClock;
+use crate::test_support::origin::AdapterOrigin;
+use crate::topology::Placement;
+use racer_control_wire::CacheDefinition;
+use racer_control_wire::Publication;
 use racer_control_wire::PublicationSequence;
 use std::{cell::RefCell, num::NonZeroU32, rc::Rc, sync::Arc, task::Context};
 use uring_runtime::drivers::DriverQueue;
@@ -667,7 +672,7 @@ use uring_runtime::drivers::DriverQueue;
 pub(crate) struct ReadWorker {
     pub coordinator: Rc<Coordinator>,
     pub streams: Rc<RangeStreams>,
-    pub membership: crate::topology::membership::MembershipLease,
+    pub membership: std::sync::Arc<crate::topology::Membership>,
     pub origin: AdapterOrigin,
     pub drivers: Rc<DriverQueue>,
     endpoint: RefCell<WorkerEndpoint>,
@@ -690,7 +695,7 @@ impl ReadWorker {
         let origin = AdapterOrigin::new(&cache.name, metadata);
         let keys = Rc::new(crate::security::test_support::keys());
         let publications = Arc::new(PublishedState::default());
-        let availability = Rc::new(crate::control::state::Availability::new(
+        let availability = Rc::new(crate::control::Availability::new(
             publications.clone(),
             keys.clone(),
         ));
@@ -701,7 +706,7 @@ impl ReadWorker {
                 cluster: keys.cluster().clone(),
                 sequence: PublicationSequence(1),
                 membership_version: MembershipVersion(1),
-                members: vec![Member {
+                members: vec![racer_control_wire::Member {
                     node: keys.node().clone(),
                     shares: NonZeroU32::new(1).unwrap(),
                     peer_endpoint: "127.0.0.1:1".into(),

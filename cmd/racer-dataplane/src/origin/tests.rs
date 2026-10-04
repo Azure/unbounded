@@ -1,14 +1,17 @@
 use super::*;
+use crate::control::PublishedState;
+use crate::http::Codec;
+use crate::model::Authorization;
+use crate::model::CacheId;
+use crate::model::CacheKey;
+use crate::model::ClusterId;
+use crate::model::Limits;
+use crate::model::ObjectId;
+use crate::model::OpaqueMetadata;
+use crate::model::RequestId;
+use crate::model::StrongEtag;
 use crate::runtime::admission::AdmissionExt;
-use crate::{
-    control::state::PublishedState,
-    http::Codec,
-    model::{
-        Authorization, CacheId, CacheKey, ClusterId, Limits, ObjectId, OpaqueMetadata, RequestId,
-        StrongEtag,
-    },
-    runtime::reactor::Reactor,
-};
+use crate::runtime::reactor::Reactor;
 use futures::executor::block_on;
 use std::{
     future::Future,
@@ -161,10 +164,10 @@ fn published_client() -> (
     OriginClient,
     Rc<flow_control::Quotas<AdmissionPolicy>>,
     Rc<Reactor>,
-    crate::control::state::SnapshotLease,
+    std::sync::Arc<crate::control::Snapshot>,
 ) {
     let (mut client, admission, reactor) = client();
-    let publication = crate::control::state::decode_publication(include_bytes!(concat!(
+    let publication = racer_control_wire::decode_publication(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../internal/racer/wire/testdata/publication.json"
     )))
@@ -268,12 +271,12 @@ fn socket_root_is_lexical_and_preserves_canonical_publications() {
 
 #[test]
 fn real_uds_root_remapping_keeps_public_authority_and_http_validation() {
+    use crate::peer::protocol::FetchMode;
+    use crate::peer::protocol::Operation as PeerOperation;
+    use crate::read::candidates::CandidatePolicy;
+    use crate::read::candidates::CandidateResolution;
     use crate::test_support::NoPeers;
-    use crate::{
-        peer::protocol::{FetchMode, Operation as PeerOperation},
-        read::candidates::{CandidatePolicy, CandidateResolution},
-        topology::routing::Placement,
-    };
+    use crate::topology::Placement;
     use std::os::fd::AsRawFd;
     struct Directory(PathBuf);
     impl Drop for Directory {
@@ -475,7 +478,7 @@ fn same_name_new_uid_dials_replacement_without_reusing_old_keepalive() {
     let old_listener = UnixListener::bind(&socket).unwrap();
     old_listener.set_nonblocking(true).unwrap();
     let (mut client, admission, reactor) = self::client();
-    let mut publication = crate::control::state::decode_publication(include_bytes!(concat!(
+    let mut publication = racer_control_wire::decode_publication(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../internal/racer/wire/testdata/publication.json"
     )))
@@ -936,16 +939,16 @@ fn real_uds_errors_preserve_credential_and_version_contracts() {
 
 #[test]
 fn public_operations_reject_wrong_authority_before_io() {
+    use crate::model::MembershipVersion;
+    use crate::model::NodeId;
+    use crate::peer::protocol::FetchMode;
+    use crate::peer::protocol::Operation as PeerOperation;
+    use crate::read::candidates::CandidatePolicy;
+    use crate::read::candidates::CandidateResolution;
     use crate::test_support::NoPeers;
-    use crate::{
-        model::{MembershipVersion, NodeId},
-        peer::protocol::{FetchMode, Operation as PeerOperation},
-        read::candidates::{CandidatePolicy, CandidateResolution},
-        topology::{
-            membership::{Member, Membership},
-            routing::Placement,
-        },
-    };
+    use crate::topology::Member;
+    use crate::topology::Membership;
+    use crate::topology::Placement;
     let node = NodeId("node".into());
     let membership = Arc::new(
         Membership::validate(

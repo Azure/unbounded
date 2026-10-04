@@ -3,19 +3,30 @@
 //!
 //! Credentials are only origin-fetch context, never Racer authorization. Do not
 //! persist headers or retain them in pooled connections after an operation ends.
-use crate::{
-    control::state::{CacheDefinition, SnapshotStore, canonical_socket_paths},
-    error::{Error, Operation, Result},
-    http::{ConnectionLease, Endpoint, HttpIo, HttpPool},
-    memory::{BufferPool, PlaintextBuffer},
-    model::{
-        MetadataSelector, ObjectId, ObjectMetadata, OriginContext, PAGE_BYTES, PageId, PageNumber,
-        ResourceClass,
-    },
-    read::candidates::OriginAuthority,
-    runtime::{admission::AdmissionPolicy, deadline::RequestScope},
-};
+use crate::control::SnapshotStore;
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::http::ConnectionLease;
+use crate::http::Endpoint;
+use crate::http::HttpIo;
+use crate::http::HttpPool;
+use crate::memory::BufferPool;
+use crate::memory::PlaintextBuffer;
+use crate::model::MetadataSelector;
+use crate::model::ObjectId;
+use crate::model::ObjectMetadata;
+use crate::model::OriginContext;
+use crate::model::PAGE_BYTES;
+use crate::model::PageId;
+use crate::model::PageNumber;
+use crate::model::ResourceClass;
+use crate::read::candidates::OriginAuthority;
+use crate::runtime::admission::AdmissionPolicy;
+use crate::runtime::deadline::RequestScope;
 use http1::{Header, MessageHead, StartLine};
+use racer_control_wire::CacheDefinition;
+use racer_control_wire::canonical_socket_paths;
 use std::{
     path::{Path, PathBuf},
     rc::Rc,
@@ -50,7 +61,7 @@ pub trait Origin {
     ) -> Operation<'a, MetadataReply>;
 }
 pub struct OriginClient {
-    health: crate::topology::health::LinkHealth,
+    health: crate::topology::LinkHealth,
     snapshots: Rc<SnapshotStore>,
     pool: Rc<HttpPool>,
     io: Rc<HttpIo>,
@@ -86,7 +97,7 @@ impl OriginClient {
             return Err(Error::InvalidConfiguration);
         }
         Ok(Self {
-            health: crate::topology::health::LinkHealth::new(64),
+            health: crate::topology::LinkHealth::new(64),
             snapshots,
             pool,
             io,

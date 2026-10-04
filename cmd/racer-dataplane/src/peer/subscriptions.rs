@@ -232,10 +232,10 @@ impl Subscriptions {
     pub(crate) async fn schedule_scoped(
         self: &Arc<Self>,
         subscription: Subscription,
-        membership: crate::topology::membership::MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         receiver: NodeId,
         local: &NodeId,
-        placement: &crate::topology::routing::Placement,
+        placement: &crate::topology::Placement,
         scope: &crate::runtime::deadline::RequestScope,
     ) -> Result<Selection> {
         use crate::peer::protocol::{encode_deadline, millis};

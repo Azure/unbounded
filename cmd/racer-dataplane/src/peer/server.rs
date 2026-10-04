@@ -3,16 +3,13 @@ use super::{
     Relay,
     protocol::{PeerResponse, SignedRequest, SignedResponse, VerifiedRequest},
 };
-use crate::{
-    error::{Error, Operation},
-    model::ResourceClass,
-    runtime::{
-        admission::{AdmissionExt, AdmissionPolicy},
-        deadline::RequestScope,
-    },
-    security::forwarding::Forwarding,
-    topology::membership::MembershipLease,
-};
+use crate::error::Error;
+use crate::error::Operation;
+use crate::model::ResourceClass;
+use crate::runtime::admission::AdmissionExt;
+use crate::runtime::admission::AdmissionPolicy;
+use crate::runtime::deadline::RequestScope;
+use crate::security::forwarding::Forwarding;
 use std::{
     rc::Rc,
     time::{Duration, Instant},
@@ -23,9 +20,9 @@ use std::{
 ///
 /// ```compile_fail
 /// use racer_dataplane::{peer::{server::LocalPageService, protocol::PeerRequest},
-///     runtime::deadline::RequestScope, topology::membership::MembershipLease};
+///     runtime::deadline::RequestScope, topology::Membership};
 /// fn unverified(service: &dyn LocalPageService, request: PeerRequest,
-///     membership: MembershipLease, scope: &RequestScope) {
+///     membership: std::sync::Arc<Membership>, scope: &RequestScope) {
 ///     service.serve_peer(request, membership, scope);
 /// }
 /// ```
@@ -33,7 +30,7 @@ pub trait LocalPageService {
     fn serve_peer<'a>(
         &'a self,
         request: VerifiedRequest,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
     ) -> Operation<'a, PeerResponse>;
 }
@@ -53,14 +50,14 @@ pub(crate) struct Settings {
 
 pub struct PeerServer {
     tcp_nodelay: bool,
-    metrics: crate::telemetry::metrics::Metrics,
+    metrics: crate::telemetry::Metrics,
     send_crc: Option<(
-        crate::telemetry::send_crc::Pair,
-        crate::telemetry::send_crc::Samples,
+        crate::telemetry::Pair,
+        crate::telemetry::Samples,
         Rc<crate::security::aead::PageCrypto>,
     )>,
     subscriptions: std::sync::Arc<super::subscriptions::Subscriptions>,
-    placement: crate::topology::routing::Placement,
+    placement: crate::topology::Placement,
     opaque_relay: bool,
     pipes: Rc<flow_control::pipe::PipePool<AdmissionPolicy>>,
     accept: AcceptMode,
@@ -82,14 +79,14 @@ impl PeerServer {
         fd.enable_tcp_nodelay(self.tcp_nodelay)?;
         Ok(fd)
     }
-    pub(crate) fn with_metrics(mut self, metrics: crate::telemetry::metrics::Metrics) -> Self {
+    pub(crate) fn with_metrics(mut self, metrics: crate::telemetry::Metrics) -> Self {
         self.metrics = metrics;
         self
     }
     pub(crate) fn with_send_crc(
         mut self,
-        pair: Option<crate::telemetry::send_crc::Pair>,
-        samples: crate::telemetry::send_crc::Samples,
+        pair: Option<crate::telemetry::Pair>,
+        samples: crate::telemetry::Samples,
         crypto: Rc<crate::security::aead::PageCrypto>,
     ) -> Self {
         self.send_crc = pair.map(|pair| (pair, samples, crypto));
@@ -100,7 +97,7 @@ impl PeerServer {
         connection: &crate::http::ConnectionLease,
         response: &SignedResponse,
         scope: &RequestScope,
-    ) -> Option<crate::telemetry::send_crc::Ticket> {
+    ) -> Option<crate::telemetry::Ticket> {
         let (pair, samples, crypto) = self.send_crc.as_ref()?;
         let ciphertext = match &response.response {
             PeerResponse::Page { ciphertext, .. }
@@ -297,10 +294,10 @@ impl PeerServer {
     ) -> Self {
         Self {
             subscriptions,
-            metrics: crate::telemetry::metrics::Metrics::default(),
+            metrics: crate::telemetry::Metrics::default(),
             tcp_nodelay: settings.tcp_nodelay,
             send_crc: None,
-            placement: crate::topology::routing::Placement::new(64),
+            placement: crate::topology::Placement::new(64),
             opaque_relay: settings.opaque_relay,
             pipes,
             accept: settings.accept,
@@ -443,7 +440,7 @@ impl PeerServer {
                         Ok(response)
                     });
                     let result = self.admission.observer().result(
-                        crate::telemetry::failures::Stage::PeerRelay,
+                        crate::telemetry::Stage::PeerRelay,
                         &request_scope,
                         result,
                     );
@@ -656,7 +653,7 @@ impl PeerServer {
     fn dispatch_verified<'a>(
         &'a self,
         request: VerifiedRequest,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
     ) -> Operation<'a, SignedResponse> {
         Box::pin(async move {
@@ -672,7 +669,7 @@ impl PeerServer {
                 let binding = request.binding().clone();
                 let result = self.relay.forward(request, membership, &scope).await;
                 let result = self.admission.observer().result(
-                    crate::telemetry::failures::Stage::PeerRelay,
+                    crate::telemetry::Stage::PeerRelay,
                     &scope,
                     result,
                 );
@@ -710,7 +707,7 @@ impl PeerServer {
             };
             let result = self.serve_selected(request, membership, &scope).await;
             let result = self.admission.observer().result(
-                crate::telemetry::failures::Stage::PeerLocal,
+                crate::telemetry::Stage::PeerLocal,
                 &scope,
                 result,
             );
@@ -733,7 +730,7 @@ impl PeerServer {
     fn serve_selected<'a>(
         &'a self,
         request: VerifiedRequest,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
     ) -> Operation<'a, PeerResponse> {
         Box::pin(async move {
@@ -945,14 +942,14 @@ mod tests {
     use super::*;
     use crate::{model::RequestId, test_support::clock::Clock};
     use futures::{channel::oneshot, stream::FuturesUnordered};
-    use std::{
-        cell::Cell,
-        future::Future,
-        io::{Read, Write},
-        os::unix::net::UnixStream,
-        pin::Pin,
-        task::{Context, Poll},
-    };
+    use std::cell::Cell;
+    use std::future::Future;
+    use std::io::Read;
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use std::pin::Pin;
+    use std::task::Context;
+    use std::task::Poll;
 
     #[derive(Default)]
     struct AcceptCounts {
@@ -1442,21 +1439,23 @@ mod tests {
 
     #[test]
     fn backpressured_handshake_responses_keep_fixed_deadline_and_fenced_admission() {
-        use crate::{
-            http::{Codec, ConnectionLease, HttpIo},
-            memory::BufferPool,
-            peer::protocol::SecurityCodec,
-            runtime::reactor::Reactor,
-            security::connection::tests::{finish, hello},
-            topology::{health::LinkHealth, routing::Paths},
-        };
+        use crate::http::Codec;
+        use crate::http::ConnectionLease;
+        use crate::http::HttpIo;
+        use crate::memory::BufferPool;
+        use crate::peer::protocol::SecurityCodec;
+        use crate::runtime::reactor::Reactor;
+        use crate::security::connection::tests::finish;
+        use crate::security::connection::tests::hello;
+        use crate::topology::LinkHealth;
+        use crate::topology::Paths;
 
         struct Never;
         impl LocalPageService for Never {
             fn serve_peer<'a>(
                 &'a self,
                 _: VerifiedRequest,
-                _: MembershipLease,
+                _: std::sync::Arc<crate::topology::Membership>,
                 _: &'a RequestScope,
             ) -> Operation<'a, PeerResponse> {
                 Box::pin(async { panic!("handshake must not dispatch") })

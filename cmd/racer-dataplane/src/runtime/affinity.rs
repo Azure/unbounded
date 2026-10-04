@@ -7,12 +7,11 @@
 //! across nodes; local pair placement must not change the page's selected rail.
 //! Opt-in SMT counts allowed logical CPUs. Reactors prefer distinct physical cores.
 
-use crate::{
-    config::Config,
-    error::{Error, Result},
-    model::WorkerId,
-    topology::rails::RailMapping,
-};
+use crate::config::Config;
+use crate::error::Error;
+use crate::error::Result;
+use crate::model::WorkerId;
+use racer_control_wire::RailMapping;
 use std::collections::{BTreeMap, HashSet};
 use uring_runtime::affinity::{CpuLocation, EffectiveTopology, NicLocality};
 #[cfg(test)]

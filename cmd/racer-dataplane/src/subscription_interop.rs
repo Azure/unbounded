@@ -117,7 +117,7 @@ struct NoPeer;
 impl NoPeer {
     fn direct_hedge_available(
         &self,
-        _: &topology::membership::MembershipLease,
+        _: &std::sync::Arc<crate::topology::Membership>,
         _: &crate::model::NodeId,
     ) -> bool {
         false
@@ -125,7 +125,7 @@ impl NoPeer {
     fn request_direct<'a>(
         &'a self,
         _: peer::protocol::PeerRequest,
-        _: topology::membership::MembershipLease,
+        _: std::sync::Arc<crate::topology::Membership>,
         _: &'a RequestScope,
     ) -> Operation<'a, peer::protocol::VerifiedResponse> {
         panic!("single-node fixture must not hedge to a peer")
@@ -133,7 +133,7 @@ impl NoPeer {
     fn request<'a>(
         &'a self,
         _: peer::protocol::PeerRequest,
-        _: topology::membership::MembershipLease,
+        _: std::sync::Arc<crate::topology::Membership>,
         _: &'a RequestScope,
     ) -> Operation<'a, peer::protocol::VerifiedResponse> {
         Box::pin(async { panic!("single-node fixture contacted peer") })
@@ -164,18 +164,18 @@ struct SubscriptionFixture {
     writer: Rc<store::StoreWriter>,
     memory: Rc<memory::cache::MemoryCache>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
-    cache: control::state::CacheDefinition,
+    cache: racer_control_wire::CacheDefinition,
     scope: RequestScope,
 }
 
 impl SubscriptionFixture {
     fn construct(root: PathBuf) -> Self {
         use client::{RequestParser, listener::ClientListeners, response::Responses};
-        use control::{
-            state::Publication,
-            state::{CacheDefinition, PublishedState, SnapshotStore},
-        };
+        use control::PublishedState;
+        use control::SnapshotStore;
         use memory::{BufferPool, cache::MemoryCache, delivery::Delivery, new_pipe_pool};
+        use racer_control_wire::CacheDefinition;
+        use racer_control_wire::Publication;
         use racer_control_wire::*;
         use read::{
             Coordinator,
@@ -208,13 +208,10 @@ impl SubscriptionFixture {
         let buffers = BufferPool::new(admission.clone());
         let keys = Rc::new(interop_keys());
         let published = Arc::new(PublishedState::default());
-        let availability = Rc::new(control::state::Availability::new(
-            published.clone(),
-            keys.clone(),
-        ));
+        let availability = Rc::new(control::Availability::new(published.clone(), keys.clone()));
         let snapshots = Rc::new(SnapshotStore::new(keys.cluster().clone(), published, 2));
         let (client_socket, origin_socket) =
-            control::state::canonical_socket_paths("interop").unwrap();
+            racer_control_wire::canonical_socket_paths("interop").unwrap();
         let cache = CacheDefinition {
             id: CacheId("33333333-3333-4333-8333-333333333333".into()),
             name: "interop".into(),
@@ -227,7 +224,7 @@ impl SubscriptionFixture {
                 cluster: keys.cluster().clone(),
                 sequence: PublicationSequence(1),
                 membership_version: MembershipVersion(1),
-                members: vec![topology::membership::Member {
+                members: vec![racer_control_wire::Member {
                     node: keys.node().clone(),
                     shares: std::num::NonZeroU32::new(1).unwrap(),
                     peer_endpoint: "127.0.0.1:1".into(),
@@ -283,7 +280,7 @@ impl SubscriptionFixture {
         );
         let candidates = Rc::new(CandidatePolicy::new(
             keys.node().clone(),
-            Rc::new(topology::routing::Placement::new(16)),
+            Rc::new(topology::Placement::new(16)),
             peers.clone(),
             credentials.clone(),
             Arc::new(Default::default()),

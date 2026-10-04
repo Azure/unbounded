@@ -2,17 +2,21 @@
 //! Bind /run/racer/<cache name>/client/socket; mount its client directory separately
 //! from the origin directory so pods receive only their authorized endpoint.
 use super::{RequestParser, response::Responses};
-use crate::{
-    control::state::CacheDefinition,
-    error::{Error, Operation, Result},
-    http::{ConnectionLease, HttpIo},
-    model::{CacheId, ObjectId, RequestId},
-    read::{Coordinator, ReadResponse},
-    runtime::{
-        admission::{AdmissionExt, AdmissionPolicy},
-        deadline::{Cancellation, RequestScope},
-    },
-};
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::http::ConnectionLease;
+use crate::http::HttpIo;
+use crate::model::CacheId;
+use crate::model::ObjectId;
+use crate::model::RequestId;
+use crate::read::Coordinator;
+use crate::read::ReadResponse;
+use crate::runtime::admission::AdmissionExt;
+use crate::runtime::admission::AdmissionPolicy;
+use crate::runtime::deadline::Cancellation;
+use crate::runtime::deadline::RequestScope;
+use racer_control_wire::CacheDefinition;
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, VecDeque},
@@ -155,7 +159,7 @@ pub struct ClientListeners {
     readiness: RefCell<ReadyListeners>,
     sim_cursor: RefCell<Option<CacheId>>,
     ingress: Option<Arc<crate::runtime::ingress::Ingress>>,
-    pub(super) metrics: crate::telemetry::metrics::Metrics,
+    pub(super) metrics: crate::telemetry::Metrics,
     pub(super) reads: Rc<Coordinator>,
     pub(super) parser: RequestParser,
     pub(super) responses: Rc<Responses>,
@@ -186,7 +190,7 @@ impl ClientListeners {
             readiness: RefCell::new(ReadyListeners::default()),
             sim_cursor: RefCell::new(None),
             ingress: None,
-            metrics: crate::telemetry::metrics::Metrics::default(),
+            metrics: crate::telemetry::Metrics::default(),
             reads,
             parser,
             responses,
@@ -211,7 +215,7 @@ impl ClientListeners {
         self.request_timeout = timeout;
         self
     }
-    pub fn with_metrics(mut self, metrics: crate::telemetry::metrics::Metrics) -> Self {
+    pub fn with_metrics(mut self, metrics: crate::telemetry::Metrics) -> Self {
         self.metrics = metrics;
         self
     }
@@ -310,7 +314,7 @@ impl ClientListeners {
     ) -> Operation<'a, PreparedListeners> {
         Box::pin(async move {
             scope.check()?;
-            crate::control::state::validate_definitions(definitions)?;
+            racer_control_wire::validate_definitions(definitions)?;
             if !self.accepting.get() {
                 return Err(Error::Unavailable);
             }
@@ -679,7 +683,7 @@ async fn serve_connection(
     retired: Arc<std::sync::atomic::AtomicBool>,
     idle: Rc<Cell<bool>>,
     timeout: Duration,
-    metrics: &crate::telemetry::metrics::Metrics,
+    metrics: &crate::telemetry::Metrics,
     deadline: Rc<Cell<std::time::Instant>>,
     #[cfg(test)] read_scopes: &RefCell<Vec<RequestScope>>,
 ) -> Result<()> {
@@ -800,18 +804,15 @@ pub(super) async fn handle_read_result(
     responses: &Responses,
     admission: &flow_control::Quotas<AdmissionPolicy>,
     scope: &RequestScope,
-    observation: &mut crate::telemetry::metrics::RequestMetrics,
+    observation: &mut crate::telemetry::RequestMetrics,
     timeout: Duration,
 ) -> Result<Option<ConnectionLease>> {
     let response = match read_result {
         Ok(response) => response,
         Err(error) => {
             admission.observer().record(
-                crate::telemetry::failures::Failure::new(
-                    crate::telemetry::failures::Stage::ClientRead,
-                    error,
-                )
-                .request(scope),
+                crate::telemetry::Failure::new(crate::telemetry::Stage::ClientRead, error)
+                    .request(scope),
             );
             let error = if error == Error::NotFound && kind.pin().is_some() {
                 Error::VersionUnavailable
@@ -1068,7 +1069,7 @@ impl PreparedListeners {
     }
 }
 
-impl crate::control::state::CacheTransition for PreparedListeners {
+impl crate::control::CacheTransition for PreparedListeners {
     fn commit(self: Box<Self>) {
         (*self).commit();
     }

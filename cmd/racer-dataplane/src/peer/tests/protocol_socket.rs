@@ -321,22 +321,20 @@ fn search_view_consumes_ingress_without_changing_signed_route() {
 
 #[test]
 fn server_authenticates_before_copy_only_service_and_signs_failures() {
-    use crate::{
-        http::{Codec, HttpIo},
-        runtime::reactor::Reactor,
-        topology::{
-            health::LinkHealth,
-            membership::{Member, Membership},
-            routing::Paths,
-        },
-    };
+    use crate::http::Codec;
+    use crate::http::HttpIo;
+    use crate::runtime::reactor::Reactor;
+    use crate::topology::LinkHealth;
+    use crate::topology::Member;
+    use crate::topology::Membership;
+    use crate::topology::Paths;
     use std::{cell::Cell, num::NonZeroU32};
     struct Service(Rc<Cell<usize>>);
     impl server::LocalPageService for Service {
         fn serve_peer<'a>(
             &'a self,
             request: protocol::VerifiedRequest,
-            _: crate::topology::membership::MembershipLease,
+            _: std::sync::Arc<crate::topology::Membership>,
             _: &'a RequestScope,
         ) -> crate::error::Operation<'a, PeerResponse> {
             Box::pin(async move {
@@ -378,7 +376,7 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
     let network = Rc::new(
         PeerNetwork::new(
             NodeId(C.into()),
-            crate::control::state::PublishedState::for_membership(membership),
+            crate::control::PublishedState::for_membership(membership),
         )
         .unwrap(),
     );
@@ -430,12 +428,12 @@ fn server_authenticates_before_copy_only_service_and_signs_failures() {
 
 #[test]
 fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
-    use crate::{
-        peer::protocol as p,
-        security::connection::signed_digest,
-        topology::membership::{Member, Membership},
-    };
-    use http1::{MessageHead, StartLine};
+    use crate::peer::protocol as p;
+    use crate::security::connection::signed_digest;
+    use crate::topology::Member;
+    use crate::topology::Membership;
+    use http1::MessageHead;
+    use http1::StartLine;
     let signers = signers();
     let membership = Arc::new(
         Membership::validate(
@@ -458,7 +456,7 @@ fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
     let network = Rc::new(
         PeerNetwork::new(
             NodeId(C.into()),
-            crate::control::state::PublishedState::for_membership(membership),
+            crate::control::PublishedState::for_membership(membership),
         )
         .unwrap(),
     );
@@ -524,11 +522,10 @@ fn handshake_capabilities_are_signed_and_bound_to_request_and_membership() {
 
 #[test]
 fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
-    use crate::topology::{
-        health::LinkHealth,
-        membership::{Member, Membership},
-        routing::Paths,
-    };
+    use crate::topology::LinkHealth;
+    use crate::topology::Member;
+    use crate::topology::Membership;
+    use crate::topology::Paths;
     for fail in [false, true] {
         let signers = signers();
         let origin = Forwarding::new(signers[0].clone());
@@ -557,7 +554,7 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
         let network = Rc::new(
             PeerNetwork::new(
                 NodeId(B.into()),
-                crate::control::state::PublishedState::for_membership(membership.clone()),
+                crate::control::PublishedState::for_membership(membership.clone()),
             )
             .unwrap(),
         );
@@ -654,11 +651,11 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
 
 #[test]
 fn v5_equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
-    use crate::topology::{
-        health::{LinkHealth, LinkOutcome},
-        membership::{Member, Membership},
-        routing::Paths,
-    };
+    use crate::topology::LinkHealth;
+    use crate::topology::LinkOutcome;
+    use crate::topology::Member;
+    use crate::topology::Membership;
+    use crate::topology::Paths;
     let signers = signers();
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
@@ -752,15 +749,14 @@ fn v5_equal_cost_signed_receiver_survives_wire_recompute_and_cache_eviction() {
 
 #[test]
 fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
-    use crate::{
-        http::{Codec, HttpIo, HttpPool},
-        runtime::reactor::Reactor,
-        topology::{
-            health::LinkHealth,
-            membership::{Member, Membership},
-            routing::Paths,
-        },
-    };
+    use crate::http::Codec;
+    use crate::http::HttpIo;
+    use crate::http::HttpPool;
+    use crate::runtime::reactor::Reactor;
+    use crate::topology::LinkHealth;
+    use crate::topology::Member;
+    use crate::topology::Membership;
+    use crate::topology::Paths;
     use std::task::{Context, Poll};
     let (signers, _) = identities();
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
@@ -810,7 +806,7 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
         Rc::new(
             PeerNetwork::new(
                 NodeId(A.into()),
-                crate::control::state::PublishedState::for_membership(members.clone()),
+                crate::control::PublishedState::for_membership(members.clone()),
             )
             .unwrap(),
         ),
@@ -906,11 +902,10 @@ fn requester_and_server_negotiate_and_exchange_over_real_tcp() {
 }
 
 fn signed_tcp_case(case: &str) {
-    use crate::topology::{
-        health::LinkHealth,
-        membership::{Member, Membership},
-        routing::Paths,
-    };
+    use crate::topology::LinkHealth;
+    use crate::topology::Member;
+    use crate::topology::Membership;
+    use crate::topology::Paths;
     use std::{
         net::TcpListener,
         task::{Context, Poll},
@@ -920,7 +915,7 @@ fn signed_tcp_case(case: &str) {
         fn serve_peer<'a>(
             &'a self,
             request: protocol::VerifiedRequest,
-            _: crate::topology::membership::MembershipLease,
+            _: std::sync::Arc<crate::topology::Membership>,
             scope: &'a RequestScope,
         ) -> crate::error::Operation<'a, PeerResponse> {
             Box::pin(async move {
@@ -981,19 +976,19 @@ fn signed_tcp_case(case: &str) {
     let source_network = Rc::new(
         PeerNetwork::new(
             NodeId(A.into()),
-            crate::control::state::PublishedState::for_membership(membership.clone()),
+            crate::control::PublishedState::for_membership(membership.clone()),
         )
         .unwrap(),
     );
     let destination_network = Rc::new(
         PeerNetwork::new(
             NodeId(C.into()),
-            crate::control::state::PublishedState::for_membership(membership.clone()),
+            crate::control::PublishedState::for_membership(membership.clone()),
         )
         .unwrap(),
     );
     let destination_auth = Rc::new(Forwarding::new(signers[2].clone()));
-    let metrics = crate::telemetry::metrics::Metrics::default();
+    let metrics = crate::telemetry::Metrics::default();
     let adaptive =
         crate::peer::adaptive::AdaptivePeers::new(Default::default(), metrics.clone()).unwrap();
     let paths = Rc::new(Paths::new(Rc::new(LinkHealth), 4).with_peer_admission(adaptive));
@@ -1087,17 +1082,11 @@ fn signed_tcp_case(case: &str) {
     };
     assert!(matches!(response.response(), PeerResponse::Miss));
     assert_eq!(
-        metrics.count(crate::telemetry::metrics::Event::PeerAdmissionAccepted),
+        metrics.count(crate::telemetry::Event::PeerAdmissionAccepted),
         1
     );
-    assert_eq!(
-        metrics.count(crate::telemetry::metrics::Event::PeerVerified),
-        1
-    );
-    assert_eq!(
-        metrics.gauge(crate::telemetry::metrics::Gauge::PeerExchanges),
-        0
-    );
+    assert_eq!(metrics.count(crate::telemetry::Event::PeerVerified), 1);
+    assert_eq!(metrics.gauge(crate::telemetry::Gauge::PeerExchanges), 0);
     assert_eq!(
         health.tracked_links(),
         0,
@@ -1107,11 +1096,11 @@ fn signed_tcp_case(case: &str) {
 
 #[test]
 fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
-    use crate::{
-        http::{Codec, HttpIo},
-        runtime::reactor::Reactor,
-        topology::{health::LinkHealth, routing::Paths},
-    };
+    use crate::http::Codec;
+    use crate::http::HttpIo;
+    use crate::runtime::reactor::Reactor;
+    use crate::topology::LinkHealth;
+    use crate::topology::Paths;
     use std::{
         future::Future,
         io::{Read, Write},
@@ -1124,7 +1113,7 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
         fn serve_peer<'a>(
             &'a self,
             _: protocol::VerifiedRequest,
-            _: crate::topology::membership::MembershipLease,
+            _: std::sync::Arc<crate::topology::Membership>,
             _: &'a RequestScope,
         ) -> crate::error::Operation<'a, PeerResponse> {
             Box::pin(async { panic!("incomplete headers must not dispatch") })
@@ -1303,18 +1292,23 @@ fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
 
 #[test]
 fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
-    use crate::{
-        http::{Codec, Endpoint, HttpIo, HttpPool},
-        model::{ExpiresAt, ObjectMetadata, PageEnvelope},
-        peer::protocol,
-        runtime::reactor::Reactor,
-        security::forwarding::ForwardedHead,
-        topology::{
-            membership::{Member, Membership},
-            rails::{self, RailId, RailMapping, TransportPlan},
-            routing::Route,
-        },
-    };
+    use crate::http::Codec;
+    use crate::http::Endpoint;
+    use crate::http::HttpIo;
+    use crate::http::HttpPool;
+    use crate::model::ExpiresAt;
+    use crate::model::ObjectMetadata;
+    use crate::model::PageEnvelope;
+    use crate::peer::protocol;
+    use crate::rdma;
+    use crate::rdma::TransportPlan;
+    use crate::runtime::reactor::Reactor;
+    use crate::security::forwarding::ForwardedHead;
+    use crate::topology::Member;
+    use crate::topology::Membership;
+    use crate::topology::Route;
+    use racer_control_wire::RailId;
+    use racer_control_wire::RailMapping;
     use std::{
         net::TcpListener,
         task::{Context, Poll},
@@ -1465,7 +1459,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
                 _ => unreachable!(),
             };
             let plan =
-                rails::select_hop(&route, &page, &NodeId(A.into()), &NodeId(C.into())).unwrap();
+                rdma::select_hop(&route, &page, &NodeId(A.into()), &NodeId(C.into())).unwrap();
             assert_eq!(plan, TransportPlan::Rdma { rail: RailId(0) });
             local.operation = Operation::Page {
                 page,
@@ -1521,7 +1515,8 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
 }
 #[test]
 fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
-    use crate::topology::membership::{Member, Membership};
+    use crate::topology::Member;
+    use crate::topology::Membership;
     let membership = Arc::new(
         Membership::validate(
             MembershipVersion(7),
@@ -1540,7 +1535,7 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
     let local = membership.members()[0].node.clone();
     let network = PeerNetwork::new(
         local.clone(),
-        Arc::new(crate::control::state::PublishedState::default()),
+        Arc::new(crate::control::PublishedState::default()),
     )
     .unwrap();
     assert!(matches!(
@@ -1588,17 +1583,16 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
 
 mod established_sessions {
     use super::*;
-    use crate::{
-        http::{Codec, ConnectionLease, HttpIo},
-        peer::protocol as p,
-        runtime::reactor::Reactor,
-        security::connection,
-        topology::{
-            health::LinkHealth,
-            membership::{Member, Membership},
-            routing::Paths,
-        },
-    };
+    use crate::http::Codec;
+    use crate::http::ConnectionLease;
+    use crate::http::HttpIo;
+    use crate::peer::protocol as p;
+    use crate::runtime::reactor::Reactor;
+    use crate::security::connection;
+    use crate::topology::LinkHealth;
+    use crate::topology::Member;
+    use crate::topology::Membership;
+    use crate::topology::Paths;
     use std::{
         cell::Cell,
         future::Future,
@@ -1611,7 +1605,7 @@ mod established_sessions {
         fn serve_peer<'a>(
             &'a self,
             _: protocol::VerifiedRequest,
-            _: crate::topology::membership::MembershipLease,
+            _: std::sync::Arc<crate::topology::Membership>,
             _: &'a RequestScope,
         ) -> crate::error::Operation<'a, PeerResponse> {
             Box::pin(async {
@@ -1667,7 +1661,7 @@ mod established_sessions {
             let network = Rc::new(
                 PeerNetwork::new(
                     NodeId(C.into()),
-                    crate::control::state::PublishedState::for_membership(membership),
+                    crate::control::PublishedState::for_membership(membership),
                 )
                 .unwrap(),
             );

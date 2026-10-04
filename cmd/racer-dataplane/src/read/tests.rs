@@ -101,7 +101,7 @@ fn remote_budget_charges_final_incoming_link_and_never_restores_attempts() {
         now + std::time::Duration::from_secs(60),
     )
     .unwrap();
-    let mut route = crate::topology::routing::RouteBudget {
+    let mut route = crate::topology::RouteBudget {
         membership: crate::model::MembershipVersion(1),
         request: scope.request,
         attempt: AttemptId([2; 16]),

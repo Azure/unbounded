@@ -11,25 +11,36 @@ use super::{
         Flights, JoinedCopy, JoinedFlight,
     },
 };
-use crate::{
-    error::{Error, Operation, Result},
-    memory::{
-        BufferPool, CiphertextPage,
-        cache::MemoryCache,
-        page::{AcquiredPage, PageResult, UnverifiedPage},
-    },
-    model::{ObjectMetadata, OriginContext, PAGE_BYTES, PageId, ResourceClass, VersionMetadata},
-    origin::Origin,
-    peer::protocol::{FetchMode, Operation as PeerOperation, PeerResponse},
-    runtime::{
-        admission::{AdmissionExt, AdmissionPolicy},
-        deadline::RequestScope,
-    },
-    security::{aead::PageCrypto, credentials::CredentialCrypto},
-    store::{StoreReader, StoreWriter},
-    telemetry::metrics::{Event, Gauge, LookupTier, Metrics},
-    topology::membership::MembershipLease,
-};
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::memory::BufferPool;
+use crate::memory::CiphertextPage;
+use crate::memory::cache::MemoryCache;
+use crate::memory::page::AcquiredPage;
+use crate::memory::page::PageResult;
+use crate::memory::page::UnverifiedPage;
+use crate::model::ObjectMetadata;
+use crate::model::OriginContext;
+use crate::model::PAGE_BYTES;
+use crate::model::PageId;
+use crate::model::ResourceClass;
+use crate::model::VersionMetadata;
+use crate::origin::Origin;
+use crate::peer::protocol::FetchMode;
+use crate::peer::protocol::Operation as PeerOperation;
+use crate::peer::protocol::PeerResponse;
+use crate::runtime::admission::AdmissionExt;
+use crate::runtime::admission::AdmissionPolicy;
+use crate::runtime::deadline::RequestScope;
+use crate::security::aead::PageCrypto;
+use crate::security::credentials::CredentialCrypto;
+use crate::store::StoreReader;
+use crate::store::StoreWriter;
+use crate::telemetry::Event;
+use crate::telemetry::Gauge;
+use crate::telemetry::LookupTier;
+use crate::telemetry::Metrics;
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
 
 #[derive(Clone)]
@@ -71,7 +82,7 @@ impl DecryptSource {
     fn observe(self, metrics: &Metrics, result: Result<PageResult>) -> Result<PageResult> {
         result.inspect_err(|error| {
             if *error == Error::CorruptRecord {
-                let _ = metrics.record(
+                metrics.record(
                     match self {
                         Self::Disk => Event::FillDecryptDiskCorrupt,
                         Self::Retained => Event::FillDecryptRetainedCorrupt,
@@ -99,7 +110,7 @@ impl Fill {
             .lookup(LookupTier::Plaintext, self.dependencies.memory.get(page))?;
         if let Some(result) = &result {
             result.validate_for(page)?;
-            self.metrics.record(Event::MemoryHit, 1)?;
+            self.metrics.record(Event::MemoryHit, 1);
         }
         Ok(result)
     }
@@ -107,7 +118,7 @@ impl Fill {
         &self,
         version: crate::model::ObjectVersion,
         demand: crate::peer::subscriptions::Demand,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         context: &OriginContext,
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
@@ -217,7 +228,7 @@ impl Fill {
         self.publish(result.clone(), None, scope).await?;
         // Selected subscription pages bypass acquire_inner's source accounting.
         // Count only authenticated, published reception on the stable owner.
-        self.metrics.record(Event::PeerHit, 1)?;
+        self.metrics.record(Event::PeerHit, 1);
         Ok(result)
     }
     pub(crate) fn observe_peer_error(
@@ -226,15 +237,16 @@ impl Fill {
         attempt: crate::model::AttemptId,
         error: Error,
     ) {
-        use crate::telemetry::failures::{Failure, Stage};
+        use crate::telemetry::Failure;
+        use crate::telemetry::Stage;
         self.dependencies.admission.observer().record(
             Failure::new(Stage::PeerLocal, error)
                 .request(scope)
                 .attempt(attempt),
         );
     }
-    pub(crate) fn record_peer_bootstrap(&self) -> Result<()> {
-        self.metrics.record(Event::PeerBootstrap, 1)
+    pub(crate) fn record_peer_bootstrap(&self) {
+        self.metrics.record(Event::PeerBootstrap, 1);
     }
     pub(super) fn reserve_with_reclamation(
         &self,
@@ -354,7 +366,7 @@ impl Fill {
     pub fn acquire<'a>(
         &'a self,
         page: PageId,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         context: &'a OriginContext,
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
@@ -373,7 +385,7 @@ impl Fill {
     pub(crate) async fn acquire_ordered(
         &self,
         page: PageId,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         context: &OriginContext,
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
@@ -400,7 +412,7 @@ impl Fill {
     pub fn acquire_ciphertext<'a>(
         &'a self,
         page: PageId,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         context: &'a OriginContext,
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
@@ -419,7 +431,7 @@ impl Fill {
     pub fn publish_bootstrap_with_context<'a>(
         &'a self,
         origin: crate::origin::OriginPage,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         context: &'a OriginContext,
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
@@ -451,7 +463,7 @@ impl Fill {
     fn acquire_with_prefetch<'a>(
         &'a self,
         page: PageId,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         context: &'a OriginContext,
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
@@ -469,7 +481,7 @@ impl Fill {
                 .lookup(LookupTier::Plaintext, self.dependencies.memory.get(&page))?
             {
                 result.validate_for(&page)?;
-                self.metrics.record(Event::MemoryHit, 1)?;
+                self.metrics.record(Event::MemoryHit, 1);
                 return Ok(result.into());
             }
             let mut waiter = match self.dependencies.flights.join_for(
@@ -663,7 +675,7 @@ impl Fill {
         &self,
         origin: crate::origin::OriginPage,
         page: &PageId,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         scope: &RequestScope,
     ) -> Result<PageResult> {
         scope.check()?;
@@ -710,7 +722,7 @@ impl Fill {
         };
         result.validate_for(page)?;
         self.publish(result.clone(), dirty, scope).await?;
-        self.metrics.record(Event::OriginFill, 1)?;
+        self.metrics.record(Event::OriginFill, 1);
         Ok(result)
     }
     /// Strictly local completed/pending copy or join of existing work; never starts
@@ -728,7 +740,7 @@ impl Fill {
                 self.dependencies.memory.ciphertext(page),
             )? {
                 validate_copy(&copy, page)?;
-                self.metrics.record(Event::MemoryHit, 1)?;
+                self.metrics.record(Event::MemoryHit, 1);
                 return Ok(Some((copy.metadata, copy.ciphertext)));
             }
             if let Some(copy) = self.metrics.lookup(
@@ -736,7 +748,7 @@ impl Fill {
                 self.dependencies.writer.copy_only(page),
             )? {
                 validate_copy(&copy, page)?;
-                self.metrics.record(Event::MemoryHit, 1)?;
+                self.metrics.record(Event::MemoryHit, 1);
                 return Ok(Some((copy.metadata, copy.ciphertext)));
             }
             // Copy-only forbids new acquisition, not reclamation of idle local
@@ -746,7 +758,7 @@ impl Fill {
                     return Ok(Some((copy.metadata, copy.ciphertext)));
                 }
                 Err(Error::CorruptRecord) => {
-                    self.metrics.record(Event::CorruptMiss, 1)?;
+                    self.metrics.record(Event::CorruptMiss, 1);
                 }
                 Ok(None) | Err(Error::MissingKey | Error::Io) => {}
                 Err(error) => return Err(error),
@@ -836,7 +848,7 @@ impl Fill {
                         | Err(Error::Overloaded | Error::MissingKey | Error::Unavailable) => {}
                         Err(error) => return Err(error),
                     }
-                    fill.metrics.record(Event::DiskHit, 1)?;
+                    fill.metrics.record(Event::DiskHit, 1);
                     Ok(Some(copy))
                 }
                 .await;
@@ -897,7 +909,7 @@ impl Fill {
                     match self.validate_disk_copy(&copy, page, token, scope).await {
                         Ok(()) => {}
                         Err(Error::CorruptRecord) => {
-                            self.metrics.record(Event::CorruptMiss, 1)?;
+                            self.metrics.record(Event::CorruptMiss, 1);
                             return Ok(None);
                         }
                         Err(Error::MissingKey) => return Ok(None),
@@ -913,7 +925,7 @@ impl Fill {
                         Event::MemoryHit
                     },
                     1,
-                )?;
+                );
                 return Ok(Some(AcquiredPage::Ciphertext(UnverifiedPage {
                     copy,
                     disk_token: token,
@@ -940,12 +952,12 @@ impl Fill {
                             Event::MemoryHit
                         },
                         1,
-                    )?;
+                    );
                     return Ok(Some(result.into()));
                 }
                 Err(error @ (Error::CorruptRecord | Error::MissingKey)) => {
                     if error == Error::CorruptRecord {
-                        self.metrics.record(Event::CorruptMiss, 1)?;
+                        self.metrics.record(Event::CorruptMiss, 1);
                     }
                     if let Some(token) = &token {
                         self.dependencies.disk.invalidate(token)?;
@@ -982,7 +994,7 @@ impl Fill {
     pub(super) async fn acquire_once(
         &self,
         page: &PageId,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         context: &OriginContext,
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
@@ -1064,7 +1076,7 @@ impl Fill {
                 result.validate_for(page)?;
                 scope.check()?;
                 self.publish(result.clone(), dirty, scope).await?;
-                self.metrics.record(Event::PeerHit, 1)?;
+                self.metrics.record(Event::PeerHit, 1);
                 return Ok(result.into());
             }
         }
@@ -1073,7 +1085,7 @@ impl Fill {
             .dependencies
             .candidates
             .resolve_after_hedge(
-                crate::topology::routing::Candidates {
+                crate::topology::Candidates {
                     membership: candidates.membership.clone(),
                     ordered: candidates.ordered.clone(),
                 },
@@ -1173,7 +1185,7 @@ impl Fill {
             // that evidence even when the supplier requested only ciphertext.
             self.publish(page.clone(), dirty, scope).await?;
         }
-        self.metrics.record(source, 1)?;
+        self.metrics.record(source, 1);
         Ok(result)
     }
 
@@ -1214,7 +1226,7 @@ impl Fill {
         scope.check()?;
         let copy = response_copy(response.response(), page).inspect_err(|error| {
             if *error == Error::CorruptRecord {
-                let _ = self.metrics.record(Event::CorruptMiss, 1);
+                self.metrics.record(Event::CorruptMiss, 1);
             }
         })?;
         let reservation = match reservation {
@@ -1225,7 +1237,7 @@ impl Fill {
             .await
             .inspect_err(|error| {
                 if *error == Error::CorruptRecord {
-                    let _ = self.metrics.record(Event::CorruptMiss, 1);
+                    self.metrics.record(Event::CorruptMiss, 1);
                 }
             })
     }
@@ -1244,7 +1256,7 @@ impl Fill {
         let result = async {
             validate_copy(&copy, page)?;
             // Keep the original immutable ciphertext lease across crypto submission.
-            self.metrics.record(Event::PageDecrypt, 1)?;
+            self.metrics.record(Event::PageDecrypt, 1);
             let plaintext = self
                 .dependencies
                 .crypto

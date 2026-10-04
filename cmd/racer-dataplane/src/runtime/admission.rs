@@ -1,9 +1,14 @@
 //! Racer resource policy and compound admission operations.
-use crate::{
-    error::{Error, Result},
-    model::{CacheId, Limits, PAGE_BYTES, ResourceClass},
-    telemetry::failures::{Detail, Failure, Observer, Stage},
-};
+use crate::error::Error;
+use crate::error::Result;
+use crate::model::CacheId;
+use crate::model::Limits;
+use crate::model::PAGE_BYTES;
+use crate::model::ResourceClass;
+use crate::telemetry::Detail;
+use crate::telemetry::Failure;
+use crate::telemetry::Observer;
+use crate::telemetry::Stage;
 use flow_control::{Charge, Policy, Quotas, Rejection, SharedQuotas};
 use std::sync::Mutex;
 

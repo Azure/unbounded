@@ -535,38 +535,44 @@ mod duplex_release {
     }
 }
 use super::fill::*;
-use crate::{
-    client::{ClientRequest, ReadKind},
-    control::state::PublishedState,
-    http::{Codec, HttpIo},
-    memory::{delivery::Delivery, new_pipe_pool},
-    model::{ByteRange, MembershipVersion},
-    peer::{
-        PeerNetwork,
-        protocol::{PeerRequest, VerifiedResponse},
-        server::{LocalPageService, PeerServer},
-    },
-    read::Coordinator,
-    security::{
-        connection::Signatures,
-        forwarding::Forwarding,
-        test_support::{network, node},
-    },
-    topology::{health::LinkHealth, routing::Paths},
-};
+use crate::client::ClientRequest;
+use crate::client::ReadKind;
+use crate::control::PublishedState;
+use crate::http::Codec;
+use crate::http::HttpIo;
+use crate::memory::delivery::Delivery;
+use crate::memory::new_pipe_pool;
+use crate::model::ByteRange;
+use crate::model::MembershipVersion;
+use crate::peer::PeerNetwork;
+use crate::peer::protocol::PeerRequest;
+use crate::peer::protocol::VerifiedResponse;
+use crate::peer::server::LocalPageService;
+use crate::peer::server::PeerServer;
+use crate::read::Coordinator;
+use crate::security::connection::Signatures;
+use crate::security::forwarding::Forwarding;
+use crate::security::test_support::network;
+use crate::security::test_support::node;
+use crate::topology::LinkHealth;
+use crate::topology::Paths;
 
 struct Link {
     client: Rc<Requester>,
     demands: Rc<RefCell<Vec<u64>>>,
 }
 impl Link {
-    fn direct_hedge_available(&self, _: &MembershipLease, _: &crate::model::NodeId) -> bool {
+    fn direct_hedge_available(
+        &self,
+        _: &std::sync::Arc<crate::topology::Membership>,
+        _: &crate::model::NodeId,
+    ) -> bool {
         false
     }
     fn request_direct<'a>(
         &'a self,
         _: PeerRequest,
-        _: MembershipLease,
+        _: std::sync::Arc<crate::topology::Membership>,
         _: &'a RequestScope,
     ) -> Operation<'a, VerifiedResponse> {
         panic!("hot-read demand fixture does not admit direct hedges")
@@ -574,7 +580,7 @@ impl Link {
     fn request<'a>(
         &'a self,
         request: PeerRequest,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
     ) -> Operation<'a, VerifiedResponse> {
         Box::pin(async move {
@@ -597,7 +603,7 @@ impl LocalPageService for Gate {
     fn serve_peer<'a>(
         &'a self,
         request: crate::peer::protocol::VerifiedRequest,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
     ) -> Operation<'a, PeerResponse> {
         Box::pin(async move {
@@ -622,7 +628,7 @@ impl LocalPageService for Gate {
         })
     }
 }
-fn local_membership(signer: &Signatures) -> MembershipLease {
+fn local_membership(signer: &Signatures) -> std::sync::Arc<crate::topology::Membership> {
     Arc::new(
         Membership::validate(
             MembershipVersion(1),
@@ -641,7 +647,7 @@ fn local_membership(signer: &Signatures) -> MembershipLease {
 pub(super) fn coordinator(
     f: &Fixture,
     signer: &Rc<Signatures>,
-    membership: &MembershipLease,
+    membership: &std::sync::Arc<crate::topology::Membership>,
     peers: Rc<Requester>,
 ) -> (
     Rc<Coordinator>,

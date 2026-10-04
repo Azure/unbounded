@@ -71,7 +71,7 @@ impl Drop for VerifiedBytes {
 #[derive(Clone)]
 pub struct CiphertextPage {
     pub(crate) inner: Arc<CiphertextBytes>,
-    pub(crate) provenance: Option<crate::telemetry::failures::PeerProvenance>,
+    pub(crate) provenance: Option<crate::telemetry::PeerProvenance>,
 }
 pub(crate) struct CiphertextBytes {
     pub checksum: std::sync::OnceLock<u64>,
@@ -338,7 +338,7 @@ pub(crate) mod tests {
             let source = admission(8);
             let target = admission(8);
             let mut page = bundle(&source, "rehome");
-            let provenance = crate::telemetry::failures::PeerProvenance {
+            let provenance = crate::telemetry::PeerProvenance {
                 request: crate::model::RequestId([3; 16]),
                 attempt: crate::model::AttemptId([4; 16]),
                 supplier: [b'a'; 36],
@@ -431,7 +431,7 @@ pub(crate) mod tests {
             None,
             "capture must not hash payload"
         );
-        let provenance = crate::telemetry::failures::PeerProvenance {
+        let provenance = crate::telemetry::PeerProvenance {
             request: RequestId([3; 16]),
             attempt: crate::model::AttemptId([4; 16]),
             supplier: [b'a'; 36],
@@ -490,7 +490,7 @@ pub(crate) mod tests {
         assert_eq!(changed.crc, changed_aad.crc);
         assert_eq!(changed.page, changed_aad.page);
         assert_ne!(changed.aad, changed_aad.aad);
-        let failures = crate::telemetry::failures::Failures::default();
+        let failures = crate::telemetry::Failures::default();
         failures.observer(crate::model::WorkerId(0)).record_aead(
             crate::runtime::crypto::CryptoId {
                 worker: crate::model::WorkerId(0),
@@ -837,7 +837,8 @@ pub(crate) fn acquire_wait<'a>(
 #[cfg(test)]
 mod pipe_tests {
     use super::*;
-    use crate::{error::Error, model::Limits};
+    use crate::error::Error;
+    use crate::model::Limits;
 
     pub(in crate::memory) fn admission(pipes: usize) -> Rc<Quotas<AdmissionPolicy>> {
         let small = std::num::NonZeroUsize::new(8).unwrap();
@@ -904,7 +905,8 @@ mod pipe_tests {
 
     #[test]
     fn scheduled_wait_cancellation_deadline_stop_and_abandonment_release_admission() {
-        use crate::{model::RequestId, test_support::WakeCounter};
+        use crate::model::RequestId;
+        use crate::test_support::WakeCounter;
         use std::{
             sync::Arc,
             task::{Context, Poll},

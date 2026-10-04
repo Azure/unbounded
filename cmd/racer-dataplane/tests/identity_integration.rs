@@ -1,6 +1,7 @@
 //! Cross-component ownership: real control decoding, application publication,
 //! immutable identity leases, and completion-retained page crypto work.
-use racer_control_wire::{self as wire, *};
+use racer_control_wire as wire;
+use racer_control_wire::*;
 use racer_dataplane::{
     config::Config,
     control::BundleInstaller,

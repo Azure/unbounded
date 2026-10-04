@@ -11,7 +11,7 @@
 //!     peer::{server::LocalPageService, protocol::{PeerRequest, VerifiedResponse}},
 //!     runtime::deadline::RequestScope,
 //!     security::forwarding::Forwarding,
-//!     topology::{membership::MembershipLease, routing::RouteBudget},
+//!     topology::{Membership, RouteBudget},
 //! };
 //!
 //! async fn round_trip(
@@ -23,7 +23,7 @@
 //!     next: &NodeId,
 //!     previous: &NodeId,
 //!     budget: RouteBudget,
-//!     membership: MembershipLease,
+//!     membership: std::sync::Arc<Membership>,
 //!     scope: &RequestScope,
 //! ) -> Result<VerifiedResponse> {
 //!     let (outbound, outstanding) = requester.sign_request(request)?;
@@ -40,15 +40,19 @@
 //! }
 //! ```
 use super::connection::{Signatures, SignedHead, node_field, receiver, signed_digest};
-use crate::{
-    error::{Error, Result},
-    model::NodeId,
-    peer::protocol::{
-        self, PeerRequest, PeerResponse, SignedRequest, SignedResponse, field, number, push,
-        push_binary,
-    },
-    topology::routing::RouteBudget,
-};
+use crate::error::Error;
+use crate::error::Result;
+use crate::model::NodeId;
+use crate::peer::protocol;
+use crate::peer::protocol::PeerRequest;
+use crate::peer::protocol::PeerResponse;
+use crate::peer::protocol::SignedRequest;
+use crate::peer::protocol::SignedResponse;
+use crate::peer::protocol::field;
+use crate::peer::protocol::number;
+use crate::peer::protocol::push;
+use crate::peer::protocol::push_binary;
+use crate::topology::RouteBudget;
 use http1::{MessageHead, StartLine};
 use racer_identity::VerifiedPeer;
 use std::{rc::Rc, sync::Arc};
@@ -392,7 +396,7 @@ impl Forwarding {
                     .try_into()
                     .map_err(|_| Error::InvalidRequest)
             };
-            Ok::<_, Error>(crate::telemetry::failures::PeerProvenance {
+            Ok::<_, Error>(crate::telemetry::PeerProvenance {
                 request: crate::model::RequestId(id("racer-request")?),
                 attempt: crate::model::AttemptId(id("racer-attempt")?),
                 supplier: origin

@@ -7,11 +7,13 @@ use racer_dataplane as dataplane;
 #[path = "support/enrollment.rs"]
 #[allow(dead_code)]
 mod enrollment_io;
-use racer_dataplane::{
-    control::{ControlEndpoint, enrollment::Enrollment, state, transport::*},
-    model::{ClusterId, RequestId},
-    runtime::deadline::RequestScope,
-};
+use racer_control_wire as state;
+use racer_dataplane::control::ControlEndpoint;
+use racer_dataplane::control::Enrollment;
+use racer_dataplane::control::*;
+use racer_dataplane::model::ClusterId;
+use racer_dataplane::model::RequestId;
+use racer_dataplane::runtime::deadline::RequestScope;
 use std::{
     rc::Rc,
     time::{Duration, Instant},

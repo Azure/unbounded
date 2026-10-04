@@ -8,20 +8,25 @@ use super::{
     candidates::{CandidatePolicy, CandidateResolution},
     flight::AcquisitionBudget,
 };
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::model::MetadataSelector;
+use crate::model::ObjectId;
+use crate::model::ObjectMetadata;
+use crate::model::ObjectVersion;
+use crate::model::OriginContext;
+use crate::model::PageId;
+use crate::model::PageNumber;
+use crate::model::StrongEtag;
+use crate::origin::Origin;
+use crate::peer::protocol::FetchMode;
+use crate::peer::protocol::Operation as PeerOperation;
+use crate::peer::protocol::PeerResponse;
 use crate::runtime::collections::HashMap;
-use crate::{
-    error::{Error, Operation, Result},
-    model::{
-        MetadataSelector, ObjectId, ObjectMetadata, ObjectVersion, OriginContext, PageId,
-        PageNumber, StrongEtag,
-    },
-    origin::Origin,
-    peer::protocol::{FetchMode, Operation as PeerOperation, PeerResponse},
-    runtime::deadline::RequestScope,
-    security::credentials::CredentialCrypto,
-    store::catalog::Index,
-    topology::membership::MembershipLease,
-};
+use crate::runtime::deadline::RequestScope;
+use crate::security::credentials::CredentialCrypto;
+use crate::store::catalog::Index;
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
@@ -397,7 +402,7 @@ impl MetadataService {
     pub fn resolve<'a>(
         &'a self,
         selector: MetadataSelector,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         context: &'a OriginContext,
         scope: &'a RequestScope,
     ) -> Operation<'a, ObjectMetadata> {
@@ -412,7 +417,7 @@ impl MetadataService {
     pub fn resolve_with_budget<'a>(
         &'a self,
         selector: MetadataSelector,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         context: &'a OriginContext,
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
@@ -440,7 +445,7 @@ impl MetadataService {
     fn resolve_inner<'a>(
         &'a self,
         selector: MetadataSelector,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         context: &'a OriginContext,
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
@@ -576,7 +581,7 @@ impl MetadataService {
     async fn refresh(
         &self,
         selector: MetadataSelector,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         context: &OriginContext,
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
@@ -673,7 +678,7 @@ impl MetadataService {
         &self,
         authority: &super::candidates::OriginAuthority,
         selector: &MetadataSelector,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         context: &OriginContext,
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
@@ -746,7 +751,7 @@ impl MetadataService {
         &self,
         authority: &super::candidates::OriginAuthority,
         selector: &MetadataSelector,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         context: &OriginContext,
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
@@ -808,7 +813,7 @@ impl MetadataService {
 
     pub(crate) async fn bootstrap_peer(
         &self,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         context: &OriginContext,
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,

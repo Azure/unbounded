@@ -97,7 +97,7 @@ impl NativePairs {
     }
 }
 impl Application {
-    pub fn discovered_nics(&self) -> &[crate::topology::rails::RailMapping] {
+    pub fn discovered_nics(&self) -> &[racer_control_wire::RailMapping] {
         &self.discovered_nics
     }
 }
@@ -118,11 +118,11 @@ impl WorkerApplication {
         }
         Ok(())
     }
-    pub(super) fn native_publication(&self) -> Result<Vec<crate::topology::rails::RailMapping>> {
+    pub(super) fn native_publication(&self) -> Result<Vec<racer_control_wire::RailMapping>> {
         let snapshot = self.snapshots.current()?;
         let member = snapshot.membership.member(self.keys.node())?;
         let capacity = self.devices.as_ref().map_or(0, |d| d.capacity());
-        Ok(crate::rdma::discovery::select_worker(
+        Ok(crate::rdma::select_worker(
             &member.rails,
             &self.discovered_nics,
             usize::from(self.worker.0),
@@ -209,13 +209,13 @@ impl WorkerApplication {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        control::state::Publication,
-        model::{MembershipVersion, ResourceClass},
-        runtime::crypto::{self, CryptoClient},
-        topology::{membership::Member, rails::RailId},
-    };
+    use crate::model::MembershipVersion;
+    use crate::model::ResourceClass;
+    use crate::runtime::crypto;
+    use crate::runtime::crypto::CryptoClient;
+    use racer_control_wire::Publication;
     use racer_control_wire::PublicationSequence;
+    use racer_control_wire::RailId;
     use std::num::NonZeroUsize;
 
     #[test]
@@ -232,16 +232,16 @@ mod tests {
         let (mut worker, engine) = worker(&app, true, true);
         let mut service = app.build_crypto(WorkerId(0), engine).unwrap();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        let mut publication = crate::control::state::Publication {
+        let mut publication = racer_control_wire::Publication {
             schema_version: 1,
             cluster: app.config.cluster.clone(),
             sequence: PublicationSequence(2),
             membership_version: MembershipVersion(2),
-            members: vec![Member {
+            members: vec![racer_control_wire::Member {
                 node: app.config.node.clone(),
                 shares: std::num::NonZeroU32::new(1).unwrap(),
                 peer_endpoint: "127.0.0.1:7443".into(),
-                rails: vec![crate::topology::rails::RailMapping {
+                rails: vec![racer_control_wire::RailMapping {
                     device: "new".into(),
                     port: 1,
                     gid: None,
@@ -256,7 +256,7 @@ mod tests {
         app.node.inventory.update(vec![]).unwrap();
         worker.poll_native(&mut cx).unwrap();
         assert!(worker.native_publication().unwrap().is_empty());
-        let fresh = crate::rdma::discovery::inventory();
+        let fresh = crate::rdma::inventory();
         app.node.inventory.update(fresh.clone()).unwrap();
         for _ in 0..20 {
             worker.poll_native(&mut cx).unwrap();
@@ -764,7 +764,7 @@ mod tests {
         // Stand in only for the identity returned by authenticated enrollment.
         config.node = NodeId("00000000-0000-4000-8000-000000000002".into());
         let mut app = Application::assemble(config).unwrap();
-        app.discovered_nics = vec![crate::topology::rails::RailMapping {
+        app.discovered_nics = vec![racer_control_wire::RailMapping {
             device: "missing".into(),
             port: 1,
             gid: Some([1; 16]),
@@ -808,7 +808,7 @@ mod tests {
                 cluster: app.config.cluster.clone(),
                 sequence: PublicationSequence(1),
                 membership_version: MembershipVersion(1),
-                members: vec![Member {
+                members: vec![racer_control_wire::Member {
                     node: app.config.node.clone(),
                     shares: std::num::NonZeroU32::new(1).unwrap(),
                     peer_endpoint: "127.0.0.1:7443".into(),
@@ -870,7 +870,7 @@ mod tests {
                 cluster: app.config.cluster.clone(),
                 sequence: PublicationSequence(2),
                 membership_version: MembershipVersion(2),
-                members: vec![Member {
+                members: vec![racer_control_wire::Member {
                     node: app.config.node.clone(),
                     shares: std::num::NonZeroU32::new(1).unwrap(),
                     peer_endpoint: "127.0.0.1:7443".into(),
@@ -895,14 +895,8 @@ mod tests {
         let mut app = configured();
         app.discovered_nics.push(app.discovered_nics[0].clone());
         assert!(
-            crate::rdma::discovery::select_worker(
-                &app.discovered_nics[..1],
-                &app.discovered_nics,
-                0,
-                None,
-                1
-            )
-            .is_empty()
+            crate::rdma::select_worker(&app.discovered_nics[..1], &app.discovered_nics, 0, None, 1)
+                .is_empty()
         );
     }
 

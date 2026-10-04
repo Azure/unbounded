@@ -1,21 +1,28 @@
 //! Signed peer operations and canonical encoding/decoding with charged ownership.
 //! Binary fields use padded standard base64, integers minimal decimal, and keys
 //! lowercase hex. Encoders never include page bytes; transports preserve signed heads.
-use crate::{
-    error::{Error, Result},
-    http::Codec,
-    memory::{BufferPool, CiphertextPage},
-    model::{
-        EncryptedAuthorization, ExpiresAt, KeyId, MetadataSelector, Nonce, ObjectMetadata,
-        OpaqueMetadata, PageEnvelope, PeerOriginContext, ResourceClass, *,
-    },
-    runtime::{
-        admission::AdmissionPolicy,
-        deadline::{Deadline, RequestScope},
-    },
-    security::{connection::SignedHead, forwarding::ForwardedHead},
-    topology::routing::RouteBudget,
-};
+use crate::error::Error;
+use crate::error::Result;
+use crate::http::Codec;
+use crate::memory::BufferPool;
+use crate::memory::CiphertextPage;
+use crate::model::EncryptedAuthorization;
+use crate::model::ExpiresAt;
+use crate::model::KeyId;
+use crate::model::MetadataSelector;
+use crate::model::Nonce;
+use crate::model::ObjectMetadata;
+use crate::model::OpaqueMetadata;
+use crate::model::PageEnvelope;
+use crate::model::PeerOriginContext;
+use crate::model::ResourceClass;
+use crate::model::*;
+use crate::runtime::admission::AdmissionPolicy;
+use crate::runtime::deadline::Deadline;
+use crate::runtime::deadline::RequestScope;
+use crate::security::connection::SignedHead;
+use crate::security::forwarding::ForwardedHead;
+use crate::topology::RouteBudget;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use http1::{Header, MessageHead, StartLine};
 use std::{

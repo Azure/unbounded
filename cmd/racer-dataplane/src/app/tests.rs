@@ -1,6 +1,6 @@
 //! Application lifecycle tests and shared assembled-worker fixtures.
 use super::*;
-use crate::control::state;
+use racer_control_wire as state;
 use racer_control_wire as wire;
 use std::{
     collections::VecDeque,
@@ -97,7 +97,7 @@ impl EnrollmentHandler {
         self.issued.fetch_add(1, Ordering::Release);
         (
             200,
-            wire::encode_enrollment_response(&crate::control::testing::issue_at(
+            wire::encode_enrollment_response(&crate::control::tests::testing::issue_at(
                 &request,
                 &self.ca,
                 &self.ca_key,
@@ -328,7 +328,7 @@ fn control_tls() -> (
     rcgen::KeyPair,
     Arc<rustls::ServerConfig>,
 ) {
-    let (ca, ca_key) = crate::control::testing::ca();
+    let (ca, ca_key) = crate::control::tests::testing::ca();
     let server_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
     let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".into()]).unwrap();
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
@@ -429,7 +429,7 @@ pub(super) fn local_worker_with_fabric(
     config: &Config,
     node: &Arc<NodeState>,
     id: u16,
-    discovered_nics: Vec<crate::topology::rails::RailMapping>,
+    discovered_nics: Vec<racer_control_wire::RailMapping>,
 ) -> (WorkerApplication, WorkerRuntime, PageCryptoEngine) {
     let worker = WorkerId(id);
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
@@ -455,10 +455,10 @@ pub(super) fn local_worker_with_fabric(
     )
 }
 
-pub(super) fn definition() -> crate::control::state::CacheDefinition {
+pub(super) fn definition() -> racer_control_wire::CacheDefinition {
     let (client_socket, origin_socket) =
-        crate::control::state::canonical_socket_paths("app-lifecycle").unwrap();
-    crate::control::state::CacheDefinition {
+        racer_control_wire::canonical_socket_paths("app-lifecycle").unwrap();
+    racer_control_wire::CacheDefinition {
         id: crate::model::CacheId("33333333-3333-4333-8333-333333333333".into()),
         name: "app-lifecycle".into(),
         client_socket,
@@ -469,14 +469,14 @@ pub(super) fn definition() -> crate::control::state::CacheDefinition {
 pub(super) fn publication(
     config: &Config,
     sequence: u64,
-    caches: Vec<crate::control::state::CacheDefinition>,
+    caches: Vec<racer_control_wire::CacheDefinition>,
 ) -> state::Publication {
     state::Publication {
         schema_version: 1,
         cluster: config.cluster.clone(),
         sequence: wire::PublicationSequence(sequence),
         membership_version: crate::model::MembershipVersion(1),
-        members: vec![crate::topology::membership::Member {
+        members: vec![racer_control_wire::Member {
             node: config.node.clone(),
             shares: std::num::NonZeroU32::new(1).unwrap(),
             peer_endpoint: "127.0.0.1:7443".into(),
@@ -920,7 +920,7 @@ fn composes_http_and_optional_rdma_without_operational_side_effects() {
         assert_eq!(worker.poll_budgeted(&mut cx, 0), Err(Error::Unavailable));
         assert_eq!(worker.poll_budgeted(&mut cx, 1), Err(Error::Unavailable));
         // Admission bounds retained generations once across the node.
-        let mut publication = crate::control::state::decode_publication(include_bytes!(concat!(
+        let mut publication = racer_control_wire::decode_publication(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../internal/racer/wire/testdata/publication.json"
         )))
@@ -952,7 +952,7 @@ fn shared_factory_is_send_and_sync_without_moving_worker_graphs() {
 #[test]
 fn multiworker_memberships_retire_after_request_leases_and_reuse_capacity() {
     use crate::{model::MembershipVersion, peer::PeerNetwork};
-    let mut publication = crate::control::state::decode_publication(include_bytes!(concat!(
+    let mut publication = racer_control_wire::decode_publication(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../internal/racer/wire/testdata/publication.json"
     )))
@@ -1031,7 +1031,7 @@ fn removal_visibility_changes_without_worker_or_checkpoint_barriers() {
     let (worker, _, _) = local_worker(&config, &node, 0);
     let cache = definition();
     let availability =
-        crate::control::state::Availability::new(node.publications.clone(), worker.keys.clone());
+        crate::control::Availability::new(node.publications.clone(), worker.keys.clone());
     for (sequence, present) in [(1, true), (2, false), (3, true)] {
         worker
             .snapshots
@@ -1303,11 +1303,10 @@ fn two_workers_start_from_real_control_and_checkpoint_one_complete_cut() {
             let (config, node, ready) = (&config, &node, &ready);
             threads.spawn(move || {
                 let (mut app, runtime, mut engine) = local_worker(config, node, id);
-                use crate::telemetry::metrics::Event;
+                use crate::telemetry::Event;
                 app.telemetry
                     .metrics
-                    .record(Event::MemoryHit, u64::from(id) + 1)
-                    .unwrap();
+                    .record(Event::MemoryHit, u64::from(id) + 1);
                 drive(
                     &runtime,
                     &mut engine,
@@ -1382,7 +1381,7 @@ fn startup_finishes_local_snapshot_installation_while_next_long_poll_is_held() {
 
 #[test]
 fn same_node_renewal_backs_off_expires_closed_and_recovers() {
-    use crate::telemetry::health::State;
+    use crate::telemetry::State;
     use uring_runtime::environment::{SimulationClock, now, wall_now};
 
     // Complete each real control turn through the application's error handling.
@@ -1619,7 +1618,7 @@ fn removal_publication_finishes_locally_after_controller_disappears() {
     let diagnostic_address = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     config.diagnostics_listen = diagnostic_address.local_addr().unwrap();
     drop(diagnostic_address);
-    let keep = crate::control::state::CacheDefinition {
+    let keep = racer_control_wire::CacheDefinition {
         id: CacheId("44444444-4444-4444-8444-444444444444".into()),
         name: "keep".into(),
         client_socket: "/run/racer/keep/client/socket".into(),
@@ -1985,7 +1984,8 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
 
 #[test]
 fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
-    use crate::{runtime::affinity::WorkerPair, store::checkpoint};
+    use crate::runtime::affinity::WorkerPair;
+    use crate::store::checkpoint;
     let mut fixture = ControlFixture::new();
     let (config, node) = fixture.bootstrap_node(2, Duration::from_secs(15));
     let keys = Keyring::new(

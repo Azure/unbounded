@@ -1,12 +1,15 @@
 //! Identity mappings, segment lifecycle, and lease-fenced second-chance eviction.
+use crate::error::Error;
+use crate::error::Result;
+use crate::model::CurrentVersion;
 use crate::model::KeyId;
+use crate::model::ObjectId;
+use crate::model::ObjectMetadata;
+use crate::model::ObjectVersion;
+use crate::model::PageId;
+use crate::model::VersionMetadata;
+use crate::model::WorkerId;
 use crate::runtime::collections::{HashMap, HashSet};
-use crate::{
-    error::{Error, Result},
-    model::{
-        CurrentVersion, ObjectId, ObjectMetadata, ObjectVersion, PageId, VersionMetadata, WorkerId,
-    },
-};
 use page_alloc::{Extent, Generation, SegmentId, SegmentState, Segments};
 use std::{
     cell::{Cell, RefCell},
@@ -26,7 +29,7 @@ pub struct Index {
     metadata_capacity: usize,
     page_capacity: Cell<usize>,
     state: RefCell<State>,
-    availability: Rc<crate::control::state::Availability>,
+    availability: Rc<crate::control::Availability>,
     reserved: Cell<usize>,
 }
 #[derive(Default)]
@@ -98,7 +101,7 @@ impl Index {
     pub fn new(
         worker: WorkerId,
         metadata_capacity: usize,
-        availability: Rc<crate::control::state::Availability>,
+        availability: Rc<crate::control::Availability>,
     ) -> Self {
         Self {
             worker,

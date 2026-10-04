@@ -3,11 +3,12 @@
 //! completions restore one slot per second. Link failures halve that peer's cap
 //! and allow one probe after backoff. No queue, background probes, or new byte
 //! budget is introduced. Existing worker memory quotas remain authoritative.
-use crate::{
-    error::{Error, Result},
-    model::NodeId,
-    telemetry::metrics::{Event, Gauge, Metrics},
-};
+use crate::error::Error;
+use crate::error::Result;
+use crate::model::NodeId;
+use crate::telemetry::Event;
+use crate::telemetry::Gauge;
+use crate::telemetry::Metrics;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -113,7 +114,7 @@ impl AdaptivePeers {
         let now = uring_runtime::environment::now();
         let mut state = self.state.lock().map_err(|_| Error::Unavailable)?;
         if state.active >= state.limit {
-            self.metrics.record(Event::PeerAdmissionRejected, 1)?;
+            self.metrics.record(Event::PeerAdmissionRejected, 1);
             return Err(Error::Overloaded);
         }
         if !state.peers.contains_key(node) && state.peers.len() == CAPACITY {
@@ -132,7 +133,7 @@ impl AdaptivePeers {
             if let Some(retired) = retired {
                 state.peers.remove(&retired);
             } else {
-                self.metrics.record(Event::PeerAdmissionRejected, 1)?;
+                self.metrics.record(Event::PeerAdmissionRejected, 1);
                 return Err(Error::Overloaded);
             }
         }
@@ -145,11 +146,11 @@ impl AdaptivePeers {
             updated: now,
         });
         if peer.probe || peer.retry.is_some_and(|at| now < at) {
-            self.metrics.record(Event::PeerCircuitRejected, 1)?;
+            self.metrics.record(Event::PeerCircuitRejected, 1);
             return Err(Error::Unavailable);
         }
         if peer.active >= peer.limit {
-            self.metrics.record(Event::PeerAdmissionRejected, 1)?;
+            self.metrics.record(Event::PeerAdmissionRejected, 1);
             return Err(Error::Overloaded);
         }
         let probe = peer.retry.is_some();
@@ -159,9 +160,9 @@ impl AdaptivePeers {
         state.active += 1;
         self.metrics
             .set_gauge(Gauge::PeerExchanges, state.active as u64);
-        self.metrics.record(Event::PeerAdmissionAccepted, 1)?;
+        self.metrics.record(Event::PeerAdmissionAccepted, 1);
         if probe {
-            self.metrics.record(Event::PeerProbe, 1)?;
+            self.metrics.record(Event::PeerProbe, 1);
         }
         Ok(Arc::new(Permit {
             owner: self.clone(),
@@ -180,7 +181,7 @@ impl Permit {
         // Local receive/connection quota pressure adapts only the node-wide
         // admission limit. It never marks a remote node or link unhealthy.
         if outcome == Outcome::LocalPressure {
-            let _ = self.owner.metrics.record(Event::PeerLocalPressure, 1);
+            self.owner.metrics.record(Event::PeerLocalPressure, 1);
             if now.saturating_duration_since(state.updated) >= BACKOFF {
                 state.limit = (state.limit / 2).max(1);
                 state.updated = now;
@@ -208,7 +209,7 @@ impl Permit {
             Outcome::LocalPressure => Event::PeerLocalPressure,
             Outcome::Neutral => return,
         };
-        let _ = self.owner.metrics.record(event, 1);
+        self.owner.metrics.record(event, 1);
         if peer.generation != self.generation {
             return;
         }

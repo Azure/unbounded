@@ -27,10 +27,10 @@ pub mod hedge {
     //! cold fallback needs additional original credits and is skipped if underfunded.
     //! A valid winner waits for the losing exchange/crypto fence before return:
     //! this can limit the latency benefit and is not an early-publication implementation.
-    use crate::{
-        error::{Error, Result},
-        telemetry::metrics::{Event, Metrics},
-    };
+    use crate::error::Error;
+    use crate::error::Result;
+    use crate::telemetry::Event;
+    use crate::telemetry::Metrics;
     use std::{
         collections::BTreeMap,
         sync::{Arc, Mutex},
@@ -100,7 +100,7 @@ pub mod hedge {
             self.config.slots > 0
         }
         pub(crate) fn suppressed(&self) {
-            let _ = self.metrics.record(Event::PageHedgeSuppressed, 1);
+            self.metrics.record(Event::PageHedgeSuppressed, 1);
         }
         pub(crate) fn acquire(self: &Arc<Self>) -> Result<Permit> {
             let mut state = self.state.lock().map_err(|_| Error::Unavailable)?;
@@ -154,14 +154,13 @@ pub mod hedge {
             }
         }
         pub(crate) fn started(&self) {
-            let _ = self.owner.metrics.record(Event::PageHedgeStarted, 1);
-            let _ = self
-                .owner
+            self.owner.metrics.record(Event::PageHedgeStarted, 1);
+            self.owner
                 .metrics
                 .record(Event::PageHedgeDuplicateBytes, DUPLICATE_BYTES as u64);
         }
         pub(crate) fn won(&self) {
-            let _ = self.owner.metrics.record(Event::PageHedgeWon, 1);
+            self.owner.metrics.record(Event::PageHedgeWon, 1);
         }
     }
     impl Drop for Permit {
@@ -285,8 +284,9 @@ pub mod hedge {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::model::RequestId;
         use crate::read::tests::page;
-        use crate::{model::RequestId, runtime::deadline::RequestScope};
+        use crate::runtime::deadline::RequestScope;
         use std::{cell::Cell, future::Future, rc::Rc};
         use uring_runtime::environment::{SimulationClock, now};
         fn scope() -> RequestScope {
@@ -614,22 +614,27 @@ use self::{
     metadata::MetadataService,
     range_stream::{RangeStream, RangeStreams},
 };
-use crate::{
-    client::{ClientRequest, ReadKind},
-    control::state::SnapshotStore,
-    error::{Error, Operation, Result},
-    model::{
-        ByteRange, MetadataSelector, ObjectId, ObjectMetadata, OriginContext, PeerOriginContext,
-        ResolvedRange,
-    },
-    peer::{
-        protocol::{FetchMode, Operation as PeerOperation, PeerResponse, VerifiedRequest},
-        server::LocalPageService,
-    },
-    runtime::deadline::RequestScope,
-    security::credentials::{ChargedOriginContext, CredentialCrypto},
-    topology::membership::MembershipLease,
-};
+use crate::client::ClientRequest;
+use crate::client::ReadKind;
+use crate::control::SnapshotStore;
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::model::ByteRange;
+use crate::model::MetadataSelector;
+use crate::model::ObjectId;
+use crate::model::ObjectMetadata;
+use crate::model::OriginContext;
+use crate::model::PeerOriginContext;
+use crate::model::ResolvedRange;
+use crate::peer::protocol::FetchMode;
+use crate::peer::protocol::Operation as PeerOperation;
+use crate::peer::protocol::PeerResponse;
+use crate::peer::protocol::VerifiedRequest;
+use crate::peer::server::LocalPageService;
+use crate::runtime::deadline::RequestScope;
+use crate::security::credentials::ChargedOriginContext;
+use crate::security::credentials::CredentialCrypto;
 use std::rc::Rc;
 
 pub struct ReadResponse {
@@ -643,7 +648,7 @@ pub struct Coordinator {
     pub(super) fill: Rc<Fill>,
     streams: Rc<RangeStreams>,
     pub(super) credentials: Rc<CredentialCrypto>,
-    availability: Rc<crate::control::state::Availability>,
+    availability: Rc<crate::control::Availability>,
 }
 // Metadata/bootstrap allowance. Normal pinned client ranges admit bounded page
 // acquisitions separately; this is not a ceiling on successful pages delivered.
@@ -651,7 +656,7 @@ pub(crate) fn default_budget(scope: &RequestScope) -> AcquisitionBudget {
     AcquisitionBudget::new(scope.deadline.0, 32, 96)
 }
 pub(crate) fn inherited_budget(
-    route: &crate::topology::routing::RouteBudget,
+    route: &crate::topology::RouteBudget,
     scope: &RequestScope,
 ) -> Result<AcquisitionBudget> {
     scope.check()?;
@@ -682,7 +687,7 @@ impl Coordinator {
         fill: Rc<Fill>,
         streams: Rc<RangeStreams>,
         credentials: Rc<CredentialCrypto>,
-        availability: Rc<crate::control::state::Availability>,
+        availability: Rc<crate::control::Availability>,
     ) -> Self {
         Self {
             snapshots,
@@ -798,7 +803,7 @@ impl LocalPageService for Coordinator {
     fn serve_peer<'a>(
         &'a self,
         verified: VerifiedRequest,
-        membership: MembershipLease,
+        membership: std::sync::Arc<crate::topology::Membership>,
         scope: &'a RequestScope,
     ) -> Operation<'a, PeerResponse> {
         Box::pin(async move {
@@ -896,7 +901,7 @@ impl LocalPageService for Coordinator {
                             mode: FetchMode::Acquire,
                             ..
                         } => {
-                            self.fill.record_peer_bootstrap()?;
+                            self.fill.record_peer_bootstrap();
                             self.metadata
                                 .bootstrap_peer(membership, &context, &effective, &mut budget)
                                 .await

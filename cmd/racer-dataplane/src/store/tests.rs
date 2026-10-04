@@ -255,7 +255,7 @@ impl Drop for Directory {
     }
 }
 struct Fixture {
-    metrics: crate::telemetry::metrics::Metrics,
+    metrics: crate::telemetry::Metrics,
     store: Store,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     reactor: Rc<Reactor>,
@@ -270,11 +270,8 @@ impl Fixture {
     fn in_directory(directory: Directory) -> Self {
         Self::assemble(directory, crate::test_support::availability())
     }
-    fn assemble(
-        directory: Directory,
-        availability: Rc<crate::control::state::Availability>,
-    ) -> Self {
-        let metrics = crate::telemetry::metrics::Metrics::default();
+    fn assemble(directory: Directory, availability: Rc<crate::control::Availability>) -> Self {
+        let metrics = crate::telemetry::Metrics::default();
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
@@ -419,11 +416,13 @@ fn scope() -> RequestScope {
 
 #[test]
 fn storage_requires_published_cache_and_live_keys_including_restore() {
-    use crate::{
-        control::state::{Availability, PublishedState, for_caches},
-        memory::{cache::MemoryCache, tests::bundle_for},
-        security::test_support::{keys, rotation_bundle},
-    };
+    use crate::control::Availability;
+    use crate::control::PublishedState;
+    use crate::control::for_caches;
+    use crate::memory::cache::MemoryCache;
+    use crate::memory::tests::bundle_for;
+    use crate::security::test_support::keys;
+    use crate::security::test_support::rotation_bundle;
     use std::sync::Arc;
 
     for mode in ["unpublished", "absent", "keyless", "available"] {
@@ -656,11 +655,7 @@ fn dirty_queue_is_bounded_and_cache_removal_discards_without_io() {
     assert_eq!(f.enqueue(first).unwrap(), ticket);
     f.enqueue(f.copy(2, 3)).unwrap();
     assert!(matches!(f.enqueue(f.copy(3, 3)), Err(Error::Overloaded)));
-    assert_eq!(
-        f.metrics
-            .count(crate::telemetry::metrics::Event::DirtyDiscard),
-        0
-    );
+    assert_eq!(f.metrics.count(crate::telemetry::Event::DirtyDiscard), 0);
     assert!(f.store.writer.copy_only(&id).unwrap().is_some());
     f.store
         .writer
@@ -671,11 +666,7 @@ fn dirty_queue_is_bounded_and_cache_removal_discards_without_io() {
     // Eviction alone has no permanent tombstone; production admission is the
     // current positive cache/key set, independently tested through the app.
     assert!(f.enqueue(f.copy(4, 3)).is_ok());
-    assert_eq!(
-        f.metrics
-            .count(crate::telemetry::metrics::Event::DirtyDiscard),
-        2
-    );
+    assert_eq!(f.metrics.count(crate::telemetry::Event::DirtyDiscard), 2);
 }
 
 #[test]
@@ -947,15 +938,10 @@ fn real_writer_rechecks_index_capacity_and_replaces_same_page_when_full() {
     f.enqueue(first).unwrap();
     f.enqueue(second).unwrap();
     assert_eq!(
-        f.metrics
-            .gauge(crate::telemetry::metrics::Gauge::PendingDiskWrites),
+        f.metrics.gauge(crate::telemetry::Gauge::PendingDiskWrites),
         2
     );
-    assert_eq!(
-        f.metrics
-            .count(crate::telemetry::metrics::Event::DiskPublication),
-        0
-    );
+    assert_eq!(f.metrics.count(crate::telemetry::Event::DiskPublication), 0);
     let request = scope();
     let mut progress = f.store.writer.progress(1, &request);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
@@ -967,14 +953,9 @@ fn real_writer_rechecks_index_capacity_and_replaces_same_page_when_full() {
     );
     assert_eq!(drive(&f.reactor, progress).unwrap(), 1);
     let original = index.lookup(&first_id).unwrap().unwrap().location;
+    assert_eq!(f.metrics.count(crate::telemetry::Event::DiskPublication), 1);
     assert_eq!(
-        f.metrics
-            .count(crate::telemetry::metrics::Event::DiskPublication),
-        1
-    );
-    assert_eq!(
-        f.metrics
-            .gauge(crate::telemetry::metrics::Gauge::PendingDiskWrites),
+        f.metrics.gauge(crate::telemetry::Gauge::PendingDiskWrites),
         1
     );
     // The queued page now turns over the full index and performs real I/O.
@@ -983,14 +964,9 @@ fn real_writer_rechecks_index_capacity_and_replaces_same_page_when_full() {
     assert_eq!(drive(&f.reactor, progress).unwrap(), 1);
     assert!(index.lookup(&second_id).unwrap().is_some());
     assert!(index.lookup(&first_id).unwrap().is_none());
+    assert_eq!(f.metrics.count(crate::telemetry::Event::DiskPublication), 2);
     assert_eq!(
-        f.metrics
-            .count(crate::telemetry::metrics::Event::DiskPublication),
-        2
-    );
-    assert_eq!(
-        f.metrics
-            .gauge(crate::telemetry::metrics::Gauge::PendingDiskWrites),
+        f.metrics.gauge(crate::telemetry::Gauge::PendingDiskWrites),
         0
     );
     assert_eq!(f.store.writer.discarded_count(), 0);
@@ -1187,11 +1163,7 @@ fn real_direct_slab_roundtrip_checkpoint_and_corruption_miss() {
             .is_none()
     );
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
-    assert_eq!(
-        f.metrics
-            .count(crate::telemetry::metrics::Event::CorruptMiss),
-        1
-    );
+    assert_eq!(f.metrics.count(crate::telemetry::Event::CorruptMiss), 1);
 }
 
 #[test]
@@ -1280,22 +1252,13 @@ fn abandoned_write_retains_kernel_lease_and_cannot_publish() {
     assert!(f.reactor.in_flight() > 0);
     drop(operation);
     assert!(f.store.writer.index().lookup(&id).unwrap().is_none());
-    assert_eq!(
-        f.metrics
-            .count(crate::telemetry::metrics::Event::DirtyDiscard),
-        1
-    );
+    assert_eq!(f.metrics.count(crate::telemetry::Event::DirtyDiscard), 1);
     assert_eq!(f.store.writer.pending_count(), 0);
     assert_eq!(
-        f.metrics
-            .gauge(crate::telemetry::metrics::Gauge::PendingDiskWrites),
+        f.metrics.gauge(crate::telemetry::Gauge::PendingDiskWrites),
         0
     );
-    assert_eq!(
-        f.metrics
-            .count(crate::telemetry::metrics::Event::DiskPublication),
-        0
-    );
+    assert_eq!(f.metrics.count(crate::telemetry::Event::DiskPublication), 0);
     assert!(f.admission.used(ResourceClass::Ciphertext) > 0);
     assert!(!f.store.writer.is_idle());
     assert_eq!(f.store.writer.writes_in_flight(), 1);
@@ -1335,26 +1298,16 @@ fn cache_removal_during_write_fences_late_publication() {
     assert!(f.store.writer.index().lookup(&id).unwrap().is_none());
     assert_eq!(f.store.writer.pending_count(), 1);
     assert_eq!(
-        f.metrics
-            .gauge(crate::telemetry::metrics::Gauge::PendingDiskWrites),
+        f.metrics.gauge(crate::telemetry::Gauge::PendingDiskWrites),
         1
     );
-    assert_eq!(
-        f.metrics
-            .count(crate::telemetry::metrics::Event::DiskPublication),
-        0
-    );
+    assert_eq!(f.metrics.count(crate::telemetry::Event::DiskPublication), 0);
     drive(&f.reactor, f.store.writer.progress(1, &request)).unwrap();
     assert_eq!(
-        f.metrics
-            .gauge(crate::telemetry::metrics::Gauge::PendingDiskWrites),
+        f.metrics.gauge(crate::telemetry::Gauge::PendingDiskWrites),
         0
     );
-    assert_eq!(
-        f.metrics
-            .count(crate::telemetry::metrics::Event::DiskPublication),
-        1
-    );
+    assert_eq!(f.metrics.count(crate::telemetry::Event::DiskPublication), 1);
     assert!(f.store.writer.index().lookup(&id).unwrap().is_some());
     assert_eq!(f.store.writer.pending_count(), 0);
     assert_eq!(f.admission.used(ResourceClass::DirtyCiphertext), 0);
@@ -1362,11 +1315,11 @@ fn cache_removal_during_write_fences_late_publication() {
 
 #[test]
 fn sustained_rotation_reclaims_history_and_fences_held_pages_and_write_completions() {
-    use crate::{
-        control::state::for_caches,
-        memory::{cache::MemoryCache, tests::bundle_for},
-        security::test_support::{keys, rotation_bundle},
-    };
+    use crate::control::for_caches;
+    use crate::memory::cache::MemoryCache;
+    use crate::memory::tests::bundle_for;
+    use crate::security::test_support::keys;
+    use crate::security::test_support::rotation_bundle;
     use racer_identity::KeyPurpose;
     use std::sync::Arc;
     let keys = Rc::new(keys());

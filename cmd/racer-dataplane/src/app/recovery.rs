@@ -335,7 +335,7 @@ fn select(
     workers: &WorkerDirectory,
     (page_capacity, metadata_capacity): (usize, usize),
     keys: &Keyring,
-    caches: &[crate::control::state::CacheDefinition],
+    caches: &[racer_control_wire::CacheDefinition],
 ) -> Option<CheckpointImage> {
     // The disk scanner supplies newest-first images, never retaining a second
     // decoded candidate while validating the first.
@@ -362,7 +362,7 @@ fn validate_candidate(
     workers: &WorkerDirectory,
     (page_capacity, metadata_capacity): (usize, usize),
     keys: &Keyring,
-    caches: &[crate::control::state::CacheDefinition],
+    caches: &[racer_control_wire::CacheDefinition],
 ) -> Option<CheckpointImage> {
     let ids: HashSet<_> = image.shards.iter().map(|s| s.worker).collect();
     if ids.len() != image.shards.len() || ids != geometry.keys().copied().collect() {
@@ -408,7 +408,7 @@ mod tests {
     fn geometry() -> CheckpointGeometry {
         CheckpointGeometry::new(8192, 4096, 2, Alignment::new(4096, 4096, 4096).unwrap()).unwrap()
     }
-    fn caches() -> Vec<crate::control::state::CacheDefinition> {
+    fn caches() -> Vec<racer_control_wire::CacheDefinition> {
         let mut cache = crate::app::tests::definition();
         cache.id = crate::model::CacheId(crate::security::test_support::CACHE.into());
         vec![cache]

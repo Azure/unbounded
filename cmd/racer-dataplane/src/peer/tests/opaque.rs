@@ -365,16 +365,17 @@ mod materialized_pairing {
 mod safety {
     //! Opaque transit keeps deadline and endpoint authentication safety boundaries.
     use super::*;
-    use crate::{
-        runtime::{
-            crypto::{self, CryptoClient},
-            worker::{CryptoRuntime, CryptoService},
-        },
-        security::aead::{PageCrypto, PageCryptoEngine},
-        telemetry::metrics::{Event, Metrics},
-    };
+    use crate::runtime::crypto;
+    use crate::runtime::crypto::CryptoClient;
+    use crate::runtime::worker::CryptoRuntime;
+    use crate::runtime::worker::CryptoService;
+    use crate::security::aead::PageCrypto;
+    use crate::security::aead::PageCryptoEngine;
+    use crate::telemetry::Event;
+    use crate::telemetry::Metrics;
     use racer_control_wire::{CacheEncryptionKey, CacheKeyPurpose, CacheKeyRef, CacheKeyState};
-    use std::{cell::RefCell, net::Shutdown};
+    use std::cell::RefCell;
+    use std::net::Shutdown;
 
     #[test]
     fn upstream_fin_before_response_head_recovers_quota_by_signed_deadline() {
@@ -786,17 +787,19 @@ mod safety {
         assert_eq!(f.admissions[0].used(ResourceClass::Plaintext), 0);
     }
 }
-use crate::{
-    http::{Codec, ConnectionLease, HttpIo, HttpPool},
-    model::{ExpiresAt, ObjectMetadata, PageEnvelope},
-    runtime::reactor::Reactor,
-    security::connection,
-    topology::{
-        health::LinkHealth,
-        membership::{Member, Membership},
-        routing::Paths,
-    },
-};
+use crate::http::Codec;
+use crate::http::ConnectionLease;
+use crate::http::HttpIo;
+use crate::http::HttpPool;
+use crate::model::ExpiresAt;
+use crate::model::ObjectMetadata;
+use crate::model::PageEnvelope;
+use crate::runtime::reactor::Reactor;
+use crate::security::connection;
+use crate::topology::LinkHealth;
+use crate::topology::Member;
+use crate::topology::Membership;
+use crate::topology::Paths;
 use http1::connection::BufferRange;
 use racer_crypto::aead;
 use std::{
@@ -826,7 +829,7 @@ impl server::LocalPageService for Never {
     fn serve_peer<'a>(
         &'a self,
         _: protocol::VerifiedRequest,
-        _: crate::topology::membership::MembershipLease,
+        _: std::sync::Arc<crate::topology::Membership>,
         _: &'a RequestScope,
     ) -> crate::error::Operation<'a, PeerResponse> {
         Box::pin(async { panic!("relay must not acquire or decrypt") })
@@ -889,11 +892,11 @@ struct RelayFixture {
 
 #[test]
 fn send_crc_http_success_failure_drop_do_not_wait_for_crypto() {
-    use crate::{
-        runtime::crypto::{CryptoClient, pair},
-        security::aead::PageCrypto,
-        telemetry::send_crc::{Pair, Samples},
-    };
+    use crate::runtime::crypto::CryptoClient;
+    use crate::runtime::crypto::pair;
+    use crate::security::aead::PageCrypto;
+    use crate::telemetry::Pair;
+    use crate::telemetry::Samples;
     for mode in ["success", "failure", "drop"] {
         let f = RelayFixture::new(true);
         let queue = Rc::new(uring_runtime::drivers::DriverQueue::new(1024));
@@ -952,7 +955,7 @@ fn send_crc_http_success_failure_drop_do_not_wait_for_crypto() {
         let (signed, _) = a.sign_request_to(local, f.signers[1].node()).unwrap();
         let admitted = b.verify_request(signed).unwrap();
         let mut page = f.page.clone();
-        page.provenance = Some(crate::telemetry::failures::PeerProvenance {
+        page.provenance = Some(crate::telemetry::PeerProvenance {
             request: f.scope.request,
             attempt: crate::model::AttemptId([9; 16]),
             supplier: C.as_bytes().try_into().unwrap(),
@@ -1089,7 +1092,7 @@ impl RelayFixture {
         let network = Rc::new(
             PeerNetwork::new(
                 NodeId(B.into()),
-                crate::control::state::PublishedState::for_membership(membership),
+                crate::control::PublishedState::for_membership(membership),
             )
             .unwrap(),
         );
@@ -1218,7 +1221,8 @@ impl RelayFixture {
             metadata,
             page,
         } = self;
-        use crate::telemetry::metrics::{Event, Metrics};
+        use crate::telemetry::Event;
+        use crate::telemetry::Metrics;
         let metrics = Metrics::default();
         let server = server.with_metrics(metrics.clone());
         let accepted = Cell::new(0);

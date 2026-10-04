@@ -66,10 +66,10 @@ pub struct MemoryCache {
     entries: RefCell<Entries>,
     ciphertext_entries: RefCell<BTreeMap<PageId, super::page::UnverifiedPage>>,
     ciphertext_cursor: RefCell<Option<PageId>>,
-    availability: Rc<crate::control::state::Availability>,
+    availability: Rc<crate::control::Availability>,
 }
 impl MemoryCache {
-    pub fn new(pool: BufferPool, availability: Rc<crate::control::state::Availability>) -> Self {
+    pub fn new(pool: BufferPool, availability: Rc<crate::control::Availability>) -> Self {
         Self {
             pool,
             entries: RefCell::new(Entries::default()),
@@ -619,7 +619,8 @@ mod tests {
     }
     #[test]
     fn empty_stable_catalog_rotates_without_consuming_page_metadata_capacity() {
-        use crate::{control::state::for_caches, security::test_support::rotation_bundle};
+        use crate::control::for_caches;
+        use crate::security::test_support::rotation_bundle;
         let admission = admission(1024);
         let keys = Rc::new(crate::security::test_support::keys());
         let roots = (*keys.peer_trust_roots().unwrap()).clone();

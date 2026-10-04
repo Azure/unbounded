@@ -1,19 +1,32 @@
 //! Vetted XChaCha20-Poly1305 adapter, canonical page AAD, fresh cryptographic nonces.
-use crate::{
-    error::{Error, Operation, Result},
-    memory::{CiphertextBytes, CiphertextPage, PlaintextBuffer, VerifiedBytes, VerifiedPage},
-    model::{Nonce, PageEnvelope, PageId, RequestId, ResourceClass},
-    runtime::{
-        admission::AdmissionPolicy,
-        crypto::{
-            CryptoClient, CryptoCompletion, CryptoInput, CryptoJob, CryptoOutcome, CryptoOutput,
-            CryptoPermit, IntegrityRejection,
-        },
-        deadline::RequestScope,
-        worker::{CryptoRuntime, CryptoService},
-    },
-    telemetry::failures::{AeadFailure, Failure, Stage},
-};
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::memory::CiphertextBytes;
+use crate::memory::CiphertextPage;
+use crate::memory::PlaintextBuffer;
+use crate::memory::VerifiedBytes;
+use crate::memory::VerifiedPage;
+use crate::model::Nonce;
+use crate::model::PageEnvelope;
+use crate::model::PageId;
+use crate::model::RequestId;
+use crate::model::ResourceClass;
+use crate::runtime::admission::AdmissionPolicy;
+use crate::runtime::crypto::CryptoClient;
+use crate::runtime::crypto::CryptoCompletion;
+use crate::runtime::crypto::CryptoInput;
+use crate::runtime::crypto::CryptoJob;
+use crate::runtime::crypto::CryptoOutcome;
+use crate::runtime::crypto::CryptoOutput;
+use crate::runtime::crypto::CryptoPermit;
+use crate::runtime::crypto::IntegrityRejection;
+use crate::runtime::deadline::RequestScope;
+use crate::runtime::worker::CryptoRuntime;
+use crate::runtime::worker::CryptoService;
+use crate::telemetry::AeadFailure;
+use crate::telemetry::Failure;
+use crate::telemetry::Stage;
 use racer_crypto::aead;
 use racer_identity::{KeyPurpose, Keyring};
 use std::{
@@ -98,7 +111,7 @@ impl PageCrypto {
         &self,
         ciphertext: CiphertextPage,
         scope: &RequestScope,
-        sample: crate::telemetry::send_crc::Work,
+        sample: crate::telemetry::Work,
     ) {
         let envelope = ciphertext.envelope();
         let key = match self.keys.lease(

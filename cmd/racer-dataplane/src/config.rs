@@ -23,7 +23,7 @@ const MAX_BYTES: u64 = 64 * 1024 * MIB;
 const MAX_ENTRIES: usize = 1_048_576;
 
 pub struct Config {
-    pub send_crc_pair: Option<crate::telemetry::send_crc::Pair>,
+    pub send_crc_pair: Option<crate::telemetry::Pair>,
     pub page_hedge: crate::read::hedge::Config,
     pub peer_admission: crate::peer::adaptive::Config,
     pub shares: std::num::NonZeroU32,
@@ -167,12 +167,10 @@ impl Config {
             Duration::from_millis(number("RACER_READER_STALL_TIMEOUT_MS", 10_000)?);
         let shutdown_timeout = Duration::from_millis(number("RACER_SHUTDOWN_TIMEOUT_MS", 30_000)?);
         let ranking_bytes = number("RACER_PLACEMENT_CACHE_BYTES", 16 * MIB)?;
-        if ranking_bytes < crate::topology::routing::RANKING_BYTES as u64
-            || ranking_bytes > 512 * MIB
-        {
+        if ranking_bytes < crate::topology::RANKING_BYTES as u64 || ranking_bytes > 512 * MIB {
             return Err(Error::InvalidConfiguration);
         }
-        let ranking_entries = ranking_bytes / crate::topology::routing::RANKING_BYTES as u64;
+        let ranking_entries = ranking_bytes / crate::topology::RANKING_BYTES as u64;
         let mut limit = |name: &str, default| {
             NonZeroUsize::new(to_usize(number(name, default)?)?).ok_or(Error::InvalidConfiguration)
         };
@@ -200,7 +198,7 @@ impl Config {
         let disk_page_entries = limit("RACER_DISK_PAGE_ENTRIES", 65536)?;
         let checkpoint_bytes = limit("RACER_CHECKPOINT_BYTES", 64 * MIB)?;
         let send_crc_pair = lookup("RACER_SEND_CRC_PAIR")?
-            .map(|value| crate::telemetry::send_crc::Pair::parse(&value))
+            .map(|value| crate::telemetry::Pair::parse(&value))
             .transpose()?;
         let config = Self {
             send_crc_pair,
@@ -512,10 +510,9 @@ mod tests {
 
     #[test]
     fn configured_ports_do_not_override_membership_or_discovered_hardware() {
-        use crate::{
-            rdma::match_publication,
-            topology::rails::{RailId, RailMapping},
-        };
+        use crate::rdma::match_publication;
+        use racer_control_wire::RailId;
+        use racer_control_wire::RailMapping;
         let nic = RailMapping {
             device: "a".into(),
             port: 1,
