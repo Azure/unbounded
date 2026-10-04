@@ -22,7 +22,7 @@ use crate::peer::protocol::Operation as PeerOperation;
 use crate::peer::protocol::PeerRequest;
 use crate::peer::protocol::PeerResponse;
 use crate::peer::protocol::VerifiedResponse;
-use uring_uring_uring_runtime::deadline::Deadline;
+use uring_uring_uring_uring_runtime::deadline::Deadline;
 use crate::runtime::RequestScope;
 use crate::security::credentials::CredentialCrypto;
 

@@ -8,7 +8,7 @@ use crate::model::ResourceClass;
 use crate::model::WorkerId;
 use crate::admission::AdmissionPolicy;
 
-use uring_uring_uring_runtime::deadline::Deadline;
+use uring_uring_uring_uring_runtime::deadline::Deadline;
 use crate::runtime::RequestScope;
 use crate::runtime::Reactor;
 use ::telemetry::Ring;
@@ -732,7 +732,7 @@ pub struct BodyProgress {
 }
 
 pub(crate) fn timestamp(at: std::time::Instant) -> u64 {
-    crate::peer::protocol::encode_deadline(uring_uring_uring_runtime::deadline::Deadline(at))
+    crate::peer::protocol::encode_deadline(uring_uring_uring_uring_runtime::deadline::Deadline(at))
         .unwrap_or_default()
 }
 

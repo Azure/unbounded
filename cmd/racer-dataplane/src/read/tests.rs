@@ -1124,7 +1124,7 @@ mod timeouts {
     use crate::peer::protocol::PeerResponse;
     use crate::peer::protocol::VerifiedResponse;
     use crate::read::flight::AcquisitionBudget;
-    use uring_uring_uring_runtime::deadline::Deadline;
+    use uring_uring_uring_uring_runtime::deadline::Deadline;
     use crate::runtime::RequestScope;
     use crate::topology::Candidates;
     use crate::model::ExpiresAt;

@@ -18,7 +18,7 @@ use crate::model::PeerOriginContext;
 use crate::model::ResourceClass;
 use crate::model::*;
 use crate::admission::AdmissionPolicy;
-use uring_uring_uring_runtime::deadline::Deadline;
+use uring_uring_uring_uring_runtime::deadline::Deadline;
 use crate::runtime::RequestScope;
 use crate::security::connection::SignedHead;
 use crate::security::forwarding::ForwardedHead;
