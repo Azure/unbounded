@@ -22,8 +22,8 @@ use crate::peer::protocol::Operation as PeerOperation;
 use crate::peer::protocol::PeerRequest;
 use crate::peer::protocol::PeerResponse;
 use crate::peer::protocol::VerifiedResponse;
-use crate::runtime::deadline::Deadline;
-use crate::runtime::deadline::RequestScope;
+use uring_runtime::deadline::Deadline;
+use crate::runtime::RequestScope;
 use crate::security::credentials::CredentialCrypto;
 
 use crate::topology::Candidates;
@@ -42,12 +42,12 @@ use std::time::Duration;
 use std::time::Instant;
 
 fn reserve_hedge_pages(
-    admission: &flow_control::Quotas<crate::runtime::admission::AdmissionPolicy>,
+    admission: &flow_control::Quotas<crate::admission::AdmissionPolicy>,
     cache: &crate::model::CacheId,
     pages: usize,
 ) -> Result<(
-    flow_control::Charge<crate::runtime::admission::AdmissionPolicy>,
-    flow_control::Charge<crate::runtime::admission::AdmissionPolicy>,
+    flow_control::Charge<crate::admission::AdmissionPolicy>,
+    flow_control::Charge<crate::admission::AdmissionPolicy>,
 )> {
     use crate::model::PAGE_BYTES;
     use crate::model::ResourceClass;
@@ -119,7 +119,7 @@ impl CandidatePolicy {
         operation: &PeerOperation,
         scope: &RequestScope,
         budget: &mut AcquisitionBudget,
-        admission: &Rc<flow_control::Quotas<crate::runtime::admission::AdmissionPolicy>>,
+        admission: &Rc<flow_control::Quotas<crate::admission::AdmissionPolicy>>,
         continuation: &mut HedgeContinuation,
         validate: impl Fn(
             VerifiedResponse,
@@ -1321,9 +1321,9 @@ impl Drop for Permit {
 pub(crate) async fn race(
     primary: impl std::future::Future<Output = Result<crate::memory::page::PageResult>>,
     secondary: impl std::future::Future<Output = Result<crate::memory::page::PageResult>>,
-    primary_scope: &crate::runtime::deadline::RequestScope,
-    secondary_scope: &crate::runtime::deadline::RequestScope,
-    parent: &crate::runtime::deadline::RequestScope,
+    primary_scope: &crate::runtime::RequestScope,
+    secondary_scope: &crate::runtime::RequestScope,
+    parent: &crate::runtime::RequestScope,
     permit: &Permit,
 ) -> Result<crate::memory::page::PageResult> {
     parent.check()?;
@@ -1557,7 +1557,7 @@ pub(super) mod tests {
         use crate::model::ClusterId;
         use crate::model::MembershipVersion;
         use crate::model::RequestId;
-        use crate::runtime::admission::AdmissionPolicy;
+        use crate::admission::AdmissionPolicy;
         use crate::topology::Member;
         use crate::topology::Membership;
         use racer_identity::KeyEpochs;
@@ -1879,7 +1879,7 @@ pub(super) mod tests {
         use racer_identity::Keyring;
         let config = crate::test_support::cluster::config(false);
         let admission = Rc::new(flow_control::Quotas::new(
-            crate::runtime::admission::AdmissionPolicy::new(config.limits),
+            crate::admission::AdmissionPolicy::new(config.limits),
         ));
         let keys = Rc::new(Keyring::new(
             config.cluster,
@@ -2015,7 +2015,7 @@ pub(super) mod tests {
         use super::*;
         use crate::read::tests::page;
         use crate::model::RequestId;
-        use crate::runtime::deadline::RequestScope;
+        use crate::runtime::RequestScope;
         use std::cell::Cell;
         use std::future::Future;
         use std::rc::Rc;

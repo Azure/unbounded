@@ -7,8 +7,8 @@ use crate::model::NodeId;
 use crate::model::ObjectId;
 use crate::model::PageNumber;
 use crate::model::RequestId;
-use crate::runtime::deadline::Deadline;
-use crate::runtime::deadline::RequestScope;
+use uring_runtime::deadline::Deadline;
+use crate::runtime::RequestScope;
 pub use ::topology::MAX_DEGREE;
 use racer_control_wire::RailMapping;
 use racer_control_wire::valid_site;
@@ -483,7 +483,7 @@ impl Placement {
         membership: std::sync::Arc<crate::topology::Membership>,
         object: &ObjectId,
         page: PageNumber,
-        scope: Option<&'a crate::runtime::deadline::RequestScope>,
+        scope: Option<&'a crate::runtime::RequestScope>,
     ) -> Operation<'a, Candidates> {
         let key = encoded_key(object, page);
         Box::pin(async move {
@@ -1385,7 +1385,7 @@ pub(crate) mod tests {
         #[test]
         fn scoped_cold_rank_cancels_between_bounded_quanta() {
             use crate::model::RequestId;
-            use crate::runtime::deadline::RequestScope;
+            use crate::runtime::RequestScope;
             let placement = Placement::with_memory_budget(4 * RANKING_BYTES);
             let members = membership(100_000);
             let scope = RequestScope::new(

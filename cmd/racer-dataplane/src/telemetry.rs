@@ -6,11 +6,11 @@ use crate::model::NodeId;
 use crate::model::RequestId;
 use crate::model::ResourceClass;
 use crate::model::WorkerId;
-use crate::runtime::admission::AdmissionPolicy;
+use crate::admission::AdmissionPolicy;
 
-use crate::runtime::deadline::Deadline;
-use crate::runtime::deadline::RequestScope;
-use crate::runtime::reactor::Reactor;
+use uring_runtime::deadline::Deadline;
+use crate::runtime::RequestScope;
+use crate::runtime::Reactor;
 use ::telemetry::Ring;
 use ::telemetry::metrics;
 use ::telemetry::server;
@@ -37,7 +37,7 @@ use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
 use uring_runtime::environment;
-use uring_runtime::reactor::Descriptor;
+use uring_runtime::Descriptor;
 
 // Bounded diagnostics and HTTP endpoints, polled by an existing worker.
 
@@ -164,7 +164,7 @@ impl DiagnosticIo {
     ) -> Result<Self> {
         let control = admission.reserve(None, ResourceClass::ControlProgress, CONTROL_SLOTS)?;
         let mut memory = admission.reserve(None, ResourceClass::RequestContext, RESERVED_BYTES)?;
-        let bookkeeping = memory.split(CONTROL_SLOTS * uring_runtime::reactor::SUBMISSION_BYTES)?;
+        let bookkeeping = memory.split(CONTROL_SLOTS * uring_runtime::SUBMISSION_BYTES)?;
         let submissions = reactor.reserve_submissions(control, bookkeeping)?;
         Ok(Self {
             reactor,
@@ -732,7 +732,7 @@ pub struct BodyProgress {
 }
 
 pub(crate) fn timestamp(at: std::time::Instant) -> u64 {
-    crate::peer::protocol::encode_deadline(crate::runtime::deadline::Deadline(at))
+    crate::peer::protocol::encode_deadline(uring_runtime::deadline::Deadline(at))
         .unwrap_or_default()
 }
 

@@ -42,7 +42,7 @@ mod measurement {
     use std::rc::Rc;
     use std::time::Duration;
     use std::time::Instant;
-    use uring_runtime::reactor::IoBuffer;
+    use uring_runtime::IoBuffer;
 
     fn page() -> PageId {
         PageId {
@@ -1342,7 +1342,7 @@ pub struct CryptoJob {
 
 impl CryptoPermit {
     pub fn job(mut self, input: CryptoInput, key: KeyLease, scope: RequestScope) -> CryptoJob {
-        use uring_runtime::reactor::IoBuffer;
+        use uring_runtime::IoBuffer;
         self.measurement.checksum_only = matches!(input, CryptoInput::Checksum { .. });
         self.measurement.decrypt = matches!(input, CryptoInput::Decrypt { .. });
         self.measurement.bytes = match &input {

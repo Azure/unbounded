@@ -34,8 +34,8 @@ use crate::peer::protocol::FetchMode;
 use crate::peer::protocol::Operation as PeerOperation;
 use crate::peer::protocol::PeerResponse;
 
-use crate::runtime::admission::AdmissionPolicy;
-use crate::runtime::deadline::RequestScope;
+use crate::admission::AdmissionPolicy;
+use crate::runtime::RequestScope;
 use crate::security::aead::PageCrypto;
 use crate::security::credentials::CredentialCrypto;
 use crate::store::StoreReader;
@@ -49,7 +49,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use uring_runtime::reactor::IoBuffer;
+use uring_runtime::IoBuffer;
 
 #[derive(Clone)]
 pub struct FillDependencies {
@@ -1202,7 +1202,7 @@ impl Fill {
         ciphertext: flow_control::Charge<AdmissionPolicy>,
         scope: &RequestScope,
     ) -> Result<PageResult> {
-        use uring_runtime::reactor::IoBuffer;
+        use uring_runtime::IoBuffer;
         if origin.metadata.version != page.version {
             return Err(Error::CorruptRecord);
         }

@@ -14,7 +14,7 @@ use crate::http::Codec;
 use crate::http::ConnectionLease;
 use crate::http::HttpIo;
 use crate::model::NodeId;
-use crate::runtime::deadline::RequestScope;
+use crate::runtime::RequestScope;
 use http1::MessageHead;
 use http1::StartLine;
 use racer_identity::Certificates;
@@ -955,8 +955,8 @@ pub(crate) mod tests {
     use crate::http::HttpPool;
     use crate::model::RequestId;
     use crate::model::ResourceClass;
-    use crate::runtime::admission::AdmissionPolicy;
-    use crate::runtime::reactor::Reactor;
+    use crate::admission::AdmissionPolicy;
+    use crate::runtime::Reactor;
     use std::future::Future;
     use std::task::Context;
     use std::task::Poll;
@@ -1192,7 +1192,7 @@ pub(crate) mod tests {
         let pool = HttpPool::new(reactor.clone(), admission.clone(), 2);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
-        let listener = Rc::new(uring_runtime::reactor::Descriptor::from(listener));
+        let listener = Rc::new(uring_runtime::Descriptor::from(listener));
         let scope = RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(30))
             .unwrap();
         let mut previous_id = None;
@@ -1323,7 +1323,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn socket_admission_rejects_replay_before_dispatch_and_closes_pool_slot() {
-        use uring_runtime::reactor::IoBuffer;
+        use uring_runtime::IoBuffer;
         let n = crate::security::test_support::network(2);
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,

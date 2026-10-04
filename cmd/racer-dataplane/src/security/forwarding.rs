@@ -9,7 +9,7 @@
 //!     error::Result,
 //!     model::NodeId,
 //!     peer::{server::LocalPageService, protocol::{PeerRequest, VerifiedResponse}},
-//!     runtime::deadline::RequestScope,
+//!     runtime::RequestScope,
 //!     security::forwarding::Forwarding,
 //!     topology::{Membership, RouteBudget},
 //! };
@@ -832,7 +832,7 @@ mod tests {
     use super::*;
     use crate::model::EncryptedAuthorization;
     use crate::model::KeyId;
-    use crate::model::Limits;
+    use crate::config::Limits;
     use crate::model::MetadataSelector;
     use crate::model::Nonce;
     use crate::model::OpaqueMetadata;
@@ -841,8 +841,8 @@ mod tests {
     use crate::model::*;
     use crate::peer::protocol::FetchMode;
     use crate::peer::protocol::Operation;
-    use crate::runtime::admission::AdmissionPolicy;
-    use crate::runtime::deadline::RequestScope;
+    use crate::admission::AdmissionPolicy;
+    use crate::runtime::RequestScope;
     use crate::security::test_support::clone_head;
     use crate::security::test_support::network;
     use crate::security::test_support::node;
@@ -2011,7 +2011,7 @@ mod tests {
     }
     #[test]
     fn deadline_roundtrip_and_verified_mailbox_ownership() {
-        let deadline = crate::runtime::deadline::Deadline(Instant::now() + Duration::from_secs(20));
+        let deadline = uring_runtime::deadline::Deadline(Instant::now() + Duration::from_secs(20));
         let value = protocol::encode_deadline(deadline).unwrap();
         let decoded = protocol::decode_deadline(value).unwrap();
         assert_eq!(protocol::encode_deadline(decoded).unwrap(), value);

@@ -1,8 +1,8 @@
 use super::dataplane;
 use dataplane::error::Operation;
-use dataplane::model::Limits;
-use dataplane::runtime::admission::AdmissionPolicy;
-use dataplane::runtime::reactor::Reactor;
+use dataplane::config::Limits;
+use dataplane::admission::AdmissionPolicy;
+use dataplane::runtime::Reactor;
 
 use std::num::NonZeroUsize;
 use std::rc::Rc;

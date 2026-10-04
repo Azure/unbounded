@@ -22,8 +22,8 @@ use crate::model::PageId;
 use crate::model::PageNumber;
 use crate::model::ResourceClass;
 use crate::read::candidates::OriginAuthority;
-use crate::runtime::admission::AdmissionPolicy;
-use crate::runtime::deadline::RequestScope;
+use crate::admission::AdmissionPolicy;
+use crate::runtime::RequestScope;
 use http1::Header;
 use http1::MessageHead;
 use http1::StartLine;
@@ -1133,5 +1133,5 @@ mod protocol {
         }
     }
 }
-use uring_runtime::reactor::Completion;
-use uring_runtime::reactor::IoBuffer;
+use uring_runtime::Completion;
+use uring_runtime::IoBuffer;

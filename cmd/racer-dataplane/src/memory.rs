@@ -12,8 +12,8 @@ use crate::model::PageEnvelope;
 use crate::model::PageId;
 use crate::model::ResourceClass;
 
-use crate::runtime::admission::AdmissionPolicy;
-use crate::runtime::deadline::RequestScope;
+use crate::admission::AdmissionPolicy;
+use crate::runtime::RequestScope;
 use flow_control::Quotas;
 use flow_control::pipe::PipeLease;
 use flow_control::pipe::PipePool;
@@ -50,7 +50,7 @@ impl Drop for PlaintextBuffer {
     }
 }
 // SAFETY: private fixed backing and reservation remain exclusively owned.
-unsafe impl uring_runtime::reactor::IoBuffer for PlaintextBuffer {
+unsafe impl uring_runtime::IoBuffer for PlaintextBuffer {
     type Error = Error;
     fn bytes(&self) -> Result<&[u8]> {
         Ok(&self.bytes)
@@ -261,7 +261,7 @@ impl CiphertextPage {
     }
 }
 // SAFETY: shared ciphertext backing is immutable and retained by the owner.
-unsafe impl uring_runtime::reactor::SendBuffer for CiphertextPage {
+unsafe impl uring_runtime::SendBuffer for CiphertextPage {
     type Error = Error;
     fn send_bytes(&self) -> Result<&[u8]> {
         Ok(self.bytes())
@@ -641,7 +641,7 @@ pub(crate) mod tests {
     }
 }
 #[cfg(test)]
-use uring_runtime::reactor::IoBuffer;
+use uring_runtime::IoBuffer;
 
 /// Credential-free page results shared by fills, memory, and flight completion.
 pub mod page {
@@ -851,7 +851,7 @@ pub(crate) fn acquire_wait<'a>(
 mod pipe_tests {
     use super::*;
     use crate::error::Error;
-    use crate::model::Limits;
+    use crate::config::Limits;
 
     pub(in crate::memory) fn admission(pipes: usize) -> Rc<Quotas<AdmissionPolicy>> {
         let small = std::num::NonZeroUsize::new(8).unwrap();

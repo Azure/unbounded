@@ -15,10 +15,10 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use uring_runtime::environment::SimulationClock;
-use uring_runtime::reactor::Descriptor;
-use uring_runtime::reactor::SocketAddress;
-use uring_runtime::reactor::simulation::Fault;
-use uring_runtime::reactor::simulation::Simulation;
+use uring_runtime::Descriptor;
+use uring_runtime::SocketAddress;
+use uring_runtime::simulation::Fault;
+use uring_runtime::simulation::Simulation;
 
 const MAX_NODES: usize = 32;
 const MAX_TURNS: usize = 100_000;
@@ -259,7 +259,7 @@ mod faults {
         }
 
         pub(super) fn disk_corruption(&mut self) {
-            use uring_runtime::reactor::simulation::DiskState;
+            use uring_runtime::simulation::DiskState;
             self.settle();
             let entries: Vec<_> = self
                 .nodes
@@ -1903,7 +1903,7 @@ impl PartialEq for ReplayTrace {
 }
 impl Eq for ReplayTrace {}
 
-fn handle(fd: &Descriptor) -> &uring_runtime::reactor::simulation::Handle {
+fn handle(fd: &Descriptor) -> &uring_runtime::simulation::Handle {
     fd.as_sim().expect("DST escaped into host I/O")
 }
 fn would_block(error: &std::io::Error) -> bool {

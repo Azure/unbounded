@@ -3,9 +3,9 @@ use super::*;
 use super::listener::*;
 use super::response::Responses;
 use crate::http::HttpIo;
-use crate::runtime::admission::AdmissionPolicy;
-use crate::runtime::deadline::Cancellation;
-use crate::runtime::deadline::RequestScope;
+use crate::admission::AdmissionPolicy;
+use crate::runtime::Cancellation;
+use crate::runtime::RequestScope;
 use crate::test_support::ReadWorker;
 use crate::test_support::origin::RequestKind;
 use racer_control_wire::CacheDefinition;
@@ -527,7 +527,7 @@ mod recovery {
 #[test]
 fn local_and_distributed_installs_drain_responses_and_retire_idle_generations() {
     use crate::model::WorkerId;
-    use crate::runtime::ingress::Ingress;
+    use crate::admission::Ingress;
     use crate::test_support::WakeCounter;
     use std::task::Waker;
 
@@ -619,7 +619,7 @@ fn local_and_distributed_installs_drain_responses_and_retire_idle_generations() 
 fn queued_handoffs_reject_retired_generations_and_stopped_receivers() {
     use crate::model::ResourceClass;
     use crate::model::WorkerId;
-    use crate::runtime::ingress::Ingress;
+    use crate::admission::Ingress;
 
     for stop_receiver in [false, true] {
         let mut acceptor = Fixture::new();
@@ -665,8 +665,8 @@ fn queued_handoffs_reject_retired_generations_and_stopped_receivers() {
 
 #[test]
 fn simulated_listener_preparation_rollback_and_real_http_exchange() {
-    use uring_runtime::reactor::SocketAddress;
-    use uring_runtime::reactor::simulation::Simulation;
+    use uring_runtime::SocketAddress;
+    use uring_runtime::simulation::Simulation;
     let sim = Simulation::new();
     let _environment = sim.enter();
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits())));
@@ -754,12 +754,12 @@ use crate::http::Codec;
 use crate::memory::delivery::Delivery;
 use crate::memory::new_pipe_pool;
 use crate::model::ExpiresAt;
-use crate::model::Limits;
+use crate::config::Limits;
 use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
 use crate::model::StrongEtag;
 use crate::read::ReadResponse;
-use crate::runtime::reactor::Reactor;
+use crate::runtime::Reactor;
 use std::io::Read;
 use std::io::Write;
 use std::num::NonZeroUsize;
@@ -829,9 +829,9 @@ struct Fixture {
     worker: Option<crate::test_support::ReadWorker>,
 }
 impl Fixture {
-    fn install_handoff(&self, ingress: &crate::runtime::ingress::Ingress) {
+    fn install_handoff(&self, ingress: &crate::admission::Ingress) {
         use crate::model::WorkerId;
-        use crate::runtime::ingress::Kind;
+        use crate::admission::Kind;
         let [accepted] = ingress
             .pop_batch::<1>(WorkerId(1), futures::task::noop_waker_ref(), 1)
             .unwrap();
@@ -1029,7 +1029,7 @@ fn client_listener_readiness_recovers_from_queue_pressure() {
     fixture.reconcile(&[definition()]).unwrap();
     let scope = scope();
     let (reader, _writer) = UnixStream::pair().unwrap();
-    let reader = Rc::new(uring_runtime::reactor::Descriptor::from(reader));
+    let reader = Rc::new(uring_runtime::Descriptor::from(reader));
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let mut pressure = Vec::new();
     for _ in 0..8 {

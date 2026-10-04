@@ -23,7 +23,7 @@ use crate::peer::protocol::Operation as PeerOperation;
 use crate::peer::protocol::PeerResponse;
 use crate::peer::protocol::VerifiedRequest;
 use crate::peer::server::LocalPageService;
-use crate::runtime::deadline::RequestScope;
+use crate::runtime::RequestScope;
 use crate::security::credentials::ChargedOriginContext;
 use crate::security::credentials::CredentialCrypto;
 

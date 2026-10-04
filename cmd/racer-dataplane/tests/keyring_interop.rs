@@ -13,7 +13,7 @@ use racer_dataplane::control::Enrollment;
 use racer_dataplane::control::*;
 use racer_dataplane::model::ClusterId;
 use racer_dataplane::model::RequestId;
-use racer_dataplane::runtime::deadline::RequestScope;
+use racer_dataplane::runtime::RequestScope;
 use std::rc::Rc;
 use std::time::Duration;
 use std::time::Instant;

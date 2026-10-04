@@ -9,7 +9,7 @@ mod body_progress {
     use crate::model::ExpiresAt;
     use crate::model::ObjectMetadata;
     use crate::model::PageEnvelope;
-    use crate::runtime::reactor::Reactor;
+    use crate::runtime::Reactor;
     use crate::telemetry::Telemetry;
     use std::cell::Cell;
     use std::net::TcpListener;
@@ -482,7 +482,7 @@ mod destination_disconnect {
     use crate::read::flight::Flights;
     use crate::read::flight::JoinedCopy;
     use crate::read::flight::JoinedFlight;
-    use crate::runtime::reactor::Reactor;
+    use crate::runtime::Reactor;
     use crate::topology::LinkHealth;
     use crate::topology::Member;
     use crate::topology::Membership;
@@ -987,7 +987,7 @@ mod encrypted_http {
     use crate::rdma::TransportPlan;
     use crate::runtime::crypto;
     use crate::runtime::crypto::CryptoClient;
-    use crate::runtime::reactor::Reactor;
+    use crate::runtime::Reactor;
     use crate::runtime::worker::CryptoRuntime;
     use crate::runtime::worker::CryptoService;
     use crate::security::aead::PageCrypto;
@@ -1149,7 +1149,7 @@ mod encrypted_http {
         assert_ne!(pages[0].envelope().nonce, pages[1].envelope().nonce);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
-        let listener = Rc::new(uring_runtime::reactor::Descriptor::from(listener));
+        let listener = Rc::new(uring_runtime::Descriptor::from(listener));
         let canceled = RequestScope::new(RequestId([9; 16]), scope.deadline.0).unwrap();
         let accepts = Cell::new(0);
         let prefix_sent = Cell::new(false);
@@ -1358,8 +1358,8 @@ mod requester_safety {
     use crate::peer::protocol::encode_envelope;
     use crate::peer::transport::RelayResponse;
     use crate::peer::*;
-    use crate::runtime::admission::AdmissionPolicy;
-    use crate::runtime::reactor::Reactor;
+    use crate::admission::AdmissionPolicy;
+    use crate::runtime::Reactor;
     use crate::security::connection;
     use crate::telemetry::Event;
     use crate::telemetry::Gauge;
@@ -1538,7 +1538,7 @@ mod requester_safety {
         let server = async {
             let fd = reactor
                 .accept(
-                    Rc::new(uring_runtime::reactor::Descriptor::from(listener)),
+                    Rc::new(uring_runtime::Descriptor::from(listener)),
                     &scope,
                 )
                 .await?;
@@ -2041,9 +2041,9 @@ use crate::peer::protocol::SecurityCodec;
 use crate::peer::protocol::decode_envelope;
 use crate::peer::protocol::encode_envelope;
 
-use crate::runtime::admission::AdmissionPolicy;
-use crate::runtime::deadline::Deadline;
-use crate::runtime::deadline::RequestScope;
+use crate::admission::AdmissionPolicy;
+use uring_runtime::deadline::Deadline;
+use crate::runtime::RequestScope;
 use crate::security::connection::Signatures;
 use crate::security::forwarding::Forwarding;
 use crate::topology::RouteBudget;
@@ -2126,7 +2126,7 @@ pub(super) fn codec(admission: &Rc<flow_control::Quotas<AdmissionPolicy>>) -> Se
 /// Common signed HTTP plumbing. Scenarios retain their own membership and service.
 pub(crate) struct SocketFixture {
     pub admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
-    pub reactor: Rc<crate::runtime::reactor::Reactor>,
+    pub reactor: Rc<crate::runtime::Reactor>,
     pub io: Rc<crate::http::HttpIo>,
     pub codec: Rc<SecurityCodec>,
     pub pool: Rc<crate::http::HttpPool>,
@@ -2140,7 +2140,7 @@ impl SocketFixture {
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
-        let reactor = Rc::new(crate::runtime::reactor::Reactor::new(admission.clone()));
+        let reactor = Rc::new(crate::runtime::Reactor::new(admission.clone()));
         let io = Rc::new(crate::http::HttpIo::with_admission(
             reactor.clone(),
             crate::http::Codec::new(protocol::MAX_ENVELOPE_HEAD),
@@ -2224,4 +2224,4 @@ impl Drop for NoOutbound {
     }
 }
 use uring_runtime::environment::SimulationClock;
-use uring_runtime::reactor::IoBuffer;
+use uring_runtime::IoBuffer;

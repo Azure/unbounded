@@ -2,8 +2,8 @@
 use super::BufferPool;
 use super::page::CiphertextCopy;
 use super::page::PageResult;
-use crate::runtime::collections::HashMap;
-use crate::runtime::collections::HashSet;
+use crate::runtime::HashMap;
+use crate::runtime::HashSet;
 use crate::error::Error;
 use crate::error::Result;
 use crate::model::CacheId;

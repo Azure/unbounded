@@ -30,8 +30,8 @@ mod duplex_release {
 
     #[test]
     fn duplex_exact_release_before_final_send_cqe_is_provisional() {
-        use uring_runtime::reactor::simulation::Fault;
-        use uring_runtime::reactor::simulation::Simulation;
+        use uring_runtime::simulation::Fault;
+        use uring_runtime::simulation::Simulation;
         for mode in ["valid", "duplicate", "malformed", "short", "drop"] {
             let sim = Simulation::new();
             let _sim = sim.enter();

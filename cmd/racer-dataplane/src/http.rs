@@ -4,10 +4,10 @@ use crate::error::Operation;
 use crate::error::Result;
 use crate::model::ResourceClass;
 
-use crate::runtime::admission::AdmissionPolicy;
-use crate::runtime::admission::ConnectionReservation;
-use crate::runtime::deadline::RequestScope;
-use crate::runtime::reactor::Reactor;
+use crate::admission::AdmissionPolicy;
+use crate::admission::ConnectionReservation;
+use crate::runtime::RequestScope;
+use crate::runtime::Reactor;
 use flow_control::pipe::MAX_PIPE_BYTES;
 use flow_control::pipe::PipeLease;
 use http1::MessageHead;
@@ -17,9 +17,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::task::Poll;
 use std::time::Duration;
-use uring_runtime::reactor::Descriptor;
-use uring_runtime::reactor::IoBuffer;
-use uring_runtime::reactor::SocketAddress;
+use uring_runtime::Descriptor;
+use uring_runtime::IoBuffer;
+use uring_runtime::SocketAddress;
 
 pub const MAX_HEAD_BYTES: usize = 32 * 1024;
 pub struct RacerOpaque;
@@ -36,7 +36,7 @@ pub struct HttpContext(pub(crate) Rc<flow_control::Quotas<AdmissionPolicy>>);
 impl http1::connection::Context for HttpContext {
     type Error = Error;
     type Scope = RequestScope;
-    type Budget = crate::runtime::reactor::AdmissionBudget;
+    type Budget = crate::runtime::AdmissionBudget;
     type Reactor = Reactor;
     type Charge = flow_control::Charge<AdmissionPolicy>;
     type Slot = ConnectionReservation;
@@ -535,8 +535,8 @@ mod relay_tests {
     use crate::memory::new_pipe_pool;
     use crate::model::RequestId;
     use crate::model::ResourceClass;
-    use crate::runtime::admission::AdmissionPolicy;
-    use crate::runtime::reactor::Reactor;
+    use crate::admission::AdmissionPolicy;
+    use crate::runtime::Reactor;
     use flow_control::pipe::PipePool;
     use http1::Header;
     use http1::MessageHead;
@@ -571,7 +571,7 @@ mod relay_tests {
         use futures::stream::FuturesUnordered;
         use std::sync::Arc;
         use std::task::Wake;
-        struct WakeReactor(uring_runtime::reactor::ReactorWake);
+        struct WakeReactor(uring_runtime::ReactorWake);
         impl Wake for WakeReactor {
             fn wake(self: Arc<Self>) {
                 self.0.wake().unwrap();

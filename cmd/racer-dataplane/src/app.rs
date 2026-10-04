@@ -11,7 +11,7 @@
 //! Cache removal closes new admission; accepted resource owners drain independently.
 //! Startup failures roll back created resources. Constructors perform no operational I/O.
 use crate::read::dispatch::WorkerMap;
-use crate::runtime::collections::HashMap;
+use crate::runtime::HashMap;
 use crate::telemetry::Health;
 use crate::telemetry::Resources;
 use crate::telemetry::State;
@@ -19,7 +19,7 @@ use crate::telemetry::Gauge;
 use crate::client::listener::PreparedListeners;
 use racer_control_wire::CacheDefinition;
 use crate::control::CacheTransition;
-use crate::runtime::collections::HashSet;
+use crate::runtime::HashSet;
 use crate::client::RequestParser;
 use crate::client::listener::ClientListeners;
 use crate::client::response::Responses;
@@ -40,7 +40,7 @@ use crate::memory::BufferPool;
 use crate::memory::cache::MemoryCache;
 use crate::memory::delivery::Delivery;
 use crate::memory::new_pipe_pool;
-use crate::model::Limits;
+use crate::config::Limits;
 use crate::model::NodeId;
 use crate::model::RequestId;
 use crate::model::WorkerId;
@@ -63,10 +63,10 @@ use crate::read::metadata::MetadataDependencies;
 use crate::read::metadata::MetadataService;
 use crate::read::range_stream::RangeStreams;
 
-use crate::runtime::admission::AdmissionPolicy;
+use crate::admission::AdmissionPolicy;
 use crate::runtime::affinity::AffinityPlan;
-use crate::runtime::deadline::RequestScope;
-use crate::runtime::reactor::Reactor;
+use crate::runtime::RequestScope;
+use crate::runtime::Reactor;
 use crate::runtime::worker::CryptoRuntime;
 use crate::runtime::worker::CryptoService;
 use crate::runtime::worker::WorkerFactory;
@@ -126,7 +126,7 @@ pub struct NodeState {
     hedges: std::sync::OnceLock<Arc<crate::read::candidates::Hedges>>,
     peer_admission: Arc<crate::peer::adaptive::AdaptivePeers>,
     subscriptions: Arc<crate::peer::subscriptions::Subscriptions>,
-    ingress: Arc<crate::runtime::ingress::Ingress>,
+    ingress: Arc<crate::admission::Ingress>,
     metrics: Vec<(WorkerId, crate::telemetry::Metrics)>,
     failures: crate::telemetry::Failures,
     publications: Arc<PublishedState>,
@@ -177,7 +177,7 @@ impl NodeState {
             inventory: crate::rdma::Inventory::shared(),
             send_crc: Default::default(),
             hedges: std::sync::OnceLock::new(),
-            ingress: Arc::new(crate::runtime::ingress::Ingress::new(&workers)),
+            ingress: Arc::new(crate::admission::Ingress::new(&workers)),
             subscriptions: Arc::new(crate::peer::subscriptions::Subscriptions::new(
                 Default::default(),
             )?),
@@ -685,7 +685,7 @@ impl WorkerApplication {
         #[cfg(not(test))]
         let distributed = true;
         #[cfg(test)]
-        let distributed = uring_runtime::reactor::simulation::Simulation::current().is_none();
+        let distributed = uring_runtime::simulation::Simulation::current().is_none();
         let peers = PeerServer::new(
             io.clone(),
             forwarding,
@@ -1095,11 +1095,11 @@ impl WorkerApplication {
                 let connection =
                     crate::http::from_reserved(accepted.fd.into(), accepted.reservation)?;
                 match accepted.kind {
-                    crate::runtime::ingress::Kind::Client(cache, retired) => {
+                    crate::admission::Kind::Client(cache, retired) => {
                         self.clients
                             .install_connection(connection, cache, retired)?;
                     }
-                    crate::runtime::ingress::Kind::Peer => {
+                    crate::admission::Kind::Peer => {
                         let peers = self.peers.clone();
                         let scope = self.task_scope.clone().ok_or(Error::Unavailable)?;
                         self.ingress_peers.push(Box::pin(async move {

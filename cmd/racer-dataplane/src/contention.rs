@@ -4,7 +4,7 @@ use crate::model::CacheId;
 use crate::model::PAGE_BYTES;
 use crate::model::ResourceClass;
 
-use crate::runtime::admission::AdmissionPolicy;
+use crate::admission::AdmissionPolicy;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -769,7 +769,7 @@ mod waiter_detach {
     use crate::read::flight::AcquisitionFailure;
     use crate::read::flight::Flights;
     use crate::read::flight::JoinedFlight;
-    use crate::runtime::deadline::RequestScope;
+    use crate::runtime::RequestScope;
     use crate::topology::Membership;
     use std::rc::Rc;
     use std::task::Context;
@@ -856,7 +856,7 @@ mod waiter_detach {
                 panic!("expected first acquisition")
             };
             let fill_reservation =
-                crate::runtime::admission::reserve_fill(&real, &origin.object.cache, true).unwrap();
+                crate::admission::reserve_fill(&real, &origin.object.cache, true).unwrap();
             let operation = flights
                 .retain_operation(
                     &leader,
@@ -1053,8 +1053,8 @@ mod fidelity {
     use crate::read::flight::Flights;
     use crate::runtime::crypto;
     use crate::runtime::crypto::CryptoClient;
-    use crate::runtime::deadline::RequestScope;
-    use crate::runtime::reactor::Reactor;
+    use crate::runtime::RequestScope;
+    use crate::runtime::Reactor;
     use crate::runtime::worker::CryptoRuntime;
     use crate::runtime::worker::CryptoService;
     use crate::security::aead::PageCrypto;
@@ -1073,7 +1073,7 @@ mod fidelity {
     use std::task::Context;
     use std::time::Duration;
     use std::time::Instant;
-    use uring_runtime::reactor::IoBuffer;
+    use uring_runtime::IoBuffer;
 
     // The abstract side owns no payload. Production pages put the same non-cloneable
     // charges inside Arc<VerifiedBytes>/Arc<CiphertextBytes> (memory/pool.rs:41-58).

@@ -4,8 +4,8 @@
 //! sequence. The worker lifecycle decides when to poll or finish a cut; its writer
 //! gating and shutdown drain predicates remain in app.rs.
 use super::*;
-use crate::runtime::collections::HashMap;
-use crate::runtime::collections::HashSet;
+use crate::runtime::HashMap;
+use crate::runtime::HashSet;
 use crate::store::checkpoint::CheckpointImage;
 
 #[derive(Default)]

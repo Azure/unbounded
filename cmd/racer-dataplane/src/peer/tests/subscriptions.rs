@@ -9,7 +9,7 @@ use crate::peer::subscriptions::Demand;
 use crate::peer::subscriptions::PageInterval;
 use crate::peer::subscriptions::Subscription;
 use crate::peer::subscriptions::TransferGrant;
-use crate::runtime::reactor::Reactor;
+use crate::runtime::Reactor;
 use crate::topology::LinkHealth;
 use crate::topology::Member;
 use crate::topology::Membership;
@@ -684,7 +684,7 @@ fn subscription_runs_through_real_tcp_requester_session_and_provider() {
     let server_work = async {
         let fd = reactor
             .accept(
-                Rc::new(uring_runtime::reactor::Descriptor::from(listener)),
+                Rc::new(uring_runtime::Descriptor::from(listener)),
                 &scope,
             )
             .await?;

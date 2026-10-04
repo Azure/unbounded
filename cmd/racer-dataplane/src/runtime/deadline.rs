@@ -6,13 +6,13 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Instant;
-pub use uring_runtime::deadline::CancellationRegistration;
-pub use uring_runtime::deadline::Deadline;
+pub use uring_uring_runtime::CancellationRegistration;
+pub use uring_uring_runtime::deadline::Deadline;
 
 /// Racer candidate policy shares the cancellation lifetime, but is not runtime policy.
 #[derive(Clone)]
 pub struct Cancellation {
-    inner: uring_runtime::deadline::Cancellation,
+    inner: uring_runtime::Cancellation,
     state: Arc<State>,
 }
 struct State {
@@ -29,7 +29,7 @@ struct CandidateBody {
 impl Cancellation {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            inner: uring_runtime::deadline::Cancellation::new()?,
+            inner: uring_runtime::Cancellation::new()?,
             state: Arc::new(State {
                 candidate_total: OnceLock::new(),
                 candidate_idle: OnceLock::new(),
@@ -200,7 +200,7 @@ impl uring_runtime::Scope for RequestScope {
         RequestScope::check(self)
     }
 
-    fn cancellation(&self) -> Option<&uring_runtime::deadline::Cancellation> {
+    fn cancellation(&self) -> Option<&uring_runtime::Cancellation> {
         Some(&self.cancellation.inner)
     }
 }

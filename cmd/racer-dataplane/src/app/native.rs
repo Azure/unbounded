@@ -1,7 +1,7 @@
 //! Native lifecycle endpoints remain per I/O shard, even with shared crypto threads.
 use super::*;
 use crate::rdma::WithNative;
-use crate::runtime::collections::HashMap;
+use crate::runtime::HashMap;
 use rdma_verbs::IoPort;
 use rdma_verbs::NativePort;
 

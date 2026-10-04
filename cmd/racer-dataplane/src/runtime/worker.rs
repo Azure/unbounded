@@ -22,7 +22,7 @@ use super::reactor::Reactor;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
-use crate::model::Limits;
+use crate::config::Limits;
 use crate::model::RequestId;
 use crate::model::WorkerId;
 #[cfg(test)]
@@ -72,7 +72,7 @@ use uring_runtime::group::Helper;
 use uring_runtime::group::Lane;
 use uring_runtime::group::Plan;
 use uring_runtime::group::Service;
-use uring_runtime::reactor::ReactorWake;
+use uring_runtime::ReactorWake;
 pub struct WorkerGroup<'a> {
     plan: AffinityPlan,
     runtime: Group<RequestScope>,

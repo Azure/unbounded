@@ -5,8 +5,8 @@ use crate::test_support::WakeCounter;
 use std::sync::Arc;
 use std::task::Context;
 use std::task::Waker;
-use uring_runtime::reactor::simulation::Fault;
-use uring_runtime::reactor::simulation::Simulation;
+use uring_runtime::simulation::Fault;
+use uring_runtime::simulation::Simulation;
 
 enum Listener {
     Tcp(std::net::TcpListener),

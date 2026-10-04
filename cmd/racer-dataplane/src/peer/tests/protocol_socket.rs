@@ -323,7 +323,7 @@ fn search_view_consumes_ingress_without_changing_signed_route() {
 fn server_authenticates_before_copy_only_service_and_signs_failures() {
     use crate::http::Codec;
     use crate::http::HttpIo;
-    use crate::runtime::reactor::Reactor;
+    use crate::runtime::Reactor;
     use crate::topology::LinkHealth;
     use crate::topology::Member;
     use crate::topology::Membership;
@@ -581,7 +581,7 @@ fn relay_dispatch_preserves_reverse_path_and_fails_closed_on_link_loss() {
             let fd = socket
                 .reactor
                 .accept(
-                    Rc::new(uring_runtime::reactor::Descriptor::from(listener)),
+                    Rc::new(uring_runtime::Descriptor::from(listener)),
                     &scope,
                 )
                 .await?;
@@ -753,7 +753,7 @@ fn refused_socket_opens_only_immediate_link_and_selects_bounded_alternate() {
     use crate::http::Codec;
     use crate::http::HttpIo;
     use crate::http::HttpPool;
-    use crate::runtime::reactor::Reactor;
+    use crate::runtime::Reactor;
     use crate::topology::LinkHealth;
     use crate::topology::Member;
     use crate::topology::Membership;
@@ -1062,7 +1062,7 @@ fn signed_tcp_case(case: &str) {
     let server_work = async {
         let fd = reactor
             .accept(
-                Rc::new(uring_runtime::reactor::Descriptor::from(listener)),
+                Rc::new(uring_runtime::Descriptor::from(listener)),
                 &scope,
             )
             .await?;
@@ -1099,7 +1099,7 @@ fn signed_tcp_case(case: &str) {
 fn incoming_header_timeout_closes_silent_partial_and_idle_keepalive_peers() {
     use crate::http::Codec;
     use crate::http::HttpIo;
-    use crate::runtime::reactor::Reactor;
+    use crate::runtime::Reactor;
     use crate::topology::LinkHealth;
     use crate::topology::Paths;
     use std::future::Future;
@@ -1303,7 +1303,7 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     use crate::peer::protocol;
     use crate::rdma;
     use crate::rdma::TransportPlan;
-    use crate::runtime::reactor::Reactor;
+    use crate::runtime::Reactor;
     use crate::security::forwarding::ForwardedHead;
     use crate::topology::Member;
     use crate::topology::Membership;
@@ -1414,10 +1414,10 @@ fn real_http_ciphertext_fragmentation_pool_reuse_and_truncation() {
     let scope =
         RequestScope::new(RequestId([7; 16]), Instant::now() + Duration::from_secs(30)).unwrap();
     let server = async {
-        use uring_runtime::reactor::IoBuffer;
+        use uring_runtime::IoBuffer;
         let fd = reactor
             .accept(
-                Rc::new(uring_runtime::reactor::Descriptor::from(listener)),
+                Rc::new(uring_runtime::Descriptor::from(listener)),
                 &scope,
             )
             .await?;
@@ -1569,7 +1569,7 @@ fn outbound_lease_routes_without_registry_and_rejects_non_neighbors() {
             assert!(matches!(endpoint, Err(Error::InvalidRequest)));
         }
     }
-    let admission = flow_control::Quotas::new(crate::runtime::admission::AdmissionPolicy::new(
+    let admission = flow_control::Quotas::new(crate::admission::AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
     ));
     let mut request = request(&admission, 1);
@@ -1587,7 +1587,7 @@ mod established_sessions {
     use crate::http::ConnectionLease;
     use crate::http::HttpIo;
     use crate::peer::protocol as p;
-    use crate::runtime::reactor::Reactor;
+    use crate::runtime::Reactor;
     use crate::security::connection;
     use crate::topology::LinkHealth;
     use crate::topology::Member;
@@ -1901,4 +1901,4 @@ mod established_sessions {
         );
     }
 }
-use uring_runtime::reactor::IoBuffer;
+use uring_runtime::IoBuffer;

@@ -14,9 +14,9 @@ use crate::model::RequestId;
 use crate::read::Coordinator;
 use crate::read::ReadResponse;
 
-use crate::runtime::admission::AdmissionPolicy;
-use crate::runtime::deadline::Cancellation;
-use crate::runtime::deadline::RequestScope;
+use crate::admission::AdmissionPolicy;
+use crate::runtime::Cancellation;
+use crate::runtime::RequestScope;
 use racer_control_wire::CacheDefinition;
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -40,15 +40,15 @@ use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
-use uring_runtime::reactor::Descriptor;
+use uring_runtime::Descriptor;
 
 enum Listener {
     Real(UnixListener),
     #[cfg(test)]
-    Sim(uring_runtime::reactor::Descriptor),
+    Sim(uring_runtime::Descriptor),
 }
 impl Listener {
-    fn accept(&self) -> std::io::Result<(uring_runtime::reactor::Descriptor, ())> {
+    fn accept(&self) -> std::io::Result<(uring_runtime::Descriptor, ())> {
         match self {
             Self::Real(listener) => listener.accept().map(|(socket, _)| (socket.into(), ())),
             #[cfg(test)]
@@ -71,7 +71,7 @@ enum Directory {
     Real(File),
     #[cfg(test)]
     Sim {
-        sim: uring_runtime::reactor::simulation::Simulation,
+        sim: uring_runtime::simulation::Simulation,
         path: PathBuf,
     },
 }
@@ -163,7 +163,7 @@ pub struct ClientListeners {
     generation: Rc<Cell<u64>>,
     readiness: RefCell<ReadyListeners>,
     sim_cursor: RefCell<Option<CacheId>>,
-    ingress: Option<Arc<crate::runtime::ingress::Ingress>>,
+    ingress: Option<Arc<crate::admission::Ingress>>,
     pub(super) metrics: crate::telemetry::Metrics,
     pub(super) reads: Rc<Coordinator>,
     pub(super) parser: RequestParser,
@@ -224,7 +224,7 @@ impl ClientListeners {
         self.metrics = metrics;
         self
     }
-    pub(crate) fn with_ingress(mut self, ingress: Arc<crate::runtime::ingress::Ingress>) -> Self {
+    pub(crate) fn with_ingress(mut self, ingress: Arc<crate::admission::Ingress>) -> Self {
         self.ingress = Some(ingress);
         self
     }
@@ -513,7 +513,7 @@ impl ClientListeners {
             #[cfg(not(test))]
             let simulated = false;
             #[cfg(test)]
-            let simulated = uring_runtime::reactor::simulation::Simulation::current().is_some();
+            let simulated = uring_runtime::simulation::Simulation::current().is_some();
             let listener = if simulated {
                 let listeners = self.listeners.borrow();
                 let key = self.sim_cursor.borrow().clone();
@@ -557,7 +557,7 @@ impl ClientListeners {
                             .map_err(|_| Error::InvalidConfiguration)?;
                         offer.deliver(
                             socket,
-                            crate::runtime::ingress::Kind::Client(
+                            crate::admission::Kind::Client(
                                 listener.definition.id.clone(),
                                 listener.retired.clone(),
                             ),
@@ -875,7 +875,7 @@ pub(super) fn new_scope(timeout: Duration, cancellation: Cancellation) -> Result
     Ok(RequestScope {
         body_deadlines: None,
         request: RequestId(id),
-        deadline: crate::runtime::deadline::Deadline(uring_runtime::environment::now() + timeout),
+        deadline: uring_runtime::deadline::Deadline(uring_runtime::environment::now() + timeout),
         cancellation,
     })
 }
@@ -1197,12 +1197,12 @@ fn bind(
     previous: Option<&BoundListener>,
 ) -> Result<BoundListener> {
     #[cfg(test)]
-    if let Some(sim) = uring_runtime::reactor::simulation::Simulation::current() {
+    if let Some(sim) = uring_runtime::simulation::Simulation::current() {
         let directory = root.join(&definition.name).join("client");
         sim.create_dir_all(&directory).map_err(|_| Error::Io)?;
         let path = directory.join(basename);
         let listener = sim
-            .listen(uring_runtime::reactor::SocketAddress::Unix(path.clone()))
+            .listen(uring_runtime::SocketAddress::Unix(path.clone()))
             .map_err(|_| Error::Io)?;
         let (inode, _) = sim.metadata(&path).map_err(|_| Error::Io)?;
         let bound = BoundListener {

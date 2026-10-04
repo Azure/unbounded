@@ -16,9 +16,9 @@ use crate::http::ConnectionLease;
 use crate::http::HttpContext;
 use crate::http::OwnedBuffer;
 use crate::model::PageSlice;
-use crate::runtime::admission::AdmissionPolicy;
-use crate::runtime::deadline::RequestScope;
-use crate::runtime::reactor::Reactor;
+use crate::admission::AdmissionPolicy;
+use crate::runtime::RequestScope;
+use crate::runtime::Reactor;
 use flow_control::pipe::PipeLease;
 use flow_control::pipe::PipePool;
 use std::io;
@@ -30,9 +30,9 @@ use std::task::Poll;
 use std::time::Duration;
 #[cfg(test)]
 use std::time::Instant;
-use uring_runtime::reactor::Descriptor;
-use uring_runtime::reactor::IoBuffer;
-use uring_runtime::reactor::SendBuffer;
+use uring_runtime::Descriptor;
+use uring_runtime::IoBuffer;
+use uring_runtime::SendBuffer;
 
 // Limit both syscall size and work in one executor turn, even for a writable peer.
 const SEND_CHUNK_BYTES: usize = 64 * 1024;
@@ -382,7 +382,7 @@ fn validate_socket(connection: &Descriptor) -> Result<()> {
     connection.validate_socket().map_err(Into::into)
 }
 
-use crate::error::cooperative_turn as yield_once;
+use crate::runtime::cooperative_turn as yield_once;
 
 #[cfg(test)]
 mod tests {
@@ -398,10 +398,10 @@ mod tests {
     use crate::model::RequestId;
     use crate::model::ResourceClass;
     use crate::model::StrongEtag;
-    use crate::runtime::admission::AdmissionPolicy;
-    use crate::runtime::deadline::Cancellation;
-    use crate::runtime::deadline::Deadline;
-    use crate::runtime::reactor::Reactor;
+    use crate::admission::AdmissionPolicy;
+    use crate::runtime::Cancellation;
+    use uring_runtime::deadline::Deadline;
+    use crate::runtime::Reactor;
     use std::io::Read;
     use std::os::unix::net::UnixStream;
     use std::sync::Arc;

@@ -23,9 +23,9 @@ pub(super) use crate::read::flight::AcquisitionEvent;
 pub(super) use crate::read::flight::Flights;
 pub(super) use crate::read::flight::JoinedCopy;
 pub(super) use crate::read::flight::JoinedFlight;
-pub(super) use crate::runtime::admission::AdmissionExt;
-pub(super) use crate::runtime::admission::AdmissionPolicy;
-pub(super) use crate::runtime::deadline::RequestScope;
+pub(super) use crate::admission::AdmissionExt;
+pub(super) use crate::admission::AdmissionPolicy;
+pub(super) use crate::runtime::RequestScope;
 pub(super) use crate::security::aead::PageCrypto;
 pub(super) use crate::security::credentials::CredentialCrypto;
 pub(super) use crate::store::StoreReader;
@@ -1139,7 +1139,7 @@ pub(super) use crate::origin::OriginPage;
 pub(super) use crate::read::dispatch::WorkerDirectory;
 pub(super) use crate::runtime::crypto;
 pub(super) use crate::runtime::crypto::CryptoClient;
-pub(super) use crate::runtime::reactor::Reactor;
+pub(super) use crate::runtime::Reactor;
 pub(super) use crate::runtime::worker::CryptoRuntime;
 pub(super) use crate::runtime::worker::CryptoService;
 pub(super) use crate::security::aead::PageCryptoEngine;
@@ -1425,7 +1425,7 @@ pub(super) fn acquire(f: &mut Fixture, budget: &mut AcquisitionBudget) -> Result
         &f.crypto,
     )
 }
-pub(super) fn fixture_with(length: u64, limits: Option<crate::model::Limits>) -> Fixture {
+pub(super) fn fixture_with(length: u64, limits: Option<crate::config::Limits>) -> Fixture {
     fixture_with_caches(
         length,
         limits,
@@ -1434,7 +1434,7 @@ pub(super) fn fixture_with(length: u64, limits: Option<crate::model::Limits>) ->
 }
 fn fixture_with_caches(
     length: u64,
-    limits: Option<crate::model::Limits>,
+    limits: Option<crate::config::Limits>,
     caches: Vec<CacheId>,
 ) -> Fixture {
     let mut config = crate::test_support::cluster::config(false);
@@ -3459,4 +3459,4 @@ fn canceled_supplier_retains_crypto_fence_before_replacement_origin_work() {
     assert_eq!(f.fill.metrics.gauge(Gauge::ActiveFills), 0);
     assert_eq!(f.fill.metrics.count(Event::OriginFill), 1);
 }
-pub(super) use uring_runtime::reactor::IoBuffer;
+pub(super) use uring_runtime::IoBuffer;

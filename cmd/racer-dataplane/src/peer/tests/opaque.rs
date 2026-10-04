@@ -143,8 +143,8 @@ mod materialized_pairing {
         let downstream_closed = Cell::new(false);
         let healthy_first = Cell::new(false);
         let overlapped = Cell::new(false);
-        let listener: Rc<uring_runtime::reactor::Descriptor> = Rc::new(listener.into());
-        let destination = |listener: Rc<uring_runtime::reactor::Descriptor>| async {
+        let listener: Rc<uring_runtime::Descriptor> = Rc::new(listener.into());
+        let destination = |listener: Rc<uring_runtime::Descriptor>| async {
             let fd = reactors[2].accept(listener, &scope).await?;
             accepted.set(accepted.get() + 1);
             let conn = crate::http::from_accepted(fd, &admissions[2])?;
@@ -798,7 +798,7 @@ use crate::http::HttpPool;
 use crate::model::ExpiresAt;
 use crate::model::ObjectMetadata;
 use crate::model::PageEnvelope;
-use crate::runtime::reactor::Reactor;
+use crate::runtime::Reactor;
 use crate::security::connection;
 use crate::topology::LinkHealth;
 use crate::topology::Member;
@@ -1591,4 +1591,4 @@ fn opaque_head_rejects_binding_length_authority_and_reverse_proof_substitution()
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
     }
 }
-use uring_runtime::reactor::IoBuffer;
+use uring_runtime::IoBuffer;

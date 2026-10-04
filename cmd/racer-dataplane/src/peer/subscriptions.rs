@@ -240,7 +240,7 @@ impl Subscriptions {
         receiver: NodeId,
         local: &NodeId,
         placement: &crate::topology::Placement,
-        scope: &crate::runtime::deadline::RequestScope,
+        scope: &crate::runtime::RequestScope,
     ) -> Result<Selection> {
         use crate::peer::protocol::encode_deadline;
         use crate::peer::protocol::millis;
@@ -1126,7 +1126,7 @@ mod tests {
         use crate::model::Nonce;
         use crate::model::PageEnvelope;
         use crate::model::ResourceClass;
-        use crate::runtime::admission::AdmissionPolicy;
+        use crate::admission::AdmissionPolicy;
         use std::rc::Rc;
         use std::time::UNIX_EPOCH;
         let scheduler = Arc::new(Subscriptions::new(Default::default()).unwrap());

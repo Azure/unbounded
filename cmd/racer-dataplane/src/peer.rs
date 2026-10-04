@@ -123,8 +123,8 @@ use crate::model::MembershipVersion;
 use crate::model::NodeId;
 use crate::model::ResourceClass;
 use crate::rdma;
-use crate::runtime::admission::AdmissionPolicy;
-use crate::runtime::deadline::RequestScope;
+use crate::admission::AdmissionPolicy;
+use crate::runtime::RequestScope;
 use crate::security::forwarding::Forwarding;
 use crate::telemetry::Observer;
 use crate::telemetry::Stage;
@@ -249,7 +249,7 @@ impl Relay {
     ///
     /// ```compile_fail
     /// use racer_dataplane::{peer::{Relay, protocol::SignedRequest},
-    ///     runtime::deadline::RequestScope, topology::Membership};
+    ///     runtime::RequestScope, topology::Membership};
     /// fn unverified(relay: &Relay, request: SignedRequest,
     ///     membership: std::sync::Arc<Membership>, scope: &RequestScope) {
     ///     relay.forward(request, membership, scope);
@@ -496,7 +496,7 @@ impl Requester {
 /// use racer_dataplane::{error::Result, peer::{Requester,
 ///     Relay, server::PeerServer,
 ///     protocol::{PeerRequest, SignedRequest, SignedResponse, VerifiedResponse}},
-///     runtime::deadline::RequestScope, security::forwarding::Forwarding,
+///     runtime::RequestScope, security::forwarding::Forwarding,
 ///     topology::Membership};
 /// async fn interfaces(
 ///     client: &Requester, transport: &Requester,

@@ -1092,7 +1092,7 @@ fn enrolled_identity(
     // and local key pairing rather than comparing opaque identity.json bytes.
     let reactor = enrollment_io::reactor();
     enrollment.attach_reactor(reactor.clone());
-    let scope = racer_dataplane::runtime::deadline::RequestScope::new(
+    let scope = racer_dataplane::runtime::RequestScope::new(
         racer_dataplane::model::RequestId([9; 16]),
         Instant::now() + Duration::from_secs(15),
     )

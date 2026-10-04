@@ -24,9 +24,9 @@ use crate::peer::protocol::VerifiedRequest;
 use crate::peer::server::LocalPageService;
 use crate::peer::server::PeerServer;
 use crate::peer::transport::Transfers;
-use crate::runtime::admission::AdmissionPolicy;
-use crate::runtime::deadline::RequestScope;
-use crate::runtime::reactor::Reactor;
+use crate::admission::AdmissionPolicy;
+use crate::runtime::RequestScope;
+use crate::runtime::Reactor;
 use crate::security::credentials::CredentialCrypto;
 use crate::security::forwarding::Forwarding;
 use crate::security::test_support::Identity;
@@ -517,7 +517,7 @@ fn remote_candidate_with_churn(absence: Option<Absence>, forbidden: bool, churn:
     let service = async {
         let fd = reactor
             .accept(
-                Rc::new(uring_runtime::reactor::Descriptor::from(listener)),
+                Rc::new(uring_runtime::Descriptor::from(listener)),
                 &scope,
             )
             .await?;

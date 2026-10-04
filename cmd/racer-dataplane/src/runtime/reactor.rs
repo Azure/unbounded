@@ -3,7 +3,7 @@
 //! Inline storage cannot meet the stable-buffer contract:
 //! ```compile_fail
 //! use racer_dataplane::error::Result;
-//! use uring_runtime::reactor::IoBuffer;
+//! use uring_runtime::IoBuffer;
 //! struct Inline([u8; 16]);
 //! impl IoBuffer for Inline {
 //!     type Error = racer_dataplane::error::Error;
@@ -14,7 +14,7 @@
 //! Borrowed storage does not have an independent completion lifetime:
 //! ```compile_fail
 //! use racer_dataplane::error::Result;
-//! use uring_runtime::reactor::IoBuffer;
+//! use uring_runtime::IoBuffer;
 //! struct Borrowed<'a>(&'a mut [u8]);
 //! unsafe impl IoBuffer for Borrowed<'_> {
 //!     type Error = racer_dataplane::error::Error;
@@ -25,8 +25,8 @@
 //! Audited production buffers own independent storage:
 //! ```
 //! use racer_dataplane::{memory::PlaintextBuffer,
-//!     runtime::admission::AdmissionPolicy};
-//! use uring_runtime::reactor::IoBuffer;
+//!     admission::AdmissionPolicy};
+//! use uring_runtime::IoBuffer;
 //! use flow_control::Charge;
 //! use page_alloc::AlignedBuffer;
 //! fn independent<T: 'static>() {}
@@ -39,7 +39,7 @@
 //! use std::rc::Rc;
 //! use racer_dataplane::{memory::CiphertextPage,
 //!     runtime::{reactor::Reactor, deadline::RequestScope}};
-//! use uring_runtime::reactor::Descriptor;
+//! use uring_runtime::Descriptor;
 //! fn receive(r: &Reactor, fd: Rc<Descriptor>, page: CiphertextPage, scope: &RequestScope) {
 //!     let _ = r.recv(fd, page, (), scope);
 //! }
@@ -55,15 +55,15 @@ use crate::model::RequestId;
 use crate::model::ResourceClass;
 use std::ops::Deref;
 use std::rc::Rc;
-use uring_runtime::reactor::ReactorWake;
-use uring_runtime::reactor::SUBMISSION_BYTES;
-use uring_runtime::reactor::SubmissionCapacity;
+use uring_runtime::ReactorWake;
+use uring_runtime::SUBMISSION_BYTES;
+use uring_runtime::SubmissionCapacity;
 pub mod filesystem {
     //! Racer filesystem buffer error boundary.
     use crate::error::Error;
     use crate::error::Result;
-    use uring_runtime::reactor::IoBuffer;
-    pub struct Buffer(pub(super) uring_runtime::reactor::filesystem::Buffer);
+    use uring_runtime::IoBuffer;
+    pub struct Buffer(pub(super) uring_runtime::filesystem::Buffer);
     // SAFETY: the runtime owner retains its private stable allocation and charge.
     unsafe impl IoBuffer for Buffer {
         type Error = Error;
@@ -102,11 +102,11 @@ impl uring_runtime::Budget for AdmissionBudget {
 }
 
 pub struct Reactor {
-    core: uring_runtime::reactor::Reactor<RequestScope, AdmissionBudget>,
+    core: uring_runtime::Reactor<RequestScope, AdmissionBudget>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
 }
 impl Deref for Reactor {
-    type Target = uring_runtime::reactor::Reactor<RequestScope, AdmissionBudget>;
+    type Target = uring_runtime::Reactor<RequestScope, AdmissionBudget>;
     fn deref(&self) -> &Self::Target {
         &self.core
     }
@@ -114,7 +114,7 @@ impl Deref for Reactor {
 impl Reactor {
     pub fn new(admission: Rc<flow_control::Quotas<AdmissionPolicy>>) -> Self {
         Self {
-            core: uring_runtime::reactor::Reactor::new(
+            core: uring_runtime::Reactor::new(
                 admission.policy().limits().queue_entries.get(),
                 AdmissionBudget(admission.clone()),
             ),
@@ -191,10 +191,10 @@ mod tests {
     use std::task::Poll;
     use std::time::Duration;
     use std::time::Instant;
-    use uring_runtime::reactor::Descriptor;
-    use uring_runtime::reactor::IoBuffer;
-    use uring_runtime::reactor::SocketAddress;
-    use uring_runtime::reactor::simulation;
+    use uring_runtime::Descriptor;
+    use uring_runtime::IoBuffer;
+    use uring_runtime::SocketAddress;
+    use uring_runtime::simulation;
 
     #[test]
     fn movable_production_buffers_preserve_subrange_through_completion() {
@@ -236,7 +236,7 @@ mod tests {
         check(reactor.file_buffer(3).unwrap());
     }
 
-    fn limits(capacity: usize) -> crate::model::Limits {
+    fn limits(capacity: usize) -> crate::config::Limits {
         let mut limits = crate::test_support::cluster::config(false).limits;
         limits.queue_entries = std::num::NonZeroUsize::new(capacity).unwrap();
         limits
@@ -514,17 +514,17 @@ mod simulation_tests {
     use crate::error::Error;
     use crate::error::Result;
     use crate::model::ResourceClass;
-    use crate::runtime::admission::AdmissionPolicy;
-    use crate::runtime::deadline::RequestScope;
+    use crate::admission::AdmissionPolicy;
+    use crate::runtime::RequestScope;
     use std::cell::Cell;
     use std::ffi::CString;
     use std::path::Path;
     use std::rc::Rc;
     use std::time::Duration;
-    use uring_runtime::reactor::simulation::DiskState;
-    use uring_runtime::reactor::simulation::Environment;
-    use uring_runtime::reactor::simulation::Fault;
-    use uring_runtime::reactor::simulation::Simulation;
+    use uring_runtime::simulation::DiskState;
+    use uring_runtime::simulation::Environment;
+    use uring_runtime::simulation::Fault;
+    use uring_runtime::simulation::Simulation;
     fn reactor() -> Reactor {
         Reactor::new(Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
@@ -560,7 +560,7 @@ mod simulation_tests {
     fn direct_io_faults_check_address_offset_and_length_independently() {
         use page_alloc::AlignedBuffer;
         use page_alloc::Alignment;
-        use uring_runtime::reactor::IoBuffer;
+        use uring_runtime::IoBuffer;
         struct View {
             buffer: AlignedBuffer<flow_control::Charge<AdmissionPolicy>>,
             start: usize,

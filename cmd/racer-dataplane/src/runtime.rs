@@ -1,6 +1,5 @@
 //! Explicit execution ownership. No library may introduce an unbudgeted thread pool.
 
-pub mod admission;
 pub mod affinity;
 pub(crate) mod collections {
     //! Seeded hashing only in simulated worlds; production retains std hashing.
@@ -87,7 +86,7 @@ pub fn unix_time() -> rustls::pki_types::UnixTime {
 mod environment_tests {
     use crate::error::Error;
     use crate::model::RequestId;
-    use crate::runtime::deadline::RequestScope;
+    use crate::runtime::RequestScope;
     use std::time::Duration;
     use uring_runtime::environment::*;
 
@@ -296,7 +295,7 @@ pub(crate) mod ingress {
     mod tests {
         use super::*;
         use crate::model::ResourceClass;
-        use crate::runtime::admission::reserve_connection;
+        use crate::admission::reserve_connection;
         #[test]
         fn offer_delivered_after_target_close_releases_socket_and_charges() {
             use std::io::Read;
@@ -499,10 +498,10 @@ mod listener_tests {
     }
     #[test]
     fn submitted_listener_cancellation_waits_for_cqe_fence() {
-        use crate::runtime::admission::AdmissionPolicy;
-        use crate::runtime::reactor::Reactor;
+        use crate::admission::AdmissionPolicy;
+        use crate::runtime::Reactor;
         use std::rc::Rc;
-        use uring_runtime::reactor::simulation::Simulation;
+        use uring_runtime::simulation::Simulation;
         let sim = Simulation::new();
         let _os = sim.enter();
         let clock = SimulationClock::new(3);

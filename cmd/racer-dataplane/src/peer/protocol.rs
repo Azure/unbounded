@@ -17,9 +17,9 @@ use crate::model::PageEnvelope;
 use crate::model::PeerOriginContext;
 use crate::model::ResourceClass;
 use crate::model::*;
-use crate::runtime::admission::AdmissionPolicy;
-use crate::runtime::deadline::Deadline;
-use crate::runtime::deadline::RequestScope;
+use crate::admission::AdmissionPolicy;
+use uring_runtime::deadline::Deadline;
+use crate::runtime::RequestScope;
 use crate::security::connection::SignedHead;
 use crate::security::forwarding::ForwardedHead;
 use crate::topology::RouteBudget;
@@ -755,7 +755,7 @@ pub fn decode_envelope(head: MessageHead, response: bool) -> Result<(ForwardedHe
     let mut version = false;
     let mut length = None;
     let mut hops = std::collections::BTreeMap::new();
-    let mut seen = crate::runtime::collections::HashSet::default();
+    let mut seen = crate::runtime::HashSet::default();
     let mut total = 0usize;
     for header in head.headers {
         total = total

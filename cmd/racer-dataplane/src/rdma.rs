@@ -8,9 +8,9 @@ use crate::model::PageEnvelope;
 use crate::model::PageId;
 use crate::model::ResourceClass;
 use crate::model::TransferId;
-use crate::runtime::admission::AdmissionPolicy;
-use crate::runtime::deadline::Deadline;
-use crate::runtime::deadline::RequestScope;
+use crate::admission::AdmissionPolicy;
+use uring_runtime::deadline::Deadline;
+use crate::runtime::RequestScope;
 use crate::runtime::worker::CryptoService;
 use crate::security::aead::PageCryptoEngine;
 use crate::security::connection::VerifiedHead;
@@ -258,7 +258,7 @@ impl Sessions {
         peer: &'a VerifiedPeer,
         rail: RailId,
         permit: Option<std::sync::Arc<crate::peer::adaptive::Permit>>,
-        scope: &'a crate::runtime::deadline::RequestScope,
+        scope: &'a crate::runtime::RequestScope,
     ) -> Operation<'a, PreparedSession> {
         #[cfg(test)]
         self.prepare_attempts.set(self.prepare_attempts.get() + 1);
@@ -2205,7 +2205,7 @@ pub(crate) mod tests {
             //! Public handoffs held at deterministic native mailbox boundaries.
             use super::*;
             use crate::model::*;
-            use crate::runtime::admission::AdmissionPolicy;
+            use crate::admission::AdmissionPolicy;
             use crate::security::test_support::network;
             use rdma_verbs::testing::Contention;
             use rdma_verbs::testing::State;
@@ -2799,7 +2799,7 @@ pub(crate) mod tests {
         mod activation_tests {
             use super::*;
             use crate::model::*;
-            use crate::runtime::admission::AdmissionPolicy;
+            use crate::admission::AdmissionPolicy;
             use crate::runtime::crypto;
             use crate::runtime::worker::CryptoRuntime;
             use crate::runtime::worker::CryptoService;
@@ -3374,7 +3374,7 @@ pub(crate) mod tests {
 
         mod lifecycle_tests {
             use super::*;
-            use crate::runtime::admission::AdmissionPolicy;
+            use crate::admission::AdmissionPolicy;
             use crate::telemetry::Gauge;
             use crate::telemetry::Metrics;
             use rdma_verbs::testing::State;

@@ -27,9 +27,9 @@ use racer_control_wire::KeyringBundle;
 use racer_control_wire::SCHEMA_VERSION;
 use racer_identity::KeyEpochs;
 use racer_identity::Keyring;
-use runtime::admission::AdmissionPolicy;
-use runtime::deadline::RequestScope;
-use runtime::reactor::Reactor;
+use admission::AdmissionPolicy;
+use runtime::RequestScope;
+use runtime::Reactor;
 use runtime::worker::CryptoRuntime;
 use runtime::worker::CryptoService;
 use std::num::NonZeroUsize;
@@ -40,7 +40,7 @@ use std::task::Context;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::UNIX_EPOCH;
-use uring_runtime::reactor::IoBuffer;
+use uring_runtime::IoBuffer;
 
 // Only origin content is generated. No client wire framing, scheduling, credit
 // accounting, page validation, encryption, or delivery is implemented here.

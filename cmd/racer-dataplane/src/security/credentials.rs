@@ -13,7 +13,7 @@
 //! use racer_dataplane::{
 //!     error::Result,
 //!     model::{OriginContext, PeerOriginContext, AttemptId},
-//!     runtime::deadline::RequestScope,
+//!     runtime::RequestScope,
 //!     security::credentials::CredentialCrypto,
 //! };
 //! fn fanout(
@@ -48,8 +48,8 @@ use crate::model::OriginContext;
 use crate::model::PeerOriginContext;
 use crate::model::RequestId;
 use crate::model::ResourceClass;
-use crate::runtime::admission::AdmissionPolicy;
-use crate::runtime::deadline::RequestScope;
+use crate::admission::AdmissionPolicy;
+use crate::runtime::RequestScope;
 use racer_crypto::aead;
 use racer_identity::KeyPurpose;
 use racer_identity::Keyring;
@@ -303,7 +303,7 @@ mod tests {
             crate::test_support::cluster::config(false).limits,
         )));
         let crypto = super::CredentialCrypto::new(keys, admission.clone());
-        let scope = crate::runtime::deadline::RequestScope::new(
+        let scope = crate::runtime::RequestScope::new(
             crate::model::RequestId([4; 16]),
             std::time::Instant::now() + std::time::Duration::from_secs(5),
         )

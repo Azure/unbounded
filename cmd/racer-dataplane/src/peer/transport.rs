@@ -24,8 +24,8 @@ use crate::rdma::Sessions;
 use crate::rdma::SetupParameters;
 use crate::rdma::TransportPlan;
 
-use crate::runtime::admission::AdmissionPolicy;
-use crate::runtime::deadline::RequestScope;
+use crate::admission::AdmissionPolicy;
+use crate::runtime::RequestScope;
 use crate::security::connection::Signatures;
 use crate::security::connection::SignedHead;
 use crate::security::connection::VerifiedHead;
@@ -246,7 +246,7 @@ mod native_exchange_tests {
     use crate::peer::protocol as p;
     use crate::rdma::Devices;
     use crate::rdma::Sessions;
-    use crate::runtime::reactor::Reactor;
+    use crate::runtime::Reactor;
     use crate::security::connection::Signatures;
     use std::os::unix::net::UnixStream;
     use std::rc::Rc;
@@ -2677,4 +2677,4 @@ mod tests {
         }
     }
 }
-use uring_runtime::reactor::IoBuffer;
+use uring_runtime::IoBuffer;

@@ -2,8 +2,8 @@
 
 use crate::error::Error;
 use crate::error::Result;
-use crate::runtime::admission::AdmissionPolicy;
-use crate::runtime::deadline::RequestScope;
+use crate::admission::AdmissionPolicy;
+use crate::runtime::RequestScope;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::time::Duration;

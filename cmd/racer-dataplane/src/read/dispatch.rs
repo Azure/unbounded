@@ -5,7 +5,7 @@
 use super::Coordinator;
 use super::flight::AcquisitionBudget;
 use crate::memory::page::PageResult;
-use crate::runtime::collections::HashMap;
+use crate::runtime::HashMap;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
@@ -22,8 +22,8 @@ use crate::model::WorkerId;
 use crate::peer::protocol::PeerResponse;
 use crate::peer::protocol::VerifiedRequest;
 use crate::peer::server::LocalPageService;
-use crate::runtime::deadline::Cancellation;
-use crate::runtime::deadline::RequestScope;
+use crate::runtime::Cancellation;
+use crate::runtime::RequestScope;
 
 use sha2::Digest;
 use sha2::Sha256;
@@ -153,7 +153,7 @@ struct Command {
 struct Receipt {
     reply: Arc<Reply>,
     scope: RequestScope,
-    cancellation: crate::runtime::deadline::CancellationRegistration,
+    cancellation: uring_runtime::CancellationRegistration,
     _permit: Arc<Permit>,
 }
 impl Future for Receipt {
@@ -185,7 +185,7 @@ impl Drop for Receipt {
     }
 }
 struct Active {
-    cancellation: Result<crate::runtime::deadline::CancellationRegistration>,
+    cancellation: Result<uring_runtime::CancellationRegistration>,
     runnable: Arc<uring_runtime::drivers::Runnable>,
     future: Operation<'static, ()>,
     scope: RequestScope,
@@ -688,7 +688,7 @@ impl WorkerEndpoint {
     /// without polling them; the simulated reactor still fences owned buffers.
     #[cfg(test)]
     pub(crate) fn simulation_crash(&mut self) {
-        assert!(uring_runtime::reactor::simulation::Simulation::current().is_some());
+        assert!(uring_runtime::simulation::Simulation::current().is_some());
         self.directory.simulation_crash();
         self.active.clear();
     }
@@ -1065,7 +1065,7 @@ mod tests {
         let directory = directory(1);
         let scope = scope();
         let admission = Rc::new(flow_control::Quotas::new(
-            crate::runtime::admission::AdmissionPolicy::new(
+            crate::admission::AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             ),
         ));

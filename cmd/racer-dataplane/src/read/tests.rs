@@ -12,7 +12,7 @@ pub(crate) fn page(byte: u8) -> crate::memory::page::PageResult {
     use crate::memory::VerifiedPage;
     use crate::model::*;
     use std::sync::Arc;
-    let admission = flow_control::Quotas::new(crate::runtime::admission::AdmissionPolicy::new(
+    let admission = flow_control::Quotas::new(crate::admission::AdmissionPolicy::new(
         crate::test_support::cluster::config(false).limits,
     ));
     let page = PageId {
@@ -179,8 +179,8 @@ mod flight {
     use crate::model::OriginContext;
     use crate::model::PageId;
     use crate::model::ResourceClass;
-    use crate::runtime::admission::AdmissionPolicy;
-    use crate::runtime::deadline::RequestScope;
+    use crate::admission::AdmissionPolicy;
+    use crate::runtime::RequestScope;
     use std::time::Duration;
     use std::rc::Rc;
     use std::task::Context;
@@ -1124,8 +1124,8 @@ mod timeouts {
     use crate::peer::protocol::PeerResponse;
     use crate::peer::protocol::VerifiedResponse;
     use crate::read::flight::AcquisitionBudget;
-    use crate::runtime::deadline::Deadline;
-    use crate::runtime::deadline::RequestScope;
+    use uring_runtime::deadline::Deadline;
+    use crate::runtime::RequestScope;
     use crate::topology::Candidates;
     use crate::model::ExpiresAt;
     use crate::model::MembershipVersion;

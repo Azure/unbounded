@@ -6,7 +6,7 @@
 use crate::error::Error;
 use crate::error::Result;
 use crate::model::ClusterId;
-use crate::model::Limits;
+use crate::config::Limits;
 use crate::model::NodeId;
 use crate::model::PAGE_BYTES;
 use crate::store::MAX_HEADER_BYTES;

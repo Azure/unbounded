@@ -885,7 +885,7 @@ fn hedge_cold_backup_coordinators_probe_predecessors_then_reach_origin_with_orig
         nodes: RefCell<Vec<Rc<Coordinator>>>,
         calls: RefCell<Vec<(NodeId, NodeId, bool, u32, u8)>>,
         unavailable: RefCell<Vec<NodeId>>,
-        admissions: Vec<Rc<flow_control::Quotas<crate::runtime::admission::AdmissionPolicy>>>,
+        admissions: Vec<Rc<flow_control::Quotas<crate::admission::AdmissionPolicy>>>,
     }
     struct Peer {
         mesh: Rc<Mesh>,

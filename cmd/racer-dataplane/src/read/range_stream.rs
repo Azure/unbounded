@@ -18,8 +18,8 @@ use crate::model::PAGE_BYTES;
 use crate::model::PageId;
 use crate::model::PageNumber;
 use crate::model::ResolvedRange;
-use crate::runtime::admission::AdmissionPolicy;
-use crate::runtime::deadline::RequestScope;
+use crate::admission::AdmissionPolicy;
+use crate::runtime::RequestScope;
 
 use flow_control::Window;
 use std::collections::BTreeMap;
@@ -1004,8 +1004,8 @@ pub(super) mod tests {
     use crate::model::RequestId;
     use crate::model::ResourceClass;
     use crate::model::WorkerId;
-    use crate::runtime::admission::AdmissionPolicy;
-    use crate::runtime::reactor::Reactor;
+    use crate::admission::AdmissionPolicy;
+    use crate::runtime::Reactor;
     use crate::topology::Membership;
 
     struct Fixture {
@@ -1015,7 +1015,7 @@ pub(super) mod tests {
     }
 
     impl Fixture {
-        fn new(limits: crate::model::Limits, capacity: usize) -> Self {
+        fn new(limits: crate::config::Limits, capacity: usize) -> Self {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits)));
             let reactor = Rc::new(Reactor::new(admission.clone()));
             let pipes = Rc::new(new_pipe_pool(admission.clone()));
@@ -1629,7 +1629,7 @@ pub(super) mod tests {
         use crate::model::RequestId;
         use crate::model::ResourceClass;
         use crate::read::ReadResponse;
-        use crate::runtime::reactor::Reactor;
+        use crate::runtime::Reactor;
         use std::io::Read;
         use std::io::Write;
         use std::os::unix::net::UnixStream;
@@ -1876,7 +1876,7 @@ pub(super) mod tests {
         use crate::model::CacheKey;
         use crate::model::ObjectId;
         use crate::model::StrongEtag;
-        use crate::runtime::admission::AdmissionPolicy;
+        use crate::admission::AdmissionPolicy;
         use flow_control::Quotas;
         use std::task::Context;
         use std::task::Poll;

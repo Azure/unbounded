@@ -12,7 +12,7 @@ use racer_dataplane::model::PageId;
 use racer_dataplane::model::PageNumber;
 use racer_dataplane::model::ResourceClass;
 use racer_dataplane::model::StrongEtag;
-use racer_dataplane::runtime::admission::AdmissionPolicy;
+use racer_dataplane::admission::AdmissionPolicy;
 use std::alloc::GlobalAlloc;
 use std::alloc::Layout;
 use std::alloc::System;
@@ -28,7 +28,7 @@ static WATCH: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 static FREED: AtomicBool = AtomicBool::new(false);
 static ZEROED: AtomicBool = AtomicBool::new(false);
 static NEXT_SIZE: AtomicUsize = AtomicUsize::new(0);
-static CANCEL_AT_ALLOCATION: Mutex<Option<racer_dataplane::runtime::deadline::RequestScope>> =
+static CANCEL_AT_ALLOCATION: Mutex<Option<racer_dataplane::runtime::RequestScope>> =
     Mutex::new(None);
 
 // SAFETY: All allocation operations delegate to System with the original layout.
@@ -189,7 +189,7 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
     use racer_dataplane::runtime::crypto::CryptoId;
     use racer_dataplane::runtime::crypto::CryptoInput;
     use racer_dataplane::runtime::crypto::pair;
-    use racer_dataplane::runtime::deadline::RequestScope;
+    use racer_dataplane::runtime::RequestScope;
     use racer_dataplane::security::aead::PageCryptoEngine;
     use racer_dataplane::security::aead::page_aad;
     use racer_identity::KeyEpochs;
@@ -354,4 +354,4 @@ fn failed_crypto_output_is_scrubbed(config: &Config) {
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
     }
 }
-use uring_runtime::reactor::IoBuffer;
+use uring_runtime::IoBuffer;

@@ -25,9 +25,9 @@ use crate::model::OriginContext;
 use crate::model::PageId;
 use crate::model::ResourceClass;
 
-use crate::runtime::admission::AdmissionPolicy;
-use crate::runtime::collections::HashMap;
-use crate::runtime::deadline::RequestScope;
+use crate::admission::AdmissionPolicy;
+use crate::runtime::HashMap;
+use crate::runtime::RequestScope;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::future::poll_fn;
@@ -366,7 +366,7 @@ pub struct AcquisitionWaiter<'a> {
 
 pub(super) struct Registration {
     flights: Rc<Flights>,
-    cancellation: crate::runtime::deadline::CancellationRegistration,
+    cancellation: uring_runtime::CancellationRegistration,
     // Waiters survive acquisition generations. Match owner/page/incarnation/id
     // for registration, then refresh this generation only on a new election.
     fence: Fence,
@@ -411,7 +411,7 @@ pub enum AcquisitionEvent {
 pub struct AcquisitionContext<'a> {
     pub origin: &'a OriginContext,
     pub scope: &'a RequestScope,
-    pub(crate) cancellation: &'a crate::runtime::deadline::CancellationRegistration,
+    pub(crate) cancellation: &'a uring_runtime::CancellationRegistration,
     pub membership: &'a std::sync::Arc<crate::topology::Membership>,
     pub budget: &'a mut AcquisitionBudget,
 }

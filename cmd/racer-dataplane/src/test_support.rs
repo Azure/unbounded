@@ -20,10 +20,10 @@ use crate::read::flight::Flights;
 use crate::read::metadata::MetadataDependencies;
 use crate::read::metadata::MetadataService;
 use crate::read::range_stream::RangeStreams;
-use crate::runtime::admission::AdmissionPolicy;
+use crate::admission::AdmissionPolicy;
 use crate::runtime::crypto;
 use crate::runtime::crypto::CryptoClient;
-use crate::runtime::reactor::Reactor;
+use crate::runtime::Reactor;
 use crate::runtime::worker::CryptoRuntime;
 use crate::runtime::worker::CryptoService;
 use crate::security::aead::PageCrypto;
@@ -46,7 +46,7 @@ use uring_runtime::drivers::DriverQueue;
 pub mod clock {
     use crate::error::Error;
     use crate::error::Result;
-    use crate::runtime::deadline::Deadline;
+    use uring_runtime::deadline::Deadline;
     use std::cell::Cell;
     use std::time::Duration;
     use std::time::Instant;
@@ -169,8 +169,8 @@ pub mod origin {
     use crate::model::ObjectMetadata;
     use crate::model::PAGE_BYTES;
     use crate::origin::OriginClient;
-    use crate::runtime::admission::AdmissionPolicy;
-    use crate::runtime::reactor::Reactor;
+    use crate::admission::AdmissionPolicy;
+    use crate::runtime::Reactor;
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
     use std::collections::VecDeque;
@@ -584,7 +584,7 @@ impl NoPeers {
         &'a self,
         _: crate::peer::protocol::PeerRequest,
         _: std::sync::Arc<crate::topology::Membership>,
-        _: &'a crate::runtime::deadline::RequestScope,
+        _: &'a crate::runtime::RequestScope,
     ) -> crate::error::Operation<'a, crate::peer::protocol::VerifiedResponse> {
         panic!("local origin scenario must not hedge to a peer")
     }
@@ -592,7 +592,7 @@ impl NoPeers {
         &'a self,
         _: crate::peer::protocol::PeerRequest,
         _: std::sync::Arc<crate::topology::Membership>,
-        _: &'a crate::runtime::deadline::RequestScope,
+        _: &'a crate::runtime::RequestScope,
     ) -> crate::error::Operation<'a, crate::peer::protocol::VerifiedResponse> {
         Box::pin(async { panic!("local origin scenario must not contact peers") })
     }
@@ -602,7 +602,7 @@ impl NoPeers {
 pub mod cluster {
     use crate::config::Config;
     use crate::model::ClusterId;
-    use crate::model::Limits;
+    use crate::config::Limits;
     use crate::model::NodeId;
     use std::num::NonZeroU32;
     use std::num::NonZeroUsize;

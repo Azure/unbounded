@@ -5,7 +5,7 @@
 pub mod listener;
 pub mod response;
 
-use crate::runtime::collections::HashSet;
+use crate::runtime::HashSet;
 use crate::error::Error;
 use crate::error::Result;
 use crate::model::Authorization;

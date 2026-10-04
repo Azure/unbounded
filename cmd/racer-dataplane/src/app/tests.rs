@@ -2,10 +2,10 @@
 use super::*;
 use racer_control_wire as state;
 
-use crate::runtime::admission::AdmissionPolicy;
+use crate::admission::AdmissionPolicy;
 use crate::runtime::crypto;
 use crate::runtime::crypto::CryptoClient;
-use crate::runtime::reactor::Reactor;
+use crate::runtime::Reactor;
 use crate::http::Codec;
 use crate::model::ExpiresAt;
 use crate::model::MetadataSelector;
@@ -2809,7 +2809,7 @@ fn distributed_peer_listener_recovers_from_queue_pressure() {
     let mut serving = app.peers.listen(address, &scope);
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
-    let reader = Rc::new(uring_runtime::reactor::Descriptor::from(reader));
+    let reader = Rc::new(uring_runtime::Descriptor::from(reader));
     let mut pressure = Vec::new();
     for _ in 0..8 {
         let mut wait = runtime
@@ -2834,7 +2834,7 @@ fn distributed_peer_listener_recovers_from_queue_pressure() {
             .unwrap()[0]
             .take()
         {
-            assert!(matches!(accepted.kind, crate::runtime::ingress::Kind::Peer));
+            assert!(matches!(accepted.kind, crate::admission::Kind::Peer));
             break;
         }
         assert!(Instant::now() < until, "distributed peer accept stalled");

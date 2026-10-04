@@ -5,13 +5,13 @@ use crate::model::Authorization;
 use crate::model::CacheId;
 use crate::model::CacheKey;
 use crate::model::ClusterId;
-use crate::model::Limits;
+use crate::config::Limits;
 use crate::model::ObjectId;
 use crate::model::OpaqueMetadata;
 use crate::model::RequestId;
 use crate::model::StrongEtag;
 
-use crate::runtime::reactor::Reactor;
+use crate::runtime::Reactor;
 use futures::executor::block_on;
 use std::future::Future;
 use std::io::Read;

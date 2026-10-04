@@ -6,8 +6,8 @@ use crate::model::ClusterId;
 use crate::model::KeyId;
 use crate::model::MembershipVersion;
 use crate::model::NodeId;
-use crate::runtime::deadline::RequestScope;
-use crate::runtime::reactor::Reactor;
+use crate::runtime::RequestScope;
+use crate::runtime::Reactor;
 use crate::topology::Member;
 use crate::topology::Membership;
 use base64::Engine;
@@ -51,7 +51,7 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
-use uring_runtime::reactor::Descriptor;
+use uring_runtime::Descriptor;
 use zeroize::Zeroize;
 use zeroize::Zeroizing;
 
@@ -1337,14 +1337,14 @@ pub(crate) fn for_caches(keys: Rc<Keyring>, caches: Vec<CacheId>) -> Rc<Availabi
 
 /// Racer's owner-local filesystem, timer, admission, and readiness adapter.
 pub struct ReactorControlIo {
-    reactor: Rc<crate::runtime::reactor::Reactor>,
+    reactor: Rc<crate::runtime::Reactor>,
     #[cfg(test)]
     connect_probe: Option<Rc<tests::scenarios::ConnectProbe>>,
 }
 impl rest_client::Io for ReactorControlIo {
     type Error = Error;
     type Scope = RequestScope;
-    type Lease = crate::runtime::admission::ConnectionReservation;
+    type Lease = crate::admission::ConnectionReservation;
 
     fn lease(&self) -> Result<Option<Rc<Self::Lease>>> {
         self.reactor
@@ -1405,14 +1405,14 @@ impl rest_client::Io for ReactorControlIo {
 }
 
 impl ReactorControlIo {
-    pub fn new(reactor: Rc<crate::runtime::reactor::Reactor>) -> Self {
+    pub fn new(reactor: Rc<crate::runtime::Reactor>) -> Self {
         Self {
             reactor,
             #[cfg(test)]
             connect_probe: None,
         }
     }
-    pub(crate) fn reactor(&self) -> Rc<crate::runtime::reactor::Reactor> {
+    pub(crate) fn reactor(&self) -> Rc<crate::runtime::Reactor> {
         self.reactor.clone()
     }
     pub fn sleep<'a>(&'a self, until: Instant, scope: &'a RequestScope) -> Operation<'a, ()> {
@@ -1423,7 +1423,7 @@ impl ReactorControlIo {
                 return Ok(());
             }
             #[cfg(test)]
-            if uring_runtime::reactor::simulation::Simulation::current().is_some() {
+            if uring_runtime::simulation::Simulation::current().is_some() {
                 return std::future::poll_fn(|cx| {
                     scope.check()?;
                     if uring_runtime::environment::now() >= until {
@@ -1610,7 +1610,7 @@ pub struct Enrollment {
     token_path: PathBuf,
     identity_directory: PathBuf,
     roots: RefCell<Vec<Vec<u8>>>,
-    reactor: RefCell<Option<Rc<crate::runtime::reactor::Reactor>>>,
+    reactor: RefCell<Option<Rc<crate::runtime::Reactor>>>,
     busy: Cell<bool>,
     previous: Cell<Option<crate::model::RequestId>>,
 }
@@ -1762,10 +1762,10 @@ impl Enrollment {
             self.request(&pending)
         })
     }
-    pub fn attach_reactor(&self, reactor: Rc<crate::runtime::reactor::Reactor>) {
+    pub fn attach_reactor(&self, reactor: Rc<crate::runtime::Reactor>) {
         *self.reactor.borrow_mut() = Some(reactor);
     }
-    fn reactor(&self) -> Result<Rc<crate::runtime::reactor::Reactor>> {
+    fn reactor(&self) -> Result<Rc<crate::runtime::Reactor>> {
         self.reactor
             .borrow()
             .clone()
@@ -1773,7 +1773,7 @@ impl Enrollment {
     }
     async fn begin<'a>(
         &'a self,
-        r: &crate::runtime::reactor::Reactor,
+        r: &crate::runtime::Reactor,
         scope: &RequestScope,
     ) -> Result<(Busy<'a>, RequestScope)> {
         scope.check()?;
@@ -2194,7 +2194,7 @@ pub(crate) async fn directory(
 }
 fn check_private(stat: &libc::statx, regular: bool) -> Result<()> {
     #[cfg(test)]
-    let uid = if uring_runtime::reactor::simulation::Simulation::current().is_some() {
+    let uid = if uring_runtime::simulation::Simulation::current().is_some() {
         0
     } else {
         unsafe { libc::geteuid() }
@@ -2502,14 +2502,14 @@ pub(crate) mod tests {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
-        pub(crate) fn scope() -> crate::runtime::deadline::RequestScope {
-            crate::runtime::deadline::RequestScope::new(
+        pub(crate) fn scope() -> crate::runtime::RequestScope {
+            crate::runtime::RequestScope::new(
                 crate::model::RequestId([7; 16]),
                 std::time::Instant::now() + std::time::Duration::from_secs(10),
             )
             .unwrap()
         }
-        pub(crate) fn reactor() -> Option<std::rc::Rc<crate::runtime::reactor::Reactor>> {
+        pub(crate) fn reactor() -> Option<std::rc::Rc<crate::runtime::Reactor>> {
             match io_uring::IoUring::new(2) {
                 Ok(ring) => drop(ring),
                 Err(e)
@@ -3431,7 +3431,7 @@ pub(crate) mod tests {
         pub(crate) struct ConnectProbe {
             calls: Cell<usize>,
             held: RefCell<Option<std::rc::Weak<Descriptor>>>,
-            leases: RefCell<Vec<std::rc::Weak<crate::runtime::admission::ConnectionReservation>>>,
+            leases: RefCell<Vec<std::rc::Weak<crate::admission::ConnectionReservation>>>,
             pub(crate) addresses: [SocketAddr; 2],
             pub(crate) mode: &'static str,
             pub(crate) parent_deadline: Instant,
@@ -3442,7 +3442,7 @@ pub(crate) mod tests {
                 fd: &Rc<Descriptor>,
                 read: bool,
                 write: bool,
-                lease: &Option<Rc<crate::runtime::admission::ConnectionReservation>>,
+                lease: &Option<Rc<crate::admission::ConnectionReservation>>,
                 scope: &RequestScope,
             ) -> Result<bool> {
                 self.leases
@@ -3576,7 +3576,7 @@ pub(crate) mod tests {
             }
         }
         fn enrolled(
-            r: &Rc<crate::runtime::reactor::Reactor>,
+            r: &Rc<crate::runtime::Reactor>,
             d: &testing::Directory,
             ca: &rcgen::Certificate,
             key: &rcgen::KeyPair,

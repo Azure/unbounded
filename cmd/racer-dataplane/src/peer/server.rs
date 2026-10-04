@@ -8,8 +8,8 @@ use crate::error::Error;
 use crate::error::Operation;
 use crate::model::ResourceClass;
 
-use crate::runtime::admission::AdmissionPolicy;
-use crate::runtime::deadline::RequestScope;
+use crate::admission::AdmissionPolicy;
+use crate::runtime::RequestScope;
 use crate::security::forwarding::Forwarding;
 use std::rc::Rc;
 use std::time::Duration;
@@ -20,7 +20,7 @@ use std::time::Instant;
 ///
 /// ```compile_fail
 /// use racer_dataplane::{peer::{server::LocalPageService, protocol::PeerRequest},
-///     runtime::deadline::RequestScope, topology::Membership};
+///     runtime::RequestScope, topology::Membership};
 /// fn unverified(service: &dyn LocalPageService, request: PeerRequest,
 ///     membership: std::sync::Arc<Membership>, scope: &RequestScope) {
 ///     service.serve_peer(request, membership, scope);
@@ -37,7 +37,7 @@ pub trait LocalPageService {
 /// Listener ownership is explicit: production distributes accepted descriptors,
 /// while local and simulated listeners serve them on their own reactor.
 pub(crate) enum AcceptMode {
-    Distributed(std::sync::Arc<crate::runtime::ingress::Ingress>),
+    Distributed(std::sync::Arc<crate::admission::Ingress>),
     Local,
 }
 
@@ -74,8 +74,8 @@ pub struct PeerServer {
 impl PeerServer {
     pub(crate) fn configure_accepted(
         &self,
-        fd: uring_runtime::reactor::Descriptor,
-    ) -> crate::error::Result<uring_runtime::reactor::Descriptor> {
+        fd: uring_runtime::Descriptor,
+    ) -> crate::error::Result<uring_runtime::Descriptor> {
         fd.enable_tcp_nodelay(self.tcp_nodelay)?;
         Ok(fd)
     }
@@ -205,7 +205,7 @@ impl PeerServer {
             use futures::stream::FuturesUnordered;
             scope.check()?;
             let reactor = self.io.reactor();
-            let fd = Rc::new(uring_runtime::reactor::Descriptor::tcp_listener(address)?);
+            let fd = Rc::new(uring_runtime::Descriptor::tcp_listener(address)?);
             let mut active = FuturesUnordered::new();
             let maximum = self
                 .admission
@@ -246,7 +246,7 @@ impl PeerServer {
                         self.configure_accepted(accepted)?
                             .into_host()
                             .map_err(|_| Error::InvalidConfiguration)?,
-                        crate::runtime::ingress::Kind::Peer,
+                        crate::admission::Kind::Peer,
                     )?;
                     continue;
                 }
@@ -851,9 +851,9 @@ async fn next_accepted<A, C>(
     accept: A,
     active: &mut futures::stream::FuturesUnordered<C>,
     scope: &RequestScope,
-) -> crate::error::Result<uring_runtime::reactor::Descriptor>
+) -> crate::error::Result<uring_runtime::Descriptor>
 where
-    A: std::future::Future<Output = crate::error::Result<uring_runtime::reactor::Descriptor>>,
+    A: std::future::Future<Output = crate::error::Result<uring_runtime::Descriptor>>,
     C: std::future::Future,
 {
     use futures::FutureExt;
@@ -977,7 +977,7 @@ mod tests {
             }
         }
     }
-    impl<F: Future<Output = crate::error::Result<uring_runtime::reactor::Descriptor>>> Future
+    impl<F: Future<Output = crate::error::Result<uring_runtime::Descriptor>>> Future
         for CountedAccept<F>
     {
         type Output = F::Output;
@@ -1012,7 +1012,7 @@ mod tests {
     fn materialized_transit_fin_and_parent_cancel_fence_head_and_body() {
         use crate::http::Codec;
         use crate::http::HttpIo;
-        use crate::runtime::reactor::Reactor;
+        use crate::runtime::Reactor;
         use std::net::Shutdown;
         use std::net::TcpListener;
         use std::net::TcpStream;
@@ -1130,7 +1130,7 @@ mod tests {
     fn materialized_transit_success_fences_watch_before_keepalive() {
         use crate::http::Codec;
         use crate::http::HttpIo;
-        use crate::runtime::reactor::Reactor;
+        use crate::runtime::Reactor;
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
             crate::test_support::cluster::config(false).limits,
         )));
@@ -1318,7 +1318,7 @@ mod tests {
 
     #[test]
     fn real_accept_retains_socket_and_fences_cancellation_and_abandonment() {
-        use crate::runtime::reactor::Reactor;
+        use crate::runtime::Reactor;
         use std::net::TcpListener;
         use std::net::TcpStream;
 
@@ -1334,7 +1334,7 @@ mod tests {
                 let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                 listener.set_nonblocking(true).unwrap();
                 let address = listener.local_addr().unwrap();
-                let fd = Rc::new(uring_runtime::reactor::Descriptor::from(listener));
+                let fd = Rc::new(uring_runtime::Descriptor::from(listener));
                 let weak = Rc::downgrade(&fd);
                 let counts = Rc::new(AcceptCounts::default());
                 let accept = CountedAccept::new(reactor.accept(fd, &scope), &counts);
@@ -1451,7 +1451,7 @@ mod tests {
         use crate::http::HttpIo;
         use crate::memory::BufferPool;
         use crate::peer::protocol::SecurityCodec;
-        use crate::runtime::reactor::Reactor;
+        use crate::runtime::Reactor;
         use crate::security::connection::tests::finish;
         use crate::security::connection::tests::hello;
         use crate::topology::LinkHealth;

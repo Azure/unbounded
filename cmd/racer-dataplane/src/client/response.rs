@@ -10,7 +10,7 @@ use crate::memory::delivery::Delivery;
 use crate::model::ObjectMetadata;
 use crate::model::ResolvedRange;
 use crate::read::ReadResponse;
-use crate::runtime::deadline::RequestScope;
+use crate::runtime::RequestScope;
 use http1::Header;
 use http1::MessageHead;
 use http1::StartLine;
@@ -40,14 +40,14 @@ mod subscription {
     use crate::model::ResolvedRange;
     use crate::read::ReadResponse;
     use crate::read::range_stream::RangeStream;
-    use crate::runtime::deadline::RequestScope;
+    use crate::runtime::RequestScope;
     use http1::MessageHead;
     use http1::StartLine;
     use std::collections::BTreeMap;
     use std::task::Context;
     use std::task::Poll;
     use std::time::Duration;
-    use uring_runtime::reactor::IoBuffer;
+    use uring_runtime::IoBuffer;
 
     pub(super) fn success_head(
         metadata: &ObjectMetadata,
@@ -101,7 +101,7 @@ mod subscription {
         fn poll(
             &mut self,
             cx: &mut Context<'_>,
-            socket: &std::rc::Rc<uring_runtime::reactor::Descriptor>,
+            socket: &std::rc::Rc<uring_runtime::Descriptor>,
             stream: &mut RangeStream,
             outstanding: &mut BTreeMap<PageNumber, u32>,
             current: Option<(crate::model::PageSlice, &crate::memory::delivery::FinalSend)>,
@@ -432,8 +432,8 @@ mod subscription {
             use crate::memory::new_pipe_pool;
             use crate::model::PageNumber;
             use crate::model::PageSlice;
-            use crate::runtime::admission::AdmissionPolicy;
-            use crate::runtime::reactor::Reactor;
+            use crate::admission::AdmissionPolicy;
+            use crate::runtime::Reactor;
             use std::rc::Rc;
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,

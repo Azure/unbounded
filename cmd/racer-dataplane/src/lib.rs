@@ -6,6 +6,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod admission;
 pub mod app;
 pub mod client;
 pub mod config;

@@ -12,7 +12,7 @@ use crate::model::PageEnvelope;
 use crate::model::PageId;
 use crate::model::RequestId;
 use crate::model::ResourceClass;
-use crate::runtime::admission::AdmissionPolicy;
+use crate::admission::AdmissionPolicy;
 use crate::runtime::crypto::CryptoClient;
 use crate::runtime::crypto::CryptoCompletion;
 use crate::runtime::crypto::CryptoInput;
@@ -21,7 +21,7 @@ use crate::runtime::crypto::CryptoOutcome;
 use crate::runtime::crypto::CryptoOutput;
 use crate::runtime::crypto::CryptoPermit;
 use crate::runtime::crypto::IntegrityRejection;
-use crate::runtime::deadline::RequestScope;
+use crate::runtime::RequestScope;
 use crate::runtime::worker::CryptoRuntime;
 use crate::runtime::worker::CryptoService;
 use crate::telemetry::AeadFailure;
@@ -170,7 +170,7 @@ impl PageCrypto {
     /// ```compile_fail
     /// use racer_dataplane::{security::aead::PageCrypto,
     ///     memory::CiphertextPage,
-    ///     runtime::{admission::AdmissionPolicy, deadline::RequestScope}};
+    ///     admission::AdmissionPolicy, runtime::RequestScope};
     /// fn require_send<T: Send>(_: T) {}
     /// fn move_future(crypto: &PageCrypto, page: CiphertextPage,
     ///     output: flow_control::Charge<AdmissionPolicy>, scope: &RequestScope) {
@@ -626,7 +626,7 @@ mod tests {
     #[test]
     fn libsodium_boundary_and_full_page_detached_vectors() {
         use crate::memory::BufferPool;
-        use crate::runtime::admission::AdmissionPolicy;
+        use crate::admission::AdmissionPolicy;
         use crate::runtime::crypto::CryptoId;
         use crate::runtime::crypto::pair;
         use sha2::Digest;
@@ -821,7 +821,7 @@ mod tests {
     #[test]
     fn engine_preserves_failed_inputs_and_completion_capacity() {
         use crate::memory::BufferPool;
-        use crate::runtime::admission::AdmissionPolicy;
+        use crate::admission::AdmissionPolicy;
         use crate::runtime::crypto::CryptoId;
         use crate::runtime::crypto::pair;
         let keys = crate::security::test_support::keys();
@@ -944,7 +944,7 @@ mod tests {
     #[test]
     fn encryption_preserves_staging_and_charges_on_failure() {
         use crate::memory::BufferPool;
-        use crate::runtime::admission::AdmissionPolicy;
+        use crate::admission::AdmissionPolicy;
         use crate::runtime::crypto::CryptoId;
         use crate::runtime::crypto::pair;
         let keys = crate::security::test_support::keys();
@@ -1065,7 +1065,7 @@ mod tests {
     #[test]
     fn engine_encrypts_and_returns_original_staging_on_failure() {
         use crate::memory::BufferPool;
-        use crate::runtime::admission::AdmissionPolicy;
+        use crate::admission::AdmissionPolicy;
         use crate::runtime::crypto::CryptoId;
         use crate::runtime::crypto::pair;
         let keys = crate::security::test_support::keys();
@@ -1187,7 +1187,7 @@ mod tests {
     }
     #[test]
     fn drain_reschedules_after_a_full_quantum() {
-        use crate::runtime::admission::AdmissionPolicy;
+        use crate::admission::AdmissionPolicy;
         use crate::runtime::crypto::CryptoId;
         use crate::runtime::crypto::pair;
         use std::sync::atomic::AtomicUsize;
@@ -1312,4 +1312,4 @@ mod tests {
         assert_eq!(admission.used(ResourceClass::Plaintext), 0);
     }
 }
-use uring_runtime::reactor::IoBuffer;
+use uring_runtime::IoBuffer;
