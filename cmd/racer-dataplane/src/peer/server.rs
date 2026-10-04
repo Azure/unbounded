@@ -960,6 +960,7 @@ mod tests {
     use std::pin::Pin;
     use std::task::Context;
     use std::task::Poll;
+    use uring_runtime::environment::SimulationClock;
 
     #[derive(Default)]
     struct AcceptCounts {
@@ -1721,5 +1722,3 @@ mod tests {
         }
     }
 }
-#[cfg(test)]
-use uring_runtime::environment::SimulationClock;

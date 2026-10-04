@@ -1272,46 +1272,6 @@ pub fn agrees(actual: &MessageHead, expected: &MessageHead, ignore_route: bool) 
     Ok(())
 }
 
-#[cfg(test)]
-mod canonical_tests {
-    use super::*;
-    use std::time::Instant;
-    #[test]
-    fn canonical_binary_numbers_node_lists_and_deadline_round_trip() {
-        assert_eq!(binary(&[0, 1, 255]), "AAH/");
-        assert!(decode_binary(b"YQ").is_err());
-        assert!(decode_binary(b"YR==").is_err());
-        let mut head = MessageHead {
-            start: StartLine::Response { status: 200 },
-            headers: Vec::new(),
-        };
-        push(&mut head, "n", "01");
-        assert!(number(&head, "n").is_err());
-        let nodes = vec![
-            crate::security::test_support::node(1),
-            crate::security::test_support::node(2),
-        ];
-        assert_eq!(
-            decode_nodes(super::nodes(&nodes).unwrap().as_bytes()).unwrap(),
-            nodes
-        );
-        assert!(
-            decode_nodes(
-                super::nodes(&[nodes[0].clone(), nodes[0].clone()])
-                    .unwrap()
-                    .as_bytes()
-            )
-            .is_err()
-        );
-        let deadline = Deadline(Instant::now() + Duration::from_secs(30));
-        let encoded = encode_deadline(deadline).unwrap();
-        let decoded = decode_deadline(encoded).unwrap();
-        assert_eq!(encode_deadline(decoded).unwrap(), encoded);
-        assert!(decoded.0 <= deadline.0);
-        assert_eq!(MAX_HEAD, MAX_SIGNED_HEAD);
-    }
-}
-
 /// Versioned HTTP envelope. Signed header values and signatures are preserved using
 /// the HTTP codec; this wrapper is framing only and is never a signing authority.
 pub fn encode_envelope(
@@ -2155,3 +2115,43 @@ impl SecurityCodec {
 }
 #[cfg(test)]
 pub(crate) mod connection_tests;
+
+#[cfg(test)]
+mod canonical_tests {
+    use super::*;
+    use std::time::Instant;
+    #[test]
+    fn canonical_binary_numbers_node_lists_and_deadline_round_trip() {
+        assert_eq!(binary(&[0, 1, 255]), "AAH/");
+        assert!(decode_binary(b"YQ").is_err());
+        assert!(decode_binary(b"YR==").is_err());
+        let mut head = MessageHead {
+            start: StartLine::Response { status: 200 },
+            headers: Vec::new(),
+        };
+        push(&mut head, "n", "01");
+        assert!(number(&head, "n").is_err());
+        let nodes = vec![
+            crate::security::test_support::node(1),
+            crate::security::test_support::node(2),
+        ];
+        assert_eq!(
+            decode_nodes(super::nodes(&nodes).unwrap().as_bytes()).unwrap(),
+            nodes
+        );
+        assert!(
+            decode_nodes(
+                super::nodes(&[nodes[0].clone(), nodes[0].clone()])
+                    .unwrap()
+                    .as_bytes()
+            )
+            .is_err()
+        );
+        let deadline = Deadline(Instant::now() + Duration::from_secs(30));
+        let encoded = encode_deadline(deadline).unwrap();
+        let decoded = decode_deadline(encoded).unwrap();
+        assert_eq!(encode_deadline(decoded).unwrap(), encoded);
+        assert!(decoded.0 <= deadline.0);
+        assert_eq!(MAX_HEAD, MAX_SIGNED_HEAD);
+    }
+}
