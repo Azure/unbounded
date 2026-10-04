@@ -1,7 +1,6 @@
 //! Client socket scenarios: ownership, publication, HTTP delivery, and retirement.
-use super::*;
 use super::listener::*;
-use super::response::Responses;
+use super::*;
 use racer_control_wire::CacheDefinition;
 use crate::admission::AdmissionPolicy;
 use crate::runtime::Cancellation;
@@ -664,8 +663,8 @@ fn queued_handoffs_reject_retired_generations_and_stopped_receivers() {
 
 #[test]
 fn simulated_listener_preparation_rollback_and_real_http_exchange() {
-    use uring_runtime::SocketAddress;
-    use uring_runtime::simulation::Simulation;
+    use uring_runtime::reactor::SocketAddress;
+    use uring_runtime::reactor::simulation::Simulation;
     let sim = Simulation::new();
     let _environment = sim.enter();
     let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(limits())));
@@ -1028,7 +1027,7 @@ fn client_listener_readiness_recovers_from_queue_pressure() {
     fixture.reconcile(&[definition()]).unwrap();
     let scope = scope();
     let (reader, _writer) = UnixStream::pair().unwrap();
-    let reader = Rc::new(uring_runtime::Descriptor::from(reader));
+    let reader = Rc::new(uring_runtime::reactor::Descriptor::from(reader));
     let mut cx = Context::from_waker(futures::task::noop_waker_ref());
     let mut pressure = Vec::new();
     for _ in 0..8 {
@@ -2443,4 +2442,263 @@ fn socket_lifecycle_rejects_symlinks_and_preserves_unowned_paths() {
     let mut invalid = definition();
     invalid.name = "../escape".into();
     assert_eq!(fixture.reconcile(&[invalid]), Err(Error::InvalidRequest));
+}
+mod response {
+    use super::*;
+    use crate::model::ExpiresAt;
+    use crate::model::ObjectVersion;
+    fn metadata(length: u64) -> ObjectMetadata {
+        ObjectMetadata {
+            content_type: None,
+            version: ObjectVersion {
+                object: ObjectId {
+                    cache: CacheId("cache".into()),
+                    key: CacheKey([0; 32]),
+                },
+                etag: StrongEtag::parse(b"\"a,b\\c\"").unwrap(),
+            },
+            length,
+            expires_at: ExpiresAt::from_system_time(UNIX_EPOCH + Duration::from_millis(123456))
+                .unwrap(),
+        }
+    }
+    #[test]
+    fn sdk_success_heads_are_exact() {
+        for length in [0, 1, i64::MAX as u64] {
+            let head = success_head(&metadata(length), None).unwrap();
+            assert!(matches!(head.start, StartLine::Response { status: 200 }));
+            assert_eq!(
+                head.unique("Content-Length").unwrap().unwrap(),
+                length.to_string().as_bytes()
+            );
+            assert_eq!(head.unique("ETag").unwrap().unwrap(), b"\"a,b\\c\"");
+            assert_eq!(head.unique("Racer-Expires-At").unwrap().unwrap(), b"123456");
+            assert!(head.unique("Content-Range").unwrap().is_none());
+        }
+        let range = ByteRange::Suffix(7).resolve(100).unwrap();
+        let head = subscription_head(&metadata(100), Some(range)).unwrap();
+        assert!(matches!(head.start, StartLine::Response { status: 200 }));
+        assert_eq!(head.unique("Racer-Range-Start").unwrap().unwrap(), b"93");
+        assert_eq!(head.unique("Racer-Range-End").unwrap().unwrap(), b"100");
+        assert_eq!(head.unique("Content-Length").unwrap().unwrap(), b"49");
+        assert_eq!(
+            head.unique("Content-Type").unwrap().unwrap(),
+            b"application/octet-stream"
+        );
+    }
+    #[test]
+    fn head_and_get_carry_optional_object_content_type() {
+        let mut metadata = metadata(3);
+        metadata.content_type = Some(
+            crate::model::ContentType::parse(b"application/vnd.oci.image.manifest.v1+json")
+                .unwrap(),
+        );
+        for range in [None, Some(ByteRange::From(0).resolve(3).unwrap())] {
+            let head = match range {
+                None => success_head(&metadata, None),
+                Some(_) => subscription_head(&metadata, range),
+            }
+            .unwrap();
+            assert_eq!(
+                head.unique("Racer-Content-Type").unwrap(),
+                Some(metadata.content_type.as_ref().unwrap().as_bytes())
+            );
+            assert_eq!(
+                head.unique("Content-Type").unwrap(),
+                Some(b"application/octet-stream".as_slice())
+            );
+        }
+    }
+    #[test]
+    fn sdk_error_statuses_and_required_fields() {
+        for (error, status) in [
+            (Error::InvalidRequest, 400),
+            (Error::MethodNotAllowed, 405),
+            (Error::HeaderTooLarge, 431),
+            (Error::OriginRejected, 401),
+            (Error::OriginForbidden, 403),
+            (Error::NotFound, 404),
+            (Error::VersionUnavailable, 412),
+            (Error::UnsatisfiableRangeWithLength(123), 416),
+            (Error::UnsatisfiableRange, 500),
+            (Error::Internal, 500),
+            (Error::BadGateway, 502),
+            (Error::Unavailable, 503),
+            (Error::DeadlineExceeded, 503),
+            (Error::Replay, 503),
+        ] {
+            let head = error_head(error).unwrap();
+            assert!(
+                matches!(head.start, StartLine::Response { status: actual } if actual == status)
+            );
+            assert_eq!(head.unique("Content-Length").unwrap().unwrap(), b"0");
+            assert!(head.unique("ETag").unwrap().is_none());
+            assert!(head.unique("Racer-Expires-At").unwrap().is_none());
+            if status == 416 {
+                assert_eq!(
+                    head.unique("Content-Range").unwrap().unwrap(),
+                    b"bytes */123"
+                );
+            } else {
+                assert!(head.unique("Content-Range").unwrap().is_none());
+            }
+            if status == 405 {
+                assert_eq!(head.unique("Allow").unwrap().unwrap(), b"HEAD, POST");
+            }
+        }
+    }
+    #[test]
+    fn rejects_unrepresentable_metadata_before_headers() {
+        assert!(success_head(&metadata(i64::MAX as u64 + 1), None).is_err());
+        for expires_at in [
+            UNIX_EPOCH - Duration::from_millis(1),
+            UNIX_EPOCH + Duration::from_nanos(1),
+            UNIX_EPOCH + Duration::from_millis(i64::MAX as u64 + 1),
+        ] {
+            assert!(ExpiresAt::from_system_time(expires_at).is_err());
+        }
+        assert!(success_head(&metadata(1), Some(ByteRange::From(0).resolve(2).unwrap())).is_err());
+    }
+    #[test]
+    fn ready_slice_precedes_auxiliary_overload() {
+        use crate::http::Delivery;
+        use crate::http::new_pipe_pool;
+        use crate::model::PageNumber;
+        use crate::model::PageSlice;
+        use crate::admission::AdmissionPolicy;
+        use crate::runtime::Reactor;
+        let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
+            crate::test_support::cluster::config(false).limits,
+        )));
+        let delivery = Delivery::new(
+            Rc::new(new_pipe_pool(admission.clone())),
+            Rc::new(Reactor::new(admission)),
+            Duration::from_secs(2),
+        );
+        let slice = PageSlice {
+            page: PageNumber(0),
+            offset: 0,
+            length: 1,
+        };
+        let reader = delivery
+            .attach(crate::read::tests::page(7).plaintext, slice)
+            .unwrap();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let mut polled = false;
+        let result = poll_slice_or_readiness(
+            &mut cx,
+            |_| {
+                polled = true;
+                Poll::Ready(Ok(Some(reader)))
+            },
+            |_| Poll::Ready(Err(Error::Overloaded)),
+        );
+        assert!(
+            matches!(result, Poll::Ready(Ok(Some(reader))) if reader.slice() == slice && reader.bytes_sent() == 0 && reader.remaining() == 1)
+        );
+        assert!(
+            polled,
+            "an available slice must not be discarded by auxiliary admission"
+        );
+    }
+    #[test]
+    fn completed_stream_never_submits_auxiliary_readiness() {
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(matches!(
+            poll_slice_or_readiness(
+                &mut cx,
+                |_| Poll::Ready(Ok(None)),
+                |_| panic!("completed stream must not submit readiness")
+            ),
+            Poll::Ready(Ok(None))
+        ));
+    }
+    #[test]
+    fn pending_slice_preserves_readiness_errors_without_retry() {
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        for error in [
+            Error::Overloaded,
+            Error::Io,
+            Error::InvalidRequest,
+            Error::Cancelled,
+            Error::DeadlineExceeded,
+        ] {
+            assert!(
+                matches!(poll_slice_or_readiness(&mut cx, |_| Poll::Pending, |_| Poll::Ready(Err(error))), Poll::Ready(Err(actual)) if actual == error)
+            );
+        }
+    }
+    #[test]
+    fn slice_failure_never_submits_auxiliary_readiness() {
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        for error in [
+            Error::Cancelled,
+            Error::DeadlineExceeded,
+            Error::Unavailable,
+        ] {
+            assert!(
+                matches!(poll_slice_or_readiness(&mut cx, |_| Poll::Ready(Err(error)), |_| panic!("terminal acquisition must not submit readiness")), Poll::Ready(Err(actual)) if actual == error)
+            );
+        }
+    }
+    #[test]
+    fn pending_slice_readiness_wakes_once_and_pending_does_not_spin() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        #[derive(Default)]
+        struct Wakes(AtomicUsize);
+        impl futures::task::ArcWake for Wakes {
+            fn wake_by_ref(this: &Arc<Self>) {
+                this.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let wakes = Arc::new(Wakes::default());
+        let waker = futures::task::waker(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            poll_slice_or_readiness(&mut cx, |_| Poll::Pending, |_| Poll::Pending).is_pending()
+        );
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+        assert!(
+            poll_slice_or_readiness(
+                &mut cx,
+                |_| Poll::Pending,
+                |_| Poll::Ready(Ok(libc::POLLIN as u32))
+            )
+            .is_pending()
+        );
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+    }
+    #[test]
+    fn frames_use_exact_network_order_fields() {
+        assert_eq!(
+            frame(1, 0x0102030405060708, 9, 10),
+            [
+                1, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 10
+            ]
+        );
+        assert_eq!(frame(2, 3, 4, 0)[17..], [0; 4]);
+    }
+    #[test]
+    fn subscription_head_counts_partial_pages_and_empty_completion() {
+        let metadata = metadata(PAGE_BYTES + 10);
+        let range = ByteRange::Closed {
+            first: PAGE_BYTES - 2,
+            last: PAGE_BYTES + 3,
+        }
+        .resolve(metadata.length)
+        .unwrap();
+        let head = subscription_head(&metadata, Some(range)).unwrap();
+        assert!(matches!(head.start, StartLine::Response { status: 200 }));
+        assert_eq!(head.unique("Content-Length").unwrap().unwrap(), b"69");
+        assert_eq!(
+            head.unique("Racer-Range-End").unwrap().unwrap(),
+            (PAGE_BYTES + 4).to_string().as_bytes()
+        );
+        assert_eq!(head.unique("Connection").unwrap().unwrap(), b"close");
+        let head = subscription_head(&self::metadata(0), None).unwrap();
+        assert_eq!(head.unique("Content-Length").unwrap().unwrap(), b"21");
+        assert!(subscription_head(&metadata, None).is_err());
+    }
 }
