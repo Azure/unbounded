@@ -70,13 +70,14 @@ type AuthenticationChallenger interface {
 
 // Server is the mirror HTTP handler.
 type Server struct {
-	cfg     *config.Config
-	store   ifaces.LocalContentStore
-	origin  ifaces.OriginPuller
-	auth    AuthenticationChallenger
-	logger  *slog.Logger
-	metrics metricsHooks
-	racer   RacerClient
+	cfg              *config.Config
+	store            ifaces.LocalContentStore
+	origin           ifaces.OriginPuller
+	auth             AuthenticationChallenger
+	logger           *slog.Logger
+	metrics          metricsHooks
+	racer            RacerClient
+	racerDiagnostics racerFailureDiagnostics
 
 	// dependencies - nil-safe. When both dht and peer are set,
 	// the cache miss path tries DHT-discovered providers before origin.

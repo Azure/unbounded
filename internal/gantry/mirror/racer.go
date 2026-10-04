@@ -5,6 +5,7 @@ package mirror
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"net/http"
@@ -36,8 +37,14 @@ func WithRacer(client RacerClient) Option {
 }
 
 func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, upstream, repo string, d digest.Digest, kind ifaces.OriginRefKind) {
+	// Fresh opaque correlation, including for aborts after headers are committed.
+	id := rand.Text()
+	w.Header().Set("Gantry-Racer-Request-ID", id)
+
 	if s.racer == nil {
+		s.logRacerFailure(id, "client", errors.New("unavailable"), -1, 0)
 		http.Error(w, "Racer unavailable", http.StatusServiceUnavailable)
+
 		return
 	}
 
@@ -45,7 +52,9 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, upstream, re
 
 	request, err := gantryracer.Request(ref, registryauth.Authorization(r.Context()))
 	if err != nil {
+		s.logRacerFailure(id, "request", err, -1, 0)
 		http.Error(w, "invalid Racer request", http.StatusBadRequest)
+
 		return
 	}
 
@@ -60,12 +69,16 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, upstream, re
 	if r.Method == http.MethodHead || ranged {
 		metadata, err = s.racer.Stat(r.Context(), request)
 		if err != nil {
+			s.logRacerFailure(id, "stat", err, -1, 0)
 			s.racerError(w, r, ref, err)
+
 			return
 		}
 
 		if !validRacerMetadata(metadata, d) {
+			s.logRacerFailure(id, "stat_metadata", errors.New("invalid metadata"), -1, 0)
 			http.Error(w, "invalid Racer metadata", http.StatusBadGateway)
+
 			return
 		}
 
@@ -95,7 +108,14 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, upstream, re
 
 	value, err := s.racer.GetStreaming(r.Context(), request, options...)
 	if err != nil {
+		expected := int64(-1)
+		if ranged {
+			expected = int64(metadata.Size) - offset
+		}
+
+		s.logRacerFailure(id, "get_streaming", err, expected, 0)
 		s.racerError(w, r, ref, err)
+
 		return
 	}
 
@@ -104,12 +124,16 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, upstream, re
 	actual := value.Metadata()
 	if !validRacerMetadata(actual, d) || (ranged && (actual.Size != metadata.Size ||
 		actual.ContentType != metadata.ContentType)) {
+		s.logRacerFailure(id, "get_metadata", errors.New("invalid metadata"), -1, 0)
 		http.Error(w, "invalid Racer metadata", http.StatusBadGateway)
+
 		return
 	}
 
 	if kind == ifaces.KindManifest && actual.Size > racersdk.PageSize {
+		s.logRacerFailure(id, "manifest_size", errors.New("manifest too large"), int64(actual.Size), 0)
 		http.Error(w, "Racer manifest too large", http.StatusBadGateway)
+
 		return
 	}
 
@@ -136,6 +160,7 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, upstream, re
 	// responses cannot withhold a final byte, so validate Complete before flushing.
 	if remaining > 0 {
 		if err := http.NewResponseController(w).Flush(); err != nil {
+			s.logRacerFailure(id, "flush_headers", err, remaining, 0)
 			panic(http.ErrAbortHandler)
 		}
 	}
@@ -144,6 +169,7 @@ func (s *Server) serveRacer(w http.ResponseWriter, r *http.Request, upstream, re
 	// rather than append an error body or let net/http complete the response.
 	// OCI digest verification belongs to the consumer's assembled object.
 	if n, err := value.WriteToHTTP(w); err != nil || n != remaining {
+		s.logRacerFailure(id, "write_body", err, remaining, n)
 		panic(http.ErrAbortHandler)
 	}
 }
