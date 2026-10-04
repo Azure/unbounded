@@ -1,6 +1,5 @@
 //! Shared signed peer fixtures and scenario suites.
 use super::*;
-use uring_runtime::deadline::Deadline;
 mod body_progress {
     use super::*;
     use crate::http::Codec;
@@ -82,9 +81,7 @@ mod body_progress {
             let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
                 crate::test_support::cluster::config(false).limits,
             )));
-            admission
-                .policy()
-                .set_observer(telemetry.failures.observer(WorkerId(2)));
+            admission.set_observer(telemetry.failures.observer(WorkerId(2)));
             let reactor = Rc::new(Reactor::new(admission.clone()));
             let io = Rc::new(crate::http::new_io(
                 reactor.clone(),
@@ -311,7 +308,7 @@ mod body_progress {
             let mut client = transfers.exchange_timed(
                 Endpoint::Peer(address.to_string()),
                 signed,
-                crate::rdma::TransportPlan::Http,
+                crate::topology::rails::TransportPlan::Http,
                 None,
                 None,
                 None,
@@ -504,7 +501,7 @@ mod destination_disconnect {
     impl server::LocalPageService for PendingPage {
         fn serve_peer<'a>(
             &'a self,
-            request: protocol::VerifiedRequest,
+            request: crate::peer::forwarding::VerifiedRequest,
             _: std::sync::Arc<crate::topology::Membership>,
             scope: &'a RequestScope,
         ) -> crate::error::Operation<'a, PeerResponse> {
@@ -1019,12 +1016,7 @@ mod encrypted_http {
             }
             assert!(Instant::now() < until, "encrypted HTTP regression watchdog");
             for engine in engines.iter_mut() {
-                uring_runtime::group::Service::poll_budgeted(
-                    engine,
-                    &mut Context::from_waker(futures::task::noop_waker_ref()),
-                    8,
-                )
-                .unwrap();
+                engine.poll_budgeted(8).unwrap();
             }
             for client in clients {
                 client.poll_budgeted(8).unwrap();
@@ -1157,7 +1149,7 @@ mod encrypted_http {
         assert_ne!(pages[0].envelope().nonce, pages[1].envelope().nonce);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = Endpoint::Peer(listener.local_addr().unwrap().to_string());
-        let listener = Rc::new(uring_runtime::Descriptor::from(listener));
+        let listener = Rc::new(uring_runtime::reactor::Descriptor::from(listener));
         let canceled = RequestScope::new(RequestId([9; 16]), scope.deadline.0).unwrap();
         let accepts = Cell::new(0);
         let prefix_sent = Cell::new(false);
@@ -1354,17 +1346,6 @@ mod opaque;
 mod protocol_socket;
 mod requester_safety {
     //! Real socket exchange with the adaptive controller attached to routing/requester.
-    use crate::http::Codec;
-    use crate::http::HttpIo;
-    use crate::http::HttpPool;
-    use crate::model::MembershipVersion;
-    use crate::model::ResourceClass;
-    use crate::peer::AdaptivePeers;
-    use crate::peer::Outcome;
-    use crate::peer::protocol::PeerResponse;
-    use crate::peer::protocol::decode_envelope;
-    use crate::peer::protocol::encode_envelope;
-    use crate::peer::transport::RelayResponse;
     use crate::peer::*;
     use crate::http::Codec;
     use crate::model::MembershipVersion;
@@ -1555,7 +1536,7 @@ mod requester_safety {
         let server = async {
             let fd = reactor
                 .accept(
-                    Rc::new(uring_runtime::Descriptor::from(listener)),
+                    Rc::new(uring_runtime::reactor::Descriptor::from(listener)),
                     &scope,
                 )
                 .await?;
@@ -1927,7 +1908,7 @@ mod timing {
         let metrics = Metrics::default();
         let requester = Requester::new(
             Rc::new(Paths::new(Rc::new(LinkHealth), 4).with_peer_admission(
-                adaptive::AdaptivePeers::new(Default::default(), metrics.clone()).unwrap(),
+                crate::peer::AdaptivePeers::new(Default::default(), metrics.clone()).unwrap(),
             )),
             Rc::new(Forwarding::new(signers[0].clone())),
             transfers,
@@ -2050,6 +2031,7 @@ use crate::model::Nonce;
 use crate::model::PeerOriginContext;
 use crate::model::ResourceClass;
 use crate::model::*;
+use crate::peer::forwarding::Forwarding;
 use crate::peer::protocol::FetchMode;
 use crate::peer::protocol::Operation;
 use crate::peer::protocol::PeerRequest;
@@ -2062,7 +2044,6 @@ use crate::admission::AdmissionPolicy;
 use uring_runtime::deadline::Deadline;
 use crate::runtime::RequestScope;
 use crate::peer::protocol::Signatures;
-use crate::peer::forwarding::Forwarding;
 use crate::topology::RouteBudget;
 use racer_identity::Certificates;
 use racer_identity::Keyring;
@@ -2265,4 +2246,204 @@ fn page_timing_duration_conversion_saturates_and_reversed_clock_is_zero() {
     drop(timing);
     assert_eq!(metrics.count(Event::PeerPageCensored), 1);
     assert_eq!(metrics.count(Event::PeerPageCheckoutNs), 0);
+}
+mod adaptive {
+    use crate::peer::*;
+    #[test]
+    fn hedges_require_spare_capacity_and_no_local_or_peer_pressure() {
+        let clock = uring_runtime::environment::SimulationClock::new(905);
+        let _env = clock.environment(0).enter();
+        let owner = AdaptivePeers::new(
+            Config {
+                total: 4,
+                per_peer: 2,
+            },
+            Metrics::default(),
+        )
+        .unwrap();
+        let node = NodeId("a".into());
+        assert!(owner.hedge_available(&node));
+        let permit = owner.acquire(&node).unwrap();
+        clock.advance(BACKOFF);
+        permit.observe(Outcome::LocalPressure);
+        assert!(!owner.hedge_available(&node));
+        drop(permit);
+        let owner = AdaptivePeers::new(
+            Config {
+                total: 4,
+                per_peer: 2,
+            },
+            Metrics::default(),
+        )
+        .unwrap();
+        let permit = owner.acquire(&node).unwrap();
+        permit.observe(Outcome::PeerFailure);
+        assert!(!owner.hedge_available(&node));
+    }
+    #[test]
+    fn churn_cannot_evict_neutral_probe_backoff_with_old_update_time() {
+        let clock = uring_runtime::environment::SimulationClock::new(783);
+        let _env = clock.environment(0).enter();
+        let owner = AdaptivePeers::new(
+            Config {
+                total: 512,
+                per_peer: 1,
+            },
+            Metrics::default(),
+        )
+        .unwrap();
+        let node = NodeId("000-circuit".into());
+        let permit = owner.acquire(&node).unwrap();
+        permit.observe(Outcome::PeerFailure);
+        drop(permit);
+        let held: Vec<_> = (1..CAPACITY)
+            .map(|i| owner.acquire(&NodeId(i.to_string())).unwrap())
+            .collect();
+        clock.advance(Duration::from_secs(61));
+        let probe = owner.acquire(&node).unwrap();
+        drop(probe);
+        assert!(!owner.available(&node));
+        assert!(matches!(
+            owner.acquire(&NodeId("new".into())),
+            Err(Error::Overloaded)
+        ));
+        // Even a stale timestamp must not make an active backoff evictable.
+        owner
+            .state
+            .lock()
+            .unwrap()
+            .peers
+            .get_mut(&node)
+            .unwrap()
+            .updated = now() - Duration::from_secs(61);
+        assert!(matches!(
+            owner.acquire(&NodeId("new".into())),
+            Err(Error::Overloaded)
+        ));
+        assert!(owner.state.lock().unwrap().peers.contains_key(&node));
+        drop(held);
+    }
+    #[test]
+    fn shared_caps_local_pressure_and_completion_fences() {
+        let metrics = Metrics::default();
+        let owner = AdaptivePeers::new(
+            Config {
+                total: 2,
+                per_peer: 1,
+            },
+            metrics.clone(),
+        )
+        .unwrap();
+        let worker = owner.clone();
+        let a = NodeId("a".into());
+        let b = NodeId("b".into());
+        let permit = owner.acquire(&a).unwrap();
+        assert!(matches!(worker.acquire(&a), Err(Error::Overloaded)));
+        let io = permit.clone();
+        permit.observe(Outcome::LocalPressure);
+        drop(permit);
+        assert!(matches!(worker.acquire(&a), Err(Error::Overloaded)));
+        let second = worker.acquire(&b).unwrap();
+        assert!(matches!(
+            owner.acquire(&NodeId("c".into())),
+            Err(Error::Overloaded)
+        ));
+        assert_eq!(metrics.gauge(Gauge::PeerExchanges), 2);
+        drop((io, second));
+        assert_eq!(metrics.gauge(Gauge::PeerExchanges), 0);
+        assert!(owner.available(&a));
+        assert_eq!(metrics.count(Event::PeerLocalPressure), 1);
+        assert_eq!(metrics.count(Event::PeerLinkFailure), 0);
+    }
+    #[test]
+    fn recovery_requires_exclusive_verified_probe_and_old_success_cannot_clear_failure() {
+        let clock = uring_runtime::environment::SimulationClock::new(779);
+        let _env = clock.environment(0).enter();
+        let owner = AdaptivePeers::new(
+            Config {
+                total: 4,
+                per_peer: 4,
+            },
+            Metrics::default(),
+        )
+        .unwrap();
+        let node = NodeId("a".into());
+        let old = owner.acquire(&node).unwrap();
+        let failed = owner.acquire(&node).unwrap();
+        failed.observe(Outcome::PeerFailure);
+        old.observe(Outcome::Verified);
+        assert!(!owner.available(&node));
+        drop((old, failed));
+        clock.advance(BACKOFF);
+        let probe = owner.acquire(&node).unwrap();
+        assert!(matches!(owner.acquire(&node), Err(Error::Unavailable)));
+        assert!(!owner.available(&node));
+        drop(probe); // Cancellation/unverified completion cannot recover.
+        assert!(!owner.available(&node));
+        clock.advance(RECOVERY);
+        let probe = owner.acquire(&node).unwrap();
+        probe.observe(Outcome::Verified);
+        assert!(!owner.available(&node)); // Still exclusive until its I/O fence.
+        drop(probe);
+        assert!(owner.available(&node));
+        let state = owner.state.lock().unwrap();
+        assert_eq!(state.peers[&node].limit, 3);
+    }
+    #[test]
+    fn state_capacity_never_evicts_live_permits_and_ages_retired_entries() {
+        let clock = uring_runtime::environment::SimulationClock::new(780);
+        let _env = clock.environment(0).enter();
+        let owner = AdaptivePeers::new(
+            Config {
+                total: 512,
+                per_peer: 1,
+            },
+            Metrics::default(),
+        )
+        .unwrap();
+        let permits: Vec<_> = (0..CAPACITY)
+            .map(|i| owner.acquire(&NodeId(i.to_string())).unwrap())
+            .collect();
+        clock.advance(Duration::from_secs(61));
+        assert!(matches!(
+            owner.acquire(&NodeId("new".into())),
+            Err(Error::Overloaded)
+        ));
+        drop(permits);
+        let _permit = owner.acquire(&NodeId("new".into())).unwrap();
+        assert_eq!(owner.state.lock().unwrap().peers.len(), CAPACITY);
+    }
+    #[test]
+    fn local_pressure_shrinks_node_limit_without_revoking_work_or_blame() {
+        let clock = uring_runtime::environment::SimulationClock::new(781);
+        let _env = clock.environment(0).enter();
+        let metrics = Metrics::default();
+        let owner = AdaptivePeers::new(
+            Config {
+                total: 4,
+                per_peer: 4,
+            },
+            metrics.clone(),
+        )
+        .unwrap();
+        let node = NodeId("a".into());
+        let permits: Vec<_> = (0..4).map(|_| owner.acquire(&node).unwrap()).collect();
+        clock.advance(BACKOFF);
+        for permit in &permits {
+            permit.observe(Outcome::LocalPressure);
+        }
+        assert_eq!(metrics.gauge(Gauge::PeerAdmissionLimit), 2);
+        assert_eq!(metrics.gauge(Gauge::PeerExchanges), 4);
+        assert!(owner.available(&node));
+        assert_eq!(metrics.count(Event::PeerLinkFailure), 0);
+        assert!(matches!(
+            owner.acquire(&NodeId("other".into())),
+            Err(Error::Overloaded)
+        ));
+        clock.advance(RECOVERY);
+        permits[0].observe(Outcome::Verified);
+        assert_eq!(metrics.gauge(Gauge::PeerAdmissionLimit), 3);
+        drop(permits);
+        assert_eq!(metrics.gauge(Gauge::PeerExchanges), 0);
+    }
 }

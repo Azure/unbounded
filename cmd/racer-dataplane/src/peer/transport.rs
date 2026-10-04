@@ -2094,14 +2094,14 @@ type ReclaimCiphertext = dyn Fn(&crate::model::CacheId, usize);
 /// its errno separately in HttpPool.
 fn observe_read(
     result: Result<usize>,
-    permit: &Option<std::sync::Arc<super::adaptive::Permit>>,
+    permit: &Option<std::sync::Arc<super::Permit>>,
     failure: &Rc<std::cell::Cell<bool>>,
     scope: &RequestScope,
 ) -> Result<usize> {
     if matches!(result, Ok(0)) && scope.check().is_ok() {
         failure.set(true);
         if let Some(permit) = permit {
-            permit.observe(super::adaptive::Outcome::PeerFailure);
+            permit.observe(super::Outcome::PeerFailure);
         }
     }
     result
@@ -2115,8 +2115,7 @@ fn adaptive_socket_attribution_ignores_local_pressure_and_expired_scope() {
         uring_runtime::environment::now() + std::time::Duration::from_secs(10),
     )
     .unwrap();
-    let owner =
-        super::adaptive::AdaptivePeers::new(Default::default(), Default::default()).unwrap();
+    let owner = super::AdaptivePeers::new(Default::default(), Default::default()).unwrap();
     let node = crate::model::NodeId("peer".into());
     let permit = Some(owner.acquire(&node).unwrap());
     let failed = Rc::new(std::cell::Cell::new(false));
@@ -2224,7 +2223,7 @@ impl Transfers {
         plan: TransportPlan,
         membership: Option<std::sync::Arc<crate::topology::Membership>>,
         relay: Option<Rc<flow_control::Charge<AdmissionPolicy>>>,
-        peer_admission: Option<std::sync::Arc<super::adaptive::Permit>>,
+        peer_admission: Option<std::sync::Arc<super::Permit>>,
         failure: Rc<std::cell::Cell<bool>>,
         mut timing: Option<&'a mut super::PageTiming<'_>>,
         scope: &'a RequestScope,
@@ -2408,7 +2407,7 @@ impl Transfers {
         length: usize,
         request: &SignedRequest,
         peer: &NodeId,
-        peer_admission: &Option<std::sync::Arc<super::adaptive::Permit>>,
+        peer_admission: &Option<std::sync::Arc<super::Permit>>,
         failure: &Rc<std::cell::Cell<bool>>,
         scope: &RequestScope,
     ) -> Result<(

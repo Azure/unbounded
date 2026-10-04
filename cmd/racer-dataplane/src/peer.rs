@@ -1,12 +1,38 @@
 //! Correlated logical requests with monotonic budgets, attempts, and cancellation.
-pub mod adaptive;
 pub mod forwarding;
 pub mod protocol;
 pub mod server;
 pub mod subscriptions;
+pub mod transport;
+use self::forwarding::Forwarding;
+use self::forwarding::VerifiedRequest;
+use self::forwarding::VerifiedResponse;
+use self::protocol::PeerRequest;
+use self::protocol::SignedRequest;
+use self::protocol::SignedResponse;
+use self::transport::Transfers;
+use crate::error::Error;
+use crate::error::Operation;
+use crate::error::Result;
+use crate::model::MembershipVersion;
+use crate::model::NodeId;
+use crate::model::ResourceClass;
+use crate::admission::AdmissionPolicy;
+use crate::runtime::RequestScope;
+use crate::telemetry::Observer;
+use crate::telemetry::Stage;
 use crate::telemetry::Event;
+use crate::telemetry::Gauge;
 use crate::telemetry::Metrics;
+
+use crate::topology::rails;
 use crate::topology::rails::TransportPlan;
+use crate::topology::Paths;
+use std::collections::BTreeMap;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
 use std::time::Instant;
 use uring_runtime::environment::now;
 
@@ -77,29 +103,248 @@ impl Drop for PageTiming<'_> {
         }
     }
 }
-pub mod transport;
-
-use self::protocol::PeerRequest;
-use self::protocol::SignedRequest;
-use self::protocol::SignedResponse;
-use self::protocol::VerifiedRequest;
-use self::protocol::VerifiedResponse;
-use self::transport::Transfers;
-use crate::error::Error;
-use crate::error::Operation;
-use crate::error::Result;
-use crate::model::MembershipVersion;
-use crate::model::NodeId;
-use crate::model::ResourceClass;
-use crate::rdma;
-use crate::admission::AdmissionPolicy;
-use crate::runtime::RequestScope;
-use crate::peer::forwarding::Forwarding;
-use crate::telemetry::Observer;
-use crate::telemetry::Stage;
-use crate::topology::Paths;
-use std::rc::Rc;
-use std::sync::Arc;
+/// Node-wide outbound admission, independent of worker count and byte quotas.
+#[derive(Clone, Copy)]
+pub struct Config {
+    pub total: usize,
+    pub per_peer: usize,
+}
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            total: 256,
+            per_peer: 32,
+        }
+    }
+}
+impl Config {
+    pub fn validate(self) -> Result<()> {
+        if self.total == 0 || self.total > 65536 || self.per_peer == 0 || self.per_peer > self.total
+        {
+            return Err(Error::InvalidConfiguration);
+        }
+        Ok(())
+    }
+}
+const CAPACITY: usize = 256;
+const BACKOFF: Duration = Duration::from_millis(250);
+const RECOVERY: Duration = Duration::from_secs(1);
+pub(crate) struct AdaptivePeers {
+    config: Config,
+    state: Mutex<State>,
+    metrics: Metrics,
+}
+struct State {
+    active: usize,
+    limit: usize,
+    updated: Instant,
+    peers: BTreeMap<NodeId, Peer>,
+}
+struct Peer {
+    active: usize,
+    limit: usize,
+    generation: u64,
+    retry: Option<Instant>,
+    probe: bool,
+    updated: Instant,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    Verified,
+    PeerFailure,
+    LocalPressure,
+    Neutral,
+}
+pub(crate) struct Permit {
+    owner: Arc<AdaptivePeers>,
+    node: NodeId,
+    generation: u64,
+    probe: bool,
+}
+impl AdaptivePeers {
+    pub(crate) fn hedge_available(&self, node: &NodeId) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            state.limit == self.config.total
+                && state.active + 1 < state.limit
+                && state.peers.get(node).is_none_or(|p| {
+                    p.retry.is_none()
+                        && !p.probe
+                        && p.limit == self.config.per_peer
+                        && p.active < p.limit
+                })
+        })
+    }
+    pub(crate) fn new(config: Config, metrics: Metrics) -> Result<Arc<Self>> {
+        config.validate()?;
+        metrics.set_gauge(Gauge::PeerAdmissionLimit, config.total as u64);
+        Ok(Arc::new(Self {
+            config,
+            metrics,
+            state: Mutex::new(State {
+                active: 0,
+                limit: config.total,
+                updated: now(),
+                peers: BTreeMap::new(),
+            }),
+        }))
+    }
+    pub(crate) fn available(&self, node: &NodeId) -> bool {
+        let now = now();
+        self.state.lock().is_ok_and(|state| {
+            state
+                .peers
+                .get(node)
+                .is_none_or(|p| !p.probe && p.retry.is_none_or(|at| now >= at))
+        })
+    }
+    pub(crate) fn acquire(self: &Arc<Self>, node: &NodeId) -> Result<Arc<Permit>> {
+        let now = now();
+        let mut state = self.state.lock().map_err(|_| Error::Unavailable)?;
+        if state.active >= state.limit {
+            self.metrics.record(Event::PeerAdmissionRejected, 1)?;
+            return Err(Error::Overloaded);
+        }
+        if !state.peers.contains_key(node) && state.peers.len() == CAPACITY {
+            // Never discard live work or a circuit still in backoff. Retired entries
+            // eventually age out without depending on any worker's retained lease.
+            let retired = state
+                .peers
+                .iter()
+                .find(|(_, p)| {
+                    p.active == 0
+                        && !p.probe
+                        && p.retry.is_none_or(|retry| now >= retry)
+                        && now.saturating_duration_since(p.updated) >= Duration::from_secs(60)
+                })
+                .map(|(n, _)| n.clone());
+            if let Some(retired) = retired {
+                state.peers.remove(&retired);
+            } else {
+                self.metrics.record(Event::PeerAdmissionRejected, 1)?;
+                return Err(Error::Overloaded);
+            }
+        }
+        let peer = state.peers.entry(node.clone()).or_insert(Peer {
+            active: 0,
+            limit: self.config.per_peer,
+            generation: 0,
+            retry: None,
+            probe: false,
+            updated: now,
+        });
+        if peer.probe || peer.retry.is_some_and(|at| now < at) {
+            self.metrics.record(Event::PeerCircuitRejected, 1)?;
+            return Err(Error::Unavailable);
+        }
+        if peer.active >= peer.limit {
+            self.metrics.record(Event::PeerAdmissionRejected, 1)?;
+            return Err(Error::Overloaded);
+        }
+        let probe = peer.retry.is_some();
+        peer.probe = probe;
+        peer.active += 1;
+        let generation = peer.generation;
+        state.active += 1;
+        self.metrics
+            .set_gauge(Gauge::PeerExchanges, state.active as u64);
+        self.metrics.record(Event::PeerAdmissionAccepted, 1)?;
+        if probe {
+            self.metrics.record(Event::PeerProbe, 1)?;
+        }
+        Ok(Arc::new(Permit {
+            owner: self.clone(),
+            node: node.clone(),
+            generation,
+            probe,
+        }))
+    }
+}
+impl Permit {
+    pub(crate) fn observe(&self, outcome: Outcome) {
+        let now = now();
+        let Ok(mut state) = self.owner.state.lock() else {
+            return;
+        };
+        // Local quota pressure adapts only the node-wide admission limit.
+        if outcome == Outcome::LocalPressure {
+            let _ = self.owner.metrics.record(Event::PeerLocalPressure, 1);
+            if now.saturating_duration_since(state.updated) >= BACKOFF {
+                state.limit = (state.limit / 2).max(1);
+                state.updated = now;
+                self.owner
+                    .metrics
+                    .set_gauge(Gauge::PeerAdmissionLimit, state.limit as u64);
+            }
+            return;
+        }
+        if outcome == Outcome::Verified && now.saturating_duration_since(state.updated) >= RECOVERY
+        {
+            state.limit = (state.limit + 1).min(self.owner.config.total);
+            state.updated = now;
+            self.owner
+                .metrics
+                .set_gauge(Gauge::PeerAdmissionLimit, state.limit as u64);
+        }
+        let peer = state
+            .peers
+            .get_mut(&self.node)
+            .expect("live permit retains peer");
+        let event = match outcome {
+            Outcome::Verified => Event::PeerVerified,
+            Outcome::PeerFailure => Event::PeerLinkFailure,
+            Outcome::LocalPressure => Event::PeerLocalPressure,
+            Outcome::Neutral => return,
+        };
+        let _ = self.owner.metrics.record(event, 1);
+        if peer.generation != self.generation {
+            return;
+        }
+        match outcome {
+            Outcome::PeerFailure => {
+                peer.limit = (peer.limit / 2).max(1);
+                peer.generation = peer.generation.saturating_add(1);
+                peer.retry = Some(now + BACKOFF);
+                peer.updated = now;
+            }
+            Outcome::Verified => {
+                // Only the exclusive probe recovers an open circuit; old successes cannot.
+                if peer.retry.is_some() && !self.probe {
+                    return;
+                }
+                peer.retry = None;
+                if now.saturating_duration_since(peer.updated) >= RECOVERY {
+                    peer.limit = (peer.limit + 1).min(self.owner.config.per_peer);
+                    peer.updated = now;
+                }
+            }
+            Outcome::LocalPressure | Outcome::Neutral => {}
+        }
+    }
+}
+impl Drop for Permit {
+    fn drop(&mut self) {
+        let Ok(mut state) = self.owner.state.lock() else {
+            return;
+        };
+        let peer = state
+            .peers
+            .get_mut(&self.node)
+            .expect("live permit retains peer");
+        peer.active -= 1;
+        if self.probe {
+            peer.probe = false;
+            if peer.retry.is_some() {
+                let now = now();
+                peer.retry = Some(now + BACKOFF);
+                peer.updated = now;
+            }
+        }
+        state.active -= 1;
+        self.owner
+            .metrics
+            .set_gauge(Gauge::PeerExchanges, state.active as u64);
+    }
+}
 
 /// Worker-local identity and a handle to the sole node-wide incoming registry.
 /// Outbound operations route directly from their retained membership lease.
@@ -109,17 +354,17 @@ pub struct PeerNetwork {
 }
 
 impl PeerNetwork {
-    pub fn new(local: NodeId, published: Arc<crate::control::PublishedState>) -> Result<Self> {
+    pub fn new(
+        local: NodeId,
+        published: Arc<crate::control::PublishedState>,
+    ) -> Result<Self> {
         if local.0.is_empty() {
             return Err(Error::InvalidConfiguration);
         }
         Ok(Self { local, published })
     }
 
-    pub fn membership(
-        &self,
-        version: MembershipVersion,
-    ) -> Result<std::sync::Arc<crate::topology::Membership>> {
+    pub fn membership(&self, version: MembershipVersion) -> Result<std::sync::Arc<crate::topology::Membership>> {
         self.published.membership(version)
     }
 
@@ -218,9 +463,9 @@ impl Relay {
     ///
     /// ```compile_fail
     /// use racer_dataplane::{peer::{Relay, protocol::SignedRequest},
-    ///     runtime::RequestScope, topology::Membership};
+    ///     runtime::RequestScope, topology::std::sync::Arc<crate::topology::Membership>};
     /// fn unverified(relay: &Relay, request: SignedRequest,
-    ///     membership: std::sync::Arc<Membership>, scope: &RequestScope) {
+    ///     membership: std::sync::Arc<crate::topology::Membership>, scope: &RequestScope) {
     ///     relay.forward(request, membership, scope);
     /// }
     /// ```
@@ -347,9 +592,7 @@ pub enum Requester {
     },
     #[cfg(any(test, feature = "subscription-interop"))]
     Scripted {
-        available: Box<
-            dyn Fn(&std::sync::Arc<crate::topology::Membership>, &crate::model::NodeId) -> bool,
-        >,
+        available: Box<dyn Fn(&std::sync::Arc<crate::topology::Membership>, &crate::model::NodeId) -> bool>,
         request: Box<
             dyn Fn(
                 PeerRequest,
@@ -364,11 +607,7 @@ impl Requester {
     #[cfg(any(test, feature = "subscription-interop"))]
     pub(crate) fn scripted<T: 'static>(
         state: Rc<T>,
-        available: fn(
-            &T,
-            &std::sync::Arc<crate::topology::Membership>,
-            &crate::model::NodeId,
-        ) -> bool,
+        available: fn(&T, &std::sync::Arc<crate::topology::Membership>, &crate::model::NodeId) -> bool,
         request: for<'a> fn(
             &'a T,
             PeerRequest,
@@ -436,7 +675,7 @@ impl Requester {
         self
     }
     #[cfg(test)]
-    pub(crate) fn admission(&self) -> &std::sync::Arc<adaptive::AdaptivePeers> {
+    pub(crate) fn admission(&self) -> &std::sync::Arc<AdaptivePeers> {
         match self {
             Self::Network { paths, .. } => paths.peer_admission.as_ref().unwrap(),
             _ => panic!("scripted requester has no network admission"),
@@ -502,14 +741,14 @@ impl Requester {
 /// ```no_run
 /// use racer_dataplane::{error::Result, peer::{Requester,
 ///     Relay, server::PeerServer,
-///     protocol::{PeerRequest, SignedRequest, SignedResponse, VerifiedResponse}},
+///     protocol::{PeerRequest, SignedRequest, SignedResponse}, forwarding::VerifiedResponse},
 ///     runtime::RequestScope, peer::forwarding::Forwarding,
-///     topology::Membership};
+///     topology::std::sync::Arc<crate::topology::Membership>};
 /// async fn interfaces(
 ///     client: &Requester, transport: &Requester,
 ///     server: &PeerServer, relay: &Relay, auth: &Forwarding,
 ///     local: PeerRequest, wire: SignedRequest, outbound: SignedRequest,
-///     inbound: SignedRequest, membership: std::sync::Arc<Membership>, scope: &RequestScope,
+///     inbound: SignedRequest, membership: std::sync::Arc<crate::topology::Membership>, scope: &RequestScope,
 /// ) -> Result<()> {
 ///     let verified: VerifiedResponse = client.request(local, membership.clone(), scope).await?;
 ///     let _wire_response: SignedResponse = verified.into_signed();
@@ -723,7 +962,7 @@ impl Requester {
                 if next != budget.destination {
                     return Err(Error::InvalidRequest);
                 }
-                crate::rdma::TransportPlan::Http
+                crate::topology::rails::TransportPlan::Http
             } else if let Some(page) = rail_hint {
                 let search = search_budget(budget, &network.local)?;
                 let route = paths
@@ -732,9 +971,9 @@ impl Requester {
                 if route.nodes.get(1) != Some(&next) {
                     return Err(Error::Unavailable);
                 }
-                rdma::select_hop(&route, &page, &network.local, &next)?
+                rails::select_hop(&route, &page, &network.local, &next)?
             } else {
-                crate::rdma::TransportPlan::Http
+                crate::topology::rails::TransportPlan::Http
             };
             let _probe = health.acquire(&next)?;
             let permit = paths
@@ -778,11 +1017,11 @@ impl Requester {
                     Ok(transport::RelayResponse::Complete(response))
                         if matches!(response.response, protocol::PeerResponse::Overloaded) =>
                     {
-                        adaptive::Outcome::Neutral
+                        Outcome::Neutral
                     }
-                    Ok(transport::RelayResponse::Complete(_)) => adaptive::Outcome::Verified,
-                    Err(Error::Overloaded) => adaptive::Outcome::LocalPressure,
-                    _ => adaptive::Outcome::Neutral,
+                    Ok(transport::RelayResponse::Complete(_)) => Outcome::Verified,
+                    Err(Error::Overloaded) => Outcome::LocalPressure,
+                    _ => Outcome::Neutral,
                 });
             }
             drop(membership);
