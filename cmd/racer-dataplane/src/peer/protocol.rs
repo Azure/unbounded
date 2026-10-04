@@ -17,11 +17,12 @@ use crate::model::PageEnvelope;
 use crate::model::PeerOriginContext;
 use crate::model::ResourceClass;
 use crate::model::*;
+use crate::peer::forwarding::ForwardedHead;
 use crate::admission::AdmissionPolicy;
 use uring_runtime::deadline::Deadline;
 use crate::runtime::RequestScope;
 use crate::peer::protocol::SignedHead;
-use crate::peer::forwarding::ForwardedHead;
+use crate::peer::protocol::node_field;
 use crate::topology::RouteBudget;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -33,9 +34,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
-
-pub use crate::peer::forwarding::VerifiedRequest;
-pub use crate::peer::forwarding::VerifiedResponse;
 
 pub enum FetchMode {
     CopyOnly,
@@ -995,9 +993,6 @@ fn array<const N: usize>(head: &MessageHead, name: &str) -> Result<[u8; N]> {
         .try_into()
         .map_err(|_| Error::InvalidRequest)
 }
-fn node(head: &MessageHead, name: &str) -> Result<NodeId> {
-    crate::peer::protocol::node_field(head, name)
-}
 fn object(head: &MessageHead) -> Result<ObjectId> {
     let cache = field(head, "racer-cache")?;
     uuid(&cache)?;
@@ -1058,7 +1053,7 @@ pub(crate) fn grant(head: &MessageHead) -> Result<super::subscriptions::Transfer
             number: PageNumber(number(head, "racer-page")?),
         },
         membership: MembershipVersion(number(head, "racer-grant-membership")?),
-        receiver: node(head, "racer-grant-receiver")?,
+        receiver: node_field(head, "racer-grant-receiver")?,
         deadline: number(head, "racer-grant-deadline")?,
         remaining_page_budget: number(head, "racer-page-budget")?
             .try_into()
@@ -1345,7 +1340,7 @@ fn route(head: &MessageHead) -> Result<RouteBudget> {
         membership: MembershipVersion(number(head, "racer-route-membership")?),
         request: RequestId(array(head, "racer-route-request")?),
         attempt: AttemptId(array(head, "racer-route-attempt")?),
-        destination: node(head, "racer-route-destination")?,
+        destination: node_field(head, "racer-route-destination")?,
         visited,
         remaining_links,
         remaining_attempts: number(head, "racer-route-attempts")?
