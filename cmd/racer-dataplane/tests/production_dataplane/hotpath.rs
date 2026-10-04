@@ -8,12 +8,10 @@
 use super::*;
 use racer_dataplane::config::Config;
 use racer_dataplane::config::DEFAULT_MAX_THREADS;
-use racer_dataplane::read::dispatch::WorkerMap;
 use racer_dataplane::worker::AffinityPlan;
-use racer_dataplane::worker::WorkerFactory;
+use racer_dataplane::worker::Resources;
 use racer_dataplane::worker::WorkerGroup;
 use racer_dataplane::worker::WorkerRuntime;
-
 use std::collections::VecDeque;
 use std::io::BufReader;
 use std::sync::Barrier;
@@ -117,6 +115,7 @@ enum Command {
     Offline,
 }
 struct Factory {
+    resources: Resources,
     root: PathBuf,
     commands: Mutex<BTreeMap<u16, mpsc::Receiver<Command>>>,
     directory: Arc<WorkerDirectory>,
@@ -132,10 +131,7 @@ fn budgets() -> Limits {
     limits.pipes = nz(16);
     limits
 }
-impl WorkerFactory for Factory {
-    fn limits(&self) -> Limits {
-        budgets()
-    }
+impl Factory {
     fn build(
         &self,
         worker: WorkerId,
@@ -169,6 +165,28 @@ impl WorkerFactory for Factory {
         runtime: CryptoRuntime,
     ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
         Ok(Box::new(PageCryptoEngine::new(runtime)))
+    }
+}
+impl uring_runtime::group::Factory<RequestScope> for Factory {
+    fn build_lane(
+        &self,
+        lane: usize,
+    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
+        self.resources
+            .build_lane(lane, |worker, runtime| self.build(worker, runtime))
+    }
+    fn build_helper(
+        &self,
+        lane: usize,
+    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
+        self.resources
+            .build_helper(lane, |worker, runtime| self.build_crypto(worker, runtime))
+    }
+    fn abandon_lane(&self, lane: usize) -> Result<()> {
+        self.resources.abandon_lane(lane)
+    }
+    fn teardown_scope(&self, _: &RequestScope) -> RequestScope {
+        scope()
     }
 }
 struct Service {
@@ -495,6 +513,7 @@ fn shared_directory_routes_cold_and_offline_reads_to_both_owners() {
         })
         .collect();
     let factory = Arc::new(Factory {
+        resources: Resources::new(budgets(), ids.clone(), 1).unwrap(),
         root: scratch.path.clone(),
         commands: Mutex::new(receivers),
         directory: Arc::new(WorkerDirectory::new(map, ids, 256).unwrap()),
@@ -573,6 +592,7 @@ fn run_case(root: &std::path::Path, default: &AffinityPlan, mode: &str, concurre
     let plan = owned_plan(default);
     let crypto_threads = plan.crypto_groups().len();
     let factory = Arc::new(Factory {
+        resources: Resources::new(budgets(), ids.clone(), 1).unwrap(),
         root: root.into(),
         commands: Mutex::new(receivers),
         directory,

@@ -1914,6 +1914,7 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
                 .store(16 * 3600 + 60, Ordering::Release);
         }
         let app = Arc::new(Application {
+            resources: std::sync::OnceLock::new(),
             limits: config.limits.clone(),
             config: Arc::new(config),
             node: node.clone(),
@@ -1931,6 +1932,7 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
                 })
                 .collect(),
         });
+        app.prepare_workers().unwrap();
         group
             .start(app.clone(), &scope(Duration::from_secs(15)).unwrap())
             .unwrap();
@@ -2016,6 +2018,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
     );
     let limits = config.limits.clone();
     let app = Arc::new(Application {
+        resources: std::sync::OnceLock::new(),
         config: Arc::new(config),
         node: node.clone(),
         limits,
@@ -2034,6 +2037,7 @@ fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
             .collect(),
     };
     let mut group = WorkerGroup::new(plan);
+    app.prepare_workers().unwrap();
     group
         .start(app.clone(), &scope(Duration::from_secs(15)).unwrap())
         .unwrap();

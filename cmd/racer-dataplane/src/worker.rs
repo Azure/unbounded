@@ -14,7 +14,7 @@ use crate::admission::AdmissionPolicy;
 use crate::runtime::Cancellation;
 use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
-use crate::security::self as crypto;
+use crate::security;
 use crate::security::CryptoClient;
 use crate::security::CryptoPort;
 use crate::security::IoCryptoPort;
@@ -32,9 +32,6 @@ use sha2::Sha256;
 use std::time::Instant;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::marker::PhantomData;
-use std::num::NonZeroUsize;
-use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -44,6 +41,9 @@ use std::task::Wake;
 use std::task::Waker;
 use std::thread;
 use std::time::Duration;
+#[cfg(test)]
+use std::num::NonZeroUsize;
+use std::ops::Deref;
 use uring_runtime::deadline::Deadline;
 
 const WORK_BUDGET: usize = 64;
@@ -252,32 +252,24 @@ use uring_runtime::group::Plan;
 use uring_runtime::group::Service;
 use uring_runtime::reactor::ReactorWake;
 
-pub struct WorkerGroup<'a> {
-    plan: AffinityPlan,
-    runtime: Group<RequestScope>,
-    generation: u64,
-    borrowed: PhantomData<&'a dyn WorkerFactory>,
-}
-
-/// Shared construction recipe only. Each build runs on its own already-pinned
-/// thread; returned local services/futures need not be Send. The I/O build owns
-/// control/diagnostics as budgeted work, never extra userspace threads.
-///
 /// Rc-backed factories cannot cross the startup boundary:
 /// ```compile_fail
 /// use std::rc::Rc;
-/// use racer_dataplane::{error::Result, model::WorkerId,
-///     worker::{WorkerFactory, WorkerRuntime,
-///                       CryptoRuntime}};
-/// use uring_runtime::group::Service;
-/// use racer_dataplane::runtime::RequestScope;
+/// use racer_dataplane::{error::Result, runtime::RequestScope};
+/// use uring_runtime::group::{Factory, Service};
 /// struct LocalFactory(Rc<()>);
-/// impl WorkerFactory for LocalFactory {
-///     fn build(&self, _: WorkerId, _: WorkerRuntime) -> Result<Box<dyn Service<RequestScope>>> { todo!() }
-///     fn build_crypto(&self, _: WorkerId, _: CryptoRuntime) -> Result<Box<dyn Service<RequestScope>>> { todo!() }
+/// impl Factory<RequestScope> for LocalFactory {
+///     fn build_lane(&self, _: usize) -> Result<Box<dyn Service<RequestScope>>> { todo!() }
 /// }
 /// ```
-pub trait WorkerFactory: Sync {
+pub struct WorkerGroup {
+    plan: AffinityPlan,
+    runtime: Group<RequestScope>,
+    generation: u64,
+}
+
+#[cfg(test)]
+trait FaultRecipe: Sync {
     /// Per-worker limits. Application factories should return their validated
     /// configuration limits here; defaults allow bounded maximum-page progress.
     /// No Config is available to WorkerGroup::new, so this is the composition hook.
@@ -317,13 +309,12 @@ pub trait WorkerFactory: Sync {
 }
 
 
-impl<'a> WorkerGroup<'a> {
+impl WorkerGroup {
     pub fn new(plan: AffinityPlan) -> Self {
         Self {
             runtime: Group::new(runtime_plan(&plan)),
             plan,
             generation: 0,
-            borrowed: PhantomData,
         }
     }
     /// Driver-controlled adapter over the same scoped execution used by `run`.
@@ -331,15 +322,38 @@ impl<'a> WorkerGroup<'a> {
     /// The external driver still requires one slot in the whole-process budget.
     pub fn start(
         &mut self,
-        factory: Arc<dyn WorkerFactory + Send>,
+        factory: Arc<dyn Factory<RequestScope> + Send>,
+        scope: &RequestScope,
+    ) -> Result<()> {
+        self.prepare(false)?;
+        self.runtime.start(factory, scope)
+    }
+    pub fn run(&mut self, factory: &dyn Factory<RequestScope>) -> Result<()> {
+        let scope = lifecycle_scope()?;
+        self.prepare(true)?;
+        self.runtime.run(factory, &scope)
+    }
+    pub fn run_with_scope(
+        &mut self,
+        factory: &dyn Factory<RequestScope>,
+        scope: &RequestScope,
+    ) -> Result<()> {
+        self.prepare(true)?;
+        self.runtime.run_with_scope(factory, scope)
+    }
+    #[cfg(test)]
+    fn start_recipe(
+        &mut self,
+        factory: Arc<dyn FaultRecipe + Send>,
         scope: &RequestScope,
     ) -> Result<()> {
         self.start_with_allocator(factory, scope, security::try_pair)
     }
 
+    #[cfg(test)]
     fn start_with_allocator(
         &mut self,
-        factory: Arc<dyn WorkerFactory + Send>,
+        factory: Arc<dyn FaultRecipe + Send>,
         scope: &RequestScope,
         allocate: impl FnMut(WorkerId, u64, NonZeroUsize) -> Result<(IoCryptoPort, CryptoPort)>,
     ) -> Result<()> {
@@ -365,16 +379,18 @@ impl<'a> WorkerGroup<'a> {
         self.runtime.join()
     }
     /// Ordered start, budgeted drive, drain, shutdown, and join (also on failure).
-    pub fn run(&mut self, factory: &'a dyn WorkerFactory) -> Result<()> {
+    #[cfg(test)]
+    fn run_recipe(&mut self, factory: &dyn FaultRecipe) -> Result<()> {
         let scope = lifecycle_scope()?;
         self.run_inner(factory, &scope, false)
     }
 
     /// Unlike `run`, also treats this scope's cancellation/deadline as a request
     /// to stop the steady-state loop. Neither form truncates completion fencing.
-    pub fn run_with_scope(
+    #[cfg(test)]
+    fn run_recipe_with_scope(
         &mut self,
-        factory: &'a dyn WorkerFactory,
+        factory: &dyn FaultRecipe,
         scope: &RequestScope,
     ) -> Result<()> {
         self.run_inner(factory, scope, true)
@@ -413,9 +429,10 @@ impl<'a> WorkerGroup<'a> {
         Ok(())
     }
 
+    #[cfg(test)]
     fn allocate(
         &self,
-        factory: &dyn WorkerFactory,
+        factory: &dyn FaultRecipe,
         mut allocate: impl FnMut(WorkerId, u64, NonZeroUsize) -> Result<(IoCryptoPort, CryptoPort)>,
     ) -> Result<Resources> {
         // Allocate every endpoint before spawning even the coordinator. Panics
@@ -436,18 +453,20 @@ impl<'a> WorkerGroup<'a> {
         .unwrap_or(Err(Error::Io))
     }
 
+    #[cfg(test)]
     fn run_inner(
         &mut self,
-        factory: &'a dyn WorkerFactory,
+        factory: &dyn FaultRecipe,
         scope: &RequestScope,
         check_scope: bool,
     ) -> Result<()> {
         self.run_with_allocator(factory, scope, check_scope, security::try_pair)
     }
 
+    #[cfg(test)]
     fn run_with_allocator(
         &mut self,
-        factory: &'a dyn WorkerFactory,
+        factory: &dyn FaultRecipe,
         scope: &RequestScope,
         check_scope: bool,
         allocate: impl FnMut(WorkerId, u64, NonZeroUsize) -> Result<(IoCryptoPort, CryptoPort)>,
@@ -463,7 +482,7 @@ impl<'a> WorkerGroup<'a> {
     }
 }
 
-impl Drop for WorkerGroup<'_> {
+impl Drop for WorkerGroup {
     fn drop(&mut self) {
         let _ = self.join();
     }
@@ -620,46 +639,65 @@ fn runtime_plan(plan: &AffinityPlan) -> Plan {
         max_threads: plan.max_threads,
     }
 }
-struct Resources {
+pub struct Resources {
     limits: Limits,
     workers: Vec<WorkerId>,
     ports: Vec<Mutex<(Option<IoCryptoPort>, Option<CryptoPort>)>>,
 }
-struct Adapter<F> {
-    factory: F,
-    resources: Resources,
-}
-impl<F> Factory<RequestScope> for Adapter<F>
-where
-    F: Deref + Sync,
-    F::Target: WorkerFactory,
-{
-    fn abandon_lane(&self, lane: usize) -> Result<()> {
-        if let Some(port) = self.resources.ports[lane].lock().unwrap().0.take() {
+impl Resources {
+    pub fn new(limits: Limits, workers: Vec<WorkerId>, generation: u64) -> Result<Self> {
+        let mut ports = Vec::with_capacity(workers.len());
+        for worker in &workers {
+            let (io, crypto) = security::try_pair(*worker, generation, limits.queue_entries)?;
+            ports.push(Mutex::new((Some(io), Some(crypto))));
+        }
+        Ok(Self {
+            limits,
+            workers,
+            ports,
+        })
+    }
+    pub fn abandon_lane(&self, lane: usize) -> Result<()> {
+        if let Some(port) = self
+            .ports
+            .get(lane)
+            .ok_or(Error::InvalidConfiguration)?
+            .lock()
+            .map_err(|_| Error::Io)?
+            .0
+            .take()
+        {
             port.close_submissions()?;
         }
         Ok(())
     }
-    fn build_lane(&self, lane: usize) -> Result<Box<dyn Service<RequestScope>>> {
-        let port = self.resources.ports[lane]
+    /// Construct on the owning I/O thread. Retain resources even when graph
+    /// construction fails or panics so group teardown closes and fences them.
+    pub fn build_lane(
+        &self,
+        lane: usize,
+        build: impl FnOnce(WorkerId, WorkerRuntime) -> Result<Box<dyn Service<RequestScope>>>,
+    ) -> Result<Box<dyn Service<RequestScope>>> {
+        let port = self
+            .ports
+            .get(lane)
+            .ok_or(Error::InvalidConfiguration)?
             .lock()
-            .unwrap()
+            .map_err(|_| Error::Io)?
             .0
             .take()
             .ok_or(Error::Io)?;
         let admission = Rc::new(flow_control::Quotas::new(AdmissionPolicy::new(
-            self.resources.limits.clone(),
+            self.limits.clone(),
         )));
         let runtime = WorkerRuntime {
             reactor: Rc::new(Reactor::new(admission.clone())),
             admission,
             crypto: Rc::new(CryptoClient::new(port)),
         };
-        // Retain the runtime even if user construction fails or panics. Returning
-        // a failed-start adapter lets the group execute the same close and fence.
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.factory.build(
-                self.resources.workers[lane],
+            build(
+                self.workers[lane],
                 WorkerRuntime {
                     reactor: runtime.reactor.clone(),
                     admission: runtime.admission.clone(),
@@ -674,15 +712,45 @@ where
             reporter: None,
         }))
     }
-    fn build_helper(&self, lane: usize) -> Result<Box<dyn Service<RequestScope>>> {
-        let port = self.resources.ports[lane]
+    pub fn build_helper(
+        &self,
+        lane: usize,
+        build: impl FnOnce(WorkerId, CryptoRuntime) -> Result<Box<dyn Service<RequestScope>>>,
+    ) -> Result<Box<dyn Service<RequestScope>>> {
+        let port = self
+            .ports
+            .get(lane)
+            .ok_or(Error::InvalidConfiguration)?
             .lock()
-            .unwrap()
+            .map_err(|_| Error::Io)?
             .1
             .take()
             .ok_or(Error::Io)?;
-        self.factory
-            .build_crypto(self.resources.workers[lane], CryptoRuntime { port })
+        build(self.workers[lane], CryptoRuntime { port })
+    }
+}
+#[cfg(test)]
+struct Adapter<F> {
+    factory: F,
+    resources: Resources,
+}
+#[cfg(test)]
+impl<F> Factory<RequestScope> for Adapter<F>
+where
+    F: Deref + Sync,
+    F::Target: FaultRecipe,
+{
+    fn abandon_lane(&self, lane: usize) -> Result<()> {
+        self.resources.abandon_lane(lane)
+    }
+    fn build_lane(&self, lane: usize) -> Result<Box<dyn Service<RequestScope>>> {
+        self.resources
+            .build_lane(lane, |worker, runtime| self.factory.build(worker, runtime))
+    }
+    fn build_helper(&self, lane: usize) -> Result<Box<dyn Service<RequestScope>>> {
+        self.resources.build_helper(lane, |worker, runtime| {
+            self.factory.build_crypto(worker, runtime)
+        })
     }
     fn teardown_scope(&self, startup: &RequestScope) -> RequestScope {
         lifecycle_scope().unwrap_or_else(|_| startup.clone())
@@ -849,7 +917,7 @@ mod tests {
             )
         }
 
-        impl WorkerFactory for Factory {
+        impl FaultRecipe for Factory {
             fn limits(&self) -> Limits {
                 let mut limits = crate::test_support::cluster::config(false).limits;
                 limits.queue_entries = NonZeroUsize::new(4).unwrap();
@@ -1171,7 +1239,7 @@ mod tests {
             let observed = factory.observed.clone();
             let mut group = WorkerGroup::new(plan);
             let scope = scope();
-            group.start(Arc::new(factory), &scope).unwrap();
+            group.start_recipe(Arc::new(factory), &scope).unwrap();
             assert_eq!(
                 group.runtime.stats().coordinators,
                 1,
@@ -1228,7 +1296,7 @@ mod tests {
             // deadline-driven teardown after all eight jobs, not startup latency.
             scope.deadline = Deadline(Instant::now() + Duration::from_secs(1));
             assert_eq!(
-                group.run_with_scope(&factory, &scope),
+                group.run_recipe_with_scope(&factory, &scope),
                 Err(Error::DeadlineExceeded)
             );
             assert_eq!(current_cpus().unwrap(), before);
@@ -1236,7 +1304,7 @@ mod tests {
             assert_eq!(factory.observed.submitted.load(Ordering::SeqCst), 8);
             let (plan, factory) = fixture(3, Failure::None, false);
             assert_eq!(
-                WorkerGroup::new(plan).start(Arc::new(factory), &scope),
+                WorkerGroup::new(plan).start_recipe(Arc::new(factory), &scope),
                 Err(Error::InvalidConfiguration)
             );
         }
@@ -1264,9 +1332,9 @@ mod tests {
                         _ => Error::Unauthorized,
                     };
                     let result = if borrowed {
-                        group.run_with_scope(&factory, &scope)
+                        group.run_recipe_with_scope(&factory, &scope)
                     } else {
-                        group.start(Arc::new(factory), &scope)
+                        group.start_recipe(Arc::new(factory), &scope)
                     };
                     assert_eq!(result, Err(expected));
                     assert_eq!(group.runtime.stats().done, 3);
@@ -1303,7 +1371,7 @@ mod tests {
                 let observed = factory.observed.clone();
                 let mut group = WorkerGroup::new(plan);
                 let scope = scope();
-                let started = group.start(Arc::new(factory), &scope);
+                let started = group.start_recipe(Arc::new(factory), &scope);
                 if failure == Failure::PollCrypto {
                     // The poll error may race the parent's readiness observation.
                     assert!(started == Ok(()) || started == Err(Error::Io));
@@ -1326,7 +1394,7 @@ mod tests {
             observed.release.store(true, Ordering::SeqCst);
             let mut group = WorkerGroup::new(plan);
             let scope = scope();
-            group.start(Arc::new(factory), &scope).unwrap();
+            group.start_recipe(Arc::new(factory), &scope).unwrap();
             assert_eq!(observed.completed.load(Ordering::SeqCst), 2);
             group.drain(&scope).unwrap();
             group.shutdown(&scope).unwrap();
@@ -1338,7 +1406,7 @@ mod tests {
             let (plan, factory) = fixture(4, Failure::None, true);
             let mut group = WorkerGroup::new(plan);
             let scope = scope();
-            group.start(Arc::new(factory), &scope).unwrap();
+            group.start_recipe(Arc::new(factory), &scope).unwrap();
             scope.cancel().unwrap();
             // A canceled drain wait may return immediately, but join must still run the
             // real crypto engines and fence every abandoned accepted job.
@@ -1358,7 +1426,7 @@ mod tests {
             let mut scope = scope();
             scope.deadline = Deadline(Instant::now() + Duration::from_millis(100));
             assert_eq!(
-                group.start(Arc::new(factory), &scope),
+                group.start_recipe(Arc::new(factory), &scope),
                 Err(Error::DeadlineExceeded)
             );
             assert_eq!(observed.completed.load(Ordering::SeqCst), 1);
@@ -1415,7 +1483,7 @@ mod tests {
             let observed = factory.observed.clone();
             let mut group = WorkerGroup::new(plan);
             let scope = scope();
-            group.start(Arc::new(factory), &scope).unwrap();
+            group.start_recipe(Arc::new(factory), &scope).unwrap();
             assert_eq!(group.runtime.stats().coordinators, 1);
             assert_eq!(group.runtime.stats().ready, 4);
             group.drain(&scope).unwrap();
@@ -1437,7 +1505,7 @@ mod tests {
             let observed = factory.observed.clone();
             let mut group = WorkerGroup::new(plan);
             let scope = scope();
-            group.start(Arc::new(factory), &scope).unwrap();
+            group.start_recipe(Arc::new(factory), &scope).unwrap();
             assert_eq!(observed.native.lock().unwrap().len(), 2);
             group.drain(&scope).unwrap();
             for io in observed.native.lock().unwrap().iter() {
@@ -1486,7 +1554,7 @@ mod tests {
         fn factory_and_crypto_runtime_have_cross_thread_bounds() {
             fn sync<T: Sync + ?Sized>() {}
             fn send<T: Send + 'static>() {}
-            sync::<dyn WorkerFactory>();
+            sync::<dyn uring_runtime::group::Factory<RequestScope>>();
             send::<CryptoRuntime>();
         }
 
@@ -1513,7 +1581,7 @@ mod tests {
                 self.events.lock().unwrap().push(event);
             }
         }
-        impl WorkerFactory for TestFactory {
+        impl FaultRecipe for TestFactory {
             fn build(
                 &self,
                 _: WorkerId,
@@ -1634,7 +1702,7 @@ mod tests {
                 })
             }
         }
-        fn fixture(max_threads: usize) -> (WorkerGroup<'static>, TestFactory) {
+        fn fixture(max_threads: usize) -> (WorkerGroup, TestFactory) {
             let plan = colocated_plan(max_threads, 1);
             let cpu = plan.pairs[0].io.cpu;
             (
@@ -1703,7 +1771,7 @@ mod tests {
             let (mut group, factory) = fixture(3);
             let events = factory.events.clone();
             let scope = lifecycle_scope().unwrap();
-            group.start(Arc::new(factory), &scope).unwrap();
+            group.start_recipe(Arc::new(factory), &scope).unwrap();
             group.drain(&scope).unwrap();
             group.shutdown(&scope).unwrap();
             group.join().unwrap();
@@ -1735,7 +1803,7 @@ mod tests {
                 .map(|_| scope.cancellation.subscribe().unwrap())
                 .collect::<Vec<_>>();
             assert_eq!(
-                group.start(Arc::new(factory), &scope),
+                group.start_recipe(Arc::new(factory), &scope),
                 Err(Error::Overloaded)
             );
             assert_eq!(group.runtime.stats().coordinators, 0);
@@ -1748,7 +1816,7 @@ mod tests {
             let scope = lifecycle_scope().unwrap();
             let (mut group, factory) = fixture(2);
             assert_eq!(
-                group.start(Arc::new(factory), &scope),
+                group.start_recipe(Arc::new(factory), &scope),
                 Err(Error::InvalidConfiguration)
             );
             for fail_crypto in [false, true] {
@@ -1760,7 +1828,7 @@ mod tests {
                 } else {
                     Error::InvalidRequest
                 };
-                assert_eq!(group.start(Arc::new(factory), &scope), Err(expected));
+                assert_eq!(group.start_recipe(Arc::new(factory), &scope), Err(expected));
                 assert_eq!(group.runtime.stats().coordinators, 0);
                 assert_eq!(group.runtime.stats().done, 2);
             }
@@ -1777,7 +1845,7 @@ mod tests {
             factory.stop_on_poll = true;
             let before = current_cpus().unwrap();
             let mut group = WorkerGroup::new(plan);
-            assert_eq!(group.run(&factory), Err(Error::Cancelled));
+            assert_eq!(group.run_recipe(&factory), Err(Error::Cancelled));
             assert_eq!(current_cpus().unwrap(), before);
             assert_eq!(group.runtime.stats().done, 2);
             assert!(factory.events.lock().unwrap().contains(&"crypto-shutdown"));
@@ -1793,7 +1861,7 @@ mod tests {
             let mut scope = lifecycle_scope().unwrap();
             scope.deadline = Deadline(Instant::now() + Duration::from_millis(50));
             assert_eq!(
-                scoped.run_with_scope(&factory, &scope),
+                scoped.run_recipe_with_scope(&factory, &scope),
                 Err(Error::DeadlineExceeded)
             );
             assert_eq!(scoped.runtime.stats().done, 2);
@@ -1853,7 +1921,7 @@ mod tests {
         #[test]
         fn limits_panic_starts_no_owned_or_borrowed_threads() {
             struct PanicLimits;
-            impl WorkerFactory for PanicLimits {
+            impl FaultRecipe for PanicLimits {
                 fn limits(&self) -> Limits {
                     panic!("injected limits panic")
                 }
@@ -1875,10 +1943,16 @@ mod tests {
             let before = current_cpus().unwrap();
             let scope = lifecycle_scope().unwrap();
             let mut group = WorkerGroup::new(colocated_plan(3, 1));
-            assert_eq!(group.start(Arc::new(PanicLimits), &scope), Err(Error::Io));
+            assert_eq!(
+                group.start_recipe(Arc::new(PanicLimits), &scope),
+                Err(Error::Io)
+            );
             assert_eq!(group.runtime.stats().done, 0);
             assert_eq!(group.runtime.stats().coordinators, 0);
-            assert_eq!(group.run_with_scope(&PanicLimits, &scope), Err(Error::Io));
+            assert_eq!(
+                group.run_recipe_with_scope(&PanicLimits, &scope),
+                Err(Error::Io)
+            );
             assert_eq!(group.runtime.stats().done, 0);
             assert_eq!(current_cpus().unwrap(), before);
         }

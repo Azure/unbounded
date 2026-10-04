@@ -71,7 +71,6 @@ use crate::runtime::RequestScope;
 use crate::worker::AffinityPlan;
 use crate::worker::CryptoRuntime;
 
-use crate::worker::WorkerFactory;
 use crate::worker::WorkerGroup;
 use crate::worker::WorkerRuntime;
 
@@ -112,6 +111,7 @@ mod native;
 mod recovery;
 
 pub struct Application {
+    resources: std::sync::OnceLock<crate::worker::Resources>,
     config: Arc<Config>,
     node: Arc<NodeState>,
     limits: Limits,
@@ -202,6 +202,7 @@ impl Application {
     /// Composition only. Does not open files, spawn threads, or accept requests.
     pub fn assemble(config: Config) -> Result<Self> {
         Ok(Self {
+            resources: std::sync::OnceLock::new(),
             limits: config.limits.clone(),
             config: Arc::new(config),
             node: Arc::new(NodeState::default()),
@@ -234,6 +235,7 @@ impl Application {
         Arc::get_mut(&mut self.config)
             .ok_or(Error::InvalidConfiguration)?
             .node = identity;
+        self.prepare_workers()?;
         let mut workers = WorkerGroup::new(plan);
         let result = workers.run(&self);
         if signals.requested() && result == Err(Error::Cancelled) {
@@ -1292,9 +1294,20 @@ fn poll_task(
     }
 }
 
-impl WorkerFactory for Application {
-    fn limits(&self) -> Limits {
-        self.limits.clone()
+impl Application {
+    fn prepare_workers(&self) -> Result<()> {
+        let resources = crate::worker::Resources::new(
+            self.limits.clone(),
+            self.node
+                .metrics
+                .iter()
+                .map(|(worker, _)| *worker)
+                .collect(),
+            1,
+        )?;
+        self.resources
+            .set(resources)
+            .map_err(|_| Error::InvalidConfiguration)
     }
     fn build(
         &self,
@@ -1318,6 +1331,35 @@ impl WorkerFactory for Application {
         self.node
             .native
             .crypto(worker, PageCryptoEngine::new(runtime))
+    }
+}
+impl uring_runtime::group::Factory<RequestScope> for Application {
+    fn build_lane(
+        &self,
+        lane: usize,
+    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
+        self.resources
+            .get()
+            .ok_or(Error::InvalidConfiguration)?
+            .build_lane(lane, |worker, runtime| self.build(worker, runtime))
+    }
+    fn build_helper(
+        &self,
+        lane: usize,
+    ) -> Result<Box<dyn uring_runtime::group::Service<RequestScope>>> {
+        self.resources
+            .get()
+            .ok_or(Error::InvalidConfiguration)?
+            .build_helper(lane, |worker, runtime| self.build_crypto(worker, runtime))
+    }
+    fn abandon_lane(&self, lane: usize) -> Result<()> {
+        self.resources
+            .get()
+            .ok_or(Error::InvalidConfiguration)?
+            .abandon_lane(lane)
+    }
+    fn teardown_scope(&self, startup: &RequestScope) -> RequestScope {
+        scope(Duration::from_secs(30)).unwrap_or_else(|_| startup.clone())
     }
 }
 impl uring_runtime::group::Service<RequestScope> for WorkerApplication {
