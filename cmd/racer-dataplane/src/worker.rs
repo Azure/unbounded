@@ -646,7 +646,14 @@ pub struct Resources {
 }
 impl Resources {
     pub fn new(limits: Limits, workers: Vec<WorkerId>, generation: u64) -> Result<Self> {
-        let mut ports = Vec::with_capacity(workers.len());
+        let mut unique = HashSet::new();
+        if workers.is_empty() || workers.iter().any(|worker| !unique.insert(*worker)) {
+            return Err(Error::InvalidConfiguration);
+        }
+        let mut ports = Vec::new();
+        ports
+            .try_reserve_exact(workers.len())
+            .map_err(|_| Error::Overloaded)?;
         for worker in &workers {
             let (io, crypto) = security::try_pair(*worker, generation, limits.queue_entries)?;
             ports.push(Mutex::new((Some(io), Some(crypto))));
@@ -842,6 +849,82 @@ fn colocated_plan(max_threads: usize, workers: u16) -> AffinityPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn direct_factory_resources_validate_sets_consume_once_and_fence() {
+        use uring_runtime::group::Factory;
+        let limits = crate::test_support::cluster::config(false).limits;
+        for workers in [vec![], vec![WorkerId(7), WorkerId(7)]] {
+            assert!(matches!(
+                Resources::new(limits.clone(), workers, 9),
+                Err(Error::InvalidConfiguration)
+            ));
+        }
+        let resources = Resources::new(limits.clone(), vec![WorkerId(7)], 9).unwrap();
+        assert_eq!(resources.abandon_lane(1), Err(Error::InvalidConfiguration));
+        resources.abandon_lane(0).unwrap();
+        resources.abandon_lane(0).unwrap();
+        assert!(matches!(
+            resources.build_lane(0, |_, _| unreachable!("abandoned lane")),
+            Err(Error::Io)
+        ));
+        assert!(matches!(
+            resources.build_helper(1, |_, _| unreachable!("invalid lane")),
+            Err(Error::InvalidConfiguration)
+        ));
+        let helper = resources
+            .build_helper(0, |worker, runtime| {
+                assert_eq!(worker, WorkerId(7));
+                Ok(Box::new(crate::security::PageCryptoEngine::new(runtime)))
+            })
+            .unwrap();
+        assert!(matches!(
+            resources.build_helper(0, |_, _| unreachable!("consumed helper")),
+            Err(Error::Io)
+        ));
+        drop(helper);
+
+        struct DirectFactory(Resources);
+        impl Factory<RequestScope> for DirectFactory {
+            fn build_lane(&self, lane: usize) -> Result<Box<dyn Service<RequestScope>>> {
+                self.0.build_lane(lane, |_, _| Ok(Box::new(Local)))
+            }
+            fn build_helper(&self, lane: usize) -> Result<Box<dyn Service<RequestScope>>> {
+                self.0.build_helper(lane, |_, runtime| {
+                    Ok(Box::new(crate::security::PageCryptoEngine::new(runtime)))
+                })
+            }
+            fn abandon_lane(&self, lane: usize) -> Result<()> {
+                self.0.abandon_lane(lane)
+            }
+            fn teardown_scope(&self, _: &RequestScope) -> RequestScope {
+                lifecycle_scope().unwrap()
+            }
+        }
+        struct Local;
+        impl Service<RequestScope> for Local {
+            fn start<'a>(&'a mut self, scope: &'a RequestScope) -> Operation<'a, ()> {
+                Box::pin(async move { scope.check() })
+            }
+            fn poll_budgeted(&mut self, _: &mut Context<'_>, _: usize) -> Result<()> {
+                Ok(())
+            }
+            fn drain<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+            fn shutdown<'a>(&'a mut self, _: &'a RequestScope) -> Operation<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+        let mut group = WorkerGroup::new(colocated_plan(3, 1));
+        let factory = Arc::new(DirectFactory(
+            Resources::new(limits, vec![WorkerId(0)], 10).unwrap(),
+        ));
+        let scope = lifecycle_scope().unwrap();
+        group.start(factory, &scope).unwrap();
+        group.drain(&scope).unwrap();
+        group.shutdown(&scope).unwrap();
+        group.join().unwrap();
+    }
     use racer_control_wire::CacheId;
     mod affinity;
     mod shared_tests {
