@@ -2226,7 +2226,7 @@ impl Transfers {
         relay: Option<Rc<flow_control::Charge<AdmissionPolicy>>>,
         peer_admission: Option<std::sync::Arc<super::adaptive::Permit>>,
         failure: Rc<std::cell::Cell<bool>>,
-        mut timing: Option<&'a mut super::timing::PageTiming<'_>>,
+        mut timing: Option<&'a mut super::PageTiming<'_>>,
         scope: &'a RequestScope,
     ) -> Operation<'a, RelayResponse> {
         Box::pin(async move {

@@ -18,8 +18,8 @@ use crate::model::OriginContext;
 use crate::model::PAGE_BYTES;
 use crate::model::StrongEtag;
 
-pub use crate::http::MAX_HEAD_BYTES;
-pub use crate::model::MAX_FIELD_BYTES;
+use crate::http::MAX_HEAD_BYTES;
+use crate::model::MAX_FIELD_BYTES;
 use http1::MessageHead;
 use http1::StartLine;
 use http1::is_token;

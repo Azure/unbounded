@@ -239,7 +239,7 @@ impl Delivery {
                 return Err(Error::InvalidRequest);
             }
             let socket = connection.socket();
-            validate_socket(&socket)?;
+            socket.validate_socket()?;
             drop(socket);
             let mut stalled_at = uring_runtime::environment::now();
             let mut copying = false;
@@ -376,10 +376,6 @@ fn splice_unsupported(error: &io::Error) -> bool {
         error.raw_os_error(),
         Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
     )
-}
-
-fn validate_socket(connection: &Descriptor) -> Result<()> {
-    connection.validate_socket().map_err(Into::into)
 }
 
 use crate::runtime::cooperative_turn as yield_once;

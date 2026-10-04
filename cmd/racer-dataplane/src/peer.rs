@@ -4,108 +4,76 @@ pub mod forwarding;
 pub mod protocol;
 pub mod server;
 pub mod subscriptions;
-#[cfg(test)]
-pub(crate) mod tests;
-mod timing {
-    use super::protocol::Operation;
-    use super::protocol::PeerRequest;
-    use super::protocol::PeerResponse;
-    use super::protocol::VerifiedResponse;
-    use crate::rdma::TransportPlan;
-    use crate::telemetry::Event;
-    use crate::telemetry::Metrics;
-    use std::time::Instant;
-    use uring_runtime::environment::now;
+use crate::telemetry::Event;
+use crate::telemetry::Metrics;
+use crate::topology::rails::TransportPlan;
+use std::time::Instant;
+use uring_runtime::environment::now;
 
-    pub(super) const STAGES: [(Event, Event); 4] = [
-        (Event::PeerPageCheckoutCount, Event::PeerPageCheckoutNs),
-        (Event::PeerPageAuthCount, Event::PeerPageAuthNs),
-        (Event::PeerPageHeadCount, Event::PeerPageHeadNs),
-        (Event::PeerPageBodyCount, Event::PeerPageBodyNs),
-    ];
+const STAGES: [(Event, Event); 4] = [
+    (Event::PeerPageCheckoutCount, Event::PeerPageCheckoutNs),
+    (Event::PeerPageAuthCount, Event::PeerPageAuthNs),
+    (Event::PeerPageHeadCount, Event::PeerPageHeadNs),
+    (Event::PeerPageBodyCount, Event::PeerPageBodyNs),
+];
 
-    /// Publish all HTTP Page stages only after verification; censor other outcomes.
-    pub(super) struct PageTiming<'a> {
-        metrics: &'a Metrics,
-        active: bool,
-        start: Option<Instant>,
-        durations: [u64; 4],
-        completed: u8,
-    }
-    impl<'a> PageTiming<'a> {
-        pub(super) fn new(metrics: &'a Metrics) -> Self {
-            Self {
-                metrics,
-                active: false,
-                start: None,
-                durations: [0; 4],
-                completed: 0,
-            }
-        }
-        pub(super) fn enable(&mut self, request: &PeerRequest, plan: TransportPlan, opaque: bool) {
-            self.active = !opaque
-                && matches!(plan, TransportPlan::Http)
-                && request.route.visited.len() == 1
-                && matches!(request.operation, Operation::Page { .. });
-            self.begin();
-        }
-        pub(super) fn begin(&mut self) {
-            if self.active {
-                self.start = Some(now());
-            }
-        }
-        pub(super) fn end(&mut self, stage: usize) {
-            if let Some(start) = self.start.take() {
-                self.durations[stage] = now()
-                    .saturating_duration_since(start)
-                    .as_nanos()
-                    .min(u64::MAX as u128) as u64;
-                self.completed |= 1 << stage;
-            }
-        }
-        pub(super) fn success(&mut self, response: &VerifiedResponse) {
-            if self.active
-                && self.completed == 15
-                && matches!(response.response(), PeerResponse::Page { .. })
-            {
-                // Concurrent scrapes are not atomic snapshots.
-                for ((count, sum), duration) in STAGES.into_iter().zip(self.durations) {
-                    self.metrics.record(sum, duration);
-                    self.metrics.record(count, 1);
-                }
-                self.active = false;
-            }
+/// Publish all HTTP Page stages only after verification; censor other outcomes.
+pub(crate) struct PageTiming<'a> {
+    metrics: &'a Metrics,
+    active: bool,
+    start: Option<Instant>,
+    durations: [u64; 4],
+    completed: u8,
+}
+impl<'a> PageTiming<'a> {
+    fn new(metrics: &'a Metrics) -> Self {
+        Self {
+            metrics,
+            active: false,
+            start: None,
+            durations: [0; 4],
+            completed: 0,
         }
     }
-    impl Drop for PageTiming<'_> {
-        fn drop(&mut self) {
-            if self.active {
-                self.metrics.record(Event::PeerPageCensored, 1);
-            }
+    fn enable(&mut self, request: &PeerRequest, plan: TransportPlan, opaque: bool) {
+        self.active = !opaque
+            && matches!(plan, TransportPlan::Http)
+            && request.route.visited.len() == 1
+            && matches!(request.operation, protocol::Operation::Page { .. });
+        self.begin();
+    }
+    fn begin(&mut self) {
+        if self.active {
+            self.start = Some(now());
         }
     }
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        #[test]
-        fn page_timing_duration_conversion_saturates_and_reversed_clock_is_zero() {
-            use std::time::Duration;
-            use uring_runtime::environment::SimulationClock;
-            let metrics = Metrics::default();
-            let clock = SimulationClock::new(9);
-            let _environment = clock.environment(1).enter();
-            let mut timing = PageTiming::new(&metrics);
-            timing.active = true;
-            timing.begin();
-            clock.advance(Duration::from_secs(u64::MAX / 1_000_000_000 + 1));
-            timing.end(0);
-            assert_eq!(timing.durations[0], u64::MAX);
-            timing.start = Some(now() + Duration::from_secs(1));
-            timing.end(1);
-            assert_eq!(timing.durations[1], 0);
-            drop(timing);
-            assert_eq!(metrics.count(Event::PeerPageCensored), 1);
-            assert_eq!(metrics.count(Event::PeerPageCheckoutNs), 0);
+    fn end(&mut self, stage: usize) {
+        if let Some(start) = self.start.take() {
+            self.durations[stage] = now()
+                .saturating_duration_since(start)
+                .as_nanos()
+                .min(u64::MAX as u128) as u64;
+            self.completed |= 1 << stage;
+        }
+    }
+    fn success(&mut self, response: &VerifiedResponse) {
+        if self.active
+            && self.completed == 15
+            && matches!(response.response(), protocol::PeerResponse::Page { .. })
+        {
+            // Concurrent scrapes are not atomic snapshots.
+            for ((count, sum), duration) in STAGES.into_iter().zip(self.durations) {
+                let _ = self.metrics.record(sum, duration);
+                let _ = self.metrics.record(count, 1);
+            }
+            self.active = false;
+        }
+    }
+}
+impl Drop for PageTiming<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.metrics.record(Event::PeerPageCensored, 1);
         }
     }
 }
@@ -582,7 +550,7 @@ impl Requester {
                 return Err(Error::Overloaded);
             }
             let (signed, binding) = forwarding.sign_request_to(request, &next)?;
-            let mut timing = timing::PageTiming::new(metrics);
+            let mut timing = PageTiming::new(metrics);
             let response = self
                 .exchange_inner_mode(signed, membership, None, &scope, true, Some(&mut timing))
                 .await?;
@@ -630,7 +598,7 @@ impl Requester {
             )?;
             let next = route.nodes.get(1).ok_or(Error::Unavailable)?;
             let (signed, binding) = forwarding.sign_request_to(request, next)?;
-            let mut timing = timing::PageTiming::new(metrics);
+            let mut timing = PageTiming::new(metrics);
             let response = self
                 .exchange_inner_mode(signed, membership, None, &scope, false, Some(&mut timing))
                 .await?;
@@ -702,7 +670,7 @@ impl Requester {
         relay: Option<Rc<flow_control::Charge<AdmissionPolicy>>>,
         scope: &'a RequestScope,
         direct_http: bool,
-        timing: Option<&'a mut timing::PageTiming<'_>>,
+        timing: Option<&'a mut PageTiming<'_>>,
     ) -> Operation<'a, transport::RelayResponse> {
         let (network, paths, health, forwarding, transfers) = match self {
             Self::Network {
@@ -858,3 +826,6 @@ impl Requester {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod tests;

@@ -188,7 +188,7 @@ mod body_progress {
                 signed,
                 binding,
             } = self;
-            let mut timing = super::super::timing::PageTiming::new(&telemetry.metrics);
+            let mut timing = super::super::PageTiming::new(&telemetry.metrics);
             let address = listener.local_addr().unwrap();
             let fixture_end = start + Duration::from_secs(5);
             let sent = Cell::new(0usize);
@@ -455,7 +455,7 @@ mod body_progress {
                 case,
                 "success" | "progress" | "reserved_progress" | "capped_progress"
             );
-            for (count, sum) in super::super::timing::STAGES {
+            for (count, sum) in super::super::STAGES {
                 assert_eq!(telemetry.metrics.count(count), u64::from(success), "{case}");
                 if !success {
                     assert_eq!(telemetry.metrics.count(sum), 0, "{case}");
@@ -1666,12 +1666,12 @@ mod requester_safety {
 mod subscriptions;
 mod timing {
     use super::*;
-    use crate::peer::timing::PageTiming;
-    use crate::peer::timing::STAGES;
-    use crate::rdma::TransportPlan;
+    use crate::peer::PageTiming;
+    use crate::peer::STAGES;
     use crate::telemetry::Event;
     use crate::telemetry::Metrics;
     use racer_control_wire::RailId;
+    use crate::topology::rails::TransportPlan;
 
     fn page_request(admission: &flow_control::Quotas<AdmissionPolicy>, attempt: u8) -> PeerRequest {
         let mut local = request(admission, attempt);
@@ -2241,4 +2241,28 @@ impl Drop for NoOutbound {
     }
 }
 use uring_runtime::environment::SimulationClock;
-use uring_runtime::IoBuffer;
+use uring_runtime::reactor::IoBuffer;
+#[test]
+fn page_timing_duration_conversion_saturates_and_reversed_clock_is_zero() {
+    use crate::peer::Event;
+    use crate::peer::Metrics;
+    use crate::peer::PageTiming;
+    use crate::peer::now;
+    use std::time::Duration;
+    use uring_runtime::environment::SimulationClock;
+    let metrics = Metrics::default();
+    let clock = SimulationClock::new(9);
+    let _environment = clock.environment(1).enter();
+    let mut timing = PageTiming::new(&metrics);
+    timing.active = true;
+    timing.begin();
+    clock.advance(Duration::from_secs(u64::MAX / 1_000_000_000 + 1));
+    timing.end(0);
+    assert_eq!(timing.durations[0], u64::MAX);
+    timing.start = Some(now() + Duration::from_secs(1));
+    timing.end(1);
+    assert_eq!(timing.durations[1], 0);
+    drop(timing);
+    assert_eq!(metrics.count(Event::PeerPageCensored), 1);
+    assert_eq!(metrics.count(Event::PeerPageCheckoutNs), 0);
+}
