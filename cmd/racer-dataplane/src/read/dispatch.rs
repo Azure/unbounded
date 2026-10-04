@@ -7,7 +7,7 @@ use super::flight::AcquisitionBudget;
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
-use crate::memory::page::PageResult;
+use crate::memory::PageResult;
 use crate::model::AttemptId;
 use crate::model::MetadataSelector;
 use crate::model::ObjectId;
@@ -76,7 +76,7 @@ enum Work {
         std::sync::Arc<crate::topology::Membership>,
         PeerOriginContext,
     ),
-    Selected(crate::memory::page::CiphertextCopy),
+    Selected(crate::memory::CiphertextCopy),
     Cached(PageId),
     Resolve(
         MetadataSelector,
@@ -259,7 +259,7 @@ impl WorkerDirectory {
     }
     pub(crate) async fn accept_selected(
         &self,
-        copy: crate::memory::page::CiphertextCopy,
+        copy: crate::memory::CiphertextCopy,
         scope: &RequestScope,
     ) -> Result<PageResult> {
         let owner = self.page_owner(&copy.ciphertext.envelope().page)?;

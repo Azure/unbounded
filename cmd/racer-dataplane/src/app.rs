@@ -31,7 +31,7 @@ use crate::http::Delivery;
 use crate::http::HttpPool;
 use crate::http::new_pipe_pool;
 use crate::memory::BufferPool;
-use crate::memory::cache::MemoryCache;
+use crate::memory::MemoryCache;
 use crate::model::NodeId;
 use crate::model::RequestId;
 use crate::model::WorkerId;

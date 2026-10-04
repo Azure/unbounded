@@ -1027,8 +1027,8 @@ mod fidelity {
     use crate::memory::BufferPool;
     use crate::memory::VerifiedBytes;
     use crate::memory::VerifiedPage;
-    use crate::memory::cache::MemoryCache;
-    use crate::memory::page::PageResult;
+    use crate::memory::MemoryCache;
+    use crate::memory::PageResult;
     use crate::model::CacheKey;
     use crate::model::MetadataSelector;
     use crate::model::Nonce;

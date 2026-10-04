@@ -6,7 +6,7 @@
 use crate::error::Error;
 use crate::error::Result;
 use crate::memory::CiphertextPage;
-use crate::memory::page::CiphertextCopy;
+use crate::memory::CiphertextCopy;
 use crate::model::MAX_FIELD_BYTES;
 use crate::model::MembershipVersion;
 use crate::model::NodeId;

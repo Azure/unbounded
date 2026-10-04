@@ -19,10 +19,10 @@ use crate::error::Operation;
 use crate::error::Result;
 use crate::memory::BufferPool;
 use crate::memory::CiphertextPage;
-use crate::memory::cache::MemoryCache;
-use crate::memory::page::AcquiredPage;
-use crate::memory::page::PageResult;
-use crate::memory::page::UnverifiedPage;
+use crate::memory::MemoryCache;
+use crate::memory::AcquiredPage;
+use crate::memory::PageResult;
+use crate::memory::UnverifiedPage;
 use crate::model::ObjectMetadata;
 use crate::model::OriginContext;
 use crate::model::PAGE_BYTES;
@@ -211,7 +211,7 @@ impl Fill {
 
     pub(crate) async fn accept_selected(
         &self,
-        mut copy: crate::memory::page::CiphertextCopy,
+        mut copy: crate::memory::CiphertextCopy,
         scope: &RequestScope,
     ) -> Result<PageResult> {
         scope.check()?;
@@ -421,7 +421,7 @@ impl Fill {
         context: &'a OriginContext,
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
-    ) -> Operation<'a, crate::memory::page::CiphertextCopy> {
+    ) -> Operation<'a, crate::memory::CiphertextCopy> {
         Box::pin(async move {
             Ok(self
                 .acquire_with_prefetch(page, membership, context, scope, budget, None, false, None)
@@ -977,7 +977,7 @@ impl Fill {
 
     pub(super) async fn validate_disk_copy(
         &self,
-        copy: &crate::memory::page::CiphertextCopy,
+        copy: &crate::memory::CiphertextCopy,
         page: &PageId,
         token: &crate::store::ReadToken,
         scope: &RequestScope,
@@ -1251,7 +1251,7 @@ impl Fill {
     pub(super) async fn decrypt(
         &self,
         page: &PageId,
-        copy: crate::memory::page::CiphertextCopy,
+        copy: crate::memory::CiphertextCopy,
         reservation: flow_control::Charge<AdmissionPolicy>,
         scope: &RequestScope,
         source: DecryptSource,
@@ -1331,10 +1331,7 @@ impl Fill {
         Ok(())
     }
 }
-fn response_copy(
-    response: &PeerResponse,
-    page: &PageId,
-) -> Result<crate::memory::page::CiphertextCopy> {
+fn response_copy(response: &PeerResponse, page: &PageId) -> Result<crate::memory::CiphertextCopy> {
     match response {
         PeerResponse::Page {
             metadata,
@@ -1345,7 +1342,7 @@ fn response_copy(
             ciphertext,
             ..
         } => {
-            let copy = crate::memory::page::CiphertextCopy {
+            let copy = crate::memory::CiphertextCopy {
                 metadata: metadata.clone(),
                 ciphertext: ciphertext.clone(),
             };
@@ -1355,10 +1352,7 @@ fn response_copy(
         _ => Err(Error::CorruptRecord),
     }
 }
-pub(super) fn validate_copy(
-    copy: &crate::memory::page::CiphertextCopy,
-    page: &PageId,
-) -> Result<()> {
+pub(super) fn validate_copy(copy: &crate::memory::CiphertextCopy, page: &PageId) -> Result<()> {
     if &copy.ciphertext.envelope().page != page {
         return Err(Error::CorruptRecord);
     }

@@ -574,7 +574,7 @@ mod destination_disconnect {
     fn page_result(
         admission: &flow_control::Quotas<AdmissionPolicy>,
         page: &PageId,
-    ) -> crate::memory::page::PageResult {
+    ) -> crate::memory::PageResult {
         use crate::memory::CiphertextBytes;
         use crate::memory::CiphertextPage;
         use crate::memory::VerifiedBytes;
@@ -582,7 +582,7 @@ mod destination_disconnect {
         use crate::model::ExpiresAt;
         use crate::model::ObjectMetadata;
         use crate::model::PageEnvelope;
-        crate::memory::page::PageResult {
+        crate::memory::PageResult {
             metadata: ObjectMetadata {
                 content_type: None,
                 version: page.version.clone(),
@@ -1647,7 +1647,7 @@ mod requester_safety {
 mod subscriptions {
     use super::*;
     use crate::http::Codec;
-    use crate::memory::page::CiphertextCopy;
+    use crate::memory::CiphertextCopy;
     use crate::model::ExpiresAt;
     use crate::model::ObjectMetadata;
     use crate::model::PageEnvelope;

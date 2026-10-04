@@ -28,6 +28,9 @@ mod measurement {
     use super::tests::input;
     use super::tests::keyring;
     use super::*;
+    use crate::telemetry::Event;
+    use crate::telemetry::Event::*;
+    use crate::telemetry::Metrics;
     use crate::memory::BufferPool;
     use crate::model::Nonce;
     use crate::model::PageEnvelope;
@@ -35,9 +38,6 @@ mod measurement {
     use crate::model::*;
     use crate::security::aead::PageCryptoEngine;
     use crate::security::aead::page_aad;
-    use crate::telemetry::Event;
-    use crate::telemetry::Event::*;
-    use crate::telemetry::Metrics;
     use racer_crypto::aead;
     use std::rc::Rc;
     use std::time::Duration;
@@ -1035,75 +1035,32 @@ mod measurement {
     }
 }
 
+use super::RequestScope;
 use crate::admission::AdmissionPolicy;
-use crate::runtime::RequestScope;
-use channel::Receiver;
-use channel::SendFailure;
-use channel::Sender;
-
-mod channel {
-    //! Racer error adapters for the runtime's bounded SPSC ownership handoffs.
-    use crate::error::Error;
-    use crate::error::Result;
-    use std::task::Context;
-    use std::task::Poll;
-    use uring_runtime::channel;
-
-    pub struct Sender<T>(channel::Sender<T>);
-    pub struct Receiver<T>(channel::Receiver<T>);
-    pub struct SendFailure<T> {
-        pub command: T,
-        pub error: Error,
-    }
-
-    pub fn bounded<T>(capacity: usize) -> Result<(Sender<T>, Receiver<T>)> {
-        let (sender, receiver) = channel::bounded(capacity)?;
-        Ok((Sender(sender), Receiver(receiver)))
-    }
-
-    impl<T> Sender<T> {
-        pub fn discard_closed(&self) -> bool {
-            self.0.discard_closed()
-        }
-
-        pub fn try_send(&self, command: T) -> std::result::Result<(), SendFailure<T>> {
-            self.0.try_send(command).map_err(|failure| SendFailure {
-                command: failure.command,
-                error: failure.error.into(),
-            })
-        }
-
-        pub fn close(&self) {
-            self.0.close();
-        }
-
-        #[cfg(test)]
-        pub fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<Result<()>> {
-            self.0
-                .poll_ready(cx)
-                .map(|result| result.map_err(Into::into))
+use uring_runtime::channel;
+use uring_runtime::channel::Receiver;
+use uring_runtime::channel::Sender;
+/// Rejected crypto work retains its owner and Racer policy failure.
+pub struct CryptoSendFailure<T> {
+    pub command: T,
+    pub error: Error,
+}
+impl<T> From<uring_runtime::channel::SendFailure<T>> for CryptoSendFailure<T> {
+    fn from(failure: uring_runtime::channel::SendFailure<T>) -> Self {
+        Self {
+            command: failure.command,
+            error: failure.error.into(),
         }
     }
-
-    impl<T> Receiver<T> {
-        pub fn is_closed(&self) -> bool {
-            self.0.is_closed()
-        }
-
-        pub fn receive(&mut self) -> Result<Option<T>> {
-            self.0.receive().map_err(Into::into)
-        }
-
-        pub fn poll_receive(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<T>>> {
-            self.0
-                .poll_receive(cx)
-                .map(|result| result.map_err(Into::into))
-        }
-    }
-
+}
+#[cfg(test)]
+mod channel_tests {
     #[cfg(test)]
     mod tests {
-        use super::*;
+        use std::task::Context;
+        use std::task::Poll;
+        use uring_runtime::Error;
+        use uring_runtime::channel::*;
 
         #[test]
         fn adapter_maps_errors_without_losing_command_ownership() {
@@ -1312,10 +1269,10 @@ impl CryptoCompletion {
             m.queue_ns.unwrap_or(0),
         ];
         for (event, amount) in events.into_iter().zip(amounts) {
-            metrics.record(event, amount);
+            let _ = metrics.record(event, amount);
         }
         if let Some(rejection) = m.rejection {
-            metrics.record(
+            let _ = metrics.record(
                 match rejection {
                     IntegrityRejection::Crc => CryptoDecryptCrcRejected,
                     IntegrityRejection::Aead => CryptoDecryptAeadRejected,
@@ -1487,11 +1444,11 @@ impl IoCryptoPort {
     pub fn try_submit(
         &self,
         mut job: CryptoJob,
-    ) -> std::result::Result<(), SendFailure<CryptoJob>> {
+    ) -> std::result::Result<(), CryptoSendFailure<CryptoJob>> {
         if !Arc::ptr_eq(&self.handoff, &job.permit.handoff)
             || self.handoff.closed.load(Ordering::Acquire)
         {
-            return Err(SendFailure {
+            return Err(CryptoSendFailure {
                 command: job,
                 error: Error::Unavailable,
             });
@@ -1506,7 +1463,10 @@ impl IoCryptoPort {
 
     /// Drain even abandoned/stale completions before returning their credits.
     pub fn poll_completion(&self, cx: &mut Context<'_>) -> Poll<Result<Option<CryptoCompletion>>> {
-        self.completions.borrow_mut().poll_receive(cx)
+        self.completions
+            .borrow_mut()
+            .poll_receive(cx)
+            .map_err(Into::into)
     }
 
     /// Refuse new reservations/submissions, but keep completions available.
@@ -1530,7 +1490,8 @@ impl CryptoPort {
             .jobs
             .as_mut()
             .expect("live engine endpoint")
-            .poll_receive(cx);
+            .poll_receive(cx)
+            .map_err(Into::into);
         match result {
             Poll::Ready(Ok(Some(mut job))) => {
                 job.permit.measurement.queue_ns = job.permit.measurement.submitted.map(elapsed_ns);
@@ -1545,9 +1506,9 @@ impl CryptoPort {
     pub fn complete(
         &mut self,
         completion: CryptoCompletion,
-    ) -> std::result::Result<(), SendFailure<CryptoCompletion>> {
+    ) -> std::result::Result<(), CryptoSendFailure<CryptoCompletion>> {
         if !Arc::ptr_eq(&self.handoff, &completion.permit.handoff) {
-            return Err(SendFailure {
+            return Err(CryptoSendFailure {
                 command: completion,
                 error: Error::StaleFlight,
             });

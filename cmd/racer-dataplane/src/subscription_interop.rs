@@ -184,7 +184,7 @@ struct SubscriptionFixture {
     crypto: Rc<runtime::crypto::CryptoClient>,
     reactor: Rc<Reactor>,
     writer: Rc<store::StoreWriter>,
-    memory: Rc<memory::cache::MemoryCache>,
+    memory: Rc<memory::MemoryCache>,
     admission: Rc<flow_control::Quotas<AdmissionPolicy>>,
     cache: racer_control_wire::CacheDefinition,
     scope: RequestScope,
@@ -200,7 +200,7 @@ impl SubscriptionFixture {
         use http::Delivery;
         use http::new_pipe_pool;
         use memory::BufferPool;
-        use memory::cache::MemoryCache;
+        use memory::MemoryCache;
         use racer_control_wire::CacheDefinition;
         use racer_control_wire::Publication;
         use racer_control_wire::*;

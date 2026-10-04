@@ -5,7 +5,7 @@ mod hot_reads;
 mod peer_copies;
 mod remote;
 
-pub(crate) fn page(byte: u8) -> crate::memory::page::PageResult {
+pub(crate) fn page(byte: u8) -> crate::memory::PageResult {
     use crate::memory::CiphertextBytes;
     use crate::memory::CiphertextPage;
     use crate::memory::VerifiedBytes;
@@ -25,7 +25,7 @@ pub(crate) fn page(byte: u8) -> crate::memory::page::PageResult {
         },
         number: PageNumber(0),
     };
-    crate::memory::page::PageResult {
+    crate::memory::PageResult {
         metadata: ObjectMetadata {
             version: page.version.clone(),
             length: 1,
@@ -169,7 +169,7 @@ mod flight {
     use crate::error::Error;
     use crate::error::Operation;
     use crate::error::Result;
-    use crate::memory::page::PageResult;
+    use crate::memory::PageResult;
     use crate::model::CacheId;
     use crate::model::CacheKey;
     use crate::model::ObjectId;

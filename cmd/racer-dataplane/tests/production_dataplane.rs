@@ -20,7 +20,7 @@ use racer_dataplane::http::Delivery;
 use racer_dataplane::http::HttpIo;
 use racer_dataplane::http::new_pipe_pool;
 use racer_dataplane::memory::BufferPool;
-use racer_dataplane::memory::cache::MemoryCache;
+use racer_dataplane::memory::MemoryCache;
 use racer_dataplane::model::PAGE_BYTES;
 use racer_dataplane::model::ResourceClass;
 use racer_dataplane::model::*;

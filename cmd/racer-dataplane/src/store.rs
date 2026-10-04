@@ -10,7 +10,7 @@ use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
 use crate::memory::BufferPool;
-use crate::memory::page::CiphertextCopy;
+use crate::memory::CiphertextCopy;
 use crate::model::CacheId;
 use crate::model::CacheKey;
 use crate::model::KeyId;
@@ -554,7 +554,7 @@ impl StoreWriter {
     }
     /// Unpin exactly one otherwise-idle memory bundle. The two ciphertext owners
     /// must be that bundle and this queued write, not a submitted operation/reader.
-    pub(crate) fn discard_idle_copy(&self, page: &crate::memory::page::PageResult) -> usize {
+    pub(crate) fn discard_idle_copy(&self, page: &crate::memory::PageResult) -> usize {
         let id = page.plaintext.page();
         let mut queue = self.queue.borrow_mut();
         let Some(position) = queue.iter().position(|queued| queued == id) else {

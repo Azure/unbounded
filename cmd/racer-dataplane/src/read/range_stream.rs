@@ -9,7 +9,7 @@ use crate::error::Operation;
 use crate::error::Result;
 use crate::http::Delivery;
 use crate::http::ReaderLease;
-use crate::memory::page::PageResult;
+use crate::memory::PageResult;
 use crate::model::ObjectMetadata;
 use crate::model::ObjectVersion;
 use crate::model::OriginContext;

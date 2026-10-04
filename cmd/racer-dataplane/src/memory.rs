@@ -1,18 +1,29 @@
 //! Distinct accounting and lifetimes for plaintext, ciphertext, pipes, and kernel I/O.
 //! Cache lookups retain the original encrypted page and immutable version metadata.
 //! Eviction releases idle leases; retirement hides entries without revoking owners.
-pub mod cache;
+use crate::runtime::HashMap;
+use crate::runtime::HashSet;
+use crate::admission::AdmissionPolicy;
 use crate::error::Error;
+use crate::error::Operation;
 use crate::error::Result;
 use crate::model::CacheId;
+use crate::model::ObjectMetadata;
+use crate::model::ObjectVersion;
 use crate::model::PAGE_BYTES;
 use crate::model::PageEnvelope;
 use crate::model::PageId;
 use crate::model::ResourceClass;
-
-use crate::admission::AdmissionPolicy;
+use crate::model::VersionMetadata;
+use crate::runtime::RequestScope;
+use flow_control::Quotas;
+use flow_control::pipe::PipeLease;
+use flow_control::pipe::PipePool;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::task::Waker;
 
 #[derive(Clone)]
 pub struct BufferPool {
@@ -155,7 +166,7 @@ impl BufferPool {
         }
         reservation.validate(class, capacity).map_err(Into::into)
     }
-    fn validate_page(&self, page: &page::PageResult) -> Result<()> {
+    fn validate_page(&self, page: &PageResult) -> Result<()> {
         page.validate_metadata()?;
         let cache = Some(&page.plaintext.page().version.object.cache);
         self.validate_reservation(
@@ -171,7 +182,7 @@ impl BufferPool {
             cache,
         )
     }
-    fn validate_ciphertext(&self, copy: &page::CiphertextCopy) -> Result<()> {
+    fn validate_ciphertext(&self, copy: &CiphertextCopy) -> Result<()> {
         copy.validate_metadata()?;
         self.validate_reservation(
             &copy.ciphertext.inner.reservation,
@@ -260,12 +271,481 @@ unsafe impl uring_runtime::reactor::SendBuffer for CiphertextPage {
         Ok(self.bytes())
     }
 }
+/// Credential-free page results shared by fills, memory, and flight completion.
+/// Retain all three values for the same version until the last reader releases
+/// them. Freshness-pointer eviction must not strand a cached page without length.
+#[derive(Clone)]
+pub struct PageResult {
+    pub metadata: ObjectMetadata,
+    pub plaintext: VerifiedPage,
+    pub ciphertext: CiphertextPage,
+}
+
+/// Pending and completed peer copies retain metadata alongside original ciphertext.
+/// The deadline is historical, not permission to advance the current-version pointer.
+#[derive(Clone)]
+pub struct CiphertextCopy {
+    pub metadata: ObjectMetadata,
+    pub ciphertext: CiphertextPage,
+}
+
+/// Structurally validated acquisition output, not proof of page AEAD. Only a
+/// plaintext consumer may promote this to PageResult after authenticating bytes.
+#[derive(Clone)]
+pub struct UnverifiedPage {
+    pub copy: CiphertextCopy,
+    pub(crate) disk_token: Option<crate::store::ReadToken>,
+}
+
+#[derive(Clone)]
+pub enum AcquiredPage {
+    Ciphertext(UnverifiedPage),
+    Plaintext(PageResult),
+}
+impl AcquiredPage {
+    #[cfg(test)]
+    pub(crate) fn verified(self) -> PageResult {
+        match self {
+            Self::Plaintext(page) => page,
+            Self::Ciphertext(_) => panic!("expected verified page"),
+        }
+    }
+    pub fn copy(&self) -> CiphertextCopy {
+        match self {
+            Self::Ciphertext(page) => page.copy.clone(),
+            Self::Plaintext(page) => page.copy(),
+        }
+    }
+    pub fn validate_for(&self, page: &PageId) -> Result<()> {
+        if let Self::Plaintext(result) = self {
+            return result.validate_for(page);
+        }
+        let copy = self.copy();
+        if &copy.ciphertext.envelope().page != page {
+            return Err(Error::CorruptRecord);
+        }
+        copy.validate_metadata()
+    }
+}
+impl From<PageResult> for AcquiredPage {
+    fn from(page: PageResult) -> Self {
+        Self::Plaintext(page)
+    }
+}
+
+impl PageResult {
+    /// An internally consistent bundle still must match the requested flight page.
+    /// This is structural validation, not a substitute for authentication.
+    pub fn validate_for(&self, page: &PageId) -> Result<()> {
+        if self.plaintext.page() != page {
+            return Err(Error::CorruptRecord);
+        }
+        self.validate_metadata()
+    }
+
+    /// Structural agreement only. Authentication remains the fill/crypto boundary.
+    pub fn validate_metadata(&self) -> Result<()> {
+        self.metadata.validate()?;
+        validate_ciphertext_length(&self.ciphertext)?;
+        validate_association(
+            &self.metadata,
+            self.plaintext.page(),
+            self.plaintext.bytes().len() as u64,
+            self.ciphertext.envelope(),
+        )
+    }
+    pub fn copy(&self) -> CiphertextCopy {
+        CiphertextCopy {
+            metadata: self.metadata.clone(),
+            ciphertext: self.ciphertext.clone(),
+        }
+    }
+}
+
+impl CiphertextCopy {
+    pub fn validate_metadata(&self) -> Result<()> {
+        validate_ciphertext(&self.metadata, &self.ciphertext)
+    }
+}
+
+fn validate_ciphertext(metadata: &ObjectMetadata, ciphertext: &CiphertextPage) -> Result<()> {
+    metadata.validate()?;
+    metadata.immutable().validate_page(ciphertext.envelope())?;
+    validate_ciphertext_length(ciphertext)
+}
+fn validate_ciphertext_length(ciphertext: &CiphertextPage) -> Result<()> {
+    if ciphertext.bytes().len() != ciphertext.envelope().ciphertext_length as usize {
+        return Err(Error::CorruptRecord);
+    }
+    Ok(())
+}
+
+fn validate_association(
+    metadata: &ObjectMetadata,
+    plaintext_page: &PageId,
+    plaintext_length: u64,
+    envelope: &PageEnvelope,
+) -> Result<()> {
+    metadata.immutable().validate_page(envelope)?;
+    if plaintext_page != &envelope.page || plaintext_length != u64::from(envelope.plaintext_length)
+    {
+        return Err(Error::CorruptRecord);
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct Entries {
+    pages: HashMap<PageId, (u64, PageResult)>,
+    lru: BTreeMap<u64, PageId>,
+    versions: HashMap<ObjectVersion, HashSet<PageId>>,
+    clock: u64,
+    reclaim_after: u64,
+}
+impl Entries {
+    fn len(&self) -> usize {
+        self.pages.len()
+    }
+    fn remove(&mut self, id: &PageId) -> Option<PageResult> {
+        let (tick, page) = self.pages.remove(id)?;
+        self.lru.remove(&tick);
+        if let Some(pages) = self.versions.get_mut(&id.version) {
+            pages.remove(id);
+            if pages.is_empty() {
+                self.versions.remove(&id.version);
+            }
+        }
+        Some(page)
+    }
+    fn insert(&mut self, page: PageResult) -> Result<()> {
+        self.clock = self.clock.checked_add(1).ok_or(Error::Overloaded)?;
+        let id = page.plaintext.page().clone();
+        self.lru.insert(self.clock, id.clone());
+        self.versions
+            .entry(id.version.clone())
+            .or_default()
+            .insert(id.clone());
+        self.pages.insert(id, (self.clock, page));
+        Ok(())
+    }
+    fn candidates(&mut self) -> Vec<PageId> {
+        let selected: Vec<_> = self
+            .lru
+            .range((
+                std::ops::Bound::Excluded(self.reclaim_after),
+                std::ops::Bound::Unbounded,
+            ))
+            .chain(self.lru.range(..=self.reclaim_after))
+            .take(256)
+            .map(|(tick, id)| (*tick, id.clone()))
+            .collect();
+        if let Some((tick, _)) = selected.last() {
+            self.reclaim_after = *tick;
+        }
+        selected.into_iter().map(|(_, id)| id).collect()
+    }
+}
+/// Worker-local idle verified pages and original ciphertext; independent of disk clock.
+pub struct MemoryCache {
+    // BufferPool is only an admission handle; do not retain a second Rc layer.
+    pool: BufferPool,
+    entries: RefCell<Entries>,
+    ciphertext_entries: RefCell<BTreeMap<PageId, UnverifiedPage>>,
+    ciphertext_cursor: RefCell<Option<PageId>>,
+    availability: Rc<crate::control::Availability>,
+}
+impl MemoryCache {
+    pub fn new(pool: BufferPool, availability: Rc<crate::control::Availability>) -> Self {
+        Self {
+            pool,
+            entries: RefCell::new(Entries::default()),
+            ciphertext_entries: RefCell::new(BTreeMap::new()),
+            ciphertext_cursor: RefCell::new(None),
+            availability,
+        }
+    }
+    fn available(&self, page: &PageResult) -> bool {
+        self.availability.page(
+            &page.metadata.version.object.cache,
+            page.ciphertext.envelope().key_id,
+        )
+    }
+    pub fn get(&self, page: &PageId) -> Result<Option<PageResult>> {
+        let mut entries = self.entries.borrow_mut();
+        let Some((tick, entry)) = entries.pages.get(page) else {
+            return Ok(None);
+        };
+        if !self.available(entry) {
+            entries.remove(page);
+            return Ok(None);
+        }
+        let old = *tick;
+        let result = entry.clone();
+        entries.clock = entries.clock.checked_add(1).ok_or(Error::Overloaded)?;
+        let tick = entries.clock;
+        entries.lru.remove(&old);
+        entries.lru.insert(tick, page.clone());
+        entries.pages.get_mut(page).unwrap().0 = tick;
+        Ok(Some(result))
+    }
+    pub fn ciphertext(&self, page: &PageId) -> Result<Option<CiphertextCopy>> {
+        if let Some(entry) = self.get(page)? {
+            return Ok(Some(entry.copy()));
+        }
+        Ok(self.unverified(page)?.map(|entry| entry.copy))
+    }
+    pub(crate) fn unverified(&self, page: &PageId) -> Result<Option<UnverifiedPage>> {
+        let mut entries = self.ciphertext_entries.borrow_mut();
+        if entries.get(page).is_some_and(|entry| {
+            !self.availability.page(
+                &page.version.object.cache,
+                entry.copy.ciphertext.envelope().key_id,
+            )
+        }) {
+            entries.remove(page);
+        }
+        Ok(entries.get(page).cloned())
+    }
+    pub(crate) fn publish_ciphertext(&self, page: UnverifiedPage) -> Result<()> {
+        self.pool.validate_ciphertext(&page.copy)?;
+        let id = &page.copy.ciphertext.envelope().page;
+        if !self.availability.page(
+            &id.version.object.cache,
+            page.copy.ciphertext.envelope().key_id,
+        ) {
+            return Err(Error::MissingKey);
+        }
+        let mut entries = self.ciphertext_entries.borrow_mut();
+        if entries.contains_key(id) {
+            return Ok(());
+        }
+        if entries.len() + self.entries.borrow().len() >= self.pool.entry_limit() {
+            return Err(Error::Overloaded);
+        }
+        entries.insert(id.clone(), page);
+        Ok(())
+    }
+    pub(crate) fn invalidate_ciphertext(&self, page: &UnverifiedPage) {
+        let id = &page.copy.ciphertext.envelope().page;
+        let mut entries = self.ciphertext_entries.borrow_mut();
+        if entries.get(id).is_some_and(|entry| {
+            Arc::ptr_eq(&entry.copy.ciphertext.inner, &page.copy.ciphertext.inner)
+        }) {
+            entries.remove(id);
+        }
+    }
+    /// Validate matching identities and full-page bounds before retaining the bundle.
+    pub fn publish(&self, page: PageResult) -> Result<()> {
+        self.pool.validate_page(&page)?;
+        self.publish_validated(page)
+    }
+    fn publish_validated(&self, page: PageResult) -> Result<()> {
+        let id = page.plaintext.page();
+        self.ciphertext_entries.borrow_mut().remove(id);
+        if !self.availability.cache(&id.version.object.cache) {
+            return Err(Error::Unavailable);
+        }
+        if !self.available(&page) {
+            return Err(Error::MissingKey);
+        }
+        let mut entries = self.entries.borrow_mut();
+        if let Some(known) = entries
+            .versions
+            .get(&page.metadata.version)
+            .and_then(|pages| pages.iter().next())
+            .and_then(|id| entries.pages.get(id))
+        {
+            if !known
+                .1
+                .metadata
+                .immutable()
+                .compatible(&page.metadata.immutable())
+            {
+                return Err(Error::CorruptRecord);
+            }
+        }
+        if let Some((_, entry)) = entries.pages.get(id) {
+            if entry.plaintext.bytes() != page.plaintext.bytes() {
+                return Err(Error::CorruptRecord);
+            }
+            // A duplicate fill must not replace the original nonce/ciphertext
+            // or turn its historical deadline into renewed freshness.
+            return Ok(());
+        }
+        if entries.len() + self.ciphertext_entries.borrow().len() >= self.pool.entry_limit() {
+            let id = entries
+                .candidates()
+                .into_iter()
+                .find(|id| idle(&entries.pages[id].1))
+                .ok_or(Error::Overloaded)?;
+            entries.remove(&id);
+        }
+        entries.insert(page)
+    }
+    pub fn metadata(&self, version: &ObjectVersion) -> Result<Option<VersionMetadata>> {
+        let entries = self.entries.borrow();
+        let found = entries
+            .versions
+            .get(version)
+            .and_then(|pages| {
+                pages
+                    .iter()
+                    .filter_map(|id| entries.pages.get(id))
+                    .find(|(_, entry)| self.available(entry))
+            })
+            .map(|(_, entry)| entry.metadata.immutable());
+        if found.is_some() {
+            return Ok(found);
+        }
+        Ok(self
+            .ciphertext_entries
+            .borrow()
+            .values()
+            .find(|entry| {
+                &entry.copy.metadata.version == version
+                    && self.availability.page(
+                        &version.object.cache,
+                        entry.copy.ciphertext.envelope().key_id,
+                    )
+            })
+            .map(|entry| entry.copy.metadata.immutable()))
+    }
+    /// Return released admission bytes, including any reserved final-page slack.
+    /// Busy plaintext OR ciphertext protects the complete retained bundle.
+    pub fn evict_idle(&self, bytes: usize) -> Result<usize> {
+        let mut released = self.reclaim_ciphertext(None, bytes);
+        let mut entries = self.entries.borrow_mut();
+        let candidates = entries.candidates();
+        for id in candidates {
+            if released >= bytes {
+                break;
+            }
+            let entry = &entries.pages[&id].1;
+            if !idle(entry) {
+                continue;
+            }
+            released = released
+                .saturating_add(entry.plaintext.inner.reservation.amount())
+                .saturating_add(entry.ciphertext.inner.reservation.amount());
+            entries.remove(&id);
+        }
+        self.pool.reclaim_buffers();
+        Ok(released)
+    }
+    /// One bounded LRU pass, counting only the exhausted class. The callback may
+    /// release a queued writer's sole extra ciphertext reference, never a reader.
+    pub(crate) fn reclaim_idle(
+        &self,
+        class: ResourceClass,
+        cache: Option<&CacheId>,
+        bytes: usize,
+        mut release_queued: impl FnMut(&PageResult) -> usize,
+    ) -> usize {
+        if !matches!(class, ResourceClass::Plaintext | ResourceClass::Ciphertext) {
+            return 0;
+        }
+        let mut released = if matches!(class, ResourceClass::Ciphertext) {
+            self.reclaim_ciphertext(cache, bytes)
+        } else {
+            0
+        };
+        let mut entries = self.entries.borrow_mut();
+        let candidates = entries.candidates();
+        for id in candidates {
+            if released >= bytes {
+                break;
+            }
+            let entry = &entries.pages[&id].1;
+            if cache.is_some_and(|cache| cache != &entry.metadata.version.object.cache)
+                || Arc::strong_count(&entry.plaintext.inner) != 1
+            {
+                continue;
+            }
+            let staging = release_queued(entry);
+            if matches!(class, ResourceClass::Ciphertext) {
+                released = released.saturating_add(staging);
+            }
+            if released >= bytes {
+                break;
+            }
+            if !idle(entry) {
+                continue;
+            }
+            released = released.saturating_add(match class {
+                ResourceClass::Plaintext => entry.plaintext.inner.reservation.amount(),
+                _ => entry.ciphertext.inner.reservation.amount(),
+            });
+            entries.remove(&id);
+        }
+        released
+    }
+    pub fn remove_cache(&self, cache: &CacheId) -> Result<()> {
+        self.ciphertext_entries
+            .borrow_mut()
+            .retain(|id, _| &id.version.object.cache != cache);
+        let mut entries = self.entries.borrow_mut();
+        let removed: Vec<_> = entries
+            .pages
+            .keys()
+            .filter(|id| &id.version.object.cache == cache)
+            .cloned()
+            .collect();
+        for id in removed {
+            entries.remove(&id);
+        }
+        Ok(())
+    }
+    fn reclaim_ciphertext(&self, cache: Option<&CacheId>, bytes: usize) -> usize {
+        let mut entries = self.ciphertext_entries.borrow_mut();
+        let cursor = self.ciphertext_cursor.borrow().clone();
+        let selected: Vec<_> = entries
+            .range((
+                cursor
+                    .as_ref()
+                    .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+                std::ops::Bound::Unbounded,
+            ))
+            .chain(
+                entries
+                    .iter()
+                    .take_while(|(id, _)| cursor.as_ref().is_some_and(|cursor| *id <= cursor)),
+            )
+            .take(256)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if let Some(last) = selected.last() {
+            *self.ciphertext_cursor.borrow_mut() = Some(last.clone());
+        }
+        let mut released = 0;
+        for id in selected {
+            if released >= bytes {
+                break;
+            }
+            if cache.is_some_and(|c| c != &id.version.object.cache)
+                || Arc::strong_count(&entries[&id].copy.ciphertext.inner) != 1
+            {
+                continue;
+            }
+            if let Some(entry) = entries.remove(&id) {
+                released += entry.copy.ciphertext.inner.reservation.amount();
+            }
+        }
+        released
+    }
+}
+fn idle(entry: &PageResult) -> bool {
+    Arc::strong_count(&entry.plaintext.inner) == 1
+        && Arc::strong_count(&entry.ciphertext.inner) == 1
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
+    mod cache;
     use super::*;
     use crate::model::Nonce;
     use crate::model::PageNumber;
     use crate::model::VersionMetadata;
+    use uring_runtime::reactor::IoBuffer;
 
     pub(in crate::memory) fn admission(
         entries: usize,
@@ -277,7 +757,7 @@ pub(crate) mod tests {
     pub(in crate::memory) fn bundle(
         admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
         version: &str,
-    ) -> super::page::PageResult {
+    ) -> PageResult {
         use crate::model::CacheKey;
         use crate::model::ObjectId;
         use crate::model::ObjectVersion;
@@ -300,7 +780,7 @@ pub(crate) mod tests {
     pub(crate) fn bundle_for(
         admission: &Rc<flow_control::Quotas<AdmissionPolicy>>,
         metadata: VersionMetadata,
-    ) -> super::page::PageResult {
+    ) -> PageResult {
         let page = PageId {
             version: metadata.version.clone(),
             number: PageNumber(0),
@@ -330,7 +810,7 @@ pub(crate) mod tests {
                 vec![2; 19],
             )
             .unwrap();
-        super::page::PageResult {
+        PageResult {
             metadata: metadata.for_pin(),
             plaintext,
             ciphertext,
@@ -632,144 +1112,7 @@ pub(crate) mod tests {
         assert_eq!(admission.used(ResourceClass::Plaintext), 0);
         assert_eq!(admission.used(ResourceClass::Ciphertext), 0);
     }
-}
-#[cfg(test)]
-use uring_runtime::reactor::IoBuffer;
-
-/// Credential-free page results shared by fills, memory, and flight completion.
-pub mod page {
-    use super::CiphertextPage;
-    use super::VerifiedPage;
-    use crate::model::ObjectMetadata;
-
-    /// Retain all three values for the same version until the last reader releases
-    /// them. Freshness-pointer eviction must not strand a cached page without length.
-    #[derive(Clone)]
-    pub struct PageResult {
-        pub metadata: ObjectMetadata,
-        pub plaintext: VerifiedPage,
-        pub ciphertext: CiphertextPage,
-    }
-
-    /// Pending and completed peer copies retain metadata alongside original ciphertext.
-    /// The deadline is historical, not permission to advance the current-version pointer.
-    #[derive(Clone)]
-    pub struct CiphertextCopy {
-        pub metadata: ObjectMetadata,
-        pub ciphertext: CiphertextPage,
-    }
-
-    /// Structurally validated acquisition output, not proof of page AEAD. Only a
-    /// plaintext consumer may promote this to PageResult after authenticating bytes.
-    #[derive(Clone)]
-    pub struct UnverifiedPage {
-        pub copy: CiphertextCopy,
-        pub(crate) disk_token: Option<crate::store::ReadToken>,
-    }
-
-    #[derive(Clone)]
-    pub enum AcquiredPage {
-        Ciphertext(UnverifiedPage),
-        Plaintext(PageResult),
-    }
-    impl AcquiredPage {
-        #[cfg(test)]
-        pub(crate) fn verified(self) -> PageResult {
-            match self {
-                Self::Plaintext(page) => page,
-                Self::Ciphertext(_) => panic!("expected verified page"),
-            }
-        }
-        pub fn copy(&self) -> CiphertextCopy {
-            match self {
-                Self::Ciphertext(page) => page.copy.clone(),
-                Self::Plaintext(page) => page.copy(),
-            }
-        }
-        pub fn validate_for(&self, page: &crate::model::PageId) -> crate::error::Result<()> {
-            if let Self::Plaintext(result) = self {
-                return result.validate_for(page);
-            }
-            let copy = self.copy();
-            if &copy.ciphertext.envelope().page != page {
-                return Err(crate::error::Error::CorruptRecord);
-            }
-            copy.validate_metadata()
-        }
-    }
-    impl From<PageResult> for AcquiredPage {
-        fn from(page: PageResult) -> Self {
-            Self::Plaintext(page)
-        }
-    }
-
-    impl PageResult {
-        /// An internally consistent bundle still must match the requested flight page.
-        /// This is structural validation, not a substitute for authentication.
-        pub fn validate_for(&self, page: &crate::model::PageId) -> crate::error::Result<()> {
-            if self.plaintext.page() != page {
-                return Err(crate::error::Error::CorruptRecord);
-            }
-            self.validate_metadata()
-        }
-
-        /// Structural agreement only. Authentication remains the fill/crypto boundary.
-        pub fn validate_metadata(&self) -> crate::error::Result<()> {
-            self.metadata.validate()?;
-            validate_ciphertext_length(&self.ciphertext)?;
-            validate_association(
-                &self.metadata,
-                self.plaintext.page(),
-                self.plaintext.bytes().len() as u64,
-                self.ciphertext.envelope(),
-            )
-        }
-        pub fn copy(&self) -> CiphertextCopy {
-            CiphertextCopy {
-                metadata: self.metadata.clone(),
-                ciphertext: self.ciphertext.clone(),
-            }
-        }
-    }
-
-    impl CiphertextCopy {
-        pub fn validate_metadata(&self) -> crate::error::Result<()> {
-            validate_ciphertext(&self.metadata, &self.ciphertext)
-        }
-    }
-
-    fn validate_ciphertext(
-        metadata: &ObjectMetadata,
-        ciphertext: &CiphertextPage,
-    ) -> crate::error::Result<()> {
-        metadata.validate()?;
-        metadata.immutable().validate_page(ciphertext.envelope())?;
-        validate_ciphertext_length(ciphertext)
-    }
-    fn validate_ciphertext_length(ciphertext: &CiphertextPage) -> crate::error::Result<()> {
-        if ciphertext.bytes().len() != ciphertext.envelope().ciphertext_length as usize {
-            return Err(crate::error::Error::CorruptRecord);
-        }
-        Ok(())
-    }
-
-    fn validate_association(
-        metadata: &ObjectMetadata,
-        plaintext_page: &crate::model::PageId,
-        plaintext_length: u64,
-        envelope: &crate::model::PageEnvelope,
-    ) -> crate::error::Result<()> {
-        metadata.immutable().validate_page(envelope)?;
-        if plaintext_page != &envelope.page
-            || plaintext_length != u64::from(envelope.plaintext_length)
-        {
-            return Err(crate::error::Error::CorruptRecord);
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    mod tests {
+    mod page {
         use super::*;
         use crate::error::Error;
         #[test]
@@ -815,149 +1158,147 @@ pub mod page {
             }
         }
     }
-}
+    pub(in crate::memory) mod pipe_tests {
+        use super::*;
+        use crate::http::new_pipe_pool;
+        use crate::http::acquire_wait;
+        use crate::config::Limits;
+        use crate::error::Error;
 
-#[cfg(test)]
-mod pipe_tests {
-    use super::*;
-    use crate::config::Limits;
-    use crate::error::Error;
-    use crate::http::acquire_wait;
-    use crate::http::new_pipe_pool;
-    use crate::runtime::RequestScope;
-    use flow_control::Quotas;
-    use std::task::Waker;
-
-    pub(in crate::memory) fn admission(pipes: usize) -> Rc<Quotas<AdmissionPolicy>> {
-        let small = std::num::NonZeroUsize::new(8).unwrap();
-        let bytes = std::num::NonZeroUsize::new(32 * 1024 * 1024).unwrap();
-        Rc::new(Quotas::new(AdmissionPolicy::new(Limits {
-            plaintext_bytes: bytes,
-            ciphertext_bytes: bytes,
-            dirty_bytes: bytes,
-            registered_bytes: bytes,
-            request_context_bytes: bytes,
-            flights: small,
-            waiters_per_flight: small,
-            queue_entries: small,
-            connections_per_neighbor: small,
-            client_connections: small,
-            pipes: std::num::NonZeroUsize::new(pipes).unwrap(),
-            range_window_pages: small,
-            header_bytes: small,
-            cached_rankings: small,
-            cached_paths: small,
-            retained_snapshots: small,
-            metadata_entries: small,
-            relay_transfers: small,
-        })))
-    }
-
-    #[test]
-    fn immediate_acquisition_does_not_subscribe_to_cancellation() {
-        use crate::model::RequestId;
-        use std::task::Context;
-        use std::task::Poll;
-        use std::time::Duration;
-        use std::time::Instant;
-        let admission = admission(1);
-        let pool = new_pipe_pool(admission.clone());
-        let scope =
-            RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(5)).unwrap();
-        let mut registrations = Vec::new();
-        loop {
-            match scope.cancellation.subscribe() {
-                Ok(registration) => registrations.push(registration),
-                Err(Error::Overloaded) => break,
-                Err(error) => panic!("unexpected registration failure: {error:?}"),
-            }
-            assert!(registrations.len() <= 1024);
+        pub(in crate::memory) fn admission(pipes: usize) -> Rc<Quotas<AdmissionPolicy>> {
+            let small = std::num::NonZeroUsize::new(8).unwrap();
+            let bytes = std::num::NonZeroUsize::new(32 * 1024 * 1024).unwrap();
+            Rc::new(Quotas::new(AdmissionPolicy::new(Limits {
+                plaintext_bytes: bytes,
+                ciphertext_bytes: bytes,
+                dirty_bytes: bytes,
+                registered_bytes: bytes,
+                request_context_bytes: bytes,
+                flights: small,
+                waiters_per_flight: small,
+                queue_entries: small,
+                connections_per_neighbor: small,
+                client_connections: small,
+                pipes: std::num::NonZeroUsize::new(pipes).unwrap(),
+                range_window_pages: small,
+                header_bytes: small,
+                cached_rankings: small,
+                cached_paths: small,
+                retained_snapshots: small,
+                metadata_entries: small,
+                relay_transfers: small,
+            })))
         }
-        let mut cx = Context::from_waker(Waker::noop());
-        let Poll::Ready(Ok(held)) = acquire_wait(&pool, &scope).as_mut().poll(&mut cx) else {
-            panic!("immediate acquisition unnecessarily subscribed")
-        };
-        assert!(matches!(
-            acquire_wait(&pool, &scope).as_mut().poll(&mut cx),
-            Poll::Ready(Err(Error::Overloaded))
-        ));
-        assert_eq!(admission.used(ResourceClass::RequestContext), 0);
-        assert_eq!(admission.used(ResourceClass::Pipe), 1);
-        drop(registrations);
-        let mut wait = acquire_wait(&pool, &scope);
-        assert!(wait.as_mut().poll(&mut cx).is_pending());
-        drop(held);
-        assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
-        assert_eq!(admission.used(ResourceClass::RequestContext), 0);
-    }
 
-    #[test]
-    fn scheduled_wait_cancellation_deadline_stop_and_abandonment_release_admission() {
-        use crate::model::RequestId;
-        use crate::test_support::WakeCounter;
-        use std::sync::Arc;
-        use std::task::Context;
-        use std::task::Poll;
-        use std::time::Duration;
-        use std::time::Instant;
-        for failure in [
-            Some(Error::Cancelled),
-            Some(Error::DeadlineExceeded),
-            Some(Error::Unavailable),
-            None,
-        ] {
+        #[test]
+        fn immediate_acquisition_does_not_subscribe_to_cancellation() {
+            use crate::model::RequestId;
+            use std::task::Context;
+            use std::task::Poll;
+            use std::time::Duration;
+            use std::time::Instant;
             let admission = admission(1);
             let pool = new_pipe_pool(admission.clone());
-            let held = pool.acquire().unwrap();
-            let scope = RequestScope::new(
-                RequestId([0; 16]),
-                Instant::now()
-                    + if failure == Some(Error::DeadlineExceeded) {
-                        Duration::from_millis(10)
-                    } else {
-                        Duration::from_secs(5)
-                    },
-            )
-            .unwrap();
-            let count = Arc::new(WakeCounter::default());
-            let waker = Waker::from(count.clone());
-            let mut cx = Context::from_waker(&waker);
-            let mut wait = acquire_wait(&pool, &scope);
-            assert!(wait.as_mut().poll(&mut cx).is_pending());
-            assert_eq!(
-                admission.used(ResourceClass::RequestContext),
-                pool.waiter_bytes()
-            );
-            match failure {
-                Some(Error::Cancelled) => {
-                    scope.cancel().unwrap();
-                    assert!(count.count() > 0);
+            let scope =
+                RequestScope::new(RequestId([0; 16]), Instant::now() + Duration::from_secs(5))
+                    .unwrap();
+            let mut registrations = Vec::new();
+            loop {
+                match scope.cancellation.subscribe() {
+                    Ok(registration) => registrations.push(registration),
+                    Err(Error::Overloaded) => break,
+                    Err(error) => panic!("unexpected registration failure: {error:?}"),
                 }
-                Some(Error::DeadlineExceeded) => std::thread::sleep(Duration::from_millis(20)),
-                Some(Error::Unavailable) => admission.stop(),
-                _ => {}
+                assert!(registrations.len() <= 1024);
             }
-            if let Some(expected) = failure {
-                assert!(
-                    matches!(wait.as_mut().poll(&mut cx), Poll::Ready(Err(error)) if error == expected)
-                );
-            }
-            drop(wait);
+            let mut cx = Context::from_waker(Waker::noop());
+            let Poll::Ready(Ok(held)) = acquire_wait(&pool, &scope).as_mut().poll(&mut cx) else {
+                panic!("immediate acquisition unnecessarily subscribed")
+            };
+            assert!(matches!(
+                acquire_wait(&pool, &scope).as_mut().poll(&mut cx),
+                Poll::Ready(Err(Error::Overloaded))
+            ));
             assert_eq!(admission.used(ResourceClass::RequestContext), 0);
             assert_eq!(admission.used(ResourceClass::Pipe), 1);
+            drop(registrations);
+            let mut wait = acquire_wait(&pool, &scope);
+            assert!(wait.as_mut().poll(&mut cx).is_pending());
             drop(held);
-            if failure != Some(Error::Unavailable) {
-                // No stale FIFO entry may prevent the next caller's progress.
-                let fresh =
-                    RequestScope::new(RequestId([1; 16]), Instant::now() + Duration::from_secs(5))
-                        .unwrap();
-                assert!(matches!(
-                    acquire_wait(&pool, &fresh).as_mut().poll(&mut cx),
-                    Poll::Ready(Ok(_))
-                ));
+            assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+            assert_eq!(admission.used(ResourceClass::RequestContext), 0);
+        }
+
+        #[test]
+        fn scheduled_wait_cancellation_deadline_stop_and_abandonment_release_admission() {
+            use crate::model::RequestId;
+            use crate::test_support::WakeCounter;
+            use std::sync::Arc;
+            use std::task::Context;
+            use std::task::Poll;
+            use std::time::Duration;
+            use std::time::Instant;
+            for failure in [
+                Some(Error::Cancelled),
+                Some(Error::DeadlineExceeded),
+                Some(Error::Unavailable),
+                None,
+            ] {
+                let admission = admission(1);
+                let pool = new_pipe_pool(admission.clone());
+                let held = pool.acquire().unwrap();
+                let scope = RequestScope::new(
+                    RequestId([0; 16]),
+                    Instant::now()
+                        + if failure == Some(Error::DeadlineExceeded) {
+                            Duration::from_millis(10)
+                        } else {
+                            Duration::from_secs(5)
+                        },
+                )
+                .unwrap();
+                let count = Arc::new(WakeCounter::default());
+                let waker = Waker::from(count.clone());
+                let mut cx = Context::from_waker(&waker);
+                let mut wait = acquire_wait(&pool, &scope);
+                assert!(wait.as_mut().poll(&mut cx).is_pending());
+                assert_eq!(
+                    admission.used(ResourceClass::RequestContext),
+                    pool.waiter_bytes()
+                );
+                match failure {
+                    Some(Error::Cancelled) => {
+                        scope.cancel().unwrap();
+                        assert!(count.count() > 0);
+                    }
+                    Some(Error::DeadlineExceeded) => std::thread::sleep(Duration::from_millis(20)),
+                    Some(Error::Unavailable) => admission.stop(),
+                    _ => {}
+                }
+                if let Some(expected) = failure {
+                    assert!(
+                        matches!(wait.as_mut().poll(&mut cx), Poll::Ready(Err(error)) if error == expected)
+                    );
+                }
+                drop(wait);
+                assert_eq!(admission.used(ResourceClass::RequestContext), 0);
+                assert_eq!(admission.used(ResourceClass::Pipe), 1);
+                drop(held);
+                if failure != Some(Error::Unavailable) {
+                    // No stale FIFO entry may prevent the next caller's progress.
+                    let fresh = RequestScope::new(
+                        RequestId([1; 16]),
+                        Instant::now() + Duration::from_secs(5),
+                    )
+                    .unwrap();
+                    assert!(matches!(
+                        acquire_wait(&pool, &fresh).as_mut().poll(&mut cx),
+                        Poll::Ready(Ok(_))
+                    ));
+                }
+                drop(pool);
+                assert_eq!(admission.used(ResourceClass::Pipe), 0);
             }
-            drop(pool);
-            assert_eq!(admission.used(ResourceClass::Pipe), 0);
         }
     }
 }

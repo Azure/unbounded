@@ -4,7 +4,7 @@ use crate::control::PublishedState;
 use crate::control::SnapshotStore;
 use crate::http::Delivery;
 use crate::memory::BufferPool;
-use crate::memory::cache::MemoryCache;
+use crate::memory::MemoryCache;
 use crate::model::MembershipVersion;
 use crate::model::ObjectMetadata;
 use crate::model::WorkerId;

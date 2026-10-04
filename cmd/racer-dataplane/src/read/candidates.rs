@@ -121,11 +121,8 @@ impl CandidatePolicy {
         budget: &mut AcquisitionBudget,
         admission: &Rc<flow_control::Quotas<crate::admission::AdmissionPolicy>>,
         continuation: &mut HedgeContinuation,
-        validate: impl Fn(
-            VerifiedResponse,
-            RequestScope,
-        ) -> Operation<'a, crate::memory::page::PageResult>,
-    ) -> Result<Option<crate::memory::page::PageResult>> {
+        validate: impl Fn(VerifiedResponse, RequestScope) -> Operation<'a, crate::memory::PageResult>,
+    ) -> Result<Option<crate::memory::PageResult>> {
         let Some(hedges) = self.hedge.as_ref().filter(|h| h.enabled()) else {
             return Ok(None);
         };
@@ -459,9 +456,9 @@ impl CandidatePolicy {
         operation: PeerOperation,
         scope: &'a RequestScope,
         budget: &'a mut AcquisitionBudget,
-        validate: impl FnMut(VerifiedResponse) -> Operation<'a, crate::memory::page::AcquiredPage> + 'a,
+        validate: impl FnMut(VerifiedResponse) -> Operation<'a, crate::memory::AcquiredPage> + 'a,
         continuation: HedgeContinuation,
-    ) -> Operation<'a, CandidateResolution<crate::memory::page::AcquiredPage>> {
+    ) -> Operation<'a, CandidateResolution<crate::memory::AcquiredPage>> {
         self.resolve_epoch(
             candidates,
             context,
@@ -1319,13 +1316,13 @@ impl Drop for Permit {
 /// Validation is inside each future. Cancellation is requested, never mistaken
 /// for completion: even a validated winner waits for the losing exchange fence.
 pub(crate) async fn race(
-    primary: impl std::future::Future<Output = Result<crate::memory::page::PageResult>>,
-    secondary: impl std::future::Future<Output = Result<crate::memory::page::PageResult>>,
+    primary: impl std::future::Future<Output = Result<crate::memory::PageResult>>,
+    secondary: impl std::future::Future<Output = Result<crate::memory::PageResult>>,
     primary_scope: &crate::runtime::RequestScope,
     secondary_scope: &crate::runtime::RequestScope,
     parent: &crate::runtime::RequestScope,
     permit: &Permit,
-) -> Result<crate::memory::page::PageResult> {
+) -> Result<crate::memory::PageResult> {
     parent.check()?;
     let mut primary = Box::pin(primary);
     let mut secondary = Box::pin(secondary);

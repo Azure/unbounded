@@ -517,7 +517,7 @@ pub(super) fn publication(
     }
 }
 
-pub(super) fn page(app: &WorkerApplication) -> crate::memory::page::PageResult {
+pub(super) fn page(app: &WorkerApplication) -> crate::memory::PageResult {
     use crate::memory::VerifiedBytes;
     use crate::memory::VerifiedPage;
     use crate::model::ResourceClass;
@@ -566,7 +566,7 @@ pub(super) fn page(app: &WorkerApplication) -> crate::memory::page::PageResult {
             vec![2; 19],
         )
         .unwrap();
-    crate::memory::page::PageResult {
+    crate::memory::PageResult {
         plaintext,
         ciphertext,
         metadata: VersionMetadata {

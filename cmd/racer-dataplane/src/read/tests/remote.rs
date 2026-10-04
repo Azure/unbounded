@@ -891,7 +891,7 @@ fn metadata_coordinator_with_newer_publication(
     use crate::control::SnapshotStore;
     use crate::http::Delivery;
     use crate::http::new_pipe_pool;
-    use crate::memory::cache::MemoryCache;
+    use crate::memory::MemoryCache;
     use crate::runtime::crypto;
     use crate::runtime::crypto::CryptoClient;
     use crate::security::aead::PageCrypto;

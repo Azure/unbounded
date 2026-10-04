@@ -77,7 +77,7 @@ struct Refresh {
 #[derive(Clone)]
 struct RefreshOutput {
     metadata: ObjectMetadata,
-    page: Option<crate::memory::page::AcquiredPage>,
+    page: Option<crate::memory::AcquiredPage>,
 }
 #[derive(Default)]
 struct RefreshTable {
@@ -620,9 +620,9 @@ impl MetadataService {
                     page_zero,
                 } if bootstrap => {
                     if let Some(ciphertext) = page_zero {
-                        bootstrap_page = Some(crate::memory::page::AcquiredPage::Ciphertext(
-                            crate::memory::page::UnverifiedPage {
-                                copy: crate::memory::page::CiphertextCopy {
+                        bootstrap_page = Some(crate::memory::AcquiredPage::Ciphertext(
+                            crate::memory::UnverifiedPage {
+                                copy: crate::memory::CiphertextCopy {
                                     metadata: metadata.clone(),
                                     ciphertext: ciphertext.clone(),
                                 },

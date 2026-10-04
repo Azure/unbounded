@@ -2,7 +2,7 @@ use super::*;
 use crate::error::Error;
 use crate::error::Result;
 use crate::memory::BufferPool;
-use crate::memory::page::CiphertextCopy;
+use crate::memory::CiphertextCopy;
 use crate::model::CacheId;
 use crate::model::CacheKey;
 use crate::model::ExpiresAt;
@@ -433,7 +433,7 @@ fn storage_requires_published_cache_and_live_keys_including_restore() {
     use crate::control::Availability;
     use crate::control::PublishedState;
     use crate::control::for_caches;
-    use crate::memory::cache::MemoryCache;
+    use crate::memory::MemoryCache;
     use crate::memory::tests::bundle_for;
     use crate::security::test_support::keys;
     use crate::security::test_support::rotation_bundle;
@@ -477,7 +477,7 @@ fn storage_requires_published_cache_and_live_keys_including_restore() {
                 })
             );
             assert_eq!(
-                memory.publish_ciphertext(crate::memory::page::UnverifiedPage {
+                memory.publish_ciphertext(crate::memory::UnverifiedPage {
                     copy: page.copy(),
                     disk_token: None
                 }),
@@ -1335,7 +1335,7 @@ fn cache_removal_during_write_fences_late_publication() {
 #[test]
 fn sustained_rotation_reclaims_history_and_fences_held_pages_and_write_completions() {
     use crate::control::for_caches;
-    use crate::memory::cache::MemoryCache;
+    use crate::memory::MemoryCache;
     use crate::memory::tests::bundle_for;
     use crate::security::test_support::keys;
     use crate::security::test_support::rotation_bundle;

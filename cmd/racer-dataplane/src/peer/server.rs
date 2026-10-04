@@ -788,7 +788,7 @@ impl PeerServer {
                             ciphertext,
                         }) => {
                             owner.complete(
-                                crate::memory::page::CiphertextCopy {
+                                crate::memory::CiphertextCopy {
                                     metadata,
                                     ciphertext,
                                 },

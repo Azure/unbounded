@@ -4,9 +4,9 @@ pub(super) use crate::error::Operation;
 pub(super) use crate::error::Result;
 pub(super) use crate::memory::BufferPool;
 pub(super) use crate::memory::CiphertextPage;
-pub(super) use crate::memory::cache::MemoryCache;
-pub(super) use crate::memory::page::PageResult;
-pub(super) use crate::memory::page::UnverifiedPage;
+pub(super) use crate::memory::MemoryCache;
+pub(super) use crate::memory::PageResult;
+pub(super) use crate::memory::UnverifiedPage;
 pub(super) use crate::model::ObjectMetadata;
 pub(super) use crate::model::OriginContext;
 pub(super) use crate::model::PAGE_BYTES;
@@ -1970,7 +1970,7 @@ fn cached_corrupt_ciphertext_falls_back_without_exposing_plaintext() {
     let result = acquire(&mut f, &mut budget).unwrap();
     let mut bytes = result.ciphertext.bytes().to_vec();
     bytes[0] ^= 1;
-    let copy = crate::memory::page::CiphertextCopy {
+    let copy = crate::memory::CiphertextCopy {
         metadata: result.metadata.clone(),
         ciphertext: f
             .fill
@@ -3312,8 +3312,8 @@ fn disk_copy_reclaims_idle_ciphertext(bootstrap: bool) {
                 expected.clone(),
             )
             .unwrap();
-        let page = crate::memory::page::UnverifiedPage {
-            copy: crate::memory::page::CiphertextCopy {
+        let page = crate::memory::UnverifiedPage {
+            copy: crate::memory::CiphertextCopy {
                 metadata,
                 ciphertext,
             },

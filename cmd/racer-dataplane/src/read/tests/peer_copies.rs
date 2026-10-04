@@ -1,6 +1,6 @@
 //! Real AEAD and signed peer responses, with deterministic ranked source scripts.
 use super::fill::*;
-use crate::memory::page::CiphertextCopy;
+use crate::memory::CiphertextCopy;
 use crate::model::NodeId;
 use crate::peer::forwarding::Forwarding;
 use crate::peer::forwarding::VerifiedResponse;

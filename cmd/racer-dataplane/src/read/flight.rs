@@ -18,9 +18,9 @@
 use crate::error::Error;
 use crate::error::Operation;
 use crate::error::Result;
-use crate::memory::page::AcquiredPage;
-use crate::memory::page::PageResult;
-use crate::memory::page::UnverifiedPage;
+use crate::memory::AcquiredPage;
+use crate::memory::PageResult;
+use crate::memory::UnverifiedPage;
 use crate::model::OriginContext;
 use crate::model::PageId;
 use crate::model::ResourceClass;
