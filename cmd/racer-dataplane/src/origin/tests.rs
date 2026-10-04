@@ -1251,3 +1251,374 @@ fn reserved_bootstrap_rejects_invalid_charges_before_io_and_releases_them() {
         assert_eq!(admission.used(ResourceClass::Connection), 0);
     }
 }
+mod metadata_tests {
+    use super::*;
+    use std::time::UNIX_EPOCH;
+    fn object() -> ObjectId {
+        ObjectId {
+            cache: CacheId("cache-uid".into()),
+            key: CacheKey([0xab; 32]),
+        }
+    }
+    fn head(length: &[u8], expiry: &[u8], etag: &[u8]) -> MessageHead {
+        response_head(
+            200,
+            &[
+                ("Content-Length", length),
+                ("Racer-Expires-At", expiry),
+                ("ETag", etag),
+            ],
+        )
+    }
+    #[test]
+    fn head_retains_quoted_validator_and_exact_millisecond_expiry() {
+        let metadata = validate_metadata(&head(b"0", b"1234", b"\"v,\\1\""), &object()).unwrap();
+        assert_eq!(metadata.length, 0);
+        assert_eq!(metadata.version.etag.as_bytes(), b"\"v,\\1\"");
+        assert_eq!(
+            metadata.expires_at.as_system_time(),
+            UNIX_EPOCH + Duration::from_millis(1234)
+        );
+        assert_eq!(
+            validate_metadata(
+                &head(b"9223372036854775807", b"9223372036854775807", b"\"\""),
+                &object()
+            )
+            .unwrap()
+            .length,
+            i64::MAX as u64
+        );
+    }
+    #[test]
+    fn metadata_rejects_ambiguous_and_out_of_domain_fields() {
+        for invalid in [
+            b"".as_slice(),
+            b"01",
+            b"-1",
+            b"+1",
+            b" 1",
+            b"1 ",
+            b"\t1",
+            b"1\t",
+            b"1.0",
+            b"9223372036854775808",
+        ] {
+            assert_eq!(decimal(invalid), Err(Error::BadGateway));
+            assert_eq!(
+                validate_metadata(&head(b"1", invalid, b"\"v\""), &object()),
+                Err(Error::BadGateway)
+            );
+            assert_eq!(
+                validate_metadata(&head(invalid, b"0", b"\"v\""), &object()),
+                Err(Error::BadGateway)
+            );
+        }
+        for etag in [b"v".as_slice(), b"W/\"v\"", b"*", b"\"v\", \"w\""] {
+            assert_eq!(
+                validate_metadata(&head(b"1", b"0", etag), &object()),
+                Err(Error::BadGateway)
+            );
+        }
+        for name in [
+            "ETag",
+            "Content-Length",
+            "Racer-Expires-At",
+            "Content-Range",
+            "Transfer-Encoding",
+            "Content-Encoding",
+        ] {
+            let mut response = head(b"1", b"0", b"\"v\"");
+            response.headers.push(Header {
+                name: name.into(),
+                value: b"1".to_vec(),
+            });
+            assert_eq!(
+                validate_metadata(&response, &object()),
+                Err(Error::BadGateway)
+            );
+        }
+    }
+    #[test]
+    fn bootstrap_empty_and_short_page_are_distinct_from_head() {
+        let mut response = head(b"0", b"0", b"\"v\"");
+        response.headers.push(Header {
+            name: "Content-Type".into(),
+            value: b"application/octet-stream".to_vec(),
+        });
+        assert_eq!(validate_bootstrap(&response, &object()).unwrap().1, 0);
+        response.headers[0].value = b"3".to_vec();
+        assert_eq!(
+            validate_bootstrap(&response, &object()),
+            Err(Error::BadGateway)
+        );
+        response.start = StartLine::Response { status: 206 };
+        response.headers.push(Header {
+            name: "Content-Range".into(),
+            value: b"bytes 0-2/3".to_vec(),
+        });
+        assert_eq!(
+            validate_bootstrap(&response, &object()).unwrap().0.length,
+            3
+        );
+        response.headers.last_mut().unwrap().value = b"bytes 0-2/4".to_vec();
+        assert_eq!(
+            validate_bootstrap(&response, &object()),
+            Err(Error::BadGateway)
+        );
+    }
+    #[test]
+    fn raw_expiry_whitespace_is_rejected_before_metadata_publication() {
+        for expiry in ["0", " 0", "0 ", "\t0", "0\t", "0 \t"] {
+            let raw = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"v\"\r\nRacer-Expires-At: {expiry}\r\n\r\n"
+            );
+            let (head, _) = Codec::new(32768)
+                .decode_head(raw.as_bytes())
+                .unwrap()
+                .unwrap();
+            let result = validate_metadata(&head, &object());
+            if expiry == "0" {
+                assert_eq!(result.unwrap().expires_at.as_system_time(), UNIX_EPOCH);
+            } else {
+                assert_eq!(result, Err(Error::BadGateway), "expiry={expiry:?}");
+            }
+        }
+    }
+}
+mod page_tests {
+    use super::*;
+    fn page() -> PageId {
+        PageId {
+            version: ObjectVersion {
+                object: ObjectId {
+                    cache: CacheId("cache".into()),
+                    key: CacheKey([0; 32]),
+                },
+                etag: StrongEtag::parse(b"\"v\"").unwrap(),
+            },
+            number: PageNumber(1),
+        }
+    }
+    fn head() -> MessageHead {
+        response_head(
+            206,
+            &[
+                ("Content-Length", b"3"),
+                ("Content-Type", b"application/octet-stream"),
+                ("Content-Range", b"bytes 16777216-16777218/16777219"),
+                ("ETag", b"\"v\""),
+                ("Racer-Expires-At", b"0"),
+            ],
+        )
+    }
+    #[test]
+    fn pinned_final_page_accepts_only_exact_body_range_and_version() {
+        let page = page();
+        assert_eq!(
+            validate_page(&head(), &page, 3).unwrap().length,
+            PAGE_BYTES + 3
+        );
+        for count in [0, 2, 4, PAGE_BYTES as usize] {
+            assert_eq!(validate_page(&head(), &page, count), Err(Error::BadGateway));
+        }
+        for range in [
+            "bytes 0-2/3",
+            "bytes 16777216-16777218/16777220",
+            "bytes */16777219",
+            "bytes 16777216-16777219/16777219",
+            "bytes 016777216-16777218/16777219",
+        ] {
+            let mut response = head();
+            response.headers[2].value = range.as_bytes().to_vec();
+            assert_eq!(validate_page(&response, &page, 3), Err(Error::BadGateway));
+        }
+        let mut response = head();
+        response.headers[3].value = b"\"other\"".to_vec();
+        assert_eq!(validate_page(&response, &page, 3), Err(Error::BadGateway));
+        response = head();
+        response.start = StartLine::Response { status: 200 };
+        assert_eq!(validate_page(&response, &page, 3), Err(Error::BadGateway));
+        response = head();
+        response.headers[1].value = b"multipart/byteranges".to_vec();
+        assert_eq!(validate_page(&response, &page, 3), Err(Error::BadGateway));
+    }
+}
+mod protocol_tests {
+    use super::*;
+    #[test]
+    fn optional_content_type_is_validated_without_transport_substitution() {
+        let object = ObjectId {
+            cache: CacheId("cache".into()),
+            key: CacheKey([0; 32]),
+        };
+        let base = response_head(
+            200,
+            &[
+                ("ETag", b"\"v1\""),
+                ("Content-Length", b"3"),
+                ("Racer-Expires-At", b"0"),
+                ("Content-Type", b"application/octet-stream"),
+            ],
+        );
+        assert!(metadata(&base, &object, 3).unwrap().content_type.is_none());
+        for value in [
+            b"application/vnd.oci.image.manifest.v1+json".as_slice(),
+            b"",
+            b"text",
+            b"text/plain\t",
+            b"text/plain, text/html",
+            b"text/\xff",
+            b"text/plain\r\nx:y",
+        ] {
+            let mut head = MessageHead {
+                start: StartLine::Response { status: 200 },
+                headers: base
+                    .headers
+                    .iter()
+                    .map(|h| Header {
+                        name: h.name.clone(),
+                        value: h.value.clone(),
+                    })
+                    .collect(),
+            };
+            head.headers.push(Header {
+                name: "Racer-Content-Type".into(),
+                value: value.to_vec(),
+            });
+            let valid = value.starts_with(b"application/");
+            assert_eq!(validate_response(&head, false).is_ok(), valid, "{value:?}");
+            assert_eq!(metadata(&head, &object, 3).is_ok(), valid);
+            if valid {
+                assert_eq!(
+                    metadata(&head, &object, 3)
+                        .unwrap()
+                        .content_type
+                        .unwrap()
+                        .as_bytes(),
+                    value
+                );
+            }
+            head.headers.push(Header {
+                name: "racer-content-type".into(),
+                value: value.to_vec(),
+            });
+            assert_eq!(validate_response(&head, false), Err(Error::BadGateway));
+            assert!(metadata(&head, &object, 3).is_err());
+        }
+    }
+    #[test]
+    fn numeric_headers_reject_padding_before_any_normalization() {
+        let object = ObjectId {
+            cache: CacheId("cache".into()),
+            key: CacheKey([0; 32]),
+        };
+        for (name, canonical) in [
+            ("Racer-Expires-At", "0"),
+            ("Content-Length", "1"),
+            ("Content-Range", "bytes 0-0/1"),
+        ] {
+            for (prefix, suffix) in [("", ""), (" ", ""), ("", " "), ("\t", ""), ("", "\t")] {
+                let fields = [
+                    ("Content-Length", "1"),
+                    ("Content-Type", "application/octet-stream"),
+                    ("Content-Range", "bytes 0-0/1"),
+                    ("ETag", "\"v\""),
+                    ("Racer-Expires-At", "0"),
+                ];
+                let mut raw = String::from("HTTP/1.1 206 Partial Content\r\n");
+                for (field, value) in fields {
+                    if field == name {
+                        raw.push_str(&format!("{field}: {prefix}{canonical}{suffix}\r\n"));
+                    } else {
+                        raw.push_str(&format!("{field}: {value}\r\n"));
+                    }
+                }
+                raw.push_str("\r\n");
+                let result = Codec::new(32768)
+                    .decode_head(raw.as_bytes())
+                    .map_err(|_| Error::BadGateway)
+                    .and_then(|head| validate_bootstrap(&head.unwrap().0, &object));
+                if prefix.is_empty() && suffix.is_empty() {
+                    assert_eq!(result.unwrap().1, 1);
+                } else {
+                    assert_eq!(result, Err(Error::BadGateway), "{name}");
+                }
+            }
+        }
+    }
+    #[test]
+    fn all_sdk_singletons_reject_case_insensitive_duplicates() {
+        for name in [
+            "Host",
+            "Content-Length",
+            "Content-Type",
+            "Content-Range",
+            "ETag",
+            "If-Match",
+            "Range",
+            "Racer-Expires-At",
+            "Racer-Metadata",
+            "Authorization",
+        ] {
+            let mut head = response_head(200, &[("Content-Length", b"0")]);
+            if name != "Content-Length" {
+                head.headers.push(Header {
+                    name: name.into(),
+                    value: b"x".to_vec(),
+                });
+            }
+            head.headers.push(Header {
+                name: name.to_ascii_lowercase(),
+                value: b"x".to_vec(),
+            });
+            assert_eq!(
+                validate_response(&head, false),
+                Err(Error::BadGateway),
+                "{name}"
+            );
+        }
+    }
+    #[test]
+    fn error_contracts_preserve_origin_credential_and_status_distinctions() {
+        for (status, expected) in [
+            (400, Error::InvalidRequest),
+            (401, Error::OriginRejected),
+            (403, Error::OriginForbidden),
+            (404, Error::NotFound),
+            (405, Error::MethodNotAllowed),
+            (412, Error::VersionUnavailable),
+            (416, Error::UnsatisfiableRangeWithLength(27)),
+            (431, Error::HeaderTooLarge),
+            (500, Error::Internal),
+            (502, Error::BadGateway),
+            (503, Error::Unavailable),
+            (302, Error::BadGateway),
+        ] {
+            let mut head = response_head(status, &[("Content-Length", b"0")]);
+            if status == 416 {
+                head.headers.push(Header {
+                    name: "Content-Range".into(),
+                    value: b"bytes */27".to_vec(),
+                });
+            }
+            if status == 405 {
+                head.headers.push(Header {
+                    name: "Allow".into(),
+                    value: b"HEAD, GET".to_vec(),
+                });
+            }
+            assert_eq!(validate_response(&head, false), Err(expected));
+            if status == 404 {
+                assert_eq!(validate_response(&head, true), Err(Error::BadGateway));
+            }
+            head.headers[0].value = b"1".to_vec();
+            assert_eq!(validate_response(&head, false), Err(Error::BadGateway));
+            head.headers[0].value = b"0".to_vec();
+            head.headers.push(Header {
+                name: "ETag".into(),
+                value: b"\"v\"".to_vec(),
+            });
+            assert_eq!(validate_response(&head, false), Err(Error::BadGateway));
+        }
+    }
+}
