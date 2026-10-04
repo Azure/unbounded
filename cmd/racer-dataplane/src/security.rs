@@ -31,7 +31,7 @@ use crate::model::PageEnvelope;
 use crate::model::PageId;
 use crate::model::RequestId;
 use crate::runtime::RequestScope;
-use crate::runtime::worker::CryptoRuntime;
+use crate::worker::CryptoRuntime;
 use crate::telemetry::AeadFailure;
 use crate::telemetry::Failure;
 use crate::telemetry::Stage;

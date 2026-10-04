@@ -1903,7 +1903,7 @@ fn startup_reauthenticates_retained_identity_and_fails_closed() {
 
 #[test]
 fn node_replacement_drains_all_workers_and_restart_converges() {
-    use crate::runtime::affinity::WorkerPair;
+    use crate::worker::WorkerPair;
     use uring_runtime::affinity::EffectiveTopology;
     for renewal_due in [false, true] {
         let mut fixture = ControlFixture::new();
@@ -2005,7 +2005,7 @@ fn node_replacement_drains_all_workers_and_restart_converges() {
 
 #[test]
 fn two_worker_real_control_key_lease_drain_and_checkpoint_cut() {
-    use crate::runtime::affinity::WorkerPair;
+    use crate::worker::WorkerPair;
     use crate::store::checkpoint;
     let mut fixture = ControlFixture::new();
     let (config, node) = fixture.bootstrap_node(2, Duration::from_secs(15));

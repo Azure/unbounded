@@ -1139,7 +1139,7 @@ pub(super) use crate::read::dispatch::WorkerDirectory;
 pub(super) use crate::runtime::Reactor;
 pub(super) use crate::security;
 pub(super) use crate::security::CryptoClient;
-pub(super) use crate::runtime::worker::CryptoRuntime;
+pub(super) use crate::worker::CryptoRuntime;
 
 pub(super) use crate::security::PageCryptoEngine;
 pub(super) use crate::store::catalog::Index;

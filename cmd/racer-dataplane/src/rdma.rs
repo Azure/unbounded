@@ -2803,7 +2803,7 @@ pub(crate) mod tests {
             use crate::admission::AdmissionPolicy;
             use crate::model::*;
             use crate::security;
-            use crate::runtime::worker::CryptoRuntime;
+            use crate::worker::CryptoRuntime;
 
             use crate::security::PageCryptoEngine;
             use racer_identity::KeyPurpose;

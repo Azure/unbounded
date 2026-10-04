@@ -22,7 +22,7 @@ use crate::read::range_stream::RangeStreams;
 use crate::runtime::Reactor;
 use crate::security;
 use crate::security::CryptoClient;
-use crate::runtime::worker::CryptoRuntime;
+use crate::worker::CryptoRuntime;
 use racer_control_wire::CacheDefinition;
 use racer_control_wire::Publication;
 

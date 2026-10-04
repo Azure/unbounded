@@ -983,7 +983,7 @@ mod encrypted_http {
     use crate::runtime::Reactor;
     use crate::security;
     use crate::security::CryptoClient;
-    use crate::runtime::worker::CryptoRuntime;
+    use crate::worker::CryptoRuntime;
 
     use crate::rdma::TransportPlan;
     use crate::security::PageCrypto;

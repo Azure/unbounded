@@ -24,6 +24,7 @@ pub mod security;
 pub mod store;
 pub mod telemetry;
 pub mod topology;
+pub mod worker;
 
 #[cfg(feature = "subscription-interop")]
 #[doc(hidden)]

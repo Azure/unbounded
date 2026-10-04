@@ -1,6 +1,5 @@
 //! Explicit execution ownership. No library may introduce an unbudgeted thread pool.
 
-pub mod affinity;
 // Seeded hashing only in simulated worlds; production retains std hashing.
 #[cfg(not(test))]
 pub(crate) type HashMap<K, V> = std::collections::HashMap<K, V>;
@@ -401,7 +400,6 @@ impl Reactor {
             .fence_matching(move |scope| scope.request == request)
     }
 }
-pub mod worker;
 
 /// Yield one cooperative turn without retaining an executor or I/O owner.
 pub(crate) async fn cooperative_turn() {

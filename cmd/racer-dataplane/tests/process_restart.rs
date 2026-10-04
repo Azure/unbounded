@@ -650,9 +650,9 @@ fn profile_thread_cap(io_shards: usize) -> usize {
     io_shards + io_shards.div_ceil(2)
 }
 
-fn profile_plan(io_shards: usize) -> racer_dataplane::runtime::affinity::AffinityPlan {
+fn profile_plan(io_shards: usize) -> racer_dataplane::worker::AffinityPlan {
     use racer_dataplane::config::Config;
-    use racer_dataplane::runtime::affinity::AffinityPlan;
+    use racer_dataplane::worker::AffinityPlan;
     let config = Config::from_lookup(|name| {
         Ok(match name {
             "RACER_CLUSTER_ID" => Some(CLUSTER.into()),
@@ -674,7 +674,7 @@ fn profile_plan(io_shards: usize) -> racer_dataplane::runtime::affinity::Affinit
 #[test]
 fn capped_profiles_count_io_shards_and_unique_crypto_threads() {
     use racer_dataplane::config::Config;
-    use racer_dataplane::runtime::affinity::AffinityPlan;
+    use racer_dataplane::worker::AffinityPlan;
     let mut config = Config::from_lookup(|name| {
         Ok(match name {
             "RACER_CLUSTER_ID" => Some(CLUSTER.into()),

@@ -31,7 +31,7 @@ use racer_identity::KeyEpochs;
 use racer_identity::Keyring;
 use runtime::Reactor;
 use runtime::RequestScope;
-use runtime::worker::CryptoRuntime;
+use worker::CryptoRuntime;
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;

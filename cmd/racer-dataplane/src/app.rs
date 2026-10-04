@@ -68,12 +68,12 @@ use std::time::UNIX_EPOCH;
 use crate::admission::AdmissionPolicy;
 use crate::runtime::Reactor;
 use crate::runtime::RequestScope;
-use crate::runtime::affinity::AffinityPlan;
-use crate::runtime::worker::CryptoRuntime;
+use crate::worker::AffinityPlan;
+use crate::worker::CryptoRuntime;
 
-use crate::runtime::worker::WorkerFactory;
-use crate::runtime::worker::WorkerGroup;
-use crate::runtime::worker::WorkerRuntime;
+use crate::worker::WorkerFactory;
+use crate::worker::WorkerGroup;
+use crate::worker::WorkerRuntime;
 
 use crate::peer::forwarding::Forwarding;
 use crate::peer::protocol::Signatures;

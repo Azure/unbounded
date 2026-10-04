@@ -21,7 +21,7 @@ use racer_dataplane::security;
 use racer_dataplane::security::CryptoClient;
 use racer_dataplane::security::CryptoInput;
 use racer_dataplane::security::CryptoOutput;
-use racer_dataplane::runtime::worker::CryptoRuntime;
+use racer_dataplane::worker::CryptoRuntime;
 
 use racer_dataplane::security::PageCryptoEngine;
 use racer_identity::KeyEpochs;

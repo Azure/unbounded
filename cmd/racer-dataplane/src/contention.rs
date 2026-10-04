@@ -1057,7 +1057,7 @@ mod fidelity {
     use crate::runtime::RequestScope;
     use crate::security;
     use crate::security::CryptoClient;
-    use crate::runtime::worker::CryptoRuntime;
+    use crate::worker::CryptoRuntime;
 
     use crate::security::PageCrypto;
     use crate::security::PageCryptoEngine;

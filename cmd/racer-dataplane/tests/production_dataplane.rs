@@ -48,7 +48,7 @@ use racer_dataplane::runtime::Reactor;
 use racer_dataplane::runtime::RequestScope;
 use racer_dataplane::security;
 use racer_dataplane::security::CryptoClient;
-use racer_dataplane::runtime::worker::CryptoRuntime;
+use racer_dataplane::worker::CryptoRuntime;
 
 use racer_dataplane::peer::forwarding::Forwarding;
 use racer_dataplane::peer::protocol::Signatures;
@@ -389,7 +389,7 @@ struct Rig {
 }
 struct RigWorker {
     scratch: Scratch,
-    runtime: racer_dataplane::runtime::worker::WorkerRuntime,
+    runtime: racer_dataplane::worker::WorkerRuntime,
     worker: WorkerId,
     directory: Arc<WorkerDirectory>,
     slab_bytes: u64,

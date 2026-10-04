@@ -9,10 +9,10 @@ use super::*;
 use racer_dataplane::config::Config;
 use racer_dataplane::config::DEFAULT_MAX_THREADS;
 use racer_dataplane::read::dispatch::WorkerMap;
-use racer_dataplane::runtime::affinity::AffinityPlan;
-use racer_dataplane::runtime::worker::WorkerFactory;
-use racer_dataplane::runtime::worker::WorkerGroup;
-use racer_dataplane::runtime::worker::WorkerRuntime;
+use racer_dataplane::worker::AffinityPlan;
+use racer_dataplane::worker::WorkerFactory;
+use racer_dataplane::worker::WorkerGroup;
+use racer_dataplane::worker::WorkerRuntime;
 
 use std::collections::VecDeque;
 use std::io::BufReader;
